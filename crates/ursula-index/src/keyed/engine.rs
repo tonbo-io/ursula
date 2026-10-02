@@ -47,11 +47,12 @@
 //! Objects a crash leaves behind are removed by the orphan sweep
 //! ([`KeyedEngine::sweep`], or the `keyed sweep` tool).
 //!
-//! Parts and manifests are content-addressed, so a retry can write an
-//! object whose deletion an earlier attempt queued. A writer therefore pins
-//! the keys it is about to reference (waiting out a deletion in flight, and
-//! re-writing the object after it), and a queued deletion decided before the
-//! latest pin of its key is dropped: the key's new life schedules its own.
+//! Every part and manifest is stored under a key unique to its write
+//! (content hash plus a random nonce, `manifest` module docs), so no key is
+//! ever reused after a deletion of it could have been decided, and a
+//! delayed DELETE can only remove an object nobody references any more. A
+//! writer still pins the keys it is about to reference, and a queued
+//! deletion decided before the latest pin of its key is dropped.
 //!
 //! The source log ([`SourceClient`]), the object store and the wall clock
 //! ([`Clock`]) are injected, and tasks and timers go through the crate's
@@ -80,13 +81,13 @@ use super::admission::Admission;
 use super::admission::AdmissionLimits;
 use super::admission::QueueTicket;
 use super::admission::Reservation;
+use super::admission::Slot;
 use super::fold::RangeQuery;
 use super::manifest::KEYED_PROJECTION_FORMAT;
 use super::manifest::KeyedManifest;
 use super::manifest::KeyedNamespace;
 use super::manifest::KeyedPartMeta;
 use super::manifest::KeyedSource;
-use super::manifest::ObjectWrite;
 use super::manifest::PublishOutcome;
 use super::manifest::PublishedKeyedManifest;
 use super::manifest::SweepReport;
@@ -298,6 +299,26 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Whether `error` is, or wraps (a Parquet read of a data page reports it
+/// as an external error), a missing object.
+fn is_missing_object(error: &IndexError) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = cause {
+        if let Some(index_error) = current.downcast_ref::<IndexError>() {
+            match index_error {
+                IndexError::MissingObject(_) => return true,
+                IndexError::Parquet(parquet::errors::ParquetError::External(inner)) => {
+                    cause = Some(inner.as_ref());
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        cause = current.source();
+    }
+    false
+}
+
 /// blake3 of a record's stored bytes: its message text plus the LF.
 pub(crate) fn stored_digest(text: &str) -> String {
     let mut hasher = blake3::Hasher::new();
@@ -361,6 +382,9 @@ struct Namespace {
     /// The last ingest stopped at `max_ingest_bytes` before its target: the
     /// next one starts without the publish interval.
     backlog: AtomicBool,
+    /// A part of the published manifest is missing although `CURRENT` did
+    /// not move: the next cycle rebuilds the namespace from the source log.
+    needs_rebuild: AtomicBool,
     /// When `CURRENT` was last read or revalidated.
     checked: Mutex<Instant>,
     /// The highest source tail `N` seen in a request (lag metric).
@@ -643,9 +667,6 @@ struct Inner {
     deletions: Notify,
     /// Garbage-collection passes run one at a time.
     gc_pass: tokio::sync::Mutex<()>,
-    /// Objects this process created, and when (pruned after half the
-    /// grace).
-    created: Mutex<HashMap<String, Instant>>,
     /// Process-wide byte budget, ingest and compaction slots, and the
     /// admission queue.
     admission: Admission,
@@ -662,7 +683,13 @@ struct Inner {
     workers: AtomicUsize,
     /// Signalled when a worker finishes.
     worker_done: Notify,
+    /// Test hook run inside the blocking run encode (see
+    /// [`KeyedEngine::set_blocking_encode_hook`]).
+    encode_hook: Mutex<Option<BlockingHook>>,
 }
+
+/// A callback run on the blocking pool; a test seam.
+pub type BlockingHook = Arc<dyn Fn() + Send + Sync>;
 
 /// Counts one background worker; uncounted (and announced) on drop, when
 /// its task ends or is cancelled.
@@ -761,13 +788,13 @@ impl KeyedEngine {
                 guards: Arc::new(Mutex::new(KeyGuards::default())),
                 deletions: Notify::new(),
                 gc_pass: tokio::sync::Mutex::new(()),
-                created: Mutex::new(HashMap::new()),
                 admission,
                 closing: AtomicBool::new(false),
                 cancel: AtomicBool::new(false),
                 cancelled: Notify::new(),
                 workers: AtomicUsize::new(0),
                 worker_done: Notify::new(),
+                encode_hook: Mutex::new(None),
             }),
         }
     }
@@ -824,7 +851,15 @@ impl KeyedEngine {
         }
     }
 
-    /// Background workers running now.
+    /// Test seam: runs `hook` inside every blocking run encode, before the
+    /// encode itself, so a test can hold one past the work deadline.
+    #[doc(hidden)]
+    pub fn set_blocking_encode_hook(&self, hook: Option<BlockingHook>) {
+        *lock(&self.inner.encode_hook) = hook;
+    }
+
+    /// Background workers running now (including blocking work a deadline
+    /// abandoned that is still running).
     pub fn background_workers(&self) -> usize {
         self.inner.workers.load(Ordering::SeqCst)
     }
@@ -932,6 +967,7 @@ impl Inner {
             work: Mutex::new(Work::default()),
             last_used: Mutex::new(Instant::now()),
             backlog: AtomicBool::new(false),
+            needs_rebuild: AtomicBool::new(false),
             checked: Mutex::new(Instant::now()),
             source_next: AtomicU64::new(0),
             requests,
@@ -1170,9 +1206,12 @@ impl Inner {
     /// Serves `selection` from `view`. When the read fails, the view's parts
     /// may have been removed by another pod's compaction and GC after this
     /// pod last loaded `CURRENT` (IX1): reload `CURRENT` once and, when it
-    /// is newer, retry on it before answering 503.
+    /// is newer, retry on it before answering 503. When a part is missing
+    /// and `CURRENT` has not moved, the published state is damaged; the
+    /// namespace is rebuilt from the source log (503 meanwhile) instead of
+    /// failing every read forever.
     async fn serve(
-        &self,
+        self: &Arc<Self>,
         namespace: &Arc<Namespace>,
         view: &View,
         selection: &Selection,
@@ -1197,6 +1236,11 @@ impl Inner {
                     }
                 }
             }
+            Ok(Some(published))
+                if published.manifest.generation == held && is_missing_object(&error) =>
+            {
+                return self.rebuild_damaged(namespace, &error);
+            }
             Ok(_) => {}
             Err(load_error) => {
                 tracing::warn!(
@@ -1208,6 +1252,26 @@ impl Inner {
             }
         }
         self.read_failed(namespace, &error)
+    }
+
+    /// `CURRENT` references a part that is gone: schedules a rebuild of the
+    /// namespace from the source log and answers 503 until it publishes.
+    fn rebuild_damaged(
+        self: &Arc<Self>,
+        namespace: &Arc<Namespace>,
+        error: &IndexError,
+    ) -> KeyedReadOutcome {
+        tracing::error!(
+            %error,
+            bucket = %namespace.source.bucket,
+            key = %namespace.source.key,
+            "keyed CURRENT references a missing object; rebuilding the namespace"
+        );
+        bump(&self.metrics.damaged_rebuilds, 1);
+        namespace.needs_rebuild.store(true, Ordering::SeqCst);
+        namespace.set_status(Status::Rebuilding);
+        let _admitted = self.request_work(namespace, None, true);
+        KeyedReadOutcome::Unavailable("keyed state is being rebuilt".to_owned())
     }
 
     fn read_failed(&self, namespace: &Namespace, error: &IndexError) -> KeyedReadOutcome {
@@ -1392,7 +1456,7 @@ impl Inner {
     /// and ingests up to `want_next`. Returns whether `D` advanced (or a
     /// re-validation ran).
     async fn cycle(
-        &self,
+        self: &Arc<Self>,
         namespace: &Arc<Namespace>,
         want_next: u64,
         verify: bool,
@@ -1414,7 +1478,8 @@ impl Inner {
                 rt::time::sleep(Duration::from_millis(wait)).await;
             }
         }
-        let _slot = self.admission.ingest_slot().await;
+        // Shared with blocking work, which keeps it past a deadline.
+        let slot = Arc::new(self.admission.ingest_slot().await);
         drop(ticket.take());
         self.within("ingest", async {
             let base = self.reload(namespace).await?;
@@ -1424,20 +1489,37 @@ impl Inner {
             if !verify && through >= lock(&namespace.work).want_record {
                 return Ok(true);
             }
-            self.ingest(namespace, base, want_next.max(through)).await?;
+            self.ingest(namespace, base, want_next.max(through), &slot)
+                .await?;
             Ok(verify || namespace.through() > before)
         })
         .await
     }
 
     async fn ingest(
-        &self,
+        self: &Arc<Self>,
         namespace: &Arc<Namespace>,
         base: Option<Arc<PublishedKeyedManifest>>,
         target: u64,
+        slot: &Arc<Slot>,
     ) -> Result<(), CycleError> {
-        let Folded::Discontinuity(reason) =
-            self.fold(namespace, base.as_ref(), false, target).await?
+        if base.is_some() && namespace.needs_rebuild.load(Ordering::SeqCst) {
+            // The published state is damaged (a missing part).
+            namespace.set_status(Status::Rebuilding);
+            return match self
+                .fold(namespace, base.as_ref(), true, true, target, slot)
+                .await?
+            {
+                Folded::Done => {
+                    namespace.needs_rebuild.store(false, Ordering::SeqCst);
+                    Ok(())
+                }
+                Folded::Discontinuity(reason) => Err(CycleError::Transient(reason)),
+            };
+        }
+        let Folded::Discontinuity(reason) = self
+            .fold(namespace, base.as_ref(), false, false, target, slot)
+            .await?
         else {
             return Ok(());
         };
@@ -1482,7 +1564,10 @@ impl Inner {
             "keyed namespace failed its continuity check; rebuilding from record 0"
         );
         namespace.set_status(Status::Rebuilding);
-        match self.fold(namespace, base.as_ref(), true, target).await? {
+        match self
+            .fold(namespace, base.as_ref(), true, false, target, slot)
+            .await?
+        {
             Folded::Done => Ok(()),
             Folded::Discontinuity(reason) => Err(CycleError::Transient(reason)),
         }
@@ -1490,12 +1575,19 @@ impl Inner {
 
     /// Reads `[D−1, target)` (from 0 for a rebuild or `D = 0`), checks the
     /// continuity record, folds the rest into one run and publishes it.
+    ///
+    /// A `repair` rebuild replaces a damaged publication (a missing part)
+    /// of a source that did not change: it reads leader-consistently and
+    /// never publishes below the old `D`; a source that ends earlier fails
+    /// the attempt transiently (it is retried, 503 meanwhile).
     async fn fold(
-        &self,
+        self: &Arc<Self>,
         namespace: &Arc<Namespace>,
         base: Option<&Arc<PublishedKeyedManifest>>,
         rebuild: bool,
+        repair: bool,
         target: u64,
+        slot: &Arc<Slot>,
     ) -> Result<Folded, CycleError> {
         let (d, mut expected) = match base {
             Some(published) if !rebuild => (
@@ -1560,7 +1652,7 @@ impl Inner {
                     cursor,
                     self.config.source_page_bytes,
                     None,
-                    false,
+                    repair,
                 )
                 .await
             {
@@ -1612,6 +1704,13 @@ impl Inner {
             }
             cursor = page.next_record;
         }
+        if repair && builder.next_record() < floor {
+            return Err(CycleError::Transient(format!(
+                "the source ends at record {} below the published D = {floor}; \
+                 the repair waits for it",
+                builder.next_record()
+            )));
+        }
         namespace.backlog.store(truncated, Ordering::SeqCst);
         let empty_base =
             || KeyedManifest::empty_at(namespace.source.clone(), namespace.namespace.format());
@@ -1625,10 +1724,24 @@ impl Inner {
         if let Some(digest) = last_digest {
             let through = builder.next_record();
             let options = self.config.part_options;
-            let built = rt::run_blocking(move || builder.finish(&options))
-                .await
-                .map_err(transient)?
-                .map_err(transient)?;
+            // The blocking encode cannot be cancelled: when the work
+            // deadline drops this future it keeps running, so it owns the
+            // reservation, the ingest slot and a worker count until it
+            // ends, and shutdown waits for it like any worker.
+            self.workers.fetch_add(1, Ordering::SeqCst);
+            let hold = (held.take(), Arc::clone(slot), WorkerGuard(Arc::clone(self)));
+            let hook = lock(&self.encode_hook).clone();
+            let (built, hold) = rt::run_blocking(move || {
+                if let Some(hook) = hook {
+                    hook();
+                }
+                (builder.finish(&options), hold)
+            })
+            .await
+            .map_err(transient)?;
+            let (reservation, _slot, _worker) = hold;
+            held = reservation;
+            let built = built.map_err(transient)?;
             pins = Some(self.store_parts(namespace, &built.parts).await?);
             new_keys = built
                 .parts
@@ -1699,10 +1812,8 @@ impl Inner {
     }
 
     /// Pins and stores `parts`; the pins last until the caller's commit
-    /// has published them or queued them for deletion. A part found already
-    /// present that this process did not create recently is settled before
-    /// returning: another pod's GC or a sweep may have decided to delete
-    /// that copy (`manifest` module docs).
+    /// has published them or queued them for deletion. Every part has a key
+    /// of its own (`manifest` module docs), so nothing is reused.
     async fn store_parts(
         &self,
         namespace: &Namespace,
@@ -1711,35 +1822,14 @@ impl Inner {
         let pins = self
             .pin(namespace, parts.iter().map(|part| part.meta.key.as_str()))
             .await;
-        let mut reused = Vec::new();
         for part in parts {
             let object = format!("{}{}", namespace.namespace.prefix(), part.meta.key);
-            let write = namespace
+            namespace
                 .namespace
                 .put_part(part)
                 .await
                 .map_err(transient)?;
-            match write {
-                ObjectWrite::Created => {
-                    lock(&self.created).insert(object.clone(), Instant::now());
-                }
-                ObjectWrite::Refreshed if !self.created_recently(&object) => {
-                    reused.push((part.meta.key.clone(), Bytes::clone(&part.bytes)));
-                }
-                ObjectWrite::Refreshed => {}
-            }
             self.written.insert(object, Bytes::clone(&part.bytes));
-        }
-        if !reused.is_empty() {
-            bump(
-                &self.metrics.reused_settled,
-                u64::try_from(reused.len()).unwrap_or(u64::MAX),
-            );
-            namespace
-                .namespace
-                .settle(&reused, self.config.gc_grace)
-                .await
-                .map_err(transient)?;
         }
         Ok(pins)
     }
@@ -1754,10 +1844,8 @@ impl Inner {
         manifest: KeyedManifest,
         new_keys: Vec<String>,
     ) -> Result<bool, CycleError> {
-        let manifest_key = manifest
-            .object_key_on(base.map(Arc::as_ref))
-            .map_err(transient)?;
-        let _pinned = self.pin(namespace, [manifest_key.as_str()]).await;
+        // The manifest's key is unique to this write, so no deletion of it
+        // can be queued: it needs no pin.
         let outcome = namespace
             .namespace
             .publish(base.map(Arc::as_ref), &manifest)
@@ -1931,7 +2019,9 @@ impl Inner {
 
     /// Runs `work` within the per-work deadline: a stalled source or store
     /// cannot hold the namespace's worker, its slot and its admission
-    /// budget forever. Dropping `work` releases them.
+    /// budget forever. Dropping `work` releases them, except what a
+    /// blocking encode still running holds (it keeps its reservation, slot
+    /// and worker count until it ends).
     async fn within<T>(
         &self,
         what: &str,
@@ -2002,7 +2092,6 @@ impl Inner {
         let mut deleted = 0_usize;
         let retry = now.checked_add(self.config.gc_tick).unwrap_or(now);
         let ttl = delete_decision_ttl(self.config.gc_grace);
-        self.forget_created();
         for (namespace, keys) in by_namespace {
             if self.draining(&namespace.source.bucket) {
                 continue;
@@ -2023,8 +2112,8 @@ impl Inner {
                     continue;
                 }
                 // Observe the object's age, then CURRENT when that load is
-                // stale, and delete within the decision TTL of both (the
-                // cross-pod reuse protocol, `manifest` module docs).
+                // stale, and delete within the decision TTL of both
+                // (`manifest` module docs).
                 let observed = Instant::now();
                 let modified = match namespace.namespace.modified_ms(&key).await {
                     Ok(Some(modified)) => modified,
@@ -2043,8 +2132,8 @@ impl Inner {
                     .checked_sub(age)
                     .filter(|d| !d.is_zero())
                 {
-                    // Rewritten since (a writer reused it): due again once
-                    // it is old, unless a manifest references it by then.
+                    // Not yet old (its writer may still publish it): due
+                    // again once it is, unless a manifest references it.
                     let due = Instant::now().checked_add(young).unwrap_or(retry);
                     self.requeue_gc(&namespace, vec![(key, decided)], due);
                     continue;
@@ -2114,9 +2203,8 @@ impl Inner {
 
     /// The objects a reader may still use: what `CURRENT` references
     /// (adopting it when newer), plus every manifest written within the
-    /// grace period and what it references (IX2). Queued orphans of a lost
-    /// CAS or an abandoned compaction are content-addressed, so a recent
-    /// manifest other than `CURRENT` may reference them.
+    /// grace period and what it references (IX2): a reader may still hold
+    /// a recent manifest other than `CURRENT`.
     async fn gc_referenced(
         &self,
         namespace: &Arc<Namespace>,
@@ -2137,30 +2225,6 @@ impl Inner {
                 .await?,
         );
         Ok(referenced)
-    }
-
-    /// Whether this process created `object` within half the grace: no
-    /// deleter can have decided to delete it as old, so reusing it needs no
-    /// settling. With a zero grace (tests) nothing is protected anyway, and
-    /// the process's own objects are reused without settling.
-    fn created_recently(&self, object: &str) -> bool {
-        let fresh = self.config.gc_grace.checked_div(2).unwrap_or_default();
-        if fresh.is_zero() {
-            return lock(&self.created).contains_key(object);
-        }
-        lock(&self.created)
-            .get(object)
-            .is_some_and(|created| created.elapsed() < fresh)
-    }
-
-    fn forget_created(&self) {
-        let fresh = self
-            .config
-            .gc_grace
-            .checked_div(2)
-            .unwrap_or_default()
-            .max(self.config.gc_tick);
-        lock(&self.created).retain(|_, created| created.elapsed() < fresh);
     }
 
     fn forget_idle(&self) {

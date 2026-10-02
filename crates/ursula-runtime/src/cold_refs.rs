@@ -58,6 +58,13 @@ pub struct ColdOrphanSweepStream {
     pub cold_range: (u64, u64),
     /// Byte ranges of the objects the stream's state references directly.
     pub referenced_ranges: Vec<(u64, u64)>,
+    /// `[retained, tail)`: every retained byte of the stream. The external
+    /// guard (RT6) needs it covered by the hot buffer, state refs and pages
+    /// before an unreferenced external payload of the stream may go.
+    pub retained_range: (u64, u64),
+    /// Byte ranges the hot buffer holds (it may hold bytes between cold
+    /// ranges).
+    pub hot_ranges: Vec<(u64, u64)>,
 }
 
 /// Outcome of one orphan-sweep step.
@@ -72,6 +79,10 @@ pub struct ColdOrphanSweepReport {
     /// object covers their part of the stream's cold range, so their page
     /// entry was lost (a page write by a deposed leader, or a rollback after
     /// an ambiguous redirect). Deleting them would lose committed data.
+    /// Also counts unreferenced external payloads kept because the stream's
+    /// retained bytes are not fully covered by the hot buffer, state refs
+    /// and page entries (a lost external page entry leaves the payload as
+    /// the only copy).
     pub uncovered_chunks_kept: u64,
     /// The step ran on the leader and reached the end of the group's streams.
     pub cycle_completed: bool,

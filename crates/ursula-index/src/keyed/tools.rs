@@ -41,7 +41,6 @@ use super::manifest::KeyedManifest;
 use super::manifest::KeyedNamespace;
 use super::manifest::KeyedRunMeta;
 use super::manifest::KeyedSource;
-use super::manifest::ObjectWrite;
 use super::manifest::PublishOutcome;
 use super::manifest::PublishedKeyedManifest;
 pub use super::manifest::SweepReport;
@@ -410,9 +409,7 @@ pub struct RebuildOptions {
     pub read: SourceReadOptions,
     /// Projection format of the namespace rebuilt (`v{fmt}/`).
     pub projection_format: u32,
-    /// The GC grace of the namespace's deleters: parts found already
-    /// present are settled for it before they are published
-    /// ([`KeyedNamespace::settle`]).
+    /// The GC grace of the namespace's deleters.
     pub gc_grace: Duration,
 }
 
@@ -476,7 +473,6 @@ pub async fn rebuild(
     }
     let namespace = KeyedNamespace::with_format(store, source.clone(), options.projection_format)
         .with_grace(options.gc_grace);
-    let mut reused = Vec::new();
     let mut base = namespace.load().await.context("load CURRENT")?;
     let target = match &base {
         Some(base) => base.manifest.through_record,
@@ -515,15 +511,7 @@ pub async fn rebuild(
         let folded = task.await.context("join range fold")??;
         report.source_bytes = report.source_bytes.saturating_add(folded.bytes);
         digest = folded.last_digest.or(digest);
-        if let Some(run) = store_run(
-            &namespace,
-            folded.builder,
-            options,
-            &mut report,
-            &mut reused,
-        )
-        .await?
-        {
+        if let Some(run) = store_run(&namespace, folded.builder, options, &mut report).await? {
             runs.push(run);
         }
     }
@@ -540,10 +528,6 @@ pub async fn rebuild(
             );
         }
         let manifest = replacement(&namespace, base.as_ref(), &runs, through, digest.clone())?;
-        namespace
-            .settle(&std::mem::take(&mut reused), options.gc_grace)
-            .await
-            .context("settle reused parts")?;
         match namespace.publish(base.as_ref(), &manifest).await? {
             PublishOutcome::Published(published) => {
                 report.through_record = published.manifest.through_record;
@@ -578,15 +562,7 @@ pub async fn rebuild(
             .await?;
             report.source_bytes = report.source_bytes.saturating_add(folded.bytes);
             digest = folded.last_digest;
-            if let Some(run) = store_run(
-                &namespace,
-                folded.builder,
-                options,
-                &mut report,
-                &mut reused,
-            )
-            .await?
-            {
+            if let Some(run) = store_run(&namespace, folded.builder, options, &mut report).await? {
                 runs.push(run);
             }
             through = next;
@@ -603,15 +579,12 @@ async fn store_run(
     builder: RunBuilder,
     options: &RebuildOptions,
     report: &mut RebuildReport,
-    reused: &mut Vec<(String, bytes::Bytes)>,
 ) -> anyhow::Result<Option<KeyedRunMeta>> {
     let Some(built) = finish(builder, options.read.part_options).await? else {
         return Ok(None);
     };
     for part in &built.parts {
-        if namespace.put_part(part).await? == ObjectWrite::Refreshed {
-            reused.push((part.meta.key.clone(), bytes::Bytes::clone(&part.bytes)));
-        }
+        namespace.put_part(part).await?;
     }
     report.parts = report.parts.saturating_add(built.parts.len());
     Ok((!built.meta.parts.is_empty()).then_some(built.meta))

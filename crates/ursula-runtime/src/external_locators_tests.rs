@@ -358,3 +358,70 @@ async fn orphan_sweep_keeps_state_and_page_referenced_staged_objects() {
     }
     assert_eq!(read_all(&runtime, &s).await, b"PAGESTATE".to_vec());
 }
+
+/// RT6 for external payloads: once the offload pass has moved a committed
+/// external ref into a page, a page read-modify-write by a deposed leader can
+/// drop that entry. The payload then looks unreferenced, but it holds the
+/// only copy of acknowledged bytes, so the sweep keeps it (and every other
+/// unreferenced external payload of the stream) and alerts instead of
+/// deleting it after the grace.
+#[tokio::test]
+async fn orphan_sweep_keeps_an_external_payload_whose_page_entry_was_lost() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = spawn(cold_store.clone());
+    raise(&runtime, FEATURE_LEVEL_EXTERNAL_LOCATORS).await;
+    let s = stream("lost-external-entry");
+    create(&runtime, &s).await;
+    let (offloaded, result) = append_external(&runtime, &cold_store, &s, b"PAGE", None).await;
+    result.expect("external append");
+    runtime
+        .offload_cold_refs(GROUP, offload_now(16))
+        .await
+        .expect("offload pass");
+    let orphan = new_external_payload_path(&s);
+    cold_store
+        .write_chunk(&orphan, b"orphan")
+        .await
+        .expect("inject orphan");
+
+    // A deposed leader rewrites the page without the committed entry.
+    let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+    let mut dropped = 0;
+    for key in cold_store
+        .list_cold_index_pages()
+        .await
+        .expect("list pages")
+    {
+        if key.stream_id != s {
+            continue;
+        }
+        let mut page = store.get_page(&key).await.unwrap().expect("page");
+        let before = page.external_segments.len();
+        page.external_segments
+            .retain(|entry| entry.s3_path != offloaded);
+        dropped += before - page.external_segments.len();
+        store.put_page(&key, &page).await.unwrap();
+    }
+    assert_eq!(dropped, 1, "the offloaded entry lived in a page");
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let swept = runtime
+        .sweep_cold_orphans_group_once(GROUP, 16, 0)
+        .await
+        .expect("sweep");
+    assert_eq!(
+        swept.orphans_deleted, 0,
+        "nothing of an uncovered stream goes"
+    );
+    assert_eq!(swept.uncovered_chunks_kept, 2);
+    assert_eq!(
+        runtime
+            .metrics()
+            .snapshot()
+            .cold_orphan_uncovered_chunks_kept,
+        2
+    );
+    for kept in [&offloaded, &orphan] {
+        assert!(cold_store.object_size(kept).await.is_ok(), "{kept} is kept");
+    }
+}

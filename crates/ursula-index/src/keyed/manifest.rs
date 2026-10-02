@@ -1,9 +1,9 @@
 //! Keyed manifest v6 and its namespace (design §3.4, §5.5, §6.1 U15).
 //!
-//! A namespace `.keyed/{bucket}/{key}/{c:016x}/v{fmt}/` holds content-
-//! addressed parts (`parts/{blake3}.parquet`), content-addressed manifests
-//! (`manifests/{generation:020}-{blake3}.json`) and the `CURRENT` pointer.
-//! A missing `CURRENT` is `state(0)`.
+//! A namespace `.keyed/{bucket}/{key}/{c:016x}/v{fmt}/` holds parts
+//! (`parts/{blake3}-{nonce}.parquet`), manifests
+//! (`manifests/{generation:020}-{blake3}-{nonce}.json`) and the `CURRENT`
+//! pointer. A missing `CURRENT` is `state(0)`.
 //!
 //! Publication follows the event-time engine's protocol: write the manifest
 //! put-if-absent, then compare-and-swap `CURRENT` against the base's entity
@@ -12,25 +12,21 @@
 //! and adopts the tag only when the bytes are its own; anything else is a
 //! conflict, after which the caller reloads.
 //!
-//! Deletion and reuse of content-addressed objects across processes. S3 has
-//! no conditional delete, so a deleter (a pod's GC, the orphan sweep) and a
-//! writer that finds an object already present (a dedupe hit: another pod's
-//! or an earlier attempt's identical part) coordinate through object age:
+//! Object identity and deletion across processes. S3 has no conditional
+//! delete, and a DELETE may land arbitrarily long after it was issued, so
+//! safety cannot rest on a writer waiting out deleters. Instead every object
+//! a writer stores gets a physical key no other write ever uses: the content
+//! hash (which readers verify) plus a random writer nonce
+//! ([`unique_object_nonce`]). A key is never reused, so a deleter can only
+//! remove an object that some writer stored and later obsoleted or
+//! abandoned: a delayed DELETE can never hit a later publication's object.
+//! Two writers that encode the same content store two objects; the loser of
+//! the `CURRENT` CAS queues its own for deletion.
 //!
-//! - A deleter removes an object only on an observation, made at most
-//!   [`delete_decision_ttl`] before the DELETE is issued, that the object
-//!   is at least the GC grace old and that no manifest a reader may hold
-//!   references it. A staler observation is made again first.
-//! - A writer that hits an existing object rewrites it (its age restarts),
-//!   and, unless it created the object itself recently, waits
-//!   [`settle_delay`] — every decision made before the rewrite has acted
-//!   by then — and rewrites whatever is gone, before publishing a manifest
-//!   that references it ([`KeyedNamespace::settle`]). Like any write, it
-//!   must publish within the grace of that rewrite.
-//!
-//! A deleter that observed the object before the rewrite has therefore
-//! acted before the writer's check, and one that observes it after sees a
-//! young object, or, after the grace, a published `CURRENT` referencing it.
+//! A deleter still removes an object only on an observation, made at most
+//! [`delete_decision_ttl`] before the DELETE is issued, that the object is at
+//! least the GC grace old and that no manifest a reader may hold references
+//! it (readers of a superseded manifest keep their objects for the grace).
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -70,22 +66,27 @@ pub fn delete_decision_ttl(grace: Duration) -> Duration {
         .clamp(MIN_DELETE_DECISION_TTL, MAX_DELETE_DECISION_TTL)
 }
 
-/// How long a writer waits after rewriting an object it found already
-/// present before checking that it survived: twice the longest decision
-/// TTL a deleter may use, leaving the second half for DELETE requests in
-/// flight.
-pub fn settle_delay(grace: Duration) -> Duration {
-    delete_decision_ttl(grace).saturating_mul(2)
-}
-
-/// Outcome of storing a content-addressed object.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ObjectWrite {
-    /// The object did not exist and was written.
-    Created,
-    /// The object existed (same key, so same bytes) and was rewritten to
-    /// restart its age; see [`KeyedNamespace::settle`].
-    Refreshed,
+/// A random 128-bit nonce (32 hex digits) that makes a stored object's key
+/// unique to one write (see the module docs). Should the OS have no
+/// randomness to give, it falls back to a hash of the process id and a
+/// process counter.
+pub fn unique_object_nonce() -> String {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+    static FALLBACK: AtomicU64 = AtomicU64::new(0);
+    let nonce = crate::rt::random_u128().unwrap_or_else(|| {
+        let counter = FALLBACK.fetch_add(1, Ordering::Relaxed);
+        let seed = format!("{}-{counter}", std::process::id());
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(
+            blake3::hash(seed.as_bytes())
+                .as_bytes()
+                .get(..16)
+                .unwrap_or(&[0; 16]),
+        );
+        u128::from_le_bytes(bytes)
+    });
+    format!("{nonce:032x}")
 }
 
 /// Result of [`KeyedNamespace::sweep`].
@@ -101,7 +102,8 @@ pub struct SweepReport {
     pub deleted: Vec<String>,
 }
 
-/// Generation of a manifest object key, `manifests/{generation:020}-{hash}.json`.
+/// Generation of a manifest object key,
+/// `manifests/{generation:020}-{hash}-{nonce}.json`.
 pub(crate) fn manifest_generation(key: &str) -> Option<u64> {
     key.strip_prefix("manifests/")?
         .strip_suffix(".json")?
@@ -377,23 +379,15 @@ impl KeyedManifest {
         Ok(Some(next))
     }
 
-    /// The object key [`KeyedNamespace::publish`] writes this manifest
-    /// under when it publishes it on top of `base`.
-    pub(crate) fn object_key_on(
-        &self,
-        base: Option<&PublishedKeyedManifest>,
-    ) -> Result<String, IndexError> {
-        let mut manifest = self.clone();
-        manifest.generation = base
-            .map_or(0, |base| base.manifest.generation)
-            .checked_add(1)
-            .ok_or_else(|| invalid("generation overflowed"))?;
-        Ok(manifest.encode()?.0)
-    }
-
-    fn encode(&self) -> Result<(String, Vec<u8>, Vec<u8>), IndexError> {
+    /// The manifest's bytes, its object key (unique to this write through
+    /// `nonce`) and the `CURRENT` pointer to it.
+    fn encode(&self, nonce: &str) -> Result<(String, Vec<u8>, Vec<u8>), IndexError> {
         let bytes = serde_json::to_vec(self)?;
-        let key = format!("manifests/{:020}-{}.json", self.generation, digest(&bytes));
+        let key = format!(
+            "manifests/{:020}-{}-{nonce}.json",
+            self.generation,
+            digest(&bytes)
+        );
         let pointer = serde_json::to_vec(&KeyedCurrent {
             version: KEYED_MANIFEST_VERSION,
             generation: self.generation,
@@ -454,12 +448,14 @@ pub fn namespace_prefix(source: &KeyedSource, format: u32) -> String {
     )
 }
 
-/// The content hash in a manifest key, `manifests/{generation}-{hash}.json`.
+/// The content hash in a manifest key,
+/// `manifests/{generation}-{hash}-{nonce}.json` (or, written before nonces,
+/// `manifests/{generation}-{hash}.json`).
 fn manifest_hash(key: &str) -> Result<&str, IndexError> {
     key.strip_prefix("manifests/")
         .and_then(|name| name.strip_suffix(".json"))
         .and_then(|name| name.split_once('-'))
-        .map(|(_, hash)| hash)
+        .map(|(_, rest)| rest.split_once('-').map_or(rest, |(hash, _)| hash))
         .ok_or_else(|| IndexError::InvalidObjectKey(key.to_owned()))
 }
 
@@ -470,7 +466,7 @@ pub struct KeyedNamespace {
     source: KeyedSource,
     format: u32,
     prefix: String,
-    /// The GC grace its writers settle reused objects for.
+    /// The GC grace of the namespace's deleters.
     grace: Duration,
 }
 
@@ -497,15 +493,14 @@ impl KeyedNamespace {
         }
     }
 
-    /// The GC grace this namespace's writers assume (it sets how long
-    /// [`Self::publish`] settles a manifest it found already present).
+    /// The GC grace this namespace's deleters use.
     #[must_use]
     pub fn with_grace(mut self, grace: Duration) -> Self {
         self.grace = grace;
         self
     }
 
-    /// The GC grace this namespace's writers assume.
+    /// The GC grace this namespace's deleters use.
     pub fn grace(&self) -> Duration {
         self.grace
     }
@@ -534,47 +529,23 @@ impl KeyedNamespace {
         StorePartOpener::new(self.store.clone(), self.prefix.clone())
     }
 
-    /// Stores a part. Parts are content-addressed, so an existing object
-    /// already holds the same bytes; it is rewritten so that its age
-    /// restarts ([`ObjectWrite::Refreshed`]), and the caller must
-    /// [`Self::settle`] it before publishing a manifest that references it
-    /// (unless it created the object itself within half the grace).
-    pub async fn put_part(&self, part: &EncodedPart) -> Result<ObjectWrite, IndexError> {
-        self.put_content(&part.meta.key, &part.bytes).await
+    /// Stores a part under its unique key (`meta.key`, see
+    /// [`unique_object_nonce`]).
+    pub async fn put_part(&self, part: &EncodedPart) -> Result<(), IndexError> {
+        self.put_new(&part.meta.key, &part.bytes).await
     }
 
-    async fn put_content(&self, key: &str, bytes: &[u8]) -> Result<ObjectWrite, IndexError> {
+    /// Writes an object under a key unique to this write. An object already
+    /// there means the key was reused, which must never happen (a deleter
+    /// may have decided to remove it), so it is an error.
+    async fn put_new(&self, key: &str, bytes: &[u8]) -> Result<(), IndexError> {
         let object = self.object(key);
         match self.store.put_if_absent(&object, bytes).await? {
-            ConditionalWrite::Written => Ok(ObjectWrite::Created),
-            ConditionalWrite::Conflict => {
-                self.store.put(&object, bytes).await?;
-                Ok(ObjectWrite::Refreshed)
-            }
+            ConditionalWrite::Written => Ok(()),
+            ConditionalWrite::Conflict => Err(invalid(format!(
+                "object key {key} already exists; keys are never reused"
+            ))),
         }
-    }
-
-    /// Makes refreshed objects safe to reference (see the module docs):
-    /// waits [`settle_delay`] of `grace` after their rewrite, then rewrites
-    /// any that a deletion decided before the rewrite removed. `objects` are
-    /// namespace-relative keys with their bytes.
-    pub async fn settle(
-        &self,
-        objects: &[(String, bytes::Bytes)],
-        grace: Duration,
-    ) -> Result<(), IndexError> {
-        if objects.is_empty() {
-            return Ok(());
-        }
-        crate::rt::time::sleep(settle_delay(grace)).await;
-        for (key, bytes) in objects {
-            let object = self.object(key);
-            if self.store.stat(&object).await?.is_none() {
-                tracing::info!(key, "keyed object deleted while being reused; rewriting it");
-                self.store.put(&object, bytes).await?;
-            }
-        }
-        Ok(())
     }
 
     /// The object's modification time, or `None` when it is absent or its
@@ -838,13 +809,8 @@ impl KeyedNamespace {
             )));
         }
         manifest.validate()?;
-        let (key, bytes, pointer) = manifest.encode()?;
-        if self.put_content(&key, &bytes).await? == ObjectWrite::Refreshed {
-            // An identical manifest existed (a retried attempt): it may be
-            // an orphan a deleter already decided to remove.
-            self.settle(&[(key.clone(), bytes::Bytes::from(bytes))], self.grace)
-                .await?;
-        }
+        let (key, bytes, pointer) = manifest.encode(&unique_object_nonce())?;
+        self.put_new(&key, &bytes).await?;
         let current = self.object(KEYED_CURRENT_KEY);
         let written = match base {
             Some(base) => {

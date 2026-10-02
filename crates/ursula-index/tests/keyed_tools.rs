@@ -730,7 +730,7 @@ async fn lost_cas_leaves_no_orphans_after_grace() {
     // Pod 1 (D = 5), the other writer, pod 1 again (D = 10).
     assert_eq!(world.published().await.manifest.generation, 3);
     // After the grace period (zero here), GC leaves exactly the published
-    // objects: the lost attempt's manifest is gone, its parts are reused.
+    // objects: the lost attempt's manifest and parts are gone.
     pod.collect_garbage().await;
     let leftover: HashSet<String> = world
         .objects()

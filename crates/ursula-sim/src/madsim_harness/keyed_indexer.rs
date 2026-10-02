@@ -785,6 +785,7 @@ pub(super) async fn run_keyed_indexer_inner(
     plan: KeyedIndexerPlan,
 ) -> ThreeNodeRaftSimOutcome {
     let seed = config.seed;
+    ursula_index::reset_random_for_sim();
     let mut trace = SimTrace::default();
     let mut rng = SplitMix64::new(seed ^ 0x6b69_6478_776c_6f64);
     let clock = Arc::new(VirtualClock {
