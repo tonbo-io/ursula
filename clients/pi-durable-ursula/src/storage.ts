@@ -44,7 +44,8 @@ import { bytesEqual, fromUtf8, type KeyedOp, parseKeyedBatch } from "./keyed-bat
 import * as pi from "./pi-layer.ts";
 import { preload, widenFetch } from "./bounded.ts";
 import { FlushLoop } from "./flush.ts";
-import { LocalStore } from "./local-store/index.ts";
+import { LocalStore, OVERLAY_ALERT_BYTES } from "./local-store/index.ts";
+import { OwnerMetrics, type OwnerMetricsSnapshot } from "./metrics.ts";
 import { type OwnerClaim, type PlannedCommit, planClaim, planCloseMarker, planCommit } from "./planner.ts";
 import { EXT_KEYED_BATCH, EXT_KEYED_STATE, extensionTokens, H, intHeader, retryAfterMs } from "./protocol.ts";
 import { FullResidentStateStore, type StateStore, type StateView } from "./state-store.ts";
@@ -60,14 +61,29 @@ import { b64, strinc } from "./tuple.ts";
 
 export type OpenMode = "fence" | "fail-if-active";
 
+/**
+ * Time source of every deadline and backoff sleep of the owner. Tests inject a virtual clock so that
+ * retries never sleep on the wall clock.
+ */
 export interface Clock {
 	now(): number;
-	sleep(ms: number): Promise<void>;
+	/** Resolve after `ms`, or as soon as `signal` aborts (the timer is then released). */
+	sleep(ms: number, signal?: AbortSignal): Promise<void>;
 }
 
 export const systemClock: Clock = {
 	now: () => Date.now(),
-	sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+	sleep: (ms, signal) =>
+		new Promise((resolve) => {
+			if (signal?.aborted === true) return resolve();
+			const timer = setTimeout(done, ms);
+			function done(): void {
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", done);
+				resolve();
+			}
+			signal?.addEventListener("abort", done, { once: true });
+		}),
 };
 
 export interface Timing {
@@ -129,11 +145,11 @@ export const DEFAULT_TIMING: Timing = {
  */
 export type StateStoreKind = "auto" | "bounded" | "full-resident";
 
-export interface OwnerAlert {
-	readonly kind: "server-limit";
-	readonly status: number;
-	readonly message: string;
-}
+export type OwnerAlert =
+	/** A first-attempt 400/413/422 showed that a pre-check missed a server limit. */
+	| { readonly kind: "server-limit"; readonly status: number; readonly message: string }
+	/** The overlay (pinned records `[E, tail)`) grew past the alert size (§7.5: 64 MiB): keyed-state lags. */
+	| { readonly kind: "overlay-size"; readonly bytes: number; readonly thresholdBytes: number };
 
 export interface UrsulaStorageOptions {
 	readonly log: LogTransport;
@@ -145,6 +161,13 @@ export interface UrsulaStorageOptions {
 	readonly cacheBudgetBytes?: number;
 	/** Bounded store: overlay hard cap in bytes (§7.5, default 256 MiB). */
 	readonly overlayCapBytes?: number;
+	/** Bounded store: overlay size that raises an `overlay-size` alert (§7.5, default 64 MiB). */
+	readonly overlayAlertBytes?: number;
+	/**
+	 * Owner metrics sink (§7.6). Share one across a host's opens to aggregate them; open-time events
+	 * (contention, refusals) are counted here too. Default: a fresh sink per open.
+	 */
+	readonly metrics?: OwnerMetrics;
 	/** Bounded store: `limit` of keyed-state range fetches (default 256). */
 	readonly pageLimit?: number;
 	/** Default `fail-if-active` (§13 Q4). */
@@ -160,7 +183,7 @@ export interface UrsulaStorageOptions {
 	readonly pid?: number;
 	readonly timing?: Partial<Timing>;
 	readonly clock?: Clock;
-	/** Called when a first-attempt 400/413/422 shows that a pre-check missed a server limit. */
+	/** Called on owner alerts: a missed server limit, or the overlay past its alert size. */
 	readonly onAlert?: (alert: OwnerAlert) => void;
 }
 
@@ -245,6 +268,8 @@ export class UrsulaStorage implements Storage {
 	private landing: Promise<void> | undefined;
 	private closing: Promise<void> | undefined;
 	private poisoned: Error | undefined;
+	private readonly ownerMetrics: OwnerMetrics;
+	private readonly countPoison: (error: Error) => void;
 
 	private constructor(init: {
 		options: UrsulaStorageOptions;
@@ -257,6 +282,7 @@ export class UrsulaStorage implements Storage {
 		nextId: number;
 		persistedNextId: number;
 		hooks: OpenHooks;
+		probe: OpenProbe;
 	}) {
 		this.log = init.options.log;
 		this.keyedState = init.options.keyedState;
@@ -269,6 +295,10 @@ export class UrsulaStorage implements Storage {
 		this.p7 = init.p7;
 		this.nextId = init.nextId;
 		this.persistedNextId = init.persistedNextId;
+		this.ownerMetrics = init.probe.metrics;
+		this.countPoison = init.probe.countPoison;
+		// From here on, Storage reads that miss the cache are Session-line remote reads.
+		init.probe.line = true;
 		// After the claim, a page above the tail waits for the in-flight commit; with none, another
 		// writer exists and the store poisons with FencedError (§3.5 step 3, I19).
 		init.hooks.ahead = () => this.landing;
@@ -281,6 +311,7 @@ export class UrsulaStorage implements Storage {
 				owner: init.owner,
 				timing: { ...init.timing, flushWaitTimeoutMs: init.timing.keyedWaitMs },
 				now: () => init.clock.now(),
+				sleep: (ms, signal) => init.clock.sleep(ms, signal),
 				inflight: () => this.landing,
 				poison: (error) => {
 					this.poisonWith(error);
@@ -310,9 +341,59 @@ export class UrsulaStorage implements Storage {
 		return this.flush?.metrics;
 	}
 
+	/** Owner metrics (§7.6): the counters of this owner's sink plus its gauges. */
+	metrics(): OwnerMetricsSnapshot {
+		const m = this.ownerMetrics;
+		const local = this.local;
+		return {
+			sessionLineRemoteReads: m.sessionLineRemoteReads,
+			openRemoteReads: m.openRemoteReads,
+			remoteReadRetries: m.remoteReadRetries,
+			remoteReadLatency: m.remoteReadLatency.snapshot(),
+			poisons: m.poisons,
+			fences: m.fences,
+			contentions: m.contentions,
+			activeRefusals: m.activeRefusals,
+			claimTimeouts: m.claimTimeouts,
+			overlayAlerts: m.overlayAlerts,
+			overlayCapWaits: m.overlayCapWaits,
+			pinnedBytes: local?.overlayBytes ?? 0,
+			pinnedRecords: local?.overlayRecords ?? 0,
+			cacheBytes: local?.cacheBytes ?? 0,
+			overlayFloor: local?.overlayFloor ?? 0,
+			tail: this.store.tail,
+			flushWaits: this.flush?.metrics.flushWaits ?? 0,
+			flushRetries: this.flush?.metrics.retries ?? 0,
+			floorsRaised: this.flush?.metrics.floorsRaised ?? 0,
+		};
+	}
+
 	// ============================================================ open (§3.6)
 
 	static async open(options: UrsulaStorageOptions): Promise<UrsulaStorage> {
+		const metrics = options.metrics ?? new OwnerMetrics();
+		let counted = false;
+		const probe: OpenProbe = {
+			metrics,
+			line: false,
+			countPoison: (error) => {
+				if (counted) return;
+				counted = true;
+				metrics.poisons++;
+				if (error instanceof FencedError) metrics.fences++;
+			},
+		};
+		try {
+			return await UrsulaStorage.openWith(options, probe);
+		} catch (error) {
+			if (error instanceof OwnershipContention) metrics.contentions++;
+			else if (error instanceof OwnershipActive) metrics.activeRefusals++;
+			else if (error instanceof ClaimTimeout) metrics.claimTimeouts++;
+			throw error;
+		}
+	}
+
+	private static async openWith(options: UrsulaStorageOptions, probe: OpenProbe): Promise<UrsulaStorage> {
 		const timing: Timing = { ...DEFAULT_TIMING, ...options.timing };
 		const clock = options.clock ?? systemClock;
 		const mode: OpenMode = options.mode ?? "fail-if-active";
@@ -349,7 +430,7 @@ export class UrsulaStorage implements Storage {
 		let local: LocalStore | undefined;
 		let activity: boolean;
 		if (bounded) {
-			const opened = await openBounded(options, mode, log, options.keyedState as KeyedStateTransport, n0, p7, clock, timing, deadline, hooks);
+			const opened = await openBounded(options, mode, log, options.keyedState as KeyedStateTransport, n0, p7, clock, timing, deadline, hooks, probe);
 			store = opened.store;
 			local = opened.store;
 			activity = opened.activity;
@@ -404,6 +485,7 @@ export class UrsulaStorage implements Storage {
 				nextId: nextIdRow ?? 2,
 				persistedNextId: nextIdRow ?? 0,
 				hooks,
+				probe,
 			});
 		} catch (error) {
 			store.close();
@@ -450,6 +532,7 @@ export class UrsulaStorage implements Storage {
 		const flush = this.flush;
 		if (local === undefined || flush === undefined || !local.overlayAtCap) return;
 		const deadline = this.clock.now() + this.timing.commitDeadlineMs;
+		this.ownerMetrics.overlayCapWaits++;
 		while (local.overlayAtCap) {
 			this.assertNotPoisoned();
 			const left = deadline - this.clock.now();
@@ -626,7 +709,10 @@ export class UrsulaStorage implements Storage {
 	}
 
 	private poisonWith(error: Error): Error {
-		this.poisoned ??= error;
+		if (this.poisoned === undefined) {
+			this.poisoned = error;
+			this.countPoison(error);
+		}
 		this.flush?.stop();
 		return error;
 	}
@@ -717,6 +803,14 @@ const asError = (e: unknown): Error => (e instanceof Error ? e : new Error(Strin
  */
 interface OpenHooks {
 	ahead: () => Promise<void> | undefined;
+}
+
+/** Metrics plumbing of one open: the sink, whether reads are on the Session line yet, and the poison counter. */
+interface OpenProbe {
+	readonly metrics: OwnerMetrics;
+	/** False during open, true once the storage exists. */
+	line: boolean;
+	readonly countPoison: (error: Error) => void;
 }
 
 /** `m/` and `strinc(m/)`: the metadata family read at open (§3.6 step 2). */
@@ -812,6 +906,7 @@ async function openBounded(
 	timing: Timing,
 	deadline: number,
 	hooks: OpenHooks,
+	probe: OpenProbe,
 ): Promise<{ store: LocalStore; activity: boolean }> {
 	let minThrough = Math.max(0, n0 - timing.openLagRecords);
 	for (;;) {
@@ -830,6 +925,19 @@ async function openBounded(
 			...(options.cacheBudgetBytes === undefined ? {} : { cacheBudgetBytes: options.cacheBudgetBytes }),
 			...(options.overlayCapBytes === undefined ? {} : { overlayCapBytes: options.overlayCapBytes }),
 			...(options.pageLimit === undefined ? {} : { pageLimit: options.pageLimit }),
+			...(options.overlayAlertBytes === undefined ? {} : { overlayAlertBytes: options.overlayAlertBytes }),
+			onOverlayAlert: (bytes) => {
+				probe.metrics.overlayAlerts++;
+				options.onAlert?.({ kind: "overlay-size", bytes, thresholdBytes: options.overlayAlertBytes ?? OVERLAY_ALERT_BYTES });
+			},
+			onRemoteRead: (latencyMs, transient) => {
+				const m = probe.metrics;
+				m.remoteReadLatency.record(latencyMs);
+				if (probe.line) m.sessionLineRemoteReads++;
+				else m.openRemoteReads++;
+				if (transient) m.remoteReadRetries++;
+			},
+			onPoison: (error) => probe.countPoison(error),
 			commitInFlight: () => hooks.ahead(),
 			readDeadlineMs: timing.readDeadlineMs,
 			now: () => clock.now(),

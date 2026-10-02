@@ -128,6 +128,14 @@ export class SkipList<V> {
 		return x === this.head ? undefined : [x.key, x.value];
 	}
 
+	/** The entry with the greatest key < k. */
+	lower(k: string): [string, V] | undefined {
+		const update: Node<V>[] = [];
+		this.seek(k, update);
+		const x = update[0];
+		return x === undefined || x === this.head ? undefined : [x.key, x.value];
+	}
+
 	/** The entry with the smallest key ≥ k. */
 	ceiling(k: string): [string, V] | undefined {
 		const n = this.seek(k);

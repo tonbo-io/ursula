@@ -37,11 +37,21 @@ const opBytes = (op: KeyedOp): number =>
 
 /** An explicit covered range `[lo, hi)`; `hi` undefined means unbounded. */
 interface CoveredRange {
-	readonly lo: string;
-	readonly hi: string | undefined;
+	/** Mutable only while the range is unpinned and not in `ranges` under its old `lo` (shrink, coalesce). */
+	lo: string;
+	hi: string | undefined;
 	/** Number of reads holding this range pinned. */
 	pins: number;
+	/** LRU tick of the last read that touched it. */
+	used: number;
+	/** The last key a read touched inside it: its hot end; eviction shrinks it from the other end (§7.5). */
+	hot: string | undefined;
 }
+
+/** Values larger than this are evicted before any LRU range (§7.5). */
+export const LARGE_VALUE_BYTES = 1024 * 1024;
+/** Overlay size that raises the owner alert (§7.5: alert at 64 MiB, hard cap 256 MiB). */
+export const OVERLAY_ALERT_BYTES = 64 * 1024 * 1024;
 
 interface OverlayRecord {
 	readonly ordinal: number;
@@ -74,6 +84,16 @@ export interface LocalStoreOptions {
 	readonly cacheBudgetBytes?: number;
 	/** Overlay hard cap in bytes (§7.5). Default 256 MiB; `overlayAtCap` reports it. */
 	readonly overlayCapBytes?: number;
+	/** Overlay size that calls `onOverlayAlert` (§7.5). Default 64 MiB. */
+	readonly overlayAlertBytes?: number;
+	/** Called once each time the overlay grows past `overlayAlertBytes`; re-armed when it drops below. */
+	readonly onOverlayAlert?: (bytes: number) => void;
+	/** Values larger than this many octets are evicted first (§7.5). Default 1 MiB. */
+	readonly largeValueBytes?: number;
+	/** Called after every keyed-state request of a read (§7.6 owner metrics): its latency, and whether it is retried. */
+	readonly onRemoteRead?: (latencyMs: number, transient: boolean) => void;
+	/** Called once, when the store poisons. */
+	readonly onPoison?: (error: Error) => void;
 	/** `limit` of range fetches (1..1000). Default 256. */
 	readonly pageLimit?: number;
 	/**
@@ -115,8 +135,11 @@ export class LocalStore implements StateStore {
 	private readonly cache = new SkipList<CachedRow>(0x51ed270b);
 	/** Explicit covered ranges keyed by `lo`. */
 	private readonly ranges = new SkipList<CoveredRange>(0x2545f491);
-	/** LRU order of explicit ranges: Map iteration order, oldest first. */
-	private readonly lru = new Map<CoveredRange, true>();
+	/** LRU clock: each touch stamps the range with the next tick. */
+	private tick = 0;
+	/** Cached keys whose value exceeds `largeValueBytes`. */
+	private readonly large = new Set<string>();
+	private overlayAlerted = false;
 	/** Records `[E, tail)` live at `[overlayHead, length)`; dropped slots are cleared so their ops can be collected. */
 	private overlay: (OverlayRecord | undefined)[] = [];
 	private overlayHead = 0;
@@ -130,7 +153,23 @@ export class LocalStore implements StateStore {
 	private poisonError: Error | undefined;
 	private readonly options: LocalStoreOptions;
 	/** Owner metrics (§7.6): remote reads and how their pages were handled. */
-	readonly metrics = { remoteReads: 0, retries: 0, stalePagesDiscarded: 0, commitWaits: 0, pagesMerged: 0, rangesEvicted: 0 };
+	readonly metrics = {
+		remoteReads: 0,
+		retries: 0,
+		stalePagesDiscarded: 0,
+		commitWaits: 0,
+		pagesMerged: 0,
+		/** Explicit ranges dropped whole. */
+		rangesEvicted: 0,
+		/** Explicit ranges shrunk from their cold end (§7.5). */
+		rangesShrunk: 0,
+		/** Adjacent unpinned ranges coalesced into one (§7.5). */
+		rangesCoalesced: 0,
+		/** Rows with values over `largeValueBytes` evicted ahead of the LRU order (§7.5). */
+		largeValuesEvicted: 0,
+		/** Times the overlay grew past `overlayAlertBytes` (§7.5). */
+		overlayAlerts: 0,
+	};
 
 	constructor(options: LocalStoreOptions) {
 		this.options = options;
@@ -193,12 +232,18 @@ export class LocalStore implements StateStore {
 			} else {
 				this.cache.deleteRange(op.start, op.end, (k, row) => {
 					this.cacheBytesTotal -= rowBytes(k, row.value);
+					this.large.delete(k);
 				});
 			}
 		}
 		this.overlay.push({ ordinal, ops, bytes });
 		this.overlayBytesTotal += bytes;
 		this.next = ordinal + 1;
+		if (!this.overlayAlerted && this.overlayBytesTotal >= (this.options.overlayAlertBytes ?? OVERLAY_ALERT_BYTES)) {
+			this.overlayAlerted = true;
+			this.metrics.overlayAlerts++;
+			this.options.onOverlayAlert?.(this.overlayBytesTotal);
+		}
 		this.enforceBudget();
 	}
 
@@ -216,20 +261,42 @@ export class LocalStore implements StateStore {
 			this.overlayHead = 0;
 		}
 		this.floor = target;
+		if (this.overlayBytesTotal < (this.options.overlayAlertBytes ?? OVERLAY_ALERT_BYTES)) this.overlayAlerted = false;
 	}
 
 	// ================================================================ eviction (§7.5)
 
 	/**
-	 * Evict until the cache holds at most `maxBytes`: least recently used unpinned explicit ranges
-	 * first, then fresh rows oldest-ID first by raising `F_fresh` (only while no read is running,
-	 * because fresh coverage cannot be pinned).
+	 * Evict until the cache holds at most `maxBytes` (§7.5):
+	 * 1. rows of unpinned explicit ranges whose value exceeds `largeValueBytes`, largest first (the
+	 *    range is split around the key: any sub-range of materialized state is still exact);
+	 * 2. unpinned explicit ranges in LRU order, each shrunk from its cold end (away from the key a
+	 *    read last touched) only as far as needed, and dropped once nothing of it is left;
+	 * 3. fresh rows oldest-ID first by raising `F_fresh` (only while no read is running, because fresh
+	 *    coverage cannot be pinned).
 	 */
 	evict(maxBytes: number): void {
 		if (this.closed) return;
-		for (const range of this.lru.keys()) {
-			if (this.cacheBytesTotal <= maxBytes) return;
-			if (range.pins === 0) this.dropRange(range);
+		if (this.cacheBytesTotal > maxBytes && this.large.size > 0) {
+			const large = [...this.large]
+				.map((key) => ({ key, bytes: this.cache.get(key)?.value.length ?? 0 }))
+				.sort((a, b) => b.bytes - a.bytes);
+			for (const { key } of large) {
+				if (this.cacheBytesTotal <= maxBytes) return;
+				const range = this.rangeAt(key);
+				// Fresh-only rows leave through F_fresh; a pinned range is in use by a read.
+				if (range === undefined || range.pins > 0 || isFreshKey(key, this.fresh)) continue;
+				this.splitOut(range, key);
+				this.metrics.largeValuesEvicted++;
+			}
+		}
+		if (this.cacheBytesTotal > maxBytes) {
+			const lru = [...this.ranges.entries()].map(([, r]) => r).filter((r) => r.pins === 0);
+			lru.sort((a, b) => a.used - b.used);
+			for (const range of lru) {
+				if (this.cacheBytesTotal <= maxBytes) return;
+				this.shrink(range, maxBytes);
+			}
 		}
 		if (this.cacheBytesTotal > maxBytes && this.activeReads === 0) this.evictFresh(maxBytes);
 	}
@@ -283,7 +350,7 @@ export class LocalStore implements StateStore {
 		try {
 			this.merge(lo, hi, false, page, through, pins);
 		} finally {
-			for (const r of pins) r.pins--;
+			this.unpin(pins);
 		}
 		return "merged";
 	}
@@ -298,9 +365,9 @@ export class LocalStore implements StateStore {
 		this.assertUsable();
 		if (this.coveredKey(key)) return;
 		this.putRow(key, { record: this.cache.get(source)?.record ?? 0, value });
-		const range: CoveredRange = { lo: key, hi: keySuccessor(key), pins: 0 };
+		const range: CoveredRange = { lo: key, hi: keySuccessor(key), pins: 0, used: ++this.tick, hot: key };
 		this.ranges.set(key, range);
-		this.lru.set(range, true);
+		this.coalesce(range);
 		this.enforceBudget();
 	}
 
@@ -344,10 +411,80 @@ export class LocalStore implements StateStore {
 	private dropRange(range: CoveredRange): void {
 		this.metrics.rangesEvicted++;
 		this.ranges.delete(range.lo);
-		this.lru.delete(range);
 		const drop: string[] = [];
 		for (const [k] of this.cache.range(range.lo, range.hi)) if (!isFreshKey(k, this.fresh)) drop.push(k);
 		for (const k of drop) this.deleteRow(k);
+	}
+
+	/** Remove `key` from the unpinned `range`, splitting it into `[lo, key)` and `(key, hi)`. */
+	private splitOut(range: CoveredRange, key: string): void {
+		this.ranges.delete(range.lo);
+		const after = keySuccessor(key);
+		if (range.lo < key) this.ranges.set(range.lo, { lo: range.lo, hi: key, pins: 0, used: range.used, hot: range.hot });
+		if (range.hi === undefined || after < range.hi) this.ranges.set(after, { lo: after, hi: range.hi, pins: 0, used: range.used, hot: range.hot });
+		this.deleteRow(key);
+	}
+
+	/**
+	 * Shrink the unpinned `range` from its cold end until the cache holds at most `maxBytes` (§7.5):
+	 * rows above its hot key go first, from the top down, then rows below it, from the bottom up;
+	 * the range is dropped when that is not enough. What remains is a sub-range of materialized
+	 * state, so it stays exact. Fresh-covered rows stay cached.
+	 */
+	private shrink(range: CoveredRange, maxBytes: number): void {
+		const hot = range.hot !== undefined && range.hot >= range.lo && (range.hi === undefined || range.hot < range.hi) ? range.hot : range.lo;
+		let hi = range.hi;
+		const above = [...this.cache.range(keySuccessor(hot), range.hi)];
+		for (let i = above.length - 1; i >= 0 && this.cacheBytesTotal > maxBytes; i--) {
+			const k = (above[i] as [string, CachedRow])[0];
+			hi = k;
+			if (!isFreshKey(k, this.fresh)) this.deleteRow(k);
+		}
+		let lo = range.lo;
+		if (this.cacheBytesTotal > maxBytes) {
+			for (const [k] of [...this.cache.range(range.lo, hot)]) {
+				if (this.cacheBytesTotal <= maxBytes) break;
+				lo = keySuccessor(k);
+				if (!isFreshKey(k, this.fresh)) this.deleteRow(k);
+			}
+		}
+		if (this.cacheBytesTotal > maxBytes) {
+			this.dropRange(range);
+			return;
+		}
+		if (lo === range.lo && hi === range.hi) return;
+		this.metrics.rangesShrunk++;
+		this.ranges.delete(range.lo);
+		range.lo = lo;
+		range.hi = hi;
+		if (hi === undefined || lo < hi) this.ranges.set(lo, range);
+	}
+
+	/** Merge the unpinned `range` with adjacent unpinned ranges (§7.5), keeping the newer LRU stamp and hot key. */
+	private coalesce(range: CoveredRange): void {
+		if (range.pins > 0 || this.ranges.get(range.lo) !== range) return;
+		let merged = range;
+		const left = this.ranges.lower(merged.lo)?.[1];
+		if (left !== undefined && left.pins === 0 && left.hi === merged.lo) {
+			this.ranges.delete(merged.lo);
+			this.absorb(left, merged);
+			merged = left;
+		}
+		const right = merged.hi === undefined ? undefined : this.ranges.get(merged.hi);
+		if (right !== undefined && right.pins === 0) {
+			this.ranges.delete(right.lo);
+			this.absorb(merged, right);
+		}
+	}
+
+	/** `into` (which precedes `from`) takes over `from`'s span. */
+	private absorb(into: CoveredRange, from: CoveredRange): void {
+		into.hi = from.hi;
+		if (from.used > into.used) {
+			into.used = from.used;
+			into.hot = from.hot;
+		}
+		this.metrics.rangesCoalesced++;
 	}
 
 	// ================================================================ reads (§3.5)
@@ -368,8 +505,14 @@ export class LocalStore implements StateStore {
 			}
 		} finally {
 			this.activeReads--;
-			for (const r of pins) r.pins--;
+			this.unpin(pins);
 		}
+	}
+
+	/** Release a read's pins, then coalesce the ranges it leaves unpinned (§7.5). */
+	private unpin(pins: Set<CoveredRange>): void {
+		for (const r of pins) r.pins--;
+		for (const r of pins) this.coalesce(r);
 	}
 
 	close(): void {
@@ -379,24 +522,24 @@ export class LocalStore implements StateStore {
 		this.overlayBytesTotal = 0;
 		this.cache.deleteRange("", undefined);
 		this.ranges.deleteRange("", undefined);
-		this.lru.clear();
+		this.large.clear();
 		this.cacheBytesTotal = 0;
 	}
 
 	private view(pins: Set<CoveredRange>): StateView {
-		const touch = (range: CoveredRange): void => {
+		const touch = (range: CoveredRange, key: string): void => {
 			if (!pins.has(range)) {
 				pins.add(range);
 				range.pins++;
 			}
-			this.lru.delete(range);
-			this.lru.set(range, true);
+			range.used = ++this.tick;
+			range.hot = key;
 		};
 		const store = this;
 		return {
 			get: (key) => {
 				const range = this.rangeAt(key);
-				if (range !== undefined) touch(range);
+				if (range !== undefined) touch(range, key);
 				else if (!isFreshKey(key, this.fresh)) throw new CacheMiss(this, key, keySuccessor(key), true);
 				return this.cache.get(key)?.value;
 			},
@@ -406,7 +549,7 @@ export class LocalStore implements StateStore {
 					const range = store.rangeAt(pos);
 					let segmentEnd: string;
 					if (range !== undefined) {
-						touch(range);
+						touch(range, pos);
 						segmentEnd = range.hi === undefined || range.hi > end ? end : range.hi;
 					} else {
 						const nextRange = store.ranges.ceiling(pos);
@@ -467,18 +610,22 @@ export class LocalStore implements StateStore {
 			let outcome: KeyedScanOutcome | undefined;
 			const r = this.floor;
 			this.metrics.remoteReads++;
+			const started = performance.now();
 			try {
 				outcome = await this.keyedState.scan({ ...request, minThroughRecord: r });
 			} catch (error) {
 				if (!(error instanceof TransportError)) throw this.poison(error instanceof Error ? error : new Error(String(error)));
 			}
-			this.assertUsable();
+			const latency = performance.now() - started;
 			const s = outcome?.status;
 			// Transient (§7.6): no response, 204, every 429 (the gateway's live-read limit sends no
 			// Retry-After), 5xx, and a 400 from a lagging node whose Stream-Record-Next is below r
 			// (r = E never exceeds the acknowledged tail).
 			const lagging = s === 400 && outcome !== undefined && (intHeader(outcome.headers, H.recordNext) ?? r) < r;
-			if (outcome === undefined || lagging || s === 204 || s === 429 || (s !== undefined && s >= 500)) {
+			const transient = outcome === undefined || lagging || s === 204 || s === 429 || (s !== undefined && s >= 500);
+			this.options.onRemoteRead?.(latency, transient);
+			this.assertUsable();
+			if (outcome === undefined || transient) {
 				failures++;
 				this.metrics.retries++;
 				if (failures > (this.options.maxRetries ?? Number.POSITIVE_INFINITY) || now() >= deadline) {
@@ -566,12 +713,12 @@ export class LocalStore implements StateStore {
 			const gapEnd = nextRange === undefined || nextRange[0] > hi ? hi : nextRange[0];
 			this.cache.deleteRange(pos, gapEnd, (k, row) => {
 				this.cacheBytesTotal -= rowBytes(k, row.value);
+				this.large.delete(k);
 			});
 			for (const [k, row] of merged.range(pos, gapEnd)) this.putRow(k, row);
-			const installed: CoveredRange = { lo: pos, hi: gapEnd, pins: 1 };
+			const installed: CoveredRange = { lo: pos, hi: gapEnd, pins: 1, used: ++this.tick, hot: pos };
 			pins.add(installed);
 			this.ranges.set(pos, installed);
-			this.lru.set(installed, true);
 			pos = gapEnd;
 		}
 		this.enforceBudget();
@@ -583,15 +730,23 @@ export class LocalStore implements StateStore {
 		const prev = this.cache.set(key, row);
 		if (prev !== undefined) this.cacheBytesTotal -= rowBytes(key, prev.value);
 		this.cacheBytesTotal += rowBytes(key, row.value);
+		if (row.value.length > (this.options.largeValueBytes ?? LARGE_VALUE_BYTES)) this.large.add(key);
+		else if (prev !== undefined) this.large.delete(key);
 	}
 
 	private deleteRow(key: string): void {
 		const prev = this.cache.delete(key);
-		if (prev !== undefined) this.cacheBytesTotal -= rowBytes(key, prev.value);
+		if (prev !== undefined) {
+			this.cacheBytesTotal -= rowBytes(key, prev.value);
+			this.large.delete(key);
+		}
 	}
 
 	private poison(error: Error): Error {
-		this.poisonError ??= error;
+		if (this.poisonError === undefined) {
+			this.poisonError = error;
+			this.options.onPoison?.(error);
+		}
 		return error;
 	}
 

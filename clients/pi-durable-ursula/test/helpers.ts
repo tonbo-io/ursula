@@ -2,7 +2,7 @@ import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { ConversationId, EntryId, Id, Seq, Storage, StorageWrite } from "@earendil-works/pi-durable";
 import { FakeUrsula } from "../src/fake/index.ts";
-import { type Timing, UrsulaStorage, type UrsulaStorageOptions } from "../src/storage.ts";
+import { type Clock, type Timing, UrsulaStorage, type UrsulaStorageOptions } from "../src/storage.ts";
 
 export const ctx: Context = BACKGROUND_CONTEXT;
 
@@ -16,6 +16,23 @@ export const FAST: Partial<Timing> = {
 	backoffBaseMs: 1,
 	backoffMaxMs: 20,
 };
+
+/**
+ * A virtual clock: `sleep(ms)` advances `now()` by `ms` and resolves on the next macrotask, so
+ * backoff and deadlines keep their arithmetic while tests never wait on the wall clock. Time moves
+ * only when someone sleeps.
+ */
+export function virtualClock(start = 1_000_000): Clock & { elapsed(): number } {
+	let t = start;
+	return {
+		now: () => t,
+		sleep: (ms) => {
+			t += Math.max(0, ms);
+			return new Promise<void>((resolve) => setImmediate(resolve));
+		},
+		elapsed: () => t - start,
+	};
+}
 
 let counter = 0;
 export const freshPath = (): string => `/b/harness-${process.pid}-${counter++}`;

@@ -5,7 +5,7 @@
 import { MemoryStorage, type Storage, type StorageWrite } from "@earendil-works/pi-durable";
 import { expect, it } from "vitest";
 import { ctx, freshPath, openOn } from "./helpers.ts";
-import { type OwnerVariant, reopen, rng, trials, VARIANTS } from "./fuzz-util.ts";
+import { type OwnerVariant, reopen, rng, trials, VARIANTS, variantOptions } from "./fuzz-util.ts";
 
 const CONVS = [1, 2];
 const KINDS = ["k1", "k", "\ud800", "k\u0000x", "k\u0000", "L".repeat(1100), "L".repeat(1099) + "\ud800"];
@@ -83,7 +83,8 @@ async function runSeed(seed: number, rounds: number, variant: OwnerVariant): Pro
 		const fake = variant.fake();
 		const path = freshPath();
 		const memory = new MemoryStorage();
-		let ursula = await openOn(fake, path, variant.options);
+		const options = variantOptions(variant);
+		let ursula = await openOn(fake, path, options);
 		const setup: StorageWrite[] = [
 			{ type: "conversation", value: { id: 1 } as never },
 			{ type: "conversation", value: { id: 2 } as never },
@@ -112,7 +113,7 @@ async function runSeed(seed: number, rounds: number, variant: OwnerVariant): Pro
 				divergences.push(`seed ${seed} trial ${trial} step ${step}: commit outcome memory=${me} ursula=${mo}`);
 				break;
 			}
-			if (rnd() < 0.3) ursula = await reopen(fake, path, ursula, rnd() < 0.5, variant.options);
+			if (rnd() < 0.3) ursula = await reopen(fake, path, ursula, rnd() < 0.5, options);
 			const a = await snapshot(memory);
 			const b = await snapshot(ursula);
 			if (a !== b) {
