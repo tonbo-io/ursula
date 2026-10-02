@@ -330,6 +330,10 @@ impl StreamStateMachine {
             prepared_record_retain,
             gc_not_before_ms,
         );
+        // F1 (level 2): retention can drop the hot bytes below dense records
+        // (an external append above them), which moves the seal point; seal
+        // here so retention leaves no seal debt for the tidy driver.
+        self.seal_record_index(&stream_id);
         StreamResponse::RetentionAdvanced {
             retained_offset,
             record_range: self.record_range(&stream_id).ok().flatten(),
