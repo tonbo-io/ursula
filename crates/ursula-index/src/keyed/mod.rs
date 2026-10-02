@@ -18,6 +18,10 @@
 //!   compaction policy (§9.6).
 //! - [`manifest`]: manifest v6, the namespace layout, and publication by
 //!   CAS on `CURRENT` (U15).
+//! - [`source`]: the source-log client: P7 pages, incarnation checks (U18).
+//! - [`engine`]: on-demand ingest with the continuity check, publication,
+//!   compaction, delta GC and drain (U16).
+//! - [`http`]: the internal `/v1/keyed` API (U17).
 //!
 //! Engine data flow: a [`RunBuilder`] folds `(record, batch)` pairs into a
 //! [`BuiltRun`]; its parts are stored with [`KeyedNamespace::put_part`]; the
@@ -26,11 +30,14 @@
 //! manifest's runs and a [`PartOpener`].
 
 pub mod batch;
+pub mod engine;
 pub mod fold;
+pub mod http;
 pub mod manifest;
 pub mod merge;
 pub mod part;
 pub mod run;
+pub mod source;
 
 pub use batch::InvalidMessage;
 pub use batch::KEYED_BATCH_PROFILE;
@@ -46,6 +53,11 @@ pub use batch::encode_key;
 pub use batch::parse_batch;
 pub use batch::validate_batch;
 pub use batch::validate_messages;
+pub use engine::KeyedEngine;
+pub use engine::KeyedEngineConfig;
+pub use engine::KeyedReadOutcome;
+pub use engine::KeyedReadRequest;
+pub use engine::Selection;
 pub use fold::KEYED_STATE_RESPONSE_BUDGET;
 pub use fold::KeyedState;
 pub use fold::Lower;
@@ -80,3 +92,5 @@ pub use run::CompactionPolicy;
 pub use run::RunBuilder;
 pub use run::compact;
 pub use run::plan_compaction;
+pub use source::KeyedSourceClient;
+pub use source::SourceError;

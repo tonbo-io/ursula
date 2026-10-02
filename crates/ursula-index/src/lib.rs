@@ -8,7 +8,9 @@
 //! - [`index`]: the S3-authoritative ingest/flush/query/compact/GC engine.
 //! - [`keyed`]: the `keyed-batch-v1` record format (validator and parser),
 //!   the reference fold of keyed state, and the keyed projection engine's
-//!   data plane (part v2, k-way merge, runs and compaction, manifest v6).
+//!   data plane (part v2, k-way merge, runs and compaction, manifest v6),
+//!   and the keyed engine service (ingest, publish, compaction, GC, the
+//!   internal `/v1/keyed` API).
 //! - [`manifest`]: the conditionally published manifest state model.
 //! - [`object_store`]: conditional object operations for S3 and local tests.
 //! - [`part`]: immutable sorted Parquet parts.

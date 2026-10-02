@@ -313,7 +313,12 @@ pub enum PublishOutcome {
     /// `CURRENT` now names the manifest.
     Published(Box<PublishedKeyedManifest>),
     /// Another writer published first; reload and retry from its state.
-    Conflict,
+    /// `manifest_key` names the manifest object this attempt wrote, which
+    /// stays unpublished (its writer deletes it after the GC grace period).
+    Conflict {
+        /// The unpublished manifest object, relative to the namespace.
+        manifest_key: String,
+    },
 }
 
 /// Percent-encodes a stream's local name as one path component
@@ -386,6 +391,17 @@ impl KeyedNamespace {
         self.store.delete(&self.object(key)).await
     }
 
+    /// Deletes every object of the namespace (the stream incarnation is
+    /// gone). Returns the number of objects deleted.
+    pub async fn delete_all(&self) -> Result<usize, IndexError> {
+        let objects = self.store.list(&self.prefix).await?;
+        let count = objects.len();
+        for object in objects {
+            self.store.delete(&object.key).await?;
+        }
+        Ok(count)
+    }
+
     /// Loads the published manifest; `None` is a missing namespace
     /// (`state(0)`).
     pub async fn load(&self) -> Result<Option<PublishedKeyedManifest>, IndexError> {
@@ -454,7 +470,7 @@ impl KeyedNamespace {
             None => self.store.put_if_absent(&current, &pointer).await?,
         };
         if written == ConditionalWrite::Conflict {
-            return Ok(PublishOutcome::Conflict);
+            return Ok(PublishOutcome::Conflict { manifest_key: key });
         }
         // Read back: adopt the entity tag only from our own bytes.
         match self.store.get(&current).await? {
@@ -465,7 +481,7 @@ impl KeyedNamespace {
                     manifest,
                 },
             ))),
-            _ => Ok(PublishOutcome::Conflict),
+            _ => Ok(PublishOutcome::Conflict { manifest_key: key }),
         }
     }
 }
@@ -561,7 +577,7 @@ mod tests {
         // A second writer with no base, or a stale base, conflicts.
         assert!(matches!(
             namespace.publish(None, &first).await.unwrap(),
-            PublishOutcome::Conflict
+            PublishOutcome::Conflict { .. }
         ));
         let (second_run, part) = run(2, 3, 2);
         namespace.put_part(&part).await.unwrap();
@@ -577,7 +593,7 @@ mod tests {
         assert_eq!(next.manifest.generation, 2);
         assert!(matches!(
             namespace.publish(Some(&loaded), &second).await.unwrap(),
-            PublishOutcome::Conflict
+            PublishOutcome::Conflict { .. }
         ));
         assert_eq!(
             namespace

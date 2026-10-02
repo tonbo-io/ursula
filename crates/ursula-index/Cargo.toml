@@ -33,7 +33,9 @@ serde_json = { workspace = true, features = ["raw_value"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tower-http = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 ursula-observability = { workspace = true }
 
 [lints]
