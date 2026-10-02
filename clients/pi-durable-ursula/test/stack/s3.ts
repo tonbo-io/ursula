@@ -67,7 +67,8 @@ export async function startS3(dir: string): Promise<S3Server> {
 	const proc = new Proc("minio", bin, ["server", data, "--address", `127.0.0.1:${port}`, "--console-address", `127.0.0.1:${consolePort}`, "--quiet"], {
 		cwd: dir,
 		log: join(dir, "minio.log"),
-		env: { MINIO_ROOT_USER: accessKey, MINIO_ROOT_PASSWORD: secretKey, MINIO_BROWSER: "off" },
+		// Public Prometheus metrics: the soak reads S3 requests by API from /minio/v2/metrics/cluster.
+		env: { MINIO_ROOT_USER: accessKey, MINIO_ROOT_PASSWORD: secretKey, MINIO_BROWSER: "off", MINIO_PROMETHEUS_AUTH_TYPE: "public" },
 	});
 	const endpoint = `http://127.0.0.1:${port}`;
 	await waitReady(`${endpoint}/minio/health/live`, proc);
