@@ -66,10 +66,16 @@ pub struct GroupStateGauges {
     pub ttl_heap_entries: u64,
     /// Unflushed payload bytes (the group hot gauge).
     pub hot_payload_bytes: u64,
-    /// Hot chunks (one per unflushed append today).
+    /// Hot blocks of up to 64 KiB (F6b; one per append before it).
     pub hot_chunks: u64,
-    /// Hot-window bookkeeping bytes beyond payload: chunk headers (F6).
+    /// Hot-window block headers beyond payload (F6b).
     pub hot_overhead_bytes: u64,
+    /// Hot records: message records at or above each stream's first hot
+    /// byte (F6c).
+    pub hot_records: u64,
+    /// Hot payload plus per-record overhead, what admission and the flush
+    /// planner count (F6c).
+    pub hot_real_bytes: u64,
     /// Pending cold-GC queue entries (F14).
     pub pending_cold_gc: u64,
     /// Per-bucket usage rows (F15, by design O(buckets ever written)).
@@ -122,6 +128,8 @@ impl StreamStateMachine {
             live_packs: as_u64(self.shared_cold_object_refs.len()),
             ttl_heap_entries: as_u64(self.registry.ttl_heap_len()),
             hot_payload_bytes: self.hot_payload_bytes,
+            hot_records: self.hot_records,
+            hot_real_bytes: self.total_hot_real_bytes(),
             pending_cold_gc: as_u64(self.cold_gc.len()),
             bucket_usage_rows: as_u64(self.bucket_usage.len()),
             erased_buckets: as_u64(self.erased_buckets.len()),
@@ -282,7 +290,8 @@ mod tests {
         assert_eq!(gauges.ttl_streams, 1);
         // F8: the heap keeps one armed entry per TTL stream.
         assert_eq!(gauges.ttl_heap_entries, 1);
-        assert_eq!(gauges.hot_chunks, 4);
+        // F6b: contiguous appends share one hot block per stream.
+        assert_eq!(gauges.hot_chunks, 2);
         assert_eq!(gauges.hot_payload_bytes, 16 + 3 * 8);
         assert!(gauges.hot_overhead_bytes > 0);
         assert_eq!(gauges.shared_refs, 0);

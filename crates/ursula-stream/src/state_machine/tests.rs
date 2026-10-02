@@ -1938,15 +1938,18 @@ fn plan_next_cold_flush_drains_distributed_group_hot_bytes() {
         ));
     }
 
+    // F6c: the group holds 2 x (2 B + one record's overhead) real bytes.
+    let group_real = 2 * (2 + crate::HOT_RECORD_OVERHEAD_BYTES as usize);
+    assert_eq!(machine.total_hot_real_bytes(), group_real as u64);
     assert_eq!(
         machine
-            .plan_next_cold_flush_batch(4, 4, 4, 1)
+            .plan_next_cold_flush_batch(group_real, 4, 4, 1)
             .expect("plan next cold flush")
             .len(),
         1
     );
     let candidates = machine
-        .plan_next_cold_flush_batch(5, 4, 4, 1)
+        .plan_next_cold_flush_batch(group_real + 1, 4, 4, 1)
         .expect("plan next cold flush");
     assert!(candidates.is_empty());
     let candidate = machine
@@ -2153,9 +2156,16 @@ fn flush_planner_drains_largest_streams_first() {
         create_stream(&mut machine, name);
         append_all(&mut machine, name, &[&vec![b'x'; len]]);
     }
-    // Group hot 100 >= 64: drain until below 32.
+    // F6c: real sizes are payload plus one record's overhead each, 196 in
+    // all. Group hot 196 >= 196: drain until below 98 (d-40 and d-30 hold
+    // 64 + 54 real bytes).
+    let group_real = 100 + 4 * crate::HOT_RECORD_OVERHEAD_BYTES as usize;
+    assert_eq!(machine.total_hot_real_bytes(), group_real as u64);
     let (pass, _) = machine
-        .plan_cold_flush_pass_from(planner_request(64, 64, usize::MAX, usize::MAX), None)
+        .plan_cold_flush_pass_from(
+            planner_request(group_real, 64, usize::MAX, usize::MAX),
+            None,
+        )
         .expect("plan drain");
     assert_eq!(
         pass.candidates
@@ -5209,4 +5219,82 @@ fn shared_ref_candidates_follow_threshold_idle_and_pack_occupancy() {
     machine.apply(StreamCommand::AckColdGc { up_to_seq: last });
     let referenced = machine.group_referenced_cold_paths();
     assert!(!referenced.contains("benchcmp/_packs/00000000/busy-0.bin"));
+}
+
+/// bounded-stream-state F6c: the group's hot-record gauge, and so its real
+/// hot size, follows appends, failed transactions, flushes, retention,
+/// deletes and snapshot restore, and agrees with a recount.
+#[test]
+fn hot_real_bytes_track_records_across_every_hot_transition() {
+    const OVERHEAD: u64 = crate::HOT_RECORD_OVERHEAD_BYTES;
+    let mut machine = machine();
+    let first = BucketStreamId::with_affinity("benchcmp", "run-7", "a");
+    let second = BucketStreamId::with_affinity("benchcmp", "run-7", "b");
+    for stream_id in [&first, &second] {
+        assert!(matches!(
+            machine.apply(create_cmd(stream_id.clone(), Create {
+                content_type: "application/json",
+                ..Create::default()
+            })),
+            StreamResponse::Created { .. }
+        ));
+    }
+    let json_append =
+        |stream_id: &BucketStreamId, body: &'static [u8], record_match| StreamCommand::Append {
+            stream_id: stream_id.clone(),
+            content_type: Some("application/json".to_owned()),
+            payload: bytes::Bytes::from_static(body),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            now_ms: 0,
+            record_match,
+        };
+    let recount = |machine: &StreamStateMachine| -> u64 {
+        [&first, &second]
+            .into_iter()
+            .map(|stream_id| machine.hot_real_len(stream_id).unwrap_or(0))
+            .sum()
+    };
+    // Three records of 8 bytes, then two of 8 bytes on the other stream.
+    machine.apply(json_append(
+        &first,
+        b"{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n",
+        None,
+    ));
+    machine.apply(json_append(&second, b"{\"b\":1}\n{\"b\":2}\n", None));
+    assert_eq!(machine.total_hot_records(), 5);
+    assert_eq!(machine.total_hot_real_bytes(), 40 + 5 * OVERHEAD);
+    assert_eq!(machine.total_hot_real_bytes(), recount(&machine));
+
+    // A failed transaction adds nothing.
+    let error = machine.append_transaction(vec![
+        json_append(&first, b"{\"a\":4}\n", Some(3)),
+        json_append(&second, b"{\"b\":3}\n", Some(0)),
+    ]);
+    assert!(error.is_err());
+    assert_eq!(machine.total_hot_records(), 5);
+    assert_eq!(machine.total_hot_real_bytes(), recount(&machine));
+
+    // Flushing the first record of the first stream removes one record.
+    assert!(matches!(
+        machine.apply(flush_cold_cmd(first.clone(), 0, 8, "first-0", 8)),
+        StreamResponse::ColdFlushed { .. }
+    ));
+    assert_eq!(machine.total_hot_records(), 4);
+    assert_eq!(machine.total_hot_real_bytes(), 32 + 4 * OVERHEAD);
+
+    // Snapshot restore re-derives the same gauge.
+    let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore");
+    assert_eq!(restored.total_hot_records(), 4);
+    assert_eq!(
+        restored.total_hot_real_bytes(),
+        machine.total_hot_real_bytes()
+    );
+
+    // Deleting a stream drops its records.
+    machine.apply(delete_cmd(second.clone()));
+    assert_eq!(machine.total_hot_records(), 2);
+    assert_eq!(machine.total_hot_real_bytes(), 16 + 2 * OVERHEAD);
+    assert_eq!(machine.total_hot_real_bytes(), recount(&machine));
 }

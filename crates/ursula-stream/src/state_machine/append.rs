@@ -28,7 +28,7 @@ use super::validate_producer_request;
 
 struct StreamAppendUndo {
     metadata: StreamMetadata,
-    hot_checkpoint: usize,
+    hot_checkpoint: super::hot_buffer::HotCheckpoint,
     message_records_len: usize,
     record_checkpoint: Option<usize>,
     integrity: StreamIntegrity,
@@ -678,6 +678,7 @@ impl StreamStateMachine {
             ));
         // F4a: an external append is a cold transition.
         self.collapse_sealed_message_records(&stream_id);
+        self.sync_hot_index(&stream_id);
         let appended_bytes = next_offset.saturating_sub(offset);
         self.usage_on_append(
             &stream_id.bucket_id,

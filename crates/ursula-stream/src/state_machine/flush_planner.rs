@@ -4,6 +4,10 @@
 //! instead of every stream in the group, reads each stream's hot size from an
 //! O(1) counter before copying any payload, and sorts once per pass:
 //!
+//! Hot sizes are real sizes (F6c): payload plus
+//! [`HOT_RECORD_OVERHEAD_BYTES`](super::HOT_RECORD_OVERHEAD_BYTES) per hot
+//! record, so a window of tiny records drains as early as its memory says.
+//!
 //! - **Group drain** (group hot at or above `min_hot_bytes`, the group flush
 //!   threshold): streams are flushed largest first until the group falls
 //!   below half of `min_hot_bytes`, instead of flushing every stream that
@@ -137,6 +141,17 @@ fn rotated_order(
 }
 
 impl StreamStateMachine {
+    /// Message records of `stream_id` that start in `[start, end)`.
+    fn hot_records_between(&self, stream_id: &BucketStreamId, start: u64, end: u64) -> u64 {
+        let Some(slot) = self.stream_slot(stream_id) else {
+            return 0;
+        };
+        let records = &slot.message_records;
+        let from = records.partition_point(|record| record.start_offset < start);
+        let to = records.partition_point(|record| record.start_offset < end);
+        u64::try_from(to.saturating_sub(from)).unwrap_or(u64::MAX)
+    }
+
     /// Leader path: plans one pass and advances the rotation cursor.
     pub fn plan_cold_flush_pass(
         &mut self,
@@ -165,7 +180,8 @@ impl StreamStateMachine {
         {
             return Ok((ColdFlushPass { candidates, stats }, None));
         }
-        let group_hot_bytes = self.hot_payload_bytes;
+        // F6c: thresholds count hot payload plus per-record overhead.
+        let group_hot_bytes = self.total_hot_real_bytes();
         let min_hot_bytes = u64::try_from(request.min_hot_bytes).unwrap_or(u64::MAX);
         let mode = match request.pressure {
             Some(pressure) => PassMode::Pressure(pressure.group_drain_bytes(group_hot_bytes)),
@@ -182,7 +198,11 @@ impl StreamStateMachine {
             };
             let hot_len = slot.hot_buffer.len();
             if hot_len > 0 {
-                hot.push((stream_id, hot_len));
+                let real_len = super::hot_real_bytes(
+                    u64::try_from(hot_len).unwrap_or(u64::MAX),
+                    slot.hot_buffer.accounted_records(),
+                );
+                hot.push((stream_id, real_len, hot_len));
             }
         }
         stats.sorts += 1;
@@ -205,7 +225,7 @@ impl StreamStateMachine {
             }
             PassMode::Pressure(target) => planned_total >= target,
         };
-        'streams: for (stream_id, hot_len) in hot {
+        'streams: for (stream_id, _real_len, hot_len) in hot {
             let mut start = self.hot_start_offset(stream_id);
             let mut planned_for_stream = 0usize;
             loop {
@@ -234,8 +254,15 @@ impl StreamStateMachine {
                 let len = candidate.payload.len();
                 stats.bytes_copied += len;
                 planned_for_stream = planned_for_stream.saturating_add(len);
-                planned_total =
-                    planned_total.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+                let records = self.hot_records_between(
+                    stream_id,
+                    candidate.start_offset,
+                    candidate.end_offset,
+                );
+                planned_total = planned_total.saturating_add(super::hot_real_bytes(
+                    u64::try_from(len).unwrap_or(u64::MAX),
+                    records,
+                ));
                 budget = budget.saturating_sub(len);
                 start = candidate.end_offset;
                 last_stream = Some(stream_id);
