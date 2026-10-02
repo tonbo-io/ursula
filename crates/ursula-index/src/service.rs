@@ -23,6 +23,7 @@ use axum::routing::post;
 use axum::routing::put;
 use chrono::DateTime;
 use clap::Args;
+use clap::Subcommand;
 use reqwest::Url;
 use serde::Deserialize;
 use serde::Serialize;
@@ -49,7 +50,11 @@ use crate::SourceBatch;
 use crate::SourceClient;
 
 #[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub struct IndexerArgs {
+    /// Maintenance commands; without one, the indexer service runs.
+    #[command(subcommand)]
+    command: Option<IndexerCommand>,
     #[arg(long)]
     stream_url: Option<Url>,
     #[command(flatten)]
@@ -60,8 +65,9 @@ pub struct IndexerArgs {
     s3_region: Option<String>,
     #[arg(long)]
     s3_endpoint: Option<String>,
-    #[arg(long)]
-    cache_dir: PathBuf,
+    /// Local cache directory (required to run the service).
+    #[arg(long, required = true)]
+    cache_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 2 * 1024 * 1024 * 1024_u64)]
     cache_max_bytes: u64,
     #[arg(long, default_value_t = 512 * 1024 * 1024_u64)]
@@ -123,6 +129,213 @@ pub struct IndexerArgs {
     /// Keyed mode: maximum concurrent waiting keyed-state reads.
     #[arg(long, default_value_t = 10_000)]
     keyed_max_waiters: usize,
+}
+
+/// Indexer maintenance commands.
+#[derive(Debug, Subcommand)]
+pub enum IndexerCommand {
+    /// Keyed namespace maintenance (design §6.1 U20).
+    #[command(subcommand)]
+    Keyed(KeyedCommand),
+}
+
+/// `ursula indexer keyed …`.
+#[derive(Debug, Subcommand)]
+pub enum KeyedCommand {
+    /// Rebuild `state(D)` from the log at the published `D` and compare it
+    /// with the namespace row by row; exits non-zero on any difference.
+    Verify(KeyedVerifyArgs),
+    /// Refold the namespace from record 0 through followers (rate-limited,
+    /// parallel by record range) and swap it in blue/green.
+    Rebuild(KeyedRebuildArgs),
+    /// Delete the namespace's unreferenced objects older than the grace
+    /// period (one LIST).
+    Sweep(KeyedSweepArgs),
+    /// Print the published pointer and manifest, optionally every row.
+    Dump(KeyedDumpArgs),
+}
+
+/// The namespace a keyed command acts on.
+#[derive(Debug, Args)]
+pub struct KeyedTargetArgs {
+    #[command(flatten)]
+    backend: BackendArgs,
+    /// Object-store root holding `.keyed/` in the S3 bucket.
+    #[arg(long, default_value = "")]
+    keyed_s3_root: String,
+    #[arg(long)]
+    s3_region: Option<String>,
+    #[arg(long)]
+    s3_endpoint: Option<String>,
+    /// Bucket of the stream.
+    #[arg(long)]
+    bucket: String,
+    /// The stream's local name (`{stream}` or `{affinity}/{stream}`).
+    #[arg(long)]
+    stream: String,
+    /// The stream incarnation (its `created_at_ms`).
+    #[arg(long)]
+    incarnation: u64,
+}
+
+/// Source reads of `verify` and `rebuild`.
+#[derive(Debug, Args)]
+pub struct KeyedSourceArgs {
+    /// Ursula node or gateway base URL serving the stream's log.
+    #[arg(long)]
+    source_url: Url,
+    /// `max_bytes` of one source page.
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    page_bytes: u64,
+    /// Source bytes per second; unlimited when absent.
+    #[arg(long)]
+    max_bytes_per_second: Option<u64>,
+}
+
+/// `ursula indexer keyed verify`.
+#[derive(Debug, Args)]
+pub struct KeyedVerifyArgs {
+    #[command(flatten)]
+    target: KeyedTargetArgs,
+    #[command(flatten)]
+    source: KeyedSourceArgs,
+    /// Compare only keys whose hash is divisible by this (1 compares all).
+    #[arg(long, default_value_t = 1)]
+    sample_modulus: u64,
+}
+
+/// `ursula indexer keyed rebuild`.
+#[derive(Debug, Args)]
+pub struct KeyedRebuildArgs {
+    #[command(flatten)]
+    target: KeyedTargetArgs,
+    #[command(flatten)]
+    source: KeyedSourceArgs,
+    /// Record ranges folded concurrently (1..=8).
+    #[arg(long, default_value_t = 4)]
+    parallelism: usize,
+}
+
+/// `ursula indexer keyed sweep`.
+#[derive(Debug, Args)]
+pub struct KeyedSweepArgs {
+    #[command(flatten)]
+    target: KeyedTargetArgs,
+    /// Only objects older than this are deleted (the engine's GC grace).
+    #[arg(long, default_value_t = 600)]
+    grace_seconds: u64,
+    /// Report what would be deleted without deleting.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+/// `ursula indexer keyed dump`.
+#[derive(Debug, Args)]
+pub struct KeyedDumpArgs {
+    #[command(flatten)]
+    target: KeyedTargetArgs,
+    /// Also print every visible row.
+    #[arg(long)]
+    rows: bool,
+}
+
+impl KeyedTargetArgs {
+    fn open(&self) -> anyhow::Result<(ObjectStore, crate::keyed::KeyedSource)> {
+        let target = match (&self.backend.object_dir, &self.backend.s3_bucket) {
+            (Some(root), _) => StoreTarget::Fs { root: root.clone() },
+            (None, Some(bucket)) => StoreTarget::S3 {
+                bucket: bucket.clone(),
+                root: self.keyed_s3_root.clone(),
+                region: self.s3_region.clone(),
+                endpoint: self.s3_endpoint.clone(),
+            },
+            (None, None) => anyhow::bail!("--object-dir or --s3-bucket is required"),
+        };
+        let store = target.open("").context("open object store")?;
+        let source = crate::keyed::KeyedSource {
+            bucket: self.bucket.clone(),
+            key: self.stream.clone(),
+            incarnation: self.incarnation,
+        };
+        Ok((store, source))
+    }
+}
+
+impl KeyedSourceArgs {
+    fn open(
+        &self,
+    ) -> anyhow::Result<(
+        crate::keyed::KeyedSourceClient,
+        crate::keyed::tools::SourceReadOptions,
+    )> {
+        let client = crate::keyed::KeyedSourceClient::new(self.source_url.clone())
+            .context("configure keyed source client")?;
+        let options = crate::keyed::tools::SourceReadOptions {
+            page_bytes: self.page_bytes,
+            max_bytes_per_second: self.max_bytes_per_second,
+            ..crate::keyed::tools::SourceReadOptions::default()
+        };
+        Ok((client, options))
+    }
+}
+
+fn print_json(value: &impl Serialize) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer_pretty(&mut stdout, value)?;
+    stdout.write_all(b"\n")?;
+    Ok(())
+}
+
+/// Runs one keyed maintenance command.
+async fn run_keyed_command(command: KeyedCommand) -> anyhow::Result<()> {
+    use crate::keyed::tools;
+    match command {
+        KeyedCommand::Verify(args) => {
+            let (store, source) = args.target.open()?;
+            let (client, read) = args.source.open()?;
+            let options = tools::VerifyOptions {
+                sample_modulus: args.sample_modulus,
+                read,
+            };
+            let report = tools::verify(store, &client, &source, &options).await?;
+            print_json(&report)?;
+            if !report.is_ok() {
+                anyhow::bail!(
+                    "keyed namespace differs from its log in {} places",
+                    report.mismatch_count
+                );
+            }
+        }
+        KeyedCommand::Rebuild(args) => {
+            let (store, source) = args.target.open()?;
+            let (client, read) = args.source.open()?;
+            let options = tools::RebuildOptions {
+                parallelism: args.parallelism,
+                read,
+                ..tools::RebuildOptions::default()
+            };
+            print_json(&tools::rebuild(store, &client, &source, &options).await?)?;
+        }
+        KeyedCommand::Sweep(args) => {
+            let (store, source) = args.target.open()?;
+            let grace = Duration::from_secs(args.grace_seconds);
+            print_json(&tools::sweep(store, &source, grace, args.dry_run).await?)?;
+        }
+        KeyedCommand::Dump(args) => {
+            let (store, source) = args.target.open()?;
+            let mut stdout = std::io::BufWriter::new(std::io::stdout());
+            tools::dump(
+                store,
+                &source,
+                args.rows,
+                &crate::keyed::PartOptions::default(),
+                &mut stdout,
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Args)]
@@ -332,9 +545,12 @@ impl IntoResponse for ApiError {
     }
 }
 
-pub async fn run(args: IndexerArgs) -> anyhow::Result<()> {
+pub async fn run(mut args: IndexerArgs) -> anyhow::Result<()> {
     let _observability =
         ursula_observability::init(ursula_observability::InitOptions::new("ursula-indexer"));
+    if let Some(IndexerCommand::Keyed(command)) = args.command.take() {
+        return run_keyed_command(command).await;
+    }
     validate_args(&args)?;
     if let Some(source_url) = args.keyed_source_url.clone() {
         return run_keyed(args, source_url).await;
@@ -345,7 +561,19 @@ pub async fn run(args: IndexerArgs) -> anyhow::Result<()> {
     }
 }
 
+impl IndexerArgs {
+    /// `--cache-dir`; [`validate_args`] has checked it is present.
+    fn cache_dir(&self) -> &std::path::Path {
+        self.cache_dir
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("."))
+    }
+}
+
 fn validate_args(args: &IndexerArgs) -> anyhow::Result<()> {
+    if args.cache_dir.is_none() {
+        anyhow::bail!("--cache-dir is required");
+    }
     if args.compaction_fan_in < 2 {
         anyhow::bail!("--compact-parts must be at least 2");
     }
@@ -391,7 +619,7 @@ async fn run_single(args: IndexerArgs, stream_url: Url) -> anyhow::Result<()> {
         .context("open object store")?;
     let index = EventIndex::open(
         store.clone(),
-        EventIndexCache::serving(&args.cache_dir, args.cache_max_bytes)?,
+        EventIndexCache::serving(args.cache_dir(), args.cache_max_bytes)?,
         config.clone(),
     )
     .await
@@ -399,7 +627,7 @@ async fn run_single(args: IndexerArgs, stream_url: Url) -> anyhow::Result<()> {
     let maintenance_index = EventIndex::open(
         store,
         EventIndexCache::maintenance(
-            args.cache_dir.join("maintenance"),
+            args.cache_dir().join("maintenance"),
             args.maintenance_cache_max_bytes,
         )?,
         config,
@@ -429,7 +657,7 @@ async fn run_single(args: IndexerArgs, stream_url: Url) -> anyhow::Result<()> {
     tracing::info!(
         listen = %args.listen,
         stream_url = %stream_url,
-        cache_dir = %args.cache_dir.display(),
+        cache_dir = %args.cache_dir().display(),
         s3_bucket = args
             .backend
             .s3_bucket
@@ -471,7 +699,7 @@ async fn run_keyed(args: IndexerArgs, source_url: Url) -> anyhow::Result<()> {
         fs @ StoreTarget::Fs { .. } => fs,
     };
     let store = target.open("").context("open object store")?;
-    let cache = EventIndexCache::serving(args.cache_dir.join("keyed"), args.cache_max_bytes)?;
+    let cache = EventIndexCache::serving(args.cache_dir().join("keyed"), args.cache_max_bytes)?;
     let source = crate::keyed::KeyedSourceClient::new(source_url.clone())
         .context("configure keyed source client")?;
     let config = crate::keyed::KeyedEngineConfig {
@@ -489,7 +717,7 @@ async fn run_keyed(args: IndexerArgs, source_url: Url) -> anyhow::Result<()> {
     tracing::info!(
         listen = %args.listen,
         source = %source_url,
-        cache_dir = %args.cache_dir.display(),
+        cache_dir = %args.cache_dir().display(),
         "keyed indexer starting"
     );
     serve(crate::keyed::http::router(engine), args.listen, shutdown_tx).await?;
@@ -555,11 +783,11 @@ async fn run_pool(args: IndexerArgs) -> anyhow::Result<()> {
         backend,
         settings: PoolIndexSettings {
             serving_cache: EventIndexCache::serving(
-                args.cache_dir.join("serving"),
+                args.cache_dir().join("serving"),
                 args.cache_max_bytes,
             )?,
             maintenance_cache: EventIndexCache::maintenance(
-                args.cache_dir.join("maintenance"),
+                args.cache_dir().join("maintenance"),
                 args.maintenance_cache_max_bytes,
             )?,
             flush_entries: args.flush_entries,
@@ -589,7 +817,7 @@ async fn run_pool(args: IndexerArgs) -> anyhow::Result<()> {
         listen = %args.listen,
         worker_id = %args.worker_id,
         segment_records = args.segment_records,
-        cache_dir = %args.cache_dir.display(),
+        cache_dir = %args.cache_dir().display(),
         "dynamic event-index worker pool starting"
     );
     serve(pool_router(state), args.listen, shutdown_tx).await?;
@@ -1292,6 +1520,74 @@ fn parse_query_timestamp(value: &str) -> Option<i64> {
             .ok()
             .map(|value| value.timestamp_millis())
     })
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use clap::Parser;
+    use clap::Subcommand;
+
+    use super::IndexerArgs;
+    use super::IndexerCommand;
+    use super::KeyedCommand;
+
+    /// The shape of the `ursula` binary's CLI.
+    #[derive(Debug, Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        command: Role,
+    }
+
+    #[derive(Debug, Subcommand)]
+    enum Role {
+        Indexer(Box<IndexerArgs>),
+    }
+
+    fn parse(args: &[&str]) -> Result<IndexerArgs, clap::Error> {
+        let Role::Indexer(args) = Cli::try_parse_from(
+            ["ursula", "indexer"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )?
+        .command;
+        Ok(*args)
+    }
+
+    #[test]
+    fn keyed_commands_parse_without_service_flags() {
+        let target = [
+            "--object-dir",
+            "/tmp/o",
+            "--bucket",
+            "b",
+            "--stream",
+            "a/s",
+            "--incarnation",
+            "7",
+        ];
+        let mut sweep = vec!["keyed", "sweep", "--grace-seconds", "0", "--dry-run"];
+        sweep.extend(target);
+        let cli = parse(&sweep).unwrap_or_else(|error| panic!("{error}"));
+        assert!(matches!(
+            cli.command,
+            Some(IndexerCommand::Keyed(KeyedCommand::Sweep(_)))
+        ));
+        for verb in ["verify", "rebuild"] {
+            let mut args = vec!["keyed", verb, "--source-url", "http://127.0.0.1:4437"];
+            args.extend(target);
+            parse(&args).unwrap();
+            // The source is required.
+            let mut args = vec!["keyed", verb];
+            args.extend(target);
+            parse(&args).unwrap_err();
+        }
+        let mut dump = vec!["keyed", "dump", "--rows"];
+        dump.extend(target);
+        parse(&dump).unwrap();
+        // The service still requires its flags.
+        parse(&[]).unwrap_err();
+        parse(&["--object-dir", "/tmp/o", "--cache-dir", "/tmp/c"]).unwrap();
+    }
 }
 
 #[cfg(test)]

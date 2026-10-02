@@ -21,7 +21,9 @@
 //! - [`source`]: the source-log client: P7 pages, incarnation checks (U18).
 //! - [`engine`]: on-demand ingest with the continuity check, publication,
 //!   compaction, delta GC and drain (U16).
-//! - [`http`]: the internal `/v1/keyed` API (U17).
+//! - [`http`]: the internal `/v1/keyed` API (U17) and the metrics endpoint.
+//! - [`metrics`]: the engine's counters and gauges (U24).
+//! - [`tools`]: namespace maintenance: verify, rebuild, sweep, dump (U20).
 //!
 //! Engine data flow: a [`RunBuilder`] folds `(record, batch)` pairs into a
 //! [`BuiltRun`]; its parts are stored with [`KeyedNamespace::put_part`]; the
@@ -35,9 +37,11 @@ pub mod fold;
 pub mod http;
 pub mod manifest;
 pub mod merge;
+pub mod metrics;
 pub mod part;
 pub mod run;
 pub mod source;
+pub mod tools;
 
 pub use batch::InvalidMessage;
 pub use batch::KEYED_BATCH_PROFILE;
