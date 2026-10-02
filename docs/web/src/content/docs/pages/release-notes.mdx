@@ -5,7 +5,7 @@ description: Changes that affect clients and operators, newest first.
 
 ## Unreleased: keyed streams and bounded stream state
 
-This release adds [keyed streams](/docs/concepts/keyed-streams) and the [keyed-state](/docs/api/keyed-state) resource, stores JSON messages exactly as written, and starts the work that keeps per-stream memory bounded without retention. Read the upgrade notes before rolling it out.
+This release adds [keyed streams](/docs/concepts/keyed-streams) and the [keyed-state](/docs/api/keyed-state) resource, stores JSON messages exactly as written, and starts the work that stops per-stream replicated memory from growing with record count, without retention (it still grows by about 16 MiB per TiB of cold history per stream per replica; see [Memory without retention](/docs/operations#memory-without-retention)). Read the upgrade notes before rolling it out.
 
 ### Upgrade notes
 
@@ -44,6 +44,7 @@ Every `application/json` stream now follows [JSON message text](/docs/specs/exte
 - **Sparse cold record marks (level 2).** The JSON record index keeps exact offsets only for unflushed records plus one mark per MiB of cold log. Record reads into sealed history are unchanged for clients. Retention by offset or record into sealed history may land at or below its target (the response's `Stream-Retained-Offset` and `Stream-Record-First` report where), and raw-offset snapshot and retention requests whose offset falls inside a JSON record answer `400`.
 - **External payload locators (level 3).** External appends commit their locator in replicated state first and the leader indexes it afterwards, so `runtime.external_payload_min_size` may be lowered on clusters at level 3.
 - **Compact hot window (level 4).** Message records are removed from replicated state: JSON streams take message boundaries from the record index, other streams keep one 8-byte start per unflushed message. Cold admission and flush thresholds then charge 8 bytes per hot record instead of 24. Bootstrap answers are unchanged, except that a snapshot published exactly at a flushed message boundary is now followed by update parts instead of an honest partial.
+- **Keyed indexer admission.** One process-wide byte budget (`--keyed-admission-budget-bytes`, default 1 GiB) covers ingest pages, folded records and compaction buffers; `--keyed-max-concurrent-ingests` and `--keyed-max-concurrent-compactions` (CPU-sized by default) bound concurrency; and a bounded admission queue (`--keyed-admission-queue`) answers keyed-state reads that need new ingestion with `503` and `Retry-After` when full. The metrics snapshot gains `admission` (budget in use and peak, queue depth, rejections).
 - **Keyed indexer tools.** `ursula indexer keyed verify|rebuild|sweep|dump` checks a namespace against the log, rebuilds it blue/green, removes orphaned objects and prints its contents.
 
 ### Changed

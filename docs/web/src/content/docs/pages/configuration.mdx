@@ -141,6 +141,10 @@ The keyed-state indexer is the `ursula indexer` subcommand started with `--keyed
 | `--keyed-min-publish-interval-ms MS` | `5000` | Minimum spacing between two publications of one stream's state. Readers that wait coalesce onto the next publication |
 | `--keyed-gc-grace-seconds S` | `600` | Grace period before unreferenced projection objects are deleted |
 | `--keyed-max-waiters N` | `10000` | Maximum concurrent waiting keyed-state reads; beyond it reads answer `503` |
+| `--keyed-admission-budget-bytes N` | `1073741824` | Process-wide byte budget for ingest pages, folded-but-unpublished records and compaction buffers. A single larger reservation is clamped to it and runs alone. Together with the caches it bounds the indexer's working memory |
+| `--keyed-max-concurrent-ingests N` | CPU count | Streams ingesting at once |
+| `--keyed-max-concurrent-compactions N` | half the CPU count | Compactions running at once; more wait |
+| `--keyed-admission-queue N` | `4096` | Streams admitted for ingestion but not yet ingesting; beyond it, reads that need new ingestion answer `503` with `Retry-After` |
 
 ## Complete examples
 
