@@ -315,7 +315,10 @@ pub struct ColdConfig {
     pub flush_max_size: Option<HumanSize>,
     /// Max groups flushed concurrently.
     pub flush_max_concurrency: usize,
-    /// Enable background same-stream cold chunk compaction.
+    /// Enable background cold compaction: the same-stream chunk compactor
+    /// and the shared pack-reference driver, which rewrites a stream's
+    /// packed slices into one exclusive chunk once it holds 64 of them or
+    /// its tail has been idle for an hour (bounded-stream-state F2).
     pub compaction_enabled: bool,
     /// Interval between cold chunk compaction discovery passes.
     pub compaction_interval: HumanDuration,
