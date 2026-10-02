@@ -109,6 +109,7 @@ pub use engine::GroupSetBucketQuotaFuture;
 pub use engine::GroupSetFeatureLevelFuture;
 pub use engine::GroupShutdownFuture;
 pub use engine::GroupSnapshotFuture;
+pub use engine::GroupStateGaugesFuture;
 pub use engine::GroupTouchStreamAccessFuture;
 pub use engine::GroupUpdateStreamAttrsFuture;
 pub use engine::GroupWriteBatchFuture;

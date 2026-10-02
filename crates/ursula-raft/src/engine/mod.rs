@@ -73,6 +73,7 @@ use ursula_runtime::GroupSetBucketQuotaFuture;
 use ursula_runtime::GroupSetFeatureLevelFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
+use ursula_runtime::GroupStateGaugesFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
 use ursula_runtime::GroupUpdateStreamAttrsFuture;
 use ursula_runtime::GroupWriteBatchFuture;
@@ -737,6 +738,16 @@ impl GroupEngine for RaftGroupEngine {
             // enable-feature` verifies every replica, not just leaders.
             self.with_state_machine(move |state_machine| {
                 Box::pin(async move { Ok(state_machine.engine.feature_level()) })
+            })
+            .await?
+        })
+    }
+
+    fn state_gauges<'a>(&'a mut self, _placement: ShardPlacement) -> GroupStateGaugesFuture<'a> {
+        Box::pin(async move {
+            // Local applied state, follower or leader, like `feature_level`.
+            self.with_state_machine(move |state_machine| {
+                Box::pin(async move { Ok(state_machine.engine.state_gauges()) })
             })
             .await?
         })
