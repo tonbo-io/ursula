@@ -4649,4 +4649,6 @@ fn request_target(uri: &Uri) -> String {
 mod tests;
 
 #[cfg(test)]
+mod keyed_indexer_tests;
+#[cfg(test)]
 mod staging_cleanup_tests;
