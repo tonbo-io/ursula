@@ -367,24 +367,25 @@ impl StreamStateMachine {
                 stream.tail_offset,
             );
         }
-        let mut retained_record_index = self
+        let prepared_record_retain = match self
             .stream_slot(&stream_id)
             .expect("stream existence checked before retention")
             .record_index
-            .clone();
-        if let Some(record_index) = retained_record_index.as_mut()
-            && record_index
-                .retain_from_offset(retained_offset, stream.tail_offset)
-                .is_err()
+            .as_ref()
+            .map(|record_index| record_index.prepare_retain(retained_offset, stream.tail_offset))
+            .transpose()
         {
-            return StreamResponse::error_with_next_offset(
-                StreamErrorCode::InvalidRecordBoundaries,
-                format!(
-                    "retention offset {retained_offset} is not a retained record boundary for stream '{stream_id}'"
-                ),
-                stream.tail_offset,
-            );
-        }
+            Ok(prepared) => prepared,
+            Err(_) => {
+                return StreamResponse::error_with_next_offset(
+                    StreamErrorCode::InvalidRecordBoundaries,
+                    format!(
+                        "retention offset {retained_offset} is not a retained record boundary for stream '{stream_id}'"
+                    ),
+                    stream.tail_offset,
+                );
+            }
+        };
         let slot = self
             .stream_slot_mut(&stream_id)
             .expect("stream existence checked before retention mutation");
@@ -394,7 +395,7 @@ impl StreamStateMachine {
             &stream_id.bucket_id,
             retained_offset.saturating_sub(previous_retained_offset),
         );
-        self.compact_retained_prefix(&stream_id, retained_offset, retained_record_index);
+        self.compact_retained_prefix(&stream_id, retained_offset, prepared_record_retain);
         StreamResponse::RetentionAdvanced {
             retained_offset,
             record_range: self.record_range(&stream_id).ok().flatten(),
@@ -734,7 +735,7 @@ impl StreamStateMachine {
         &mut self,
         stream_id: &BucketStreamId,
         retained_offset: u64,
-        retained_record_index: Option<crate::StreamRecordIndex>,
+        prepared_record_retain: Option<crate::record_index::PreparedRetain>,
     ) {
         let frontier = self.cold_frontier_offset(stream_id, retained_offset).max(
             self.stream_slot(stream_id)
@@ -745,7 +746,11 @@ impl StreamStateMachine {
         let slot = self
             .stream_slot_mut(stream_id)
             .expect("stream existence checked before retained-prefix compaction");
-        slot.record_index = retained_record_index;
+        if let (Some(record_index), Some(prepared)) =
+            (slot.record_index.as_mut(), prepared_record_retain)
+        {
+            record_index.commit_retain(prepared);
+        }
         slot.integrity.evict_before(retained_offset);
         let dropped_cold_paths = slot.cold.compact_before(retained_offset);
         self.release_shared_cold_objects(&stream_id.bucket_id, dropped_cold_paths, 0);
@@ -770,7 +775,16 @@ impl StreamStateMachine {
             .expect("stream existence checked before message-record compaction");
         let records = std::mem::take(&mut slot.message_records);
         let frontier = frontier.max(retained_offset);
-        let mut compacted = Vec::with_capacity(records.len());
+        // F7: allocate the post-collapse size, not the pre-collapse length.
+        let kept = records
+            .iter()
+            .filter(|record| {
+                record.end_offset > frontier
+                    && record.end_offset > record.start_offset.max(frontier).max(retained_offset)
+            })
+            .count();
+        let mut compacted =
+            Vec::with_capacity(kept.saturating_add(usize::from(frontier > retained_offset)));
         if frontier > retained_offset {
             compacted.push(StreamMessageRecord {
                 start_offset: retained_offset,

@@ -1159,7 +1159,13 @@ struct ColdCacheEntry {
 struct StreamReadState {
     next_offset: u64,
     sequential_score: usize,
+    /// Cache generation of the last read, for pruning idle readers (F13).
+    last_read: u64,
 }
+
+/// Minimum number of readahead reader entries kept before idle ones are
+/// pruned (F13).
+const MIN_TRACKED_READERS: usize = 4_096;
 
 impl ColdReadCache {
     fn new(config: ColdReadCacheParams) -> Self {
@@ -1215,7 +1221,12 @@ impl ColdReadCache {
         len: usize,
     ) -> usize {
         let mut inner = self.inner.lock().expect("cold cache mutex poisoned");
+        let generation = Self::next_generation(&mut inner);
+        if !inner.readers.contains_key(stream_id) {
+            self.prune_readers_if_needed(&mut inner);
+        }
         let state = inner.readers.entry(stream_id.clone()).or_default();
+        state.last_read = generation;
         if read_start_offset == state.next_offset {
             state.sequential_score = state
                 .sequential_score
@@ -1227,6 +1238,32 @@ impl ColdReadCache {
         state.next_offset =
             read_start_offset.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
         state.sequential_score.min(self.config.max_readahead_blocks)
+    }
+
+    /// Readahead state is kept per stream ever read; bound it at
+    /// max(4 x cache blocks, 4,096) entries by dropping the least recently
+    /// read half once the map is full. Amortized O(1) per new reader. A
+    /// pruned stream only loses its readahead score.
+    fn prune_readers_if_needed(&self, inner: &mut ColdReadCacheInner) {
+        let capacity_blocks = self.config.max_bytes / self.config.block_bytes.max(1);
+        let limit = capacity_blocks.saturating_mul(4).max(MIN_TRACKED_READERS);
+        if inner.readers.len() < limit {
+            return;
+        }
+        let keep = limit / 2;
+        let mut generations = inner
+            .readers
+            .values()
+            .map(|state| state.last_read)
+            .collect::<Vec<_>>();
+        let drop_count = generations.len().saturating_sub(keep);
+        if drop_count == 0 {
+            return;
+        }
+        let (_, threshold, _) = generations.select_nth_unstable(drop_count - 1);
+        let threshold = *threshold;
+        inner.readers.retain(|_, state| state.last_read > threshold);
+        inner.readers.shrink_to(limit);
     }
 
     fn invalidate_path(&self, path: &str) {
@@ -1246,6 +1283,12 @@ impl ColdReadCache {
 
     fn invalidate_prefix(&self, prefix: &str) {
         let mut inner = self.inner.lock().expect("cold cache mutex poisoned");
+        // Drop readahead state of every stream at or below the prefix: a
+        // stream prefix (`bucket/stream/...`) or a whole bucket (`bucket/`).
+        inner.readers.retain(|stream_id, _| {
+            let stream_prefix = format!("{stream_id}/");
+            !(prefix.starts_with(&stream_prefix) || stream_prefix.starts_with(prefix))
+        });
         let keys = inner
             .blocks
             .keys()
@@ -1614,6 +1657,42 @@ mod tests {
             inner.lru.len(),
             inner.blocks.len(),
         );
+    }
+
+    #[test]
+    fn readahead_readers_are_pruned_and_invalidated() {
+        // Measured before F13: one reader entry per stream ever read
+        // (149 B each), never evicted.
+        let cache = ColdReadCache::new(ColdReadCacheParams {
+            max_bytes: 4 * 1024,
+            block_bytes: 1024,
+            max_readahead_blocks: 2,
+        });
+        for index in 0..20_000 {
+            let stream_id = BucketStreamId::new("bucket", format!("s{index}"));
+            cache.record_stream_read(&stream_id, 0, 8);
+        }
+        let readers = cache.inner.lock().expect("cache mutex").readers.len();
+        assert!(readers <= 4_096, "{readers} reader entries retained");
+
+        // The most recent reader keeps its sequential state (a fresh entry
+        // reading at offset 8 would score 0).
+        let recent = BucketStreamId::new("bucket", "s19999");
+        assert_eq!(cache.record_stream_read(&recent, 8, 8), 2);
+
+        let doomed = BucketStreamId::new("other", "gone");
+        cache.record_stream_read(&doomed, 0, 8);
+        cache.invalidate_prefix(&super::cold_chunk_prefix(&doomed));
+        assert!(
+            !cache
+                .inner
+                .lock()
+                .expect("cache mutex")
+                .readers
+                .contains_key(&doomed)
+        );
+        cache.invalidate_prefix(&super::cold_bucket_prefix("bucket"));
+        assert!(cache.inner.lock().expect("cache mutex").readers.is_empty());
     }
 
     #[test]

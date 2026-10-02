@@ -290,6 +290,7 @@ impl StreamStateMachine {
                 retained_offset,
                 visible_snapshot,
                 producers: producer_states,
+                append_count: 0,
             };
             if machine.insert_stream_slot(slot).is_none() {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));

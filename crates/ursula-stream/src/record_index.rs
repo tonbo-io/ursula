@@ -27,6 +27,13 @@ impl PreparedRecordAppend {
     }
 }
 
+/// A validated retention advance; see [`StreamRecordIndex::prepare_retain`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreparedRetain {
+    removed: usize,
+    first_record: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordIndexError {
     InvalidBoundaries,
@@ -94,6 +101,11 @@ impl StreamRecordIndex {
             first_record: self.first_record,
             next_record,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_offsets_capacity(&self) -> usize {
+        self.record_offsets.capacity()
     }
 
     pub fn record_offsets(&self) -> &[u64] {
@@ -211,6 +223,17 @@ impl StreamRecordIndex {
         retained_offset: u64,
         tail_offset: u64,
     ) -> Result<u64, RecordIndexError> {
+        let prepared = self.prepare_retain(retained_offset, tail_offset)?;
+        Ok(self.commit_retain(prepared))
+    }
+
+    /// Validates a retention advance against the borrowed index without
+    /// mutating it (F7: retention no longer clones the index to validate).
+    pub(crate) fn prepare_retain(
+        &self,
+        retained_offset: u64,
+        tail_offset: u64,
+    ) -> Result<PreparedRetain, RecordIndexError> {
         let removed = if retained_offset == tail_offset {
             self.record_offsets.len()
         } else {
@@ -220,12 +243,27 @@ impl StreamRecordIndex {
         };
         let removed_u64 =
             u64::try_from(removed).map_err(|_| RecordIndexError::ArithmeticOverflow)?;
-        self.first_record = self
+        let first_record = self
             .first_record
             .checked_add(removed_u64)
             .ok_or(RecordIndexError::ArithmeticOverflow)?;
+        Ok(PreparedRetain {
+            removed,
+            first_record,
+        })
+    }
+
+    /// Applies a prepared retention in place and releases the dropped
+    /// offsets' capacity once it exceeds `2 * len + 64`.
+    pub(crate) fn commit_retain(&mut self, prepared: PreparedRetain) -> u64 {
+        let removed = prepared.removed.min(self.record_offsets.len());
+        self.first_record = prepared.first_record;
         self.record_offsets.drain(..removed);
-        Ok(self.first_record)
+        let len = self.record_offsets.len();
+        if self.record_offsets.capacity() > len.saturating_mul(2).saturating_add(64) {
+            self.record_offsets.shrink_to(len.saturating_mul(2));
+        }
+        self.first_record
     }
 
     pub fn validate(&self, retained_offset: u64, tail_offset: u64) -> Result<(), RecordIndexError> {

@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod hygiene_tests;
 pub mod in_memory;
 
 use std::borrow::Cow;

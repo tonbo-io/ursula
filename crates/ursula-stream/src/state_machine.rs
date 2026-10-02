@@ -152,6 +152,10 @@ struct StreamSlot {
     retained_offset: u64,
     visible_snapshot: Option<StreamVisibleSnapshot>,
     producers: HashMap<String, ProducerState>,
+    /// Runtime append count for this incarnation (F9). Kept by the group
+    /// engine, not in [`StreamSnapshot`]; living in the slot makes it die with
+    /// the stream on every removal path (delete, TTL expiry, bucket purge).
+    append_count: u64,
 }
 
 impl StreamStateMachine {
@@ -975,5 +979,7 @@ fn snapshot_digest(content_type: &str, payload: &[u8]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+#[cfg(test)]
+mod hygiene_tests;
 #[cfg(test)]
 mod tests;

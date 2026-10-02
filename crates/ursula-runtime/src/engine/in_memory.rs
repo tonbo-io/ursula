@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -140,7 +139,6 @@ pub(crate) struct AppendPayloadInput<'a> {
 pub struct InMemoryGroupEngine {
     pub(crate) commit_index: u64,
     pub(crate) state_machine: StreamStateMachine,
-    pub(crate) stream_append_counts: HashMap<BucketStreamId, u64>,
     pub(crate) cold_store: Option<ColdStoreHandle>,
     pub(crate) cold_index_cache: Option<Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>>,
 }
@@ -199,12 +197,9 @@ impl InMemoryGroupEngine {
                     "append transaction contains a command without a stream",
                 ));
             };
-            append_counts.entry(stream_id.clone()).or_insert_with(|| {
-                self.stream_append_counts
-                    .get(&stream_id)
-                    .copied()
-                    .unwrap_or(0)
-            });
+            append_counts
+                .entry(stream_id.clone())
+                .or_insert_with(|| self.state_machine.stream_append_count(&stream_id));
             stream_ids.push(stream_id);
         }
         let responses = match self.state_machine.append_transaction(commands) {
@@ -218,7 +213,8 @@ impl InMemoryGroupEngine {
                 Err(err) => {
                     self.commit_index = commit_index;
                     for (stream_id, count) in append_counts {
-                        self.stream_append_counts.insert(stream_id, count);
+                        self.state_machine
+                            .set_stream_append_count(&stream_id, count);
                     }
                     return Err(err);
                 }
@@ -328,14 +324,12 @@ impl InMemoryGroupEngine {
                 )
                 .map_err(stream_response_error)?;
             let old_commit_index = self.commit_index;
-            let old_append_count = *self.stream_append_counts.get(&stream_id).unwrap_or(&0);
+            let old_append_count = self.state_machine.stream_append_count(&stream_id);
             if !batch.deduplicated {
                 let count = u64::try_from(batch.items.len()).expect("item count fits u64");
                 self.commit_index += count;
-                *self
-                    .stream_append_counts
-                    .entry(stream_id.clone())
-                    .or_insert(0) += count;
+                self.state_machine
+                    .add_stream_append_count(&stream_id, count);
             }
             let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
             let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
@@ -468,16 +462,16 @@ impl InMemoryGroupEngine {
                     .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?;
                 let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
                 let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
-                let stream_append_count = self.stream_append_counts.entry(stream_id).or_insert(0);
                 if !deduplicated {
                     self.commit_index += 1;
-                    *stream_append_count += 1;
+                    self.state_machine.add_stream_append_count(&stream_id, 1);
                 }
+                let stream_append_count = self.state_machine.stream_append_count(&stream_id);
                 Ok(GroupWriteResponse::Append(AppendResponse {
                     placement,
                     start_offset: offset,
                     next_offset,
-                    stream_append_count: *stream_append_count,
+                    stream_append_count,
                     group_commit_index: self.commit_index,
                     closed,
                     deduplicated,
@@ -621,11 +615,8 @@ impl InMemoryGroupEngine {
                 }))
             }
             StreamResponse::Deleted => {
-                let stream_id = require_response_stream_id(stream_id, "deleted")?;
+                require_response_stream_id(stream_id, "deleted")?;
                 self.commit_index += 1;
-                // Stream is gone: drop its runtime append count so the map
-                // stays bounded under delete churn.
-                self.stream_append_counts.remove(&stream_id);
                 Ok(GroupWriteResponse::DeleteStream(DeleteStreamResponse {
                     placement,
                     group_commit_index: self.commit_index,
@@ -714,26 +705,19 @@ impl InMemoryGroupEngine {
         placement: ShardPlacement,
         admission: ColdWriteAdmission,
     ) -> Result<CreateStreamResponse, GroupEngineError> {
-        let stream_id = request.stream_id.clone();
-        if admission.is_enabled() {
-            let mut preview = self.clone();
-            let preview_response = match preview
-                .apply_committed_write(GroupWriteCommand::from(request.clone()), placement)?
-            {
-                GroupWriteResponse::CreateStream(response) => response,
-                other => {
-                    return Err(GroupEngineError::new(format!(
-                        "unexpected create stream preview response: {other:?}"
-                    )));
-                }
-            };
-            if !preview_response.already_exists {
-                self.check_cold_write_admission_bytes(
-                    &stream_id,
-                    admission,
-                    u64::try_from(request.initial_payload.len()).expect("payload len fits u64"),
-                )?;
-            }
+        // F9: O(1) admission instead of previewing the write on a copy of the
+        // group. A create of a live stream is answered without adding hot
+        // bytes (already-exists or a conflict), so it bypasses admission.
+        if admission.is_enabled()
+            && !self
+                .state_machine
+                .stream_is_live(&request.stream_id, request.now_ms)
+        {
+            self.check_cold_write_admission_bytes(
+                &request.stream_id,
+                admission,
+                u64::try_from(request.initial_payload.len()).expect("payload len fits u64"),
+            )?;
         }
         let response =
             match self.apply_committed_write(GroupWriteCommand::from(request), placement)? {
@@ -753,26 +737,20 @@ impl InMemoryGroupEngine {
         placement: ShardPlacement,
         admission: ColdWriteAdmission,
     ) -> Result<AppendResponse, GroupEngineError> {
-        let stream_id = request.stream_id.clone();
-        if admission.is_enabled() {
-            let mut preview = self.clone();
-            let preview_response = match preview
-                .apply_committed_write(GroupWriteCommand::from(request.clone()), placement)?
-            {
-                GroupWriteResponse::Append(response) => response,
-                other => {
-                    return Err(GroupEngineError::new(format!(
-                        "unexpected append preview response: {other:?}"
-                    )));
-                }
-            };
-            if !preview_response.deduplicated {
-                self.check_cold_write_admission_bytes(
-                    &stream_id,
-                    admission,
-                    u64::try_from(request.payload.len()).expect("payload len fits u64"),
-                )?;
-            }
+        // F9: O(1) admission; a deduplicated producer retry adds no hot bytes
+        // and bypasses it, decided read-only.
+        if admission.is_enabled()
+            && !self.state_machine.append_would_deduplicate(
+                &request.stream_id,
+                request.producer.as_ref(),
+                request.now_ms,
+            )
+        {
+            self.check_cold_write_admission_bytes(
+                &request.stream_id,
+                admission,
+                u64::try_from(request.payload.len()).expect("payload len fits u64"),
+            )?;
         }
         let response =
             match self.apply_committed_write(GroupWriteCommand::from(request), placement)? {
@@ -792,31 +770,21 @@ impl InMemoryGroupEngine {
         placement: ShardPlacement,
         admission: ColdWriteAdmission,
     ) -> Result<GroupAppendBatchResponse, GroupEngineError> {
-        let stream_id = request.stream_id.clone();
-        let incoming_bytes = request
-            .payloads
-            .iter()
-            .map(|payload| u64::try_from(payload.len()).expect("payload len fits u64"))
-            .sum();
-        if admission.is_enabled() {
-            let mut preview = self.clone();
-            let preview_response = match preview
-                .apply_committed_write(GroupWriteCommand::from(request.clone()), placement)?
-            {
-                GroupWriteResponse::AppendBatch(response) => response,
-                other => {
-                    return Err(GroupEngineError::new(format!(
-                        "unexpected append batch preview response: {other:?}"
-                    )));
-                }
-            };
-            let mutates = preview_response
-                .items
+        // F9: O(1) admission; see `append_with_admission_inner`. A producer
+        // batch is deduplicated as a whole or not at all.
+        if admission.is_enabled()
+            && !self.state_machine.append_would_deduplicate(
+                &request.stream_id,
+                request.producer.as_ref(),
+                request.now_ms,
+            )
+        {
+            let incoming_bytes = request
+                .payloads
                 .iter()
-                .any(|item| matches!(item, Ok(response) if !response.deduplicated));
-            if mutates {
-                self.check_cold_write_admission_bytes(&stream_id, admission, incoming_bytes)?;
-            }
+                .map(|payload| u64::try_from(payload.len()).expect("payload len fits u64"))
+                .sum();
+            self.check_cold_write_admission_bytes(&request.stream_id, admission, incoming_bytes)?;
         }
         let response =
             match self.apply_committed_write(GroupWriteCommand::from(request), placement)? {
@@ -930,23 +898,20 @@ impl InMemoryGroupEngine {
             } => {
                 let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
                 let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
-                let stream_append_count = self
-                    .stream_append_counts
-                    .entry(stream_id.clone())
-                    .or_insert(0);
                 let record_range = self
                     .state_machine
                     .record_range_for_append(&stream_id, offset, next_offset, producer.as_ref())
                     .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?;
                 if !deduplicated {
                     self.commit_index += 1;
-                    *stream_append_count += 1;
+                    self.state_machine.add_stream_append_count(&stream_id, 1);
                 }
+                let stream_append_count = self.state_machine.stream_append_count(&stream_id);
                 Ok(AppendResponse {
                     placement,
                     start_offset: offset,
                     next_offset,
-                    stream_append_count: *stream_append_count,
+                    stream_append_count,
                     group_commit_index: self.commit_index,
                     closed,
                     deduplicated,
@@ -1344,7 +1309,7 @@ impl InMemoryGroupEngine {
 
     pub(crate) fn build_snapshot(&self, placement: ShardPlacement) -> GroupSnapshot {
         let stream_snapshot = self.state_machine.snapshot();
-        let stream_append_counts = self.stream_append_counts_snapshot(&stream_snapshot);
+        let stream_append_counts = self.stream_append_counts_snapshot();
         GroupSnapshot {
             placement,
             group_commit_index: self.commit_index,
@@ -1353,28 +1318,14 @@ impl InMemoryGroupEngine {
         }
     }
 
-    pub(crate) fn stream_append_counts_snapshot(
-        &self,
-        stream_snapshot: &ursula_stream::StreamSnapshot,
-    ) -> Vec<StreamAppendCount> {
-        // Only emit append counts for streams actually present in the snapshot.
-        // A deleted/expired stream can leave a stale entry in the runtime map;
-        // emitting it would make every follower's `install_snapshot` fail the
-        // `restore_stream_append_counts` consistency check, so a lagging node
-        // could never catch up (and leadership transfer, which catches the
-        // target up via a snapshot, could never complete).
-        let live: HashSet<&BucketStreamId> = stream_snapshot
-            .streams
-            .iter()
-            .map(|entry| &entry.metadata.stream_id)
-            .collect();
+    pub(crate) fn stream_append_counts_snapshot(&self) -> Vec<StreamAppendCount> {
+        // Counts live in the stream slots, so only live streams carry one.
         let mut counts = self
-            .stream_append_counts
-            .iter()
-            .filter(|(stream_id, _)| live.contains(stream_id))
+            .state_machine
+            .stream_append_counts()
             .map(|(stream_id, append_count)| StreamAppendCount {
                 stream_id: stream_id.clone(),
-                append_count: *append_count,
+                append_count,
             })
             .collect::<Vec<_>>();
         counts.sort_by(|left, right| compare_stream_ids(&left.stream_id, &right.stream_id));
@@ -1385,6 +1336,11 @@ impl InMemoryGroupEngine {
     /// pre-proposal cold-index page writes use.
     pub fn cold_index_generation(&self, stream_id: &BucketStreamId) -> Option<u64> {
         self.state_machine.cold_index_generation(stream_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_append_count_entries(&self) -> usize {
+        self.state_machine.stream_append_counts().count()
     }
 
     pub fn stream_tail_offset(&self, stream_id: &BucketStreamId) -> Option<u64> {
@@ -1482,18 +1438,16 @@ impl InMemoryGroupEngine {
         stream_snapshot: StreamSnapshot,
         stream_append_counts: Vec<StreamAppendCount>,
     ) -> Result<(), GroupEngineError> {
-        let stream_ids = stream_snapshot
-            .streams
-            .iter()
-            .map(|entry| entry.metadata.stream_id.clone())
-            .collect::<HashSet<_>>();
-        let state_machine = StreamStateMachine::restore(stream_snapshot)
+        let mut state_machine = StreamStateMachine::restore(stream_snapshot)
             .map_err(|err| GroupEngineError::new(format!("restore stream snapshot: {err}")))?;
-        let stream_append_counts = restore_stream_append_counts(stream_append_counts, &stream_ids)?;
+        // A count for a stream the snapshot does not hold has nothing to
+        // attach to and is dropped (F9: counts die with their slot).
+        for count in stream_append_counts {
+            state_machine.set_stream_append_count(&count.stream_id, count.append_count);
+        }
 
         self.commit_index = group_commit_index;
         self.state_machine = state_machine;
-        self.stream_append_counts = stream_append_counts;
         Ok(())
     }
 }
@@ -2402,29 +2356,4 @@ pub(crate) fn stream_response_error(response: StreamResponse) -> GroupEngineErro
         } => GroupEngineError::stream_with_context(code, message, next_offset, context),
         other => GroupEngineError::new(format!("unexpected stream response error: {other:?}")),
     }
-}
-
-pub(crate) fn restore_stream_append_counts(
-    counts: Vec<StreamAppendCount>,
-    snapshot_stream_ids: &HashSet<BucketStreamId>,
-) -> Result<HashMap<BucketStreamId, u64>, GroupEngineError> {
-    let mut restored = HashMap::with_capacity(counts.len());
-    for count in counts {
-        if !snapshot_stream_ids.contains(&count.stream_id) {
-            return Err(GroupEngineError::new(format!(
-                "append count references missing snapshot stream '{}'",
-                count.stream_id
-            )));
-        }
-        if restored
-            .insert(count.stream_id.clone(), count.append_count)
-            .is_some()
-        {
-            return Err(GroupEngineError::new(format!(
-                "snapshot contains duplicate append count for stream '{}'",
-                count.stream_id
-            )));
-        }
-    }
-    Ok(restored)
 }

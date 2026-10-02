@@ -797,6 +797,7 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
             .expect("cold index page cache mutex poisoned");
         let page = inner.pages.get(key)?.page.clone();
         Self::touch(&mut inner, key.clone());
+        Self::compact_lru_if_needed(&mut inner);
         Some(page)
     }
 
@@ -810,6 +811,28 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
             .pages
             .insert(key, ColdIndexPageCacheEntry { page, generation });
         Self::evict_over_capacity(&mut inner, self.capacity_pages);
+        Self::compact_lru_if_needed(&mut inner);
+    }
+
+    /// `touch` appends a fresh `(key, generation)` per lookup and leaves the
+    /// stale one behind; eviction only reclaims those when the cache is over
+    /// capacity. Rebuild the deque from the live pages, in recency order, once
+    /// it holds more than twice as many entries (F13): amortized O(1) per
+    /// lookup, since each rebuild leaves `pages.len()` entries.
+    fn compact_lru_if_needed(inner: &mut ColdIndexPageCacheInner) {
+        if inner.lru.len() <= inner.pages.len().saturating_mul(2).saturating_add(16) {
+            return;
+        }
+        let mut live = inner
+            .pages
+            .iter()
+            .map(|(key, entry)| (entry.generation, key.clone()))
+            .collect::<Vec<_>>();
+        live.sort_unstable_by_key(|(generation, _)| *generation);
+        inner.lru = live
+            .into_iter()
+            .map(|(generation, key)| (key, generation))
+            .collect();
     }
 
     fn touch(inner: &mut ColdIndexPageCacheInner, key: ColdIndexPageKey) -> u64 {
@@ -1314,6 +1337,57 @@ mod tests {
             }],
             external_segments: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn page_cache_lru_stays_bounded_under_repeated_lookups() {
+        // Measured before F13: every lookup appended a cloned key to the
+        // recency deque and only an over-capacity insert drained it (1.1M
+        // lookups of one page: +223 MiB).
+        let store = Arc::new(InMemoryColdIndexPageStore::new());
+        let cache = ColdIndexPageCache::new(store, 1024);
+        for page_id in 0..4 {
+            cache
+                .put_page(&key(page_id), &page(page_id * 128, (page_id + 1) * 128))
+                .await
+                .expect("put page");
+        }
+        for _ in 0..10_000 {
+            for page_id in 0..4 {
+                assert!(cache.get_page(&key(page_id)).await.expect("get").is_some());
+            }
+        }
+        {
+            let inner = cache.inner.lock().expect("cache mutex");
+            assert_eq!(inner.pages.len(), 4);
+            assert!(
+                inner.lru.len() <= inner.pages.len() * 2 + 16,
+                "lru deque grew to {} entries for {} pages",
+                inner.lru.len(),
+                inner.pages.len()
+            );
+        }
+        // Recency order survives compaction: page 0 is the oldest, so an
+        // over-capacity insert into a 4-page cache evicts it first.
+        let small = ColdIndexPageCache::new(Arc::new(InMemoryColdIndexPageStore::new()), 4);
+        for page_id in 0..4 {
+            small
+                .put_page(&key(page_id), &page(page_id * 128, (page_id + 1) * 128))
+                .await
+                .expect("put page");
+        }
+        for _ in 0..100 {
+            for page_id in 1..4 {
+                assert!(small.get_page(&key(page_id)).await.expect("get").is_some());
+            }
+        }
+        small
+            .put_page(&key(9), &page(9 * 128, 10 * 128))
+            .await
+            .expect("put page");
+        let inner = small.inner.lock().expect("cache mutex");
+        assert!(!inner.pages.contains_key(&key(0)));
+        assert!((1..4).all(|page_id| inner.pages.contains_key(&key(page_id))));
     }
 
     #[tokio::test]
