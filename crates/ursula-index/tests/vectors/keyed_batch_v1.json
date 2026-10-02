@@ -1,0 +1,925 @@
+{
+ "profile": "keyed-batch-v1",
+ "description": "Conformance vectors for keyed-batch-v1 (design \u00a74.1, \u00a75.2) and keyed-state range reads (\u00a75.3 normative 2, 3, 5). Message texts, expected ops and row values are raw JSON text. Keys are canonical unpadded base64url. A read's 'lower' is null (first key), {start} or {after}; 'budget' is body bytes including each line's LF, null for unbounded; 'after' is Stream-Keyed-After.",
+ "messages": [
+  {
+   "name": "empty ops",
+   "message": "{\"ops\":[]}",
+   "valid": true,
+   "ops": []
+  },
+  {
+   "name": "all op shapes, other members kept and ignored",
+   "message": "{\"v\":1,\"ops\":[[\"p\",\"AQ\",{\"b\":2,\"a\":1}],[\"d\",\"Ag\"],[\"x\",\"AA\",\"AP8\"]],\"meta\":{\"n\":1.50e3}}",
+   "valid": true,
+   "ops": [
+    [
+     "p",
+     "AQ",
+     "{\"b\":2,\"a\":1}"
+    ],
+    [
+     "d",
+     "Ag"
+    ],
+    [
+     "x",
+     "AA",
+     "AP8"
+    ]
+   ]
+  },
+  {
+   "name": "escaped ops member name",
+   "message": "{\"o\\u0070s\":[[\"p\",\"AQ\",1]]}",
+   "valid": true,
+   "ops": [
+    [
+     "p",
+     "AQ",
+     "1"
+    ]
+   ]
+  },
+  {
+   "name": "escaped op codes",
+   "message": "{\"ops\":[[\"\\u0070\",\"AQ\",1],[\"\\u0064\",\"AQ\"],[\"\\u0078\",\"AA\",\"AQ\"]]}",
+   "valid": true,
+   "ops": [
+    [
+     "p",
+     "AQ",
+     "1"
+    ],
+    [
+     "d",
+     "AQ"
+    ],
+    [
+     "x",
+     "AA",
+     "AQ"
+    ]
+   ]
+  },
+  {
+   "name": "put of literal null",
+   "message": "{\"ops\":[[\"p\",\"AQ\",null]]}",
+   "valid": true,
+   "ops": [
+    [
+     "p",
+     "AQ",
+     "null"
+    ]
+   ]
+  },
+  {
+   "name": "lone surrogates inside values, including nested member names",
+   "message": "{\"ops\":[[\"p\",\"AQ\",{\"\\ud800\":\"\\udc00\"}]],\"m\":{\"\\udc00\":1}}",
+   "valid": true,
+   "ops": [
+    [
+     "p",
+     "AQ",
+     "{\"\\ud800\":\"\\udc00\"}"
+    ]
+   ]
+  },
+  {
+   "name": "paired surrogate escape in a top-level member name",
+   "message": "{\"\\ud83d\\ude00\":1,\"ops\":[]}",
+   "valid": true,
+   "ops": []
+  },
+  {
+   "name": "number text kept verbatim",
+   "message": "{\"ops\":[[\"p\",\"AQ\",1e400],[\"p\",\"Ag\",-0.0E+1]]}",
+   "valid": true,
+   "ops": [
+    [
+     "p",
+     "AQ",
+     "1e400"
+    ],
+    [
+     "p",
+     "Ag",
+     "-0.0E+1"
+    ]
+   ]
+  },
+  {
+   "name": "4096-octet key",
+   "message": "{\"ops\":[[\"d\",\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"]]}",
+   "valid": true,
+   "ops": [
+    [
+     "d",
+     "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    ]
+   ]
+  },
+  {
+   "name": "url-safe alphabet",
+   "message": "{\"ops\":[[\"d\",\"-_8\"]]}",
+   "valid": true,
+   "ops": [
+    [
+     "d",
+     "-_8"
+    ]
+   ]
+  },
+  {
+   "name": "range bounds compare as unsigned octets",
+   "message": "{\"ops\":[[\"x\",\"fw\",\"gA\"]]}",
+   "valid": true,
+   "ops": [
+    [
+     "x",
+     "fw",
+     "gA"
+    ]
+   ]
+  },
+  {
+   "name": "range end extends start",
+   "message": "{\"ops\":[[\"x\",\"AQ\",\"AQA\"]]}",
+   "valid": true,
+   "ops": [
+    [
+     "x",
+     "AQ",
+     "AQA"
+    ]
+   ]
+  },
+  {
+   "name": "same key repeated in one batch",
+   "message": "{\"ops\":[[\"p\",\"AQ\",1],[\"d\",\"AQ\"],[\"p\",\"AQ\",2]]}",
+   "valid": true,
+   "ops": [
+    [
+     "p",
+     "AQ",
+     "1"
+    ],
+    [
+     "d",
+     "AQ"
+    ],
+    [
+     "p",
+     "AQ",
+     "2"
+    ]
+   ]
+  },
+  {
+   "name": "insignificant whitespace tolerated",
+   "message": " { \"ops\" : [ [ \"d\" , \"AQ\" ] ] }\n",
+   "valid": true,
+   "ops": [
+    [
+     "d",
+     "AQ"
+    ]
+   ]
+  },
+  {
+   "name": "non-ops member named like an op",
+   "message": "{\"p\":[\"p\",\"AB\"],\"ops\":[]}",
+   "valid": true,
+   "ops": []
+  },
+  {
+   "name": "array",
+   "message": "[]",
+   "valid": false,
+   "reason": "not_object"
+  },
+  {
+   "name": "string",
+   "message": "\"ops\"",
+   "valid": false,
+   "reason": "not_object"
+  },
+  {
+   "name": "null",
+   "message": "null",
+   "valid": false,
+   "reason": "not_object"
+  },
+  {
+   "name": "empty object",
+   "message": "{}",
+   "valid": false,
+   "reason": "missing_ops"
+  },
+  {
+   "name": "case differs",
+   "message": "{\"Ops\":[]}",
+   "valid": false,
+   "reason": "missing_ops"
+  },
+  {
+   "name": "duplicate ops",
+   "message": "{\"ops\":[],\"ops\":[]}",
+   "valid": false,
+   "reason": "duplicate_ops"
+  },
+  {
+   "name": "escaped duplicate ops",
+   "message": "{\"ops\":[],\"o\\u0070s\":[]}",
+   "valid": false,
+   "reason": "duplicate_ops"
+  },
+  {
+   "name": "lone high surrogate in top-level name",
+   "message": "{\"\\ud800\":1,\"ops\":[]}",
+   "valid": false,
+   "reason": "invalid_member_name"
+  },
+  {
+   "name": "lone low surrogate in top-level name",
+   "message": "{\"ops\":[],\"a\\udc00b\":1}",
+   "valid": false,
+   "reason": "invalid_member_name"
+  },
+  {
+   "name": "two high surrogates in top-level name",
+   "message": "{\"\\ud800\\ud800\":1,\"ops\":[]}",
+   "valid": false,
+   "reason": "invalid_member_name"
+  },
+  {
+   "name": "ops is object",
+   "message": "{\"ops\":{}}",
+   "valid": false,
+   "reason": "ops_not_array"
+  },
+  {
+   "name": "ops is null",
+   "message": "{\"ops\":null}",
+   "valid": false,
+   "reason": "ops_not_array"
+  },
+  {
+   "name": "ops is string",
+   "message": "{\"ops\":\"[]\"}",
+   "valid": false,
+   "reason": "ops_not_array"
+  },
+  {
+   "name": "empty op",
+   "message": "{\"ops\":[[]]}",
+   "valid": false,
+   "reason": "invalid_op"
+  },
+  {
+   "name": "op is number",
+   "message": "{\"ops\":[1]}",
+   "valid": false,
+   "reason": "invalid_op"
+  },
+  {
+   "name": "op is object",
+   "message": "{\"ops\":[{\"p\":1}]}",
+   "valid": false,
+   "reason": "invalid_op"
+  },
+  {
+   "name": "op is huge number",
+   "message": "{\"ops\":[1e400]}",
+   "valid": false,
+   "reason": "invalid_op"
+  },
+  {
+   "name": "put missing value",
+   "message": "{\"ops\":[[\"p\",\"AQ\"]]}",
+   "valid": false,
+   "reason": "invalid_op"
+  },
+  {
+   "name": "put extra element",
+   "message": "{\"ops\":[[\"p\",\"AQ\",1,2]]}",
+   "valid": false,
+   "reason": "invalid_op"
+  },
+  {
+   "name": "delete missing key",
+   "message": "{\"ops\":[[\"d\"]]}",
+   "valid": false,
+   "reason": "invalid_op"
+  },
+  {
+   "name": "delete extra element",
+   "message": "{\"ops\":[[\"d\",\"AQ\",1]]}",
+   "valid": false,
+   "reason": "invalid_op"
+  },
+  {
+   "name": "range missing end",
+   "message": "{\"ops\":[[\"x\",\"AA\"]]}",
+   "valid": false,
+   "reason": "invalid_op"
+  },
+  {
+   "name": "second op invalid",
+   "message": "{\"ops\":[[\"d\",\"AQ\"],[]]}",
+   "valid": false,
+   "reason": "invalid_op"
+  },
+  {
+   "name": "upper-case op code",
+   "message": "{\"ops\":[[\"P\",\"AQ\",1]]}",
+   "valid": false,
+   "reason": "unknown_op_code"
+  },
+  {
+   "name": "long op code",
+   "message": "{\"ops\":[[\"put\",\"AQ\",1]]}",
+   "valid": false,
+   "reason": "unknown_op_code"
+  },
+  {
+   "name": "op code not a string",
+   "message": "{\"ops\":[[1,\"AQ\"]]}",
+   "valid": false,
+   "reason": "unknown_op_code"
+  },
+  {
+   "name": "op code null",
+   "message": "{\"ops\":[[null]]}",
+   "valid": false,
+   "reason": "unknown_op_code"
+  },
+  {
+   "name": "op code with lone surrogate",
+   "message": "{\"ops\":[[\"\\ud800\",\"AQ\"]]}",
+   "valid": false,
+   "reason": "unknown_op_code"
+  },
+  {
+   "name": "op code with trailing space",
+   "message": "{\"ops\":[[\"p \",\"AQ\",1]]}",
+   "valid": false,
+   "reason": "unknown_op_code"
+  },
+  {
+   "name": "non-zero pad bits",
+   "message": "{\"ops\":[[\"d\",\"AB\"]]}",
+   "valid": false,
+   "reason": "invalid_key"
+  },
+  {
+   "name": "padded",
+   "message": "{\"ops\":[[\"d\",\"AA==\"]]}",
+   "valid": false,
+   "reason": "invalid_key"
+  },
+  {
+   "name": "standard alphabet",
+   "message": "{\"ops\":[[\"d\",\"+/\"]]}",
+   "valid": false,
+   "reason": "invalid_key"
+  },
+  {
+   "name": "empty key",
+   "message": "{\"ops\":[[\"d\",\"\"]]}",
+   "valid": false,
+   "reason": "invalid_key"
+  },
+  {
+   "name": "length 1 mod 4",
+   "message": "{\"ops\":[[\"d\",\"A\"]]}",
+   "valid": false,
+   "reason": "invalid_key"
+  },
+  {
+   "name": "escaped key characters",
+   "message": "{\"ops\":[[\"d\",\"A\\u0051\"]]}",
+   "valid": false,
+   "reason": "invalid_key"
+  },
+  {
+   "name": "key not a string",
+   "message": "{\"ops\":[[\"d\",1]]}",
+   "valid": false,
+   "reason": "invalid_key"
+  },
+  {
+   "name": "key is array",
+   "message": "{\"ops\":[[\"p\",[\"AQ\"],1]]}",
+   "valid": false,
+   "reason": "invalid_key"
+  },
+  {
+   "name": "key with space",
+   "message": "{\"ops\":[[\"d\",\"A Q\"]]}",
+   "valid": false,
+   "reason": "invalid_key"
+  },
+  {
+   "name": "4097-octet key",
+   "message": "{\"ops\":[[\"d\",\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"]]}",
+   "valid": false,
+   "reason": "invalid_key"
+  },
+  {
+   "name": "range end key invalid",
+   "message": "{\"ops\":[[\"x\",\"AA\",\"AB\"]]}",
+   "valid": false,
+   "reason": "invalid_key"
+  },
+  {
+   "name": "range start equals end",
+   "message": "{\"ops\":[[\"x\",\"AQ\",\"AQ\"]]}",
+   "valid": false,
+   "reason": "empty_range"
+  },
+  {
+   "name": "range reversed",
+   "message": "{\"ops\":[[\"x\",\"Ag\",\"AQ\"]]}",
+   "valid": false,
+   "reason": "empty_range"
+  },
+  {
+   "name": "range reversed in unsigned order",
+   "message": "{\"ops\":[[\"x\",\"gA\",\"fw\"]]}",
+   "valid": false,
+   "reason": "empty_range"
+  },
+  {
+   "name": "unterminated",
+   "message": "{\"ops\":[]",
+   "valid": false,
+   "reason": "invalid_json"
+  },
+  {
+   "name": "trailing value",
+   "message": "{\"ops\":[]} {}",
+   "valid": false,
+   "reason": "invalid_json"
+  },
+  {
+   "name": "grammar error before syntax error",
+   "message": "{\"ops\":[[\"d\",\"AB\"]]",
+   "valid": false,
+   "reason": "invalid_json"
+  },
+  {
+   "name": "single quotes",
+   "message": "{'ops':[]}",
+   "valid": false,
+   "reason": "invalid_json"
+  },
+  {
+   "name": "empty text",
+   "message": "",
+   "valid": false,
+   "reason": "invalid_json"
+  },
+  {
+   "name": "bad escape",
+   "message": "{\"ops\":[[\"p\",\"AQ\",\"\\u12\"]]}",
+   "valid": false,
+   "reason": "invalid_json"
+  },
+  {
+   "name": "bad escape in name",
+   "message": "{\"\\x\":1,\"ops\":[]}",
+   "valid": false,
+   "reason": "invalid_json"
+  },
+  {
+   "name": "raw control character",
+   "message": "{\"ops\":[[\"p\",\"AQ\",\"\n\"]]}",
+   "valid": false,
+   "reason": "invalid_json"
+  },
+  {
+   "name": "trailing comma",
+   "message": "{\"ops\":[],}",
+   "valid": false,
+   "reason": "invalid_json"
+  }
+ ],
+ "sequences": [
+  {
+   "name": "third message invalid",
+   "messages": [
+    "{\"ops\":[]}",
+    "{\"ops\":[[\"d\",\"AQ\"]]}",
+    "{}",
+    "["
+   ],
+   "first_invalid": 2
+  },
+  {
+   "name": "all valid",
+   "messages": [
+    "{\"ops\":[]}",
+    "{\"x\":1,\"ops\":[]}"
+   ],
+   "first_invalid": null
+  },
+  {
+   "name": "empty request",
+   "messages": [],
+   "first_invalid": null
+  },
+  {
+   "name": "first message invalid json",
+   "messages": [
+    "{",
+    "{}"
+   ],
+   "first_invalid": 0
+  }
+ ],
+ "folds": [
+  {
+   "name": "puts, deletes, range deletes, unsigned order",
+   "log": [
+    "{\"ops\":[[\"p\",\"AQ\",1],[\"p\",\"Ag\",\"two\"],[\"p\",\"Aw\",{\"x\":[1,2]}]]}",
+    "{\"ops\":[[\"d\",\"Ag\"],[\"d\",\"BA\"],[\"p\",\"Ag\",22],[\"p\",\"BQ\",5],[\"d\",\"BQ\"]]}",
+    "{\"note\":\"r2\",\"ops\":[[\"x\",\"AQ\",\"Aw\"],[\"x\",\"_w\",\"_w8\"]]}",
+    "{\"ops\":[[\"p\",\"gA\",\"hi\"],[\"p\",\"fw\",\"lo\"],[\"p\",\"AA\",0],[\"p\",\"AQA\",[]]]}",
+    "{\"ops\":[]}"
+   ],
+   "states": [
+    {
+     "through": 0,
+     "rows": []
+    },
+    {
+     "through": 1,
+     "rows": [
+      {
+       "key": "AQ",
+       "record": 0,
+       "value": "1"
+      },
+      {
+       "key": "Ag",
+       "record": 0,
+       "value": "\"two\""
+      },
+      {
+       "key": "Aw",
+       "record": 0,
+       "value": "{\"x\":[1,2]}"
+      }
+     ]
+    },
+    {
+     "through": 2,
+     "rows": [
+      {
+       "key": "AQ",
+       "record": 0,
+       "value": "1"
+      },
+      {
+       "key": "Ag",
+       "record": 1,
+       "value": "22"
+      },
+      {
+       "key": "Aw",
+       "record": 0,
+       "value": "{\"x\":[1,2]}"
+      }
+     ]
+    },
+    {
+     "through": 3,
+     "rows": [
+      {
+       "key": "Aw",
+       "record": 0,
+       "value": "{\"x\":[1,2]}"
+      }
+     ]
+    },
+    {
+     "through": 4,
+     "rows": [
+      {
+       "key": "AA",
+       "record": 3,
+       "value": "0"
+      },
+      {
+       "key": "AQA",
+       "record": 3,
+       "value": "[]"
+      },
+      {
+       "key": "Aw",
+       "record": 0,
+       "value": "{\"x\":[1,2]}"
+      },
+      {
+       "key": "fw",
+       "record": 3,
+       "value": "\"lo\""
+      },
+      {
+       "key": "gA",
+       "record": 3,
+       "value": "\"hi\""
+      }
+     ]
+    },
+    {
+     "through": 5,
+     "rows": [
+      {
+       "key": "AA",
+       "record": 3,
+       "value": "0"
+      },
+      {
+       "key": "AQA",
+       "record": 3,
+       "value": "[]"
+      },
+      {
+       "key": "Aw",
+       "record": 0,
+       "value": "{\"x\":[1,2]}"
+      },
+      {
+       "key": "fw",
+       "record": 3,
+       "value": "\"lo\""
+      },
+      {
+       "key": "gA",
+       "record": 3,
+       "value": "\"hi\""
+      }
+     ]
+    }
+   ],
+   "reads": [
+    {
+     "through": 5,
+     "lower": null,
+     "end": null,
+     "limit": 100,
+     "budget": null,
+     "keys": [
+      "AA",
+      "AQA",
+      "Aw",
+      "fw",
+      "gA"
+     ],
+     "after": null,
+     "body": "{\"key\":\"AA\",\"record\":3,\"value\":0}\n{\"key\":\"AQA\",\"record\":3,\"value\":[]}\n{\"key\":\"Aw\",\"record\":0,\"value\":{\"x\":[1,2]}}\n{\"key\":\"fw\",\"record\":3,\"value\":\"lo\"}\n{\"key\":\"gA\",\"record\":3,\"value\":\"hi\"}\n"
+    },
+    {
+     "through": 5,
+     "lower": {
+      "start": "AQ"
+     },
+     "end": "fw",
+     "limit": 100,
+     "budget": null,
+     "keys": [
+      "AQA",
+      "Aw"
+     ],
+     "after": null
+    },
+    {
+     "through": 5,
+     "lower": {
+      "after": "AQA"
+     },
+     "end": null,
+     "limit": 2,
+     "budget": null,
+     "keys": [
+      "Aw",
+      "fw"
+     ],
+     "after": "fw"
+    },
+    {
+     "through": 5,
+     "lower": {
+      "after": "fw"
+     },
+     "end": null,
+     "limit": 1,
+     "budget": null,
+     "keys": [
+      "gA"
+     ],
+     "after": null
+    },
+    {
+     "through": 5,
+     "lower": {
+      "start": "AA"
+     },
+     "end": "AA",
+     "limit": 100,
+     "budget": null,
+     "keys": [],
+     "after": null
+    },
+    {
+     "through": 5,
+     "lower": {
+      "after": "gA"
+     },
+     "end": "AA",
+     "limit": 100,
+     "budget": null,
+     "keys": [],
+     "after": null
+    },
+    {
+     "through": 5,
+     "lower": null,
+     "end": null,
+     "limit": 100,
+     "budget": 1,
+     "keys": [
+      "AA"
+     ],
+     "after": "AA"
+    },
+    {
+     "through": 5,
+     "lower": null,
+     "end": null,
+     "limit": 100,
+     "budget": 70,
+     "keys": [
+      "AA",
+      "AQA"
+     ],
+     "after": "AQA"
+    },
+    {
+     "through": 5,
+     "lower": null,
+     "end": null,
+     "limit": 100,
+     "budget": 69,
+     "keys": [
+      "AA"
+     ],
+     "after": "AA"
+    },
+    {
+     "through": 3,
+     "lower": null,
+     "end": null,
+     "limit": 100,
+     "budget": null,
+     "keys": [
+      "Aw"
+     ],
+     "after": null
+    },
+    {
+     "through": 0,
+     "lower": null,
+     "end": null,
+     "limit": 100,
+     "budget": null,
+     "keys": [],
+     "after": null
+    }
+   ]
+  },
+  {
+   "name": "order of ops within one record",
+   "log": [
+    "{\"ops\":[[\"p\",\"AQ\",1],[\"x\",\"AA\",\"Ag\"],[\"p\",\"AQ\",2]]}",
+    "{\"ops\":[[\"p\",\"Ag\",3],[\"x\",\"AQ\",\"Aw\"]]}",
+    "{\"ops\":[[\"d\",\"AQ\"],[\"p\",\"AQ\",4],[\"p\",\"AQ\",5]]}"
+   ],
+   "states": [
+    {
+     "through": 1,
+     "rows": [
+      {
+       "key": "AQ",
+       "record": 0,
+       "value": "2"
+      }
+     ]
+    },
+    {
+     "through": 2,
+     "rows": []
+    },
+    {
+     "through": 3,
+     "rows": [
+      {
+       "key": "AQ",
+       "record": 2,
+       "value": "5"
+      }
+     ]
+    }
+   ],
+   "reads": []
+  },
+  {
+   "name": "record is the ordinal of the last put, values verbatim",
+   "log": [
+    "{\"ops\":[[\"p\",\"AQ\",{\"b\":1,\"a\":2,\"b\":3}]]}",
+    "{\"ops\":[[\"d\",\"Ag\"]]}",
+    "{\"ops\":[[\"p\",\"AQ\",1.50e3],[\"p\",\"____\",null]]}"
+   ],
+   "states": [
+    {
+     "through": 1,
+     "rows": [
+      {
+       "key": "AQ",
+       "record": 0,
+       "value": "{\"b\":1,\"a\":2,\"b\":3}"
+      }
+     ]
+    },
+    {
+     "through": 2,
+     "rows": [
+      {
+       "key": "AQ",
+       "record": 0,
+       "value": "{\"b\":1,\"a\":2,\"b\":3}"
+      }
+     ]
+    },
+    {
+     "through": 3,
+     "rows": [
+      {
+       "key": "AQ",
+       "record": 2,
+       "value": "1.50e3"
+      },
+      {
+       "key": "____",
+       "record": 2,
+       "value": "null"
+      }
+     ]
+    }
+   ],
+   "reads": [
+    {
+     "through": 3,
+     "lower": {
+      "after": "AQ"
+     },
+     "end": null,
+     "limit": 100,
+     "budget": null,
+     "keys": [
+      "____"
+     ],
+     "after": null
+    }
+   ]
+  },
+  {
+   "name": "range delete spares its end and the max key",
+   "log": [
+    "{\"ops\":[[\"p\",\"AA\",1],[\"p\",\"AAA\",2],[\"p\",\"__8\",3],[\"p\",\"____\",4]]}",
+    "{\"ops\":[[\"x\",\"AA\",\"__8\"]]}"
+   ],
+   "states": [
+    {
+     "through": 2,
+     "rows": [
+      {
+       "key": "__8",
+       "record": 0,
+       "value": "3"
+      },
+      {
+       "key": "____",
+       "record": 0,
+       "value": "4"
+      }
+     ]
+    }
+   ],
+   "reads": []
+  }
+ ]
+}
