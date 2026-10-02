@@ -80,6 +80,7 @@ use super::admission::Admission;
 use super::admission::AdmissionLimits;
 use super::admission::QueueTicket;
 use super::admission::Reservation;
+use super::admission::Slot;
 use super::fold::RangeQuery;
 use super::manifest::KEYED_PROJECTION_FORMAT;
 use super::manifest::KeyedManifest;
@@ -662,7 +663,13 @@ struct Inner {
     workers: AtomicUsize,
     /// Signalled when a worker finishes.
     worker_done: Notify,
+    /// Test hook run inside the blocking run encode (see
+    /// [`KeyedEngine::set_blocking_encode_hook`]).
+    encode_hook: Mutex<Option<BlockingHook>>,
 }
+
+/// A callback run on the blocking pool; a test seam.
+pub type BlockingHook = Arc<dyn Fn() + Send + Sync>;
 
 /// Counts one background worker; uncounted (and announced) on drop, when
 /// its task ends or is cancelled.
@@ -768,6 +775,7 @@ impl KeyedEngine {
                 cancelled: Notify::new(),
                 workers: AtomicUsize::new(0),
                 worker_done: Notify::new(),
+                encode_hook: Mutex::new(None),
             }),
         }
     }
@@ -824,7 +832,15 @@ impl KeyedEngine {
         }
     }
 
-    /// Background workers running now.
+    /// Test seam: runs `hook` inside every blocking run encode, before the
+    /// encode itself, so a test can hold one past the work deadline.
+    #[doc(hidden)]
+    pub fn set_blocking_encode_hook(&self, hook: Option<BlockingHook>) {
+        *lock(&self.inner.encode_hook) = hook;
+    }
+
+    /// Background workers running now (including blocking work a deadline
+    /// abandoned that is still running).
     pub fn background_workers(&self) -> usize {
         self.inner.workers.load(Ordering::SeqCst)
     }
@@ -1392,7 +1408,7 @@ impl Inner {
     /// and ingests up to `want_next`. Returns whether `D` advanced (or a
     /// re-validation ran).
     async fn cycle(
-        &self,
+        self: &Arc<Self>,
         namespace: &Arc<Namespace>,
         want_next: u64,
         verify: bool,
@@ -1414,7 +1430,8 @@ impl Inner {
                 rt::time::sleep(Duration::from_millis(wait)).await;
             }
         }
-        let _slot = self.admission.ingest_slot().await;
+        // Shared with blocking work, which keeps it past a deadline.
+        let slot = Arc::new(self.admission.ingest_slot().await);
         drop(ticket.take());
         self.within("ingest", async {
             let base = self.reload(namespace).await?;
@@ -1424,20 +1441,23 @@ impl Inner {
             if !verify && through >= lock(&namespace.work).want_record {
                 return Ok(true);
             }
-            self.ingest(namespace, base, want_next.max(through)).await?;
+            self.ingest(namespace, base, want_next.max(through), &slot)
+                .await?;
             Ok(verify || namespace.through() > before)
         })
         .await
     }
 
     async fn ingest(
-        &self,
+        self: &Arc<Self>,
         namespace: &Arc<Namespace>,
         base: Option<Arc<PublishedKeyedManifest>>,
         target: u64,
+        slot: &Arc<Slot>,
     ) -> Result<(), CycleError> {
         let Folded::Discontinuity(reason) =
-            self.fold(namespace, base.as_ref(), false, target).await?
+            self.fold(namespace, base.as_ref(), false, target, slot)
+                .await?
         else {
             return Ok(());
         };
@@ -1482,7 +1502,10 @@ impl Inner {
             "keyed namespace failed its continuity check; rebuilding from record 0"
         );
         namespace.set_status(Status::Rebuilding);
-        match self.fold(namespace, base.as_ref(), true, target).await? {
+        match self
+            .fold(namespace, base.as_ref(), true, target, slot)
+            .await?
+        {
             Folded::Done => Ok(()),
             Folded::Discontinuity(reason) => Err(CycleError::Transient(reason)),
         }
@@ -1491,11 +1514,12 @@ impl Inner {
     /// Reads `[D−1, target)` (from 0 for a rebuild or `D = 0`), checks the
     /// continuity record, folds the rest into one run and publishes it.
     async fn fold(
-        &self,
+        self: &Arc<Self>,
         namespace: &Arc<Namespace>,
         base: Option<&Arc<PublishedKeyedManifest>>,
         rebuild: bool,
         target: u64,
+        slot: &Arc<Slot>,
     ) -> Result<Folded, CycleError> {
         let (d, mut expected) = match base {
             Some(published) if !rebuild => (
@@ -1625,10 +1649,28 @@ impl Inner {
         if let Some(digest) = last_digest {
             let through = builder.next_record();
             let options = self.config.part_options;
-            let built = rt::run_blocking(move || builder.finish(&options))
-                .await
-                .map_err(transient)?
-                .map_err(transient)?;
+            // The blocking encode cannot be cancelled: when the work
+            // deadline drops this future it keeps running, so it owns the
+            // reservation, the ingest slot and a worker count until it
+            // ends, and shutdown waits for it like any worker.
+            self.workers.fetch_add(1, Ordering::SeqCst);
+            let hold = (
+                held.take(),
+                Arc::clone(slot),
+                WorkerGuard(Arc::clone(self)),
+            );
+            let hook = lock(&self.encode_hook).clone();
+            let (built, hold) = rt::run_blocking(move || {
+                if let Some(hook) = hook {
+                    hook();
+                }
+                (builder.finish(&options), hold)
+            })
+            .await
+            .map_err(transient)?;
+            let (reservation, _slot, _worker) = hold;
+            held = reservation;
+            let built = built.map_err(transient)?;
             pins = Some(self.store_parts(namespace, &built.parts).await?);
             new_keys = built
                 .parts
@@ -1931,7 +1973,9 @@ impl Inner {
 
     /// Runs `work` within the per-work deadline: a stalled source or store
     /// cannot hold the namespace's worker, its slot and its admission
-    /// budget forever. Dropping `work` releases them.
+    /// budget forever. Dropping `work` releases them, except what a
+    /// blocking encode still running holds (it keeps its reservation, slot
+    /// and worker count until it ends).
     async fn within<T>(
         &self,
         what: &str,

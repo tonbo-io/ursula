@@ -502,6 +502,69 @@ async fn a_stalled_ingest_is_dropped_at_the_work_deadline() {
     assert_eq!(page.body(), expected(&logs, "s0"));
 }
 
+/// The blocking run encode cannot be cancelled: a work deadline that drops
+/// the ingest leaves it running, so it keeps the reservation, the ingest
+/// slot and a worker count until it ends, and shutdown waits for it. (Real
+/// time: tokio does not auto-advance paused time while blocking work runs.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocking_encode_past_the_deadline_keeps_its_slot_and_budget() {
+    let logs = Arc::new(FakeLogs::new());
+    logs.append("s0", (0..10).map(record));
+    let engine = engine(&logs, KeyedEngineConfig {
+        work_deadline: Duration::from_millis(300),
+        ..config()
+    });
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let entered_tx = Mutex::new(entered_tx);
+    let release_rx = Mutex::new(release_rx);
+    engine.set_blocking_encode_hook(Some(Arc::new(move || {
+        let _ = entered_tx.lock().unwrap().send(());
+        let _ = release_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30));
+    }) as Arc<dyn Fn() + Send + Sync>));
+
+    let reader = tokio::spawn({
+        let engine = engine.clone();
+        async move { read(&engine, "s0", 10, Duration::from_millis(100)).await }
+    });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(10)))
+        .await
+        .unwrap()
+        .expect("the encode starts");
+    let _ = reader.await.unwrap();
+
+    // Past the deadline the ingest future is gone, but the encode still
+    // runs and holds what it was admitted with.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let metrics = engine.metrics();
+    assert_eq!(metrics.work_deadlines, 1, "{metrics:?}");
+    assert_eq!(engine.background_workers(), 1, "the encode is counted");
+    assert_eq!(metrics.admission.ingests_running, 1, "{metrics:?}");
+    assert!(metrics.admission.in_use_bytes > 0, "{metrics:?}");
+
+    // Shutdown does not report idle while the encode runs.
+    let shutdown = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.shutdown(Duration::from_millis(100)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!shutdown.is_finished(), "shutdown waits for the encode");
+    assert_eq!(engine.background_workers(), 1);
+
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), shutdown)
+        .await
+        .expect("shutdown ends once the encode does")
+        .unwrap();
+    assert_eq!(engine.background_workers(), 0);
+    let admission = engine.metrics().admission;
+    assert_eq!(admission.ingests_running, 0, "{admission:?}");
+    assert_eq!(admission.in_use_bytes, 0, "{admission:?}");
+}
+
 #[tokio::test(start_paused = true)]
 async fn shutdown_lets_in_flight_ingests_finish_within_the_grace() {
     let logs = Arc::new(FakeLogs::new());
