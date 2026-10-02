@@ -983,11 +983,11 @@ impl RaftGroupHandleRegistry {
     }
 
     pub fn set_snapshot_build_max_concurrency(&self, max_concurrency: usize) {
-        *self
+        let mut coordinator = self
             .snapshot_build
             .lock()
-            .expect("raft group snapshot build coordinator mutex") =
-            SnapshotBuildCoordinator::new(max_concurrency);
+            .expect("raft group snapshot build coordinator mutex");
+        *coordinator = coordinator.with_max_concurrency(max_concurrency);
     }
 
     pub fn set_snapshot_store(&self, snapshot_store: Option<SharedSnapshotStore>) {
@@ -1075,8 +1075,13 @@ impl RaftGroupHandleRegistry {
             .map(|(raft_group_id, raft)| (*raft_group_id, raft.clone()))
             .collect::<Vec<_>>();
 
+        let log_progress = self.snapshot_build_coordinator().log_progress();
         let mut snapshots = Vec::with_capacity(groups.len());
         for (raft_group_id, raft) in groups {
+            let log = log_progress
+                .get(&raft_group_id)
+                .copied()
+                .unwrap_or_default();
             let metrics = raft.metrics().borrow_watched().clone();
             let membership = metrics.membership_config.membership();
             snapshots.push(RaftGroupMetricsSnapshot {
@@ -1091,6 +1096,7 @@ impl RaftGroupHandleRegistry {
                 purged: metrics.purged.map(log_progress_snapshot),
                 voter_ids: membership.voter_ids().collect(),
                 learner_ids: membership.learner_ids().collect(),
+                log,
             });
         }
         snapshots

@@ -144,8 +144,11 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
             snapshot_store,
             config.storage.cold.s3.as_ref(),
             snapshot_drive_interval_ms,
-            config.raft.snapshot_logs_since_last,
-            config.raft.snapshot_pressure_unpurged_logs,
+            ursula_raft::snapshot_cadence::SnapshotCadence::new(
+                config.raft.snapshot_log_budget.as_bytes(),
+                topology.raft_group_count(),
+                config.raft.snapshot_backstop_logs,
+            ),
             config.raft.snapshot_pressure_max_groups_per_tick,
         );
         leadership::spawn_leadership_balancer(
