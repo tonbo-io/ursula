@@ -61,10 +61,16 @@ impl StreamStateMachine {
                     hot_start_offset: self.hot_start_offset(&stream_id),
                     payload,
                     hot_segments: slot.hot_buffer.hot_segments(),
-                    cold_frontier_offset: self.cold_frontier_offset(
-                        &stream_id,
-                        self.earliest_retained_offset(&stream_id),
-                    ),
+                    // F18 step 2: at Lb1 field 6 is the seal point, written
+                    // for tooling and ignored at restore.
+                    cold_frontier_offset: if self.bounded_lb1() {
+                        self.seal_point(&stream_id)
+                    } else {
+                        self.cold_frontier_offset(
+                            &stream_id,
+                            self.earliest_retained_offset(&stream_id),
+                        )
+                    },
                     cold_index_generation: slot.cold.cold_generation(),
                     cold_chunks: slot.cold.cold_chunks().to_vec(),
                     external_segments: slot.cold.external_segments().to_vec(),
@@ -279,7 +285,13 @@ impl StreamStateMachine {
                 attrs: normalize_stream_attrs(entry.attrs),
                 hot_buffer: HotBuffer::from_snapshot(entry.payload, &hot_segments),
                 cold: StreamColdState::restore(
-                    entry.cold_frontier_offset,
+                    // F18 step 2: Lb1 derives coverage from the hot buffer and
+                    // never reads the scalar, so field 6 is ignored.
+                    if machine.bounded_lb1() {
+                        0
+                    } else {
+                        entry.cold_frontier_offset
+                    },
                     entry.cold_index_generation,
                     entry.cold_chunks,
                     entry.external_segments,

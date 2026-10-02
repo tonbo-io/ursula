@@ -94,6 +94,7 @@ async fn raft_compacts_shared_slice_into_exclusive_chunk() {
     let slice = shared_slice(pack, 0, b"aaaa");
     runtime
         .flush_cold(FlushColdRequest {
+            cold_generation: None,
             stream_id: stream.clone(),
             chunk: slice.clone(),
         })
@@ -164,6 +165,7 @@ async fn raft_legacy_cross_bucket_pack_migration_and_bucket_purge() {
     ] {
         runtime
             .flush_cold(FlushColdRequest {
+                cold_generation: None,
                 stream_id: stream.clone(),
                 chunk: shared_slice(legacy_path, object_offset, payload),
             })

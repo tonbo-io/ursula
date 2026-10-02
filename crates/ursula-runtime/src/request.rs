@@ -519,6 +519,16 @@ pub struct AckColdGcResponse {
     pub group_commit_index: u64,
 }
 
+/// Result of a replicated `DeferColdGc` (bounded-state F14b).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferColdGcResponse {
+    pub placement: ShardPlacement,
+    /// The entry's sequence number at the tail, or `None` when no pending
+    /// entry had the requested one.
+    pub new_seq: Option<u64>,
+    pub group_commit_index: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PurgeBucketResponse {
     pub placement: ShardPlacement,
@@ -540,6 +550,10 @@ const fn unknown_pending_cold_gc_entries() -> u64 {
 pub struct FlushColdRequest {
     pub stream_id: BucketStreamId,
     pub chunk: ColdChunkRef,
+    /// Cold generation the chunk was planned from
+    /// ([`ursula_stream::ColdFlushCandidate::cold_generation`]); see
+    /// `StreamCommand::FlushCold`. `None` skips the incarnation check.
+    pub cold_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -733,6 +733,41 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
         inner.lru.retain(|(key, _)| &key.stream_id != stream_id);
     }
 
+    /// Drops every cached page.
+    pub fn clear(&self) {
+        let mut inner = self.inner.lock().expect("cold index cache mutex poisoned");
+        inner.pages.clear();
+        inner.lru.clear();
+    }
+
+    /// Drops the cached pages of one stream generation that cover
+    /// `[start_offset, end_offset)`. A replicated `FlushCold` invokes this on
+    /// every replica when it applies: the leader rewrote those pages (and the
+    /// F19 clip rule may have removed entries from them), so a follower's
+    /// cached copy must not keep serving the old entries.
+    pub fn invalidate_range(
+        &self,
+        stream_id: &BucketStreamId,
+        generation: u64,
+        start_offset: u64,
+        end_offset: u64,
+    ) {
+        if end_offset <= start_offset {
+            return;
+        }
+        let span = ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
+        let first_page = start_offset / span;
+        let last_page = (end_offset - 1) / span;
+        let covered = |key: &ColdIndexPageKey| {
+            &key.stream_id == stream_id
+                && key.generation == generation
+                && (first_page..=last_page).contains(&key.page_id)
+        };
+        let mut inner = self.inner.lock().expect("cold index cache mutex poisoned");
+        inner.pages.retain(|key, _| !covered(key));
+        inner.lru.retain(|(key, _)| !covered(key));
+    }
+
     async fn reload_page(&self, key: &ColdIndexPageKey) -> io::Result<Option<Arc<ColdIndexPage>>> {
         let Some(page) = self.store.get_page(key).await? else {
             return Ok(None);
@@ -1037,6 +1072,14 @@ pub async fn replace_cold_chunk_index_pages_with_rollback_in_generation<
     Ok(Some(rollback))
 }
 
+/// Objects of `page` that serve `[read_start, read_end)`, ordered by start.
+///
+/// Reads apply the page-local rules of F19 repair, so a page that repair
+/// has not reached yet, or a stale cached copy of a page it rewrote, serves
+/// the same bytes: of several external entries at one start only the
+/// last-written is used, and an external entry overlapping a chunk entry is
+/// ignored (chunk entries hold committed, proven bytes). Chunk entries come
+/// first at a shared start.
 fn objects_for_read(page: &ColdIndexPage, read_start: u64, read_end: u64) -> Vec<ObjectPayloadRef> {
     let mut objects = Vec::new();
     for chunk in &page.cold_chunks {
@@ -1045,7 +1088,23 @@ fn objects_for_read(page: &ColdIndexPage, read_start: u64, read_end: u64) -> Vec
             objects.push(object);
         }
     }
-    for object in &page.external_segments {
+    for (index, object) in page.external_segments.iter().enumerate() {
+        let superseded = page
+            .external_segments
+            .iter()
+            .skip(index.saturating_add(1))
+            .any(|later| later.start_offset == object.start_offset);
+        let overlaps_chunk = page.cold_chunks.iter().any(|chunk| {
+            ranges_overlap(
+                object.start_offset,
+                object.end_offset,
+                chunk.start_offset,
+                chunk.end_offset,
+            )
+        });
+        if superseded || overlaps_chunk {
+            continue;
+        }
         if let Some(object) = intersect_object(object, read_start, read_end) {
             objects.push(object);
         }
@@ -1733,5 +1792,94 @@ mod tests {
         .await
         .expect("load replacement");
         assert_eq!(loaded, vec![replacement]);
+    }
+
+    fn external(start_offset: u64, end_offset: u64, s3_path: &str) -> ObjectPayloadRef {
+        ObjectPayloadRef {
+            start_offset,
+            end_offset,
+            s3_path: s3_path.to_owned(),
+            object_size: end_offset - start_offset,
+            object_offset: 0,
+        }
+    }
+
+    /// Wave-1 follow-up: reads prefer the last-written external entry at a
+    /// start, matching F19 repair, instead of the first one (a stale entry
+    /// left by a rejected external append).
+    #[test]
+    fn reads_use_the_last_written_external_entry_at_a_start() {
+        let page = ColdIndexPage {
+            start_offset: 0,
+            end_offset: 64,
+            cold_chunks: Vec::new(),
+            external_segments: vec![
+                external(0, 16, "s/external/rejected.bin"),
+                external(0, 10, "s/external/committed.bin"),
+                external(10, 20, "s/external/next.bin"),
+            ],
+        };
+        let paths = objects_for_read(&page, 0, 20)
+            .into_iter()
+            .map(|object| object.s3_path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec![
+            "s/external/committed.bin",
+            "s/external/next.bin"
+        ]);
+    }
+
+    #[test]
+    fn reads_ignore_external_entries_overlapping_a_chunk_entry() {
+        let mut page = page(0, 64);
+        page.cold_chunks[0].end_offset = 32;
+        page.cold_chunks[0].start_offset = 8;
+        page.cold_chunks.insert(0, ColdChunkRef {
+            start_offset: 0,
+            end_offset: 8,
+            s3_path: "s/chunks/head.bin".to_owned(),
+            object_size: 8,
+            ..Default::default()
+        });
+        page.external_segments = vec![
+            external(0, 20, "s/external/stale.bin"),
+            external(32, 40, "s/external/live.bin"),
+        ];
+        let objects = objects_for_read(&page, 0, 40);
+        assert!(
+            objects
+                .iter()
+                .all(|object| object.s3_path != "s/external/stale.bin"),
+            "{objects:?}"
+        );
+        assert!(objects_cover_range(&objects, 0, 40));
+    }
+
+    /// A follower's cached copy of a page that repair rewrote on the leader
+    /// serves the same objects as the repaired page.
+    #[test]
+    fn stale_cached_page_reads_like_its_repaired_copy() {
+        let mut stale = page(0, 64);
+        stale.cold_chunks[0].end_offset = 16;
+        stale.external_segments = vec![
+            external(8, 24, "s/external/overlaps-chunk.bin"),
+            external(16, 32, "s/external/rejected.bin"),
+            external(16, 32, "s/external/committed.bin"),
+        ];
+        let mut repaired = stale.clone();
+        let input = ColdIndexRepairInput {
+            stream_id: BucketStreamId::new("benchcmp", "cold-index"),
+            generation: 7,
+            retained_offset: 0,
+            tail_offset: 32,
+            created_at_ms: 0,
+            hot_ranges: Vec::new(),
+            state_refs: Vec::new(),
+        };
+        assert!(repair_cold_index_page(&mut repaired, &input).pages_rewritten > 0);
+        assert_eq!(
+            objects_for_read(&stale, 0, 32),
+            objects_for_read(&repaired, 0, 32)
+        );
     }
 }

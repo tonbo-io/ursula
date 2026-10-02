@@ -78,6 +78,7 @@ use crate::request::CompactColdResponse;
 use crate::request::CreateStreamExternalRequest;
 use crate::request::CreateStreamRequest;
 use crate::request::CreateStreamResponse;
+use crate::request::DeferColdGcResponse;
 use crate::request::DeleteSnapshotRequest;
 use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;
@@ -111,6 +112,10 @@ use crate::rt::sync::mpsc;
 use crate::rt::sync::oneshot;
 use crate::rt::time::Instant;
 use crate::trace::Traced;
+
+/// Backoff before the cold GC retries an entry it deferred after a failure
+/// (bounded-state F14b, feature level 1).
+pub const COLD_GC_DEFER_BACKOFF_MS: u64 = 60_000;
 
 fn is_legacy_cross_bucket_pack(stream_id: &BucketStreamId, chunk: &ColdChunkRef) -> bool {
     chunk.shared_object
@@ -435,6 +440,7 @@ impl ShardRuntime {
             .flush_cold(FlushColdRequest {
                 stream_id: candidate.stream_id,
                 chunk,
+                cold_generation: Some(candidate.cold_generation),
             })
             .await;
         match publish {
@@ -578,6 +584,7 @@ impl ShardRuntime {
                         shared_object: true,
                         payload_digest: candidate.payload_digest,
                     },
+                    cold_generation: Some(candidate.cold_generation),
                 })
                 .await;
             match publish {
@@ -1162,10 +1169,21 @@ impl ShardRuntime {
         if planned.is_empty() {
             return Ok(0);
         }
+        // F14b (feature level 1): a failing entry is moved to the tail with a
+        // backoff, so it no longer blocks every entry behind it. Below level 1
+        // the worker stops at the first failure, as before.
+        let defer_failures = self
+            .feature_level(raft_group_id)
+            .await
+            .is_ok_and(|level| level >= crate::FEATURE_LEVEL_KEYED_STREAMS);
         let mut acked_seq = None;
         let mut reclaimed = 0usize;
-        // Entries are FIFO by seq; stop at the first failure so the ack never
-        // skips past an object that is still present in cold storage.
+        let mut deferred = 0usize;
+        let mut first_error = None;
+        // Entries are FIFO by seq; the ack pops a prefix, so it never skips
+        // past an object that is still present in cold storage: a failing
+        // entry is either deferred (restamped behind the acked prefix) before
+        // the ack, or ends the pass.
         for planned_entry in planned {
             let entry = &planned_entry.entry;
             if entry.not_before_ms > unix_time_ms() {
@@ -1200,10 +1218,38 @@ impl ShardRuntime {
                 }
                 Err(err) => {
                     self.metrics.record_cold_gc_error();
+                    let error = RuntimeError::ColdStoreIo {
+                        message: err.to_string(),
+                    };
+                    if defer_failures {
+                        let not_before_ms = unix_time_ms().saturating_add(COLD_GC_DEFER_BACKOFF_MS);
+                        match self
+                            .defer_cold_gc(raft_group_id, entry.seq, not_before_ms)
+                            .await
+                        {
+                            Ok(_) => {
+                                tracing::warn!(
+                                    raft_group_id = raft_group_id.0,
+                                    seq = entry.seq,
+                                    error = %err,
+                                    "cold GC entry failed; deferred to the tail of the queue"
+                                );
+                                deferred += 1;
+                                first_error.get_or_insert(error);
+                                continue;
+                            }
+                            Err(defer_err) => {
+                                tracing::warn!(
+                                    raft_group_id = raft_group_id.0,
+                                    seq = entry.seq,
+                                    error = %defer_err,
+                                    "failed to defer a failing cold GC entry"
+                                );
+                            }
+                        }
+                    }
                     if acked_seq.is_none() {
-                        return Err(RuntimeError::ColdStoreIo {
-                            message: err.to_string(),
-                        });
+                        return Err(error);
                     }
                     break;
                 }
@@ -1213,6 +1259,14 @@ impl ShardRuntime {
             self.ack_cold_gc(raft_group_id, up_to_seq).await?;
             self.metrics
                 .record_cold_gc_reclaimed(u64::try_from(reclaimed).expect("reclaimed fits u64"));
+        }
+        // A pass that only deferred entries reports the failure, so the
+        // all-groups runner and its callers still see it.
+        if reclaimed == 0
+            && deferred > 0
+            && let Some(error) = first_error
+        {
+            return Err(error);
         }
         Ok(reclaimed)
     }
@@ -1761,7 +1815,7 @@ async fn list_cold_index_page_ids(
 }
 
 #[cfg(not(madsim))]
-fn unix_time_ms() -> u64 {
+pub(crate) fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
@@ -1769,7 +1823,7 @@ fn unix_time_ms() -> u64 {
 }
 
 #[cfg(madsim)]
-fn unix_time_ms() -> u64 {
+pub(crate) fn unix_time_ms() -> u64 {
     0
 }
 

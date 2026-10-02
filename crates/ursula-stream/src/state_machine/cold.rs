@@ -14,6 +14,12 @@ use super::StreamStateMachine;
 use super::StreamVisibleSnapshot;
 use super::stream_is_expired;
 
+/// Grace before the cold GC may delete pack slices that retention dropped
+/// (bounded-state F14i, Lb1). It matches the default
+/// `storage.cold.compaction_gc_grace`; apply cannot read node configuration,
+/// so the replicated rule uses this constant.
+pub(super) const RETENTION_COLD_GC_GRACE_MS: u64 = 300_000;
+
 impl StreamStateMachine {
     pub fn plan_cold_flush(
         &self,
@@ -296,7 +302,21 @@ impl StreamStateMachine {
             &stream_id.bucket_id,
             retained_offset.saturating_sub(previous_retained_offset),
         );
-        self.compact_retained_prefix(&stream_id, retained_offset, prepared_record_retain);
+        // F14i (Lb1): dropped pack slices stay readable for the compaction
+        // grace, so a read planned before this retention still finds its
+        // bytes. The not-before time derives from the command's `now_ms`, so
+        // every replica enqueues the same entry.
+        let gc_not_before_ms = if self.bounded_lb1() {
+            now_ms.saturating_add(RETENTION_COLD_GC_GRACE_MS)
+        } else {
+            0
+        };
+        self.compact_retained_prefix(
+            &stream_id,
+            retained_offset,
+            prepared_record_retain,
+            gc_not_before_ms,
+        );
         StreamResponse::RetentionAdvanced {
             retained_offset,
             record_range: self.record_range(&stream_id).ok().flatten(),
@@ -307,8 +327,17 @@ impl StreamStateMachine {
         &mut self,
         stream_id: BucketStreamId,
         chunk: ColdChunkRef,
+        cold_generation: Option<u64>,
     ) -> StreamResponse {
         if let Err(response) = self.check_cold_flush(&stream_id, &chunk) {
+            return response;
+        }
+        // F14g follow-up (Lb1): a flush planned from a removed incarnation
+        // must not publish into the stream that replaced it, even when the
+        // new incarnation's hot prefix holds the same bytes.
+        if self.bounded_lb1()
+            && let Err(response) = self.check_cold_flush_generation(&stream_id, cold_generation)
+        {
             return response;
         }
         let shared_path = chunk.shared_object.then(|| chunk.s3_path.clone());
@@ -435,6 +464,40 @@ impl StreamStateMachine {
             ));
         }
         Ok(())
+    }
+
+    /// Read-only incarnation check of a cold flush: `Ok` when
+    /// `cold_generation` is `None` or names the live stream's generation.
+    /// Apply runs it from feature level 1; leaders run it before writing any
+    /// page entry at every level, because the entry lands in the live
+    /// stream's generation.
+    pub fn check_cold_flush_generation(
+        &self,
+        stream_id: &BucketStreamId,
+        cold_generation: Option<u64>,
+    ) -> Result<(), StreamResponse> {
+        let Some(planned) = cold_generation else {
+            return Ok(());
+        };
+        let Some(slot) = self.stream_slot(stream_id) else {
+            return Err(StreamResponse::error(
+                StreamErrorCode::StreamNotFound,
+                format!("stream '{stream_id}' does not exist"),
+            ));
+        };
+        let live = slot.cold.cold_generation();
+        if live == planned {
+            return Ok(());
+        }
+        Err(StreamResponse::error_with_next_offset_and_context(
+            StreamErrorCode::InvalidColdFlush,
+            format!(
+                "cold chunk for stream '{stream_id}' was planned from cold generation {planned}, \
+                 but the live incarnation uses generation {live}"
+            ),
+            slot.metadata.tail_offset,
+            vec![StreamErrorContext::StaleColdFlushCandidate],
+        ))
     }
 
     pub(super) fn compact_cold(
@@ -567,6 +630,19 @@ impl StreamStateMachine {
         StreamResponse::ColdGcAcked { removed }
     }
 
+    /// Applies [`crate::StreamCommand::DeferColdGc`] (F14b, Lb1).
+    pub(super) fn defer_cold_gc(&mut self, seq: u64, not_before_ms: u64) -> StreamResponse {
+        if let Err(response) = self.require_feature_level(
+            crate::feature::FEATURE_LEVEL_KEYED_STREAMS,
+            "cold GC deferral",
+        ) {
+            return response;
+        }
+        StreamResponse::ColdGcDeferred {
+            new_seq: self.cold_gc.defer(seq, not_before_ms),
+        }
+    }
+
     /// A bounded snapshot of the front of the GC queue for the leader's worker
     /// to reclaim. Read-only; draining is confirmed by a replicated `AckColdGc`.
     pub fn pending_cold_gc_batch(&self, max: usize) -> Vec<ColdGcEntry> {
@@ -615,22 +691,48 @@ impl StreamStateMachine {
             .unwrap_or(0)
     }
 
+    /// Bounded-state level Lb1 (feature level 1): F18 step 2 derived cold
+    /// coverage, F14b `DeferColdGc`, F14i retention grace and F12a binary
+    /// snapshot envelopes.
+    pub(super) fn bounded_lb1(&self) -> bool {
+        self.feature_level >= crate::feature::FEATURE_LEVEL_KEYED_STREAMS
+    }
+
+    /// Seal point `p(s)`: the first hot byte, or the tail when nothing is
+    /// hot. Every byte of `[retained, tail)` the hot buffer does not hold is
+    /// cold: everything below `p(s)`, and external appends above hot bytes.
+    pub(super) fn seal_point(&self, stream_id: &BucketStreamId) -> u64 {
+        self.hot_start_offset(stream_id)
+    }
+
     pub(super) fn snapshot_offset_aligned(
         &self,
         stream_id: &BucketStreamId,
         snapshot_offset: u64,
         retained_offset: u64,
     ) -> bool {
+        let is_record_end = || {
+            self.stream_slot(stream_id).is_some_and(|slot| {
+                slot.message_records
+                    .iter()
+                    .any(|record| record.end_offset == snapshot_offset)
+            })
+        };
+        if self.bounded_lb1() {
+            // F18 step 2: the retained offset, any offset at or below the
+            // seal point, or a message-record end. The scalar frontier's
+            // clause is gone: raised by external appends, it also accepted
+            // intra-message offsets in hot bytes below them.
+            return snapshot_offset == retained_offset
+                || snapshot_offset <= self.seal_point(stream_id)
+                || is_record_end();
+        }
         snapshot_offset == retained_offset
             || snapshot_offset <= self.cold_frontier_offset(stream_id, retained_offset)
             || self
                 .stream_slot(stream_id)
                 .is_some_and(|slot| snapshot_offset <= slot.hot_buffer.hot_start_offset())
-            || self.stream_slot(stream_id).is_some_and(|slot| {
-                slot.message_records
-                    .iter()
-                    .any(|record| record.end_offset == snapshot_offset)
-            })
+            || is_record_end()
     }
 
     pub(super) fn compact_retained_prefix(
@@ -638,12 +740,18 @@ impl StreamStateMachine {
         stream_id: &BucketStreamId,
         retained_offset: u64,
         prepared_record_retain: Option<crate::record_index::PreparedRetain>,
+        gc_not_before_ms: u64,
     ) {
-        let frontier = self.cold_frontier_offset(stream_id, retained_offset).max(
-            self.stream_slot(stream_id)
-                .map(|slot| slot.hot_buffer.hot_start_offset())
-                .unwrap_or(retained_offset),
-        );
+        let frontier = if self.bounded_lb1() {
+            // F18 step 2: collapse only what lies below the seal point.
+            self.seal_point(stream_id)
+        } else {
+            self.cold_frontier_offset(stream_id, retained_offset).max(
+                self.stream_slot(stream_id)
+                    .map(|slot| slot.hot_buffer.hot_start_offset())
+                    .unwrap_or(retained_offset),
+            )
+        };
         self.compact_message_records_before(stream_id, retained_offset, frontier);
         let slot = self
             .stream_slot_mut(stream_id)
@@ -655,7 +763,11 @@ impl StreamStateMachine {
         }
         slot.integrity.evict_before(retained_offset);
         let dropped_cold_paths = slot.cold.compact_before(retained_offset);
-        self.release_shared_cold_objects(&stream_id.bucket_id, dropped_cold_paths, 0);
+        self.release_shared_cold_objects(
+            &stream_id.bucket_id,
+            dropped_cold_paths,
+            gc_not_before_ms,
+        );
 
         let slot = self
             .stream_slot_mut(stream_id)
@@ -727,10 +839,15 @@ impl StreamStateMachine {
             return 0;
         };
         let retained_offset = slot.retained_offset;
-        let frontier = slot
-            .cold
-            .cold_frontier_offset(retained_offset)
-            .max(slot.hot_buffer.hot_start_offset());
+        let frontier = if self.bounded_lb1() {
+            // F18 step 2: records that start at or above the seal point are
+            // whole messages; at Lb1 collapse never reaches past it.
+            self.seal_point(stream_id)
+        } else {
+            slot.cold
+                .cold_frontier_offset(retained_offset)
+                .max(slot.hot_buffer.hot_start_offset())
+        };
         if frontier <= retained_offset {
             return retained_offset;
         }

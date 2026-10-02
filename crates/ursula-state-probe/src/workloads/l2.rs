@@ -458,6 +458,7 @@ async fn legacy_on(engine: Engine) -> Result<(Value, bool)> {
         .context("write legacy pack")?;
     let flush = rt
         .flush_cold(FlushColdRequest {
+            cold_generation: None,
             stream_id: a.clone(),
             chunk: ColdChunkRef {
                 start_offset: 0,

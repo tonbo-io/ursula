@@ -119,6 +119,7 @@ fn flush_collapse_allocates_post_collapse_message_records() {
     let end = 2 * u64::try_from(RECORDS).unwrap() - 20;
     assert!(matches!(
         machine.apply(StreamCommand::FlushCold {
+            cold_generation: None,
             stream_id: stream_id.clone(),
             chunk: ColdChunkRef {
                 start_offset: 0,

@@ -242,6 +242,7 @@ async fn d3_flush_clips_the_page_entry_of_a_rejected_external_append() {
     engine
         .flush_cold(
             FlushColdRequest {
+                cold_generation: None,
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,

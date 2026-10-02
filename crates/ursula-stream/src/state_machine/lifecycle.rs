@@ -629,7 +629,15 @@ impl StreamStateMachine {
         // The cold objects we wrote for this stream are now unreferenced.
         // Enqueue the whole prefix for the background GC worker to reclaim;
         // A prefix sweep is safe and keeps the queue O(streams), not O(chunks).
-        if slot.cold.has_cold_objects() {
+        let has_cold_objects = if self.bounded_lb1() {
+            // F18 step 2: any byte of `[0, tail)` the hot buffer does not hold
+            // may have been written to cold storage.
+            u64::try_from(slot.hot_buffer.len()).unwrap_or(u64::MAX) < slot.metadata.tail_offset
+                || slot.cold.has_state_refs()
+        } else {
+            slot.cold.has_cold_objects()
+        };
+        if has_cold_objects {
             // At feature level 1 the entry names the removed incarnation's
             // generation, so the worker deletes only that incarnation's
             // objects, its external payloads included (F14a, F14g step 2).

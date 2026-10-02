@@ -70,6 +70,13 @@ pub enum StreamResponse {
     ColdGcAcked {
         removed: u64,
     },
+    /// Result of [`StreamCommand::DeferColdGc`]: the entry's new sequence
+    /// number, or `None` when no pending entry had the given `seq`.
+    ///
+    /// [`StreamCommand::DeferColdGc`]: crate::StreamCommand::DeferColdGc
+    ColdGcDeferred {
+        new_seq: Option<u64>,
+    },
     /// A whole-bucket purge accepted by [`StreamCommand::PurgeBucket`].
     ///
     /// [`StreamCommand::PurgeBucket`]: crate::StreamCommand::PurgeBucket

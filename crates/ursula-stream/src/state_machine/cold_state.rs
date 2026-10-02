@@ -1,4 +1,8 @@
 //! Cold-tier reference state: flushed chunks, external segments, and the cold frontier.
+//!
+//! The scalar cold frontier is a level-0 representation. From bounded-state
+//! level Lb1 (feature level 1, F18 step 2) apply derives cold coverage from
+//! the hot buffer and never reads it.
 
 use super::ColdChunkRef;
 use super::ObjectPayloadRef;
@@ -71,8 +75,14 @@ impl StreamColdState {
         }
     }
 
+    /// Legacy (level 0) test: the scalar frontier ever moved, or state holds
+    /// a cold ref.
     pub(super) fn has_cold_objects(&self) -> bool {
-        self.cold_frontier > 0 || !self.cold_chunks.is_empty() || !self.external_segments.is_empty()
+        self.cold_frontier > 0 || self.has_state_refs()
+    }
+
+    pub(super) fn has_state_refs(&self) -> bool {
+        !self.cold_chunks.is_empty() || !self.external_segments.is_empty()
     }
 
     pub(super) fn compact_before(&mut self, retained_offset: u64) -> Vec<String> {

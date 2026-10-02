@@ -214,6 +214,7 @@ impl From<FlushColdRequest> for StreamCommand {
         Self::FlushCold {
             stream_id: request.stream_id,
             chunk: request.chunk,
+            cold_generation: request.cold_generation,
         }
     }
 }

@@ -779,7 +779,11 @@ impl StreamStateMachine {
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
             }
-            StreamCommand::FlushCold { stream_id, chunk } => self.flush_cold(stream_id, chunk),
+            StreamCommand::FlushCold {
+                stream_id,
+                chunk,
+                cold_generation,
+            } => self.flush_cold(stream_id, chunk, cold_generation),
             StreamCommand::CompactCold {
                 stream_id,
                 old_chunks,
@@ -799,6 +803,9 @@ impl StreamStateMachine {
             StreamCommand::DeleteStream { stream_id } => self.delete_stream(&stream_id),
             StreamCommand::PurgeBucket { bucket_id } => self.purge_bucket(&bucket_id),
             StreamCommand::AckColdGc { up_to_seq } => self.ack_cold_gc(up_to_seq),
+            StreamCommand::DeferColdGc { seq, not_before_ms } => {
+                self.defer_cold_gc(seq, not_before_ms)
+            }
             StreamCommand::ImportSnapshot { snapshot } => self.import_snapshot(*snapshot),
             StreamCommand::SetBucketQuota {
                 bucket_id,
@@ -1013,5 +1020,7 @@ fn snapshot_digest(content_type: &str, payload: &[u8]) -> String {
 
 #[cfg(test)]
 mod hygiene_tests;
+#[cfg(test)]
+mod lb1_cold_tests;
 #[cfg(test)]
 mod tests;

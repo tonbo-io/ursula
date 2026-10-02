@@ -18,8 +18,12 @@
 //!   bounded-state Lb1 — C7 unique stream incarnation (`created_at_ms`
 //!   strictly increases per group), C8 apply-time reservation of the
 //!   `keyed-state` stream name, F14a/F14g incarnation-scoped cold objects and
-//!   stream GC, and creation of `application/json; profile=keyed-batch-v1`
-//!   streams.
+//!   stream GC, creation of `application/json; profile=keyed-batch-v1`
+//!   streams, F18 step 2 cold coverage derived from the hot buffer (the
+//!   scalar cold frontier is no longer read; snapshot field 6 carries the
+//!   seal point), F14b `DeferColdGc`, F14i retention grace for dropped pack
+//!   slices, the `FlushCold` incarnation check, and F12a MessagePack
+//!   snapshot envelopes.
 //!
 //! Later core-track changes (C1, C3, C4, C6, U22) take the next levels in
 //! release order.

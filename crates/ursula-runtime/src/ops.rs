@@ -345,6 +345,13 @@ macro_rules! runtime_operations {
                 handle { call ack_cold_gc(engine, up_to_seq, placement) }
                 client { group fn ack_cold_gc }
             }
+            op DeferColdGc {
+                fields { seq: u64, not_before_ms: u64 }
+                reply { response_tx: DeferColdGcResponse }
+                guard { none }
+                handle { call defer_cold_gc(engine, seq, not_before_ms, placement) }
+                client { group fn defer_cold_gc }
+            }
             op PurgeBucket {
                 fields { bucket_id: String }
                 reply { response_tx: PurgeBucketResponse }

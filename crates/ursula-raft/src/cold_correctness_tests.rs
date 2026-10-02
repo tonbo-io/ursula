@@ -185,6 +185,7 @@ async fn d1_raft_engine_reads_and_installs_external_above_a_flushed_hot_prefix()
     engine
         .flush_cold(
             FlushColdRequest {
+                cold_generation: None,
                 stream_id: stream_id.clone(),
                 chunk: chunk(0, 2, "benchcmp/raft-d1/chunks/ab.bin"),
             },
@@ -279,6 +280,7 @@ async fn d1_openraft_snapshot_with_regressed_frontier_builds_and_installs() {
             record_match: None,
         },
         StreamCommand::FlushCold {
+            cold_generation: None,
             stream_id: stream_id.clone(),
             chunk: chunk(0, 2, "chunks/ab.bin"),
         },
@@ -365,6 +367,7 @@ async fn d3_raft_flush_clips_the_page_entry_of_a_rejected_external_append() {
     engine
         .flush_cold(
             FlushColdRequest {
+                cold_generation: None,
                 stream_id: stream_id.clone(),
                 chunk: chunk(0, 8, "benchcmp/raft-d3-clip/chunks/0-8.bin"),
             },
@@ -431,6 +434,7 @@ async fn f14e_raft_stale_flush_leaves_no_page_entry() {
     engine
         .flush_cold(
             FlushColdRequest {
+                cold_generation: None,
                 stream_id: stream_id.clone(),
                 chunk: chunk(0, 4, "benchcmp/raft-stale-flush/chunks/live.bin"),
             },
@@ -447,6 +451,7 @@ async fn f14e_raft_stale_flush_leaves_no_page_entry() {
     let err = engine
         .flush_cold(
             FlushColdRequest {
+                cold_generation: None,
                 stream_id: stream_id.clone(),
                 chunk: chunk(0, 2, "benchcmp/raft-stale-flush/chunks/stale.bin"),
             },
@@ -553,5 +558,69 @@ async fn d3_raft_repair_keeps_the_last_written_external_entry_at_each_start() {
         .await
         .expect("read external");
     assert_eq!(read.payload, b"WXYZ");
+    engine.shutdown().await.expect("shutdown");
+}
+
+/// Wave-1 follow-up: the Raft read path and the state machine share one
+/// cold-index page cache, so the page invalidation that runs when a
+/// replicated `FlushCold` applies (on every replica) also drops the pages the
+/// read path cached.
+#[tokio::test]
+async fn raft_read_path_shares_the_page_cache_that_apply_invalidates() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let mut engine = cold_engine(cold_store.clone()).await;
+    let stream_id = bsid("raft-shared-cache");
+    engine
+        .create_stream(
+            CreateStreamRequest::new(stream_id.clone(), OCTET),
+            placement(),
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("create stream");
+    engine
+        .append(
+            append_req(&stream_id, b"abcdefgh", None),
+            placement(),
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("append");
+    for (start, end, path) in [
+        (0, 4, "benchcmp/raft-shared-cache/chunks/abcd.bin"),
+        (4, 8, "benchcmp/raft-shared-cache/chunks/efgh.bin"),
+    ] {
+        let payload = &b"abcdefgh"
+            [usize::try_from(start).expect("start")..usize::try_from(end).expect("end")];
+        stage(&cold_store, path, payload).await;
+        if start == 4 {
+            // Cache the stream's page through the read path first.
+            let read = engine
+                .read_stream(read_req(stream_id.clone(), 0, 4), placement())
+                .await
+                .expect("cold read");
+            assert_eq!(read.payload, b"abcd");
+            let cache = engine.cold_index_cache.as_ref().expect("page cache");
+            assert_eq!(cache.cached_page_count(), 1);
+        }
+        engine
+            .flush_cold(
+                FlushColdRequest {
+                    cold_generation: None,
+                    stream_id: stream_id.clone(),
+                    chunk: chunk(start, end, path),
+                },
+                placement(),
+            )
+            .await
+            .expect("flush");
+    }
+    let cache = engine.cold_index_cache.as_ref().expect("page cache");
+    assert_eq!(cache.cached_page_count(), 0);
+    let read = engine
+        .read_stream(read_req(stream_id, 0, 8), placement())
+        .await
+        .expect("read both chunks");
+    assert_eq!(read.payload, b"abcdefgh");
     engine.shutdown().await.expect("shutdown");
 }

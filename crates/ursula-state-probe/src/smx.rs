@@ -194,6 +194,7 @@ pub fn flush_pass(
                 };
                 ok(
                     m.apply(StreamCommand::FlushCold {
+                        cold_generation: None,
                         stream_id: candidate.stream_id.clone(),
                         chunk: chunk.clone(),
                     }),
@@ -222,6 +223,7 @@ pub fn flush_pass(
                 };
                 ok(
                     m.apply(StreamCommand::FlushCold {
+                        cold_generation: None,
                         stream_id: candidate.stream_id.clone(),
                         chunk: chunk.clone(),
                     }),
