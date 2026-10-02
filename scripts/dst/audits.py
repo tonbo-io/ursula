@@ -37,6 +37,9 @@ from scripts.dst.common import (
 EXEMPT_PATH_PREFIXES = (
     "crates/ursula-bench/",
     "crates/ursula-sim/",
+    # Measurement harness (bounded-stream-state.md §7.1): times its own
+    # workloads and spawns its own runtime; never built under cfg(madsim).
+    "crates/ursula-state-probe/",
 )
 EXEMPT_PATH_SUBSTRINGS = (
     "/tests/",
@@ -529,9 +532,13 @@ EXPECTED_PR_FAMILIES = {
     "pipeline-smoke-runtime-raft-network-snapshot-corruption",
     "pipeline-smoke-runtime-raft-network-tail-read-corruption",
     "runtime-raft-snapshot-install-failures",
+    "keyed-indexer",
 }
 EXPECTED_PR_RANGES = {"60..=64", "137..=140"}
-EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {"runtime-raft-network-randomized-extended"}
+EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {
+    "runtime-raft-network-randomized-extended",
+    "keyed-indexer-extended",
+}
 EXPECTED_NIGHTLY_RANGES = {"60..=199"}
 
 # DoD #7: PR ≤ 2 min, Nightly ≤ 30 min at ~70 seeds/min/core conservative

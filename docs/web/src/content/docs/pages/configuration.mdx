@@ -23,6 +23,7 @@ With no config file at all, `ursula` starts a single-node in-memory runtime. Tha
 | `--config FILE` | searches `./ursula.toml`, `/etc/ursula/ursula.toml`, then user config paths | TOML config file |
 | `--preset PRESET` | `default` when no config file is found, otherwise none | Resource preset: `default`, `dev`, `tiny`, `small`, `standard`, or `large` |
 | `--node-id ID` | config file or preset | Overrides `raft.node_id` |
+| `--keyed-state-upstream URL` | config file | Overrides `server.keyed_state_upstream` ([Keyed state](#keyed-state)) |
 
 CLI `--node-id` intentionally overrides any `raft.node_id` value in the config file so the same file can be mounted on every node. Helm derives it from the StatefulSet ordinal.
 
@@ -103,12 +104,53 @@ Every cold-tier object write requests server-side encryption by default (`server
 | `storage.cold.flush_size` | `8MiB` | Target bytes flushed per group per tick |
 | `storage.cold.flush_max_concurrency` | `4` | Parallel cold writes in flight |
 | `storage.cold.max_hot_size_per_group` | `64MiB` | Backpressure ceiling: when a group's hot bytes exceed this, new writes get HTTP `503` until the flush catches up. Explicit `0` disables the cap |
+| `storage.cold.flush_max_hot_age` | `5m` | A stream's hot tail older than this is flushed whole even when its group is below the flush threshold. `0` disables |
+| `storage.cold.compaction_enabled` | `true` | Background compaction: merges small chunks that flushes recorded as compaction debt (no bucket listing) and rewrites packed slices once a stream holds 64 of them |
+| `storage.snapshot.backend` | `auto` | `auto` (S3 snapshots when `storage.cold.backend = "s3"`, inline otherwise), `inline`, or `s3` |
+| `raft.snapshot_log_budget` | `1GiB` | Node Raft-log budget of the snapshot driver: a group snapshots once its log since the last snapshot reaches the larger of this budget over twice the group count (at most `16MiB`) and twice its last snapshot's size; above three quarters of the budget a pressure pass snapshots the groups that free the most log per snapshot byte |
 
-Flush defaults are conservative, so tune them under load. A typical benchmark profile drops the interval to `200ms`, raises concurrency to `32`, and bumps the per-group ceiling. Advanced deployments can split the flush threshold and batch size with `storage.cold.flush_min_hot_size` and `storage.cold.flush_max_size`, but the single `storage.cold.flush_size` knob is the normal path. Once a group's accumulated hot payload reaches the threshold, Ursula packs eligible slices from that group into one immutable object up to the configured maximum; large single-stream slices keep the same direct-object layout.
+Hot bytes here are real bytes: payload plus 24 bytes of bookkeeping per unflushed record, so admission and flush thresholds charge a window of tiny records for the memory it occupies. Flush defaults are conservative, so tune them under load. A typical benchmark profile drops the interval to `200ms`, raises concurrency to `32`, and bumps the per-group ceiling. Advanced deployments can split the flush threshold and batch size with `storage.cold.flush_min_hot_size` and `storage.cold.flush_max_size`, but the single `storage.cold.flush_size` knob is the normal path. Once a group's accumulated hot payload reaches the threshold, Ursula packs eligible slices from that group into one immutable object up to the configured maximum; single-stream slices of 1 MiB or more keep the direct-object layout, and smaller ones are packed even when they are alone.
 
 Raft snapshotting does not force a partial cold flush. Payload below the cold threshold stays in the bounded hot tail and is included in the next group snapshot, so a short snapshot interval does not turn small tails into small cold objects.
 
 Helm and the EC2 scripts map their deployment inputs onto these same keys, so this table applies to every deployment method.
+
+## Keyed state
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `server.keyed_state_upstream` | unset | Base URL of a single keyed-state indexer (`ursula indexer --keyed-source-url …`, one pod or a load balancer) behind `{stream}/keyed-state`, used when `keyed_state.indexer_urls` is empty. With neither set, `keyed-state` answers `404` and nothing advertises `keyed-state-v1`. CLI: `ursula server --keyed-state-upstream <url>` |
+| `keyed_state.indexer_urls` | `[]` | Base URL of every keyed-state indexer pod, in failover order. Keyed-state reads go to the first healthy pod (the primary, then the standbys); a non-empty list takes precedence over `server.keyed_state_upstream` for reads. Bucket purge sends `POST {url}/v1/keyed/drain` to each one and erases `.keyed/{bucket}/` only after all acknowledge. Empty with `server.keyed_state_upstream` set: the upstream is the one pod |
+| `keyed_state.drain_timeout` | `60s` | Per-indexer timeout of one drain request; a pod that does not acknowledge leaves the purge incomplete, and the idempotent purge is retried |
+| `keyed_state.upstream_connect_timeout` | `2s` | TCP connect timeout of one keyed-state request to one indexer pod |
+| `keyed_state.failover_header_timeout` | `10s` | How long a read waits for a pod's response headers, beyond its own `timeout_ms`, before it fails over to the next pod. The last pod tried gets the rest of the request's budget |
+| `keyed_state.unhealthy_backoff` | `2s` | How long a failed pod (connection error, header timeout, `502`, `503`, `504`) stays behind the healthy pods before the node probes its `/readyz`; a successful probe puts it back in order, so traffic returns to the primary. At least `1s` |
+
+Set `server.keyed_state_upstream` or `keyed_state.indexer_urls` to the same value on every node: whichever node serves a stream proxies its keyed-state reads. With several pods listed, a read that fails on one pod (connection error, no headers in time, a broken body, `502`/`503`/`504`) is retried on the next pod within the read's own budget, the remaining `timeout_ms` passed on; when every pod fails the node answers `503` with `Retry-After`. This is active/standby availability, not load sharding.
+
+### Keyed indexer flags
+
+The keyed-state indexer is the `ursula indexer` subcommand started with `--keyed-source-url`. It takes flags only, no config file:
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--keyed-source-url URL` | required | Ursula node base URL the indexer reads stream records from. The indexer sends no credentials, so point it at a node or an internal Service, not at an authenticating gateway |
+| `--s3-bucket NAME` or `--object-dir DIR` | one is required | Object store for projections. Use the nodes' cold-store bucket: projections live under `.keyed/` next to the stream data, and stream delete and bucket purge erase them through the nodes' cold store |
+| `--keyed-s3-root PREFIX` | `""` | Prefix inside the S3 bucket that holds `.keyed/`. Set it to the nodes' `storage.cold.root` |
+| `--s3-region`, `--s3-endpoint` | AWS defaults | S3 region and endpoint for S3-compatible stores. Credentials come from the standard AWS SDK chain |
+| `--cache-dir DIR` | required | Local cache of projection parts. Disposable |
+| `--cache-max-bytes N` | `2147483648` | Cache budget in bytes |
+| `--listen ADDR` | `127.0.0.1:4493` | Listener for `/v1/keyed`, `/v1/keyed/drain`, `/livez` and `/readyz`. Keep it internal |
+| `--keyed-min-publish-interval-ms MS` | `5000` | Minimum spacing between two publications of one stream's state. Readers that wait coalesce onto the next publication |
+| `--keyed-gc-grace-seconds S` | `600` | Grace period before unreferenced projection objects are deleted |
+| `--keyed-max-waiters N` | `10000` | Maximum concurrent waiting keyed-state reads; beyond it reads answer `503` |
+| `--keyed-admission-budget-bytes N` | `1073741824` | Process-wide byte budget for ingest pages, folded-but-unpublished records and compaction buffers. A single larger reservation is clamped to it and runs alone. Together with the caches it bounds the indexer's working memory |
+| `--keyed-max-concurrent-ingests N` | CPU count | Streams ingesting at once |
+| `--keyed-max-concurrent-compactions N` | half the CPU count | Compactions running at once; more wait |
+| `--keyed-admission-queue N` | `4096` | Streams admitted for ingestion but not yet ingesting; beyond it, reads that need new ingestion answer `503` with `Retry-After` |
+| `--keyed-source-timeout-ms MS` | `30000` | Total timeout of one record read from the source node (connect, headers and body). A stalled response fails as transient and is retried |
+| `--keyed-work-deadline-ms MS` | `120000` | Longest one admitted ingest step or compaction may run. Past it the work is dropped, its slot and budget are released, waiting reads answer `503`, and the next read retries |
+| `--keyed-shutdown-grace-ms MS` | `10000` | On shutdown, new keyed-state reads answer `503`; in-flight ingests and compactions get this long to finish and are then cancelled |
 
 ## Complete examples
 

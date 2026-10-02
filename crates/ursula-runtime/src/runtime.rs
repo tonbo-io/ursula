@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::io;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -17,19 +19,31 @@ use ursula_shard::ShardPlacement;
 use ursula_shard::StaticShardMap;
 use ursula_stream::ColdChunkRef;
 use ursula_stream::ColdFlushCandidate;
-use ursula_stream::ColdGcEntry;
+use ursula_stream::ColdGcPlanEntry;
 use ursula_stream::ColdGcTarget;
 
 use crate::admission::RaftUncommittedAdmission;
 use crate::admission::RaftUncommittedBytesTracker;
+use crate::cold_index::ColdIndexPageKey;
+use crate::cold_index::ColdIndexPageStore;
+use crate::cold_index::ColdIndexRepairReport;
 use crate::cold_index::ColdStoreColdIndexPageStore;
-use crate::cold_index::cold_index_prefix;
+use crate::cold_index::RepairColdIndexRequest;
+use crate::cold_index::RepairColdIndexResponse;
+use crate::cold_index::cold_index_generation_dir;
 use crate::cold_index::load_cold_chunks_from_pages;
+use crate::cold_index::parse_cold_index_page_file_name;
 use crate::cold_index::select_cold_chunk_compaction;
+use crate::cold_refs::ColdOrphanSweepPlan;
+use crate::cold_refs::ColdOrphanSweepRequest;
+use crate::cold_store::ColdStore;
 use crate::cold_store::ColdStoreHandle;
 use crate::cold_store::ColdStoreInfo;
-use crate::cold_store::cold_chunk_prefix;
-use crate::cold_store::new_cold_chunk_path;
+use crate::cold_store::cold_chunk_dir;
+use crate::cold_store::cold_external_dir;
+use crate::cold_store::is_cold_chunk_file_name;
+use crate::cold_store::is_external_payload_file_name;
+use crate::cold_store::new_cold_chunk_path_in_generation;
 use crate::cold_store::new_cold_pack_path;
 use crate::command::GroupSnapshot;
 use crate::core_worker::CoreCommand;
@@ -67,6 +81,7 @@ use crate::request::CompactColdResponse;
 use crate::request::CreateStreamExternalRequest;
 use crate::request::CreateStreamRequest;
 use crate::request::CreateStreamResponse;
+use crate::request::DeferColdGcResponse;
 use crate::request::DeleteSnapshotRequest;
 use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;
@@ -78,6 +93,8 @@ use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
 use crate::request::ImportGroupStateRequest;
 use crate::request::ImportGroupStateResponse;
+use crate::request::ListBucketStreamsRequest;
+use crate::request::ListBucketStreamsResponse;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
@@ -89,6 +106,10 @@ use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
 use crate::request::SetBucketQuotaRequest;
 use crate::request::SetBucketQuotaResponse;
+use crate::request::SetFeatureLevelRequest;
+use crate::request::SetFeatureLevelResponse;
+use crate::request::TidyStreamsRequest;
+use crate::request::TidyStreamsResponse;
 use crate::request::UpdateStreamAttrsRequest;
 use crate::request::UpdateStreamAttrsResponse;
 use crate::rt::sync::Semaphore;
@@ -97,11 +118,43 @@ use crate::rt::sync::oneshot;
 use crate::rt::time::Instant;
 use crate::trace::Traced;
 
-fn is_legacy_cross_bucket_pack(stream_id: &BucketStreamId, chunk: &ColdChunkRef) -> bool {
-    chunk.shared_object
-        && !chunk
-            .s3_path
-            .starts_with(&format!("{}/_packs/", stream_id.bucket_id))
+mod compaction_debt;
+mod orphan_sweep;
+mod shared_ref_compaction;
+
+use compaction_debt::CompactionDebt;
+
+/// A lone flush candidate below this size goes down the pack path as a pack
+/// of one instead of becoming a tiny exclusive object (F14c): its shared ref
+/// is compacted by the pack-reference driver, and the flush rewrites no
+/// cold-index page.
+pub const EXCLUSIVE_FLUSH_MIN_BYTES: usize = 1 << 20;
+
+/// Default size below which an exclusive chunk is compaction debt (F14d);
+/// the compaction worker replaces it with its configured target.
+const DEFAULT_COMPACTION_DEBT_CHUNK_BYTES: u64 = 8 << 20;
+
+/// Debt pages one compaction pass takes; pages of streams the pass does not
+/// reach go back into the debt.
+const COMPACTION_DEBT_PAGES_PER_PASS: usize = 4_096;
+
+pub use orphan_sweep::COLD_ORPHAN_SWEEP_GRACE_MS;
+
+/// Backoff before the cold GC retries an entry it deferred after its first
+/// failure (bounded-state F14b, feature level 1). Each further deferral
+/// doubles it, up to [`COLD_GC_DEFER_MAX_BACKOFF_MS`].
+pub const COLD_GC_DEFER_BACKOFF_MS: u64 = 60_000;
+
+/// Longest backoff between retries of a failing cold GC entry (one hour).
+pub const COLD_GC_DEFER_MAX_BACKOFF_MS: u64 = 60 * 60 * 1_000;
+
+/// Backoff for an entry that has already been deferred `attempts` times:
+/// 1 min, 2 min, 4 min, ... capped at one hour.
+pub fn cold_gc_defer_backoff_ms(attempts: u32) -> u64 {
+    COLD_GC_DEFER_BACKOFF_MS
+        .checked_shl(attempts.min(32))
+        .unwrap_or(u64::MAX)
+        .min(COLD_GC_DEFER_MAX_BACKOFF_MS)
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +227,28 @@ pub struct ShardRuntime {
     metrics: Arc<RuntimeMetricsInner>,
     next_waiter_id: Arc<AtomicU64>,
     cold_store: Option<ColdStoreHandle>,
+    cold_index_repair: Arc<std::sync::Mutex<HashMap<RaftGroupId, ColdIndexRepairCursor>>>,
+    /// Node-local cursor of each group's cold orphan sweep (F14h).
+    cold_orphan_sweep: Arc<std::sync::Mutex<HashMap<RaftGroupId, Option<BucketStreamId>>>>,
+    /// Cold-index pages that may hold compactable small chunks (F14d).
+    compaction_debt: Arc<std::sync::Mutex<CompactionDebt>>,
+    /// Exclusive chunks below this many bytes are compaction debt (F14d).
+    compaction_debt_chunk_bytes: Arc<AtomicU64>,
+}
+
+/// Node-local position of one group's cold-index repair cursor.
+#[derive(Debug, Clone, Default)]
+struct ColdIndexRepairCursor {
+    after: Option<BucketStreamId>,
+    last_full_cycle_ms: Option<u64>,
+}
+
+/// Result of one repair step for one group.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColdIndexRepairStep {
+    pub report: ColdIndexRepairReport,
+    /// The step reached the end of the group's streams on its leader.
+    pub cycle_completed: bool,
 }
 
 /// Cluster-local summary of a bucket purge across all Raft groups.
@@ -250,7 +325,60 @@ impl ShardRuntime {
             metrics,
             next_waiter_id: Arc::new(AtomicU64::new(1)),
             cold_store,
+            cold_index_repair: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            cold_orphan_sweep: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            compaction_debt: Arc::default(),
+            compaction_debt_chunk_bytes: Arc::new(AtomicU64::new(
+                DEFAULT_COMPACTION_DEBT_CHUNK_BYTES,
+            )),
         })
+    }
+
+    /// Sets the size below which exclusive chunks are compaction debt; the
+    /// compaction worker passes its target (F14d).
+    pub fn set_compaction_debt_chunk_bytes(&self, bytes: u64) {
+        self.compaction_debt_chunk_bytes
+            .store(bytes.max(1), Ordering::Relaxed);
+    }
+
+    /// Pages currently held as compaction debt (F14d).
+    pub fn compaction_debt_pages(&self) -> usize {
+        self.compaction_debt.lock().map_or(0, |debt| debt.len())
+    }
+
+    /// Records `[start_offset, end_offset)` of one incarnation as compaction
+    /// debt when its exclusive object is below the debt size (F14d).
+    pub(crate) fn record_compaction_debt(
+        &self,
+        stream_id: &BucketStreamId,
+        generation: u64,
+        start_offset: u64,
+        end_offset: u64,
+        object_bytes: u64,
+    ) {
+        if object_bytes >= self.compaction_debt_chunk_bytes.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut debt) = self.compaction_debt.lock() {
+            debt.record_range(stream_id, generation, start_offset, end_offset);
+        }
+    }
+
+    fn record_compaction_debt_pages(&self, pages: Vec<ColdIndexPageKey>) {
+        if pages.is_empty() {
+            return;
+        }
+        if let Ok(mut debt) = self.compaction_debt.lock() {
+            for key in pages {
+                debt.record_page(key);
+            }
+        }
+    }
+
+    fn take_compaction_debt(&self, max: usize) -> Vec<ColdIndexPageKey> {
+        self.compaction_debt
+            .lock()
+            .map_or_else(|_| Vec::new(), |mut debt| debt.take(max))
     }
 
     pub fn locate(&self, stream_id: &BucketStreamId) -> ShardPlacement {
@@ -367,8 +495,9 @@ impl ShardRuntime {
                 message: "cold backend must be configured before flushing cold chunks".to_owned(),
             });
         };
-        let path = new_cold_chunk_path(
+        let path = new_cold_chunk_path_in_generation(
             &candidate.stream_id,
+            candidate.cold_generation,
             candidate.start_offset,
             candidate.end_offset,
         );
@@ -398,19 +527,44 @@ impl ShardRuntime {
             payload_digest: candidate.payload_digest,
         };
         let publish_started_at = Instant::now();
+        let debt_stream = candidate.stream_id.clone();
         let publish = self
             .flush_cold(FlushColdRequest {
                 stream_id: candidate.stream_id,
                 chunk,
+                cold_generation: Some(candidate.cold_generation),
             })
             .await;
         match publish {
             Ok(response) => {
                 self.metrics
                     .record_cold_publish(object_size, elapsed_ns(publish_started_at));
+                self.record_compaction_debt(
+                    &debt_stream,
+                    candidate.cold_generation,
+                    candidate.start_offset,
+                    candidate.end_offset,
+                    object_size,
+                );
                 Ok(response)
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                // F14e: a typed stream error (a stale candidate) or a
+                // redirect before proposal means the flush definitely did not
+                // commit, and the engine rolled back or never wrote its page
+                // entry, so nothing references the chunk. Any other failure
+                // is ambiguous and keeps the chunk.
+                if (err.stream_error_code().is_some() || err.is_forward_before_proposal())
+                    && let Err(cleanup_err) = cold_store.delete_chunk(&path).await
+                {
+                    tracing::warn!(
+                        path = %path,
+                        error = %cleanup_err,
+                        "failed to remove the chunk of a rejected cold flush"
+                    );
+                }
+                Err(err)
+            }
         }
     }
 
@@ -436,7 +590,12 @@ impl ShardRuntime {
 
         let mut responses = Vec::new();
         for mut batch in bucket_batches {
-            if batch.len() > 1 {
+            // F14c: a lone candidate below 1 MiB is packed alone rather
+            // than written as a tiny exclusive object.
+            let small_single = batch
+                .first()
+                .is_some_and(|candidate| candidate.payload.len() < EXCLUSIVE_FLUSH_MIN_BYTES);
+            if batch.len() > 1 || small_single {
                 responses.extend(self.flush_cold_candidates_pack(batch).await?);
                 continue;
             }
@@ -461,7 +620,7 @@ impl ShardRuntime {
         };
         let first = candidates
             .first()
-            .expect("packed cold flush requires at least two candidates");
+            .expect("packed cold flush requires at least one candidate");
         let placement = self.shard_map.locate(&first.stream_id);
         if candidates
             .iter()
@@ -529,6 +688,7 @@ impl ShardRuntime {
                         shared_object: true,
                         payload_digest: candidate.payload_digest,
                     },
+                    cold_generation: Some(candidate.cold_generation),
                 })
                 .await;
             match publish {
@@ -547,13 +707,18 @@ impl ShardRuntime {
                 Err(err) => return Err(err),
             }
         }
-        if published == 0 {
-            cold_store
-                .delete_chunk(&path)
-                .await
-                .map_err(|err| RuntimeError::ColdStoreIo {
-                    message: err.to_string(),
-                })?;
+        // Every candidate was definitely rejected as stale, so nothing
+        // references the pack. Cleanup is best effort, as for an exclusive
+        // chunk: a failed delete leaves an orphan for the sweep (F14h), and
+        // since F14c this path also carries lone small candidates.
+        if published == 0
+            && let Err(cleanup_err) = cold_store.delete_chunk(&path).await
+        {
+            tracing::warn!(
+                path = %path,
+                error = %cleanup_err,
+                "failed to remove the pack of a rejected cold flush"
+            );
         }
         Ok(responses)
     }
@@ -600,10 +765,12 @@ impl ShardRuntime {
     }
 
     /// Removes the entire bucket erasure domain, including external payloads
-    /// and stage-before-commit orphans, then verifies the authoritative store
-    /// no longer lists an object below that prefix. Call only after every
-    /// group has durably installed the bucket tombstone and legacy shared-pack
-    /// debt has converged to zero.
+    /// and stage-before-commit orphans, and the bucket's keyed-state
+    /// projection namespaces `.keyed/{bucket}/` (keyed-streams U23), then
+    /// verifies the authoritative store no longer lists an object below
+    /// either prefix. Call only after every group has durably installed the
+    /// bucket tombstone, legacy shared-pack debt has converged to zero, and
+    /// every keyed-state indexer has acknowledged `drain(bucket)`.
     pub async fn erase_bucket_cold_prefix_and_prove(
         &self,
         bucket_id: &str,
@@ -611,24 +778,11 @@ impl ShardRuntime {
         let Some(cold_store) = self.cold_store.as_ref() else {
             return Ok(());
         };
-        let prefix = crate::cold_bucket_prefix(bucket_id);
-        cold_store
-            .remove_all(&prefix)
-            .await
-            .map_err(|err| RuntimeError::ColdStoreIo {
-                message: err.to_string(),
-            })?;
-        let absent =
-            cold_store
-                .prefix_is_empty(&prefix)
-                .await
-                .map_err(|err| RuntimeError::ColdStoreIo {
-                    message: err.to_string(),
-                })?;
-        if !absent {
-            return Err(RuntimeError::ColdStoreIo {
-                message: format!("bucket prefix '{prefix}' still contains objects after erasure"),
-            });
+        for prefix in [
+            crate::cold_bucket_prefix(bucket_id),
+            ursula_shard::keyed_namespace::keyed_bucket_prefix(bucket_id),
+        ] {
+            erase_prefix_and_prove(cold_store, &prefix).await?;
         }
         Ok(())
     }
@@ -666,6 +820,37 @@ impl ShardRuntime {
         Ok(report)
     }
 
+    /// Lists a bucket's streams (`extensions.md` §1.4) by asking every Raft
+    /// group for its first `limit + 1` eligible streams and merging them by
+    /// bucket-local stream path. Each group answers from local replica state,
+    /// so a just-created stream may lag on a follower. Returns `None` when no
+    /// group knows the bucket.
+    pub async fn list_bucket_streams_all_groups(
+        &self,
+        bucket_id: &str,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+        now_ms: u64,
+    ) -> Result<Option<ListBucketStreamsResponse>, RuntimeError> {
+        let request = ListBucketStreamsRequest {
+            bucket_id: bucket_id.to_owned(),
+            prefix: prefix.to_owned(),
+            after: after.map(str::to_owned),
+            limit: limit.saturating_add(1),
+            now_ms,
+        };
+        let group_count = self.shard_map.raft_group_count();
+        let mut shares = Vec::new();
+        for group_id in 0..group_count {
+            shares.push(
+                self.list_bucket_streams(RaftGroupId(group_id), request.clone())
+                    .await?,
+            );
+        }
+        Ok(merge_bucket_stream_listings(shares, limit))
+    }
+
     /// Replicates one bucket's quota record to every Raft group so each
     /// enforces the same local backstop. Serial like the other all-group
     /// admin sweeps; quota changes are rare control-plane writes.
@@ -685,6 +870,130 @@ impl ShardRuntime {
             .await?;
         }
         Ok(())
+    }
+
+    /// Replicated feature level (C0) of every Raft group as held by this
+    /// node's applied replica state. Per-group results, so a group this node
+    /// does not host reports its own error instead of hiding the others.
+    pub async fn feature_levels_all_groups(&self) -> Vec<(RaftGroupId, Result<u32, RuntimeError>)> {
+        let group_count = self.shard_map.raft_group_count();
+        let mut levels = Vec::new();
+        for group_id in 0..group_count {
+            let group = RaftGroupId(group_id);
+            levels.push((group, self.feature_level(group).await));
+        }
+        levels
+    }
+
+    /// Bounded-state gauges (`docs/architecture/bounded-stream-state.md`
+    /// §7.5) of every Raft group as held by this node's applied replica state.
+    /// Groups are asked concurrently; per-group results, like
+    /// [`Self::feature_levels_all_groups`].
+    pub async fn state_gauges_all_groups(
+        &self,
+    ) -> Vec<(
+        RaftGroupId,
+        Result<ursula_stream::GroupStateGauges, RuntimeError>,
+    )> {
+        let group_count = self.shard_map.raft_group_count();
+        let requests = (0..group_count).map(|group_id| {
+            let group = RaftGroupId(group_id);
+            async move { (group, self.state_gauges(group).await) }
+        });
+        futures_util::future::join_all(requests).await
+    }
+
+    /// Proposes `SetFeatureLevel { level }` to every Raft group (C0), serially
+    /// like the other all-group admin sweeps. Each group ends at
+    /// `max(current, level)`, so re-running after a partial failure is safe.
+    /// Results are per group: on a Raft cluster a group led by another node
+    /// fails with a forward-to-leader error, and the operator (`ursulactl
+    /// cluster enable-feature`) asks every node so each leader proposes for
+    /// its own groups. Callers must ensure every voter and learner supports
+    /// `level`.
+    pub async fn set_feature_level_all_groups(
+        &self,
+        level: u32,
+    ) -> Vec<(RaftGroupId, Result<SetFeatureLevelResponse, RuntimeError>)> {
+        let group_count = self.shard_map.raft_group_count();
+        let mut responses = Vec::new();
+        for group_id in 0..group_count {
+            let group = RaftGroupId(group_id);
+            responses.push((
+                group,
+                self.set_feature_level(group, SetFeatureLevelRequest { level })
+                    .await,
+            ));
+        }
+        responses
+    }
+
+    /// One leader-side external-locator offload pass (bounded-state F5) in
+    /// every group this node leads: each offloads up to
+    /// `max_streams_per_group` streams whose state-held external refs are
+    /// due. A failing group is logged and skipped, so it cannot stall the
+    /// others. Groups below feature level 3 hold no staged refs.
+    pub async fn offload_cold_refs_all_groups_once(
+        &self,
+        max_streams_per_group: usize,
+        now_ms: u64,
+    ) -> crate::cold_refs::OffloadColdRefsResponse {
+        let mut report = crate::cold_refs::OffloadColdRefsResponse::default();
+        if self.cold_store.is_none() {
+            return report;
+        }
+        for group_id in 0..self.shard_map.raft_group_count() {
+            let request =
+                crate::cold_refs::OffloadColdRefsRequest::new(now_ms, max_streams_per_group);
+            match self.offload_cold_refs(RaftGroupId(group_id), request).await {
+                Ok(step) => report.add(&step),
+                Err(err) => tracing::warn!(
+                    raft_group_id = group_id,
+                    error = %err,
+                    "external-locator offload pass failed; continuing with remaining groups"
+                ),
+            }
+        }
+        report
+    }
+
+    /// One leader-side `TidyStream` pass over every Raft group
+    /// (bounded-state F0): each group this node leads proposes `TidyStream`
+    /// for at most `max_streams_per_group` streams with normalization debt.
+    /// A failing group does not stop the others; the first error is
+    /// returned after every group had its pass.
+    pub async fn tidy_streams_all_groups_once(
+        &self,
+        max_streams_per_group: usize,
+        now_ms: u64,
+    ) -> Result<TidyStreamsResponse, RuntimeError> {
+        let mut total = TidyStreamsResponse::default();
+        let mut first_error = None;
+        for group_id in 0..self.shard_map.raft_group_count() {
+            let request = TidyStreamsRequest {
+                max_streams: max_streams_per_group,
+                now_ms,
+            };
+            match self.tidy_streams(RaftGroupId(group_id), request).await {
+                Ok(report) => {
+                    total.tidied = total.tidied.saturating_add(report.tidied);
+                    total.debt_remaining =
+                        total.debt_remaining.saturating_add(report.debt_remaining);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        raft_group_id = group_id,
+                        error = %err,
+                        "tidy pass failed; continuing with remaining groups"
+                    );
+                    first_error.get_or_insert(err);
+                }
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(total),
+        }
     }
 
     pub async fn flush_cold_all_groups_once(
@@ -766,7 +1075,9 @@ impl ShardRuntime {
     }
 
     /// Rewrites undersized, contiguous objects from the same stream into
-    /// target-sized immutable chunks. Discovery reads only cold-index pages.
+    /// target-sized immutable chunks. Discovery drains the compaction debt
+    /// that flushes, compaction outputs and the repair cursor record, and
+    /// reads only those cold-index pages, by key: it lists nothing (F14d).
     pub async fn compact_cold_once(
         &self,
         target_bytes: u64,
@@ -777,28 +1088,54 @@ impl ShardRuntime {
         let Some(cold_store) = self.cold_store.as_ref() else {
             return Ok(0);
         };
-        let pages =
-            cold_store
-                .list_cold_index_pages()
-                .await
-                .map_err(|err| RuntimeError::ColdStoreIo {
-                    message: err.to_string(),
-                })?;
-        let mut pages_by_stream: HashMap<BucketStreamId, Vec<_>> = HashMap::new();
+        let pages = self.take_compaction_debt(COMPACTION_DEBT_PAGES_PER_PASS);
+        // Pages are grouped per stream incarnation (F14g). The engine
+        // republishes into the live incarnation's generation, so inputs from
+        // a deleted incarnation fail the page match and are skipped.
+        let mut pages_by_stream: Vec<((BucketStreamId, u64), Vec<ColdIndexPageKey>)> = Vec::new();
         for page in pages {
-            if page.generation == 0 {
-                pages_by_stream
-                    .entry(page.stream_id.clone())
-                    .or_default()
-                    .push(page);
+            let identity = (page.stream_id.clone(), page.generation);
+            match pages_by_stream
+                .iter_mut()
+                .find(|(existing, _)| *existing == identity)
+            {
+                Some((_, stream_pages)) => stream_pages.push(page),
+                None => pages_by_stream.push((identity, vec![page])),
             }
         }
+        let mut pages_by_stream = pages_by_stream.into_iter();
+        let result = self
+            .compact_cold_debt(
+                cold_store,
+                &mut pages_by_stream,
+                target_bytes,
+                max_bytes,
+                max_streams,
+                gc_grace_ms,
+            )
+            .await;
+        // Streams this pass did not reach stay debt for the next one.
+        for (_, stream_pages) in pages_by_stream {
+            self.record_compaction_debt_pages(stream_pages);
+        }
+        result
+    }
+
+    async fn compact_cold_debt(
+        &self,
+        cold_store: &ColdStoreHandle,
+        pages_by_stream: &mut impl Iterator<Item = ((BucketStreamId, u64), Vec<ColdIndexPageKey>)>,
+        target_bytes: u64,
+        max_bytes: u64,
+        max_streams: usize,
+        gc_grace_ms: u64,
+    ) -> Result<usize, RuntimeError> {
         let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
         let mut compacted = 0;
-        for (stream_id, stream_pages) in pages_by_stream {
-            if compacted >= max_streams {
+        while compacted < max_streams {
+            let Some(((stream_id, generation), stream_pages)) = pages_by_stream.next() else {
                 break;
-            }
+            };
             // Only the local Raft leader may publish a replacement.
             if self
                 .require_local_live_read_owner(&stream_id)
@@ -847,7 +1184,12 @@ impl ShardRuntime {
             let last = old_chunks
                 .last()
                 .expect("candidate contains at least two chunks");
-            let path = new_cold_chunk_path(&stream_id, first.start_offset, last.end_offset);
+            let path = new_cold_chunk_path_in_generation(
+                &stream_id,
+                generation,
+                first.start_offset,
+                last.end_offset,
+            );
             let object_size = cold_store
                 .write_chunk(&path, &payload)
                 .await
@@ -864,6 +1206,11 @@ impl ShardRuntime {
                 payload_digest: blake3::hash(&payload).to_hex().to_string(),
             };
             let replacement_path = replacement.s3_path.clone();
+            let replacement_range = (
+                replacement.start_offset,
+                replacement.end_offset,
+                replacement.object_size,
+            );
             let gc_not_before_ms = unix_time_ms().saturating_add(gc_grace_ms);
             let compact_result = self
                 .compact_cold(CompactColdRequest {
@@ -875,7 +1222,7 @@ impl ShardRuntime {
                 .await;
             if let Err(err) = compact_result {
                 let rollback_safe =
-                    err.leader_hint().is_some() || err.stream_error_code().is_some();
+                    err.is_forward_before_proposal() || err.stream_error_code().is_some();
                 if !rollback_safe {
                     return Err(err);
                 }
@@ -894,98 +1241,17 @@ impl ShardRuntime {
                 );
                 continue;
             }
+            // A replacement still below the debt size may merge further.
+            self.record_compaction_debt(
+                &stream_id,
+                generation,
+                replacement_range.0,
+                replacement_range.1,
+                replacement_range.2,
+            );
             compacted += 1;
         }
         Ok(compacted)
-    }
-
-    /// Rewrites a bounded number of pre-erasure-domain shared pack slices as
-    /// stream-exclusive objects. Each replacement is published through the
-    /// same group mutation and cold-index rollback contract as compaction.
-    pub async fn migrate_legacy_shared_cold_once(
-        &self,
-        max_chunks: usize,
-        gc_grace_ms: u64,
-    ) -> Result<LegacySharedMigrationReport, RuntimeError> {
-        let Some(cold_store) = self.cold_store.as_ref() else {
-            return Ok(LegacySharedMigrationReport::default());
-        };
-        let mut candidates = Vec::new();
-        for group_id in 0..self.shard_map.raft_group_count() {
-            let snapshot = self.snapshot_group(RaftGroupId(group_id)).await?;
-            for stream in snapshot.stream_snapshot.streams {
-                let stream_id = stream.metadata.stream_id;
-                for chunk in stream.cold_chunks {
-                    if is_legacy_cross_bucket_pack(&stream_id, &chunk) {
-                        candidates.push((stream_id.clone(), chunk));
-                    }
-                }
-            }
-        }
-        candidates.sort_by(|left, right| {
-            left.0
-                .bucket_id
-                .cmp(&right.0.bucket_id)
-                .then_with(|| left.0.affinity_key.cmp(&right.0.affinity_key))
-                .then_with(|| left.0.stream_id.cmp(&right.0.stream_id))
-                .then_with(|| left.1.start_offset.cmp(&right.1.start_offset))
-        });
-
-        let observed_chunks = candidates.len();
-        let mut migrated_chunks = 0usize;
-        for (stream_id, chunk) in candidates.into_iter().take(max_chunks) {
-            let logical_bytes = chunk.end_offset.saturating_sub(chunk.start_offset);
-            let len = usize::try_from(logical_bytes).map_err(|_| RuntimeError::ColdStoreIo {
-                message: "legacy shared chunk exceeds addressable memory".to_owned(),
-            })?;
-            let payload = cold_store
-                .read_chunk_range(&chunk, chunk.start_offset, len)
-                .await
-                .map_err(|err| RuntimeError::ColdStoreIo {
-                    message: err.to_string(),
-                })?;
-            let path = new_cold_chunk_path(&stream_id, chunk.start_offset, chunk.end_offset);
-            let object_size = cold_store
-                .write_chunk(&path, &payload)
-                .await
-                .map_err(|err| RuntimeError::ColdStoreIo {
-                    message: err.to_string(),
-                })?;
-            let replacement = ColdChunkRef {
-                start_offset: chunk.start_offset,
-                end_offset: chunk.end_offset,
-                object_size,
-                s3_path: path.clone(),
-                object_offset: 0,
-                shared_object: false,
-                payload_digest: blake3::hash(&payload).to_hex().to_string(),
-            };
-            if let Err(err) = self
-                .compact_cold(CompactColdRequest {
-                    stream_id: stream_id.clone(),
-                    old_chunks: vec![chunk],
-                    replacement,
-                    gc_not_before_ms: unix_time_ms().saturating_add(gc_grace_ms),
-                })
-                .await
-            {
-                if let Err(cleanup_err) = cold_store.delete_chunk(&path).await {
-                    tracing::warn!(
-                        stream = %stream_id,
-                        path,
-                        error = %cleanup_err,
-                        "failed to remove unpublished legacy pack replacement"
-                    );
-                }
-                return Err(err);
-            }
-            migrated_chunks = migrated_chunks.saturating_add(1);
-        }
-        Ok(LegacySharedMigrationReport {
-            observed_chunks,
-            migrated_chunks,
-            pending_chunks: observed_chunks.saturating_sub(migrated_chunks),
-        })
     }
 
     /// Drains the leader-side cold-GC queue for one group: physically reclaims
@@ -1000,29 +1266,54 @@ impl ShardRuntime {
         let Some(cold_store) = self.cold_store.as_ref() else {
             return Ok(0);
         };
-        let entries = self.plan_cold_gc(raft_group_id, max_entries).await?;
-        if entries.is_empty() {
+        let planned = self.plan_cold_gc(raft_group_id, max_entries).await?;
+        if planned.is_empty() {
             return Ok(0);
         }
+        // F14b (feature level 1): a failing entry is moved to the tail with a
+        // backoff, so it no longer blocks every entry behind it. Below level 1
+        // the worker stops at the first failure, as before.
+        let defer_failures = self
+            .feature_level(raft_group_id)
+            .await
+            .is_ok_and(|level| level >= crate::FEATURE_LEVEL_KEYED_STREAMS);
         let mut acked_seq = None;
         let mut reclaimed = 0usize;
-        // Entries are FIFO by seq; stop at the first failure so the ack never
-        // skips past an object that is still present in cold storage.
-        for entry in entries {
+        let mut deferred = 0usize;
+        let mut first_error = None;
+        // Entries are FIFO by seq; the ack pops a prefix, so it never skips
+        // past an object that is still present in cold storage: a failing
+        // entry is either deferred (restamped behind the acked prefix) before
+        // the ack, or ends the pass.
+        for planned_entry in planned {
+            let entry = &planned_entry.entry;
             if entry.not_before_ms > unix_time_ms() {
                 break;
             }
             let result = match &entry.target {
                 ColdGcTarget::Stream(stream_id) => {
-                    match cold_store.remove_all(&cold_chunk_prefix(stream_id)).await {
-                        Ok(()) => cold_store.remove_all(&cold_index_prefix(stream_id)).await,
-                        Err(err) => Err(err),
-                    }
+                    self.reclaim_stream_incarnation(
+                        cold_store,
+                        raft_group_id,
+                        max_entries,
+                        &planned_entry,
+                        stream_id,
+                    )
+                    .await
                 }
                 ColdGcTarget::Paths(paths) => {
                     let mut outcome = Ok(());
                     for path in paths {
-                        if let Err(err) = cold_store.delete_chunk(path).await {
+                        // A keyed stream's deleted incarnation enqueues its
+                        // projection namespace as a prefix (U22). Every
+                        // other path names one object (F14g containment).
+                        let removed =
+                            if ursula_shard::keyed_namespace::is_keyed_incarnation_prefix(path) {
+                                cold_store.remove_all(path).await
+                            } else {
+                                cold_store.delete_chunk(path).await
+                            };
+                        if let Err(err) = removed {
                             outcome = Err(err);
                             break;
                         }
@@ -1037,10 +1328,39 @@ impl ShardRuntime {
                 }
                 Err(err) => {
                     self.metrics.record_cold_gc_error();
+                    let error = RuntimeError::ColdStoreIo {
+                        message: err.to_string(),
+                    };
+                    if defer_failures {
+                        let not_before_ms = unix_time_ms()
+                            .saturating_add(cold_gc_defer_backoff_ms(entry.defer_attempts));
+                        match self
+                            .defer_cold_gc(raft_group_id, entry.seq, not_before_ms)
+                            .await
+                        {
+                            Ok(_) => {
+                                tracing::warn!(
+                                    raft_group_id = raft_group_id.0,
+                                    seq = entry.seq,
+                                    error = %err,
+                                    "cold GC entry failed; deferred to the tail of the queue"
+                                );
+                                deferred += 1;
+                                first_error.get_or_insert(error);
+                                continue;
+                            }
+                            Err(defer_err) => {
+                                tracing::warn!(
+                                    raft_group_id = raft_group_id.0,
+                                    seq = entry.seq,
+                                    error = %defer_err,
+                                    "failed to defer a failing cold GC entry"
+                                );
+                            }
+                        }
+                    }
                     if acked_seq.is_none() {
-                        return Err(RuntimeError::ColdStoreIo {
-                            message: err.to_string(),
-                        });
+                        return Err(error);
                     }
                     break;
                 }
@@ -1051,7 +1371,215 @@ impl ShardRuntime {
             self.metrics
                 .record_cold_gc_reclaimed(u64::try_from(reclaimed).expect("reclaimed fits u64"));
         }
+        // A pass that only deferred entries reports the failure, so the
+        // all-groups runner and its callers still see it.
+        if reclaimed == 0
+            && deferred > 0
+            && let Some(error) = first_error
+        {
+            return Err(error);
+        }
         Ok(reclaimed)
+    }
+
+    /// Reclaims the cold objects of one removed stream incarnation (F14a,
+    /// F14g). The sweep deletes only object names Ursula writes for that
+    /// stream, one directory level at a time, so it never reaches another
+    /// stream's namespace, such as an affinity stream under a two-segment
+    /// stream's name. It never deletes objects of the generation a live
+    /// stream of the same name uses, and checks that again before deleting
+    /// pages, which are the last objects removed.
+    ///
+    /// - Legacy entries (no generation, enqueued below level 1) delete
+    ///   legacy-format chunk names directly under `{stream}/chunks/` and
+    ///   generation-0 pages, and are acknowledged without deleting anything
+    ///   while a stream with the name exists again (step 1).
+    /// - Entries naming generation `g` (level 1) delete the external
+    ///   payloads that generation's pages reference inside
+    ///   `{stream}/external/` (F14a), the chunks of that generation (legacy
+    ///   names for `g = 0`, `{stream}/chunks/{g:016x}/` otherwise), and its
+    ///   pages.
+    async fn reclaim_stream_incarnation(
+        &self,
+        cold_store: &ColdStoreHandle,
+        raft_group_id: RaftGroupId,
+        max_entries: usize,
+        planned: &ColdGcPlanEntry,
+        stream_id: &BucketStreamId,
+    ) -> io::Result<()> {
+        let generation = planned.entry.cold_generation.unwrap_or(0);
+        if stream_gc_blocked_by_live_stream(
+            planned.entry.cold_generation,
+            planned.live_cold_generation,
+        ) {
+            tracing::debug!(
+                stream = %stream_id,
+                seq = planned.entry.seq,
+                "stream gc entry acknowledged without deletion: the name is live again"
+            );
+            return Ok(());
+        }
+
+        if planned.entry.cold_generation.is_some() {
+            let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+            let external_dir = cold_external_dir(stream_id);
+            let mut referenced = BTreeSet::new();
+            for page_id in list_cold_index_page_ids(cold_store, stream_id, generation).await? {
+                let key = ColdIndexPageKey {
+                    stream_id: stream_id.clone(),
+                    generation,
+                    page_id,
+                };
+                let Some(page) = store.get_page(&key).await? else {
+                    continue;
+                };
+                referenced.extend(
+                    page.external_segments
+                        .iter()
+                        .filter(|object| {
+                            object
+                                .s3_path
+                                .strip_prefix(&external_dir)
+                                .is_some_and(is_external_payload_file_name)
+                        })
+                        .map(|object| object.s3_path.clone()),
+                );
+            }
+            for path in referenced {
+                cold_store.delete_chunk(&path).await?;
+            }
+        }
+
+        let chunk_dir = cold_chunk_dir(stream_id, generation);
+        for name in cold_store.list_file_names(&chunk_dir).await? {
+            if is_cold_chunk_file_name(&name) {
+                cold_store
+                    .delete_chunk(&format!("{chunk_dir}{name}"))
+                    .await?;
+            }
+        }
+
+        // The pages are the discovery surface for referenced objects, so
+        // they go last, after checking the name once more.
+        let live = self
+            .plan_cold_gc(raft_group_id, max_entries)
+            .await
+            .map_err(|err| io::Error::other(err.to_string()))?
+            .into_iter()
+            .find(|candidate| candidate.entry.seq == planned.entry.seq)
+            .and_then(|candidate| candidate.live_cold_generation);
+        if stream_gc_blocked_by_live_stream(planned.entry.cold_generation, live) {
+            return Ok(());
+        }
+        let page_dir = cold_index_generation_dir(stream_id, generation);
+        for page_id in list_cold_index_page_ids(cold_store, stream_id, generation).await? {
+            cold_store
+                .delete_chunk(&format!("{page_dir}{page_id:020}.idx"))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// One step of the leader-side cold-index page repair cursor for one
+    /// group (bounded-state F19 step 2): repairs the pages of up to
+    /// `max_streams` streams after the cursor and advances it. A step that
+    /// reaches the end of the group's streams records a completed cycle. On
+    /// a follower the step repairs nothing and restarts the cursor.
+    pub async fn repair_cold_index_group_once(
+        &self,
+        raft_group_id: RaftGroupId,
+        max_streams: usize,
+    ) -> Result<ColdIndexRepairStep, RuntimeError> {
+        if self.cold_store.is_none() {
+            return Ok(ColdIndexRepairStep::default());
+        }
+        let after = self
+            .cold_index_repair
+            .lock()
+            .map_err(|_| RuntimeError::ColdStoreConfig {
+                message: "cold-index repair cursor lock poisoned".to_owned(),
+            })?
+            .get(&raft_group_id)
+            .and_then(|cursor| cursor.after.clone());
+        let response = self
+            .repair_cold_index(raft_group_id, RepairColdIndexRequest {
+                after,
+                max_streams: max_streams.max(1),
+                stream: None,
+            })
+            .await?;
+        let mut cursors =
+            self.cold_index_repair
+                .lock()
+                .map_err(|_| RuntimeError::ColdStoreConfig {
+                    message: "cold-index repair cursor lock poisoned".to_owned(),
+                })?;
+        let cursor = cursors.entry(raft_group_id).or_default();
+        cursor.after = response.next_after;
+        if response.cycle_completed {
+            cursor.last_full_cycle_ms = Some(unix_time_ms());
+        }
+        drop(cursors);
+        self.record_compaction_debt_pages(response.compaction_pages);
+        Ok(ColdIndexRepairStep {
+            report: response.report,
+            cycle_completed: response.cycle_completed,
+        })
+    }
+
+    /// When this node, as leader of `raft_group_id`, last completed a full
+    /// cold-index repair cycle over the group's streams.
+    pub fn cold_index_repair_last_full_cycle_ms(&self, raft_group_id: RaftGroupId) -> Option<u64> {
+        self.cold_index_repair
+            .lock()
+            .ok()?
+            .get(&raft_group_id)
+            .and_then(|cursor| cursor.last_full_cycle_ms)
+    }
+
+    /// Whether this node has completed a cold-index page-repair cycle as
+    /// leader of `raft_group_id` (F19), which the raise to feature level 2
+    /// (F1 sparse marks) requires. Without a cold store no page exists, so
+    /// the cycle is vacuously complete.
+    pub fn cold_index_repair_completed(&self, raft_group_id: RaftGroupId) -> bool {
+        self.cold_store.is_none()
+            || self
+                .cold_index_repair_last_full_cycle_ms(raft_group_id)
+                .is_some()
+    }
+
+    /// One repair step in every group. A failing group is logged and
+    /// skipped, so it cannot stall the others.
+    pub async fn repair_cold_index_all_groups_once(
+        &self,
+        max_streams_per_group: usize,
+    ) -> ColdIndexRepairReport {
+        let mut report = ColdIndexRepairReport::default();
+        if self.cold_store.is_none() {
+            return report;
+        }
+        for group_id in 0..self.shard_map.raft_group_count() {
+            match self
+                .repair_cold_index_group_once(RaftGroupId(group_id), max_streams_per_group)
+                .await
+            {
+                Ok(step) => {
+                    report.add(&step.report);
+                    if step.cycle_completed {
+                        tracing::debug!(
+                            raft_group_id = group_id,
+                            "cold-index repair cycle completed"
+                        );
+                    }
+                }
+                Err(err) => tracing::warn!(
+                    raft_group_id = group_id,
+                    error = %err,
+                    "cold-index repair step failed; continuing with remaining groups"
+                ),
+            }
+        }
+        report
     }
 
     pub async fn run_cold_gc_all_groups_once(
@@ -1061,13 +1589,31 @@ impl ShardRuntime {
         if self.cold_store.is_none() {
             return Ok(0);
         }
+        // F14b: one group's failure must not stall reclamation in the groups
+        // after it. Every group runs; the first error is reported once all
+        // have had their pass.
         let mut reclaimed = 0;
+        let mut first_error = None;
         for group_id in 0..self.shard_map.raft_group_count() {
-            reclaimed += self
+            match self
                 .run_cold_gc_group_once(RaftGroupId(group_id), max_entries_per_group)
-                .await?;
+                .await
+            {
+                Ok(group_reclaimed) => reclaimed += group_reclaimed,
+                Err(err) => {
+                    tracing::warn!(
+                        raft_group_id = group_id,
+                        error = %err,
+                        "cold GC pass failed; continuing with remaining groups"
+                    );
+                    first_error.get_or_insert(err);
+                }
+            }
         }
-        Ok(reclaimed)
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(reclaimed),
+        }
     }
 
     /// Number of raft groups this runtime is sharded into. Backup tooling
@@ -1363,8 +1909,38 @@ impl ShardRuntime {
     }
 }
 
+/// F14g: a stream GC entry deletes nothing while a live stream of the same
+/// name uses its objects. A legacy entry (no generation) shares names with
+/// any recreated stream, so it waits for none; an entry naming generation
+/// `g` only conflicts with a live incarnation in `g`, which C7 rules out.
+fn stream_gc_blocked_by_live_stream(
+    entry_generation: Option<u64>,
+    live_generation: Option<u64>,
+) -> bool {
+    match entry_generation {
+        None => live_generation.is_some(),
+        Some(generation) => live_generation == Some(generation),
+    }
+}
+
+/// Page ids present in one generation directory of a stream, ignoring any
+/// name Ursula does not write there.
+async fn list_cold_index_page_ids(
+    cold_store: &ColdStoreHandle,
+    stream_id: &BucketStreamId,
+    generation: u64,
+) -> io::Result<Vec<u64>> {
+    let dir = cold_index_generation_dir(stream_id, generation);
+    Ok(cold_store
+        .list_file_names(&dir)
+        .await?
+        .iter()
+        .filter_map(|name| parse_cold_index_page_file_name(name))
+        .collect())
+}
+
 #[cfg(not(madsim))]
-fn unix_time_ms() -> u64 {
+pub(crate) fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
@@ -1372,7 +1948,7 @@ fn unix_time_ms() -> u64 {
 }
 
 #[cfg(madsim)]
-fn unix_time_ms() -> u64 {
+pub(crate) fn unix_time_ms() -> u64 {
     0
 }
 
@@ -1615,4 +2191,50 @@ fn spawn_core_worker(threading: RuntimeThreading, worker: CoreWorker) -> Result<
                 })
         }
     }
+}
+
+/// Removes every object below `prefix`, then proves the store lists none.
+async fn erase_prefix_and_prove(cold_store: &ColdStore, prefix: &str) -> Result<(), RuntimeError> {
+    cold_store
+        .remove_all(prefix)
+        .await
+        .map_err(|err| RuntimeError::ColdStoreIo {
+            message: err.to_string(),
+        })?;
+    let absent =
+        cold_store
+            .prefix_is_empty(prefix)
+            .await
+            .map_err(|err| RuntimeError::ColdStoreIo {
+                message: err.to_string(),
+            })?;
+    if !absent {
+        return Err(RuntimeError::ColdStoreIo {
+            message: format!("bucket prefix '{prefix}' still contains objects after erasure"),
+        });
+    }
+    Ok(())
+}
+
+/// Merges per-group bucket listing shares (`extensions.md` §1.4): each share
+/// is one group's first `limit + 1` eligible streams, or `None` when that
+/// group does not know the bucket. Returns `None` when no group knows it.
+pub fn merge_bucket_stream_listings(
+    shares: impl IntoIterator<Item = Option<Vec<ursula_stream::BucketStreamListing>>>,
+    limit: usize,
+) -> Option<ListBucketStreamsResponse> {
+    let mut bucket_known = false;
+    let mut streams = Vec::new();
+    for share in shares.into_iter().flatten() {
+        bucket_known = true;
+        streams.extend(share);
+    }
+    if !bucket_known {
+        return None;
+    }
+    streams.sort_by(|left, right| left.stream_id.cmp(&right.stream_id));
+    streams.dedup_by(|right, left| right.stream_id == left.stream_id);
+    let has_more = streams.len() > limit;
+    streams.truncate(limit);
+    Some(ListBucketStreamsResponse { streams, has_more })
 }

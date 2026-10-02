@@ -1,0 +1,11 @@
+{
+  "name": "ursula-ds-conformance",
+  "private": true,
+  "type": "module",
+  "description": "Runs the official Durable Streams server conformance suite against Ursula through a path adapter.",
+  "dependencies": {
+    "@durable-streams/server-conformance-tests": "0.3.7",
+    "fast-check": "^4.4.0",
+    "vitest": "^4.0.0"
+  }
+}

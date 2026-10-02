@@ -12,6 +12,7 @@ autobenches = false
 
 [dependencies]
 blake3 = { workspace = true }
+memchr = { workspace = true }
 bytes = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

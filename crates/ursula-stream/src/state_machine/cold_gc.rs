@@ -30,6 +30,22 @@ impl ColdGcQueue {
         self.enqueue_after(bucket_id, target, 0);
     }
 
+    /// Append the removal of one stream incarnation. `cold_generation` is
+    /// `Some` only for entries enqueued at feature level 1 or later (F14g).
+    pub(super) fn enqueue_stream(
+        &mut self,
+        bucket_id: String,
+        stream_id: ursula_shard::BucketStreamId,
+        cold_generation: Option<u64>,
+    ) {
+        self.push(
+            bucket_id,
+            ColdGcTarget::Stream(stream_id),
+            0,
+            cold_generation,
+        );
+    }
+
     /// Append a reclamation target that must remain readable until the given
     /// wall-clock timestamp. Cold-object compaction uses this grace period so
     /// a lagging replica can apply the replacement and invalidate its cached
@@ -40,6 +56,16 @@ impl ColdGcQueue {
         target: ColdGcTarget,
         not_before_ms: u64,
     ) {
+        self.push(bucket_id, target, not_before_ms, None);
+    }
+
+    fn push(
+        &mut self,
+        bucket_id: String,
+        target: ColdGcTarget,
+        not_before_ms: u64,
+        cold_generation: Option<u64>,
+    ) {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         self.pending.push_back(ColdGcEntry {
@@ -47,6 +73,8 @@ impl ColdGcQueue {
             bucket_id,
             not_before_ms,
             target,
+            cold_generation,
+            defer_attempts: 0,
         });
     }
 
@@ -61,6 +89,23 @@ impl ColdGcQueue {
             self.pending.pop_front();
         }
         u64::try_from(before - self.pending.len()).expect("removed fits u64")
+    }
+
+    /// Moves the entry `seq` to the tail under the next sequence number, due
+    /// no earlier than `not_before_ms` (F14b). Acks pop a prefix by sequence
+    /// number, so the entry must be restamped: under its old number a later
+    /// ack would pop it without its objects having been reclaimed. Returns
+    /// the new number, or `None` when no entry has `seq`.
+    pub(super) fn defer(&mut self, seq: u64, not_before_ms: u64) -> Option<u64> {
+        let index = self.pending.iter().position(|entry| entry.seq == seq)?;
+        let mut entry = self.pending.remove(index)?;
+        let new_seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        entry.seq = new_seq;
+        entry.not_before_ms = entry.not_before_ms.max(not_before_ms);
+        entry.defer_attempts = entry.defer_attempts.saturating_add(1);
+        self.pending.push_back(entry);
+        Some(new_seq)
     }
 
     /// A bounded view of the front of the queue for the leader's GC worker.
@@ -96,6 +141,58 @@ impl ColdGcQueue {
 mod tests {
     use super::*;
 
+    fn paths_entry(seq: u64, path: &str) -> ColdGcEntry {
+        ColdGcEntry {
+            seq,
+            bucket_id: "bucket".to_owned(),
+            not_before_ms: 0,
+            target: ColdGcTarget::Paths(vec![path.to_owned()]),
+            cold_generation: None,
+            defer_attempts: 0,
+        }
+    }
+
+    #[test]
+    fn defer_moves_entry_to_tail_with_new_seq_and_backoff() {
+        let mut queue = ColdGcQueue::from_parts(vec![paths_entry(3, "a"), paths_entry(4, "b")], 5);
+        assert_eq!(queue.defer(3, 1_000), Some(5));
+        let order = queue
+            .entries()
+            .map(|entry| (entry.seq, entry.not_before_ms))
+            .collect::<Vec<_>>();
+        assert_eq!(order, vec![(4, 0), (5, 1_000)]);
+        assert_eq!(
+            queue.batch(2)[1].defer_attempts,
+            1,
+            "deferral counts an attempt"
+        );
+        assert_eq!(queue.defer(5, 2_000), Some(6));
+        assert_eq!(queue.batch(2)[1].defer_attempts, 2);
+        assert_eq!(queue.next_seq(), 7);
+        let mut queue = ColdGcQueue::from_parts(vec![paths_entry(3, "a"), paths_entry(4, "b")], 5);
+        assert_eq!(queue.defer(3, 1_000), Some(5));
+        assert_eq!(queue.next_seq(), 6);
+        // Acking the entry behind it must not pop the deferred one.
+        assert_eq!(queue.ack(4), 1);
+        assert_eq!(queue.len(), 1);
+        // Replay of the same deferral is a no-op.
+        assert_eq!(queue.defer(3, 1_000), None);
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn defer_never_shortens_an_existing_grace() {
+        let mut queue = ColdGcQueue::from_parts(
+            vec![ColdGcEntry {
+                not_before_ms: 9_000,
+                ..paths_entry(0, "a")
+            }],
+            1,
+        );
+        assert_eq!(queue.defer(0, 1_000), Some(1));
+        assert_eq!(queue.batch(1)[0].not_before_ms, 9_000);
+    }
+
     #[test]
     fn legacy_unattributed_gc_debt_blocks_every_bucket_proof() {
         let queue = ColdGcQueue::from_parts(
@@ -104,6 +201,8 @@ mod tests {
                 bucket_id: String::new(),
                 not_before_ms: 0,
                 target: ColdGcTarget::Paths(vec!["_packs/legacy.bin".to_owned()]),
+                cold_generation: None,
+                defer_attempts: 0,
             }],
             8,
         );

@@ -7,13 +7,13 @@ A stream is an append-only byte sequence addressed by a URL: `/{bucket}/{stream}
 
 ## Naming
 
-Stream IDs may contain any byte that is not `/`, `\0`, or `..`. Maximum stream ID length is 122 bytes, and the combined bucket-plus-stream path is also capped at 122 bytes. The literal name `streams` is reserved (it's the bucket-level listing endpoint).
+Stream IDs may contain any byte that is not `/`, `\0`, or `..`. Maximum stream ID length is 122 bytes, and the combined bucket-plus-stream path is also capped at 122 bytes. The literal name `streams` is reserved: `GET /{bucket}/streams` [lists the bucket's streams](/docs/api/list-streams).
 
 A workspace app might use `/workspace-a/doc-123`. An agent system might use `/agents/run-2026-05-13-abc`. Anything within the rules above is fair.
 
 ## Content type
 
-A stream's content type is set on creation (PUT) or on first append (POST) and defaults to `application/octet-stream` if no `Content-Type` header is supplied. Subsequent appends must declare the same content type, or the server rejects them with `400`. The content type rides along on reads so clients can dispatch on it without inspecting payloads.
+A stream's content type is set on creation (PUT) or on first append (POST) and defaults to `application/octet-stream` if no `Content-Type` header is supplied. Subsequent appends must declare the same content type, or the server rejects them with `409`. `application/json; profile=keyed-batch-v1` makes a [keyed stream](/docs/concepts/keyed-streams). The content type rides along on reads so clients can dispatch on it without inspecting payloads.
 
 ## Lifecycle
 

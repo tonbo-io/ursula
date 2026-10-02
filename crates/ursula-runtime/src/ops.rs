@@ -284,10 +284,31 @@ macro_rules! runtime_operations {
             }
             op PlanColdGc {
                 fields { max: usize }
-                reply { response_tx: Vec<ColdGcEntry> }
+                reply { response_tx: Vec<ColdGcPlanEntry> }
                 guard { none }
                 handle { call plan_cold_gc(engine, max, placement) }
                 client { group fn plan_cold_gc }
+            }
+            op RepairColdIndex {
+                fields { request: RepairColdIndexRequest }
+                reply { response_tx: RepairColdIndexResponse }
+                guard { none }
+                handle { call repair_cold_index(engine, request, placement) }
+                client { group fn repair_cold_index }
+            }
+            op PlanSharedRefCompaction {
+                fields { request: ursula_stream::SharedRefCompactionRequest }
+                reply { response_tx: Vec<ursula_stream::SharedRefCandidate> }
+                guard { none }
+                handle { call plan_shared_ref_compaction(engine, request, placement) }
+                client { group fn plan_shared_ref_compaction }
+            }
+            op PlanColdOrphanSweep {
+                fields { request: ColdOrphanSweepRequest }
+                reply { response_tx: ColdOrphanSweepPlan }
+                guard { none }
+                handle { call plan_cold_orphan_sweep(engine, request, placement) }
+                client { group fn plan_cold_orphan_sweep }
             }
             op BucketUsage {
                 fields {}
@@ -303,12 +324,61 @@ macro_rules! runtime_operations {
                 handle { call set_bucket_quota(engine, metrics, request, placement) }
                 client { pub group fn set_bucket_quota }
             }
+            op ListBucketStreams {
+                fields { request: ListBucketStreamsRequest }
+                reply { response_tx: Option<Vec<ursula_stream::BucketStreamListing>> }
+                guard { none }
+                handle { call list_bucket_streams(engine, metrics, request, placement) }
+                client { pub group fn list_bucket_streams }
+            }
+            op FeatureLevel {
+                fields {}
+                reply { response_tx: u32 }
+                guard { none }
+                handle { call feature_level(engine, metrics, placement) }
+                client { pub group fn feature_level }
+            }
+            op StateGauges {
+                fields {}
+                reply { response_tx: ursula_stream::GroupStateGauges }
+                guard { none }
+                handle { call state_gauges(engine, metrics, placement) }
+                client { pub group fn state_gauges }
+            }
+            op SetFeatureLevel {
+                fields { request: SetFeatureLevelRequest }
+                reply { response_tx: SetFeatureLevelResponse }
+                guard { none }
+                handle { call set_feature_level(engine, metrics, request, placement) }
+                client { pub group fn set_feature_level }
+            }
+            op OffloadColdRefs {
+                fields { request: crate::cold_refs::OffloadColdRefsRequest }
+                reply { response_tx: crate::cold_refs::OffloadColdRefsResponse }
+                guard { none }
+                handle { call offload_cold_refs(engine, metrics, request, placement) }
+                client { pub group fn offload_cold_refs }
+            }
+            op TidyStreams {
+                fields { request: TidyStreamsRequest }
+                reply { response_tx: TidyStreamsResponse }
+                guard { none }
+                handle { call tidy_streams(engine, metrics, request, placement) }
+                client { pub group fn tidy_streams }
+            }
             op AckColdGc {
                 fields { up_to_seq: u64 }
                 reply { response_tx: AckColdGcResponse }
                 guard { none }
                 handle { call ack_cold_gc(engine, up_to_seq, placement) }
                 client { group fn ack_cold_gc }
+            }
+            op DeferColdGc {
+                fields { seq: u64, not_before_ms: u64 }
+                reply { response_tx: DeferColdGcResponse }
+                guard { none }
+                handle { call defer_cold_gc(engine, seq, not_before_ms, placement) }
+                client { group fn defer_cold_gc }
             }
             op PurgeBucket {
                 fields { bucket_id: String }

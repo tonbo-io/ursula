@@ -4364,12 +4364,15 @@ dependencies = [
  "chrono",
  "clap",
  "console-subscriber",
+ "criterion",
  "flate2",
  "fs4",
  "futures-util",
  "madsim",
+ "memchr",
  "openraft",
  "opentelemetry",
+ "proptest",
  "reqwest",
  "rmp-serde",
  "serde",
@@ -4385,6 +4388,7 @@ dependencies = [
  "tracing",
  "url",
  "ursula-config",
+ "ursula-ctl",
  "ursula-gateway",
  "ursula-index",
  "ursula-observability",
@@ -4490,6 +4494,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "axum 0.8.9",
+ "base64 0.22.1",
  "blake3",
  "bytes",
  "chrono",
@@ -4497,8 +4502,11 @@ dependencies = [
  "criterion",
  "foyer",
  "futures-util",
+ "getrandom 0.3.4",
+ "madsim-tokio",
  "opendal",
  "parquet",
+ "proptest",
  "reqwest",
  "serde",
  "serde_json",
@@ -4506,8 +4514,11 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tower 0.5.3",
+ "tower-http",
  "tracing",
+ "url",
  "ursula-observability",
+ "ursula-shard",
 ]
 
 [[package]]
@@ -4540,6 +4551,7 @@ name = "ursula-raft"
 version = "0.5.1"
 dependencies = [
  "bitflags",
+ "blake3",
  "bytes",
  "criterion",
  "fs4",
@@ -4556,6 +4568,7 @@ dependencies = [
  "rand 0.10.1",
  "rmp-serde",
  "serde",
+ "serde_bytes",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
@@ -4585,6 +4598,7 @@ dependencies = [
  "futures-util",
  "madsim-tokio",
  "opendal",
+ "rmp-serde",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -4620,10 +4634,31 @@ dependencies = [
  "tracing",
  "ursula",
  "ursula-ctl",
+ "ursula-index",
  "ursula-observability",
  "ursula-raft",
  "ursula-runtime",
  "ursula-shard",
+]
+
+[[package]]
+name = "ursula-state-probe"
+version = "0.5.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "bytes",
+ "clap",
+ "prost 0.13.5",
+ "serde",
+ "serde_json",
+ "tokio",
+ "ursula-proto",
+ "ursula-raft",
+ "ursula-runtime",
+ "ursula-shard",
+ "ursula-stream",
+ "zstd",
 ]
 
 [[package]]
@@ -4633,6 +4668,7 @@ dependencies = [
  "blake3",
  "bytes",
  "criterion",
+ "memchr",
  "proptest",
  "serde",
  "serde_json",

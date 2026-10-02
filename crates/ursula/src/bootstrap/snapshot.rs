@@ -3,96 +3,55 @@ use std::time::Duration;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGroupMetricsSnapshot;
+use ursula_raft::snapshot_cadence::GroupLogProgress;
+use ursula_raft::snapshot_cadence::SnapshotCadence;
+use ursula_raft::snapshot_cadence::SnapshotPlan;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::default_snapshot_store;
 use ursula_shard::RaftGroupId;
 
+/// Default driver interval: 5 s with an external snapshot store, whose
+/// health the driver probes every tick, and 1 s inline. `Some(0)` disables
+/// the driver, and OpenRaft's entry-count policy runs instead.
 pub(crate) fn resolve_snapshot_drive_interval_ms(
     configured: Option<usize>,
     snapshot_store_configured: bool,
 ) -> usize {
-    configured.unwrap_or(if snapshot_store_configured { 5_000 } else { 0 })
+    configured.unwrap_or(if snapshot_store_configured {
+        5_000
+    } else {
+        1_000
+    })
 }
 
-pub(crate) fn next_snapshot_to_drive(
-    snapshots: &[RaftGroupMetricsSnapshot],
-    next_pos: usize,
-    logs_since_last: u64,
-) -> Option<(usize, &RaftGroupMetricsSnapshot)> {
-    if snapshots.is_empty() {
-        return None;
+/// One group's log progress as the driver sees it (F12e): the state
+/// machine's log gauge, plus OpenRaft's view of whether a snapshot exists.
+/// A group with no applied state reports no log, so it is never due: an
+/// empty in-memory node must not publish a `group-X-empty` snapshot.
+pub(crate) fn group_log_progress(snapshot: &RaftGroupMetricsSnapshot) -> GroupLogProgress {
+    if snapshot.last_applied.is_none() {
+        return GroupLogProgress::default();
     }
-    let start = next_pos % snapshots.len();
-    snapshots
-        .iter()
-        .enumerate()
-        .cycle()
-        .skip(start)
-        .take(snapshots.len())
-        .find(|(_, snapshot)| should_drive_snapshot_for_group(snapshot, logs_since_last))
+    let mut progress = snapshot.log;
+    progress.has_snapshot |= snapshot.snapshot.is_some();
+    progress
 }
 
-pub(crate) fn should_drive_snapshot_for_group(
-    snapshot: &RaftGroupMetricsSnapshot,
-    logs_since_last: u64,
-) -> bool {
-    // An empty in-memory raft node has no applied state yet; triggering a
-    // manual snapshot there publishes a `group-X-empty` object that cannot be a
-    // valid recovery source for an existing group.
-    let Some(last_applied) = snapshot.last_applied else {
-        return false;
-    };
-    let Some(current) = snapshot.snapshot else {
-        // Establish the first recoverable external snapshot as soon as a group
-        // has applied state. Subsequent snapshots must amortize the configured
-        // number of replicated logs.
-        return true;
-    };
-    last_applied.index.saturating_sub(current.index) >= logs_since_last.max(1)
-}
-
-pub(crate) fn unpurged_log_entries(snapshot: &RaftGroupMetricsSnapshot) -> u64 {
-    let Some(last_log_index) = snapshot.last_log_index else {
-        return 0;
-    };
-    snapshot.purged.map_or_else(
-        || last_log_index.saturating_add(1),
-        |purged| last_log_index.saturating_sub(purged.index),
-    )
-}
-
-fn snapshot_advance_entries(snapshot: &RaftGroupMetricsSnapshot) -> u64 {
-    let Some(last_applied) = snapshot.last_applied else {
-        return 0;
-    };
-    snapshot.snapshot.map_or_else(
-        || last_applied.index.saturating_add(1),
-        |current| last_applied.index.saturating_sub(current.index),
-    )
-}
-
-pub(crate) fn pressure_snapshot_groups(
-    snapshots: &[RaftGroupMetricsSnapshot],
+/// Groups to snapshot this tick under the byte-based cadence (F12e).
+pub(crate) fn plan_snapshot_drive<'a>(
+    snapshots: &'a [RaftGroupMetricsSnapshot],
+    cadence: &SnapshotCadence,
     max_groups: usize,
-) -> Vec<&RaftGroupMetricsSnapshot> {
-    let mut candidates = snapshots
+) -> (SnapshotPlan, Vec<&'a RaftGroupMetricsSnapshot>) {
+    let progress = snapshots.iter().map(group_log_progress).collect::<Vec<_>>();
+    let plan = cadence.plan(&progress, max_groups.max(1));
+    let selected = plan
+        .groups
         .iter()
-        .filter_map(|snapshot| {
-            let advance = snapshot_advance_entries(snapshot);
-            (advance > 0).then_some((advance, snapshot))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_unstable_by(|(left_advance, left), (right_advance, right)| {
-        right_advance
-            .cmp(left_advance)
-            .then_with(|| left.raft_group_id.cmp(&right.raft_group_id))
-    });
-    candidates
-        .into_iter()
-        .take(max_groups)
-        .map(|(_, snapshot)| snapshot)
-        .collect()
+        .filter_map(|index| snapshots.get(*index))
+        .collect();
+    (plan, selected)
 }
 
 /// Config-driven snapshot driver. Reads parameters from typed config.
@@ -102,13 +61,15 @@ pub fn spawn_snapshot_driver(
     snapshot_store: Option<SharedSnapshotStore>,
     s3_cfg: Option<&ursula_config::S3Config>,
     interval_ms: usize,
-    logs_since_last: u64,
-    pressure_unpurged_logs: u64,
-    pressure_max_groups_per_tick: usize,
+    cadence: SnapshotCadence,
+    max_groups_per_tick: usize,
 ) {
     if interval_ms == 0 {
         return;
     }
+    // Only an external store is probed; inline snapshots depend on nothing
+    // outside the node, so the inline driver never sheds leadership.
+    let external_store = snapshot_store.is_some();
     let snapshot_store = snapshot_store.unwrap_or_else(default_snapshot_store);
     let probe_timeout = Duration::from_millis(
         s3_cfg
@@ -125,17 +86,20 @@ pub fn spawn_snapshot_driver(
         let mut consecutive_good = 0usize;
         let mut yielded = false;
         let mut last_flush_errors = runtime.metrics().snapshot().cold_flush_write_errors;
-        let mut next_snapshot_drive_pos = 0usize;
         loop {
             let snaps = registry.metrics_snapshot();
-            let probe_healthy = matches!(
-                tokio::time::timeout(probe_timeout, snapshot_store.health_check()).await,
-                Ok(Ok(()))
-            );
-            let flush_errors_now = runtime.metrics().snapshot().cold_flush_write_errors;
-            let flush_failing = flush_errors_now > last_flush_errors;
-            last_flush_errors = flush_errors_now;
-            let bad_tick = !probe_healthy || flush_failing;
+            let bad_tick = if external_store {
+                let probe_healthy = matches!(
+                    tokio::time::timeout(probe_timeout, snapshot_store.health_check()).await,
+                    Ok(Ok(()))
+                );
+                let flush_errors_now = runtime.metrics().snapshot().cold_flush_write_errors;
+                let flush_failing = flush_errors_now > last_flush_errors;
+                last_flush_errors = flush_errors_now;
+                !probe_healthy || flush_failing
+            } else {
+                false
+            };
             if bad_tick {
                 consecutive_bad += 1;
                 consecutive_good = 0;
@@ -179,43 +143,28 @@ pub fn spawn_snapshot_driver(
             }
 
             if !bad_tick {
-                let unpurged_logs = snaps
-                    .iter()
-                    .map(unpurged_log_entries)
-                    .fold(0u64, u64::saturating_add);
-                if unpurged_logs >= pressure_unpurged_logs.max(1) {
-                    let candidates =
-                        pressure_snapshot_groups(&snaps, pressure_max_groups_per_tick.max(1));
-                    let mut triggered = 0u64;
-                    for snapshot in candidates {
-                        let gid = snapshot.raft_group_id;
-                        let Some(raft) = registry.get(RaftGroupId(gid)) else {
-                            continue;
-                        };
-                        match raft.trigger().snapshot().await {
-                            Ok(()) => triggered = triggered.saturating_add(1),
-                            Err(err) => tracing::error!(
-                                "snapshot pressure driver trigger group {gid} error: {err}"
-                            ),
+                let (plan, selected) = plan_snapshot_drive(&snaps, &cadence, max_groups_per_tick);
+                let mut triggered = 0u64;
+                for snapshot in selected {
+                    let gid = snapshot.raft_group_id;
+                    let Some(raft) = registry.get(RaftGroupId(gid)) else {
+                        continue;
+                    };
+                    match raft.trigger().snapshot().await {
+                        Ok(()) => triggered = triggered.saturating_add(1),
+                        Err(err) => {
+                            tracing::error!("snapshot driver trigger group {gid} error: {err}")
                         }
                     }
+                }
+                if plan.pressure {
                     runtime.metrics().record_raft_snapshot_pressure(triggered);
                     tracing::info!(
-                        unpurged_logs,
-                        pressure_unpurged_logs,
+                        node_log_bytes = plan.node_log_bytes,
+                        node_log_budget = cadence.node_budget_bytes,
                         triggered,
                         "raft snapshot pressure pass completed"
                     );
-                } else if let Some((pos, snapshot)) =
-                    next_snapshot_to_drive(&snaps, next_snapshot_drive_pos, logs_since_last)
-                {
-                    next_snapshot_drive_pos = pos.wrapping_add(1);
-                    if let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) {
-                        let gid = snapshot.raft_group_id;
-                        if let Err(err) = raft.trigger().snapshot().await {
-                            tracing::error!("snapshot driver trigger group {gid} error: {err}");
-                        }
-                    }
                 }
             }
 

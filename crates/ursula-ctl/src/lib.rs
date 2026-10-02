@@ -14,16 +14,21 @@
 //! - [`observe`]: read-only status and cluster-wide readiness reporting.
 //! - [`plan`]: pure drain planning and per-node readiness checks.
 //! - [`backup`]: verifiable cluster backup, verification, and restore.
+//! - [`feature`]: replicated group feature levels (`cluster enable-feature`).
 //! - [`maintenance`]: node-maintenance verbs (drain, restart repair, catch-up).
 //! - [`provider`]: cluster manifest loading and node addressing.
 
 pub mod backup;
+pub mod feature;
 pub mod maintenance;
 pub mod metrics;
 pub mod observe;
 pub mod plan;
 pub mod provider;
 
+pub use feature::EnableFeatureOptions;
+pub use feature::EnableFeatureOutcome;
+pub use feature::enable_feature;
 pub use maintenance::CatchUpOptions;
 pub use maintenance::CatchUpOutcome;
 pub use maintenance::DrainOptions;

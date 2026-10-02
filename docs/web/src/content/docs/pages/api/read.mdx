@@ -32,7 +32,7 @@ api: "GET /{bucket}/{stream}"
 </ParamField>
 
 <ParamField query="max_records" type="number">
- Maximum number of complete records to return. Requires `record` or `tail_records` and cannot be combined with `max_bytes`.
+ Maximum number of complete records to return. Requires `record` or `tail_records`. May be combined with `max_bytes`; the response stops at whichever limit is reached first.
 </ParamField>
 
 <ParamField query="record_view" type="string">
@@ -44,7 +44,9 @@ api: "GET /{bucket}/{stream}"
 </ParamField>
 
 <ParamField query="max_bytes" type="number">
- Maximum bytes to read in one response or SSE data batch. For UTF-8 SSE data, Ursula may shorten the emitted batch so `Stream-Next-Offset` lands on a valid text boundary.
+ On an offset read, the maximum bytes to read in one response or SSE data batch. For UTF-8 SSE data, Ursula may shorten the emitted batch so `Stream-Next-Offset` lands on a valid text boundary.
+
+ With `record` or `tail_records`, a positive integer that bounds complete records instead: the response holds the longest run of whole records whose stored size (each message plus its LF) is at most `max_bytes`, and always at least one record when one exists, even if it alone is larger. It never ends inside a record.
 </ParamField>
 
 ## Read modes
@@ -58,7 +60,7 @@ api: "GET /{bucket}/{stream}"
     ```
  </Tab>
  <Tab title="Long-poll">
- `live=long-poll`. Returns immediately if data is available, otherwise holds the connection until new data arrives or a ~3 second timeout.
+ `live=long-poll`. Returns immediately if data is available, otherwise holds the connection until new data arrives or `timeout_ms` elapses (default 1000, at most 60000).
 
     ```bash
     curl 'http://127.0.0.1:4437/demo/hello?offset=42&live=long-poll'
@@ -85,9 +87,11 @@ api: "GET /{bucket}/{stream}"
 
 Response headers include `Stream-Next-Offset`, `Stream-Cursor`, `ETag`, `Stream-Up-To-Date`, `Stream-Closed`, and `Content-Type`.
 
-Record-aware responses also advertise `json-record-coordinates-v1` in `Stream-Extensions` and include `Stream-Record-First`, `Stream-Record-Start`, and `Stream-Record-Next`. Continue with `record=<Stream-Record-Next>`. A record below `Stream-Record-First` returns `410`, and a record beyond the current tail returns `400`.
+Record-aware responses also advertise `json-record-coordinates-v1` in `Stream-Extensions` and include `Stream-Record-First`, `Stream-Record-Start`, and `Stream-Record-Next`. Continue with `record=<Stream-Record-Next>`. A record below `Stream-Record-First` returns `410`, and a record beyond the current tail returns `400`. On a [keyed stream](/docs/concepts/keyed-streams), `Stream-Extensions` also contains `keyed-batch-v1`.
 
-Streams written with `Content-Type: application/json` are returned as newline-delimited JSON with response `Content-Type: application/x-ndjson`. `max_bytes` applies to the encoded byte stream, so a response can end mid-line. Resume from `Stream-Next-Offset` and buffer any incomplete trailing line before parsing. `HEAD` reports the configured stream content type, while read responses report the wire representation.
+Releases before record-aware `max_bytes` reject it with `400`. A node that advertises `keyed-state-v1` for a stream always supports it on that stream.
+
+Streams written with `Content-Type: application/json` are returned as newline-delimited JSON with response `Content-Type: application/x-ndjson`, one stored message per line, exactly as written minus insignificant whitespace ([JSON message text](/docs/specs/extensions#json-message-text)). On an offset read, `max_bytes` applies to the encoded byte stream, so a response can end mid-line. Resume from `Stream-Next-Offset` and buffer any incomplete trailing line before parsing. `HEAD` reports the configured stream content type, while read responses report the wire representation.
 
 ## SSE event format
 
@@ -112,6 +116,10 @@ curl 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
 
 ```bash Read complete JSON records
 curl -i 'http://127.0.0.1:4437/demo/hello?record=42&max_records=100'
+```
+
+```bash Read complete JSON records, at most 16 MiB
+curl -i 'http://127.0.0.1:4437/demo/hello?record=42&max_bytes=16777216'
 ```
 
 ```bash Read the latest JSON records with ordinals

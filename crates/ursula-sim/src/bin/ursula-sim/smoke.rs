@@ -309,6 +309,20 @@ struct SeedFamily {
 /// `end` fields) for the seed-inventory audit; keep the field layout intact.
 const SEED_FAMILIES: &[SeedFamily] = &[
     SeedFamily {
+        name: "keyed-indexer",
+        start: 600,
+        end: 605,
+        kind: "keyed-indexer",
+        generate: SimSchedule::generate_keyed_indexer,
+    },
+    SeedFamily {
+        name: "keyed-indexer-extended",
+        start: 600,
+        end: 1399,
+        kind: "keyed-indexer",
+        generate: SimSchedule::generate_keyed_indexer,
+    },
+    SeedFamily {
         name: "runtime-interleaving",
         start: 72,
         end: 96,

@@ -36,6 +36,8 @@ use crate::core_worker::ReadWatchers;
 use crate::error::ErrorStatus;
 use crate::metrics::RuntimeMetricsInner;
 
+const R: u64 = ursula_stream::HOT_RECORD_OVERHEAD_BYTES;
+
 fn runtime(core_count: usize, group_count: usize) -> ShardRuntime {
     ShardRuntime::spawn(test_config(core_count, group_count, 128)).expect("spawn runtime")
 }
@@ -78,6 +80,7 @@ fn read_req(stream_id: BucketStreamId, offset: u64, max_len: usize) -> ReadStrea
         record: None,
         max_records: None,
         leader_only: false,
+        record_anchor: None,
     }
 }
 
@@ -367,6 +370,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             already_exists: false,
             group_commit_index: 1,
             record_range: None,
+            hot_backlog: Some(crate::request::WriteHotBacklog::default()),
         })
     );
 
@@ -397,14 +401,17 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             deduplicated: false,
             producer: None,
             record_range: None,
-            stream_hot_bytes: 3,
-            group_hot_bytes: 3,
+            // F6c: real hot bytes, payload plus one record's overhead.
+            stream_hot_bytes: 3 + R,
+            group_hot_bytes: 3 + R,
+            receipt_evicted: false,
         })
     );
 
     let flushed = engine
         .apply_committed_write(
             GroupWriteCommand::Stream(StreamCommand::FlushCold {
+                cold_generation: None,
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -423,6 +430,13 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             placement,
             hot_start_offset: 2,
             group_commit_index: 3,
+            // F6a: the write response carries the backlog it left. The
+            // clipped record [2, 3) still costs one record's overhead (F6c),
+            // as a replica restored from a snapshot counts it.
+            hot_backlog: Some(crate::request::WriteHotBacklog {
+                stream_hot_bytes: 1 + R,
+                group_hot_bytes: 1 + R,
+            }),
         })
     );
 
@@ -486,6 +500,7 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
     engine
         .flush_cold(
             FlushColdRequest {
+                cold_generation: None,
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -535,13 +550,26 @@ async fn cold_index_read_materializes_overlapping_flush_objects_once() {
         .write_chunk(&second.s3_path, b"cdef")
         .await
         .expect("write second cold object");
+    // Pages written before the clip rule (bounded-state F19) can hold
+    // overlapping chunk entries; the clip rule now removes them on write, so
+    // the legacy page is stored directly.
     let page_store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-    write_cold_chunk_index_pages(&page_store, &stream, &first)
+    page_store
+        .put_page(
+            &ColdIndexPageKey {
+                stream_id: stream.clone(),
+                generation: 0,
+                page_id: 0,
+            },
+            &ColdIndexPage {
+                start_offset: 0,
+                end_offset: ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES,
+                cold_chunks: vec![first, second],
+                external_segments: Vec::new(),
+            },
+        )
         .await
-        .expect("index first cold object");
-    write_cold_chunk_index_pages(&page_store, &stream, &second)
-        .await
-        .expect("index overlapping cold object");
+        .expect("store legacy page with overlapping cold objects");
     let cache = Arc::new(ColdIndexPageCache::new(Arc::new(page_store), 8));
     let plan = StreamReadPlan {
         offset: 0,
@@ -556,6 +584,7 @@ async fn cold_index_read_materializes_overlapping_flush_objects_once() {
         up_to_date: true,
         closed: false,
         retained_record_range: None,
+        record_trim: None,
         record_range: None,
     };
 
@@ -568,6 +597,84 @@ async fn cold_index_read_materializes_overlapping_flush_objects_once() {
     .await
     .expect("materialize overlapping cold objects");
     assert_eq!(payload, b"abcdef");
+}
+
+/// RT2: a cached cold-index page can name a chunk that a compaction already
+/// replaced and garbage-collected. The read refreshes the page once on a
+/// missing object instead of failing until the page is evicted.
+#[tokio::test]
+async fn cold_read_refreshes_page_when_its_object_was_collected() {
+    let stream = BucketStreamId::new("benchcmp", "collected-cold-read");
+    let cold_store = Arc::new(memory_cold_store());
+    let old = ColdChunkRef {
+        start_offset: 0,
+        end_offset: 4,
+        s3_path: "benchcmp/collected-cold-read/chunks/old.bin".to_owned(),
+        object_size: 4,
+        ..Default::default()
+    };
+    let replacement = ColdChunkRef {
+        s3_path: "benchcmp/collected-cold-read/chunks/replacement.bin".to_owned(),
+        ..old.clone()
+    };
+    cold_store
+        .write_chunk(&old.s3_path, b"abcd")
+        .await
+        .expect("write old cold object");
+    let page_store = Arc::new(ColdStoreColdIndexPageStore::new(cold_store.clone()));
+    let key = ColdIndexPageKey {
+        stream_id: stream.clone(),
+        generation: 0,
+        page_id: 0,
+    };
+    let page = |chunk: ColdChunkRef| ColdIndexPage {
+        start_offset: 0,
+        end_offset: ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES,
+        cold_chunks: vec![chunk],
+        external_segments: Vec::new(),
+    };
+    page_store
+        .put_page(&key, &page(old.clone()))
+        .await
+        .expect("store old page");
+    let cache = Arc::new(ColdIndexPageCache::new(page_store.clone(), 8));
+    let plan = StreamReadPlan {
+        offset: 0,
+        next_offset: 4,
+        content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+        segments: vec![StreamReadSegment::ColdIndex(StreamReadColdIndexSegment {
+            generation: 0,
+            page_id: 0,
+            read_start_offset: 0,
+            len: 4,
+        })],
+        up_to_date: true,
+        closed: false,
+        retained_record_range: None,
+        record_trim: None,
+        record_range: None,
+    };
+    let read = || {
+        InMemoryGroupEngine::read_payload_from_plan(Some(&cold_store), Some(&cache), &stream, &plan)
+    };
+    assert_eq!(read().await.expect("read old chunk"), b"abcd");
+
+    // Compaction rewrites the page and GC deletes the input chunk; this
+    // cache missed the invalidation and still holds the old page.
+    cold_store
+        .write_chunk(&replacement.s3_path, b"abcd")
+        .await
+        .expect("write replacement");
+    page_store
+        .put_page(&key, &page(replacement))
+        .await
+        .expect("rewrite page");
+    cold_store
+        .delete_chunk(&old.s3_path)
+        .await
+        .expect("collect old chunk");
+
+    assert_eq!(read().await.expect("read after collection"), b"abcd");
 }
 
 #[tokio::test]
@@ -606,6 +713,7 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
     engine
         .flush_cold(
             FlushColdRequest {
+                cold_generation: None,
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -623,6 +731,7 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
     let stale_flush = engine
         .flush_cold(
             FlushColdRequest {
+                cold_generation: None,
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -788,8 +897,170 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
     assert!(entry.external_segments.is_empty());
 }
 
+/// bounded-stream-state F11: bootstrap plans one read window for all hot
+/// updates instead of one plan per message (O(hot records²) before).
 #[tokio::test]
-async fn bootstrap_reads_retained_updates_from_cold_chunk_after_snapshot() {
+async fn bootstrap_issues_one_read_plan_for_all_updates() {
+    let placement = placement();
+    let stream = BucketStreamId::new("benchcmp", "bootstrap-one-plan");
+    let mut engine = InMemoryGroupEngine::default();
+    engine
+        .create_stream(
+            CreateStreamRequest::new(stream.clone(), DEFAULT_CONTENT_TYPE),
+            placement,
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("create stream");
+    let payloads = (0..64)
+        .map(|index| format!("message-{index}").into_bytes())
+        .collect::<Vec<_>>();
+    for payload in &payloads {
+        engine
+            .append(
+                AppendRequest::from_bytes(stream.clone(), payload.clone()),
+                placement,
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .expect("append");
+    }
+
+    let plans_before = engine.bootstrap_read_plans;
+    let bootstrap = engine
+        .bootstrap_stream(
+            BootstrapStreamRequest {
+                stream_id: stream.clone(),
+                now_ms: 0,
+            },
+            placement,
+        )
+        .await
+        .expect("bootstrap");
+    assert_eq!(engine.bootstrap_read_plans - plans_before, 1);
+    assert!(bootstrap.up_to_date);
+    assert_eq!(bootstrap.updates.len(), payloads.len());
+    let mut offset = 0u64;
+    for (update, payload) in bootstrap.updates.iter().zip(&payloads) {
+        assert_eq!(&update.payload, payload);
+        assert_eq!(update.start_offset, offset);
+        offset += u64::try_from(payload.len()).expect("len fits u64");
+        assert_eq!(update.next_offset, offset);
+    }
+    assert_eq!(bootstrap.next_offset, offset);
+}
+
+/// bounded-stream-state F4b (feature level 4): without message records,
+/// bootstrap derives one part per message from the hot append starts. A
+/// flush that splits a message leaves no exact boundary before the next one,
+/// so bootstrap from below it is an honest partial; from the next message
+/// start it is exact again.
+#[tokio::test]
+async fn bootstrap_at_level_4_is_exact_per_message_or_an_honest_partial() {
+    let placement = placement();
+    let stream = BucketStreamId::new("benchcmp", "bootstrap-lb4");
+    let mut engine = InMemoryGroupEngine::default();
+    assert!(matches!(
+        engine
+            .state_machine
+            .apply(ursula_stream::StreamCommand::SetFeatureLevel {
+                level: ursula_stream::FEATURE_LEVEL_HOT_REPRESENTATION,
+            }),
+        ursula_stream::StreamResponse::FeatureLevelSet { .. }
+    ));
+    engine
+        .create_stream(
+            CreateStreamRequest::new(stream.clone(), DEFAULT_CONTENT_TYPE),
+            placement,
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("create stream");
+    for payload in [b"aaaa".as_slice(), b"bbbb", b"cccc"] {
+        engine
+            .append(
+                AppendRequest::from_bytes(stream.clone(), payload.to_vec()),
+                placement,
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .expect("append");
+    }
+    async fn bootstrap(
+        engine: &mut InMemoryGroupEngine,
+        stream: &BucketStreamId,
+        placement: ShardPlacement,
+    ) -> BootstrapStreamResponse {
+        engine
+            .bootstrap_stream(
+                BootstrapStreamRequest {
+                    stream_id: stream.clone(),
+                    now_ms: 0,
+                },
+                placement,
+            )
+            .await
+            .expect("bootstrap")
+    }
+    let all = bootstrap(&mut engine, &stream, placement).await;
+    assert!(all.up_to_date);
+    let parts = all
+        .updates
+        .iter()
+        .map(|update| update.payload.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(parts, vec![
+        b"aaaa".to_vec(),
+        b"bbbb".to_vec(),
+        b"cccc".to_vec()
+    ]);
+
+    engine
+        .flush_cold(
+            FlushColdRequest {
+                cold_generation: None,
+                stream_id: stream.clone(),
+                chunk: ColdChunkRef {
+                    start_offset: 0,
+                    end_offset: 6,
+                    s3_path: "benchcmp/bootstrap-lb4/chunks/000000.bin".to_owned(),
+                    object_size: 6,
+                    ..Default::default()
+                },
+            },
+            placement,
+        )
+        .await
+        .expect("flush into the second message");
+    let partial = bootstrap(&mut engine, &stream, placement).await;
+    assert!(partial.updates.is_empty());
+    assert!(!partial.up_to_date);
+    assert_eq!(partial.next_offset, 0);
+
+    engine
+        .publish_snapshot(
+            PublishSnapshotRequest {
+                stream_id: stream.clone(),
+                snapshot_offset: 8,
+                content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+                payload: Bytes::from_static(b"state"),
+                expected_digest: None,
+                now_ms: 0,
+            },
+            placement,
+        )
+        .await
+        .expect("publish snapshot at the third message");
+    let exact = bootstrap(&mut engine, &stream, placement).await;
+    assert!(exact.up_to_date);
+    assert_eq!(exact.snapshot_offset, Some(8));
+    assert_eq!(exact.updates.len(), 1);
+    assert_eq!(exact.updates[0].payload, b"cccc");
+    assert_eq!(exact.next_offset, 12);
+}
+
+#[tokio::test]
+async fn bootstrap_returns_honest_partial_when_updates_after_snapshot_are_cold() {
     let placement = placement();
     let stream = BucketStreamId::new("benchcmp", "cold-bootstrap");
     let cold_store = Arc::new(memory_cold_store());
@@ -826,6 +1097,7 @@ async fn bootstrap_reads_retained_updates_from_cold_chunk_after_snapshot() {
     engine
         .flush_cold(
             FlushColdRequest {
+                cold_generation: None,
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -871,6 +1143,53 @@ async fn bootstrap_reads_retained_updates_from_cold_chunk_after_snapshot() {
         .expect("read retained update from cold chunk");
     assert_eq!(read.payload, b"de");
 
+    // The update after the snapshot is only in cold storage, so bootstrap
+    // returns the snapshot alone and sends the client back to an ordinary
+    // read from the snapshot offset (the read above).
+    let bootstrap = engine
+        .bootstrap_stream(
+            BootstrapStreamRequest {
+                stream_id: stream.clone(),
+                now_ms: 0,
+            },
+            placement,
+        )
+        .await
+        .expect("bootstrap");
+    assert_eq!(bootstrap.snapshot_offset, Some(3));
+    assert_eq!(bootstrap.snapshot_payload, b"abc-state");
+    assert!(bootstrap.updates.is_empty());
+    assert_eq!(bootstrap.next_offset, 3);
+    assert!(!bootstrap.up_to_date);
+    assert!(!bootstrap.closed);
+
+    // Messages appended after the flush stay hot. Once a snapshot sits at
+    // the cold frontier boundary, bootstrap is complete again with one part
+    // per message.
+    for payload in [b"fg".as_slice(), b"hij".as_slice()] {
+        engine
+            .append(
+                AppendRequest::from_bytes(stream.clone(), payload.to_vec()),
+                placement,
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .expect("append hot message");
+    }
+    engine
+        .publish_snapshot(
+            PublishSnapshotRequest {
+                stream_id: stream.clone(),
+                snapshot_offset: 7,
+                content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+                payload: Bytes::from_static(b"abcdefg-state"),
+                expected_digest: None,
+                now_ms: 0,
+            },
+            placement,
+        )
+        .await
+        .expect("publish hot snapshot");
     let bootstrap = engine
         .bootstrap_stream(
             BootstrapStreamRequest {
@@ -881,13 +1200,13 @@ async fn bootstrap_reads_retained_updates_from_cold_chunk_after_snapshot() {
         )
         .await
         .expect("bootstrap");
-    assert_eq!(bootstrap.snapshot_offset, Some(3));
-    assert_eq!(bootstrap.snapshot_payload, b"abc-state");
-    assert_eq!(bootstrap.next_offset, 5);
+    assert_eq!(bootstrap.snapshot_offset, Some(7));
+    assert_eq!(bootstrap.next_offset, 10);
+    assert!(bootstrap.up_to_date);
     assert_eq!(bootstrap.updates.len(), 1);
-    assert_eq!(bootstrap.updates[0].start_offset, 3);
-    assert_eq!(bootstrap.updates[0].next_offset, 5);
-    assert_eq!(bootstrap.updates[0].payload, b"de");
+    assert_eq!(bootstrap.updates[0].start_offset, 7);
+    assert_eq!(bootstrap.updates[0].next_offset, 10);
+    assert_eq!(bootstrap.updates[0].payload, b"hij");
 }
 
 #[tokio::test]
@@ -986,6 +1305,7 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
                 record: None,
                 max_records: None,
                 leader_only: false,
+                record_anchor: None,
             },
             placement,
         )
@@ -1030,6 +1350,7 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
                 record: None,
                 max_records: None,
                 leader_only: false,
+                record_anchor: None,
             },
             placement,
         )
@@ -1599,6 +1920,8 @@ async fn install_group_snapshot_rejects_mismatched_placement_before_routing() {
             shared_cold_object_owners: Vec::new(),
             bucket_usage: Vec::new(),
             bucket_quotas: Vec::new(),
+            feature_level: 0,
+            last_created_at_ms: 0,
         },
         stream_append_counts: Vec::new(),
     };
@@ -1941,6 +2264,7 @@ async fn flush_cold_publishes_chunk_metadata_on_owner_group() {
 
     let flushed = runtime
         .flush_cold(FlushColdRequest {
+            cold_generation: None,
             stream_id: stream.clone(),
             chunk: ColdChunkRef {
                 start_offset: 0,
@@ -2024,6 +2348,8 @@ async fn flush_cold_group_batch_once_publishes_multiple_chunks() {
                 min_hot_bytes: 1,
                 max_flush_bytes: 1,
                 max_batch_bytes: 4,
+                pressure: None,
+                max_hot_age: None,
             },
             4,
         )
@@ -2109,6 +2435,8 @@ async fn packed_cold_object_survives_until_last_stream_is_deleted() {
                 min_hot_bytes: 4,
                 max_flush_bytes: 4,
                 max_batch_bytes: 8,
+                pressure: None,
+                max_hot_age: None,
             },
             8,
         )
@@ -2192,6 +2520,8 @@ async fn cold_packs_are_bucket_scoped_erasure_domains_within_one_raft_group() {
                 min_hot_bytes: 4,
                 max_flush_bytes: 4,
                 max_batch_bytes: 16,
+                pressure: None,
+                max_hot_age: None,
             },
             16,
         )
@@ -2252,6 +2582,86 @@ async fn cold_packs_are_bucket_scoped_erasure_domains_within_one_raft_group() {
     );
 }
 
+async fn node_hot_bytes(runtime: &ShardRuntime, group_count: u32) -> u64 {
+    let mut total = 0u64;
+    for group_id in 0..group_count {
+        let snapshot = runtime
+            .snapshot_group(RaftGroupId(group_id))
+            .await
+            .expect("snapshot group");
+        total += snapshot
+            .stream_snapshot
+            .streams
+            .iter()
+            .map(|entry| u64::try_from(entry.payload.len()).expect("len fits u64"))
+            .sum::<u64>();
+    }
+    total
+}
+
+/// bounded-stream-state F10: node pressure with many small groups (each far
+/// below flush_size) brings node hot bytes under three quarters of the
+/// watermark by draining the largest streams, instead of being a no-op for
+/// small groups or flushing every stream that holds a byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn node_pressure_drains_small_groups_below_the_watermark() {
+    const GROUPS: u32 = 8;
+    const FLUSH_SIZE: usize = 8 * 1024;
+    const WATERMARK: u64 = 10 * 1024;
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(RuntimeConfig::new(2, GROUPS as usize), cold_store);
+    for group_id in 0..GROUPS {
+        for (index, len) in [256usize, 512, 768].into_iter().enumerate() {
+            let stream = stream_on_group(
+                &runtime,
+                RaftGroupId(group_id),
+                &format!("pressure-{index}"),
+            );
+            create_stream(&runtime, &stream).await;
+            append_bytes(&runtime, &stream, &vec![b'p'; len]).await;
+        }
+    }
+    let before = node_hot_bytes(&runtime, GROUPS).await;
+    assert_eq!(before, u64::from(GROUPS) * 1536);
+    assert!(before >= WATERMARK);
+
+    // Without pressure, groups far below flush_size plan nothing.
+    let request = PlanGroupColdFlushRequest {
+        min_hot_bytes: FLUSH_SIZE,
+        max_flush_bytes: FLUSH_SIZE,
+        max_batch_bytes: FLUSH_SIZE,
+        pressure: None,
+        max_hot_age: None,
+    };
+    assert_eq!(
+        runtime
+            .flush_cold_all_groups_once_bounded(request.clone(), 1)
+            .await
+            .expect("flush pass"),
+        0
+    );
+
+    let target = WATERMARK / 4 * 3;
+    let flushed = runtime
+        .flush_cold_all_groups_once_bounded(
+            PlanGroupColdFlushRequest {
+                pressure: Some(ColdFlushPressure {
+                    node_hot_bytes: before,
+                    node_target_bytes: target,
+                }),
+                ..request
+            },
+            1,
+        )
+        .await
+        .expect("pressure pass");
+    let after = node_hot_bytes(&runtime, GROUPS).await;
+    assert!(after <= target, "node hot {after} above target {target}");
+    // Largest first: each group flushed only its largest stream.
+    assert_eq!(flushed, usize::try_from(GROUPS).expect("fits"));
+    assert_eq!(after, u64::from(GROUPS) * 768);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_cross_bucket_pack_is_rewritten_before_bucket_erasure_proof() {
     let cold_store = Arc::new(memory_cold_store());
@@ -2285,6 +2695,7 @@ async fn legacy_cross_bucket_pack_is_rewritten_before_bucket_erasure_proof() {
         };
         runtime
             .flush_cold(FlushColdRequest {
+                cold_generation: None,
                 stream_id: stream.clone(),
                 chunk,
             })
@@ -2403,6 +2814,8 @@ async fn all_stale_packed_candidates_reclaim_unpublished_object() {
                 min_hot_bytes: 4,
                 max_flush_bytes: 4,
                 max_batch_bytes: 8,
+                pressure: None,
+                max_hot_age: None,
             },
             8,
         )
@@ -2455,7 +2868,7 @@ async fn cold_gc_worker_physically_reclaims_deleted_stream_chunks() {
     let chunk = ColdChunkRef {
         start_offset: 0,
         end_offset: 4,
-        s3_path: "benchcmp/cold-gc/chunks/000000.bin".to_owned(),
+        s3_path: new_cold_chunk_path(&stream, 0, 4),
         object_size: 4,
         ..Default::default()
     };
@@ -2465,6 +2878,7 @@ async fn cold_gc_worker_physically_reclaims_deleted_stream_chunks() {
         .expect("write cold chunk");
     runtime
         .flush_cold(FlushColdRequest {
+            cold_generation: None,
             stream_id: stream.clone(),
             chunk: chunk.clone(),
         })
@@ -2521,7 +2935,7 @@ async fn purge_report_proves_cold_gc_queue_is_empty_only_after_reclamation() {
     let chunk = ColdChunkRef {
         start_offset: 0,
         end_offset: 4,
-        s3_path: "offboard-tenant/cold-payload/chunks/000000.bin".to_owned(),
+        s3_path: new_cold_chunk_path(&stream, 0, 4),
         object_size: 4,
         ..Default::default()
     };
@@ -2531,6 +2945,7 @@ async fn purge_report_proves_cold_gc_queue_is_empty_only_after_reclamation() {
         .expect("write cold chunk");
     runtime
         .flush_cold(FlushColdRequest {
+            cold_generation: None,
             stream_id: stream,
             chunk: chunk.clone(),
         })
@@ -2583,6 +2998,7 @@ async fn cold_compaction_preserves_reads_and_reclaims_inputs_after_grace() {
             .expect("write input chunk");
         runtime
             .flush_cold(FlushColdRequest {
+                cold_generation: None,
                 stream_id: stream.clone(),
                 chunk,
             })
@@ -2590,6 +3006,24 @@ async fn cold_compaction_preserves_reads_and_reclaims_inputs_after_grace() {
             .expect("flush input chunk");
     }
 
+    // F14d: chunks published outside the flush worker record no debt, so
+    // the compactor finds nothing until the repair cursor reads the
+    // stream's pages, and discovery issues no LIST either way.
+    let lists_before = cold_store.list_request_count();
+    assert_eq!(
+        runtime
+            .compact_cold_once(8, 16, 1, 0)
+            .await
+            .expect("compact without debt"),
+        0
+    );
+    let group = runtime.locate(&stream).raft_group_id;
+    runtime
+        .repair_cold_index_group_once(group, 16)
+        .await
+        .expect("repair step");
+    assert_eq!(runtime.compaction_debt_pages(), 1);
+    let lists_before_compaction = cold_store.list_request_count();
     assert_eq!(
         runtime
             .compact_cold_once(8, 16, 1, 0)
@@ -2597,6 +3031,19 @@ async fn cold_compaction_preserves_reads_and_reclaims_inputs_after_grace() {
             .expect("compact cold chunks"),
         1
     );
+    assert_eq!(cold_store.list_request_count(), lists_before_compaction);
+    assert_eq!(lists_before_compaction, lists_before);
+    // The small replacement is debt again; the next pass finds nothing left
+    // to merge and drops it.
+    assert_eq!(runtime.compaction_debt_pages(), 1);
+    assert_eq!(
+        runtime
+            .compact_cold_once(8, 16, 1, 0)
+            .await
+            .expect("drain debt"),
+        0
+    );
+    assert_eq!(runtime.compaction_debt_pages(), 0);
     let read = runtime
         .read_stream(read_req(stream.clone(), 0, 8))
         .await
@@ -2641,6 +3088,8 @@ async fn stale_cold_flush_batch_after_delete_recreate_is_classified_for_cleanup(
                 min_hot_bytes: 18,
                 max_flush_bytes: 18,
                 max_batch_bytes: 18,
+                pressure: None,
+                max_hot_age: None,
             },
             1,
         )
@@ -2680,9 +3129,10 @@ async fn stale_cold_flush_batch_after_delete_recreate_is_classified_for_cleanup(
 async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(
-        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4 + R)),
         cold_store,
     );
+    // F6c: admission counts payload plus per-record overhead.
     let stream = BucketStreamId::new("benchcmp", "cold-admission");
     create_stream(&runtime, &stream).await;
     append_bytes(&runtime, &stream, b"abcd").await;
@@ -2704,19 +3154,19 @@ async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
             ..
         } => {
             assert_eq!(stream_id, stream);
-            assert_eq!(before_group_hot_bytes, 4);
-            assert_eq!(after_group_hot_bytes, 5);
-            assert_eq!(limit, 4);
+            assert_eq!(before_group_hot_bytes, 4 + R);
+            assert_eq!(after_group_hot_bytes, 5 + 2 * R);
+            assert_eq!(limit, 4 + R);
         }
         other => panic!("expected cold backpressure, got {other:?}"),
     }
     let metrics = runtime.metrics().snapshot();
     let group_index = usize::try_from(runtime.locate(&stream).raft_group_id.0).unwrap();
     assert_eq!(metrics.accepted_appends, 1);
-    assert_eq!(metrics.cold_hot_bytes, 4);
-    assert_eq!(metrics.per_group_cold_hot_bytes[group_index], 4);
-    assert_eq!(metrics.cold_hot_group_bytes_max, 4);
-    assert_eq!(metrics.cold_hot_stream_bytes_max, 4);
+    assert_eq!(metrics.cold_hot_bytes, 4 + R);
+    assert_eq!(metrics.per_group_cold_hot_bytes[group_index], 4 + R);
+    assert_eq!(metrics.cold_hot_group_bytes_max, 4 + R);
+    assert_eq!(metrics.cold_hot_stream_bytes_max, 4 + R);
     assert_eq!(metrics.cold_backpressure_events, 1);
     assert_eq!(metrics.per_group_cold_backpressure_events[group_index], 1);
     assert_eq!(metrics.cold_backpressure_bytes, 1);
@@ -2734,7 +3184,8 @@ async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
     assert_eq!(metrics_after_flush.cold_hot_bytes, 0);
     assert_eq!(metrics_after_flush.cold_hot_group_bytes_max, 0);
     assert_eq!(
-        metrics_after_flush.per_group_cold_hot_bytes_max[group_index], 4,
+        metrics_after_flush.per_group_cold_hot_bytes_max[group_index],
+        4 + R,
         "the diagnostic high-water mark remains monotonic"
     );
 
@@ -2750,7 +3201,7 @@ async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
 async fn cold_write_admission_allows_deduplicated_append_retry_at_hot_limit() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(
-        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4 + R)),
         cold_store,
     );
     let stream = BucketStreamId::new("benchcmp", "cold-admission-dedup-append");
@@ -2775,7 +3226,7 @@ async fn cold_write_admission_allows_deduplicated_append_retry_at_hot_limit() {
 async fn cold_write_admission_allows_deduplicated_append_batch_retry_at_hot_limit() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(
-        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4 + 4 * R)),
         cold_store,
     );
     let stream = BucketStreamId::new("benchcmp", "cold-admission-dedup-batch");
@@ -2811,7 +3262,7 @@ async fn cold_write_admission_allows_deduplicated_append_batch_retry_at_hot_limi
 async fn cold_write_admission_allows_existing_create_retry_at_hot_limit() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(
-        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4 + R)),
         cold_store,
     );
     let stream = BucketStreamId::new("benchcmp", "cold-admission-existing-create");
@@ -2885,7 +3336,7 @@ async fn raft_uncommitted_admission_rejects_when_incoming_would_exceed_limit() {
 async fn cold_write_admission_rejects_append_batch_without_partial_mutation() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(
-        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4 + R)),
         cold_store,
     );
     let stream = BucketStreamId::new("benchcmp", "cold-admission-batch");
@@ -2912,9 +3363,10 @@ async fn cold_write_admission_rejects_append_batch_without_partial_mutation() {
             ..
         } => {
             assert_eq!(stream_id, stream);
-            assert_eq!(before_group_hot_bytes, 3);
-            assert_eq!(after_group_hot_bytes, 5);
-            assert_eq!(limit, 4);
+            // F6c: each batch item is charged one record's overhead.
+            assert_eq!(before_group_hot_bytes, 3 + R);
+            assert_eq!(after_group_hot_bytes, 5 + 3 * R);
+            assert_eq!(limit, 4 + R);
         }
         other => panic!("expected cold backpressure, got {other:?}"),
     }
@@ -2972,6 +3424,8 @@ async fn flush_cold_group_once_selects_stream_inside_owner_group() {
             min_hot_bytes: 4,
             max_flush_bytes: 4,
             max_batch_bytes: 4,
+            pressure: None,
+            max_hot_age: None,
         })
         .await
         .expect("flush group")
@@ -3002,6 +3456,8 @@ async fn flush_cold_all_groups_once_bounded_flushes_multiple_groups() {
                 min_hot_bytes: 4,
                 max_flush_bytes: 4,
                 max_batch_bytes: 8,
+                pressure: None,
+                max_hot_age: None,
             },
             2,
         )
@@ -3021,7 +3477,7 @@ async fn flush_cold_all_groups_once_bounded_flushes_multiple_groups() {
 async fn repeated_cold_flush_keeps_hot_bytes_bounded_while_writes_continue() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(
-        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(16)),
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(16 + 4 * R)),
         cold_store,
     );
     let streams = [
@@ -3047,7 +3503,7 @@ async fn repeated_cold_flush_keeps_hot_bytes_bounded_while_writes_continue() {
 
         let metrics_before_flush = runtime.metrics().snapshot();
         assert!(
-            metrics_before_flush.cold_hot_bytes <= 64,
+            metrics_before_flush.cold_hot_bytes <= 4 * (16 + 4 * R),
             "hot bytes should stay within one unflushed batch per group before flush: {}",
             metrics_before_flush.cold_hot_bytes
         );
@@ -3058,6 +3514,8 @@ async fn repeated_cold_flush_keeps_hot_bytes_bounded_while_writes_continue() {
                     min_hot_bytes: 4,
                     max_flush_bytes: 4,
                     max_batch_bytes: 4,
+                    pressure: None,
+                    max_hot_age: None,
                 },
                 streams.len(),
             )
@@ -3481,6 +3939,8 @@ async fn background_cold_flush_skips_groups_that_cannot_accept_local_writes() {
                 min_hot_bytes: 1,
                 max_flush_bytes: 1,
                 max_batch_bytes: 4,
+                pressure: None,
+                max_hot_age: None,
             },
             4,
         )
@@ -4147,6 +4607,8 @@ impl GroupEngine for BlockingReadEngine {
                     shared_cold_object_owners: Vec::new(),
                     bucket_usage: Vec::new(),
                     bucket_quotas: Vec::new(),
+                    feature_level: 0,
+                    last_created_at_ms: 0,
                 },
                 stream_append_counts: Vec::new(),
             })
@@ -4187,6 +4649,7 @@ impl GroupEngine for RecordingEngine {
                 already_exists: false,
                 group_commit_index: self.commit_index,
                 record_range: None,
+                hot_backlog: None,
             })
         })
     }
@@ -4211,6 +4674,7 @@ impl GroupEngine for RecordingEngine {
                 retained_offset: 0,
                 integrity: empty_integrity(),
                 record_range: None,
+                created_at_ms: None,
             })
         })
     }
@@ -4283,6 +4747,7 @@ impl GroupEngine for RecordingEngine {
             Ok(DeleteStreamResponse {
                 placement,
                 group_commit_index: self.commit_index,
+                hot_backlog: None,
             })
         })
     }
@@ -4310,6 +4775,7 @@ impl GroupEngine for RecordingEngine {
                 record_range: None,
                 stream_hot_bytes: 0,
                 group_hot_bytes: 0,
+                receipt_evicted: false,
             })
         })
     }
@@ -4347,6 +4813,7 @@ impl GroupEngine for RecordingEngine {
                     record_range: None,
                     stream_hot_bytes: 0,
                     group_hot_bytes: 0,
+                    receipt_evicted: false,
                 }));
             }
             Ok(GroupAppendBatchResponse { placement, items })
@@ -4383,6 +4850,8 @@ impl GroupEngine for RecordingEngine {
                     shared_cold_object_owners: Vec::new(),
                     bucket_usage: Vec::new(),
                     bucket_quotas: Vec::new(),
+                    feature_level: 0,
+                    last_created_at_ms: 0,
                 },
                 stream_append_counts: Vec::new(),
             })
@@ -4677,4 +5146,58 @@ impl GroupEngine for FailingEngine {
     ) -> GroupInstallSnapshotFuture<'a> {
         Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
     }
+}
+
+/// bounded-stream-state F14c and F14d: a lone flush candidate below 1 MiB is
+/// packed alone instead of becoming a tiny exclusive object, and a larger
+/// exclusive chunk below the compaction target becomes compaction debt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lone_small_flush_is_packed_and_small_exclusive_chunk_is_compaction_debt() {
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(RuntimeConfig::new(2, 8), cold_store.clone());
+    let stream = BucketStreamId::new("benchcmp", "f14c-lone");
+    create_stream(&runtime, &stream).await;
+    let request = PlanGroupColdFlushRequest {
+        min_hot_bytes: 1,
+        max_flush_bytes: 8 << 20,
+        max_batch_bytes: 8 << 20,
+        pressure: None,
+        max_hot_age: None,
+    };
+
+    append_bytes(&runtime, &stream, &[b'a'; 100]).await;
+    assert_eq!(
+        runtime
+            .flush_cold_all_groups_once_bounded(request.clone(), 1)
+            .await
+            .expect("flush small"),
+        1
+    );
+    let metrics = runtime.metrics().snapshot();
+    assert_eq!(metrics.cold_pack_uploads, 1, "the lone candidate is packed");
+    assert_eq!(metrics.cold_pack_slices, 1);
+    assert_eq!(runtime.compaction_debt_pages(), 0);
+
+    let large = vec![b'b'; (1 << 20) + 10];
+    append_bytes(&runtime, &stream, &large).await;
+    assert_eq!(
+        runtime
+            .flush_cold_all_groups_once_bounded(request, 1)
+            .await
+            .expect("flush large"),
+        1
+    );
+    let metrics = runtime.metrics().snapshot();
+    assert_eq!(
+        metrics.cold_pack_uploads, 1,
+        "a 1 MiB candidate is exclusive"
+    );
+    assert_eq!(runtime.compaction_debt_pages(), 1);
+
+    let read = runtime
+        .read_stream(read_req(stream, 0, 100 + large.len()))
+        .await
+        .expect("read flushed stream");
+    assert_eq!(&read.payload[..100], &[b'a'; 100]);
+    assert_eq!(&read.payload[100..], large.as_slice());
 }

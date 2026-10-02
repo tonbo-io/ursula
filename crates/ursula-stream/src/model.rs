@@ -83,11 +83,19 @@ pub struct ProducerSnapshot {
     pub last_next_offset: u64,
     pub last_closed: bool,
     pub last_items: Vec<ProducerAppendRecord>,
-    /// Bounded exact response history for delayed retries. Missing in legacy
-    /// snapshots, which are restored with the last response as the sole
+    /// Exact response history for delayed retries, oldest first. At feature
+    /// level 1 it is bounded by the stream's receipt window (F3), and a
+    /// producer's newest receipt is never evicted. Missing in legacy
+    /// snapshots: a level-0 restore uses the last response as the sole
     /// receipt.
     #[serde(default)]
     pub receipts: Vec<ProducerReceipt>,
+    /// `now_ms` of the producer's newest accepted write (F3 idle expiry),
+    /// kept from feature level 1 on. `None` for producers last written
+    /// below level 1 and in legacy snapshots: their idle period starts at
+    /// the first `TidyStream` that stamps them.
+    #[serde(default)]
+    pub last_seen_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,14 +125,25 @@ pub(crate) struct ProducerState {
     pub(crate) last_start_offset: u64,
     pub(crate) last_next_offset: u64,
     pub(crate) last_closed: bool,
+    /// The newest receipt's items. Kept only below feature level 1, where
+    /// snapshots still carry it for older binaries; level 1 answers from the
+    /// newest receipt, which the window never evicts (F3).
     pub(crate) last_items: Vec<ProducerAppendRecord>,
-    pub(crate) receipts: Vec<ProducerReceipt>,
+    /// Receipts of the current epoch in sequence order, with contiguous
+    /// sequences, so a duplicate's receipt sits at `seq - front.seq`.
+    pub(crate) receipts: std::collections::VecDeque<ProducerReceipt>,
+    /// See [`ProducerSnapshot::last_seen_ms`].
+    pub(crate) last_seen_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamBatchAppend {
     pub items: Vec<StreamBatchAppendItem>,
     pub deduplicated: bool,
+    /// A duplicate whose receipt the stream's receipt window evicted (F3,
+    /// feature level 1): deduplicated without per-frame ranges, so `items`
+    /// is empty.
+    pub receipt_evicted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +152,9 @@ pub struct StreamBatchAppendItem {
     pub next_offset: u64,
     pub closed: bool,
     pub deduplicated: bool,
+    /// Records of this frame, as apply computed them (stored receipt for a
+    /// duplicate). `None` on streams without record coordinates.
+    pub record_range: Option<crate::StreamRecordRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,12 +207,41 @@ pub struct ColdGcEntry {
     #[serde(default)]
     pub not_before_ms: u64,
     pub target: ColdGcTarget,
+    /// Cold generation of the removed incarnation for a
+    /// [`ColdGcTarget::Stream`] entry enqueued at feature level 1 or later
+    /// (F14g step 2): the worker deletes only that generation's cold-index
+    /// pages, the objects they reference, and chunk names scoped to it.
+    /// `None` marks a legacy entry, which deletes only legacy-format chunk
+    /// names and generation-0 pages and never runs while a stream of the
+    /// same name exists (F14g step 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_generation: Option<u64>,
+    /// How many times the leader's GC worker deferred this entry after a
+    /// failure (`DeferColdGc`, F14b, feature level 1). The worker backs off
+    /// exponentially in it.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub defer_attempts: u32,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+/// A pending GC entry as planned for the leader's GC worker, with the cold
+/// generation of the live stream that currently holds the entry's name, if
+/// any. Not replicated: the worker uses it to avoid deleting a live
+/// incarnation's objects (F14g step 1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColdGcPlanEntry {
+    pub entry: ColdGcEntry,
+    pub live_cold_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColdGcTarget {
-    /// Every cold object owned by a fully removed stream. The whole
-    /// `{stream}/chunks/` prefix can be reclaimed at once.
+    /// Every cold object owned by a fully removed stream incarnation. The
+    /// worker deletes only object names Ursula writes for that stream and
+    /// never recurses into another stream's namespace (F14g).
     Stream(BucketStreamId),
     /// Specific cold object paths dropped while the stream lives on (snapshot
     /// retention compaction).
@@ -208,6 +259,9 @@ pub struct HotPayloadSegment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColdFlushCandidate {
     pub stream_id: BucketStreamId,
+    /// Cold generation of the planned incarnation (F14g); the chunk name
+    /// and cold-index pages written for this candidate use it.
+    pub cold_generation: u64,
     pub start_offset: u64,
     pub end_offset: u64,
     pub payload: Vec<u8>,
@@ -253,6 +307,11 @@ pub struct StreamReadPlan {
     pub closed: bool,
     pub retained_record_range: Option<crate::StreamRecordRange>,
     pub record_range: Option<crate::StreamRecordRange>,
+    /// Set on a bracketed record read (F1): the segments cover a byte
+    /// window around the requested records, and materialization trims it
+    /// by counting LFs, then rewrites `offset`, `next_offset`,
+    /// `record_range` and `up_to_date`. Until then `up_to_date` is false.
+    pub record_trim: Option<Box<crate::RecordTrim>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +330,10 @@ pub struct StreamVisibleSnapshot {
     #[serde(default)]
     pub digest: String,
 }
+
+/// Default cap on the update bytes one `/bootstrap` response carries
+/// (bounded-stream-state F11, the 8 MiB server read cap).
+pub const BOOTSTRAP_MAX_UPDATE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamBootstrapPlan {
@@ -314,6 +377,27 @@ pub struct BucketUsage {
 pub struct BucketUsageSnapshot {
     pub bucket_id: String,
     pub usage: BucketUsage,
+}
+
+/// One stream in a bucket listing (`extensions.md` §1.4). `stream_id` is the
+/// bucket-local path: the plain stream ID, or `{affinity_key}/{stream_id}`
+/// for a stream addressed through path affinity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketStreamListing {
+    pub stream_id: String,
+    pub status: StreamStatus,
+    pub content_type: String,
+    pub tail_offset: u64,
+    pub created_at_ms: u64,
+}
+
+/// Returns the bucket-local path of a stream: what follows `/{bucket_id}/` in
+/// its URL.
+pub fn bucket_local_stream_path(stream_id: &BucketStreamId) -> String {
+    match &stream_id.affinity_key {
+        Some(affinity_key) => format!("{affinity_key}/{}", stream_id.stream_id),
+        None => stream_id.stream_id.clone(),
+    }
 }
 
 /// Per-bucket data-plane quota stored in replicated state. `None` means

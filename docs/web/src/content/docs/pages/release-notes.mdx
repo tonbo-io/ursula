@@ -1,0 +1,72 @@
+---
+title: Release notes
+description: Changes that affect clients and operators, newest first.
+---
+
+## Unreleased: keyed streams and bounded stream state
+
+This release adds [keyed streams](/docs/concepts/keyed-streams) and the [keyed-state](/docs/api/keyed-state) resource, stores JSON messages exactly as written, and starts the work that stops per-stream replicated memory from growing with record count, without retention (it still grows by about 16 MiB per TiB of cold history per stream per replica; see [Memory without retention](/docs/operations#memory-without-retention)). Read the upgrade notes before rolling it out.
+
+### Upgrade notes
+
+1. **Roll out as usual, then raise the feature level.** The new release applies replicated commands exactly like the previous one until you raise the cluster's [feature level](/docs/operations#feature-levels). After every voter and learner runs this release, run `ursulactl cluster enable-feature --config cluster.json --level 1`. Keyed streams, the producer receipt window and the other level-1 changes start only then. Levels 2 to 4 (below) are raised the same way; levels 2 and above wait until every group's leader has completed a cold-index page-repair cycle (`enable-feature` checks it).
+2. **No downgrade after the raise.** Once a group is at level 1, a binary that supports only level 0 must not run it; it refuses the group's snapshots. Rolling back to the previous release is possible only before the raise. Raise the level only when you no longer need that rollback.
+3. **JSON text changes take effect per node, without a level.** A node running this release stores JSON messages verbatim (see below) as soon as it serves writes. During the rollout, a write may be stored with the old normalization or the new text depending on which node handled it. Clients that compare stored bytes, such as `Stream-Record-Match` writers that read records back, should finish the rollout before relying on byte equality.
+4. **Keyed state is opt-in.** Nothing changes for existing streams until you create a keyed stream. To serve keyed state, run a keyed-state indexer and set `server.keyed_state_upstream` on every node; with Helm, `keyedIndexer.enabled=true` does both ([Deploy](/docs/deploy-cluster#optional-keyed-state-indexer)).
+
+### Observable changes for JSON streams
+
+Every `application/json` stream now follows [JSON message text](/docs/specs/extensions#json-message-text): Ursula validates the body and stores each message as the writer's text with insignificant whitespace removed, followed by one LF. Compared with earlier releases, which re-serialized every message:
+
+| Input | Before | Now |
+| --- | --- | --- |
+| `{"b":1,"a":2}` | `{"a":2,"b":1}` (members sorted) | `{"b":1,"a":2}` (writer's order) |
+| `{"a":1,"a":2}` | one `a` kept | both members kept |
+| `1.50e3` | `1500.0` | `1.50e3` |
+| `1e400` | `400 Bad Request` | stored as written |
+| `"\ud800"` (unpaired surrogate escape) | `400 Bad Request` | stored as written |
+| `[{"a":[…127 levels…]}]` | depth counted including the outer array | depth counted per message: a message inside an array body may be as deep as a bare one (127) |
+
+- Every read surface returns the stored text: NDJSON reads, the envelope view's `value`, SSE, bootstrap parts and keyed-state `value`.
+- Offsets, ETags, byte counts and record coordinates refer to the stored text, so a message's size can differ from what the previous release would have stored for the same input.
+- Messages stored before the upgrade are not rewritten.
+- Clients that parse records must accept unpaired surrogate escapes and numbers outside the double range. Ursula's event-time indexer does.
+
+### New
+
+- **Keyed streams.** Create a stream with `Content-Type: application/json; profile=keyed-batch-v1` to get writer-declared key-value batches (`keyed-batch-v1`), validated at append time with `422` for grammar errors, and the `GET {stream}/keyed-state` resource (`keyed-state-v1`) that serves the folded state with `Stream-Keyed-Through`, `Stream-Keyed-After` and `min_through_record` waits. Needs feature level 1. See [Keyed streams](/docs/concepts/keyed-streams).
+- **Keyed-state indexer.** `ursula indexer --keyed-source-url …` runs the projection engine, and nodes proxy to it through `server.keyed_state_upstream`. Bucket purge drains every indexer listed in `keyed_state.indexer_urls` and erases `.keyed/{bucket}/`; its response gains `keyed_drain_complete`, `keyed_drain_error`, `keyed_indexers_drained` and `keyed_prefix_absent`.
+- **Pi Durable.** `clients/pi-durable-ursula` implements Pi Durable's `Storage` on a keyed stream. See [Pi Durable on Ursula](/docs/examples/pi-durable).
+- **Byte-bounded record reads.** `max_bytes` now works with `record=` and `tail_records=`: it bounds complete records and may be combined with `max_records`. It used to be rejected with `400`.
+- **Bucket stream listing.** `GET /{bucket}/streams?prefix=&after=&limit=` lists a bucket's streams. See [List streams](/docs/api/list-streams).
+- **Feature levels.** `GET` and `POST /__ursula/feature-level` on the admin plane, and `ursulactl cluster feature-level` and `cluster enable-feature`.
+- **Metrics.** `/__ursula/metrics` adds `group_state_gauges` (per-group state sizes), `keyed_state_requests` (keyed-state responses by status) and `record_coordinate_corruptions`. The keyed indexer serves its own counters at `GET /__ursula/indexer/metrics`.
+- **Sparse cold record marks (level 2).** The JSON record index keeps exact offsets only for unflushed records plus one mark per MiB of cold log. Record reads into sealed history are unchanged for clients. Retention by offset or record into sealed history may land at or below its target (the response's `Stream-Retained-Offset` and `Stream-Record-First` report where), and raw-offset snapshot and retention requests whose offset falls inside a JSON record answer `400`.
+- **External payload locators (level 3).** External appends commit their locator in replicated state first and the leader indexes it afterwards, so `runtime.external_payload_min_size` may be lowered on clusters at level 3.
+- **Compact hot window (level 4).** Message records are removed from replicated state: JSON streams take message boundaries from the record index, other streams keep one 8-byte start per unflushed message. Cold admission and flush thresholds then charge 8 bytes per hot record instead of 24. Bootstrap answers are unchanged, except that a snapshot published exactly at a flushed message boundary is now followed by update parts instead of an honest partial.
+- **Keyed indexer admission.** One process-wide byte budget (`--keyed-admission-budget-bytes`, default 1 GiB) covers ingest pages, folded records and compaction buffers; `--keyed-max-concurrent-ingests` and `--keyed-max-concurrent-compactions` (CPU-sized by default) bound concurrency; and a bounded admission queue (`--keyed-admission-queue`) answers keyed-state reads that need new ingestion with `503` and `Retry-After` when full. The metrics snapshot gains `admission` (budget in use and peak, queue depth, rejections).
+- **Keyed indexer tools.** `ursula indexer keyed verify|rebuild|sweep|dump` checks a namespace against the log, rebuilds it blue/green, removes orphaned objects and prints its contents.
+
+### Changed
+
+- **Bootstrap is an honest partial.** `/bootstrap` never reads cold storage and never skips a message. When updates after the snapshot are already cold, it returns the snapshot part alone with `Stream-Next-Offset` at the snapshot point and no `Stream-Up-To-Date`; when updates exceed 8 MiB, it stops at the last message boundary within the cap. Clients continue from `Stream-Next-Offset` with ordinary reads, as the specification already required. Each update part holds exactly one message, so a JSON array append now appears as one part per record.
+- **Producer receipts are bounded (level 1).** Each stream keeps exact receipts for 1,024 items plus each producer's newest one. An older duplicate is still deduplicated, but answered `204` without range headers. A producer idle on a stream for 7 days is forgotten and must restart at sequence `0` or bump its epoch. See [Exactly-once writes](/docs/concepts/exactly-once-writes).
+- **`Producer-Id` and `Stream-Seq` are capped at 256 bytes** on every write path, with `400` above it.
+- **Reserved name (level 1).** `keyed-state` cannot be used as a stream ID under an affinity path.
+- **Unique incarnations (level 1).** A stream's `created_at_ms` strictly increases within a Raft group, so a stream deleted and recreated at the same path is always a distinguishable incarnation, and stream GC only removes the deleted incarnation's objects.
+- **`$transaction` content types** are normalized like `Content-Type` headers before they are compared with the stream's content type.
+- **Snapshots (level 1)** are written in a compact MessagePack envelope that earlier releases cannot read, which is one reason downgrade is unsupported.
+- **Producer cap (level 1).** A stream holds at most 4,096 producers; a new producer evicts producers idle for at least an hour, and when none is, the write answers `429` with a body starting `producer_limit`.
+- **Reads are capped at 8 MiB.** A larger `max_bytes` is clamped. Without `max_bytes`, a capped JSON offset read ends at a record boundary.
+- **Hot tails are flushed after `storage.cold.flush_max_hot_age`** (default 5 minutes, `0` disables), even when the group is below its flush threshold.
+- **Defaults.** `storage.cold.compaction_enabled` now defaults to `true`, and `storage.snapshot.backend` defaults to `auto` (S3 when the cold backend is S3, inline otherwise). Raft snapshots are taken by log bytes against a node-wide `raft.snapshot_log_budget` (default 1 GiB) with a `raft.snapshot_backstop_logs` entry backstop. Cold admission and the hot backlog count 24 bytes per hot record on top of the payload (8 bytes at level 4).
+- **Helm chart defaults.** The chart now renders `coldStorage.compaction.enabled: true` and `snapshotStore.backend: auto` (previously `false` and `inline`), so releases with cold storage get compaction and S3 snapshots on upgrade. Set the old values to keep the old behaviour. The chart also gains an optional keyed-state indexer (`keyedIndexer.*`) and node keyed-state settings (`keyedState.*`).
+
+### Fixed
+
+- `/bootstrap` silently dropped bytes after a checkpoint that retention had not followed.
+- After a stream with small hot bytes received an append of 1 MiB or more and then flushed, the large append could become unreadable and snapshots holding the stream could not be restored.
+- Cold-index pages could keep entries of rejected large appends and later serve wrong bytes; existing pages are clipped and repaired.
+- Stream GC after a delete and recreate could delete objects of the new incarnation.
+- Staged external payloads were deleted after ambiguous failures, even when the append might have committed.
+- Several node-local structures grew without bound: the cold-index page cache's LRU, cold-read readahead readers, per-stream append counts and the TTL index.

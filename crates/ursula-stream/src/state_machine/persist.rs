@@ -61,14 +61,21 @@ impl StreamStateMachine {
                     hot_start_offset: self.hot_start_offset(&stream_id),
                     payload,
                     hot_segments: slot.hot_buffer.hot_segments(),
-                    cold_frontier_offset: self.cold_frontier_offset(
-                        &stream_id,
-                        self.earliest_retained_offset(&stream_id),
-                    ),
+                    // F18 step 2: at Lb1 field 6 is the seal point, written
+                    // for tooling and ignored at restore.
+                    cold_frontier_offset: if self.bounded_lb1() {
+                        self.seal_point(&stream_id)
+                    } else {
+                        self.cold_frontier_offset(
+                            &stream_id,
+                            self.earliest_retained_offset(&stream_id),
+                        )
+                    },
                     cold_index_generation: slot.cold.cold_generation(),
                     cold_chunks: slot.cold.cold_chunks().to_vec(),
                     external_segments: slot.cold.external_segments().to_vec(),
                     message_records: slot.message_records.clone(),
+                    hot_append_starts: slot.hot_buffer.append_starts().iter().copied().collect(),
                     record_index: slot.record_index.clone(),
                     integrity: slot
                         .integrity
@@ -107,6 +114,8 @@ impl StreamStateMachine {
             shared_cold_object_owners,
             bucket_usage: self.bucket_usage_report(),
             bucket_quotas: self.bucket_quota_report(),
+            feature_level: self.feature_level,
+            last_created_at_ms: self.last_created_at_ms,
         }
     }
 
@@ -127,10 +136,30 @@ impl StreamStateMachine {
                 ),
             );
         }
+        if snapshot.feature_level > self.feature_level {
+            // Raising the level is `SetFeatureLevel`'s job, behind the
+            // operator's all-nodes support check; an import that raised it
+            // would let replicas on an older binary diverge.
+            return StreamResponse::error(
+                StreamErrorCode::ImportConflict,
+                format!(
+                    "snapshot is at feature level {}, above this group's level {}; raise the group's feature level first",
+                    snapshot.feature_level, self.feature_level
+                ),
+            );
+        }
         let buckets = u64::try_from(snapshot.buckets.len()).unwrap_or(u64::MAX);
         let streams = u64::try_from(snapshot.streams.len()).unwrap_or(u64::MAX);
         match Self::restore(snapshot) {
-            Ok(restored) => {
+            Ok(mut restored) => {
+                // The feature level is neither raised (checked above) nor
+                // lowered by importing a backup taken at a lower level.
+                restored.feature_level = self.feature_level;
+                // C7: the counter never goes backwards, so a later create
+                // never reuses an incarnation this group already assigned.
+                restored.last_created_at_ms =
+                    restored.last_created_at_ms.max(self.last_created_at_ms);
+                restored.normalize_last_created_at_ms();
                 *self = restored;
                 StreamResponse::SnapshotImported { buckets, streams }
             }
@@ -141,8 +170,28 @@ impl StreamStateMachine {
         }
     }
 
+    /// Keeps C7's invariant after a restore or import: at feature level 1 or
+    /// later, `last_created_at_ms` is at least every live stream's
+    /// `created_at_ms`, so the next create is unique even when the snapshot
+    /// predates the field or comes from a lower-level backup.
+    fn normalize_last_created_at_ms(&mut self) {
+        if self.incarnation_scoped_cold_objects() {
+            self.last_created_at_ms = self.max_live_created_at_ms(self.last_created_at_ms);
+        }
+    }
+
     pub fn restore(snapshot: StreamSnapshot) -> Result<Self, StreamSnapshotError> {
-        let mut machine = Self::default();
+        if snapshot.feature_level > crate::feature::MAX_SUPPORTED_FEATURE_LEVEL {
+            return Err(StreamSnapshotError::UnsupportedFeatureLevel {
+                level: snapshot.feature_level,
+                supported: crate::feature::MAX_SUPPORTED_FEATURE_LEVEL,
+            });
+        }
+        let mut machine = Self {
+            feature_level: snapshot.feature_level,
+            last_created_at_ms: snapshot.last_created_at_ms,
+            ..Self::default()
+        };
         for bucket_id in &snapshot.buckets {
             if !machine.buckets.insert(bucket_id.clone()) {
                 return Err(StreamSnapshotError::DuplicateBucket(bucket_id.clone()));
@@ -187,10 +236,13 @@ impl StreamStateMachine {
                     tail_offset: entry.metadata.tail_offset,
                 });
             }
+            // Sealed records (marks) exist only at feature level 2 (F1).
             if let Some(record_index) = entry.record_index.as_ref()
-                && record_index
+                && (record_index
                     .validate(retained_offset, entry.metadata.tail_offset)
                     .is_err()
+                    || (!record_index.marks().is_empty()
+                        && snapshot.feature_level < crate::feature::FEATURE_LEVEL_SPARSE_MARKS))
             {
                 return Err(StreamSnapshotError::RecordBoundaryMismatch { stream_id });
             }
@@ -206,7 +258,6 @@ impl StreamStateMachine {
             };
             if !hot_segments_match_payload(&hot_segments, entry.payload.len())
                 || !payload_sources_cover_retained_suffix(
-                    entry.cold_frontier_offset,
                     &entry.cold_chunks,
                     &entry.external_segments,
                     &hot_segments,
@@ -220,11 +271,32 @@ impl StreamStateMachine {
                     payload_len: entry.payload.len(),
                 });
             }
-            if !message_records_cover_retained_suffix(
-                &entry.message_records,
-                retained_offset,
-                entry.metadata.tail_offset,
-            ) {
+            // F4b (level 4): a converted stream holds no message records;
+            // its boundaries are the dense offsets or the append starts,
+            // which must lie at or above the seal point. A stream that
+            // still holds legacy records restores them as before.
+            let records_removed =
+                snapshot.feature_level >= crate::feature::FEATURE_LEVEL_HOT_REPRESENTATION;
+            let seal_point = hot_segments
+                .first()
+                .map_or(entry.metadata.tail_offset, |segment| segment.start_offset);
+            let boundaries_valid = if records_removed && entry.message_records.is_empty() {
+                super::boundaries::append_starts_valid(
+                    &entry.hot_append_starts,
+                    seal_point,
+                    entry.metadata.tail_offset,
+                    entry.record_index.is_some(),
+                    records_removed,
+                )
+            } else {
+                entry.hot_append_starts.is_empty()
+                    && message_records_cover_retained_suffix(
+                        &entry.message_records,
+                        retained_offset,
+                        entry.metadata.tail_offset,
+                    )
+            };
+            if !boundaries_valid {
                 return Err(StreamSnapshotError::MessageBoundaryMismatch { stream_id });
             }
             let integrity = StreamIntegrity::restore(entry.integrity).ok_or_else(|| {
@@ -235,7 +307,8 @@ impl StreamStateMachine {
             if machine.registry.contains_key(&stream_id) {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));
             }
-            let producer_states = restore_producer_states(&stream_id, entry.producer_states)?;
+            let producer_states =
+                restore_producer_states(&stream_id, entry.producer_states, snapshot.feature_level)?;
             let visible_snapshot = entry.visible_snapshot.map(|mut snapshot| {
                 if snapshot.digest.is_empty() {
                     snapshot.digest =
@@ -249,12 +322,20 @@ impl StreamStateMachine {
                 .filter(|chunk| chunk.shared_object)
                 .map(|chunk| chunk.s3_path.clone())
                 .collect::<Vec<_>>();
+            let mut hot_buffer = HotBuffer::from_snapshot(entry.payload, &hot_segments);
+            hot_buffer.restore_append_starts(entry.hot_append_starts);
             let slot = StreamSlot {
                 metadata: entry.metadata,
                 attrs: normalize_stream_attrs(entry.attrs),
-                hot_buffer: HotBuffer::from_snapshot(entry.payload, &hot_segments),
+                hot_buffer,
                 cold: StreamColdState::restore(
-                    entry.cold_frontier_offset,
+                    // F18 step 2: Lb1 derives coverage from the hot buffer and
+                    // never reads the scalar, so field 6 is ignored.
+                    if machine.bounded_lb1() {
+                        0
+                    } else {
+                        entry.cold_frontier_offset
+                    },
                     entry.cold_index_generation,
                     entry.cold_chunks,
                     entry.external_segments,
@@ -264,7 +345,9 @@ impl StreamStateMachine {
                 integrity,
                 retained_offset,
                 visible_snapshot,
+                receipt_window: super::producers::ReceiptWindow::rebuild(&producer_states),
                 producers: producer_states,
+                append_count: 0,
             };
             if machine.insert_stream_slot(slot).is_none() {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));
@@ -289,6 +372,7 @@ impl StreamStateMachine {
 
         machine.cold_gc =
             ColdGcQueue::from_parts(snapshot.pending_cold_gc, snapshot.next_cold_gc_seq);
+        machine.normalize_last_created_at_ms();
 
         // Usage restore: gauges are recomputed from the restored slots so a
         // snapshot can never carry gauge drift forward; only the monotonic
@@ -343,7 +427,8 @@ fn producer_snapshot(states: &HashMap<String, ProducerState>) -> Vec<ProducerSna
             last_next_offset: state.last_next_offset,
             last_closed: state.last_closed,
             last_items: state.last_items.clone(),
-            receipts: state.receipts.clone(),
+            receipts: state.receipts.iter().cloned().collect(),
+            last_seen_ms: state.last_seen_ms,
         })
         .collect::<Vec<_>>();
     producer_states.sort_by(|left, right| left.producer_id.cmp(&right.producer_id));
@@ -353,10 +438,15 @@ fn producer_snapshot(states: &HashMap<String, ProducerState>) -> Vec<ProducerSna
 fn restore_producer_states(
     stream_id: &BucketStreamId,
     snapshots: Vec<ProducerSnapshot>,
+    feature_level: u32,
 ) -> Result<HashMap<String, ProducerState>, StreamSnapshotError> {
     let mut states = HashMap::with_capacity(snapshots.len());
     for snapshot in snapshots {
-        let receipts = if snapshot.receipts.is_empty() {
+        // Only level-0 snapshots synthesize a receipt from `last_*`; at level
+        // 1 an empty list restores as empty, as a live replica holds it (F3).
+        let receipts = if snapshot.receipts.is_empty()
+            && feature_level < crate::feature::FEATURE_LEVEL_KEYED_STREAMS
+        {
             vec![ProducerReceipt {
                 producer_seq: snapshot.producer_seq,
                 start_offset: snapshot.last_start_offset,
@@ -375,7 +465,8 @@ fn restore_producer_states(
                 last_next_offset: snapshot.last_next_offset,
                 last_closed: snapshot.last_closed,
                 last_items: snapshot.last_items,
-                receipts,
+                receipts: receipts.into(),
+                last_seen_ms: snapshot.last_seen_ms,
             })
             .is_some()
         {
@@ -429,8 +520,15 @@ fn hot_segments_match_payload(segments: &[HotPayloadSegment], payload_len: usize
     expected_payload_start == payload_len
 }
 
+/// F18 step 1: coverage is the complement of the hot buffer, so every byte
+/// of `[retained, tail)` that no hot segment holds is cold and served by
+/// state refs or cold-index pages. Restore therefore no longer requires the
+/// replicated scalar frontier to reach the hot buffer or the tail; snapshots
+/// that carry a regressed frontier (bounded-state D1) restore and install.
+/// What remains checked is that every source is well formed: refs are
+/// valid, and hot segments are non-empty, ordered, disjoint and end at or
+/// below the tail.
 fn payload_sources_cover_retained_suffix(
-    cold_frontier_offset: u64,
     cold_chunks: &[ColdChunkRef],
     external_segments: &[ObjectPayloadRef],
     hot_segments: &[HotPayloadSegment],
@@ -440,45 +538,22 @@ fn payload_sources_cover_retained_suffix(
     if tail_offset < retained_offset {
         return false;
     }
-    let mut ranges =
-        Vec::with_capacity(1 + cold_chunks.len() + external_segments.len() + hot_segments.len());
-    if cold_frontier_offset > retained_offset {
-        ranges.push((retained_offset, cold_frontier_offset));
+    if !cold_chunks.iter().all(valid_cold_chunk_ref)
+        || !external_segments.iter().all(valid_object_payload_ref)
+    {
+        return false;
     }
-    for chunk in cold_chunks {
-        if !valid_cold_chunk_ref(chunk) {
-            return false;
-        }
-        ranges.push((chunk.start_offset, chunk.end_offset));
-    }
-    for object in external_segments {
-        if !valid_object_payload_ref(object) {
-            return false;
-        }
-        ranges.push((object.start_offset, object.end_offset));
-    }
+    let mut previous_end = 0;
     for segment in hot_segments {
-        if segment.end_offset <= segment.start_offset {
+        if segment.end_offset <= segment.start_offset
+            || segment.start_offset < previous_end
+            || segment.end_offset > tail_offset
+        {
             return false;
         }
-        ranges.push((segment.start_offset, segment.end_offset));
+        previous_end = segment.end_offset;
     }
-    ranges.sort_unstable();
-
-    let mut expected_start = retained_offset;
-    for (start_offset, end_offset) in ranges {
-        if end_offset <= expected_start {
-            continue;
-        }
-        if start_offset > expected_start {
-            return false;
-        }
-        expected_start = end_offset;
-        if expected_start >= tail_offset {
-            return true;
-        }
-    }
-    expected_start == tail_offset
+    true
 }
 
 pub(super) fn message_records_cover_retained_suffix(

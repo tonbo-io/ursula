@@ -1830,7 +1830,8 @@
           "description": "Same-stream cold chunk compaction settings.",
           "properties": {
             "enabled": {
-              "type": "boolean"
+              "type": "boolean",
+              "description": "Enable same-stream cold chunk compaction (default true)."
             },
             "intervalMs": {
               "type": "integer",
@@ -1896,10 +1897,11 @@
         "backend": {
           "type": "string",
           "enum": [
+            "auto",
             "inline",
             "s3"
           ],
-          "description": "Snapshot backend."
+          "description": "Snapshot backend. auto (Ursula's default) uses S3 with the S3 cold store and inline otherwise."
         },
         "prefix": {
           "type": "string",
@@ -1914,6 +1916,421 @@
           "description": "Manual snapshot driver interval in milliseconds; 0 disables the manual driver."
         }
       }
+    },
+    "keyedState": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Node-side keyed-state settings: [server].keyed_state_upstream and [keyed_state].",
+      "properties": {
+        "upstream": {
+          "type": "string",
+          "pattern": "^$|^https?://",
+          "description": "Single keyed-state indexer base URL, used only when no indexer pods are listed. Empty: unset."
+        },
+        "indexerUrls": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^https?://"
+          },
+          "description": "Keyed indexer pod base URLs in failover order (primary first), all drained on bucket purge. Empty uses every chart keyed indexer pod when enabled."
+        },
+        "drainTimeoutMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "Per-pod drain timeout in milliseconds; null keeps Ursula's default."
+        }
+      },
+      "required": [
+        "upstream",
+        "indexerUrls"
+      ]
+    },
+    "keyedIndexer": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional keyed-state indexer (ursula indexer in keyed mode).",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sourceUrl": {
+          "type": "string",
+          "pattern": "^$|^https?://",
+          "description": "Node or gateway base URL the indexer reads records from. Empty uses the node Service."
+        },
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "tag": {
+              "type": "string"
+            },
+            "pullPolicy": {
+              "type": "string",
+              "enum": [
+                "",
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ]
+            }
+          },
+          "required": [
+            "repository",
+            "tag",
+            "pullPolicy"
+          ]
+        },
+        "serviceAccount": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "create": {
+              "type": "boolean"
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 63,
+              "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+            },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "automountServiceAccountToken": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "create",
+            "name",
+            "annotations",
+            "automountServiceAccountToken"
+          ]
+        },
+        "ports": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "http": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            }
+          },
+          "required": [
+            "http"
+          ]
+        },
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "ClusterIP",
+                "NodePort",
+                "LoadBalancer"
+              ]
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "type",
+            "port",
+            "annotations"
+          ]
+        },
+        "rustLog": {
+          "type": "string"
+        },
+        "cache": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "maxBytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "emptyDir": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "sizeLimit": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "sizeLimit"
+              ]
+            }
+          },
+          "required": [
+            "maxBytes",
+            "emptyDir"
+          ]
+        },
+        "minPublishIntervalMs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "gcGraceSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxWaiters": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "probes": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "startup": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "failureThreshold": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "periodSeconds": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "timeoutSeconds": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "enabled",
+                "failureThreshold",
+                "periodSeconds",
+                "timeoutSeconds"
+              ]
+            },
+            "readiness": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "periodSeconds": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "timeoutSeconds": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "enabled",
+                "periodSeconds",
+                "timeoutSeconds"
+              ]
+            },
+            "liveness": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "periodSeconds": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "timeoutSeconds": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "enabled",
+                "periodSeconds",
+                "timeoutSeconds"
+              ]
+            }
+          },
+          "required": [
+            "startup",
+            "readiness",
+            "liveness"
+          ]
+        },
+        "podDisruptionBudget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "maxUnavailable": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "enabled",
+            "maxUnavailable"
+          ]
+        },
+        "networkPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "additionalIngress": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          },
+          "required": [
+            "enabled",
+            "additionalIngress"
+          ]
+        },
+        "podAnnotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "podLabels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "podSecurityContext": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "securityContext": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "resources": {
+          "type": "object"
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "extraEnv": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "extraEnvFrom": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "scheduling": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "nodeSelector": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "tolerations": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "affinity": {
+              "type": "object"
+            },
+            "topologySpreadConstraints": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          },
+          "required": [
+            "nodeSelector",
+            "tolerations",
+            "affinity",
+            "topologySpreadConstraints"
+          ]
+        }
+      },
+      "required": [
+        "enabled",
+        "replicaCount",
+        "sourceUrl",
+        "image",
+        "serviceAccount",
+        "ports",
+        "service",
+        "rustLog",
+        "cache",
+        "minPublishIntervalMs",
+        "gcGraceSeconds",
+        "maxWaiters",
+        "probes",
+        "podDisruptionBudget",
+        "networkPolicy",
+        "podAnnotations",
+        "podLabels",
+        "podSecurityContext",
+        "securityContext",
+        "resources",
+        "terminationGracePeriodSeconds",
+        "extraArgs",
+        "extraEnv",
+        "extraEnvFrom",
+        "scheduling"
+      ]
     },
     "tests": {
       "type": "object",

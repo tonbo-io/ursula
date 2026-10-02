@@ -401,3 +401,117 @@ Validate gateway values before manifests are accepted.
 {{- end -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+Keyed-state indexer (`ursula indexer` in keyed mode). The StatefulSet name
+stays within 52 characters so its pods' controller-revision-hash label fits.
+*/}}
+{{- define "ursula.keyedIndexerFullname" -}}
+{{- printf "%s-keyed-indexer" (include "ursula.fullname" . | trunc 38 | trimSuffix "-") -}}
+{{- end -}}
+
+{{- define "ursula.keyedIndexerHeadlessName" -}}
+{{- printf "%s-headless" (include "ursula.keyedIndexerFullname" .) -}}
+{{- end -}}
+
+{{- define "ursula.keyedIndexerSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "ursula.name" . | trunc 49 | trimSuffix "-" }}-keyed-indexer
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: keyed-indexer
+{{- end -}}
+
+{{- define "ursula.keyedIndexerLabels" -}}
+helm.sh/chart: {{ include "ursula.chart" . }}
+{{ include "ursula.keyedIndexerSelectorLabels" . }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end -}}
+
+{{- define "ursula.keyedIndexerServiceAccountName" -}}
+{{- if .Values.keyedIndexer.serviceAccount.create -}}
+{{- default (include "ursula.keyedIndexerFullname" .) .Values.keyedIndexer.serviceAccount.name -}}
+{{- else -}}
+{{- default (include "ursula.serviceAccountName" .) .Values.keyedIndexer.serviceAccount.name -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ursula.keyedIndexerImage" -}}
+{{- $repository := default .Values.global.image.repository .Values.keyedIndexer.image.repository -}}
+{{- $tag := default (default .Chart.AppVersion .Values.global.image.tag) .Values.keyedIndexer.image.tag -}}
+{{- printf "%s:%s" $repository $tag -}}
+{{- end -}}
+
+{{/*
+The nodes' cold-store root, which also holds the keyed namespaces (`.keyed/`).
+*/}}
+{{- define "ursula.coldRoot" -}}
+{{- include "ursula.joinPath" (list .Values.s3.prefix .Values.coldStorage.prefix) -}}
+{{- end -}}
+
+{{/*
+Base URL the keyed indexer reads records from.
+*/}}
+{{- define "ursula.keyedIndexerSourceUrl" -}}
+{{- if .Values.keyedIndexer.sourceUrl -}}
+{{- .Values.keyedIndexer.sourceUrl | toString | trimSuffix "/" -}}
+{{- else -}}
+{{- printf "http://%s:%d" (include "ursula.fullname" .) (.Values.server.service.port | int) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Node `server.keyed_state_upstream`: the explicit value, else empty (unset). The
+chart keyed indexer is wired through `keyed_state.indexer_urls` instead, which
+the nodes use as the active/standby failover order.
+*/}}
+{{- define "ursula.keyedStateUpstream" -}}
+{{- if .Values.keyedState.upstream -}}
+{{- .Values.keyedState.upstream | toString -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Node `keyed_state.indexer_urls` as a JSON list, in failover order (primary
+first): the explicit list, else every chart keyed indexer pod through the
+headless Service (pod 0 is the primary, the others standbys), else empty (the
+node then reads from and drains its upstream).
+*/}}
+{{- define "ursula.keyedStateIndexerUrls" -}}
+{{- $urls := list -}}
+{{- if .Values.keyedState.indexerUrls -}}
+{{- $urls = .Values.keyedState.indexerUrls -}}
+{{- else if .Values.keyedIndexer.enabled -}}
+{{- $name := include "ursula.keyedIndexerFullname" . -}}
+{{- $headless := include "ursula.keyedIndexerHeadlessName" . -}}
+{{- range $i := until (.Values.keyedIndexer.replicaCount | int) -}}
+{{- $urls = append $urls (printf "http://%s-%d.%s.%s.svc.%s:%d" $name $i $headless $.Release.Namespace ($.Values.global.clusterDomain | toString) ($.Values.keyedIndexer.ports.http | int)) -}}
+{{- end -}}
+{{- end -}}
+{{- $urls | toJson -}}
+{{- end -}}
+
+{{- define "ursula.validateKeyedIndexerConfig" -}}
+{{- if .Values.keyedIndexer.enabled -}}
+{{- if not .Values.coldStorage.enabled -}}
+{{- fail "keyedIndexer.enabled requires coldStorage.enabled=true: keyed namespaces live under the nodes' cold-store root" -}}
+{{- end -}}
+{{- $replicas := .Values.keyedIndexer.replicaCount | int -}}
+{{- if lt $replicas 1 -}}
+{{- fail "keyedIndexer.replicaCount must be at least 1" -}}
+{{- end -}}
+{{- if and .Values.keyedIndexer.podDisruptionBudget.enabled (lt $replicas 2) -}}
+{{- fail "keyedIndexer.podDisruptionBudget.enabled requires keyedIndexer.replicaCount greater than 1" -}}
+{{- end -}}
+{{- if and (not .Values.keyedIndexer.sourceUrl) (not .Values.server.service.enabled) -}}
+{{- fail "keyedIndexer.sourceUrl must be set when server.service.enabled=false" -}}
+{{- end -}}
+{{- if or (lt (.Values.keyedIndexer.gcGraceSeconds | int64) 1) (lt (.Values.keyedIndexer.maxWaiters | int64) 1) -}}
+{{- fail "keyedIndexer.gcGraceSeconds and keyedIndexer.maxWaiters must be positive" -}}
+{{- end -}}
+{{- range $label := list "app.kubernetes.io/name" "app.kubernetes.io/instance" "app.kubernetes.io/component" -}}
+{{- if hasKey $.Values.keyedIndexer.podLabels $label -}}
+{{- fail (printf "keyedIndexer.podLabels must not set reserved selector label %q" $label) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

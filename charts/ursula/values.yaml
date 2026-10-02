@@ -256,7 +256,9 @@ coldStorage:
     maxConcurrency: 4
     maxHotBytesPerGroup: 67108864
   compaction:
-    enabled: false
+    # Same-stream cold chunk compaction. On by default, as in Ursula itself;
+    # set false to keep the pre-compaction behaviour.
+    enabled: true
     intervalMs: 30000
     targetBytes: 8388608
     maxBytes: 16777216
@@ -269,8 +271,10 @@ coldStorage:
     readaheadBlocks: null
 
 snapshotStore:
-  # Snapshot backend: inline or s3. Rendered explicitly as storage.snapshot.backend.
-  backend: inline
+  # Snapshot backend: auto, inline or s3. Rendered as storage.snapshot.backend.
+  # auto is Ursula's default: S3 snapshots whenever the S3 cold store is enabled,
+  # inline otherwise. Set inline to keep snapshots inside the Raft log stores.
+  backend: auto
   # Snapshot object suffix rendered as storage.snapshot.s3_prefix; resolved against
   # storage.cold.root when present, otherwise against the S3 bucket root for S3 snapshots.
   prefix: snapshots
@@ -506,6 +510,122 @@ indexer:
       memory: 2Gi
       ephemeral-storage: 3Gi
   terminationGracePeriodSeconds: 120
+  extraArgs: []
+  extraEnv: []
+  extraEnvFrom: []
+  scheduling:
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    topologySpreadConstraints: []
+
+# Node-side keyed-state settings (keyed streams). They render
+# [server].keyed_state_upstream and the [keyed_state] table of every node.
+keyedState:
+  # Single keyed-state indexer base URL (one pod or a load balancer) the nodes
+  # proxy `{stream}/keyed-state` to when no indexer pods are listed. Empty:
+  # unset (keyed-state answers 404 unless indexerUrls or the chart indexer
+  # provides pods).
+  upstream: ""
+  # Base URL of every keyed indexer pod, in failover order: the nodes send
+  # keyed-state reads to the first healthy pod (primary, then standbys) and
+  # bucket purge drains each one. Takes precedence over `upstream` for reads.
+  # Empty: every chart keyed indexer pod (pod 0 first) when
+  # keyedIndexer.enabled=true, otherwise the node reads from and drains its
+  # upstream.
+  indexerUrls: []
+  # Optional per-pod drain timeout in milliseconds. Null keeps Ursula's 60 s.
+  drainTimeoutMs: null
+
+# Optional keyed-state indexer (`ursula indexer` in keyed mode). It folds keyed
+# streams into key-value namespaces under `{cold root}/.keyed/` in the nodes'
+# bucket and serves `{stream}/keyed-state` through the nodes. Requires
+# coldStorage.enabled=true. Rendered as a StatefulSet so every pod has a stable
+# DNS name for bucket-purge drains; the pods keep no persistent state.
+keyedIndexer:
+  enabled: false
+  # Pod 0 is the primary that takes every keyed-state read; the others are warm
+  # standbys the nodes fail over to (active/standby, not load sharding).
+  replicaCount: 2
+  # Ursula node or gateway base URL the indexer reads records from. Empty uses
+  # the internal node Service (server.service.enabled must be true).
+  sourceUrl: ""
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: ""
+  serviceAccount:
+    # false: run as the server ServiceAccount (or `name`), which already has
+    # access to the cold root. true: create a dedicated account; its identity
+    # needs read, write, list and delete on `{cold root}/.keyed/`.
+    create: false
+    name: ""
+    annotations: {}
+    automountServiceAccountToken: false
+  ports:
+    http: 4493
+  service:
+    type: ClusterIP
+    port: 4493
+    annotations: {}
+  rustLog: "ursula_index=info"
+  cache:
+    # Local cache of namespace parts; the object store is the source of truth.
+    maxBytes: 1073741824
+    emptyDir:
+      sizeLimit: 2Gi
+  # Minimum spacing of one namespace's publications.
+  minPublishIntervalMs: 5000
+  # Grace period before unreachable keyed objects are deleted.
+  gcGraceSeconds: 600
+  # Maximum concurrent waiting keyed-state reads per pod.
+  maxWaiters: 10000
+  probes:
+    startup:
+      enabled: true
+      failureThreshold: 60
+      periodSeconds: 5
+      timeoutSeconds: 2
+    readiness:
+      enabled: true
+      periodSeconds: 5
+      timeoutSeconds: 2
+    liveness:
+      enabled: true
+      periodSeconds: 10
+      timeoutSeconds: 2
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+  networkPolicy:
+    # Restrict ingress to this release namespace (the nodes proxy keyed-state
+    # reads and send purge drains). Egress stays open for DNS, nodes and S3.
+    enabled: true
+    additionalIngress: []
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext:
+    fsGroup: 10001
+    fsGroupChangePolicy: OnRootMismatch
+  securityContext:
+    runAsUser: 10001
+    runAsGroup: 10001
+    runAsNonRoot: true
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+      ephemeral-storage: 2Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+      ephemeral-storage: 3Gi
+  terminationGracePeriodSeconds: 60
   extraArgs: []
   extraEnv: []
   extraEnvFrom: []

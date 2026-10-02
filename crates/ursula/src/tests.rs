@@ -140,6 +140,7 @@ async fn wait_raft_state_machine_payload(
                                     record: None,
                                     max_records: None,
                                     leader_only: false,
+                                    record_anchor: None,
                                 },
                                 placement,
                             )
@@ -537,6 +538,44 @@ async fn path_affinity_keeps_sibling_streams_independent_and_advertises_extensio
     let response = http_head(&app, "/benchcmp/ungrouped").await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert!(response.headers().get(HEADER_STREAM_EXTENSIONS).is_none());
+}
+
+#[tokio::test]
+async fn keyed_state_resource_routes_answer_404_and_never_reach_an_affinity_stream() {
+    let app = test_router();
+    for uri in ["/benchcmp/session", "/benchcmp/run-42/session"] {
+        let response = http_put(
+            &app,
+            uri,
+            &[(CONTENT_TYPE.as_str(), "text/plain")],
+            Body::from("event"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    // Without a keyed-state upstream, every method on the resource answers
+    // 404 for both stream forms, so `/{b}/{s}/keyed-state` is never read, written or
+    // created as the affinity stream `keyed-state` (C8, U5).
+    for uri in [
+        "/benchcmp/session/keyed-state",
+        "/benchcmp/run-42/session/keyed-state",
+    ] {
+        for method in ["GET", "HEAD", "PUT", "POST", "DELETE"] {
+            let response = send(&app, method, uri, &[], Body::empty()).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+    }
+    let response = http_put(
+        &app,
+        "/benchcmp/session/keyed-state",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("not a stream"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = http_get(&app, "/benchcmp/session").await;
+    assert_eq!(&body_bytes(response).await[..], b"event");
 }
 
 #[tokio::test]
@@ -1319,6 +1358,231 @@ async fn json_mode_normalizes_appends_and_reads_ndjson() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn json_message_text_is_stored_verbatim_minus_whitespace() {
+    let app = test_router();
+    let create_body = " [ { \"z\" : 1 , \"a\" : 2 } ] ";
+    let response = http_put(
+        &app,
+        "/benchcmp/json-fidelity",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(create_body),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // Member order, duplicate members, number text and escapes (including a
+    // lone surrogate) survive; only insignificant whitespace is removed.
+    let append_body = "[\n  {\"b\": 1.50e3, \"a\": -0, \"a\": 1e400},\n  \"\\ud800 \\u00e9 \\/ \\\"x\\\"\",\n  [ 1 ,\t2 ]\r\n]";
+    let response = http_post(
+        &app,
+        "/benchcmp/json-fidelity",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(append_body),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "1");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "4");
+
+    let batch = batch_body(&[b"{ \"k\" : [ ] }", b"[ 7 , { } ]"]);
+    let response = http_post(
+        &app,
+        "/benchcmp/json-fidelity/append-batch",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(batch),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let expected = "{\"z\":1,\"a\":2}\n\
+                    {\"b\":1.50e3,\"a\":-0,\"a\":1e400}\n\
+                    \"\\ud800 \\u00e9 \\/ \\\"x\\\"\"\n\
+                    [1,2]\n\
+                    {\"k\":[]}\n\
+                    7\n\
+                    {}\n";
+    let response = http_get(&app, "/benchcmp/json-fidelity").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    assert_eq!(std::str::from_utf8(&body).unwrap(), expected);
+
+    let response = http_head(&app, "/benchcmp/json-fidelity").await;
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        format!("{:020}", expected.len())
+    );
+
+    // The envelope view splices the stored text; a lone surrogate must not
+    // turn it into a 500.
+    let response = http_get(
+        &app,
+        "/benchcmp/json-fidelity?record=1&max_records=2&record_view=envelope",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    assert_eq!(
+        std::str::from_utf8(&body).unwrap(),
+        "{\"record\":1,\"value\":{\"b\":1.50e3,\"a\":-0,\"a\":1e400}}\n\
+         {\"record\":2,\"value\":\"\\ud800 \\u00e9 \\/ \\\"x\\\"\"}\n"
+    );
+
+    // Close the stream so the SSE response ends at the tail.
+    let response = http_post(
+        &app,
+        "/benchcmp/json-fidelity",
+        &[
+            (CONTENT_TYPE.as_str(), "application/json"),
+            (HEADER_STREAM_CLOSED, "true"),
+        ],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = http_get(&app, "/benchcmp/json-fidelity?offset=-1&live=sse").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    let body = std::str::from_utf8(&body).unwrap();
+    assert!(
+        body.contains("data:{\"b\":1.50e3,\"a\":-0,\"a\":1e400}\n"),
+        "{body}"
+    );
+    assert!(
+        body.contains("data:\"\\ud800 \\u00e9 \\/ \\\"x\\\"\"\n"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn invalid_json_bodies_are_refused_without_committing() {
+    let app = test_router();
+    let response = http_put(
+        &app,
+        "/benchcmp/json-invalid",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from("{\"seed\":true}"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let deep_object = format!("{}1{}", "{\"k\":".repeat(128), "}".repeat(128));
+    let deep_wrapped = format!("[1,{}{}]", "[".repeat(128), "]".repeat(128));
+    let bodies: Vec<Vec<u8>> = vec![
+        b"{\"a\":1".to_vec(),
+        b"[1,2,]".to_vec(),
+        b"\"\\x\"".to_vec(),
+        b"\"\xff\xfe\"".to_vec(),
+        b"[{\"ok\":1}, \"\xc3\"]".to_vec(),
+        b"1 2".to_vec(),
+        deep_object.into_bytes(),
+        deep_wrapped.into_bytes(),
+    ];
+    for body in bodies {
+        let response = http_post(
+            &app,
+            "/benchcmp/json-invalid",
+            &[(CONTENT_TYPE.as_str(), "application/json")],
+            Body::from(body.clone()),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    let response = http_post(
+        &app,
+        "/benchcmp/json-invalid/append-batch",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(batch_body(&[b"{\"ok\":1}", b"{\"bad\":"])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = http_put(
+        &app,
+        "/benchcmp/json-invalid-create",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from("[{\"a\":1},"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = http_head(&app, "/benchcmp/json-invalid-create").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = http_head(&app, "/benchcmp/json-invalid").await;
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "1");
+    let response = http_get(&app, "/benchcmp/json-invalid").await;
+    let body = body_bytes(response).await;
+    assert_eq!(&body[..], b"{\"seed\":true}\n");
+}
+
+#[tokio::test]
+async fn json_depth_limit_applies_per_message_after_flattening() {
+    let app = test_router();
+    let response = http_put(
+        &app,
+        "/benchcmp/json-depth",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let object = |depth: usize| format!("{}1{}", "{\"k\":".repeat(depth), "}".repeat(depth));
+    let cases = [
+        (object(127), StatusCode::NO_CONTENT),
+        (object(128), StatusCode::BAD_REQUEST),
+        (format!("[{}]", object(127)), StatusCode::NO_CONTENT),
+        (format!("[{}]", object(128)), StatusCode::BAD_REQUEST),
+        // A 128-deep bare array body is flattened into one 127-deep message.
+        (
+            format!("{}{}", "[".repeat(128), "]".repeat(128)),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            format!("{}{}", "[".repeat(129), "]".repeat(129)),
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+    for (body, status) in cases {
+        let response = http_post(
+            &app,
+            "/benchcmp/json-depth",
+            &[(CONTENT_TYPE.as_str(), "application/json")],
+            Body::from(body.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), status, "{}", &body[..16]);
+    }
+    let response = http_head(&app, "/benchcmp/json-depth").await;
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "3");
+
+    let response = http_get(
+        &app,
+        "/benchcmp/json-depth?record=0&max_records=3&record_view=envelope",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    let lines: Vec<&[u8]> = body
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(
+        lines[2],
+        format!(
+            "{{\"record\":2,\"value\":{}{}}}",
+            "[".repeat(127),
+            "]".repeat(127)
+        )
+        .as_bytes()
+    );
 }
 
 #[tokio::test]
@@ -2212,7 +2476,9 @@ async fn sse_json_max_bytes_does_not_split_utf8_codepoints() {
             (CONTENT_TYPE.as_str(), "application/json"),
             (HEADER_STREAM_CLOSED, "true"),
         ],
-        Body::from(r#"{"m":"\u00e9"}"#),
+        // A literal two-byte code point: P1 stores escapes verbatim, so a
+        // `\u00e9` escape would stay ASCII and not exercise the split.
+        Body::from("{\"m\":\"\u{00e9}\"}"),
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -2913,6 +3179,136 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
     );
     assert!(location.ends_with(&format!("/{}", stream_id)));
     assert!(nodes[0].registry.get(RaftGroupId(1)).is_none());
+
+    for node in nodes {
+        node.shutdown().await;
+    }
+}
+
+/// RT3: with subset voter placement no node hosts every group. A bucket
+/// listing on such a node fetches the missing groups' share from one of their
+/// voters instead of failing with 503 (or silently skipping the group).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn static_grpc_bucket_listing_spans_groups_this_node_does_not_host() {
+    let mut listeners = Vec::new();
+    let mut peers = Vec::new();
+    for node_id in 1..=4u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        peers.push((node_id, format!("http://{addr}")));
+        listeners.push(listener);
+    }
+    let group_voters = BTreeMap::from([
+        (RaftGroupId(0), BTreeSet::from([1, 2, 3])),
+        (RaftGroupId(1), BTreeSet::from([2, 3, 4])),
+    ]);
+    let mut nodes = Vec::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        nodes.push(
+            spawn_static_grpc_test_node(
+                node_id,
+                listener,
+                peers.clone(),
+                peers.clone(),
+                true,
+                2,
+                StaticGrpcTestNodeStorage {
+                    per_group_initializers: true,
+                    per_group_voters: group_voters.clone(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    for (raft_group_id, voters) in &group_voters {
+        for (index, node) in nodes.iter().enumerate() {
+            let node_id = u64::try_from(index + 1).expect("node id fits u64");
+            if voters.contains(&node_id) {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    node.runtime.warm_group(*raft_group_id),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("warm node {node_id} group {} timed out", raft_group_id.0)
+                })
+                .expect("warm voter group");
+            }
+        }
+    }
+
+    let in_group = |group: u32| {
+        (0..10_000)
+            .map(|index| format!("listing-{index}"))
+            .find(|name| {
+                nodes[0]
+                    .runtime
+                    .locate(&BucketStreamId::new("listing", name.clone()))
+                    .raft_group_id
+                    == RaftGroupId(group)
+            })
+            .expect("find stream in group")
+    };
+    let mut expected = vec![in_group(0), in_group(1)];
+    expected.sort();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build reqwest client");
+    for name in &expected {
+        // Retry while the groups still elect their leaders (503).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = client
+                .put(format!("{}/listing/{name}", peers[1].1))
+                .header(CONTENT_TYPE, "text/plain")
+                .send()
+                .await
+                .expect("create stream");
+            if response.status() == StatusCode::SERVICE_UNAVAILABLE
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            assert_eq!(response.status(), StatusCode::CREATED, "create {name}");
+            break;
+        }
+    }
+
+    // Node 1 does not host group 1 and node 4 does not host group 0.
+    for peer in [&peers[0].1, &peers[3].1] {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = client
+                .get(format!("{peer}/listing/streams"))
+                .send()
+                .await
+                .expect("list bucket");
+            let status = response.status();
+            let body = response.text().await.expect("listing body");
+            assert_eq!(status, StatusCode::OK, "listing on {peer}: {body}");
+            let listing: serde_json::Value = serde_json::from_str(&body).expect("listing json");
+            let listed = listing["streams"]
+                .as_array()
+                .expect("streams array")
+                .iter()
+                .map(|entry| entry["stream_id"].as_str().expect("id").to_owned())
+                .collect::<Vec<_>>();
+            if listed == expected {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "listing on {peer} never converged: {listed:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 
     for node in nodes {
         node.shutdown().await;
@@ -4098,6 +4494,8 @@ async fn static_grpc_raft_durable_cold_flush_replicates_manifest() {
                 min_hot_bytes: 4,
                 max_flush_bytes: 4,
                 max_batch_bytes: payload.len(),
+                pressure: None,
+                max_hot_age: None,
             },
             8,
         )
@@ -4583,7 +4981,9 @@ async fn flush_cold_endpoint_uploads_and_reads_back_segments() {
 async fn cold_backpressure_returns_service_unavailable_and_metrics() {
     let cold_store = std::sync::Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        RuntimeConfig::new(1, 1).with_cold_max_hot_bytes_per_group(Some(4)),
+        // F6c: the cap counts payload plus per-record overhead.
+        RuntimeConfig::new(1, 1)
+            .with_cold_max_hot_bytes_per_group(Some(4 + ursula_runtime::HOT_RECORD_OVERHEAD_BYTES)),
         InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
         Some(cold_store),
     )
@@ -4627,7 +5027,10 @@ async fn cold_backpressure_returns_service_unavailable_and_metrics() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("utf8 body");
-    assert!(body.contains("\"cold_hot_bytes\":4"));
+    assert!(body.contains(&format!(
+        "\"cold_hot_bytes\":{}",
+        4 + ursula_runtime::HOT_RECORD_OVERHEAD_BYTES
+    )));
     assert!(body.contains("\"cold_backpressure_events\":1"));
     assert!(body.contains("\"cold_backpressure_bytes\":1"));
     assert!(body.contains("\"cold_store\":{\"backend\":\"memory\""));
@@ -4790,6 +5193,226 @@ async fn bootstrap_without_snapshot_emits_empty_snapshot_part_and_rejects_live()
     let body = std::str::from_utf8(&body).expect("multipart utf8");
     assert!(body.contains("Content-Type: application/octet-stream\r\n\r\n\r\n--"));
     assert!(body.contains("one"));
+}
+
+fn cold_test_router() -> Router {
+    let cold_store = std::sync::Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+        RuntimeConfig::new(1, 1),
+        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
+        Some(cold_store),
+    )
+    .expect("runtime");
+    router(runtime)
+}
+
+/// Splits a bootstrap multipart body into its parts' payloads.
+fn bootstrap_parts(response_content_type: &str, body: &[u8]) -> Vec<String> {
+    let boundary = response_content_type
+        .split("boundary=")
+        .nth(1)
+        .expect("multipart boundary");
+    let body = std::str::from_utf8(body).expect("multipart utf8");
+    let delimiter = format!("--{boundary}");
+    body.split(delimiter.as_str())
+        .skip(1)
+        .filter(|part| !part.starts_with("--"))
+        .map(|part| {
+            let (_, payload) = part.split_once("\r\n\r\n").expect("part headers");
+            payload
+                .strip_suffix("\r\n")
+                .expect("part terminator")
+                .to_owned()
+        })
+        .collect()
+}
+
+async fn bootstrap_get(app: &Router, uri: &str) -> (Response, Vec<String>) {
+    let response = http_get(app, uri).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = header_str(&response, CONTENT_TYPE).to_owned();
+    let (parts, body) = response.into_parts();
+    let bytes = to_bytes(body, usize::MAX).await.expect("body");
+    let payloads = bootstrap_parts(&content_type, &bytes);
+    (Response::from_parts(parts, Body::empty()), payloads)
+}
+
+async fn post_messages(app: &Router, uri: &str, content_type: &str, payloads: &[&str]) {
+    for payload in payloads {
+        let response = http_post(
+            app,
+            uri,
+            &[(CONTENT_TYPE.as_str(), content_type)],
+            Body::from(payload.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+}
+
+async fn flush_cold(app: &Router, stream_path: &str, max_bytes: u64) {
+    let response = http_post(
+        app,
+        &format!("/__ursula/flush-cold{stream_path}?min_hot_bytes=1&max_bytes={max_bytes}"),
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// Regression: a cold flush past the snapshot made bootstrap drop the
+/// collapsed messages after the snapshot while still claiming the tail and
+/// `Stream-Up-To-Date: true`.
+#[tokio::test]
+async fn bootstrap_after_cold_flush_past_snapshot_is_honest_partial() {
+    let app = cold_test_router();
+    let stream_uri = "/benchcmp/bootstrap-cold-partial";
+    let response = http_put(
+        &app,
+        stream_uri,
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    post_messages(&app, stream_uri, "application/octet-stream", &[
+        "abc", "de", "fg",
+    ])
+    .await;
+    let response = http_put(
+        &app,
+        &format!("{stream_uri}/snapshot/00000000000000000003"),
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"state":"abc"}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    flush_cold(&app, stream_uri, 5).await;
+
+    let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET),
+        "00000000000000000003"
+    );
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        "00000000000000000003"
+    );
+    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
+    assert!(response.headers().get(HEADER_STREAM_CLOSED).is_none());
+    assert_eq!(parts, vec![r#"{"state":"abc"}"#.to_owned()]);
+
+    // The client continues with an ordinary read from the next offset.
+    let response = http_get(&app, &format!("{stream_uri}?offset=00000000000000000003")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(&body_bytes(response).await[..], b"defg");
+
+    // Once the snapshot is past the exact-message frontier, bootstrap is
+    // complete again with one part per message.
+    post_messages(&app, stream_uri, "application/octet-stream", &["hi", "jkl"]).await;
+    let response = http_put(
+        &app,
+        &format!("{stream_uri}/snapshot/00000000000000000007"),
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"state":"abcdefg"}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        "00000000000000000012"
+    );
+    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert_eq!(parts, vec![
+        r#"{"state":"abcdefg"}"#.to_owned(),
+        "hi".to_owned(),
+        "jkl".to_owned(),
+    ]);
+}
+
+/// Regression: without a snapshot (or with one at the retained offset), the
+/// collapsed cold prefix came back as a single part holding many messages.
+#[tokio::test]
+async fn json_bootstrap_never_merges_cold_messages_into_one_part() {
+    let app = cold_test_router();
+    let stream_uri = "/benchcmp/bootstrap-cold-json";
+    let response = http_put(
+        &app,
+        stream_uri,
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    post_messages(&app, stream_uri, "application/json", &[
+        r#"{"a":1}"#,
+        r#"{"b":2}"#,
+    ])
+    .await;
+    let response = http_head(&app, stream_uri).await;
+    let flushed_tail = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+    flush_cold(&app, stream_uri, 1024).await;
+
+    let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
+    assert_eq!(header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET), "-1");
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        "00000000000000000000"
+    );
+    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
+    assert_eq!(parts, vec![String::new()]);
+
+    let response = http_get(&app, &format!("{stream_uri}?offset=-1")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    let body = std::str::from_utf8(&body).expect("json body");
+    assert!(body.contains(r#"{"a":1}"#) && body.contains(r#"{"b":2}"#));
+
+    post_messages(&app, stream_uri, "application/json", &[
+        r#"{"c":3}"#,
+        r#"{"d":4}"#,
+    ])
+    .await;
+    let response = http_head(&app, stream_uri).await;
+    let tail = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+    // The first message after the flush could be a fragment as far as the
+    // state machine knows, so a snapshot at the flush point is partial...
+    let response = http_put(
+        &app,
+        &format!("{stream_uri}/snapshot/{flushed_tail}"),
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"n":2}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        flushed_tail
+    );
+    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
+    assert_eq!(parts, vec![r#"{"n":2}"#.to_owned()]);
+
+    // ...and a snapshot one message later is complete, one JSON message per
+    // update part.
+    let response = http_get(&app, &format!("{stream_uri}?record=2&max_records=1")).await;
+    let after_c = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+    let response = http_put(
+        &app,
+        &format!("{stream_uri}/snapshot/{after_c}"),
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"n":3}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
+    assert_eq!(header_str(&response, HEADER_STREAM_NEXT_OFFSET), tail);
+    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0], r#"{"n":3}"#);
+    assert!(parts[1].contains(r#"{"d":4}"#) && !parts[1].contains(r#"{"c":3}"#));
 }
 
 #[tokio::test]
@@ -5450,6 +6073,7 @@ fn raft_metrics_snapshot(
         purged: None,
         voter_ids: voters,
         learner_ids: vec![],
+        log: Default::default(),
     }
 }
 
@@ -5597,20 +6221,22 @@ mod cold_health {
 
 mod snapshot_driver {
     use ursula_raft::RaftGroupMetricsSnapshot;
-    use ursula_raft::RaftLogProgressSnapshot;
+    use ursula_raft::snapshot_cadence::GroupLogProgress;
+    use ursula_raft::snapshot_cadence::SnapshotCadence;
 
-    use crate::bootstrap::next_snapshot_to_drive;
-    use crate::bootstrap::pressure_snapshot_groups;
+    use crate::bootstrap::group_log_progress;
+    use crate::bootstrap::plan_snapshot_drive;
     use crate::bootstrap::resolve_snapshot_drive_interval_ms;
-    use crate::bootstrap::should_drive_snapshot_for_group;
-    use crate::bootstrap::unpurged_log_entries;
 
-    fn snap_with_group(
+    const MIB: u64 = 1 << 20;
+
+    fn snap(
         raft_group_id: u32,
         last_applied: Option<u64>,
         snapshot_index: Option<u64>,
+        log: GroupLogProgress,
     ) -> RaftGroupMetricsSnapshot {
-        super::raft_metrics_snapshot(
+        let mut snapshot = super::raft_metrics_snapshot(
             raft_group_id,
             1,
             Some(1),
@@ -5618,42 +6244,24 @@ mod snapshot_driver {
             last_applied,
             snapshot_index,
             vec![1, 2, 3],
-        )
+        );
+        snapshot.log = log;
+        snapshot
     }
 
-    fn snap(last_applied: Option<u64>, snapshot_index: Option<u64>) -> RaftGroupMetricsSnapshot {
-        snap_with_group(0, last_applied, snapshot_index)
-    }
-
-    #[test]
-    fn snapshot_driver_amortizes_applied_work_after_the_first_snapshot() {
-        assert!(!should_drive_snapshot_for_group(&snap(None, None), 5));
-        assert!(should_drive_snapshot_for_group(&snap(Some(42), None), 5));
-        assert!(!should_drive_snapshot_for_group(
-            &snap(Some(42), Some(41)),
-            5
-        ));
-        assert!(!should_drive_snapshot_for_group(
-            &snap(Some(46), Some(42)),
-            5
-        ));
-        assert!(should_drive_snapshot_for_group(
-            &snap(Some(47), Some(42)),
-            5
-        ));
-        assert!(!should_drive_snapshot_for_group(
-            &snap(Some(42), Some(42)),
-            5
-        ));
-        assert!(!should_drive_snapshot_for_group(
-            &snap(Some(42), Some(43)),
-            5
-        ));
+    fn log(log_bytes: u64, last_snapshot_bytes: u64) -> GroupLogProgress {
+        GroupLogProgress {
+            log_bytes,
+            log_entries: 1 + log_bytes / 256,
+            last_snapshot_bytes,
+            has_snapshot: last_snapshot_bytes > 0,
+        }
     }
 
     #[test]
     fn snapshot_driver_default_interval_follows_external_store() {
-        assert_eq!(resolve_snapshot_drive_interval_ms(None, false), 0);
+        // F12e: the inline backend runs the byte-based driver too.
+        assert_eq!(resolve_snapshot_drive_interval_ms(None, false), 1_000);
         assert_eq!(resolve_snapshot_drive_interval_ms(None, true), 5_000);
         assert_eq!(resolve_snapshot_drive_interval_ms(Some(0), false), 0);
         assert_eq!(resolve_snapshot_drive_interval_ms(Some(0), true), 0);
@@ -5668,56 +6276,92 @@ mod snapshot_driver {
     }
 
     #[test]
-    fn snapshot_driver_picks_one_due_group_round_robin() {
-        let snapshots = vec![
-            snap_with_group(0, Some(42), Some(42)),
-            snap_with_group(1, Some(42), Some(41)),
-            snap_with_group(2, Some(42), Some(41)),
-        ];
-
-        let first = next_snapshot_to_drive(&snapshots, 0, 1).expect("first due snapshot");
-        assert_eq!(first.0, 1);
-        assert_eq!(first.1.raft_group_id, 1);
-
-        let second =
-            next_snapshot_to_drive(&snapshots, first.0 + 1, 1).expect("second due snapshot");
-        assert_eq!(second.0, 2);
-        assert_eq!(second.1.raft_group_id, 2);
-
-        let wrapped =
-            next_snapshot_to_drive(&snapshots, second.0 + 1, 1).expect("wrapped snapshot");
-        assert_eq!(wrapped.0, 1);
-        assert_eq!(wrapped.1.raft_group_id, 1);
+    fn snapshot_driver_never_snapshots_a_group_without_applied_state() {
+        let empty = snap(0, None, None, log(MIB, 0));
+        assert_eq!(group_log_progress(&empty), GroupLogProgress::default());
+        // OpenRaft's snapshot counts even if the gauge has not seen one.
+        let installed = snap(1, Some(9), Some(9), GroupLogProgress {
+            log_entries: 1,
+            log_bytes: 10,
+            ..GroupLogProgress::default()
+        });
+        assert!(group_log_progress(&installed).has_snapshot);
     }
 
     #[test]
-    fn snapshot_driver_counts_unpurged_logs() {
-        assert_eq!(unpurged_log_entries(&snap(Some(99), None)), 100);
-
-        let mut partially_purged = snap(Some(99), Some(80));
-        partially_purged.purged = Some(RaftLogProgressSnapshot { term: 1, index: 63 });
-        assert_eq!(unpurged_log_entries(&partially_purged), 36);
-
-        assert_eq!(unpurged_log_entries(&snap(None, None)), 0);
-    }
-
-    #[test]
-    fn snapshot_pressure_prioritizes_largest_reclaimable_groups() {
+    fn snapshot_driver_follows_log_bytes_not_entry_counts() {
+        // 128 groups and a 1 GiB budget: a 4 MiB floor.
+        let cadence = SnapshotCadence::new(1 << 30, 128, 100_000);
         let snapshots = vec![
-            snap_with_group(0, Some(90), Some(80)),
-            snap_with_group(1, Some(150), Some(50)),
-            snap_with_group(2, Some(75), None),
-            snap_with_group(3, Some(42), Some(42)),
+            // First snapshot as soon as there is applied state.
+            snap(0, Some(3), None, log(512, 0)),
+            // Below max(4 MiB, 2 x 1 MiB).
+            snap(1, Some(50_000), Some(10), log(4 * MIB - 1, MIB)),
+            // Past max(4 MiB, 2 x 3 MiB) = 6 MiB.
+            snap(2, Some(9_000), Some(10), log(6 * MIB, 3 * MIB)),
+            // Many entries, few bytes: below the floor and the backstop.
+            snap(3, Some(90_000), Some(10), GroupLogProgress {
+                log_bytes: MIB,
+                log_entries: 89_990,
+                last_snapshot_bytes: MIB,
+                has_snapshot: true,
+            }),
         ];
-
-        let selected = pressure_snapshot_groups(&snapshots, 2);
+        let (plan, selected) = plan_snapshot_drive(&snapshots, &cadence, 16);
+        assert!(!plan.pressure);
         assert_eq!(
             selected
                 .iter()
                 .map(|snapshot| snapshot.raft_group_id)
                 .collect::<Vec<_>>(),
-            vec![1, 2]
+            vec![0, 2]
         );
+        let (_, one) = plan_snapshot_drive(&snapshots, &cadence, 1);
+        assert_eq!(one.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_pressure_keeps_unpurged_log_within_the_node_budget() {
+        // A 64 MiB budget over 4 groups: floor 8 MiB, pressure from 48 MiB.
+        let cadence = SnapshotCadence::new(64 * MIB, 4, 100_000);
+        let snapshots = vec![
+            snap(0, Some(100), Some(1), log(14 * MIB, 8 * MIB)),
+            snap(1, Some(100), Some(1), log(12 * MIB, 16 * MIB)),
+            snap(2, Some(100), Some(1), log(14 * MIB, 10 * MIB)),
+            snap(3, Some(100), Some(1), log(10 * MIB, 6 * MIB)),
+        ];
+        let (plan, selected) = plan_snapshot_drive(&snapshots, &cadence, 16);
+        assert!(plan.pressure);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|snapshot| snapshot.raft_group_id)
+                .collect::<Vec<_>>(),
+            vec![0, 3]
+        );
+    }
+
+    #[test]
+    fn metrics_export_log_bytes_since_snapshot_and_last_snapshot_size() {
+        // Bounded-state §7.5 soak gauges: unpurged log bytes and snapshot raw
+        // bytes per group, scraped from `/__ursula/metrics`.
+        let rendered = crate::render::render_raft_group_metrics_array(&[snap(
+            3,
+            Some(100),
+            Some(40),
+            GroupLogProgress {
+                log_bytes: 5 * MIB,
+                log_entries: 60,
+                last_snapshot_bytes: 3 * MIB,
+                has_snapshot: true,
+            },
+        )]);
+        let group = &rendered[0];
+        assert_eq!(group["raft_group_id"], 3);
+        assert_eq!(group["log_bytes_since_snapshot"], 5 * MIB);
+        assert_eq!(group["log_entries_since_snapshot"], 60);
+        assert_eq!(group["last_snapshot_bytes"], 3 * MIB);
+        assert_eq!(group["has_snapshot"], true);
     }
 }
 
@@ -7105,4 +7749,1751 @@ async fn bucket_quota_endpoint_enforces_and_clears_backstops() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+// Bounded-state §7.5: per-group state gauges exported in /__ursula/metrics.
+#[tokio::test]
+async fn metrics_expose_per_group_state_gauges() {
+    let app = test_router();
+    let response = http_put(
+        &app,
+        "/benchcmp/gauge-stream",
+        &[
+            (CONTENT_TYPE.as_str(), "application/json"),
+            ("Stream-TTL", "3600"),
+        ],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    for seq in 0..3 {
+        let seq = seq.to_string();
+        let response = http_post(
+            &app,
+            "/benchcmp/gauge-stream",
+            &[
+                (CONTENT_TYPE.as_str(), "application/json"),
+                ("Producer-Id", "writer-1"),
+                ("Producer-Epoch", "0"),
+                ("Producer-Seq", seq.as_str()),
+            ],
+            Body::from(r#"[{"a":1},{"b":2}]"#),
+        )
+        .await;
+        assert!(response.status().is_success(), "{}", response.status());
+    }
+
+    let response = http_get(&app, "/__ursula/metrics").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let metrics: serde_json::Value =
+        serde_json::from_slice(&body_bytes(response).await).expect("metrics json");
+    let groups = metrics["group_state_gauges"]
+        .as_array()
+        .expect("group_state_gauges array");
+    assert_eq!(groups.len(), 8, "{metrics}");
+    assert!(
+        groups
+            .iter()
+            .all(|group| group["hosted"] == true && group["feature_level"] == 0)
+    );
+    let streams: u64 = groups.iter().filter_map(|g| g["streams"].as_u64()).sum();
+    assert_eq!(streams, 1);
+    let group = groups
+        .iter()
+        .find(|group| group["streams"] == 1)
+        .expect("group holding the stream");
+    assert_eq!(group["dense_record_entries"], 6, "{group}");
+    assert_eq!(group["record_marks"], 0);
+    assert_eq!(group["producers"], 1);
+    assert_eq!(group["receipts"], 3);
+    assert_eq!(group["ttl_streams"], 1);
+    assert!(group["ttl_heap_entries"].as_u64().expect("ttl heap") >= 1);
+    // F6b: the three contiguous appends share one hot block.
+    assert_eq!(group["hot_chunks"], 1);
+    assert_eq!(group["hot_records"], 6);
+    for key in [
+        "message_records",
+        "shared_refs",
+        "live_packs",
+        "staged_external_refs",
+        "receipt_items",
+        "producer_bytes",
+        "hot_payload_bytes",
+        "hot_overhead_bytes",
+        "hot_real_bytes",
+        "pending_cold_gc",
+    ] {
+        assert!(group[key].is_u64(), "missing {key}: {group}");
+    }
+}
+
+// Keyed-streams C0: replicated group feature level admin surface.
+#[tokio::test]
+async fn feature_level_endpoint_reports_and_raises_every_group() {
+    let app = test_router();
+
+    let response = http_get(&app, "/__ursula/feature-level").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let report: serde_json::Value =
+        serde_json::from_slice(&body_bytes(response).await).expect("report json");
+    assert_eq!(report["version"], 1);
+    assert_eq!(
+        report["supported_level"],
+        u64::from(ursula_runtime::MAX_SUPPORTED_FEATURE_LEVEL)
+    );
+    let groups = report["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 8);
+    assert!(groups.iter().all(|group| group["level"] == 0));
+
+    let response = http_post(
+        &app,
+        "/__ursula/feature-level",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"level":1}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let outcome: serde_json::Value =
+        serde_json::from_slice(&body_bytes(response).await).expect("outcome json");
+    let groups = outcome["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 8);
+    assert!(
+        groups
+            .iter()
+            .all(|group| group["status"] == "set" && group["level"] == 1),
+        "{outcome}"
+    );
+
+    // Lower levels are accepted as no-ops: never lowered.
+    let response = http_post(
+        &app,
+        "/__ursula/feature-level",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"level":0}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = http_get(&app, "/__ursula/feature-level").await;
+    let report: serde_json::Value =
+        serde_json::from_slice(&body_bytes(response).await).expect("report json");
+    let groups = report["groups"].as_array().expect("groups");
+    assert!(groups.iter().all(|group| group["level"] == 1), "{report}");
+}
+
+#[tokio::test]
+async fn feature_level_endpoint_refuses_levels_this_node_cannot_apply() {
+    let app = test_router();
+    let level = ursula_runtime::MAX_SUPPORTED_FEATURE_LEVEL + 1;
+    let response = http_post(
+        &app,
+        "/__ursula/feature-level",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(format!(r#"{{"level":{level}}}"#)),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+    assert!(body.contains("supported level"), "{body}");
+
+    let response = http_get(&app, "/__ursula/feature-level").await;
+    let report: serde_json::Value =
+        serde_json::from_slice(&body_bytes(response).await).expect("report json");
+    let groups = report["groups"].as_array().expect("groups");
+    assert!(groups.iter().all(|group| group["level"] == 0), "{report}");
+}
+
+#[test]
+fn feature_not_enabled_maps_to_conflict() {
+    assert_eq!(
+        crate::render::stream_error_code_status(ursula_runtime::StreamErrorCode::FeatureNotEnabled),
+        StatusCode::CONFLICT
+    );
+}
+
+// Keyed streams P2 (`keyed-batch-v1`) on the write paths: design §5.2, §6.1
+// U4 and U10; `extensions.md` §9.1.
+
+const KEYED_CT: &str = "application/json; profile=keyed-batch-v1";
+
+async fn keyed_router_at_level_1() -> Router {
+    let app = test_router();
+    raise_feature_level(&app, 1).await;
+    app
+}
+
+async fn raise_feature_level(app: &Router, level: u32) {
+    let response = http_post(
+        app,
+        "/__ursula/feature-level",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(format!(r#"{{"level":{level}}}"#)),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+async fn body_text(response: Response) -> String {
+    String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8 body")
+}
+
+fn extension_tokens(response: &Response) -> Vec<String> {
+    response
+        .headers()
+        .get(HEADER_STREAM_EXTENSIONS)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .map(|token| token.trim().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[track_caller]
+fn assert_keyed_advertised(response: &Response) {
+    let tokens = extension_tokens(response);
+    assert!(
+        tokens.iter().any(|token| token == KEYED_BATCH_EXTENSION),
+        "{tokens:?}"
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|token| token == JSON_RECORD_COORDINATES_EXTENSION),
+        "{tokens:?}"
+    );
+}
+
+#[track_caller]
+fn assert_keyed_not_advertised(response: &Response) {
+    let tokens = extension_tokens(response);
+    assert!(
+        !tokens.iter().any(|token| token == KEYED_BATCH_EXTENSION),
+        "{tokens:?}"
+    );
+}
+
+#[tokio::test]
+async fn keyed_create_is_refused_below_feature_level_1_and_allowed_after_raising_it() {
+    let app = test_router();
+    let response = http_put(
+        &app,
+        "/benchcmp/keyed-gated",
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = body_text(response).await;
+    assert!(body.contains("requires group feature level 1"), "{body}");
+    assert_eq!(
+        http_head(&app, "/benchcmp/keyed-gated").await.status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // A quoted profile is not keyed and is not gated.
+    let response = http_put(
+        &app,
+        "/benchcmp/keyed-quoted",
+        &[(
+            CONTENT_TYPE.as_str(),
+            "application/json; profile=\"keyed-batch-v1\"",
+        )],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_keyed_not_advertised(&response);
+
+    raise_feature_level(&app, 1).await;
+    let response = http_put(
+        &app,
+        "/benchcmp/keyed-gated",
+        &[(
+            CONTENT_TYPE.as_str(),
+            "Application/JSON;Profile=keyed-batch-v1",
+        )],
+        Body::from(r#"{"ops":[["p","AQ",1]]}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(header_str(&response, CONTENT_TYPE), KEYED_CT);
+    assert_keyed_advertised(&response);
+
+    // Idempotent re-create also advertises.
+    let response = http_put(
+        &app,
+        "/benchcmp/keyed-gated",
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_advertised(&response);
+}
+
+/// RT4: a close-only POST (empty body, no content type) to a keyed stream
+/// advertises `keyed-batch-v1` like every other successful write (§9.1.5);
+/// one to a plain stream does not.
+#[tokio::test]
+async fn keyed_close_only_post_advertises_keyed_batch() {
+    let app = keyed_router_at_level_1().await;
+    for (uri, content_type, keyed) in [
+        ("/benchcmp/keyed-close-only", KEYED_CT, true),
+        ("/benchcmp/plain-close-only", "application/json", false),
+    ] {
+        let response = http_put(
+            &app,
+            uri,
+            &[(CONTENT_TYPE.as_str(), content_type)],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let response = http_post(&app, uri, &[(HEADER_STREAM_CLOSED, "true")], Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        if keyed {
+            assert_keyed_advertised(&response);
+        } else {
+            assert_keyed_not_advertised(&response);
+        }
+    }
+}
+
+#[tokio::test]
+async fn keyed_create_body_is_validated_before_the_feature_gate() {
+    let app = test_router();
+    // 422 (HTTP layer) precedes the apply-time 409 of the level gate.
+    let response = http_put(
+        &app,
+        "/benchcmp/keyed-create-invalid",
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"[{"ops":[]},{"ops":[["p","AA=",1]]}]"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = body_text(response).await;
+    assert!(
+        body.starts_with("invalid keyed batch at message 1: "),
+        "{body}"
+    );
+
+    // JSON syntax stays 400.
+    let response = http_put(
+        &app,
+        "/benchcmp/keyed-create-invalid",
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"{"ops":["#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    raise_feature_level(&app, 1).await;
+    let response = http_put(
+        &app,
+        "/benchcmp/keyed-create-invalid",
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"{"ops":[["q","AQ"]]}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        http_head(&app, "/benchcmp/keyed-create-invalid")
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn keyed_append_validates_every_message_and_commits_nothing_on_failure() {
+    let app = keyed_router_at_level_1().await;
+    let uri = "/benchcmp/keyed-append";
+    let response = http_put(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_keyed_advertised(&response);
+
+    let response = http_post(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"{"o":17, "ops":[["p","AQ",{"b":2,"a":1}],["d","Ag"],["x","AA","AP8"]]}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_keyed_advertised(&response);
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "1");
+
+    let response = http_post(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"[{"ops":[]},{"ops":[]},{"ops":[["x","AP8","AA"]]}]"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_keyed_not_advertised(&response);
+    let body = body_text(response).await;
+    assert!(
+        body.starts_with("invalid keyed batch at message 2: "),
+        "{body}"
+    );
+
+    let response = http_post(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"[{"ops":[]},{"ops":"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = http_get(&app, uri).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_advertised(&response);
+    assert_eq!(
+        &body_bytes(response).await[..],
+        b"{\"o\":17,\"ops\":[[\"p\",\"AQ\",{\"b\":2,\"a\":1}],[\"d\",\"Ag\"],[\"x\",\"AA\",\"AP8\"]]}\n"
+    );
+
+    let response = http_head(&app, uri).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_advertised(&response);
+
+    let response = http_get(&app, &format!("{uri}?record=0&record_view=envelope")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_advertised(&response);
+
+    let response = http_get(&app, &format!("{uri}?offset=now")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_advertised(&response);
+}
+
+#[tokio::test]
+async fn keyed_validation_runs_before_stream_lookup() {
+    let app = test_router();
+    // Absent stream: grammar failure is 422, a valid batch is the apply-time 404.
+    let response = http_post(
+        &app,
+        "/benchcmp/keyed-absent",
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"{"ops":[["p","AQ"]]}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let response = http_post(
+        &app,
+        "/benchcmp/keyed-absent",
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"{"ops":[["p","AQ",1]]}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_keyed_not_advertised(&response);
+
+    // Non-keyed stream: ungrammatical keyed write is 422, a valid one 409.
+    let uri = "/benchcmp/plain-json";
+    let response = http_put(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_keyed_not_advertised(&response);
+    let response = http_post(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"{"no_ops":1}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let response = http_post(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"{"ops":[]}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_keyed_not_advertised(&response);
+
+    // Plain JSON streams accept any JSON and never advertise keyed-batch-v1.
+    let response = http_post(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"no_ops":1}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_keyed_not_advertised(&response);
+    let response = http_head(&app, uri).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_not_advertised(&response);
+    let response = http_get(&app, &format!("{uri}?record=0")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_not_advertised(&response);
+}
+
+#[tokio::test]
+async fn keyed_append_batch_fails_whole_request_with_frame_and_message_index() {
+    let app = keyed_router_at_level_1().await;
+    let uri = "/benchcmp/keyed-batch";
+    let response = http_put(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = http_post(
+        &app,
+        &format!("{uri}/append-batch"),
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(batch_body(&[
+            br#"{"ops":[["p","AQ",1]]}"#.as_slice(),
+            br#"[{"ops":[]},{"ops":[["d","AQ","AQ"]]}]"#.as_slice(),
+        ])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = body_text(response).await;
+    assert!(
+        body.starts_with("invalid keyed batch at frame 1 message 1: "),
+        "{body}"
+    );
+    let response = http_head(&app, uri).await;
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "0");
+
+    let response = http_post(
+        &app,
+        &format!("{uri}/append-batch"),
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(batch_body(&[
+            br#"{"ops":[["p","AQ",1]]}"#.as_slice(),
+            br#"[{"ops":[]},{"ops":[["d","AQ"]]}]"#.as_slice(),
+        ])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_advertised(&response);
+    let response = http_head(&app, uri).await;
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "3");
+}
+
+fn transaction_op(stream: &str, content_type: &str, payload: &str) -> serde_json::Value {
+    json!({
+        "stream": stream,
+        "content_type": content_type,
+        "payload_base64": BASE64_STANDARD.encode(payload),
+    })
+}
+
+async fn post_transaction(app: &Router, uri: &str, operations: Vec<serde_json::Value>) -> Response {
+    http_post(
+        app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(json!({ "operations": operations }).to_string()),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn keyed_transaction_ops_are_validated_and_advertised() {
+    let app = keyed_router_at_level_1().await;
+    for (stream, content_type) in [("keyed", KEYED_CT), ("plain", "application/json")] {
+        let response = http_put(
+            &app,
+            &format!("/benchcmp/txn-keyed/{stream}"),
+            &[(CONTENT_TYPE.as_str(), content_type)],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+    let txn = "/benchcmp/txn-keyed/$transaction";
+
+    let response = post_transaction(&app, txn, vec![
+        transaction_op("plain", "application/json", r#"{"a":1}"#),
+        transaction_op("keyed", KEYED_CT, r#"[{"ops":[]},{"ops":[["p","AQ"]]}]"#),
+    ])
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = body_text(response).await;
+    assert!(
+        body.starts_with("invalid keyed batch at message 1: "),
+        "{body}"
+    );
+    for stream in ["keyed", "plain"] {
+        let response = http_head(&app, &format!("/benchcmp/txn-keyed/{stream}")).await;
+        assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "0");
+    }
+
+    // RT5 (§9.1.3): invalid JSON in a later op is 400 even when an earlier
+    // op is valid JSON with invalid keyed grammar (422).
+    let response = post_transaction(&app, txn, vec![
+        transaction_op("keyed", KEYED_CT, r#"{"ops":[["q","AQ"]]}"#),
+        transaction_op("plain", "application/json", r#"{"a":"#),
+    ])
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Plain-only transactions do not advertise keyed-batch-v1.
+    let response = post_transaction(&app, txn, vec![transaction_op(
+        "plain",
+        "application/json",
+        r#"{"a":1}"#,
+    )])
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_not_advertised(&response);
+
+    // Op content types are normalized like the Content-Type header (U10).
+    let response = post_transaction(&app, txn, vec![
+        transaction_op("plain", "Application/JSON", r#"{"a":2}"#),
+        transaction_op(
+            "keyed",
+            "application/json ;Profile=Keyed-Batch-V1",
+            r#"{"ops":[["p","AQ",1]]}"#,
+        ),
+    ])
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        body_text(response).await
+    );
+}
+
+#[tokio::test]
+async fn transaction_op_content_types_are_normalized() {
+    // U10 regression: `$transaction` compared op content types verbatim, so
+    // a differently-cased type that the Content-Type header would accept was
+    // a 409.
+    let app = test_router();
+    let response = http_put(
+        &app,
+        "/benchcmp/txn-norm/journal",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = post_transaction(&app, "/benchcmp/txn-norm/$transaction", vec![
+        transaction_op("journal", " Application/JSON ", r#"{"a":1}"#),
+    ])
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_not_advertised(&response);
+    let body = body_bytes(http_get(&app, "/benchcmp/txn-norm/journal").await).await;
+    assert_eq!(&body[..], b"{\"a\":1}\n");
+}
+
+#[tokio::test]
+async fn keyed_batch_v1_message_vectors_through_http() {
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../ursula-index/tests/vectors/keyed_batch_v1.json"
+    ))
+    .expect("vectors");
+    let app = keyed_router_at_level_1().await;
+    let uri = "/benchcmp/keyed-vectors";
+    let response = http_put(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let mut committed = 0u64;
+    for vector in vectors["messages"].as_array().expect("messages") {
+        let name = vector["name"].as_str().expect("name");
+        let message = vector["message"].as_str().expect("message");
+        // Wrap in an array so P1 flattening yields exactly this message.
+        let response = http_post(
+            &app,
+            uri,
+            &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+            Body::from(format!("[{message}]")),
+        )
+        .await;
+        let status = response.status();
+        let text = body_text(response).await;
+        match (vector["valid"].as_bool(), vector["reason"].as_str()) {
+            (Some(true), _) => {
+                assert_eq!(status, StatusCode::NO_CONTENT, "{name}: {text}");
+                committed += 1;
+            }
+            (_, Some("invalid_json")) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {text}");
+            }
+            _ => {
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{name}: {text}");
+                assert!(
+                    text.starts_with("invalid keyed batch at message 0: "),
+                    "{name}: {text}"
+                );
+            }
+        }
+    }
+    let response = http_head(&app, uri).await;
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_RECORD_NEXT),
+        committed.to_string()
+    );
+}
+
+// --- P7: byte-bounded record-aware reads (extensions.md §6.6) ---
+
+/// Record sizes in stored bytes, LF included: 8, 8, 49, 8.
+const P7_RECORDS: [&str; 4] = [
+    r#"{"a":1}"#,
+    r#"{"a":2}"#,
+    r#"{"b":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}"#,
+    r#"{"a":4}"#,
+];
+
+async fn p7_stream(app: &Router, uri: &str, close: bool) {
+    let response = http_put(
+        app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    post_messages(app, uri, "application/json", &P7_RECORDS).await;
+    if close {
+        let response = http_post(
+            app,
+            uri,
+            &[
+                (CONTENT_TYPE.as_str(), "application/json"),
+                (HEADER_STREAM_CLOSED, "true"),
+            ],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+}
+
+/// Reads `uri` and returns (status, record start, record next, next offset, body).
+async fn p7_read(app: &Router, uri: &str) -> (StatusCode, String, String, String, String) {
+    let response = http_get(app, uri).await;
+    let status = response.status();
+    if status != StatusCode::OK {
+        let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+        return (status, String::new(), String::new(), String::new(), body);
+    }
+    let start = header_str(&response, HEADER_STREAM_RECORD_START).to_owned();
+    let next = header_str(&response, HEADER_STREAM_RECORD_NEXT).to_owned();
+    let next_offset = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+    (status, start, next, next_offset, body)
+}
+
+fn p7_lines(range: std::ops::Range<usize>) -> String {
+    P7_RECORDS[range]
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect()
+}
+
+#[tokio::test]
+async fn record_read_max_bytes_returns_longest_complete_record_run() {
+    let app = test_router();
+    let uri = "/benchcmp/p7-records";
+    p7_stream(&app, uri, false).await;
+
+    // Exactly two small records fit (8 + 8 bytes, LF included).
+    let (status, start, next, next_offset, body) =
+        p7_read(&app, &format!("{uri}?record=0&max_bytes=16")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!((start.as_str(), next.as_str()), ("0", "2"));
+    assert_eq!(body, p7_lines(0..2));
+    let (_, _, _, by_count_offset, _) =
+        p7_read(&app, &format!("{uri}?record=0&max_records=2")).await;
+    assert_eq!(next_offset, by_count_offset);
+
+    // One byte short of the second record's LF: only the first record.
+    let (_, _, next, _, body) = p7_read(&app, &format!("{uri}?record=0&max_bytes=15")).await;
+    assert_eq!(next, "1");
+    assert_eq!(body, p7_lines(0..1));
+
+    // A budget smaller than the first record still returns that record.
+    let (_, _, next, _, body) = p7_read(&app, &format!("{uri}?record=0&max_bytes=1")).await;
+    assert_eq!(next, "1");
+    assert_eq!(body, p7_lines(0..1));
+
+    // A single record larger than max_bytes is returned whole and alone.
+    let (_, start, next, _, body) = p7_read(&app, &format!("{uri}?record=2&max_bytes=10")).await;
+    assert_eq!((start.as_str(), next.as_str()), ("2", "3"));
+    assert_eq!(body, p7_lines(2..3));
+
+    // The large record stops the run that precedes it.
+    let (_, _, next, _, body) = p7_read(&app, &format!("{uri}?record=1&max_bytes=56")).await;
+    assert_eq!(next, "2");
+    assert_eq!(body, p7_lines(1..2));
+    let (_, _, next, _, body) = p7_read(&app, &format!("{uri}?record=1&max_bytes=57")).await;
+    assert_eq!(next, "3");
+    assert_eq!(body, p7_lines(1..3));
+
+    // A budget beyond the tail returns everything.
+    let (_, _, next, _, body) = p7_read(&app, &format!("{uri}?record=0&max_bytes=100000")).await;
+    assert_eq!(next, "4");
+    assert_eq!(body, p7_lines(0..4));
+
+    // tail_records composes with max_bytes.
+    let (_, start, next, _, body) =
+        p7_read(&app, &format!("{uri}?tail_records=2&max_bytes=49")).await;
+    assert_eq!((start.as_str(), next.as_str()), ("2", "3"));
+    assert_eq!(body, p7_lines(2..3));
+
+    // At the tail the read is an empty up-to-date read.
+    let (status, start, next, _, body) =
+        p7_read(&app, &format!("{uri}?record=4&max_bytes=8")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!((start.as_str(), next.as_str()), ("4", "4"));
+    assert!(body.is_empty());
+}
+
+#[tokio::test]
+async fn record_read_max_bytes_combines_with_max_records() {
+    let app = test_router();
+    let uri = "/benchcmp/p7-both";
+    p7_stream(&app, uri, false).await;
+
+    // max_records is the tighter limit.
+    let (status, _, next, _, body) = p7_read(
+        &app,
+        &format!("{uri}?record=0&max_bytes=1000&max_records=1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(next, "1");
+    assert_eq!(body, p7_lines(0..1));
+
+    // max_bytes is the tighter limit.
+    let (_, _, next, _, body) =
+        p7_read(&app, &format!("{uri}?record=0&max_bytes=20&max_records=3")).await;
+    assert_eq!(next, "2");
+    assert_eq!(body, p7_lines(0..2));
+
+    // Both allow everything up to max_records.
+    let (_, _, next, _, body) = p7_read(
+        &app,
+        &format!("{uri}?record=0&max_bytes=1000&max_records=3"),
+    )
+    .await;
+    assert_eq!(next, "3");
+    assert_eq!(body, p7_lines(0..3));
+}
+
+#[tokio::test]
+async fn record_read_max_bytes_envelope_counts_stored_bytes_only() {
+    let app = test_router();
+    let uri = "/benchcmp/p7-envelope";
+    p7_stream(&app, uri, false).await;
+
+    // Envelope framing does not count: 16 stored bytes still yield two records.
+    let response = http_get(
+        &app,
+        &format!("{uri}?record=0&max_bytes=16&record_view=envelope"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header_str(&response, CONTENT_TYPE),
+        "application/vnd.durable-stream-records+ndjson"
+    );
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
+    let body = body_bytes(response).await;
+    assert_eq!(
+        &body[..],
+        b"{\"record\":0,\"value\":{\"a\":1}}\n{\"record\":1,\"value\":{\"a\":2}}\n"
+    );
+}
+
+#[tokio::test]
+async fn record_read_max_bytes_pages_continue_without_gaps() {
+    let app = test_router();
+    let uri = "/benchcmp/p7-pages";
+    p7_stream(&app, uri, false).await;
+    let (_, _, _, _, full) = p7_read(&app, &format!("{uri}?record=0")).await;
+
+    for max_bytes in [1_usize, 8, 9, 16, 20, 49, 57, 64] {
+        let mut record = 0_u64;
+        let mut pages = String::new();
+        let mut page_count = 0;
+        while record < 4 {
+            let (status, start, next, _, body) = p7_read(
+                &app,
+                &format!("{uri}?record={record}&max_bytes={max_bytes}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(start, record.to_string());
+            let next: u64 = next.parse().expect("record next");
+            assert!(next > record, "max_bytes={max_bytes} made no progress");
+            let page_records = usize::try_from(next - record).expect("count");
+            assert!(
+                page_records == 1 || body.len() <= max_bytes,
+                "{max_bytes}: {body}"
+            );
+            pages.push_str(&body);
+            record = next;
+            page_count += 1;
+        }
+        assert_eq!(pages, full, "max_bytes={max_bytes}");
+        assert!(page_count <= 4);
+    }
+}
+
+#[tokio::test]
+async fn record_read_max_bytes_rejects_non_positive_values() {
+    let app = test_router();
+    let uri = "/benchcmp/p7-invalid";
+    p7_stream(&app, uri, false).await;
+    for raw in ["0", "-1", "abc", ""] {
+        let response = http_get(&app, &format!("{uri}?record=0&max_bytes={raw}")).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "max_bytes={raw}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn record_read_max_bytes_applies_to_long_poll_and_sse() {
+    let app = test_router();
+    let uri = "/benchcmp/p7-live";
+    p7_stream(&app, uri, true).await;
+
+    let (status, _, next, _, body) = p7_read(
+        &app,
+        &format!("{uri}?record=0&max_bytes=16&live=long-poll&timeout_ms=10"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(next, "2");
+    assert_eq!(body, p7_lines(0..2));
+
+    let response = http_get(&app, &format!("{uri}?record=0&max_bytes=16&live=sse")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    let body = std::str::from_utf8(&body).expect("utf8 sse body");
+    let next_records: Vec<&str> = body
+        .match_indices("\"streamNextRecord\":")
+        .map(|(index, key)| {
+            let rest = &body[index + key.len()..];
+            let end = rest.find(|ch: char| !ch.is_ascii_digit()).expect("digits");
+            &rest[..end]
+        })
+        .collect();
+    assert_eq!(next_records, vec!["2", "3", "4"], "{body}");
+}
+
+#[tokio::test]
+async fn record_read_max_bytes_cuts_cold_windows() {
+    let app = cold_test_router();
+    let uri = "/benchcmp/p7-cold";
+    p7_stream(&app, uri, false).await;
+    flush_cold(&app, uri, 1024).await;
+
+    let (status, _, next, _, body) = p7_read(&app, &format!("{uri}?record=0&max_bytes=16")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(next, "2");
+    assert_eq!(body, p7_lines(0..2));
+    let (_, _, next, _, body) = p7_read(&app, &format!("{uri}?record=2&max_bytes=1")).await;
+    assert_eq!(next, "3");
+    assert_eq!(body, p7_lines(2..3));
+}
+
+// --- U9: bucket stream listing (extensions.md §1.4) ---
+
+async fn list_streams(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    let response = http_get(app, uri).await;
+    let status = response.status();
+    let body = body_bytes(response).await;
+    let value = serde_json::from_slice(&body)
+        .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&body).into()));
+    (status, value)
+}
+
+fn listed_ids(listing: &serde_json::Value) -> Vec<String> {
+    listing["streams"]
+        .as_array()
+        .expect("streams array")
+        .iter()
+        .map(|entry| entry["stream_id"].as_str().expect("stream_id").to_owned())
+        .collect()
+}
+
+async fn create_listing_streams(app: &Router, bucket: &str, ids: &[&str]) {
+    for id in ids {
+        let response = http_put(
+            app,
+            &format!("/{bucket}/{id}"),
+            &[(CONTENT_TYPE.as_str(), "text/plain")],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED, "{id}");
+    }
+}
+
+#[tokio::test]
+async fn bucket_listing_merges_streams_across_groups() {
+    let app = test_router();
+    let ids: Vec<String> = (0..24).map(|index| format!("s-{index:02}")).collect();
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    create_listing_streams(&app, "catalog", &id_refs).await;
+    let runtime_groups: std::collections::HashSet<u32> = {
+        let shard_map = ursula_shard::StaticShardMap::new(2, 8).expect("shard map");
+        ids.iter()
+            .map(|id| {
+                shard_map
+                    .locate(&BucketStreamId::new("catalog", id.as_str()))
+                    .raft_group_id
+                    .0
+            })
+            .collect()
+    };
+    assert!(runtime_groups.len() > 1, "streams must span several groups");
+
+    let response = http_post(
+        &app,
+        "/catalog/s-03",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("hello"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let (status, listing) = list_streams(&app, "/catalog/streams").await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert_eq!(listing["bucket_id"], "catalog");
+    assert_eq!(listing["stream_count"], 24);
+    assert_eq!(listing["has_more"], false);
+    assert!(listing["next_cursor"].is_null());
+    assert_eq!(listed_ids(&listing), ids);
+    let entry = &listing["streams"][3];
+    assert_eq!(entry["stream_id"], "s-03");
+    assert_eq!(entry["status"], "Open");
+    assert_eq!(entry["content_type"], "text/plain");
+    assert_eq!(entry["tail_offset"], 5);
+    assert!(entry["created_at_ms"].as_u64().is_some());
+    assert!(entry.get("last_write_at_ms").is_none());
+}
+
+#[tokio::test]
+async fn bucket_listing_filters_by_prefix_and_pages_by_cursor() {
+    let app = test_router();
+    create_listing_streams(&app, "catalog", &[
+        "user-3", "user-1", "admin", "user-2", "user-10", "zeta",
+    ])
+    .await;
+    let response = http_put(
+        &app,
+        "/catalog/user-run/journal",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = http_post(
+        &app,
+        "/catalog/user-2",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_STREAM_CLOSED, "true"),
+        ],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let (status, listing) = list_streams(&app, "/catalog/streams?prefix=user-").await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert_eq!(listing["prefix"], "user-");
+    assert_eq!(listed_ids(&listing), vec![
+        "user-1",
+        "user-10",
+        "user-2",
+        "user-3",
+        "user-run/journal"
+    ]);
+    assert_eq!(listing["streams"][2]["status"], "Closed");
+
+    let mut cursor: Option<String> = None;
+    let mut pages = Vec::new();
+    loop {
+        let uri = match &cursor {
+            Some(after) => format!("/catalog/streams?prefix=user-&limit=2&after={after}"),
+            None => "/catalog/streams?prefix=user-&limit=2".to_owned(),
+        };
+        let (status, listing) = list_streams(&app, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{listing}");
+        let page = listed_ids(&listing);
+        assert!(page.len() <= 2);
+        pages.push(page.clone());
+        if listing["has_more"] == true {
+            assert_eq!(
+                listing["next_cursor"],
+                page.last().expect("non-empty page").as_str()
+            );
+            cursor = Some(
+                url::form_urlencoded::byte_serialize(page.last().expect("page").as_bytes())
+                    .collect(),
+            );
+        } else {
+            assert!(listing["next_cursor"].is_null());
+            break;
+        }
+    }
+    assert_eq!(pages, vec![
+        vec!["user-1".to_owned(), "user-10".to_owned()],
+        vec!["user-2".to_owned(), "user-3".to_owned()],
+        vec!["user-run/journal".to_owned()],
+    ]);
+
+    let (status, listing) = list_streams(&app, "/catalog/streams?after=user-3").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed_ids(&listing), vec!["user-run/journal", "zeta"]);
+    let (status, listing) = list_streams(&app, "/catalog/streams?prefix=nobody").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listing["stream_count"], 0);
+    assert_eq!(listing["has_more"], false);
+}
+
+#[tokio::test]
+async fn bucket_listing_of_empty_and_unknown_buckets() {
+    let app = test_router();
+    create_listing_streams(&app, "emptied", &["only"]).await;
+    let response = http_delete(&app, "/emptied/only").await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (status, listing) = list_streams(&app, "/emptied/streams").await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert_eq!(listing["stream_count"], 0);
+    assert_eq!(listing["streams"], serde_json::json!([]));
+    assert_eq!(listing["has_more"], false);
+
+    let (status, _) = list_streams(&app, "/missing-bucket/streams").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn bucket_listing_rejects_invalid_parameters() {
+    let app = test_router();
+    create_listing_streams(&app, "catalog", &["a-stream"]).await;
+    for uri in [
+        "/catalog/streams?limit=0",
+        "/catalog/streams?limit=1001",
+        "/catalog/streams?limit=abc",
+        "/catalog/streams?limit=",
+        "/BAD/streams",
+        "/abc/streams",
+    ] {
+        let (status, body) = list_streams(&app, uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+    }
+    let (status, listing) = list_streams(&app, "/catalog/streams?limit=1000").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed_ids(&listing), vec!["a-stream"]);
+
+    // `streams` stays reserved: the name cannot be created as a stream.
+    let response = http_put(
+        &app,
+        "/catalog/streams",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
+    assert!(response.status().is_client_error(), "{}", response.status());
+}
+
+#[tokio::test]
+async fn bucket_listing_on_raft_engine() {
+    let app = router(
+        spawn_runtime(
+            &test_config(1, 2),
+            Persistence::Raft { log_dir: None },
+            Topology::SingleNode {
+                raft_group_count: 2,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    );
+    create_listing_streams(&app, "catalog", &["b", "a", "c"]).await;
+    let (status, listing) = list_streams(&app, "/catalog/streams?limit=2").await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert_eq!(listed_ids(&listing), vec!["a", "b"]);
+    assert_eq!(listing["has_more"], true);
+    assert_eq!(listing["next_cursor"], "b");
+}
+
+/// bounded-stream-state F3: `Producer-Id` and `Stream-Seq` are capped at
+/// 256 bytes on every HTTP write path, ungated.
+#[tokio::test]
+async fn producer_id_and_stream_seq_length_caps_reject_with_400() {
+    let app = test_router();
+    let at_cap = "p".repeat(WRITE_IDENTIFIER_MAX_BYTES);
+    let over_cap = "p".repeat(WRITE_IDENTIFIER_MAX_BYTES + 1);
+    let producer = |id: &str| -> Vec<(&'static str, String)> {
+        vec![
+            (HEADER_PRODUCER_ID, id.to_owned()),
+            (HEADER_PRODUCER_EPOCH, "0".to_owned()),
+            (HEADER_PRODUCER_SEQ, "0".to_owned()),
+        ]
+    };
+    fn as_refs<'a>(headers: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+        headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect()
+    }
+
+    // Create.
+    let mut headers = producer(&over_cap);
+    headers.push((CONTENT_TYPE.as_str(), "text/plain".to_owned()));
+    let response = http_put(&app, "/benchcmp/caps-a", &as_refs(&headers), Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = http_put(
+        &app,
+        "/benchcmp/caps-a",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_STREAM_SEQ, over_cap.as_str()),
+        ],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = http_put(
+        &app,
+        "/benchcmp/caps-a",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // Append.
+    let mut headers = producer(&over_cap);
+    headers.push((CONTENT_TYPE.as_str(), "text/plain".to_owned()));
+    let response = http_post(
+        &app,
+        "/benchcmp/caps-a",
+        &as_refs(&headers),
+        Body::from("a"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = http_post(
+        &app,
+        "/benchcmp/caps-a",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_STREAM_SEQ, over_cap.as_str()),
+        ],
+        Body::from("a"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // Exactly at the cap is accepted.
+    let mut headers = producer(&at_cap);
+    headers.push((CONTENT_TYPE.as_str(), "text/plain".to_owned()));
+    headers.push((HEADER_STREAM_SEQ, at_cap.clone()));
+    let response = http_post(
+        &app,
+        "/benchcmp/caps-a",
+        &as_refs(&headers),
+        Body::from("a"),
+    )
+    .await;
+    assert!(response.status().is_success(), "{}", response.status());
+
+    // Append batch.
+    let response = http_post(
+        &app,
+        "/benchcmp/caps-a/append-batch",
+        &as_refs(&producer(&over_cap)),
+        Body::from(batch_body(&[b"b".as_slice()])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Close with an empty body.
+    let mut headers = producer(&over_cap);
+    headers.push((HEADER_STREAM_CLOSED, "true".to_owned()));
+    let response = http_post(&app, "/benchcmp/caps-a", &as_refs(&headers), Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = http_post(
+        &app,
+        "/benchcmp/caps-a",
+        &[
+            (HEADER_STREAM_CLOSED, "true"),
+            (HEADER_STREAM_SEQ, over_cap.as_str()),
+        ],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // `$transaction` JSON.
+    let response = http_put(
+        &app,
+        "/benchcmp/run-caps/journal",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    for operation in [
+        json!({
+            "stream": "journal",
+            "content_type": "application/json",
+            "payload_base64": "eyJldmVudCI6MX0K",
+            "stream_seq": over_cap,
+        }),
+        json!({
+            "stream": "journal",
+            "content_type": "application/json",
+            "payload_base64": "eyJldmVudCI6MX0K",
+            "producer": {"producer_id": over_cap, "producer_epoch": 0, "producer_seq": 0},
+        }),
+    ] {
+        let response = http_post(
+            &app,
+            "/benchcmp/run-caps/$transaction",
+            &[(CONTENT_TYPE.as_str(), "application/json")],
+            Body::from(
+                serde_json::to_vec(&json!({"operations": [operation]}))
+                    .expect("serialize transaction"),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let journal = body_bytes(http_get(&app, "/benchcmp/run-caps/journal").await).await;
+    assert!(journal.is_empty());
+}
+
+/// bounded-stream-state F3 at feature level 1: a duplicate whose receipt
+/// the stream's receipt window evicted answers `204` with `Producer-Seq` and
+/// without byte or record range headers, and never appends.
+#[tokio::test]
+async fn duplicate_beyond_receipt_window_answers_204_without_ranges() {
+    let app = test_router();
+    let response = http_post(
+        &app,
+        "/__ursula/feature-level",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"level":1}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = http_put(
+        &app,
+        "/benchcmp/receipt-window",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let post = |seq: u64| {
+        let app = app.clone();
+        async move {
+            let seq = seq.to_string();
+            http_post(
+                &app,
+                "/benchcmp/receipt-window",
+                &[
+                    (CONTENT_TYPE.as_str(), "application/json"),
+                    (HEADER_PRODUCER_ID, "writer"),
+                    (HEADER_PRODUCER_EPOCH, "0"),
+                    (HEADER_PRODUCER_SEQ, seq.as_str()),
+                ],
+                Body::from(r#"{"a":1}"#),
+            )
+            .await
+        }
+    };
+    for seq in 0..1_026 {
+        assert_eq!(post(seq).await.status(), StatusCode::OK);
+    }
+    let tail = http_head(&app, "/benchcmp/receipt-window").await;
+    let tail_offset = tail.headers().get(HEADER_STREAM_NEXT_OFFSET).cloned();
+
+    let evicted = post(0).await;
+    assert_eq!(evicted.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        evicted
+            .headers()
+            .get(HEADER_PRODUCER_SEQ)
+            .and_then(|value| value.to_str().ok()),
+        Some("0")
+    );
+    assert!(evicted.headers().get(HEADER_STREAM_NEXT_OFFSET).is_none());
+    assert!(evicted.headers().get("Stream-Record-Start").is_none());
+    assert!(evicted.headers().get("Stream-Record-Next").is_none());
+
+    let newest = post(1_025).await;
+    assert_eq!(newest.status(), StatusCode::NO_CONTENT);
+    assert!(newest.headers().get(HEADER_STREAM_NEXT_OFFSET).is_some());
+    assert!(newest.headers().get("Stream-Record-Start").is_some());
+
+    let after = http_head(&app, "/benchcmp/receipt-window").await;
+    assert_eq!(
+        after.headers().get(HEADER_STREAM_NEXT_OFFSET).cloned(),
+        tail_offset
+    );
+}
+
+/// bounded-stream-state F11: ordinary reads are capped at 8 MiB, like
+/// bootstrap. An offset read of a byte stream ends at the cap; a JSON offset
+/// read without `max_bytes` ends at the last record boundary within it; a
+/// record read ends at a record; a capped response is partial and the
+/// continuation from `Stream-Next-Offset` returns the rest.
+#[tokio::test]
+async fn reads_are_capped_at_the_server_response_limit() {
+    const CAP: usize = 8 * 1024 * 1024;
+    let app = test_router();
+
+    // Byte stream: 9 MiB in one append.
+    let response = http_put(
+        &app,
+        "/benchcmp/capped-bytes",
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let payload = vec![b'x'; CAP + 1024 * 1024];
+    let response = http_post(
+        &app,
+        "/benchcmp/capped-bytes",
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::from(payload.clone()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = http_get(&app, "/benchcmp/capped-bytes?offset=-1").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        format!("{CAP:020}")
+    );
+    assert_eq!(body_bytes(response).await.len(), CAP);
+    // A larger client max_bytes is clamped to the cap.
+    let response = http_get(&app, "/benchcmp/capped-bytes?offset=-1&max_bytes=99999999").await;
+    assert_eq!(body_bytes(response).await.len(), CAP);
+    let response = http_get(&app, &format!("/benchcmp/capped-bytes?offset={CAP:020}")).await;
+    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert_eq!(body_bytes(response).await.len(), payload.len() - CAP);
+
+    // JSON stream: 10,000 records of about 1 KiB (just over 9.5 MiB).
+    let response = http_put(
+        &app,
+        "/benchcmp/capped-json",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let value = "v".repeat(1_000);
+    let records = (0..10_000)
+        .map(|index| format!(r#"{{"i":{index},"v":"{value}"}}"#))
+        .collect::<Vec<_>>();
+    let response = http_post(
+        &app,
+        "/benchcmp/capped-json",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(format!("[{}]", records.join(","))),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let mut offset = "-1".to_owned();
+    let mut seen = Vec::new();
+    loop {
+        let response = http_get(&app, &format!("/benchcmp/capped-json?offset={offset}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let up_to_date = response.headers().get(HEADER_STREAM_UP_TO_DATE).is_some();
+        offset = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+        let body = body_bytes(response).await;
+        assert!(body.len() <= CAP);
+        assert!(body.ends_with(b"\n"), "capped JSON reads end at a record");
+        seen.extend_from_slice(&body);
+        if up_to_date {
+            break;
+        }
+    }
+    let expected = records
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect::<String>();
+    assert_eq!(seen, expected.as_bytes());
+
+    // Record read without max_records stops at a record within the cap.
+    let response = http_get(&app, "/benchcmp/capped-json?record=0").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
+    let next_record = header_str(&response, HEADER_STREAM_RECORD_NEXT)
+        .parse::<u64>()
+        .unwrap();
+    assert!(next_record > 0 && next_record < 10_000);
+    let body = body_bytes(response).await;
+    assert!(body.len() <= CAP && body.ends_with(b"\n"));
+}
+
+/// F11: a single JSON record larger than the read cap is returned whole.
+#[tokio::test]
+async fn a_json_record_larger_than_the_read_cap_is_returned_whole() {
+    const CAP: usize = 8 * 1024 * 1024;
+    let app = test_router();
+    let response = http_put(
+        &app,
+        "/benchcmp/capped-big-record",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let big = format!(r#"{{"v":"{}"}}"#, "b".repeat(CAP + 4096));
+    for body in [big.clone(), r#"{"v":"small"}"#.to_owned()] {
+        let response = http_post(
+            &app,
+            "/benchcmp/capped-big-record",
+            &[(CONTENT_TYPE.as_str(), "application/json")],
+            Body::from(body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    let response = http_get(&app, "/benchcmp/capped-big-record?offset=-1").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
+    let next = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+    let body = body_bytes(response).await;
+    assert_eq!(body, format!("{big}\n").as_bytes());
+    assert_eq!(next, format!("{:020}", big.len() + 1));
+    let response = http_get(&app, &format!("/benchcmp/capped-big-record?offset={next}")).await;
+    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert_eq!(body_bytes(response).await, "{\"v\":\"small\"}\n".as_bytes());
+}
+
+/// F11 regression: a capped JSON offset read (catch-up and long-poll, on a
+/// stream that is closed at its tail) returns whole records, record headers
+/// that match the returned body, `Stream-Closed` only at the tail, and a
+/// `Stream-Next-Offset` that continues exactly after the last returned byte.
+#[tokio::test]
+async fn capped_json_offset_reads_keep_record_headers_and_continuation_consistent() {
+    const CAP: usize = 8 * 1024 * 1024;
+    let app = test_router();
+    let response = http_put(
+        &app,
+        "/benchcmp/capped-consistent",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    // Records of varying size so the cap lands inside a record.
+    let records = (0..9_000)
+        .map(|index| format!(r#"{{"i":{index},"v":"{}"}}"#, "v".repeat(900 + index % 257)))
+        .collect::<Vec<_>>();
+    for (index, chunk) in records.chunks(3_000).enumerate() {
+        let close = index == 2;
+        let mut headers = vec![(CONTENT_TYPE.as_str(), "application/json")];
+        if close {
+            headers.push((HEADER_STREAM_CLOSED, "true"));
+        }
+        let response = http_post(
+            &app,
+            "/benchcmp/capped-consistent",
+            &headers,
+            Body::from(format!("[{}]", chunk.join(","))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    let expected = records
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect::<String>();
+    let head = http_head(&app, "/benchcmp/capped-consistent").await;
+    let record_next = header_str(&head, HEADER_STREAM_RECORD_NEXT).to_owned();
+    assert_eq!(record_next, "9000");
+
+    for live in ["", "&live=long-poll"] {
+        let mut offset = 0_u64;
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        loop {
+            let response = http_get(
+                &app,
+                &format!("/benchcmp/capped-consistent?offset={offset:020}{live}"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "live={live}");
+            pages += 1;
+            let up_to_date = response.headers().get(HEADER_STREAM_UP_TO_DATE).is_some();
+            let closed = response.headers().get(HEADER_STREAM_CLOSED).is_some();
+            let next = header_str(&response, HEADER_STREAM_NEXT_OFFSET)
+                .parse::<u64>()
+                .unwrap();
+            let start = response
+                .headers()
+                .get(HEADER_STREAM_RECORD_START)
+                .map(|value| value.to_str().unwrap().parse::<u64>().unwrap());
+            let record_next = response
+                .headers()
+                .get(HEADER_STREAM_RECORD_NEXT)
+                .map(|value| value.to_str().unwrap().parse::<u64>().unwrap());
+            let body = body_bytes(response).await;
+            assert!(body.len() <= CAP, "live={live}");
+            assert!(body.ends_with(b"\n"), "live={live}: whole records only");
+            assert_eq!(
+                next,
+                offset + u64::try_from(body.len()).unwrap(),
+                "live={live}: continuation follows the returned bytes"
+            );
+            let lines = u64::try_from(body.iter().filter(|byte| **byte == b'\n').count()).unwrap();
+            for line in body
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+            {
+                serde_json::from_slice::<serde_json::Value>(line).expect("whole JSON record");
+            }
+            match (start, record_next) {
+                (Some(start), Some(record_next)) => {
+                    assert_eq!(
+                        record_next - start,
+                        lines,
+                        "live={live}: record headers match body"
+                    );
+                }
+                (None, _) => {}
+                (Some(_), None) => panic!("live={live}: Stream-Record-Start without Next"),
+            }
+            assert_eq!(
+                closed, up_to_date,
+                "live={live}: Stream-Closed only at the tail"
+            );
+            seen.extend_from_slice(&body);
+            offset = next;
+            if up_to_date {
+                break;
+            }
+        }
+        assert!(pages > 1, "live={live}: the read was capped");
+        assert_eq!(seen, expected.as_bytes(), "live={live}");
+    }
+}
+
+/// F11 regression: cutting a capped read at a record boundary rewrites every
+/// coordinate from the kept bytes, including a record range (a partial last
+/// record is not counted) and the continuation offset.
+#[test]
+fn cutting_a_capped_read_keeps_the_record_range_consistent() {
+    let mut response = ReadStreamResponse {
+        placement: ursula_shard::ShardPlacement {
+            core_id: ursula_shard::CoreId(0),
+            shard_id: ursula_shard::ShardId(0),
+            raft_group_id: RaftGroupId(0),
+        },
+        offset: 100,
+        next_offset: 100 + 20,
+        content_type: "application/json".to_owned(),
+        payload: b"{\"a\":1}\n{\"b\":2}\n{\"c\"".to_vec(),
+        up_to_date: true,
+        closed: true,
+        retained_record_range: Some(ursula_runtime::StreamRecordRange {
+            first_record: 0,
+            next_record: 10,
+        }),
+        record_range: Some(ursula_runtime::StreamRecordRange {
+            first_record: 7,
+            next_record: 10,
+        }),
+    };
+    cut_read_after(&mut response, 16);
+    assert_eq!(response.payload, b"{\"a\":1}\n{\"b\":2}\n");
+    assert_eq!(response.next_offset, 116);
+    assert!(!response.up_to_date);
+    assert_eq!(
+        response.record_range,
+        Some(ursula_runtime::StreamRecordRange {
+            first_record: 7,
+            next_record: 9,
+        })
+    );
+    // The retained range describes the stream, not the response.
+    assert_eq!(
+        response
+            .retained_record_range
+            .map(|range| range.next_record),
+        Some(10)
+    );
+}
+
+/// F11 regression: the first SSE event of a JSON offset read never splits a
+/// record larger than the read cap; the record arrives whole in one event.
+#[tokio::test]
+async fn sse_offset_reads_do_not_split_a_json_record_larger_than_the_cap() {
+    const CAP: usize = 8 * 1024 * 1024;
+    let app = test_router();
+    let response = http_put(
+        &app,
+        "/benchcmp/sse-capped-big-record",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let big = format!(r#"{{"v":"{}"}}"#, "b".repeat(CAP + 4096));
+    for (body, close) in [(big.clone(), false), (r#"{"v":"small"}"#.to_owned(), true)] {
+        let mut headers = vec![(CONTENT_TYPE.as_str(), "application/json")];
+        if close {
+            headers.push((HEADER_STREAM_CLOSED, "true"));
+        }
+        let response = http_post(
+            &app,
+            "/benchcmp/sse-capped-big-record",
+            &headers,
+            Body::from(body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    let response = http_get(&app, "/benchcmp/sse-capped-big-record?offset=-1&live=sse").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    let body = std::str::from_utf8(&body).expect("utf8 sse body");
+    assert!(
+        body.contains(&format!("data:{big}\n")),
+        "the big record arrives whole in one event"
+    );
+    assert!(body.contains("data:{\"v\":\"small\"}\n"));
+    assert!(body.contains("\"streamClosed\":true"));
 }

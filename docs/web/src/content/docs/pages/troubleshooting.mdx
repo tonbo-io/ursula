@@ -118,7 +118,15 @@ The stream hasn't been created. Create with `PUT /{bucket}/{stream}` first. Ther
 
 ### `400 Bad Request` on JSON appends
 
-JSON streams are parsed and normalized on the server. Malformed JSON or empty arrays without `allow_empty_array` are rejected. Send valid JSON or switch to `application/octet-stream`.
+JSON streams are validated on the server. Malformed JSON, invalid UTF-8, messages nested deeper than 127 levels, and empty arrays without `allow_empty_array` are rejected. Send valid JSON or switch to `application/octet-stream`.
+
+### `422 Unprocessable Content` on keyed streams
+
+The request used `application/json; profile=keyed-batch-v1` and a message is not a valid `keyed-batch-v1` batch. The body names the message and op, for example `invalid keyed batch at message 0: op 1: key is not canonical unpadded base64url`. Keys must be canonical unpadded base64url of 1 to 4096 octets. Nothing from the request was committed. See [Keyed streams](/docs/concepts/keyed-streams).
+
+### `409 Conflict` creating a keyed stream
+
+The body reads `... requires group feature level 1`. Raise the cluster's feature level once every node runs a release that supports it: see [Feature levels](/docs/operations#feature-levels).
 
 ## Read path
 
@@ -137,6 +145,13 @@ Expected. SSE wire format is text-only, so binary stream data events carry raw b
 ### Reads stall for hundreds of ms for cold offsets
 
 The first read of a cold offset triggers an S3 `GetObject` range read. It runs off the actor turn so it doesn't block other commands, but the request still pays S3 latency.
+
+### `keyed-state` answers `404`, `503` or `500`
+
+- `404` on a stream you know is keyed: the node has no keyed-state indexer configured. Set `keyed_state.indexer_urls` (primary first) or `server.keyed_state_upstream` (or `--keyed-state-upstream`) on every node. `HEAD` then advertises `keyed-state-v1`.
+- `503` with `Retry-After`: the indexer is unreachable, could not read the stream, or is rebuilding the projection (for example after a restore). Check the indexer's `/readyz` and its logs, then retry.
+- `204`: not an error. Keyed state had not reached `min_through_record` within `timeout_ms`; retry the same request.
+- `500` naming a record: keyed state cannot advance past that record, usually because retention removed records the projection still needed. Keyed streams must not be trimmed; see [Keyed streams](/docs/concepts/keyed-streams#retention).
 
 ## Replication and consensus
 

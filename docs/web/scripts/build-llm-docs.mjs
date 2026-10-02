@@ -51,11 +51,13 @@ const PAGE_ORDER = new Map([
   ["examples/resumable-ai-stream", ["Examples", 1]],
   ["examples/chat-room", ["Examples", 2]],
   ["examples/browser-telemetry", ["Examples", 3]],
+  ["examples/pi-durable", ["Examples", 4]],
 
   ["concepts/streams", ["Concepts", 1]],
   ["concepts/buckets", ["Concepts", 2]],
   ["concepts/offsets", ["Concepts", 3]],
   ["concepts/record-coordinates", ["Concepts", 4]],
+  ["concepts/keyed-streams", ["Concepts", 4.5]],
   ["concepts/read-modes", ["Concepts", 5]],
   ["concepts/exactly-once-writes", ["Concepts", 6]],
   ["concepts/conditional-writes", ["Concepts", 7]],
@@ -67,9 +69,11 @@ const PAGE_ORDER = new Map([
 
   ["api/overview", ["API Reference", 1]],
   ["api/create-bucket", ["API Reference", 2]],
+  ["api/list-streams", ["API Reference", 2.5]],
   ["api/create-stream", ["API Reference", 3]],
   ["api/append", ["API Reference", 4]],
   ["api/read", ["API Reference", 5]],
+  ["api/keyed-state", ["API Reference", 5.5]],
   ["api/head-stream", ["API Reference", 6]],
   ["api/stream-attrs", ["API Reference", 7]],
   ["api/publish-snapshot", ["API Reference", 8]],
@@ -88,6 +92,8 @@ const PAGE_ORDER = new Map([
   ["specs/extensions", ["Protocol Specification", 2]],
 
   ["competitive-comparison", ["Comparisons", 1]],
+
+  ["release-notes", ["Reference", 1]],
 ]);
 
 function parseFrontmatter(source) {
@@ -266,7 +272,7 @@ async function main() {
       title: meta.title,
       description: meta.description ?? "",
       group: meta.group ?? orderConfig?.[0] ?? "Reference",
-      order: parseInt(meta.order ?? String(orderConfig?.[1] ?? 999), 10),
+      order: Number(meta.order ?? orderConfig?.[1] ?? 999),
       markdown: transformMdxToMarkdown(body),
     });
   }

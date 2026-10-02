@@ -3,11 +3,28 @@
 //!
 //! Module map:
 //!
+//! - [`json_text`]: JSON Message Text (P1): validation, flattening and lexical
+//!   minification of `application/json` write bodies.
+//! - [`keyed_state`]: `{stream_url}/keyed-state` (keyed-streams P3): parameter
+//!   validation, stream resolution and forwarding to the indexer's `/v1/keyed`.
+//! - `keyed_upstream`: active/standby failover over the keyed-state indexer
+//!   pods (ordered list, health backoff, `/readyz` prober, failover metrics).
+//! - `keyed_lifecycle`: keyed-state lifecycle on the node: the bucket-purge
+//!   drain fan-out to keyed-state indexers (U23) and keyed-state request
+//!   counters (U24).
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
+//! - `bucket_listing`: `GET /{bucket}/streams` across Raft groups, fetching
+//!   the share of a group this node does not host from one of its voters
+//!   (RT3).
 //! - [`bootstrap`]: typed-config `spawn_*_runtime` constructors and cold-flush worker.
 //! - [`server`]: command arguments and the long-running server service entrypoint.
 
 mod bootstrap;
+mod bucket_listing;
+pub mod json_text;
+mod keyed_lifecycle;
+pub mod keyed_state;
+mod keyed_upstream;
 mod otel_metrics;
 pub mod server;
 mod http_time {
@@ -57,6 +74,7 @@ use axum::middleware::Next;
 use axum::middleware::{self};
 use axum::response::IntoResponse;
 use axum::response::Response;
+use axum::routing::any;
 use axum::routing::get;
 use axum::routing::post;
 use axum::routing::put;
@@ -111,6 +129,7 @@ use ursula_runtime::ProducerRequest;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::ReadStreamResponse;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::StreamAttrs;
@@ -188,6 +207,7 @@ const HEADER_STREAM_SEQ: &str = "stream-seq";
 const HEADER_STREAM_TTL: &str = "stream-ttl";
 const HEADER_STREAM_UP_TO_DATE: &str = "stream-up-to-date";
 const JSON_RECORD_COORDINATES_EXTENSION: &str = "json-record-coordinates-v1";
+const KEYED_BATCH_EXTENSION: &str = ursula_shard::KEYED_BATCH_PROFILE;
 const PATH_AFFINITY_EXTENSION: &str = "path-affinity-v1";
 const GROUP_APPEND_TRANSACTION_EXTENSION: &str = "group-append-transaction-v1";
 const HEADER_PRODUCER_ID: &str = "producer-id";
@@ -210,6 +230,11 @@ const MALLOC_CONF_ENV_VAR: &str = if cfg!(target_vendor = "apple") {
 const APPEND_BATCH_MAX_ITEMS: usize = 512;
 const APPEND_BATCH_MAX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Server-side cap on one read response (bounded-stream-state F11), the same
+/// 8 MiB that caps bootstrap updates. A request's `max_bytes` is clamped to
+/// it; a capped response is partial (`Stream-Up-To-Date` absent) and the
+/// client continues from `Stream-Next-Offset`.
+const READ_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_HTTP_INFLIGHT_BODY_BYTES: usize = MAX_HTTP_BODY_BYTES * 8;
 const DEFAULT_LONG_POLL_TIMEOUT_MS: u64 = 1_000;
 const MAX_LONG_POLL_TIMEOUT_MS: u64 = 60_000;
@@ -315,6 +340,7 @@ struct CreateStreamHttpResponseInput<'a> {
     stream_ttl_seconds: Option<u64>,
     stream_expires_at_ms: Option<u64>,
     producer: Option<&'a ProducerRequest>,
+    keyed_state_served: bool,
 }
 
 pub trait WallClock: Send + Sync + 'static {
@@ -345,6 +371,15 @@ pub struct HttpState {
     /// (e.g. ursulactl auto-enabling empty-log rejoin only for `memory`).
     wal_backend: &'static str,
     wal_disk: WalDiskMonitor,
+    /// Indexer pods serving `/v1/keyed`, in failover order; `None` means
+    /// keyed state is not served
+    /// (`{stream_url}/keyed-state` answers 404 and nothing advertises
+    /// `keyed-state-v1`).
+    keyed_state_upstream: Option<Arc<keyed_state::KeyedStateUpstream>>,
+    /// Bucket-purge drain fan-out to the keyed-state indexer pods (U23).
+    keyed_drain: keyed_lifecycle::KeyedStateDrain,
+    /// Keyed-state responses by status (U24).
+    keyed_state_metrics: Arc<keyed_lifecycle::KeyedStateRequestMetrics>,
 }
 
 impl HttpState {
@@ -367,6 +402,9 @@ impl HttpState {
             external_payload_min_bytes: 1024 * 1024,
             wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
+            keyed_state_upstream: None,
+            keyed_drain: keyed_lifecycle::KeyedStateDrain::default(),
+            keyed_state_metrics: Arc::default(),
         }
     }
 
@@ -386,6 +424,9 @@ impl HttpState {
             external_payload_min_bytes: 1024 * 1024,
             wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
+            keyed_state_upstream: None,
+            keyed_drain: keyed_lifecycle::KeyedStateDrain::default(),
+            keyed_state_metrics: Arc::default(),
         }
     }
 
@@ -426,6 +467,9 @@ impl HttpState {
             external_payload_min_bytes: 1024 * 1024,
             wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
+            keyed_state_upstream: None,
+            keyed_drain: keyed_lifecycle::KeyedStateDrain::default(),
+            keyed_state_metrics: Arc::default(),
         }
     }
 
@@ -457,6 +501,18 @@ impl HttpState {
         self
     }
 
+    /// Serve `{stream_url}/keyed-state` through these indexer pods
+    /// (keyed-streams P3, U7), first healthy pod first.
+    pub fn with_keyed_state_upstream(mut self, upstream: keyed_state::KeyedStateUpstream) -> Self {
+        self.keyed_state_upstream = Some(Arc::new(upstream));
+        self
+    }
+
+    /// Whether `keyed-state-v1` is served (and advertised) for keyed streams.
+    pub(crate) fn serves_keyed_state(&self) -> bool {
+        self.keyed_state_upstream.is_some()
+    }
+
     /// Record the raft WAL backend so it appears in the metrics JSON.
     pub fn with_wal_backend(mut self, backend: &'static str) -> Self {
         self.wal_backend = backend;
@@ -481,6 +537,12 @@ impl HttpState {
             self.external_payload_min_bytes = usize::try_from(min_size.as_bytes())
                 .expect("config validation ensures payload size fits usize");
         }
+        self
+    }
+
+    /// Apply the keyed-state settings: the indexer pods bucket purge drains.
+    pub fn with_keyed_state_config(mut self, config: &ursula_config::KeyedStateConfig) -> Self {
+        self.keyed_drain = keyed_lifecycle::KeyedStateDrain::from_config(config);
         self
     }
 
@@ -538,11 +600,17 @@ struct HttpMetricsSnapshot {
 /// `server.cluster_listen` address when it is set. Peer URLs are also used as
 /// HTTP leader-redirect targets, so clients and gateways must be able to reach
 /// them too.
+/// Timeout of one node-to-node fan-out request.
+const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Clone, Debug)]
 pub struct ClientWriteLeaderRouter {
     peers: Arc<BTreeMap<u64, String>>,
     node_id: Option<u64>,
     per_group_voters: Arc<BTreeMap<RaftGroupId, BTreeSet<u64>>>,
+    /// Node-to-node HTTP client for fan-out reads such as a bucket listing
+    /// share of a group this node does not host (RT3).
+    peer_client: reqwest::Client,
 }
 
 impl ClientWriteLeaderRouter {
@@ -564,7 +632,28 @@ impl ClientWriteLeaderRouter {
             ),
             node_id: node_id.into(),
             per_group_voters: Arc::new(per_group_voters),
+            peer_client: reqwest::Client::builder()
+                .timeout(PEER_REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
         }
+    }
+
+    pub(crate) fn peer_client(&self) -> &reqwest::Client {
+        &self.peer_client
+    }
+
+    /// Base URLs of `group`'s voters other than this node.
+    pub(crate) fn group_voter_bases(&self, group: RaftGroupId) -> Vec<String> {
+        self.per_group_voters
+            .get(&group)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|node_id| Some(*node_id) != self.node_id)
+            .filter_map(|node_id| self.peers.get(&node_id))
+            .map(|base| base.trim_end_matches('/').to_owned())
+            .collect()
     }
 
     fn leader_base(&self, err: &RuntimeError) -> Option<(u64, String)> {
@@ -945,6 +1034,10 @@ fn admin_ops_router(state: HttpState) -> Router {
         .route(
             "/__ursula/leadership-shed/maintenance",
             post(mark_maintenance_drain).delete(clear_maintenance_drain),
+        )
+        .route(
+            "/__ursula/feature-level",
+            get(feature_level_status).post(set_feature_level),
         );
     #[cfg(feature = "jemalloc-prof")]
     let router = router.route("/__ursula/debug/heap-profile", get(heap_profile));
@@ -1303,6 +1396,7 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
                     media_type == "application/json"
                         || media_type == "application/x-ndjson"
                         || media_type == "application/vnd.durable-stream-records+ndjson"
+                        || media_type == keyed_state::KEYED_ROWS_CONTENT_TYPE
                 })
         };
     let response_compression = CompressionLayer::new()
@@ -1321,6 +1415,11 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         .route("/__ursula/quota/{bucket}", put(set_bucket_quota))
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .route("/{bucket}", put(create_bucket))
+        .route("/{bucket}/streams", get(list_bucket_streams))
+        .route(
+            bucket_listing::GROUP_SHARE_PATH,
+            get(bucket_listing::group_share),
+        )
         .route(
             "/{bucket}/{stream}/snapshot",
             get(read_latest_snapshot).put(publish_snapshot_at_record),
@@ -1353,6 +1452,14 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
                 .head(head_stream),
         )
         .route("/{bucket}/{stream}/append-batch", post(append_batch))
+        .route(
+            "/{bucket}/{stream}/keyed-state",
+            any(keyed_state::keyed_state),
+        )
+        .route(
+            "/{bucket}/{affinity}/{stream}/keyed-state",
+            any(keyed_state::keyed_state),
+        )
         .route(
             "/{bucket}/{affinity}/$transaction",
             post(append_transaction),
@@ -1446,11 +1553,65 @@ pub(crate) async fn stage_external_payload(
     })
 }
 
-pub(crate) async fn cleanup_external_payload(state: &HttpState, s3_path: &str) {
+/// Bounded-state F5 cleanup rule (ungated): a staged external object may be
+/// deleted only when its append or create definitely did not commit. That is
+/// a typed stream error (apply, or a pre-proposal check, rejected it on every
+/// replica alike), a redirect raised by the local pre-proposal leadership
+/// check or a backpressure rejection before proposal, or a
+/// request the runtime refused before dispatch. Every other failure (a lost
+/// response, a forward-to-leader reported by OpenRaft after `client_write`
+/// (RT1), a transport or storage error, an untyped engine error) may
+/// follow a committed proposal that references the object, so the object is
+/// kept; an orphan sweep or stream GC reclaims it if nothing does.
+pub(crate) fn staged_external_definitely_unreferenced(err: &RuntimeError) -> bool {
+    match err {
+        RuntimeError::GroupEngine { error, .. } => {
+            error.code().is_some() || error.is_forward_before_proposal() || error.is_backpressure()
+        }
+        RuntimeError::EmptyAppend
+        | RuntimeError::InvalidAppendTransaction { .. }
+        | RuntimeError::InvalidRaftGroup { .. }
+        | RuntimeError::GroupNotHosted { .. } => true,
+        RuntimeError::InvalidConfig(_)
+        | RuntimeError::SnapshotPlacementMismatch { .. }
+        | RuntimeError::ColdStoreConfig { .. }
+        | RuntimeError::StaticMembershipConfig { .. }
+        | RuntimeError::ColdStoreIo { .. }
+        | RuntimeError::LiveReadBackpressure { .. }
+        | RuntimeError::MailboxClosed { .. }
+        | RuntimeError::ResponseDropped { .. }
+        | RuntimeError::SpawnCoreThread { .. } => false,
+    }
+}
+
+/// Deletes a staged external object after a failed append or create, but
+/// only when [`staged_external_definitely_unreferenced`] allows it.
+pub(crate) async fn cleanup_external_payload(state: &HttpState, s3_path: &str, err: &RuntimeError) {
+    if !staged_external_definitely_unreferenced(err) {
+        tracing::warn!(
+            path = %s3_path,
+            error = %err,
+            "keeping staged external payload after an ambiguous failure"
+        );
+        return;
+    }
+    delete_unreferenced_staged_payload(state, s3_path).await;
+}
+
+/// Deletes a staged external object that no committed command references:
+/// one whose write was definitely rejected, or whose write was answered
+/// without applying it (a deduplicated append, a create of a live stream).
+pub(crate) async fn delete_unreferenced_staged_payload(state: &HttpState, s3_path: &str) {
     let Some(cold_store) = state.runtime.cold_store() else {
         return;
     };
-    let _ = cold_store.delete_chunk(s3_path).await;
+    if let Err(cleanup_err) = cold_store.delete_chunk(s3_path).await {
+        tracing::warn!(
+            path = %s3_path,
+            error = %cleanup_err,
+            "failed to remove an unreferenced staged external payload"
+        );
+    }
 }
 
 pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'_>) -> Response {
@@ -1461,6 +1622,7 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
         stream_ttl_seconds,
         stream_expires_at_ms,
         producer,
+        keyed_state_served,
     } = input;
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
@@ -1472,6 +1634,8 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
     if let Some(record_range) = response.record_range {
         insert_record_operation_headers(&mut headers, record_range);
     }
+    insert_keyed_extension_for(&mut headers, content_type);
+    insert_keyed_state_extension_for(&mut headers, content_type, keyed_state_served);
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
     }
@@ -1486,7 +1650,11 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
 pub(crate) fn append_http_response(response: AppendResponse) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
-    insert_offset(&mut headers, response.next_offset);
+    // A duplicate beyond the receipt window (bounded-state F3) is answered
+    // `204` with `Producer-Seq` and without byte or record ranges.
+    if !response.receipt_evicted {
+        insert_offset(&mut headers, response.next_offset);
+    }
     insert_producer_ack(&mut headers, response.producer.as_ref());
     if let Some(record_range) = response.record_range {
         insert_record_operation_headers(&mut headers, record_range);
@@ -1503,8 +1671,10 @@ pub(crate) fn append_http_response(response: AppendResponse) -> Response {
 }
 
 /// Administrator-triggered tenant offboarding (#150): purges the bucket from
-/// every Raft group, then runs one cold-GC pass so the enqueued cold-object
-/// prefixes are reclaimed before the report returns. Idempotent — purging an
+/// every Raft group, drains every keyed-state indexer pod (U23), then runs
+/// one cold-GC pass so the enqueued cold-object prefixes are reclaimed
+/// before the report returns, and finally erases and proves empty both
+/// `{bucket}/` and `.keyed/{bucket}/`. Idempotent — purging an
 /// absent bucket returns the same report shape with zero counts, and a
 /// crashed purge converges on re-run because cold reclamation is
 /// list-then-delete over object prefixes.
@@ -1541,6 +1711,9 @@ pub(crate) async fn purge_bucket(
             "cold_gc_complete": false,
             "cold_gc_error": null,
             "bucket_prefix_absent": false,
+            "keyed_drain_complete": false,
+            "keyed_drain_error": null,
+            "keyed_prefix_absent": false,
             "legacy_shared_chunks_pending": legacy.pending_chunks,
         }))
         .into_response();
@@ -1552,6 +1725,33 @@ pub(crate) async fn purge_bucket(
             return runtime_error_or_leader_redirect_async(&state, err, &target).await;
         }
     };
+    // After the tombstone, nodes answer 404 for the bucket's streams, so no
+    // new keyed-state work arrives. Every indexer pod must still block new
+    // work for the bucket and finish its in-flight ingestion before
+    // `.keyed/{bucket}/` is erased, or a late publish could recreate objects
+    // below the proven-empty prefix (keyed-streams U23). Without every
+    // acknowledgement the purge stays incomplete and is retried.
+    if let Err(err) = state.keyed_drain.drain_bucket(&bucket).await {
+        tracing::warn!(
+            bucket = %bucket,
+            error = %err,
+            "keyed-state indexer drain failed; bucket erasure deferred"
+        );
+        return axum::Json(serde_json::json!({
+            "bucket": bucket,
+            "removed_streams": report.removed_streams,
+            "groups_with_streams": report.groups_with_streams,
+            "cold_gc_entries_reclaimed": 0,
+            "cold_gc_pending_entries": report.pending_cold_gc_entries,
+            "cold_gc_complete": false,
+            "cold_gc_error": null,
+            "bucket_prefix_absent": false,
+            "keyed_drain_complete": false,
+            "keyed_drain_error": err,
+            "keyed_prefix_absent": false,
+        }))
+        .into_response();
+    }
     // Reclaim the just-enqueued cold prefixes now instead of waiting for the
     // background worker's next pass. Failures leave entries queued for the
     // worker; the purge itself is already durable.
@@ -1607,6 +1807,12 @@ pub(crate) async fn purge_bucket(
         "cold_gc_complete": cold_gc_complete,
         "cold_gc_error": cold_gc_error,
         "bucket_prefix_absent": bucket_prefix_absent,
+        "keyed_drain_complete": true,
+        "keyed_drain_error": null,
+        "keyed_indexers_drained": state.keyed_drain.indexer_count(),
+        // `erase_bucket_cold_prefix_and_prove` erases and proves
+        // `{bucket}/` and `.keyed/{bucket}/` together.
+        "keyed_prefix_absent": bucket_prefix_absent,
     }))
     .into_response()
 }
@@ -1616,6 +1822,77 @@ const LEGACY_SHARED_MIGRATION_MAX_CHUNKS: usize = 32;
 
 pub(crate) async fn create_bucket(Path(_bucket): Path<String>) -> Response {
     StatusCode::CREATED.into_response()
+}
+
+/// Default and maximum page size of the bucket listing (`extensions.md` §1.4).
+const BUCKET_LISTING_MAX_LIMIT: usize = 1000;
+
+/// `GET /{bucket}/streams?prefix=&after=&limit=` (`extensions.md` §1.4): the
+/// bucket's streams merged across every Raft group, sorted by bucket-local
+/// stream path. Groups answer from local replica state, so the listing may
+/// briefly lag a just-committed create or delete. `last_write_at_ms` is
+/// omitted because Ursula does not track it.
+pub(crate) async fn list_bucket_streams(
+    State(state): State<HttpState>,
+    Path(bucket): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    if let Err(message) = ursula_runtime::validate_bucket_id(&bucket) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
+    let query = match parse_query(raw_query.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
+    };
+    let limit = match query.get("limit") {
+        None => BUCKET_LISTING_MAX_LIMIT,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(limit) if (1..=BUCKET_LISTING_MAX_LIMIT).contains(&limit) => limit,
+            _ => {
+                return (StatusCode::BAD_REQUEST, "limit must be in 1..=1000").into_response();
+            }
+        },
+    };
+    let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
+    let after = query.get("after").map(String::as_str);
+    let listing =
+        match bucket_listing::list_across_groups(&state, &bucket, prefix, after, limit).await {
+            Ok(Some(listing)) => listing,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!("bucket '{bucket}' does not exist"),
+                )
+                    .into_response();
+            }
+            Err(response) => return response,
+        };
+    let next_cursor = listing
+        .has_more
+        .then(|| listing.streams.last().map(|entry| entry.stream_id.clone()))
+        .flatten();
+    let streams = listing
+        .streams
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "stream_id": entry.stream_id,
+                "status": entry.status,
+                "content_type": entry.content_type,
+                "tail_offset": entry.tail_offset,
+                "created_at_ms": entry.created_at_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    axum::Json(serde_json::json!({
+        "bucket_id": bucket,
+        "prefix": prefix,
+        "stream_count": streams.len(),
+        "streams": streams,
+        "next_cursor": next_cursor,
+        "has_more": listing.has_more,
+    }))
+    .into_response()
 }
 
 /// Versioned, self-described per-bucket usage summed across this node's Raft
@@ -1686,6 +1963,164 @@ pub(crate) async fn set_bucket_quota(
     }
 }
 
+/// Version of the `/__ursula/feature-level` JSON contract.
+const FEATURE_LEVEL_REPORT_VERSION: u32 = 1;
+
+/// Node id this server runs as, when it hosts Raft groups.
+fn local_raft_node_id(state: &HttpState) -> Option<u64> {
+    state.raft_registry().and_then(|registry| {
+        registry
+            .metrics_snapshot()
+            .first()
+            .map(|group| group.node_id)
+    })
+}
+
+/// `GET /__ursula/feature-level` (C0): this node's supported feature level
+/// and each group's replicated level as held by this node's applied replica
+/// state (leader or follower). A group this node does not host is reported
+/// with `hosted: false`; any other read failure carries `error`.
+pub(crate) async fn feature_level_status(State(state): State<HttpState>) -> Response {
+    let groups = state
+        .runtime
+        .feature_levels_all_groups()
+        .await
+        .into_iter()
+        .map(|(group, result)| match result {
+            Ok(level) => serde_json::json!({
+                "raft_group_id": group.0,
+                "hosted": true,
+                "level": level,
+                // F19: the raise to level 2 needs a completed page-repair
+                // cycle in every group (reported by its leader).
+                "page_repair_completed": state.runtime.cold_index_repair_completed(group),
+            }),
+            Err(RuntimeError::GroupNotHosted { .. }) => serde_json::json!({
+                "raft_group_id": group.0,
+                "hosted": false,
+            }),
+            Err(err) => serde_json::json!({
+                "raft_group_id": group.0,
+                "hosted": true,
+                "error": err.to_string(),
+            }),
+        })
+        .collect::<Vec<_>>();
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "version": FEATURE_LEVEL_REPORT_VERSION,
+            "node_id": local_raft_node_id(&state),
+            "supported_level": ursula_runtime::MAX_SUPPORTED_FEATURE_LEVEL,
+            "groups": groups,
+        })
+        .to_string(),
+    )
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetFeatureLevelBody {
+    level: u32,
+}
+
+/// `POST /__ursula/feature-level` with `{"level": N}` (C0): proposes
+/// `SetFeatureLevel` to every group this node can write (on a Raft cluster,
+/// the groups it leads). Each group ends at `max(current, N)`. Groups led
+/// elsewhere are reported with `status: "not_leader"` and the leader id when
+/// known, so `ursulactl cluster enable-feature` asks every node in turn.
+///
+/// Refuses (409) a level above this node's supported level. Checking that
+/// every other voter and learner supports it is the operator tool's job.
+pub(crate) async fn set_feature_level(
+    State(state): State<HttpState>,
+    axum::Json(body): axum::Json<SetFeatureLevelBody>,
+) -> Response {
+    let supported = ursula_runtime::MAX_SUPPORTED_FEATURE_LEVEL;
+    if body.level > supported {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "feature level {} is above this node's supported level {supported}",
+                body.level
+            ),
+        )
+            .into_response();
+    }
+    let results = if body.level >= ursula_runtime::FEATURE_LEVEL_SPARSE_MARKS {
+        // F1 (bounded-state §5.1): sealing trusts cold bytes, so a group
+        // reaches level 2 only through a leader that completed a cold-index
+        // page-repair cycle (F19). Other groups report `repair_pending`.
+        let mut results = Vec::new();
+        for group_id in 0..state.runtime.raft_group_count() {
+            let group = RaftGroupId(group_id);
+            let result = if state.runtime.cold_index_repair_completed(group) {
+                Some(
+                    state
+                        .runtime
+                        .set_feature_level(group, ursula_runtime::SetFeatureLevelRequest {
+                            level: body.level,
+                        })
+                        .await,
+                )
+            } else {
+                None
+            };
+            results.push((group, result));
+        }
+        results
+    } else {
+        state
+            .runtime
+            .set_feature_level_all_groups(body.level)
+            .await
+            .into_iter()
+            .map(|(group, result)| (group, Some(result)))
+            .collect()
+    };
+    let groups = results
+        .into_iter()
+        .map(|(group, result)| match result {
+            None => serde_json::json!({
+                "raft_group_id": group.0,
+                "status": "repair_pending",
+            }),
+            Some(result) => match result {
+                Ok(response) => serde_json::json!({
+                    "raft_group_id": group.0,
+                    "status": "set",
+                    "level": response.level,
+                    "previous_level": response.previous_level,
+                }),
+                Err(err) if err.leader_hint().is_some() => serde_json::json!({
+                    "raft_group_id": group.0,
+                    "status": "not_leader",
+                    "leader_id": err.leader_hint().and_then(|hint| hint.node_id),
+                }),
+                Err(RuntimeError::GroupNotHosted { .. }) => serde_json::json!({
+                    "raft_group_id": group.0,
+                    "status": "not_hosted",
+                }),
+                Err(err) => serde_json::json!({
+                    "raft_group_id": group.0,
+                    "status": "error",
+                    "error": err.to_string(),
+                }),
+            },
+        })
+        .collect::<Vec<_>>();
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "version": FEATURE_LEVEL_REPORT_VERSION,
+            "node_id": local_raft_node_id(&state),
+            "requested_level": body.level,
+            "groups": groups,
+        })
+        .to_string(),
+    )
+}
+
 pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
     let raft_groups = state
         .raft_registry()
@@ -1703,7 +2138,28 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
     // status-publishing pipeline survives SSM exec failures).
     let rss = state.node_memory.last_rss_bytes();
     let cap = state.node_memory.abort_cap_bytes().unwrap_or_default();
+    let group_state_gauges = group_state_gauges_json(&state).await;
     if let Some(object) = body.as_object_mut() {
+        object.insert("group_state_gauges".to_owned(), group_state_gauges);
+        // F1 anchor verification (RC-21): record reads failed because cold
+        // bytes disagreed with the record marks.
+        object.insert(
+            "record_coordinate_corruptions".to_owned(),
+            serde_json::Value::from(ursula_runtime::record_coordinate_corruptions()),
+        );
+        object.insert(
+            "keyed_state_requests".to_owned(),
+            serde_json::to_value(state.keyed_state_metrics.snapshot())
+                .unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "keyed_state_upstream".to_owned(),
+            state
+                .keyed_state_upstream
+                .as_ref()
+                .and_then(|upstream| serde_json::to_value(upstream.snapshot()).ok())
+                .unwrap_or(serde_json::Value::Null),
+        );
         object.insert("process_rss_bytes".to_owned(), serde_json::json!(rss));
         object.insert(
             "node_memory_abort_cap_bytes".to_owned(),
@@ -1736,6 +2192,47 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         );
     }
     json_response(StatusCode::OK, body.to_string())
+}
+
+/// Upper bound on how long a metrics scrape waits for the per-group
+/// bounded-state gauges; a busy or wedged group must not stall the scrape.
+const GROUP_STATE_GAUGES_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Per-group bounded-state gauges (`docs/architecture/bounded-stream-state.md`
+/// §7.5) for `/__ursula/metrics`: one object per Raft group with the group id,
+/// whether this node hosts it, and either the gauges or an error.
+async fn group_state_gauges_json(state: &HttpState) -> serde_json::Value {
+    let Ok(groups) = http_time::timeout(
+        GROUP_STATE_GAUGES_TIMEOUT,
+        state.runtime.state_gauges_all_groups(),
+    )
+    .await
+    else {
+        return serde_json::json!({ "error": "timed out collecting group state gauges" });
+    };
+    let groups = groups
+        .into_iter()
+        .map(|(group, result)| match result {
+            Ok(gauges) => {
+                let mut value = serde_json::to_value(gauges).unwrap_or(serde_json::Value::Null);
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("raft_group_id".to_owned(), serde_json::json!(group.0));
+                    object.insert("hosted".to_owned(), serde_json::json!(true));
+                }
+                value
+            }
+            Err(RuntimeError::GroupNotHosted { .. }) => serde_json::json!({
+                "raft_group_id": group.0,
+                "hosted": false,
+            }),
+            Err(err) => serde_json::json!({
+                "raft_group_id": group.0,
+                "hosted": true,
+                "error": err.to_string(),
+            }),
+        })
+        .collect::<Vec<_>>();
+    serde_json::Value::Array(groups)
 }
 
 #[cfg(feature = "jemalloc-prof")]
@@ -2423,8 +2920,14 @@ pub(crate) async fn create_stream_by_id(
         Ok(payload) => payload,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
+    if let Err(response) = validate_keyed_write(&content_type, &request.initial_payload, None) {
+        return *response;
+    }
     request.close_after = stream_closed(&request_headers);
-    request.stream_seq = stream_seq(&request_headers);
+    request.stream_seq = match stream_seq(&request_headers) {
+        Ok(stream_seq) => stream_seq,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
     request.stream_ttl_seconds = stream_ttl_seconds;
     request.stream_expires_at_ms = stream_expires_at_ms;
     request.attrs = attrs;
@@ -2445,6 +2948,7 @@ pub(crate) async fn create_stream_by_id(
             stream_ttl_seconds,
             stream_expires_at_ms,
             producer: producer.as_ref(),
+            keyed_state_served: state.serves_keyed_state(),
         }),
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
@@ -2471,16 +2975,24 @@ pub(crate) async fn create_stream_external_by_id(
         CreateStreamExternalRequest::from_create_request(request, external_payload, record_ends);
 
     match state.runtime.create_stream_external(external_request).await {
-        Ok(response) => create_stream_http_response(CreateStreamHttpResponseInput {
-            response,
-            stream_id: &stream_id,
-            content_type: &content_type,
-            stream_ttl_seconds,
-            stream_expires_at_ms,
-            producer: producer.as_ref(),
-        }),
+        Ok(response) => {
+            if response.already_exists {
+                // The live stream was not replaced; its initial payload is
+                // another object (F5 cleanup rule).
+                delete_unreferenced_staged_payload(&state, &external_path).await;
+            }
+            create_stream_http_response(CreateStreamHttpResponseInput {
+                response,
+                stream_id: &stream_id,
+                content_type: &content_type,
+                stream_ttl_seconds,
+                stream_expires_at_ms,
+                producer: producer.as_ref(),
+                keyed_state_served: state.serves_keyed_state(),
+            })
+        }
         Err(err) => {
-            cleanup_external_payload(&state, &external_path).await;
+            cleanup_external_payload(&state, &external_path, &err).await;
             runtime_error_or_leader_redirect_async(&state, err, &request_target).await
         }
     }
@@ -2516,11 +3028,15 @@ pub(crate) async fn append_stream_by_id(
             Ok(producer) => producer,
             Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
         };
+        let stream_seq = match stream_seq(&headers) {
+            Ok(stream_seq) => stream_seq,
+            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        };
         return match state
             .runtime
             .close_stream(CloseStreamRequest {
-                stream_id,
-                stream_seq: stream_seq(&headers),
+                stream_id: stream_id.clone(),
+                stream_seq,
                 producer: producer.clone(),
                 now_ms: state.unix_time_ms(),
             })
@@ -2529,6 +3045,18 @@ pub(crate) async fn append_stream_by_id(
             Ok(response) => {
                 let mut headers = HeaderMap::new();
                 insert_default_response_headers(&mut headers);
+                // RT4 (§9.1.5): a close-only POST carries no content type, so
+                // learn whether the stream is keyed from its head.
+                if let Ok(head) = state
+                    .runtime
+                    .head_stream(HeadStreamRequest {
+                        stream_id,
+                        now_ms: state.unix_time_ms(),
+                    })
+                    .await
+                {
+                    insert_keyed_extension_for(&mut headers, &head.content_type);
+                }
                 insert_offset(&mut headers, response.next_offset);
                 insert_producer_ack(&mut headers, producer.as_ref());
                 if let Some(record_range) = response.record_range {
@@ -2553,10 +3081,17 @@ pub(crate) async fn append_stream_by_id(
         Ok(payload) => payload,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
+    if let Err(response) = validate_keyed_write(&content_type, &payload, None) {
+        return *response;
+    }
+    let keyed = ursula_shard::is_keyed_batch_content_type(&content_type);
     let mut request = AppendRequest::from_bytes(stream_id, payload);
     request.content_type = content_type;
     request.close_after = close_after;
-    request.stream_seq = stream_seq(&headers);
+    request.stream_seq = match stream_seq(&headers) {
+        Ok(stream_seq) => stream_seq,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
     request.now_ms = state.unix_time_ms();
     let producer = match producer_request(&headers) {
         Ok(producer) => producer,
@@ -2569,11 +3104,12 @@ pub(crate) async fn append_stream_by_id(
     };
 
     if should_externalize_payload(&state, request.payload.len(), true) {
-        return append_stream_external_by_id(state, request_target, request).await;
+        let response = append_stream_external_by_id(state, request_target, request).await;
+        return advertise_keyed_on_success(response, keyed);
     }
 
     match state.runtime.append(request).await {
-        Ok(response) => append_http_response(response),
+        Ok(response) => advertise_keyed_on_success(append_http_response(response), keyed),
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
@@ -2594,9 +3130,16 @@ pub(crate) async fn append_stream_external_by_id(
     let external_request =
         AppendExternalRequest::from_append_request(request, external_payload, record_ends);
     match state.runtime.append_external(external_request).await {
-        Ok(response) => append_http_response(response),
+        Ok(response) => {
+            if response.deduplicated {
+                // The original append committed with its own object; this
+                // retry's object is referenced by nothing (F5 cleanup rule).
+                delete_unreferenced_staged_payload(&state, &external_path).await;
+            }
+            append_http_response(response)
+        }
         Err(err) => {
-            cleanup_external_payload(&state, &external_path).await;
+            cleanup_external_payload(&state, &external_path, &err).await;
             runtime_error_or_leader_redirect_async(&state, err, &request_target).await
         }
     }
@@ -2645,6 +3188,14 @@ pub(crate) async fn append_batch(
         Ok(payloads) => payloads,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
+    // Every frame is validated before any is committed: one bad frame fails
+    // the whole request (`extensions.md` §9.1.3).
+    for (frame, payload) in payloads.iter().enumerate() {
+        if let Err(response) = validate_keyed_write(&content_type, payload, Some(frame)) {
+            return *response;
+        }
+    }
+    let keyed = ursula_shard::is_keyed_batch_content_type(&content_type);
     let mut request = AppendBatchRequest::new(stream_id, payloads);
     request.content_type = content_type;
     request.producer = producer.clone();
@@ -2666,6 +3217,9 @@ pub(crate) async fn append_batch(
     });
     if has_record_ranges {
         insert_record_extension(&mut headers);
+    }
+    if keyed && response.items.iter().any(Result::is_ok) {
+        insert_keyed_extension_for(&mut headers, ursula_shard::KEYED_BATCH_CONTENT_TYPE);
     }
     if minimal_ack && response.items.iter().all(Result::is_ok) && !has_record_ranges {
         return (StatusCode::NO_CONTENT, headers).into_response();
@@ -2707,7 +3261,14 @@ pub(crate) async fn append_transaction(
     };
     let now_ms = state.unix_time_ms();
     let mut operations = Vec::with_capacity(transaction.operations.len());
+    let mut keyed = false;
     for operation in transaction.operations {
+        if let Err(message) = check_transaction_operation_identifiers(&operation) {
+            return (StatusCode::BAD_REQUEST, message).into_response();
+        }
+        // U10: op content types are normalized like the Content-Type header,
+        // so apply compares them to the stream's stored (normalized) type.
+        let content_type = normalize_content_type(&operation.content_type);
         let payload = match BASE64_STANDARD.decode(operation.payload_base64) {
             Ok(payload) => Bytes::from(payload),
             Err(err) => {
@@ -2718,17 +3279,18 @@ pub(crate) async fn append_transaction(
                     .into_response();
             }
         };
-        let payload = match normalize_http_write_payload(&operation.content_type, payload, false) {
+        let payload = match normalize_http_write_payload(&content_type, payload, false) {
             Ok(payload) => payload,
             Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
         };
+        keyed |= ursula_shard::is_keyed_batch_content_type(&content_type);
         operations.push(AppendRequest {
             stream_id: BucketStreamId::with_affinity(
                 path.bucket.clone(),
                 path.affinity.clone(),
                 operation.stream,
             ),
-            content_type: operation.content_type,
+            content_type,
             payload,
             close_after: operation.close_after,
             stream_seq: operation.stream_seq,
@@ -2736,6 +3298,15 @@ pub(crate) async fn append_transaction(
             now_ms,
             record_match: operation.record_match,
         });
+    }
+    // RT5 (§9.1.3): every op is decoded and normalized (400) before any op's
+    // keyed grammar is validated (422), as append-batch does.
+    for operation in &operations {
+        if let Err(response) =
+            validate_keyed_write(&operation.content_type, &operation.payload, None)
+        {
+            return *response;
+        }
     }
     let response = match state
         .runtime
@@ -2761,6 +3332,12 @@ pub(crate) async fn append_transaction(
     let mut response_headers = HeaderMap::new();
     insert_default_response_headers(&mut response_headers);
     insert_content_type(&mut response_headers, "application/json");
+    if keyed {
+        insert_keyed_extension_for(
+            &mut response_headers,
+            ursula_shard::KEYED_BATCH_CONTENT_TYPE,
+        );
+    }
     (StatusCode::OK, response_headers, body).into_response()
 }
 
@@ -2914,6 +3491,12 @@ pub(crate) async fn head_stream_by_id(
             let mut headers = HeaderMap::new();
             insert_default_response_headers(&mut headers);
             insert_content_type(&mut headers, &response.content_type);
+            insert_keyed_extension_for(&mut headers, &response.content_type);
+            insert_keyed_state_extension_for(
+                &mut headers,
+                &response.content_type,
+                state.serves_keyed_state(),
+            );
             insert_offset(&mut headers, response.tail_offset);
             insert_u64_header(
                 &mut headers,
@@ -2987,6 +3570,78 @@ pub(crate) async fn head_stream_by_id(
 
 fn insert_record_extension(headers: &mut HeaderMap) {
     insert_extension_token(headers, JSON_RECORD_COORDINATES_EXTENSION);
+}
+
+/// Advertises `keyed-batch-v1` together with `json-record-coordinates-v1`
+/// when `content_type` is the keyed activation type (`extensions.md`
+/// §9.1.5); responses for other streams never carry `keyed-batch-v1`.
+pub(crate) fn insert_keyed_extension_for(headers: &mut HeaderMap, content_type: &str) {
+    if ursula_shard::is_keyed_batch_content_type(content_type) {
+        insert_record_extension(headers);
+        insert_extension_token(headers, KEYED_BATCH_EXTENSION);
+    }
+}
+
+/// Advertises `keyed-state-v1` on the create and `HEAD` responses of a keyed
+/// stream when this node serves the resource (`extensions.md` §9.2.7).
+pub(crate) fn insert_keyed_state_extension_for(
+    headers: &mut HeaderMap,
+    content_type: &str,
+    served: bool,
+) {
+    if served && ursula_shard::is_keyed_batch_content_type(content_type) {
+        insert_extension_token(headers, keyed_state::KEYED_STATE_EXTENSION);
+    }
+}
+
+/// Adds the keyed advertisement to a successful write response whose request
+/// content type is keyed. Apply refuses a content type that differs from the
+/// stream's (409), so success proves the target stream is keyed.
+fn advertise_keyed_on_success(mut response: Response, keyed: bool) -> Response {
+    if keyed && response.status().is_success() {
+        insert_keyed_extension_for(
+            response.headers_mut(),
+            ursula_shard::KEYED_BATCH_CONTENT_TYPE,
+        );
+    }
+    response
+}
+
+/// Validates a P1-normalized JSON write body against `keyed-batch-v1`
+/// (`extensions.md` §9.1.3) when the request content type is the keyed
+/// activation type; other content types pass untouched. `frame` names the
+/// append-batch frame in the error text. Runs before the stream is looked
+/// up, so precedence is 400 (JSON), 422 (grammar), then apply statuses.
+fn validate_keyed_write(
+    content_type: &str,
+    normalized: &[u8],
+    frame: Option<usize>,
+) -> Result<(), Box<Response>> {
+    if !ursula_shard::is_keyed_batch_content_type(content_type) {
+        return Ok(());
+    }
+    // P1 stores one minified message per LF-terminated line; a minified
+    // message never contains a raw LF, and its text is valid UTF-8.
+    let messages = normalized
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| std::str::from_utf8(line).unwrap_or_default());
+    let Err(invalid) = ursula_index::keyed::validate_messages(messages) else {
+        return Ok(());
+    };
+    let status = if invalid.error.reason().is_json_syntax() {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::UNPROCESSABLE_ENTITY
+    };
+    let message = match frame {
+        Some(frame) => format!(
+            "invalid keyed batch at frame {frame} message {}: {}",
+            invalid.index, invalid.error
+        ),
+        None => invalid.to_string(),
+    };
+    Err(Box::new((status, message).into_response()))
 }
 
 fn insert_extension_token(headers: &mut HeaderMap, token: &'static str) {
@@ -3099,13 +3754,6 @@ pub(crate) async fn read_stream_by_id(
         )
             .into_response();
     }
-    if record_aware && query.contains_key("max_bytes") {
-        return (
-            StatusCode::BAD_REQUEST,
-            "record-aware reads do not support max_bytes",
-        )
-            .into_response();
-    }
     if live_mode.is_some() && !query.contains_key("offset") && !record_aware {
         return (
             StatusCode::BAD_REQUEST,
@@ -3153,10 +3801,25 @@ pub(crate) async fn read_stream_by_id(
             Err(response) => return *response,
         }
     };
-    let max_len = query
-        .get("max_bytes")
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(usize::MAX);
+    // On a record-aware read `max_bytes` bounds complete records (P7,
+    // extensions.md §6.6) and must be a positive integer; offset reads keep
+    // the base protocol's lenient parsing.
+    // F11: every read is capped at READ_MAX_RESPONSE_BYTES. Without a
+    // client `max_bytes`, a capped offset read of a JSON stream ends at a
+    // record boundary (see `end_capped_json_read_at_record_boundary`).
+    let max_len = match query.get("max_bytes") {
+        Some(raw) if record_aware => match raw.parse::<usize>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                return (StatusCode::BAD_REQUEST, "max_bytes must be positive").into_response();
+            }
+        },
+        Some(raw) => raw.parse::<usize>().unwrap_or(usize::MAX),
+        None => usize::MAX,
+    };
+    let server_capped = max_len > READ_MAX_RESPONSE_BYTES;
+    let max_len = max_len.min(READ_MAX_RESPONSE_BYTES);
+    let trim_json = server_capped && !record_aware && !offset_is_now;
 
     match live_mode {
         Some("sse") => {
@@ -3192,19 +3855,33 @@ pub(crate) async fn read_stream_by_id(
         None => {}
     }
 
-    match state
+    let read = state
         .runtime
         .read_stream(ReadStreamRequest {
-            stream_id,
+            stream_id: stream_id.clone(),
             offset,
             max_len,
             now_ms: state.unix_time_ms(),
             record,
             max_records,
             leader_only,
+            record_anchor: None,
         })
-        .await
-    {
+        .await;
+    let read = match read {
+        Ok(response) if trim_json => {
+            end_capped_json_read_at_record_boundary(
+                &state.runtime,
+                state.unix_time_ms(),
+                &stream_id,
+                response,
+                leader_only,
+            )
+            .await
+        }
+        other => other,
+    };
+    match read {
         Ok(response) if offset_is_now => offset_now_response(response),
         Ok(response) if envelope_view => record_envelope_response(response, &headers, None),
         Ok(response) => read_response(response, &headers, None),
@@ -3293,15 +3970,81 @@ pub(crate) async fn publish_snapshot(
         Ok(offset) => offset,
         Err(response) => return *response,
     };
+    let request_target = request_target(&uri);
+    if let Err(response) =
+        check_json_record_boundary(&state, &stream_id, snapshot_offset, &request_target).await
+    {
+        return *response;
+    }
     publish_snapshot_by_offset(
         state,
-        request_target(&uri),
+        request_target,
         stream_id,
         snapshot_offset,
         headers,
         body,
     )
     .await
+}
+
+/// Leader-side record-boundary check for the raw-offset snapshot and
+/// retention routes (F1, RC-12, RC-14). Stored JSON records end with LF and
+/// contain no other LF, so an offset strictly inside the retained log is a
+/// record boundary exactly when the byte before it is LF. Rejects an
+/// intra-record offset with 400 before proposing; apply still lands on a
+/// real boundary if a racing delete or recreate makes this check stale.
+/// Streams without record coordinates, offsets at the retained offset or
+/// tail, and failed lookups are left to apply.
+async fn check_json_record_boundary(
+    state: &HttpState,
+    stream_id: &BucketStreamId,
+    offset: u64,
+    request_target: &str,
+) -> Result<(), BoxResponse> {
+    let head = match state
+        .runtime
+        .head_stream(HeadStreamRequest {
+            stream_id: stream_id.clone(),
+            now_ms: state.unix_time_ms(),
+        })
+        .await
+    {
+        Ok(head) => head,
+        Err(err) => {
+            return Err(Box::new(
+                runtime_error_or_leader_redirect_async(state, err, request_target).await,
+            ));
+        }
+    };
+    if head.record_range.is_none() || offset <= head.retained_offset || offset >= head.tail_offset {
+        return Ok(());
+    }
+    let Ok(read) = state
+        .runtime
+        .read_stream(ReadStreamRequest {
+            stream_id: stream_id.clone(),
+            offset: offset - 1,
+            max_len: 1,
+            now_ms: state.unix_time_ms(),
+            record: None,
+            max_records: None,
+            leader_only: false,
+            record_anchor: None,
+        })
+        .await
+    else {
+        return Ok(());
+    };
+    match read.payload.first() {
+        Some(b'\n') | None => Ok(()),
+        Some(_) => Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                format!("offset {offset} is not a JSON record boundary"),
+            )
+                .into_response(),
+        )),
+    }
 }
 
 async fn publish_snapshot_by_offset(
@@ -3401,6 +4144,7 @@ async fn resolve_record_offset(
             record: Some(record),
             max_records: Some(1),
             leader_only: false,
+            record_anchor: None,
         })
         .await
     {
@@ -3419,7 +4163,13 @@ pub(crate) async fn advance_retention(
         Ok(offset) => offset,
         Err(response) => return *response,
     };
-    advance_retention_by_offset(state, request_target(&uri), stream_id, retained_offset).await
+    let request_target = request_target(&uri);
+    if let Err(response) =
+        check_json_record_boundary(&state, &stream_id, retained_offset, &request_target).await
+    {
+        return *response;
+    }
+    advance_retention_by_offset(state, request_target, stream_id, retained_offset).await
 }
 
 pub(crate) async fn advance_retention_at_record(
@@ -3676,6 +4426,77 @@ pub(crate) async fn read_offset(
     }
 }
 
+/// F11: an offset read of a JSON stream that the server cap cut (no client
+/// `max_bytes`) ends at the last record boundary within the cap, so clients
+/// never see a partial record they did not ask for. A single record larger
+/// than the cap is returned whole (the body cap bounds it), through one more
+/// read of at most one record. The continuation (`next_offset`) and any
+/// record range always describe exactly the returned bytes.
+async fn end_capped_json_read_at_record_boundary(
+    runtime: &ShardRuntime,
+    now_ms: u64,
+    stream_id: &BucketStreamId,
+    mut response: ReadStreamResponse,
+    leader_only: bool,
+) -> Result<ReadStreamResponse, RuntimeError> {
+    if response.up_to_date
+        || response.payload.len() < READ_MAX_RESPONSE_BYTES
+        || !render::is_json_content_type(&response.content_type)
+        || response.payload.ends_with(b"\n")
+    {
+        return Ok(response);
+    }
+    if let Some(newline) = response.payload.iter().rposition(|byte| *byte == b'\n') {
+        cut_read_after(&mut response, newline.saturating_add(1));
+        return Ok(response);
+    }
+    let mut whole = runtime
+        .read_stream(ReadStreamRequest {
+            stream_id: stream_id.clone(),
+            offset: response.offset,
+            max_len: MAX_HTTP_BODY_BYTES.saturating_add(1),
+            now_ms,
+            record: None,
+            max_records: None,
+            record_anchor: None,
+            leader_only,
+        })
+        .await?;
+    if let Some(newline) = whole.payload.iter().position(|byte| *byte == b'\n') {
+        let len = newline.saturating_add(1);
+        if len < whole.payload.len() {
+            cut_read_after(&mut whole, len);
+        }
+    }
+    Ok(whole)
+}
+
+/// Cuts a read response after its first `len` payload bytes (`len` ends at
+/// an LF) and keeps every coordinate consistent with the kept bytes: the
+/// continuation offset, `up_to_date` (a cut response is never at the tail)
+/// and the record range, whose `next_record` counts the complete records
+/// returned.
+fn cut_read_after(response: &mut ReadStreamResponse, len: usize) {
+    if len >= response.payload.len() {
+        return;
+    }
+    response.payload.truncate(len);
+    response.next_offset = response
+        .offset
+        .saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+    response.up_to_date = false;
+    if let Some(range) = response.record_range.as_mut() {
+        let records = response
+            .payload
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        range.next_record = range
+            .first_record
+            .saturating_add(u64::try_from(records).unwrap_or(u64::MAX));
+    }
+}
+
 pub(crate) async fn long_poll_stream(
     state: HttpState,
     request_target: String,
@@ -3689,6 +4510,9 @@ pub(crate) async fn long_poll_stream(
     headers: HeaderMap,
 ) -> Response {
     let timeout_ms = long_poll_timeout_ms(query);
+    // F11: without a client `max_bytes` a capped JSON offset read ends at a
+    // record boundary.
+    let trim_json = record.is_none() && !query.contains_key("max_bytes");
     let read = state.runtime.wait_read_stream(ReadStreamRequest {
         stream_id: stream_id.clone(),
         offset,
@@ -3697,7 +4521,23 @@ pub(crate) async fn long_poll_stream(
         record,
         max_records,
         leader_only: false,
+        record_anchor: None,
     });
+    let read = async {
+        match read.await {
+            Ok(response) if trim_json => {
+                end_capped_json_read_at_record_boundary(
+                    &state.runtime,
+                    state.unix_time_ms(),
+                    &stream_id,
+                    response,
+                    false,
+                )
+                .await
+            }
+            other => other,
+        }
+    };
     match http_time::timeout(Duration::from_millis(timeout_ms), read).await {
         Ok(Ok(response)) if response.payload.is_empty() && response.up_to_date => {
             long_poll_no_content_response(&response, query.get("cursor").map(String::as_str))
@@ -3724,6 +4564,7 @@ pub(crate) async fn long_poll_stream(
             Ok(head) => {
                 let mut headers = HeaderMap::new();
                 insert_default_response_headers(&mut headers);
+                insert_keyed_extension_for(&mut headers, &head.content_type);
                 insert_offset(&mut headers, head.tail_offset);
                 insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
                 if let (Some(record), Some(record_range)) = (record, head.record_range) {
@@ -3765,6 +4606,14 @@ struct SseState {
     record: Option<u64>,
     max_records: Option<u64>,
     envelope_view: bool,
+    /// Stream incarnation seen when the session opened (F1 anchors).
+    incarnation: Option<u64>,
+    /// Where `record` starts, from this session's previous response (F1):
+    /// lets a sealed continuation skip the scan from its mark.
+    record_anchor: Option<ursula_runtime::RecordAnchor>,
+    /// F11: an offset read without a client `max_bytes` ends a capped JSON
+    /// event at a record boundary and never splits one record.
+    trim_json: bool,
 }
 
 pub(crate) async fn sse_stream(
@@ -3797,7 +4646,9 @@ pub(crate) async fn sse_stream(
         .http_metrics
         .sse_streams_opened
         .fetch_add(1, Ordering::Relaxed);
-    let sse_max_len = if encode_base64 {
+    // Record-aware reads always return whole records, so only offset reads
+    // need room for one complete UTF-8 code point.
+    let sse_max_len = if encode_base64 || record.is_some() {
         max_len.max(1)
     } else {
         max_len.max(4)
@@ -3815,6 +4666,9 @@ pub(crate) async fn sse_stream(
         record,
         max_records,
         envelope_view,
+        incarnation: head.created_at_ms,
+        record_anchor: None,
+        trim_json: record.is_none() && !query.contains_key("max_bytes"),
     };
     let body_stream = stream::unfold(Some(sse_state), |state| async move {
         let mut state = match state {
@@ -3837,12 +4691,26 @@ pub(crate) async fn sse_stream(
                 state.max_records
             },
             leader_only: false,
+            record_anchor: state.record_anchor,
         };
         let read = if state.initial_read {
             state.initial_read = false;
             state.runtime.read_stream(read_request).await
         } else {
             state.runtime.wait_read_stream(read_request).await
+        };
+        let read = match read {
+            Ok(read) if state.trim_json => {
+                end_capped_json_read_at_record_boundary(
+                    &state.runtime,
+                    state.wall_clock.unix_time_ms(),
+                    &state.stream_id,
+                    read,
+                    false,
+                )
+                .await
+            }
+            other => other,
         };
         let mut read = match read {
             Ok(read) => read,
@@ -3865,6 +4733,14 @@ pub(crate) async fn sse_stream(
 
         state.offset = read.next_offset;
         state.record = read.record_range.map(|range| range.next_record);
+        state.record_anchor = match (state.incarnation, read.record_range) {
+            (Some(incarnation), Some(range)) => Some(ursula_runtime::RecordAnchor {
+                incarnation,
+                record: range.next_record,
+                offset: read.next_offset,
+            }),
+            _ => None,
+        };
         let done = read.closed && read.up_to_date;
         if !read.payload.is_empty() {
             state
@@ -3897,6 +4773,7 @@ pub(crate) async fn sse_stream(
     if head.record_range.is_some() {
         insert_record_extension(&mut headers);
     }
+    insert_keyed_extension_for(&mut headers, &head.content_type);
     if encode_base64 {
         insert_static(&mut headers, HEADER_STREAM_SSE_DATA_ENCODING, "base64");
     }
@@ -3977,13 +4854,7 @@ pub(crate) fn has_content_type(headers: &HeaderMap) -> bool {
 }
 
 pub(crate) fn normalize_content_type(value: &str) -> String {
-    value
-        .split(';')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>()
-        .join("; ")
+    ursula_shard::normalize_content_type(value)
 }
 
 pub(crate) fn stream_lifetime(
@@ -4037,12 +4908,43 @@ pub(crate) fn stream_closed(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
-pub(crate) fn stream_seq(headers: &HeaderMap) -> Option<String> {
-    headers
+/// Maximum length in bytes of a `Producer-Id` or `Stream-Seq` value on every
+/// HTTP write path, `$transaction` JSON included (bounded-stream-state F3).
+/// Both values are kept in replicated per-stream state, so their length must
+/// be bounded at the edge.
+pub(crate) const WRITE_IDENTIFIER_MAX_BYTES: usize = 256;
+
+fn check_write_identifier_len(name: &str, value: &str) -> Result<(), String> {
+    if value.len() > WRITE_IDENTIFIER_MAX_BYTES {
+        return Err(format!(
+            "{name} must be at most {WRITE_IDENTIFIER_MAX_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn stream_seq(headers: &HeaderMap) -> Result<Option<String>, String> {
+    let Some(value) = headers
         .get(HEADER_STREAM_SEQ)
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+    check_write_identifier_len(HEADER_STREAM_SEQ, value)?;
+    Ok(Some(value.to_owned()))
+}
+
+fn check_transaction_operation_identifiers(
+    operation: &AppendTransactionHttpOperation,
+) -> Result<(), String> {
+    if let Some(stream_seq) = operation.stream_seq.as_deref() {
+        check_write_identifier_len("stream_seq", stream_seq)?;
+    }
+    if let Some(producer) = operation.producer.as_ref() {
+        check_write_identifier_len("producer_id", &producer.producer_id)?;
+    }
+    Ok(())
 }
 
 fn stream_record_match(headers: &HeaderMap) -> Result<Option<u64>, BoxResponse> {
@@ -4077,6 +4979,7 @@ pub(crate) fn producer_request(headers: &HeaderMap) -> Result<Option<ProducerReq
     if producer_id.trim().is_empty() {
         return Err("producer-id must not be empty".to_owned());
     }
+    check_write_identifier_len(HEADER_PRODUCER_ID, producer_id)?;
     Ok(Some(ProducerRequest {
         producer_id: producer_id.to_owned(),
         producer_epoch: parse_producer_integer(
@@ -4194,3 +5097,15 @@ fn request_target(uri: &Uri) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod keyed_indexer_tests;
+#[cfg(test)]
+mod staging_cleanup_tests;
+
+#[cfg(test)]
+mod keyed_lifecycle_tests;
+#[cfg(test)]
+mod keyed_state_tests;
+#[cfg(test)]
+mod sparse_marks_http_tests;

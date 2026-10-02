@@ -1,0 +1,82 @@
+---
+title: Keyed streams
+sidebarTitle: Keyed streams
+---
+
+A keyed stream is a JSON stream whose records are batches of key-value mutations. Writers declare every mutation in the record; Ursula checks the grammar when the record is appended, never runs application code, and serves the resulting key-value state through the [keyed-state](/docs/api/keyed-state) resource. The log stays the source of truth: the state is a deterministic fold of the records and can be rebuilt from them at any time.
+
+Use a keyed stream when an application needs both a durable commit log and point or range reads over the state that log produces, for example an agent harness that commits its session, task and conversation tables as one record per step. [Pi Durable on Ursula](/docs/examples/pi-durable) is the reference user.
+
+## Creating one
+
+A stream is keyed when its content type is exactly `application/json; profile=keyed-batch-v1` (case-insensitive, no quotes, no other parameters). The content type is fixed at creation:
+
+```bash
+curl -i -X PUT http://127.0.0.1:4437/pi/harness-1 \
+  -H 'Content-Type: application/json; profile=keyed-batch-v1'
+```
+
+The response advertises `json-record-coordinates-v1` and `keyed-batch-v1` in `Stream-Extensions`, plus `keyed-state-v1` when the node serves keyed state. Verify `keyed-batch-v1` before the first append: a node that does not advertise it would store your records as ordinary JSON without validating them.
+
+Creating a keyed stream needs the stream's Raft group at [feature level](/docs/operations#feature-levels) 1 or higher. A group below that answers `409 Conflict` naming the level to raise to.
+
+A keyed stream is an `application/json` stream for every other purpose. Generic clients read it as NDJSON, and [record coordinates](/docs/concepts/record-coordinates), `Stream-Record-Match`, snapshots and bootstrap work unchanged.
+
+## Record format
+
+Every message is a JSON object with an `ops` array:
+
+```json
+{"o":17,"ops":[["p","AW5leHRfaWQA",130],["d","QQIAAAAAAAAAgA"],["x","VAAAAAAAAAAEAAAAAAAAAAA","VAAAAAAAAAAEAAAAAAAAAGc"]]}
+```
+
+| Op | Meaning |
+| --- | --- |
+| `["p", key, value]` | Put: set `key` to any JSON `value`. A put of `null` makes the key visible with value `null`; it is not a delete. |
+| `["d", key]` | Delete one key. |
+| `["x", start, end]` | Delete every key in `[start, end)`. `start` must sort before `end`. |
+
+- Keys are opaque octet strings of 1 to 4096 octets, written as canonical unpadded base64url (no `=`, no escapes). Ursula compares them as unsigned octet strings, so pick an order-preserving encoding if you want useful ranges.
+- Other members of the message, such as `o` above, are stored verbatim and ignored by the fold. Put metadata there.
+- An empty `ops` array is valid, and there is no limit on ops per message. A top-level JSON array body appends one record per element, as for any JSON stream, and all of them commit atomically.
+
+Ursula validates every message of a request before committing any of them. JSON syntax errors are `400`; a well-formed message that breaks the grammar is `422 Unprocessable Content` with a body such as `invalid keyed batch at message 0: op 2: key is not canonical unpadded base64url`, and nothing from the request is committed. Every write to a keyed stream must use the keyed content type; any other content type is `409`.
+
+## The fold
+
+`state(D)` is what you get by applying records `0 … D−1` in order, and the ops inside each record in array order. A key is visible when the last op that touched it was a put. Its row carries the put's value and `record`, the ordinal of the record that held the put.
+
+The keyed-state resource always answers with one `state(D)` and names `D` in `Stream-Keyed-Through`. Because ordinals are record numbers, a writer can read its own commit at record `s` by asking for `min_through_record=s+1`, and a reader that holds the records `[D, tail)` itself can replay them over a page to get the state at its tail.
+
+## How keyed state is served
+
+```text
+client ── GET {stream}/keyed-state ──► node (stream leader) ──► keyed indexer ──► S3 .keyed/
+                                         │ resolves the stream,           │ reads records from the
+                                         │ its incarnation and tail N     │ node in max_bytes pages
+```
+
+The node checks the parameters and the stream, then forwards to an `ursula indexer` running in keyed mode. The indexer folds new records on demand, when a read asks for a `min_through_record` above what it has published, and publishes immutable sorted runs to object storage under `.keyed/`. A stream that nobody reads costs no indexer work. The projection is a cache: if it is lost or found inconsistent with the log, the indexer rebuilds it from record 0 and answers `503` until it catches up. See [Deploy](/docs/deploy-cluster#optional-keyed-state-indexer) for running one.
+
+## Retention
+
+Keyed logs are meant to be kept forever. Retention removes the records the projection is built from: once the first retained record passes what the indexer still needs, keyed state can no longer advance or be rebuilt, and the resource answers `500` for anything newer. Do not advance retention on keyed streams. Memory on the replicas does not depend on retention; see [Operations](/docs/operations#feature-levels).
+
+`/bootstrap` on a keyed stream returns the batch log, not keyed state. Read state through keyed-state.
+
+## Limits
+
+| Limit | Value |
+| --- | --- |
+| Key length | 1 to 4096 octets |
+| Message nesting depth | 127 |
+| Request body | 32 MiB (`413` above it) |
+| Ops per message | unlimited |
+| Rows per keyed-state response | `limit`, at most 1000, and at most 4 MiB of body (the first row is always whole) |
+
+## Related
+
+- [Read keyed state](/docs/api/keyed-state)
+- [Pi Durable on Ursula](/docs/examples/pi-durable)
+- [Record Coordinates](/docs/concepts/record-coordinates)
+- [Extensions spec, section 9](/docs/specs/extensions#9-keyed-streams)

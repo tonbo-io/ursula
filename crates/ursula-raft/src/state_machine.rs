@@ -26,7 +26,7 @@ use ursula_runtime::AppendTransactionRequest;
 use ursula_runtime::BootstrapStreamRequest;
 use ursula_runtime::BootstrapStreamResponse;
 use ursula_runtime::ColdFlushCandidate;
-use ursula_runtime::ColdGcEntry;
+use ursula_runtime::ColdGcPlanEntry;
 use ursula_runtime::ColdHotBacklog;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::ColdWriteAdmission;
@@ -46,6 +46,7 @@ use ursula_runtime::ReadSnapshotResponse;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::ReadStreamResponse;
 use ursula_runtime::SharedSnapshotStore;
+use ursula_runtime::SnapshotEnvelope;
 use ursula_runtime::SnapshotKey;
 use ursula_runtime::SnapshotLocation;
 use ursula_runtime::SnapshotPointer;
@@ -59,6 +60,9 @@ use crate::log_store::elapsed_ns;
 use crate::rt::sync::OwnedSemaphorePermit;
 use crate::rt::sync::Semaphore;
 use crate::rt::time::Instant;
+use crate::snapshot_cadence::GroupLogGauge;
+use crate::snapshot_cadence::GroupLogMark;
+use crate::snapshot_cadence::GroupLogProgress;
 use crate::snapshot_codec::decode_group_snapshot;
 use crate::snapshot_codec::group_snapshot_frames;
 use crate::types::RaftGroupResponse;
@@ -72,6 +76,9 @@ pub struct SnapshotBuildCoordinator {
 #[derive(Debug)]
 struct SnapshotBuildCoordinatorInner {
     semaphore: Arc<Semaphore>,
+    /// Per-group log gauges (F12e), shared node-wide like the permit, so
+    /// the snapshot driver reads what every group's state machine counts.
+    log_gauges: Arc<Mutex<BTreeMap<u32, Arc<GroupLogGauge>>>>,
 }
 
 impl Default for SnapshotBuildCoordinator {
@@ -85,8 +92,41 @@ impl SnapshotBuildCoordinator {
         Self {
             inner: Arc::new(SnapshotBuildCoordinatorInner {
                 semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
+                log_gauges: Arc::default(),
             }),
         }
+    }
+
+    /// A coordinator with a new build concurrency that keeps this one's log
+    /// gauges.
+    pub fn with_max_concurrency(&self, max_concurrency: usize) -> Self {
+        Self {
+            inner: Arc::new(SnapshotBuildCoordinatorInner {
+                semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
+                log_gauges: Arc::clone(&self.inner.log_gauges),
+            }),
+        }
+    }
+
+    /// The log gauge of `raft_group_id`, created on first use (F12e).
+    pub fn log_gauge(&self, raft_group_id: u32) -> Arc<GroupLogGauge> {
+        let mut gauges = self
+            .inner
+            .log_gauges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(gauges.entry(raft_group_id).or_default())
+    }
+
+    /// The log progress of every group with a gauge (F12e).
+    pub fn log_progress(&self) -> BTreeMap<u32, GroupLogProgress> {
+        self.inner
+            .log_gauges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(group, gauge)| (*group, gauge.progress()))
+            .collect()
     }
 
     pub async fn acquire(&self) -> Result<OwnedSemaphorePermit, GroupEngineError> {
@@ -96,6 +136,18 @@ impl SnapshotBuildCoordinator {
             .acquire_owned()
             .await
             .map_err(|err| GroupEngineError::new(format!("snapshot build gate closed: {err}")))
+    }
+
+    /// Takes a build permit only if one is free right now. The policy path
+    /// uses this so that one group's apply worker never waits behind another
+    /// group's snapshot build (bounded-stream-state F12d).
+    pub fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        self.inner.semaphore.clone().try_acquire_owned().ok()
+    }
+
+    #[cfg(test)]
+    fn available_permits(&self) -> usize {
+        self.inner.semaphore.available_permits()
     }
 }
 
@@ -107,7 +159,9 @@ pub struct SnapshotInstallCoordinator {
 #[derive(Debug)]
 struct SnapshotInstallCoordinatorInner {
     semaphore: Arc<Semaphore>,
-    prefetched: Mutex<BTreeMap<String, Arc<Vec<u8>>>>,
+    /// Snapshots downloaded and decoded before OpenRaft's install, keyed by
+    /// pointer. Install consumes the decoded group, so it decodes once.
+    prefetched: Mutex<BTreeMap<String, GroupSnapshot>>,
 }
 
 impl Default for SnapshotInstallCoordinator {
@@ -162,23 +216,23 @@ impl SnapshotInstallCoordinator {
         &self,
         snapshot_id: &str,
         location: &SnapshotLocation,
-        bytes: Vec<u8>,
+        snapshot: GroupSnapshot,
     ) -> String {
         let key = Self::cache_key(snapshot_id, location);
         self.inner
             .prefetched
             .lock()
             .expect("snapshot install prefetch cache mutex")
-            .insert(key.clone(), Arc::new(bytes));
+            .insert(key.clone(), snapshot);
         key
     }
 
-    pub fn take_prefetched(&self, pointer: &SnapshotPointer) -> Option<Arc<Vec<u8>>> {
+    pub fn take_prefetched(&self, pointer: &SnapshotPointer) -> Option<GroupSnapshot> {
         let key = Self::cache_key(&pointer.snapshot_id, &pointer.location);
         self.clear_prefetched_key(&key)
     }
 
-    pub fn clear_prefetched_key(&self, key: &str) -> Option<Arc<Vec<u8>>> {
+    pub fn clear_prefetched_key(&self, key: &str) -> Option<GroupSnapshot> {
         self.inner
             .prefetched
             .lock()
@@ -214,11 +268,17 @@ pub struct RaftGroupStateMachine {
     pub(crate) snapshot_build: SnapshotBuildCoordinator,
     pub(crate) snapshot_install: SnapshotInstallCoordinator,
     snapshot_metadata_path: Option<PathBuf>,
+    /// Log applied since the last snapshot (F12e), read by the driver.
+    log_gauge: Arc<GroupLogGauge>,
 }
 
+/// Node-local record of the current snapshot (`group-N.snapshot.json`).
+/// Written in the JSON envelope below feature level 1 and in MessagePack
+/// from it (bounded-state F12a); read in either.
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedSnapshot {
     meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
+    #[serde(with = "serde_bytes")]
     pointer_bytes: Vec<u8>,
 }
 
@@ -268,6 +328,7 @@ impl RaftGroupStateMachine {
         snapshot_install: SnapshotInstallCoordinator,
         snapshot_metadata_path: Option<PathBuf>,
     ) -> Self {
+        let log_gauge = snapshot_build.log_gauge(placement.raft_group_id.0);
         Self {
             placement,
             engine: match cold_store {
@@ -282,6 +343,7 @@ impl RaftGroupStateMachine {
             snapshot_build,
             snapshot_install,
             snapshot_metadata_path,
+            log_gauge,
         }
     }
 
@@ -293,8 +355,8 @@ impl RaftGroupStateMachine {
             return Ok(());
         }
 
-        let persisted = serde_json::from_slice::<PersistedSnapshot>(&std::fs::read(path)?)
-            .map_err(invalid_data)?;
+        let persisted = SnapshotEnvelope::decode::<PersistedSnapshot>(&std::fs::read(path)?)
+            .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
         let pointer = SnapshotPointer::decode(&persisted.pointer_bytes)
             .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
         let snapshot_bytes = match &pointer.location {
@@ -318,11 +380,18 @@ impl RaftGroupStateMachine {
             .map_err(group_engine_io_error)?;
         self.last_applied_log_id = persisted.meta.last_log_id;
         self.last_membership = persisted.meta.last_membership.clone();
+        self.log_gauge
+            .record_snapshot(self.log_gauge.mark(), pointer.location.size_hint());
         *self.current_snapshot.lock().expect("snapshot mutex") = Some(CurrentSnapshot {
             meta: persisted.meta,
             pointer_bytes: persisted.pointer_bytes,
         });
         Ok(())
+    }
+
+    /// Log applied since this group's last snapshot (F12e).
+    pub fn log_progress(&self) -> GroupLogProgress {
+        self.log_gauge.progress()
     }
 
     pub async fn group_snapshot(&mut self) -> Result<GroupSnapshot, io::Error> {
@@ -413,7 +482,7 @@ impl RaftGroupStateMachine {
         &mut self,
         max: usize,
         placement: ShardPlacement,
-    ) -> Result<Vec<ColdGcEntry>, GroupEngineError> {
+    ) -> Result<Vec<ColdGcPlanEntry>, GroupEngineError> {
         self.engine.plan_cold_gc(max, placement).await
     }
 
@@ -459,10 +528,11 @@ impl RaftGroupStateMachine {
             .iter()
             .map(|payload| u64::try_from(payload.len()).expect("payload len fits u64"))
             .sum();
-        self.engine.check_cold_write_admission_bytes(
+        self.engine.check_cold_write_admission(
             &request.stream_id,
             admission,
             incoming_bytes,
+            u64::try_from(request.payloads.len()).unwrap_or(u64::MAX),
         )?;
         Ok(())
     }
@@ -483,8 +553,16 @@ impl RaftGroupStateMachine {
             .flat_map(|request| request.payloads.iter())
             .map(|payload| u64::try_from(payload.len()).expect("payload len fits u64"))
             .sum();
-        self.engine
-            .check_cold_write_admission_bytes(&stream_id, admission, incoming_bytes)?;
+        let incoming_records = requests
+            .iter()
+            .map(|request| u64::try_from(request.payloads.len()).unwrap_or(u64::MAX))
+            .fold(0u64, u64::saturating_add);
+        self.engine.check_cold_write_admission(
+            &stream_id,
+            admission,
+            incoming_bytes,
+            incoming_records,
+        )?;
         Ok(())
     }
 
@@ -498,10 +576,11 @@ impl RaftGroupStateMachine {
         let Some(first) = request.operations.first() else {
             return Ok(());
         };
-        self.engine.check_cold_write_admission_bytes(
+        self.engine.check_cold_write_admission(
             &first.stream_id,
             admission,
             request.payload_bytes(),
+            u64::try_from(request.operations.len()).unwrap_or(u64::MAX),
         )?;
         Ok(())
     }
@@ -511,6 +590,28 @@ impl RaftGroupStateMachine {
         snapshot: GroupSnapshot,
     ) -> Result<(), GroupEngineError> {
         self.engine.install_snapshot(snapshot).await
+    }
+
+    async fn snapshot_builder_with_permit(
+        &mut self,
+        build_permit: OwnedSemaphorePermit,
+    ) -> RaftGroupSnapshotBuilder {
+        let snapshot = self
+            .group_snapshot()
+            .await
+            .expect("in-memory group snapshot should not fail");
+        RaftGroupSnapshotBuilder {
+            placement: self.placement,
+            snapshot: Arc::new(snapshot),
+            meta: self.snapshot_meta(),
+            current_snapshot: self.current_snapshot.clone(),
+            snapshot_store: self.snapshot_store.clone(),
+            metrics: self.metrics.clone(),
+            _build_permit: build_permit,
+            snapshot_metadata_path: self.snapshot_metadata_path.clone(),
+            log_gauge: Arc::clone(&self.log_gauge),
+            log_mark: self.log_gauge.mark(),
+        }
     }
 
     pub(crate) fn snapshot_meta(&self) -> SnapshotMetaOf<UrsulaRaftTypeConfig> {
@@ -556,6 +657,13 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         while let Some((entry, responder)) = entries.try_next().await? {
             self.last_applied_log_id = Some(entry.log_id);
 
+            let log_bytes = match &entry.payload {
+                EntryPayload::Normal(command) => command.log_bytes_estimate(),
+                EntryPayload::Blank | EntryPayload::Membership(_) => {
+                    ursula_stream::COMMAND_LOG_OVERHEAD_BYTES
+                }
+            };
+            self.log_gauge.record_applied(log_bytes);
             let response = match entry.payload {
                 EntryPayload::Blank => RaftGroupResponse::Blank,
                 EntryPayload::Normal(command) => {
@@ -588,26 +696,30 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         Ok(())
     }
 
+    async fn try_create_snapshot_builder(&mut self, force: bool) -> Option<Self::SnapshotBuilder> {
+        if force {
+            return Some(self.get_snapshot_builder().await);
+        }
+        // A policy-triggered build defers instead of waiting for the
+        // node-wide permit on this group's state-machine worker; OpenRaft
+        // retries on a later trigger.
+        let Some(build_permit) = self.snapshot_build.try_acquire() else {
+            tracing::debug!(
+                raft_group_id = self.placement.raft_group_id.0,
+                "deferring OpenRaft snapshot build while another group holds the build permit"
+            );
+            return None;
+        };
+        Some(self.snapshot_builder_with_permit(build_permit).await)
+    }
+
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         let build_permit = self
             .snapshot_build
             .acquire()
             .await
             .expect("snapshot build coordinator should not close");
-        let snapshot = self
-            .group_snapshot()
-            .await
-            .expect("in-memory group snapshot should not fail");
-        RaftGroupSnapshotBuilder {
-            placement: self.placement,
-            snapshot,
-            meta: self.snapshot_meta(),
-            current_snapshot: self.current_snapshot.clone(),
-            snapshot_store: self.snapshot_store.clone(),
-            metrics: self.metrics.clone(),
-            _build_permit: build_permit,
-            snapshot_metadata_path: self.snapshot_metadata_path.clone(),
-        }
+        self.snapshot_builder_with_permit(build_permit).await
     }
 
     async fn begin_receiving_snapshot(
@@ -624,28 +736,36 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         let pointer_bytes = snapshot.into_inner();
         let pointer = SnapshotPointer::decode(&pointer_bytes)
             .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
-        let snapshot_bytes = match &pointer.location {
-            SnapshotLocation::Inline { bytes } => Arc::new(bytes.clone()),
-            location => {
-                if let Some(bytes) = self.snapshot_install.take_prefetched(&pointer) {
-                    bytes
-                } else {
-                    Arc::new(
-                        self.snapshot_store
-                            .download(location)
-                            .await
-                            .map_err(|err| err.into_io())?,
-                    )
-                }
+        let envelope = SnapshotEnvelope::detect(&pointer_bytes);
+        // Decode exactly once (bounded-stream-state F12c): inline bytes are
+        // decoded in place, and a prefetched external snapshot arrives
+        // already decoded.
+        let group_snapshot = match &pointer.location {
+            SnapshotLocation::Inline { bytes } => {
+                decode_group_snapshot(bytes).map_err(|err| err.into_io())?
             }
+            location => match self.snapshot_install.take_prefetched(&pointer) {
+                Some(group_snapshot) => group_snapshot,
+                None => {
+                    let bytes = self
+                        .snapshot_store
+                        .download(location)
+                        .await
+                        .map_err(|err| err.into_io())?;
+                    decode_group_snapshot(&bytes).map_err(|err| err.into_io())?
+                }
+            },
         };
-        let group_snapshot =
-            decode_group_snapshot(snapshot_bytes.as_slice()).map_err(|err| err.into_io())?;
         self.engine
             .install_snapshot(group_snapshot)
             .await
             .map_err(group_engine_io_error)?;
-        persist_snapshot_metadata(self.snapshot_metadata_path.as_deref(), meta, &pointer_bytes)?;
+        persist_snapshot_metadata(
+            self.snapshot_metadata_path.as_deref(),
+            envelope,
+            meta,
+            &pointer_bytes,
+        )?;
         if matches!(pointer.location, SnapshotLocation::S3 { .. }) {
             self.snapshot_store
                 .publish_reference(self.placement.raft_group_id.0, &pointer.location)
@@ -654,6 +774,8 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         }
         self.last_applied_log_id = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
+        self.log_gauge
+            .record_snapshot(self.log_gauge.mark(), pointer.location.size_hint());
         *self.current_snapshot.lock().expect("snapshot mutex") = Some(CurrentSnapshot {
             meta: meta.clone(),
             pointer_bytes,
@@ -678,13 +800,18 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
 
 pub struct RaftGroupSnapshotBuilder {
     placement: ShardPlacement,
-    snapshot: GroupSnapshot,
+    /// Shared with the frame iterators, so an upload and any inline fallback
+    /// encode the same group without deep-cloning it (F12c).
+    snapshot: Arc<GroupSnapshot>,
     pub(crate) meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
     current_snapshot: Arc<Mutex<Option<CurrentSnapshot>>>,
     snapshot_store: SharedSnapshotStore,
     metrics: Option<GroupEngineMetrics>,
     _build_permit: OwnedSemaphorePermit,
     snapshot_metadata_path: Option<PathBuf>,
+    log_gauge: Arc<GroupLogGauge>,
+    /// The applied log this snapshot covers (F12e).
+    log_mark: GroupLogMark,
 }
 
 impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
@@ -698,7 +825,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
         };
         let location = match self
             .snapshot_store
-            .upload_iter(key, group_snapshot_frames(self.snapshot.clone()))
+            .upload_iter(key, group_snapshot_frames(Arc::clone(&self.snapshot)))
             .await
         {
             Ok(location) => {
@@ -716,7 +843,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                             "falling back to inline OpenRaft snapshot after external snapshot verification failed"
                         );
                         SnapshotLocation::Inline {
-                            bytes: group_snapshot_frames(self.snapshot.clone())
+                            bytes: group_snapshot_frames(Arc::clone(&self.snapshot))
                                 .collect::<Result<Vec<_>, _>>()
                                 .map_err(|err| err.into_io())?
                                 .into_iter()
@@ -733,7 +860,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                     "falling back to inline OpenRaft snapshot after external snapshot upload failed"
                 );
                 SnapshotLocation::Inline {
-                    bytes: group_snapshot_frames(self.snapshot.clone())
+                    bytes: group_snapshot_frames(Arc::clone(&self.snapshot))
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|err| err.into_io())?
                         .into_iter()
@@ -746,9 +873,14 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             snapshot_id: snapshot_id.clone(),
             location,
         };
-        let mut pointer_bytes = pointer.encode().map_err(|err| err.into_io())?;
+        // F12a: the binary envelope starts at feature level 1, when every
+        // follower that receives this pointer can decode it.
+        let envelope =
+            SnapshotEnvelope::for_feature_level(self.snapshot.stream_snapshot.feature_level);
+        let mut pointer_bytes = envelope.encode(&pointer).map_err(|err| err.into_io())?;
         persist_snapshot_metadata(
             self.snapshot_metadata_path.as_deref(),
+            envelope,
             &self.meta,
             &pointer_bytes,
         )?;
@@ -771,16 +903,17 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                 );
             }
             pointer.location = SnapshotLocation::Inline {
-                bytes: group_snapshot_frames(self.snapshot.clone())
+                bytes: group_snapshot_frames(Arc::clone(&self.snapshot))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|err| err.into_io())?
                     .into_iter()
                     .flat_map(|chunk| chunk.to_vec())
                     .collect(),
             };
-            pointer_bytes = pointer.encode().map_err(|err| err.into_io())?;
+            pointer_bytes = envelope.encode(&pointer).map_err(|err| err.into_io())?;
             persist_snapshot_metadata(
                 self.snapshot_metadata_path.as_deref(),
+                envelope,
                 &self.meta,
                 &pointer_bytes,
             )?;
@@ -805,6 +938,8 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                 pointer_bytes: pointer_bytes.clone(),
             });
         }
+        self.log_gauge
+            .record_snapshot(self.log_mark, pointer.location.size_hint());
         if let Err(err) = self
             .snapshot_store
             .prune_retired(
@@ -829,6 +964,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
 
 fn persist_snapshot_metadata(
     path: Option<&Path>,
+    envelope: SnapshotEnvelope,
     meta: &SnapshotMetaOf<UrsulaRaftTypeConfig>,
     pointer_bytes: &[u8],
 ) -> Result<(), io::Error> {
@@ -838,11 +974,12 @@ fn persist_snapshot_metadata(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let encoded = serde_json::to_vec(&PersistedSnapshot {
-        meta: meta.clone(),
-        pointer_bytes: pointer_bytes.to_vec(),
-    })
-    .map_err(invalid_data)?;
+    let encoded = envelope
+        .encode(&PersistedSnapshot {
+            meta: meta.clone(),
+            pointer_bytes: pointer_bytes.to_vec(),
+        })
+        .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
     let temporary = path.with_extension("json.tmp");
     {
         use std::io::Write;
@@ -931,12 +1068,14 @@ mod tests {
         let current_snapshot = Arc::new(Mutex::new(None));
         let mut builder = RaftGroupSnapshotBuilder {
             placement,
-            snapshot: test_group_snapshot(placement, 42),
+            snapshot: Arc::new(test_group_snapshot(placement, 42)),
             meta: test_snapshot_meta(42),
             current_snapshot,
             snapshot_store: default_snapshot_store(),
             metrics: None,
             _build_permit: test_build_permit().await,
+            log_gauge: Arc::default(),
+            log_mark: GroupLogMark::default(),
             snapshot_metadata_path: Some(metadata_path.clone()),
         };
         builder.build_snapshot().await.expect("persist snapshot");
@@ -967,6 +1106,167 @@ mod tests {
         let _ = std::fs::remove_dir_all(directory);
     }
 
+    /// F12a decode support: a node restores its persisted snapshot record
+    /// when both the record and the pointer inside it use the MessagePack
+    /// envelope that level Lb1 will emit, and the JSON record still decodes.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn persisted_snapshot_restores_from_the_binary_envelope() {
+        use ursula_runtime::decode_snapshot_envelope;
+        use ursula_runtime::encode_binary_envelope;
+        use ursula_runtime::is_json_snapshot_envelope;
+        use ursula_shard::CoreId;
+        use ursula_shard::RaftGroupId;
+        use ursula_shard::ShardId;
+
+        let placement = ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(0),
+            raft_group_id: RaftGroupId(7),
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "ursula-persisted-binary-snapshot-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("snapshot metadata directory");
+        let metadata_path = directory.join("group-7.snapshot.json");
+        let mut builder = RaftGroupSnapshotBuilder {
+            placement,
+            snapshot: Arc::new(test_group_snapshot(placement, 42)),
+            meta: test_snapshot_meta(42),
+            current_snapshot: Arc::new(Mutex::new(None)),
+            snapshot_store: default_snapshot_store(),
+            metrics: None,
+            _build_permit: test_build_permit().await,
+            log_gauge: Arc::default(),
+            log_mark: GroupLogMark::default(),
+            snapshot_metadata_path: Some(metadata_path.clone()),
+        };
+        builder.build_snapshot().await.expect("persist snapshot");
+
+        let json = std::fs::read(&metadata_path).expect("persisted record");
+        assert!(
+            is_json_snapshot_envelope(&json),
+            "emission stays JSON below Lb1"
+        );
+        let persisted =
+            decode_snapshot_envelope::<PersistedSnapshot>(&json).expect("decode JSON record");
+        let pointer = SnapshotPointer::decode(&persisted.pointer_bytes).expect("JSON pointer");
+        let binary = encode_binary_envelope(&PersistedSnapshot {
+            meta: persisted.meta,
+            pointer_bytes: pointer.encode_binary().expect("binary pointer"),
+        })
+        .expect("binary record");
+        assert!(!is_json_snapshot_envelope(&binary));
+        assert!(binary.len() < json.len());
+        std::fs::write(&metadata_path, &binary).expect("rewrite record");
+
+        let mut restored = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+            placement,
+            None,
+            None,
+            default_snapshot_store(),
+            SnapshotBuildCoordinator::default(),
+            SnapshotInstallCoordinator::default(),
+            Some(metadata_path),
+        );
+        restored
+            .restore_persisted_snapshot()
+            .await
+            .expect("restore the binary record");
+        assert_eq!(restored.last_applied_log_id, Some(test_log_id(42)));
+        assert_eq!(
+            restored
+                .group_snapshot()
+                .await
+                .expect("snapshot restored state")
+                .group_commit_index,
+            42
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// F12a: a group below feature level 1 keeps emitting the JSON
+    /// envelope; at level 1 the pointer and the persisted record are
+    /// MessagePack. Both restore, and both install on a follower.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn snapshot_envelope_switches_to_binary_at_feature_level_one() {
+        use ursula_shard::CoreId;
+        use ursula_shard::RaftGroupId;
+        use ursula_shard::ShardId;
+
+        let placement = ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(0),
+            raft_group_id: RaftGroupId(7),
+        };
+        for (level, expected) in [
+            (0, SnapshotEnvelope::Json),
+            (1, SnapshotEnvelope::MessagePack),
+        ] {
+            let directory = std::env::temp_dir().join(format!(
+                "ursula-snapshot-envelope-{level}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&directory);
+            std::fs::create_dir_all(&directory).expect("snapshot metadata directory");
+            let metadata_path = directory.join("group-7.snapshot.json");
+            let mut group = test_group_snapshot(placement, 42);
+            group.stream_snapshot.feature_level = level;
+            let mut builder = RaftGroupSnapshotBuilder {
+                placement,
+                snapshot: Arc::new(group),
+                meta: test_snapshot_meta(42),
+                current_snapshot: Arc::new(Mutex::new(None)),
+                snapshot_store: default_snapshot_store(),
+                metrics: None,
+                _build_permit: test_build_permit().await,
+                log_gauge: Arc::default(),
+                log_mark: GroupLogMark::default(),
+                snapshot_metadata_path: Some(metadata_path.clone()),
+            };
+            let built = builder.build_snapshot().await.expect("build snapshot");
+            let pointer_bytes = built.snapshot.into_inner();
+            assert_eq!(SnapshotEnvelope::detect(&pointer_bytes), expected);
+            let persisted = std::fs::read(&metadata_path).expect("persisted record");
+            assert_eq!(SnapshotEnvelope::detect(&persisted), expected);
+
+            let mut restored = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+                placement,
+                None,
+                None,
+                default_snapshot_store(),
+                SnapshotBuildCoordinator::default(),
+                SnapshotInstallCoordinator::default(),
+                Some(metadata_path),
+            );
+            restored
+                .restore_persisted_snapshot()
+                .await
+                .expect("restore persisted snapshot");
+            assert_eq!(restored.last_applied_log_id, Some(test_log_id(42)));
+            assert_eq!(
+                restored
+                    .group_snapshot()
+                    .await
+                    .expect("restored state")
+                    .stream_snapshot
+                    .feature_level,
+                level
+            );
+
+            let mut follower = RaftGroupStateMachine::new(placement);
+            follower
+                .install_snapshot(&test_snapshot_meta(42), Cursor::new(pointer_bytes))
+                .await
+                .expect("follower installs the pointer");
+            assert_eq!(follower.last_applied_log_id, Some(test_log_id(42)));
+            let _ = std::fs::remove_dir_all(directory);
+        }
+    }
+
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn snapshot_builder_keeps_external_snapshots_referenced_by_published_pointers() {
@@ -995,12 +1295,14 @@ mod tests {
 
         let mut first = RaftGroupSnapshotBuilder {
             placement,
-            snapshot: test_group_snapshot(placement, 1),
+            snapshot: Arc::new(test_group_snapshot(placement, 1)),
             meta: test_snapshot_meta(1),
             current_snapshot: current_snapshot.clone(),
             snapshot_store: snapshot_store.clone(),
             metrics: None,
             _build_permit: test_build_permit().await,
+            log_gauge: Arc::default(),
+            log_mark: GroupLogMark::default(),
             snapshot_metadata_path: None,
         };
         let first_snapshot = first.build_snapshot().await.expect("first snapshot");
@@ -1009,12 +1311,14 @@ mod tests {
 
         let mut second = RaftGroupSnapshotBuilder {
             placement,
-            snapshot: test_group_snapshot(placement, 2),
+            snapshot: Arc::new(test_group_snapshot(placement, 2)),
             meta: test_snapshot_meta(2),
             current_snapshot: current_snapshot.clone(),
             snapshot_store: snapshot_store.clone(),
             metrics: None,
             _build_permit: test_build_permit().await,
+            log_gauge: Arc::default(),
+            log_mark: GroupLogMark::default(),
             snapshot_metadata_path: None,
         };
         let second_snapshot = second.build_snapshot().await.expect("second snapshot");
@@ -1040,12 +1344,14 @@ mod tests {
         let current_snapshot = Arc::new(Mutex::new(None));
         let mut third = RaftGroupSnapshotBuilder {
             placement,
-            snapshot: test_group_snapshot(placement, 3),
+            snapshot: Arc::new(test_group_snapshot(placement, 3)),
             meta: test_snapshot_meta(3),
             current_snapshot,
             snapshot_store,
             metrics: None,
             _build_permit: test_build_permit().await,
+            log_gauge: Arc::default(),
+            log_mark: GroupLogMark::default(),
             snapshot_metadata_path: None,
         };
         let third_snapshot = third.build_snapshot().await.expect("third snapshot");
@@ -1119,12 +1425,14 @@ mod tests {
         let current_snapshot = Arc::new(Mutex::new(None));
         let mut builder = RaftGroupSnapshotBuilder {
             placement,
-            snapshot: test_group_snapshot(placement, 3),
+            snapshot: Arc::new(test_group_snapshot(placement, 3)),
             meta: test_snapshot_meta(3),
             current_snapshot: current_snapshot.clone(),
             snapshot_store: Arc::new(FailingSnapshotStore),
             metrics: None,
             _build_permit: test_build_permit().await,
+            log_gauge: Arc::default(),
+            log_mark: GroupLogMark::default(),
             snapshot_metadata_path: None,
         };
 
@@ -1137,6 +1445,9 @@ mod tests {
         let group = decode_group_snapshot(&bytes).expect("decode inline snapshot");
         assert_eq!(group.group_commit_index, 3);
         assert!(current_snapshot.lock().expect("snapshot mutex").is_some());
+        // F12c: the upload attempt and the inline fallback both encoded from
+        // the shared group without keeping or deep-cloning it.
+        assert_eq!(Arc::strong_count(&builder.snapshot), 1);
     }
 
     #[tokio::test]
@@ -1159,5 +1470,100 @@ mod tests {
 
         drop(permit);
         assert_eq!(coordinator.available_permits(), 1);
+    }
+
+    #[cfg(not(madsim))]
+    fn test_state_machine(
+        build: SnapshotBuildCoordinator,
+        install: SnapshotInstallCoordinator,
+    ) -> RaftGroupStateMachine {
+        use ursula_shard::CoreId;
+        use ursula_shard::RaftGroupId;
+        use ursula_shard::ShardId;
+
+        RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+            ShardPlacement {
+                core_id: CoreId(0),
+                shard_id: ShardId(0),
+                raft_group_id: RaftGroupId(7),
+            },
+            None,
+            None,
+            default_snapshot_store(),
+            build,
+            install,
+            None,
+        )
+    }
+
+    /// F12d: a policy-triggered snapshot never waits on the node-wide build
+    /// permit; it defers while another group builds, and a forced one (needed
+    /// for replication) still waits for the permit.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn policy_snapshot_build_defers_while_another_group_holds_the_permit() {
+        let build = SnapshotBuildCoordinator::new(1);
+        let mut state_machine =
+            test_state_machine(build.clone(), SnapshotInstallCoordinator::default());
+        let held = build.acquire().await.expect("other group's build permit");
+
+        let deferred = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state_machine.try_create_snapshot_builder(false),
+        )
+        .await
+        .expect("policy build must not wait for the permit");
+        assert!(deferred.is_none());
+
+        drop(held);
+        let builder = state_machine
+            .try_create_snapshot_builder(false)
+            .await
+            .expect("free permit builds");
+        assert_eq!(build.available_permits(), 0);
+        drop(builder);
+        assert_eq!(build.available_permits(), 1);
+        assert!(
+            state_machine
+                .try_create_snapshot_builder(true)
+                .await
+                .is_some()
+        );
+    }
+
+    /// F12c: installing an inline snapshot decodes it exactly once.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn inline_snapshot_install_decodes_once() {
+        use crate::snapshot_codec::decode_calls_on_this_thread;
+
+        let mut state_machine = test_state_machine(
+            SnapshotBuildCoordinator::default(),
+            SnapshotInstallCoordinator::default(),
+        );
+        let placement = state_machine.placement;
+        let bytes = group_snapshot_frames(Arc::new(test_group_snapshot(placement, 9)))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("encode group snapshot")
+            .concat();
+        let meta = test_snapshot_meta(9);
+        let pointer = SnapshotPointer {
+            snapshot_id: meta.snapshot_id.clone(),
+            location: SnapshotLocation::Inline { bytes },
+        };
+        let before = decode_calls_on_this_thread();
+        state_machine
+            .install_snapshot(&meta, Cursor::new(pointer.encode().expect("pointer")))
+            .await
+            .expect("install inline snapshot");
+        assert_eq!(decode_calls_on_this_thread() - before, 1);
+        assert_eq!(
+            state_machine
+                .group_snapshot()
+                .await
+                .expect("installed group")
+                .group_commit_index,
+            9
+        );
     }
 }

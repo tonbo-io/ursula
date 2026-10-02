@@ -1,0 +1,34 @@
+[package]
+name = "ursula-state-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = false
+description = "Bounded-state measurement harness: drives the real stream state machine and ShardRuntime with long-lived-stream workloads and checks per-stream state growth against ratchets."
+
+[[bin]]
+name = "ursula-state-probe"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
+ursula-proto = { workspace = true }
+ursula-raft = { workspace = true }
+ursula-runtime = { workspace = true }
+ursula-shard = { workspace = true }
+ursula-stream = { workspace = true }
+zstd = { workspace = true }
+
+[lints.clippy]
+wildcard_imports = "deny"

@@ -4,6 +4,7 @@
 
 use super::BucketStreamId;
 use super::HttpProtocolSurfacePlan;
+use super::KeyedIndexerPlan;
 use super::RuntimeInterleavingPlan;
 use super::RuntimeRaftNetworkWorkloadPlan;
 use super::SimFaultAction;
@@ -178,6 +179,17 @@ impl SimSchedule {
                 },
             )],
         )
+    }
+
+    pub fn generate_keyed_indexer(seed: u64) -> Self {
+        Self::from_steps(seed, SimScenario::KeyedIndexer, "keyed-indexer", vec![
+            step(
+                "keyed_indexer_workload",
+                SimFaultAction::RunKeyedIndexerWorkload {
+                    plan: KeyedIndexerPlan::from_seed(seed),
+                },
+            ),
+        ])
     }
 
     pub fn generate_http_protocol_surface_randomized_failure(seed: u64) -> Self {

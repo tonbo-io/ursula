@@ -18,6 +18,7 @@ use crate::request::DeleteStreamRequest;
 use crate::request::FlushColdRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::SetBucketQuotaRequest;
+use crate::request::SetFeatureLevelRequest;
 use crate::request::StreamAppendCount;
 use crate::request::UpdateStreamAttrsRequest;
 
@@ -44,6 +45,19 @@ pub enum GroupWriteCommand {
     Stream(StreamCommand),
     Batch { commands: Vec<StreamCommand> },
     Transaction { commands: Vec<StreamCommand> },
+}
+
+impl GroupWriteCommand {
+    /// Approximate Raft-log bytes of this command (bounded-state F12e).
+    pub fn log_bytes_estimate(&self) -> u64 {
+        match self {
+            Self::Stream(command) => command.log_bytes_estimate(),
+            Self::Batch { commands } | Self::Transaction { commands } => commands
+                .iter()
+                .map(StreamCommand::log_bytes_estimate)
+                .fold(0, u64::saturating_add),
+        }
+    }
 }
 
 impl From<StreamCommand> for GroupWriteCommand {
@@ -181,6 +195,14 @@ impl From<SetBucketQuotaRequest> for StreamCommand {
     }
 }
 
+impl From<SetFeatureLevelRequest> for StreamCommand {
+    fn from(request: SetFeatureLevelRequest) -> Self {
+        Self::SetFeatureLevel {
+            level: request.level,
+        }
+    }
+}
+
 impl From<CloseStreamRequest> for StreamCommand {
     fn from(request: CloseStreamRequest) -> Self {
         Self::Close {
@@ -205,6 +227,7 @@ impl From<FlushColdRequest> for StreamCommand {
         Self::FlushCold {
             stream_id: request.stream_id,
             chunk: request.chunk,
+            cold_generation: request.cold_generation,
         }
     }
 }
@@ -240,6 +263,7 @@ group_write_from_request!(
     PublishSnapshotRequest,
     AdvanceRetentionRequest,
     SetBucketQuotaRequest,
+    SetFeatureLevelRequest,
     CloseStreamRequest,
     DeleteStreamRequest,
     FlushColdRequest,

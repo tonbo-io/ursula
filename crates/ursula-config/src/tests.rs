@@ -201,6 +201,68 @@ max_in_snapshot_log_to_keep = 128
     }
 
     #[test]
+    fn snapshot_cadence_follows_a_node_log_budget() {
+        let default = UrsulaConfig::default();
+        assert_eq!(default.raft.snapshot_log_budget.as_bytes(), 1 << 30);
+        assert_eq!(default.raft.snapshot_backstop_logs, 100_000);
+        let config: UrsulaConfig = toml::from_str(
+            r#"
+[raft]
+snapshot_log_budget = "256MiB"
+snapshot_backstop_logs = 50000
+"#,
+        )
+        .expect("snapshot cadence parses");
+        assert_eq!(config.raft.snapshot_log_budget.as_bytes(), 256 << 20);
+        assert_eq!(config.raft.snapshot_backstop_logs, 50_000);
+    }
+
+    #[test]
+    fn snapshot_backend_defaults_to_s3_with_an_s3_cold_store() {
+        use crate::config::ColdBackend;
+        use crate::config::RaftSnapshotBackend;
+        // F12b: `auto` is the default and picks S3 snapshots whenever the
+        // cold store is S3; `inline` and `s3` stay explicit choices.
+        assert_eq!(
+            UrsulaConfig::default().storage.snapshot.backend,
+            RaftSnapshotBackend::Auto
+        );
+        assert_eq!(
+            RaftSnapshotBackend::Auto.resolve(ColdBackend::S3),
+            RaftSnapshotBackend::S3
+        );
+        for cold in [ColdBackend::None, ColdBackend::Memory] {
+            assert_eq!(
+                RaftSnapshotBackend::Auto.resolve(cold),
+                RaftSnapshotBackend::Inline
+            );
+        }
+        assert_eq!(
+            RaftSnapshotBackend::Inline.resolve(ColdBackend::S3),
+            RaftSnapshotBackend::Inline
+        );
+        let explicit: UrsulaConfig = toml::from_str(
+            r#"
+[storage.snapshot]
+backend = "inline"
+"#,
+        )
+        .expect("explicit inline parses");
+        assert_eq!(
+            explicit.storage.snapshot.backend,
+            RaftSnapshotBackend::Inline
+        );
+        let auto: UrsulaConfig = toml::from_str(
+            r#"
+[storage.snapshot]
+backend = "auto"
+"#,
+        )
+        .expect("auto parses");
+        assert_eq!(auto.storage.snapshot.backend, RaftSnapshotBackend::Auto);
+    }
+
+    #[test]
     fn snapshot_drive_interval_is_optional_and_zero_is_explicit_disable() {
         use crate::human::HumanDuration;
 
@@ -360,6 +422,40 @@ core_count = 2
         let config = load_config(Some(tmp.path()), Some(Preset::Tiny), Some(1)).unwrap();
         assert_eq!(config.runtime.core_count, 2); // user overrides preset's 4
         assert_eq!(config.raft.group_count, 64); // preset still applies
+    }
+
+    #[test]
+    fn keyed_state_upstream_loads_and_requires_an_http_url() {
+        let tmp = temp_config(
+            ".toml",
+            r#"
+[server]
+keyed_state_upstream = "http://127.0.0.1:7071"
+"#,
+        );
+        let config = load_config(Some(tmp.path()), None, Some(1)).unwrap();
+        assert_eq!(
+            config.server.keyed_state_upstream.as_deref(),
+            Some("http://127.0.0.1:7071")
+        );
+        assert_eq!(
+            load_config(None, None, Some(1))
+                .unwrap()
+                .server
+                .keyed_state_upstream,
+            None
+        );
+
+        for bad in ["127.0.0.1:7071", "ftp://indexer", "http://"] {
+            let tmp = temp_config(
+                ".toml",
+                &format!("[server]\nkeyed_state_upstream = \"{bad}\"\n"),
+            );
+            let msg = load_config(Some(tmp.path()), None, Some(1))
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("keyed_state_upstream"), "{bad}: {msg}");
+        }
     }
 
     #[test]
@@ -725,5 +821,77 @@ kms_key_id = "arn:aws:kms:us-east-1:111122223333:key/test"
             s3.kms_key_id.as_deref(),
             Some("arn:aws:kms:us-east-1:111122223333:key/test")
         );
+    }
+}
+
+#[cfg(test)]
+mod keyed_state_tests {
+    use std::time::Duration;
+
+    use crate::config::UrsulaConfig;
+
+    #[test]
+    fn keyed_state_indexer_urls_parse_and_default_empty() {
+        let config = UrsulaConfig::default();
+        assert!(config.keyed_state.indexer_urls.is_empty());
+        assert_eq!(
+            config.keyed_state.drain_timeout.as_duration(),
+            Duration::from_secs(60)
+        );
+        let mut config: UrsulaConfig = toml::from_str(
+            r#"
+[keyed_state]
+indexer_urls = ["http://indexer-0:4440", "https://indexer-1:4440"]
+drain_timeout = "5s"
+"#,
+        )
+        .expect("valid config");
+        assert_eq!(config.keyed_state.indexer_urls.len(), 2);
+        assert_eq!(
+            config.keyed_state.drain_timeout.as_duration(),
+            Duration::from_secs(5)
+        );
+        config.raft.node_id = 1;
+        config.validate().expect("valid keyed_state config");
+        config.keyed_state.indexer_urls = vec!["indexer-0:4440".to_owned()];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn keyed_state_failover_settings_default_and_validate() {
+        let config = UrsulaConfig::default();
+        assert_eq!(
+            config.keyed_state.upstream_connect_timeout.as_duration(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            config.keyed_state.failover_header_timeout.as_duration(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            config.keyed_state.unhealthy_backoff.as_duration(),
+            Duration::from_secs(2)
+        );
+        let mut config: UrsulaConfig = toml::from_str(
+            r#"
+[keyed_state]
+indexer_urls = ["http://primary:4440", "http://standby:4440"]
+upstream_connect_timeout = "500ms"
+failover_header_timeout = "3s"
+unhealthy_backoff = "5s"
+"#,
+        )
+        .expect("valid config");
+        config.raft.node_id = 1;
+        config.validate().expect("valid failover config");
+        assert_eq!(
+            config.keyed_state.unhealthy_backoff.as_duration(),
+            Duration::from_secs(5)
+        );
+        config.keyed_state.unhealthy_backoff = Duration::from_millis(500).into();
+        assert!(config.validate().is_err());
+        config.keyed_state.unhealthy_backoff = Duration::from_secs(1).into();
+        config.keyed_state.failover_header_timeout = Duration::ZERO.into();
+        assert!(config.validate().is_err());
     }
 }

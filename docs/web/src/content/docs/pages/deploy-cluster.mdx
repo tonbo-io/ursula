@@ -55,6 +55,8 @@ serviceAccount:
     eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ursula-s3
 ```
 
+With cold storage enabled the chart also turns on cold-chunk compaction and lets Ursula pick S3 for Raft snapshots (`snapshotStore.backend: auto`). Set `coldStorage.compaction.enabled=false` or `snapshotStore.backend=inline` to opt out.
+
 For MinIO or another S3-compatible backend, set `s3.endpoint`. Prefer workload identity over static S3 credentials. To use a registry mirror, set `global.image.repository`, `global.image.tag`, and optionally `global.imagePullSecrets`.
 
 `server.replicaCount` controls the voter set for a **fresh** cluster and supports `1`, `3`, and `5`. Production should use `3`, or `5` only when tolerating two simultaneous voter failures justifies the larger write quorum. Changing it on an initialized cluster is not safe Raft voter reconfiguration. Safe scaling needs the future operator workflow.
@@ -100,6 +102,48 @@ indexer:
 ```
 
 Register streams dynamically with `PUT /v1/indexes/{id}` on the internal indexer Service. No Helm upgrade is needed. The Service is an internal ClusterIP. If remote applications need read access, front it with an authenticated, path-aware proxy and never expose the registration or administration routes.
+
+## Optional: keyed-state indexer
+
+[Keyed streams](/docs/concepts/keyed-streams) serve their key-value state through `{stream}/keyed-state`, which the stream's leader proxies to an `ursula indexer` running in keyed mode. Without one, keyed streams still accept writes, and `keyed-state` answers `404`. The chart deploys it next to the cluster:
+
+```yaml
+coldStorage:
+  enabled: true      # required: projections live under the nodes' cold root
+
+keyedIndexer:
+  enabled: true
+  replicaCount: 2
+```
+
+This renders:
+
+- a `ursula-keyed-indexer` StatefulSet running `ursula indexer --keyed-source-url http://ursula:4437 --s3-bucket <s3.bucket> --keyed-s3-root <s3.prefix>/<coldStorage.prefix>`. Its only volume is an `emptyDir` cache; the object store is the source of truth, so pods start and roll in parallel.
+- a headless Service `ursula-keyed-indexer-headless`. The address of each pod goes into the nodes' `keyed_state.indexer_urls` in pod order. Every node sends keyed-state reads to the first healthy pod, so pod 0 is the primary and the others are warm standbys, and [bucket purge](/docs/operations#tenant-offboarding-bucket-purge) drains every pod before it erases projections.
+- a ClusterIP Service `ursula-keyed-indexer` for operators and tools; the nodes do not route through it.
+- a PodDisruptionBudget and a NetworkPolicy that admits only the release namespace. Keep the listener internal; it trusts the node to have authorized the request.
+
+The indexer runs as the server ServiceAccount by default, because it writes under the same cold root. For a narrower identity, set `keyedIndexer.serviceAccount.create=true` with its own workload-identity annotation; it needs read, write, list and delete on `{cold root}/.keyed/` only.
+
+Then raise the feature level so keyed streams can be created, once every node runs a release that supports level 1:
+
+```bash
+ursulactl cluster enable-feature --config cluster.json --level 1
+```
+
+Enabling the indexer changes the generated node config, so the upgrade rolls the voters. Use the chart's OnDelete graceful rollout or the usual drain procedure. Afterwards `HEAD` on a keyed stream advertises `keyed-state-v1`.
+
+### Active/standby topology
+
+The default `keyedIndexer.replicaCount: 2` runs one primary and one standby on the same object store. The pods coordinate through compare-and-swap on object storage, so either can serve any stream, and correctness does not depend on which pod a node picks. Each node fails over on its own: a read that fails on the primary (connection error, no response headers within its wait plus `keyed_state.failover_header_timeout`, `502`/`503`/`504`) is retried on the standby within the same request, and the primary is set aside for `keyed_state.unhealthy_backoff`. The node then probes the primary's `/readyz` and moves traffic back as soon as it answers. While the primary is out, the standby builds each namespace from the published state on its first read, so reads are slower for a moment but `Stream-Keyed-Through` never goes back. More replicas are more standbys, tried in pod order.
+
+This is availability only: one pod takes all the traffic. Spreading streams over several active pods (rendezvous hashing over the pod list) belongs to the horizontal-scaling work and is not available yet.
+
+To point the nodes at an indexer the chart does not manage, leave `keyedIndexer.enabled=false` and set `keyedState.indexerUrls` to its pods, primary first, or `keyedState.upstream` for a single pod or load balancer. A non-empty pod list takes precedence over the upstream for reads. `keyedIndexer.sourceUrl` reads records through a gateway instead of the node Service. See [Configuration](/docs/configuration#keyed-indexer-flags) for every indexer flag and the [chart README](https://github.com/tonbo-io/ursula/tree/main/charts/ursula#keyed-state-indexer) for every value.
+
+Outside Kubernetes, run the same command by hand on each indexer host and set `[keyed_state] indexer_urls` (primary first) in every node's config, or `[server] keyed_state_upstream` for a single indexer.
+
+Clusters that serve [Pi Durable](/docs/examples/pi-durable) also need per-group admission caps of at least 64 MiB (`standard` or `large` preset) so a 32 MiB commit can be admitted.
 
 ## Without Kubernetes (bare metal / VMs)
 

@@ -28,7 +28,11 @@
 {{- $coldFlushMaxConcurrency := .Values.coldStorage.flush.maxConcurrency | int64 -}}
 {{- $coldMaxHotBytesPerGroup := .Values.coldStorage.flush.maxHotBytesPerGroup | int64 -}}
 {{- $coldCompaction := .Values.coldStorage.compaction | default dict -}}
-{{- $coldCompactionEnabled := $coldCompaction.enabled | default false -}}
+{{- /* `default` would turn an explicit false into true; compaction is on unless set false. */ -}}
+{{- $coldCompactionEnabled := true -}}
+{{- if and (hasKey $coldCompaction "enabled") (not (eq $coldCompaction.enabled nil)) -}}
+{{- $coldCompactionEnabled = $coldCompaction.enabled -}}
+{{- end -}}
 {{- $coldCompactionIntervalMs := $coldCompaction.intervalMs | default 30000 | int64 -}}
 {{- $coldCompactionTargetBytes := $coldCompaction.targetBytes | default 8388608 | int64 -}}
 {{- $coldCompactionMaxBytes := $coldCompaction.maxBytes | default 16777216 | int64 -}}
@@ -39,6 +43,10 @@
 {{- $coldCacheBlockSizeBytes := $coldCache.blockSizeBytes -}}
 {{- $coldCacheReadaheadBlocks := $coldCache.readaheadBlocks -}}
 {{- $snapshotDriveIntervalMs := .Values.snapshotStore.driveIntervalMs -}}
+{{- $snapshotBackend := .Values.snapshotStore.backend | default "auto" | toString -}}
+{{- $keyedStateUpstream := include "ursula.keyedStateUpstream" . -}}
+{{- $keyedStateIndexerUrls := include "ursula.keyedStateIndexerUrls" . | fromJsonArray -}}
+{{- $keyedStateDrainTimeoutMs := .Values.keyedState.drainTimeoutMs -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -97,6 +105,9 @@ data:
     [server]
     listen = "0.0.0.0:{{ $clientPort }}"
     admin_listen = {{ .Values.server.adminListen | quote }}
+{{- if $keyedStateUpstream }}
+    keyed_state_upstream = {{ $keyedStateUpstream | quote }}
+{{- end }}
 
     [runtime]
     core_count = {{ .Values.server.coreCount }}
@@ -182,14 +193,22 @@ data:
 {{- end }}
 
     [storage.snapshot]
-{{- if .Values.snapshotStore.backend | eq "s3" }}
-    backend = "s3"
+    backend = {{ $snapshotBackend | quote }}
+{{- if ne $snapshotBackend "inline" }}
     s3_prefix = {{ .Values.snapshotStore.prefix | quote }}
-{{- else }}
-    backend = "inline"
 {{- end }}
 {{- if not (eq $snapshotDriveIntervalMs nil) }}
     drive_interval = "{{ $snapshotDriveIntervalMs }}ms"
+{{- end }}
+{{- if or $keyedStateIndexerUrls (not (eq $keyedStateDrainTimeoutMs nil)) }}
+
+    [keyed_state]
+{{- if $keyedStateIndexerUrls }}
+    indexer_urls = [{{ range $i, $url := $keyedStateIndexerUrls }}{{ if $i }}, {{ end }}{{ $url | toString | quote }}{{ end }}]
+{{- end }}
+{{- if not (eq $keyedStateDrainTimeoutMs nil) }}
+    drain_timeout = "{{ $keyedStateDrainTimeoutMs | int64 }}ms"
+{{- end }}
 {{- end }}
     EOF
 

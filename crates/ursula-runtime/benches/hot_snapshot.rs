@@ -140,6 +140,7 @@ fn build_machine(scenario: SnapshotScenario) -> StreamStateMachine {
                 u64::try_from((CHUNKS_PER_STREAM / 2) * CHUNK_BYTES).expect("cold bytes fit u64");
             assert!(matches!(
                 machine.apply(StreamCommand::FlushCold {
+                    cold_generation: None,
                     stream_id: stream_id.clone(),
                     chunk: ColdChunkRef {
                         start_offset: 0,

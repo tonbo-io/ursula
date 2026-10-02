@@ -12,7 +12,7 @@ api: "PUT /{bucket}/{stream}"
 </ParamField>
 
 <ParamField header="Content-Type" type="string">
- Content type of the initial payload (e.g. `application/json`). Becomes the stream's content type.
+ Content type of the initial payload (e.g. `application/json`). Becomes the stream's content type. `application/json; profile=keyed-batch-v1` creates a [keyed stream](/docs/concepts/keyed-streams), which needs the stream's Raft group at [feature level](/docs/operations#feature-levels) 1.
 </ParamField>
 
 <ParamField header="Stream-Closed" type="string">
@@ -57,12 +57,15 @@ api: "PUT /{bucket}/{stream}"
 | ------ | ------------------------------------------------------------------------- |
 | `201` | Stream created. |
 | `200` | Stream already exists (idempotent). |
-| `400` | Invalid stream ID, invalid headers, or bad JSON payload. |
-| `409` | Stream already exists with different content type, or sequence conflict. |
+| `400` | Invalid stream ID (including a reserved name such as `keyed-state` under an affinity path), invalid headers, or bad JSON payload. |
+| `409` | Stream already exists with different content type, or sequence conflict. Also a keyed stream on a Raft group below feature level 1; the plain-text body names the level to raise. |
+| `422` | A keyed stream's initial payload does not match the `keyed-batch-v1` grammar. |
 
 Response headers include `Location`, `Content-Type`, `Stream-Next-Offset`, and lifetime headers (`Stream-TTL` / `Stream-Expires-At`) when set. `Stream-Closed: true` is set if the create request also closed the stream. `ETag` is set on reads only.
 
 When the initial payload creates records in an `application/json` stream advertising `json-record-coordinates-v1`, the response also includes `Stream-Record-Start` and `Stream-Record-Next`. A top-level JSON array creates one record per element.
+
+For a keyed stream, `Stream-Extensions` contains `json-record-coordinates-v1` and `keyed-batch-v1`, and also `keyed-state-v1` when this node serves the [keyed-state](/docs/api/keyed-state) resource. Check for `keyed-batch-v1` before the first append.
 
 <RequestExample>
 ```bash Create empty stream
@@ -78,6 +81,11 @@ curl -X PUT http://127.0.0.1:4437/demo/hello \
 ```bash Create with TTL
 curl -X PUT http://127.0.0.1:4437/demo/ephemeral \
   -H 'Stream-TTL: 3600'
+```
+
+```bash Create a keyed stream
+curl -i -X PUT http://127.0.0.1:4437/pi/harness-1 \
+  -H 'Content-Type: application/json; profile=keyed-batch-v1'
 ```
 
 ```bash Create with attributes

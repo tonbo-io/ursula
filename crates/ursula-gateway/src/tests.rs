@@ -1697,3 +1697,172 @@ mod credential_deadline {
         );
     }
 }
+
+#[test]
+fn request_classifier_treats_bucket_listing_as_bucket_read() {
+    let request = Request::builder()
+        .method("GET")
+        .uri("/owner-a/streams?prefix=user-&limit=10")
+        .body(Body::empty())
+        .expect("request");
+    let classified = classify_request(request.method(), request.uri(), request.headers())
+        .expect("classified bucket listing");
+    assert_eq!(classified.resource.bucket_id, "owner-a");
+    assert_eq!(classified.resource.stream_id, None);
+    assert_eq!(classified.action, Action::Read);
+
+    // Only GET lists; `streams` is a reserved stream ID for every other method.
+    for method in ["PUT", "POST", "DELETE", "HEAD"] {
+        let request = Request::builder()
+            .method(method)
+            .uri("/owner-a/streams")
+            .body(Body::empty())
+            .expect("request");
+        assert!(
+            classify_request(request.method(), request.uri(), request.headers()).is_none(),
+            "{method}"
+        );
+    }
+}
+
+#[test]
+fn stream_affinity_key_skips_bucket_listing() {
+    let listing: Uri = "/bucket/streams?limit=5".parse().expect("uri");
+    assert_eq!(stream_affinity_key(&listing, None), None);
+}
+
+#[test]
+fn request_classifier_treats_keyed_state_waits_as_tail() {
+    let cases = [
+        ("GET", "/owner-a/orders/keyed-state", Action::Read, "orders"),
+        (
+            "GET",
+            "/owner-a/orders/keyed-state?start=AQ&limit=10",
+            Action::Read,
+            "orders",
+        ),
+        (
+            "GET",
+            "/owner-a/orders/keyed-state?key=AQ&min_through_record=4&timeout_ms=50",
+            Action::Tail,
+            "orders",
+        ),
+        (
+            "GET",
+            "/owner-a/run-42/session/keyed-state?min_through_record=0",
+            Action::Tail,
+            "run-42/session",
+        ),
+        (
+            "GET",
+            "/owner-a/run-42/session/keyed-state?after=AQ",
+            Action::Read,
+            "run-42/session",
+        ),
+        // Every other method reaches the node, which answers 405.
+        (
+            "HEAD",
+            "/owner-a/orders/keyed-state",
+            Action::Read,
+            "orders",
+        ),
+        (
+            "POST",
+            "/owner-a/run-42/session/keyed-state",
+            Action::Read,
+            "run-42/session",
+        ),
+    ];
+    for (method, uri, expected_action, expected_stream) in cases {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request");
+        let classified = classify_request(request.method(), request.uri(), request.headers())
+            .expect("classified keyed-state request");
+        assert_eq!(classified.resource.bucket_id, "owner-a", "{method} {uri}");
+        assert_eq!(
+            classified.resource.stream_id.as_deref(),
+            Some(expected_stream),
+            "{method} {uri}"
+        );
+        assert_eq!(classified.action, expected_action, "{method} {uri}");
+    }
+}
+
+#[test]
+fn stream_affinity_key_pins_keyed_state_to_its_stream() {
+    let two_segment: Uri = "/bucket/orders/keyed-state?key=AQ".parse().expect("uri");
+    assert_eq!(
+        stream_affinity_key(&two_segment, None).as_deref(),
+        Some("/bucket/orders")
+    );
+    let affinity: Uri = "/bucket/run/session/keyed-state".parse().expect("uri");
+    assert_eq!(
+        stream_affinity_key(&affinity, None).as_deref(),
+        Some("/bucket/run/session")
+    );
+}
+
+#[test]
+fn gateway_gives_keyed_state_waits_long_poll_header_headroom() {
+    let gateway =
+        gateway_with_response_header_timeout("http://127.0.0.1:1", Duration::from_secs(30));
+    for (url, expected) in [
+        (
+            "http://127.0.0.1:1/b/s/keyed-state?min_through_record=4&timeout_ms=45000",
+            Duration::from_secs(47),
+        ),
+        (
+            "http://127.0.0.1:1/b/a/s/keyed-state?min_through_record=4&timeout_ms=999999",
+            Duration::from_secs(62),
+        ),
+        // Without a wait, timeout_ms is ignored by the node.
+        (
+            "http://127.0.0.1:1/b/s/keyed-state?timeout_ms=45000",
+            Duration::from_secs(30),
+        ),
+        // A stream named `keyed-state` is an ordinary read.
+        (
+            "http://127.0.0.1:1/b/keyed-state?min_through_record=4&timeout_ms=45000",
+            Duration::from_secs(30),
+        ),
+    ] {
+        assert_eq!(
+            gateway.response_header_timeout_for_url(url),
+            expected,
+            "{url}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gateway_keeps_keyed_state_waits_open_past_the_header_timeout() {
+    let upstream = spawn_upstream(Router::new().route(
+        "/bucket/stream/keyed-state",
+        get(|| async {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            (StatusCode::NO_CONTENT, [("stream-keyed-through", "3")])
+        }),
+    ))
+    .await;
+    let gateway =
+        gateway_with_response_header_timeout(upstream.url.clone(), Duration::from_millis(50));
+    let req = Request::builder()
+        .method("GET")
+        .uri("/bucket/stream/keyed-state?min_through_record=4&timeout_ms=75")
+        .body(Body::empty())
+        .expect("build request");
+
+    let response = gateway.handle(req).await;
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        response
+            .headers()
+            .get("stream-keyed-through")
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+}
