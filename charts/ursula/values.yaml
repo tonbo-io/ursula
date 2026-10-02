@@ -522,13 +522,17 @@ indexer:
 # Node-side keyed-state settings (keyed streams). They render
 # [server].keyed_state_upstream and the [keyed_state] table of every node.
 keyedState:
-  # Base URL of the keyed-state indexer the nodes proxy `{stream}/keyed-state`
-  # to. Empty: the chart's keyed indexer Service when keyedIndexer.enabled=true,
-  # otherwise unset (keyed-state answers 404).
+  # Single keyed-state indexer base URL (one pod or a load balancer) the nodes
+  # proxy `{stream}/keyed-state` to when no indexer pods are listed. Empty:
+  # unset (keyed-state answers 404 unless indexerUrls or the chart indexer
+  # provides pods).
   upstream: ""
-  # Base URL of every keyed indexer pod; bucket purge drains each one before it
-  # erases the bucket's keyed namespaces. Empty: every chart keyed indexer pod
-  # when keyedIndexer.enabled=true, otherwise the node drains its upstream.
+  # Base URL of every keyed indexer pod, in failover order: the nodes send
+  # keyed-state reads to the first healthy pod (primary, then standbys) and
+  # bucket purge drains each one. Takes precedence over `upstream` for reads.
+  # Empty: every chart keyed indexer pod (pod 0 first) when
+  # keyedIndexer.enabled=true, otherwise the node reads from and drains its
+  # upstream.
   indexerUrls: []
   # Optional per-pod drain timeout in milliseconds. Null keeps Ursula's 60 s.
   drainTimeoutMs: null
@@ -540,6 +544,8 @@ keyedState:
 # DNS name for bucket-purge drains; the pods keep no persistent state.
 keyedIndexer:
   enabled: false
+  # Pod 0 is the primary that takes every keyed-state read; the others are warm
+  # standbys the nodes fail over to (active/standby, not load sharding).
   replicaCount: 2
   # Ursula node or gateway base URL the indexer reads records from. Empty uses
   # the internal node Service (server.service.enabled must be true).

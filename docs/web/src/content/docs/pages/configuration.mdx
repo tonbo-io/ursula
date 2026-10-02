@@ -119,11 +119,14 @@ Helm and the EC2 scripts map their deployment inputs onto these same keys, so th
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `server.keyed_state_upstream` | unset | Base URL of the keyed-state indexer (`ursula indexer --keyed-source-url …`) behind `{stream}/keyed-state`. Unset: `keyed-state` answers `404` and nothing advertises `keyed-state-v1`. CLI: `ursula server --keyed-state-upstream <url>` |
-| `keyed_state.indexer_urls` | `[]` | Base URL of every keyed-state indexer pod. Bucket purge sends `POST {url}/v1/keyed/drain` to each one and erases `.keyed/{bucket}/` only after all acknowledge. Empty with `server.keyed_state_upstream` set: purge drains the upstream |
+| `server.keyed_state_upstream` | unset | Base URL of a single keyed-state indexer (`ursula indexer --keyed-source-url …`, one pod or a load balancer) behind `{stream}/keyed-state`, used when `keyed_state.indexer_urls` is empty. With neither set, `keyed-state` answers `404` and nothing advertises `keyed-state-v1`. CLI: `ursula server --keyed-state-upstream <url>` |
+| `keyed_state.indexer_urls` | `[]` | Base URL of every keyed-state indexer pod, in failover order. Keyed-state reads go to the first healthy pod (the primary, then the standbys); a non-empty list takes precedence over `server.keyed_state_upstream` for reads. Bucket purge sends `POST {url}/v1/keyed/drain` to each one and erases `.keyed/{bucket}/` only after all acknowledge. Empty with `server.keyed_state_upstream` set: the upstream is the one pod |
 | `keyed_state.drain_timeout` | `60s` | Per-indexer timeout of one drain request; a pod that does not acknowledge leaves the purge incomplete, and the idempotent purge is retried |
+| `keyed_state.upstream_connect_timeout` | `2s` | TCP connect timeout of one keyed-state request to one indexer pod |
+| `keyed_state.failover_header_timeout` | `10s` | How long a read waits for a pod's response headers, beyond its own `timeout_ms`, before it fails over to the next pod. The last pod tried gets the rest of the request's budget |
+| `keyed_state.unhealthy_backoff` | `2s` | How long a failed pod (connection error, header timeout, `502`, `503`, `504`) stays behind the healthy pods before the node probes its `/readyz`; a successful probe puts it back in order, so traffic returns to the primary. At least `1s` |
 
-Set `server.keyed_state_upstream` to the same value on every node: whichever node leads a stream proxies its keyed-state reads.
+Set `server.keyed_state_upstream` or `keyed_state.indexer_urls` to the same value on every node: whichever node serves a stream proxies its keyed-state reads. With several pods listed, a read that fails on one pod (connection error, no headers in time, a broken body, `502`/`503`/`504`) is retried on the next pod within the read's own budget, the remaining `timeout_ms` passed on; when every pod fails the node answers `503` with `Retry-After`. This is active/standby availability, not load sharding.
 
 ### Keyed indexer flags
 

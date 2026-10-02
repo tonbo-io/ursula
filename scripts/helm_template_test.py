@@ -639,10 +639,8 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertIn("serviceAccountName: test-ursula\n", workload)
         self.assertEqual(documents(rendered, "ServiceAccount", "test-ursula-keyed-indexer"), [])
 
-        self.assertEqual(
-            parsed["server"]["keyed_state_upstream"],
-            "http://test-ursula-keyed-indexer.default.svc.cluster.local:4493",
-        )
+        # The nodes route through the ordered pod list (pod 0 primary), not the Service.
+        self.assertNotIn("keyed_state_upstream", parsed["server"])
         self.assertEqual(
             parsed["keyed_state"]["indexer_urls"],
             [

@@ -460,21 +460,21 @@ Base URL the keyed indexer reads records from.
 {{- end -}}
 
 {{/*
-Node `server.keyed_state_upstream`: the explicit value, else the chart keyed
-indexer Service, else empty (unset).
+Node `server.keyed_state_upstream`: the explicit value, else empty (unset). The
+chart keyed indexer is wired through `keyed_state.indexer_urls` instead, which
+the nodes use as the active/standby failover order.
 */}}
 {{- define "ursula.keyedStateUpstream" -}}
 {{- if .Values.keyedState.upstream -}}
 {{- .Values.keyedState.upstream | toString -}}
-{{- else if .Values.keyedIndexer.enabled -}}
-{{- printf "http://%s.%s.svc.%s:%d" (include "ursula.keyedIndexerFullname" .) .Release.Namespace (.Values.global.clusterDomain | toString) (.Values.keyedIndexer.service.port | int) -}}
 {{- end -}}
 {{- end -}}
 
 {{/*
-Node `keyed_state.indexer_urls` as a JSON list: the explicit list, else every
-chart keyed indexer pod through the headless Service, else empty (the node then
-drains its upstream).
+Node `keyed_state.indexer_urls` as a JSON list, in failover order (primary
+first): the explicit list, else every chart keyed indexer pod through the
+headless Service (pod 0 is the primary, the others standbys), else empty (the
+node then reads from and drains its upstream).
 */}}
 {{- define "ursula.keyedStateIndexerUrls" -}}
 {{- $urls := list -}}

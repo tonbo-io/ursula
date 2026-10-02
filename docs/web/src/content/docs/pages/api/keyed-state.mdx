@@ -5,7 +5,7 @@ api: "GET /{bucket}/{stream}/keyed-state"
 
 Returns the folded key-value state of a [keyed stream](/docs/concepts/keyed-streams): every key whose last op is a put, with the value it was put with and the record that put it. One response always reflects exactly one state, `state(D)`, the fold of records `0 … D−1`, and names `D` in `Stream-Keyed-Through`.
 
-The node serves this resource only when it has a keyed-state indexer configured (`server.keyed_state_upstream`, see [Configuration](/docs/configuration#keyed-state)). The create and `HEAD` responses of a keyed stream advertise `keyed-state-v1` in `Stream-Extensions` when it is served. The affinity form `/{bucket}/{affinity}/{stream}/keyed-state` works the same way.
+The node serves this resource only when it has a keyed-state indexer configured (`keyed_state.indexer_urls` in failover order, or `server.keyed_state_upstream`, see [Configuration](/docs/configuration#keyed-state)). The create and `HEAD` responses of a keyed stream advertise `keyed-state-v1` in `Stream-Extensions` when it is served. The affinity form `/{bucket}/{affinity}/{stream}/keyed-state` works the same way.
 
 <ParamField path="bucket" type="string" required>
  Bucket ID.

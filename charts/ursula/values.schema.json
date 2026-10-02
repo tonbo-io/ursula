@@ -1925,7 +1925,7 @@
         "upstream": {
           "type": "string",
           "pattern": "^$|^https?://",
-          "description": "Keyed-state indexer base URL. Empty uses the chart keyed indexer when enabled."
+          "description": "Single keyed-state indexer base URL, used only when no indexer pods are listed. Empty: unset."
         },
         "indexerUrls": {
           "type": "array",
@@ -1933,7 +1933,7 @@
             "type": "string",
             "pattern": "^https?://"
           },
-          "description": "Base URL of every keyed indexer pod drained on bucket purge. Empty uses every chart keyed indexer pod when enabled."
+          "description": "Keyed indexer pod base URLs in failover order (primary first), all drained on bucket purge. Empty uses every chart keyed indexer pod when enabled."
         },
         "drainTimeoutMs": {
           "type": [

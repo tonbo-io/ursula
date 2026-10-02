@@ -23,7 +23,8 @@ metadata:
 automountServiceAccountToken: {{ $values.serviceAccount.automountServiceAccountToken }}
 {{- end }}
 ---
-# Load-balanced entrypoint: the nodes' keyed_state_upstream.
+# Load-balanced entrypoint for operators and tools. The nodes do not use it:
+# they route through keyed_state.indexer_urls (active/standby failover order).
 apiVersion: v1
 kind: Service
 metadata:
@@ -44,8 +45,10 @@ spec:
   selector:
     {{- include "ursula.keyedIndexerSelectorLabels" $root | nindent 4 }}
 ---
-# Stable per-pod DNS: the nodes' keyed_state.indexer_urls, drained one by one
-# on bucket purge. Not-ready pods stay resolvable so a drain reaches them too.
+# Stable per-pod DNS: the nodes' keyed_state.indexer_urls. Keyed-state reads go
+# to the first healthy pod (pod 0 the primary, the others standbys), and bucket
+# purge drains every pod. Not-ready pods stay resolvable so a drain reaches them
+# too.
 apiVersion: v1
 kind: Service
 metadata:
