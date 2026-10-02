@@ -89,15 +89,15 @@ Every Raft group carries a replicated feature level, `0` until an operator raise
 | Level | Enables | Status |
 | --- | --- | --- |
 | 1 | Keyed streams: `application/json; profile=keyed-batch-v1` creation, the reserved `keyed-state` name under affinity paths, and unique stream incarnations. Bounded state, first step: a 1,024-item producer receipt window per stream with 7-day idle-producer expiry, message-record collapse at every cold flush, incarnation-scoped cold objects and stream GC, and a compact MessagePack snapshot envelope | Supported by this release |
-| 2 | Sparse cold record marks: the JSON record index keeps exact offsets only for unflushed records plus one mark per MiB of cold log | Next release |
-| 3 | External payload locators committed first and indexed after, so state holds only in-flight ones | Next release |
+| 2 | Sparse cold record marks: the JSON record index keeps exact offsets only for unflushed records plus one mark per MiB of cold log. Retention into sealed history lands on the mark at or below its target. Raised only for groups whose leader completed a cold-index page-repair cycle | Supported by this release |
+| 3 | External payload locators committed first and indexed after, so state holds only in-flight ones | Supported by this release |
 | 4 | Compact hot-window representation (message records removed) | Next release |
 
 `GET /__ursula/feature-level` on the admin plane reports `supported_level`, the highest level this binary can apply, and each group's current `level`. The procedure to raise a level:
 
 1. Roll every voter and learner to a release whose `supported_level` covers the target, with the usual drain and wait steps. Behavior does not change yet.
 2. Check: `ursulactl cluster feature-level --config cluster.json`.
-3. Raise: `ursulactl cluster enable-feature --config cluster.json --level N`. It refuses unless every voter, learner and manifest node supports `N`, proposes the level through each group's leader, and verifies every replica. It is idempotent; rerun it after an interruption.
+3. Raise: `ursulactl cluster enable-feature --config cluster.json --level N`. It refuses unless every voter, learner and manifest node supports `N` (and, from level 2, unless every group reports a completed cold-index page-repair cycle), proposes the level through each group's leader, and verifies every replica. It is idempotent; rerun it after an interruption.
 
 Raising a group to `N` enables every level up to `N`. Levels are never lowered. Commands that need a higher level than their group holds fail with `409 Conflict` and a plain-text body naming the level.
 

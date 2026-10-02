@@ -9,7 +9,7 @@ This release adds [keyed streams](/docs/concepts/keyed-streams) and the [keyed-s
 
 ### Upgrade notes
 
-1. **Roll out as usual, then raise the feature level.** The new release applies replicated commands exactly like the previous one until you raise the cluster's [feature level](/docs/operations#feature-levels). After every voter and learner runs this release, run `ursulactl cluster enable-feature --config cluster.json --level 1`. Keyed streams, the producer receipt window and the other level-1 changes start only then.
+1. **Roll out as usual, then raise the feature level.** The new release applies replicated commands exactly like the previous one until you raise the cluster's [feature level](/docs/operations#feature-levels). After every voter and learner runs this release, run `ursulactl cluster enable-feature --config cluster.json --level 1`. Keyed streams, the producer receipt window and the other level-1 changes start only then. Levels 2 and 3 (below) are raised the same way, after every group's leader has completed a cold-index page-repair cycle (`enable-feature` checks it).
 2. **No downgrade after the raise.** Once a group is at level 1, a binary that supports only level 0 must not run it; it refuses the group's snapshots. Rolling back to the previous release is possible only before the raise. Raise the level only when you no longer need that rollback.
 3. **JSON text changes take effect per node, without a level.** A node running this release stores JSON messages verbatim (see below) as soon as it serves writes. During the rollout, a write may be stored with the old normalization or the new text depending on which node handled it. Clients that compare stored bytes, such as `Stream-Record-Match` writers that read records back, should finish the rollout before relying on byte equality.
 4. **Keyed state is opt-in.** Nothing changes for existing streams until you create a keyed stream. To serve keyed state, run a keyed-state indexer and set `server.keyed_state_upstream` on every node ([Deploy](/docs/deploy-cluster#optional-keyed-state-indexer)).
@@ -40,7 +40,10 @@ Every `application/json` stream now follows [JSON message text](/docs/specs/exte
 - **Byte-bounded record reads.** `max_bytes` now works with `record=` and `tail_records=`: it bounds complete records and may be combined with `max_records`. It used to be rejected with `400`.
 - **Bucket stream listing.** `GET /{bucket}/streams?prefix=&after=&limit=` lists a bucket's streams. See [List streams](/docs/api/list-streams).
 - **Feature levels.** `GET` and `POST /__ursula/feature-level` on the admin plane, and `ursulactl cluster feature-level` and `cluster enable-feature`.
-- **Metrics.** `/__ursula/metrics` adds `group_state_gauges` (per-group state sizes) and `keyed_state_requests` (keyed-state responses by status).
+- **Metrics.** `/__ursula/metrics` adds `group_state_gauges` (per-group state sizes), `keyed_state_requests` (keyed-state responses by status) and `record_coordinate_corruptions`. The keyed indexer serves its own counters at `GET /__ursula/indexer/metrics`.
+- **Sparse cold record marks (level 2).** The JSON record index keeps exact offsets only for unflushed records plus one mark per MiB of cold log. Record reads into sealed history are unchanged for clients. Retention by offset or record into sealed history may land at or below its target (the response's `Stream-Retained-Offset` and `Stream-Record-First` report where), and raw-offset snapshot and retention requests whose offset falls inside a JSON record answer `400`.
+- **External payload locators (level 3).** External appends commit their locator in replicated state first and the leader indexes it afterwards, so `runtime.external_payload_min_size` may be lowered on clusters at level 3.
+- **Keyed indexer tools.** `ursula indexer keyed verify|rebuild|sweep|dump` checks a namespace against the log, rebuilds it blue/green, removes orphaned objects and prints its contents.
 
 ### Changed
 
@@ -51,6 +54,10 @@ Every `application/json` stream now follows [JSON message text](/docs/specs/exte
 - **Unique incarnations (level 1).** A stream's `created_at_ms` strictly increases within a Raft group, so a stream deleted and recreated at the same path is always a distinguishable incarnation, and stream GC only removes the deleted incarnation's objects.
 - **`$transaction` content types** are normalized like `Content-Type` headers before they are compared with the stream's content type.
 - **Snapshots (level 1)** are written in a compact MessagePack envelope that earlier releases cannot read, which is one reason downgrade is unsupported.
+- **Producer cap (level 1).** A stream holds at most 4,096 producers; a new producer evicts producers idle for at least an hour, and when none is, the write answers `429` with a body starting `producer_limit`.
+- **Reads are capped at 8 MiB.** A larger `max_bytes` is clamped. Without `max_bytes`, a capped JSON offset read ends at a record boundary.
+- **Hot tails are flushed after `storage.cold.flush_max_hot_age`** (default 5 minutes, `0` disables), even when the group is below its flush threshold.
+- **Defaults.** `storage.cold.compaction_enabled` now defaults to `true`, and `storage.snapshot.backend` defaults to `auto` (S3 when the cold backend is S3, inline otherwise). Raft snapshots are taken by log bytes against a node-wide `raft.snapshot_log_budget` (default 1 GiB) with a `raft.snapshot_backstop_logs` entry backstop. Cold admission and the hot backlog count 24 bytes per hot record on top of the payload.
 
 ### Fixed
 

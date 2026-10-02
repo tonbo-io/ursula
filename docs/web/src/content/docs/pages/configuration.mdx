@@ -104,6 +104,7 @@ Every cold-tier object write requests server-side encryption by default (`server
 | `storage.cold.flush_size` | `8MiB` | Target bytes flushed per group per tick |
 | `storage.cold.flush_max_concurrency` | `4` | Parallel cold writes in flight |
 | `storage.cold.max_hot_size_per_group` | `64MiB` | Backpressure ceiling: when a group's hot bytes exceed this, new writes get HTTP `503` until the flush catches up. Explicit `0` disables the cap |
+| `storage.cold.flush_max_hot_age` | `5m` | A stream's hot tail older than this is flushed whole even when its group is below the flush threshold. `0` disables |
 | `storage.cold.compaction_enabled` | `true` | Background compaction: merges small chunks that flushes recorded as compaction debt (no bucket listing) and rewrites packed slices once a stream holds 64 of them |
 | `storage.snapshot.backend` | `auto` | `auto` (S3 snapshots when `storage.cold.backend = "s3"`, inline otherwise), `inline`, or `s3` |
 | `raft.snapshot_log_budget` | `1GiB` | Node Raft-log budget of the snapshot driver: a group snapshots once its log since the last snapshot reaches the larger of this budget over twice the group count (at most `16MiB`) and twice its last snapshot's size; above three quarters of the budget a pressure pass snapshots the groups that free the most log per snapshot byte |
