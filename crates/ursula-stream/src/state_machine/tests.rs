@@ -4289,3 +4289,75 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn list_bucket_streams_filters_sorts_pages_and_hides_expired() {
+    let mut machine = machine();
+    assert_eq!(machine.list_bucket_streams("absent", "", None, 10, 0), None);
+    assert_eq!(
+        machine.list_bucket_streams("benchcmp", "", None, 10, 0),
+        Some(Vec::new())
+    );
+    for id in ["user-2", "user-1", "admin"] {
+        create_stream(&mut machine, id);
+    }
+    assert!(matches!(
+        machine.apply(create_cmd(
+            BucketStreamId::with_affinity("benchcmp", "run-42", "journal"),
+            Create::default()
+        )),
+        StreamResponse::Created { .. }
+    ));
+    assert!(matches!(
+        machine.apply(create_cmd(stream("user-3"), Create {
+            content_type: "application/json",
+            close_after: true,
+            now_ms: 7,
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+    assert!(matches!(
+        machine.apply(create_cmd(stream("user-expiring"), Create {
+            expires_at_ms: Some(100),
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+    let ids = |listing: Option<Vec<BucketStreamListing>>| {
+        listing
+            .expect("bucket exists")
+            .into_iter()
+            .map(|entry| entry.stream_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(machine.list_bucket_streams("benchcmp", "", None, 10, 0)),
+        vec![
+            "admin",
+            "run-42/journal",
+            "user-1",
+            "user-2",
+            "user-3",
+            "user-expiring"
+        ]
+    );
+    assert_eq!(
+        ids(machine.list_bucket_streams("benchcmp", "user-", None, 10, 100)),
+        vec!["user-1", "user-2", "user-3"]
+    );
+    assert_eq!(
+        ids(machine.list_bucket_streams("benchcmp", "user-", Some("user-1"), 1, 100)),
+        vec!["user-2"]
+    );
+    let listing = machine
+        .list_bucket_streams("benchcmp", "user-3", None, 10, 0)
+        .expect("bucket exists");
+    assert_eq!(listing, vec![BucketStreamListing {
+        stream_id: "user-3".to_owned(),
+        status: StreamStatus::Closed,
+        content_type: "application/json".to_owned(),
+        tail_offset: 0,
+        created_at_ms: 7,
+    }]);
+}

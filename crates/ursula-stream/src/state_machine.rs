@@ -37,6 +37,7 @@ use crate::model::AppendExternalInput;
 use crate::model::AppendStreamInput;
 use crate::model::BucketQuota;
 use crate::model::BucketQuotaSnapshot;
+use crate::model::BucketStreamListing;
 use crate::model::BucketUsage;
 use crate::model::BucketUsageSnapshot;
 use crate::model::COLD_INDEX_PAGE_SPAN_BYTES;

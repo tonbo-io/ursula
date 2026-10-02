@@ -1328,6 +1328,7 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         .route("/__ursula/quota/{bucket}", put(set_bucket_quota))
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .route("/{bucket}", put(create_bucket))
+        .route("/{bucket}/streams", get(list_bucket_streams))
         .route(
             "/{bucket}/{stream}/snapshot",
             get(read_latest_snapshot).put(publish_snapshot_at_record),
@@ -1623,6 +1624,80 @@ const LEGACY_SHARED_MIGRATION_MAX_CHUNKS: usize = 32;
 
 pub(crate) async fn create_bucket(Path(_bucket): Path<String>) -> Response {
     StatusCode::CREATED.into_response()
+}
+
+/// Default and maximum page size of the bucket listing (`extensions.md` §1.4).
+const BUCKET_LISTING_MAX_LIMIT: usize = 1000;
+
+/// `GET /{bucket}/streams?prefix=&after=&limit=` (`extensions.md` §1.4): the
+/// bucket's streams merged across every Raft group, sorted by bucket-local
+/// stream path. Groups answer from local replica state, so the listing may
+/// briefly lag a just-committed create or delete. `last_write_at_ms` is
+/// omitted because Ursula does not track it.
+pub(crate) async fn list_bucket_streams(
+    State(state): State<HttpState>,
+    Path(bucket): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    if let Err(message) = ursula_runtime::validate_bucket_id(&bucket) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
+    let query = match parse_query(raw_query.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
+    };
+    let limit = match query.get("limit") {
+        None => BUCKET_LISTING_MAX_LIMIT,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(limit) if (1..=BUCKET_LISTING_MAX_LIMIT).contains(&limit) => limit,
+            _ => {
+                return (StatusCode::BAD_REQUEST, "limit must be in 1..=1000").into_response();
+            }
+        },
+    };
+    let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
+    let after = query.get("after").map(String::as_str);
+    let listing = match state
+        .runtime
+        .list_bucket_streams_all_groups(&bucket, prefix, after, limit, state.unix_time_ms())
+        .await
+    {
+        Ok(Some(listing)) => listing,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("bucket '{bucket}' does not exist"),
+            )
+                .into_response();
+        }
+        Err(err) => return runtime_error_response(err),
+    };
+    let next_cursor = listing
+        .has_more
+        .then(|| listing.streams.last().map(|entry| entry.stream_id.clone()))
+        .flatten();
+    let streams = listing
+        .streams
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "stream_id": entry.stream_id,
+                "status": entry.status,
+                "content_type": entry.content_type,
+                "tail_offset": entry.tail_offset,
+                "created_at_ms": entry.created_at_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    axum::Json(serde_json::json!({
+        "bucket_id": bucket,
+        "prefix": prefix,
+        "stream_count": streams.len(),
+        "streams": streams,
+        "next_cursor": next_cursor,
+        "has_more": listing.has_more,
+    }))
+    .into_response()
 }
 
 /// Versioned, self-described per-bucket usage summed across this node's Raft

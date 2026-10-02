@@ -60,6 +60,7 @@ use ursula_runtime::GroupFlushColdFuture;
 use ursula_runtime::GroupGetStreamAttrsFuture;
 use ursula_runtime::GroupHeadStreamFuture;
 use ursula_runtime::GroupInstallSnapshotFuture;
+use ursula_runtime::GroupListBucketStreamsFuture;
 use ursula_runtime::GroupPlanColdFlushFuture;
 use ursula_runtime::GroupPlanColdGcFuture;
 use ursula_runtime::GroupPlanNextColdFlushBatchFuture;
@@ -79,6 +80,7 @@ use ursula_runtime::GroupWriteBatchFuture;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
+use ursula_runtime::ListBucketStreamsRequest;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::PlanGroupColdFlushRequest;
 use ursula_runtime::PublishSnapshotRequest;
@@ -726,6 +728,23 @@ impl GroupEngine for RaftGroupEngine {
             // whenever any group is led elsewhere.
             self.with_state_machine(move |state_machine| {
                 Box::pin(async move { Ok(state_machine.engine.bucket_usage_report()) })
+            })
+            .await?
+        })
+    }
+
+    fn list_bucket_streams<'a>(
+        &'a mut self,
+        request: ListBucketStreamsRequest,
+        _placement: ShardPlacement,
+    ) -> GroupListBucketStreamsFuture<'a> {
+        Box::pin(async move {
+            // Local applied state, follower or leader, like `bucket_usage`:
+            // the bucket listing is a catalog that tolerates replication lag.
+            self.with_state_machine(move |state_machine| {
+                Box::pin(
+                    async move { Ok(state_machine.engine.list_bucket_streams_report(&request)) },
+                )
             })
             .await?
         })

@@ -40,6 +40,7 @@ use super::GroupFlushColdFuture;
 use super::GroupGetStreamAttrsFuture;
 use super::GroupHeadStreamFuture;
 use super::GroupInstallSnapshotFuture;
+use super::GroupListBucketStreamsFuture;
 use super::GroupPlanColdFlushFuture;
 use super::GroupPlanColdGcFuture;
 use super::GroupPlanNextColdFlushBatchFuture;
@@ -97,6 +98,7 @@ use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
 use crate::request::ImportGroupStateRequest;
 use crate::request::ImportGroupStateResponse;
+use crate::request::ListBucketStreamsRequest;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
@@ -1099,6 +1101,22 @@ impl InMemoryGroupEngine {
         self.state_machine.bucket_usage_report()
     }
 
+    /// This group's share of a bucket listing; see
+    /// [`ursula_stream::StreamStateMachine::list_bucket_streams`]. Public so
+    /// the Raft engine can serve it from its applied state machine.
+    pub fn list_bucket_streams_report(
+        &self,
+        request: &ListBucketStreamsRequest,
+    ) -> Option<Vec<ursula_stream::BucketStreamListing>> {
+        self.state_machine.list_bucket_streams(
+            &request.bucket_id,
+            &request.prefix,
+            request.after.as_deref(),
+            request.limit,
+            request.now_ms,
+        )
+    }
+
     /// Replicated group feature level (C0) of the applied state.
     pub fn feature_level(&self) -> u32 {
         self.state_machine.feature_level()
@@ -1526,6 +1544,14 @@ impl GroupEngine for InMemoryGroupEngine {
 
     fn feature_level<'a>(&'a mut self, _placement: ShardPlacement) -> GroupFeatureLevelFuture<'a> {
         Box::pin(async move { Ok(self.state_machine.feature_level()) })
+    }
+
+    fn list_bucket_streams<'a>(
+        &'a mut self,
+        request: ListBucketStreamsRequest,
+        _placement: ShardPlacement,
+    ) -> GroupListBucketStreamsFuture<'a> {
+        Box::pin(async move { Ok(self.list_bucket_streams_report(&request)) })
     }
 
     fn set_feature_level<'a>(

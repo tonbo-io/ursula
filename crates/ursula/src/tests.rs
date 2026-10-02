@@ -7905,3 +7905,227 @@ async fn record_read_max_bytes_cuts_cold_windows() {
     assert_eq!(next, "3");
     assert_eq!(body, p7_lines(2..3));
 }
+
+// --- U9: bucket stream listing (extensions.md §1.4) ---
+
+async fn list_streams(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    let response = http_get(app, uri).await;
+    let status = response.status();
+    let body = body_bytes(response).await;
+    let value = serde_json::from_slice(&body)
+        .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&body).into()));
+    (status, value)
+}
+
+fn listed_ids(listing: &serde_json::Value) -> Vec<String> {
+    listing["streams"]
+        .as_array()
+        .expect("streams array")
+        .iter()
+        .map(|entry| entry["stream_id"].as_str().expect("stream_id").to_owned())
+        .collect()
+}
+
+async fn create_listing_streams(app: &Router, bucket: &str, ids: &[&str]) {
+    for id in ids {
+        let response = http_put(
+            app,
+            &format!("/{bucket}/{id}"),
+            &[(CONTENT_TYPE.as_str(), "text/plain")],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED, "{id}");
+    }
+}
+
+#[tokio::test]
+async fn bucket_listing_merges_streams_across_groups() {
+    let app = test_router();
+    let ids: Vec<String> = (0..24).map(|index| format!("s-{index:02}")).collect();
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    create_listing_streams(&app, "catalog", &id_refs).await;
+    let runtime_groups: std::collections::HashSet<u32> = {
+        let shard_map = ursula_shard::StaticShardMap::new(2, 8).expect("shard map");
+        ids.iter()
+            .map(|id| {
+                shard_map
+                    .locate(&BucketStreamId::new("catalog", id.as_str()))
+                    .raft_group_id
+                    .0
+            })
+            .collect()
+    };
+    assert!(runtime_groups.len() > 1, "streams must span several groups");
+
+    let response = http_post(
+        &app,
+        "/catalog/s-03",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("hello"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let (status, listing) = list_streams(&app, "/catalog/streams").await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert_eq!(listing["bucket_id"], "catalog");
+    assert_eq!(listing["stream_count"], 24);
+    assert_eq!(listing["has_more"], false);
+    assert!(listing["next_cursor"].is_null());
+    assert_eq!(listed_ids(&listing), ids);
+    let entry = &listing["streams"][3];
+    assert_eq!(entry["stream_id"], "s-03");
+    assert_eq!(entry["status"], "Open");
+    assert_eq!(entry["content_type"], "text/plain");
+    assert_eq!(entry["tail_offset"], 5);
+    assert!(entry["created_at_ms"].as_u64().is_some());
+    assert!(entry.get("last_write_at_ms").is_none());
+}
+
+#[tokio::test]
+async fn bucket_listing_filters_by_prefix_and_pages_by_cursor() {
+    let app = test_router();
+    create_listing_streams(&app, "catalog", &[
+        "user-3", "user-1", "admin", "user-2", "user-10", "zeta",
+    ])
+    .await;
+    let response = http_put(
+        &app,
+        "/catalog/user-run/journal",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = http_post(
+        &app,
+        "/catalog/user-2",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_STREAM_CLOSED, "true"),
+        ],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let (status, listing) = list_streams(&app, "/catalog/streams?prefix=user-").await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert_eq!(listing["prefix"], "user-");
+    assert_eq!(listed_ids(&listing), vec![
+        "user-1",
+        "user-10",
+        "user-2",
+        "user-3",
+        "user-run/journal"
+    ]);
+    assert_eq!(listing["streams"][2]["status"], "Closed");
+
+    let mut cursor: Option<String> = None;
+    let mut pages = Vec::new();
+    loop {
+        let uri = match &cursor {
+            Some(after) => format!("/catalog/streams?prefix=user-&limit=2&after={after}"),
+            None => "/catalog/streams?prefix=user-&limit=2".to_owned(),
+        };
+        let (status, listing) = list_streams(&app, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{listing}");
+        let page = listed_ids(&listing);
+        assert!(page.len() <= 2);
+        pages.push(page.clone());
+        if listing["has_more"] == true {
+            assert_eq!(
+                listing["next_cursor"],
+                page.last().expect("non-empty page").as_str()
+            );
+            cursor = Some(
+                url::form_urlencoded::byte_serialize(page.last().expect("page").as_bytes())
+                    .collect(),
+            );
+        } else {
+            assert!(listing["next_cursor"].is_null());
+            break;
+        }
+    }
+    assert_eq!(pages, vec![
+        vec!["user-1".to_owned(), "user-10".to_owned()],
+        vec!["user-2".to_owned(), "user-3".to_owned()],
+        vec!["user-run/journal".to_owned()],
+    ]);
+
+    let (status, listing) = list_streams(&app, "/catalog/streams?after=user-3").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed_ids(&listing), vec!["user-run/journal", "zeta"]);
+    let (status, listing) = list_streams(&app, "/catalog/streams?prefix=nobody").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listing["stream_count"], 0);
+    assert_eq!(listing["has_more"], false);
+}
+
+#[tokio::test]
+async fn bucket_listing_of_empty_and_unknown_buckets() {
+    let app = test_router();
+    create_listing_streams(&app, "emptied", &["only"]).await;
+    let response = http_delete(&app, "/emptied/only").await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (status, listing) = list_streams(&app, "/emptied/streams").await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert_eq!(listing["stream_count"], 0);
+    assert_eq!(listing["streams"], serde_json::json!([]));
+    assert_eq!(listing["has_more"], false);
+
+    let (status, _) = list_streams(&app, "/missing-bucket/streams").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn bucket_listing_rejects_invalid_parameters() {
+    let app = test_router();
+    create_listing_streams(&app, "catalog", &["a-stream"]).await;
+    for uri in [
+        "/catalog/streams?limit=0",
+        "/catalog/streams?limit=1001",
+        "/catalog/streams?limit=abc",
+        "/catalog/streams?limit=",
+        "/BAD/streams",
+        "/abc/streams",
+    ] {
+        let (status, body) = list_streams(&app, uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+    }
+    let (status, listing) = list_streams(&app, "/catalog/streams?limit=1000").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed_ids(&listing), vec!["a-stream"]);
+
+    // `streams` stays reserved: the name cannot be created as a stream.
+    let response = http_put(
+        &app,
+        "/catalog/streams",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
+    assert!(response.status().is_client_error(), "{}", response.status());
+}
+
+#[tokio::test]
+async fn bucket_listing_on_raft_engine() {
+    let app = router(
+        spawn_runtime(
+            &test_config(1, 2),
+            Persistence::Raft { log_dir: None },
+            Topology::SingleNode {
+                raft_group_count: 2,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    );
+    create_listing_streams(&app, "catalog", &["b", "a", "c"]).await;
+    let (status, listing) = list_streams(&app, "/catalog/streams?limit=2").await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert_eq!(listed_ids(&listing), vec!["a", "b"]);
+    assert_eq!(listing["has_more"], true);
+    assert_eq!(listing["next_cursor"], "b");
+}
