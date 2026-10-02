@@ -91,7 +91,7 @@ Every Raft group carries a replicated feature level, `0` until an operator raise
 | 1 | Keyed streams: `application/json; profile=keyed-batch-v1` creation, the reserved `keyed-state` name under affinity paths, and unique stream incarnations. Bounded state, first step: a 1,024-item producer receipt window per stream with 7-day idle-producer expiry, message-record collapse at every cold flush, incarnation-scoped cold objects and stream GC, and a compact MessagePack snapshot envelope | Supported by this release |
 | 2 | Sparse cold record marks: the JSON record index keeps exact offsets only for unflushed records plus one mark per MiB of cold log. Retention into sealed history lands on the mark at or below its target. Raised only for groups whose leader completed a cold-index page-repair cycle | Supported by this release |
 | 3 | External payload locators committed first and indexed after, so state holds only in-flight ones | Supported by this release |
-| 4 | Compact hot-window representation (message records removed) | Next release |
+| 4 | Compact hot-window representation: message records are removed. JSON streams take message boundaries from the record index's unflushed offsets, other streams keep one 8-byte start per unflushed message, so the hot window costs 8 bytes per record beyond its payload instead of 24. Streams convert on their next write, flush, retention or tidy pass | Supported by this release |
 
 `GET /__ursula/feature-level` on the admin plane reports `supported_level`, the highest level this binary can apply, and each group's current `level`. The procedure to raise a level:
 
@@ -107,7 +107,7 @@ Raising a group to `N` enables every level up to `N`. Levels are never lowered. 
 
 ### Memory without retention
 
-Per-stream replicated state is meant to stay bounded however long a stream lives, without retention: about 32 KiB plus 8 bytes per unflushed record plus 16 bytes per MiB of cold log, plus bounded producer state. Each level removes one growth source, so the bound holds once every level through 3 is raised; at level 1 the producer receipts, message records and cold-object bookkeeping are bounded, and the JSON record index still costs 8 bytes per retained record until level 2. Retention stays available as a storage-cost tool, but it is not the way to bound memory, and [keyed streams](/docs/concepts/keyed-streams#retention) must not be trimmed at all.
+Per-stream replicated state is meant to stay bounded however long a stream lives, without retention: about 32 KiB plus 8 bytes per unflushed record plus 16 bytes per MiB of cold log, plus bounded producer state. Each level removes one growth source, so the bound holds once every level through 3 is raised; at level 1 the producer receipts, message records and cold-object bookkeeping are bounded, and the JSON record index still costs 8 bytes per retained record until level 2. Level 4 shrinks the hot window's bookkeeping from 24 to 8 bytes per unflushed record, and cold admission and the flush thresholds charge that smaller figure. Retention stays available as a storage-cost tool, but it is not the way to bound memory, and [keyed streams](/docs/concepts/keyed-streams#retention) must not be trimmed at all.
 
 The per-group gauges under `group_state_gauges` in `/__ursula/metrics` show what each group holds.
 
