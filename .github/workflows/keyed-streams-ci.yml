@@ -1,0 +1,121 @@
+name: Keyed streams CI
+
+# Full verification for the keyed-streams work (docs/architecture/keyed-streams-pi-durable.md).
+# Runs on pushes to the integration branch and to its agent task branches only.
+
+on:
+  push:
+    branches:
+      - agent/keyed-streams
+      - "agent/ks-**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Rust lint
+    runs-on: depot-ubuntu-24.04-16
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  units:
+    name: Rust units (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - depot-ubuntu-24.04-16
+          - depot-ubuntu-24.04-arm-16
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Test workspace units and binaries
+        run: cargo test --workspace --lib --bins
+
+      - name: Test workspace docs
+        run: cargo test --workspace --doc
+
+  integration:
+    name: Rust integration tests
+    runs-on: depot-ubuntu-24.04-16
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      # Every integration test target, including ursula-index's, which the main
+      # CI does not run. ursula-sim runs under madsim in the dst job.
+      - name: Test all integration targets
+        run: cargo test --workspace --tests --exclude ursula-sim
+
+  dst:
+    name: Deterministic simulation smoke
+    runs-on: depot-ubuntu-24.04-16
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Audit DST guards
+        run: python3 -m scripts.dst all
+
+      - name: Run madsim smoke corpus
+        run: RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim smoke_corpus_replays -- --nocapture
+
+  typescript:
+    name: TypeScript owner
+    runs-on: depot-ubuntu-24.04-16
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Test clients/pi-durable-ursula
+        run: |
+          if [ ! -f clients/pi-durable-ursula/package.json ]; then
+            echo "clients/pi-durable-ursula does not exist yet"
+            exit 0
+          fi
+          cd clients/pi-durable-ursula
+          npm ci
+          npm run typecheck
+          npm test
