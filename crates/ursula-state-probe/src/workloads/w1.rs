@@ -58,7 +58,8 @@ pub struct W1Args {
     /// Also restore the final snapshot and report restored heap.
     #[arg(long)]
     pub restore: bool,
-    /// Group feature level to run at (2 = F1 sparse record marks).
+    /// Group feature level to run at (2 = F1 sparse record marks, 4 = F4b
+    /// message records removed).
     #[arg(long, default_value_t = 0)]
     pub level: u32,
     /// F1 legacy migration: append and flush at level 1, then raise to 2 and

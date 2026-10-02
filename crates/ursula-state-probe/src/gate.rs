@@ -67,6 +67,12 @@ pub fn pr_suite() -> Result<Vec<Job>> {
             )?),
         ),
         job(
+            "w1_lb4",
+            Workload::W1(parse::<W1Args>(
+                "--records=300000 --checkpoints=75000,300000 --level=4 --name=w1_lb4",
+            )?),
+        ),
+        job(
             "w6_w1",
             Workload::W1(parse::<W1Args>(
                 "--records=200000 --retain-every=10000 --retain-keep=2000 --checkpoints=100000,200000 --level=2",
@@ -165,6 +171,12 @@ pub fn nightly_suite() -> Result<Vec<Job>> {
             "w1",
             Workload::W1(parse::<W1Args>(
                 "--records=3000000 --zstd --restore --level=2",
+            )?),
+        ),
+        job(
+            "w1_lb4",
+            Workload::W1(parse::<W1Args>(
+                "--records=3000000 --restore --level=4 --name=w1_lb4",
             )?),
         ),
         job(
