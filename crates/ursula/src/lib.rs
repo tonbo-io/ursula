@@ -1517,15 +1517,17 @@ pub(crate) async fn stage_external_payload(
 /// Bounded-state F5 cleanup rule (ungated): a staged external object may be
 /// deleted only when its append or create definitely did not commit. That is
 /// a typed stream error (apply, or a pre-proposal check, rejected it on every
-/// replica alike), a redirect or backpressure rejection before proposal, or a
+/// replica alike), a redirect raised by the local pre-proposal leadership
+/// check or a backpressure rejection before proposal, or a
 /// request the runtime refused before dispatch. Every other failure (a lost
-/// response, a transport or storage error, an untyped engine error) may
+/// response, a forward-to-leader reported by OpenRaft after `client_write`
+/// (RT1), a transport or storage error, an untyped engine error) may
 /// follow a committed proposal that references the object, so the object is
 /// kept; an orphan sweep or stream GC reclaims it if nothing does.
 pub(crate) fn staged_external_definitely_unreferenced(err: &RuntimeError) -> bool {
     match err {
         RuntimeError::GroupEngine { error, .. } => {
-            error.code().is_some() || error.leader_hint().is_some() || error.is_backpressure()
+            error.code().is_some() || error.is_forward_before_proposal() || error.is_backpressure()
         }
         RuntimeError::EmptyAppend
         | RuntimeError::InvalidAppendTransaction { .. }

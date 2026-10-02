@@ -1341,6 +1341,12 @@ pub enum GroupEngineError {
     ForwardToLeader {
         message: String,
         leader_hint: GroupLeaderHint,
+        /// True only when the node checked leadership locally before it
+        /// proposed anything (RT1). A forward reported by OpenRaft after
+        /// `client_write` (a responder dropped on step-down or log purge) may
+        /// follow a committed entry, so it stays `false`: ambiguous.
+        #[serde(default)]
+        before_proposal: bool,
     },
 }
 
@@ -1409,6 +1415,9 @@ impl GroupEngineError {
         })
     }
 
+    /// A forward-to-leader error whose command may already have been
+    /// proposed (and even committed): callers must not treat it as a
+    /// definite rejection.
     pub fn forward_to_leader(
         message: impl Into<String>,
         node_id: Option<u64>,
@@ -1417,7 +1426,30 @@ impl GroupEngineError {
         Self::ForwardToLeader {
             message: message.into(),
             leader_hint: GroupLeaderHint { node_id, address },
+            before_proposal: false,
         }
+    }
+
+    /// A forward-to-leader error raised by a local leadership check before
+    /// anything was proposed: the command definitely did not commit here.
+    pub fn forward_to_leader_before_proposal(
+        message: impl Into<String>,
+        node_id: Option<u64>,
+        address: Option<String>,
+    ) -> Self {
+        Self::ForwardToLeader {
+            message: message.into(),
+            leader_hint: GroupLeaderHint { node_id, address },
+            before_proposal: true,
+        }
+    }
+
+    /// True when this is a forward-to-leader error raised before proposal.
+    pub fn is_forward_before_proposal(&self) -> bool {
+        matches!(self, Self::ForwardToLeader {
+            before_proposal: true,
+            ..
+        })
     }
 
     pub fn message(&self) -> Cow<'_, str> {
