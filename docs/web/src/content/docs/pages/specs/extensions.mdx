@@ -123,7 +123,7 @@ The response body is:
 {
   "bucket_id": "agents",
   "prefix": "user-",
-  "stream_count": 2,
+  "stream_count": 1,
   "streams": [
     {
       "stream_id": "user-1",
@@ -134,14 +134,22 @@ The response body is:
       "last_write_at_ms": 1735689601000
     }
   ],
-  "next_cursor": "user-2",
+  "next_cursor": "user-1",
   "has_more": true
 }
 ```
 
 `streams` is sorted lexicographically by `stream_id`.
 
+- `stream_id` is the bucket-local path of the stream: what follows `/{bucket_id}/` in its URL. For a stream addressed through the affinity form (Section 1.7) it is `{affinity_key}/{stream_id}`, so `prefix` and `after` also apply to that path.
+- `prefix` echoes the request's prefix, and is the empty string when the request has none.
+- `stream_count` is the number of entries in `streams` on this page, not the number of streams in the bucket.
+- `has_more` is `true` when more matching streams sort after the last entry. `next_cursor` is then that entry's `stream_id`, to be passed as `after`; otherwise it is `null`.
+- `status` is `Open` or `Closed`. `tail_offset` is the stream's tail as an integer byte offset. Streams whose TTL or expiry time has passed are not listed.
+
 Each entry MUST include `stream_id`, `status`, `content_type`, `tail_offset` and `created_at_ms`. `last_write_at_ms` is OPTIONAL: a server that does not track the time of the last write MUST omit it rather than report a substitute value, and clients MUST tolerate its absence.
+
+> **Note (informative).** Ursula omits `last_write_at_ms`. It assembles a page from every Raft group's local replica on the node that serves the request, so a stream created a moment earlier may be missing from a page served by a follower.
 
 **Response Codes:**
 
@@ -377,7 +385,7 @@ GET {stream_url}/bootstrap
 - `Content-Type: multipart/mixed; boundary=<token>`
 - `Stream-Snapshot-Offset`: The snapshot offset, or `-1` if no snapshot exists.
 - `Stream-Next-Offset`: The offset immediately after the last returned update message. When the response contains no update parts, it is the snapshot point (defined below).
-- `Stream-Up-To-Date`: `true` when `Stream-Next-Offset` equals the stream's tail offset at the time the response was produced, otherwise `false`.
+- `Stream-Up-To-Date: true`: Present when `Stream-Next-Offset` equals the stream's tail offset at the time the response was produced. Otherwise the server MUST either omit the header, as for ordinary reads in the base protocol, or send `false`. Clients MUST treat an absent header as `false`.
 
 The **snapshot point** `S` is the visible snapshot's offset when a snapshot exists, and otherwise the offset of the earliest retained message.
 
@@ -386,13 +394,13 @@ The **snapshot point** `S` is the visible snapshot's offset when a snapshot exis
 A server MUST return one of the following:
 
 - **Complete:** one update part for every retained message in `[S, tail)`, with `Stream-Next-Offset` equal to the tail and `Stream-Up-To-Date: true`.
-- **Partial:** one update part for every retained message in `[S, P)` for some boundary `P` with `S ≤ P < tail`, with `Stream-Next-Offset: P` and `Stream-Up-To-Date: false`. `P` MAY equal `S`, in which case the response contains the snapshot part and no update parts.
+- **Partial:** one update part for every retained message in `[S, P)` for some boundary `P` with `S ≤ P < tail`, with `Stream-Next-Offset: P` and no `Stream-Up-To-Date: true`. `P` MAY equal `S`, in which case the response contains the snapshot part and no update parts.
 
 In both cases the update parts MUST be the retained messages starting exactly at `S`, contiguous and in stream order: a server MUST NOT skip any message between `S` and `Stream-Next-Offset`, MUST NOT duplicate a message, and MUST NOT place more than one message in a part. `Stream-Next-Offset` MUST be a committed message boundary that ordinary reads accept, and MUST NOT be below `S`.
 
-A server MAY choose the partial form for any reason, for example because some messages after `S` are held only in a storage tier that does not keep per-message boundaries in memory. Serving `/bootstrap` never requires a server to read such a tier. A client MUST NOT treat `Stream-Up-To-Date: false` as an error.
+A server MAY choose the partial form for any reason, for example because some messages after `S` are held only in a storage tier that does not keep per-message boundaries in memory. Serving `/bootstrap` never requires a server to read such a tier. A client MUST NOT treat a partial response as an error.
 
-> **Note (informative).** Ursula returns the complete form when every message in `[S, tail)` is above the stream's cold frontier, and otherwise the partial form with `P = S` (the snapshot part only). It never reads cold storage while serving `/bootstrap`. It also caps the update parts of one response at 8 MiB: when the updates exceed the cap it returns the partial form with `P` at the last message boundary that keeps the parts within the cap, and always includes at least one message, even when that message alone exceeds the cap.
+> **Note (informative).** Ursula returns the complete form when every message in `[S, tail)` is above the stream's cold frontier, and otherwise the partial form with `P = S` (the snapshot part only). It never reads cold storage while serving `/bootstrap`, and it omits `Stream-Up-To-Date` from a partial response. It also caps the update parts of one response at 8 MiB: when the updates exceed the cap it returns the partial form with `P` at the last message boundary that keeps the parts within the cap, and always includes at least one message, even when that message alone exceeds the cap.
 
 **Response Body:**
 
@@ -437,7 +445,6 @@ HTTP/1.1 200 OK
 Content-Type: multipart/mixed; boundary=rr-bootstrap-4b7d01c3
 Stream-Snapshot-Offset: 0000000000000012
 Stream-Next-Offset: 0000000000000012
-Stream-Up-To-Date: false
 Cache-Control: no-store
 
 --rr-bootstrap-4b7d01c3
@@ -459,7 +466,7 @@ Bootstrap is one-shot only:
 - `/bootstrap` returns an ordered initialization payload once.
 - `/bootstrap` does not support `live=sse` or `live=long-poll`.
 - After applying the bootstrap response, clients MUST continue tailing through the ordinary stream read APIs using the returned `Stream-Next-Offset`.
-- When the response carries `Stream-Up-To-Date: false`, the ordinary catch-up reads from `Stream-Next-Offset` return the remaining updates; clients MUST apply them before treating their state as current.
+- When the response does not carry `Stream-Up-To-Date: true`, the ordinary catch-up reads from `Stream-Next-Offset` return the remaining updates; clients MUST apply them before treating their state as current.
 - Clients SHOULD prefer `GET {stream_url}?offset=<offset>&live=sse` and fall back to `GET {stream_url}?offset=<offset>&live=long-poll` when SSE is unavailable.
 
 ### 3.4. Compatibility
@@ -1020,7 +1027,7 @@ GET {stream_url}/keyed-state?[start={k} | after={k}][&end={k}][&limit={n}]
 
 Both forms accept `&min_through_record={r}` and `&timeout_ms={t}`. The resource exists for both the two-segment and the affinity form of a stream URL; `keyed-state` is a reserved local stream ID under an affinity path (Section 1.7).
 
-Only `GET` is defined. Every other method, including `HEAD`, MUST be answered `405 Method Not Allowed` with `Allow: GET`.
+Only `GET` is defined. Every other method, including `HEAD`, MUST be answered `405 Method Not Allowed` with `Allow: GET`. A server that does not serve keyed state for any stream MAY instead answer `404 Not Found` to every method.
 
 Parameters:
 
@@ -1031,6 +1038,7 @@ Parameters:
 - `min_through_record=r` is a non-negative integer: the response MUST reflect `state(D)` with `D ≥ r` (Section 9.2.4).
 - `timeout_ms=t` bounds the wait for `min_through_record`. The default is `1000`. An unparseable value means the default, and a parsed value is clamped to `1..60000`. It is ignored without `min_through_record`.
 - A repeated parameter, a forbidden combination, an invalid key, an out-of-range `limit`, or an unparseable `min_through_record` MUST be rejected with `400 Bad Request`.
+- Unrecognized parameters are ignored, as on the other read surfaces.
 
 Request targets can be long: two 4096-octet keys produce a request target of about 11 KB. Deployments SHOULD accept request lines of at least 12 KiB on this resource.
 
@@ -1127,9 +1135,9 @@ Implementations MUST preserve these invariants. Each is testable against a refer
 8. Keyed state is served only for the incarnation it was built from, and only while it is consistent with the source log's records below `D`.
 9. A response stops before the end of the selected range only with `Stream-Keyed-After` naming its last row; paging with `after` until `Stream-Keyed-After` is absent visits every key of the range at most once.
 10. No response exceeds `limit` rows, and no response exceeds the 4 MiB budget unless it contains exactly one row.
-11. `HEAD` and every method other than `GET` on the resource return `405` with `Allow: GET`.
+11. `HEAD` and every method other than `GET` on the resource return `405` with `Allow: GET`, unless the server serves keyed state for no stream (Section 9.2.1).
 12. A keyed stream with no built state is served as `state(0)`.
-13. Non-keyed streams are unaffected: they never advertise `keyed-batch-v1` or `keyed-state-v1`, and their keyed-state resource answers `404`.
+13. Non-keyed streams are unaffected: they never advertise `keyed-batch-v1` or `keyed-state-v1`, and a `GET` of their keyed-state resource answers `404`.
 
 Conformance tests SHOULD cover: escaped and duplicate `ops` members; unpaired-surrogate escapes in top-level member names (rejected) and in member names inside values (accepted); non-canonical keys (`AB`, `AA==`, `+/`, the empty string) and escaped keys; range deletes with `start ≥ end`; depth 127, 128 and 129, bare and inside an array body; `1e400`; `lo ≥ hi`; repeated parameters; `HEAD` and other methods; out-of-range and unparseable `timeout_ms`; wait timeouts; keyed state ahead of the source log; an invalid batch sent to a non-keyed or absent stream; `max_bytes` with `max_records` and with `record_view=envelope`; a stream with no built state; and deleting and recreating the same stream URL within one millisecond.
 

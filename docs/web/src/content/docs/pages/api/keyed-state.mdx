@@ -1,0 +1,125 @@
+---
+title: Read keyed state
+api: "GET /{bucket}/{stream}/keyed-state"
+---
+
+Returns the folded key-value state of a [keyed stream](/docs/concepts/keyed-streams): every key whose last op is a put, with the value it was put with and the record that put it. One response always reflects exactly one state, `state(D)`, the fold of records `0 … D−1`, and names `D` in `Stream-Keyed-Through`.
+
+The node serves this resource only when it has a keyed-state indexer configured (`server.keyed_state_upstream`, see [Configuration](/docs/configuration#keyed-state)). The create and `HEAD` responses of a keyed stream advertise `keyed-state-v1` in `Stream-Extensions` when it is served. The affinity form `/{bucket}/{affinity}/{stream}/keyed-state` works the same way.
+
+<ParamField path="bucket" type="string" required>
+ Bucket ID.
+</ParamField>
+
+<ParamField path="stream" type="string" required>
+ Stream ID of a keyed stream, created with `Content-Type: application/json; profile=keyed-batch-v1`.
+</ParamField>
+
+<ParamField query="key" type="string">
+ Point read of one key. Keys are the canonical unpadded base64url encoding of 1 to 4096 octets. Cannot be combined with `start`, `after`, `end` or `limit`.
+</ParamField>
+
+<ParamField query="start" type="string">
+ Inclusive lower bound of a range read. Mutually exclusive with `after`. Default: before the first key.
+</ParamField>
+
+<ParamField query="after" type="string">
+ Exclusive lower bound of a range read, used to continue from `Stream-Keyed-After`. Mutually exclusive with `start`.
+</ParamField>
+
+<ParamField query="end" type="string">
+ Exclusive upper bound of a range read. Default: after the last key. Keys compare as unsigned octet strings. A lower bound at or above `end` selects nothing.
+</ParamField>
+
+<ParamField query="limit" type="number">
+ Maximum rows, `1` to `1000`. Default `100`.
+</ParamField>
+
+<ParamField query="min_through_record" type="number">
+ Require `D ≥ min_through_record`, waiting up to `timeout_ms` for keyed state to catch up. A writer that committed record `s` reads its own write with `min_through_record=s+1`. Without it, any published `D` may be returned.
+</ParamField>
+
+<ParamField query="timeout_ms" type="number">
+ Wait bound for `min_through_record`. Default `1000`, clamped to `1..60000`; an unparseable value means the default. Ignored without `min_through_record`.
+</ParamField>
+
+## Response
+
+| Status | Meaning |
+| ------ | ------- |
+| `200` | Rows of `state(D)` for the selection, possibly none. A point read of a key that is not visible is a `200` with an empty body. |
+| `204` | `min_through_record` was not reached within `timeout_ms`. `Stream-Keyed-Through` reports the current `D`. Retry the same request. |
+| `400` | Invalid parameter: a repeated parameter, a forbidden combination, a non-canonical key, `limit` out of range, or an unparseable `min_through_record`. Also `min_through_record` above the stream's record tail, with `Stream-Record-Next` naming the tail. |
+| `404` | The stream does not exist, is not a keyed stream, or this node serves no keyed state. |
+| `405` | Any method other than `GET`, including `HEAD`. `Allow: GET`. |
+| `500` | A permanent condition prevents state at or beyond the requested record. The plain-text body names the record. The usual cause is retention that removed records the projection still needs. |
+| `503` | Temporarily unavailable: the indexer is unreachable, the source log could not be read, or the projection is being re-validated or rebuilt. Retry after `Retry-After` seconds. |
+
+The checks run in this order: parameter `400`, then `404`, then the beyond-tail `400`, then `5xx`, then `204`.
+
+| Header | Description |
+| ------ | ----------- |
+| `Content-Type` | `application/vnd.durable-stream-keyed-rows+ndjson` on `200`. |
+| `Stream-Keyed-Through` | `D` on every `200` and `204`. Exclusive: the rows reflect every record below `D` and none at or above it. |
+| `Stream-Keyed-After` | The last returned key, present when the response stopped before the end of the range because of `limit` or the 4 MiB body budget. Continue with `after=<value>` and the same `end`. Its absence means the range is exhausted. |
+| `Stream-Extensions` | Contains `keyed-state-v1` on every response for a keyed stream except `404`. |
+| `Cache-Control` | `no-store`. |
+
+## Response body
+
+One line per visible key in ascending octet order. Each line is a JSON object with exactly the members `key`, `record` and `value`, in that order:
+
+```json
+{"key":"AW5leHRfaWQA","record":103,"value":130}
+{"key":"AW93bmVyAA","record":42,"value":{"epoch":42,"nonce":"c0ffee00112233445566778899aabbcc"}}
+```
+
+- `key` is the key in canonical base64url.
+- `record` is the ordinal of the record whose put set the current value. Compaction or a rebuild of the projection never changes it.
+- `value` is the put's value exactly as the writer sent it, minus insignificant whitespace ([JSON message text](/docs/specs/extensions#json-message-text)). Slice it from the line rather than re-serializing a parsed object if you need the exact bytes.
+
+A response never exceeds `limit` rows or 4 MiB of uncompressed body, except that the first row is always returned whole. Large responses are gzip-compressed when the client accepts it.
+
+## Consistency
+
+- Rows of one response never mix states, and `D` never exceeds the stream's record tail.
+- For one stream, `D` never goes down from one response to the next, unless an operator restored the log from a backup.
+- Paging with `after` never returns a key twice, but each page may reflect a different `D`. To get one consistent view across pages, pass the highest `D` seen so far as `min_through_record` and reconcile rows by `D`.
+- A stream deleted and recreated at the same URL is a new stream. Its keyed state is never served from the old one.
+- Keyed state is built on demand. A read whose `min_through_record` is above the published `D` makes the indexer catch up; a stream that nobody reads costs no indexer work. A keyed stream with no state built yet answers as the empty state, `D = 0`.
+
+<RequestExample>
+```bash Point read
+curl -i 'http://127.0.0.1:4437/pi/harness-1/keyed-state?key=AW93bmVyAA'
+```
+
+```bash Range read, waiting for record 104
+curl -i 'http://127.0.0.1:4437/pi/harness-1/keyed-state?start=AQ&end=Ag&limit=2&min_through_record=104&timeout_ms=5000'
+```
+
+```bash Continue a truncated range
+curl -i 'http://127.0.0.1:4437/pi/harness-1/keyed-state?after=AW93bmVyAA&end=Ag&limit=2'
+```
+</RequestExample>
+
+<ResponseExample>
+```http 200
+HTTP/1.1 200 OK
+Content-Type: application/vnd.durable-stream-keyed-rows+ndjson
+Stream-Extensions: keyed-state-v1
+Stream-Keyed-Through: 104
+Stream-Keyed-After: AW93bmVyAA
+Cache-Control: no-store
+
+{"key":"AW5leHRfaWQA","record":103,"value":130}
+{"key":"AW93bmVyAA","record":42,"value":{"epoch":42,"nonce":"c0ffee00112233445566778899aabbcc"}}
+```
+</ResponseExample>
+
+<Note>
+Two 4096-octet keys make a request target of about 11 KB. Proxies in front of Ursula should accept request lines of at least 12 KiB on this resource.
+</Note>
+
+<Info>
+See [Keyed streams](/docs/concepts/keyed-streams) for the record format and the fold, and [extensions spec section 9.2](/docs/specs/extensions#92-keyed-state-resource) for the normative text.
+</Info>

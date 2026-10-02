@@ -44,6 +44,8 @@ For an `application/json` stream implementing Record Coordinates, `HEAD` also in
 | `Stream-Record-First` | First retained record ordinal. |
 | `Stream-Record-Next` | Current record tail and next ordinal to be assigned. |
 
+For a [keyed stream](/docs/concepts/keyed-streams), `Stream-Extensions` also contains `keyed-batch-v1`, and `keyed-state-v1` when this node serves the [keyed-state](/docs/api/keyed-state) resource.
+
 <RequestExample>
 ```bash Example
 curl -I http://127.0.0.1:4437/demo/hello

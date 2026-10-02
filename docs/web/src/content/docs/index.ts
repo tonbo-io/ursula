@@ -48,12 +48,14 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   "examples/resumable-ai-stream": { group: "Examples", order: 1 },
   "examples/chat-room": { group: "Examples", order: 2 },
   "examples/browser-telemetry": { group: "Examples", order: 3 },
+  "examples/pi-durable": { group: "Examples", order: 4 },
 
   // Concepts - encounter order: primitive, organization, reading, writing, long-stream, transport.
   "concepts/streams": { group: "Concepts", order: 1 },
   "concepts/buckets": { group: "Concepts", order: 2 },
   "concepts/offsets": { group: "Concepts", order: 3 },
   "concepts/record-coordinates": { group: "Concepts", order: 4 },
+  "concepts/keyed-streams": { group: "Concepts", order: 4.5 },
   "concepts/read-modes": { group: "Concepts", order: 5 },
   "concepts/exactly-once-writes": { group: "Concepts", order: 6 },
   "concepts/conditional-writes": { group: "Concepts", order: 7 },
@@ -66,9 +68,11 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   // API Reference - typical call order: setup, hot path, snapshots/bootstrap, lifecycle, compatibility.
   "api/overview": { group: "API Reference", order: 1 },
   "api/create-bucket": { group: "API Reference", order: 2 },
+  "api/list-streams": { group: "API Reference", order: 2.5 },
   "api/create-stream": { group: "API Reference", order: 3 },
   "api/append": { group: "API Reference", order: 4 },
   "api/read": { group: "API Reference", order: 5 },
+  "api/keyed-state": { group: "API Reference", order: 5.5 },
   "api/head-stream": { group: "API Reference", order: 6 },
   "api/stream-attrs": { group: "API Reference", order: 7 },
   "api/publish-snapshot": { group: "API Reference", order: 8 },
@@ -91,6 +95,9 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
 
   // Comparisons - positioning.
   "competitive-comparison": { group: "Comparisons", order: 1 },
+
+  // Reference - release history.
+  "release-notes": { group: "Reference", order: 1 },
 };
 
 function inferSlug(path: string) {
