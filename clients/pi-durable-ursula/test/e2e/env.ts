@@ -7,11 +7,11 @@ import { FAST } from "../helpers.ts";
 export const E2E_BUCKET = "pi-e2e";
 
 /**
- * Whether open requires `keyed-batch-v1`. The node advertises it once the server-side P2 task
- * merges; until then the suite runs against the generic JSON surface. Set E2E_REQUIRE_KEYED=1 to
- * require it.
+ * Whether open requires `keyed-batch-v1`. The node advertises it since server-side P2 merged, so
+ * the suite requires it by default. Set E2E_REQUIRE_KEYED=0 to run against an older node that
+ * serves only the generic JSON surface.
  */
-export const REQUIRE_KEYED = process.env.E2E_REQUIRE_KEYED === "1";
+export const REQUIRE_KEYED = process.env.E2E_REQUIRE_KEYED !== "0";
 
 let counter = 0;
 /** A fresh `{bucket}/{stream}` path. */

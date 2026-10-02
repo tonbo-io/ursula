@@ -23,7 +23,7 @@ npm test          # FUZZ_TABLE_TRIALS / FUZZ_DOC_TRIALS scale the differential f
 
 # End to end against a real single-node ursula (memory engine, free port), spawned by the suite:
 cargo build --release -p ursula --bin ursula
-URSULA_BIN=../../target/release/ursula npm run test:e2e   # E2E_REQUIRE_KEYED=1 requires keyed-batch-v1
+URSULA_BIN=../../target/release/ursula npm run test:e2e   # requires keyed-batch-v1; E2E_REQUIRE_KEYED=0 for an older node
 ```
 
 ```ts

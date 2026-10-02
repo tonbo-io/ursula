@@ -49,12 +49,42 @@ async function waitReady(url: string, child: ChildProcess, logs: () => string): 
 	throw new Error(`ursula did not become ready within 60 s:\n${logs()}`);
 }
 
+/**
+ * Raises every group to feature level 1 through the admin listener, so keyed
+ * (`profile=keyed-batch-v1`) creates are accepted (keyed streams design §6.3). Retries until every
+ * group reports `set`, because a fresh node may still be electing some group leaders.
+ */
+async function enableKeyedStreams(adminUrl: string): Promise<void> {
+	const deadline = Date.now() + 30_000;
+	let last = "";
+	while (Date.now() < deadline) {
+		try {
+			const r = await fetch(`${adminUrl}/__ursula/feature-level`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ level: 1 }),
+				signal: AbortSignal.timeout(5000),
+			});
+			last = `${r.status} ${await r.text()}`;
+			if (r.ok) {
+				const report = JSON.parse(last.slice(last.indexOf(" ") + 1)) as { groups: { status: string }[] };
+				if (report.groups.every((group) => group.status === "set")) return;
+			}
+		} catch (error) {
+			last = String(error);
+		}
+		await new Promise((r) => setTimeout(r, 200));
+	}
+	throw new Error(`could not raise the feature level to 1: ${last}`);
+}
+
 export default async function setup(project: TestProject): Promise<() => Promise<void>> {
 	const bin = ursulaBinary();
 	const port = await freePort();
+	const adminPort = await freePort();
 	const dir = mkdtempSync(join(tmpdir(), "pi-durable-ursula-e2e-"));
 	const config = join(dir, "ursula.toml");
-	writeFileSync(config, `[server]\nlisten = "127.0.0.1:${port}"\n\n[raft]\nnode_id = 1\n\n[raft.wal]\nbackend = "memory"\n`);
+	writeFileSync(config, `[server]\nlisten = "127.0.0.1:${port}"\nadmin_listen = "127.0.0.1:${adminPort}"\n\n[raft]\nnode_id = 1\n\n[raft.wal]\nbackend = "memory"\n`);
 	let output = "";
 	const child = spawn(bin, ["server", "--config", config, "--preset", "default"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
 	const keep = (chunk: Buffer): void => {
@@ -67,6 +97,7 @@ export default async function setup(project: TestProject): Promise<() => Promise
 		await waitReady(url, child, () => output);
 		const bucket = await fetch(`${url}/${E2E_BUCKET}`, { method: "PUT" });
 		if (!bucket.ok && bucket.status !== 409) throw new Error(`create bucket: ${bucket.status} ${await bucket.text()}`);
+		await enableKeyedStreams(`http://127.0.0.1:${adminPort}`);
 	} catch (error) {
 		child.kill("SIGKILL");
 		rmSync(dir, { recursive: true, force: true });
