@@ -701,13 +701,18 @@ impl ShardRuntime {
                 Err(err) => return Err(err),
             }
         }
-        if published == 0 {
-            cold_store
-                .delete_chunk(&path)
-                .await
-                .map_err(|err| RuntimeError::ColdStoreIo {
-                    message: err.to_string(),
-                })?;
+        // Every candidate was definitely rejected as stale, so nothing
+        // references the pack. Cleanup is best effort, as for an exclusive
+        // chunk: a failed delete leaves an orphan for the sweep (F14h), and
+        // since F14c this path also carries lone small candidates.
+        if published == 0
+            && let Err(cleanup_err) = cold_store.delete_chunk(&path).await
+        {
+            tracing::warn!(
+                path = %path,
+                error = %cleanup_err,
+                "failed to remove the pack of a rejected cold flush"
+            );
         }
         Ok(responses)
     }
