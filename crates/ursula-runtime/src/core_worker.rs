@@ -33,7 +33,7 @@ use crate::metrics::RuntimeMetricsInner;
 use crate::metrics::append_batch_payload_bytes;
 use crate::metrics::elapsed_ns;
 use crate::metrics::record_cold_backpressure_error;
-use crate::metrics::record_cold_hot_backlog;
+use crate::metrics::record_write_hot_backlog;
 use crate::request::AckColdGcResponse;
 use crate::request::AdvanceRetentionRequest;
 use crate::request::AdvanceRetentionResponse;
@@ -588,7 +588,17 @@ impl CoreWorker {
                 placement.raft_group_id,
                 elapsed_ns(started_at),
             );
-            record_cold_hot_backlog(group, &metrics, stream_id.clone(), placement).await;
+            record_write_hot_backlog(
+                group,
+                &metrics,
+                response
+                    .as_ref()
+                    .ok()
+                    .and_then(|response| response.hot_backlog),
+                stream_id.clone(),
+                placement,
+            )
+            .await;
             Self::notify_read_watchers(
                 group,
                 metrics,
@@ -628,7 +638,17 @@ impl CoreWorker {
                 placement.raft_group_id,
                 elapsed_ns(started_at),
             );
-            record_cold_hot_backlog(group, &metrics, stream_id.clone(), placement).await;
+            record_write_hot_backlog(
+                group,
+                &metrics,
+                response
+                    .as_ref()
+                    .ok()
+                    .and_then(|response| response.hot_backlog),
+                stream_id.clone(),
+                placement,
+            )
+            .await;
             Self::notify_read_watchers(
                 group,
                 metrics,
@@ -884,7 +904,17 @@ impl CoreWorker {
                 placement.raft_group_id,
                 elapsed_ns(started_at),
             );
-            record_cold_hot_backlog(group, &metrics, stream_id.clone(), placement).await;
+            record_write_hot_backlog(
+                group,
+                &metrics,
+                response
+                    .as_ref()
+                    .ok()
+                    .and_then(|response| response.hot_backlog),
+                stream_id.clone(),
+                placement,
+            )
+            .await;
             Self::notify_read_watchers(
                 group,
                 metrics,
@@ -936,7 +966,17 @@ impl CoreWorker {
                 placement.raft_group_id,
                 elapsed_ns(started_at),
             );
-            record_cold_hot_backlog(group, &metrics, stream_id.clone(), placement).await;
+            record_write_hot_backlog(
+                group,
+                &metrics,
+                response
+                    .as_ref()
+                    .ok()
+                    .and_then(|response| response.hot_backlog),
+                stream_id.clone(),
+                placement,
+            )
+            .await;
             Self::notify_read_watchers(
                 group,
                 metrics,
@@ -1425,7 +1465,8 @@ impl CoreWorker {
                 placement.raft_group_id,
                 elapsed_ns(started_at),
             );
-            record_cold_hot_backlog(group, &metrics, stream_id, placement).await;
+            record_write_hot_backlog(group, &metrics, response.hot_backlog, stream_id, placement)
+                .await;
         }
         Ok(response)
     }
@@ -1454,7 +1495,8 @@ impl CoreWorker {
                 placement.raft_group_id,
                 elapsed_ns(started_at),
             );
-            record_cold_hot_backlog(group, &metrics, stream_id, placement).await;
+            record_write_hot_backlog(group, &metrics, response.hot_backlog, stream_id, placement)
+                .await;
         }
         Ok(response)
     }
@@ -1625,7 +1667,17 @@ impl CoreWorker {
                 placement.raft_group_id,
                 elapsed_ns(started_at),
             );
-            record_cold_hot_backlog(group, &metrics, stream_id.clone(), placement).await;
+            record_write_hot_backlog(
+                group,
+                &metrics,
+                Some(crate::request::WriteHotBacklog {
+                    stream_hot_bytes: response.stream_hot_bytes,
+                    group_hot_bytes: response.group_hot_bytes,
+                }),
+                stream_id.clone(),
+                placement,
+            )
+            .await;
             Self::notify_read_watchers(
                 group,
                 metrics,

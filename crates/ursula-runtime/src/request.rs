@@ -99,6 +99,13 @@ impl CreateStreamRequest {
     }
 }
 
+/// A stream's and its group's hot payload bytes right after a write applied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteHotBacklog {
+    pub stream_hot_bytes: u64,
+    pub group_hot_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateStreamResponse {
     pub placement: ShardPlacement,
@@ -107,6 +114,11 @@ pub struct CreateStreamResponse {
     pub already_exists: bool,
     pub group_commit_index: u64,
     pub record_range: Option<StreamRecordRange>,
+    /// Hot backlog after the write applied (bounded-stream-state F6a), so
+    /// the runtime records its metric without a second state-machine round
+    /// trip. `None` from an older leader.
+    #[serde(default)]
+    pub hot_backlog: Option<WriteHotBacklog>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,6 +360,11 @@ pub struct PublishSnapshotResponse {
     pub snapshot_digest: String,
     pub group_commit_index: u64,
     pub record_range: Option<StreamRecordRange>,
+    /// Hot backlog after the write applied (bounded-stream-state F6a), so
+    /// the runtime records its metric without a second state-machine round
+    /// trip. `None` from an older leader.
+    #[serde(default)]
+    pub hot_backlog: Option<WriteHotBacklog>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,6 +380,11 @@ pub struct AdvanceRetentionResponse {
     pub retained_offset: u64,
     pub group_commit_index: u64,
     pub record_range: Option<StreamRecordRange>,
+    /// Hot backlog after the write applied (bounded-stream-state F6a), so
+    /// the runtime records its metric without a second state-machine round
+    /// trip. `None` from an older leader.
+    #[serde(default)]
+    pub hot_backlog: Option<WriteHotBacklog>,
 }
 
 /// Sets or clears one bucket's data-plane quota record on a group. The
@@ -535,6 +557,11 @@ pub struct DeleteStreamRequest {
 pub struct DeleteStreamResponse {
     pub placement: ShardPlacement,
     pub group_commit_index: u64,
+    /// Hot backlog after the write applied (bounded-stream-state F6a), so
+    /// the runtime records its metric without a second state-machine round
+    /// trip. `None` from an older leader.
+    #[serde(default)]
+    pub hot_backlog: Option<WriteHotBacklog>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -586,6 +613,11 @@ pub struct FlushColdResponse {
     pub placement: ShardPlacement,
     pub hot_start_offset: u64,
     pub group_commit_index: u64,
+    /// Hot backlog after the write applied (bounded-stream-state F6a), so
+    /// the runtime records its metric without a second state-machine round
+    /// trip. `None` from an older leader.
+    #[serde(default)]
+    pub hot_backlog: Option<WriteHotBacklog>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

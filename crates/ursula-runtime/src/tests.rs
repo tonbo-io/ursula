@@ -367,6 +367,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             already_exists: false,
             group_commit_index: 1,
             record_range: None,
+            hot_backlog: Some(crate::request::WriteHotBacklog::default()),
         })
     );
 
@@ -425,6 +426,11 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             placement,
             hot_start_offset: 2,
             group_commit_index: 3,
+            // F6a: the write response carries the backlog it left.
+            hot_backlog: Some(crate::request::WriteHotBacklog {
+                stream_hot_bytes: 1,
+                group_hot_bytes: 1,
+            }),
         })
     );
 
@@ -4413,6 +4419,7 @@ impl GroupEngine for RecordingEngine {
                 already_exists: false,
                 group_commit_index: self.commit_index,
                 record_range: None,
+                hot_backlog: None,
             })
         })
     }
@@ -4510,6 +4517,7 @@ impl GroupEngine for RecordingEngine {
             Ok(DeleteStreamResponse {
                 placement,
                 group_commit_index: self.commit_index,
+                hot_backlog: None,
             })
         })
     }

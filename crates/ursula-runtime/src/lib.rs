@@ -224,6 +224,7 @@ pub use request::TidyStreamsResponse;
 pub use request::TouchStreamAccessResponse;
 pub use request::UpdateStreamAttrsRequest;
 pub use request::UpdateStreamAttrsResponse;
+pub use request::WriteHotBacklog;
 pub use runtime::COLD_ORPHAN_SWEEP_GRACE_MS;
 pub use runtime::ColdIndexRepairStep;
 pub use runtime::PurgeBucketReport;

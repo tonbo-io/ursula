@@ -833,6 +833,25 @@ pub(crate) fn is_stale_cold_flush_candidate_error(err: &RuntimeError) -> bool {
     }
 }
 
+/// Records the hot backlog a write response carried (F6a), falling back to
+/// a state-machine query when the response came from an older leader.
+pub(crate) async fn record_write_hot_backlog(
+    group: &mut Box<dyn GroupEngine>,
+    metrics: &RuntimeMetricsInner,
+    backlog: Option<crate::request::WriteHotBacklog>,
+    stream_id: BucketStreamId,
+    placement: ShardPlacement,
+) {
+    match backlog {
+        Some(backlog) => metrics.record_cold_hot_backlog(
+            placement.raft_group_id,
+            backlog.stream_hot_bytes,
+            backlog.group_hot_bytes,
+        ),
+        None => record_cold_hot_backlog(group, metrics, stream_id, placement).await,
+    }
+}
+
 pub(crate) async fn record_cold_hot_backlog(
     group: &mut Box<dyn GroupEngine>,
     metrics: &RuntimeMetricsInner,
