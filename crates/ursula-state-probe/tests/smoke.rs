@@ -53,15 +53,17 @@ fn tiny_workloads_produce_metrics_and_checks() {
     let w3 = Workload::W3(parse::<W3Args>("--appends=20 --recs-per-append=10"))
         .run(&dir, false)
         .expect("w3");
-    assert_eq!(w3.metrics["message_records"], 200.0);
-    assert!(!check_met(&w3, "f4_message_records_per_stream"));
+    // F4a (level 1): external appends collapse the cold message records.
+    assert_eq!(w3.metrics["message_records"], 1.0);
+    assert!(check_met(&w3, "f4_message_records_per_stream"));
     assert!(check_met(&w3, "f5_staged_external_refs_per_stream"));
 
     let w4 = Workload::W4(parse::<W4Args>("--appends=2000 --checkpoints=2000"))
         .run(&dir, false)
         .expect("w4");
-    assert_eq!(w4.metrics["receipts"], 2000.0);
-    assert!(!check_met(&w4, "f3_receipt_items_per_stream"));
+    // F3 (level 1): the receipt window keeps 1,024 items.
+    assert_eq!(w4.metrics["receipts"], 1024.0);
+    assert!(check_met(&w4, "f3_receipt_items_per_stream"));
 
     let w5 = Workload::W5(parse::<W5Args>("--mode=ttl-heap --appends=500"))
         .run(&dir, false)

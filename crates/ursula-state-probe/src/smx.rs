@@ -34,6 +34,16 @@ pub fn sid(bucket: &str, affinity: &str, name: &str) -> BucketStreamId {
     BucketStreamId::with_affinity(bucket, affinity, name)
 }
 
+/// Raises the group to `level` (C0) so level-gated bounds apply, as on a
+/// cluster whose operator raised it (W3/W4 run at level 1: F3, F4a).
+pub fn raise_feature_level(m: &mut StreamStateMachine, level: u32) -> Result<()> {
+    ok(
+        m.apply(StreamCommand::SetFeatureLevel { level }),
+        "set feature level",
+    )?;
+    Ok(())
+}
+
 pub fn create_bucket(m: &mut StreamStateMachine, bucket: &str) -> Result<()> {
     ok(
         m.apply(StreamCommand::CreateBucket {

@@ -2,6 +2,7 @@
 //! bounded (8 MiB threshold) so producer state dominates. `--producers=P`
 //! round-robins over P producer ids; `--epoch-every=E` bumps each producer's
 //! epoch every E of its appends; `--retain-every=N` (W6) adds retention.
+//! Runs at feature level 1, where the per-stream receipt window (F3) applies.
 
 use std::time::Instant;
 
@@ -85,6 +86,7 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
     let mut rng = payload::Rng::new(11);
     let base = Baseline::now();
     let mut m = StreamStateMachine::new();
+    smx::raise_feature_level(&mut m, ursula_stream::FEATURE_LEVEL_KEYED_STREAMS)?;
     smx::create_bucket(&mut m, "bkt1")?;
     let id = smx::sid("bkt1", "h0001", "log");
     smx::create_stream(&mut m, &id, None, None, smx::T0)?;
