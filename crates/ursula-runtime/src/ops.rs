@@ -303,6 +303,20 @@ macro_rules! runtime_operations {
                 handle { call set_bucket_quota(engine, metrics, request, placement) }
                 client { pub group fn set_bucket_quota }
             }
+            op FeatureLevel {
+                fields {}
+                reply { response_tx: u32 }
+                guard { none }
+                handle { call feature_level(engine, metrics, placement) }
+                client { pub group fn feature_level }
+            }
+            op SetFeatureLevel {
+                fields { request: SetFeatureLevelRequest }
+                reply { response_tx: SetFeatureLevelResponse }
+                guard { none }
+                handle { call set_feature_level(engine, metrics, request, placement) }
+                client { pub group fn set_feature_level }
+            }
             op AckColdGc {
                 fields { up_to_seq: u64 }
                 reply { response_tx: AckColdGcResponse }

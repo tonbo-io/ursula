@@ -35,6 +35,7 @@ use super::GroupEngineCreateFuture;
 use super::GroupEngineError;
 use super::GroupEngineFactory;
 use super::GroupEngineMetrics;
+use super::GroupFeatureLevelFuture;
 use super::GroupFlushColdFuture;
 use super::GroupGetStreamAttrsFuture;
 use super::GroupHeadStreamFuture;
@@ -48,6 +49,7 @@ use super::GroupReadSnapshotFuture;
 use super::GroupReadStreamFuture;
 use super::GroupReadStreamPartsFuture;
 use super::GroupSetBucketQuotaFuture;
+use super::GroupSetFeatureLevelFuture;
 use super::GroupSnapshotFuture;
 use super::GroupTouchStreamAccessFuture;
 use super::GroupUpdateStreamAttrsFuture;
@@ -105,6 +107,8 @@ use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::SetBucketQuotaRequest;
 use crate::request::SetBucketQuotaResponse;
+use crate::request::SetFeatureLevelRequest;
+use crate::request::SetFeatureLevelResponse;
 use crate::request::StreamAppendCount;
 use crate::request::TouchStreamAccessResponse;
 use crate::request::UpdateStreamAttrsRequest;
@@ -494,6 +498,20 @@ impl InMemoryGroupEngine {
                     placement,
                     group_commit_index: self.commit_index,
                 }))
+            }
+            StreamResponse::FeatureLevelSet {
+                level,
+                previous_level,
+            } => {
+                self.commit_index += 1;
+                Ok(GroupWriteResponse::SetFeatureLevel(
+                    SetFeatureLevelResponse {
+                        placement,
+                        level,
+                        previous_level,
+                        group_commit_index: self.commit_index,
+                    },
+                ))
             }
             StreamResponse::RetentionAdvanced {
                 retained_offset,
@@ -1036,6 +1054,11 @@ impl InMemoryGroupEngine {
         self.state_machine.bucket_usage_report()
     }
 
+    /// Replicated group feature level (C0) of the applied state.
+    pub fn feature_level(&self) -> u32 {
+        self.state_machine.feature_level()
+    }
+
     pub fn head_stream_after_access(
         &mut self,
         request: &HeadStreamRequest,
@@ -1439,6 +1462,26 @@ impl GroupEngine for InMemoryGroupEngine {
                 GroupWriteResponse::ImportGroupState(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
                     "unexpected group state import response: {other:?}"
+                ))),
+            }
+        })
+    }
+
+    fn feature_level<'a>(&'a mut self, _placement: ShardPlacement) -> GroupFeatureLevelFuture<'a> {
+        Box::pin(async move { Ok(self.state_machine.feature_level()) })
+    }
+
+    fn set_feature_level<'a>(
+        &'a mut self,
+        request: SetFeatureLevelRequest,
+        placement: ShardPlacement,
+    ) -> GroupSetFeatureLevelFuture<'a> {
+        Box::pin(async move {
+            let command = GroupWriteCommand::from(request);
+            match self.apply_committed_write(command, placement)? {
+                GroupWriteResponse::SetFeatureLevel(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected set feature level write response: {other:?}"
                 ))),
             }
         })
@@ -2073,7 +2116,8 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::PurgeBucket { .. }
         | StreamCommand::AckColdGc { .. }
         | StreamCommand::ImportSnapshot { .. }
-        | StreamCommand::SetBucketQuota { .. } => None,
+        | StreamCommand::SetBucketQuota { .. }
+        | StreamCommand::SetFeatureLevel { .. } => None,
         StreamCommand::CreateStream { stream_id, .. }
         | StreamCommand::CreateExternal { stream_id, .. }
         | StreamCommand::Append { stream_id, .. }

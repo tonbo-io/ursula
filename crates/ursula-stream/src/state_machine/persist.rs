@@ -107,6 +107,7 @@ impl StreamStateMachine {
             shared_cold_object_owners,
             bucket_usage: self.bucket_usage_report(),
             bucket_quotas: self.bucket_quota_report(),
+            feature_level: self.feature_level,
         }
     }
 
@@ -130,7 +131,10 @@ impl StreamStateMachine {
         let buckets = u64::try_from(snapshot.buckets.len()).unwrap_or(u64::MAX);
         let streams = u64::try_from(snapshot.streams.len()).unwrap_or(u64::MAX);
         match Self::restore(snapshot) {
-            Ok(restored) => {
+            Ok(mut restored) => {
+                // The feature level is never lowered, not even by importing
+                // a backup taken at a lower level.
+                restored.feature_level = restored.feature_level.max(self.feature_level);
                 *self = restored;
                 StreamResponse::SnapshotImported { buckets, streams }
             }
@@ -142,7 +146,16 @@ impl StreamStateMachine {
     }
 
     pub fn restore(snapshot: StreamSnapshot) -> Result<Self, StreamSnapshotError> {
-        let mut machine = Self::default();
+        if snapshot.feature_level > crate::feature::MAX_SUPPORTED_FEATURE_LEVEL {
+            return Err(StreamSnapshotError::UnsupportedFeatureLevel {
+                level: snapshot.feature_level,
+                supported: crate::feature::MAX_SUPPORTED_FEATURE_LEVEL,
+            });
+        }
+        let mut machine = Self {
+            feature_level: snapshot.feature_level,
+            ..Self::default()
+        };
         for bucket_id in &snapshot.buckets {
             if !machine.buckets.insert(bucket_id.clone()) {
                 return Err(StreamSnapshotError::DuplicateBucket(bucket_id.clone()));

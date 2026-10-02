@@ -38,6 +38,10 @@ pub struct StreamSnapshot {
     /// Per-bucket data-plane quota records. Absent in legacy snapshots.
     #[serde(default)]
     pub bucket_quotas: Vec<BucketQuotaSnapshot>,
+    /// Replicated group feature level (C0). Absent in legacy snapshots,
+    /// which decode as level 0.
+    #[serde(default)]
+    pub feature_level: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,4 +115,9 @@ pub enum StreamSnapshotError {
         snapshot_offset: u64,
         tail_offset: u64,
     },
+    #[error(
+        "snapshot feature level {level} exceeds this binary's supported level {supported}; \
+         a binary that cannot apply that level must not run this group"
+    )]
+    UnsupportedFeatureLevel { level: u32, supported: u32 },
 }

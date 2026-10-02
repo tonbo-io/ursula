@@ -55,6 +55,7 @@ use ursula_runtime::GroupDeleteStreamFuture;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
+use ursula_runtime::GroupFeatureLevelFuture;
 use ursula_runtime::GroupFlushColdFuture;
 use ursula_runtime::GroupGetStreamAttrsFuture;
 use ursula_runtime::GroupHeadStreamFuture;
@@ -69,6 +70,7 @@ use ursula_runtime::GroupReadStreamFuture;
 use ursula_runtime::GroupReadStreamParts;
 use ursula_runtime::GroupReadStreamPartsFuture;
 use ursula_runtime::GroupSetBucketQuotaFuture;
+use ursula_runtime::GroupSetFeatureLevelFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
@@ -83,6 +85,7 @@ use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::SetBucketQuotaRequest;
+use ursula_runtime::SetFeatureLevelRequest;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::StreamErrorCode;
 use ursula_runtime::TouchStreamAccessResponse;
@@ -728,6 +731,17 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
+    fn feature_level<'a>(&'a mut self, _placement: ShardPlacement) -> GroupFeatureLevelFuture<'a> {
+        Box::pin(async move {
+            // Local applied state, follower or leader: `ursulactl cluster
+            // enable-feature` verifies every replica, not just leaders.
+            self.with_state_machine(move |state_machine| {
+                Box::pin(async move { Ok(state_machine.engine.feature_level()) })
+            })
+            .await?
+        })
+    }
+
     fn get_stream_attrs<'a>(
         &'a mut self,
         request: GetStreamAttrsRequest,
@@ -964,6 +978,33 @@ impl GroupEngine for RaftGroupEngine {
                 GroupWriteResponse::SetBucketQuota(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
                     "unexpected set bucket quota write response: {other:?}"
+                ))),
+            }
+        })
+    }
+
+    fn set_feature_level<'a>(
+        &'a mut self,
+        request: SetFeatureLevelRequest,
+        _placement: ShardPlacement,
+    ) -> GroupSetFeatureLevelFuture<'a> {
+        Box::pin(async move {
+            let command = GroupWriteCommand::from(request);
+            if let Some(response) = self
+                .forward_write_to_leader_if_follower(command.clone())
+                .await?
+            {
+                return match response {
+                    GroupWriteResponse::SetFeatureLevel(response) => Ok(response),
+                    other => Err(GroupEngineError::new(format!(
+                        "unexpected set feature level write response: {other:?}"
+                    ))),
+                };
+            }
+            match self.write(command).await? {
+                GroupWriteResponse::SetFeatureLevel(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected set feature level write response: {other:?}"
                 ))),
             }
         })

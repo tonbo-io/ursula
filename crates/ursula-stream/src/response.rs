@@ -85,6 +85,14 @@ pub enum StreamResponse {
         buckets: u64,
         streams: u64,
     },
+    /// Result of [`StreamCommand::SetFeatureLevel`]: the group's level after
+    /// apply and the level it held before.
+    ///
+    /// [`StreamCommand::SetFeatureLevel`]: crate::StreamCommand::SetFeatureLevel
+    FeatureLevelSet {
+        level: u32,
+        previous_level: u32,
+    },
     Error {
         code: StreamErrorCode,
         message: String,
@@ -126,6 +134,9 @@ pub enum StreamErrorCode {
     /// A state import payload failed snapshot validation.
     ImportInvalid,
     QuotaExceeded,
+    /// The command needs a higher group feature level than the group holds.
+    /// Deterministic: every replica rejects it the same way.
+    FeatureNotEnabled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
