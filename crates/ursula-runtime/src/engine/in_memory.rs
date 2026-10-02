@@ -1222,6 +1222,18 @@ impl InMemoryGroupEngine {
                 .state_machine
                 .read_plan_at(stream_id, record.start_offset, len, now_ms)
                 .map_err(stream_response_error)?;
+            // Bootstrap never reads cold storage: the plan only lists
+            // messages at or above the exact-message frontier, which are hot.
+            if plan
+                .segments
+                .iter()
+                .any(|segment| !matches!(segment, StreamReadSegment::Hot(_)))
+            {
+                return Err(GroupEngineError::new(format!(
+                    "bootstrap message [{}..{}) for stream '{stream_id}' is not hot",
+                    record.start_offset, record.end_offset
+                )));
+            }
             let payload = self.read_own_payload_from_plan(stream_id, &plan).await?;
             updates.push(BootstrapUpdate {
                 start_offset: record.start_offset,

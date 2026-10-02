@@ -750,6 +750,34 @@ impl StreamStateMachine {
             .message_records = compacted;
     }
 
+    /// Lowest offset from which every retained message record is known to
+    /// be one exact, whole message whose bytes are still hot.
+    ///
+    /// Cold flushes cut at byte offsets, then collapse the records below the
+    /// flush frontier into one record and truncate a record that straddles
+    /// it. The record that starts at (or crosses) the frontier may therefore
+    /// be the tail fragment of a message whose head is cold, so the boundary
+    /// is placed after that record. Without any cold coverage above the
+    /// retained offset, every record is exact and the result is the retained
+    /// offset.
+    pub(super) fn exact_message_frontier(&self, stream_id: &BucketStreamId) -> u64 {
+        let Some(slot) = self.stream_slot(stream_id) else {
+            return 0;
+        };
+        let retained_offset = slot.retained_offset;
+        let frontier = slot
+            .cold
+            .cold_frontier_offset(retained_offset)
+            .max(slot.hot_buffer.hot_start_offset());
+        if frontier <= retained_offset {
+            return retained_offset;
+        }
+        slot.message_records
+            .iter()
+            .find(|record| record.end_offset > frontier)
+            .map_or(frontier, |record| record.end_offset)
+    }
+
     pub(super) fn cold_frontier_offset(
         &self,
         stream_id: &BucketStreamId,

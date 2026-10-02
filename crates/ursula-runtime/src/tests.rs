@@ -789,7 +789,7 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
 }
 
 #[tokio::test]
-async fn bootstrap_reads_retained_updates_from_cold_chunk_after_snapshot() {
+async fn bootstrap_returns_honest_partial_when_updates_after_snapshot_are_cold() {
     let placement = placement();
     let stream = BucketStreamId::new("benchcmp", "cold-bootstrap");
     let cold_store = Arc::new(memory_cold_store());
@@ -871,6 +871,53 @@ async fn bootstrap_reads_retained_updates_from_cold_chunk_after_snapshot() {
         .expect("read retained update from cold chunk");
     assert_eq!(read.payload, b"de");
 
+    // The update after the snapshot is only in cold storage, so bootstrap
+    // returns the snapshot alone and sends the client back to an ordinary
+    // read from the snapshot offset (the read above).
+    let bootstrap = engine
+        .bootstrap_stream(
+            BootstrapStreamRequest {
+                stream_id: stream.clone(),
+                now_ms: 0,
+            },
+            placement,
+        )
+        .await
+        .expect("bootstrap");
+    assert_eq!(bootstrap.snapshot_offset, Some(3));
+    assert_eq!(bootstrap.snapshot_payload, b"abc-state");
+    assert!(bootstrap.updates.is_empty());
+    assert_eq!(bootstrap.next_offset, 3);
+    assert!(!bootstrap.up_to_date);
+    assert!(!bootstrap.closed);
+
+    // Messages appended after the flush stay hot. Once a snapshot sits at
+    // the cold frontier boundary, bootstrap is complete again with one part
+    // per message.
+    for payload in [b"fg".as_slice(), b"hij".as_slice()] {
+        engine
+            .append(
+                AppendRequest::from_bytes(stream.clone(), payload.to_vec()),
+                placement,
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .expect("append hot message");
+    }
+    engine
+        .publish_snapshot(
+            PublishSnapshotRequest {
+                stream_id: stream.clone(),
+                snapshot_offset: 7,
+                content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+                payload: Bytes::from_static(b"abcdefg-state"),
+                expected_digest: None,
+                now_ms: 0,
+            },
+            placement,
+        )
+        .await
+        .expect("publish hot snapshot");
     let bootstrap = engine
         .bootstrap_stream(
             BootstrapStreamRequest {
@@ -881,13 +928,13 @@ async fn bootstrap_reads_retained_updates_from_cold_chunk_after_snapshot() {
         )
         .await
         .expect("bootstrap");
-    assert_eq!(bootstrap.snapshot_offset, Some(3));
-    assert_eq!(bootstrap.snapshot_payload, b"abc-state");
-    assert_eq!(bootstrap.next_offset, 5);
+    assert_eq!(bootstrap.snapshot_offset, Some(7));
+    assert_eq!(bootstrap.next_offset, 10);
+    assert!(bootstrap.up_to_date);
     assert_eq!(bootstrap.updates.len(), 1);
-    assert_eq!(bootstrap.updates[0].start_offset, 3);
-    assert_eq!(bootstrap.updates[0].next_offset, 5);
-    assert_eq!(bootstrap.updates[0].payload, b"de");
+    assert_eq!(bootstrap.updates[0].start_offset, 7);
+    assert_eq!(bootstrap.updates[0].next_offset, 10);
+    assert_eq!(bootstrap.updates[0].payload, b"hij");
 }
 
 #[tokio::test]
