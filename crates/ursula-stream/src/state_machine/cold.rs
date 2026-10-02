@@ -404,96 +404,8 @@ impl StreamStateMachine {
         stream_id: BucketStreamId,
         chunk: ColdChunkRef,
     ) -> StreamResponse {
-        if let Err(response) = self.validate_stream_scope(&stream_id) {
+        if let Err(response) = self.check_cold_flush(&stream_id, &chunk) {
             return response;
-        }
-        if chunk.s3_path.trim().is_empty() {
-            return StreamResponse::error(
-                StreamErrorCode::InvalidColdFlush,
-                "cold chunk S3 path must not be empty",
-            );
-        }
-        if chunk.object_size == 0 {
-            return StreamResponse::error(
-                StreamErrorCode::InvalidColdFlush,
-                "cold chunk object size must be greater than zero",
-            );
-        }
-        let Some(slot) = self.stream_slot(&stream_id) else {
-            return StreamResponse::error(
-                StreamErrorCode::StreamNotFound,
-                format!("stream '{stream_id}' does not exist"),
-            );
-        };
-        let stream = &slot.metadata;
-        if chunk.end_offset <= chunk.start_offset {
-            return StreamResponse::error_with_next_offset(
-                StreamErrorCode::InvalidColdFlush,
-                "cold chunk must cover at least one byte",
-                stream.tail_offset,
-            );
-        }
-        let logical_size = chunk.end_offset.saturating_sub(chunk.start_offset);
-        if chunk
-            .object_offset
-            .checked_add(logical_size)
-            .is_none_or(|end| end > chunk.object_size)
-        {
-            return StreamResponse::error_with_next_offset(
-                StreamErrorCode::InvalidColdFlush,
-                "cold chunk slice is outside the physical object",
-                stream.tail_offset,
-            );
-        }
-        if !chunk.shared_object && chunk.object_offset != 0 {
-            return StreamResponse::error_with_next_offset(
-                StreamErrorCode::InvalidColdFlush,
-                "exclusive cold chunks must start at physical object offset zero",
-                stream.tail_offset,
-            );
-        }
-        if chunk.end_offset > stream.tail_offset {
-            return StreamResponse::error_with_next_offset_and_context(
-                StreamErrorCode::InvalidColdFlush,
-                format!(
-                    "cold chunk end {} is beyond stream '{}' tail {}",
-                    chunk.end_offset, stream_id, stream.tail_offset
-                ),
-                stream.tail_offset,
-                vec![StreamErrorContext::StaleColdFlushCandidate],
-            );
-        }
-        let hot_buffer = &slot.hot_buffer;
-        if hot_buffer.hot_start_offset() != chunk.start_offset {
-            return StreamResponse::error_with_next_offset_and_context(
-                StreamErrorCode::InvalidColdFlush,
-                format!("cold chunk for stream '{stream_id}' must start at the hot prefix"),
-                stream.tail_offset,
-                vec![StreamErrorContext::StaleColdFlushCandidate],
-            );
-        }
-        if !hot_buffer.covers_prefix(chunk.start_offset, chunk.end_offset) {
-            return StreamResponse::error_with_next_offset_and_context(
-                StreamErrorCode::InvalidColdFlush,
-                format!(
-                    "cold chunk for stream '{stream_id}' does not cover contiguous hot payload"
-                ),
-                stream.tail_offset,
-                vec![StreamErrorContext::StaleColdFlushCandidate],
-            );
-        }
-        if !chunk.payload_digest.is_empty()
-            && hot_buffer
-                .digest_prefix(chunk.start_offset, chunk.end_offset)
-                .as_deref()
-                != Some(chunk.payload_digest.as_str())
-        {
-            return StreamResponse::error_with_next_offset_and_context(
-                StreamErrorCode::InvalidColdFlush,
-                format!("cold chunk payload for stream '{stream_id}' is stale"),
-                stream.tail_offset,
-                vec![StreamErrorContext::StaleColdFlushCandidate],
-            );
         }
         let shared_path = chunk.shared_object.then(|| chunk.s3_path.clone());
         let slot = self
@@ -515,6 +427,109 @@ impl StreamStateMachine {
         StreamResponse::ColdFlushed {
             hot_start_offset: self.hot_start_offset(&stream_id),
         }
+    }
+
+    /// Read-only half of `FlushCold` apply: `Ok` exactly when applying
+    /// `FlushCold { stream_id, chunk }` now would succeed. A leader checks it
+    /// before writing the chunk's cold-index page entry, so the entry's range
+    /// is proven to be hot, committed bytes when the write clips other
+    /// entries (bounded-state F19 step 1), and a stale candidate writes no
+    /// entry at all.
+    pub fn check_cold_flush(
+        &self,
+        stream_id: &BucketStreamId,
+        chunk: &ColdChunkRef,
+    ) -> Result<(), StreamResponse> {
+        self.validate_stream_scope(stream_id)?;
+        if chunk.s3_path.trim().is_empty() {
+            return Err(StreamResponse::error(
+                StreamErrorCode::InvalidColdFlush,
+                "cold chunk S3 path must not be empty",
+            ));
+        }
+        if chunk.object_size == 0 {
+            return Err(StreamResponse::error(
+                StreamErrorCode::InvalidColdFlush,
+                "cold chunk object size must be greater than zero",
+            ));
+        }
+        let Some(slot) = self.stream_slot(stream_id) else {
+            return Err(StreamResponse::error(
+                StreamErrorCode::StreamNotFound,
+                format!("stream '{stream_id}' does not exist"),
+            ));
+        };
+        let stream = &slot.metadata;
+        if chunk.end_offset <= chunk.start_offset {
+            return Err(StreamResponse::error_with_next_offset(
+                StreamErrorCode::InvalidColdFlush,
+                "cold chunk must cover at least one byte",
+                stream.tail_offset,
+            ));
+        }
+        let logical_size = chunk.end_offset.saturating_sub(chunk.start_offset);
+        if chunk
+            .object_offset
+            .checked_add(logical_size)
+            .is_none_or(|end| end > chunk.object_size)
+        {
+            return Err(StreamResponse::error_with_next_offset(
+                StreamErrorCode::InvalidColdFlush,
+                "cold chunk slice is outside the physical object",
+                stream.tail_offset,
+            ));
+        }
+        if !chunk.shared_object && chunk.object_offset != 0 {
+            return Err(StreamResponse::error_with_next_offset(
+                StreamErrorCode::InvalidColdFlush,
+                "exclusive cold chunks must start at physical object offset zero",
+                stream.tail_offset,
+            ));
+        }
+        if chunk.end_offset > stream.tail_offset {
+            return Err(StreamResponse::error_with_next_offset_and_context(
+                StreamErrorCode::InvalidColdFlush,
+                format!(
+                    "cold chunk end {} is beyond stream '{}' tail {}",
+                    chunk.end_offset, stream_id, stream.tail_offset
+                ),
+                stream.tail_offset,
+                vec![StreamErrorContext::StaleColdFlushCandidate],
+            ));
+        }
+        let hot_buffer = &slot.hot_buffer;
+        if hot_buffer.hot_start_offset() != chunk.start_offset {
+            return Err(StreamResponse::error_with_next_offset_and_context(
+                StreamErrorCode::InvalidColdFlush,
+                format!("cold chunk for stream '{stream_id}' must start at the hot prefix"),
+                stream.tail_offset,
+                vec![StreamErrorContext::StaleColdFlushCandidate],
+            ));
+        }
+        if !hot_buffer.covers_prefix(chunk.start_offset, chunk.end_offset) {
+            return Err(StreamResponse::error_with_next_offset_and_context(
+                StreamErrorCode::InvalidColdFlush,
+                format!(
+                    "cold chunk for stream '{stream_id}' does not cover contiguous hot payload"
+                ),
+                stream.tail_offset,
+                vec![StreamErrorContext::StaleColdFlushCandidate],
+            ));
+        }
+        if !chunk.payload_digest.is_empty()
+            && hot_buffer
+                .digest_prefix(chunk.start_offset, chunk.end_offset)
+                .as_deref()
+                != Some(chunk.payload_digest.as_str())
+        {
+            return Err(StreamResponse::error_with_next_offset_and_context(
+                StreamErrorCode::InvalidColdFlush,
+                format!("cold chunk payload for stream '{stream_id}' is stale"),
+                stream.tail_offset,
+                vec![StreamErrorContext::StaleColdFlushCandidate],
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn compact_cold(
