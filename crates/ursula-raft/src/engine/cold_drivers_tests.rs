@@ -86,6 +86,7 @@ async fn read_all(runtime: &ShardRuntime, stream_id: &BucketStreamId) -> Vec<u8>
             record: None,
             max_records: None,
             leader_only: false,
+            record_anchor: None,
         })
         .await
         .expect("read stream")

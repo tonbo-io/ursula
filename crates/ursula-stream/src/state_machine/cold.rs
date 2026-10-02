@@ -293,6 +293,18 @@ impl StreamStateMachine {
                 );
             }
         };
+        // F1 (level 2): a target inside sealed history lands on the mark at
+        // or below it; the response reports the effective boundary.
+        let retained_offset = prepared_record_retain.as_ref().map_or(
+            retained_offset,
+            crate::record_index::PreparedRetain::effective_offset,
+        );
+        if retained_offset == current {
+            return StreamResponse::RetentionAdvanced {
+                retained_offset,
+                record_range: self.record_range(&stream_id).ok().flatten(),
+            };
+        }
         let slot = self
             .stream_slot_mut(&stream_id)
             .expect("stream existence checked before retention mutation");
@@ -361,6 +373,8 @@ impl StreamStateMachine {
         // F4a (level 1): external appends above the flushed hot prefix are
         // cold too; collapse everything below the seal point.
         self.collapse_sealed_message_records(&stream_id);
+        // F1 (level 2): seal the record offsets below the seal point.
+        self.seal_record_index(&stream_id);
         StreamResponse::ColdFlushed {
             hot_start_offset: self.hot_start_offset(&stream_id),
         }

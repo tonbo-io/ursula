@@ -1624,6 +1624,7 @@ pub(super) async fn verify_runtime_raft_partial_read(
             record: None,
             max_records: None,
             leader_only: false,
+            record_anchor: None,
         })
         .await
         .expect("runtime raft partial read");
@@ -1673,6 +1674,7 @@ pub(super) async fn verify_runtime_raft_tail_read(
             record: None,
             max_records: None,
             leader_only: false,
+            record_anchor: None,
         })
         .await
         .expect("runtime raft tail read");
@@ -1742,6 +1744,7 @@ pub(super) async fn verify_runtime_raft_close_stream(
             record: None,
             max_records: None,
             leader_only: false,
+            record_anchor: None,
         })
         .await
         .expect("read closed runtime raft stream");
@@ -2135,6 +2138,7 @@ pub(super) async fn read_local_payload_eventually(
                     record: None,
                     max_records: None,
                     leader_only: false,
+                    record_anchor: None,
                 },
                 placement(),
             )

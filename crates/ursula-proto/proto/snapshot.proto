@@ -84,8 +84,17 @@ message StreamSnapshotEntryV1 {
   StreamVisibleSnapshotV1 visible_snapshot = 12;
   repeated ProducerSnapshotV1 producer_states = 13;
   optional uint64 first_record = 14;
+  // Exact start offsets of the dense (unflushed) records, from
+  // dense_first_record (field 19) when present, else from first_record.
   repeated uint64 record_offsets = 15;
   optional uint64 retained_offset = 16;
+  // Sparse cold record marks (bounded-state F1, feature level 2): one
+  // (record, offset) pair per 1 MiB block of sealed log that holds a record
+  // start, as two parallel lists. Absent means all-dense.
+  repeated uint64 record_mark_records = 17;
+  repeated uint64 record_mark_offsets = 18;
+  // First record with a dense offset. Absent means first_record.
+  optional uint64 dense_first_record = 19;
 }
 
 message StreamMetadataV1 {

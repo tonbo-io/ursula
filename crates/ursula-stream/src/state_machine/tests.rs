@@ -400,6 +400,7 @@ fn appended(offset: u64, next_offset: u64) -> StreamResponse {
         deduplicated: false,
         producer: None,
         receipt_evicted: false,
+        record_range: None,
     }
 }
 
@@ -418,6 +419,7 @@ fn appended_by(
         deduplicated,
         producer: Some(producer),
         receipt_evicted: false,
+        record_range: None,
     }
 }
 
@@ -504,7 +506,18 @@ fn json_record_coordinates_survive_flush_restore_and_retention() {
             now_ms: 1,
             ..Append::default()
         })),
-        appended(16, 24)
+        StreamResponse::Appended {
+            offset: 16,
+            next_offset: 24,
+            closed: false,
+            deduplicated: false,
+            producer: None,
+            receipt_evicted: false,
+            record_range: Some(StreamRecordRange {
+                first_record: 2,
+                next_record: 3,
+            }),
+        }
     );
     assert_eq!(
         machine.record_range(&stream_id),
@@ -2633,6 +2646,7 @@ fn close_is_monotonic_and_close_only_is_idempotent() {
             deduplicated: false,
             producer: None,
             receipt_evicted: false,
+            record_range: None,
         }
     );
     assert_eq!(
@@ -2800,12 +2814,14 @@ fn producer_append_batch_deduplicates_retries_without_partial_mutation() {
             next_offset: 2,
             closed: false,
             deduplicated: false,
+            record_range: None,
         },
         StreamBatchAppendItem {
             offset: 2,
             next_offset: 3,
             closed: false,
             deduplicated: false,
+            record_range: None,
         },
     ]);
     assert!(!first.deduplicated);
@@ -3122,6 +3138,7 @@ fn append_conflict_precedence_reports_closed_before_mismatch_or_seq() {
             deduplicated: false,
             producer: None,
             receipt_evicted: false,
+            record_range: None,
         }
     );
 
@@ -3511,6 +3528,7 @@ proptest! {
                 next_offset,
                 closed: false,
                 deduplicated: true,
+                record_range: None,
             });
         }
 

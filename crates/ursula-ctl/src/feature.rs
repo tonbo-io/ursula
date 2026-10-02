@@ -54,7 +54,16 @@ pub struct GroupFeatureLevel {
     pub level: Option<u32>,
     #[serde(default)]
     pub error: Option<String>,
+    /// Whether the reporting node completed a cold-index page-repair cycle
+    /// as this group's leader (bounded-state F19). Absent on nodes that
+    /// predate level 2, which counts as not completed.
+    #[serde(default)]
+    pub page_repair_completed: bool,
 }
+
+/// First feature level whose raise needs a completed page-repair cycle in
+/// every group (bounded-state Lb2, F1 sparse marks).
+pub const PAGE_REPAIR_REQUIRED_LEVEL: u32 = 2;
 
 fn default_hosted() -> bool {
     true
@@ -70,7 +79,8 @@ pub struct SetFeatureLevelReport {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GroupFeatureLevelOutcome {
     pub raft_group_id: u64,
-    /// `set`, `not_leader`, `not_hosted`, or `error`.
+    /// `set`, `not_leader`, `not_hosted`, `repair_pending` (level 2 and up,
+    /// no completed page-repair cycle on this node), or `error`.
     pub status: String,
     #[serde(default)]
     pub level: Option<u32>,
@@ -205,6 +215,36 @@ pub fn check_feature_support(
     }
 }
 
+/// Page-repair check for the raise to level 2 (bounded-state §5.1): every
+/// group any node reports must have a node reporting a completed cold-index
+/// page-repair cycle for it. `Ok` below level 2.
+pub fn check_page_repair(level: u32, reports: &BTreeMap<u64, FeatureLevelReport>) -> Result<()> {
+    if level < PAGE_REPAIR_REQUIRED_LEVEL {
+        return Ok(());
+    }
+    let mut groups = BTreeMap::<u64, bool>::new();
+    for report in reports.values() {
+        for group in &report.groups {
+            let completed = groups.entry(group.raft_group_id).or_default();
+            *completed = *completed || (group.hosted && group.page_repair_completed);
+        }
+    }
+    let pending = groups
+        .into_iter()
+        .filter(|(_, completed)| !completed)
+        .map(|(group, _)| group.to_string())
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "refusing to enable feature level {level}: no node reports a completed cold-index \
+             page-repair cycle for group(s) {}",
+            pending.join(", ")
+        ))
+    }
+}
+
 /// Verification: every group replica each node hosts reports a level
 /// `>= level`, and every group id seen anywhere is hosted somewhere. Returns
 /// the number of verified groups, or one line per lagging replica.
@@ -286,12 +326,20 @@ pub async fn enable_feature(
         .map(|(node_id, report)| (*node_id, report.supported_level))
         .collect::<BTreeMap<_, _>>();
     check_feature_support(level, &members, &supported)?;
+    check_page_repair(level, &reports)?;
 
     let deadline = tokio::time::Instant::now() + options.timeout;
     loop {
         for node in nodes {
             let report = client.set_feature_level(node, level).await?;
             for group in &report.groups {
+                if group.status == "repair_pending" {
+                    tracing::info!(
+                        node_id = node.id,
+                        raft_group_id = group.raft_group_id,
+                        "node has no completed page-repair cycle for group; its leader proposes"
+                    );
+                }
                 if group.status == "error" {
                     tracing::warn!(
                         node_id = node.id,
@@ -381,6 +429,7 @@ mod tests {
                     hosted: true,
                     level: *level,
                     error: None,
+                    page_repair_completed: false,
                 })
                 .collect(),
         }
@@ -439,6 +488,7 @@ mod tests {
             hosted: false,
             level: None,
             error: None,
+            page_repair_completed: false,
         });
         let reports =
             BTreeMap::from([(1, report(1, &[(0, Some(1)), (1, Some(1))])), (2, node_two)]);
@@ -452,9 +502,26 @@ mod tests {
                 hosted: false,
                 level: None,
                 error: None,
+                page_repair_completed: false,
             }],
         })]);
         assert!(verify_feature_levels(1, &orphan).is_err());
+    }
+
+    #[test]
+    fn page_repair_check_gates_only_level_two_and_up() {
+        let mut leader = report(2, &[(0, Some(1)), (1, Some(1))]);
+        leader.groups[0].page_repair_completed = true;
+        let follower = report(2, &[(0, Some(1)), (1, Some(1))]);
+        let reports = BTreeMap::from([(1, leader.clone()), (2, follower.clone())]);
+        check_page_repair(1, &reports).unwrap();
+        let err = check_page_repair(2, &reports).unwrap_err();
+        assert!(err.to_string().contains("group(s) 1"), "{err}");
+        // Group 1's leader reports a completed cycle on another node.
+        let mut other_leader = follower;
+        other_leader.groups[1].page_repair_completed = true;
+        let reports = BTreeMap::from([(1, leader), (2, other_leader)]);
+        check_page_repair(2, &reports).unwrap();
     }
 
     /// Fake node: owns `led` groups, hosts `hosted` groups, all of which

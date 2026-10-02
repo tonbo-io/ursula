@@ -43,6 +43,9 @@ impl StreamStateMachine {
             .transpose()
     }
 
+    /// Exact start offset of `record`. A sealed record (feature level 2)
+    /// that no mark names fails with [`RecordIndexError::RecordSealed`]; use
+    /// [`Self::locate_record`] to get its bracket.
     pub fn offset_for_record(
         &self,
         stream_id: &BucketStreamId,
@@ -53,10 +56,15 @@ impl StreamStateMachine {
         };
         slot.record_index
             .as_ref()
-            .map(|index| index.offset_for(record, slot.metadata.tail_offset))
+            .map(|index| index.exact_offset_for(record, slot.metadata.tail_offset))
             .transpose()
     }
 
+    /// Record range of a close acknowledgement (`start == next == tail`) or
+    /// of a producer's newest receipt item. Append acknowledgements carry
+    /// the range apply computed ([`StreamResponse::Appended`]); this never
+    /// derives one from the record index, which may have sealed it (F1,
+    /// RC-10).
     pub fn record_range_for_append(
         &self,
         stream_id: &BucketStreamId,
@@ -85,16 +93,17 @@ impl StreamStateMachine {
                 next_record,
             }));
         }
-        slot.record_index
-            .as_ref()
-            .map(|index| {
-                Ok(StreamRecordRange {
-                    first_record: index
-                        .record_for_offset(start_offset, slot.metadata.tail_offset)?,
-                    next_record: index.record_for_offset(next_offset, slot.metadata.tail_offset)?,
-                })
-            })
-            .transpose()
+        let Some(index) = slot.record_index.as_ref() else {
+            return Ok(None);
+        };
+        if start_offset == next_offset && next_offset == slot.metadata.tail_offset {
+            let next_record = index.range()?.next_record;
+            return Ok(Some(StreamRecordRange {
+                first_record: next_record,
+                next_record,
+            }));
+        }
+        Ok(None)
     }
 
     pub fn stream_attrs(&self, stream_id: &BucketStreamId) -> Option<&StreamAttrs> {
@@ -472,6 +481,7 @@ impl StreamStateMachine {
             closed: stream.status == StreamStatus::Closed,
             retained_record_range: None,
             record_range: None,
+            record_trim: None,
         })
     }
 

@@ -78,6 +78,7 @@ fn read_req(stream_id: BucketStreamId, offset: u64, max_len: usize) -> ReadStrea
         record: None,
         max_records: None,
         leader_only: false,
+        record_anchor: None,
     }
 }
 
@@ -572,6 +573,7 @@ async fn cold_index_read_materializes_overlapping_flush_objects_once() {
         up_to_date: true,
         closed: false,
         retained_record_range: None,
+        record_trim: None,
         record_range: None,
     };
 
@@ -1105,6 +1107,7 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
                 record: None,
                 max_records: None,
                 leader_only: false,
+                record_anchor: None,
             },
             placement,
         )
@@ -1149,6 +1152,7 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
                 record: None,
                 max_records: None,
                 leader_only: false,
+                record_anchor: None,
             },
             placement,
         )

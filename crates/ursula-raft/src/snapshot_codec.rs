@@ -310,13 +310,30 @@ fn stream_to_proto(
         .record_index
         .as_ref()
         .map(|index| {
-            index
-                .range()
-                .map(|range| (Some(range.first_record), index.record_offsets().to_vec()))
+            index.range().map(|range| {
+                (
+                    Some(range.first_record),
+                    index.dense_offsets().iter().copied().collect::<Vec<_>>(),
+                )
+            })
         })
         .transpose()
         .map_err(|err| SnapshotStoreError::Serialize(format!("record index: {err:?}")))?
         .unwrap_or((None, Vec::new()));
+    // F1 (level 2): marks are written only when the index has sealed records,
+    // so all-dense entries stay byte-identical to earlier releases.
+    let (record_mark_records, record_mark_offsets, dense_first_record) = entry
+        .record_index
+        .as_ref()
+        .filter(|index| !index.marks().is_empty())
+        .map(|index| {
+            (
+                index.marks().iter().map(|mark| mark.record).collect(),
+                index.marks().iter().map(|mark| mark.offset).collect(),
+                Some(index.dense_first_record()),
+            )
+        })
+        .unwrap_or_default();
     Ok(proto::StreamSnapshotEntryV1 {
         metadata: Some(metadata_to_proto(entry.metadata)),
         attrs_json: entry
@@ -354,6 +371,9 @@ fn stream_to_proto(
         first_record,
         record_offsets,
         retained_offset: entry.retained_offset,
+        record_mark_records,
+        record_mark_offsets,
+        dense_first_record,
     })
 }
 
@@ -372,11 +392,26 @@ fn stream_from_proto(
         .as_ref()
         .map(|metadata| metadata.tail_offset)
         .unwrap_or(0);
+    if entry.record_mark_records.len() != entry.record_mark_offsets.len() {
+        return Err(SnapshotStoreError::Deserialize(
+            "record index: mark record and offset lists differ in length".to_owned(),
+        ));
+    }
     let record_index = entry
         .first_record
         .map(|first_record| {
-            ursula_stream::StreamRecordIndex::restore(
+            ursula_stream::StreamRecordIndex::restore_sparse(
                 first_record,
+                entry
+                    .record_mark_records
+                    .iter()
+                    .zip(&entry.record_mark_offsets)
+                    .map(|(record, offset)| ursula_stream::RecordMark {
+                        record: *record,
+                        offset: *offset,
+                    })
+                    .collect(),
+                entry.dense_first_record.unwrap_or(first_record),
                 entry.record_offsets.clone(),
                 retained_offset,
                 tail_offset,

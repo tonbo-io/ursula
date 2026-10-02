@@ -9,6 +9,9 @@ use ursula_stream::ColdFlushPassRequest;
 use ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
 use ursula_stream::ObjectPayloadRef;
 use ursula_stream::ProducerRequest;
+use ursula_stream::RecordPlanError;
+use ursula_stream::RecordReadAnchor;
+use ursula_stream::RecordReadRequest;
 use ursula_stream::SharedRefCandidate;
 use ursula_stream::SharedRefCompactionRequest;
 use ursula_stream::SharedRefIdleTracker;
@@ -433,17 +436,9 @@ impl InMemoryGroupEngine {
                         closed: item.closed,
                         deduplicated: item.deduplicated,
                         producer: None,
-                        record_range: self
-                            .state_machine
-                            .record_range_for_append(
-                                &stream_id,
-                                item.offset,
-                                item.next_offset,
-                                Some(&producer),
-                            )
-                            .map_err(|err| {
-                                GroupEngineError::new(format!("record range: {err:?}"))
-                            })?,
+                        // F1 (RC-10, RC-11): the range apply computed or the
+                        // stored receipt's, never one derived from the index.
+                        record_range: item.record_range,
                         stream_hot_bytes,
                         group_hot_bytes,
                         receipt_evicted: false,
@@ -533,16 +528,11 @@ impl InMemoryGroupEngine {
                 deduplicated,
                 producer,
                 receipt_evicted,
+                record_range,
             } => {
                 let stream_id = require_response_stream_id(stream_id, "appended")?;
-                // F3: an evicted duplicate never gets a recomputed range.
-                let record_range = if receipt_evicted {
-                    None
-                } else {
-                    self.state_machine
-                        .record_range_for_append(&stream_id, offset, next_offset, producer.as_ref())
-                        .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?
-                };
+                // F1 (RC-10, RC-11): apply computed the range (or kept the
+                // receipt's); F3: an evicted duplicate carries none.
                 let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
                 let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
                 if !deduplicated {
@@ -998,17 +988,12 @@ impl InMemoryGroupEngine {
                 deduplicated,
                 producer,
                 receipt_evicted,
+                record_range,
             } => {
                 let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
                 let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
-                // F3: an evicted duplicate never gets a recomputed range.
-                let record_range = if receipt_evicted {
-                    None
-                } else {
-                    self.state_machine
-                        .record_range_for_append(&stream_id, offset, next_offset, producer.as_ref())
-                        .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?
-                };
+                // F1 (RC-10, RC-11): apply computed the range (or kept the
+                // receipt's); F3: an evicted duplicate carries none.
                 if !deduplicated {
                     self.commit_index += 1;
                     self.state_machine.add_stream_append_count(&stream_id, 1);
@@ -1075,106 +1060,23 @@ impl InMemoryGroupEngine {
                 .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?;
             return Ok(plan);
         };
-        let retained_record_range = self
-            .state_machine
-            .record_range(&request.stream_id)
-            .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?
-            .ok_or_else(|| {
-                GroupEngineError::stream(
-                    StreamErrorCode::InvalidRecordBoundaries,
-                    "record coordinates are inactive for this stream",
-                )
-            })?;
-        if record < retained_record_range.first_record {
-            return Err(GroupEngineError::stream(
-                StreamErrorCode::StreamGone,
-                format!(
-                    "record {record} is older than first retained record {}",
-                    retained_record_range.first_record
-                ),
-            ));
-        }
-        if record > retained_record_range.next_record {
-            return Err(GroupEngineError::stream(
-                StreamErrorCode::InvalidRecordBoundaries,
-                format!(
-                    "record {record} is beyond record tail {}",
-                    retained_record_range.next_record
-                ),
-            ));
-        }
-        let window_end = request
-            .max_records
-            .map(|limit| record.saturating_add(limit))
-            .unwrap_or(retained_record_range.next_record)
-            .min(retained_record_range.next_record);
-        let offset = self.record_offset(&request.stream_id, record)?;
-        // P7 (extensions.md §6.6): `max_len` is the request's `max_bytes`
-        // budget and cuts the planned window at the last record boundary
-        // within it, keeping at least one record.
-        let (next_record, next_offset) = self.record_byte_cut(
-            &request.stream_id,
-            record,
-            offset,
-            window_end,
-            request.max_len,
-        )?;
-        let max_len = usize::try_from(next_offset.saturating_sub(offset))
-            .map_err(|_| GroupEngineError::new("record read window exceeds usize"))?;
-        let mut plan = self
-            .state_machine
-            .read_plan_at(&request.stream_id, offset, max_len, request.now_ms)
-            .map_err(stream_response_error)?;
-        plan.retained_record_range = Some(retained_record_range);
-        plan.record_range = Some(ursula_stream::StreamRecordRange {
-            first_record: record,
-            next_record,
-        });
-        Ok(plan)
-    }
-
-    fn record_offset(
-        &self,
-        stream_id: &BucketStreamId,
-        record: u64,
-    ) -> Result<u64, GroupEngineError> {
         self.state_machine
-            .offset_for_record(stream_id, record)
-            .map_err(|err| GroupEngineError::new(format!("record offset: {err:?}")))?
-            .ok_or_else(|| GroupEngineError::new("record stream disappeared"))
-    }
-
-    /// Returns the end `(record, offset)` of the longest run of complete
-    /// records in `[record, window_end)` whose stored bytes fit in
-    /// `max_bytes`, and never fewer than one record when the window is not
-    /// empty. Record boundaries are monotonic, so this binary-searches them.
-    fn record_byte_cut(
-        &self,
-        stream_id: &BucketStreamId,
-        record: u64,
-        offset: u64,
-        window_end: u64,
-        max_bytes: usize,
-    ) -> Result<(u64, u64), GroupEngineError> {
-        let window_end_offset = self.record_offset(stream_id, window_end)?;
-        let budget = u64::try_from(max_bytes).unwrap_or(u64::MAX);
-        if window_end <= record || window_end_offset.saturating_sub(offset) <= budget {
-            return Ok((window_end, window_end_offset));
-        }
-        let limit = offset.saturating_add(budget);
-        // Invariant: `low` fits (or is the mandatory first record); every
-        // record end above `high` does not fit.
-        let mut low = record.saturating_add(1);
-        let mut high = window_end.saturating_sub(1);
-        while low < high {
-            let mid = low + (high - low).div_ceil(2);
-            if self.record_offset(stream_id, mid)? <= limit {
-                low = mid;
-            } else {
-                high = mid - 1;
-            }
-        }
-        Ok((low, self.record_offset(stream_id, low)?))
+            .record_read_plan(&RecordReadRequest {
+                stream_id: &request.stream_id,
+                record,
+                max_records: request.max_records,
+                max_bytes: request.max_len,
+                now_ms: request.now_ms,
+                anchor: request.record_anchor.map(|anchor| RecordReadAnchor {
+                    incarnation: anchor.incarnation,
+                    record: anchor.record,
+                    offset: anchor.offset,
+                }),
+            })
+            .map_err(|err| match err {
+                RecordPlanError::Response(response) => stream_response_error(response),
+                RecordPlanError::Index(message) => GroupEngineError::new(message),
+            })
     }
 
     /// Per-bucket usage held by this group's state machine. Public so the

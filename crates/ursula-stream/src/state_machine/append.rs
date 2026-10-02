@@ -30,7 +30,7 @@ struct StreamAppendUndo {
     metadata: StreamMetadata,
     hot_checkpoint: usize,
     message_records_len: usize,
-    record_checkpoint: Option<usize>,
+    record_checkpoint: Option<u64>,
     integrity: StreamIntegrity,
     producers: HashMap<String, Option<ProducerState>>,
 }
@@ -274,6 +274,7 @@ impl StreamStateMachine {
                 deduplicated: true,
                 producer: Some(producer),
                 receipt_evicted: true,
+                record_range: None,
             };
         }
         if let ProducerDecision::Duplicate {
@@ -281,7 +282,7 @@ impl StreamStateMachine {
             next_offset,
             closed,
             producer,
-            ..
+            items,
         } = producer_decision
         {
             if payload.is_empty() {
@@ -298,6 +299,7 @@ impl StreamStateMachine {
                 deduplicated: true,
                 producer: Some(producer),
                 receipt_evicted: false,
+                record_range: duplicate_record_range(&items, offset, next_offset),
             };
         }
 
@@ -466,6 +468,7 @@ impl StreamStateMachine {
                 deduplicated: false,
                 producer: producer_ack,
                 receipt_evicted: false,
+                record_range,
             }
         }
     }
@@ -533,6 +536,7 @@ impl StreamStateMachine {
                 deduplicated: true,
                 producer: Some(producer),
                 receipt_evicted: true,
+                record_range: None,
             };
         }
         if let ProducerDecision::Duplicate {
@@ -540,7 +544,7 @@ impl StreamStateMachine {
             next_offset,
             closed,
             producer,
-            ..
+            items,
         } = producer_decision
         {
             return StreamResponse::Appended {
@@ -550,6 +554,7 @@ impl StreamStateMachine {
                 deduplicated: true,
                 producer: Some(producer),
                 receipt_evicted: false,
+                record_range: duplicate_record_range(&items, offset, next_offset),
             };
         }
 
@@ -678,6 +683,10 @@ impl StreamStateMachine {
             ));
         // F4a: an external append is a cold transition.
         self.collapse_sealed_message_records(&stream_id);
+        // F1 (level 2): and it seals the records below the seal point, which
+        // may include its own; the acknowledgement uses the range computed
+        // above, never the index (RC-10).
+        self.seal_record_index(&stream_id);
         let appended_bytes = next_offset.saturating_sub(offset);
         self.usage_on_append(
             &stream_id.bucket_id,
@@ -691,6 +700,7 @@ impl StreamStateMachine {
             deduplicated: false,
             producer: producer_ack,
             receipt_evicted: false,
+            record_range,
         }
     }
 
@@ -760,6 +770,7 @@ impl StreamStateMachine {
                         next_offset: item.next_offset,
                         closed: item.closed,
                         deduplicated: true,
+                        record_range: item_record_range(&item),
                     })
                     .collect(),
                 deduplicated: true,
@@ -955,6 +966,7 @@ impl StreamStateMachine {
             items: items
                 .into_iter()
                 .map(|item| StreamBatchAppendItem {
+                    record_range: item_record_range(&item),
                     offset: item.start_offset,
                     next_offset: item.next_offset,
                     closed: item.closed,
@@ -1201,6 +1213,30 @@ impl StreamStateMachine {
             .add_producer(&producer.producer_id, &state);
         slot.producers.insert(producer.producer_id, state);
     }
+}
+
+/// The record range a producer receipt item stored at apply time.
+fn item_record_range(item: &ProducerAppendRecord) -> Option<crate::StreamRecordRange> {
+    match (item.record_start, item.record_next) {
+        (Some(first_record), Some(next_record)) => Some(crate::StreamRecordRange {
+            first_record,
+            next_record,
+        }),
+        _ => None,
+    }
+}
+
+/// A duplicate's acknowledgement range: the stored receipt item for its
+/// byte range (RC-11), never one recomputed from the index.
+fn duplicate_record_range(
+    items: &[ProducerAppendRecord],
+    offset: u64,
+    next_offset: u64,
+) -> Option<crate::StreamRecordRange> {
+    items
+        .iter()
+        .find(|item| item.start_offset == offset && item.next_offset == next_offset)
+        .and_then(item_record_range)
 }
 
 /// O(1) duplicate lookup (F3): receipts hold contiguous sequences, so the

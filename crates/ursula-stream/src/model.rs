@@ -152,6 +152,9 @@ pub struct StreamBatchAppendItem {
     pub next_offset: u64,
     pub closed: bool,
     pub deduplicated: bool,
+    /// Records of this frame, as apply computed them (stored receipt for a
+    /// duplicate). `None` on streams without record coordinates.
+    pub record_range: Option<crate::StreamRecordRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +298,11 @@ pub struct StreamReadPlan {
     pub closed: bool,
     pub retained_record_range: Option<crate::StreamRecordRange>,
     pub record_range: Option<crate::StreamRecordRange>,
+    /// Set on a bracketed record read (F1): the segments cover a byte
+    /// window around the requested records, and materialization trims it
+    /// by counting LFs, then rewrites `offset`, `next_offset`,
+    /// `record_range` and `up_to_date`. Until then `up_to_date` is false.
+    pub record_trim: Option<crate::RecordTrim>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

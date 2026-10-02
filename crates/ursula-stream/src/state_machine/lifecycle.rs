@@ -475,6 +475,8 @@ impl StreamStateMachine {
         self.record_created_at_ms(created_at_ms);
         // F4a: the external body is cold at once; collapse its records.
         self.collapse_sealed_message_records(&stream_id);
+        // F1 (level 2): and seal them.
+        self.seal_record_index(&stream_id);
         self.usage_on_stream_created(
             &stream_id.bucket_id,
             initial_len,

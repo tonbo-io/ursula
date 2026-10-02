@@ -93,6 +93,7 @@ async fn read(runtime: &ShardRuntime, stream: &BucketStreamId, len: usize) -> Ve
             record: None,
             max_records: None,
             leader_only: false,
+            record_anchor: None,
         })
         .await
         .expect("read stream")

@@ -4665,6 +4665,7 @@ dependencies = [
  "blake3",
  "bytes",
  "criterion",
+ "memchr",
  "proptest",
  "serde",
  "serde_json",

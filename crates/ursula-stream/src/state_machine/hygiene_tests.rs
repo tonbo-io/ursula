@@ -69,7 +69,7 @@ fn retention_shrinks_record_index_and_message_records() {
     ));
     let slot = slot(&machine, &stream_id);
     let index = slot.record_index.as_ref().unwrap();
-    assert_eq!(index.record_offsets().len(), 10);
+    assert_eq!(index.dense_len(), 10);
     assert!(
         bounded(10, index.record_offsets_capacity()),
         "record index capacity {}",
