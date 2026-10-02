@@ -39,6 +39,12 @@ listen = "127.0.0.1:4437"
 # built-in or preset default; the built-in default is 256MiB.
 # http_inflight_body_size = "256MiB"   # default: 256 MiB
 
+# Base URL of the keyed-state indexer (`ursula indexer` in keyed mode) that
+# serves `{stream_url}/keyed-state` for keyed streams. When unset, the
+# resource answers 404 and HEAD/create never advertise keyed-state-v1.
+# The `--keyed-state-upstream` CLI flag overrides this value.
+# keyed_state_upstream = "http://127.0.0.1:7071"
+
 # ------------------------------------------------------------------------------
 # [runtime]  — Per-core runtime sizing and admission controls
 # ------------------------------------------------------------------------------

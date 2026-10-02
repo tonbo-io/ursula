@@ -36,6 +36,11 @@ pub struct ServerArgs {
     /// Raft node identity.  Must be unique per node in a cluster.
     #[arg(long)]
     node_id: Option<u64>,
+
+    /// Base URL of the keyed-state indexer serving `/v1/keyed`; overrides
+    /// `server.keyed_state_upstream`. Unset: `{stream}/keyed-state` is 404.
+    #[arg(long)]
+    keyed_state_upstream: Option<String>,
 }
 
 pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -49,7 +54,11 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         preset = Some(Preset::Default);
     }
 
-    let config = load_config(config_path.as_deref(), preset, args.node_id)?;
+    let mut config = load_config(config_path.as_deref(), preset, args.node_id)?;
+    if let Some(upstream) = args.keyed_state_upstream {
+        config.server.keyed_state_upstream = Some(upstream);
+        config.validate()?;
+    }
 
     let tokio_console =
         config.observability.tokio_console || std::env::var_os("URSULA_TOKIO_CONSOLE").is_some();
@@ -197,6 +206,12 @@ async fn init_state(
     let mut state = state
         .with_runtime_config(&config.runtime)
         .with_wal_backend(wal_backend);
+    if let Some(upstream) = &config.server.keyed_state_upstream {
+        let upstream = crate::keyed_state::KeyedStateUpstream::new(upstream)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+        tracing::info!(upstream = %upstream.base(), "serving keyed-state through the indexer");
+        state = state.with_keyed_state_upstream(upstream);
+    }
     if let Some(wal_path) = config.raft.wal.resolved_path() {
         let monitor = crate::bootstrap::initialize_wal_disk_monitor(
             &wal_path,
