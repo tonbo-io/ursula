@@ -63,6 +63,65 @@ pub struct ColdIndexPageRollback {
     key: ColdIndexPageKey,
     previous: Option<ColdIndexPage>,
     written_chunk: ColdChunkRef,
+    clipped_entries: u64,
+}
+
+impl ColdIndexPageRollback {
+    /// Entries this write removed because they overlapped the written range
+    /// (F19 clip rule). Callers drop cached pages of the stream when any were
+    /// removed, so a cached copy cannot keep serving them.
+    pub fn clipped_entries(&self) -> u64 {
+        self.clipped_entries
+    }
+}
+
+/// Total entries clipped by a set of page writes.
+pub fn clipped_entries(rollback: &[ColdIndexPageRollback]) -> u64 {
+    rollback
+        .iter()
+        .map(ColdIndexPageRollback::clipped_entries)
+        .fold(0, u64::saturating_add)
+}
+
+fn ranges_overlap(start: u64, end: u64, other_start: u64, other_end: u64) -> bool {
+    start < other_end && other_start < end
+}
+
+/// F19 step 1, the clip rule: removes every entry other than `chunk` that
+/// overlaps `chunk`'s range. Only call it for a range whose bytes state
+/// proves: a flush of hot bytes, or a replacement of state-held refs. Such a
+/// range is never covered by a committed external append or by another
+/// committed chunk, so whatever overlaps it is a leftover of a proposal that
+/// did not commit there (a rejected external append, a stale flush).
+fn clip_page_for_proven_chunk(page: &mut ColdIndexPage, chunk: &ColdChunkRef) -> u64 {
+    let before = page
+        .cold_chunks
+        .len()
+        .saturating_add(page.external_segments.len());
+    page.cold_chunks.retain(|existing| {
+        (existing.start_offset == chunk.start_offset
+            && existing.end_offset == chunk.end_offset
+            && existing.s3_path == chunk.s3_path)
+            || !ranges_overlap(
+                existing.start_offset,
+                existing.end_offset,
+                chunk.start_offset,
+                chunk.end_offset,
+            )
+    });
+    page.external_segments.retain(|existing| {
+        !ranges_overlap(
+            existing.start_offset,
+            existing.end_offset,
+            chunk.start_offset,
+            chunk.end_offset,
+        )
+    });
+    let after = page
+        .cold_chunks
+        .len()
+        .saturating_add(page.external_segments.len());
+    u64::try_from(before.saturating_sub(after)).unwrap_or(u64::MAX)
 }
 
 fn encode_page(key: &ColdIndexPageKey, page: &ColdIndexPage) -> Vec<u8> {
@@ -357,6 +416,10 @@ pub async fn write_cold_chunk_index_pages<S: ColdIndexPageStore + ?Sized>(
         .map(|_| ())
 }
 
+/// Writes `chunk` into every page it spans. The range must be one whose bytes
+/// state proves (a flush of hot bytes, or a replacement of state-held refs):
+/// the write clips every other overlapping entry in the same
+/// read-modify-write (F19 step 1). Rollback restores the previous pages.
 pub async fn write_cold_chunk_index_pages_with_rollback<S: ColdIndexPageStore + ?Sized>(
     store: &S,
     stream_id: &BucketStreamId,
@@ -383,10 +446,12 @@ pub async fn write_cold_chunk_index_pages_with_rollback<S: ColdIndexPageStore + 
             cold_chunks: Vec::new(),
             external_segments: Vec::new(),
         });
+        let clipped_entries = clip_page_for_proven_chunk(&mut page, chunk);
         rollback.push(ColdIndexPageRollback {
             key: key.clone(),
             previous,
             written_chunk: chunk.clone(),
+            clipped_entries,
         });
         page.cold_chunks.retain(|existing| {
             existing.start_offset != chunk.start_offset || existing.end_offset != chunk.end_offset
@@ -872,6 +937,7 @@ pub async fn replace_cold_chunk_index_pages_with_rollback<S: ColdIndexPageStore 
             key,
             previous: Some(previous),
             written_chunk: replacement.clone(),
+            clipped_entries: 0,
         });
     }
     Ok(Some(rollback))
@@ -919,6 +985,234 @@ fn objects_cover_range(objects: &[ObjectPayloadRef], start: u64, end: u64) -> bo
         }
     }
     expected == end
+}
+
+/// How long an external object may predate its stream's creation before page
+/// repair treats it as another incarnation's object (bounded-state D4).
+const REPAIR_PREDATING_SLACK_MS: u64 = 60_000;
+
+/// What replicated state proves about one stream, as page repair needs it
+/// (bounded-state F19 step 2). Built on the group's leader from its applied
+/// state, inside the group actor, so it is consistent with every page write
+/// that the actor serializes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColdIndexRepairInput {
+    pub stream_id: BucketStreamId,
+    pub retained_offset: u64,
+    pub tail_offset: u64,
+    pub created_at_ms: u64,
+    /// Ranges the hot buffer holds: committed inline bytes, never external.
+    pub hot_ranges: Vec<(u64, u64)>,
+    /// State-held object refs (shared pack slices, external refs).
+    pub state_refs: Vec<ObjectPayloadRef>,
+}
+
+/// Counts from one repair pass. `pages_rewritten` pages changed; every
+/// dropped entry is counted once, under the first rule that dropped it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ColdIndexRepairReport {
+    pub streams_scanned: u64,
+    pub pages_scanned: u64,
+    pub pages_rewritten: u64,
+    /// External entries followed by a later-written entry at the same start.
+    pub superseded_entries_dropped: u64,
+    /// External entries that start at or beyond the stream's tail.
+    pub beyond_tail_entries_dropped: u64,
+    /// External entries overlapping a chunk entry, hot bytes, or another
+    /// object's state ref.
+    pub overlapping_entries_dropped: u64,
+    /// External entries whose object predates the stream's creation.
+    pub predating_entries_dropped: u64,
+}
+
+impl ColdIndexRepairReport {
+    pub fn entries_dropped(&self) -> u64 {
+        self.superseded_entries_dropped
+            .saturating_add(self.beyond_tail_entries_dropped)
+            .saturating_add(self.overlapping_entries_dropped)
+            .saturating_add(self.predating_entries_dropped)
+    }
+
+    pub fn add(&mut self, other: &Self) {
+        self.streams_scanned = self.streams_scanned.saturating_add(other.streams_scanned);
+        self.pages_scanned = self.pages_scanned.saturating_add(other.pages_scanned);
+        self.pages_rewritten = self.pages_rewritten.saturating_add(other.pages_rewritten);
+        self.superseded_entries_dropped = self
+            .superseded_entries_dropped
+            .saturating_add(other.superseded_entries_dropped);
+        self.beyond_tail_entries_dropped = self
+            .beyond_tail_entries_dropped
+            .saturating_add(other.beyond_tail_entries_dropped);
+        self.overlapping_entries_dropped = self
+            .overlapping_entries_dropped
+            .saturating_add(other.overlapping_entries_dropped);
+        self.predating_entries_dropped = self
+            .predating_entries_dropped
+            .saturating_add(other.predating_entries_dropped);
+    }
+}
+
+/// One step of the leader-side repair cursor over a group's streams.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepairColdIndexRequest {
+    /// Resume after this stream id; `None` starts a new cycle.
+    pub after: Option<BucketStreamId>,
+    pub max_streams: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepairColdIndexResponse {
+    pub report: ColdIndexRepairReport,
+    /// Where the next step resumes; `None` starts a new cycle.
+    pub next_after: Option<BucketStreamId>,
+    /// This step ran on the leader and reached the end of the group's
+    /// streams. A follower answers `false` and repairs nothing.
+    pub cycle_completed: bool,
+}
+
+/// Millisecond timestamp encoded in a staged external object's name
+/// (`{stream}/external/{unix_nanos:032x}-{sequence:016x}.bin`), or `None`
+/// when the name carries none (other layouts, or the simulator's zero clock).
+fn external_object_unix_ms(s3_path: &str) -> Option<u64> {
+    let (prefix, file_name) = s3_path.rsplit_once('/')?;
+    if !prefix.ends_with("/external") && prefix != "external" {
+        return None;
+    }
+    let (nanos_hex, _) = file_name.strip_suffix(".bin")?.split_once('-')?;
+    let nanos = u128::from_str_radix(nanos_hex, 16).ok()?;
+    if nanos == 0 {
+        return None;
+    }
+    u64::try_from(nanos / 1_000_000).ok()
+}
+
+/// F19 step 2 for one page: keeps only the last-written external entry at
+/// each start offset, and drops external entries that start at or beyond the
+/// tail, that overlap a chunk entry, hot bytes or another object's state ref,
+/// or whose objects predate the stream's creation by more than a minute.
+/// Chunk entries hold committed bytes and are kept. Within a leader's term
+/// the group actor runs page writes one at a time, so a later entry at the
+/// same start follows a proposal that did not commit there.
+pub fn repair_cold_index_page(
+    page: &mut ColdIndexPage,
+    input: &ColdIndexRepairInput,
+) -> ColdIndexRepairReport {
+    let mut report = ColdIndexRepairReport {
+        pages_scanned: 1,
+        ..ColdIndexRepairReport::default()
+    };
+    let externals = std::mem::take(&mut page.external_segments);
+    let mut kept = Vec::with_capacity(externals.len());
+    for (index, entry) in externals.iter().enumerate() {
+        let superseded = externals
+            .iter()
+            .skip(index.saturating_add(1))
+            .any(|later| later.start_offset == entry.start_offset);
+        if superseded {
+            report.superseded_entries_dropped = report.superseded_entries_dropped.saturating_add(1);
+            continue;
+        }
+        if entry.start_offset >= input.tail_offset {
+            report.beyond_tail_entries_dropped =
+                report.beyond_tail_entries_dropped.saturating_add(1);
+            continue;
+        }
+        let overlaps =
+            |start: u64, end: u64| ranges_overlap(entry.start_offset, entry.end_offset, start, end);
+        let overlapping = page
+            .cold_chunks
+            .iter()
+            .any(|chunk| overlaps(chunk.start_offset, chunk.end_offset))
+            || input
+                .hot_ranges
+                .iter()
+                .any(|(start, end)| overlaps(*start, *end))
+            || input.state_refs.iter().any(|object| {
+                object.s3_path != entry.s3_path && overlaps(object.start_offset, object.end_offset)
+            });
+        if overlapping {
+            report.overlapping_entries_dropped =
+                report.overlapping_entries_dropped.saturating_add(1);
+            continue;
+        }
+        if external_object_unix_ms(&entry.s3_path).is_some_and(|object_ms| {
+            object_ms.saturating_add(REPAIR_PREDATING_SLACK_MS) < input.created_at_ms
+        }) {
+            report.predating_entries_dropped = report.predating_entries_dropped.saturating_add(1);
+            continue;
+        }
+        kept.push(entry.clone());
+    }
+    page.external_segments = kept;
+    if report.entries_dropped() > 0 {
+        report.pages_rewritten = 1;
+    }
+    report
+}
+
+/// Repairs the pages of each stream in `inputs` and drops the cached pages
+/// of every stream whose pages changed.
+pub async fn repair_cold_index_streams<S: ColdIndexPageStore + ?Sized>(
+    store: &S,
+    cache: Option<&ColdIndexPageCache<ColdStoreColdIndexPageStore>>,
+    inputs: &[ColdIndexRepairInput],
+) -> io::Result<ColdIndexRepairReport> {
+    let mut report = ColdIndexRepairReport::default();
+    for input in inputs {
+        let stream_report = repair_stream_cold_index_pages(store, input).await?;
+        if stream_report.pages_rewritten > 0 {
+            if let Some(cache) = cache {
+                cache.invalidate_stream(&input.stream_id);
+            }
+            tracing::info!(
+                stream = %input.stream_id,
+                pages_rewritten = stream_report.pages_rewritten,
+                entries_dropped = stream_report.entries_dropped(),
+                "repaired cold-index pages"
+            );
+        }
+        report.add(&stream_report);
+    }
+    Ok(report)
+}
+
+/// Repairs every cold-index page of one stream from the retained offset on:
+/// the pages up to the one holding the tail, then any later pages that
+/// entries spanning past the tail left behind. Writes only changed pages.
+pub async fn repair_stream_cold_index_pages<S: ColdIndexPageStore + ?Sized>(
+    store: &S,
+    input: &ColdIndexRepairInput,
+) -> io::Result<ColdIndexRepairReport> {
+    let span = ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
+    let tail_page_id = input.tail_offset / span;
+    let mut page_id = input.retained_offset / span;
+    let mut report = ColdIndexRepairReport {
+        streams_scanned: 1,
+        ..ColdIndexRepairReport::default()
+    };
+    loop {
+        let key = ColdIndexPageKey {
+            stream_id: input.stream_id.clone(),
+            generation: 0,
+            page_id,
+        };
+        match store.get_page(&key).await? {
+            Some(mut page) => {
+                let page_report = repair_cold_index_page(&mut page, input);
+                if page_report.pages_rewritten > 0 {
+                    store.put_page(&key, &page).await?;
+                }
+                report.add(&page_report);
+            }
+            None if page_id >= tail_page_id => break,
+            None => {}
+        }
+        let Some(next) = page_id.checked_add(1) else {
+            break;
+        };
+        page_id = next;
+    }
+    Ok(report)
 }
 
 #[cfg(test)]

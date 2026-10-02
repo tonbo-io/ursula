@@ -126,6 +126,41 @@ pub fn spawn_cold_gc_worker_if_configured(
     });
 }
 
+/// Pause between cold-index repair steps.
+const COLD_INDEX_REPAIR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Streams per group whose pages one repair step reads and rewrites.
+const COLD_INDEX_REPAIR_MAX_STREAMS_PER_STEP: usize = 16;
+
+/// Start the leader-side cold-index page repair cursor (bounded-state F19
+/// step 2). Every interval each group the node leads repairs the pages of a
+/// bounded number of streams after its cursor, so a full cycle over a group's
+/// streams is slow and its page I/O stays small. Repair is a correctness
+/// fix for stale page entries, so it is not behind a config switch.
+pub fn spawn_cold_index_repair_worker(runtime: &ShardRuntime) {
+    if !runtime.has_cold_store() {
+        return;
+    }
+    let runtime = runtime.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(COLD_INDEX_REPAIR_INTERVAL).await;
+            let report = runtime
+                .repair_cold_index_all_groups_once(COLD_INDEX_REPAIR_MAX_STREAMS_PER_STEP)
+                .await;
+            if report.entries_dropped() > 0 {
+                tracing::info!(
+                    pages_rewritten = report.pages_rewritten,
+                    superseded = report.superseded_entries_dropped,
+                    beyond_tail = report.beyond_tail_entries_dropped,
+                    overlapping = report.overlapping_entries_dropped,
+                    predating = report.predating_entries_dropped,
+                    "cold-index repair dropped stale page entries"
+                );
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::effective_min_hot_bytes;

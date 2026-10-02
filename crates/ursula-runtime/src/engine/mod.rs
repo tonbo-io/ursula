@@ -129,6 +129,13 @@ pub type GroupPurgeBucketFuture<'a> =
     Pin<Box<dyn Future<Output = Result<PurgeBucketResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupPlanColdGcFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<ColdGcEntry>, GroupEngineError>> + Send + 'a>>;
+pub type GroupRepairColdIndexFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<crate::cold_index::RepairColdIndexResponse, GroupEngineError>>
+            + Send
+            + 'a,
+    >,
+>;
 pub type GroupImportGroupStateFuture<'a> = Pin<
     Box<
         dyn Future<Output = Result<crate::request::ImportGroupStateResponse, GroupEngineError>>
@@ -448,6 +455,18 @@ pub trait GroupEngine: Send + 'static {
         _placement: ShardPlacement,
     ) -> GroupPlanColdGcFuture<'a> {
         Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Leader-side cold-index page repair for one step of the group's stream
+    /// cursor (bounded-state F19 step 2). It runs in the group actor, one at a
+    /// time with every other page writer. Default repairs nothing and ends
+    /// the cycle.
+    fn repair_cold_index<'a>(
+        &'a mut self,
+        _request: crate::cold_index::RepairColdIndexRequest,
+        _placement: ShardPlacement,
+    ) -> GroupRepairColdIndexFuture<'a> {
+        Box::pin(async { Ok(crate::cold_index::RepairColdIndexResponse::default()) })
     }
 
     fn append<'a>(

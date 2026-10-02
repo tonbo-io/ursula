@@ -535,13 +535,26 @@ async fn cold_index_read_materializes_overlapping_flush_objects_once() {
         .write_chunk(&second.s3_path, b"cdef")
         .await
         .expect("write second cold object");
+    // Pages written before the clip rule (bounded-state F19) can hold
+    // overlapping chunk entries; the clip rule now removes them on write, so
+    // the legacy page is stored directly.
     let page_store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-    write_cold_chunk_index_pages(&page_store, &stream, &first)
+    page_store
+        .put_page(
+            &ColdIndexPageKey {
+                stream_id: stream.clone(),
+                generation: 0,
+                page_id: 0,
+            },
+            &ColdIndexPage {
+                start_offset: 0,
+                end_offset: ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES,
+                cold_chunks: vec![first, second],
+                external_segments: Vec::new(),
+            },
+        )
         .await
-        .expect("index first cold object");
-    write_cold_chunk_index_pages(&page_store, &stream, &second)
-        .await
-        .expect("index overlapping cold object");
+        .expect("store legacy page with overlapping cold objects");
     let cache = Arc::new(ColdIndexPageCache::new(Arc::new(page_store), 8));
     let plan = StreamReadPlan {
         offset: 0,

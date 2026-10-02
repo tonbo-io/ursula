@@ -289,6 +289,13 @@ macro_rules! runtime_operations {
                 handle { call plan_cold_gc(engine, max, placement) }
                 client { group fn plan_cold_gc }
             }
+            op RepairColdIndex {
+                fields { request: RepairColdIndexRequest }
+                reply { response_tx: RepairColdIndexResponse }
+                guard { none }
+                handle { call repair_cold_index(engine, request, placement) }
+                client { group fn repair_cold_index }
+            }
             op BucketUsage {
                 fields {}
                 reply { response_tx: Vec<ursula_stream::BucketUsageSnapshot> }
