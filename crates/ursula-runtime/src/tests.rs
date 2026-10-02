@@ -36,6 +36,8 @@ use crate::core_worker::ReadWatchers;
 use crate::error::ErrorStatus;
 use crate::metrics::RuntimeMetricsInner;
 
+const R: u64 = ursula_stream::HOT_RECORD_OVERHEAD_BYTES;
+
 fn runtime(core_count: usize, group_count: usize) -> ShardRuntime {
     ShardRuntime::spawn(test_config(core_count, group_count, 128)).expect("spawn runtime")
 }
@@ -397,8 +399,9 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             deduplicated: false,
             producer: None,
             record_range: None,
-            stream_hot_bytes: 3,
-            group_hot_bytes: 3,
+            // F6c: real hot bytes, payload plus one record's overhead.
+            stream_hot_bytes: 3 + R,
+            group_hot_bytes: 3 + R,
             receipt_evicted: false,
         })
     );
@@ -2799,6 +2802,24 @@ async fn cold_compaction_preserves_reads_and_reclaims_inputs_after_grace() {
             .expect("flush input chunk");
     }
 
+    // F14d: chunks published outside the flush worker record no debt, so
+    // the compactor finds nothing until the repair cursor reads the
+    // stream's pages, and discovery issues no LIST either way.
+    let lists_before = cold_store.list_request_count();
+    assert_eq!(
+        runtime
+            .compact_cold_once(8, 16, 1, 0)
+            .await
+            .expect("compact without debt"),
+        0
+    );
+    let group = runtime.locate(&stream).raft_group_id;
+    runtime
+        .repair_cold_index_group_once(group, 16)
+        .await
+        .expect("repair step");
+    assert_eq!(runtime.compaction_debt_pages(), 1);
+    let lists_before_compaction = cold_store.list_request_count();
     assert_eq!(
         runtime
             .compact_cold_once(8, 16, 1, 0)
@@ -2806,6 +2827,19 @@ async fn cold_compaction_preserves_reads_and_reclaims_inputs_after_grace() {
             .expect("compact cold chunks"),
         1
     );
+    assert_eq!(cold_store.list_request_count(), lists_before_compaction);
+    assert_eq!(lists_before_compaction, lists_before);
+    // The small replacement is debt again; the next pass finds nothing left
+    // to merge and drops it.
+    assert_eq!(runtime.compaction_debt_pages(), 1);
+    assert_eq!(
+        runtime
+            .compact_cold_once(8, 16, 1, 0)
+            .await
+            .expect("drain debt"),
+        0
+    );
+    assert_eq!(runtime.compaction_debt_pages(), 0);
     let read = runtime
         .read_stream(read_req(stream.clone(), 0, 8))
         .await
@@ -2890,9 +2924,10 @@ async fn stale_cold_flush_batch_after_delete_recreate_is_classified_for_cleanup(
 async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(
-        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4 + R)),
         cold_store,
     );
+    // F6c: admission counts payload plus per-record overhead.
     let stream = BucketStreamId::new("benchcmp", "cold-admission");
     create_stream(&runtime, &stream).await;
     append_bytes(&runtime, &stream, b"abcd").await;
@@ -2914,19 +2949,19 @@ async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
             ..
         } => {
             assert_eq!(stream_id, stream);
-            assert_eq!(before_group_hot_bytes, 4);
-            assert_eq!(after_group_hot_bytes, 5);
-            assert_eq!(limit, 4);
+            assert_eq!(before_group_hot_bytes, 4 + R);
+            assert_eq!(after_group_hot_bytes, 5 + 2 * R);
+            assert_eq!(limit, 4 + R);
         }
         other => panic!("expected cold backpressure, got {other:?}"),
     }
     let metrics = runtime.metrics().snapshot();
     let group_index = usize::try_from(runtime.locate(&stream).raft_group_id.0).unwrap();
     assert_eq!(metrics.accepted_appends, 1);
-    assert_eq!(metrics.cold_hot_bytes, 4);
-    assert_eq!(metrics.per_group_cold_hot_bytes[group_index], 4);
-    assert_eq!(metrics.cold_hot_group_bytes_max, 4);
-    assert_eq!(metrics.cold_hot_stream_bytes_max, 4);
+    assert_eq!(metrics.cold_hot_bytes, 4 + R);
+    assert_eq!(metrics.per_group_cold_hot_bytes[group_index], 4 + R);
+    assert_eq!(metrics.cold_hot_group_bytes_max, 4 + R);
+    assert_eq!(metrics.cold_hot_stream_bytes_max, 4 + R);
     assert_eq!(metrics.cold_backpressure_events, 1);
     assert_eq!(metrics.per_group_cold_backpressure_events[group_index], 1);
     assert_eq!(metrics.cold_backpressure_bytes, 1);
@@ -2944,7 +2979,8 @@ async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
     assert_eq!(metrics_after_flush.cold_hot_bytes, 0);
     assert_eq!(metrics_after_flush.cold_hot_group_bytes_max, 0);
     assert_eq!(
-        metrics_after_flush.per_group_cold_hot_bytes_max[group_index], 4,
+        metrics_after_flush.per_group_cold_hot_bytes_max[group_index],
+        4 + R,
         "the diagnostic high-water mark remains monotonic"
     );
 
@@ -2960,7 +2996,7 @@ async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
 async fn cold_write_admission_allows_deduplicated_append_retry_at_hot_limit() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(
-        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4 + R)),
         cold_store,
     );
     let stream = BucketStreamId::new("benchcmp", "cold-admission-dedup-append");
@@ -2985,7 +3021,7 @@ async fn cold_write_admission_allows_deduplicated_append_retry_at_hot_limit() {
 async fn cold_write_admission_allows_deduplicated_append_batch_retry_at_hot_limit() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(
-        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4 + 4 * R)),
         cold_store,
     );
     let stream = BucketStreamId::new("benchcmp", "cold-admission-dedup-batch");
@@ -3021,7 +3057,7 @@ async fn cold_write_admission_allows_deduplicated_append_batch_retry_at_hot_limi
 async fn cold_write_admission_allows_existing_create_retry_at_hot_limit() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(
-        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4 + R)),
         cold_store,
     );
     let stream = BucketStreamId::new("benchcmp", "cold-admission-existing-create");
@@ -3095,7 +3131,7 @@ async fn raft_uncommitted_admission_rejects_when_incoming_would_exceed_limit() {
 async fn cold_write_admission_rejects_append_batch_without_partial_mutation() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(
-        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4 + R)),
         cold_store,
     );
     let stream = BucketStreamId::new("benchcmp", "cold-admission-batch");
@@ -3122,9 +3158,10 @@ async fn cold_write_admission_rejects_append_batch_without_partial_mutation() {
             ..
         } => {
             assert_eq!(stream_id, stream);
-            assert_eq!(before_group_hot_bytes, 3);
-            assert_eq!(after_group_hot_bytes, 5);
-            assert_eq!(limit, 4);
+            // F6c: each batch item is charged one record's overhead.
+            assert_eq!(before_group_hot_bytes, 3 + R);
+            assert_eq!(after_group_hot_bytes, 5 + 3 * R);
+            assert_eq!(limit, 4 + R);
         }
         other => panic!("expected cold backpressure, got {other:?}"),
     }
@@ -3233,7 +3270,7 @@ async fn flush_cold_all_groups_once_bounded_flushes_multiple_groups() {
 async fn repeated_cold_flush_keeps_hot_bytes_bounded_while_writes_continue() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(
-        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(16)),
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(16 + 4 * R)),
         cold_store,
     );
     let streams = [
@@ -3259,7 +3296,7 @@ async fn repeated_cold_flush_keeps_hot_bytes_bounded_while_writes_continue() {
 
         let metrics_before_flush = runtime.metrics().snapshot();
         assert!(
-            metrics_before_flush.cold_hot_bytes <= 64,
+            metrics_before_flush.cold_hot_bytes <= 4 * (16 + 4 * R),
             "hot bytes should stay within one unflushed batch per group before flush: {}",
             metrics_before_flush.cold_hot_bytes
         );
@@ -4898,4 +4935,57 @@ impl GroupEngine for FailingEngine {
     ) -> GroupInstallSnapshotFuture<'a> {
         Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
     }
+}
+
+/// bounded-stream-state F14c and F14d: a lone flush candidate below 1 MiB is
+/// packed alone instead of becoming a tiny exclusive object, and a larger
+/// exclusive chunk below the compaction target becomes compaction debt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lone_small_flush_is_packed_and_small_exclusive_chunk_is_compaction_debt() {
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(RuntimeConfig::new(2, 8), cold_store.clone());
+    let stream = BucketStreamId::new("benchcmp", "f14c-lone");
+    create_stream(&runtime, &stream).await;
+    let request = PlanGroupColdFlushRequest {
+        min_hot_bytes: 1,
+        max_flush_bytes: 8 << 20,
+        max_batch_bytes: 8 << 20,
+        pressure: None,
+    };
+
+    append_bytes(&runtime, &stream, &[b'a'; 100]).await;
+    assert_eq!(
+        runtime
+            .flush_cold_all_groups_once_bounded(request.clone(), 1)
+            .await
+            .expect("flush small"),
+        1
+    );
+    let metrics = runtime.metrics().snapshot();
+    assert_eq!(metrics.cold_pack_uploads, 1, "the lone candidate is packed");
+    assert_eq!(metrics.cold_pack_slices, 1);
+    assert_eq!(runtime.compaction_debt_pages(), 0);
+
+    let large = vec![b'b'; (1 << 20) + 10];
+    append_bytes(&runtime, &stream, &large).await;
+    assert_eq!(
+        runtime
+            .flush_cold_all_groups_once_bounded(request, 1)
+            .await
+            .expect("flush large"),
+        1
+    );
+    let metrics = runtime.metrics().snapshot();
+    assert_eq!(
+        metrics.cold_pack_uploads, 1,
+        "a 1 MiB candidate is exclusive"
+    );
+    assert_eq!(runtime.compaction_debt_pages(), 1);
+
+    let read = runtime
+        .read_stream(read_req(stream, 0, 100 + large.len()))
+        .await
+        .expect("read flushed stream");
+    assert_eq!(&read.payload[..100], &[b'a'; 100]);
+    assert_eq!(&read.payload[100..], large.as_slice());
 }

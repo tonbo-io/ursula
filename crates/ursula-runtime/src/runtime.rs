@@ -118,8 +118,25 @@ use crate::rt::sync::oneshot;
 use crate::rt::time::Instant;
 use crate::trace::Traced;
 
+mod compaction_debt;
 mod orphan_sweep;
 mod shared_ref_compaction;
+
+use compaction_debt::CompactionDebt;
+
+/// A lone flush candidate below this size goes down the pack path as a pack
+/// of one instead of becoming a tiny exclusive object (F14c): its shared ref
+/// is compacted by the pack-reference driver, and the flush rewrites no
+/// cold-index page.
+pub const EXCLUSIVE_FLUSH_MIN_BYTES: usize = 1 << 20;
+
+/// Default size below which an exclusive chunk is compaction debt (F14d);
+/// the compaction worker replaces it with its configured target.
+const DEFAULT_COMPACTION_DEBT_CHUNK_BYTES: u64 = 8 << 20;
+
+/// Debt pages one compaction pass takes; pages of streams the pass does not
+/// reach go back into the debt.
+const COMPACTION_DEBT_PAGES_PER_PASS: usize = 4_096;
 
 pub use orphan_sweep::COLD_ORPHAN_SWEEP_GRACE_MS;
 
@@ -207,6 +224,10 @@ pub struct ShardRuntime {
     cold_index_repair: Arc<std::sync::Mutex<HashMap<RaftGroupId, ColdIndexRepairCursor>>>,
     /// Node-local cursor of each group's cold orphan sweep (F14h).
     cold_orphan_sweep: Arc<std::sync::Mutex<HashMap<RaftGroupId, Option<BucketStreamId>>>>,
+    /// Cold-index pages that may hold compactable small chunks (F14d).
+    compaction_debt: Arc<std::sync::Mutex<CompactionDebt>>,
+    /// Exclusive chunks below this many bytes are compaction debt (F14d).
+    compaction_debt_chunk_bytes: Arc<AtomicU64>,
 }
 
 /// Node-local position of one group's cold-index repair cursor.
@@ -300,7 +321,58 @@ impl ShardRuntime {
             cold_store,
             cold_index_repair: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cold_orphan_sweep: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            compaction_debt: Arc::default(),
+            compaction_debt_chunk_bytes: Arc::new(AtomicU64::new(
+                DEFAULT_COMPACTION_DEBT_CHUNK_BYTES,
+            )),
         })
+    }
+
+    /// Sets the size below which exclusive chunks are compaction debt; the
+    /// compaction worker passes its target (F14d).
+    pub fn set_compaction_debt_chunk_bytes(&self, bytes: u64) {
+        self.compaction_debt_chunk_bytes
+            .store(bytes.max(1), Ordering::Relaxed);
+    }
+
+    /// Pages currently held as compaction debt (F14d).
+    pub fn compaction_debt_pages(&self) -> usize {
+        self.compaction_debt.lock().map_or(0, |debt| debt.len())
+    }
+
+    /// Records `[start_offset, end_offset)` of one incarnation as compaction
+    /// debt when its exclusive object is below the debt size (F14d).
+    pub(crate) fn record_compaction_debt(
+        &self,
+        stream_id: &BucketStreamId,
+        generation: u64,
+        start_offset: u64,
+        end_offset: u64,
+        object_bytes: u64,
+    ) {
+        if object_bytes >= self.compaction_debt_chunk_bytes.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut debt) = self.compaction_debt.lock() {
+            debt.record_range(stream_id, generation, start_offset, end_offset);
+        }
+    }
+
+    fn record_compaction_debt_pages(&self, pages: Vec<ColdIndexPageKey>) {
+        if pages.is_empty() {
+            return;
+        }
+        if let Ok(mut debt) = self.compaction_debt.lock() {
+            for key in pages {
+                debt.record_page(key);
+            }
+        }
+    }
+
+    fn take_compaction_debt(&self, max: usize) -> Vec<ColdIndexPageKey> {
+        self.compaction_debt
+            .lock()
+            .map_or_else(|_| Vec::new(), |mut debt| debt.take(max))
     }
 
     pub fn locate(&self, stream_id: &BucketStreamId) -> ShardPlacement {
@@ -449,6 +521,7 @@ impl ShardRuntime {
             payload_digest: candidate.payload_digest,
         };
         let publish_started_at = Instant::now();
+        let debt_stream = candidate.stream_id.clone();
         let publish = self
             .flush_cold(FlushColdRequest {
                 stream_id: candidate.stream_id,
@@ -460,6 +533,13 @@ impl ShardRuntime {
             Ok(response) => {
                 self.metrics
                     .record_cold_publish(object_size, elapsed_ns(publish_started_at));
+                self.record_compaction_debt(
+                    &debt_stream,
+                    candidate.cold_generation,
+                    candidate.start_offset,
+                    candidate.end_offset,
+                    object_size,
+                );
                 Ok(response)
             }
             Err(err) => {
@@ -504,7 +584,12 @@ impl ShardRuntime {
 
         let mut responses = Vec::new();
         for mut batch in bucket_batches {
-            if batch.len() > 1 {
+            // F14c: a lone candidate below 1 MiB is packed alone rather
+            // than written as a tiny exclusive object.
+            let small_single = batch
+                .first()
+                .is_some_and(|candidate| candidate.payload.len() < EXCLUSIVE_FLUSH_MIN_BYTES);
+            if batch.len() > 1 || small_single {
                 responses.extend(self.flush_cold_candidates_pack(batch).await?);
                 continue;
             }
@@ -529,7 +614,7 @@ impl ShardRuntime {
         };
         let first = candidates
             .first()
-            .expect("packed cold flush requires at least two candidates");
+            .expect("packed cold flush requires at least one candidate");
         let placement = self.shard_map.locate(&first.stream_id);
         if candidates
             .iter()
@@ -961,7 +1046,9 @@ impl ShardRuntime {
     }
 
     /// Rewrites undersized, contiguous objects from the same stream into
-    /// target-sized immutable chunks. Discovery reads only cold-index pages.
+    /// target-sized immutable chunks. Discovery drains the compaction debt
+    /// that flushes, compaction outputs and the repair cursor record, and
+    /// reads only those cold-index pages, by key: it lists nothing (F14d).
     pub async fn compact_cold_once(
         &self,
         target_bytes: u64,
@@ -972,29 +1059,54 @@ impl ShardRuntime {
         let Some(cold_store) = self.cold_store.as_ref() else {
             return Ok(0);
         };
-        let pages =
-            cold_store
-                .list_cold_index_pages()
-                .await
-                .map_err(|err| RuntimeError::ColdStoreIo {
-                    message: err.to_string(),
-                })?;
+        let pages = self.take_compaction_debt(COMPACTION_DEBT_PAGES_PER_PASS);
         // Pages are grouped per stream incarnation (F14g). The engine
         // republishes into the live incarnation's generation, so inputs from
         // a deleted incarnation fail the page match and are skipped.
-        let mut pages_by_stream: HashMap<(BucketStreamId, u64), Vec<_>> = HashMap::new();
+        let mut pages_by_stream: Vec<((BucketStreamId, u64), Vec<ColdIndexPageKey>)> = Vec::new();
         for page in pages {
-            pages_by_stream
-                .entry((page.stream_id.clone(), page.generation))
-                .or_default()
-                .push(page);
+            let identity = (page.stream_id.clone(), page.generation);
+            match pages_by_stream
+                .iter_mut()
+                .find(|(existing, _)| *existing == identity)
+            {
+                Some((_, stream_pages)) => stream_pages.push(page),
+                None => pages_by_stream.push((identity, vec![page])),
+            }
         }
+        let mut pages_by_stream = pages_by_stream.into_iter();
+        let result = self
+            .compact_cold_debt(
+                cold_store,
+                &mut pages_by_stream,
+                target_bytes,
+                max_bytes,
+                max_streams,
+                gc_grace_ms,
+            )
+            .await;
+        // Streams this pass did not reach stay debt for the next one.
+        for (_, stream_pages) in pages_by_stream {
+            self.record_compaction_debt_pages(stream_pages);
+        }
+        result
+    }
+
+    async fn compact_cold_debt(
+        &self,
+        cold_store: &ColdStoreHandle,
+        pages_by_stream: &mut impl Iterator<Item = ((BucketStreamId, u64), Vec<ColdIndexPageKey>)>,
+        target_bytes: u64,
+        max_bytes: u64,
+        max_streams: usize,
+        gc_grace_ms: u64,
+    ) -> Result<usize, RuntimeError> {
         let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
         let mut compacted = 0;
-        for ((stream_id, generation), stream_pages) in pages_by_stream {
-            if compacted >= max_streams {
+        while compacted < max_streams {
+            let Some(((stream_id, generation), stream_pages)) = pages_by_stream.next() else {
                 break;
-            }
+            };
             // Only the local Raft leader may publish a replacement.
             if self
                 .require_local_live_read_owner(&stream_id)
@@ -1065,6 +1177,11 @@ impl ShardRuntime {
                 payload_digest: blake3::hash(&payload).to_hex().to_string(),
             };
             let replacement_path = replacement.s3_path.clone();
+            let replacement_range = (
+                replacement.start_offset,
+                replacement.end_offset,
+                replacement.object_size,
+            );
             let gc_not_before_ms = unix_time_ms().saturating_add(gc_grace_ms);
             let compact_result = self
                 .compact_cold(CompactColdRequest {
@@ -1095,6 +1212,14 @@ impl ShardRuntime {
                 );
                 continue;
             }
+            // A replacement still below the debt size may merge further.
+            self.record_compaction_debt(
+                &stream_id,
+                generation,
+                replacement_range.0,
+                replacement_range.1,
+                replacement_range.2,
+            );
             compacted += 1;
         }
         Ok(compacted)
@@ -1458,6 +1583,8 @@ impl ShardRuntime {
         if response.cycle_completed {
             cursor.last_full_cycle_ms = Some(unix_time_ms());
         }
+        drop(cursors);
+        self.record_compaction_debt_pages(response.compaction_pages);
         Ok(ColdIndexRepairStep {
             report: response.report,
             cycle_completed: response.cycle_completed,

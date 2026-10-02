@@ -1222,6 +1222,11 @@ pub struct RepairColdIndexRequest {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepairColdIndexResponse {
     pub report: ColdIndexRepairReport,
+    /// Pages the step found holding at least two exclusive chunks below
+    /// [`COMPACTION_DEBT_CHUNK_BYTES`]: compaction debt the leader's
+    /// compactor drains (F14d). This is how idle streams, which no new
+    /// flush records as debt, still get compacted after a failover.
+    pub compaction_pages: Vec<ColdIndexPageKey>,
     /// Where the next step resumes; `None` starts a new cycle.
     pub next_after: Option<BucketStreamId>,
     /// This step ran on the leader and reached the end of the group's
@@ -1309,16 +1314,37 @@ pub fn repair_cold_index_page(
     report
 }
 
+/// Exclusive chunks below this size make a page compaction debt when the
+/// repair cursor reads it (F14d); the compactor applies its configured
+/// target when it drains the debt.
+pub const COMPACTION_DEBT_CHUNK_BYTES: u64 = 8 << 20;
+
+/// Whether `page` holds at least two exclusive chunk entries below
+/// [`COMPACTION_DEBT_CHUNK_BYTES`].
+pub fn page_has_compaction_debt(page: &ColdIndexPage) -> bool {
+    page.cold_chunks
+        .iter()
+        .filter(|chunk| {
+            !chunk.shared_object
+                && chunk.end_offset.saturating_sub(chunk.start_offset) < COMPACTION_DEBT_CHUNK_BYTES
+        })
+        .nth(1)
+        .is_some()
+}
+
 /// Repairs the pages of each stream in `inputs` and drops the cached pages
-/// of every stream whose pages changed.
+/// of every stream whose pages changed. Also returns the pages that hold
+/// compaction debt (F14d).
 pub async fn repair_cold_index_streams<S: ColdIndexPageStore + ?Sized>(
     store: &S,
     cache: Option<&ColdIndexPageCache<ColdStoreColdIndexPageStore>>,
     inputs: &[ColdIndexRepairInput],
-) -> io::Result<ColdIndexRepairReport> {
+) -> io::Result<(ColdIndexRepairReport, Vec<ColdIndexPageKey>)> {
     let mut report = ColdIndexRepairReport::default();
+    let mut compaction_pages = Vec::new();
     for input in inputs {
-        let stream_report = repair_stream_cold_index_pages(store, input).await?;
+        let stream_report =
+            repair_stream_cold_index_pages_collecting(store, input, &mut compaction_pages).await?;
         if stream_report.pages_rewritten > 0 {
             if let Some(cache) = cache {
                 cache.invalidate_stream(&input.stream_id);
@@ -1332,7 +1358,7 @@ pub async fn repair_cold_index_streams<S: ColdIndexPageStore + ?Sized>(
         }
         report.add(&stream_report);
     }
-    Ok(report)
+    Ok((report, compaction_pages))
 }
 
 /// Repairs every cold-index page of one stream from the retained offset on:
@@ -1341,6 +1367,16 @@ pub async fn repair_cold_index_streams<S: ColdIndexPageStore + ?Sized>(
 pub async fn repair_stream_cold_index_pages<S: ColdIndexPageStore + ?Sized>(
     store: &S,
     input: &ColdIndexRepairInput,
+) -> io::Result<ColdIndexRepairReport> {
+    repair_stream_cold_index_pages_collecting(store, input, &mut Vec::new()).await
+}
+
+/// [`repair_stream_cold_index_pages`], also collecting the pages that hold
+/// compaction debt into `compaction_pages`.
+pub async fn repair_stream_cold_index_pages_collecting<S: ColdIndexPageStore + ?Sized>(
+    store: &S,
+    input: &ColdIndexRepairInput,
+    compaction_pages: &mut Vec<ColdIndexPageKey>,
 ) -> io::Result<ColdIndexRepairReport> {
     let span = ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
     let tail_page_id = input.tail_offset / span;
@@ -1360,6 +1396,9 @@ pub async fn repair_stream_cold_index_pages<S: ColdIndexPageStore + ?Sized>(
                 let page_report = repair_cold_index_page(&mut page, input);
                 if page_report.pages_rewritten > 0 {
                     store.put_page(&key, &page).await?;
+                }
+                if page_has_compaction_debt(&page) {
+                    compaction_pages.push(key);
                 }
                 report.add(&page_report);
             }

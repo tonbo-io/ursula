@@ -23,8 +23,9 @@ fn pass_pressure(observed_hot_bytes: u64, pressure_hot_bytes: u64) -> Option<Col
     })
 }
 
-/// Start the periodic cold compactors when explicitly enabled: the
-/// same-stream chunk compactor and the shared pack-reference driver
+/// Start the periodic cold compactors when enabled (the default): the
+/// same-stream chunk compactor, which drains compaction debt instead of
+/// listing the cold root (F14d), and the shared pack-reference driver
 /// (bounded-stream-state F2), which keeps at most T = 64 shared refs per
 /// stream and releases idle packs.
 pub fn spawn_cold_compaction_worker_if_configured(
@@ -41,6 +42,7 @@ pub fn spawn_cold_compaction_worker_if_configured(
     let gc_grace_ms =
         u64::try_from(config.compaction_gc_grace.as_duration().as_millis()).unwrap_or(u64::MAX);
     let shared_refs = SharedRefCompactionConfig::new(max_bytes, max_streams, gc_grace_ms);
+    runtime.set_compaction_debt_chunk_bytes(target_bytes);
     let runtime = runtime.clone();
     tokio::spawn(async move {
         loop {

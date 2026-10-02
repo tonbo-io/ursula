@@ -47,6 +47,19 @@ pub enum GroupWriteCommand {
     Transaction { commands: Vec<StreamCommand> },
 }
 
+impl GroupWriteCommand {
+    /// Approximate Raft-log bytes of this command (bounded-state F12e).
+    pub fn log_bytes_estimate(&self) -> u64 {
+        match self {
+            Self::Stream(command) => command.log_bytes_estimate(),
+            Self::Batch { commands } | Self::Transaction { commands } => commands
+                .iter()
+                .map(StreamCommand::log_bytes_estimate)
+                .fold(0, u64::saturating_add),
+        }
+    }
+}
+
 impl From<StreamCommand> for GroupWriteCommand {
     fn from(command: StreamCommand) -> Self {
         Self::Stream(command)

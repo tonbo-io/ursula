@@ -205,10 +205,20 @@ impl ShardRuntime {
             })
             .await;
         match result {
-            Ok(_) => Ok(SharedRunOutcome::Compacted {
-                slices,
-                bytes: total_bytes,
-            }),
+            Ok(_) => {
+                // F14d: a small replacement is compaction debt.
+                self.record_compaction_debt(
+                    stream_id,
+                    generation,
+                    start_offset,
+                    end_offset,
+                    object_size,
+                );
+                Ok(SharedRunOutcome::Compacted {
+                    slices,
+                    bytes: total_bytes,
+                })
+            }
             Err(err) if err.stream_error_code().is_some() || err.leader_hint().is_some() => {
                 // Definitely not committed: the engine rolled the page entry
                 // back, so nothing references the replacement.
