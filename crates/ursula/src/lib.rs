@@ -3720,7 +3720,6 @@ pub(crate) async fn read_stream_by_id(
                 envelope_view,
                 &query,
                 headers,
-                trim_json,
             )
             .await;
         }
@@ -4281,9 +4280,11 @@ pub(crate) async fn long_poll_stream(
     envelope_view: bool,
     query: &HashMap<String, String>,
     headers: HeaderMap,
-    trim_json: bool,
 ) -> Response {
     let timeout_ms = long_poll_timeout_ms(query);
+    // F11: without a client `max_bytes` a capped JSON offset read ends at a
+    // record boundary.
+    let trim_json = record.is_none() && !query.contains_key("max_bytes");
     let read = state.runtime.wait_read_stream(ReadStreamRequest {
         stream_id: stream_id.clone(),
         offset,
