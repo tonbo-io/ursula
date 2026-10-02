@@ -15,8 +15,8 @@
 // until the read settles, so eviction between awaits cannot livelock it (§7.2 "Single-state reads").
 import { FencedError } from "../errors.ts";
 import type { KeyedOp } from "../keyed-batch.ts";
-import { H, intHeader } from "../protocol.ts";
-import type { StateStore, StateView } from "../state-store.ts";
+import { H, intHeader, retryAfterMs } from "../protocol.ts";
+import { type StateStore, type StateView, ViewAbort } from "../state-store.ts";
 import type { KeyedScanOutcome, KeyedScanRequest, KeyedStateTransport } from "../transport.ts";
 import { TransportError } from "../transport.ts";
 import { b64, keySuccessor, unb64 } from "../tuple.ts";
@@ -50,7 +50,7 @@ interface OverlayRecord {
 }
 
 /** Thrown from a view to abort a pass that reached `[lo, hi)` outside every covered region. */
-class CacheMiss extends Error {
+class CacheMiss extends ViewAbort {
 	readonly store: LocalStore;
 	readonly lo: string;
 	readonly hi: string;
@@ -77,19 +77,38 @@ export interface LocalStoreOptions {
 	/** `limit` of range fetches (1..1000). Default 256. */
 	readonly pageLimit?: number;
 	/**
-	 * Called when a page reflects records above `tail`. Returns a promise that settles once the
+	 * Called when a page reflects records above `tail`. Returns a promise that resolves once the
 	 * in-flight commit has been applied (or failed), or undefined when no commit is in flight, in
-	 * which case another writer exists and the store poisons with `FencedError` (§3.5 step 3).
+	 * which case another writer exists and the store poisons with `FencedError` (§3.5 step 3). It may
+	 * throw, or return a promise that rejects, to abort the read with that error (open uses this
+	 * before its claim, §3.6 step 4).
 	 */
 	readonly commitInFlight?: () => Promise<void> | undefined;
-	/** Waits before retry `attempt` (1-based) of a transient fetch failure. Default: capped exponential timer. */
-	readonly backoff?: (attempt: number) => Promise<void>;
-	/** Transient fetch failures tolerated per fetch before poisoning (§7.6). Default 12. */
+	/**
+	 * Waits before retry `attempt` (1-based) of a transient fetch failure; `retryAfterMs` is the
+	 * response's `Retry-After` when present (§7.6: honour it). Default: capped exponential timer.
+	 */
+	readonly backoff?: (attempt: number, retryAfterMs: number | undefined) => Promise<void>;
+	/** Transient fetch failures tolerated per fetch before poisoning. Default: unlimited (the deadline governs). */
 	readonly maxRetries?: number;
+	/**
+	 * Deadline of one fetch, in ms, measured with `now` (§7.6: Session-line reads retry transient
+	 * failures for up to 30 s, then poison). Default 30 000.
+	 */
+	readonly readDeadlineMs?: number;
+	/** Clock for `readDeadlineMs`. Default `Date.now`. */
+	readonly now?: () => number;
+	/**
+	 * Widen a fetch for a miss at `[lo, hi)` (or the point `lo`) to a larger range that contains it,
+	 * for example a whole per-conversation prefix (§4.5: the first requestId lookup in a conversation
+	 * fetches all of `s.r/{conv}/`). The store clips the result to the gap around the miss, so the
+	 * fetch never re-reads covered ranges and always makes progress. Default: no widening.
+	 */
+	readonly widen?: (lo: string, hi: string, point: boolean) => { readonly lo: string; readonly hi: string } | undefined;
 }
 
-const DEFAULT_BACKOFF = (attempt: number): Promise<void> =>
-	new Promise((resolve) => setTimeout(resolve, Math.min(5000, 25 * 2 ** Math.min(attempt, 10))));
+const DEFAULT_BACKOFF = (attempt: number, retryAfterMs: number | undefined): Promise<void> =>
+	new Promise((resolve) => setTimeout(resolve, retryAfterMs ?? Math.min(5000, 25 * 2 ** Math.min(attempt, 10))));
 
 export class LocalStore implements StateStore {
 	private readonly keyedState: KeyedStateTransport;
@@ -227,6 +246,64 @@ export class LocalStore implements StateStore {
 		for (const k of drop) this.deleteRow(k);
 	}
 
+	/**
+	 * Start complete-at-mint coverage at `floor` (§3.6 step 7: `F_fresh := m/next_id` after the claim).
+	 * Allowed once, while no fresh coverage exists: it is sound only when no committed key has an ID
+	 * component of `floor` or more, which the high-water rule of `m/next_id` guarantees (§7.3).
+	 */
+	startFresh(floor: number): void {
+		this.assertUsable();
+		if (Number.isFinite(this.fresh)) throw new Error(`LocalStore: fresh coverage already started at ${this.fresh}`);
+		if (!Number.isFinite(floor) || floor < 0) throw new Error(`LocalStore: invalid fresh floor ${floor}`);
+		// Defensive: a put in the overlay of a key that would be fresh but is not cached (a record
+		// written without the high-water rule) raises the floor past it.
+		let f = floor;
+		for (let i = this.overlayHead; i < this.overlay.length; i++) {
+			for (const op of this.overlay[i]?.ops ?? []) {
+				if (op.op !== "p" || !isFreshKey(op.key, f) || this.rangeAt(op.key) !== undefined) continue;
+				this.fresh = f;
+				f = this.keepingId(op.key) + 1;
+			}
+		}
+		this.fresh = f;
+	}
+
+	/**
+	 * Merge a keyed-state page fetched by the caller for the range `[lo, hi)` (§3.5 step 3), for
+	 * example open's `m/` read (§3.6 step 3). Returns "stale" when `D_resp < E` (the caller refetches)
+	 * and "ahead" when `D_resp > tail` (the caller replays the log further, then merges again).
+	 */
+	mergePage(lo: string, hi: string, page: KeyedScanOutcome): "merged" | "stale" | "ahead" {
+		this.assertUsable();
+		const through = page.through;
+		if (page.status !== 200 || through === undefined) throw new Error(`LocalStore: mergePage needs a 200 with Stream-Keyed-Through (got ${page.status})`);
+		if (through < this.floor) return "stale";
+		if (through > this.next) return "ahead";
+		const pins = new Set<CoveredRange>();
+		try {
+			this.merge(lo, hi, false, page, through, pins);
+		} finally {
+			for (const r of pins) r.pins--;
+		}
+		return "merged";
+	}
+
+	/**
+	 * Install a derived point row (§7.4): `key` holds `value` in `state(tail)`, as the caller derived
+	 * it from the row `source` during a read whose tail is still current (for example `t/{id}` from
+	 * the covering `t.s/{st}/{id}` row, I25). Keys that are already covered are left alone. The row's
+	 * informational `record` is the source row's.
+	 */
+	installDerived(key: string, value: string, source: string): void {
+		this.assertUsable();
+		if (this.coveredKey(key)) return;
+		this.putRow(key, { record: this.cache.get(source)?.record ?? 0, value });
+		const range: CoveredRange = { lo: key, hi: keySuccessor(key), pins: 0 };
+		this.ranges.set(key, range);
+		this.lru.set(range, true);
+		this.enforceBudget();
+	}
+
 	private enforceBudget(): void {
 		const budget = this.options.cacheBudgetBytes ?? 64 * 1024 * 1024;
 		if (this.cacheBytesTotal > budget) this.evict(budget);
@@ -355,12 +432,35 @@ export class LocalStore implements StateStore {
 		return this.rangeAt(key) !== undefined || isFreshKey(key, this.fresh);
 	}
 
-	/** Fetch `[miss.lo, miss.hi)` (or the point) until one acceptable page has been merged. */
+	/** The fetch range for a miss: the owner's widening, clipped to the gap around the miss. */
+	private fetchRange(miss: CacheMiss): { lo: string; hi: string; point: boolean } {
+		const wide = this.options.widen?.(miss.lo, miss.hi, miss.point);
+		if (wide === undefined || !(wide.lo <= miss.lo && wide.hi >= miss.hi)) return { lo: miss.lo, hi: miss.hi, point: miss.point };
+		let lo = wide.lo;
+		let hi = wide.hi;
+		// Do not reach back over a covered range: start right after the last one below the miss.
+		const below = this.ranges.floor(miss.lo);
+		if (below !== undefined) {
+			const end = below[1].hi;
+			if (end === undefined || end > miss.lo) return { lo: miss.lo, hi: miss.hi, point: miss.point };
+			if (end > lo) lo = end;
+		}
+		// Do not reach forward into a covered range.
+		const above = this.ranges.ceiling(keySuccessor(miss.lo));
+		if (above !== undefined && above[0] < hi) hi = above[0];
+		if (!(lo <= miss.lo && hi >= miss.hi && lo < hi)) return { lo: miss.lo, hi: miss.hi, point: miss.point };
+		return { lo, hi, point: false };
+	}
+
+	/** Fetch the miss (widened, §4.5) until one acceptable page has been merged. */
 	private async fill(miss: CacheMiss, pins: Set<CoveredRange>): Promise<void> {
 		const limit = this.options.pageLimit ?? 256;
-		const request: KeyedScanRequest = miss.point
-			? { key: b64(miss.lo) }
-			: { start: b64(miss.lo), end: b64(miss.hi), limit };
+		const range = this.fetchRange(miss);
+		const request: KeyedScanRequest = range.point
+			? { key: b64(range.lo) }
+			: { start: b64(range.lo), end: b64(range.hi), limit };
+		const now = this.options.now ?? Date.now;
+		const deadline = now() + (this.options.readDeadlineMs ?? 30_000);
 		let failures = 0;
 		for (;;) {
 			this.assertUsable();
@@ -374,17 +474,21 @@ export class LocalStore implements StateStore {
 			}
 			this.assertUsable();
 			const s = outcome?.status;
-			// Transient (§7.6): no response, 204, 429, 5xx, and a 400 from a lagging node whose
-			// Stream-Record-Next is below r (r = E never exceeds the acknowledged tail).
+			// Transient (§7.6): no response, 204, every 429 (the gateway's live-read limit sends no
+			// Retry-After), 5xx, and a 400 from a lagging node whose Stream-Record-Next is below r
+			// (r = E never exceeds the acknowledged tail).
 			const lagging = s === 400 && outcome !== undefined && (intHeader(outcome.headers, H.recordNext) ?? r) < r;
 			if (outcome === undefined || lagging || s === 204 || s === 429 || (s !== undefined && s >= 500)) {
 				failures++;
 				this.metrics.retries++;
-				if (failures > (this.options.maxRetries ?? 12)) {
+				if (failures > (this.options.maxRetries ?? Number.POSITIVE_INFINITY) || now() >= deadline) {
 					throw this.poison(new Error(`LocalStore: keyed-state read failed after ${failures} attempts (last status ${s ?? "none"})`));
 				}
-				await (this.options.backoff ?? DEFAULT_BACKOFF)(failures);
+				await (this.options.backoff ?? DEFAULT_BACKOFF)(failures, outcome === undefined ? undefined : retryAfterMs(outcome.headers));
 				continue;
+			}
+			if (s === 401 || s === 403) {
+				throw this.poison(new Error(`LocalStore: keyed-state read was not authorized (${s}); refresh credentials and reopen`));
 			}
 			if (s !== 200) throw this.poison(new Error(`LocalStore: keyed-state read answered ${s}${outcome.message ? `: ${outcome.message}` : ""}`));
 			const through = outcome.through;
@@ -399,7 +503,7 @@ export class LocalStore implements StateStore {
 				}
 				if (through <= this.next) {
 					this.metrics.pagesMerged++;
-					this.merge(miss, outcome, through, pins);
+					this.merge(range.lo, range.hi, range.point, outcome, through, pins);
 					return;
 				}
 				const wait = this.options.commitInFlight?.();
@@ -407,18 +511,18 @@ export class LocalStore implements StateStore {
 					throw this.poison(new FencedError(`keyed-state reflects record ${through - 1} above the local tail ${this.next}: another writer exists`));
 				}
 				this.metrics.commitWaits++;
-				await wait.catch(() => undefined);
+				// A rejection aborts this read with that error: asking again could spin forever.
+				await wait;
 			}
 		}
 	}
 
 	/** Merge one page at `D_resp` into the cache: `fold(page rows, overlay [D_resp, tail))` over its covered range. */
-	private merge(miss: CacheMiss, page: KeyedScanOutcome, through: number, pins: Set<CoveredRange>): void {
-		const lo = miss.lo;
-		let hi: string = miss.hi;
-		if (!miss.point && page.after !== undefined) {
+	private merge(lo: string, requestedHi: string, point: boolean, page: KeyedScanOutcome, through: number, pins: Set<CoveredRange>): void {
+		let hi: string = requestedHi;
+		if (!point && page.after !== undefined) {
 			const after = unb64(page.after);
-			if (after === undefined || after < lo || after >= miss.hi) throw this.poison(new Error("LocalStore: Stream-Keyed-After outside the requested range"));
+			if (after === undefined || after < lo || after >= requestedHi) throw this.poison(new Error("LocalStore: Stream-Keyed-After outside the requested range"));
 			hi = keySuccessor(after);
 		}
 		const merged = new SkipList<CachedRow>();

@@ -70,6 +70,17 @@ export interface FakeUrsulaOptions {
 	readonly advertiseKeyedState?: boolean;
 	/** Keyed-state publish policy: the `D` to publish for a request (default: the tail). */
 	readonly publishTarget?: (tail: number, minThroughRecord: number | undefined) => number;
+	/**
+	 * Indexer behaviour (overrides `publishTarget`), modelling the keyed engine's publish frontier:
+	 * - `normal`: on demand. A request whose `min_through_record = r` exceeds the published `D`
+	 *   publishes to a seeded random point in `[r, tail]`; other requests are served at the current,
+	 *   lagging `D`.
+	 * - `paused`: never publishes (an indexer outage); waits time out with 204.
+	 * - `aggressive`: publishes after every appended record, before the append is acknowledged.
+	 */
+	readonly indexer?: "normal" | "paused" | "aggressive";
+	/** Seed of the `normal` indexer's publish points. */
+	readonly seed?: number;
 }
 
 interface Waiter {
@@ -133,9 +144,16 @@ export class FakeUrsula {
 	private readonly options: FakeUrsulaOptions;
 	private counter = 0;
 	private readonly pending = new Set<Promise<unknown>>();
+	private rng: number;
 
 	constructor(options: FakeUrsulaOptions = {}) {
 		this.options = options;
+		this.rng = (options.seed ?? 1) >>> 0 || 1;
+	}
+
+	private random(n: number): number {
+		this.rng = (Math.imul(this.rng, 1103515245) + 12345) & 0x7fffffff;
+		return Math.floor((this.rng / 0x80000000) * n);
 	}
 
 	// ------------------------------------------------------------ transports
@@ -289,6 +307,7 @@ export class FakeUrsula {
 		const waiters = s.appendWaiters;
 		s.appendWaiters = [];
 		for (const w of waiters) w.resolve();
+		if (this.options.indexer === "aggressive") s.publishTo(s.tail);
 		return {
 			status: 204,
 			headers: { ...this.extHeaders(s), [H.recordStart]: String(start), [H.recordNext]: String(start + 1) },
@@ -338,6 +357,19 @@ export class FakeUrsula {
 		return { status: 200, headers, records };
 	}
 
+	private publishTarget(s: FakeStream, r: number | undefined): number {
+		switch (this.options.indexer) {
+			case "paused":
+			case "aggressive":
+				return s.published;
+			case "normal":
+				if (r === undefined || r <= s.published) return s.published;
+				return r + this.random(s.tail - r + 1);
+			default:
+				return this.options.publishTarget?.(s.tail, r) ?? s.tail;
+		}
+	}
+
 	private async scan(path: string, req: KeyedScanRequest): Promise<KeyedScanOutcome> {
 		const bad = (message: string): KeyedScanOutcome => ({ status: 400, headers: {}, rows: [], message });
 		const decode = (k: string | undefined): string | undefined | null => {
@@ -364,7 +396,7 @@ export class FakeUrsula {
 		if (r !== undefined && r > s.tail) {
 			return { status: 400, headers: { [H.recordNext]: String(s.tail) }, rows: [], message: "min_through_record beyond tail" };
 		}
-		const target = this.options.publishTarget?.(s.tail, r) ?? s.tail;
+		const target = this.publishTarget(s, r);
 		if (target > s.published) s.publishTo(target);
 		const ext = { [H.extensions]: EXT_KEYED_STATE, "cache-control": "no-store" };
 		if (r !== undefined && s.published < r) {

@@ -1,8 +1,14 @@
-// UrsulaStorage: Pi's Storage on one keyed Ursula stream (design §3.3, §3.6, §3.7, §7.6–§7.8).
+// UrsulaStorage: Pi's Storage on one keyed Ursula stream (design §3.3, §3.5–§3.7, §7.2–§7.9).
 //
-// M1 shape: a full-resident StateStore (E = 0, full replay from record 0 at open). The commit path,
-// the stateful outcome policy with read-back, open with claim in both modes, close with a close
-// marker, and poison semantics are the final ones.
+// Two state stores sit behind the StateStore contract:
+// - bounded (M3, the default when the node serves keyed-state): a LocalStore holding the overlay
+//   `[E, tail)` and a range cache of `state(tail)`. Open reads `m/` through keyed-state, replays
+//   `[D, N0)` into the overlay, preloads the live set, then claims (§3.6). Misses read keyed-state
+//   at `min_through_record = E` (§3.5). A background flush loop raises `E` (§7.9).
+// - full-resident (M1; kept for tests and for nodes without `keyed-state-v1`): every record from 0
+//   replayed into one materialized map.
+// The commit path, the stateful outcome policy with read-back, the claim loop, close markers, and
+// poison semantics are shared.
 import { randomBytes } from "node:crypto";
 import { hostname } from "node:os";
 import type { Context } from "@earendil-works/chord";
@@ -36,11 +42,21 @@ import { ClaimTimeout, FencedError, OpenRefused, OwnershipActive, OwnershipConte
 import { FORMAT_VALUE, K, META } from "./families.ts";
 import { bytesEqual, fromUtf8, type KeyedOp, parseKeyedBatch } from "./keyed-batch.ts";
 import * as pi from "./pi-layer.ts";
+import { preload, widenFetch } from "./bounded.ts";
+import { FlushLoop } from "./flush.ts";
+import { LocalStore } from "./local-store/index.ts";
 import { type OwnerClaim, type PlannedCommit, planClaim, planCloseMarker, planCommit } from "./planner.ts";
 import { EXT_KEYED_BATCH, EXT_KEYED_STATE, extensionTokens, H, intHeader, retryAfterMs } from "./protocol.ts";
 import { FullResidentStateStore, type StateStore, type StateView } from "./state-store.ts";
-import { type HttpOutcome, type KeyedStateTransport, type LogTransport, type ReadRecordsOutcome, TransportError } from "./transport.ts";
-import { b64 } from "./tuple.ts";
+import {
+	type HttpOutcome,
+	type KeyedScanOutcome,
+	type KeyedStateTransport,
+	type LogTransport,
+	type ReadRecordsOutcome,
+	TransportError,
+} from "./transport.ts";
+import { b64, strinc } from "./tuple.ts";
 
 export type OpenMode = "fence" | "fail-if-active";
 
@@ -71,6 +87,20 @@ export interface Timing {
 	readonly replayPageBytes: number;
 	/** `max_records` page size for replay otherwise. */
 	readonly replayPageRecords: number;
+	/** Deadline of one Session-line keyed-state read before poisoning (§7.6). */
+	readonly readDeadlineMs: number;
+	/** `timeout_ms` of keyed-state waits: open's `m/` read and flush-waits (§3.6 step 2, §7.9). */
+	readonly keyedWaitMs: number;
+	/** Open's `m/` read asks for `D ≥ N0 − openLagRecords` (§3.6 step 2). */
+	readonly openLagRecords: number;
+	/** Replay at open is discarded and `D` re-read once it exceeds this many bytes (§3.6 step 3). */
+	readonly openReplayCapBytes: number;
+	/** Flush-wait triggers (§7.9): overlay bytes, overlay records, oldest record age. */
+	readonly flushMaxBytes: number;
+	readonly flushMaxRecords: number;
+	readonly flushMaxAgeMs: number;
+	/** Backoff cap of flush-wait retries (§7.6). */
+	readonly flushBackoffMaxMs: number;
 }
 
 export const DEFAULT_TIMING: Timing = {
@@ -83,7 +113,21 @@ export const DEFAULT_TIMING: Timing = {
 	backoffMaxMs: 1000,
 	replayPageBytes: 16 * 1024 * 1024,
 	replayPageRecords: 1000,
+	readDeadlineMs: 30_000,
+	keyedWaitMs: 60_000,
+	openLagRecords: 50_000,
+	openReplayCapBytes: 64 * 1024 * 1024,
+	flushMaxBytes: 4 * 1024 * 1024,
+	flushMaxRecords: 5000,
+	flushMaxAgeMs: 10 * 60_000,
+	flushBackoffMaxMs: 30_000,
 };
+
+/**
+ * Which state store backs the owner. `auto` (default) is `bounded` when a keyed-state transport is
+ * given and the node advertises `keyed-state-v1` for the stream, otherwise `full-resident`.
+ */
+export type StateStoreKind = "auto" | "bounded" | "full-resident";
 
 export interface OwnerAlert {
 	readonly kind: "server-limit";
@@ -93,8 +137,16 @@ export interface OwnerAlert {
 
 export interface UrsulaStorageOptions {
 	readonly log: LogTransport;
-	/** Keyed-state resource. Optional in M1, where state is fully replayed from the log. */
+	/** Keyed-state resource. Required by the bounded store; the full-resident store uses it only to finalize on close. */
 	readonly keyedState?: KeyedStateTransport;
+	/** State store (default `auto`). `bounded` refuses to open unless the node serves keyed-state. */
+	readonly stateStore?: StateStoreKind;
+	/** Bounded store: cache budget in bytes (§7.5, default 64 MiB). */
+	readonly cacheBudgetBytes?: number;
+	/** Bounded store: overlay hard cap in bytes (§7.5, default 256 MiB). */
+	readonly overlayCapBytes?: number;
+	/** Bounded store: `limit` of keyed-state range fetches (default 256). */
+	readonly pageLimit?: number;
 	/** Default `fail-if-active` (§13 Q4). */
 	readonly mode?: OpenMode;
 	/**
@@ -179,6 +231,8 @@ export class UrsulaStorage implements Storage {
 	private readonly log: LogTransport;
 	private readonly keyedState: KeyedStateTransport | undefined;
 	private readonly store: StateStore;
+	private readonly local: LocalStore | undefined;
+	private readonly flush: FlushLoop | undefined;
 	private readonly timing: Timing;
 	private readonly clock: Clock;
 	private readonly onAlert: ((alert: OwnerAlert) => void) | undefined;
@@ -187,29 +241,52 @@ export class UrsulaStorage implements Storage {
 	private nextId: number;
 	private persistedNextId: number;
 	private chain: Promise<unknown> = Promise.resolve();
+	/** The landing (append + apply) of the commit in flight, if any (§3.5 step 3). */
+	private landing: Promise<void> | undefined;
 	private closing: Promise<void> | undefined;
 	private poisoned: Error | undefined;
 
-	private constructor(
-		options: UrsulaStorageOptions,
-		timing: Timing,
-		clock: Clock,
-		store: StateStore,
-		owner: OwnerClaim,
-		p7: boolean,
-		nextId: number,
-		persistedNextId: number,
-	) {
-		this.log = options.log;
-		this.keyedState = options.keyedState;
-		this.onAlert = options.onAlert;
-		this.timing = timing;
-		this.clock = clock;
-		this.store = store;
-		this.owner = owner;
-		this.p7 = p7;
-		this.nextId = nextId;
-		this.persistedNextId = persistedNextId;
+	private constructor(init: {
+		options: UrsulaStorageOptions;
+		timing: Timing;
+		clock: Clock;
+		store: StateStore;
+		local: LocalStore | undefined;
+		owner: OwnerClaim;
+		p7: boolean;
+		nextId: number;
+		persistedNextId: number;
+		hooks: OpenHooks;
+	}) {
+		this.log = init.options.log;
+		this.keyedState = init.options.keyedState;
+		this.onAlert = init.options.onAlert;
+		this.timing = init.timing;
+		this.clock = init.clock;
+		this.store = init.store;
+		this.local = init.local;
+		this.owner = init.owner;
+		this.p7 = init.p7;
+		this.nextId = init.nextId;
+		this.persistedNextId = init.persistedNextId;
+		// After the claim, a page above the tail waits for the in-flight commit; with none, another
+		// writer exists and the store poisons with FencedError (§3.5 step 3, I19).
+		init.hooks.ahead = () => this.landing;
+		const local = init.local;
+		const keyedState = init.options.keyedState;
+		if (local !== undefined && keyedState !== undefined) {
+			this.flush = new FlushLoop({
+				local,
+				keyedState,
+				owner: init.owner,
+				timing: { ...init.timing, flushWaitTimeoutMs: init.timing.keyedWaitMs },
+				now: () => init.clock.now(),
+				inflight: () => this.landing,
+				poison: (error) => {
+					this.poisonWith(error);
+				},
+			});
+		}
 	}
 
 	/** The owner's epoch: the ordinal of its claim record. */
@@ -220,9 +297,17 @@ export class UrsulaStorage implements Storage {
 	get tail(): number {
 		return this.store.tail;
 	}
-	/** The error that poisoned this storage, if any. */
+	/** The error that poisoned this storage, if any (including the bounded store's). */
 	get poison(): Error | undefined {
-		return this.poisoned;
+		return this.poisoned ?? this.local?.poisoned;
+	}
+	/** The bounded store, when this owner uses one (metrics and tests). */
+	get localStore(): LocalStore | undefined {
+		return this.local;
+	}
+	/** Flush loop metrics, when this owner uses the bounded store. */
+	get flushMetrics(): FlushLoop["metrics"] | undefined {
+		return this.flush?.metrics;
 	}
 
 	// ============================================================ open (§3.6)
@@ -248,48 +333,82 @@ export class UrsulaStorage implements Storage {
 		if (options.requireKeyedBatch !== false && !tokens.has(EXT_KEYED_BATCH)) {
 			throw new OpenRefused(`the node does not advertise ${EXT_KEYED_BATCH} for this stream`);
 		}
-		if (options.requireKeyedState === true && !tokens.has(EXT_KEYED_STATE)) {
+		const kind = options.stateStore ?? "auto";
+		if ((options.requireKeyedState === true || kind === "bounded") && !tokens.has(EXT_KEYED_STATE)) {
 			throw new OpenRefused(`the node does not advertise ${EXT_KEYED_STATE} for this stream`);
 		}
+		if (kind === "bounded" && options.keyedState === undefined) throw new OpenRefused("the bounded store needs a keyed-state transport");
 		const p7 = tokens.has(EXT_KEYED_STATE);
 		const n0 = intHeader(head.headers, H.recordNext);
 		if (n0 === undefined) throw new OpenRefused("HEAD did not return Stream-Record-Next");
+		const bounded = kind === "bounded" || (kind === "auto" && p7 && options.keyedState !== undefined);
 
-		// Steps 2–3 (M1): full replay from record 0 into a full-resident store.
-		const store = new FullResidentStateStore();
-		await replay(log, store, p7, clock, timing, deadline);
-		if (store.tail < n0) throw new Error(`UrsulaStorage open: replay ended at ${store.tail} below HEAD's ${n0}`);
-		const activity = store.tail > n0;
-
-		const format = store.readSync((v) => pi.meta<{ pi_durable_keyed?: number; tuple?: number }>(v, META.format));
-		if (store.tail > 0 && format === undefined) throw new OpenRefused("the stream is not a Pi Durable keyed log (no m/format)");
-		if (format !== undefined && ((format.pi_durable_keyed ?? 0) > FORMAT_VALUE.pi_durable_keyed || (format.tuple ?? 0) > FORMAT_VALUE.tuple)) {
-			throw new OpenRefused(`the stream's format ${JSON.stringify(format)} is newer than this owner's`);
+		// Steps 2–4: state at the tail, and whether the current owner wrote during open.
+		const hooks: OpenHooks = { ahead: () => undefined };
+		let store: StateStore;
+		let local: LocalStore | undefined;
+		let activity: boolean;
+		if (bounded) {
+			const opened = await openBounded(options, mode, log, options.keyedState as KeyedStateTransport, n0, p7, clock, timing, deadline, hooks);
+			store = opened.store;
+			local = opened.store;
+			activity = opened.activity;
+		} else {
+			const full = new FullResidentStateStore();
+			await replay(log, full, p7, clock, timing, deadline);
+			if (full.tail < n0) throw new Error(`UrsulaStorage open: replay ended at ${full.tail} below HEAD's ${n0}`);
+			store = full;
+			activity = full.tail > n0;
 		}
-
-		// Step 5: mode check. Nothing has been written yet.
-		if (mode === "fail-if-active") {
-			if (activity) throw new OwnershipActive(`records beyond ${n0} appeared during open: the current owner is writing`);
-			const current = store.readSync((v) => pi.meta<OwnerClaim>(v, META.owner));
-			if (current !== undefined && current.closed_at_ms === undefined) {
-				const poll = await retryIdempotent(
-					clock,
-					timing,
-					deadline,
-					() => log.readRecords(store.tail, { longPollMs: timing.activityWindowMs }),
-					openError("activity long-poll"),
-				);
-				if (poll.status === 200 && poll.records.length > 0) {
-					throw new OwnershipActive(`the current owner (epoch ${current.epoch}) wrote within ${timing.activityWindowMs} ms`);
-				}
-				if (!is2xx(poll.status)) throw new Error(`UrsulaStorage open: activity long-poll failed with ${describe(poll)}`);
+		try {
+			const format = await store.read((v) => pi.meta<{ pi_durable_keyed?: number; tuple?: number }>(v, META.format));
+			if (store.tail > 0 && format === undefined) throw new OpenRefused("the stream is not a Pi Durable keyed log (no m/format)");
+			if (format !== undefined && ((format.pi_durable_keyed ?? 0) > FORMAT_VALUE.pi_durable_keyed || (format.tuple ?? 0) > FORMAT_VALUE.tuple)) {
+				throw new OpenRefused(`the stream's format ${JSON.stringify(format)} is newer than this owner's`);
 			}
-		}
 
-		// Step 6: claim.
-		const owner = await claim(options, mode, log, store, p7, clock, timing);
-		const nextIdRow = store.readSync((v) => pi.meta<number>(v, META.nextId));
-		return new UrsulaStorage(options, timing, clock, store, owner, p7, nextIdRow ?? 2, nextIdRow ?? 0);
+			// Step 5: mode check. Nothing has been written yet.
+			if (mode === "fail-if-active") {
+				if (activity) throw new OwnershipActive(`records beyond ${n0} appeared during open: the current owner is writing`);
+				const current = await store.read((v) => pi.meta<OwnerClaim>(v, META.owner));
+				if (current !== undefined && current.closed_at_ms === undefined) {
+					const poll = await retryIdempotent(
+						clock,
+						timing,
+						deadline,
+						() => log.readRecords(store.tail, { longPollMs: timing.activityWindowMs }),
+						openError("activity long-poll"),
+					);
+					if (poll.status === 200 && poll.records.length > 0) {
+						throw new OwnershipActive(`the current owner (epoch ${current.epoch}) wrote within ${timing.activityWindowMs} ms`);
+					}
+					if (!is2xx(poll.status)) throw new Error(`UrsulaStorage open: activity long-poll failed with ${describe(poll)}`);
+				}
+			}
+
+			// Step 6: claim.
+			const owner = await claim(options, mode, log, store, p7, clock, timing);
+			// From here on a page above the tail means another writer (until commits start, §3.5 step 3).
+			hooks.ahead = () => undefined;
+			// Step 7: nextId and the fresh floor F_fresh := m/next_id (§7.3).
+			const nextIdRow = await store.read((v) => pi.meta<number>(v, META.nextId));
+			local?.startFresh(nextIdRow ?? 2);
+			return new UrsulaStorage({
+				options,
+				timing,
+				clock,
+				store,
+				local,
+				owner,
+				p7,
+				nextId: nextIdRow ?? 2,
+				persistedNextId: nextIdRow ?? 0,
+				hooks,
+			});
+		} catch (error) {
+			store.close();
+			throw error;
+		}
 	}
 
 	// ============================================================ commit (§3.3)
@@ -304,15 +423,41 @@ export class UrsulaStorage implements Storage {
 	private async commitNow(writes: readonly StorageWrite[]): Promise<Seq> {
 		// Accepted before close(): close waits for it, so only poison is re-checked here.
 		this.assertNotPoisoned();
+		await this.waitForOverlayRoom();
 		const seq = this.store.tail;
 		const plan = await this.store.read((view) =>
 			planCommit(view, writes, { seq, epoch: this.owner.epoch, nextId: this.nextId, persistedNextId: this.persistedNextId }),
 		);
-		await this.appendWithPolicy(plan);
-		this.store.apply(seq, plan.ops);
-		this.nextId = Math.max(this.nextId, plan.nextId);
-		this.persistedNextId = plan.persistedNextId;
+		this.assertNotPoisoned();
+		const landing = this.appendWithPolicy(plan).then(() => {
+			this.store.apply(seq, plan.ops);
+			this.nextId = Math.max(this.nextId, plan.nextId);
+			this.persistedNextId = plan.persistedNextId;
+			this.flush?.noteApplied(seq);
+		});
+		this.landing = landing.catch(() => undefined);
+		try {
+			await landing;
+		} finally {
+			this.landing = undefined;
+		}
 		return seq as Seq;
+	}
+
+	/** At the overlay hard cap, wait for the flush loop until the commit deadline, then poison (§7.5). */
+	private async waitForOverlayRoom(): Promise<void> {
+		const local = this.local;
+		const flush = this.flush;
+		if (local === undefined || flush === undefined || !local.overlayAtCap) return;
+		const deadline = this.clock.now() + this.timing.commitDeadlineMs;
+		while (local.overlayAtCap) {
+			this.assertNotPoisoned();
+			const left = deadline - this.clock.now();
+			if (left <= 0) {
+				throw this.poisonWith(new Error(`the overlay reached its ${local.overlayBytes}-byte cap and keyed-state did not catch up within ${this.timing.commitDeadlineMs} ms`));
+			}
+			await Promise.race([flush.urge(), this.clock.sleep(Math.min(left, this.timing.backoffMaxMs * 10))]);
+		}
 	}
 
 	/** The stateful outcome policy (§3.3). Resolves when record N holds this plan's bytes. */
@@ -413,20 +558,25 @@ export class UrsulaStorage implements Storage {
 
 	private async closeNow(): Promise<void> {
 		await this.chain;
-		if (this.poisoned === undefined) {
+		if (this.poison === undefined) {
+			const marker = this.appendCloseMarker().catch(() => undefined);
+			this.landing = marker;
 			try {
-				await this.appendCloseMarker();
-			} catch {
-				// The next fail-if-active open pays W once.
+				// The next fail-if-active open pays W once when this fails.
+				await marker;
+			} finally {
+				this.landing = undefined;
 			}
 		}
-		if (this.keyedState !== undefined) {
+		if (this.keyedState !== undefined && this.poison === undefined) {
 			try {
+				// Finalize-on-close (§3.7): trigger ingestion up to the tail without waiting for it.
 				await this.keyedState.scan({ key: b64(K.m(META.owner)), minThroughRecord: this.store.tail, timeoutMs: 1 });
 			} catch {
-				// Finalize-on-close is best effort.
+				// Best effort.
 			}
 		}
+		this.flush?.stop();
 		this.store.close();
 	}
 
@@ -468,7 +618,7 @@ export class UrsulaStorage implements Storage {
 	}
 
 	private assertNotPoisoned(): void {
-		const p = this.poisoned;
+		const p = this.poison;
 		if (p !== undefined) {
 			const message = `UrsulaStorage is poisoned: ${p.message}`;
 			throw p instanceof FencedError ? new FencedError(message, { cause: p }) : new Error(message, { cause: p });
@@ -477,6 +627,7 @@ export class UrsulaStorage implements Storage {
 
 	private poisonWith(error: Error): Error {
 		this.poisoned ??= error;
+		this.flush?.stop();
 		return error;
 	}
 
@@ -559,10 +710,171 @@ const asError = (e: unknown): Error => (e instanceof Error ? e : new Error(Strin
 
 // ================================================================ open helpers
 
+/**
+ * What a LocalStore does with a keyed-state page above its tail. Before the claim (§3.6 step 4): in
+ * `fence` mode, replay the log further; in `fail-if-active` mode, refuse with OwnershipActive. After
+ * the claim: wait for the in-flight commit, or (undefined) poison with FencedError.
+ */
+interface OpenHooks {
+	ahead: () => Promise<void> | undefined;
+}
+
+/** `m/` and `strinc(m/)`: the metadata family read at open (§3.6 step 2). */
+const META_LO = K.m("").slice(0, 1);
+const META_HI = strinc(META_LO);
+
+/** Read the parsed records `[from, up to date)`, giving up (undefined) past `capBytes`. */
+async function readLog(
+	log: LogTransport,
+	from: number,
+	p7: boolean,
+	clock: Clock,
+	timing: Timing,
+	deadline: number,
+	capBytes: number,
+): Promise<ReplayedRecord[] | undefined> {
+	const out: ReplayedRecord[] = [];
+	let next = from;
+	let bytes = 0;
+	for (;;) {
+		const at = next;
+		const page = await retryIdempotent(
+			clock,
+			timing,
+			deadline,
+			() => log.readRecords(at, p7 ? { maxBytes: timing.replayPageBytes } : { maxRecords: timing.replayPageRecords }),
+			(last) => new Error(`UrsulaStorage open: replay from record ${at} did not succeed before the deadline: ${last}`),
+		);
+		if (page.status !== 200 && page.status !== 204) throw new Error(`UrsulaStorage open: replay from record ${at} failed with ${describe(page)}`);
+		const start = intHeader(page.headers, H.recordStart) ?? at;
+		if (page.records.length > 0 && start !== at) throw new Error(`UrsulaStorage: log page starts at ${start}, expected ${at}`);
+		for (const recordBytes of page.records) {
+			let ops: KeyedOp[];
+			try {
+				ops = parseKeyedBatch(fromUtf8(recordBytes));
+			} catch (error) {
+				throw new Error(`UrsulaStorage: record ${next} is not a valid keyed batch`, { cause: error });
+			}
+			out.push({ ordinal: next, bytes: recordBytes, ops });
+			bytes += recordBytes.length;
+			next++;
+		}
+		if (bytes > capBytes) return undefined;
+		if (page.records.length === 0 || page.headers[H.upToDate] === "true") return out;
+	}
+}
+
+/**
+ * Open's `m/` read (§3.6 step 2): `GET keyed-state?start=m/&end=strinc(m/)&min_through_record=r`.
+ * A 204 means keyed-state lags: retry until the open deadline, then fail with a retryable error.
+ */
+async function readMeta(keyedState: KeyedStateTransport, r: number, clock: Clock, timing: Timing, deadline: number): Promise<KeyedScanOutcome> {
+	const backoff = new Backoff(clock, timing);
+	let last = "no attempt";
+	for (;;) {
+		if (clock.now() > deadline) throw new Error(`UrsulaStorage open: keyed-state lag: no state at or above record ${r} before the deadline (${last})`);
+		let outcome: KeyedScanOutcome | undefined;
+		try {
+			const wait = Math.max(1, Math.min(timing.keyedWaitMs, deadline - clock.now()));
+			outcome = await keyedState.scan({ start: b64(META_LO), end: b64(META_HI), limit: 100, minThroughRecord: r, timeoutMs: wait });
+		} catch (error) {
+			if (!(error instanceof TransportError)) throw error;
+			last = error.message;
+		}
+		if (outcome !== undefined) {
+			const s = outcome.status;
+			if (s === 200 && outcome.through !== undefined) return outcome;
+			if (isAuth(s)) throw new Error(`UrsulaStorage open: keyed-state was not authorized: ${describe(outcome)}; refresh credentials and reopen`);
+			if (s === 404) throw new OpenRefused(`keyed-state is not served for this stream: ${describe(outcome)}`);
+			const lagging = s === 400 && (intHeader(outcome.headers, H.recordNext) ?? r) < r;
+			if (s === 400 && !lagging) throw new Error(`UrsulaStorage open: keyed-state answered ${describe(outcome)}`);
+			last = describe(outcome);
+			if (s === 204) continue; // the server already waited
+			await backoff.wait(deadline, retryAfterMs(outcome.headers));
+			continue;
+		}
+		await backoff.wait(deadline);
+	}
+}
+
+/**
+ * Bounded open, steps 2–4 (§3.6): read `m/` at `D ≥ N0 − 50000`, replay `[D, N0)` into the overlay
+ * (`E := D`), merge the `m/` page, and preload. `activity` reports records beyond `N0`.
+ */
+async function openBounded(
+	options: UrsulaStorageOptions,
+	mode: OpenMode,
+	log: LogTransport,
+	keyedState: KeyedStateTransport,
+	n0: number,
+	p7: boolean,
+	clock: Clock,
+	timing: Timing,
+	deadline: number,
+	hooks: OpenHooks,
+): Promise<{ store: LocalStore; activity: boolean }> {
+	let minThrough = Math.max(0, n0 - timing.openLagRecords);
+	for (;;) {
+		const meta = n0 > 0 ? await readMeta(keyedState, minThrough, clock, timing, deadline) : undefined;
+		const d = meta?.through ?? 0;
+		const records = await readLog(log, d, p7, clock, timing, deadline, timing.openReplayCapBytes);
+		if (records === undefined) {
+			// The replay outgrew its cap: ask keyed-state for a higher D (§3.6 step 3).
+			minThrough = Math.max(minThrough + 1, n0);
+			continue;
+		}
+		let activity = d > n0;
+		const store: LocalStore = new LocalStore({
+			keyedState,
+			base: d,
+			...(options.cacheBudgetBytes === undefined ? {} : { cacheBudgetBytes: options.cacheBudgetBytes }),
+			...(options.overlayCapBytes === undefined ? {} : { overlayCapBytes: options.overlayCapBytes }),
+			...(options.pageLimit === undefined ? {} : { pageLimit: options.pageLimit }),
+			commitInFlight: () => hooks.ahead(),
+			readDeadlineMs: timing.readDeadlineMs,
+			now: () => clock.now(),
+			backoff: (attempt, retryAfter) =>
+				clock.sleep(retryAfter ?? Math.min(timing.backoffMaxMs, timing.backoffBaseMs * 2 ** Math.min(attempt, 30)) * (0.5 + Math.random() / 2)),
+			widen: widenFetch,
+		});
+		try {
+			for (const r of records) store.apply(r.ordinal, r.ops);
+			activity ||= store.tail > n0;
+			// Before the claim, a page above the replayed tail means the current owner is writing.
+			let replaying: Promise<void> | undefined;
+			hooks.ahead = () => {
+				activity = true;
+				if (mode === "fail-if-active") throw new OwnershipActive(`keyed-state reflects records beyond ${n0}: the current owner is writing`);
+				replaying ??= replay(log, store, p7, clock, timing, deadline).then(
+					() => {
+						replaying = undefined;
+					},
+					(error: unknown) => {
+						replaying = undefined;
+						throw error;
+					},
+				);
+				return replaying;
+			};
+			if (meta !== undefined) {
+				// E = D and D ≤ the replayed tail, so the page is neither stale nor ahead.
+				const merged = store.mergePage(META_LO, META_HI, meta);
+				if (merged !== "merged") throw new Error(`UrsulaStorage open: the m/ page at ${String(meta.through)} could not be merged (${merged})`);
+			}
+			// A new log (state(0) plus the claim to come) has nothing to preload.
+			if (store.tail > 0) await preload(store);
+			return { store, activity };
+		} catch (error) {
+			store.close();
+			throw error;
+		}
+	}
+}
+
 /** Replay records `[store.tail, tail)` into `store` until the log reports up to date. */
 async function replay(
 	log: LogTransport,
-	store: FullResidentStateStore,
+	store: StateStore,
 	p7: boolean,
 	clock: Clock,
 	timing: Timing,
@@ -584,7 +896,7 @@ async function replay(
 	}
 }
 
-function applyPage(store: FullResidentStateStore, page: ReadRecordsOutcome): ReplayedRecord[] {
+function applyPage(store: StateStore, page: ReadRecordsOutcome): ReplayedRecord[] {
 	const start = intHeader(page.headers, H.recordStart) ?? store.tail;
 	if (page.records.length > 0 && start !== store.tail) {
 		throw new Error(`UrsulaStorage: log page starts at ${start}, expected ${store.tail}`);
@@ -609,7 +921,7 @@ async function claim(
 	options: UrsulaStorageOptions,
 	mode: OpenMode,
 	log: LogTransport,
-	store: FullResidentStateStore,
+	store: StateStore,
 	p7: boolean,
 	clock: Clock,
 	timing: Timing,
