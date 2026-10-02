@@ -6,6 +6,7 @@
 // - keyed-batch.ts — keyed-batch-v1 encoding, P1 JSON normalization, P2 grammar validation, op parsing.
 // - ordered-map.ts — sorted binary-key map used by the state store and the fake.
 // - state-store.ts — StateStore/StateView contract and the full-resident M1 store.
+// - local-store/   — bounded StateStore (§7.2–§7.5): overlay + range cache, fresh floor, eviction, skip list.
 // - pi-layer.ts    — read plans of the Storage methods (§4.5) over a StateView.
 // - planner.ts     — StorageWrite → ops (§4.4), MemoryStorage-ported validation, pre-checks, claims.
 // - transport.ts   — LogTransport / KeyedStateTransport interfaces (1:1 with the HTTP API).
@@ -26,6 +27,7 @@ export {
 } from "./http.ts";
 export { encodeRecord, type KeyedOp, KeyedBatchError, normalizeJsonMessage, parseKeyedBatch } from "./keyed-batch.ts";
 export { EXT_KEYED_BATCH, EXT_KEYED_STATE, H, KEYED_CONTENT_TYPE, KEYED_ROWS_MEDIA_TYPE, LIMITS } from "./protocol.ts";
+export { LocalStore, type LocalStoreOptions } from "./local-store/index.ts";
 export { FullResidentStateStore, type Row, type StateStore, type StateView } from "./state-store.ts";
 export {
 	type Clock,

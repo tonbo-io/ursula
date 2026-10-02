@@ -10,10 +10,16 @@ over a full-resident state store (every record replayed from 0 at open). It talk
 `LogTransport` and `KeyedStateTransport` interfaces in `src/transport.ts`, implemented over `fetch` in
 `src/http.ts`. `src/fake/` is an in-memory Ursula with fold semantics, `Stream-Record-Match`, and fault injection.
 
+`src/local-store/` is the bounded owner state of M3 (§7.2–§7.5), not yet wired into `UrsulaStorage`:
+`LocalStore` keeps the overlay of records `[E, tail)` plus a range cache of materialized `state(tail)` rows
+(skip list), merges keyed-state pages at `D_resp ≥ E` by replaying the overlay, serves new IDs locally via
+the complete-at-mint fresh floor, and evicts LRU ranges that no running read has pinned.
+
 ```sh
 npm ci
 npm run typecheck
-npm test          # FUZZ_TABLE_TRIALS / FUZZ_DOC_TRIALS scale the differential fuzzers
+npm test          # FUZZ_TABLE_TRIALS / FUZZ_DOC_TRIALS scale the differential fuzzers;
+                  # LOCAL_STORE_MODEL_CASES (default 10^4; 10^5 for M0e) / LOCAL_STORE_PI_CASES scale the LocalStore model tests
 
 # End to end against a real single-node ursula (memory engine, free port), spawned by the suite:
 cargo build --release -p ursula --bin ursula
