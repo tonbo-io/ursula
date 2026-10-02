@@ -5131,6 +5131,7 @@ fn shared_ref_candidates_follow_threshold_idle_and_pack_occupancy() {
         now_ms: 10_000,
         max_run_bytes: 8,
         limit: 16,
+        legacy_packs_only: false,
     };
     let candidates = machine.shared_ref_candidates(&request, &mut tracker);
     assert_eq!(
@@ -5209,4 +5210,56 @@ fn shared_ref_candidates_follow_threshold_idle_and_pack_occupancy() {
     machine.apply(StreamCommand::AckColdGc { up_to_seq: last });
     let referenced = machine.group_referenced_cold_paths();
     assert!(!referenced.contains("benchcmp/_packs/00000000/busy-0.bin"));
+}
+
+/// The legacy-pack filter (#278) on F2 discovery: only slices of packs
+/// outside the stream's own `{bucket}/_packs/` count, any one makes the
+/// stream a candidate, the run covers only them, and the idle tracker is not
+/// touched.
+#[test]
+fn shared_ref_candidates_legacy_filter_selects_only_legacy_pack_slices() {
+    let mut machine = machine();
+    for id in ["legacy", "modern"] {
+        create_stream(&mut machine, id);
+    }
+    for (index, pack) in [
+        "_packs/old-0.bin",
+        "_packs/old-1.bin",
+        "benchcmp/_packs/0/new.bin",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let start = u64::try_from(index).unwrap() * 4;
+        machine.apply(append_cmd(stream("legacy"), b"abcd", Append::default()));
+        flush_shared_slice(&mut machine, "legacy", start, start + 4, pack);
+    }
+    machine.apply(append_cmd(stream("modern"), b"abcd", Append::default()));
+    flush_shared_slice(&mut machine, "modern", 0, 4, "benchcmp/_packs/0/new.bin");
+
+    let mut tracker = SharedRefIdleTracker::default();
+    let candidates = machine.shared_ref_candidates(
+        &SharedRefCompactionRequest::legacy_packs(u64::MAX, 16),
+        &mut tracker,
+    );
+    assert_eq!(candidates.len(), 1);
+    let legacy = &candidates[0];
+    assert_eq!(legacy.stream_id, stream("legacy"));
+    assert_eq!(legacy.shared_refs, 2, "only legacy slices count");
+    assert_eq!(
+        legacy
+            .run
+            .iter()
+            .map(|chunk| chunk.s3_path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["_packs/old-0.bin", "_packs/old-1.bin"]
+    );
+    assert!(
+        tracker.is_empty(),
+        "the legacy filter leaves the idle tracker alone"
+    );
+    assert!(crate::is_legacy_cross_bucket_pack(
+        &stream("legacy"),
+        &legacy.run[0]
+    ));
 }

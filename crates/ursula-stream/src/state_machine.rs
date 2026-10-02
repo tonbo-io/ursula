@@ -99,6 +99,7 @@ pub use self::cold_refs::SHARED_REF_IDLE_MS;
 pub use self::cold_refs::SharedRefCandidate;
 pub use self::cold_refs::SharedRefCompactionRequest;
 pub use self::cold_refs::SharedRefIdleTracker;
+pub use self::cold_refs::is_legacy_cross_bucket_pack;
 pub use self::cold_refs::plan_shared_ref_run;
 pub use self::flush_planner::ColdFlushPass;
 pub use self::flush_planner::ColdFlushPassRequest;

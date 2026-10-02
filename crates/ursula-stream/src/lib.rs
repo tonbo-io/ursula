@@ -91,6 +91,7 @@ pub use state_machine::SharedRefCandidate;
 pub use state_machine::SharedRefCompactionRequest;
 pub use state_machine::SharedRefIdleTracker;
 pub use state_machine::StreamStateMachine;
+pub use state_machine::is_legacy_cross_bucket_pack;
 pub use state_machine::plan_shared_ref_run;
 pub use validate::validate_bucket_id;
 pub use validate::validate_stream_id;
