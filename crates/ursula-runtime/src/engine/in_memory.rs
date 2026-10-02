@@ -307,8 +307,16 @@ impl InMemoryGroupEngine {
             command => {
                 let stream_id = command_stream_id(&command);
                 let command_producer = command_producer(&command);
+                // Commands whose pages the leader rewrote before proposing:
+                // compaction, and external appends and creates, whose entries
+                // the leader writes straight to the page store (bounded-state
+                // F13). Every replica drops the stream's cached pages, so a
+                // page cached earlier (possibly holding a stale entry over the
+                // same offsets) is reloaded.
                 let compacted_stream_id = match &command {
-                    StreamCommand::CompactCold { stream_id, .. } => Some(stream_id.clone()),
+                    StreamCommand::CompactCold { stream_id, .. }
+                    | StreamCommand::AppendExternal { stream_id, .. }
+                    | StreamCommand::CreateExternal { stream_id, .. } => Some(stream_id.clone()),
                     _ => None,
                 };
                 // Pages an exclusive cold flush rewrote (and possibly clipped)

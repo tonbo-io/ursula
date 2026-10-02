@@ -683,10 +683,16 @@ impl ColdIndexPageStore for InMemoryColdIndexPageStore {
     }
 }
 
+/// Default byte bound of a group's cold-index page cache (bounded-state
+/// F13): pages hold one entry per flush or external append, so a page count
+/// alone does not bound memory.
+pub const DEFAULT_COLD_INDEX_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct ColdIndexPageCache<S: ColdIndexPageStore + ?Sized> {
     store: Arc<S>,
     capacity_pages: usize,
+    capacity_bytes: usize,
     inner: Mutex<ColdIndexPageCacheInner>,
 }
 
@@ -695,21 +701,85 @@ struct ColdIndexPageCacheInner {
     next_generation: u64,
     pages: HashMap<ColdIndexPageKey, ColdIndexPageCacheEntry>,
     lru: VecDeque<(ColdIndexPageKey, u64)>,
+    /// Sum of the cached pages' approximate heap bytes.
+    bytes: usize,
 }
 
 #[derive(Debug)]
 struct ColdIndexPageCacheEntry {
     page: Arc<ColdIndexPage>,
     generation: u64,
+    bytes: usize,
+}
+
+/// Approximate heap bytes of one cached page: the page, its entries and
+/// their path strings, plus the key.
+fn approximate_page_bytes(key: &ColdIndexPageKey, page: &ColdIndexPage) -> usize {
+    let chunks = page.cold_chunks.iter().fold(0_usize, |total, chunk| {
+        total
+            .saturating_add(std::mem::size_of::<ColdChunkRef>())
+            .saturating_add(chunk.s3_path.len())
+            .saturating_add(chunk.payload_digest.len())
+    });
+    let externals = page
+        .external_segments
+        .iter()
+        .fold(0_usize, |total, segment| {
+            total
+                .saturating_add(std::mem::size_of::<ObjectPayloadRef>())
+                .saturating_add(segment.s3_path.len())
+        });
+    std::mem::size_of::<ColdIndexPage>()
+        .saturating_add(std::mem::size_of::<ColdIndexPageCacheEntry>())
+        .saturating_add(std::mem::size_of::<ColdIndexPageKey>())
+        .saturating_add(key.stream_id.bucket_id.len())
+        .saturating_add(key.stream_id.stream_id.len())
+        .saturating_add(key.stream_id.affinity_key.as_ref().map_or(0, String::len))
+        .saturating_add(chunks)
+        .saturating_add(externals)
+}
+
+impl ColdIndexPageCacheInner {
+    fn remove_where(&mut self, mut remove: impl FnMut(&ColdIndexPageKey) -> bool) {
+        let mut freed = 0_usize;
+        self.pages.retain(|key, entry| {
+            let drop = remove(key);
+            if drop {
+                freed = freed.saturating_add(entry.bytes);
+            }
+            !drop
+        });
+        self.bytes = self.bytes.saturating_sub(freed);
+        self.lru.retain(|(key, _)| !remove(key));
+    }
 }
 
 impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
     pub fn new(store: Arc<S>, capacity_pages: usize) -> Self {
+        Self::with_capacity_bytes(store, capacity_pages, DEFAULT_COLD_INDEX_CACHE_BYTES)
+    }
+
+    /// A cache bounded by both a page count and approximate heap bytes
+    /// (bounded-state F13); the least recently used pages go first.
+    pub fn with_capacity_bytes(
+        store: Arc<S>,
+        capacity_pages: usize,
+        capacity_bytes: usize,
+    ) -> Self {
         Self {
             store,
             capacity_pages,
+            capacity_bytes,
             inner: Mutex::new(ColdIndexPageCacheInner::default()),
         }
+    }
+
+    /// Approximate heap bytes of the cached pages.
+    pub fn cached_bytes(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("cold index page cache mutex poisoned")
+            .bytes
     }
 
     pub async fn put_page(&self, key: &ColdIndexPageKey, page: &ColdIndexPage) -> io::Result<()> {
@@ -729,8 +799,7 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
     /// this on every replica when the replicated replacement command applies.
     pub fn invalidate_stream(&self, stream_id: &BucketStreamId) {
         let mut inner = self.inner.lock().expect("cold index cache mutex poisoned");
-        inner.pages.retain(|key, _| &key.stream_id != stream_id);
-        inner.lru.retain(|(key, _)| &key.stream_id != stream_id);
+        inner.remove_where(|key| &key.stream_id == stream_id);
     }
 
     /// Drops every cached page.
@@ -738,6 +807,7 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
         let mut inner = self.inner.lock().expect("cold index cache mutex poisoned");
         inner.pages.clear();
         inner.lru.clear();
+        inner.bytes = 0;
     }
 
     /// Drops the cached pages of one stream generation that cover
@@ -764,8 +834,7 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
                 && (first_page..=last_page).contains(&key.page_id)
         };
         let mut inner = self.inner.lock().expect("cold index cache mutex poisoned");
-        inner.pages.retain(|key, _| !covered(key));
-        inner.lru.retain(|(key, _)| !covered(key));
+        inner.remove_where(covered);
     }
 
     async fn reload_page(&self, key: &ColdIndexPageKey) -> io::Result<Option<Arc<ColdIndexPage>>> {
@@ -842,10 +911,16 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
             .lock()
             .expect("cold index page cache mutex poisoned");
         let generation = Self::touch(&mut inner, key.clone());
-        inner
-            .pages
-            .insert(key, ColdIndexPageCacheEntry { page, generation });
-        Self::evict_over_capacity(&mut inner, self.capacity_pages);
+        let bytes = approximate_page_bytes(&key, &page);
+        inner.bytes = inner.bytes.saturating_add(bytes);
+        if let Some(replaced) = inner.pages.insert(key, ColdIndexPageCacheEntry {
+            page,
+            generation,
+            bytes,
+        }) {
+            inner.bytes = inner.bytes.saturating_sub(replaced.bytes);
+        }
+        Self::evict_over_capacity(&mut inner, self.capacity_pages, self.capacity_bytes);
         Self::compact_lru_if_needed(&mut inner);
     }
 
@@ -880,13 +955,18 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
         generation
     }
 
-    fn evict_over_capacity(inner: &mut ColdIndexPageCacheInner, capacity_pages: usize) {
+    fn evict_over_capacity(
+        inner: &mut ColdIndexPageCacheInner,
+        capacity_pages: usize,
+        capacity_bytes: usize,
+    ) {
         if capacity_pages == 0 {
             inner.pages.clear();
             inner.lru.clear();
+            inner.bytes = 0;
             return;
         }
-        while inner.pages.len() > capacity_pages {
+        while inner.pages.len() > capacity_pages || inner.bytes > capacity_bytes {
             let Some((key, generation)) = inner.lru.pop_front() else {
                 break;
             };
@@ -897,7 +977,9 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
             if stale {
                 continue;
             }
-            inner.pages.remove(&key);
+            if let Some(removed) = inner.pages.remove(&key) {
+                inner.bytes = inner.bytes.saturating_sub(removed.bytes);
+            }
         }
     }
 }
@@ -1399,6 +1481,36 @@ mod tests {
             }],
             external_segments: Vec::new(),
         }
+    }
+
+    /// F13: the page cache is bounded by approximate bytes, not only by a
+    /// page count, because one page can hold thousands of entries.
+    #[tokio::test]
+    async fn page_cache_is_bounded_by_bytes_and_evicts_least_recently_used() {
+        let store = Arc::new(InMemoryColdIndexPageStore::new());
+        let one_page = approximate_page_bytes(&key(0), &page(0, 128));
+        let cache = ColdIndexPageCache::with_capacity_bytes(store, 1024, one_page * 3);
+        for page_id in 0..3 {
+            cache
+                .put_page(&key(page_id), &page(page_id * 128, (page_id + 1) * 128))
+                .await
+                .expect("put page");
+        }
+        assert_eq!(cache.cached_page_count(), 3);
+        assert_eq!(cache.cached_bytes(), one_page * 3);
+        // Touch page 0 so page 1 is the least recently used.
+        assert!(cache.get_cached(&key(0)).is_some());
+        cache
+            .put_page(&key(3), &page(3 * 128, 4 * 128))
+            .await
+            .expect("put page");
+        assert_eq!(cache.cached_page_count(), 3);
+        assert!(cache.cached_bytes() <= one_page * 3);
+        assert!(cache.get_cached(&key(1)).is_none(), "LRU page evicted");
+        assert!(cache.get_cached(&key(0)).is_some());
+        cache.invalidate_stream(&key(0).stream_id);
+        assert_eq!(cache.cached_bytes(), 0);
+        assert_eq!(cache.cached_page_count(), 0);
     }
 
     #[tokio::test]
