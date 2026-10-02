@@ -7,5 +7,7 @@ export default defineConfig({
 		globalSetup: ["test/e2e/global-setup.ts"],
 		testTimeout: 120_000,
 		hookTimeout: 120_000,
+		// The watchdog ends a run whose teardown hangs after the results are known (CI only needs them).
+		reporters: ["default", "./test/e2e/watchdog-reporter.ts"],
 	},
 });
