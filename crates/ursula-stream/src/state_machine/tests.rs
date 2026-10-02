@@ -1194,21 +1194,16 @@ fn flush_cold_compacts_message_records_to_cold_prefix() {
         }
     );
     assert_eq!(
-        machine
-            .bootstrap_plan(&stream("cold-records"))
-            .expect("bootstrap")
-            .updates,
-        vec![
-            StreamMessageRecord {
-                start_offset: 0,
-                end_offset: 4,
-            },
-            StreamMessageRecord {
-                start_offset: 4,
-                end_offset: 6,
-            },
-        ]
+        stream_message_records(&machine, "cold-records"),
+        records(&[(0, 4), (4, 6)])
     );
+    // Bootstrap must not return the collapsed cold prefix as one part.
+    let plan = machine
+        .bootstrap_plan(&stream("cold-records"))
+        .expect("bootstrap");
+    assert!(plan.updates.is_empty());
+    assert_eq!(plan.next_offset, 0);
+    assert!(!plan.up_to_date);
 
     assert_eq!(
         machine.apply(flush_cold_cmd(
@@ -1223,14 +1218,8 @@ fn flush_cold_compacts_message_records_to_cold_prefix() {
         }
     );
     assert_eq!(
-        machine
-            .bootstrap_plan(&stream("cold-records"))
-            .expect("bootstrap")
-            .updates,
-        vec![StreamMessageRecord {
-            start_offset: 0,
-            end_offset: 6,
-        }]
+        stream_message_records(&machine, "cold-records"),
+        records(&[(0, 6)])
     );
     let snapshot = machine.snapshot();
     let entry = snapshot
@@ -1255,6 +1244,266 @@ fn flush_cold_compacts_message_records_to_cold_prefix() {
             ..
         }
     ));
+}
+
+fn stream_message_records(machine: &StreamStateMachine, id: &str) -> Vec<StreamMessageRecord> {
+    machine
+        .snapshot()
+        .streams
+        .into_iter()
+        .find(|entry| entry.metadata.stream_id == stream(id))
+        .expect("stream snapshot")
+        .message_records
+}
+
+fn append_all(machine: &mut StreamStateMachine, id: &str, payloads: &[&[u8]]) {
+    for payload in payloads {
+        assert!(matches!(
+            machine.apply(append_cmd(stream(id), payload, Append::default())),
+            StreamResponse::Appended { .. }
+        ));
+    }
+}
+
+fn records(ranges: &[(u64, u64)]) -> Vec<StreamMessageRecord> {
+    ranges
+        .iter()
+        .map(|&(start_offset, end_offset)| StreamMessageRecord {
+            start_offset,
+            end_offset,
+        })
+        .collect()
+}
+
+/// Regression: a cold flush past the snapshot offset collapsed the
+/// messages between the snapshot and the flush frontier into one record that
+/// starts below the snapshot. Bootstrap used to drop that record and still
+/// claim `up_to_date` at the tail, silently skipping messages.
+#[test]
+fn bootstrap_after_cold_flush_past_snapshot_does_not_skip_messages() {
+    let mut machine = machine();
+    create_stream(&mut machine, "boot-skip");
+    append_all(&mut machine, "boot-skip", &[b"abc", b"de", b"fg"]);
+    assert!(matches!(
+        machine.apply(publish_snapshot_cmd(stream("boot-skip"), 3, OCTET, b"s", 0)),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    assert_eq!(
+        machine.apply(flush_cold_cmd(
+            stream("boot-skip"),
+            0,
+            5,
+            "s3://b/boot-skip/0",
+            5
+        )),
+        StreamResponse::ColdFlushed {
+            hot_start_offset: 5
+        }
+    );
+
+    let plan = machine
+        .bootstrap_plan(&stream("boot-skip"))
+        .expect("bootstrap");
+    assert_eq!(
+        plan.snapshot.as_ref().map(|snapshot| snapshot.offset),
+        Some(3)
+    );
+    assert!(plan.updates.is_empty());
+    assert_eq!(plan.next_offset, 3);
+    assert!(!plan.up_to_date);
+    assert!(!plan.closed);
+    // The client continues with ordinary reads from S and gets every
+    // remaining message.
+    let read = machine
+        .read_plan(&stream("boot-skip"), 3, 4)
+        .expect("read from S");
+    assert_eq!(read.next_offset, 7);
+}
+
+/// Regression: when the snapshot offset equals the retained offset, the
+/// collapsed cold prefix used to come back as one bootstrap part holding
+/// several messages.
+#[test]
+fn bootstrap_never_returns_collapsed_cold_prefix_as_one_part() {
+    let mut machine = machine();
+    create_stream(&mut machine, "boot-merge");
+    append_all(&mut machine, "boot-merge", &[b"ab", b"cd", b"ef"]);
+    assert!(matches!(
+        machine.apply(flush_cold_cmd(
+            stream("boot-merge"),
+            0,
+            4,
+            "s3://b/boot-merge/0",
+            4
+        )),
+        StreamResponse::ColdFlushed { .. }
+    ));
+
+    // No snapshot: S is the retained offset 0, below the cold frontier.
+    let plan = machine
+        .bootstrap_plan(&stream("boot-merge"))
+        .expect("bootstrap");
+    assert!(plan.snapshot.is_none());
+    assert!(plan.updates.is_empty());
+    assert_eq!(plan.next_offset, 0);
+    assert!(!plan.up_to_date);
+
+    // Snapshot at the retained offset behaves the same.
+    assert!(matches!(
+        machine.apply(publish_snapshot_cmd(stream("boot-merge"), 0, OCTET, b"", 0)),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    let plan = machine
+        .bootstrap_plan(&stream("boot-merge"))
+        .expect("bootstrap");
+    assert_eq!(
+        plan.snapshot.as_ref().map(|snapshot| snapshot.offset),
+        Some(0)
+    );
+    assert!(plan.updates.is_empty());
+    assert_eq!(plan.next_offset, 0);
+    assert!(!plan.up_to_date);
+}
+
+#[test]
+fn bootstrap_returns_one_part_per_message_when_snapshot_is_above_cold_frontier() {
+    let mut machine = machine();
+    create_stream(&mut machine, "boot-hot");
+    append_all(&mut machine, "boot-hot", &[b"ab", b"cd", b"ef", b"gh"]);
+    // The cold chunk ends inside message "cd", leaving the fragment [3, 4).
+    assert!(matches!(
+        machine.apply(flush_cold_cmd(
+            stream("boot-hot"),
+            0,
+            3,
+            "s3://b/boot-hot/0",
+            3
+        )),
+        StreamResponse::ColdFlushed { .. }
+    ));
+    // A snapshot at the cold frontier itself may sit inside a message whose
+    // head is cold, so the possible fragment [3, 4) must never become a part.
+    assert!(matches!(
+        machine.apply(publish_snapshot_cmd(stream("boot-hot"), 3, OCTET, b"s", 0)),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    let plan = machine
+        .bootstrap_plan(&stream("boot-hot"))
+        .expect("bootstrap");
+    assert_eq!(
+        plan.snapshot.as_ref().map(|snapshot| snapshot.offset),
+        Some(3)
+    );
+    assert!(plan.updates.is_empty());
+    assert_eq!(plan.next_offset, 3);
+    assert!(!plan.up_to_date);
+
+    assert!(matches!(
+        machine.apply(publish_snapshot_cmd(stream("boot-hot"), 4, OCTET, b"s", 0)),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    let plan = machine
+        .bootstrap_plan(&stream("boot-hot"))
+        .expect("bootstrap");
+    assert_eq!(plan.updates, records(&[(4, 6), (6, 8)]));
+    assert_eq!(plan.next_offset, 8);
+    assert!(plan.up_to_date);
+}
+
+#[test]
+fn bootstrap_without_cold_flush_returns_every_message() {
+    let mut machine = machine();
+    create_stream(&mut machine, "boot-all");
+    append_all(&mut machine, "boot-all", &[b"ab", b"cd"]);
+    let plan = machine
+        .bootstrap_plan(&stream("boot-all"))
+        .expect("bootstrap");
+    assert_eq!(plan.updates, records(&[(0, 2), (2, 4)]));
+    assert_eq!(plan.next_offset, 4);
+    assert!(plan.up_to_date);
+}
+
+#[test]
+fn bootstrap_reports_closed_only_when_complete() {
+    let mut machine = machine();
+    create_stream(&mut machine, "boot-closed");
+    append_all(&mut machine, "boot-closed", &[b"ab", b"cd"]);
+    assert!(matches!(
+        machine.apply(close_cmd(stream("boot-closed"))),
+        StreamResponse::Closed { .. }
+    ));
+    let plan = machine
+        .bootstrap_plan(&stream("boot-closed"))
+        .expect("bootstrap");
+    assert!(plan.up_to_date);
+    assert!(plan.closed);
+
+    assert!(matches!(
+        machine.apply(flush_cold_cmd(
+            stream("boot-closed"),
+            0,
+            2,
+            "s3://b/boot-closed/0",
+            2
+        )),
+        StreamResponse::ColdFlushed { .. }
+    ));
+    let plan = machine
+        .bootstrap_plan(&stream("boot-closed"))
+        .expect("bootstrap");
+    assert!(plan.updates.is_empty());
+    assert_eq!(plan.next_offset, 0);
+    assert!(!plan.up_to_date);
+    assert!(!plan.closed);
+}
+
+#[test]
+fn json_bootstrap_after_cold_flush_is_honest_partial() {
+    let mut machine = machine();
+    let stream_id = stream("boot-json");
+    assert!(matches!(
+        machine.apply(create_cmd(stream_id.clone(), Create {
+            content_type: "application/json",
+            payload: b"{\"a\":1}\n{\"b\":2}\n".to_vec(),
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+    assert!(matches!(
+        machine.apply(append_cmd(stream_id.clone(), b"{\"c\":3}\n", Append {
+            content_type: Some("application/json"),
+            ..Append::default()
+        })),
+        StreamResponse::Appended { .. }
+    ));
+    let plan = machine.bootstrap_plan(&stream_id).expect("bootstrap");
+    assert_eq!(plan.updates, records(&[(0, 8), (8, 16), (16, 24)]));
+    assert!(plan.up_to_date);
+
+    assert!(matches!(
+        machine.apply(publish_snapshot_cmd(
+            stream_id.clone(),
+            8,
+            "application/json",
+            b"{}",
+            0
+        )),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    assert!(matches!(
+        machine.apply(flush_cold_cmd(
+            stream_id.clone(),
+            0,
+            16,
+            "s3://b/boot-json/0",
+            16
+        )),
+        StreamResponse::ColdFlushed { .. }
+    ));
+    let plan = machine.bootstrap_plan(&stream_id).expect("bootstrap");
+    assert!(plan.updates.is_empty());
+    assert_eq!(plan.next_offset, 8);
+    assert!(!plan.up_to_date);
 }
 
 fn flush_one_cold_chunk(machine: &mut StreamStateMachine, id: &str) {
@@ -3387,12 +3636,16 @@ proptest! {
             bootstrap.snapshot.as_ref(),
             expected_snapshot.as_ref()
         );
+        // The flush starts at the snapshot offset, so the messages after the
+        // snapshot are now (partly) cold: bootstrap is an honest partial.
+        prop_assert!(bootstrap.updates.is_empty());
+        prop_assert_eq!(bootstrap.next_offset, snapshot_offset);
+        prop_assert!(!bootstrap.up_to_date);
         prop_assert!(message_records_cover_retained_suffix(
-            &bootstrap.updates,
+            &stream_message_records(&machine, "prop-snapshot-cold"),
             snapshot_offset,
             tail_offset
         ));
-        prop_assert_eq!(bootstrap.next_offset, tail_offset);
 
         let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
         prop_assert_eq!(
@@ -3965,4 +4218,74 @@ fn set_feature_level_command_round_trips_through_serde() {
     let decoded: StreamCommand = serde_json::from_slice(&bytes).expect("decode command");
     assert_eq!(decoded, command);
     assert_eq!(command.to_string(), "set_feature_level:1");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Bootstrap is either complete (one part per appended message from the
+    /// snapshot to the tail, every part hot) or an honest partial that hands
+    /// the client back to ordinary reads at the snapshot offset.
+    #[test]
+    fn prop_bootstrap_is_complete_per_message_or_honest_partial(
+        payloads in payloads_strategy(),
+        flush_bytes in 0_usize..=96,
+        snapshot_index_seed in 0_usize..=24,
+        publish_snapshot in any::<bool>(),
+    ) {
+        let mut machine = machine();
+        create_stream(&mut machine, "prop-boot");
+        let stream_id = stream("prop-boot");
+        let mut messages = Vec::with_capacity(payloads.len());
+        let mut tail = 0_u64;
+        for payload in &payloads {
+            let response = append_payload(&mut machine, "prop-boot", payload.clone(), false, None);
+            let appended = matches!(response, StreamResponse::Appended { .. });
+            prop_assert!(appended);
+            let end = tail + u64::try_from(payload.len()).expect("len fits u64");
+            messages.push(StreamMessageRecord { start_offset: tail, end_offset: end });
+            tail = end;
+        }
+        if flush_bytes > 0
+            && let Some(candidate) = machine
+                .plan_cold_flush(&stream_id, 1, flush_bytes)
+                .expect("plan cold flush")
+        {
+            let flushed = matches!(
+                machine.apply(flush_candidate_cmd(stream_id.clone(), &candidate, "s3://b/prop-boot/0")),
+                StreamResponse::ColdFlushed { .. }
+            );
+            prop_assert!(flushed);
+        }
+        let mut snapshot_offset = 0;
+        if publish_snapshot {
+            let index = snapshot_index_seed % (messages.len() + 1);
+            snapshot_offset = if index == 0 { 0 } else { messages[index - 1].end_offset };
+            let published = matches!(
+                machine.apply(publish_snapshot_cmd(stream_id.clone(), snapshot_offset, OCTET, b"s", 0)),
+                StreamResponse::SnapshotPublished { .. }
+            );
+            prop_assert!(published);
+        }
+
+        let plan = machine.bootstrap_plan(&stream_id).expect("bootstrap");
+        let hot_start = machine.hot_start_offset(&stream_id);
+        if plan.up_to_date {
+            prop_assert_eq!(plan.next_offset, tail);
+            let expected = messages
+                .iter()
+                .filter(|record| record.start_offset >= snapshot_offset)
+                .cloned()
+                .collect::<Vec<_>>();
+            prop_assert_eq!(&plan.updates, &expected);
+            prop_assert!(plan.updates.iter().all(|record| record.start_offset >= hot_start));
+        } else {
+            prop_assert!(plan.updates.is_empty());
+            prop_assert_eq!(plan.next_offset, snapshot_offset);
+            // Only a cold flush that reaches the snapshot makes bootstrap
+            // partial. A flush ending exactly at the snapshot counts: the
+            // state machine cannot tell whether that cut split a message.
+            prop_assert!(hot_start > 0 && hot_start >= snapshot_offset);
+        }
+    }
 }

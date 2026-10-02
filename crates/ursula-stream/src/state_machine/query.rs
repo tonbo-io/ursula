@@ -395,14 +395,30 @@ impl StreamStateMachine {
         };
         let stream = &slot.metadata;
         let snapshot = slot.visible_snapshot.clone();
-        let retained_offset = snapshot
+        let snapshot_offset = snapshot
             .as_ref()
-            .map(|snapshot| snapshot.offset)
-            .unwrap_or(0);
+            .map_or(slot.retained_offset, |snapshot| snapshot.offset);
+        let exact_frontier = self.exact_message_frontier(stream_id);
+        let closed = stream.status == StreamStatus::Closed;
+        if snapshot_offset < exact_frontier {
+            // Honest partial: the messages right after the snapshot only
+            // survive as a collapsed cold record, so bootstrap cannot split
+            // them into one part per message without reading cold storage.
+            // The client continues with ordinary reads from the snapshot,
+            // which also report closure once they reach the tail.
+            return Ok(StreamBootstrapPlan {
+                snapshot,
+                updates: Vec::new(),
+                next_offset: snapshot_offset,
+                content_type: stream.content_type.clone(),
+                up_to_date: false,
+                closed: false,
+            });
+        }
         let updates = slot
             .message_records
             .iter()
-            .filter(|record| record.start_offset >= retained_offset)
+            .filter(|record| record.start_offset >= snapshot_offset)
             .cloned()
             .collect::<Vec<_>>();
         Ok(StreamBootstrapPlan {
@@ -411,7 +427,7 @@ impl StreamStateMachine {
             next_offset: stream.tail_offset,
             content_type: stream.content_type.clone(),
             up_to_date: true,
-            closed: stream.status == StreamStatus::Closed,
+            closed,
         })
     }
 }

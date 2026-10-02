@@ -5019,6 +5019,226 @@ async fn bootstrap_without_snapshot_emits_empty_snapshot_part_and_rejects_live()
     assert!(body.contains("one"));
 }
 
+fn cold_test_router() -> Router {
+    let cold_store = std::sync::Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+        RuntimeConfig::new(1, 1),
+        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
+        Some(cold_store),
+    )
+    .expect("runtime");
+    router(runtime)
+}
+
+/// Splits a bootstrap multipart body into its parts' payloads.
+fn bootstrap_parts(response_content_type: &str, body: &[u8]) -> Vec<String> {
+    let boundary = response_content_type
+        .split("boundary=")
+        .nth(1)
+        .expect("multipart boundary");
+    let body = std::str::from_utf8(body).expect("multipart utf8");
+    let delimiter = format!("--{boundary}");
+    body.split(delimiter.as_str())
+        .skip(1)
+        .filter(|part| !part.starts_with("--"))
+        .map(|part| {
+            let (_, payload) = part.split_once("\r\n\r\n").expect("part headers");
+            payload
+                .strip_suffix("\r\n")
+                .expect("part terminator")
+                .to_owned()
+        })
+        .collect()
+}
+
+async fn bootstrap_get(app: &Router, uri: &str) -> (Response, Vec<String>) {
+    let response = http_get(app, uri).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = header_str(&response, CONTENT_TYPE).to_owned();
+    let (parts, body) = response.into_parts();
+    let bytes = to_bytes(body, usize::MAX).await.expect("body");
+    let payloads = bootstrap_parts(&content_type, &bytes);
+    (Response::from_parts(parts, Body::empty()), payloads)
+}
+
+async fn post_messages(app: &Router, uri: &str, content_type: &str, payloads: &[&str]) {
+    for payload in payloads {
+        let response = http_post(
+            app,
+            uri,
+            &[(CONTENT_TYPE.as_str(), content_type)],
+            Body::from(payload.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+}
+
+async fn flush_cold(app: &Router, stream_path: &str, max_bytes: u64) {
+    let response = http_post(
+        app,
+        &format!("/__ursula/flush-cold{stream_path}?min_hot_bytes=1&max_bytes={max_bytes}"),
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// Regression: a cold flush past the snapshot made bootstrap drop the
+/// collapsed messages after the snapshot while still claiming the tail and
+/// `Stream-Up-To-Date: true`.
+#[tokio::test]
+async fn bootstrap_after_cold_flush_past_snapshot_is_honest_partial() {
+    let app = cold_test_router();
+    let stream_uri = "/benchcmp/bootstrap-cold-partial";
+    let response = http_put(
+        &app,
+        stream_uri,
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    post_messages(&app, stream_uri, "application/octet-stream", &[
+        "abc", "de", "fg",
+    ])
+    .await;
+    let response = http_put(
+        &app,
+        &format!("{stream_uri}/snapshot/00000000000000000003"),
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"state":"abc"}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    flush_cold(&app, stream_uri, 5).await;
+
+    let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET),
+        "00000000000000000003"
+    );
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        "00000000000000000003"
+    );
+    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
+    assert!(response.headers().get(HEADER_STREAM_CLOSED).is_none());
+    assert_eq!(parts, vec![r#"{"state":"abc"}"#.to_owned()]);
+
+    // The client continues with an ordinary read from the next offset.
+    let response = http_get(&app, &format!("{stream_uri}?offset=00000000000000000003")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(&body_bytes(response).await[..], b"defg");
+
+    // Once the snapshot is past the exact-message frontier, bootstrap is
+    // complete again with one part per message.
+    post_messages(&app, stream_uri, "application/octet-stream", &["hi", "jkl"]).await;
+    let response = http_put(
+        &app,
+        &format!("{stream_uri}/snapshot/00000000000000000007"),
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"state":"abcdefg"}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        "00000000000000000012"
+    );
+    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert_eq!(parts, vec![
+        r#"{"state":"abcdefg"}"#.to_owned(),
+        "hi".to_owned(),
+        "jkl".to_owned(),
+    ]);
+}
+
+/// Regression: without a snapshot (or with one at the retained offset), the
+/// collapsed cold prefix came back as a single part holding many messages.
+#[tokio::test]
+async fn json_bootstrap_never_merges_cold_messages_into_one_part() {
+    let app = cold_test_router();
+    let stream_uri = "/benchcmp/bootstrap-cold-json";
+    let response = http_put(
+        &app,
+        stream_uri,
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    post_messages(&app, stream_uri, "application/json", &[
+        r#"{"a":1}"#,
+        r#"{"b":2}"#,
+    ])
+    .await;
+    let response = http_head(&app, stream_uri).await;
+    let flushed_tail = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+    flush_cold(&app, stream_uri, 1024).await;
+
+    let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
+    assert_eq!(header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET), "-1");
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        "00000000000000000000"
+    );
+    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
+    assert_eq!(parts, vec![String::new()]);
+
+    let response = http_get(&app, &format!("{stream_uri}?offset=-1")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    let body = std::str::from_utf8(&body).expect("json body");
+    assert!(body.contains(r#"{"a":1}"#) && body.contains(r#"{"b":2}"#));
+
+    post_messages(&app, stream_uri, "application/json", &[
+        r#"{"c":3}"#,
+        r#"{"d":4}"#,
+    ])
+    .await;
+    let response = http_head(&app, stream_uri).await;
+    let tail = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+    // The first message after the flush could be a fragment as far as the
+    // state machine knows, so a snapshot at the flush point is partial...
+    let response = http_put(
+        &app,
+        &format!("{stream_uri}/snapshot/{flushed_tail}"),
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"n":2}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        flushed_tail
+    );
+    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
+    assert_eq!(parts, vec![r#"{"n":2}"#.to_owned()]);
+
+    // ...and a snapshot one message later is complete, one JSON message per
+    // update part.
+    let response = http_get(&app, &format!("{stream_uri}?record=2&max_records=1")).await;
+    let after_c = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+    let response = http_put(
+        &app,
+        &format!("{stream_uri}/snapshot/{after_c}"),
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"n":3}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
+    assert_eq!(header_str(&response, HEADER_STREAM_NEXT_OFFSET), tail);
+    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0], r#"{"n":3}"#);
+    assert!(parts[1].contains(r#"{"d":4}"#) && !parts[1].contains(r#"{"c":3}"#));
+}
+
 #[tokio::test]
 async fn snapshot_publish_errors_and_overwrite_follow_extension_statuses() {
     let app = test_router();
