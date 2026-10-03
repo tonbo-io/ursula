@@ -1,6 +1,6 @@
 // The commit barrier: SIGKILL/abort around it in a child process, the cache-spill case, and an append
 // whose outcome is unknown.
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { attach } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
@@ -172,3 +172,23 @@ it("(h) killed in the middle of a recovery's page writes: the next attach resume
 	expect(Buffer.compare(readFileSync(file), readFileSync(fresh))).toBe(0);
 	expect(rows(file, "WHERE x = 'late'")).toEqual(["late"]);
 });
+
+// Regression (P1): closing the last connection under synchronous=OFF checkpointed the WAL into the db
+// file without syncing it and deleted the WAL; after a power loss that dropped those writes, re-attach
+// trusted the sidecar and served the old file (integrity ok, the table gone).
+const powerLossAfterClose = async (sync: string): Promise<void> => {
+	const path = streamPath();
+	const file = freshFile();
+	const child = runChild(file, ursulaUrl() + path, [`PRAGMA synchronous = ${sync}`, ...SQL], { URSULA_VFS_DURABLE_SHADOW: "1", CHILD_EXIT: "1" });
+	const done = await child.waitFor((l) => l.done === true);
+	expect((await child.exited).code).toBe(0);
+	expect(done.poisoned).toBe(false);
+	expect(existsSync(`${file}-wal`)).toBe(false); // the close checkpointed and deleted the WAL
+	// Power loss: only the db file as of its last sync survives (the WAL is gone, the sidecar stays).
+	renameSync(`${file}-ursula-durable`, file);
+	rmSync(`${file}-shm`, { force: true });
+	attach(file, ursulaUrl() + path);
+	expect(rows(file)).toEqual(["M-one", "M-two"]);
+};
+it("(i) power loss after the last close under synchronous=OFF: the committed rows survive re-attach", () => powerLossAfterClose("OFF"));
+it("(i-control, temporary) the same under synchronous=NORMAL", () => powerLossAfterClose("NORMAL"));

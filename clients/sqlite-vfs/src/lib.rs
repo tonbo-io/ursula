@@ -39,6 +39,8 @@
 //! commit of an attachment, before the local WAL write. `URSULA_VFS_RETRY_MS` bounds the retries of
 //! an append with an unknown outcome (default 30000). `URSULA_VFS_SNAPSHOT_MIN_BYTES` sets the
 //! smallest log (bytes since the latest snapshot) that triggers a snapshot.
+//! `URSULA_VFS_DURABLE_SHADOW=1` keeps `<db>-ursula-durable` equal to the db file as of its last
+//! sync (see `durable_shadow`), so a test can simulate a power loss.
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 pub mod frame;
@@ -234,7 +236,11 @@ impl Db {
     /// With synchronous=OFF a checkpoint does not sync the db file; sync it before the WAL frames
     /// it copied are overwritten (a WAL restart) or truncated away.
     unsafe fn sync_db_file(&self) -> Result<(), String> {
-        unsafe { sync_handle(&self.db_handles, &self.path) }
+        unsafe { sync_handle(&self.db_handles, &self.path)? };
+        if durable_shadow() {
+            unsafe { write_shadow(self.db_handles[0].0, &self.path) };
+        }
+        Ok(())
     }
 
     /// The write transaction ended (WAL write lock released): drop what never committed; after an
@@ -368,6 +374,49 @@ fn fail_post_ack() -> Option<u64> {
             .ok()
             .and_then(|v| v.parse().ok())
     })
+}
+
+/// Test hook `URSULA_VFS_DURABLE_SHADOW=1`: `<db>-ursula-durable` holds the db file as of its last
+/// sync through this VFS (or the end of attach), i.e. what survives a power loss that drops every
+/// unsynced db-file write. Syncs by the private "unix" connections are not tracked: a test using it
+/// must not make a snapshot due.
+fn durable_shadow() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("URSULA_VFS_DURABLE_SHADOW").is_ok_and(|v| v == "1"))
+}
+
+/// Copies the db file, read through SQLite's just-synced handle `f` (never a descriptor of our
+/// own; see `sync_handle`), to the durable shadow.
+unsafe fn write_shadow(f: *mut ffi::sqlite3_file, path: &str) {
+    fn fail(path: &str, what: String) -> ! {
+        eprintln!("sqlite-ursula-vfs: URSULA_VFS_DURABLE_SHADOW: {path}: {what}");
+        std::process::abort();
+    }
+    let mut size: ffi::sqlite3_int64 = 0;
+    let rc = unsafe { ((*(*f).pMethods).xFileSize.unwrap())(f, &mut size) };
+    if rc != OK {
+        fail(path, format!("size: {rc}"));
+    }
+    let mut image = vec![0u8; size as usize];
+    for (i, chunk) in image.chunks_mut(1 << 20).enumerate() {
+        let rc = unsafe {
+            ((*(*f).pMethods).xRead.unwrap())(
+                f,
+                chunk.as_mut_ptr() as *mut c_void,
+                chunk.len() as c_int,
+                (i << 20) as i64,
+            )
+        };
+        if rc != OK {
+            fail(path, format!("read: {rc}"));
+        }
+    }
+    let tmp = format!("{path}-ursula-durable.tmp");
+    if let Err(e) =
+        fs::write(&tmp, &image).and_then(|()| fs::rename(&tmp, format!("{path}-ursula-durable")))
+    {
+        fail(path, e.to_string());
+    }
 }
 
 /// Replaces the sidecar atomically and durably: temp file, fsync, rename, fsync of the directory.
@@ -1288,6 +1337,10 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
     if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0 {
         unsafe { init_wal_format(&path)? };
     }
+    if durable_shadow() {
+        fs::copy(&path, format!("{path}-ursula-durable"))
+            .map_err(|e| format!("URSULA_VFS_DURABLE_SHADOW: copy {path}: {e}"))?;
+    }
     write_sidecar(&sidecar, offset, epoch)?;
     let pages = (fs::metadata(&path).map(|m| m.len()).unwrap_or(0) / PAGE as u64) as u32;
     let snapper = Arc::new(Snapper::default());
@@ -2149,7 +2202,18 @@ unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3
 unsafe extern "C" fn x_sync(file: *mut ffi::sqlite3_file, flags: c_int) -> c_int {
     unsafe {
         let Some(db) = wal_db(file) else {
-            return fwd!(file, xSync, flags);
+            let rc = fwd!(file, xSync, flags);
+            if rc == OK
+                && durable_shadow()
+                && let Some(path) = (*(file as *mut File))
+                    .ext
+                    .as_ref()
+                    .filter(|e| e.db.is_some())
+                    .and_then(|e| e.path.as_deref())
+            {
+                write_shadow(inner(file), path);
+            }
+            return rc;
         };
         let mut db = lock(&db);
         let rc = if db.fault() {
