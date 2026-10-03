@@ -49,6 +49,7 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   "examples/chat-room": { group: "Examples", order: 2 },
   "examples/browser-telemetry": { group: "Examples", order: 3 },
   "examples/pi-durable": { group: "Examples", order: 4 },
+  "examples/sqlite-vfs": { group: "Examples", order: 5 },
 
   // Concepts - encounter order: primitive, organization, reading, writing, long-stream, transport.
   "concepts/streams": { group: "Concepts", order: 1 },
