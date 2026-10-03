@@ -133,6 +133,8 @@ struct Db {
     offset: u64,
     poisoned: Option<String>,
     fenced: bool,
+    /// A db-file sync failed (`sync_db_file`); it also poisons. See `x_truncate`.
+    db_sync_failed: bool,
     /// The write transaction in progress (between taking and releasing the WAL write lock).
     write_locked: bool,
     /// WAL writes of that transaction not yet on the local WAL, by offset (WAL writes never
@@ -242,8 +244,12 @@ impl Db {
     /// that had nothing left to copy. `SQLITE_SYNC_FULL`: on Apple, F_FULLFSYNC, so the drive
     /// cannot persist the WAL's destruction before the pages (once per checkpoint or WAL restart,
     /// not per commit).
-    unsafe fn sync_db_file(&self) -> Result<(), String> {
-        unsafe { sync_handle(&self.db_handles, &self.path, ffi::SQLITE_SYNC_FULL)? };
+    unsafe fn sync_db_file(&mut self) -> Result<(), String> {
+        let synced = unsafe { sync_handle(&self.db_handles, &self.path, ffi::SQLITE_SYNC_FULL) };
+        if let Err(e) = synced {
+            self.db_sync_failed = true;
+            return Err(e);
+        }
         if durable_shadow() {
             unsafe {
                 write_shadow(
@@ -1434,6 +1440,7 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
         offset,
         poisoned: None,
         fenced: false,
+        db_sync_failed: false,
         write_locked: false,
         overlay: BTreeMap::new(),
         committed: false,
@@ -1580,7 +1587,7 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
         let d = lock(db);
         if d.poisoned.is_some() {
             // Its private "unix" connection bypasses `x_truncate`, which completes no checkpoint
-            // of a poisoned database (see there); nor may this one.
+            // after a failed db-file sync (see there); a poisoned database takes no snapshot.
             return Ok(true);
         }
         d.path.clone()
@@ -2302,11 +2309,12 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
 /// delete the WAL while the db file lacks frames a checkpoint at synchronous=OFF copied. (The
 /// `SQLITE_FCNTL_CKPT_DONE` hint comes earlier but its result is ignored.)
 ///
-/// A poisoned database truncates neither file (as `x_delete` keeps its WAL): an earlier sync may
-/// have failed and a retried fsync can report success for pages that never reached the disk, while
-/// a complete checkpoint copies only the frames above nBackfill. So no checkpoint completes (the
-/// frames stay unbackfilled, a TRUNCATE checkpoint gets SQLITE_BUSY) and the WAL stays whole; the
-/// next connection after this process rebuilds the wal-index and copies every frame again.
+/// Once a db-file sync has failed, neither file is truncated: a retried fsync can report success
+/// for pages the failed writeback dropped, and a complete checkpoint copies only the frames above
+/// nBackfill, so a partial checkpoint's pages would never be copied again. No checkpoint completes
+/// (the frames stay unbackfilled, a TRUNCATE checkpoint gets SQLITE_BUSY), the WAL stays whole,
+/// and the next connection after this process rebuilds the wal-index and copies every frame
+/// again. (Any other poison, such as fencing, leaves the local files sound: checkpoints go on.)
 unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3_int64) -> c_int {
     unsafe {
         if let Some(db) = main_db(file) {
@@ -2316,7 +2324,7 @@ unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3
                     "db file truncate outside a checkpoint (journal_mode must stay WAL)".into(),
                 );
             }
-            if db.poisoned.is_some() {
+            if db.db_sync_failed {
                 return ffi::SQLITE_IOERR_TRUNCATE;
             }
             let rc = fwd!(file, xTruncate, size);
@@ -2333,7 +2341,7 @@ unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3
             return fwd!(file, xTruncate, size);
         };
         let mut db = lock(&db);
-        if db.poisoned.is_some() {
+        if db.db_sync_failed {
             return ffi::SQLITE_IOERR_TRUNCATE;
         }
         db.overlay.retain(|&o, _| o < size);

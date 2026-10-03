@@ -187,9 +187,9 @@ and the log keeps growing. A superseded cold body stays readable for 5 minutes.
     deletes the WAL over frames that are not. The db file is also synced again before this VFS
     restarts, truncates or deletes the WAL.
   - Hence every frame the sidecar covers survives in the db file or in a WAL SQLite recovers. A
-    failed sync poisons the database, and a poisoned database completes no checkpoint and never
-    truncates or deletes its WAL (a retried fsync can report success for pages that never reached
-    the disk).
+    failed sync poisons the database, and a poisoned database keeps its WAL on close. After a
+    failed db-file sync no checkpoint completes and the WAL is never truncated either (a retried
+    fsync can report success for pages that never reached the disk).
   - Exception: a connection in another process that copies frames in a checkpoint (its own
     `PRAGMA wal_checkpoint`, or its close as the last connection) and runs at `synchronous=OFF`,
     or on Apple without `PRAGMA checkpoint_fullfsync=ON` (the node:sqlite default; its plain fsync
