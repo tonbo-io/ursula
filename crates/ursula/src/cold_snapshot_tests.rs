@@ -50,7 +50,7 @@ async fn snapshot_above_the_inline_cap_round_trips_through_the_cold_tier() {
     )
     .expect("runtime");
     let app = router(runtime.clone());
-    let response = send(&app, "PUT", "/f16/s", Body::from("ab")).await;
+    let response = send(&app, "PUT", "/cold-snapshots/s", Body::from("ab")).await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
     let snapshot = (0..MAX_HTTP_BODY_BYTES + (1 << 20))
@@ -59,7 +59,7 @@ async fn snapshot_above_the_inline_cap_round_trips_through_the_cold_tier() {
     let response = send(
         &app,
         "PUT",
-        "/f16/s/snapshot/2",
+        "/cold-snapshots/s/snapshot/2",
         Body::from(snapshot.clone()),
     )
     .await;
@@ -78,7 +78,7 @@ async fn snapshot_above_the_inline_cap_round_trips_through_the_cold_tier() {
     let response = send(
         &app,
         "PUT",
-        "/f16/s/snapshot/2",
+        "/cold-snapshots/s/snapshot/2",
         Body::from(snapshot.clone()),
     )
     .await;
@@ -92,12 +92,15 @@ async fn snapshot_above_the_inline_cap_round_trips_through_the_cold_tier() {
         "the staged digest equals the inline one"
     );
     let staged = cold_store
-        .list_file_names(&cold_external_dir(&BucketStreamId::new("f16", "s")))
+        .list_file_names(&cold_external_dir(&BucketStreamId::new(
+            "cold-snapshots",
+            "s",
+        )))
         .await
         .expect("list external dir");
     assert_eq!(staged.len(), 1, "{staged:?}");
 
-    let response = send(&app, "GET", "/f16/s/snapshot/2", Body::empty()).await;
+    let response = send(&app, "GET", "/cold-snapshots/s/snapshot/2", Body::empty()).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers()[HEADER_STREAM_SNAPSHOT_DIGEST],
@@ -109,7 +112,7 @@ async fn snapshot_above_the_inline_cap_round_trips_through_the_cold_tier() {
     );
     assert!(body_of(response).await == snapshot);
 
-    let response = send(&app, "GET", "/f16/s/bootstrap", Body::empty()).await;
+    let response = send(&app, "GET", "/cold-snapshots/s/bootstrap", Body::empty()).await;
     assert_eq!(response.status(), StatusCode::OK);
     let length = response.headers()[CONTENT_LENGTH]
         .to_str()
