@@ -176,10 +176,10 @@ it("(h) killed in the middle of a recovery's page writes: the next attach resume
 // Regression (P1): closing the last connection under synchronous=OFF checkpointed the WAL into the db
 // file without syncing it and deleted the WAL; after a power loss that dropped those writes, re-attach
 // trusted the sidecar and served the old file (integrity ok, the table gone).
-const powerLossAfterClose = async (sync: string): Promise<void> => {
+it("(i) power loss after the last close under synchronous=OFF: the committed rows survive re-attach", async () => {
 	const path = streamPath();
 	const file = freshFile();
-	const child = runChild(file, ursulaUrl() + path, [`PRAGMA synchronous = ${sync}`, ...SQL], { URSULA_VFS_DURABLE_SHADOW: "1", CHILD_EXIT: "1" });
+	const child = runChild(file, ursulaUrl() + path, ["PRAGMA synchronous = OFF", ...SQL], { URSULA_VFS_DURABLE_SHADOW: "1", CHILD_EXIT: "1" });
 	const done = await child.waitFor((l) => l.done === true);
 	expect((await child.exited).code).toBe(0);
 	expect(done.poisoned).toBe(false);
@@ -189,6 +189,4 @@ const powerLossAfterClose = async (sync: string): Promise<void> => {
 	rmSync(`${file}-shm`, { force: true });
 	attach(file, ursulaUrl() + path);
 	expect(rows(file)).toEqual(["M-one", "M-two"]);
-};
-it("(i) power loss after the last close under synchronous=OFF: the committed rows survive re-attach", () => powerLossAfterClose("OFF"));
-it("(i-control, temporary) the same under synchronous=NORMAL", () => powerLossAfterClose("NORMAL"));
+});

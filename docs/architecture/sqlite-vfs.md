@@ -175,6 +175,13 @@ and the log keeps growing. A superseded cold body stays readable for 5 minutes.
 - Crash of the owner at any point: the sidecar never runs ahead of a synced local WAL; re-attach
   replays from it (or installs a snapshot). Covered: SIGKILL before and after the ack, the cache
   spill with in-place checksum rewrites, a failed local write after the ack.
+- Power loss: the WAL is synced at every commit whatever `synchronous` says; the db file is synced
+  before any WAL frame copied into it is destroyed (a WAL restart, a truncate, or the delete when
+  the last connection closes or leaves WAL mode), so under `synchronous=OFF` too, every frame the
+  sidecar covers survives in the db file or in a WAL SQLite recovers. A failed sync keeps the WAL
+  and poisons the database. The snapshot thread's private connection never deletes the WAL, and
+  recovery's checkpoint runs at `synchronous=FULL`. Covered: a simulated loss of every unsynced
+  db-file write after the last close under `synchronous=OFF`.
 - Network partition or slow server: commits block up to the retry budget, then poison.
 - Two owners: the later claim wins; the earlier one's next commit fails cleanly
   (`UrsulaReplicationError` with `fenced: true` through the Pi helper).

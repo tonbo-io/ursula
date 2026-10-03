@@ -234,7 +234,7 @@ impl Db {
     }
 
     /// With synchronous=OFF a checkpoint does not sync the db file; sync it before the WAL frames
-    /// it copied are overwritten (a WAL restart) or truncated away.
+    /// it copied are overwritten (a WAL restart), truncated away or deleted (`x_delete`).
     unsafe fn sync_db_file(&self) -> Result<(), String> {
         unsafe { sync_handle(&self.db_handles, &self.path)? };
         if durable_shadow() {
@@ -855,6 +855,26 @@ impl Private {
         }
     }
 
+    /// Its close never deletes (or truncates) the WAL: `SQLITE_FCNTL_PERSIST_WAL`. Closing as the
+    /// last connection on the file, it would otherwise delete the WAL through "unix", past
+    /// `x_delete`, while frames an unsynced checkpoint copied may not be durable in the db file.
+    /// The next connection recovers the WAL; the last one closing through this VFS deletes it.
+    unsafe fn keep_wal(&self) -> Result<(), String> {
+        let mut on: c_int = 1;
+        let rc = unsafe {
+            (api().file_control.unwrap())(
+                self.db,
+                c"main".as_ptr(),
+                ffi::SQLITE_FCNTL_PERSIST_WAL,
+                &mut on as *mut c_int as *mut c_void,
+            )
+        };
+        if rc != OK {
+            return Err(format!("persist WAL: {rc}"));
+        }
+        Ok(())
+    }
+
     /// Pages `1..=n` of the db file, read through the connection's own file handle (closing a
     /// descriptor of our own would drop the process's POSIX locks on the file).
     unsafe fn read_pages(&self, n: u32) -> Result<Vec<u8>, String> {
@@ -899,9 +919,17 @@ impl Drop for Private {
 /// private "unix" connection and fails unless every frame was checkpointed and that connection was
 /// the last one on the file (closing the last connection deletes the WAL; any other connection, in
 /// any process, keeps it), so nothing holds an old WAL or page cache while pages are rewritten.
+///
+/// `synchronous=FULL`, whatever the host's compiled-in default: the checkpoint then syncs the db
+/// file before it truncates the WAL (it backfills every frame, the wal-index being rebuilt by this
+/// first connection), so the frames the sidecar covers stay durable.
 unsafe fn checkpoint_local(path: &str) -> Result<(), String> {
-    let complete = unsafe { Private::open(path)?.checkpoint(c"PRAGMA wal_checkpoint(TRUNCATE)") }
-        .map_err(|e| format!("checkpoint {path}: {e}"))?;
+    let complete = unsafe {
+        let conn = Private::open(path)?;
+        conn.query(c"PRAGMA synchronous=FULL")?;
+        conn.checkpoint(c"PRAGMA wal_checkpoint(TRUNCATE)")
+    }
+    .map_err(|e| format!("checkpoint {path}: {e}"))?;
     if complete != Checkpoint::Done {
         return Err(format!(
             "checkpoint {path}: incomplete; another connection is open"
@@ -1498,6 +1526,7 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
     let started = Instant::now();
     let path = lock(db).path.clone();
     let conn = unsafe { Private::open(&path)? };
+    unsafe { conn.keep_wal()? };
     // Backfill outside the window, so the checkpoint inside it (which commits wait for) only
     // covers the frames committed in between.
     unsafe { conn.checkpoint(c"PRAGMA wal_checkpoint(PASSIVE)")? };
@@ -2384,6 +2413,42 @@ unsafe extern "C" fn x_unfetch(
     unsafe { fwd!(file, xUnfetch, off, p) }
 }
 
+/// SQLite deletes an attached database's WAL when its last connection closes (or the database
+/// leaves WAL mode), right after checkpointing every frame into the db file. That checkpoint syncs
+/// the db file only under synchronous=NORMAL or above and only if it copied frames itself (one at
+/// OFF, or another connection's, may have copied them all unsynced), while the sidecar already
+/// covers those frames: sync the db file first, through the closing connection's handle (SQLite
+/// closes it after deleting the WAL). If that fails, keep the WAL (SQLite ignores the result; the
+/// next connection recovers from it) and poison the database.
+unsafe extern "C" fn x_delete(
+    _vfs: *mut ffi::sqlite3_vfs,
+    zname: *const c_char,
+    sync_dir: c_int,
+) -> c_int {
+    unsafe {
+        let u = unix();
+        let db = if zname.is_null() {
+            None
+        } else {
+            CStr::from_ptr(zname)
+                .to_str()
+                .ok()
+                .and_then(|n| n.strip_suffix("-wal"))
+                .and_then(lookup)
+        };
+        let Some(db) = db else {
+            return ((*u).xDelete.unwrap())(u, zname, sync_dir);
+        };
+        let mut db = lock(&db);
+        if let Err(e) = db.sync_db_file() {
+            let why = format!("{e}; keeping {}", db.wal);
+            db.poison(why);
+            return ffi::SQLITE_IOERR_DELETE;
+        }
+        ((*u).xDelete.unwrap())(u, zname, sync_dir)
+    }
+}
+
 static METHODS: ffi::sqlite3_io_methods = ffi::sqlite3_io_methods {
     iVersion: 3,
     xClose: Some(x_close),
@@ -2429,6 +2494,7 @@ pub unsafe extern "C" fn sqlite3_extension_init(
             v.szOsFile = (std::mem::offset_of!(File, inner) + (*u).szOsFile as usize) as c_int;
             v.pNext = null_mut();
             v.xOpen = Some(x_open);
+            v.xDelete = Some(x_delete);
             let v = Box::into_raw(Box::new(v));
             let rc = (a.vfs_register.unwrap())(v, 1);
             if rc != OK {
