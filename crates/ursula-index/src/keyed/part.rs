@@ -1004,10 +1004,9 @@ fn check_schema(schema: &Schema) -> Result<(), IndexError> {
     let expected = self::schema();
     let fields = schema.fields();
     if fields.len() != expected.fields().len()
-        || fields
-            .iter()
-            .zip(expected.fields())
-            .any(|(field, want)| field.name() != want.name() || field.data_type() != want.data_type())
+        || fields.iter().zip(expected.fields()).any(|(field, want)| {
+            field.name() != want.name() || field.data_type() != want.data_type()
+        })
     {
         return Err(IndexError::InvalidPartSchema);
     }
