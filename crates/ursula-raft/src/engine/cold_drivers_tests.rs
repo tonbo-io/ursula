@@ -1,16 +1,15 @@
 //! Raft-engine tests for the leader-side cold-reference drivers
 //! (bounded-stream-state B2): the shared pack-reference compaction driver
-//! (F2) and the cold orphan sweep (F14h). The in-memory engine runs the same
-//! scenarios in `ursula-runtime`'s `cold_drivers_tests`.
+//! (F2) and the cold orphan sweep (F14h): one wiring test per driver. The
+//! drivers' contracts are pinned against the in-memory engine in
+//! `ursula-runtime`'s `cold_drivers_tests`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdStore;
 use ursula_runtime::CreateStreamRequest;
-use ursula_runtime::ExternalPayloadRef;
 use ursula_runtime::PlanGroupColdFlushRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeConfig;
@@ -101,31 +100,8 @@ fn driver(min_refs: usize, gc_grace_ms: u64) -> SharedRefCompactionConfig {
     }
 }
 
-fn external(
-    stream_id: &BucketStreamId,
-    path: &str,
-    len: u64,
-    seq: Option<&str>,
-) -> AppendExternalRequest {
-    AppendExternalRequest {
-        stream_id: stream_id.clone(),
-        content_type: CONTENT_TYPE.to_owned(),
-        payload: ExternalPayloadRef {
-            s3_path: path.to_owned(),
-            payload_len: len,
-            object_size: len,
-        },
-        record_ends: Vec::new(),
-        close_after: false,
-        stream_seq: seq.map(str::to_owned),
-        producer: None,
-        now_ms: 0,
-        record_match: None,
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn raft_f2_driver_compacts_shared_refs_and_packs_are_gced() {
+async fn raft_shared_ref_driver_compacts_and_packs_are_gced() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = spawn(cold_store.clone());
     let (a, b) = (stream("trickle-a"), stream("trickle-b"));
@@ -165,59 +141,7 @@ async fn raft_f2_driver_compacts_shared_refs_and_packs_are_gced() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn raft_f2_rejected_external_append_under_a_packed_trickle_reads_correctly_after_compaction()
-{
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let runtime = spawn(cold_store.clone());
-    let (s, t) = (stream("d3-trickle"), stream("d3-companion"));
-    create(&runtime, &s).await;
-    create(&runtime, &t).await;
-    let mut request = AppendRequest::from_bytes(s.clone(), b"ab".to_vec());
-    request.stream_seq = Some("5".to_owned());
-    runtime
-        .append(request)
-        .await
-        .expect("append with stream seq");
-    let rejected = new_external_payload_path(&s);
-    cold_store
-        .write_chunk(&rejected, &[b'#'; 30])
-        .await
-        .expect("stage rejected payload");
-    runtime
-        .append_external(external(&s, &rejected, 30, Some("1")))
-        .await
-        .expect_err("a regressed stream seq rejects the external append");
-
-    let mut expected = b"ab".to_vec();
-    for round in 0..6_u8 {
-        let payload = [b'c' + round, b'C' + round];
-        append(&runtime, &s, &payload).await;
-        append(&runtime, &t, b"t").await;
-        expected.extend_from_slice(&payload);
-        assert_eq!(pack_flush(&runtime).await, 2);
-    }
-    let committed = new_external_payload_path(&s);
-    cold_store
-        .write_chunk(&committed, b"WXYZ")
-        .await
-        .expect("stage committed payload");
-    runtime
-        .append_external(external(&s, &committed, 4, None))
-        .await
-        .expect("committed external append");
-    expected.extend_from_slice(b"WXYZ");
-
-    let report = runtime
-        .compact_shared_refs_group_once(GROUP, &driver(2, 0))
-        .await
-        .expect("driver pass");
-    assert_eq!(report.compacted_streams, 2);
-    assert_eq!(runtime.state_gauges(GROUP).await.unwrap().shared_refs, 0);
-    assert_eq!(read_all(&runtime, &s).await, expected);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn raft_f14h_orphan_sweep_reclaims_only_unreferenced_objects() {
+async fn raft_orphan_sweep_reclaims_only_unreferenced_objects() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = spawn(cold_store.clone());
     let (a, b) = (stream("sweep-a"), stream("sweep-b"));

@@ -3,9 +3,7 @@
 //! written before a proposal; the offload pass writes entries only for
 //! committed refs, clipping whatever overlapped them (Invariant 11); state
 //! keeps at most T_ext staged refs per stream (W3); and the orphan sweep
-//! never deletes a staged object that state or pages reference. The Raft
-//! engine runs the same scenarios in `ursula-raft`'s
-//! `engine::external_locators_tests`.
+//! never deletes a staged object that state or pages reference.
 
 use std::sync::Arc;
 use std::time::Duration;

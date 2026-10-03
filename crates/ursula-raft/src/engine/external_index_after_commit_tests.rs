@@ -1,6 +1,8 @@
-//! Raft-engine tests for bounded-stream-state F5 at feature level 3:
-//! external locators committed first and indexed after. The in-memory
-//! engine runs the same scenarios in `ursula-runtime`'s
+//! Raft-engine wiring for bounded-stream-state F5 at feature level 3:
+//! external locators committed first and indexed after (the leader skips its
+//! pre-proposal page write; the offload pass indexes the committed append).
+//! The contracts (stale-entry clipping, the staged-refs bound T_ext, orphan
+//! sweeps) are pinned against the in-memory engine in `ursula-runtime`'s
 //! `external_locators_tests`.
 
 use std::sync::Arc;
@@ -21,7 +23,6 @@ use ursula_runtime::ShardRuntime;
 use ursula_runtime::new_external_payload_path;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
-use ursula_stream::MAX_STAGED_EXTERNAL_REFS;
 use ursula_stream::ObjectPayloadRef;
 
 use super::ColdRaftGroupEngineFactory;
@@ -180,56 +181,4 @@ async fn level_three_writes_no_page_entry_before_a_proposal() {
         0
     );
     assert_eq!(read_all(&runtime, &s).await, b"abWXYZ".to_vec());
-}
-
-#[tokio::test]
-async fn offload_clips_a_stale_entry_and_keeps_staged_refs_within_t_ext() {
-    let (cold_store, runtime, s) = setup(FEATURE_LEVEL_KEYED_STREAMS, "stale").await;
-    let (stale, ok) = append_external(&runtime, &cold_store, &s, &[b'#'; 30], Some("1")).await;
-    assert!(!ok);
-    raise(&runtime, FEATURE_LEVEL_EXTERNAL_LOCATORS).await;
-
-    let fresh_only = OffloadColdRefsRequest {
-        min_age_ms: u64::MAX,
-        ..OffloadColdRefsRequest::new(0, 16)
-    };
-    let mut acknowledged = b"ab".to_vec();
-    let mut max_staged = 0;
-    let mut clipped = 0;
-    for index in 0..40_u8 {
-        let payload = [b'a' + index % 26; 3];
-        let (_, ok) = append_external(&runtime, &cold_store, &s, &payload, None).await;
-        assert!(ok);
-        acknowledged.extend_from_slice(&payload);
-        let report = runtime
-            .offload_cold_refs(GROUP, fresh_only)
-            .await
-            .expect("offload pass");
-        clipped += report.page_entries_clipped;
-        max_staged = max_staged.max(
-            runtime
-                .state_gauges(GROUP)
-                .await
-                .unwrap()
-                .staged_external_refs,
-        );
-    }
-    assert_eq!(max_staged, u64::try_from(MAX_STAGED_EXTERNAL_REFS).unwrap());
-    assert_eq!(clipped, 1, "the stale entry is clipped once");
-    let entries = page_external_entries(&cold_store, &s).await;
-    assert!(entries.iter().all(|entry| entry.s3_path != stale));
-    for entry in entries {
-        let start = usize::try_from(entry.start_offset).unwrap();
-        let end = usize::try_from(entry.end_offset).unwrap();
-        let bytes = cold_store
-            .read_object_range(&entry, entry.start_offset, end - start)
-            .await
-            .expect("read page entry");
-        assert_eq!(acknowledged.get(start..end), Some(bytes.as_slice()));
-    }
-    runtime
-        .offload_cold_refs(GROUP, offload_now())
-        .await
-        .expect("final offload pass");
-    assert_eq!(read_all(&runtime, &s).await, acknowledged);
 }

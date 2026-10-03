@@ -49,9 +49,19 @@ E2E_NODES=3 E2E_S3=1 URSULA_BIN=../../target/release/ursula npm run test:e2e
 # (default 600), DRILL_OWNERS, DRILL_SETTLE_S, DRILL_RECOVERY_S, DRILL_COMMIT_DEADLINE_MS shorten them;
 # the rolling-upgrade drill needs main's binary (scripts/ks_build_old_ursula.sh) in URSULA_OLD_BIN.
 URSULA_BIN=../../target/release/ursula URSULA_OLD_BIN=../../target/ks-old/e6d8d70/ursula npm run test:drills
+```
 
-# M3 performance gates (§10 M3, §11.10) against the same spawned stack; several minutes:
-URSULA_BIN=../../target/release/ursula PERF_OUT=perf.json npm run bench:e2e   # PERF_GATES=0 reports without asserting
+### Manual tools (not run in CI)
+
+These are kept as documented tools and run by hand; no workflow runs them.
+
+```sh
+# M3 performance gates (§10 M3, §11.10, test/e2e/perf/open.perf.ts) against the e2e stack; several minutes:
+URSULA_BIN=../../target/release/ursula PERF_OUT=perf.json npm run perf:manual   # PERF_GATES=0 reports without asserting
+
+# Keyed-streams soak (test/soak/, 3 nodes + gateway + keyed indexer on MinIO, a mixed Pi population);
+# planned as a run on AWS against real S3. SOAK_* knobs, see scripts/ks_soak.sh:
+SOAK_DURATION_S=3600 ../../scripts/ks_soak.sh
 ```
 
 `test/stack/` holds the stack the e2e suite and the drills share: process control, a MinIO launcher and a
@@ -67,7 +77,7 @@ const storage = await UrsulaStorage.open({ log, keyedState, mode: "fail-if-activ
 
 ## M3 benchmark results
 
-`npm run bench:e2e` (`test/e2e/perf/open.perf.ts`) on 2026-10-02, after the indexer read-path fix (decoded part
+`npm run perf:manual` (`test/e2e/perf/open.perf.ts`) on 2026-10-02, after the indexer read-path fix (decoded part
 footers, page indexes and verified tails cached per part and shared by the pod, write cache footers decoded once,
 memory-hit range blocks not re-hashed, single-block reads without copying): Apple Silicon laptop, 10 cores, under
 load from other builds; single-node memory-engine `ursula` plus the keyed indexer on the same machine, 30

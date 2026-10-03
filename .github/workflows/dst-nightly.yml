@@ -126,7 +126,7 @@ jobs:
             --failure-dir target/ursula-sim-runtime-raft-cold-live-write-failures
 
       # Bounded-state seed families (§7.4) beyond the PR subset that
-      # keyed-streams-ci runs: same tests, larger seed ranges.
+      # ci.yml's DST job runs: same tests, larger seed ranges.
       - name: Run bounded-state seed families (nightly ranges)
         env:
           SPARSE_MARKS_SEEDS: "2000..=2039"

@@ -158,20 +158,32 @@ describe("fail-if-active and fence on a real node", () => {
 		const stream = freshStream();
 		const a = await openHttp(stream);
 		let fenced: unknown;
+		let commits = 0;
 		const zombie = (async () => {
 			for (let id = 100; ; id++) {
 				try {
 					await a.commit(conv(id), ctx);
+					commits++;
 				} catch (e) {
 					fenced = e;
 					return;
 				}
+				// The claim's conflict window is one read round trip (§3.6 step 6): after a 412 the
+				// opener reads the new records, then appends at the new tail. A zombie that sends its
+				// next append in the same microtask chain as the previous response always reaches the
+				// node first, so the claim could only win when the zombie happened to stall; that is a
+				// livelock of Stream-Record-Match, not of the claim loop. Give the zombie the few ms
+				// of think time any real owner has between commits (still about 200 commits per second).
+				await new Promise((r) => setTimeout(r, 5));
 			}
 		})();
 		await new Promise((r) => setTimeout(r, 20));
+		const before = commits;
 		const b = await openHttp(stream, { mode: "fence" });
 		await zombie;
 		expect(fenced).toBeInstanceOf(FencedError);
+		// The zombie kept writing while the opener replayed and claimed.
+		expect(commits).toBeGreaterThan(before);
 		await b.commit(conv(1), ctx);
 		await b.close(ctx);
 	});

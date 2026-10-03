@@ -1,7 +1,10 @@
-//! Raft-engine regressions for the bounded-state cold-path defects: D1
-//! (regressed cold frontier, including openraft snapshot build/install), D3
-//! (stale page entries of rejected external appends) and F14e (stale
-//! flushes leave no page entry).
+//! Raft-engine wiring of the cold index: what the Raft engine does itself
+//! rather than through the shared state machine and page helpers. Openraft
+//! snapshot build/install of a regressed cold frontier (D1), the leader's
+//! stale-flush check before its page write (F14e), the page cache shared by
+//! the read path and apply, and cold-index repair. The cold-path contracts
+//! themselves are pinned once, against the in-memory engine, by
+//! `ursula-runtime`'s cold-path tests.
 
 use std::sync::Arc;
 
@@ -74,7 +77,7 @@ fn read_req(stream_id: BucketStreamId, offset: u64, max_len: usize) -> ReadStrea
 async fn cold_engine(cold_store: Arc<ColdStore>) -> RaftGroupEngine {
     let config = Arc::new(
         Config {
-            cluster_name: "ursula-cold-correctness".to_owned(),
+            cluster_name: "ursula-cold-index".to_owned(),
             heartbeat_interval: 10,
             election_timeout_min: 30,
             election_timeout_max: 60,
@@ -150,80 +153,6 @@ async fn stage(cold_store: &ColdStore, path: &str, payload: &[u8]) {
         .expect("stage cold object");
 }
 
-/// D1 through the Raft engine: reads of the external above a flushed hot
-/// prefix work, and the engine's group snapshot (which still carries the
-/// regressed frontier) installs into a fresh engine that serves the bytes.
-#[tokio::test]
-async fn d1_raft_engine_reads_and_installs_external_above_a_flushed_hot_prefix() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let mut engine = cold_engine(cold_store.clone()).await;
-    let stream_id = bsid("raft-d1");
-    engine
-        .create_stream(
-            CreateStreamRequest::new(stream_id.clone(), OCTET),
-            placement(),
-            ColdWriteAdmission::default(),
-        )
-        .await
-        .expect("create stream");
-    engine
-        .append(
-            append_req(&stream_id, b"ab", None),
-            placement(),
-            ColdWriteAdmission::default(),
-        )
-        .await
-        .expect("append hot prefix");
-    stage(&cold_store, "benchcmp/raft-d1/external/xyz.bin", b"XYZ").await;
-    engine
-        .append_external(
-            append_external_req(&stream_id, "benchcmp/raft-d1/external/xyz.bin", 3, None),
-            placement(),
-        )
-        .await
-        .expect("append external");
-    stage(&cold_store, "benchcmp/raft-d1/chunks/ab.bin", b"ab").await;
-    engine
-        .flush_cold(
-            FlushColdRequest {
-                cold_generation: None,
-                stream_id: stream_id.clone(),
-                chunk: chunk(0, 2, "benchcmp/raft-d1/chunks/ab.bin"),
-            },
-            placement(),
-        )
-        .await
-        .expect("flush hot prefix");
-
-    let read = engine
-        .read_stream(read_req(stream_id.clone(), 0, 16), placement())
-        .await
-        .expect("read across the flushed prefix and the external");
-    assert_eq!(read.payload, b"abXYZ");
-
-    let snapshot = engine.snapshot(placement()).await.expect("snapshot");
-    let entry = snapshot
-        .stream_snapshot
-        .streams
-        .iter()
-        .find(|entry| entry.metadata.stream_id == stream_id)
-        .expect("snapshot entry");
-    assert_eq!(entry.cold_frontier_offset, 2);
-    engine.shutdown().await.expect("shutdown source");
-
-    let mut target = cold_engine(cold_store).await;
-    target
-        .install_snapshot(snapshot)
-        .await
-        .expect("install snapshot with a regressed frontier");
-    let read = target
-        .read_stream(read_req(stream_id, 0, 16), placement())
-        .await
-        .expect("read after install");
-    assert_eq!(read.payload, b"abXYZ");
-    target.shutdown().await.expect("shutdown target");
-}
-
 fn log_id(index: u64) -> LogId<CommittedLeaderId> {
     LogId {
         leader_id: CommittedLeaderId::new(1, 1),
@@ -244,7 +173,7 @@ fn normal_entry(
 /// D1 through openraft's own snapshot path: a snapshot built after the
 /// frontier regressed installs on a lagging replica.
 #[tokio::test]
-async fn d1_openraft_snapshot_with_regressed_frontier_builds_and_installs() {
+async fn openraft_snapshot_with_regressed_frontier_builds_and_installs() {
     let stream_id = bsid("raft-d1-install");
     let commands = vec![
         StreamCommand::CreateStream {
@@ -309,104 +238,10 @@ async fn d1_openraft_snapshot_with_regressed_frontier_builds_and_installs() {
     assert_eq!(target.engine.stream_tail_offset(&stream_id), Some(5));
 }
 
-/// D3 through the Raft engine: the page entry of a rejected external append
-/// must not serve bytes once a flush proves the range.
-#[tokio::test]
-async fn d3_raft_flush_clips_the_page_entry_of_a_rejected_external_append() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let mut engine = cold_engine(cold_store.clone()).await;
-    let stream_id = bsid("raft-d3-clip");
-    engine
-        .create_stream(
-            CreateStreamRequest::new(stream_id.clone(), OCTET),
-            placement(),
-            ColdWriteAdmission::default(),
-        )
-        .await
-        .expect("create stream");
-    engine
-        .append(
-            append_req(&stream_id, b"ab", Some("5")),
-            placement(),
-            ColdWriteAdmission::default(),
-        )
-        .await
-        .expect("append with stream seq");
-    stage(
-        &cold_store,
-        "benchcmp/raft-d3-clip/external/rejected.bin",
-        b"0123456789",
-    )
-    .await;
-    let err = engine
-        .append_external(
-            append_external_req(
-                &stream_id,
-                "benchcmp/raft-d3-clip/external/rejected.bin",
-                10,
-                Some("1"),
-            ),
-            placement(),
-        )
-        .await
-        .expect_err("a regressed stream seq rejects the external append");
-    assert_eq!(err.code(), Some(StreamErrorCode::StreamSeqConflict));
-    engine
-        .append(
-            append_req(&stream_id, b"cdefgh", None),
-            placement(),
-            ColdWriteAdmission::default(),
-        )
-        .await
-        .expect("append hot bytes over the rejected range");
-    stage(
-        &cold_store,
-        "benchcmp/raft-d3-clip/chunks/0-8.bin",
-        b"abcdefgh",
-    )
-    .await;
-    engine
-        .flush_cold(
-            FlushColdRequest {
-                cold_generation: None,
-                stream_id: stream_id.clone(),
-                chunk: chunk(0, 8, "benchcmp/raft-d3-clip/chunks/0-8.bin"),
-            },
-            placement(),
-        )
-        .await
-        .expect("flush hot prefix");
-    stage(
-        &cold_store,
-        "benchcmp/raft-d3-clip/external/tail.bin",
-        b"WXYZ",
-    )
-    .await;
-    engine
-        .append_external(
-            append_external_req(
-                &stream_id,
-                "benchcmp/raft-d3-clip/external/tail.bin",
-                4,
-                None,
-            ),
-            placement(),
-        )
-        .await
-        .expect("append external tail");
-
-    let read = engine
-        .read_stream(read_req(stream_id, 0, 64), placement())
-        .await
-        .expect("read cold history");
-    assert_eq!(read.payload, b"abcdefghWXYZ");
-    engine.shutdown().await.expect("shutdown");
-}
-
 /// F14e: a stale flush on the Raft engine is rejected before it writes a
 /// page entry, so no entry is left behind for an unreferenced chunk.
 #[tokio::test]
-async fn f14e_raft_stale_flush_leaves_no_page_entry() {
+async fn stale_flush_leaves_no_page_entry() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let mut engine = cold_engine(cold_store.clone()).await;
     let stream_id = bsid("raft-stale-flush");
@@ -480,89 +315,6 @@ async fn f14e_raft_stale_flush_leaves_no_page_entry() {
     engine.shutdown().await.expect("shutdown");
 }
 
-/// D3 through the Raft engine: a rejected and a committed external append at
-/// the same start; page repair keeps the committed (last-written) entry.
-#[tokio::test]
-async fn d3_raft_repair_keeps_the_last_written_external_entry_at_each_start() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let mut engine = cold_engine(cold_store.clone()).await;
-    let stream_id = bsid("raft-d3-repair");
-    engine
-        .create_stream(
-            CreateStreamRequest::new(stream_id.clone(), OCTET),
-            placement(),
-            ColdWriteAdmission::default(),
-        )
-        .await
-        .expect("create stream");
-    engine
-        .append(
-            append_req(&stream_id, b"ab", Some("5")),
-            placement(),
-            ColdWriteAdmission::default(),
-        )
-        .await
-        .expect("append with stream seq");
-    stage(
-        &cold_store,
-        "benchcmp/raft-d3-repair/external/rejected.bin",
-        b"0123456789",
-    )
-    .await;
-    engine
-        .append_external(
-            append_external_req(
-                &stream_id,
-                "benchcmp/raft-d3-repair/external/rejected.bin",
-                10,
-                Some("1"),
-            ),
-            placement(),
-        )
-        .await
-        .expect_err("a regressed stream seq rejects the external append");
-    stage(
-        &cold_store,
-        "benchcmp/raft-d3-repair/external/live.bin",
-        b"WXYZ",
-    )
-    .await;
-    engine
-        .append_external(
-            append_external_req(
-                &stream_id,
-                "benchcmp/raft-d3-repair/external/live.bin",
-                4,
-                None,
-            ),
-            placement(),
-        )
-        .await
-        .expect("append external");
-
-    let response = engine
-        .repair_cold_index(
-            ursula_runtime::RepairColdIndexRequest {
-                after: None,
-                max_streams: 16,
-                stream: None,
-            },
-            placement(),
-        )
-        .await
-        .expect("repair");
-    assert!(response.cycle_completed);
-    assert_eq!(response.report.superseded_entries_dropped, 1);
-    assert_eq!(response.report.pages_rewritten, 1);
-
-    let read = engine
-        .read_stream(read_req(stream_id, 2, 64), placement())
-        .await
-        .expect("read external");
-    assert_eq!(read.payload, b"WXYZ");
-    engine.shutdown().await.expect("shutdown");
-}
-
 /// Wave-1 follow-up: the Raft read path and the state machine share one
 /// cold-index page cache, so the page invalidation that runs when a
 /// replicated `FlushCold` applies (on every replica) also drops the pages the
@@ -631,7 +383,8 @@ async fn raft_read_path_shares_the_page_cache_that_apply_invalidates() {
 /// straight to the page store. A page that a replica cached earlier (here
 /// holding a rejected append's stale entry over the same offsets) must not
 /// keep serving the old entries once the append applies: apply drops the
-/// stream's cached pages on every replica.
+/// stream's cached pages on every replica. Cold-index repair through the
+/// Raft engine then drops the superseded entry (D3).
 #[tokio::test]
 async fn external_append_apply_invalidates_a_cached_page_holding_a_stale_entry() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
@@ -688,9 +441,28 @@ async fn external_append_apply_invalidates_a_cached_page_holding_a_stale_entry()
         .await
         .expect("append external");
     let read = engine
-        .read_stream(read_req(stream_id, 2, 64), placement())
+        .read_stream(read_req(stream_id.clone(), 2, 64), placement())
         .await
         .expect("read external");
+    assert_eq!(read.payload, b"WXYZ");
+
+    let response = engine
+        .repair_cold_index(
+            ursula_runtime::RepairColdIndexRequest {
+                after: None,
+                max_streams: 16,
+                stream: None,
+            },
+            placement(),
+        )
+        .await
+        .expect("repair");
+    assert!(response.cycle_completed);
+    assert_eq!(response.report.superseded_entries_dropped, 1);
+    let read = engine
+        .read_stream(read_req(stream_id, 2, 64), placement())
+        .await
+        .expect("read external after repair");
     assert_eq!(read.payload, b"WXYZ");
     engine.shutdown().await.expect("shutdown");
 }

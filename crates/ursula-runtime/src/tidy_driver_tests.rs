@@ -1,5 +1,7 @@
-//! Bounded-state F3 (receipt window, `204` beyond it) and the F0 tidy
-//! driver through the runtime on the in-memory engine.
+//! The bounded-state F0 tidy driver through the runtime on the in-memory
+//! engine: rate-limited passes over every group converge streams written
+//! before the feature-level raise. (The F3 receipt window is pinned by the
+//! state machine's producer-window tests and the HTTP 204 regression.)
 
 use ursula_shard::BucketStreamId;
 use ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
@@ -10,8 +12,6 @@ use crate::CreateStreamRequest;
 use crate::RuntimeConfig;
 use crate::ShardRuntime;
 use crate::cold_store::DEFAULT_CONTENT_TYPE;
-
-const WINDOW: u64 = 1_024;
 
 fn spawn() -> ShardRuntime {
     ShardRuntime::spawn(RuntimeConfig::new(1, 2)).expect("spawn runtime")
@@ -35,46 +35,6 @@ fn producer_append(stream: &BucketStreamId, seq: u64) -> AppendRequest {
     });
     request.now_ms = 1;
     request
-}
-
-#[tokio::test]
-async fn duplicate_beyond_the_window_is_deduplicated_without_ranges() {
-    let runtime = spawn();
-    raise(&runtime).await;
-    let stream = BucketStreamId::new("window", "beyond");
-    runtime
-        .create_stream(CreateStreamRequest::new(
-            stream.clone(),
-            DEFAULT_CONTENT_TYPE,
-        ))
-        .await
-        .expect("create");
-    for seq in 0..(WINDOW + 3) {
-        let response = runtime
-            .append(producer_append(&stream, seq))
-            .await
-            .expect("append");
-        assert!(!response.deduplicated);
-    }
-    let retry = runtime
-        .append(producer_append(&stream, 0))
-        .await
-        .expect("retry");
-    assert!(retry.deduplicated);
-    assert!(retry.receipt_evicted);
-    assert!(retry.record_range.is_none());
-    assert_eq!(retry.next_offset, (WINDOW + 3) * 4);
-
-    let newest = runtime
-        .append(producer_append(&stream, WINDOW + 2))
-        .await
-        .expect("newest retry");
-    assert!(newest.deduplicated);
-    assert!(!newest.receipt_evicted);
-    assert_eq!(
-        (newest.start_offset, newest.next_offset),
-        ((WINDOW + 2) * 4, (WINDOW + 3) * 4)
-    );
 }
 
 #[tokio::test]

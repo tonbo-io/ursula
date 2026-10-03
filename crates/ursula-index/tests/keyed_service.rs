@@ -363,6 +363,23 @@ impl Harness {
         }
     }
 
+    /// Waits until the engine has no background worker. A read returns as
+    /// soon as `D` reaches the wanted record, but the namespace's worker then
+    /// runs a compaction pass, which may still write parts and publish a
+    /// manifest (queuing the superseded one for GC) after the read returned.
+    /// Tests that compare the stored objects with the published manifest must
+    /// let that work finish first.
+    async fn quiesce(&self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while self.engine.background_workers() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background workers did not finish"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Object keys of a namespace, relative to it.
     fn objects(&self, source: &KeyedSource) -> HashSet<String> {
         let root = self._dir.path().join(namespace_prefix(source, 1));
@@ -630,6 +647,7 @@ async fn continuity_failure_rebuilds_from_record_zero() {
     assert_eq!(answer.body, fold_body(&diverged, 6, &full_query()));
 
     // GC leaves exactly the rebuilt namespace's objects.
+    h.quiesce().await;
     h.engine.collect_garbage().await;
     let source = h.source("s");
     assert_eq!(h.objects(&source), h.referenced(&source).await);
@@ -664,6 +682,8 @@ async fn compaction_and_gc_preserve_state_at_every_d() {
             );
         }
     }
+    // The last read returned at D = tail; its worker may still be compacting.
+    h.quiesce().await;
     let namespace = KeyedNamespace::new(h.store.clone(), source.clone());
     let published = namespace.load().await.unwrap().unwrap();
     assert!(published.manifest.runs.len() <= CompactionPolicy::default().max_runs);
@@ -727,6 +747,8 @@ async fn two_pods_race_and_leave_no_orphans() {
             );
         }
     }
+    a.quiesce().await;
+    b.quiesce().await;
     a.engine.collect_garbage().await;
     b.engine.collect_garbage().await;
     assert_eq!(a.objects(&source), a.referenced(&source).await);

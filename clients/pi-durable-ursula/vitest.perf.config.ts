@@ -1,5 +1,6 @@
 import { defineConfig } from "vitest/config";
 
+// MANUAL TOOL, NOT RUN IN CI: `URSULA_BIN=... npm run perf:manual`.
 // M3 performance gates against the real keyed stack (design §9.3, §10 M3, §11.10), spawned by the e2e
 // global setup. Not part of `test:e2e`: building the 100k-record history takes minutes.
 // The 100k-record logs exceed the node's default 64 MiB per-group hot cap (no cold tier in the e2e stack).
