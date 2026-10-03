@@ -2,6 +2,7 @@
 // says they were written in this boot (a process crash keeps the page cache) into this db file, and
 // otherwise discards them and rebuilds from snapshot + tail. URSULA_VFS_TEST_BOOT_ID stands in for a
 // reboot; the damage a power loss could do is applied by hand.
+import { spawn } from "node:child_process";
 import { readFileSync, renameSync, statSync, truncateSync, writeFileSync } from "node:fs";
 import { expect, it } from "vitest";
 import { attach, status } from "../src/index.ts";
@@ -42,9 +43,20 @@ async function crashedOwner(boot?: string): Promise<{ url: string; file: string;
 
 it("(a) after a reboot, files a power loss damaged are discarded and rebuilt from snapshot + tail", async () => {
 	const { url, file, older } = await crashedOwner("before-the-reboot");
+	// A plain connection in another process (no extension) holds the file open, idle.
+	const reader = spawn(
+		process.execPath,
+		["-e", `const { DatabaseSync } = require("node:sqlite"); const db = new DatabaseSync(${JSON.stringify(file)}); db.prepare("SELECT count(*) FROM t").get(); console.log("open"); setInterval(() => {}, 1000);`],
+		{ stdio: ["ignore", "pipe", "inherit"] },
+	);
+	await new Promise<void>((res) => reader.stdout?.once("data", () => res()));
 	// The power loss: the db file's writes since the older image lost (same inode), the WAL cut mid-frame.
 	writeFileSync(file, older);
 	truncateSync(`${file}-wal`, Math.floor(statSync(`${file}-wal`).size / 2));
+	// Never discarded under another process's feet.
+	expect(() => attach(file, url)).toThrow(/open by another process/);
+	reader.kill("SIGKILL");
+	await new Promise((r) => reader.once("exit", r));
 	attach(file, url);
 	const s = status(file);
 	expect(s.local).toBe(0);
@@ -53,6 +65,9 @@ it("(a) after a reboot, files a power loss damaged are discarded and rebuilt fro
 	attach(fresh, url);
 	expect(Buffer.compare(readFileSync(file), readFileSync(fresh))).toBe(0);
 	expect(rows(file)).toEqual(ACKED);
+	// The rebuilt file (a snapshot renamed over the old one) is trusted again in this boot.
+	attach(file, url);
+	expect(status(file)).toMatchObject({ local: s.offset, installed: 0 });
 });
 
 it("(b) in the same boot, a crashed owner's files are used as they are: no snapshot, no replay from scratch", async () => {
