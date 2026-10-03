@@ -8,7 +8,7 @@
 import { appendFileSync } from "node:fs";
 import type { Storage, StorageWrite } from "@earendil-works/pi-durable";
 import { it } from "vitest";
-import { attach, drainStats, openUrsulaPiStorage, type VfsCommitStat } from "../src/index.ts";
+import { attach, drainStats, openUrsulaPiStorage, status, type VfsCommitStat, type VfsSnapshotStat } from "../src/index.ts";
 import { openHarness, textTurn, toolTurn } from "./harness-kit.ts";
 import { ctx, freshFile } from "./helpers.ts";
 import { streamPath, ursulaUrl } from "./kit.ts";
@@ -37,21 +37,27 @@ it("benchmark: Pi on the ursula VFS against real Ursula", async () => {
 	let commits = 0;
 	let turn = 0;
 	const out: string[] = [];
+	const snapshots: VfsSnapshotStat[] = [];
+	const drain = (file: string) => {
+		const s = drainStats(file);
+		snapshots.push(...s.snapshots);
+		return s;
+	};
 	for (const target of [1000, 10_000]) {
 		const storage = await openUrsulaPiStorage(file, url);
-		commits += drainStats(file).commits.length;
+		commits += drain(file).commits.length;
 		const timed = new Proxy(storage, {
 			get(t, prop) {
 				const value = Reflect.get(t, prop, t) as unknown;
 				if (prop === "commit") {
 					return async (writes: readonly StorageWrite[], c: typeof ctx) => {
-						commits += drainStats(file).commits.length;
+						commits += drain(file).commits.length;
 						const started = performance.now();
 						try {
 							return await t.commit(writes, c);
 						} finally {
 							const elapsed = performance.now() - started;
-							const s = drainStats(file);
+							const s = drain(file);
 							commits += s.commits.length;
 							samples.push({ ms: elapsed, kind: kindOf(writes), commits: s.commits, checkpointsUs: s.checkpoints_us });
 						}
@@ -65,13 +71,14 @@ it("benchmark: Pi on the ursula VFS against real Ursula", async () => {
 			if (turn % 3 === 2) await toolTurn(root, turn);
 			else await textTurn(root, turn);
 			turn++;
-			commits += drainStats(file).commits.length;
+			commits += drain(file).commits.length;
 		}
 		await harness.close(ctx);
+		const { snapshot, retained } = status(file);
 		await storage.close(ctx);
 		const started = performance.now();
 		attach(freshFile(), url);
-		out.push(`cold rebuild of a fresh file from ${commits} commits (${turn} turns): ${f(performance.now() - started)} ms`);
+		out.push(`cold rebuild of a fresh file from ${commits} commits (${turn} turns; snapshot at ${snapshot}, retention ${retained}): ${f(performance.now() - started)} ms`);
 	}
 
 	const steady = samples.slice(10);
@@ -98,13 +105,19 @@ it("benchmark: Pi on the ursula VFS against real Ursula", async () => {
 		const [bytes, raw, pages] = [sum((r) => r.bytes), sum((r) => r.raw), sum((r) => r.pages)];
 		out.push(`Pi commit ${k} (n=${ss.length}): stream bytes p50 ${pct(bytes, 50)}, p99 ${pct(bytes, 99)}, max ${Math.max(...bytes)}; raw p50 ${pct(raw, 50)}; pages p50 ${pct(pages, 50)}, p99 ${pct(pages, 99)}, max ${Math.max(...pages)}`);
 	}
+	if (snapshots.length > 0) {
+		out.push(
+			`snapshots: ${snapshots.length}, body bytes p50 ${pct(snapshots.map((s) => s.bytes), 50)} (db ${pct(snapshots.map((s) => s.raw), 50)}); page copy ms ${dist(snapshots.map((s) => ms(s.copy_us)))}; whole snapshot ms ${dist(snapshots.map((s) => ms(s.total_us)))}`,
+		);
+	}
 	const total = all.reduce((a, r) => a + r.bytes, 0);
 	const raw = all.reduce((a, r) => a + r.raw, 0);
 	const pages = all.map((r) => r.pages);
 	out.push(`pages per commit p50 ${pct(pages, 50)}, p99 ${pct(pages, 99)}, max ${Math.max(...pages)}`);
 	out.push(`total stream bytes: ${total} (${f(total / all.length)} per commit, ${f(total / turn)} per turn); raw ${raw} (zstd ratio ${f(raw / total)})`);
 	const report = out.join("\n");
-	console.log(`\n=== sqlite-ursula VFS benchmark (single node, memory WAL, cold ${process.env.URSULA_COLD ?? "memory"}) ===\n${report}\n`);
+	const setup = process.env.E2E_NODES === "3" ? "3 nodes + gateway, memory WAL, cold S3" : `single node, memory WAL, cold ${process.env.URSULA_COLD ?? "memory"}`;
+	console.log(`\n=== sqlite-ursula VFS benchmark (${setup}) ===\n${report}\n`);
 	const summary = process.env.GITHUB_STEP_SUMMARY;
-	if (summary !== undefined) appendFileSync(summary, `### sqlite-ursula VFS benchmark (cold ${process.env.URSULA_COLD ?? "memory"})\n\n\`\`\`\n${report}\n\`\`\`\n`);
+	if (summary !== undefined) appendFileSync(summary, `### sqlite-ursula VFS benchmark (${setup})\n\n\`\`\`\n${report}\n\`\`\`\n`);
 }, 1_800_000);

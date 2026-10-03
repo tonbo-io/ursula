@@ -19,7 +19,8 @@ export function loadUrsulaVfs(path = process.env.SQLITE_URSULA_VFS): DatabaseSyn
 }
 
 /**
- * Catches `file` up from the stream, claims the stream for this process (fencing every earlier owner)
+ * Catches `file` up from the stream (installing the stream's latest snapshot first when the file is
+ * missing or behind it), claims the stream for this process (fencing every earlier owner)
  * and attaches the file. No connection to `file` may be open; the process keeps a host lock on the file
  * for its lifetime. Returns the stream offset the file reflects.
  */
@@ -38,6 +39,10 @@ export interface AttachStatus {
 	/** Poisoned because a newer owner claimed the stream. */
 	readonly fenced: boolean;
 	readonly reason: string | null;
+	/** Offset of the latest snapshot known readable (published and read back, or found at attach); 0 for none. */
+	readonly snapshot: number;
+	/** Retention this owner advanced the stream to (0: none yet). */
+	readonly retained: number;
 }
 
 export function status(file: string): AttachStatus {
@@ -61,10 +66,25 @@ export interface VfsCommitStat {
 	readonly vfs_us: number;
 }
 
+/** One published (and read back) snapshot. */
+export interface VfsSnapshotStat {
+	/** Stream offset it reflects. */
+	readonly offset: number;
+	/** Body bytes (compressed). */
+	readonly bytes: number;
+	/** Database bytes. */
+	readonly raw: number;
+	/** Page copy under the read transaction. */
+	readonly copy_us: number;
+	/** Checkpoint, copy, compression, publish and read-back. */
+	readonly total_us: number;
+}
+
 export interface VfsStats {
 	readonly commits: VfsCommitStat[];
 	/** Checkpoints of the file since the last drain (time holding the checkpoint lock). */
 	readonly checkpoints_us: number[];
+	readonly snapshots: VfsSnapshotStat[];
 }
 
 /** Drains the per-commit and per-checkpoint stats of an attached file. */
