@@ -1,6 +1,7 @@
 # SQLite on Ursula: the replicating VFS
 
 Status: implemented. M1 (#324): the VFS core. M3: snapshots, retention, attach from a snapshot.
+The local files are a non-durable cache (§6): durability is the stream's acknowledgement alone.
 
 Scope: run an unmodified SQLite application (Pi Durable's official node `SqliteStorage` is the
 reference user) with an Ursula stream as the source of truth. Code: `clients/sqlite-vfs` (the
@@ -21,8 +22,9 @@ WAL commit is appended to the stream *before* any of the transaction's frames re
   it and the transaction's final page images) or a **claim** (a producer epoch and a 128-bit
   random nonce).
 - The local file's position in the stream is the sidecar `<db>-ursula`: the byte offset after the
-  last frame the file reflects, and the owner's epoch, replaced atomically (temp file, fsync,
-  rename, directory fsync).
+  last frame the file reflects, the owner's epoch, the kernel boot id it was written in, the
+  stream's path and the db file's device and inode, replaced atomically against a process crash
+  (temp file, rename; no fsync).
 - One owner per file per host: attach takes `flock` on `<db>-ursula.lock` for the process
   lifetime, and refuses while any connection to the file is open.
 
@@ -36,7 +38,11 @@ appended with the idempotent producer (`Producer-Id` per database, `Producer-Epo
 
 - **Acknowledged**: the overlay goes to the local WAL, later writes of the transaction (checksum
   rewrites of spilled frames, padding) go straight to it, and when the write transaction ends (the
-  WAL write lock is released) the WAL is synced and only then the sidecar advances.
+  WAL write lock is released) the sidecar advances. Nothing is fsynced (§6).
+- **Answered as a duplicate** (204, a retry whose first attempt was applied): the bytes at the
+  answered position are read back and must be ours. A cloned process (a VM or CRIU snapshot
+  restored twice, a fork after attach) shares epoch and sequence, and its twin's append would
+  otherwise be taken as this one's; a mismatch poisons the file as fenced.
 - **Outcome unknown** (timeout, connection loss, 5xx): retried with the same sequence until the
   server answers, for up to `URSULA_VFS_RETRY_MS` (30 s). The server deduplicates.
 - **403** (a newer epoch claimed the stream), a definite rejection, or an exhausted budget: the
@@ -52,7 +58,12 @@ appended with the idempotent producer (`Producer-Id` per database, `Producer-Epo
 `ursula_attach`:
 
 1. Takes the host lock; refuses if a connection to the file is open in this process.
-2. Reads the sidecar. A file with content and no sidecar was never attached and is refused.
+2. Reads the sidecar, before anything opens the file through SQLite. A file with content and no
+   sidecar was never attached and is refused (it may be a database whose pages were never in the
+   stream). A sidecar for another stream path is refused. A sidecar written in this boot for this
+   db file is trusted (or carries the recovery marker, §4.3); anything else (another or unknown
+   boot id, an older version's two-field sidecar, a torn one, a replaced db file) means the local
+   files are discarded (§6) and the attach proceeds as on a fresh host.
 3. Recovery (only when it rewrites pages): a private `unix` connection runs
    `wal_checkpoint(TRUNCATE)` and must see every frame checkpointed and be the last connection
    (the WAL is deleted on its close); otherwise attach fails rather than rewriting pages under
@@ -140,10 +151,11 @@ threshold of retained log. The newer snapshot has read back before any history i
 retained stream always holds a readable snapshot at or above its start.
 
 Attach installs a snapshot when the file is behind the latest one: it verifies the body (offset,
-size, checksum), recovers the old file as in §3, writes the image to a temp file, fsyncs it,
-renames it over the db file and fsyncs the directory, then replays the tail. A crash after the
-rename leaves the sidecar at the old offset (a fresh file gets a `0 0` sidecar before anything is
-written), so the next attach installs again or replays idempotently. A tail read that hits `410`
+size, checksum), recovers the old file as in §3 (writing the recovery marker into the sidecar
+first), writes the image to a temp file and renames it over the db file, then replays the tail. A
+crash after the rename leaves the marked sidecar at the old offset (a fresh file gets a `0 0`
+sidecar before anything is written), so the next attach in the same boot installs again or
+replays idempotently; after a reboot it discards the files. A tail read that hits `410`
 (retention moved under a stale `HEAD`), or a snapshot superseded between `HEAD` and `GET` (a 404,
 or a body cut short when its cold object is deleted after the grace), restarts
 attach from `HEAD`, up to ten times.
@@ -162,9 +174,10 @@ and the log keeps growing. A superseded cold body stays readable for 5 minutes.
 
 - An acknowledged commit (the SQL `COMMIT` returned) is in the stream, and every host that
   attaches after it sees it, through replay or a snapshot that includes it.
-- Nothing unacknowledged becomes visible: no frame of a transaction reaches the local WAL before
-  its append is acknowledged, and a fenced or failed commit leaves no trace locally or remotely
-  (the server deduplicates retries).
+- Nothing the stream did not acknowledge becomes visible: no frame of a transaction reaches the
+  local WAL before its append is acknowledged, and a fenced or failed commit leaves no trace
+  locally or remotely (the server deduplicates retries). An append the server applied but whose
+  answer the client never saw is in the stream, and appears after the next attach.
 - Fencing: after a claim at epoch `e` is verified, appends below `e` fail. Snapshots carry the
   highest epoch, so this survives retention trimming the claims.
 - A snapshot reflects exactly the stream at its offset; retention advances only past a snapshot
@@ -172,20 +185,63 @@ and the log keeps growing. A superseded cold body stays readable for 5 minutes.
 
 ## 6. Failure model
 
-- Crash of the owner at any point: the sidecar never runs ahead of a synced local WAL; re-attach
-  replays from it (or installs a snapshot). Covered: SIGKILL before and after the ack, the cache
-  spill with in-place checksum rewrites, a failed local write after the ack.
+Durability of a commit is Ursula's acknowledgement, nothing else. The local db file, `-wal`, `-shm`
+and sidecar are a cache of the stream and are never fsynced: `xSync` of an attached database is a
+no-op, the extension's own private connections run `synchronous=OFF`, and the sidecar and snapshot
+installs are temp file + rename without fsync. So the application's `PRAGMA synchronous` level
+affects neither correctness nor commit latency (leave it as the application sets it). What attach
+does with the local files depends on whether the kernel has kept them since they were written:
+
+- **Process crash, same boot** (SIGKILL, OOM kill, abort, container restart, a pod rescheduled to
+  the same node with a local volume): every completed `write()` is in the page cache, so the files
+  are exactly what this host wrote. A killed write leaves a prefix; SQLite's salted, cumulative WAL
+  checksums stop recovery at the last whole commit, `-shm` is rebuilt, checkpoints are redone from
+  the WAL, and the sidecar is written only after the WAL writes return, so it never runs ahead of
+  the files. Attach trusts them and replays from the sidecar's offset (fast). Covered: SIGKILL
+  before and after the ack, the cache spill with in-place checksum rewrites, a failed local write
+  after the ack, a crash mid-recovery (the recovery marker).
+- **Reboot, power loss, kexec, a volume moved to another host**: the kernel boot id differs (Linux
+  `/proc/sys/kernel/random/boot_id`, macOS `kern.bootsessionuuid`; unknown never matches), and a
+  power loss may have left any prefix of any unsynced write in any file. Attach discards the
+  local files and rebuilds from the latest snapshot and the tail. A new random boot id cannot be
+  on disk from before it was generated, so no torn sidecar passes the check. Discarding runs
+  before anything opens the file through SQLite (a torn file could fail any checkpoint), refuses
+  while another process has the file open, removes `-wal`, `-shm`, the db and leftover temp files
+  (never the held lock file), and rewrites the sidecar last, so a crash midway discards again. The
+  first attach after upgrading from a version without boot ids rebuilds once.
+- **Cost of a rebuild**: one snapshot GET (the database, held in memory twice while it is
+  decoded; up to 1 GiB compressed) plus the tail since it, at most about twice
+  `max(database size, URSULA_VFS_SNAPSHOT_MIN_BYTES)` while snapshots keep up. Every reboot pays it,
+  clean ones included, so a fleet-wide rolling reboot is a burst of snapshot reads. If snapshots
+  cannot be published (a body over the gateway's 32 MiB, a reader pinning WAL frames), a rebuild
+  replays the whole log from 0: snapshot health is an availability dependency (watch the log
+  since the latest snapshot).
+- **Wrong stream**: the sidecar names the stream's path; attaching the file to another stream is
+  refused, and so is attaching it to its stream after that was deleted and recreated shorter
+  (the replay start is beyond the stream's end). A stream recreated at the same path and already
+  grown past the file's offset is not detected.
 - Network partition or slow server: commits block up to the retry budget, then poison.
 - Two owners: the later claim wins; the earlier one's next commit fails cleanly
   (`UrsulaReplicationError` with `fenced: true` through the Pi helper).
 - A snapshot that cannot be taken (a long reader pins WAL frames) or published (body too large):
   the log grows, nothing is lost; retention simply does not advance.
 
+Unsupported, because they break "same boot means the files are what this host wrote": a disk
+write-back I/O error (nothing fsyncs, so nobody sees it), a block volume force-detached and
+reattached without a reboot, a runtime that fakes a fixed boot id, edits to the files outside the
+extension (a process that never loaded it, or copying a backup over the db in place; a db file
+replaced by rename is detected and discarded), and network or FUSE filesystems for the local
+files (NFS/EFS, SMB, 9p, virtiofs: no page-cache coherence or reliable POSIX locks, and a second
+host's attach would discard files the first is using). To force a rebuild, delete `<db>`. Sandbox
+runtimes with their own kernel (gVisor, Kata, Firecracker, WSL2, Docker Desktop) are safe but
+rebuild on every restart of the sandbox or VM.
+
 ## 7. Limits
 
 - 4 KiB pages; WAL mode only; `locking_mode=EXCLUSIVE` unsupported.
 - One owner process per stream at a time; connections in other processes are not replicated (and
   block recovery).
+- The local files must be on a local filesystem (§6).
 - Commit frames are at most the server's request limit (32 MiB), about 8000 changed pages per
   transaction.
 - Snapshots hold the database image in memory (twice, briefly: raw and compressed) and are capped
@@ -196,8 +252,14 @@ and the log keeps growing. A superseded cold body stays readable for 5 minutes.
 ## 8. Tests
 
 - Units (`cargo test`): frame and snapshot encodings (whole frames only, damage refused).
+- Units also cover the sidecar: trusted only in this boot for this db file (or with the recovery
+  marker); legacy, other-boot and torn sidecars are not; a missing one is an error.
 - e2e against a real node (`clients/sqlite-ursula`): transparency (any schema, byte-identical
-  rebuild), the crash matrix, fencing, recovery exclusion, snapshots + retention (a ~160 MB run;
+  rebuild), the crash matrix (including an append answered as a duplicate of a clone's bytes),
+  fencing, recovery exclusion, the local cache (a simulated reboot with a rolled-back db file and a
+  cut WAL rebuilds byte-identical from snapshot + tail; the same boot reuses the files with no
+  snapshot and no replay from scratch; a replaced db file is rebuilt; a file without a sidecar,
+  another stream and a recreated stream are refused), snapshots + retention (a ~160 MB run;
   CI also runs it without a cold tier under the default hot limit; fresh and lagging hosts rebuild
   byte-identical from snapshot + tail; the takeover after the trim fences the old owner), Pi
   conformance in three modes, and a benchmark (sanity numbers only).

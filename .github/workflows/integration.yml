@@ -124,7 +124,7 @@ jobs:
           name: sqlite-ursula-vfs
           path: ${{ runner.temp }}/vfs
 
-      - name: e2e (transparency, crash matrix, fencing, recovery, snapshots, Pi conformance, benchmark)
+      - name: e2e (transparency, crash matrix, fencing, recovery, local cache, snapshots, Pi conformance, benchmark)
         timeout-minutes: 30
         run: |
           chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
