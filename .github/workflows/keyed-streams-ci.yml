@@ -186,16 +186,10 @@ jobs:
         run: |
           cd clients/sqlite-vfs
           cargo fmt --check
-          cargo clippy --release --all-targets -- -D warnings
-          cargo test --release
-          cargo build --release
+          cargo clippy --locked --release --all-targets -- -D warnings
+          cargo test --locked --release
+          cargo build --locked --release
           ldd target/release/libsqlite_ursula_vfs.so
-
-      - name: Upload the resolved Cargo.lock
-        uses: actions/upload-artifact@v6
-        with:
-          name: sqlite-vfs-cargo-lock
-          path: clients/sqlite-vfs/Cargo.lock
 
       - name: Install Node
         uses: actions/setup-node@v6
