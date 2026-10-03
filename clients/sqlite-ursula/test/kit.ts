@@ -55,6 +55,10 @@ export type ChildLine = {
 	poisoned?: boolean;
 	offset?: number;
 	epoch?: number;
+	/** On `done`: snapshots published, the latest known snapshot and the retention this owner set. */
+	snapshots?: number;
+	snapshot?: number;
+	retained?: number;
 };
 
 export interface Child {
