@@ -38,7 +38,9 @@
 //!   only then advances the stream's retention to the *previous* snapshot's offset. Attach installs
 //!   the latest snapshot when the local file is missing or behind it, then replays the tail.
 //! * `SELECT ursula_status(path)` returns
-//!   `{"offset","epoch","poisoned","fenced","reason","snapshot","retained"}`;
+//!   `{"offset","epoch","poisoned","fenced","reason","snapshot","retained","local","installed"}`
+//!   (`local`: the stream offset of the local state attach started from, 0 when it rebuilt the
+//!   file; `installed`: the offset of the snapshot attach installed, 0 for none);
 //!   `SELECT ursula_stats(path)` drains per-commit, per-checkpoint and per-snapshot numbers (bench).
 //!
 //! Test hooks: `URSULA_VFS_ABORT_AFTER_ACK=<n>` aborts the process right after the n-th acknowledged
@@ -349,17 +351,14 @@ fn fail_post_ack() -> Option<u64> {
 /// This kernel's boot id (`URSULA_VFS_TEST_BOOT_ID` replaces it); `None` when unknown, which
 /// never matches a recorded one. Within one boot every completed write stays visible (the page
 /// cache survives any process crash), so local files written since this boot are exactly what this
-/// host wrote; across a reboot or power loss they may be anything.
-fn boot_id() -> Option<&'static str> {
-    static V: OnceLock<Option<String>> = OnceLock::new();
-    V.get_or_init(|| {
-        std::env::var("URSULA_VFS_TEST_BOOT_ID")
-            .ok()
-            .or_else(read_boot_id)
-            .map(|id| id.trim().to_owned())
-            .filter(|id| !id.is_empty() && !id.contains(char::is_whitespace))
-    })
-    .as_deref()
+/// host wrote; across a reboot or power loss they may be anything. Read at every attach, never
+/// cached: a process restored after a reboot (CRIU) must see the new boot.
+fn boot_id() -> Option<String> {
+    std::env::var("URSULA_VFS_TEST_BOOT_ID")
+        .ok()
+        .or_else(read_boot_id)
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty() && !id.contains(char::is_whitespace))
 }
 
 #[cfg(target_os = "linux")]
@@ -400,20 +399,20 @@ fn stream_key(url: &str) -> &str {
     rest.find('/').map_or("", |i| &rest[i..])
 }
 
-/// The db file's identity (device and inode), when it exists.
+/// The db file's identity, when it exists: its inode. Not the device: an overlay root filesystem
+/// (a container's writable layer) gets a new device number at every mount, and a db on another
+/// volume has its own sidecar next to it anyway.
 fn file_id(path: &str) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
-    fs::metadata(path)
-        .ok()
-        .map(|m| format!("{}:{}", m.dev(), m.ino()))
+    fs::metadata(path).ok().map(|m| m.ino().to_string())
 }
 
-/// What a sidecar records besides offset and epoch: the boot it was written in, the stream, and
-/// the db file it describes (see `trusted`).
-fn stamp(path: &str, url: &str) -> String {
+/// What a sidecar records besides offset and epoch: the boot it was written in (`boot`, from
+/// `boot_id`), the stream, and the db file it describes (see `trusted`).
+fn stamp(path: &str, url: &str, boot: Option<&str>) -> String {
     let mut s = format!(
         " boot={} stream={}",
-        boot_id().unwrap_or("unknown"),
+        boot.unwrap_or("unknown"),
         stream_key(url)
     );
     if let Some(id) = file_id(path) {
@@ -456,9 +455,10 @@ struct Sidecar {
 impl Sidecar {
     /// The local files are exactly what this host wrote: since this boot, into this db file (one
     /// replaced behind our back would get the old one's WAL applied to it; an interrupted recovery
-    /// may have renamed a snapshot over it). A sidecar of an older version (no boot) is not.
-    fn trusted(&self, path: &str) -> bool {
-        boot_id().is_some_and(|b| self.boot.as_deref() == Some(b))
+    /// may have renamed a snapshot over it). A sidecar of an older version (no boot) is not, and
+    /// nothing is when the current boot (`boot`, from `boot_id`) is unknown.
+    fn trusted(&self, path: &str, boot: Option<&str>) -> bool {
+        boot.is_some_and(|b| self.boot.as_deref() == Some(b))
             && (self.recovering || (self.file.is_some() && self.file == file_id(path)))
     }
 }
@@ -502,7 +502,14 @@ fn read_sidecar(path: &str) -> Result<Option<Sidecar>, String> {
 /// discards again.
 fn discard_local(path: &str) -> Result<(), String> {
     check_unused(path)?;
-    for suffix in ["-wal", "-shm", "-ursula.snap", "-ursula.tmp", ""] {
+    for suffix in [
+        "-wal",
+        "-shm",
+        "-journal",
+        "-ursula.snap",
+        "-ursula.tmp",
+        "",
+    ] {
         let f = format!("{path}{suffix}");
         if let Err(e) = fs::remove_file(&f)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -571,13 +578,8 @@ fn header_u64(r: &ureq::http::Response<ureq::Body>, name: &str) -> Option<u64> {
 }
 
 enum Append {
-    /// Applied (or, `duplicate`, a duplicate of an applied append: 204); the stream offset after it
-    /// when known.
-    Acked {
-        next: Option<u64>,
-        attempts: u32,
-        duplicate: bool,
-    },
+    /// Applied (or a duplicate of an applied append); the stream offset after it when known.
+    Acked { next: Option<u64>, attempts: u32 },
     /// 403: a newer epoch owns the stream.
     Fenced { current: Option<u64> },
     /// 409 expecting sequence 0: the server expired this idle producer (7 days).
@@ -588,10 +590,9 @@ enum Append {
 
 /// One idempotent append: retried with the same producer sequence until the outcome is known.
 ///
-/// A duplicate answer (204) proves nothing by itself: whatever holds (epoch, seq) answers it. A
-/// verified claim (see `claim_once`) makes this owner the only writer at its epoch, unless the
-/// process was cloned (a VM or CRIU snapshot restored twice, a fork after attach): so the caller
-/// reads a duplicate's bytes back (see `stream_holds`).
+/// A duplicate answer (204) is taken as proof of *our* earlier attempt only for commits (seq >= 1):
+/// they are sent after a verified claim (see `claim_once`), which makes this owner the only writer
+/// at its epoch, so whatever holds (epoch, seq) is ours. A claim's answer is verified separately.
 fn append(url: &str, body: &[u8], epoch: u64, seq: u64) -> Append {
     let deadline = Instant::now() + retry_budget();
     let mut backoff = Duration::from_millis(20);
@@ -617,7 +618,6 @@ fn append(url: &str, body: &[u8], epoch: u64, seq: u64) -> Append {
                         return Append::Acked {
                             next: header_u64(&r, "stream-next-offset"),
                             attempts,
-                            duplicate: status == 204,
                         };
                     }
                     403 => {
@@ -735,19 +735,6 @@ fn read_from(url: &str, offset: u64) -> Result<(Vec<u8>, u64), Fail> {
         )));
     }
     Ok((body, next))
-}
-
-/// Whether the stream holds exactly `bytes` at `at`.
-fn stream_holds(url: &str, at: u64, bytes: &[u8]) -> Result<bool, String> {
-    let mut got = Vec::new();
-    while got.len() < bytes.len() {
-        let (b, _) = read_from(url, at + got.len() as u64)?;
-        if b.is_empty() {
-            break;
-        }
-        got.extend_from_slice(&b);
-    }
-    Ok(got.get(..bytes.len()) == Some(bytes))
 }
 
 /// Snapshot transfers move whole databases: a longer timeout than appends.
@@ -1010,6 +997,8 @@ unsafe fn checkpoint_local(path: &str) -> Result<(), String> {
 struct Applier {
     path: String,
     url: String,
+    /// This boot's id, for the recovery marker (see `stamp`).
+    boot: Option<String>,
     sidecar: String,
     /// Offset and epoch a recovery restarts from, recorded in the recovery marker.
     restart: (u64, u64),
@@ -1055,7 +1044,7 @@ impl Applier {
                 if fs::metadata(&self.path).is_ok_and(|m| m.len() > 0) {
                     unsafe { checkpoint_local(&self.path)? };
                 }
-                let stamp = stamp(&self.path, &self.url);
+                let stamp = stamp(&self.path, &self.url, self.boot.as_deref());
                 write_recovery_marker(&self.sidecar, self.restart.0, self.restart.1, &stamp)?;
                 self.recovering = true;
             }
@@ -1197,7 +1186,7 @@ fn claim_once(url: &str, epoch: u64) -> Result<Claimed, String> {
         } => {
             let start = next.checked_sub(frame.len() as u64);
             let ours = match start {
-                Some(start) => stream_holds(url, start, &frame)?,
+                Some(start) => read_from(url, start)?.0.get(..frame.len()) == Some(&frame[..]),
                 None => false,
             };
             Ok(match start {
@@ -1351,6 +1340,7 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
     }
     create_stream(&url)?;
     let sidecar = format!("{path}-ursula");
+    let boot = boot_id();
     let mut local = None;
     if fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
         // A file with content but no sidecar was never attached: its pages are not in the stream.
@@ -1366,7 +1356,7 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
             ));
         }
         match s {
-            Some(s) if s.trusted(&path) => local = Some(s),
+            Some(s) if s.trusted(&path, boot.as_deref()) => local = Some(s),
             // Written before a reboot (a power loss may have left any prefix of any write), by an
             // older version, torn, or for another db file: the stream has everything committed.
             _ => {
@@ -1378,6 +1368,10 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
             }
         }
     }
+    // The only rollback journal an attached file can have is `init_wal_format`'s, left by a crash
+    // mid-switch: the file is an empty database with or without it, but the first open (SQLite's,
+    // or `checkpoint_local`'s) would roll it back, truncating whatever attach writes after it.
+    let _ = fs::remove_file(format!("{path}-journal"));
     let (from, epoch, recovering) = match &local {
         Some(s) => (s.offset, s.epoch, s.recovering),
         None => {
@@ -1387,7 +1381,7 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
             // idempotent).
             let _ = fs::remove_file(format!("{path}-wal"));
             let _ = fs::remove_file(format!("{path}-shm"));
-            write_sidecar(&sidecar, 0, 0, &stamp(&path, &url))?;
+            write_sidecar(&sidecar, 0, 0, &stamp(&path, &url, boot.as_deref()))?;
             (0, 0, false)
         }
     };
@@ -1403,6 +1397,7 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
     let mut applier = Applier {
         path: path.clone(),
         url: url.clone(),
+        boot: boot.clone(),
         sidecar: sidecar.clone(),
         restart: (from, epoch),
         recovering,
@@ -1435,7 +1430,7 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
     if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0 {
         unsafe { init_wal_format(&path)? };
     }
-    let stamp = stamp(&path, &url);
+    let stamp = stamp(&path, &url, boot.as_deref());
     write_sidecar(&sidecar, offset, epoch, &stamp)?;
     let pages = (fs::metadata(&path).map(|m| m.len()).unwrap_or(0) / PAGE as u64) as u32;
     let snapper = Arc::new(Snapper::default());
@@ -2195,27 +2190,7 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
     let append_time = t.elapsed();
     let expected = db.offset + body.len() as u64;
     let attempts = match outcome {
-        Append::Acked {
-            next,
-            attempts,
-            duplicate,
-        } if next.is_none_or(|n| n == expected) => {
-            // A duplicate is ours only if the stream holds our bytes (see `append`).
-            match duplicate.then(|| stream_holds(&db.url, db.offset, &body)) {
-                None | Some(Ok(true)) => attempts,
-                Some(Ok(false)) => {
-                    db.fenced = true;
-                    return db.poison(format!(
-                        "append at {} answered as a duplicate of other bytes: another writer \
-                         holds epoch {} (a cloned process?)",
-                        db.offset, db.epoch
-                    ));
-                }
-                Some(Err(e)) => {
-                    return db.poison(format!("reading back a duplicate append: {e}"));
-                }
-            }
-        }
+        Append::Acked { next, attempts } if next.is_none_or(|n| n == expected) => attempts,
         Append::Acked { next, .. } => {
             return db.poison(format!(
                 "append at {} acknowledged with next offset {next:?}, expected {expected}",
@@ -2569,28 +2544,38 @@ mod tests {
         let db = dir.join("db").to_str().unwrap().to_owned();
         let sidecar = format!("{db}-ursula");
         fs::write(&db, b"x").unwrap();
-        let trust = |line: &[u8]| {
+        let trust = |line: &[u8], boot: Option<&str>| {
             fs::write(&sidecar, line).unwrap();
-            read_sidecar(&sidecar).unwrap().map(|s| s.trusted(&db))
+            read_sidecar(&sidecar)
+                .unwrap()
+                .map(|s| s.trusted(&db, boot))
         };
-        let known = boot_id().is_some();
-        let here = stamp(&db, "http://h:1/b/s");
-        assert!(here.contains(" stream=/b/s "));
-        assert_eq!(trust(format!("7 2{here}\n").as_bytes()), Some(known));
-        let other_boot = here.replace(boot_id().unwrap_or("unknown"), "other");
-        assert_eq!(trust(format!("7 2{other_boot}\n").as_bytes()), Some(false));
-        let other_file = format!(" boot={} stream=/b/s file=0:0", boot_id().unwrap_or("x"));
-        assert_eq!(trust(format!("7 2{other_file}\n").as_bytes()), Some(false));
-        let marker = format!("7 2{other_file} recovering\n");
-        assert_eq!(trust(marker.as_bytes()), Some(known));
-        assert_eq!(trust(b"7 2\n"), Some(false));
-        assert_eq!(trust(b"7 2 recovering\n"), Some(false));
+        let b1 = Some("b1");
+        let here = format!("7 2{}\n", stamp(&db, "http://h:1/b/s", b1));
+        assert!(here.starts_with("7 2 boot=b1 stream=/b/s file="));
+        assert_eq!(trust(here.as_bytes(), b1), Some(true));
+        assert_eq!(trust(here.as_bytes(), Some("b2")), Some(false));
+        assert_eq!(trust(here.as_bytes(), None), Some(false));
+        let unknown = format!("7 2{}\n", stamp(&db, "http://h:1/b/s", None));
+        assert!(unknown.starts_with("7 2 boot=unknown "));
+        assert_eq!(trust(unknown.as_bytes(), None), Some(false));
+        // Another db file (replaced by a rename) is not trusted, unless an interrupted recovery
+        // (which renames a snapshot over it) wrote the marker in this boot.
+        let other_file = "7 2 boot=b1 stream=/b/s file=0";
+        assert_eq!(trust(format!("{other_file}\n").as_bytes(), b1), Some(false));
+        let marker = format!("{other_file} recovering\n");
+        assert_eq!(trust(marker.as_bytes(), b1), Some(true));
+        assert_eq!(trust(marker.as_bytes(), Some("b2")), Some(false));
+        assert_eq!(trust(b"7 2\n", b1), Some(false));
+        assert_eq!(trust(b"7 2 recovering\n", b1), Some(false));
         for torn in ["", "7", "7 2 boot", "7 2 x=1"] {
-            assert_eq!(trust(torn.as_bytes()), None);
+            assert_eq!(trust(torn.as_bytes(), b1), None);
         }
-        assert_eq!(trust(b"\xff\xfe 7 2"), None);
+        assert_eq!(trust(b"\xff\xfe 7 2", b1), None);
         fs::remove_file(&sidecar).unwrap();
         assert!(read_sidecar(&sidecar).is_err());
         fs::remove_dir_all(&dir).unwrap();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(boot_id().is_some(), "the kernel's boot id is unreadable");
     }
 }

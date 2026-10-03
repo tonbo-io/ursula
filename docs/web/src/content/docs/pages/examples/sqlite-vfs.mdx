@@ -43,7 +43,7 @@ db.exec("CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, body TEXT)");
 db.prepare("INSERT INTO notes(body) VALUES (?)").run("replicated"); // returns after Ursula has it
 
 console.log(status("/data/app.db"));
-// { offset, epoch, poisoned, fenced, reason, snapshot, retained }
+// { offset, epoch, poisoned, fenced, reason, snapshot, retained, local, installed }
 ```
 
 From SQL, the same functions are `ursula_attach(path, url)`, `ursula_status(path)` and `ursula_stats(path)`.
@@ -66,7 +66,7 @@ A commit the stream does not accept surfaces as `UrsulaReplicationError`; `fence
 - WAL mode only, 4 KiB pages (SQLite's default). `locking_mode=EXCLUSIVE` is not supported.
 - One process owns a database file at a time (a lock file next to it enforces this on the host). Use as many connections inside that process as you like.
 - Treat the local file as a cache: do not copy it elsewhere and attach it to another stream. A commit is durable once Ursula acknowledges it; the local files are never fsynced, so `PRAGMA synchronous` does not matter.
-- After a reboot, a power loss, or on another host, attach discards the local files and rebuilds them from the latest snapshot and the stream's tail (a crashed process on the same boot resumes from its local files). Keep the file on a local disk, not a network filesystem. Delete the file to force a rebuild.
+- After a reboot, a power loss, or on another host, attach discards the local files and rebuilds them from the latest snapshot and the stream's tail (a crashed process on the same boot resumes from its local files). Keep the file on a local disk, not a network filesystem. Delete the file to force a rebuild, and after downgrading the extension to a version without this behavior.
 - A commit whose append gets no answer is retried with the same producer sequence for up to 30 s (`URSULA_VFS_RETRY_MS`), then fails, and the file must be attached again.
 - An owner idle for 7 days loses its producer state on the server; its next commit takes the stream back only if nobody else wrote meanwhile.
 - `URSULA_VFS_SNAPSHOT_MIN_BYTES` sets the smallest log between snapshots (default 8 MiB).

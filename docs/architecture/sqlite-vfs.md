@@ -23,8 +23,8 @@ WAL commit is appended to the stream *before* any of the transaction's frames re
   random nonce).
 - The local file's position in the stream is the sidecar `<db>-ursula`: the byte offset after the
   last frame the file reflects, the owner's epoch, the kernel boot id it was written in, the
-  stream's path and the db file's device and inode, replaced atomically against a process crash
-  (temp file, rename; no fsync).
+  stream's path and the db file's inode, replaced atomically against a process crash (temp file,
+  rename; no fsync).
 - One owner per file per host: attach takes `flock` on `<db>-ursula.lock` for the process
   lifetime, and refuses while any connection to the file is open.
 
@@ -39,10 +39,6 @@ appended with the idempotent producer (`Producer-Id` per database, `Producer-Epo
 - **Acknowledged**: the overlay goes to the local WAL, later writes of the transaction (checksum
   rewrites of spilled frames, padding) go straight to it, and when the write transaction ends (the
   WAL write lock is released) the sidecar advances. Nothing is fsynced (§6).
-- **Answered as a duplicate** (204, a retry whose first attempt was applied): the bytes at the
-  answered position are read back and must be ours. A cloned process (a VM or CRIU snapshot
-  restored twice, a fork after attach) shares epoch and sequence, and its twin's append would
-  otherwise be taken as this one's; a mismatch poisons the file as fenced.
 - **Outcome unknown** (timeout, connection loss, 5xx): retried with the same sequence until the
   server answers, for up to `URSULA_VFS_RETRY_MS` (30 s). The server deduplicates.
 - **403** (a newer epoch claimed the stream), a definite rejection, or an exhausted budget: the
@@ -206,20 +202,25 @@ does with the local files depends on whether the kernel has kept them since they
   local files and rebuilds from the latest snapshot and the tail. A new random boot id cannot be
   on disk from before it was generated, so no torn sidecar passes the check. Discarding runs
   before anything opens the file through SQLite (a torn file could fail any checkpoint), refuses
-  while another process has the file open, removes `-wal`, `-shm`, the db and leftover temp files
-  (never the held lock file), and rewrites the sidecar last, so a crash midway discards again. The
-  first attach after upgrading from a version without boot ids rebuilds once.
-- **Cost of a rebuild**: one snapshot GET (the database, held in memory twice while it is
-  decoded; up to 1 GiB compressed) plus the tail since it, at most about twice
-  `max(database size, URSULA_VFS_SNAPSHOT_MIN_BYTES)` while snapshots keep up. Every reboot pays it,
-  clean ones included, so a fleet-wide rolling reboot is a burst of snapshot reads. If snapshots
-  cannot be published (a body over the gateway's 32 MiB, a reader pinning WAL frames), a rebuild
-  replays the whole log from 0: snapshot health is an availability dependency (watch the log
-  since the latest snapshot).
+  while another process has the file open, removes `-wal`, `-shm`, `-journal`, the db and leftover
+  temp files (never the held lock file), and rewrites the sidecar last, so a crash midway discards
+  again. The first attach after upgrading from a version without boot ids rebuilds once; that
+  version refuses this one's sidecar, so after a downgrade delete `<db>` (it is rebuilt from the
+  stream).
+- **Cost of a rebuild**: one snapshot GET (the database, held in memory twice while it is decoded;
+  up to 1 GiB compressed) plus the tail since it, at most about twice `max(database size,
+  URSULA_VFS_SNAPSHOT_MIN_BYTES)` while snapshots keep up. Every reboot pays it, clean ones
+  included, so a fleet-wide rolling reboot is a burst of snapshot reads. If snapshots cannot be
+  published (a body over the gateway's 32 MiB, a reader pinning WAL frames), a rebuild replays
+  everything since the last published snapshot (the whole log if none was ever published):
+  snapshot health is an availability dependency (watch the log since the latest snapshot).
 - **Wrong stream**: the sidecar names the stream's path; attaching the file to another stream is
   refused, and so is attaching it to its stream after that was deleted and recreated shorter
   (the replay start is beyond the stream's end). A stream recreated at the same path and already
   grown past the file's offset is not detected.
+- A rollback journal next to an attached file can only be left by a crash while attach switched
+  an empty file to WAL; attach deletes it in every case (rolling it back would truncate the file
+  under the pages attach writes next).
 - Network partition or slow server: commits block up to the retry budget, then poison.
 - Two owners: the later claim wins; the earlier one's next commit fails cleanly
   (`UrsulaReplicationError` with `fenced: true` through the Pi helper).
@@ -253,16 +254,18 @@ rebuild on every restart of the sandbox or VM.
 
 - Units (`cargo test`): frame and snapshot encodings (whole frames only, damage refused).
 - Units also cover the sidecar: trusted only in this boot for this db file (or with the recovery
-  marker); legacy, other-boot and torn sidecars are not; a missing one is an error.
+  marker written in this boot); legacy, other-boot and torn sidecars are not, nothing is when the
+  current boot id is unknown, and a missing sidecar is an error.
 - e2e against a real node (`clients/sqlite-ursula`): transparency (any schema, byte-identical
-  rebuild), the crash matrix (including an append answered as a duplicate of a clone's bytes),
-  fencing, recovery exclusion, the local cache (a simulated reboot with a rolled-back db file and a
-  cut WAL rebuilds byte-identical from snapshot + tail; the same boot reuses the files with no
-  snapshot and no replay from scratch; a replaced db file is rebuilt; a file without a sidecar,
-  another stream and a recreated stream are refused), snapshots + retention (a ~160 MB run;
-  CI also runs it without a cold tier under the default hot limit; fresh and lagging hosts rebuild
-  byte-identical from snapshot + tail; the takeover after the trim fences the old owner), Pi
-  conformance in three modes, and a benchmark (sanity numbers only).
+  rebuild), the crash matrix (same-boot re-attaches resume from the sidecar or the recovery
+  marker, without a snapshot), fencing, recovery exclusion, the local cache (a simulated reboot
+  with a rolled-back db file and a cut WAL rebuilds byte-identical from snapshot + tail; the same
+  boot reuses the files with no snapshot and no replay from scratch, also for a file rebuilt from
+  a snapshot; discarding is refused while another process has the file open; a replaced db file is
+  rebuilt; a file without a sidecar, another stream and a recreated stream are refused), snapshots
+  and retention (a ~160 MB run; CI also runs it without a cold tier under the default hot limit;
+  fresh and lagging hosts rebuild byte-identical from snapshot + tail; the takeover after the trim
+  fences the old owner), Pi conformance in three modes, and a benchmark (sanity numbers only).
 - The same Pi conformance, snapshot and benchmark suites on 3 nodes + gateway + MinIO at feature
   level 5 (the snapshot run's ~3.5 MB bodies go to the cold tier), with a 64 KiB snapshot minimum
   so the benchmark's Pi workload snapshots and trims at its database size.

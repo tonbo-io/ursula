@@ -2,7 +2,7 @@
 // whose outcome is unknown.
 import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
-import { attach } from "../src/index.ts";
+import { attach, status } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
 import { integrity, openPlain, runChild, StallProxy, streamPath, ursulaUrl, walContains } from "./kit.ts";
 
@@ -50,7 +50,10 @@ it("(b) killed after the ack, before the local WAL write: present after re-attac
 	expect(child.lines.some((l) => l.step === 2 && l.phase === "start")).toBe(true);
 	expect(walContains(file, "M-one")).toBe(true);
 	expect(walContains(file, "M-two")).toBe(false);
+	const behind = Number(readFileSync(`${file}-ursula`, "utf8").split(" ")[0]);
 	attach(file, ursulaUrl() + path);
+	// Same boot: the local files are trusted and only the missing commit is replayed.
+	expect(status(file)).toMatchObject({ local: behind, installed: 0 });
 	expect(rows(file)).toEqual(["M-one", "M-two"]);
 });
 
@@ -165,26 +168,14 @@ it("(h) killed in the middle of a recovery's page writes: the next attach resume
 	// Re-attaching the first file replays that; the child dies after the first page write (page 1).
 	const child = runChild(file, url, [], { URSULA_VFS_ABORT_IN_REPLAY: "1" });
 	expect((await child.exited).signal).toBe("SIGABRT");
-	expect(readFileSync(`${file}-ursula`, "utf8")).toMatch(/recovering/);
+	const sidecar = readFileSync(`${file}-ursula`, "utf8");
+	expect(sidecar).toMatch(/recovering/);
+	const marker = Number(sidecar.split(" ")[0]);
+	expect(marker).toBeGreaterThan(0);
 	attach(file, url);
+	expect(status(file)).toMatchObject({ local: marker, installed: 0 });
 	const fresh = freshFile();
 	attach(fresh, url);
 	expect(Buffer.compare(readFileSync(file), readFileSync(fresh))).toBe(0);
 	expect(rows(file, "WHERE x = 'late'")).toEqual(["late"]);
-});
-
-// Regression: a duplicate answer was taken as proof of this owner's earlier attempt. A cloned process
-// (a VM or CRIU snapshot restored twice, a fork after attach) shares epoch and sequence: the server
-// answers its append as a duplicate of the clone's same-length frame, and the commit showed locally
-// although the stream holds other bytes. Now the bytes are read back.
-it("(i) an append answered as a duplicate of another writer's bytes fails and stays out of the file", async () => {
-	const path = streamPath();
-	const file = freshFile();
-	proxy.cloneAt = 2; // the claim and CREATE go through; a twin of M-one (one byte flipped) lands first
-	const child = runChild(file, proxy.url + path, SQL.slice(0, 2), { CHILD_EXIT: "1" });
-	const done = await child.waitFor((l) => l.done === true);
-	expect((await child.exited).code).toBe(0);
-	expect(child.lines.find((l) => l.step === 1 && l.ok !== undefined)?.ok).toBe(false);
-	expect(done.poisoned).toBe(true);
-	expect(walContains(file, "M-one")).toBe(false);
 });
