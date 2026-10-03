@@ -1,3 +1,5 @@
+// MANUAL TOOL, NOT RUN IN CI. Run with `scripts/ks_soak.sh` or `npm run soak:manual`
+// (vitest.soak.config.ts); the soak is planned as a run on AWS against real S3.
 // Keyed streams soak (keyed-streams-pi-durable.md §10 M4 soak; bounded-stream-state.md §7.5), a
 // shortened local form of the design's 7-day / 72-hour soak: a 3-node cluster with disk WAL behind
 // the gateway, the keyed indexer, MinIO as the cold store and the indexer's store, at the highest

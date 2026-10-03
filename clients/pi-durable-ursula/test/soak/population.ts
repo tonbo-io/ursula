@@ -1,3 +1,5 @@
+// MANUAL TOOL, NOT RUN IN CI. Run with `scripts/ks_soak.sh` or `npm run soak:manual`
+// (vitest.soak.config.ts); the soak is planned as a run on AWS against real S3.
 // The soak's harness population (keyed streams design §9.1, §10 M4 soak): real Pi Harnesses on the
 // bounded owner over HTTP, each with its own faux model so concurrent turns never share a response
 // queue.

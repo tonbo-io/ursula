@@ -291,23 +291,20 @@ pub use ursula_stream::StreamSnapshot;
 pub use ursula_stream::validate_bucket_id;
 
 #[cfg(test)]
+mod cold_drivers_tests;
+#[cfg(all(test, not(madsim)))]
+mod cold_gc_hygiene_tests;
+#[cfg(test)]
+mod cold_page_repair_tests;
+#[cfg(all(test, not(madsim)))]
+mod cold_record_marks_tests;
+#[cfg(test)]
+mod external_offload_tests;
+#[cfg(test)]
 mod incarnation_gc_tests;
 #[cfg(test)]
 mod keyed_lifecycle_tests;
-#[cfg(all(test, not(madsim)))]
-mod lb1_cold_tests;
-#[cfg(test)]
-mod producer_window_tests;
-#[cfg(all(test, not(madsim)))]
-mod sparse_marks_tests;
 #[cfg(test)]
 mod tests;
-
 #[cfg(test)]
-mod cold_correctness_tests;
-
-#[cfg(test)]
-mod cold_drivers_tests;
-
-#[cfg(test)]
-mod external_locators_tests;
+mod tidy_driver_tests;

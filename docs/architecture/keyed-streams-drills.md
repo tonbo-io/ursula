@@ -1,6 +1,6 @@
 # Keyed streams M4 drills and S3 / multi-node end-to-end runs
 
-Status: all six drills automated and passing, 2026-10-02. They ran locally at the design's durations (10-minute outages, 16 owners) and run in CI with short knobs on every push to `agent/keyed-streams` and `agent/ks-**`. A nightly workflow runs them at full length. This is not the 7-day soak of M4's exit; the drills are the building blocks that soak would schedule.
+Status: all six drills automated and passing, 2026-10-02. They ran locally at the design's durations (10-minute outages, 16 owners); a nightly workflow runs them at full length. Pull requests do not run them: the per-push short-knob job was moved to nightly only once the work merged, and pull requests run the e2e suites below. This is not the 7-day soak of M4's exit; the drills are the building blocks that soak would schedule.
 
 Design references: `keyed-streams-pi-durable.md` §3.8 (lifecycle, purge, disaster recovery), §5.5 (continuity, versioned namespaces), §6.3 (rolling-upgrade gate), §10 M4 (drills), §11.7 (fault and takeover).
 
@@ -11,7 +11,7 @@ Design references: `keyed-streams-pi-durable.md` §3.8 (lifecycle, purge, disast
 | e2e suite, single node, filesystem indexer (existing) | CI `typescript-e2e` | `npm run test:e2e` |
 | e2e suite on S3, single node, plus the S3 lifecycle checks | CI `typescript-e2e-s3` | `E2E_S3=1 npm run test:e2e` |
 | e2e suite on S3 through the gateway of 3 nodes, plus the cluster checks | CI `typescript-e2e-s3` | `E2E_NODES=3 E2E_S3=1 npm run test:e2e` |
-| the drills, short knobs (30 s outages, 4 owners) | CI job `Keyed fault drills (short)` (`fault-drills`) | `DRILL_OUTAGE_S=30 DRILL_SETTLE_S=5 DRILL_OWNERS=4 DRILL_COMMIT_DEADLINE_MS=10000 npm run test:drills` |
+| the drills, short knobs (30 s outages, 4 owners) | locally, or `keyed-streams-drills.yml` via workflow_dispatch with `outage_seconds=30 owners=4` | `DRILL_OUTAGE_S=30 DRILL_SETTLE_S=5 DRILL_OWNERS=4 DRILL_COMMIT_DEADLINE_MS=10000 npm run test:drills` |
 | the drills, design durations (600 s outages, 16 owners) | nightly `keyed-streams-drills.yml` (`Keyed fault drills (nightly)`), or locally | `npm run test:drills` (defaults), nightly uses `DRILL_OWNERS=16 DRILL_SETTLE_S=30` |
 
 All commands run in `clients/pi-durable-ursula` with `URSULA_BIN` set to the release binary. The rolling-upgrade drill also needs `URSULA_OLD_BIN`, main's binary at `e6d8d70`, which `scripts/ks_build_old_ursula.sh` builds with `git archive` (CI caches it). S3 is MinIO: `URSULA_S3_ENDPOINT` names an external one (CI starts it with `scripts/ks_minio_ci.sh`); otherwise each stack spawns `minio` from `PATH` or `MINIO_BIN`. Each stack creates its own S3 bucket. Each drill appends its measurements to `drill-results/results.jsonl` (or `$DRILL_RESULTS_DIR`), which CI uploads as an artifact.

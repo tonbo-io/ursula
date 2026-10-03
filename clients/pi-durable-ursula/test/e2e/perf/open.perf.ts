@@ -1,3 +1,5 @@
+// MANUAL TOOL, NOT RUN IN CI. Run with `URSULA_BIN=../../target/release/ursula npm run perf:manual`
+// (vitest.perf.config.ts); it takes several minutes. Results are recorded in README.md.
 // M3 performance gates (design §9.3, §10 M3 exit, §11.10) against the real keyed stack: a
 // single-node memory-engine `ursula` with the keyed indexer (filesystem object store), spawned by
 // the e2e global setup.

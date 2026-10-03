@@ -3,7 +3,7 @@ mod cold_drivers_tests;
 #[cfg(test)]
 mod compact_tests;
 #[cfg(test)]
-mod external_locators_tests;
+mod external_index_after_commit_tests;
 mod factory;
 
 use std::collections::BTreeMap;

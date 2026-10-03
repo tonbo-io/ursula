@@ -1,3 +1,5 @@
+// MANUAL TOOL, NOT RUN IN CI. Run with `scripts/ks_soak.sh` or `npm run soak:manual`
+// (vitest.soak.config.ts); the soak is planned as a run on AWS against real S3.
 // Soak sampling (bounded-stream-state §7.5, keyed streams §10 M4): per-group state gauges and Raft
 // log/snapshot sizes from every node's `/__ursula/metrics`, node RSS, the keyed indexer's lag and S3
 // requests, and S3 requests by API from MinIO's Prometheus endpoint.
