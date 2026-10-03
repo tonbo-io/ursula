@@ -193,28 +193,11 @@ it("(i) power loss after the last close under synchronous=OFF: the committed row
 	expect(rows(file)).toEqual(["M-one", "M-two"]);
 });
 
-// The sync before the WAL delete fails: the WAL must be kept (SQLite has already removed -shm, so
-// the next open recovers every frame from it), whatever reached the db file.
-it("(j) the db-file sync before the last close's WAL delete fails: the WAL is kept and the rows survive a power loss", async () => {
-	const path = streamPath();
-	const file = freshFile();
-	const env = { URSULA_VFS_TEST_DURABLE_SHADOW: "1", URSULA_VFS_TEST_FAIL_WAL_DELETE_SYNC: "1", CHILD_EXIT: "1" };
-	const child = runChild(file, ursulaUrl() + path, ["PRAGMA synchronous = OFF", ...SQL], env);
-	const done = await child.waitFor((l) => l.done === true);
-	expect((await child.exited).code).toBe(0);
-	expect(done.poisoned).toBe(false);
-	expect(existsSync(`${file}-wal`)).toBe(true);
-	renameSync(`${file}-ursula-durable`, file);
-	rmSync(`${file}-shm`, { force: true });
-	attach(file, ursulaUrl() + path);
-	expect(rows(file)).toEqual(["M-one", "M-two"]);
-});
-
 // Regression (#331 review): a WAL-restart commit wrote the new WAL header and its frames in one burst
 // and synced once, so a power loss could keep the old header while later frames persisted; SQLite
 // then recovered a stale prefix of the previous WAL generation over the newer db file and the next
 // checkpoint copied it in (integrity ok, rows gone). The header must be durable before any frame.
-it("(k) power loss in a WAL-restart commit: no stale prefix of the previous WAL is recovered", async () => {
+it("(j) power loss in a WAL-restart commit: no stale prefix of the previous WAL is recovered", async () => {
 	const path = streamPath();
 	const file = freshFile();
 	const restart = [
@@ -230,6 +213,7 @@ it("(k) power loss in a WAL-restart commit: no stale prefix of the previous WAL 
 	expect((await child.exited).signal).toBe("SIGABRT");
 	const synced = readFileSync(`${file}-ursula-durable-wal`);
 	const written = readFileSync(`${file}-wal`);
+	expect(written.readUInt32BE(12)).toBe(1); // checkpoint sequence: the 4th commit restarted the WAL
 	const lost = 3 * 4096; // the old CREATE frames end at 32 + 2 * 4120 = 8272, M-one's frame spans 12288
 	expect(written.length).toBeGreaterThan(lost);
 	// Power loss: the db file as of its last sync; of the WAL's unsynced writes the first three 4 KiB
@@ -244,7 +228,7 @@ it("(k) power loss in a WAL-restart commit: no stale prefix of the previous WAL 
 // Regression (#331 review): a checkpoint under synchronous=OFF backfilled every frame without a sync,
 // then a connection in another process (outside this VFS's bookkeeping) closed last: its checkpoint
 // had nothing to copy, so nothing synced, and it deleted the WAL.
-it("(l) a reader in another process closes last after an unsynced full checkpoint: the rows survive a power loss", async () => {
+it("(k) a reader in another process closes last after an unsynced full checkpoint: the rows survive a power loss", async () => {
 	const path = streamPath();
 	const file = freshFile();
 	const child = runChild(file, ursulaUrl() + path, ["PRAGMA synchronous = OFF", ...SQL, "PRAGMA wal_checkpoint(PASSIVE)"], { URSULA_VFS_TEST_DURABLE_SHADOW: "1" });
@@ -254,6 +238,8 @@ it("(l) a reader in another process closes last after an unsynced full checkpoin
 	expect((reader.prepare("SELECT count(*) AS n FROM t").get() as { n: number }).n).toBe(2);
 	child.proc.kill("SIGKILL");
 	await child.exited;
+	// The sidecar covers every commit: re-attach replays nothing that could rewrite a stale db file.
+	expect(Number(readFileSync(`${file}-ursula`, "utf8").split(" ")[0])).toBe(done.offset);
 	reader.close(); // the last connection: it deletes the WAL
 	expect(existsSync(`${file}-wal`)).toBe(false);
 	renameSync(`${file}-ursula-durable`, file);

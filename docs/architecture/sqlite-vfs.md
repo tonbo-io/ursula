@@ -187,13 +187,16 @@ and the log keeps growing. A superseded cold body stays readable for 5 minutes.
     deletes the WAL over frames that are not. The db file is also synced again before this VFS
     restarts, truncates or deletes the WAL.
   - Hence every frame the sidecar covers survives in the db file or in a WAL SQLite recovers. A
-    failed sync poisons the database, and a poisoned database keeps its WAL on close.
-  - Exception: a connection in another process that itself runs at `synchronous=OFF` and copies
-    frames in a checkpoint (its own `PRAGMA wal_checkpoint`, or its close as the last connection)
-    does not sync the db file before it truncates or deletes the WAL (§7).
+    failed sync poisons the database, and a poisoned database completes no checkpoint and never
+    truncates or deletes its WAL (a retried fsync can report success for pages that never reached
+    the disk).
+  - Exception: a connection in another process that copies frames in a checkpoint (its own
+    `PRAGMA wal_checkpoint`, or its close as the last connection) and runs at `synchronous=OFF`,
+    or on Apple without `PRAGMA checkpoint_fullfsync=ON` (the node:sqlite default; its plain fsync
+    does not order the drive's writes), can truncate or delete the WAL before the db file is
+    durable (§7).
   - Covered: a simulated loss of every unsynced write after the last close under
-    `synchronous=OFF`, after a foreign reader closes last, and inside a WAL-restart commit; a
-    failed sync before the WAL delete keeps the WAL.
+    `synchronous=OFF`, after a foreign reader closes last, and inside a WAL-restart commit.
 - Network partition or slow server: commits block up to the retry budget, then poison.
 - Two owners: the later claim wins; the earlier one's next commit fails cleanly
   (`UrsulaReplicationError` with `fenced: true` through the Pi helper).
@@ -204,9 +207,10 @@ and the log keeps growing. A superseded cold body stays readable for 5 minutes.
 
 - 4 KiB pages; WAL mode only; `locking_mode=EXCLUSIVE` unsupported.
 - One owner process per stream at a time; connections in other processes are not replicated (and
-  block recovery). Such a connection must not run at `synchronous=OFF` while it may checkpoint:
-  it would copy WAL frames into the db file and destroy the WAL without a sync, so a power loss
-  could lose frames the sidecar covers (§6).
+  block recovery). Such a connection must not run at `synchronous=OFF`, nor on Apple without
+  `PRAGMA checkpoint_fullfsync=ON` (off by default in node:sqlite), while it may checkpoint: it
+  would copy WAL frames into the db file and destroy the WAL without a durable sync, so a power
+  loss could lose frames the sidecar covers (§6).
 - Commit frames are at most the server's request limit (32 MiB), about 8000 changed pages per
   transaction.
 - Snapshots hold the database image in memory (twice, briefly: raw and compressed) and are capped

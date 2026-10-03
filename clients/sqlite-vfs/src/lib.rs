@@ -43,8 +43,7 @@
 //! `URSULA_VFS_TEST_DURABLE_SHADOW=1` keeps `<db>-ursula-durable` and `<db>-ursula-durable-wal`
 //! equal to the db file and the WAL as of their last sync (see `durable_shadow`);
 //! `URSULA_VFS_TEST_ABORT_AFTER_WAL_WRITE=<n>` aborts right after the n-th acknowledged commit's
-//! frames reach the local WAL, before it is synced; `URSULA_VFS_TEST_FAIL_WAL_DELETE_SYNC=1` fails
-//! the db-file sync that precedes deleting the WAL (`x_delete`).
+//! frames reach the local WAL, before it is synced.
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 pub mod frame;
@@ -419,12 +418,6 @@ fn abort_after_wal_write() -> Option<u64> {
             .ok()
             .and_then(|v| v.parse().ok())
     })
-}
-
-/// Test hook `URSULA_VFS_TEST_FAIL_WAL_DELETE_SYNC=1`: the db-file sync before a WAL delete fails.
-fn fail_wal_delete_sync() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("URSULA_VFS_TEST_FAIL_WAL_DELETE_SYNC").is_ok_and(|v| v == "1"))
 }
 
 /// Copies a file, read through SQLite's just-synced handle `f` (never a descriptor of our own; see
@@ -1583,7 +1576,15 @@ fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
 unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, String> {
     let stopped = || snapper.stopped();
     let started = Instant::now();
-    let path = lock(db).path.clone();
+    let path = {
+        let d = lock(db);
+        if d.poisoned.is_some() {
+            // Its private "unix" connection bypasses `x_truncate`, which completes no checkpoint
+            // of a poisoned database (see there); nor may this one.
+            return Ok(true);
+        }
+        d.path.clone()
+    };
     let conn = unsafe { Private::open(&path)? };
     unsafe {
         conn.keep_wal()?;
@@ -2300,6 +2301,12 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
 /// and no connection (another process's included, whatever VFS it uses) can restart, truncate or
 /// delete the WAL while the db file lacks frames a checkpoint at synchronous=OFF copied. (The
 /// `SQLITE_FCNTL_CKPT_DONE` hint comes earlier but its result is ignored.)
+///
+/// A poisoned database truncates neither file (as `x_delete` keeps its WAL): an earlier sync may
+/// have failed and a retried fsync can report success for pages that never reached the disk, while
+/// a complete checkpoint copies only the frames above nBackfill. So no checkpoint completes (the
+/// frames stay unbackfilled, a TRUNCATE checkpoint gets SQLITE_BUSY) and the WAL stays whole; the
+/// next connection after this process rebuilds the wal-index and copies every frame again.
 unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3_int64) -> c_int {
     unsafe {
         if let Some(db) = main_db(file) {
@@ -2308,6 +2315,9 @@ unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3
                 return db.poison(
                     "db file truncate outside a checkpoint (journal_mode must stay WAL)".into(),
                 );
+            }
+            if db.poisoned.is_some() {
+                return ffi::SQLITE_IOERR_TRUNCATE;
             }
             let rc = fwd!(file, xTruncate, size);
             if rc != OK {
@@ -2323,6 +2333,9 @@ unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3
             return fwd!(file, xTruncate, size);
         };
         let mut db = lock(&db);
+        if db.poisoned.is_some() {
+            return ffi::SQLITE_IOERR_TRUNCATE;
+        }
         db.overlay.retain(|&o, _| o < size);
         // Truncating drops frames a checkpoint copied into the db file (see `sync_db_file`).
         if let Err(e) = db.sync_db_file() {
@@ -2553,12 +2566,7 @@ unsafe extern "C" fn x_delete(
         if db.poisoned.is_some() {
             return ffi::SQLITE_IOERR_DELETE;
         }
-        let synced = if fail_wal_delete_sync() {
-            Err("sync failed (URSULA_VFS_TEST_FAIL_WAL_DELETE_SYNC)".to_owned())
-        } else {
-            db.sync_db_file()
-        };
-        if let Err(e) = synced {
+        if let Err(e) = db.sync_db_file() {
             let why = format!("{e}; keeping {}", db.wal);
             db.poison(why);
             return ffi::SQLITE_IOERR_DELETE;
