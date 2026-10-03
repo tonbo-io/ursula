@@ -1,0 +1,27 @@
+{
+  "name": "@tonbo-io/sqlite-ursula",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Spike: a local SQLite database replicated through an Ursula JSON stream of session changesets, with Pi Durable's SqliteStorage on top",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "vitest --run",
+    "test:e2e": "vitest --run --config vitest.e2e.config.ts",
+    "typecheck": "tsc -p .",
+    "test:vfs": "vitest --run --config vitest.vfs.config.ts"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "1.0.0",
+    "@earendil-works/pi-durable": "1.0.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.0.0",
+    "@types/node": "22.20.5",
+    "typescript": "7.0.2",
+    "vitest": "5.0.3"
+  }
+}
