@@ -20,6 +20,16 @@ use super::stream_is_expired;
 /// so the replicated rule uses this constant.
 pub(super) const RETENTION_COLD_GC_GRACE_MS: u64 = 300_000;
 
+/// The body of a snapshot publish: inline bytes, or a staged cold-tier
+/// object with the digest its proposer computed (F16, feature level 5).
+pub(super) enum SnapshotBody {
+    Inline(Vec<u8>),
+    Object {
+        object: super::ExternalPayloadRef,
+        digest: String,
+    },
+}
+
 impl StreamStateMachine {
     pub fn plan_cold_flush(
         &self,
@@ -92,7 +102,7 @@ impl StreamStateMachine {
         stream_id: BucketStreamId,
         snapshot_offset: u64,
         content_type: String,
-        payload: Vec<u8>,
+        body: SnapshotBody,
         expected_digest: Option<String>,
         now_ms: u64,
     ) -> StreamResponse {
@@ -140,7 +150,13 @@ impl StreamStateMachine {
                 tail_offset,
             );
         }
-        let digest = super::snapshot_digest(&content_type, &payload);
+        let (payload, object, digest) = match body {
+            SnapshotBody::Inline(payload) => {
+                let digest = super::snapshot_digest(&content_type, &payload);
+                (payload, None, digest)
+            }
+            SnapshotBody::Object { object, digest } => (Vec::new(), Some(object), digest),
+        };
         let current_snapshot = self
             .stream_slot(&stream_id)
             .and_then(|slot| slot.visible_snapshot.as_ref());
@@ -166,6 +182,19 @@ impl StreamStateMachine {
             }
             if snapshot_offset == current.offset {
                 if current.digest == digest {
+                    // An idempotent repeat: the body this command staged is
+                    // referenced by nothing (F16).
+                    let unreferenced = object.filter(|object| {
+                        current.object.as_ref().map(|current| &current.s3_path)
+                            != Some(&object.s3_path)
+                    });
+                    if let Some(object) = unreferenced {
+                        self.cold_gc.enqueue_after(
+                            stream_id.bucket_id.clone(),
+                            ColdGcTarget::Paths(vec![object.s3_path]),
+                            now_ms.saturating_add(RETENTION_COLD_GC_GRACE_MS),
+                        );
+                    }
                     return StreamResponse::SnapshotPublished {
                         snapshot_offset,
                         snapshot_digest: digest,
@@ -193,14 +222,26 @@ impl StreamStateMachine {
 
         let record_range = self.record_range(&stream_id).ok().flatten();
 
-        self.stream_slot_mut(&stream_id)
+        let superseded = self
+            .stream_slot_mut(&stream_id)
             .expect("stream existence checked before snapshot publish")
-            .visible_snapshot = Some(StreamVisibleSnapshot {
-            offset: snapshot_offset,
-            content_type,
-            payload,
-            digest: digest.clone(),
-        });
+            .visible_snapshot
+            .replace(StreamVisibleSnapshot {
+                offset: snapshot_offset,
+                content_type,
+                payload,
+                digest: digest.clone(),
+                object,
+            });
+        // A superseded cold body stays readable for the grace, so a read
+        // planned before this publish still finds it (F16, as F14i).
+        if let Some(superseded) = superseded.and_then(|snapshot| snapshot.object) {
+            self.cold_gc.enqueue_after(
+                stream_id.bucket_id.clone(),
+                ColdGcTarget::Paths(vec![superseded.s3_path]),
+                now_ms.saturating_add(RETENTION_COLD_GC_GRACE_MS),
+            );
+        }
         StreamResponse::SnapshotPublished {
             snapshot_offset,
             snapshot_digest: digest,

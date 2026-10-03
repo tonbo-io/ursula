@@ -285,8 +285,9 @@ impl StreamStateMachine {
     }
 
     /// Object paths one stream's replicated state references directly:
-    /// shared and exclusive chunk refs and external payload refs. Pages hold
-    /// the rest; the orphan sweep reads them separately.
+    /// shared and exclusive chunk refs, external payload refs and a cold
+    /// snapshot body (F16). Pages hold the rest; the orphan sweep reads them
+    /// separately.
     pub fn stream_referenced_cold_paths(&self, stream_id: &BucketStreamId) -> Vec<String> {
         let Some(slot) = self.stream_slot(stream_id) else {
             return Vec::new();
@@ -299,6 +300,12 @@ impl StreamStateMachine {
                 slot.cold
                     .external_segments()
                     .iter()
+                    .map(|object| object.s3_path.clone()),
+            )
+            .chain(
+                slot.visible_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.object.as_ref())
                     .map(|object| object.s3_path.clone()),
             )
             .collect()

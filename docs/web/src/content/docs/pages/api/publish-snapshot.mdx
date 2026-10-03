@@ -28,7 +28,7 @@ For JSON streams, `PUT /{bucket}/{stream}/snapshot?record={record}` resolves a s
 </ParamField>
 
 <ParamField body="body" type="binary" required>
- The snapshot blob bytes. Maximum size is **128 MiB**. Larger bodies return `413`.
+ The snapshot blob bytes. Bodies of up to **32 MiB** are stored inline in the stream's replicated state. On a node with a cold backend whose group is at [feature level 5](/docs/operations#feature-levels), a body of at least `runtime.external_payload_min_size` (1 MiB by default) is streamed into the cold tier instead, and bodies of up to **1 GiB** are accepted. Larger bodies return `413`.
 </ParamField>
 
 ## Response
@@ -40,7 +40,8 @@ For JSON streams, `PUT /{bucket}/{stream}/snapshot?record={record}` resolves a s
 | `404` | Stream not found or expired. |
 | `409` | Stale publish (a newer snapshot exists) or offset out of range. |
 | `410` | Snapshot offset is older than the retained stream history. |
-| `413` | Snapshot body exceeds the maximum allowed size. |
+| `413` | Snapshot body exceeds the maximum allowed size (32 MiB inline, 1 GiB in the cold tier). |
+| `502` | The cold backend failed while storing the body. |
 
 Response headers include `Stream-Next-Offset`, `Stream-Snapshot-Offset`, and `Stream-Snapshot-Digest`. Repeating the same offset, content type, and body is idempotent and returns the same digest. Reusing an offset with different content returns `409`.
 

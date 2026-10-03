@@ -256,6 +256,7 @@ async fn f2_driver_deletes_the_replacement_of_a_rejected_compaction() {
                     content_type: DEFAULT_CONTENT_TYPE.to_owned(),
                     payload: Bytes::from_static(b"checkpoint"),
                     expected_digest: None,
+                    cold_body: None,
                     now_ms: 0,
                 })
                 .await

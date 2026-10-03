@@ -155,8 +155,12 @@ message StreamIntegritySnapshotV1 {
 message StreamVisibleSnapshotV1 {
   uint64 offset = 1;
   string content_type = 2;
+  // Inline body; empty when `object` holds it.
   bytes payload = 3;
   string digest = 4;
+  // Cold-tier object holding the whole body (bounded-state F16, feature
+  // level 5). Absent for inline snapshots.
+  ExternalPayloadRefV1 object = 5;
 }
 
 message ProducerSnapshotV1 {

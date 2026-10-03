@@ -845,7 +845,33 @@ impl StreamStateMachine {
                     stream_id,
                     snapshot_offset,
                     content_type,
-                    payload.into(),
+                    cold::SnapshotBody::Inline(payload.into()),
+                    expected_digest,
+                    now_ms,
+                );
+                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
+                response
+            }
+            StreamCommand::PublishSnapshotExternal {
+                stream_id,
+                snapshot_offset,
+                content_type,
+                object,
+                digest,
+                expected_digest,
+                now_ms,
+            } => {
+                if let Err(response) = self.require_feature_level(
+                    crate::feature::FEATURE_LEVEL_COLD_SNAPSHOTS,
+                    "cold snapshot publish",
+                ) {
+                    return response;
+                }
+                let response = self.publish_snapshot(
+                    stream_id,
+                    snapshot_offset,
+                    content_type,
+                    cold::SnapshotBody::Object { object, digest },
                     expected_digest,
                     now_ms,
                 );
@@ -1115,13 +1141,13 @@ fn compare_stream_ids(left: &BucketStreamId, right: &BucketStreamId) -> std::cmp
 }
 
 fn snapshot_digest(content_type: &str, payload: &[u8]) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&(content_type.len() as u64).to_le_bytes());
-    hasher.update(content_type.as_bytes());
-    hasher.update(payload);
-    hasher.finalize().to_hex().to_string()
+    let mut digest = crate::model::SnapshotDigest::new(content_type);
+    digest.update(payload);
+    digest.finalize()
 }
 
+#[cfg(test)]
+mod cold_snapshot_tests;
 #[cfg(test)]
 mod external_locators_tests;
 #[cfg(test)]

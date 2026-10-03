@@ -36,8 +36,9 @@ Response headers include `Location`, `Stream-Next-Offset`, `Stream-Snapshot-Offs
 | ------ | -------------------------------------- |
 | `200` | Snapshot blob returned. |
 | `404` | Stream, snapshot, or offset not found. |
+| `502` | The snapshot body is in the cold tier and could not be read. |
 
-Response headers include `Content-Type`, `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, `Stream-Up-To-Date`, and `Stream-Closed`.
+Response headers include `Content-Type`, `Content-Length`, `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, `Stream-Up-To-Date`, and `Stream-Closed`. A body stored in the cold tier is streamed from it.
 
 <RequestExample>
 ```bash Follow redirect to latest
