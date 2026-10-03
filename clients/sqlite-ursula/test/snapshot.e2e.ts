@@ -49,7 +49,7 @@ it("snapshots + retention bound the stream; fresh and lagging hosts rebuild from
 		const rows = [0, 1, 2, 3].map((j) => `(${(i * 4 + j) % 48}, randomblob(65536))`);
 		steps.push(`INSERT OR REPLACE INTO t VALUES ${rows.join(", ")}`);
 	}
-	steps.push("@sleep:20000", "INSERT INTO t VALUES (1000, 'zombie')");
+	steps.push("@sleep:30000", "INSERT INTO t VALUES (1000, 'zombie')");
 	const file = freshFile();
 	const owner = runChild(file, url, steps, { CHILD_EXIT: "1" });
 	await owner.waitFor((x) => x.step === ROUNDS && x.phase === "start", 600_000);
