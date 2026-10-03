@@ -1,0 +1,24 @@
+[package]
+name = "sqlite-ursula-vfs"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "A SQLite VFS (loadable extension) that replicates every WAL commit to an Ursula stream before it reaches the local WAL"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Types only (the vfs/io-method structs and sqlite3_api_routines): every call goes through the
+# host's sqlite3_api_routines, so the extension runs on whatever SQLite the host links (node:sqlite).
+libsqlite3-sys = { version = "=0.38.2", features = ["loadable_extension", "bundled_bindings"] }
+ureq = { version = "3.4", default-features = false }
+zstd = { version = "0.13", default-features = false }
+crc32c = "0.6"
+
+# Standalone: not a member of the repository workspace.
+[workspace]
+
+[profile.release]
+debug = 1
