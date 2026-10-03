@@ -80,6 +80,8 @@ const OK: c_int = ffi::SQLITE_OK;
 /// a checkpoint.
 const WAL_WRITE_LOCK: c_int = 0;
 const WAL_CKPT_LOCK: c_int = 1;
+/// The longest a commit waits at its commit point for a due snapshot to open its window.
+const WINDOW_WAIT: Duration = Duration::from_secs(1);
 const PRODUCER_ID: &str = "sqlite-ursula-vfs";
 const CONTENT_TYPE: &str = "application/octet-stream";
 
@@ -160,6 +162,9 @@ struct Db {
     snapper: Arc<Snapper>,
     /// A snapshot is pinning the state at `offset`: no commit is acknowledged until it closes.
     window: bool,
+    /// A due snapshot is waiting to open its window: the next commit waits at its commit point
+    /// (up to `WINDOW_WAIT`) until it has, so a writer committing back to back cannot starve it.
+    window_wanted: bool,
     snapshot_stats: Vec<SnapshotStat>,
 }
 
@@ -658,6 +663,17 @@ unsafe fn full_pathname(path: &str) -> Result<String, String> {
     }
 }
 
+/// Outcome of a checkpoint on a [`Private`] connection.
+#[derive(PartialEq)]
+enum Checkpoint {
+    /// Every WAL frame is in the db file.
+    Done,
+    /// A reader pins WAL frames the checkpoint needs.
+    Pinned,
+    /// Another connection holds the checkpoint (or a needed) lock.
+    Busy,
+}
+
 /// A private connection on the "unix" VFS, outside this VFS's bookkeeping: recovery's checkpoint,
 /// and the snapshot thread's checkpoint, read transaction and page copy.
 struct Private {
@@ -714,11 +730,13 @@ impl Private {
         }
     }
 
-    /// `PRAGMA wal_checkpoint(mode)`: whether every WAL frame is now in the db file.
-    unsafe fn checkpoint(&self, sql: &CStr) -> Result<bool, String> {
+    /// `PRAGMA wal_checkpoint(mode)`.
+    unsafe fn checkpoint(&self, sql: &CStr) -> Result<Checkpoint, String> {
         let row = unsafe { self.query(sql)? };
         match row[..] {
-            [busy, log, done] => Ok(busy == 0 && log == done),
+            [0, log, done] if log == done => Ok(Checkpoint::Done),
+            [0, ..] => Ok(Checkpoint::Pinned),
+            [_, ..] => Ok(Checkpoint::Busy),
             _ => Err(format!("{sql:?}: no result row")),
         }
     }
@@ -770,7 +788,7 @@ impl Drop for Private {
 unsafe fn checkpoint_local(path: &str) -> Result<(), String> {
     let complete = unsafe { Private::open(path)?.checkpoint(c"PRAGMA wal_checkpoint(TRUNCATE)") }
         .map_err(|e| format!("checkpoint {path}: {e}"))?;
-    if !complete {
+    if complete != Checkpoint::Done {
         return Err(format!(
             "checkpoint {path}: incomplete; another connection is open"
         ));
@@ -1202,6 +1220,7 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
         retained: 0,
         snapper: snapper.clone(),
         window: false,
+        window_wanted: false,
         snapshot_stats: Vec::new(),
     }));
     let thread = {
@@ -1283,23 +1302,27 @@ impl Snapper {
 }
 
 fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
-    let mut backoff = Duration::from_millis(100);
+    // A pinned or busy checkpoint clears up quickly; a failing server may not.
+    let (mut busy, mut failing) = (Duration::from_millis(10), Duration::from_millis(100));
     while snapper.wait() {
-        let outcome = unsafe { snapshot_once(db, snapper) };
-        if let Ok(true) = outcome {
-            backoff = Duration::from_millis(100);
-            continue;
-        }
-        if let Err(e) = outcome {
-            eprintln!(
-                "sqlite-ursula-vfs: {}: snapshot: {e}; retrying later",
-                lock(db).url
-            );
-        }
-        if !snapper.pause(backoff) {
+        let (backoff, cap) = match unsafe { snapshot_once(db, snapper) } {
+            Ok(true) => {
+                (busy, failing) = (Duration::from_millis(10), Duration::from_millis(100));
+                continue;
+            }
+            Ok(false) => (&mut busy, Duration::from_secs(1)),
+            Err(e) => {
+                eprintln!(
+                    "sqlite-ursula-vfs: {}: snapshot: {e}; retrying later",
+                    lock(db).url
+                );
+                (&mut failing, Duration::from_secs(30))
+            }
+        };
+        if !snapper.pause(*backoff) {
             return;
         }
-        backoff = (backoff * 2).min(Duration::from_secs(30));
+        *backoff = (*backoff * 2).min(cap);
         if lock(db).snapshot_due() {
             snapper.request();
         }
@@ -1307,10 +1330,12 @@ fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
 }
 
 /// One snapshot attempt (see the crate docs). `Ok(false)`: not possible right now (a reader pins
-/// WAL frames the checkpoint needs), try again later.
+/// WAL frames the checkpoint needs, or another checkpoint kept it busy), try again shortly.
 ///
 /// The image is exactly the stream's state at `offset`. The window opens once every acknowledged
-/// commit is published locally (`!committed`) and keeps any further commit from being
+/// commit is published locally (`!committed`); until then the next commit waits for it at its
+/// commit point (`window_wanted`, bounded by `WINDOW_WAIT`), so a writer committing back to back
+/// cannot starve it: a due snapshot opens its window within one transaction. It keeps any further commit from being
 /// acknowledged (it waits at its commit point) until the read transaction has started, so the
 /// checkpoint moves every WAL frame up to `offset` into the db file and the read transaction sees
 /// the db file alone at `offset`. While the read transaction lasts no checkpoint can write newer
@@ -1329,24 +1354,41 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
         let mut d = lock(db);
         loop {
             if !d.snapshot_due() || d.poisoned.is_some() || stopped() {
+                d.window_wanted = false;
+                snapper.window_cv.notify_all();
                 return Ok(true);
             }
-            if !d.committed {
+            // Not while a commit is acknowledged but unpublished, nor while another connection
+            // (typically the writer's auto-checkpoint, right after its commit) holds the
+            // checkpoint lock, which would make the checkpoint below busy.
+            if !d.committed && d.checkpoint_started.is_none() {
                 break;
             }
-            let snapper = d.snapper.clone();
+            // The next commit waits for the window (see `window_wanted`).
+            d.window_wanted = true;
             d = snapper
                 .window_cv
                 .wait_timeout(d, Duration::from_millis(100))
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
+        d.window_wanted = false;
         d.window = true;
         (d.url.clone(), d.offset, d.epoch, d.pages)
     };
     let window = Window(db);
-    if !unsafe { conn.checkpoint(c"PRAGMA wal_checkpoint(PASSIVE)")? } {
-        return Ok(false);
+    // A checkpoint started by another connection after the window opened makes this one busy
+    // (it gets no busy handler): retry briefly, it only covers frames up to `offset` too.
+    let mut tries = 0;
+    loop {
+        match unsafe { conn.checkpoint(c"PRAGMA wal_checkpoint(PASSIVE)")? } {
+            Checkpoint::Done => break,
+            Checkpoint::Busy if tries < 50 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            _ => return Ok(false),
+        }
     }
     unsafe {
         conn.query(c"BEGIN")?;
@@ -1830,11 +1872,26 @@ unsafe extern "C" fn x_write(
             let size = be32(&h[4..8]);
             if size != 0 {
                 let snapper = db.snapper.clone();
-                while db.window {
+                // Nothing is acknowledged yet (`!committed`), so a wanted window opens now.
+                if db.window_wanted {
+                    snapper.window_cv.notify_all();
+                }
+                let deadline = Instant::now() + WINDOW_WAIT;
+                while db.window || db.window_wanted {
+                    let now = Instant::now();
+                    if !db.window && now >= deadline {
+                        break;
+                    }
+                    let wait = if db.window {
+                        Duration::from_secs(1)
+                    } else {
+                        deadline - now
+                    };
                     db = snapper
                         .window_cv
-                        .wait(db)
-                        .unwrap_or_else(|e| e.into_inner());
+                        .wait_timeout(db, wait)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
                 }
                 return commit(file, &mut db, size, off - FRAME_HDR);
             }
@@ -2129,6 +2186,8 @@ unsafe extern "C" fn x_shm_lock(
                 {
                     db.checkpoints.push(t.elapsed());
                 }
+                // A snapshot waiting for this checkpoint to finish before it opens its window.
+                db.snapper.window_cv.notify_all();
             }
             _ => {}
         }

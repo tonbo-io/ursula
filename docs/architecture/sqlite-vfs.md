@@ -95,11 +95,19 @@ rewrite pages, and are not). The thread:
 1. Opens a private `unix` connection on the file and runs `wal_checkpoint(PASSIVE)` once, so
    the checkpoint inside the window only covers the frames committed since.
 2. Opens the *window* (under the database's mutex): waits until no acknowledged commit is
-   unpublished, records `W` (the offset), the epoch and the page count. While the window is open a
-   commit that reaches its commit point waits there (holding SQLite's write lock, which neither
+   unpublished and no other connection holds the checkpoint lock (typically the writer's own
+   auto-checkpoint right after a commit), records `W` (the offset), the epoch and the page count.
+   While it waits, the next commit to reach its commit point waits there too (for at most 1 s)
+   until the window has opened: a writer committing back to back would otherwise leave the
+   window only the gaps between its transactions and can starve the snapshot indefinitely
+   (observed: no snapshot for 120 s under 1.4 MB transactions while ~1 GB of log piled up). So a
+   due snapshot pins a state at most one transaction past the threshold. While the window is open
+   a commit that reaches its commit point waits there (holding SQLite's write lock, which neither
    step below needs).
-3. `wal_checkpoint(PASSIVE)` on the private connection. Unless every WAL frame was checkpointed (a
-   reader pins older frames), gives up for now (backoff, from 100 ms up to 30 s).
+3. `wal_checkpoint(PASSIVE)` on the private connection, retried for up to ~100 ms while another
+   connection's checkpoint keeps it busy (a passive checkpoint gets no busy handler). Unless every
+   WAL frame was checkpointed (a reader pins older frames), gives up for now and retries shortly
+   (backoff from 10 ms up to 1 s; server errors back off from 100 ms up to 30 s).
 4. `BEGIN` and a read: the read transaction starts at `W`. Closes the window.
 5. Copies pages `1..n` of the db file through the private connection's own file handle (a second
    descriptor's close would drop the process's POSIX locks). While the read transaction lasts no
@@ -107,8 +115,9 @@ rewrite pages, and are not). The thread:
    later mark it caps it) and no closing connection can checkpoint (that needs an EXCLUSIVE lock),
    so the pages are those of `W`. Ends the read transaction.
 
-Commits wait only for steps 3 and 4: a passive checkpoint of the few frames committed since step
-1, and the start of a read transaction. A re-attach stops the thread: it checks the stop flag
+Commits wait only for steps 3 and 4 (a passive checkpoint of the few frames committed since step
+1, and the start of a read transaction) and, once a snapshot is due, for the window to open
+(step 2, at most one commit, bounded). A re-attach stops the thread: it checks the stop flag
 between steps and retries, and each snapshot request is bounded to 120 s.
 
 The body is `"USS1" | u64 W | u64 epoch | u32 pages | u32 crc32c(image) | zstd(image)`. The epoch
