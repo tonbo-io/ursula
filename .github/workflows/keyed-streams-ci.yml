@@ -162,3 +162,60 @@ jobs:
         run: |
           cd clients/pi-durable-ursula
           E2E_NODES=3 E2E_S3=1 URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" npm run test:e2e
+
+  sqlite-vfs:
+    name: sqlite-vfs (extension lint + units + build, then e2e against real ursula)
+    needs: build-ursula
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    env:
+      # Keeps libsqlite3-sys from probing (and linking) a system libsqlite3: the extension only calls
+      # the host's SQLite through sqlite3_api_routines.
+      SQLITE3_LIB_DIR: /nonexistent
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+          cache-workspaces: clients/sqlite-vfs
+
+      - name: Lint, unit-test and build the extension
+        run: |
+          cd clients/sqlite-vfs
+          cargo fmt --check
+          cargo clippy --release --all-targets -- -D warnings
+          cargo test --release
+          cargo build --release
+          ldd target/release/libsqlite_ursula_vfs.so
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Download ursula
+        uses: actions/download-artifact@v7
+        with:
+          name: ursula-release
+          path: ${{ runner.temp }}/ursula-bin
+
+      - name: e2e (transparency, crash matrix, fencing, recovery, Pi conformance, benchmark)
+        timeout-minutes: 30
+        run: |
+          chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
+          cd clients/sqlite-ursula
+          npm ci
+          npm run typecheck
+          URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$GITHUB_WORKSPACE/clients/sqlite-vfs/target/release/libsqlite_ursula_vfs.so" npm run test:e2e
+
+      # Informational: the same benchmark without a cold tier, where the default per-group hot
+      # admission limit (64 MiB) bounds how much a stream can hold.
+      - name: Benchmark without a cold tier (informational)
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          cd clients/sqlite-ursula
+          URSULA_COLD=none URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$GITHUB_WORKSPACE/clients/sqlite-vfs/target/release/libsqlite_ursula_vfs.so" npx vitest --run test/bench.e2e.ts

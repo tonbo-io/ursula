@@ -1,0 +1,25 @@
+{
+  "name": "@tonbo-io/sqlite-ursula",
+  "version": "0.0.0",
+  "private": true,
+  "description": "SQLite replicated through an Ursula stream by the sqlite-ursula-vfs extension, with Pi Durable's official SqliteStorage on top",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "typecheck": "tsc -p .",
+    "test:e2e": "vitest --run"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "1.0.0",
+    "@earendil-works/pi-durable": "1.0.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.0.0",
+    "@types/node": "22.20.5",
+    "typescript": "7.0.2",
+    "vitest": "5.0.3"
+  }
+}
