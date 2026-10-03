@@ -1971,7 +1971,7 @@ unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3
         let mut db = lock(&db);
         db.overlay.retain(|&o, _| o < size);
         // Truncating drops frames a checkpoint copied into the db file (see `sync_db_file`).
-        if let Err(e) = unsafe { db.sync_db_file() } {
+        if let Err(e) = db.sync_db_file() {
             return db.poison(e);
         }
         let rc = fwd!(file, xTruncate, size);
