@@ -140,7 +140,10 @@ struct Db {
     commit_frame_no: u32,
     /// Open WAL handles, and whether a main db handle holds an EXCLUSIVE file lock: together the
     /// closing connection's checkpoint, the one main-db write that takes no checkpoint shm lock.
-    wal_handles: usize,
+    wal_handles: Vec<Handle>,
+    /// The underlying "unix" files of the open main db handles: the db file is synced through
+    /// them (see `sync_db_file`).
+    db_handles: Vec<Handle>,
     exclusive: bool,
     acked: u64,
     fault_fired: bool,
@@ -220,15 +223,13 @@ impl Db {
     /// closing connection's checkpoint (EXCLUSIVE file lock with the WAL still open). Anything else
     /// (a rollback journal mode, journal_mode=MEMORY/OFF) would bypass replication.
     fn db_write_allowed(&self) -> bool {
-        self.checkpoint_started.is_some() || (self.exclusive && self.wal_handles > 0)
+        self.checkpoint_started.is_some() || (self.exclusive && !self.wal_handles.is_empty())
     }
 
     /// With synchronous=OFF a checkpoint does not sync the db file; sync it before the WAL frames
     /// it copied are overwritten (a WAL restart) or truncated away.
-    fn sync_db_file(&mut self) -> Result<(), String> {
-        fs::File::open(&self.path)
-            .and_then(|f| f.sync_all())
-            .map_err(|e| format!("sync {}: {e}", self.path))
+    unsafe fn sync_db_file(&self) -> Result<(), String> {
+        unsafe { sync_handle(&self.db_handles, &self.path) }
     }
 
     /// The write transaction ended (WAL write lock released): drop what never committed; after an
@@ -260,9 +261,8 @@ impl Db {
             ));
             return;
         }
-        let synced = fs::File::open(&self.wal).and_then(|f| f.sync_data());
-        if let Err(e) = synced {
-            self.poison(format!("sync {}: {e}", self.wal));
+        if let Err(e) = unsafe { sync_handle(&self.wal_handles, &self.wal) } {
+            self.poison(e);
             return;
         }
         if let Err(e) = write_sidecar(&self.sidecar, self.offset, self.epoch) {
@@ -273,6 +273,30 @@ impl Db {
             self.snapper.request();
         }
     }
+}
+
+/// An underlying "unix" file of an open handle of an attached database (owned by SQLite; tracked
+/// from `x_open` to `x_close`, and only used under the database's mutex).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Handle(*mut ffi::sqlite3_file);
+
+// SAFETY: the pointer is only dereferenced under the database's mutex while the handle is open,
+// and a unix file may be synced from any thread.
+unsafe impl Send for Handle {}
+
+/// Syncs a file through one of SQLite's own open handles on it. Never through a descriptor of our
+/// own: closing any descriptor of a file drops every POSIX (fcntl) lock this process holds on it,
+/// SQLite's included, which would let another process take conflicting locks. fsync covers the
+/// file, whichever descriptor issues it.
+unsafe fn sync_handle(handles: &[Handle], what: &str) -> Result<(), String> {
+    let Some(&Handle(f)) = handles.first() else {
+        return Err(format!("sync {what}: no open handle"));
+    };
+    let rc = unsafe { ((*(*f).pMethods).xSync.unwrap())(f, ffi::SQLITE_SYNC_NORMAL) };
+    if rc != OK {
+        return Err(format!("sync {what}: {rc}"));
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -766,6 +790,13 @@ fn sync_dir(path: &str) -> std::io::Result<()> {
 }
 
 /// Applies records to the db file, deduplicating page writes per batch.
+///
+/// Runs only inside `ursula_attach`, which refuses while any connection of this process has the
+/// file open and has stopped the previous attachment's snapshot thread; `checkpoint_local` proves
+/// no other process holds it either. So its own descriptors on the db file (and the temp file and
+/// rename of `install`) cannot drop anyone's POSIX locks when they close. Everywhere else the
+/// extension touches the db file, -wal or -shm only through SQLite's handles (`sync_handle`, the
+/// private connections of `Private`).
 struct Applier {
     path: String,
     file: Option<fs::File>,
@@ -1157,7 +1188,8 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
         overlay: BTreeMap::new(),
         committed: false,
         commit_frame_no: 0,
-        wal_handles: 0,
+        wal_handles: Vec::new(),
+        db_handles: Vec::new(),
         exclusive: false,
         acked: 0,
         fault_fired: false,
@@ -1609,6 +1641,10 @@ unsafe extern "C" fn x_open(
                 let mut reg = registry();
                 *reg.open.entry(name.to_owned()).or_default() += 1;
                 let db = reg.dbs.get(name).cloned();
+                drop(reg);
+                if let Some(db) = &db {
+                    lock(db).db_handles.push(Handle(inner(file)));
+                }
                 (*f).ext = Box::into_raw(Box::new(Ext {
                     path: Some(name.to_owned()),
                     db,
@@ -1618,7 +1654,7 @@ unsafe extern "C" fn x_open(
             } else if flags & ffi::SQLITE_OPEN_WAL != 0
                 && let Some(db) = name.strip_suffix("-wal").and_then(lookup)
             {
-                lock(&db).wal_handles += 1;
+                lock(&db).wal_handles.push(Handle(inner(file)));
                 (*f).ext = Box::into_raw(Box::new(Ext {
                     path: None,
                     db: Some(db),
@@ -1634,26 +1670,32 @@ unsafe extern "C" fn x_open(
 
 unsafe extern "C" fn x_close(file: *mut ffi::sqlite3_file) -> c_int {
     unsafe {
-        let rc = fwd!(file, xClose);
+        // Untracked before the underlying file closes: nothing syncs through it afterwards.
         let f = file as *mut File;
-        if !(*f).ext.is_null() {
-            let ext = Box::from_raw((*f).ext);
-            (*f).ext = null_mut();
-            if let Some(db) = &ext.db {
-                let mut db = lock(db);
-                if ext.wal {
-                    db.wal_handles -= 1;
-                } else if ext.exclusive {
+        let ext = if (*f).ext.is_null() {
+            None
+        } else {
+            Some(Box::from_raw(std::mem::replace(&mut (*f).ext, null_mut())))
+        };
+        if let Some(db) = ext.as_ref().and_then(|e| e.db.as_ref()) {
+            let mut db = lock(db);
+            let h = Handle(inner(file));
+            if ext.as_ref().is_some_and(|e| e.wal) {
+                db.wal_handles.retain(|&x| x != h);
+            } else {
+                db.db_handles.retain(|&x| x != h);
+                if ext.as_ref().is_some_and(|e| e.exclusive) {
                     db.exclusive = false;
                 }
             }
-            if let Some(path) = ext.path {
-                let mut reg = registry();
-                if let Some(n) = reg.open.get_mut(&path) {
-                    *n -= 1;
-                    if *n == 0 {
-                        reg.open.remove(&path);
-                    }
+        }
+        let rc = fwd!(file, xClose);
+        if let Some(path) = ext.and_then(|e| e.path) {
+            let mut reg = registry();
+            if let Some(n) = reg.open.get_mut(&path) {
+                *n -= 1;
+                if *n == 0 {
+                    reg.open.remove(&path);
                 }
             }
         }
@@ -1879,7 +1921,7 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
     }
     // A WAL header write restarts the WAL over frames a checkpoint copied into the db file.
     if db.overlay.contains_key(&0)
-        && let Err(e) = db.sync_db_file()
+        && let Err(e) = unsafe { db.sync_db_file() }
     {
         return db.poison(e);
     }
@@ -1929,7 +1971,7 @@ unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3
         let mut db = lock(&db);
         db.overlay.retain(|&o, _| o < size);
         // Truncating drops frames a checkpoint copied into the db file (see `sync_db_file`).
-        if let Err(e) = db.sync_db_file() {
+        if let Err(e) = unsafe { db.sync_db_file() } {
             return db.poison(e);
         }
         let rc = fwd!(file, xTruncate, size);
