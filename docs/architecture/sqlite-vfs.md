@@ -207,72 +207,141 @@ and the log keeps growing. A superseded cold body stays readable for 5 minutes.
 
 ## 9. Performance
 
-One run, 2026-10-03, main `740d910`. EKS 1.33 in us-east-1: three `m6i.xlarge` Ursula nodes, one
-per AZ (chart defaults of `charts/ursula/examples/production-eks.yaml`: 256 groups, 4 cores, 8 GiB
-limit), three gateways, real S3 cold tier and snapshot store, feature level 5. The client is one
-`m6i.2xlarge` pod (node 22, the extension built in CI) in us-east-1a, one process per database,
-writing through the gateway Service. Workload: Pi Durable's `SqliteStorage` via
-`openUrsulaPiStorage`, a real `Harness` with a faux model, turns of text, text, tool (5.0 Pi
-commits per turn). Latency is `Storage.commit` wall time after a 30 s warm-up; each cell ran 10.5
-min. Disk: `raft.wal.backend = "disk"` on 50 GiB gp3. Deviations from the chart: gateway
-`maxRequestBodyBytes` 1 GiB (for the 1 GB snapshot) and `server_side_encryption = "none"` (see
-the S3 note below; the bucket's default SSE-S3 still applies).
+One run, 2026-10-03. EKS 1.33 in us-east-1: three `m6i.xlarge` Ursula nodes, one per AZ (the chart's
+`examples/production-eks.yaml` shape: 256 groups, 4 cores, 8 GiB limit), three gateways, real S3
+for the cold tier and snapshots with Ursula's default S3 settings (`server_side_encryption =
+"aes256"`), feature level 5. Server image: main `05132e0`. Extension: `05132e0` for the memory-WAL
+cells, `6ba4e60` for the disk-WAL cells (the difference is 429/503 retry and recovery, not the
+commit path). Clients: `m6i.2xlarge` pods (node 22) in us-east-1a, one process per database,
+through the gateway Service. The chart deploys the gateway without a quota policy, so there was no
+rate limit and no client saw a 429. Gateway `maxRequestBodyBytes` was raised to 1 GiB for the 1 GB
+snapshot; everything else is the chart default.
 
-Commit latency, ms (p50 / p99 / p99.9 / max), and throughput:
+Workload: Pi Durable's `SqliteStorage` on the VFS via `openUrsulaPiStorage`, a real `Harness` with
+a faux model, turns of text, text, tool (5.0 Pi commits per turn). Latency is `Storage.commit`
+wall time after a 30 s warm-up; each cell runs 10.5 min. Agent pace: one turn per 2 s per database.
+Baselines on the same client node type:
 
-| cell | memory WAL | disk WAL |
-| --- | --- | --- |
-| 1 owner, 1 turn / 2 s | 7.0 / 10.9 / 23.7 / 93 | 14.6 / 18.7 / 24.0 / 26 |
-| 1 owner, flat out | 7.4 / 11.1 / 47 / 117; 68 commits/s | 16.0 / 19.8 / 62 / 1619; 44 commits/s |
-| 16 owners, flat out | 14.6 / 48.5 / 79 / 298; 542 commits/s | 22.7 / 49.2 / 116 / 658; 478 commits/s |
-| 128 owners, flat out | 92 / 190 / 236 / 5232; 1202 commits/s | failed: Ursula OOM, see below |
+- B1: the same Pi workload on Pi's own `openNodeSqliteStorage` on the pod's disk, no extension
+  (WAL, `synchronous=NORMAL`).
+- B2: the same with `PRAGMA synchronous=FULL` (the WAL synced on every commit).
+- B3: raw appends, no SQLite: closed-loop writers, one stream each, 5 to 7 KiB random bodies (the
+  VFS's compressed frames are 4.5 to 7.4 KB) with producer headers, through the gateway or straight
+  to the stream's leader (node Service, `307` followed and the leader kept). 120 s cells (memory
+  WAL) and 75 s cells (disk WAL), 15 s warm-up.
 
-The append request alone (p50): memory 1.8 ms (1 owner), 4.9 ms (16), 48 ms (128); disk 9.0 /
-10.3 ms (1), 14.8 ms (16). The rest of a single owner's commit (about 5.5 ms) is local: Pi's own
-work and SQLite's WAL sync. At 128 owners the client node (8 vCPU, 128 node processes) was
-saturated (load average 86), so that cell measures the client as much as Ursula.
+Pi commit latency, ms, p50 / p99 (p99.9 / max where they matter), and Pi commits/s flat out:
 
-Stream and snapshots (all cells alike): 10.8 pages per commit, 6.3x zstd at speed (9.8x at
-agent pace, smaller databases), 4.5 to 7.4 KB per commit, 22 KB per turn at agent pace and 35
-KB per turn flat out. Snapshot bodies 0.1 to 0.55 MB for 1 to 6 MB databases, 40 to 100 ms each
-(350 ms p50 at 128 owners). Retained log per database (tail minus retention) stayed between 10
-and 17 MB in every cell that ran (threshold 8 MiB), while streams grew to 315 MB.
-
-Cold start (fresh host: snapshot install + tail replay; best of three, first in parentheses):
-
-| database | snapshot body | tail after it | memory WAL | disk WAL |
+| cell | B1 local, NORMAL | B2 local, FULL | VFS, memory WAL | VFS, disk WAL |
 | --- | --- | --- | --- | --- |
-| 10 MB | 2.8 MB | 3 to 5 MB | 104 ms (207) | 134 ms (361) |
-| 100 MB | 27.8 MB | 20.5 MB | 845 ms (1580) | 864 ms (1671) |
-| 1 GB | 278 MB | 120 MB | 14.8 s (20.8) | 15.6 s (22.9) |
+| 1 db, agent pace | 0.11 / 7.6 | 1.8 / 4.6 | 9.7 / 12.8 | 16.5 / 20.0 |
+| 1 db, flat out | 0.16 / 8.9; 115/s | 2.2 / 4.9; 100/s | 9.4 / 12.8 (42 / 147); 60/s | 15.2 / 18.7 (65 / 124); 46/s |
+| 16 dbs, agent pace | 0.11 / 6.5 | 1.6 / 4.8 | not run | 16.0 / 182 (3,043 / 8,960) [1] |
+| 16 dbs, flat out | 0.20 / 13.1; 651/s | 2.8 / 19.1; 652/s | 13.0 / 31.8 (50 / 132); 565/s | 21.7 / 37.1 (110 / 363); 499/s |
+| 128 dbs, flat out [2] | | | 49.9 / 120 (5,041 / 10,097); 1,900/s | 46.3 / 2,123 (4,826 / 26,220); 841/s |
 
-Taking the 1 GB snapshot took 13.7 to 14.1 s; the 120 MB tail is what the writer committed
-meanwhile.
+[1] Run on the disk cluster after the 128-database and failover cells; see the issues below.
+[2] Two client nodes, 64 databases each, both saturated (load average 31 to 38 on 8 vCPU), so this
+row measures the clients as much as Ursula.
 
-Failover: 16 owners flat out, `kubectl delete --force` of the node leading the most groups at
-120 s (86 of 256). The owners whose groups it led stalled 19.1 to 22.2 s (memory, 6 of 16) and
-18.3 to 18.4 s (disk, 4 of 16), with 8 to 14 retried appends and no failed commit; the others
-stayed under 0.9 s. After the run every owner's file and a fresh rebuild from its stream were
-identical row for row, `integrity_check` ok.
+Raw append floor (B3), ms p50 / p99 (p99.9), and appends/s:
 
-S3 (CloudWatch request metrics, whole bucket): idle about 75 PUT and 130 GET per minute; 1 owner
-flat out about 75 PUT / 145 GET; 16 owners about 180 PUT / 500 GET; 128 owners 350 to 450 PUT
-and 600 to 1,500 GET per minute.
+| writers | memory WAL, gateway | memory WAL, leader | disk WAL, gateway | disk WAL, leader |
+| --- | --- | --- | --- | --- |
+| 1 | 1.15 / 1.75 (7.2); 796/s | 1.12 / 1.55 (8.8); 833/s | 8.2 / 8.8 (16); 121/s | 8.7 / 9.2 (20); 114/s |
+| 16 | 2.4 / 7.4 (18); 6,274/s | 1.9 / 7.6 (20); 6,957/s | 16.9 / 27.3 (93); 916/s | 15.1 / 28.2 (247); 1,000/s |
 
-Found in this run:
+The disk-WAL row is from a freshly deployed cluster. On the disk cluster that had just run the
+128-database cell, the same 16-writer cells had p99 330 ms (p99.9 2.0 and 2.4 s), and the
+leader-direct writers got 763 `503`s.
 
-- Cold objects written in parts (`ColdObjectWriter`, 8 MiB parts: snapshot bodies of 8 MiB and
-  more) fail on AWS with the default `server_side_encryption = "aes256"`: S3 rejects the
-  encryption header on `UploadPart` ("x-amz-server-side-encryption header is not supported for
-  this operation"). The snapshot `PUT` returns 502, the VFS retries with backoff, and the log
-  grows unbounded. MinIO accepts the header, so CI does not catch it.
-- 128 owners flat out (about 1,200 appends/s, 7.6 MB/s): node RSS grew about 0.7 GB/min to 5.2
-  GB with the memory WAL, and past the 8 GiB limit with the disk WAL; all three nodes were
-  OOM-killed and OOM-killed again during recovery until the load stopped. Every database was
-  poisoned (appends 502/503 past the 30 s budget).
-- Retention did not reclaim cold chunks: 17 to 25 minutes after retention passed them, a
-  stream's chunk objects from offset 0 were all still in S3 (201 MB for a 193 MB retention).
-- A writer that commits back to back in large transactions (5 MB database, 1.4 MB frames, no
-  await between them) published no snapshot in 120 s (970 MB of log). Yielding briefly every 20
-  commits, the first snapshot came at 59 MB of log; with a 50 ms pause between transactions, at
-  1.1x to 3x the threshold.
+Where one database's commit goes (agent pace, p50, ms):
+
+| component | memory WAL | disk WAL |
+| --- | --- | --- |
+| Pi + SQLite, no fsync (B1) | 0.1 | 0.1 |
+| local WAL fsync (B2 minus B1) | 1.7 | 1.7 |
+| VFS commit hook: frame build and local WAL write | 0.2 | 0.1 |
+| VFS commit hook: the append request | 4.0 | 10.9 |
+| sidecar replace: temp file, fsync, rename, directory fsync (measured alone) | 3.0 | 3.0 |
+| sum | 9.0 | 15.8 |
+| measured Pi commit | 9.7 | 16.5 |
+| for reference: raw append, same frame sizes (B3, gateway, 1 writer) | 1.15 | 8.2 |
+
+The VFS's append request was 1.4 to 2.8 ms above the raw floor: 4.0 and 10.9 ms at agent pace, and
+3.8 and 9.6 ms for one database flat out. It reuses its connection (one `TIME_WAIT` socket in 15 s of commits), so connection
+setup is not the cause; each of these is a single stream, so the leader's placement differs between
+them, and a same-stream comparison is still to do.
+
+**128 databases.** Memory WAL: 1,900 commits/s, no database poisoned, 1 retried append in 1.2
+million. Node RSS rose from 0.9 to 2.6 GB and fell back to 1.6 to 1.8 GB after the load (8 GiB
+limit). No AppendStream backpressure rejections. Disk WAL: 841 commits/s, RSS peak 2.8 GB, 367
+AppendStream backpressure rejections on two of the nodes, 55 appends retried (up to 13 attempts)
+and acknowledged, and one of the 128 databases poisoned (below).
+
+**Stream and snapshots.** 10.9 pages per commit (10.6 at agent pace). zstd ratio 6.1 to 7.3 flat
+out, 9.8 at agent pace. 4.5 KB per commit at agent pace and 6.0 to 7.4 KB flat out, which is 22
+KB and 30 to 37 KB per turn. Snapshot bodies were 0.09 to 0.5 MB for 0.9 to 5.2 MB databases,
+taking 40 to 78 ms p50 (180 to 235 ms at 128 databases). The retained log (tail minus retention)
+stayed at or below 16.8 MB per database in every cell.
+
+**Back-to-back large transactions** (5 MB table, 2,000-row updates, 1.4 MB frames, no pause, 300
+s). Memory WAL: 352 snapshots. Disk WAL: 336. The first came at 9.7 MB of log, while 3.4 and 3.2 GB
+were written. The retained log never exceeded 20.7 MB (sampled every 10 s) and ended at 15.2 and
+11.0 MB. Commit p50 was 118 and 124 ms.
+
+**Cold start** (fresh host: snapshot install plus tail replay; best of three, first attach in
+parentheses). The 27.8 MB and 278 MB snapshots were published to S3 with the default encryption
+setting:
+
+| database | snapshot (publish time, memory / disk) | memory WAL | disk WAL |
+| --- | --- | --- | --- |
+| 10 MB | 2.8 MB (0.2 / 0.2 s) | 107 ms (205) | 110 ms (222) |
+| 100 MB | 27.8 MB (2.7 / 1.8 s) | 0.91 s (2.17) | 0.79 s (1.80) |
+| 1 GB | 278 MB (18.7 / 15.7 s) | 16.9 s (27.1) | 16.1 s (25.0) |
+
+The tail after the snapshot was 2.8 MB, 21 to 34 MB and 133 to 169 MB: what the writer committed
+while the snapshot was being taken.
+
+**Failover** (16 databases flat out; `kubectl delete --force` at 120 s of the node leading the
+most groups, 86 of 256). Memory WAL: 5 databases stalled 19.3 to 22.3 s, two for 1.3 and 2.3 s, and
+the rest under 0.15 s. Disk WAL: 7 stalled 8.3 to 10.1 s and the rest 1.7 to 4.0 s. No commit
+failed. Afterwards every owner's file and a fresh rebuild from its stream were identical row for
+row, with `integrity_check` ok (16 of 16 on both WALs).
+
+**S3.** Retention frees cold chunks. One minute after the memory-WAL failover cell, its 16 streams
+still held 2 or 3 chunks wholly below retention minus 64 MiB. Ten minutes later, and in a later
+check of the disk cluster, no chunk object of any of 167 and 218 streams lay below that line. A
+279 MB stream retained from 262 MB held 85 MB in S3 (its first chunk starts at 193 MB); a 211 MB
+stream retained from 202 MB held 17 MB.
+
+Requests per minute (CloudWatch, whole bucket):
+
+| load | PUT | GET |
+| --- | --- | --- |
+| 1 database at agent pace | 0 to 11 | under 30 |
+| 1 database flat out | 6 to 37 | 31 to 81 |
+| 16 databases flat out | 110 to 350 | 340 to 870 |
+| 128 databases, memory WAL (1,900 commits/s) | 1,060 to 1,540 | 3,100 to 4,150 |
+| 128 databases, disk WAL (841 commits/s) | 500 to 600 | 1,550 to 1,920 |
+
+A freshly deployed cluster made 1,400 to 1,550 PUTs in its first 2 to 3 minutes.
+
+**Open issues seen in this run.**
+
+- Disk WAL, 128 databases: one database was poisoned. Its append hit the VFS's 10 s per-request
+  timeout three times, using up the 30 s budget (`append: timeout: global (outcome unknown after
+  3 attempts); database poisoned`). Acknowledged commits reached 26.2 s. Each node logged 3,700 to
+  5,300 `rebuilding channel ... after 8 consecutive AppendStream failures` warnings during the
+  11-minute cell. Outside it there were 64 to 160 at deploy, about 180 at the failover kill, and
+  bursts of 24 to 119 later.
+- Disk WAL after that load: 16 databases at agent pace (40 commits/s in total) had p99 182 ms,
+  p99.9 3.0 s and max 9.0 s, and raw 16-writer appends p99 330 ms with 763 `503`s. On a fresh disk
+  cluster the raw p99 was 27 to 28 ms. The nodes were reclaiming 100 to 137 MB WAL journals online
+  in this period.
+- Memory WAL, 128 databases: the p99.9 sits at 5.0 s in both client halves, with a max of 10.1 s.
+- Retention does not reclaim external payload objects (appends of 1 MiB or more). The two
+  back-to-back streams still held 3.41 and 3.25 GB in S3 16 and 25 minutes after the writes ended,
+  although retention had passed all but their last 15 and 11 MB.
+- A snapshot read-back `GET` through the gateway was answered `503` ("read_snapshot has to forward
+  request to leader") instead of being forwarded; the VFS retried it.
