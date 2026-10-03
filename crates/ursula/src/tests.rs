@@ -5906,6 +5906,7 @@ async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {
             IngressAdmission {
                 body_bytes: Arc::new(tokio::sync::Semaphore::new(4)),
                 wal_disk: WalDiskMonitor::default(),
+                raft_log: None,
             },
             ingress_admission_middleware,
         ));
@@ -5955,6 +5956,7 @@ async fn ingress_body_budget_holds_credit_until_response_finishes() {
             IngressAdmission {
                 body_bytes: Arc::new(tokio::sync::Semaphore::new(4)),
                 wal_disk: WalDiskMonitor::default(),
+                raft_log: None,
             },
             ingress_admission_middleware,
         ));
@@ -6079,7 +6081,11 @@ async fn raft_log_pressure_rejects_body_writes_with_retry_after() {
     )
     .await;
     assert_eq!(write.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(write.headers().contains_key(axum::http::header::RETRY_AFTER));
+    assert!(
+        write
+            .headers()
+            .contains_key(axum::http::header::RETRY_AFTER)
+    );
     let body = body_bytes(write).await;
     assert!(
         std::str::from_utf8(&body)

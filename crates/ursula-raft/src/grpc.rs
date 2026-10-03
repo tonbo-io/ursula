@@ -207,7 +207,9 @@ impl QueuedAppendBytes {
         gauge: &'static AtomicU64,
         max: &'static AtomicU64,
     ) -> Self {
-        let now = gauge.fetch_add(bytes, Ordering::Relaxed).saturating_add(bytes);
+        let now = gauge
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes);
         max.fetch_max(now, Ordering::Relaxed);
         Self {
             _permit: permit,
@@ -304,8 +306,8 @@ pub fn raft_grpc_metrics_snapshot() -> RaftGrpcMetricsSnapshot {
             .load(Ordering::Relaxed),
         raft_grpc_append_stream_queued_bytes_max: GRPC_APPEND_STREAM_QUEUED_BYTES_MAX
             .load(Ordering::Relaxed),
-        raft_grpc_append_stream_backpressure_rejections:
-            GRPC_APPEND_STREAM_BACKPRESSURE_REJECTIONS.load(Ordering::Relaxed),
+        raft_grpc_append_stream_backpressure_rejections: GRPC_APPEND_STREAM_BACKPRESSURE_REJECTIONS
+            .load(Ordering::Relaxed),
         raft_grpc_append_stream_expired_unsent: GRPC_APPEND_STREAM_EXPIRED_UNSENT
             .load(Ordering::Relaxed),
         raft_grpc_append_stream_stalls: GRPC_APPEND_STREAM_STALLS.load(Ordering::Relaxed),
@@ -553,7 +555,9 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         // Decoded frames waiting for (or in) processing hold a share of this budget; the next
         // frame is not read off the stream until it fits, so a slow follower pushes back through
         // HTTP/2 flow control instead of buffering the leader's backlog in memory.
-        let budget = Arc::new(Semaphore::new(RAFT_GRPC_APPEND_STREAM_SERVER_MAX_BUFFERED_BYTES));
+        let budget = Arc::new(Semaphore::new(
+            RAFT_GRPC_APPEND_STREAM_SERVER_MAX_BUFFERED_BYTES,
+        ));
         let shutdown = registry.subscribe_transport_shutdown();
         let requests = futures_util::stream::unfold(
             (request.into_inner(), shutdown, budget),
@@ -1335,7 +1339,10 @@ type PendingAppend = oneshot::Sender<Result<raft_internal_proto::RaftRpcAckV1, t
 
 /// One request frame on its way to the encoder, with the queue budget its calls hold until the
 /// encoder takes it.
-type WireFrame = (raft_internal_proto::RaftAppendStreamRequest, Vec<QueuedAppendBytes>);
+type WireFrame = (
+    raft_internal_proto::RaftAppendStreamRequest,
+    Vec<QueuedAppendBytes>,
+);
 
 async fn run_append_session(
     mut client: RaftClient,

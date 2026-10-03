@@ -32,7 +32,7 @@ const bump = (key: string): void => {
 	counts.set(key, (counts.get(key) ?? 0) + 1);
 };
 
-async function put(url: string, body: Uint8Array | undefined, stop: () => boolean): Promise<number> {
+async function put(url: string, body: Buffer | null, stop: () => boolean): Promise<number> {
 	let backoff = 20;
 	for (;;) {
 		let status = 0;
@@ -53,7 +53,7 @@ async function put(url: string, body: Uint8Array | undefined, stop: () => boolea
 
 async function owner(base: string, index: number, stop: () => boolean): Promise<void> {
 	const url = `${base}/sqlite-e2e/soak-${process.pid}-${index}`;
-	const created = await put(url, undefined, stop);
+	const created = await put(url, null, stop);
 	if (created >= 300 && created !== 409) throw new Error(`create ${url}: ${created}`);
 	let seq = 0;
 	let offset = 0;
@@ -99,7 +99,7 @@ async function owner(base: string, index: number, stop: () => boolean): Promise<
 			if (s >= 200 && s < 300) {
 				previousSnapshot = snapshot;
 				snapshot = offset;
-				if (previousSnapshot > 0) await put(`${url}/retention/${previousSnapshot}`, undefined, stop);
+				if (previousSnapshot > 0) await put(`${url}/retention/${previousSnapshot}`, null, stop);
 			}
 		}
 	}

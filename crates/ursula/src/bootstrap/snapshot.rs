@@ -83,7 +83,9 @@ fn spawn_log_pressure_monitor(coordinator: SnapshotBuildCoordinator, cadence: &S
             let log_bytes = coordinator
                 .log_progress()
                 .values()
-                .fold(0_u64, |total, progress| total.saturating_add(progress.log_bytes));
+                .fold(0_u64, |total, progress| {
+                    total.saturating_add(progress.log_bytes)
+                });
             match coordinator.observe_log_bytes(log_bytes, limit, resume) {
                 Some(true) => tracing::warn!(
                     log_bytes,

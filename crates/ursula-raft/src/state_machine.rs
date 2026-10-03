@@ -1639,7 +1639,12 @@ mod tests {
         assert!(!build.reclaim_handoff(group));
         assert_eq!(build.available_permits(), 0);
         // The next trigger without a handoff defers while this build runs.
-        assert!(state_machine.try_create_snapshot_builder(false).await.is_none());
+        assert!(
+            state_machine
+                .try_create_snapshot_builder(false)
+                .await
+                .is_none()
+        );
         drop(builder);
         assert_eq!(build.available_permits(), 1);
 
