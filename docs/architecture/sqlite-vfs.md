@@ -189,5 +189,6 @@ and the log keeps growing. A superseded cold body stays readable for 5 minutes.
   CI also runs it without a cold tier under the default hot limit; fresh and lagging hosts rebuild
   byte-identical from snapshot + tail; the takeover after the trim fences the old owner), Pi
   conformance in three modes, and a benchmark (sanity numbers only).
-- The same Pi conformance and snapshot suites on 3 nodes + gateway + MinIO at feature level 5,
-  with a 64 KiB snapshot minimum, so the reopen modes rebuild from snapshot + tail throughout.
+- The same Pi conformance, snapshot and benchmark suites on 3 nodes + gateway + MinIO at feature
+  level 5 (the snapshot run's ~3.5 MB bodies go to the cold tier), with a 64 KiB snapshot minimum
+  so the benchmark's Pi workload snapshots and trims at its database size.

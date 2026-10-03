@@ -274,12 +274,12 @@ jobs:
           name: sqlite-ursula-vfs
           path: ${{ runner.temp }}/vfs
 
-      # Snapshot bodies above 1 MiB go to the cold tier (S3). A 64 KiB snapshot minimum makes Pi
-      # conformance snapshot and trim as it goes, so its reopen modes rebuild from snapshot + tail.
-      - name: Pi conformance (3 modes) and snapshots + retention through the gateway
+      # Snapshot bodies above 1 MiB go to the cold tier (S3). The benchmark's Pi turns snapshot and
+      # trim as they go (a 64 KiB minimum, so the threshold is the database size).
+      - name: Pi conformance (3 modes), snapshots + retention, benchmark through the gateway
         timeout-minutes: 30
         run: |
           chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
           cd clients/sqlite-ursula
           npm ci
-          E2E_NODES=3 URSULA_VFS_SNAPSHOT_MIN_BYTES=65536 URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/conformance.e2e.ts test/snapshot.e2e.ts
+          E2E_NODES=3 URSULA_VFS_SNAPSHOT_MIN_BYTES=65536 URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/conformance.e2e.ts test/snapshot.e2e.ts test/bench.e2e.ts
