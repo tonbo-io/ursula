@@ -55,16 +55,24 @@ it("snapshots + retention bound the stream; fresh and lagging hosts rebuild from
 	await owner.waitFor((x) => x.step === ROUNDS && x.phase === "start", 600_000);
 	expect(owner.lines.filter((x) => x.ok === false)).toEqual([]);
 
-	// Every commit went through, the stream holds far more than the hot limit, and the retained
-	// part stays a small multiple of the snapshot threshold (8 MiB by default).
+	// Every commit went through, the stream holds far more than the hot limit, and once the
+	// snapshot thread has caught up with the (now idle) owner the retained part is a small multiple
+	// of the snapshot threshold T (8 MiB by default): the latest snapshot is within T of the tail
+	// (a due snapshot is taken within one commit), and retention trails it by one snapshot, whose
+	// gap is T plus what the writer appended while the previous snapshot was in flight. Measured
+	// before it settles, the tail can be several snapshot cycles ahead of a burst-fast writer.
 	let h = await head(url);
-	for (let i = 0; i < 100 && h.retained <= laggingOffset; i++) {
+	for (let i = 0, still = 0; i < 200 && still < 5; i++) {
 		await new Promise((r) => setTimeout(r, 100));
-		h = await head(url);
+		const next = await head(url);
+		still = next.snapshot === h.snapshot && next.retained === h.retained && next.retained > laggingOffset ? still + 1 : 0;
+		h = next;
 	}
+	console.log(`settled: tail ${h.tail}, snapshot ${h.snapshot}, retained ${h.retained}`);
 	expect(h.tail).toBeGreaterThan(150 * MiB);
 	expect(h.retained).toBeGreaterThan(laggingOffset);
 	expect(h.snapshot).toBeGreaterThanOrEqual(h.retained);
+	expect(h.tail - h.snapshot).toBeLessThan(9 * MiB);
 	expect(h.tail - h.retained).toBeLessThan(40 * MiB);
 	expect((await fetch(`${url}?offset=0`)).status).toBe(410);
 
