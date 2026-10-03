@@ -496,105 +496,139 @@ fn op() -> impl Strategy<Value = Op> {
     ]
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+/// Cases of the dense-oracle property per run: 16 by default (records of up
+/// to 3 MiB make each case expensive), `URSULA_PROPTEST_CASES` for nightly
+/// or local sweeps.
+fn oracle_cases() -> u32 {
+    std::env::var("URSULA_PROPTEST_CASES")
+        .ok()
+        .and_then(|cases| cases.parse().ok())
+        .unwrap_or(16)
+}
 
-    /// RC-2 at the index level: after any sequence of appends, seals at
-    /// arbitrary (including mid-record) points and retentions, every
-    /// retained record resolves to the dense oracle's offset within one
-    /// block, every boundary maps back to its ordinal, every other offset is
-    /// rejected, and retention lands on the oracle's boundary at or below
-    /// its target.
+/// RC-2 at the index level: after any sequence of appends, seals at
+/// arbitrary (including mid-record) points and retentions, every retained
+/// record resolves to the dense oracle's offset within one block, every
+/// boundary maps back to its ordinal, every other offset is rejected, and
+/// retention lands on the oracle's boundary at or below its target.
+fn check_against_dense_oracle(ops: Vec<Op>) -> Result<(), TestCaseError> {
+    let mut index = StreamRecordIndex::new();
+    let mut bytes = Vec::<u8>::new();
+    // Oracle: start offset of every record ever appended.
+    let mut starts = Vec::<u64>::new();
+    let mut first_record = 0_u64;
+    let mut retained = 0_u64;
+    for op in ops {
+        let tail = bytes.len() as u64;
+        match op {
+            Op::Append(sizes) => {
+                let mut ends = Vec::new();
+                let mut total = 0;
+                for size in sizes {
+                    starts.push(tail + total);
+                    total += size;
+                    ends.push(total);
+                    bytes.extend(std::iter::repeat_n(b'x', usize::try_from(size - 1).unwrap()));
+                    bytes.push(b'\n');
+                }
+                index.append_relative_ends(tail, total, &ends).unwrap();
+            }
+            Op::Seal { at, budget } => {
+                let point = retained + (tail - retained) * at / 999;
+                let before = index.range().unwrap();
+                index.seal_below(point, tail, budget);
+                prop_assert_eq!(index.range().unwrap(), before);
+            }
+            Op::Retain { at } => {
+                if starts.len() as u64 == first_record {
+                    continue;
+                }
+                let target_record = first_record
+                    + (starts.len() as u64 - first_record) * at / 1_000;
+                let target = starts[usize::try_from(target_record).unwrap()];
+                let prepared = index.prepare_retain(target, tail).unwrap();
+                let effective = prepared.effective_offset();
+                prop_assert!(effective <= target);
+                let new_first = index.commit_retain(prepared);
+                prop_assert!(new_first <= target_record);
+                prop_assert_eq!(starts[usize::try_from(new_first).unwrap()], effective);
+                first_record = new_first;
+                retained = effective;
+            }
+        }
+        let tail = bytes.len() as u64;
+        index.validate(retained, tail).unwrap();
+        let range = index.range().unwrap();
+        prop_assert_eq!(range.first_record, first_record);
+        prop_assert_eq!(range.next_record, starts.len() as u64);
+        for record in first_record..range.next_record {
+            let offset = resolve(&index, &bytes, record, tail);
+            prop_assert_eq!(offset, starts[usize::try_from(record).unwrap()]);
+            if let Ok(RecordOffset::Bracket(bracket)) = index.offset_for(record, tail) {
+                // RC-3: the scan stays inside one block.
+                prop_assert!(bracket.limit <= mark_block_end(bracket.from_offset));
+            }
+        }
+        for (ordinal, start) in starts.iter().enumerate().skip(usize::try_from(first_record).unwrap()) {
+            let located = index.locate_offset(*start, tail).unwrap();
+            let ordinal = ordinal as u64;
+            match located {
+                OffsetLocation::Exact(record) => prop_assert_eq!(record, ordinal),
+                OffsetLocation::Bracket(bracket) => {
+                    let window = &bytes[usize::try_from(bracket.from_offset).unwrap()
+                        ..usize::try_from(*start).unwrap()];
+                    let lfs = window.iter().filter(|b| **b == b'\n').count() as u64;
+                    prop_assert_eq!(bytes[usize::try_from(*start - 1).unwrap()], b'\n');
+                    prop_assert_eq!(bracket.from_record + lfs, ordinal);
+                }
+                OffsetLocation::NotBoundary => prop_assert!(false, "boundary rejected"),
+            }
+            // The byte after a start is never a boundary unless the
+            // record is one byte long, which records here never are.
+            let inside = *start + 1;
+            if inside < tail {
+                match index.locate_offset(inside, tail).unwrap() {
+                    OffsetLocation::Exact(_) => prop_assert!(false, "non-boundary accepted"),
+                    OffsetLocation::Bracket(_) => {
+                        prop_assert_ne!(bytes[usize::try_from(inside - 1).unwrap()], b'\n');
+                    }
+                    OffsetLocation::NotBoundary => {}
+                }
+            }
+        }
+        prop_assert_eq!(
+            index.locate_offset(tail, tail).unwrap(),
+            OffsetLocation::Exact(starts.len() as u64)
+        );
+    }
+    Ok(())
+}
+
+/// A fixed sequence through the same oracle: records straddling the 1 MiB
+/// block boundaries, a seal through them, a retention into sealed history and
+/// appends after it, independent of what the property draws.
+#[test]
+fn sparse_index_matches_the_dense_oracle_across_block_boundaries() {
+    check_against_dense_oracle(vec![
+        Op::Append(vec![MIB / 2, MIB, 300, 2 * MIB + 7, 100]),
+        Op::Seal {
+            at: 999,
+            budget: u64::MAX,
+        },
+        Op::Append(vec![MIB - 1, 2, MIB / 3]),
+        Op::Retain { at: 500 },
+        Op::Seal { at: 700, budget: 1 },
+        Op::Append(vec![3 * MIB / 2]),
+        Op::Retain { at: 999 },
+    ])
+    .unwrap();
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(oracle_cases()))]
+
     #[test]
     fn sparse_index_matches_the_dense_oracle(ops in prop::collection::vec(op(), 1..25)) {
-        let mut index = StreamRecordIndex::new();
-        let mut bytes = Vec::<u8>::new();
-        // Oracle: start offset of every record ever appended.
-        let mut starts = Vec::<u64>::new();
-        let mut first_record = 0_u64;
-        let mut retained = 0_u64;
-        for op in ops {
-            let tail = bytes.len() as u64;
-            match op {
-                Op::Append(sizes) => {
-                    let mut ends = Vec::new();
-                    let mut total = 0;
-                    for size in sizes {
-                        starts.push(tail + total);
-                        total += size;
-                        ends.push(total);
-                        bytes.extend(std::iter::repeat_n(b'x', usize::try_from(size - 1).unwrap()));
-                        bytes.push(b'\n');
-                    }
-                    index.append_relative_ends(tail, total, &ends).unwrap();
-                }
-                Op::Seal { at, budget } => {
-                    let point = retained + (tail - retained) * at / 999;
-                    let before = index.range().unwrap();
-                    index.seal_below(point, tail, budget);
-                    prop_assert_eq!(index.range().unwrap(), before);
-                }
-                Op::Retain { at } => {
-                    if starts.len() as u64 == first_record {
-                        continue;
-                    }
-                    let target_record = first_record
-                        + (starts.len() as u64 - first_record) * at / 1_000;
-                    let target = starts[usize::try_from(target_record).unwrap()];
-                    let prepared = index.prepare_retain(target, tail).unwrap();
-                    let effective = prepared.effective_offset();
-                    prop_assert!(effective <= target);
-                    let new_first = index.commit_retain(prepared);
-                    prop_assert!(new_first <= target_record);
-                    prop_assert_eq!(starts[usize::try_from(new_first).unwrap()], effective);
-                    first_record = new_first;
-                    retained = effective;
-                }
-            }
-            let tail = bytes.len() as u64;
-            index.validate(retained, tail).unwrap();
-            let range = index.range().unwrap();
-            prop_assert_eq!(range.first_record, first_record);
-            prop_assert_eq!(range.next_record, starts.len() as u64);
-            for record in first_record..range.next_record {
-                let offset = resolve(&index, &bytes, record, tail);
-                prop_assert_eq!(offset, starts[usize::try_from(record).unwrap()]);
-                if let Ok(RecordOffset::Bracket(bracket)) = index.offset_for(record, tail) {
-                    // RC-3: the scan stays inside one block.
-                    prop_assert!(bracket.limit <= mark_block_end(bracket.from_offset));
-                }
-            }
-            for (ordinal, start) in starts.iter().enumerate().skip(usize::try_from(first_record).unwrap()) {
-                let located = index.locate_offset(*start, tail).unwrap();
-                let ordinal = ordinal as u64;
-                match located {
-                    OffsetLocation::Exact(record) => prop_assert_eq!(record, ordinal),
-                    OffsetLocation::Bracket(bracket) => {
-                        let window = &bytes[usize::try_from(bracket.from_offset).unwrap()
-                            ..usize::try_from(*start).unwrap()];
-                        let lfs = window.iter().filter(|b| **b == b'\n').count() as u64;
-                        prop_assert_eq!(bytes[usize::try_from(*start - 1).unwrap()], b'\n');
-                        prop_assert_eq!(bracket.from_record + lfs, ordinal);
-                    }
-                    OffsetLocation::NotBoundary => prop_assert!(false, "boundary rejected"),
-                }
-                // The byte after a start is never a boundary unless the
-                // record is one byte long, which records here never are.
-                let inside = *start + 1;
-                if inside < tail {
-                    match index.locate_offset(inside, tail).unwrap() {
-                        OffsetLocation::Exact(_) => prop_assert!(false, "non-boundary accepted"),
-                        OffsetLocation::Bracket(_) => {
-                            prop_assert_ne!(bytes[usize::try_from(inside - 1).unwrap()], b'\n');
-                        }
-                        OffsetLocation::NotBoundary => {}
-                    }
-                }
-            }
-            prop_assert_eq!(
-                index.locate_offset(tail, tail).unwrap(),
-                OffsetLocation::Exact(starts.len() as u64)
-            );
-        }
+        check_against_dense_oracle(ops)?;
     }
 }
