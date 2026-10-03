@@ -1,6 +1,6 @@
 // The commit barrier: SIGKILL/abort around it in a child process, the cache-spill case, and an append
 // whose outcome is unknown.
-import { existsSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { attach } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
@@ -179,12 +179,83 @@ it("(h) killed in the middle of a recovery's page writes: the next attach resume
 it("(i) power loss after the last close under synchronous=OFF: the committed rows survive re-attach", async () => {
 	const path = streamPath();
 	const file = freshFile();
-	const child = runChild(file, ursulaUrl() + path, ["PRAGMA synchronous = OFF", ...SQL], { URSULA_VFS_DURABLE_SHADOW: "1", CHILD_EXIT: "1" });
+	const child = runChild(file, ursulaUrl() + path, ["PRAGMA synchronous = OFF", ...SQL], { URSULA_VFS_TEST_DURABLE_SHADOW: "1", CHILD_EXIT: "1" });
 	const done = await child.waitFor((l) => l.done === true);
 	expect((await child.exited).code).toBe(0);
 	expect(done.poisoned).toBe(false);
 	expect(existsSync(`${file}-wal`)).toBe(false); // the close checkpointed and deleted the WAL
+	// The sidecar covers every commit: re-attach replays nothing that could mask a stale db file.
+	expect(Number(readFileSync(`${file}-ursula`, "utf8").split(" ")[0])).toBe(done.offset);
 	// Power loss: only the db file as of its last sync survives (the WAL is gone, the sidecar stays).
+	renameSync(`${file}-ursula-durable`, file);
+	rmSync(`${file}-shm`, { force: true });
+	attach(file, ursulaUrl() + path);
+	expect(rows(file)).toEqual(["M-one", "M-two"]);
+});
+
+// The sync before the WAL delete fails: the WAL must be kept (SQLite has already removed -shm, so
+// the next open recovers every frame from it), whatever reached the db file.
+it("(j) the db-file sync before the last close's WAL delete fails: the WAL is kept and the rows survive a power loss", async () => {
+	const path = streamPath();
+	const file = freshFile();
+	const env = { URSULA_VFS_TEST_DURABLE_SHADOW: "1", URSULA_VFS_TEST_FAIL_WAL_DELETE_SYNC: "1", CHILD_EXIT: "1" };
+	const child = runChild(file, ursulaUrl() + path, ["PRAGMA synchronous = OFF", ...SQL], env);
+	const done = await child.waitFor((l) => l.done === true);
+	expect((await child.exited).code).toBe(0);
+	expect(done.poisoned).toBe(false);
+	expect(existsSync(`${file}-wal`)).toBe(true);
+	renameSync(`${file}-ursula-durable`, file);
+	rmSync(`${file}-shm`, { force: true });
+	attach(file, ursulaUrl() + path);
+	expect(rows(file)).toEqual(["M-one", "M-two"]);
+});
+
+// Regression (#331 review): a WAL-restart commit wrote the new WAL header and its frames in one burst
+// and synced once, so a power loss could keep the old header while later frames persisted; SQLite
+// then recovered a stale prefix of the previous WAL generation over the newer db file and the next
+// checkpoint copied it in (integrity ok, rows gone). The header must be durable before any frame.
+it("(k) power loss in a WAL-restart commit: no stale prefix of the previous WAL is recovered", async () => {
+	const path = streamPath();
+	const file = freshFile();
+	const restart = [
+		"BEGIN",
+		"CREATE TABLE u(y)",
+		"WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 20) INSERT INTO u SELECT hex(randomblob(1500)) FROM c",
+		"COMMIT",
+	].join(";\n");
+	// Four frames (CREATE: pages 1-2; M-one, M-two: page 2), all backfilled; then the 4th commit
+	// restarts the WAL and the child dies right after writing its ~21 frames, before any WAL sync.
+	const env = { URSULA_VFS_TEST_DURABLE_SHADOW: "1", URSULA_VFS_TEST_ABORT_AFTER_WAL_WRITE: "4" };
+	const child = runChild(file, ursulaUrl() + path, ["PRAGMA synchronous = NORMAL", ...SQL, "PRAGMA wal_checkpoint(PASSIVE)", restart], env);
+	expect((await child.exited).signal).toBe("SIGABRT");
+	const synced = readFileSync(`${file}-ursula-durable-wal`);
+	const written = readFileSync(`${file}-wal`);
+	const lost = 3 * 4096; // the old CREATE frames end at 32 + 2 * 4120 = 8272, M-one's frame spans 12288
+	expect(written.length).toBeGreaterThan(lost);
+	// Power loss: the db file as of its last sync; of the WAL's unsynced writes the first three 4 KiB
+	// blocks were lost and the later ones persisted.
+	writeFileSync(`${file}-wal`, Buffer.concat([synced.subarray(0, lost), written.subarray(lost)]));
+	renameSync(`${file}-ursula-durable`, file);
+	rmSync(`${file}-shm`, { force: true });
+	attach(file, ursulaUrl() + path);
+	expect(rows(file)).toEqual(["M-one", "M-two"]);
+});
+
+// Regression (#331 review): a checkpoint under synchronous=OFF backfilled every frame without a sync,
+// then a connection in another process (outside this VFS's bookkeeping) closed last: its checkpoint
+// had nothing to copy, so nothing synced, and it deleted the WAL.
+it("(l) a reader in another process closes last after an unsynced full checkpoint: the rows survive a power loss", async () => {
+	const path = streamPath();
+	const file = freshFile();
+	const child = runChild(file, ursulaUrl() + path, ["PRAGMA synchronous = OFF", ...SQL, "PRAGMA wal_checkpoint(PASSIVE)"], { URSULA_VFS_TEST_DURABLE_SHADOW: "1" });
+	const done = await child.waitFor((l) => l.done === true);
+	expect(done.poisoned).toBe(false);
+	const reader = openPlain(file); // this process has not attached the file: a foreign connection
+	expect((reader.prepare("SELECT count(*) AS n FROM t").get() as { n: number }).n).toBe(2);
+	child.proc.kill("SIGKILL");
+	await child.exited;
+	reader.close(); // the last connection: it deletes the WAL
+	expect(existsSync(`${file}-wal`)).toBe(false);
 	renameSync(`${file}-ursula-durable`, file);
 	rmSync(`${file}-shm`, { force: true });
 	attach(file, ursulaUrl() + path);

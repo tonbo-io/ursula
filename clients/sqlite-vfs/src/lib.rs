@@ -39,8 +39,12 @@
 //! commit of an attachment, before the local WAL write. `URSULA_VFS_RETRY_MS` bounds the retries of
 //! an append with an unknown outcome (default 30000). `URSULA_VFS_SNAPSHOT_MIN_BYTES` sets the
 //! smallest log (bytes since the latest snapshot) that triggers a snapshot.
-//! `URSULA_VFS_DURABLE_SHADOW=1` keeps `<db>-ursula-durable` equal to the db file as of its last
-//! sync (see `durable_shadow`), so a test can simulate a power loss.
+//! Power-loss test hooks (`URSULA_VFS_TEST_*`, never for production use):
+//! `URSULA_VFS_TEST_DURABLE_SHADOW=1` keeps `<db>-ursula-durable` and `<db>-ursula-durable-wal`
+//! equal to the db file and the WAL as of their last sync (see `durable_shadow`);
+//! `URSULA_VFS_TEST_ABORT_AFTER_WAL_WRITE=<n>` aborts right after the n-th acknowledged commit's
+//! frames reach the local WAL, before it is synced; `URSULA_VFS_TEST_FAIL_WAL_DELETE_SYNC=1` fails
+//! the db-file sync that precedes deleting the WAL (`x_delete`).
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 pub mod frame;
@@ -238,9 +242,23 @@ impl Db {
     unsafe fn sync_db_file(&self) -> Result<(), String> {
         unsafe { sync_handle(&self.db_handles, &self.path)? };
         if durable_shadow() {
-            unsafe { write_shadow(self.db_handles[0].0, &self.path) };
+            unsafe {
+                write_shadow(
+                    self.db_handles[0].0,
+                    &format!("{}-ursula-durable", self.path),
+                )
+            };
         }
         Ok(())
+    }
+
+    /// Test hook: the local WAL was just synced (see `durable_shadow`).
+    unsafe fn shadow_wal(&self) {
+        if durable_shadow()
+            && let Some(&Handle(f)) = self.wal_handles.first()
+        {
+            unsafe { write_shadow(f, &format!("{}-ursula-durable-wal", self.path)) };
+        }
     }
 
     /// The write transaction ended (WAL write lock released): drop what never committed; after an
@@ -276,6 +294,7 @@ impl Db {
             self.poison(e);
             return;
         }
+        unsafe { self.shadow_wal() };
         if let Err(e) = write_sidecar(&self.sidecar, self.offset, self.epoch) {
             self.poison(e);
             return;
@@ -376,26 +395,43 @@ fn fail_post_ack() -> Option<u64> {
     })
 }
 
-/// Test hook `URSULA_VFS_DURABLE_SHADOW=1`: `<db>-ursula-durable` holds the db file as of its last
-/// sync through this VFS (or the end of attach), i.e. what survives a power loss that drops every
-/// unsynced db-file write. Syncs by the private "unix" connections are not tracked: a test using it
-/// must not make a snapshot due.
+/// Test hook `URSULA_VFS_TEST_DURABLE_SHADOW=1`: `<db>-ursula-durable` holds the db file and
+/// `<db>-ursula-durable-wal` the local WAL as of their last sync through this VFS (or the end of
+/// attach), i.e. what survives a power loss that drops every unsynced write. Syncs by the private
+/// "unix" connections are not tracked: a test using it must not make a snapshot due.
 fn durable_shadow() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("URSULA_VFS_DURABLE_SHADOW").is_ok_and(|v| v == "1"))
+    *V.get_or_init(|| std::env::var("URSULA_VFS_TEST_DURABLE_SHADOW").is_ok_and(|v| v == "1"))
 }
 
-/// Copies the db file, read through SQLite's just-synced handle `f` (never a descriptor of our
-/// own; see `sync_handle`), to the durable shadow.
-unsafe fn write_shadow(f: *mut ffi::sqlite3_file, path: &str) {
-    fn fail(path: &str, what: String) -> ! {
-        eprintln!("sqlite-ursula-vfs: URSULA_VFS_DURABLE_SHADOW: {path}: {what}");
+/// Test hook `URSULA_VFS_TEST_ABORT_AFTER_WAL_WRITE=<n>`: abort right after the n-th acknowledged
+/// commit's frames are written to the local WAL, before anything syncs it.
+fn abort_after_wal_write() -> Option<u64> {
+    static V: OnceLock<Option<u64>> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("URSULA_VFS_TEST_ABORT_AFTER_WAL_WRITE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+}
+
+/// Test hook `URSULA_VFS_TEST_FAIL_WAL_DELETE_SYNC=1`: the db-file sync before a WAL delete fails.
+fn fail_wal_delete_sync() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("URSULA_VFS_TEST_FAIL_WAL_DELETE_SYNC").is_ok_and(|v| v == "1"))
+}
+
+/// Copies a file, read through SQLite's just-synced handle `f` (never a descriptor of our own; see
+/// `sync_handle`), to the durable shadow `dest`.
+unsafe fn write_shadow(f: *mut ffi::sqlite3_file, dest: &str) {
+    fn fail(dest: &str, what: String) -> ! {
+        eprintln!("sqlite-ursula-vfs: URSULA_VFS_TEST_DURABLE_SHADOW: {dest}: {what}");
         std::process::abort();
     }
     let mut size: ffi::sqlite3_int64 = 0;
     let rc = unsafe { ((*(*f).pMethods).xFileSize.unwrap())(f, &mut size) };
     if rc != OK {
-        fail(path, format!("size: {rc}"));
+        fail(dest, format!("size: {rc}"));
     }
     let mut image = vec![0u8; size as usize];
     for (i, chunk) in image.chunks_mut(1 << 20).enumerate() {
@@ -408,14 +444,12 @@ unsafe fn write_shadow(f: *mut ffi::sqlite3_file, path: &str) {
             )
         };
         if rc != OK {
-            fail(path, format!("read: {rc}"));
+            fail(dest, format!("read: {rc}"));
         }
     }
-    let tmp = format!("{path}-ursula-durable.tmp");
-    if let Err(e) =
-        fs::write(&tmp, &image).and_then(|()| fs::rename(&tmp, format!("{path}-ursula-durable")))
-    {
-        fail(path, e.to_string());
+    let tmp = format!("{dest}.tmp");
+    if let Err(e) = fs::write(&tmp, &image).and_then(|()| fs::rename(&tmp, dest)) {
+        fail(dest, e.to_string());
     }
 }
 
@@ -1366,8 +1400,14 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
         unsafe { init_wal_format(&path)? };
     }
     if durable_shadow() {
-        fs::copy(&path, format!("{path}-ursula-durable"))
-            .map_err(|e| format!("URSULA_VFS_DURABLE_SHADOW: copy {path}: {e}"))?;
+        let err = |e: std::io::Error| format!("URSULA_VFS_TEST_DURABLE_SHADOW: {path}: {e}");
+        fs::copy(&path, format!("{path}-ursula-durable")).map_err(err)?;
+        let wal = format!("{path}-wal");
+        if fs::metadata(&wal).is_ok() {
+            fs::copy(&wal, format!("{path}-ursula-durable-wal")).map_err(err)?;
+        } else {
+            let _ = fs::remove_file(format!("{path}-ursula-durable-wal"));
+        }
     }
     write_sidecar(&sidecar, offset, epoch)?;
     let pages = (fs::metadata(&path).map(|m| m.len()).unwrap_or(0) / PAGE as u64) as u32;
@@ -2190,6 +2230,12 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
             return rc;
         }
     }
+    if abort_after_wal_write() == Some(db.acked) {
+        eprintln!(
+            "sqlite-ursula-vfs: URSULA_VFS_TEST_ABORT_AFTER_WAL_WRITE: aborting before the WAL sync"
+        );
+        std::process::abort();
+    }
     db.committed = true;
     if db.stats.len() < 1_000_000 {
         db.stats.push(CommitStat {
@@ -2240,7 +2286,7 @@ unsafe extern "C" fn x_sync(file: *mut ffi::sqlite3_file, flags: c_int) -> c_int
                     .filter(|e| e.db.is_some())
                     .and_then(|e| e.path.as_deref())
             {
-                write_shadow(inner(file), path);
+                write_shadow(inner(file), &format!("{path}-ursula-durable"));
             }
             return rc;
         };
@@ -2250,6 +2296,9 @@ unsafe extern "C" fn x_sync(file: *mut ffi::sqlite3_file, flags: c_int) -> c_int
         } else {
             fwd!(file, xSync, flags)
         };
+        if rc == OK {
+            db.shadow_wal();
+        }
         db.post_ack("local WAL sync", rc)
     }
 }
@@ -2440,10 +2489,16 @@ unsafe extern "C" fn x_delete(
             return ((*u).xDelete.unwrap())(u, zname, sync_dir);
         };
         let mut db = lock(&db);
-        if let Err(e) = db.sync_db_file() {
+        let synced = if fail_wal_delete_sync() {
+            Err("sync failed (URSULA_VFS_TEST_FAIL_WAL_DELETE_SYNC)".to_owned())
+        } else {
+            db.sync_db_file()
+        };
+        // TEMPORARY mutant (expected red for crash test (j)): the WAL is deleted although the sync
+        // failed. The next commit restores the early return.
+        if let Err(e) = synced {
             let why = format!("{e}; keeping {}", db.wal);
             db.poison(why);
-            return ffi::SQLITE_IOERR_DELETE;
         }
         ((*u).xDelete.unwrap())(u, zname, sync_dir)
     }
