@@ -4,7 +4,7 @@ import { K, scopeKey, TAG } from "./families.ts";
 import type { LocalStore } from "./local-store/index.ts";
 import type { EntryRow } from "./pi-layer.ts";
 import type { StateView } from "./state-store.ts";
-import { readU64, readU64Desc, strinc } from "./tuple.ts";
+import { idSuffix, readU64Desc, strinc } from "./tuple.ts";
 
 const tag = (t: number): string => String.fromCharCode(t);
 
@@ -26,8 +26,6 @@ export function widenFetch(lo: string, hi: string, point: boolean): { lo: string
 	if (point) return t === TAG.sr ? { lo: scope, hi: end } : undefined;
 	return hi <= end ? { lo, hi: end } : undefined;
 }
-
-const idSuffix = (key: string): number => Number(readU64(key, key.length - 8));
 
 /** Visit up to `max` rows of `[lo, hi)` so the pass covers them; returns the values. */
 function touch(view: StateView, lo: string, hi: string, max = Number.POSITIVE_INFINITY): string[] {

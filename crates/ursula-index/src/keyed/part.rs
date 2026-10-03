@@ -92,7 +92,7 @@ pub struct KeyedEntry {
 }
 
 impl KeyedEntry {
-    fn weight(&self) -> usize {
+    pub(crate) fn weight(&self) -> usize {
         self.key
             .len()
             .saturating_add(self.value.as_ref().map_or(0, String::len))
@@ -361,11 +361,6 @@ impl PartFooter {
         })
     }
 
-    /// The part's range tombstones.
-    pub fn tombstones(&self) -> &[RangeTombstone] {
-        &self.tombstones
-    }
-
     /// Approximate heap footprint, for cache weighting.
     fn weight(&self) -> usize {
         self.tombstones
@@ -587,16 +582,6 @@ impl MemoryParts {
     /// Removes a part.
     pub fn remove(&mut self, key: &str) {
         self.parts.remove(key);
-    }
-
-    /// Number of parts held.
-    pub fn len(&self) -> usize {
-        self.parts.len()
-    }
-
-    /// Whether no part is held.
-    pub fn is_empty(&self) -> bool {
-        self.parts.is_empty()
     }
 }
 
@@ -1016,28 +1001,16 @@ pub async fn open_part(
 }
 
 fn check_schema(schema: &Schema) -> Result<(), IndexError> {
-    let expected = schema_fields();
+    let expected = self::schema();
     let fields = schema.fields();
-    if fields.len() != expected.len()
-        || fields
-            .iter()
-            .zip(expected)
-            .any(|(field, (name, data_type))| {
-                field.name() != name || field.data_type() != &data_type
-            })
+    if fields.len() != expected.fields().len()
+        || fields.iter().zip(expected.fields()).any(|(field, want)| {
+            field.name() != want.name() || field.data_type() != want.data_type()
+        })
     {
         return Err(IndexError::InvalidPartSchema);
     }
     Ok(())
-}
-
-fn schema_fields() -> [(&'static str, DataType); 4] {
-    [
-        ("key", DataType::Binary),
-        ("record", DataType::UInt64),
-        ("del", DataType::Boolean),
-        ("value", DataType::Binary),
-    ]
 }
 
 /// Row selection from the page index of `key`: a page is read unless its
@@ -1189,10 +1162,6 @@ pub async fn read_part(
         rows.push(entry);
     }
     Ok((rows, tombstones))
-}
-
-pub(crate) fn entry_weight(entry: &KeyedEntry) -> usize {
-    entry.weight()
 }
 
 #[cfg(test)]

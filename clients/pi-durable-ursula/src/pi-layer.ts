@@ -10,8 +10,6 @@ import type {
 	ConversationQuery,
 	ConversationRecord,
 	Cursor,
-	DocumentAddress,
-	DocumentId,
 	DocumentPoint,
 	DocumentQuery,
 	DocumentRecord,
@@ -39,7 +37,7 @@ import {
 	type TableTag,
 } from "./families.ts";
 import type { StateView } from "./state-store.ts";
-import { keySuccessor, readU64, readU64Desc, strinc, u64, u64desc } from "./tuple.ts";
+import { idSuffix, keySuccessor, readU64Desc, strinc, u64, u64desc } from "./tuple.ts";
 
 export type StoredTask = TaskRecord<JsonValue, JsonValue, JsonValue>;
 /** Value of the `x/{id}` row. */
@@ -109,8 +107,6 @@ function page<T extends { readonly id: number }>(values: T[], limit: number): Pa
 const afterKey = (prefix: string, after: number | undefined): string | undefined =>
 	after === undefined ? undefined : keySuccessor(prefix + u64(after));
 
-const idSuffix = (key: string): number => Number(readU64(key, key.length - 8));
-
 function mustConversation(view: StateView, id: number): ConversationRecord {
 	const conversation = value<ConversationRecord>(view, K.c(id));
 	if (conversation === undefined) throw new Error(`Unknown conversation: ${id}`);
@@ -160,12 +156,6 @@ export function materializeDocument(view: StateView, id: number, at: DocumentPoi
 	const materialized = applyImmutableBatches(base.value, deltas) as JsonObject;
 	return { record: row.record, version: base.version, value: materialized, deltasSinceBase: deltas.length };
 }
-
-export const findDocument = (view: StateView, address: DocumentAddress, at: DocumentPoint): DocumentRecord | undefined =>
-	findDocumentAt(view, address, at);
-
-export const document = (view: StateView, id: DocumentId, at: DocumentPoint): StoredDocument | undefined =>
-	materializeDocument(view, id, at);
 
 export function scanDocuments(view: StateView, query: DocumentQuery, limit: number, cursor: Cursor | undefined): Page<DocumentRecord, Cursor> {
 	const prefix = K.ds(query.scope);

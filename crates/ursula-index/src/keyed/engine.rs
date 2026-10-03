@@ -881,7 +881,6 @@ impl KeyedEngine {
             source.clone(),
             self.inner.config.projection_format,
         )
-        .with_grace(grace)
         .sweep(&*self.inner.clock, grace, false)
         .await
     }
@@ -947,8 +946,7 @@ impl Inner {
             self.store.clone().counted(Arc::clone(&requests)),
             source.clone(),
             self.config.projection_format,
-        )
-        .with_grace(self.config.gc_grace);
+        );
         let mut store = namespace.opener().with_footer_cache(self.footers.clone());
         if let Some(cache) = &self.cache {
             store = store.with_cache(cache)?;

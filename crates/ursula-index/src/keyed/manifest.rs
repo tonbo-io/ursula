@@ -429,21 +429,12 @@ pub enum PublishOutcome {
     },
 }
 
-/// Percent-encodes a stream's local name as one path component
-/// (`%` → `%25`, `/` → `%2F`).
-///
-/// Shared with the node's stream-delete GC and bucket purge
-/// (`ursula_shard::keyed_namespace`), so both name the same objects.
-pub fn encode_stream_component(key: &str) -> String {
-    ursula_shard::keyed_namespace::encode_key_component(key)
-}
-
 /// `.keyed/{bucket}/{key}/{c:016x}/v{fmt}/`.
 pub fn namespace_prefix(source: &KeyedSource, format: u32) -> String {
     format!(
         ".keyed/{}/{}/{:016x}/v{format}/",
         source.bucket,
-        encode_stream_component(&source.key),
+        ursula_shard::keyed_namespace::encode_key_component(&source.key),
         source.incarnation
     )
 }
@@ -466,8 +457,6 @@ pub struct KeyedNamespace {
     source: KeyedSource,
     format: u32,
     prefix: String,
-    /// The GC grace of the namespace's deleters.
-    grace: Duration,
 }
 
 /// Default GC grace of a namespace (the engine's default `gc_grace`).
@@ -489,20 +478,7 @@ impl KeyedNamespace {
             source,
             format,
             prefix,
-            grace: DEFAULT_GC_GRACE,
         }
-    }
-
-    /// The GC grace this namespace's deleters use.
-    #[must_use]
-    pub fn with_grace(mut self, grace: Duration) -> Self {
-        self.grace = grace;
-        self
-    }
-
-    /// The GC grace this namespace's deleters use.
-    pub fn grace(&self) -> Duration {
-        self.grace
     }
 
     /// The projection format of this namespace.
@@ -757,17 +733,10 @@ impl KeyedNamespace {
         if pointer.version != KEYED_MANIFEST_VERSION {
             return Err(IndexError::ManifestVersion(pointer.version));
         }
-        let hash = manifest_hash(&pointer.manifest)?;
-        let object = self
-            .store
-            .get(&self.object(&pointer.manifest))
+        let manifest = self
+            .manifest(&pointer.manifest)
             .await?
             .ok_or_else(|| IndexError::MissingObject(pointer.manifest.clone()))?;
-        if digest(&object.bytes) != hash {
-            return Err(IndexError::ObjectHashMismatch(pointer.manifest));
-        }
-        let manifest: KeyedManifest = serde_json::from_slice(&object.bytes)?;
-        manifest.validate()?;
         if manifest.generation != pointer.generation {
             return Err(invalid("CURRENT generation does not match its manifest"));
         }

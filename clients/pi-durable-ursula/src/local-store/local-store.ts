@@ -16,18 +16,12 @@
 import { FencedError } from "../errors.ts";
 import type { KeyedOp } from "../keyed-batch.ts";
 import { H, intHeader, retryAfterMs } from "../protocol.ts";
-import { type StateStore, type StateView, ViewAbort } from "../state-store.ts";
+import { type Row, type StateStore, type StateView, ViewAbort } from "../state-store.ts";
 import type { KeyedScanOutcome, KeyedScanRequest, KeyedStateTransport } from "../transport.ts";
 import { TransportError } from "../transport.ts";
 import { b64, keySuccessor, unb64 } from "../tuple.ts";
 import { isFreshKey, isFreshRange } from "./fresh.ts";
 import { SkipList } from "./skip-list.ts";
-
-/** A visible row of the cache. */
-export interface CachedRow {
-	readonly record: number;
-	readonly value: string;
-}
 
 /** Accounting overhead per cached row or overlay op, on top of key and value octets. */
 export const ROW_OVERHEAD = 64;
@@ -136,7 +130,7 @@ const DEFAULT_BACKOFF = (attempt: number, retryAfterMs: number | undefined): Pro
 
 export class LocalStore implements StateStore {
 	private readonly keyedState: KeyedStateTransport;
-	private readonly cache = new SkipList<CachedRow>(0x51ed270b);
+	private readonly cache = new SkipList<Row>(0x51ed270b);
 	/** Explicit covered ranges keyed by `lo`. */
 	private readonly ranges = new SkipList<CoveredRange>(0x2545f491);
 	/** LRU clock: each touch stamps the range with the next tick. */
@@ -441,7 +435,7 @@ export class LocalStore implements StateStore {
 		let hi = range.hi;
 		const above = [...this.cache.range(keySuccessor(hot), range.hi)];
 		for (let i = above.length - 1; i >= 0 && this.cacheBytesTotal > maxBytes; i--) {
-			const k = (above[i] as [string, CachedRow])[0];
+			const k = (above[i] as [string, Row])[0];
 			hi = k;
 			if (!isFreshKey(k, this.fresh)) this.deleteRow(k);
 		}
@@ -680,7 +674,7 @@ export class LocalStore implements StateStore {
 			if (after === undefined || after < lo || after >= requestedHi) throw this.poison(new Error("LocalStore: Stream-Keyed-After outside the requested range"));
 			hi = keySuccessor(after);
 		}
-		const merged = new SkipList<CachedRow>();
+		const merged = new SkipList<Row>();
 		let prev: string | undefined;
 		for (const row of page.rows) {
 			const key = unb64(row.key);
@@ -747,7 +741,7 @@ export class LocalStore implements StateStore {
 		this.cacheBytesTotal -= rangeBytes(range);
 	}
 
-	private putRow(key: string, row: CachedRow): void {
+	private putRow(key: string, row: Row): void {
 		const prev = this.cache.set(key, row);
 		if (prev !== undefined) this.cacheBytesTotal -= rowBytes(key, prev.value);
 		this.cacheBytesTotal += rowBytes(key, row.value);
@@ -784,7 +778,7 @@ export class LocalStore implements StateStore {
 	}
 
 	/** Every cached row, ascending. */
-	cachedRows(): [string, CachedRow][] {
+	cachedRows(): [string, Row][] {
 		return [...this.cache.entries()];
 	}
 

@@ -260,11 +260,6 @@ impl KeyedSourceClient {
         })
     }
 
-    /// The configured base URL.
-    pub fn base(&self) -> &Url {
-        &self.base
-    }
-
     fn stream_url(&self, bucket: &str, key: &str) -> Result<Url, SourceError> {
         let mut url = self.base.clone();
         url.path_segments_mut()
