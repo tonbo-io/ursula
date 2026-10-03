@@ -5906,6 +5906,7 @@ async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {
             IngressAdmission {
                 body_bytes: Arc::new(tokio::sync::Semaphore::new(4)),
                 wal_disk: WalDiskMonitor::default(),
+                raft_log: None,
             },
             ingress_admission_middleware,
         ));
@@ -5955,6 +5956,7 @@ async fn ingress_body_budget_holds_credit_until_response_finishes() {
             IngressAdmission {
                 body_bytes: Arc::new(tokio::sync::Semaphore::new(4)),
                 wal_disk: WalDiskMonitor::default(),
+                raft_log: None,
             },
             ingress_admission_middleware,
         ));
@@ -6046,6 +6048,62 @@ async fn wal_disk_pressure_rejects_writes_and_marks_readiness_unavailable() {
         http_get(&app, READINESS_PATH).await.status(),
         StatusCode::OK
     );
+}
+
+/// Over its hard Raft-log limit a node answers body-carrying writes with 503 +
+/// Retry-After (the EKS OOM: the log outgrew memory with no pushback), while
+/// bodiless writes such as retention advances still pass.
+#[tokio::test]
+async fn raft_log_pressure_rejects_body_writes_with_retry_after() {
+    let coordinator = ursula_raft::SnapshotBuildCoordinator::new(1);
+    let state = HttpState::new(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    );
+    let app = client_router_with_admission(
+        state,
+        IngressAdmission::default().with_raft_log_pressure(Some(coordinator.clone())),
+    );
+    assert_eq!(coordinator.observe_log_bytes(300, 200, 100), Some(true));
+
+    let write = http_put(
+        &app,
+        "/benchcmp/log-pressure",
+        &[(CONTENT_LENGTH.as_str(), "1")],
+        Body::from("x"),
+    )
+    .await;
+    assert_eq!(write.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        write
+            .headers()
+            .contains_key(axum::http::header::RETRY_AFTER)
+    );
+    let body = body_bytes(write).await;
+    assert!(
+        std::str::from_utf8(&body)
+            .expect("utf8 response")
+            .contains("RaftLogPressure")
+    );
+    let bodiless = http_put(&app, "/benchcmp", &[], Body::empty()).await;
+    assert_ne!(bodiless.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    assert_eq!(coordinator.observe_log_bytes(50, 200, 100), Some(false));
+    let write = http_put(
+        &app,
+        "/benchcmp/log-pressure",
+        &[(CONTENT_LENGTH.as_str(), "1")],
+        Body::from("x"),
+    )
+    .await;
+    assert_ne!(write.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 /// Shared fixture for the governance unit-test modules below: one

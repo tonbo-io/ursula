@@ -29,6 +29,7 @@ use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
 use prost::Message;
 use serde::de::DeserializeOwned;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -79,6 +80,13 @@ static GRPC_APPEND_STREAM_BATCH_FRAMES: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_BATCH_ITEMS_MAX: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_INFLIGHT: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_INFLIGHT_MAX: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_STREAM_QUEUED_BYTES: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_STREAM_QUEUED_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_STREAM_BACKPRESSURE_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_STREAM_EXPIRED_UNSENT: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_STREAM_STALLS: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_STREAM_SERVER_BUFFERED_BYTES: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_STREAM_SERVER_BUFFERED_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_HEARTBEAT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_HEARTBEAT_REQUEST_BYTES: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_REPLICATION_REQUESTS: AtomicU64 = AtomicU64::new(0);
@@ -95,6 +103,8 @@ static GRPC_SNAPSHOT_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(0);
 use crate::registry::LeadershipShedFlag;
 use crate::registry::LeadershipShedState;
 use crate::registry::RaftGroupHandleRegistry;
+
+const APPEND_STREAM_BACKLOG_FULL: &str = "raft append stream backlog full";
 
 pub(crate) type RaftClient = raft_internal_proto::raft_internal_client::RaftInternalClient<Channel>;
 
@@ -169,11 +179,58 @@ struct SharedRaftChannel {
 #[derive(Clone)]
 struct SharedAppendSession {
     sender: mpsc::UnboundedSender<AppendStreamCall>,
+    /// Bytes of Append calls this session may hold before they reach the HTTP/2 encoder
+    /// ([`RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES`]).
+    budget: Arc<Semaphore>,
 }
 
 struct AppendStreamCall {
     envelope: raft_internal_proto::RaftRpcEnvelopeV1,
     response: oneshot::Sender<Result<raft_internal_proto::RaftRpcAckV1, tonic::Status>>,
+    queued: QueuedAppendBytes,
+}
+
+/// A share of a byte budget, held from the moment an Append call (or an inbound frame) is
+/// buffered until it leaves the buffer: on the leader when the HTTP/2 encoder takes the frame or
+/// the caller gave up before it was sent; on the follower when the frame's items are answered.
+/// Keeps the process-wide gauge in step.
+struct QueuedAppendBytes {
+    _permit: OwnedSemaphorePermit,
+    bytes: u64,
+    gauge: &'static AtomicU64,
+}
+
+impl QueuedAppendBytes {
+    fn new(
+        permit: OwnedSemaphorePermit,
+        bytes: u64,
+        gauge: &'static AtomicU64,
+        max: &'static AtomicU64,
+    ) -> Self {
+        let now = gauge
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes);
+        max.fetch_max(now, Ordering::Relaxed);
+        Self {
+            _permit: permit,
+            bytes,
+            gauge,
+        }
+    }
+}
+
+impl Drop for QueuedAppendBytes {
+    fn drop(&mut self) {
+        self.gauge.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// Budget charge of a buffered message of `encoded_len` bytes: at least
+/// [`RAFT_GRPC_APPEND_STREAM_MIN_CHARGE_BYTES`] so tiny heartbeats bound the queue length too, and
+/// at most the whole budget so one oversized message still passes when nothing else is queued.
+fn append_budget_charge(encoded_len: usize, budget: usize) -> u32 {
+    let charge = encoded_len.clamp(RAFT_GRPC_APPEND_STREAM_MIN_CHARGE_BYTES, budget);
+    u32::try_from(charge).unwrap_or(u32::MAX)
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -190,6 +247,20 @@ pub struct RaftGrpcMetricsSnapshot {
     pub raft_grpc_append_stream_batch_items_max: u64,
     pub raft_grpc_append_stream_inflight: u64,
     pub raft_grpc_append_stream_inflight_max: u64,
+    /// Leader side: bytes of Append calls queued for peers but not yet taken by the HTTP/2
+    /// encoder, bounded per peer by `RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES`.
+    pub raft_grpc_append_stream_queued_bytes: u64,
+    pub raft_grpc_append_stream_queued_bytes_max: u64,
+    /// Append calls refused because the peer's queue was full (the replication
+    /// stream backs off instead of piling up more copies of its entries).
+    pub raft_grpc_append_stream_backpressure_rejections: u64,
+    /// Queued Append calls dropped unsent because their caller had already timed out.
+    pub raft_grpc_append_stream_expired_unsent: u64,
+    /// Append sessions closed because the peer stopped answering.
+    pub raft_grpc_append_stream_stalls: u64,
+    /// Follower side: decoded inbound Append frames not yet answered.
+    pub raft_grpc_append_stream_server_buffered_bytes: u64,
+    pub raft_grpc_append_stream_server_buffered_bytes_max: u64,
     /// Logical protobuf bytes before tonic's optional ZSTD compression and
     /// HTTP/2 framing. Compare these counters with VPC/CUR bytes to calculate
     /// transport and billing amplification.
@@ -231,6 +302,19 @@ pub fn raft_grpc_metrics_snapshot() -> RaftGrpcMetricsSnapshot {
         raft_grpc_append_stream_inflight: GRPC_APPEND_STREAM_INFLIGHT.load(Ordering::Relaxed),
         raft_grpc_append_stream_inflight_max: GRPC_APPEND_STREAM_INFLIGHT_MAX
             .load(Ordering::Relaxed),
+        raft_grpc_append_stream_queued_bytes: GRPC_APPEND_STREAM_QUEUED_BYTES
+            .load(Ordering::Relaxed),
+        raft_grpc_append_stream_queued_bytes_max: GRPC_APPEND_STREAM_QUEUED_BYTES_MAX
+            .load(Ordering::Relaxed),
+        raft_grpc_append_stream_backpressure_rejections: GRPC_APPEND_STREAM_BACKPRESSURE_REJECTIONS
+            .load(Ordering::Relaxed),
+        raft_grpc_append_stream_expired_unsent: GRPC_APPEND_STREAM_EXPIRED_UNSENT
+            .load(Ordering::Relaxed),
+        raft_grpc_append_stream_stalls: GRPC_APPEND_STREAM_STALLS.load(Ordering::Relaxed),
+        raft_grpc_append_stream_server_buffered_bytes: GRPC_APPEND_STREAM_SERVER_BUFFERED_BYTES
+            .load(Ordering::Relaxed),
+        raft_grpc_append_stream_server_buffered_bytes_max:
+            GRPC_APPEND_STREAM_SERVER_BUFFERED_BYTES_MAX.load(Ordering::Relaxed),
         raft_grpc_append_heartbeat_requests: GRPC_APPEND_HEARTBEAT_REQUESTS.load(Ordering::Relaxed),
         raft_grpc_append_heartbeat_request_bytes: GRPC_APPEND_HEARTBEAT_REQUEST_BYTES
             .load(Ordering::Relaxed),
@@ -291,6 +375,21 @@ pub const RAFT_GRPC_MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const RAFT_GRPC_PROTOCOL_VERSION: u32 = 1;
 const RAFT_GRPC_APPEND_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const RAFT_GRPC_APPEND_STREAM_MAX_BATCH_ITEMS: usize = 32;
+/// Leader side, per peer: bytes of Append calls queued (not yet taken by the HTTP/2 encoder).
+/// Beyond it a call fails fast as `Unavailable`, which OpenRaft treats as an unreachable peer and
+/// backs off on. Before this bound a lagging peer's queue grew without limit: every replication
+/// retry after a 250 ms RPC timeout queued another copy of the same entries while the timed-out
+/// copies were still sent (EKS, 128 SQLite-VFS owners: ~0.7 GB/min per node to OOM).
+const RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
+/// Follower side, per inbound stream: decoded Append frames held before they are answered.
+const RAFT_GRPC_APPEND_STREAM_SERVER_MAX_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
+const RAFT_GRPC_APPEND_STREAM_MIN_CHARGE_BYTES: usize = 1024;
+/// Request frames between the session loop and the HTTP/2 encoder. Kept small so queued calls
+/// wait where an expired caller can still be skipped.
+const RAFT_GRPC_APPEND_STREAM_WIRE_FRAMES: usize = 4;
+/// A session with calls outstanding and no response for this long is closed (its calls fail as
+/// `Unavailable`); the next call opens a fresh stream.
+const RAFT_GRPC_APPEND_STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(15);
 const RAFT_GRPC_ZSTD_MIN_MESSAGE_BYTES: usize = 1024;
 
 #[derive(Debug)]
@@ -453,30 +552,59 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
     ) -> Result<tonic::Response<Self::AppendStreamStream>, tonic::Status> {
         let registry = self.registry.clone();
         let concurrency = Arc::new(Semaphore::new(64));
+        // Decoded frames waiting for (or in) processing hold a share of this budget; the next
+        // frame is not read off the stream until it fits, so a slow follower pushes back through
+        // HTTP/2 flow control instead of buffering the leader's backlog in memory.
+        let budget = Arc::new(Semaphore::new(
+            RAFT_GRPC_APPEND_STREAM_SERVER_MAX_BUFFERED_BYTES,
+        ));
         let shutdown = registry.subscribe_transport_shutdown();
         let requests = futures_util::stream::unfold(
-            (request.into_inner(), shutdown),
-            |(mut requests, mut shutdown)| async move {
+            (request.into_inner(), shutdown, budget),
+            |(mut requests, mut shutdown, budget)| async move {
                 if *shutdown.borrow() {
                     return None;
                 }
-                tokio::select! {
+                let request = tokio::select! {
                     biased;
                     changed = shutdown.changed() => {
                         let _ = changed;
-                        None
+                        return None;
                     }
-                    request = requests.next() => {
-                        request.map(|request| (request, (requests, shutdown)))
+                    request = requests.next() => request?,
+                };
+                let buffered = match &request {
+                    Ok(frame) => {
+                        let charge = append_budget_charge(
+                            frame.encoded_len(),
+                            RAFT_GRPC_APPEND_STREAM_SERVER_MAX_BUFFERED_BYTES,
+                        );
+                        let permit = tokio::select! {
+                            biased;
+                            changed = shutdown.changed() => {
+                                let _ = changed;
+                                return None;
+                            }
+                            permit = budget.clone().acquire_many_owned(charge) => permit.ok()?,
+                        };
+                        Some(QueuedAppendBytes::new(
+                            permit,
+                            u64::from(charge),
+                            &GRPC_APPEND_STREAM_SERVER_BUFFERED_BYTES,
+                            &GRPC_APPEND_STREAM_SERVER_BUFFERED_BYTES_MAX,
+                        ))
                     }
-                }
+                    Err(_) => None,
+                };
+                Some(((request, buffered), (requests, shutdown, budget)))
             },
         );
         let responses = requests
-            .map(move |request| {
+            .map(move |(request, buffered)| {
                 let registry = registry.clone();
                 let concurrency = concurrency.clone();
                 async move {
+                    let _buffered = buffered;
                     let request = request?;
                     let items = futures_util::stream::iter(request.items)
                         .map(|item| {
@@ -1010,16 +1138,51 @@ impl GrpcRaftNetwork {
         let client = self
             .client()
             .map_err(|err| tonic::Status::unavailable(err.to_string()))?;
-        let sender =
+        let session =
             shared_append_session(&self.endpoint, client).map_err(tonic::Status::unavailable)?;
+        let charge = append_budget_charge(
+            envelope.encoded_len(),
+            RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES,
+        );
+        // Fair admission: a call that does not fit waits in the semaphore's FIFO queue, which
+        // hands freed budget to the oldest waiter first (and lets no later call overtake it), so
+        // a multi-MiB catch-up append is not starved by a stream of small ones. The wait shares
+        // the call's OpenRaft deadline; still not admitted by then is the true overflow case.
+        let deadline = tokio::time::Instant::now() + option.hard_ttl();
+        let admitted = match session.budget.clone().try_acquire_many_owned(charge) {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                tokio::time::timeout_at(deadline, session.budget.clone().acquire_many_owned(charge))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+            }
+        };
+        let Some(permit) = admitted else {
+            GRPC_APPEND_STREAM_BACKPRESSURE_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            return Err(tonic::Status::unavailable(format!(
+                "{APPEND_STREAM_BACKLOG_FULL}: {} of {} bytes queued",
+                RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES
+                    .saturating_sub(session.budget.available_permits()),
+                RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES,
+            )));
+        };
+        let queued = QueuedAppendBytes::new(
+            permit,
+            u64::from(charge),
+            &GRPC_APPEND_STREAM_QUEUED_BYTES,
+            &GRPC_APPEND_STREAM_QUEUED_BYTES_MAX,
+        );
         let (response_sender, response_receiver) = oneshot::channel();
-        sender
+        session
+            .sender
             .send(AppendStreamCall {
                 envelope,
                 response: response_sender,
+                queued,
             })
             .map_err(|_| tonic::Status::unavailable("raft append stream is closed"))?;
-        match tokio::time::timeout(option.hard_ttl(), response_receiver).await {
+        match tokio::time::timeout_at(deadline, response_receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(tonic::Status::unavailable(
                 "raft append stream closed without a response",
@@ -1041,8 +1204,14 @@ impl GrpcRaftNetwork {
                 Ok(ack)
             }
             Err(status) => {
+                // A full queue is congestion on a live stream, not a broken channel: rebuilding
+                // the channel would not drain it.
+                let backpressure = status.code() == tonic::Code::Unavailable
+                    && status.message().starts_with(APPEND_STREAM_BACKLOG_FULL);
                 let mapped = self.map_tonic_status("AppendStream", status);
-                self.note_failure("AppendStream");
+                if !backpressure {
+                    self.note_failure("AppendStream");
+                }
                 Err(mapped)
             }
         }
@@ -1132,7 +1301,7 @@ fn shared_raft_client(
 fn shared_append_session(
     endpoint: &str,
     client: RaftClient,
-) -> Result<mpsc::UnboundedSender<AppendStreamCall>, String> {
+) -> Result<SharedAppendSession, String> {
     let sessions = GRPC_APPEND_SESSIONS.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut sessions = sessions
         .lock()
@@ -1140,25 +1309,39 @@ fn shared_append_session(
     if let Some(session) = sessions.get(endpoint)
         && !session.sender.is_closed()
     {
-        return Ok(session.sender.clone());
+        return Ok(session.clone());
     }
 
     let (sender, receiver) = mpsc::unbounded_channel();
     tokio::spawn(run_append_session(client, receiver));
-    sessions.insert(endpoint.to_owned(), SharedAppendSession {
-        sender: sender.clone(),
-    });
-    Ok(sender)
+    let session = SharedAppendSession {
+        sender,
+        budget: Arc::new(Semaphore::new(RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES)),
+    };
+    sessions.insert(endpoint.to_owned(), session.clone());
+    Ok(session)
 }
 
+/// Collect `first` and the calls already queued behind it (up to the frame limit) into one
+/// frame, dropping calls whose caller has already given up: their response would go nowhere, and
+/// sending them anyway is what turned a lagging peer into an ever-growing backlog (each OpenRaft
+/// retry re-queues the same entries).
 fn collect_append_stream_frame(
     first: AppendStreamCall,
     calls: &mut mpsc::UnboundedReceiver<AppendStreamCall>,
 ) -> (Vec<AppendStreamCall>, bool) {
-    let mut frame = vec![first];
+    fn keep(call: AppendStreamCall, frame: &mut Vec<AppendStreamCall>) {
+        if call.response.is_closed() {
+            GRPC_APPEND_STREAM_EXPIRED_UNSENT.fetch_add(1, Ordering::Relaxed);
+        } else {
+            frame.push(call);
+        }
+    }
+    let mut frame = Vec::new();
+    keep(first, &mut frame);
     while frame.len() < RAFT_GRPC_APPEND_STREAM_MAX_BATCH_ITEMS {
         match calls.try_recv() {
-            Ok(call) => frame.push(call),
+            Ok(call) => keep(call, &mut frame),
             Err(mpsc::error::TryRecvError::Empty) => return (frame, true),
             Err(mpsc::error::TryRecvError::Disconnected) => return (frame, false),
         }
@@ -1166,15 +1349,31 @@ fn collect_append_stream_frame(
     (frame, true)
 }
 
+type PendingAppend = oneshot::Sender<Result<raft_internal_proto::RaftRpcAckV1, tonic::Status>>;
+
+/// One request frame on its way to the encoder, with the queue budget its calls hold until the
+/// encoder takes it.
+type WireFrame = (
+    raft_internal_proto::RaftAppendStreamRequest,
+    Vec<QueuedAppendBytes>,
+);
+
 async fn run_append_session(
     mut client: RaftClient,
     mut calls: mpsc::UnboundedReceiver<AppendStreamCall>,
 ) {
-    let (wire_sender, wire_receiver) = mpsc::channel(1024);
+    let (wire_sender, wire_receiver) =
+        mpsc::channel::<WireFrame>(RAFT_GRPC_APPEND_STREAM_WIRE_FRAMES);
+    // The encoder pulls the next frame only when HTTP/2 flow control has room; the queue budget is
+    // released right there, so it bounds exactly the bytes waiting on this side of the wire.
+    let outbound = ReceiverStream::new(wire_receiver).map(|(request, queued)| {
+        drop(queued);
+        request
+    });
     client = client.send_compressed(CompressionEncoding::Zstd);
     let response = tokio::time::timeout(
         RAFT_GRPC_APPEND_STREAM_CONNECT_TIMEOUT,
-        client.append_stream(tonic::Request::new(ReceiverStream::new(wire_receiver))),
+        client.append_stream(tonic::Request::new(outbound)),
     )
     .await;
     let mut responses = match response {
@@ -1193,12 +1392,10 @@ async fn run_append_session(
     };
 
     let mut wire_sender = Some(wire_sender);
-    let mut pending = BTreeMap::<
-        u64,
-        oneshot::Sender<Result<raft_internal_proto::RaftRpcAckV1, tonic::Status>>,
-    >::new();
+    let mut pending = BTreeMap::<u64, PendingAppend>::new();
     let mut next_request_id = 1_u64;
     let mut accepting = true;
+    let mut last_progress = tokio::time::Instant::now();
 
     loop {
         let pending_before_retain = pending.len();
@@ -1208,68 +1405,25 @@ async fn run_append_session(
         if !accepting && pending.is_empty() {
             break;
         }
+        if pending.is_empty() {
+            last_progress = tokio::time::Instant::now();
+        }
+        let stall_deadline = last_progress + RAFT_GRPC_APPEND_STREAM_STALL_TIMEOUT;
+        // Take a call only once the wire has room for its frame, so this loop never blocks on
+        // the wire while responses (which free the peer to read more) wait unread.
+        let next_call = async {
+            let slot = match wire_sender.as_ref() {
+                Some(sender) => sender.clone().reserve_owned().await.ok(),
+                None => None,
+            };
+            (slot, calls.recv().await)
+        };
         tokio::select! {
-            call = calls.recv(), if accepting => {
-                let Some(call) = call else {
-                    accepting = false;
-                    wire_sender.take();
-                    continue;
-                };
-                let (frame_calls, receiver_open) =
-                    collect_append_stream_frame(call, &mut calls);
-                if !receiver_open {
-                    accepting = false;
-                }
-                let frame_items = frame_calls.len() as u64;
-                let inflight = GRPC_APPEND_STREAM_INFLIGHT
-                    .fetch_add(frame_items, Ordering::Relaxed)
-                    .saturating_add(frame_items);
-                GRPC_APPEND_STREAM_INFLIGHT_MAX.fetch_max(inflight, Ordering::Relaxed);
-                GRPC_APPEND_STREAM_REQUESTS.fetch_add(frame_items, Ordering::Relaxed);
-                GRPC_APPEND_STREAM_REQUEST_FRAMES.fetch_add(1, Ordering::Relaxed);
-                if frame_items > 1 {
-                    GRPC_APPEND_STREAM_BATCH_FRAMES.fetch_add(1, Ordering::Relaxed);
-                }
-                GRPC_APPEND_STREAM_BATCH_ITEMS_MAX.fetch_max(frame_items, Ordering::Relaxed);
-
-                let mut items = Vec::with_capacity(frame_calls.len());
-                for call in frame_calls {
-                    let request_id = next_request_id;
-                    next_request_id = next_request_id.saturating_add(1);
-                    GRPC_APPEND_STREAM_REQUEST_BYTES.fetch_add(
-                        call.envelope.encoded_len() as u64,
-                        Ordering::Relaxed,
-                    );
-                    pending.insert(request_id, call.response);
-                    items.push(raft_internal_proto::RaftAppendStreamRequestItem {
-                        request_id,
-                        envelope: Some(call.envelope),
-                    });
-                }
-                let request_ids = items.iter().map(|item| item.request_id).collect::<Vec<_>>();
-                let request = raft_internal_proto::RaftAppendStreamRequest {
-                    items,
-                };
-                let sent = match wire_sender.as_ref() {
-                    Some(sender) => sender.send(request).await.is_ok(),
-                    None => false,
-                };
-                if !sent {
-                    GRPC_APPEND_STREAM_INFLIGHT.fetch_sub(frame_items, Ordering::Relaxed);
-                    for request_id in request_ids {
-                        if let Some(response) = pending.remove(&request_id) {
-                            let _ = response.send(Err(tonic::Status::unavailable(
-                                "raft append stream request channel closed",
-                            )));
-                        }
-                    }
-                    accepting = false;
-                    wire_sender.take();
-                }
-            }
+            biased;
             response = responses.message() => {
                 match response {
                     Ok(Some(response)) => {
+                        last_progress = tokio::time::Instant::now();
                         GRPC_APPEND_STREAM_RESPONSE_FRAMES.fetch_add(1, Ordering::Relaxed);
                         GRPC_APPEND_STREAM_RESPONSE_BYTES.fetch_add(
                             response.encoded_len() as u64,
@@ -1305,6 +1459,67 @@ async fn run_append_session(
                         break;
                     }
                 }
+            }
+            () = tokio::time::sleep_until(stall_deadline), if !pending.is_empty() => {
+                GRPC_APPEND_STREAM_STALLS.fetch_add(1, Ordering::Relaxed);
+                GRPC_APPEND_STREAM_SESSION_FAILURES.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            (slot, call) = next_call, if accepting => {
+                let Some(call) = call else {
+                    accepting = false;
+                    wire_sender.take();
+                    continue;
+                };
+                let (frame_calls, receiver_open) =
+                    collect_append_stream_frame(call, &mut calls);
+                if !receiver_open {
+                    accepting = false;
+                }
+                if frame_calls.is_empty() {
+                    continue;
+                }
+                let Some(slot) = slot else {
+                    for call in frame_calls {
+                        let _ = call.response.send(Err(tonic::Status::unavailable(
+                            "raft append stream request channel closed",
+                        )));
+                    }
+                    accepting = false;
+                    wire_sender.take();
+                    continue;
+                };
+                let frame_items = frame_calls.len() as u64;
+                let inflight = GRPC_APPEND_STREAM_INFLIGHT
+                    .fetch_add(frame_items, Ordering::Relaxed)
+                    .saturating_add(frame_items);
+                GRPC_APPEND_STREAM_INFLIGHT_MAX.fetch_max(inflight, Ordering::Relaxed);
+                GRPC_APPEND_STREAM_REQUESTS.fetch_add(frame_items, Ordering::Relaxed);
+                GRPC_APPEND_STREAM_REQUEST_FRAMES.fetch_add(1, Ordering::Relaxed);
+                if frame_items > 1 {
+                    GRPC_APPEND_STREAM_BATCH_FRAMES.fetch_add(1, Ordering::Relaxed);
+                }
+                GRPC_APPEND_STREAM_BATCH_ITEMS_MAX.fetch_max(frame_items, Ordering::Relaxed);
+
+                let mut items = Vec::with_capacity(frame_calls.len());
+                let mut queued = Vec::with_capacity(frame_calls.len());
+                for call in frame_calls {
+                    let request_id = next_request_id;
+                    next_request_id = next_request_id.saturating_add(1);
+                    GRPC_APPEND_STREAM_REQUEST_BYTES.fetch_add(
+                        call.envelope.encoded_len() as u64,
+                        Ordering::Relaxed,
+                    );
+                    pending.insert(request_id, call.response);
+                    queued.push(call.queued);
+                    items.push(raft_internal_proto::RaftAppendStreamRequestItem {
+                        request_id,
+                        envelope: Some(call.envelope),
+                    });
+                }
+                // The slot was reserved above, so this cannot wait.
+                let _sender =
+                    slot.send((raft_internal_proto::RaftAppendStreamRequest { items }, queued));
             }
         }
     }
@@ -1558,30 +1773,184 @@ mod reconnect_tests {
         (format!("http://{address}"), registry, task)
     }
 
+    static TEST_QUEUED_BYTES: AtomicU64 = AtomicU64::new(0);
+    static TEST_QUEUED_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
+
+    /// A queued call and the receiver its caller waits on (dropping it = the caller gave up).
+    fn queued_call(
+        raft_group_id: u32,
+    ) -> (
+        AppendStreamCall,
+        oneshot::Receiver<Result<raft_internal_proto::RaftRpcAckV1, tonic::Status>>,
+    ) {
+        let (response, receiver) = oneshot::channel();
+        let permit = Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("test permit");
+        let call = AppendStreamCall {
+            envelope: raft_internal_proto::RaftRpcEnvelopeV1 {
+                raft_group_id,
+                node_id: 2,
+                protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+                payload: Vec::new().into(),
+            },
+            response,
+            queued: QueuedAppendBytes::new(permit, 0, &TEST_QUEUED_BYTES, &TEST_QUEUED_BYTES_MAX),
+        };
+        (call, receiver)
+    }
+
     #[test]
     fn append_stream_frame_drains_only_already_queued_calls() {
         let (sender, mut receiver) = mpsc::unbounded_channel();
-        let call = |raft_group_id| {
-            let (response, _receiver) = oneshot::channel();
-            AppendStreamCall {
-                envelope: raft_internal_proto::RaftRpcEnvelopeV1 {
-                    raft_group_id,
-                    node_id: 2,
-                    protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
-                    payload: Vec::new().into(),
-                },
-                response,
-            }
-        };
-        sender.send(call(2)).expect("queue second call");
-        sender.send(call(3)).expect("queue third call");
+        let (first, _first) = queued_call(1);
+        let (second, _second) = queued_call(2);
+        let (third, _third) = queued_call(3);
+        sender.send(second).expect("queue second call");
+        sender.send(third).expect("queue third call");
 
-        let (batch, receiver_open) = collect_append_stream_frame(call(1), &mut receiver);
+        let (batch, receiver_open) = collect_append_stream_frame(first, &mut receiver);
         assert!(receiver_open);
         assert_eq!(batch.len(), 3);
         assert_eq!(batch[0].envelope.raft_group_id, 1);
         assert_eq!(batch[1].envelope.raft_group_id, 2);
         assert_eq!(batch[2].envelope.raft_group_id, 3);
+    }
+
+    #[test]
+    fn append_stream_frame_drops_calls_whose_caller_gave_up() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (first, first_waiter) = queued_call(1);
+        let (second, _second_waiter) = queued_call(2);
+        let (third, third_waiter) = queued_call(3);
+        drop(first_waiter);
+        drop(third_waiter);
+        sender.send(second).expect("queue second call");
+        sender.send(third).expect("queue third call");
+
+        let (batch, receiver_open) = collect_append_stream_frame(first, &mut receiver);
+        assert!(receiver_open);
+        assert_eq!(batch.len(), 1, "timed-out calls must not be sent");
+        assert_eq!(batch[0].envelope.raft_group_id, 2);
+    }
+
+    /// The EKS OOM: a peer that does not keep up must not let the leader queue an unbounded
+    /// backlog of Append calls (each OpenRaft retry after a 250 ms timeout queued another copy of
+    /// the same entries). Here the session never drains: the queue stops at the byte budget, later
+    /// calls fail fast as backpressure, and backpressure does not count toward a channel rebuild.
+    #[tokio::test]
+    async fn stalled_peer_append_queue_is_bounded_by_its_byte_budget() {
+        let endpoint = "http://127.0.0.1:9".to_owned();
+        let (sender, _stalled_receiver) = mpsc::unbounded_channel();
+        let budget = Arc::new(Semaphore::new(RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES));
+        GRPC_APPEND_SESSIONS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("append session pool lock")
+            .insert(endpoint.clone(), SharedAppendSession {
+                sender,
+                budget: budget.clone(),
+            });
+        let mut network = GrpcRaftNetwork::new(RaftGroupId(1), 2, endpoint.clone());
+        let entry_bytes = 1024 * 1024;
+        let envelope = || raft_internal_proto::RaftRpcEnvelopeV1 {
+            raft_group_id: 1,
+            node_id: 2,
+            protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+            payload: vec![7_u8; entry_bytes].into(),
+        };
+        let mut timed_out = 0;
+        let mut rejected = 0;
+        for _ in 0..(3 * RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES / entry_bytes) {
+            let result = network
+                .try_append_stream(envelope(), RPCOption::new(Duration::from_millis(1)))
+                .await;
+            let status = result.expect_err("a stalled peer never answers");
+            match status.code() {
+                tonic::Code::DeadlineExceeded => timed_out += 1,
+                tonic::Code::Unavailable => {
+                    assert!(status.message().starts_with(APPEND_STREAM_BACKLOG_FULL));
+                    rejected += 1;
+                }
+                code => panic!("unexpected status {code:?}"),
+            }
+        }
+        // Only what fits the budget was queued (and is still held: nothing drained it).
+        assert!(timed_out <= RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES / entry_bytes);
+        assert!(budget.available_permits() < entry_bytes);
+        assert!(rejected >= 2 * RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES / entry_bytes);
+
+        // Backpressure is congestion on a live stream, not a broken channel.
+        let failures_before = network.consecutive_failures;
+        let error = network
+            .append_rpc(envelope(), RPCOption::new(Duration::from_millis(1)))
+            .await
+            .expect_err("still backlogged");
+        assert!(matches!(error, RPCError::Unreachable(_)));
+        assert_eq!(network.consecutive_failures, failures_before);
+        GRPC_APPEND_SESSIONS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("append session pool lock")
+            .remove(&endpoint);
+    }
+
+    /// Fair admission: a large catch-up append waiting for budget is served
+    /// before later small calls, which must not overtake it.
+    #[tokio::test]
+    async fn large_append_is_not_starved_by_later_small_calls() {
+        let endpoint = "http://127.0.0.1:10".to_owned();
+        let (sender, _stalled_receiver) = mpsc::unbounded_channel();
+        let budget = Arc::new(Semaphore::new(RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES));
+        GRPC_APPEND_SESSIONS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("append session pool lock")
+            .insert(endpoint.clone(), SharedAppendSession {
+                sender,
+                budget: budget.clone(),
+            });
+        let mib = 1024 * 1024;
+        let others = budget
+            .clone()
+            .try_acquire_many_owned(
+                u32::try_from(RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES - mib).expect("fits"),
+            )
+            .expect("other groups' queued bytes");
+        let envelope = |raft_group_id, bytes: usize| raft_internal_proto::RaftRpcEnvelopeV1 {
+            raft_group_id,
+            node_id: 2,
+            protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+            payload: vec![7_u8; bytes].into(),
+        };
+        let large = GrpcRaftNetwork::new(RaftGroupId(1), 2, endpoint.clone());
+        let large = tokio::spawn(async move {
+            large
+                .try_append_stream(envelope(1, 2 * mib), RPCOption::new(Duration::from_secs(2)))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Budget is free for a small call, but the large one is ahead of it.
+        let small = GrpcRaftNetwork::new(RaftGroupId(2), 2, endpoint.clone())
+            .try_append_stream(envelope(2, 16), RPCOption::new(Duration::from_millis(50)))
+            .await
+            .expect_err("the small call waits behind the large one");
+        assert_eq!(small.code(), tonic::Code::Unavailable);
+        assert!(small.message().starts_with(APPEND_STREAM_BACKLOG_FULL));
+
+        drop(others);
+        let large = large.await.expect("large call task");
+        // Admitted and queued; the stalled peer never answers it.
+        assert_eq!(
+            large.expect_err("stalled peer").code(),
+            tonic::Code::DeadlineExceeded
+        );
+        GRPC_APPEND_SESSIONS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("append session pool lock")
+            .remove(&endpoint);
     }
 
     #[tokio::test]

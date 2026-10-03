@@ -7,6 +7,7 @@
 //   tier).
 // Process and S3 helpers trimmed from clients/pi-durable-ursula/test/stack.
 import { type ChildProcess, spawn } from "node:child_process";
+import { appendFileSync } from "node:fs";
 import { createHash, createHmac } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
@@ -38,13 +39,21 @@ function ursulaBin(): string {
 class Proc {
 	private readonly child: ChildProcess;
 	private tail = "";
-	constructor(bin: string, args: readonly string[], cwd: string, env: NodeJS.ProcessEnv = {}) {
+	/** With E2E_LOG_DIR set, the full output also goes to `${E2E_LOG_DIR}/${name}.log`. */
+	constructor(bin: string, args: readonly string[], cwd: string, env: NodeJS.ProcessEnv = {}, name?: string) {
 		this.child = spawn(bin, [...args], { cwd, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...env } });
+		const logDir = process.env.E2E_LOG_DIR;
+		const logFile = logDir !== undefined && logDir.length > 0 && name !== undefined ? join(logDir, `${name}.log`) : undefined;
+		if (logFile !== undefined) mkdirSync(logDir as string, { recursive: true });
 		const keep = (chunk: Buffer): void => {
 			this.tail = (this.tail + chunk.toString()).slice(-20_000);
+			if (logFile !== undefined) appendFileSync(logFile, chunk);
 		};
 		this.child.stdout?.on("data", keep);
 		this.child.stderr?.on("data", keep);
+	}
+	get pid(): number {
+		return this.child.pid ?? 0;
 	}
 	get exited(): boolean {
 		return this.child.exitCode !== null || this.child.signalCode !== null;
@@ -107,8 +116,15 @@ async function waitWritable(url: string, logs: () => string): Promise<void> {
 	throw new Error(`ursula not writable: ${last}\n${logs()}`);
 }
 
+/** A server node: its HTTP URL and process id (for RSS sampling). */
+export interface StackNode {
+	readonly url: string;
+	readonly pid: number;
+}
+
 interface Stack {
 	readonly url: string;
+	readonly nodes: readonly StackNode[];
 	stop(): Promise<void>;
 }
 
@@ -150,7 +166,7 @@ async function startSingle(): Promise<Stack> {
 		await stop();
 		throw error;
 	}
-	return { url, stop };
+	return { url, nodes: [{ url, pid: node.pid }], stop };
 }
 
 // ---- S3 (MinIO): bucket creation with a minimal path-style SigV4 request
@@ -189,6 +205,11 @@ async function startCluster(): Promise<Stack> {
 	const bucket = `sqlite-${process.pid}-${Date.now().toString(36)}`;
 	await createS3Bucket(endpoint, bucket, accessKey, secretKey, region);
 	const dir = mkdtempSync(join(tmpdir(), "sqlite-ursula-cluster-"));
+	// Defaults are the e2e shape; the soak (test/soak.e2e.ts) raises them with E2E_GROUPS,
+	// E2E_CORES and E2E_WAL=disk.
+	const groups = Number(process.env.E2E_GROUPS ?? 4);
+	const cores = Number(process.env.E2E_CORES ?? 2);
+	const wal = process.env.E2E_WAL ?? "memory";
 	const nodes: { id: number; port: number; admin: string }[] = [];
 	for (const id of [1, 2, 3]) nodes.push({ id, port: await freePort(), admin: `http://127.0.0.1:${await freePort()}` });
 	const procs: Proc[] = [];
@@ -208,17 +229,16 @@ async function startCluster(): Promise<Stack> {
 				`admin_listen = "${node.admin.replace("http://", "")}"`,
 				"",
 				"[runtime]",
-				"core_count = 2",
+				`core_count = ${cores}`,
 				"",
 				"[raft]",
 				`node_id = ${node.id}`,
-				"group_count = 4",
+				`group_count = ${groups}`,
 				`init_membership = ${node.id === 1}`,
 				"init_membership_per_group = false",
 				"",
 				"[raft.wal]",
-				'backend = "memory"',
-				"allow_volatile_multi_peer = true",
+				...(wal === "disk" ? ['backend = "disk"', `path = "${join(nodeDir, "wal")}"`] : ['backend = "memory"', "allow_volatile_multi_peer = true"]),
 			];
 			for (const peer of nodes) lines.push("", "[[raft.peers]]", `node_id = ${peer.id}`, `url = "http://127.0.0.1:${peer.port}"`);
 			lines.push(
@@ -236,13 +256,13 @@ async function startCluster(): Promise<Stack> {
 				'server_side_encryption = "none"',
 			);
 			writeFileSync(config, `${lines.join("\n")}\n`);
-			procs.push(new Proc(ursulaBin(), ["server", "--config", config], nodeDir, { AWS_ACCESS_KEY_ID: accessKey, AWS_SECRET_ACCESS_KEY: secretKey, AWS_REGION: region }));
+			procs.push(new Proc(ursulaBin(), ["server", "--config", config], nodeDir, { AWS_ACCESS_KEY_ID: accessKey, AWS_SECRET_ACCESS_KEY: secretKey, AWS_REGION: region }, `node${node.id}`));
 		}
 		await Promise.all(nodes.map((node, i) => waitReady(`http://127.0.0.1:${node.port}/__ursula/ready`, procs[i] as Proc)));
 		const gatewayPort = await freePort();
-		const args = ["gateway", "--listen", `127.0.0.1:${gatewayPort}`, "--raft-group-count", "4"];
+		const args = ["gateway", "--listen", `127.0.0.1:${gatewayPort}`, "--raft-group-count", `${groups}`];
 		for (const node of nodes) args.push("--upstream", `http://127.0.0.1:${node.port}`);
-		procs.push(new Proc(ursulaBin(), args, dir));
+		procs.push(new Proc(ursulaBin(), args, dir, {}, "gateway"));
 		const url = `http://127.0.0.1:${gatewayPort}`;
 		await waitWritable(url, logs);
 		// Feature level 5 on every group: POST to every node until every hosted replica reports it.
@@ -258,7 +278,7 @@ async function startCluster(): Promise<Stack> {
 			if (Date.now() > deadline) throw new Error(`feature level 5 not reached (min ${min})\n${logs()}`);
 			await sleep(250);
 		}
-		return { url, stop };
+		return { url, nodes: nodes.map((node, i) => ({ url: `http://127.0.0.1:${node.port}`, pid: (procs[i] as Proc).pid })), stop };
 	} catch (error) {
 		await stop();
 		throw error;
@@ -268,11 +288,13 @@ async function startCluster(): Promise<Stack> {
 declare module "vitest" {
 	export interface ProvidedContext {
 		ursulaUrl: string;
+		ursulaNodes: StackNode[];
 	}
 }
 
 export default async function setup(project: TestProject): Promise<() => Promise<void>> {
 	const stack = process.env.E2E_NODES === "3" ? await startCluster() : await startSingle();
 	project.provide("ursulaUrl", stack.url);
+	project.provide("ursulaNodes", [...stack.nodes]);
 	return () => stack.stop();
 }
