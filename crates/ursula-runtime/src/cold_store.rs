@@ -98,7 +98,7 @@ pub(crate) fn apply_s3_encryption(
 pub(crate) fn apply_s3_encryption_with_fetcher(
     builder: opendal::services::S3,
     s3: &ursula_config::S3Config,
-    fetcher: opendal::raw::HttpFetcher,
+    fetcher: opendal::raw::HttpClient,
 ) -> io::Result<(opendal::services::S3, &'static str)> {
     use ursula_config::S3ServerSideEncryption;
     let builder = match s3.server_side_encryption {
@@ -1898,9 +1898,12 @@ mod tests {
                 .access_key_id("AKIDTEST")
                 .secret_access_key("secret")
                 .session_token("token");
-            let (builder, _) =
-                super::apply_s3_encryption_with_fetcher(builder, s3, recorder.clone())
-                    .expect("encryption");
+            let (builder, _) = super::apply_s3_encryption_with_fetcher(
+                builder,
+                s3,
+                opendal::raw::HttpClient::with(recorder.clone()),
+            )
+            .expect("encryption");
             let store = ColdStore::from_operator(
                 opendal::Operator::new(builder).expect("operator").finish(),
                 super::ColdStoreInfo {

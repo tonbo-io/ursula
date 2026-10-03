@@ -19,8 +19,6 @@
 //! when it reaches the HTTP client, so [`MultipartSseFetch`] strips the
 //! headers there and signs the request again with the same credential chain.
 
-use std::sync::Arc;
-
 use http::Method;
 use http::Request;
 use http::Response;
@@ -29,8 +27,8 @@ use opendal::Buffer;
 use opendal::Error;
 use opendal::ErrorKind;
 use opendal::raw::HttpBody;
+use opendal::raw::HttpClient;
 use opendal::raw::HttpFetch;
-use opendal::raw::HttpFetcher;
 use reqsign::AwsConfig;
 use reqsign::AwsDefaultLoader;
 use reqsign::AwsV4Signer;
@@ -48,7 +46,7 @@ const UPLOAD_SCOPED_SSE_HEADERS: [&str; 4] = [
 /// UploadPart and CompleteMultipartUpload requests and re-signs them; every
 /// other request passes through untouched.
 pub(crate) struct MultipartSseFetch {
-    inner: HttpFetcher,
+    inner: HttpClient,
     signer: AwsV4Signer,
     loader: AwsDefaultLoader,
 }
@@ -58,7 +56,7 @@ impl MultipartSseFetch {
     /// a re-signed request carries the same identity as the original.
     /// `None` when no region resolves: opendal then refuses to build the
     /// operator anyway.
-    pub(crate) fn new(s3: &ursula_config::S3Config, inner: HttpFetcher) -> Option<Self> {
+    pub(crate) fn new(s3: &ursula_config::S3Config, inner: HttpClient) -> Option<Self> {
         let non_empty = |value: &Option<String>| {
             value
                 .as_deref()
@@ -144,6 +142,6 @@ impl HttpFetch for MultipartSseFetch {
 }
 
 /// The production HTTP transport opendal would otherwise build for S3.
-pub(crate) fn default_fetcher() -> HttpFetcher {
-    Arc::new(reqwest::Client::new())
+pub(crate) fn default_fetcher() -> HttpClient {
+    HttpClient::with(reqwest::Client::new())
 }
