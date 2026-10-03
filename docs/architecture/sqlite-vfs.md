@@ -204,3 +204,75 @@ and the log keeps growing. A superseded cold body stays readable for 5 minutes.
 - The same Pi conformance, snapshot and benchmark suites on 3 nodes + gateway + MinIO at feature
   level 5 (the snapshot run's ~3.5 MB bodies go to the cold tier), with a 64 KiB snapshot minimum
   so the benchmark's Pi workload snapshots and trims at its database size.
+
+## 9. Performance
+
+One run, 2026-10-03, main `740d910`. EKS 1.33 in us-east-1: three `m6i.xlarge` Ursula nodes, one
+per AZ (chart defaults of `charts/ursula/examples/production-eks.yaml`: 256 groups, 4 cores, 8 GiB
+limit), three gateways, real S3 cold tier and snapshot store, feature level 5. The client is one
+`m6i.2xlarge` pod (node 22, the extension built in CI) in us-east-1a, one process per database,
+writing through the gateway Service. Workload: Pi Durable's `SqliteStorage` via
+`openUrsulaPiStorage`, a real `Harness` with a faux model, turns of text, text, tool (5.0 Pi
+commits per turn). Latency is `Storage.commit` wall time after a 30 s warm-up; each cell ran 10.5
+min. Disk: `raft.wal.backend = "disk"` on 50 GiB gp3. Deviations from the chart: gateway
+`maxRequestBodyBytes` 1 GiB (for the 1 GB snapshot) and `server_side_encryption = "none"` (see
+the S3 note below; the bucket's default SSE-S3 still applies).
+
+Commit latency, ms (p50 / p99 / p99.9 / max), and throughput:
+
+| cell | memory WAL | disk WAL |
+| --- | --- | --- |
+| 1 owner, 1 turn / 2 s | 7.0 / 10.9 / 23.7 / 93 | 14.6 / 18.7 / 24.0 / 26 |
+| 1 owner, flat out | 7.4 / 11.1 / 47 / 117; 68 commits/s | 16.0 / 19.8 / 62 / 1619; 44 commits/s |
+| 16 owners, flat out | 14.6 / 48.5 / 79 / 298; 542 commits/s | 22.7 / 49.2 / 116 / 658; 478 commits/s |
+| 128 owners, flat out | 92 / 190 / 236 / 5232; 1202 commits/s | failed: Ursula OOM, see below |
+
+The append request alone (p50): memory 1.8 ms (1 owner), 4.9 ms (16), 48 ms (128); disk 9.0 /
+10.3 ms (1), 14.8 ms (16). The rest of a single owner's commit (about 5.5 ms) is local: Pi's own
+work and SQLite's WAL sync. At 128 owners the client node (8 vCPU, 128 node processes) was
+saturated (load average 86), so that cell measures the client as much as Ursula.
+
+Stream and snapshots (all cells alike): 10.8 pages per commit, 6.3x zstd at speed (9.8x at
+agent pace, smaller databases), 4.5 to 7.4 KB per commit, 22 KB per turn at agent pace and 35
+KB per turn flat out. Snapshot bodies 0.1 to 0.55 MB for 1 to 6 MB databases, 40 to 100 ms each
+(350 ms p50 at 128 owners). Retained log per database (tail minus retention) stayed between 10
+and 17 MB in every cell that ran (threshold 8 MiB), while streams grew to 315 MB.
+
+Cold start (fresh host: snapshot install + tail replay; best of three, first in parentheses):
+
+| database | snapshot body | tail after it | memory WAL | disk WAL |
+| --- | --- | --- | --- | --- |
+| 10 MB | 2.8 MB | 3 to 5 MB | 104 ms (207) | 134 ms (361) |
+| 100 MB | 27.8 MB | 20.5 MB | 845 ms (1580) | 864 ms (1671) |
+| 1 GB | 278 MB | 120 MB | 14.8 s (20.8) | 15.6 s (22.9) |
+
+Taking the 1 GB snapshot took 13.7 to 14.1 s; the 120 MB tail is what the writer committed
+meanwhile.
+
+Failover: 16 owners flat out, `kubectl delete --force` of the node leading the most groups at
+120 s (86 of 256). The owners whose groups it led stalled 19.1 to 22.2 s (memory, 6 of 16) and
+18.3 to 18.4 s (disk, 4 of 16), with 8 to 14 retried appends and no failed commit; the others
+stayed under 0.9 s. After the run every owner's file and a fresh rebuild from its stream were
+identical row for row, `integrity_check` ok.
+
+S3 (CloudWatch request metrics, whole bucket): idle about 75 PUT and 130 GET per minute; 1 owner
+flat out about 75 PUT / 145 GET; 16 owners about 180 PUT / 500 GET; 128 owners 350 to 450 PUT
+and 600 to 1,500 GET per minute.
+
+Found in this run:
+
+- Cold objects written in parts (`ColdObjectWriter`, 8 MiB parts: snapshot bodies of 8 MiB and
+  more) fail on AWS with the default `server_side_encryption = "aes256"`: S3 rejects the
+  encryption header on `UploadPart` ("x-amz-server-side-encryption header is not supported for
+  this operation"). The snapshot `PUT` returns 502, the VFS retries with backoff, and the log
+  grows unbounded. MinIO accepts the header, so CI does not catch it.
+- 128 owners flat out (about 1,200 appends/s, 7.6 MB/s): node RSS grew about 0.7 GB/min to 5.2
+  GB with the memory WAL, and past the 8 GiB limit with the disk WAL; all three nodes were
+  OOM-killed and OOM-killed again during recovery until the load stopped. Every database was
+  poisoned (appends 502/503 past the 30 s budget).
+- Retention did not reclaim cold chunks: 17 to 25 minutes after retention passed them, a
+  stream's chunk objects from offset 0 were all still in S3 (201 MB for a 193 MB retention).
+- A writer that commits back to back in large transactions (5 MB database, 1.4 MB frames, no
+  await between them) published no snapshot in 120 s (970 MB of log). Yielding briefly every 20
+  commits, the first snapshot came at 59 MB of log; with a 50 ms pause between transactions, at
+  1.1x to 3x the threshold.
