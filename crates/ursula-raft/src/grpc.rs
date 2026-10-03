@@ -1144,7 +1144,22 @@ impl GrpcRaftNetwork {
             envelope.encoded_len(),
             RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES,
         );
-        let Ok(permit) = session.budget.clone().try_acquire_many_owned(charge) else {
+        // Fair admission: a call that does not fit waits in the semaphore's FIFO queue, which
+        // hands freed budget to the oldest waiter first (and lets no later call overtake it), so
+        // a multi-MiB catch-up append is not starved by a stream of small ones. The wait shares
+        // the call's OpenRaft deadline; still not admitted by then is the true overflow case.
+        let deadline = tokio::time::Instant::now() + option.hard_ttl();
+        let admitted = match session.budget.clone().try_acquire_many_owned(charge) {
+            Ok(permit) => Some(permit),
+            Err(_) => tokio::time::timeout_at(
+                deadline,
+                session.budget.clone().acquire_many_owned(charge),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok),
+        };
+        let Some(permit) = admitted else {
             GRPC_APPEND_STREAM_BACKPRESSURE_REJECTIONS.fetch_add(1, Ordering::Relaxed);
             return Err(tonic::Status::unavailable(format!(
                 "{APPEND_STREAM_BACKLOG_FULL}: {} of {} bytes queued",
@@ -1168,7 +1183,7 @@ impl GrpcRaftNetwork {
                 queued,
             })
             .map_err(|_| tonic::Status::unavailable("raft append stream is closed"))?;
-        match tokio::time::timeout(option.hard_ttl(), response_receiver).await {
+        match tokio::time::timeout_at(deadline, response_receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(tonic::Status::unavailable(
                 "raft append stream closed without a response",
@@ -1874,6 +1889,64 @@ mod reconnect_tests {
             .expect_err("still backlogged");
         assert!(matches!(error, RPCError::Unreachable(_)));
         assert_eq!(network.consecutive_failures, failures_before);
+        GRPC_APPEND_SESSIONS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("append session pool lock")
+            .remove(&endpoint);
+    }
+
+    /// Fair admission: a large catch-up append waiting for budget is served
+    /// before later small calls, which must not overtake it.
+    #[tokio::test]
+    async fn large_append_is_not_starved_by_later_small_calls() {
+        let endpoint = "http://127.0.0.1:10".to_owned();
+        let (sender, _stalled_receiver) = mpsc::unbounded_channel();
+        let budget = Arc::new(Semaphore::new(RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES));
+        GRPC_APPEND_SESSIONS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("append session pool lock")
+            .insert(endpoint.clone(), SharedAppendSession {
+                sender,
+                budget: budget.clone(),
+            });
+        let mib = 1024 * 1024;
+        let others = budget
+            .clone()
+            .try_acquire_many_owned(
+                u32::try_from(RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES - mib).expect("fits"),
+            )
+            .expect("other groups' queued bytes");
+        let envelope = |raft_group_id, bytes: usize| raft_internal_proto::RaftRpcEnvelopeV1 {
+            raft_group_id,
+            node_id: 2,
+            protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+            payload: vec![7_u8; bytes].into(),
+        };
+        let large = GrpcRaftNetwork::new(RaftGroupId(1), 2, endpoint.clone());
+        let large = tokio::spawn(async move {
+            large
+                .try_append_stream(envelope(1, 2 * mib), RPCOption::new(Duration::from_secs(2)))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Budget is free for a small call, but the large one is ahead of it.
+        let small = GrpcRaftNetwork::new(RaftGroupId(2), 2, endpoint.clone())
+            .try_append_stream(envelope(2, 16), RPCOption::new(Duration::from_millis(50)))
+            .await
+            .expect_err("the small call waits behind the large one");
+        assert_eq!(small.code(), tonic::Code::Unavailable);
+        assert!(small.message().starts_with(APPEND_STREAM_BACKLOG_FULL));
+
+        drop(others);
+        let large = large.await.expect("large call task");
+        // Admitted and queued; the stalled peer never answers it.
+        assert_eq!(
+            large.expect_err("stalled peer").code(),
+            tonic::Code::DeadlineExceeded
+        );
         GRPC_APPEND_SESSIONS
             .get_or_init(|| Mutex::new(BTreeMap::new()))
             .lock()

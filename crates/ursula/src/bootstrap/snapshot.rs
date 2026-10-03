@@ -73,6 +73,19 @@ async fn trigger_snapshot_build(
     Ok(!coordinator.reclaim_handoff(raft_group_id))
 }
 
+/// Whether this tick triggers snapshot builds.
+///
+/// A bad tick (store probe failed, or new cold-flush write errors) holds
+/// routine snapshots back so the driver does not push uploads into a failing
+/// store. Not once the log is over the pressure watermark: a build whose
+/// upload, verification or reference publication fails falls back to an
+/// inline snapshot, which still truncates the log, so nothing a snapshot needs
+/// depends on the store. Holding builds back there would grow the log into
+/// the node-wide 503 write gate while the store is merely throttling.
+fn should_drive_snapshots(bad_tick: bool, log_pressure: bool) -> bool {
+    !bad_tick || log_pressure
+}
+
 /// Keeps the coordinator's log-pressure flag (read by HTTP admission) in step
 /// with the node's unsnapshotted Raft log bytes.
 fn spawn_log_pressure_monitor(coordinator: SnapshotBuildCoordinator, cadence: &SnapshotCadence) {
@@ -234,8 +247,8 @@ pub fn spawn_snapshot_driver(
             }
 
             let mut pause = interval;
-            if !bad_tick {
-                let (plan, selected) = plan_snapshot_drive(&snaps, &cadence, max_groups_per_tick);
+            let (plan, selected) = plan_snapshot_drive(&snaps, &cadence, max_groups_per_tick);
+            if should_drive_snapshots(bad_tick, plan.pressure) {
                 let mut triggered = 0u64;
                 for snapshot in selected {
                     match trigger_snapshot_build(&registry, &coordinator, snapshot.raft_group_id)
@@ -263,4 +276,17 @@ pub fn spawn_snapshot_driver(
             tokio::time::sleep(pause).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_trouble_holds_back_routine_snapshots_but_not_a_pressure_pass() {
+        assert!(should_drive_snapshots(false, false));
+        assert!(!should_drive_snapshots(true, false));
+        assert!(should_drive_snapshots(true, true));
+        assert!(should_drive_snapshots(false, true));
+    }
 }
