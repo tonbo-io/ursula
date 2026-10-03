@@ -1,0 +1,128 @@
+name: Memory soak
+
+# Write-overload memory soak: 3 nodes + gateway + MinIO at feature level 5, many SQLite-VFS-shaped
+# owners appending flat out (clients/sqlite-ursula/test/soak.e2e.ts). Node RSS must stay bounded —
+# overload has to reach clients as 503/429 pushback, not as server memory growth (the EKS OOM of
+# 2026-10: ~0.7 GB/min per node at 128 owners).
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Load duration in seconds
+        default: "600"
+      owners:
+        description: Concurrent owners
+        default: "128"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-ursula:
+    name: Build release ursula
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Build ursula
+        run: cargo build --release -p ursula --bin ursula
+
+      - name: Upload ursula
+        uses: actions/upload-artifact@v6
+        with:
+          name: ursula-soak-release
+          path: target/release/ursula
+          if-no-files-found: error
+          retention-days: 3
+
+  soak:
+    name: Soak (${{ matrix.wal }} WAL, ${{ github.event.inputs.owners || '128' }} owners)
+    needs: build-ursula
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        wal: [memory, disk]
+    env:
+      URSULA_S3_ENDPOINT: http://127.0.0.1:9000
+      URSULA_S3_ACCESS_KEY: minioadmin
+      URSULA_S3_SECRET_KEY: minioadmin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Start MinIO
+        run: scripts/ks_minio_ci.sh
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Download ursula
+        uses: actions/download-artifact@v7
+        with:
+          name: ursula-soak-release
+          path: ${{ runner.temp }}/ursula-bin
+
+      - name: Soak
+        timeout-minutes: 30
+        run: |
+          chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
+          free -m
+          nproc
+          cd clients/sqlite-ursula
+          npm ci
+          E2E_NODES=3 E2E_GROUPS=32 E2E_CORES=2 E2E_WAL=${{ matrix.wal }} \
+            E2E_LOG_DIR="$RUNNER_TEMP/soak-logs" \
+            SOAK_SECONDS=${{ github.event.inputs.seconds || '600' }} SOAK_OWNERS=${{ github.event.inputs.owners || '128' }} \
+            SOAK_OUT="$RUNNER_TEMP/soak-logs/samples.jsonl" SOAK_MAX_RSS_MB=2048 SOAK_ABORT_RSS_MB=6144 \
+            URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" npx vitest --run test/soak.e2e.ts
+
+      - name: Summary
+        if: always()
+        run: |
+          logs="$RUNNER_TEMP/soak-logs"
+          for f in "$logs"/node*.log; do
+            [ -f "$f" ] || continue
+            echo "$(basename "$f"): $(grep -c 'rebuilding channel' "$f" || true) channel-rebuild warnings, $(grep -c WARN "$f" || true) WARN, $(grep -c ERROR "$f" || true) ERROR"
+            grep -E 'WARN|ERROR' "$f" | sed -E 's/[0-9]+/N/g' | sort | uniq -c | sort -rn | head -8 || true
+          done
+          [ -f "$logs/samples.jsonl" ] && python3 - "$logs/samples.jsonl" <<'EOF'
+          import json, sys
+          rows = [json.loads(l) for l in open(sys.argv[1])]
+          for r in rows:
+              g = r["gauges"]
+              keys = ["raft_grpc_append_stream_inflight", "raft_log_entries_unpurged", "raft_log_bytes_since_snapshot"]
+              extra = " ".join(f"{k}={[n.get(k) for n in g]}" for k in keys)
+              print(f"t={r['t']:>4}s rss_mb={r['rss_mb']} appends/s={r['appends_per_s']} {extra}")
+          last = rows[-1]
+          print("final counts:", last["counts"])
+          print("final gauges:")
+          for i, n in enumerate(last["gauges"]):
+              print(f"  node{i+1}:", json.dumps(n, sort_keys=True))
+          EOF
+
+      - name: Upload soak logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: soak-logs-${{ matrix.wal }}
+          path: ${{ runner.temp }}/soak-logs
+          retention-days: 7
