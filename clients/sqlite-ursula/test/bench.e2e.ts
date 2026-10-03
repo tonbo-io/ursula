@@ -1,4 +1,5 @@
-// Benchmark: a real Pi Harness on Pi's official node driver over the VFS, text and tool turns until
+// Benchmark (sanity/regression check: bytes per turn, pages per commit, compression ratio, and no
+// hot-limit trip in the default config; real performance runs on EKS with S3): a real Pi Harness on Pi's official node driver over the VFS, text and tool turns until
 // the stream holds 1k and then 10k commits; after each phase the storage closes and a fresh file is
 // rebuilt from the stream (a cold attach), then the original file is re-attached (it takes the
 // stream back) and the next phase continues. Reports Pi commit latency (Storage.commit wall time), the

@@ -211,11 +211,3 @@ jobs:
           npm run typecheck
           URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$GITHUB_WORKSPACE/clients/sqlite-vfs/target/release/libsqlite_ursula_vfs.so" npm run test:e2e
 
-      # Informational: the same benchmark without a cold tier, where the default per-group hot
-      # admission limit (64 MiB) bounds how much a stream can hold.
-      - name: Benchmark without a cold tier (informational)
-        continue-on-error: true
-        timeout-minutes: 15
-        run: |
-          cd clients/sqlite-ursula
-          URSULA_COLD=none URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$GITHUB_WORKSPACE/clients/sqlite-vfs/target/release/libsqlite_ursula_vfs.so" npx vitest --run test/bench.e2e.ts
