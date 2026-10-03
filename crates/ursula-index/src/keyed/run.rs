@@ -24,7 +24,6 @@ use super::part::PartOptions;
 use super::part::RangeTombstone;
 use super::part::coalesce_tombstones;
 use super::part::encode_part;
-use super::part::entry_weight;
 use crate::IndexError;
 
 fn invalid(message: impl Into<String>) -> IndexError {
@@ -73,18 +72,6 @@ impl RunBuilder {
     /// Whether no record was applied.
     pub fn is_empty(&self) -> bool {
         self.next_record == self.start_record
-    }
-
-    /// Estimated raw size of the folded content.
-    pub fn weight(&self) -> usize {
-        self.entries
-            .iter()
-            .map(|(key, (_, value))| {
-                key.len()
-                    .saturating_add(value.as_ref().map_or(0, String::len))
-                    .saturating_add(16)
-            })
-            .fold(0_usize, usize::saturating_add)
     }
 
     /// Validates and applies the stored text of record `record`.
@@ -207,7 +194,7 @@ impl PartSink {
             let boundary = entry.key.clone();
             self.cut(Some(&boundary))?;
         }
-        self.weight = self.weight.saturating_add(entry_weight(&entry));
+        self.weight = self.weight.saturating_add(entry.weight());
         self.entries.push(entry);
         Ok(())
     }

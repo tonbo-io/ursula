@@ -286,12 +286,6 @@ function parseOps(sc: Scanner, start: number): KeyedOp[] {
 	}
 }
 
-/** Read the `"o"` member of a record this package encoded (`{"o":N,…`), or undefined. */
-export function recordEpoch(text: string): number | undefined {
-	const m = /^\{"o":(\d+),/.exec(text);
-	return m === null ? undefined : Number(m[1]);
-}
-
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 export const utf8 = (text: string): Uint8Array => encoder.encode(text);

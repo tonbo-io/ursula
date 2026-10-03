@@ -61,11 +61,6 @@ export class SkipList<V> {
 		return n !== undefined && n.key === k ? n.value : undefined;
 	}
 
-	has(k: string): boolean {
-		const n = this.seek(k);
-		return n !== undefined && n.key === k;
-	}
-
 	/** Sets `k`; returns the previous value. */
 	set(k: string, v: V): V | undefined {
 		const update: Node<V>[] = [];

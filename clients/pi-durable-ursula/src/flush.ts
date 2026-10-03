@@ -58,7 +58,6 @@ export class FlushLoop {
 	private wakeSleep: (() => void) | undefined;
 	private timer: ReturnType<typeof setTimeout> | undefined;
 	private progressWaiters: (() => void)[] = [];
-	private readonly done: Promise<void>;
 	/** Metrics (§7.6): flush-waits issued, retried, and floors raised. */
 	readonly metrics = { flushWaits: 0, retries: 0, floorsRaised: 0 };
 
@@ -67,7 +66,7 @@ export class FlushLoop {
 		// Records already in the overlay at open (replay, claim) start their age clock now.
 		const now = host.now();
 		for (let o = host.local.overlayFloor; o < host.local.tail; o++) this.applied.push({ ordinal: o, at: now });
-		this.done = this.run();
+		void this.run();
 	}
 
 	/** A record was applied to the overlay: start its age clock; the loop re-evaluates its triggers. */
@@ -91,11 +90,6 @@ export class FlushLoop {
 		this.stopped = true;
 		this.kick();
 		this.release();
-	}
-
-	/** Resolves when the loop has exited (tests). */
-	stopped$(): Promise<void> {
-		return this.done;
 	}
 
 	private due(): boolean {
