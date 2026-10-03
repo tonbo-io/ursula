@@ -92,7 +92,8 @@ The body must be the stream's state at a frame boundary `W`, page-identical to a
 `[0, W)`, so later page-image frames apply on top of it (`VACUUM INTO` and the backup API both
 rewrite pages, and are not). The thread:
 
-1. Opens a private `unix` connection on the file.
+1. Opens a private `unix` connection on the file and runs `wal_checkpoint(PASSIVE)` once, so
+   the checkpoint inside the window only covers the frames committed since.
 2. Opens the *window* (under the database's mutex): waits until no acknowledged commit is
    unpublished, records `W` (the offset), the epoch and the page count. While the window is open a
    commit that reaches its commit point waits there (holding SQLite's write lock, which neither
@@ -106,8 +107,9 @@ rewrite pages, and are not). The thread:
    later mark it caps it) and no closing connection can checkpoint (that needs an EXCLUSIVE lock),
    so the pages are those of `W`. Ends the read transaction.
 
-Commits wait only for steps 3 and 4: one passive checkpoint of the WAL since the previous one
-(SQLite's auto-checkpoint keeps it under about 1000 pages) and the start of a read transaction.
+Commits wait only for steps 3 and 4: a passive checkpoint of the few frames committed since step
+1, and the start of a read transaction. A re-attach stops the thread: it checks the stop flag
+between steps and retries, and each snapshot request is bounded to 120 s.
 
 The body is `"USS1" | u64 W | u64 epoch | u32 pages | u32 crc32c(image) | zstd(image)`. The epoch
 is the highest one claimed before `W`: retention may trim every claim frame, and the next owner
@@ -133,7 +135,8 @@ size, checksum), recovers the old file as in §3, writes the image to a temp fil
 renames it over the db file and fsyncs the directory, then replays the tail. A crash after the
 rename leaves the sidecar at the old offset (a fresh file gets a `0 0` sidecar before anything is
 written), so the next attach installs again or replays idempotently. A tail read that hits `410`
-(retention moved under a stale `HEAD`), or a snapshot superseded between `HEAD` and `GET`, restarts
+(retention moved under a stale `HEAD`), or a snapshot superseded between `HEAD` and `GET` (a 404,
+or a body cut short when its cold object is deleted after the grace), restarts
 attach from `HEAD`, up to ten times.
 
 Any owner may publish a snapshot of its own offset, a fenced one included: its state at its offset

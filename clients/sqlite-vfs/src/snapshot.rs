@@ -42,7 +42,19 @@ pub fn decode(body: &[u8]) -> Result<Snapshot, String> {
     let u64_at = |i: usize| u64::from_le_bytes(body[i..i + 8].try_into().unwrap());
     let u32_at = |i: usize| u32::from_le_bytes(body[i..i + 4].try_into().unwrap());
     let (offset, epoch, pages, crc) = (u64_at(4), u64_at(12), u32_at(20) as usize, u32_at(24));
-    let image = zstd::bulk::decompress(&body[HEADER..], pages * PAGE)
+    // The header is not checksummed: size the buffer only once the zstd frame's own content size
+    // agrees with it, and allocate fallibly, so a damaged body is an error rather than an abort.
+    let payload = &body[HEADER..];
+    let len = pages * PAGE;
+    match zstd::zstd_safe::get_frame_content_size(payload) {
+        Ok(Some(n)) if n == len as u64 => {}
+        _ => return Err("snapshot: page count does not match the compressed image".into()),
+    }
+    let mut image = Vec::new();
+    image
+        .try_reserve_exact(len)
+        .map_err(|e| format!("snapshot: {len} bytes: {e}"))?;
+    zstd::bulk::decompress_to_buffer(payload, &mut image)
         .map_err(|e| format!("snapshot: zstd: {e}"))?;
     if image.len() != pages * PAGE || crc32c::crc32c(&image) != crc {
         return Err("snapshot: image does not match its size and checksum".into());

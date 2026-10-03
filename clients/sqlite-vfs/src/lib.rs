@@ -554,7 +554,7 @@ fn bulk_agent() -> &'static ureq::Agent {
     static A: OnceLock<ureq::Agent> = OnceLock::new();
     A.get_or_init(|| {
         ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(600)))
+            .timeout_global(Some(Duration::from_secs(120)))
             .http_status_as_error(false)
             .build()
             .into()
@@ -588,12 +588,11 @@ fn get_snapshot(url: &str, offset: u64) -> Result<Option<Vec<u8>>, String> {
         .call()
         .map_err(|e| format!("get snapshot {offset}: {e}"))?;
     let status = r.status().as_u16();
-    let body = r
-        .body_mut()
-        .with_config()
-        .limit(2 << 30)
-        .read_to_vec()
-        .map_err(|e| format!("get snapshot {offset}: body: {e}"))?;
+    // A body cut short: the snapshot was superseded and its cold object deleted (after its grace)
+    // while it was streaming, or the connection dropped. Either way, start again from `HEAD`.
+    let Ok(body) = r.body_mut().with_config().limit(2 << 30).read_to_vec() else {
+        return Ok(None);
+    };
     match status {
         200 => Ok(Some(body)),
         404 | 410 => Ok(None),
@@ -605,10 +604,12 @@ fn get_snapshot(url: &str, offset: u64) -> Result<Option<Vec<u8>>, String> {
 }
 
 /// `PUT` with retries while the outcome is unknown (transport errors, 5xx): both publishing a
-/// snapshot and advancing retention are idempotent. Returns the status and response.
+/// snapshot and advancing retention are idempotent. Returns the status and response. Gives up
+/// once `stopped` (a re-attach is waiting for the snapshot thread).
 fn put_idempotent(
     url: &str,
     body: &[u8],
+    stopped: &dyn Fn() -> bool,
 ) -> Result<(u16, ureq::http::Response<ureq::Body>), String> {
     let deadline = Instant::now() + retry_budget();
     let mut backoff = Duration::from_millis(50);
@@ -626,7 +627,7 @@ fn put_idempotent(
             ),
             Err(e) => e.to_string(),
         };
-        if Instant::now() + backoff > deadline {
+        if Instant::now() + backoff > deadline || stopped() {
             return Err(format!("put {url}: {unknown}"));
         }
         std::thread::sleep(backoff);
@@ -1247,6 +1248,10 @@ impl Snapper {
         self.cv.notify_one();
     }
 
+    fn stopped(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).1
+    }
+
     fn stop(&self) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).1 = true;
         self.cv.notify_one();
@@ -1280,7 +1285,7 @@ impl Snapper {
 fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
     let mut backoff = Duration::from_millis(100);
     while snapper.wait() {
-        let outcome = unsafe { snapshot_once(db) };
+        let outcome = unsafe { snapshot_once(db, snapper) };
         if let Ok(true) = outcome {
             backoff = Duration::from_millis(100);
             continue;
@@ -1312,14 +1317,18 @@ fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
 /// frames into the db file (a reader at mark 0 blocks backfill, one at a later mark caps it) and no
 /// closing connection can checkpoint (that needs an EXCLUSIVE lock), so the pages copied are those
 /// of `offset`. Commits wait only for the checkpoint and the start of the read transaction.
-unsafe fn snapshot_once(db: &Mutex<Db>) -> Result<bool, String> {
+unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, String> {
+    let stopped = || snapper.stopped();
     let started = Instant::now();
     let path = lock(db).path.clone();
     let conn = unsafe { Private::open(&path)? };
+    // Backfill outside the window, so the checkpoint inside it (which commits wait for) only
+    // covers the frames committed in between.
+    unsafe { conn.checkpoint(c"PRAGMA wal_checkpoint(PASSIVE)")? };
     let (url, offset, epoch, pages) = {
         let mut d = lock(db);
         loop {
-            if !d.snapshot_due() || d.poisoned.is_some() {
+            if !d.snapshot_due() || d.poisoned.is_some() || stopped() {
                 return Ok(true);
             }
             if !d.committed {
@@ -1349,7 +1358,7 @@ unsafe fn snapshot_once(db: &Mutex<Db>) -> Result<bool, String> {
     drop(conn); // ends the read transaction
     let copy = copy_started.elapsed();
     let body = snapshot::encode(offset, epoch, &image);
-    match put_idempotent(&format!("{url}/snapshot/{offset}"), &body)? {
+    match put_idempotent(&format!("{url}/snapshot/{offset}"), &body, &stopped)? {
         (200..=299, _) => {}
         (409 | 410, _) => {
             // A newer snapshot exists (another owner's, or this file's before a re-attach).
@@ -1368,6 +1377,9 @@ unsafe fn snapshot_once(db: &Mutex<Db>) -> Result<bool, String> {
     // Nothing relies on the snapshot before it reads back intact (a follower may not show it yet).
     let mut verified = false;
     for i in 1..=20 {
+        if stopped() {
+            return Ok(true);
+        }
         if get_snapshot(&url, offset)?.as_deref() == Some(&body[..]) {
             verified = true;
             break;
@@ -1395,7 +1407,7 @@ unsafe fn snapshot_once(db: &Mutex<Db>) -> Result<bool, String> {
     // Retention trails one snapshot behind: a host that read the previous snapshot (or whose file
     // is past it) still finds the frames after it, and the newer snapshot has read back.
     if previous > retained && previous < offset {
-        match put_idempotent(&format!("{url}/retention/{previous}"), &[])? {
+        match put_idempotent(&format!("{url}/retention/{previous}"), &[], &stopped)? {
             (200..=299, r) => {
                 let effective = header_u64(&r, "stream-retained-offset").unwrap_or(previous);
                 let mut d = lock(db);
