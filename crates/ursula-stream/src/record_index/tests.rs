@@ -528,7 +528,10 @@ fn check_against_dense_oracle(ops: Vec<Op>) -> Result<(), TestCaseError> {
                     starts.push(tail + total);
                     total += size;
                     ends.push(total);
-                    bytes.extend(std::iter::repeat_n(b'x', usize::try_from(size - 1).unwrap()));
+                    bytes.extend(std::iter::repeat_n(
+                        b'x',
+                        usize::try_from(size - 1).unwrap(),
+                    ));
                     bytes.push(b'\n');
                 }
                 index.append_relative_ends(tail, total, &ends).unwrap();
@@ -543,8 +546,8 @@ fn check_against_dense_oracle(ops: Vec<Op>) -> Result<(), TestCaseError> {
                 if starts.len() as u64 == first_record {
                     continue;
                 }
-                let target_record = first_record
-                    + (starts.len() as u64 - first_record) * at / 1_000;
+                let target_record =
+                    first_record + (starts.len() as u64 - first_record) * at / 1_000;
                 let target = starts[usize::try_from(target_record).unwrap()];
                 let prepared = index.prepare_retain(target, tail).unwrap();
                 let effective = prepared.effective_offset();
@@ -569,7 +572,11 @@ fn check_against_dense_oracle(ops: Vec<Op>) -> Result<(), TestCaseError> {
                 prop_assert!(bracket.limit <= mark_block_end(bracket.from_offset));
             }
         }
-        for (ordinal, start) in starts.iter().enumerate().skip(usize::try_from(first_record).unwrap()) {
+        for (ordinal, start) in starts
+            .iter()
+            .enumerate()
+            .skip(usize::try_from(first_record).unwrap())
+        {
             let located = index.locate_offset(*start, tail).unwrap();
             let ordinal = ordinal as u64;
             match located {
