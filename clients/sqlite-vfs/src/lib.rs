@@ -372,23 +372,79 @@ fn fail_post_ack() -> Option<u64> {
 
 /// Replaces the sidecar atomically and durably: temp file, fsync, rename, fsync of the directory.
 fn write_sidecar(path: &str, offset: u64, epoch: u64) -> Result<(), String> {
+    write_sidecar_line(path, &format!("{offset} {epoch}\n"))
+}
+
+/// The recovery marker: attach is rewriting the db file from the stream, restarting from `offset`.
+/// Until the sidecar is written again the file may be inconsistent (some pages of a later state),
+/// so the next attach must not let SQLite read it before replaying (see `attach`).
+fn write_recovery_marker(path: &str, offset: u64, epoch: u64) -> Result<(), String> {
+    write_sidecar_line(path, &format!("{offset} {epoch} recovering\n"))
+}
+
+fn write_sidecar_line(path: &str, line: &str) -> Result<(), String> {
     let err = |e: std::io::Error| format!("sidecar {path}: {e}");
     let tmp = format!("{path}.tmp");
     let mut f = fs::File::create(&tmp).map_err(err)?;
-    std::io::Write::write_all(&mut f, format!("{offset} {epoch}\n").as_bytes()).map_err(err)?;
+    std::io::Write::write_all(&mut f, line.as_bytes()).map_err(err)?;
     f.sync_all().map_err(err)?;
     fs::rename(&tmp, path).map_err(err)?;
     sync_dir(path).map_err(err)
 }
 
-/// `(offset, epoch)` reflected by the local file.
-fn read_sidecar(path: &str) -> Result<(u64, u64), String> {
+/// `(offset, epoch, recovering)`: the offset the local file reflects (or, with the recovery
+/// marker, the offset an interrupted recovery restarts from).
+fn read_sidecar(path: &str) -> Result<(u64, u64, bool), String> {
     let text = fs::read_to_string(path).map_err(|e| format!("sidecar {path}: {e}"))?;
-    let mut it = text.split_whitespace().map(|v| v.parse::<u64>());
-    match (it.next(), it.next()) {
-        (Some(Ok(offset)), Some(Ok(epoch))) => Ok((offset, epoch)),
+    let mut it = text.split_whitespace();
+    let mut num = || it.next().and_then(|v| v.parse::<u64>().ok());
+    match (num(), num()) {
+        (Some(offset), Some(epoch)) => match it.next() {
+            None => Ok((offset, epoch, false)),
+            Some("recovering") if it.next().is_none() => Ok((offset, epoch, true)),
+            _ => Err(format!("sidecar {path}: malformed {text:?}")),
+        },
         _ => Err(format!("sidecar {path}: malformed {text:?}")),
     }
+}
+
+fn abort_in_replay() -> Option<u64> {
+    static V: OnceLock<Option<u64>> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("URSULA_VFS_ABORT_IN_REPLAY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+}
+
+/// Recovery restarting after a crash must not open the (possibly inconsistent) file through
+/// SQLite, so it proves "no other process uses the file" without parsing pages: every SQLite
+/// connection on a WAL-format file (any process, any unix-based VFS) holds a POSIX lock in the
+/// db file's lock-byte range (SHARED, from its first read until it closes); F_GETLK reports such
+/// a lock without taking one or reading the file. Another *attached* process is excluded by the
+/// host lock already held, and this process by the open-connection count. Our descriptor holds no
+/// POSIX lock, so closing it drops none of this process's (there are none on the file either).
+fn check_unused(path: &str) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let f = fs::File::open(path).map_err(|e| format!("open {path}: {e}"))?;
+    let mut l: libc::flock = unsafe { std::mem::zeroed() };
+    l.l_type = libc::F_WRLCK as _;
+    l.l_whence = libc::SEEK_SET as _;
+    l.l_start = 0x4000_0000; // PENDING_BYTE; RESERVED and the SHARED range follow (512 bytes)
+    l.l_len = 512;
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETLK, &mut l) } != 0 {
+        return Err(format!(
+            "F_GETLK {path}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if l.l_type != libc::F_UNLCK as _ {
+        return Err(format!(
+            "{path} is open by another process (pid {}); close it before attaching",
+            l.l_pid
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -438,9 +494,13 @@ fn append(url: &str, body: &[u8], epoch: u64, seq: u64) -> Append {
             .header("producer-epoch", epoch.to_string())
             .header("producer-seq", seq.to_string())
             .send(body);
+        let mut retry_after = None;
         let unknown = match sent {
             Ok(mut r) => {
                 let status = r.status().as_u16();
+                // Rate limiting (429, e.g. ursulagw) and overload (503) are transient: retried
+                // with the same producer sequence, no sooner than Retry-After (seconds).
+                retry_after = header_u64(&r, "retry-after").map(Duration::from_secs);
                 match status {
                     200..=299 => {
                         return Append::Acked {
@@ -456,6 +516,10 @@ fn append(url: &str, body: &[u8], epoch: u64, seq: u64) -> Append {
                     409 if seq > 0 && header_u64(&r, "producer-expected-seq") == Some(0) => {
                         return Append::ProducerExpired;
                     }
+                    429 => format!(
+                        "append: 429 {}",
+                        r.body_mut().read_to_string().unwrap_or_default()
+                    ),
                     400..=499 => {
                         let text = r.body_mut().read_to_string().unwrap_or_default();
                         return Append::Failed(format!("append rejected: {status} {text}"));
@@ -468,12 +532,13 @@ fn append(url: &str, body: &[u8], epoch: u64, seq: u64) -> Append {
             }
             Err(e) => format!("append: {e}"),
         };
-        if Instant::now() + backoff > deadline {
+        let wait = retry_after.map_or(backoff, |r| r.max(backoff));
+        if Instant::now() + wait > deadline {
             return Append::Failed(format!(
                 "{unknown} (outcome unknown after {attempts} attempts)"
             ));
         }
-        std::thread::sleep(backoff);
+        std::thread::sleep(wait);
         backoff = (backoff * 2).min(Duration::from_secs(1));
     }
 }
@@ -818,6 +883,13 @@ fn sync_dir(path: &str) -> std::io::Result<()> {
 /// private connections of `Private`).
 struct Applier {
     path: String,
+    sidecar: String,
+    /// Offset and epoch a recovery restarts from, recorded in the recovery marker.
+    restart: (u64, u64),
+    /// The recovery marker is durable: the file may be rewritten.
+    recovering: bool,
+    /// Page images written (for the `URSULA_VFS_ABORT_IN_REPLAY` test hook).
+    written: u64,
     file: Option<fs::File>,
     /// Final image per page of the current batch (pages past a later shrink removed).
     pages: BTreeMap<u32, Vec<u8>>,
@@ -845,11 +917,17 @@ impl Applier {
         }
     }
 
-    /// The db file, opened once; a file with content is recovered first (`checkpoint_local`).
+    /// The db file, opened once. Before its first write: a file with content is checkpointed
+    /// (`checkpoint_local`; the WAL is empty after it) and the recovery marker is made durable,
+    /// unless an interrupted recovery is being resumed (marker already set).
     unsafe fn file(&mut self) -> Result<&fs::File, String> {
         if self.file.is_none() {
-            if fs::metadata(&self.path).is_ok_and(|m| m.len() > 0) {
-                unsafe { checkpoint_local(&self.path)? };
+            if !self.recovering {
+                if fs::metadata(&self.path).is_ok_and(|m| m.len() > 0) {
+                    unsafe { checkpoint_local(&self.path)? };
+                }
+                write_recovery_marker(&self.sidecar, self.restart.0, self.restart.1)?;
+                self.recovering = true;
             }
             let f = OpenOptions::new()
                 .read(true)
@@ -868,6 +946,7 @@ impl Applier {
             return Ok(());
         };
         let pages = std::mem::take(&mut self.pages);
+        let mut written = self.written;
         let f = unsafe { self.file()? };
         let len = f.metadata().map_err(|e| e.to_string())?.len();
         if len > min as u64 * PAGE as u64 {
@@ -877,9 +956,15 @@ impl Applier {
         for (pgno, data) in pages {
             f.write_all_at(&data, (pgno as u64 - 1) * PAGE as u64)
                 .map_err(|e| e.to_string())?;
+            written += 1;
+            if abort_in_replay() == Some(written) {
+                eprintln!("sqlite-ursula-vfs: URSULA_VFS_ABORT_IN_REPLAY: aborting mid-replay");
+                std::process::abort();
+            }
         }
         f.set_len(size as u64 * PAGE as u64)
             .map_err(|e| e.to_string())?;
+        self.written = written;
         Ok(())
     }
 
@@ -1148,22 +1233,35 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
     create_stream(&url)?;
     let sidecar = format!("{path}-ursula");
     let db_len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    let (from, epoch) = if db_len == 0 {
+    let (from, epoch, recovering) = if db_len == 0 {
         // Nothing local: a WAL next to an empty db file holds nothing committed. The sidecar is
         // written before anything lands in the file, so an attach that fails halfway leaves a
         // file the next one resumes (replaying page images from an older offset is idempotent).
         let _ = fs::remove_file(format!("{path}-wal"));
         let _ = fs::remove_file(format!("{path}-shm"));
         write_sidecar(&sidecar, 0, 0)?;
-        (0, 0)
+        (0, 0, false)
     } else {
         // A file with content but no sidecar was never attached: its pages are not in the stream.
         read_sidecar(&sidecar).map_err(|e| {
             format!("{path} has content but no valid sidecar ({e}); refusing to attach")
         })?
     };
+    if recovering {
+        // An earlier recovery died mid-rewrite: the file may be inconsistent, so SQLite must not
+        // read it (no checkpoint). Its WAL is empty: recovery starts only after a complete local
+        // checkpoint (or on an empty file), so stale -wal/-shm files carry nothing.
+        check_unused(&path)?;
+        let _ = fs::remove_file(format!("{path}-wal"));
+        let _ = fs::remove_file(format!("{path}-shm"));
+        eprintln!("sqlite-ursula-vfs: {path}: resuming an interrupted recovery from {from}");
+    }
     let mut applier = Applier {
         path: path.clone(),
+        sidecar: sidecar.clone(),
+        restart: (from, epoch),
+        recovering,
+        written: 0,
         file: None,
         pages: BTreeMap::new(),
         min_size: None,
@@ -2166,29 +2264,35 @@ unsafe extern "C" fn x_shm_lock(
             return fwd!(file, xShmLock, offset, n, flags);
         };
         let locking = flags & ffi::SQLITE_SHM_LOCK != 0;
-        if offset == WAL_WRITE_LOCK && !locking {
+        if !locking {
+            // Releases: the bookkeeping and the real unlock happen in one critical section of the
+            // db mutex. Released first, another thread's connection could take the lock and start
+            // its own write transaction or checkpoint, whose state (`committed`,
+            // `checkpoint_started`) this bookkeeping would then clear or misjudge.
             let mut db = lock(&db);
-            db.end_write_transaction(file);
-            return fwd!(file, xShmLock, offset, n, flags);
+            if offset == WAL_WRITE_LOCK {
+                db.end_write_transaction(file);
+                return fwd!(file, xShmLock, offset, n, flags);
+            }
+            if let Some(t) = db.checkpoint_started.take()
+                && db.checkpoints.len() < 1_000_000
+            {
+                db.checkpoints.push(t.elapsed());
+            }
+            let rc = fwd!(file, xShmLock, offset, n, flags);
+            // A snapshot waiting for this checkpoint to finish before it opens its window.
+            db.snapper.window_cv.notify_all();
+            return rc;
         }
         let rc = fwd!(file, xShmLock, offset, n, flags);
         let mut db = lock(&db);
-        match (offset, locking) {
-            (WAL_WRITE_LOCK, true) if rc == OK => {
+        match offset {
+            WAL_WRITE_LOCK if rc == OK => {
                 db.write_locked = true;
                 db.committed = false;
                 db.overlay.clear();
             }
-            (WAL_CKPT_LOCK, true) if rc == OK => db.checkpoint_started = Some(Instant::now()),
-            (WAL_CKPT_LOCK, false) => {
-                if let Some(t) = db.checkpoint_started.take()
-                    && db.checkpoints.len() < 1_000_000
-                {
-                    db.checkpoints.push(t.elapsed());
-                }
-                // A snapshot waiting for this checkpoint to finish before it opens its window.
-                db.snapper.window_cv.notify_all();
-            }
+            WAL_CKPT_LOCK if rc == OK => db.checkpoint_started = Some(Instant::now()),
             _ => {}
         }
         rc
