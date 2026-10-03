@@ -13,11 +13,22 @@
 //! grace ([`ursula_stream::RETENTION_COLD_GC_GRACE_MS`], the grace apply
 //! gives the pack slices that retention drops), a read planned before the
 //! retention can no longer be in flight, and
-//! [`collect_retained_cold_objects`] removes every page entry that lies
-//! wholly below that offset, deletes pages left with nothing at or above
-//! it, and then deletes the entries' objects. Pages go first, so a crash
-//! in between leaves unreferenced objects for the orphan sweep rather than
-//! entries naming deleted objects.
+//! [`collect_retained_cold_objects`] deletes every page that lies wholly
+//! below that offset and holds only entries wholly below it, then the
+//! objects those entries name. Pages go first, so a crash in between leaves
+//! unreferenced objects for the orphan sweep rather than entries naming
+//! deleted objects.
+//!
+//! It never writes the boundary page (the one holding the offset) and never
+//! deletes an object that page, or any page it keeps, names. Page writes are
+//! unconditional PUTs and `is_leader` is checked only when a step starts, so
+//! a deposed leader rewriting the boundary page could overwrite an entry a
+//! new leader just flushed into it, and at Lb1 that entry is the chunk's only
+//! reference. Pages wholly below the offset take no new entries. The cost is
+//! at most about one page span (64 MiB) of objects below the offset per
+//! stream, left until retention moves past that page. Conditional page PUTs
+//! for repair, flush and compaction would remove the hazard generally; that
+//! is a follow-up.
 //!
 //! The tracker is leader-local and not replicated: a new leader starts it
 //! empty and waits a full grace again, which only delays collection. Page
@@ -56,7 +67,6 @@ pub struct RetentionGcTarget {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RetentionGcReport {
     pub pages_deleted: u64,
-    pub pages_rewritten: u64,
     pub objects_deleted: u64,
 }
 
@@ -160,7 +170,14 @@ pub async fn collect_retained_cold_objects(
     let mut report = RetentionGcReport::default();
     let mut completed = Vec::with_capacity(targets.len());
     for target in targets {
-        match collect_stream(cold_store, target, &mut report).await {
+        match collect_stream(
+            cold_store,
+            target,
+            ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES,
+            &mut report,
+        )
+        .await
+        {
             Ok(changed) => {
                 if changed && let Some(cache) = cache {
                     cache.invalidate_stream(&target.stream_id);
@@ -184,7 +201,6 @@ pub async fn collect_retained_cold_objects(
         tracing::info!(
             objects_deleted = report.objects_deleted,
             pages_deleted = report.pages_deleted,
-            pages_rewritten = report.pages_rewritten,
             "retention gc reclaimed cold objects below retained offsets"
         );
     }
@@ -194,11 +210,13 @@ pub async fn collect_retained_cold_objects(
 async fn collect_stream(
     cold_store: &ColdStoreHandle,
     target: &RetentionGcTarget,
+    span: u64,
     report: &mut RetentionGcReport,
 ) -> io::Result<bool> {
-    let span = ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
     let below = target.collect_below;
     let dir = cold_index_generation_dir(&target.stream_id, target.generation);
+    // Pages that start below the offset: the ones wholly below it, plus the
+    // boundary page, which is only read.
     let mut page_ids = cold_store
         .list_file_names(&dir)
         .await?
@@ -210,49 +228,176 @@ async fn collect_stream(
     let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
     let mut doomed = BTreeSet::new();
     let mut kept = target.keep_paths.iter().cloned().collect::<BTreeSet<_>>();
-    let mut changed = false;
+    let mut deletable_pages = Vec::new();
     for page_id in page_ids {
         let key = ColdIndexPageKey {
             stream_id: target.stream_id.clone(),
             generation: target.generation,
             page_id,
         };
-        let Some(mut page) = store.get_page(&key).await? else {
+        let Some(page) = store.get_page(&key).await? else {
             continue;
         };
-        let before = page.cold_chunks.len() + page.external_segments.len();
-        page.cold_chunks.retain(|chunk| {
-            let keep = chunk.shared_object || chunk.end_offset > below;
-            if keep {
-                kept.insert(chunk.s3_path.clone());
-            } else {
-                doomed.insert(chunk.s3_path.clone());
-            }
-            keep
-        });
-        page.external_segments.retain(|object| {
-            let keep = object.end_offset > below;
-            if keep {
-                kept.insert(object.s3_path.clone());
-            } else {
-                doomed.insert(object.s3_path.clone());
-            }
-            keep
-        });
-        let after = page.cold_chunks.len() + page.external_segments.len();
-        if after == 0 && page_id.saturating_add(1).saturating_mul(span) <= below {
-            cold_store.delete_chunk(&key.path()).await?;
-            report.pages_deleted = report.pages_deleted.saturating_add(1);
-            changed = true;
-        } else if after < before {
-            store.put_page(&key, &page).await?;
-            report.pages_rewritten = report.pages_rewritten.saturating_add(1);
-            changed = true;
+        let paths = page
+            .cold_chunks
+            .iter()
+            .map(|chunk| (chunk.s3_path.clone(), chunk.end_offset, chunk.shared_object))
+            .chain(
+                page.external_segments
+                    .iter()
+                    .map(|object| (object.s3_path.clone(), object.end_offset, false)),
+            )
+            .collect::<Vec<_>>();
+        let wholly_below = page_id.saturating_add(1).saturating_mul(span) <= below;
+        let all_below = paths
+            .iter()
+            .all(|(_, end_offset, shared)| !shared && *end_offset <= below);
+        if wholly_below && all_below {
+            doomed.extend(paths.into_iter().map(|(path, _, _)| path));
+            deletable_pages.push(key);
+        } else {
+            // The boundary page (a leader may be flushing into it) and any
+            // page an entry at or above the offset still needs stay as they
+            // are, and so do the objects they name.
+            kept.extend(paths.into_iter().map(|(path, _, _)| path));
         }
+    }
+    let changed = !deletable_pages.is_empty();
+    for key in deletable_pages {
+        cold_store.delete_chunk(&key.path()).await?;
+        report.pages_deleted = report.pages_deleted.saturating_add(1);
     }
     for path in doomed.difference(&kept) {
         cold_store.delete_chunk(path).await?;
         report.objects_deleted = report.objects_deleted.saturating_add(1);
     }
     Ok(changed)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use ursula_shard::BucketStreamId;
+    use ursula_stream::ColdChunkRef;
+    use ursula_stream::ObjectPayloadRef;
+
+    use super::RetentionGcReport;
+    use super::RetentionGcTarget;
+    use super::RetentionGcTracker;
+    use super::collect_stream;
+    use crate::ColdIndexPage;
+    use crate::ColdStore;
+    use crate::cold_index::ColdIndexPageKey;
+    use crate::cold_index::ColdIndexPageStore;
+    use crate::cold_index::ColdIndexRepairInput;
+    use crate::cold_index::ColdStoreColdIndexPageStore;
+
+    fn chunk(start_offset: u64, end_offset: u64, s3_path: &str) -> ColdChunkRef {
+        ColdChunkRef {
+            start_offset,
+            end_offset,
+            s3_path: s3_path.to_owned(),
+            object_size: end_offset - start_offset,
+            ..Default::default()
+        }
+    }
+
+    async fn exists(cold_store: &ColdStore, path: &str) -> bool {
+        let (dir, name) = path.rsplit_once('/').expect("object path has a directory");
+        cold_store
+            .list_file_names(&format!("{dir}/"))
+            .await
+            .expect("list objects")
+            .iter()
+            .any(|listed| listed == name)
+    }
+
+    /// With an 8-byte page span and the retained offset at 10: page 0 lies
+    /// wholly below it and goes with the objects only it names. Page 1 holds
+    /// the offset, so it is never rewritten, and the objects it names stay,
+    /// including the chunk wholly below the offset and the one that spans
+    /// both pages.
+    #[tokio::test]
+    async fn collects_whole_pages_below_the_offset_and_never_the_boundary_page() {
+        let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+        let stream = BucketStreamId::new("benchcmp", "retention-pages");
+        let path = |name: &str| format!("benchcmp/retention-pages/chunks/{name}.bin");
+        let (a, x, e, c, d) = (path("a"), path("x"), path("e"), path("c"), path("d"));
+        for object in [&a, &x, &e, &c, &d] {
+            cold_store.write_chunk(object, b"..").await.expect("stage");
+        }
+        let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+        let key = |page_id| ColdIndexPageKey {
+            stream_id: stream.clone(),
+            generation: 7,
+            page_id,
+        };
+        let page0 = ColdIndexPage {
+            start_offset: 0,
+            end_offset: 8,
+            cold_chunks: vec![chunk(0, 4, &a), chunk(6, 9, &e)],
+            external_segments: vec![ObjectPayloadRef {
+                start_offset: 4,
+                end_offset: 6,
+                s3_path: x.clone(),
+                object_size: 2,
+                object_offset: 0,
+            }],
+        };
+        let page1 = ColdIndexPage {
+            start_offset: 8,
+            end_offset: 16,
+            cold_chunks: vec![chunk(6, 9, &e), chunk(9, 10, &c), chunk(10, 12, &d)],
+            external_segments: Vec::new(),
+        };
+        store.put_page(&key(0), &page0).await.expect("page 0");
+        store.put_page(&key(1), &page1).await.expect("page 1");
+
+        let target = RetentionGcTarget {
+            stream_id: stream.clone(),
+            generation: 7,
+            created_at_ms: 1,
+            collect_below: 10,
+            keep_paths: Vec::new(),
+        };
+        let mut report = RetentionGcReport::default();
+        let changed = collect_stream(&cold_store, &target, 8, &mut report)
+            .await
+            .expect("collect");
+        assert!(changed);
+        assert_eq!(report.pages_deleted, 1);
+        assert_eq!(report.objects_deleted, 2);
+        assert!(store.get_page(&key(0)).await.expect("read").is_none());
+        assert_eq!(
+            store.get_page(&key(1)).await.expect("read"),
+            Some(page1),
+            "boundary page untouched"
+        );
+        assert!(!exists(&cold_store, &a).await);
+        assert!(!exists(&cold_store, &x).await);
+        for kept in [&e, &c, &d] {
+            assert!(exists(&cold_store, kept).await, "{kept} deleted");
+        }
+    }
+
+    #[test]
+    fn tracker_releases_an_offset_only_after_the_grace() {
+        let input = ColdIndexRepairInput {
+            stream_id: BucketStreamId::new("benchcmp", "grace"),
+            generation: 0,
+            retained_offset: 10,
+            tail_offset: 20,
+            created_at_ms: 1,
+            hot_ranges: Vec::new(),
+            state_refs: Vec::new(),
+        };
+        let mut tracker = RetentionGcTracker::default();
+        assert_eq!(tracker.observe(&input, 100, 50), None);
+        assert_eq!(tracker.observe(&input, 149, 50), None);
+        let target = tracker.observe(&input, 150, 50).expect("due after grace");
+        assert_eq!(target.collect_below, 10);
+        tracker.collected(&target);
+        assert_eq!(tracker.observe(&input, 500, 50), None);
+    }
 }

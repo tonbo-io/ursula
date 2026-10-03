@@ -94,8 +94,13 @@ impl MultipartSseFetch {
             .set_temporary()
         })?;
         let Some(credential) = credential else {
-            // Anonymous access: opendal did not sign the request either.
-            return Ok(());
+            // The SSE headers are gone but the old signature still covers
+            // them; sending it would fail with SignatureDoesNotMatch.
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "no S3 credential to re-sign a multipart request",
+            )
+            .set_temporary());
         };
         let headers = req.headers_mut();
         headers.remove(header::AUTHORIZATION);

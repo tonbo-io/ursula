@@ -182,7 +182,7 @@ Cold data lives under the `storage.cold.root` prefix. Benchmark and test runs sh
 aws s3 rm "s3://my-ursula-bucket/ursula-test-20260518T000000Z" --recursive
 ```
 
-There is no automatic retention policy. Application checkpoints and explicit stream-retention advances control which cold objects become eligible for GC. After a retention advance, each group's leader deletes the stream's cold objects that lie wholly below the retained offset (chunks, offloaded external payloads, and cold-index pages left empty) once a 5-minute grace has passed, so reads planned before the advance still complete; its cold-index cursor visits 16 streams per group per minute, so on groups with many streams collection can lag further. The grace restarts after a leader change. Retention is a storage-cost tool only: replica memory does not depend on it once the [feature levels](#feature-levels) are raised.
+There is no automatic retention policy. Application checkpoints and explicit stream-retention advances control which cold objects become eligible for GC. After a retention advance, each group's leader deletes the stream's cold objects that lie wholly below the retained offset (chunks and offloaded external payloads, in whole 64 MiB cold-index pages, so up to one page just below the retained offset can remain until retention moves past it) once a 5-minute grace has passed, so reads planned before the advance still complete; its cold-index cursor visits 16 streams per group per minute, so on groups with many streams collection can lag further. The grace restarts after a leader change. Retention is a storage-cost tool only: replica memory does not depend on it once the [feature levels](#feature-levels) are raised.
 
 ## Backup and disaster recovery
 

@@ -765,13 +765,13 @@ async fn cold_object_exists(cold_store: &ColdStore, path: &str) -> bool {
         .any(|listed| listed == name)
 }
 
-/// Regression (AWS EKS run, F14f): exclusive chunks live only in cold-index
-/// pages, so retention released none of them and they stayed in S3 forever.
-/// The leader's repair cursor now deletes the objects wholly below the
-/// retained offset once the retention grace has passed, drops their page
-/// entries, and keeps everything a retained byte still needs.
+/// F14f through the engine: the retained offset lies in page 0, the
+/// boundary page, which a new leader may be flushing into. After the grace,
+/// retention GC leaves that page and every object it names alone, even the
+/// chunk wholly below the offset; reads from the offset still work. (Whole
+/// pages below the offset are covered in `retention_gc`'s unit tests.)
 #[tokio::test]
-async fn retention_gc_deletes_chunks_below_the_retained_offset_after_the_grace() {
+async fn retention_gc_never_touches_the_boundary_page() {
     let placement = placement();
     let cold_store = memory_cold_store();
     let stream = BucketStreamId::new("benchcmp", "retention-gc");
@@ -851,21 +851,13 @@ async fn retention_gc_deletes_chunks_below_the_retained_offset_after_the_grace()
     };
     let t0 = 1_000_000;
     let grace = ursula_stream::RETENTION_COLD_GC_GRACE_MS;
-    for now_ms in [t0, t0 + grace - 1] {
+    for now_ms in [t0, t0 + grace, t0 + 2 * grace] {
         engine
             .repair_cold_index(step(now_ms), placement)
             .await
             .expect("repair step");
-        assert!(
-            cold_object_exists(&cold_store, below).await,
-            "deleted within the grace"
-        );
     }
-    engine
-        .repair_cold_index(step(t0 + grace), placement)
-        .await
-        .expect("repair step after the grace");
-    assert!(!cold_object_exists(&cold_store, below).await);
+    assert!(cold_object_exists(&cold_store, below).await);
     assert!(cold_object_exists(&cold_store, straddling).await);
     let page = ColdStoreColdIndexPageStore::new(cold_store.clone())
         .get_page(&ColdIndexPageKey {
@@ -875,13 +867,13 @@ async fn retention_gc_deletes_chunks_below_the_retained_offset_after_the_grace()
         })
         .await
         .expect("read page")
-        .expect("page kept for retained entries");
+        .expect("boundary page kept");
     let paths: Vec<_> = page
         .cold_chunks
         .iter()
         .map(|chunk| chunk.s3_path.as_str())
         .collect();
-    assert_eq!(paths, [straddling]);
+    assert_eq!(paths, [below, straddling]);
     let read = engine
         .read_stream(read_req(stream, 4, 64), placement)
         .await
