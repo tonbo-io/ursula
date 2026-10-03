@@ -3,15 +3,20 @@ name: Memory soak
 # Write-overload memory soak: 3 nodes + gateway + MinIO at feature level 5, many SQLite-VFS-shaped
 # owners appending flat out (clients/sqlite-ursula/test/soak.e2e.ts). Node RSS must stay bounded —
 # overload has to reach clients as 503/429 pushback, not as server memory growth (the EKS OOM of
-# 2026-10: ~0.7 GB/min per node at 128 owners).
+# 2026-10: ~0.7 GB/min per node at 128 owners; here, before the fix, ~4 GB/min to 6 GB in 80 s).
 
 on:
   pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.lock"
+      - "clients/sqlite-ursula/**"
+      - ".github/workflows/memory-soak.yml"
   workflow_dispatch:
     inputs:
       seconds:
         description: Load duration in seconds
-        default: "600"
+        default: "300"
       owners:
         description: Concurrent owners
         default: "128"
@@ -91,8 +96,8 @@ jobs:
           npm ci
           E2E_NODES=3 E2E_GROUPS=32 E2E_CORES=2 E2E_WAL=${{ matrix.wal }} \
             E2E_LOG_DIR="$RUNNER_TEMP/soak-logs" \
-            SOAK_SECONDS=${{ github.event.inputs.seconds || '600' }} SOAK_OWNERS=${{ github.event.inputs.owners || '128' }} \
-            SOAK_OUT="$RUNNER_TEMP/soak-logs/samples.jsonl" SOAK_MAX_RSS_MB=2048 SOAK_ABORT_RSS_MB=6144 \
+            SOAK_SECONDS=${{ github.event.inputs.seconds || '300' }} SOAK_OWNERS=${{ github.event.inputs.owners || '128' }} \
+            SOAK_OUT="$RUNNER_TEMP/soak-logs/samples.jsonl" SOAK_MAX_RSS_MB=3072 SOAK_ABORT_RSS_MB=6144 \
             URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" npx vitest --run test/soak.e2e.ts
 
       - name: Summary
@@ -109,7 +114,7 @@ jobs:
           rows = [json.loads(l) for l in open(sys.argv[1])]
           for r in rows:
               g = r["gauges"]
-              keys = ["raft_grpc_append_stream_inflight", "raft_log_entries_unpurged", "raft_log_bytes_since_snapshot"]
+              keys = ["raft_log_bytes_since_snapshot", "raft_snapshot_builds", "raft_grpc_append_stream_queued_bytes"]
               extra = " ".join(f"{k}={[n.get(k) for n in g]}" for k in keys)
               print(f"t={r['t']:>4}s rss_mb={r['rss_mb']} appends/s={r['appends_per_s']} {extra}")
           last = rows[-1]

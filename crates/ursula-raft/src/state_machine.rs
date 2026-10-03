@@ -6,6 +6,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use futures_util::Stream;
 use futures_util::TryStreamExt;
@@ -79,6 +81,12 @@ struct SnapshotBuildCoordinatorInner {
     /// Per-group log gauges (F12e), shared node-wide like the permit, so
     /// the snapshot driver reads what every group's state machine counts.
     log_gauges: Arc<Mutex<BTreeMap<u32, Arc<GroupLogGauge>>>>,
+    /// Build permits the snapshot driver took for a group it is about to
+    /// trigger; that group's next build uses it instead of competing for one.
+    handoffs: Mutex<BTreeMap<u32, OwnedSemaphorePermit>>,
+    /// Set while the node's unsnapshotted Raft log is over its hard limit;
+    /// client writes are refused with 503 until snapshots bring it back.
+    log_pressure: Arc<AtomicBool>,
 }
 
 impl Default for SnapshotBuildCoordinator {
@@ -93,6 +101,8 @@ impl SnapshotBuildCoordinator {
             inner: Arc::new(SnapshotBuildCoordinatorInner {
                 semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
                 log_gauges: Arc::default(),
+                handoffs: Mutex::default(),
+                log_pressure: Arc::default(),
             }),
         }
     }
@@ -104,6 +114,8 @@ impl SnapshotBuildCoordinator {
             inner: Arc::new(SnapshotBuildCoordinatorInner {
                 semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
                 log_gauges: Arc::clone(&self.inner.log_gauges),
+                handoffs: Mutex::default(),
+                log_pressure: Arc::clone(&self.inner.log_pressure),
             }),
         }
     }
@@ -143,6 +155,65 @@ impl SnapshotBuildCoordinator {
     /// group's snapshot build (bounded-stream-state F12d).
     pub fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
         self.inner.semaphore.clone().try_acquire_owned().ok()
+    }
+
+    /// Reserves `permit` for the next snapshot build of `raft_group_id`.
+    ///
+    /// The snapshot driver acquires a permit (waiting for the previous build
+    /// to finish) and hands it to the group it triggers. A triggered build
+    /// otherwise only *tries* for a permit and is refused while another group
+    /// builds, so a driver firing many groups at once built about one per
+    /// tick and the Raft log outgrew memory under sustained writes.
+    pub fn hand_off(&self, raft_group_id: u32, permit: OwnedSemaphorePermit) {
+        self.handoffs().insert(raft_group_id, permit);
+    }
+
+    /// Whether `raft_group_id`'s handed-off permit is still unclaimed.
+    pub fn handoff_pending(&self, raft_group_id: u32) -> bool {
+        self.handoffs().contains_key(&raft_group_id)
+    }
+
+    /// Takes back an unclaimed handed-off permit (the trigger was dropped);
+    /// returns whether there was one.
+    pub fn reclaim_handoff(&self, raft_group_id: u32) -> bool {
+        self.handoffs().remove(&raft_group_id).is_some()
+    }
+
+    fn take_handoff(&self, raft_group_id: u32) -> Option<OwnedSemaphorePermit> {
+        self.handoffs().remove(&raft_group_id)
+    }
+
+    fn handoffs(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, OwnedSemaphorePermit>> {
+        self.inner
+            .handoffs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether the node's unsnapshotted Raft log is over its hard limit.
+    pub fn log_pressured(&self) -> bool {
+        self.inner.log_pressure.load(Ordering::Acquire)
+    }
+
+    /// Updates the log-pressure flag from the node's unsnapshotted log
+    /// bytes, with hysteresis: it sets above `limit_bytes` and clears below
+    /// `resume_bytes`. Returns the new state when it changed.
+    pub fn observe_log_bytes(
+        &self,
+        log_bytes: u64,
+        limit_bytes: u64,
+        resume_bytes: u64,
+    ) -> Option<bool> {
+        let pressured = self.log_pressured();
+        let next = if pressured {
+            log_bytes >= resume_bytes
+        } else {
+            log_bytes > limit_bytes
+        };
+        (next != pressured).then(|| {
+            self.inner.log_pressure.store(next, Ordering::Release);
+            next
+        })
     }
 
     #[cfg(test)]
@@ -700,6 +771,13 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         if force {
             return Some(self.get_snapshot_builder().await);
         }
+        // The snapshot driver hands the permit over before it triggers.
+        if let Some(build_permit) = self
+            .snapshot_build
+            .take_handoff(self.placement.raft_group_id.0)
+        {
+            return Some(self.snapshot_builder_with_permit(build_permit).await);
+        }
         // A policy-triggered build defers instead of waiting for the
         // node-wide permit on this group's state-machine worker; OpenRaft
         // retries on a later trigger.
@@ -714,11 +792,19 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        let build_permit = self
+        // A permit already handed to this group would otherwise be held
+        // while this build waits for another one.
+        let build_permit = match self
             .snapshot_build
-            .acquire()
-            .await
-            .expect("snapshot build coordinator should not close");
+            .take_handoff(self.placement.raft_group_id.0)
+        {
+            Some(build_permit) => build_permit,
+            None => self
+                .snapshot_build
+                .acquire()
+                .await
+                .expect("snapshot build coordinator should not close"),
+        };
         self.snapshot_builder_with_permit(build_permit).await
     }
 
@@ -1529,6 +1615,54 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    /// The snapshot driver's permit handoff: a group handed a permit builds
+    /// on it even while the node's only other permit is gone, and a group
+    /// without one still defers.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn handed_off_permit_builds_instead_of_deferring() {
+        let build = SnapshotBuildCoordinator::new(1);
+        let mut state_machine =
+            test_state_machine(build.clone(), SnapshotInstallCoordinator::default());
+        let group = state_machine.placement.raft_group_id.0;
+        let permit = build.acquire().await.expect("driver's build permit");
+        build.hand_off(group, permit);
+        assert!(build.handoff_pending(group));
+
+        let builder = state_machine
+            .try_create_snapshot_builder(false)
+            .await
+            .expect("a handed-off permit builds");
+        assert!(!build.handoff_pending(group));
+        assert!(!build.reclaim_handoff(group));
+        assert_eq!(build.available_permits(), 0);
+        // The next trigger without a handoff defers while this build runs.
+        assert!(state_machine.try_create_snapshot_builder(false).await.is_none());
+        drop(builder);
+        assert_eq!(build.available_permits(), 1);
+
+        // An unclaimed handoff is taken back.
+        build.hand_off(group, build.acquire().await.expect("permit"));
+        assert!(build.reclaim_handoff(group));
+        assert_eq!(build.available_permits(), 1);
+    }
+
+    #[test]
+    fn log_pressure_uses_hysteresis() {
+        let build = SnapshotBuildCoordinator::new(1);
+        assert_eq!(build.observe_log_bytes(150, 200, 100), None);
+        assert_eq!(build.observe_log_bytes(201, 200, 100), Some(true));
+        assert!(build.log_pressured());
+        assert_eq!(build.observe_log_bytes(150, 200, 100), None);
+        assert!(build.log_pressured());
+        assert_eq!(build.observe_log_bytes(99, 200, 100), Some(false));
+        assert!(!build.log_pressured());
+        // A coordinator rebuilt with another concurrency shares the flag.
+        let resized = build.with_max_concurrency(2);
+        assert_eq!(resized.observe_log_bytes(500, 200, 100), Some(true));
+        assert!(build.log_pressured());
     }
 
     /// F12c: installing an inline snapshot decodes it exactly once.

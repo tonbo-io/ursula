@@ -127,7 +127,7 @@ async function gauges(url: string): Promise<Json> {
 		const picked: Json = { raft_log_entries_unpurged: logEntries, raft_log_bytes_since_snapshot: logBytes };
 		for (const [k, v] of Object.entries(m)) {
 			if (typeof v !== "number") continue;
-			if (/inflight|hot|pending|queue|backlog|uncommitted|rejected|overload|cold_flush|_live_|in_memory/.test(k)) picked[k] = v;
+			if (/inflight|hot|pending|queue|backlog|backpressure|stall|expired|buffered|uncommitted|rejected|overload|cold_flush|snapshot_builds|snapshot_pressure|_live_|in_memory/.test(k)) picked[k] = v;
 		}
 		return picked;
 	} catch (error) {
