@@ -148,6 +148,9 @@ use crate::request::TouchStreamAccessResponse;
 use crate::request::UpdateStreamAttrsRequest;
 use crate::request::UpdateStreamAttrsResponse;
 use crate::request::WriteHotBacklog;
+use crate::retention_gc::RetentionGcTarget;
+use crate::retention_gc::RetentionGcTracker;
+use crate::retention_gc::collect_retained_cold_objects;
 
 pub(crate) struct AppendPayloadInput<'a> {
     stream_id: BucketStreamId,
@@ -172,6 +175,9 @@ pub struct InMemoryGroupEngine {
     /// Leader-local tail tracker of the shared-ref compaction driver (F2).
     /// Not replicated; a new leader starts it empty.
     pub(crate) shared_ref_idle: SharedRefIdleTracker,
+    /// Leader-local grace clock of retention GC (F14f). Not replicated; a
+    /// new leader starts it empty.
+    pub(crate) retention_gc: RetentionGcTracker,
 }
 
 impl InMemoryGroupEngine {
@@ -1634,6 +1640,41 @@ impl InMemoryGroupEngine {
         }
     }
 
+    /// Retention GC due for the streams one repair cursor step visits
+    /// (bounded-state F14f). A step that starts a cycle first forgets the
+    /// incarnations that no longer exist.
+    pub fn retention_gc_targets(
+        &mut self,
+        request: &RepairColdIndexRequest,
+        inputs: &[ColdIndexRepairInput],
+    ) -> Vec<RetentionGcTarget> {
+        let Some(now_ms) = request.retention_gc_now_ms else {
+            return Vec::new();
+        };
+        if request.after.is_none() && request.stream.is_none() {
+            let state_machine = &self.state_machine;
+            self.retention_gc.retain(|stream_id, created_at_ms| {
+                state_machine
+                    .head(stream_id)
+                    .is_some_and(|metadata| metadata.created_at_ms == created_at_ms)
+            });
+        }
+        inputs
+            .iter()
+            .filter_map(|input| {
+                self.retention_gc
+                    .observe(input, now_ms, ursula_stream::RETENTION_COLD_GC_GRACE_MS)
+            })
+            .collect()
+    }
+
+    /// Records the retention GC targets that completed.
+    pub fn retention_gc_collected(&mut self, targets: &[RetentionGcTarget]) {
+        for target in targets {
+            self.retention_gc.collected(target);
+        }
+    }
+
     /// What applied state proves about one stream, for cold-index page repair.
     pub fn cold_index_repair_input(
         &self,
@@ -2299,15 +2340,25 @@ impl GroupEngine for InMemoryGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupRepairColdIndexFuture<'a> {
         Box::pin(async move {
-            let Some(cold_store) = self.cold_store.as_ref() else {
+            let Some(cold_store) = self.cold_store.clone() else {
                 return Ok(RepairColdIndexResponse::default());
             };
             let inputs = self.cold_index_repair_inputs_for(&request);
+            let retention_targets = self.retention_gc_targets(&request, &inputs);
             let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
             let (report, compaction_pages) =
                 repair_cold_index_streams(&store, self.cold_index_cache.as_deref(), &inputs)
                     .await
                     .map_err(|err| GroupEngineError::new(err.to_string()))?;
+            if !retention_targets.is_empty() {
+                let (_, completed) = collect_retained_cold_objects(
+                    &cold_store,
+                    self.cold_index_cache.as_deref(),
+                    &retention_targets,
+                )
+                .await;
+                self.retention_gc_collected(&completed);
+            }
             Ok(repair_cold_index_response(
                 &request,
                 &inputs,

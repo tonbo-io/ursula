@@ -111,6 +111,7 @@ pub use state_machine::GroupStateGauges;
 pub use state_machine::HOT_RECORD_OVERHEAD_BYTES;
 pub use state_machine::HOT_RECORD_OVERHEAD_BYTES_LB4;
 pub use state_machine::MAX_STAGED_EXTERNAL_REFS;
+pub use state_machine::RETENTION_COLD_GC_GRACE_MS;
 pub use state_machine::RecordPlanError;
 pub use state_machine::RecordReadAnchor;
 pub use state_machine::RecordReadRequest;
