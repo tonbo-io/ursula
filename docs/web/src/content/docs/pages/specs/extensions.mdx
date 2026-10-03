@@ -265,6 +265,8 @@ Creates a snapshot at the specified offset. The snapshot represents the material
 - `410 Gone`: `snapshot_offset` is older than the current earliest retained offset.
 - `413 Payload Too Large`: Snapshot exceeds the server's size limit.
 
+> **Note (informative).** Ursula keeps snapshot bodies of up to 32 MiB in replicated state. With a cold backend and feature level 5, it stores bodies of at least its external-payload threshold (1 MiB by default) as cold-tier objects instead and accepts up to 1 GiB; only the reference is replicated, and the digest is the same as for an inline body.
+
 **Idempotency:**
 
 The server MUST return `Stream-Snapshot-Digest` for a successful publish. Repeating a publish at the same offset with the same content type and body MUST succeed and return the same digest. Publishing different content at an already-published offset MUST return `409 Conflict`.
@@ -400,7 +402,7 @@ In both cases the update parts MUST be the retained messages starting exactly at
 
 A server MAY choose the partial form for any reason, for example because some messages after `S` are held only in a storage tier that does not keep per-message boundaries in memory. Serving `/bootstrap` never requires a server to read such a tier. A client MUST NOT treat a partial response as an error.
 
-> **Note (informative).** Ursula returns the complete form when every message in `[S, tail)` is above the stream's cold frontier, and otherwise the partial form with `P = S` (the snapshot part only). It never reads cold storage while serving `/bootstrap`, and it omits `Stream-Up-To-Date` from a partial response. It also caps the update parts of one response at 8 MiB: when the updates exceed the cap it returns the partial form with `P` at the last message boundary that keeps the parts within the cap, and always includes at least one message, even when that message alone exceeds the cap.
+> **Note (informative).** Ursula returns the complete form when every message in `[S, tail)` is above the stream's cold frontier, and otherwise the partial form with `P = S` (the snapshot part only). It never reads cold storage for update parts while serving `/bootstrap` (a snapshot body stored in the cold tier is streamed from it as the first part), and it omits `Stream-Up-To-Date` from a partial response. It also caps the update parts of one response at 8 MiB: when the updates exceed the cap it returns the partial form with `P` at the last message boundary that keeps the parts within the cap, and always includes at least one message, even when that message alone exceeds the cap.
 
 **Response Body:**
 
