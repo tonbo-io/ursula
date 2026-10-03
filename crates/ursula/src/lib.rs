@@ -1098,6 +1098,9 @@ pub fn cluster_router_from_state(state: HttpState) -> Router {
 pub struct IngressAdmission {
     body_bytes: Arc<tokio::sync::Semaphore>,
     wal_disk: WalDiskMonitor,
+    /// The node's Raft log-pressure flag (set by the snapshot driver's
+    /// monitor while the unsnapshotted log is over its hard limit).
+    raft_log: Option<ursula_raft::SnapshotBuildCoordinator>,
 }
 
 impl Default for IngressAdmission {
@@ -1107,6 +1110,7 @@ impl Default for IngressAdmission {
                 DEFAULT_HTTP_INFLIGHT_BODY_BYTES,
             )),
             wal_disk: WalDiskMonitor::default(),
+            raft_log: None,
         }
     }
 }
@@ -1117,6 +1121,7 @@ impl IngressAdmission {
         Self {
             body_bytes: Arc::new(tokio::sync::Semaphore::new(body_budget)),
             wal_disk: WalDiskMonitor::default(),
+            raft_log: None,
         }
     }
 
@@ -1124,11 +1129,21 @@ impl IngressAdmission {
         Self {
             body_bytes: Arc::new(tokio::sync::Semaphore::new(usize::MAX)),
             wal_disk: WalDiskMonitor::default(),
+            raft_log: None,
         }
     }
 
     pub(crate) fn with_wal_disk_monitor(mut self, monitor: WalDiskMonitor) -> Self {
         self.wal_disk = monitor;
+        self
+    }
+
+    /// Refuse client writes while the node's Raft log is over its hard limit.
+    pub fn with_raft_log_pressure(
+        mut self,
+        coordinator: Option<ursula_raft::SnapshotBuildCoordinator>,
+    ) -> Self {
+        self.raft_log = coordinator;
         self
     }
 }
@@ -1149,6 +1164,16 @@ async fn ingress_admission_middleware(
     }
     if admission.wal_disk.is_pressured() {
         return retry_after_json("WalDiskPressure");
+    }
+    // Every write that carries a body grows the Raft log; bodiless ones
+    // (retention advances, deletes) only shrink state.
+    if body_bytes > 0
+        && admission
+            .raft_log
+            .as_ref()
+            .is_some_and(ursula_raft::SnapshotBuildCoordinator::log_pressured)
+    {
+        return retry_after_json("RaftLogPressure");
     }
     // A snapshot body above the inline cap streams to the cold store in
     // bounded parts (F16), so it holds at most the inline cap in memory.

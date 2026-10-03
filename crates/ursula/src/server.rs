@@ -319,7 +319,12 @@ async fn serve(
         let client_app = client_router_with_admission(
             state.clone(),
             crate::IngressAdmission::new(&config.server)
-                .with_wal_disk_monitor(state.wal_disk_monitor()),
+                .with_wal_disk_monitor(state.wal_disk_monitor())
+                .with_raft_log_pressure(
+                    state
+                        .raft_registry()
+                        .map(ursula_raft::RaftGroupHandleRegistry::snapshot_build_coordinator),
+                ),
         );
         let cluster_app = cluster_router_from_state(state);
         let client_listener = tokio::net::TcpListener::bind(listen).await?;
@@ -343,7 +348,12 @@ async fn serve(
         admin_res?;
     } else {
         let admission = crate::IngressAdmission::new(&config.server)
-            .with_wal_disk_monitor(state.wal_disk_monitor());
+            .with_wal_disk_monitor(state.wal_disk_monitor())
+            .with_raft_log_pressure(
+                state
+                    .raft_registry()
+                    .map(ursula_raft::RaftGroupHandleRegistry::snapshot_build_coordinator),
+            );
         let app = cluster_router_from_state(state.clone())
             .merge(client_router_with_admission(state, admission));
         let listener = tokio::net::TcpListener::bind(listen).await?;
