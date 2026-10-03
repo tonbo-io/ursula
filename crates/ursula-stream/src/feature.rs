@@ -56,6 +56,15 @@
 //!   legacy message records converts them on its next write, flush,
 //!   retention or `TidyStream`.
 //!
+//! - [`FEATURE_LEVEL_COLD_SNAPSHOTS`] (5): bounded-state F16 — visible
+//!   snapshot bodies in the cold tier. `PublishSnapshotExternal` publishes a
+//!   snapshot whose body the HTTP layer staged as an object under the
+//!   stream's external prefix; replicated state keeps only the offset,
+//!   content type, digest and the object reference (stream entry field 12,
+//!   visible snapshot field 5). Superseded and deleted snapshot objects are
+//!   queued for cold GC. Bodies of up to [`crate::MAX_COLD_SNAPSHOT_BYTES`]
+//!   are accepted this way.
+//!
 //! Later core-track changes (C1, C3, C4, U22) take the remaining levels in
 //! release order.
 //!
@@ -85,10 +94,14 @@ pub const FEATURE_LEVEL_EXTERNAL_LOCATORS: u32 = 3;
 /// the dense record offsets (JSON) or the hot buffer's append starts.
 pub const FEATURE_LEVEL_HOT_REPRESENTATION: u32 = 4;
 
-/// Highest group feature level this binary can apply.
-pub const MAX_SUPPORTED_FEATURE_LEVEL: u32 = FEATURE_LEVEL_HOT_REPRESENTATION;
+/// Bounded-state F16: visible snapshot bodies stored as cold-tier objects
+/// (`PublishSnapshotExternal`).
+pub const FEATURE_LEVEL_COLD_SNAPSHOTS: u32 = 5;
 
-const _: () = assert!(MAX_SUPPORTED_FEATURE_LEVEL >= FEATURE_LEVEL_HOT_REPRESENTATION);
+/// Highest group feature level this binary can apply.
+pub const MAX_SUPPORTED_FEATURE_LEVEL: u32 = FEATURE_LEVEL_COLD_SNAPSHOTS;
+
+const _: () = assert!(MAX_SUPPORTED_FEATURE_LEVEL >= FEATURE_LEVEL_COLD_SNAPSHOTS);
 
 /// Pure form of the apply-time gate: `Ok` when a group at `current` may run
 /// an operation that needs `required`, otherwise the plain-text reason that

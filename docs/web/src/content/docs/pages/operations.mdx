@@ -92,6 +92,7 @@ Every Raft group carries a replicated feature level, `0` until an operator raise
 | 2 | Sparse cold record marks: the JSON record index keeps exact offsets only for unflushed records plus one mark per MiB of cold log. Retention into sealed history lands on the mark at or below its target. Raised only for groups whose leader completed a cold-index page-repair cycle | Supported by this release |
 | 3 | External payload locators committed first and indexed after, so state holds only in-flight ones | Supported by this release |
 | 4 | Compact hot-window representation: message records are removed. JSON streams take message boundaries from the record index's unflushed offsets, other streams keep one 8-byte start per unflushed message, so the hot window costs 8 bytes per record beyond its payload instead of 24. Streams convert on their next write, flush, retention or tidy pass | Supported by this release |
+| 5 | Snapshot bodies in the cold tier: on nodes with a cold backend, a [published snapshot](/docs/api/publish-snapshot) of at least `runtime.external_payload_min_size` is stored as an object under the stream's external prefix and only its reference is replicated; bodies of up to 1 GiB are accepted | Supported by this release |
 
 `GET /__ursula/feature-level` on the admin plane reports `supported_level`, the highest level this binary can apply, and each group's current `level`. The procedure to raise a level:
 

@@ -2131,6 +2131,7 @@ async fn sparse_marks_scenario(seed: u64) {
                 content_type: "application/json".to_owned(),
                 payload: b"{}".to_vec().into(),
                 expected_digest: None,
+                cold_body: None,
                 now_ms: 1,
             },
             placement(),

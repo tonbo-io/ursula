@@ -164,13 +164,24 @@ impl From<AppendBatchRequest> for StreamCommand {
 
 impl From<PublishSnapshotRequest> for StreamCommand {
     fn from(request: PublishSnapshotRequest) -> Self {
-        Self::PublishSnapshot {
-            stream_id: request.stream_id,
-            snapshot_offset: request.snapshot_offset,
-            content_type: request.content_type,
-            payload: request.payload,
-            expected_digest: request.expected_digest,
-            now_ms: request.now_ms,
+        match request.cold_body {
+            Some(body) => Self::PublishSnapshotExternal {
+                stream_id: request.stream_id,
+                snapshot_offset: request.snapshot_offset,
+                content_type: request.content_type,
+                object: body.object,
+                digest: body.digest,
+                expected_digest: request.expected_digest,
+                now_ms: request.now_ms,
+            },
+            None => Self::PublishSnapshot {
+                stream_id: request.stream_id,
+                snapshot_offset: request.snapshot_offset,
+                content_type: request.content_type,
+                payload: request.payload,
+                expected_digest: request.expected_digest,
+                now_ms: request.now_ms,
+            },
         }
     }
 }

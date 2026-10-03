@@ -324,11 +324,43 @@ pub struct StreamMessageRecord {
 pub struct StreamVisibleSnapshot {
     pub offset: u64,
     pub content_type: String,
+    /// Inline body. Empty when `object` holds the body.
     pub payload: Vec<u8>,
-    /// BLAKE3 digest over the content type and payload. Empty only when
+    /// BLAKE3 digest over the content type and body. Empty only when
     /// decoding legacy snapshots; restore recomputes it.
     #[serde(default)]
     pub digest: String,
+    /// Cold-tier object holding the whole body (feature level 5,
+    /// bounded-state F16). `payload_len` is the body length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<ExternalPayloadRef>,
+}
+
+/// Largest snapshot body Ursula stores as a cold-tier object (feature
+/// level 5). Inline bodies stay bounded by the HTTP body cap.
+pub const MAX_COLD_SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Incremental form of the snapshot digest: BLAKE3 over the content type's
+/// length, the content type and the body. The HTTP layer feeds a staged
+/// body through it piece by piece; apply uses it for inline bodies.
+#[derive(Debug, Clone)]
+pub struct SnapshotDigest(blake3::Hasher);
+
+impl SnapshotDigest {
+    pub fn new(content_type: &str) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&(content_type.len() as u64).to_le_bytes());
+        hasher.update(content_type.as_bytes());
+        Self(hasher)
+    }
+
+    pub fn update(&mut self, body: &[u8]) {
+        self.0.update(body);
+    }
+
+    pub fn finalize(&self) -> String {
+        self.0.finalize().to_hex().to_string()
+    }
 }
 
 /// Default cap on the update bytes one `/bootstrap` response carries

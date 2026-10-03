@@ -2036,6 +2036,7 @@ impl GroupEngine for InMemoryGroupEngine {
                 content_type: snapshot.content_type,
                 snapshot_digest: snapshot.digest,
                 payload: snapshot.payload,
+                object: snapshot.object,
                 up_to_date: snapshot.offset == tail_offset,
                 record_range: self
                     .state_machine
@@ -2096,6 +2097,10 @@ impl GroupEngine for InMemoryGroupEngine {
                 .as_ref()
                 .map(|snapshot| snapshot.payload.clone())
                 .unwrap_or_default();
+            let snapshot_object = plan
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.object.clone());
             let updates = self
                 .bootstrap_updates(
                     &request.stream_id,
@@ -2109,6 +2114,7 @@ impl GroupEngine for InMemoryGroupEngine {
                 snapshot_offset,
                 snapshot_content_type,
                 snapshot_payload,
+                snapshot_object,
                 updates,
                 next_offset: plan.next_offset,
                 up_to_date: plan.up_to_date,
@@ -2726,6 +2732,7 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::AppendExternal { stream_id, .. }
         | StreamCommand::AppendBatch { stream_id, .. }
         | StreamCommand::PublishSnapshot { stream_id, .. }
+        | StreamCommand::PublishSnapshotExternal { stream_id, .. }
         | StreamCommand::AdvanceRetention { stream_id, .. }
         | StreamCommand::TouchStreamAccess { stream_id, .. }
         | StreamCommand::UpdateStreamAttrs { stream_id, .. }

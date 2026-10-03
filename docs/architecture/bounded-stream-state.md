@@ -111,7 +111,7 @@ Every growth source the audits found, replicated or not, with the fix that bound
 | 5 | `message_records` (`state_machine.rs:138`) | yes | O(records since `FlushCold`); forever on external-only streams | 16 B/record heap, 12-15 B snapshot; 5,000-record external body: 120 KB heap, 91 KB snapshot per append | `FlushCold` or retention; collapse keeps capacity | F4, F7 |
 | 6 | Hot window chunk overhead (`hot_buffer.rs:7-17, 88-97`) | yes | O(unflushed appends) | about 64 B tight per record beyond payload; 2.6 MB deque kept after one flush window | flush thresholds and group cap, both payload-only | F6, F7 |
 | 7 | External locators in state (planned by Pi C6) `external_segments` (`cold_state.rs:9`) | yes | O(external appends) if shipped as written | est. 120 B snapshot, 170 B heap per append of 1 MiB or more | retention only | F5 |
-| 8 | Visible snapshot payload (`model.rs:264-273`) | yes | O(1), up to the 32 MiB body cap | inline on every replica and every group snapshot | replacement | F16 |
+| 8 | Visible snapshot payload (`model.rs:264-273`) | yes | O(1), up to the 32 MiB body cap; at Lb5 a reference above the staging threshold | inline on every replica and every group snapshot | replacement | F16 |
 | 9 | `last_stream_seq` and producer id length (`append.rs:347-349`; `state_machine.rs:752-761`) | yes | O(1), length unbounded through `$transaction` JSON | up to 32 MiB | replacement | F3 |
 | 10 | Engine `stream_append_counts` (`ursula-runtime/src/engine/in_memory.rs:128`) | frames | one leaked entry per TTL-expired or purged stream | est. 150 B per removed stream | restart or snapshot install | F9 |
 | 11 | TTL heap (`registry.rs:24-29, 126-138`; `ttl.rs:11-21`) | no | O(appends) on TTL streams | 104 B and 3 allocations per append; 1M appends: 104 MB that survives delete | each entry's own expiry | F8 |
@@ -175,12 +175,13 @@ Each subsection gives the data-structure change, read and write path changes, sn
 
 **Raising.** `ursulactl cluster raise-feature-level --to N` reads each node's maximum supported level from the node admin info endpoint (a new field), requires every voter and learner of every group to support `N`, then proposes `SetFeatureLevel` to each group. The raise to Lb2 also requires every group to report a completed page-repair cycle (F19). Levels are never lowered. Membership changes refuse to add a node whose maximum is below the group's level. Once raised, binaries below the level cannot restore the group's snapshots, so downgrades are unsupported, as Pi §6.3 already states.
 
-**Levels.** Levels follow release order, and each costs one predicate per call site. This document defines four:
+**Levels.** Levels follow release order, and each costs one predicate per call site. This document defines five:
 
 - **Lb1, state hygiene:** F18's derived cold coverage, F3, F4a, `TidyStream`, F14a with F14g, F14b's `DeferColdGc`, F14i, and F12a emission.
 - **Lb2, sparse marks:** F1.
 - **Lb3, external locators:** F5.
-- **Lb4, hot representation:** F4b, and F16 if accepted.
+- **Lb4, hot representation:** F4b.
+- **Lb5, cold snapshots:** F16 (§5.16), feature level 5 (`FEATURE_LEVEL_COLD_SNAPSHOTS`).
 
 Pi's keyed level (Pi C8) and these share one sequence: numbers are assigned at release, and a level may carry items from both tracks when they release together.
 
@@ -469,7 +470,18 @@ Every returned entry is at its stream's true expiry, and every smaller key has a
 
 **F15, tenant tombstones.** `bucket_usage` keeps a row of about 200 B per bucket ever written in every group. `erased_buckets` keeps about 95 B per purged bucket in every group, and `PurgeBucket` runs on all groups (`runtime.rs:579-600`). Both are deliberate (#258, #280), and both grow with tenant churn rather than records. Options: a gated `PruneBucketUsage { bucket_id, observed }` sent after the meter durably records the counters; fences held in the meta group, with only a 16-byte fingerprint set in data groups. Q9 asks the maintainers to decide.
 
-**F16, visible snapshot.** O(1) per stream, but inline up to the 32 MiB body cap on every replica and in every group snapshot. The option is an inline cap (64 KiB) at Lb4, with larger payloads staged as S3 objects through F5's path. Q8.
+**F16, visible snapshot.** O(1) per stream, but inline up to the 32 MiB body cap on every replica and in every group snapshot. Accepted for Pi Durable's SQLite VFS, which publishes the database file itself as the snapshot (`docs/architecture/keyed-streams-pi-durable.md`), and implemented at Lb5 as follows.
+
+*Design (Lb5, feature level 5).* The smallest change that reuses F5:
+
+1. **Staging.** `PUT {stream}/snapshot/{offset}` (and `?record=`) reads the body as a stream. Below the staging threshold, the smaller of `runtime.external_payload_min_size` (1 MiB by default) and the 32 MiB inline cap, the body stays inline and is proposed as today's `PublishSnapshot`. Above it, when a cold store is configured and the stream's group is at level 5 as the local replica sees it, the HTTP layer streams the body into a new object under `{stream}/external/` (F5's `new_external_payload_path`, uploaded in 8 MiB multipart parts) while hashing it with the same BLAKE3 digest apply uses for inline bodies. Memory per request stays at most one inline cap; admission charges at most 32 MiB of the in-flight budget for a snapshot PUT and admits bodies up to `MAX_COLD_SNAPSHOT_BYTES` = 1 GiB, enforced again while streaming (413).
+2. **Command.** A new command, `PublishSnapshotExternal { stream_id, snapshot_offset, content_type, object: ExternalPayloadRef, digest, expected_digest, now_ms }`, gated at Lb5 (`FeatureNotEnabled` below it). It is a new variant rather than an optional field on `PublishSnapshot`, so a binary without it fails loudly instead of applying an empty inline body (§5.1). Apply runs the existing publish rules unchanged (scope, tail, retained offset, alignment, `Stream-Snapshot-Match`, idempotency by digest) and stores `StreamVisibleSnapshot { offset, content_type, digest, object, payload: [] }`. Group snapshots carry the reference as `StreamVisibleSnapshotV1.object` (field 5); the level frame keeps older binaries from installing them.
+3. **Reads.** `GET {stream}/snapshot/{offset}` and `/bootstrap` plan as before; the plan carries the reference instead of bytes, and the HTTP layer streams the object from the cold store in 8 MiB pieces outside the state machine (no S3 inside `with_state_machine`, as F11 requires). The first piece is read before the status line, so a missing object answers 502 rather than a truncated 200. Both set `Content-Length`. Snapshot reads already require the local leader, so no body crosses the Raft gRPC path.
+4. **Object lifecycle, all through existing machinery.** The F5 cleanup rule deletes a staged body after a definite rejection and keeps it after an ambiguous failure. Apply queues a `ColdGcTarget::Paths` entry for a superseded cold body with the F14i grace (300 s), so a read planned before the publish still finds it; for the staged copy of an idempotent repeat (same digest, nothing references it), with the same grace; and for the visible body when the stream is removed (stream GC only reaches externals that pages reference). The orphan sweep (F14h) treats the visible body as a state ref (`stream_referenced_cold_paths`), so it reclaims only staged bodies whose publish never committed, after a day. Bucket purge erases the prefix as before.
+
+*Not covered.* `ImportSnapshot` copies the reference, not the object, so an import into a cluster with a different cold store loses cold bodies. The gateway (`ursulagw`) still buffers request bodies up to `--max-request-body-bytes` (32 MiB by default); larger snapshots go straight to a node or need that flag raised. A node without a cold store never stages, so every body there keeps the 32 MiB cap.
+
+*Bound.* Replicated state holds about 150 B per cold snapshot instead of its body; the inline path is unchanged.
 
 ### 5.17 F17: hardening
 
@@ -524,7 +536,8 @@ New stale entries stop at Lb3, when F5 removes the pre-proposal write.
 | F12 snapshot pipeline | F12a emission at Lb1 | +350 | +300 | medium | B1 (c, d), B2 (a decode), B3 (a emit), B6 (b, e) |
 | F13 node caches | none | +100 | +120 | low | B1 |
 | F14 cold-object hygiene | (a), (b) defer, (g) 2, (i) at Lb1; (f) gated | +600 | +500 | medium | B1 (b, e, g 1), B2 (h), B3 (a, b defer, g 2, i), B6 (c, d) |
-| F15, F16 | next level, if accepted | +100 each | +100 each | low | decision in B7 |
+| F15 | next level, if accepted | +100 | +100 | low | decision in B7 |
+| F16 cold snapshots | Lb5 | +450 | +200 | medium | after B7 (Pi Durable VFS, M2) |
 | F17 hardening | none | +150 | +100 | low | B7 |
 | F18 cold coverage | B1 rule none; representation Lb1 | +80 | +150 | low | B1, B3 |
 | F19 page-entry hygiene | none | +200 | +250 | medium | B1 |
@@ -779,7 +792,7 @@ The workstream starts now. It does not depend on keyed streams and touches no pr
 5. **Response caps.** Can reads and `/bootstrap` cap responses at 8 MiB by default? Do the ursula-index source, the SDKs or Pi assume that a record read without `max_records`, or a bootstrap, returns everything up to the tail?
 6. **Maximum hot age.** Is keeping slow streams' small tails hot for up to 5 minutes acceptable? It bounds how long records stay hot in quiet groups; in the healthy regime it changes slices little (288 against 308 per day), and the large slice reductions come from F10's batching and F2.
 7. **Defaults.** Should compaction become on by default once discovery is debt-driven (F14d), S3 snapshots the default whenever a cold store exists (F12b, which also turns on S3-health leadership shedding), and snapshot cadence byte-based with a 1 GiB node log budget (F12e)? Is the inline backend meant for production clusters at all?
-8. **Visible snapshots.** Cap and externalize them (F16), or only document a size limit?
+8. **Visible snapshots.** Decided 2026-10-03: externalize above the staging threshold at Lb5 (F16, §5.16), up to 1 GiB.
 9. **Tenant tombstones.** Who acknowledges metered usage so rows can be pruned, and should erasure fences move to the meta group (F15)? Until then, O(buckets ever) rows per group are the documented exception to I2.
 10. **Mark granularity.** Is a 1 MiB block right, or should cold reads by record trade 16 times more marks (256 B per MiB) for a 64 KiB scan bound? Per node, marks cost 16 MiB per TiB of cold history, about 65 MiB per day at a sustained 50 MB/s of ingest. Recommended: commit now to thinning history older than 30 days to 8 MiB marks, at a later level, once mark bytes on any node exceed 1 GiB.
 11. **Anchor cache.** Should a node-local anchor cache keyed by stream incarnation, exact once F14g makes incarnations unique, remove the front scan for client loops that read by record?

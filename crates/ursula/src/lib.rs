@@ -21,6 +21,7 @@
 
 mod bootstrap;
 mod bucket_listing;
+mod cold_snapshot;
 pub mod json_text;
 mod keyed_lifecycle;
 pub mod keyed_state;
@@ -1143,12 +1144,16 @@ async fn ingress_admission_middleware(
     let Some(body_bytes) = request_write_body_bytes(&request) else {
         return next.run(request).await;
     };
-    if body_bytes > u64::try_from(MAX_HTTP_BODY_BYTES).expect("max body bytes fits u64") {
+    if body_bytes > cold_snapshot::max_admitted_body_bytes(request.method(), request.uri()) {
         return (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large").into_response();
     }
     if admission.wal_disk.is_pressured() {
         return retry_after_json("WalDiskPressure");
     }
+    // A snapshot body above the inline cap streams to the cold store in
+    // bounded parts (F16), so it holds at most the inline cap in memory.
+    let body_bytes =
+        body_bytes.min(u64::try_from(MAX_HTTP_BODY_BYTES).expect("max body bytes fits u64"));
 
     let _body_permits = if body_bytes > 0 {
         let Ok(permits) = u32::try_from(body_bytes) else {
@@ -3956,14 +3961,14 @@ async fn read_record_start(
 #[tracing::instrument(
     name = "http.snapshot_publish",
     skip_all,
-    fields(bucket = %path.bucket, affinity = ?path.affinity, stream = %path.stream, snapshot_offset = %path.snapshot_offset, bytes = body.len()),
+    fields(bucket = %path.bucket, affinity = ?path.affinity, stream = %path.stream, snapshot_offset = %path.snapshot_offset),
 )]
 pub(crate) async fn publish_snapshot(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
     Path(path): Path<SnapshotPath>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let (stream_id, snapshot_offset) = path.into_parts();
     let snapshot_offset = match parse_snapshot_offset(&snapshot_offset) {
@@ -4053,7 +4058,7 @@ async fn publish_snapshot_by_offset(
     stream_id: BucketStreamId,
     snapshot_offset: u64,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let expected_digest = match headers.get(HEADER_STREAM_SNAPSHOT_MATCH) {
         Some(value) => match value.to_str() {
@@ -4064,15 +4069,32 @@ async fn publish_snapshot_by_offset(
         },
         None => None,
     };
+    let content_type = request_content_type(&headers);
+    let (payload, cold_body) =
+        match cold_snapshot::receive_snapshot_body(&state, &stream_id, &content_type, body).await {
+            Ok(cold_snapshot::SnapshotUpload::Inline(payload)) => (payload, None),
+            Ok(cold_snapshot::SnapshotUpload::Cold(cold_body)) => (Bytes::new(), Some(cold_body)),
+            Err(response) => return response,
+        };
+    let staged_path = cold_body
+        .as_ref()
+        .map(|cold_body| cold_body.object.s3_path.clone());
     let request = PublishSnapshotRequest {
         stream_id,
         snapshot_offset,
-        content_type: request_content_type(&headers),
-        payload: body,
+        content_type,
+        payload,
         expected_digest,
+        cold_body,
         now_ms: state.unix_time_ms(),
     };
-    match state.runtime.publish_snapshot(request).await {
+    let result = state.runtime.publish_snapshot(request).await;
+    if let (Err(err), Some(staged_path)) = (&result, staged_path.as_deref()) {
+        // F5 cleanup rule: delete the staged body only after a definite
+        // rejection; the orphan sweep reclaims it otherwise.
+        cleanup_external_payload(&state, staged_path, err).await;
+    }
+    match result {
         Ok(response) => {
             let mut headers = HeaderMap::new();
             insert_default_response_headers(&mut headers);
@@ -4093,7 +4115,7 @@ pub(crate) async fn publish_snapshot_at_record(
     Path(path): Path<StreamPath>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let query = match parse_query(raw_query.as_deref()) {
         Ok(query) => query,
@@ -4311,7 +4333,23 @@ pub(crate) async fn read_snapshot(
         })
         .await
     {
-        Ok(response) => snapshot_response(response),
+        Ok(mut response) => {
+            let object = response.object.take();
+            let mut rendered = snapshot_response(response);
+            if let Some(object) = object {
+                let len = object.payload_len;
+                match cold_snapshot::cold_snapshot_body(&state, object).await {
+                    Ok(body) => {
+                        *rendered.body_mut() = body;
+                        rendered
+                            .headers_mut()
+                            .insert(CONTENT_LENGTH, HeaderValue::from(len));
+                    }
+                    Err(response) => return response,
+                }
+            }
+            rendered
+        }
         Err(err) => {
             runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
         }
@@ -4379,7 +4417,10 @@ pub(crate) async fn bootstrap_stream(
         })
         .await
     {
-        Ok(response) => bootstrap_response(response),
+        Ok(response) => match response.snapshot_object.clone() {
+            None => bootstrap_response(response),
+            Some(object) => cold_snapshot::bootstrap_response(&state, response, object).await,
+        },
         Err(err) => {
             runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
         }
@@ -5098,6 +5139,8 @@ fn request_target(uri: &Uri) -> String {
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod cold_snapshot_tests;
 #[cfg(test)]
 mod keyed_indexer_tests;
 #[cfg(test)]

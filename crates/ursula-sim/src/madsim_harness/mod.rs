@@ -1850,6 +1850,7 @@ pub(super) async fn verify_runtime_raft_snapshot_publish(
             content_type: content_type.clone(),
             payload: snapshot_payload.clone().into(),
             expected_digest: None,
+            cold_body: None,
             now_ms: 0,
         })
         .await

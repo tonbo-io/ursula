@@ -267,8 +267,7 @@ fn assert_restore_matches_live(machine: &StreamStateMachine, id: &str) -> Stream
 }
 
 #[test]
-fn max_supported_feature_level_is_four() {
-    assert_eq!(crate::MAX_SUPPORTED_FEATURE_LEVEL, LB4);
+fn level_four_can_be_raised() {
     let mut machine = machine_at(0);
     raise(&mut machine, LB4);
     assert_eq!(machine.feature_level(), LB4);

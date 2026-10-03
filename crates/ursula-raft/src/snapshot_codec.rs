@@ -601,6 +601,7 @@ fn visible_snapshot_to_proto(snapshot: StreamVisibleSnapshot) -> proto::StreamVi
         content_type: snapshot.content_type,
         payload: snapshot.payload.into(),
         digest: snapshot.digest,
+        object: snapshot.object,
     }
 }
 
@@ -610,6 +611,7 @@ fn visible_snapshot_from_proto(snapshot: proto::StreamVisibleSnapshotV1) -> Stre
         content_type: snapshot.content_type,
         payload: snapshot.payload.to_vec(),
         digest: snapshot.digest,
+        object: snapshot.object,
     }
 }
 
@@ -1310,6 +1312,57 @@ mod tests {
         assert!(
             matches!(&err, SnapshotStoreError::Deserialize(message) if message.contains("feature level")),
             "{err:?}"
+        );
+    }
+
+    /// Bounded-state F16 (level 5): a cold snapshot body travels through
+    /// the codec as its object reference, never as inline bytes.
+    #[test]
+    fn cold_snapshot_reference_round_trips() {
+        let mut machine = ursula_stream::StreamStateMachine::new();
+        machine.apply(ursula_stream::StreamCommand::SetFeatureLevel {
+            level: ursula_stream::FEATURE_LEVEL_COLD_SNAPSHOTS,
+        });
+        machine.apply(ursula_stream::StreamCommand::CreateBucket {
+            bucket_id: "bucket".to_owned(),
+        });
+        let stream_id = BucketStreamId::new("bucket", "s");
+        machine.apply(ursula_stream::StreamCommand::CreateStream {
+            stream_id: stream_id.clone(),
+            content_type: "application/octet-stream".to_owned(),
+            initial_payload: bytes::Bytes::from_static(b"ab"),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            attrs: None,
+            now_ms: 1,
+        });
+        let object = ursula_stream::ExternalPayloadRef {
+            s3_path: "bucket/s/external/a.bin".to_owned(),
+            payload_len: 1 << 30,
+            object_size: 1 << 30,
+        };
+        machine.apply(ursula_stream::StreamCommand::PublishSnapshotExternal {
+            stream_id,
+            snapshot_offset: 2,
+            content_type: "application/octet-stream".to_owned(),
+            object: object.clone(),
+            digest: "d".to_owned(),
+            expected_digest: None,
+            now_ms: 2,
+        });
+        let entry = machine.snapshot().streams.remove(0);
+        let encoded = stream_to_proto(entry.clone()).expect("encode entry");
+        let visible = encoded.visible_snapshot.as_ref().expect("visible snapshot");
+        assert!(visible.payload.is_empty());
+        assert_eq!(visible.object.as_ref(), Some(&object));
+        assert_eq!(
+            stream_from_proto(encoded)
+                .expect("decode entry")
+                .visible_snapshot,
+            entry.visible_snapshot
         );
     }
 }

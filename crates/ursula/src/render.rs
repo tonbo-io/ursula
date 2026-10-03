@@ -601,7 +601,18 @@ pub(crate) fn snapshot_response(response: ReadSnapshotResponse) -> Response {
 }
 
 pub(crate) fn bootstrap_response(response: BootstrapStreamResponse) -> Response {
-    let boundary = bootstrap_boundary(&response);
+    let (boundary, headers) = bootstrap_head(&response);
+    (
+        StatusCode::OK,
+        headers,
+        render_bootstrap_multipart(&response, &boundary),
+    )
+        .into_response()
+}
+
+/// The multipart boundary and response headers of a `/bootstrap` answer.
+pub(crate) fn bootstrap_head(response: &BootstrapStreamResponse) -> (String, HeaderMap) {
+    let boundary = bootstrap_boundary(response);
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     insert_content_type(
@@ -623,12 +634,7 @@ pub(crate) fn bootstrap_response(response: BootstrapStreamResponse) -> Response 
         insert_record_head_headers(&mut headers, record_range);
     }
     insert_cache_control(&mut headers, "no-store");
-    (
-        StatusCode::OK,
-        headers,
-        render_bootstrap_multipart(&response, &boundary),
-    )
-        .into_response()
+    (boundary, headers)
 }
 
 pub(crate) fn bootstrap_boundary(response: &BootstrapStreamResponse) -> String {
@@ -636,7 +642,13 @@ pub(crate) fn bootstrap_boundary(response: &BootstrapStreamResponse) -> String {
     response.snapshot_offset.hash(&mut hasher);
     response.next_offset.hash(&mut hasher);
     response.updates.len().hash(&mut hasher);
-    response.snapshot_payload.len().hash(&mut hasher);
+    let snapshot_len = response.snapshot_object.as_ref().map_or(
+        u64::try_from(response.snapshot_payload.len()).unwrap_or(u64::MAX),
+        |object| object.payload_len,
+    );
+    usize::try_from(snapshot_len)
+        .unwrap_or(usize::MAX)
+        .hash(&mut hasher);
     format!("ursula-bootstrap-{:016x}", hasher.finish())
 }
 
@@ -644,20 +656,37 @@ pub(crate) fn render_bootstrap_multipart(
     response: &BootstrapStreamResponse,
     boundary: &str,
 ) -> Vec<u8> {
-    let mut body = Vec::new();
-    push_multipart_part(
-        &mut body,
-        boundary,
-        &response.snapshot_content_type,
-        &response.snapshot_payload,
-    );
+    let (mut body, suffix) = bootstrap_multipart_around_snapshot(response, boundary);
+    body.extend_from_slice(&response.snapshot_payload);
+    body.extend_from_slice(&suffix);
+    body
+}
+
+/// The multipart entity of a `/bootstrap` answer split around the snapshot
+/// part's body: everything before it and everything after it. A cold
+/// snapshot body (F16) is streamed between the two.
+pub(crate) fn bootstrap_multipart_around_snapshot(
+    response: &BootstrapStreamResponse,
+    boundary: &str,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut prefix = Vec::new();
+    push_multipart_part_head(&mut prefix, boundary, &response.snapshot_content_type);
+    let mut suffix = b"\r\n".to_vec();
     for update in &response.updates {
-        push_multipart_part(&mut body, boundary, &update.content_type, &update.payload);
+        push_multipart_part(&mut suffix, boundary, &update.content_type, &update.payload);
     }
+    suffix.extend_from_slice(b"--");
+    suffix.extend_from_slice(boundary.as_bytes());
+    suffix.extend_from_slice(b"--\r\n");
+    (prefix, suffix)
+}
+
+fn push_multipart_part_head(body: &mut Vec<u8>, boundary: &str, content_type: &str) {
     body.extend_from_slice(b"--");
     body.extend_from_slice(boundary.as_bytes());
-    body.extend_from_slice(b"--\r\n");
-    body
+    body.extend_from_slice(b"\r\nContent-Type: ");
+    body.extend_from_slice(content_type.as_bytes());
+    body.extend_from_slice(b"\r\n\r\n");
 }
 
 pub(crate) fn push_multipart_part(
@@ -666,11 +695,7 @@ pub(crate) fn push_multipart_part(
     content_type: &str,
     payload: &[u8],
 ) {
-    body.extend_from_slice(b"--");
-    body.extend_from_slice(boundary.as_bytes());
-    body.extend_from_slice(b"\r\nContent-Type: ");
-    body.extend_from_slice(content_type.as_bytes());
-    body.extend_from_slice(b"\r\n\r\n");
+    push_multipart_part_head(body, boundary, content_type);
     body.extend_from_slice(payload);
     body.extend_from_slice(b"\r\n");
 }
