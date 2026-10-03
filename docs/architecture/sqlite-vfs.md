@@ -57,13 +57,19 @@ appended with the idempotent producer (`Producer-Id` per database, `Producer-Epo
 2. Reads the sidecar, before anything opens the file through SQLite. A file with content and no
    sidecar was never attached and is refused (it may be a database whose pages were never in the
    stream). A sidecar for another stream path is refused. A sidecar written in this boot for this
-   db file is trusted (or carries the recovery marker, §4.3); anything else (another or unknown
+   db file is trusted (or carries the recovery marker, step 3); anything else (another or unknown
    boot id, an older version's two-field sidecar, a torn one, a replaced db file) means the local
-   files are discarded (§6) and the attach proceeds as on a fresh host.
+   files are discarded (§6) and the attach proceeds as on a fresh host, unless a read at the
+   sidecar's offset shows the stream lost acknowledged data (§6, wrong stream).
 3. Recovery (only when it rewrites pages): a private `unix` connection runs
    `wal_checkpoint(TRUNCATE)` and must see every frame checkpointed and be the last connection
    (the WAL is deleted on its close); otherwise attach fails rather than rewriting pages under
-   another connection's cache.
+   another connection's cache. Before its first page write, recovery replaces the sidecar with the
+   recovery marker (`<restart offset> <epoch> boot=… recovering`). An attach in the same boot that
+   finds it does not open the file through SQLite, because the file may be inconsistent: it checks
+   that no other process holds the file, deletes `-wal`/`-shm` (empty, since recovery starts only
+   after a complete checkpoint) and replays from the recorded offset. The db file's inode is not
+   compared, because a snapshot install renames over it.
 4. `HEAD` the stream. If its latest snapshot is ahead of the file (a fresh host, or a file left
    below the retention), installs it (§4.3). Then replays frames to the tail.
 5. Claims: appends a claim at (epoch = highest seen + 1, seq 0) and reads the frame back. A 2xx
@@ -169,7 +175,9 @@ and the log keeps growing. A superseded cold body stays readable for 5 minutes.
 ## 5. Guarantees
 
 - An acknowledged commit (the SQL `COMMIT` returned) is in the stream, and every host that
-  attaches after it sees it, through replay or a snapshot that includes it.
+  attaches after it sees it, through replay or a snapshot that includes it. Caveat: the owner's
+  later commits are page images read from its local files, so a local disk that silently loses a
+  write (the write-back I/O error of §6) can overwrite acknowledged changes in the stream.
 - Nothing the stream did not acknowledge becomes visible: no frame of a transaction reaches the
   local WAL before its append is acknowledged, and a fenced or failed commit leaves no trace
   locally or remotely (the server deduplicates retries). An append the server applied but whose
@@ -202,9 +210,9 @@ does with the local files depends on whether the kernel has kept them since they
   local files and rebuilds from the latest snapshot and the tail. A new random boot id cannot be
   on disk from before it was generated, so no torn sidecar passes the check. Discarding runs
   before anything opens the file through SQLite (a torn file could fail any checkpoint), refuses
-  while another process has the file open, removes `-wal`, `-shm`, `-journal`, the db and leftover
-  temp files (never the held lock file), and rewrites the sidecar last, so a crash midway discards
-  again. The first attach after upgrading from a version without boot ids rebuilds once; that
+  while another process has the file open, removes the db and leftover snapshot temp files (never
+  the held lock file); attach's fresh path then removes `-wal`, `-shm` and `-journal` and rewrites
+  the sidecar last, so a crash midway discards again. The first attach after upgrading from a version without boot ids rebuilds once; that
   version refuses this one's sidecar, so after a downgrade delete `<db>` (it is rebuilt from the
   stream).
 - **Cost of a rebuild**: one snapshot GET (the database, held in memory twice while it is decoded;
@@ -215,9 +223,11 @@ does with the local files depends on whether the kernel has kept them since they
   everything since the last published snapshot (the whole log if none was ever published):
   snapshot health is an availability dependency (watch the log since the latest snapshot).
 - **Wrong stream**: the sidecar names the stream's path; attaching the file to another stream is
-  refused, and so is attaching it to its stream after that was deleted and recreated shorter
-  (the replay start is beyond the stream's end). A stream recreated at the same path and already
-  grown past the file's offset is not detected.
+  refused, and so is attaching it to its stream after that was deleted and recreated shorter: a
+  read at the sidecar's offset (the replay start for trusted files, a check before discarding
+  otherwise) is beyond the stream's end. Both hold after a reboot too, and the local files are
+  kept. A stream recreated at the same path and already grown past the file's offset is not
+  detected.
 - A rollback journal next to an attached file can only be left by a crash while attach switched
   an empty file to WAL; attach deletes it in every case (rolling it back would truncate the file
   under the pages attach writes next).
@@ -228,7 +238,9 @@ does with the local files depends on whether the kernel has kept them since they
   the log grows, nothing is lost; retention simply does not advance.
 
 Unsupported, because they break "same boot means the files are what this host wrote": a disk
-write-back I/O error (nothing fsyncs, so nobody sees it), a block volume force-detached and
+write-back I/O error (nothing fsyncs, so nobody sees it; after the page is evicted SQLite reads the
+old block back and later commits append page images built on it, so acknowledged commits are lost
+from the stream itself, not only from the cache), a block volume force-detached and
 reattached without a reboot, a runtime that fakes a fixed boot id, edits to the files outside the
 extension (a process that never loaded it, or copying a backup over the db in place; a db file
 replaced by rename is detected and discarded), and network or FUSE filesystems for the local
@@ -259,10 +271,11 @@ rebuild on every restart of the sandbox or VM.
 - e2e against a real node (`clients/sqlite-ursula`): transparency (any schema, byte-identical
   rebuild), the crash matrix (same-boot re-attaches resume from the sidecar or the recovery
   marker, without a snapshot), fencing, recovery exclusion, the local cache (a simulated reboot
-  with a rolled-back db file and a cut WAL rebuilds byte-identical from snapshot + tail; the same
+  with a rolled-back db file whose first sector is torn and a cut WAL rebuilds byte-identical from snapshot + tail; the same
   boot reuses the files with no snapshot and no replay from scratch, also for a file rebuilt from
   a snapshot; discarding is refused while another process has the file open; a replaced db file is
-  rebuilt; a file without a sidecar, another stream and a recreated stream are refused), snapshots
+  rebuilt; a file without a sidecar, another stream and a recreated stream are refused, the last also after a
+  reboot), snapshots
   and retention (a ~160 MB run; CI also runs it without a cold tier under the default hot limit;
   fresh and lagging hosts rebuild byte-identical from snapshot + tail; the takeover after the trim
   fences the old owner), Pi conformance in three modes, and a benchmark (sanity numbers only).

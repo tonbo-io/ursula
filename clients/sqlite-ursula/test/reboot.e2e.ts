@@ -1,7 +1,7 @@
 // The local files are a cache of the stream, never fsynced: attach trusts them only when the sidecar
 // says they were written in this boot (a process crash keeps the page cache) into this db file, and
-// otherwise discards them and rebuilds from snapshot + tail. URSULA_VFS_TEST_BOOT_ID stands in for a
-// reboot; the damage a power loss could do is applied by hand.
+// otherwise discards them and rebuilds from snapshot + tail. A reboot is simulated by rewriting the
+// sidecar's boot id to one this kernel never had; the damage a power loss could do is applied by hand.
 import { spawn } from "node:child_process";
 import { readFileSync, renameSync, statSync, truncateSync, writeFileSync } from "node:fs";
 import { expect, it } from "vitest";
@@ -25,15 +25,20 @@ const rows = (file: string): string[] => {
 	}
 };
 
-/** An owner (in `boot`, when given) that wrote everything and was SIGKILLed with a WAL, and an older image of its db file. */
-async function crashedOwner(boot?: string): Promise<{ url: string; file: string; older: Buffer; offset: number }> {
+/** What a previous boot leaves behind: the sidecar records a boot id this kernel never had. */
+const rebooted = (file: string): void => {
+	const sidecar = `${file}-ursula`;
+	writeFileSync(sidecar, readFileSync(sidecar, "utf8").replace(/ boot=\S+/, " boot=before-the-reboot"));
+};
+
+/** An owner that wrote everything and was SIGKILLed with a WAL, and an older image of its db file. */
+async function crashedOwner(): Promise<{ url: string; file: string; older: Buffer; offset: number }> {
 	const url = ursulaUrl() + streamPath();
 	const file = freshFile();
-	const env: Record<string, string> = boot === undefined ? {} : { URSULA_VFS_TEST_BOOT_ID: boot };
-	const first = runChild(file, url, FIRST, { ...env, CHILD_EXIT: "1" });
+	const first = runChild(file, url, FIRST, { CHILD_EXIT: "1" });
 	expect((await first.exited).code).toBe(0);
 	const older = readFileSync(file);
-	const child = runChild(file, url, REST, { ...env, URSULA_VFS_SNAPSHOT_MIN_BYTES: "1" });
+	const child = runChild(file, url, REST, { URSULA_VFS_SNAPSHOT_MIN_BYTES: "1" });
 	const done = await child.waitFor((l) => l.done === true);
 	expect(done.snapshots).toBeGreaterThan(0);
 	child.proc.kill("SIGKILL");
@@ -42,7 +47,8 @@ async function crashedOwner(boot?: string): Promise<{ url: string; file: string;
 }
 
 it("(a) after a reboot, files a power loss damaged are discarded and rebuilt from snapshot + tail", async () => {
-	const { url, file, older } = await crashedOwner("before-the-reboot");
+	const { url, file, older } = await crashedOwner();
+	rebooted(file);
 	// A plain connection in another process (no extension) holds the file open, idle.
 	const reader = spawn(
 		process.execPath,
@@ -50,8 +56,9 @@ it("(a) after a reboot, files a power loss damaged are discarded and rebuilt fro
 		{ stdio: ["ignore", "pipe", "inherit"] },
 	);
 	await new Promise<void>((res) => reader.stdout?.once("data", () => res()));
-	// The power loss: the db file's writes since the older image lost (same inode), the WAL cut mid-frame.
-	writeFileSync(file, older);
+	// The power loss: the db file's writes since the older image lost and page 1 torn (same inode;
+	// SQLite cannot open it, so attach must discard it unread), the WAL cut mid-frame.
+	writeFileSync(file, Buffer.concat([Buffer.alloc(512), older.subarray(512)]));
 	truncateSync(`${file}-wal`, Math.floor(statSync(`${file}-wal`).size / 2));
 	// Never discarded under another process's feet.
 	expect(() => attach(file, url)).toThrow(/open by another process/);
@@ -112,4 +119,8 @@ it("(e) attaching the cache of one stream to another, or to its stream deleted a
 	expect(() => attach(file, ursulaUrl() + streamPath())).toThrow(/is a cache of stream/);
 	expect((await fetch(url, { method: "DELETE" })).ok).toBe(true);
 	expect(() => attach(file, url)).toThrow(/beyond the stream's end/);
+	// After a reboot too: the files are kept, not discarded for an empty database.
+	rebooted(file);
+	expect(() => attach(file, url)).toThrow(/beyond the stream's end/);
+	expect(statSync(file).size).toBeGreaterThan(0);
 });

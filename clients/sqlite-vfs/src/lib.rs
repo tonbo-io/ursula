@@ -44,9 +44,8 @@
 //!   `SELECT ursula_stats(path)` drains per-commit, per-checkpoint and per-snapshot numbers (bench).
 //!
 //! Test hooks: `URSULA_VFS_ABORT_AFTER_ACK=<n>` aborts the process right after the n-th acknowledged
-//! commit of an attachment, before the local WAL write; `URSULA_VFS_TEST_BOOT_ID` replaces the
-//! kernel's boot id (a reboot, as far as the local files are concerned). `URSULA_VFS_RETRY_MS`
-//! bounds the retries of an append with an unknown outcome (default 30000).
+//! commit of an attachment, before the local WAL write. `URSULA_VFS_RETRY_MS` bounds the retries
+//! of an append with an unknown outcome (default 30000).
 //! `URSULA_VFS_SNAPSHOT_MIN_BYTES` sets the smallest log (bytes since the latest snapshot) that
 //! triggers a snapshot.
 #![allow(non_snake_case, clippy::missing_safety_doc)]
@@ -348,15 +347,14 @@ fn fail_post_ack() -> Option<u64> {
     })
 }
 
-/// This kernel's boot id (`URSULA_VFS_TEST_BOOT_ID` replaces it); `None` when unknown, which
-/// never matches a recorded one. Within one boot every completed write stays visible (the page
-/// cache survives any process crash), so local files written since this boot are exactly what this
-/// host wrote; across a reboot or power loss they may be anything. Read at every attach, never
-/// cached: a process restored after a reboot (CRIU) must see the new boot.
+/// This kernel's boot id; `None` when unknown, which never matches a recorded one. Within one boot
+/// every completed write stays visible (the page cache survives any process crash), so local files
+/// written since this boot are exactly what this host wrote; across a reboot or power loss they may
+/// be anything. Read at every attach, never cached: a process restored after a reboot (CRIU) must
+/// see the new boot. No override, not even for tests (they rewrite the sidecar instead): a fixed id
+/// would make every reboot look like the same boot.
 fn boot_id() -> Option<String> {
-    std::env::var("URSULA_VFS_TEST_BOOT_ID")
-        .ok()
-        .or_else(read_boot_id)
+    read_boot_id()
         .map(|id| id.trim().to_owned())
         .filter(|id| !id.is_empty() && !id.contains(char::is_whitespace))
 }
@@ -497,27 +495,23 @@ fn read_sidecar(path: &str) -> Result<Option<Sidecar>, String> {
 }
 
 /// Deletes a database's local files (a cache of the stream) so attach rebuilds them: never while
-/// another process has the file open, and never the host lock (held). The sidecar goes last, as
-/// the fresh attach rewrites it: until then it marks whatever is left untrusted, so a crash midway
-/// discards again.
+/// another process has the file open, and never the host lock (held). Attach's fresh path then
+/// removes `-wal`, `-shm` and `-journal` and rewrites the sidecar: until then the sidecar marks
+/// whatever is left untrusted, so a crash midway discards again.
 fn discard_local(path: &str) -> Result<(), String> {
     check_unused(path)?;
-    for suffix in [
-        "-wal",
-        "-shm",
-        "-journal",
-        "-ursula.snap",
-        "-ursula.tmp",
-        "",
-    ] {
-        let f = format!("{path}{suffix}");
-        if let Err(e) = fs::remove_file(&f)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(format!("remove {f}: {e}"));
-        }
+    for suffix in ["-ursula.snap", "-ursula.tmp", ""] {
+        remove_if_exists(&format!("{path}{suffix}"))?;
     }
     Ok(())
+}
+
+/// Fails loudly: a stale WAL or journal left next to a rebuilt db file would be applied to it.
+fn remove_if_exists(f: &str) -> Result<(), String> {
+    match fs::remove_file(f) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("remove {f}: {e}")),
+        _ => Ok(()),
+    }
 }
 
 fn abort_in_replay() -> Option<u64> {
@@ -996,10 +990,10 @@ unsafe fn checkpoint_local(path: &str) -> Result<(), String> {
 /// connections of `Private`).
 struct Applier {
     path: String,
-    url: String,
-    /// This boot's id, for the recovery marker (see `stamp`).
-    boot: Option<String>,
     sidecar: String,
+    /// The recovery marker's stamp: the db file is not compared for a marker (see `trusted`), so
+    /// attach's stamp holds even after `install` renames over the file.
+    stamp: String,
     /// Offset and epoch a recovery restarts from, recorded in the recovery marker.
     restart: (u64, u64),
     /// The recovery marker is written: the file may be rewritten.
@@ -1044,8 +1038,7 @@ impl Applier {
                 if fs::metadata(&self.path).is_ok_and(|m| m.len() > 0) {
                     unsafe { checkpoint_local(&self.path)? };
                 }
-                let stamp = stamp(&self.path, &self.url, self.boot.as_deref());
-                write_recovery_marker(&self.sidecar, self.restart.0, self.restart.1, &stamp)?;
+                write_recovery_marker(&self.sidecar, self.restart.0, self.restart.1, &self.stamp)?;
                 self.recovering = true;
             }
             let f = OpenOptions::new()
@@ -1359,7 +1352,16 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
             Some(s) if s.trusted(&path, boot.as_deref()) => local = Some(s),
             // Written before a reboot (a power loss may have left any prefix of any write), by an
             // older version, torn, or for another db file: the stream has everything committed.
-            _ => {
+            s => {
+                // Unless it lost acknowledged data (deleted and recreated): a sidecar offset never
+                // exceeds an acknowledged one, so a read there answering 416 (beyond the end)
+                // refuses, as for trusted files, instead of rebuilding an empty database. `Gone`
+                // (below retention) is fine: the rebuild starts from a snapshot.
+                if let Some(s) = s.filter(|s| s.offset > 0)
+                    && let Err(Fail::Other(e)) = read_from(&url, s.offset)
+                {
+                    return Err(e);
+                }
                 eprintln!(
                     "sqlite-ursula-vfs: {path}: local files untrusted (another boot, torn, or \
                      replaced); discarding them and rebuilding from the stream"
@@ -1371,7 +1373,8 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
     // The only rollback journal an attached file can have is `init_wal_format`'s, left by a crash
     // mid-switch: the file is an empty database with or without it, but the first open (SQLite's,
     // or `checkpoint_local`'s) would roll it back, truncating whatever attach writes after it.
-    let _ = fs::remove_file(format!("{path}-journal"));
+    remove_if_exists(&format!("{path}-journal"))?;
+    let mark = stamp(&path, &url, boot.as_deref());
     let (from, epoch, recovering) = match &local {
         Some(s) => (s.offset, s.epoch, s.recovering),
         None => {
@@ -1379,9 +1382,9 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
             // is written before anything lands in the file, so an attach that fails halfway leaves
             // a file the next one resumes (replaying page images from an older offset is
             // idempotent).
-            let _ = fs::remove_file(format!("{path}-wal"));
-            let _ = fs::remove_file(format!("{path}-shm"));
-            write_sidecar(&sidecar, 0, 0, &stamp(&path, &url, boot.as_deref()))?;
+            remove_if_exists(&format!("{path}-wal"))?;
+            remove_if_exists(&format!("{path}-shm"))?;
+            write_sidecar(&sidecar, 0, 0, &mark)?;
             (0, 0, false)
         }
     };
@@ -1390,15 +1393,14 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
         // read it (no checkpoint). Its WAL is empty: recovery starts only after a complete local
         // checkpoint (or on an empty file), so stale -wal/-shm files carry nothing.
         check_unused(&path)?;
-        let _ = fs::remove_file(format!("{path}-wal"));
-        let _ = fs::remove_file(format!("{path}-shm"));
+        remove_if_exists(&format!("{path}-wal"))?;
+        remove_if_exists(&format!("{path}-shm"))?;
         eprintln!("sqlite-ursula-vfs: {path}: resuming an interrupted recovery from {from}");
     }
     let mut applier = Applier {
         path: path.clone(),
-        url: url.clone(),
-        boot: boot.clone(),
         sidecar: sidecar.clone(),
+        stamp: mark,
         restart: (from, epoch),
         recovering,
         installed: 0,
