@@ -164,10 +164,9 @@ jobs:
           E2E_NODES=3 E2E_S3=1 URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" npm run test:e2e
 
   sqlite-vfs:
-    name: sqlite-vfs (extension lint + units + build, then e2e against real ursula)
-    needs: build-ursula
+    name: sqlite-vfs (extension lint + units + build)
     runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
-    timeout-minutes: 45
+    timeout-minutes: 20
     env:
       # Keeps libsqlite3-sys from probing (and linking) a system libsqlite3: the extension only calls
       # the host's SQLite through sqlite3_api_routines.
@@ -191,6 +190,23 @@ jobs:
           cargo build --locked --release
           ldd target/release/libsqlite_ursula_vfs.so
 
+      - name: Upload the extension
+        uses: actions/upload-artifact@v6
+        with:
+          name: sqlite-ursula-vfs
+          path: clients/sqlite-vfs/target/release/libsqlite_ursula_vfs.so
+          if-no-files-found: error
+          retention-days: 1
+
+  sqlite-vfs-e2e:
+    name: sqlite-vfs e2e (single-node ursula)
+    needs: [build-ursula, sqlite-vfs]
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
       - name: Install Node
         uses: actions/setup-node@v6
         with:
@@ -202,12 +218,68 @@ jobs:
           name: ursula-release
           path: ${{ runner.temp }}/ursula-bin
 
-      - name: e2e (transparency, crash matrix, fencing, recovery, Pi conformance, benchmark)
+      - name: Download the extension
+        uses: actions/download-artifact@v7
+        with:
+          name: sqlite-ursula-vfs
+          path: ${{ runner.temp }}/vfs
+
+      - name: e2e (transparency, crash matrix, fencing, recovery, snapshots, Pi conformance, benchmark)
         timeout-minutes: 30
         run: |
           chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
           cd clients/sqlite-ursula
           npm ci
           npm run typecheck
-          URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$GITHUB_WORKSPACE/clients/sqlite-vfs/target/release/libsqlite_ursula_vfs.so" npm run test:e2e
+          URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npm run test:e2e
 
+      # Without a cold tier the default per-group hot limit trips after ~68 MB of frames: the
+      # snapshot run writes ~160 MB, so only snapshots + retention keep it admitted.
+      - name: snapshots + retention without a cold tier (default hot limit)
+        timeout-minutes: 10
+        run: |
+          cd clients/sqlite-ursula
+          URSULA_COLD=none URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/snapshot.e2e.ts
+
+  sqlite-vfs-e2e-cluster:
+    name: sqlite-vfs e2e (3 nodes + gateway + MinIO, feature level 5)
+    needs: [build-ursula, sqlite-vfs]
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 40
+    env:
+      URSULA_S3_ENDPOINT: http://127.0.0.1:9000
+      URSULA_S3_ACCESS_KEY: minioadmin
+      URSULA_S3_SECRET_KEY: minioadmin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Start MinIO
+        run: scripts/ks_minio_ci.sh
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Download ursula
+        uses: actions/download-artifact@v7
+        with:
+          name: ursula-release
+          path: ${{ runner.temp }}/ursula-bin
+
+      - name: Download the extension
+        uses: actions/download-artifact@v7
+        with:
+          name: sqlite-ursula-vfs
+          path: ${{ runner.temp }}/vfs
+
+      # Snapshot bodies above 1 MiB go to the cold tier (S3). The benchmark's Pi turns snapshot and
+      # trim as they go (a 64 KiB minimum, so the threshold is the database size).
+      - name: Pi conformance (3 modes), snapshots + retention, benchmark through the gateway
+        timeout-minutes: 30
+        run: |
+          chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
+          cd clients/sqlite-ursula
+          npm ci
+          E2E_NODES=3 URSULA_VFS_SNAPSHOT_MIN_BYTES=65536 URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/conformance.e2e.ts test/snapshot.e2e.ts test/bench.e2e.ts

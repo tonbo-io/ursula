@@ -1,0 +1,77 @@
+---
+title: SQLite on Ursula
+sidebarTitle: SQLite (VFS)
+---
+
+`sqlite-ursula-vfs` is a SQLite loadable extension that replicates a database file to an Ursula stream. Your application keeps using SQLite unchanged, for example `node:sqlite` or Pi Durable's official `SqliteStorage`: every commit is appended to the stream before it reaches the local file, and any host can rebuild the database from the stream. The extension lives in [`clients/sqlite-vfs`](https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-vfs), and the TypeScript helpers in [`clients/sqlite-ursula`](https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-ursula).
+
+How it works:
+
+- One database is one binary stream (`application/octet-stream`). A commit is one append carrying the transaction's final page images, zstd-compressed.
+- The append happens at SQLite's commit point. `COMMIT` returns only after Ursula acknowledged it; if the append is rejected, SQLite rolls the transaction back and nothing of it stays local.
+- Attaching a file claims the stream with a new producer epoch. Every earlier owner is fenced: its next commit fails.
+- The owner publishes a [snapshot](/docs/concepts/snapshots) of the database whenever the log since the last one outgrows the database (8 MiB at least), reads it back, and then advances the stream's retention to the snapshot before it. A new host starts from the latest snapshot and replays only the tail.
+
+## What the cluster needs
+
+- Room for one transaction per append: up to 32 MiB of compressed page images.
+- For databases whose snapshots exceed 1 MiB, a cold backend and [feature level 5](/docs/operations#feature-levels), so snapshot bodies are stored in the cold tier (up to 1 GiB). Without it, snapshots are kept inline, up to 32 MiB.
+- Snapshots above 32 MiB must go straight to a node, or through a gateway whose `--max-request-body-bytes` is raised.
+
+## Build and load
+
+```bash
+cd clients/sqlite-vfs
+cargo build --release   # target/release/libsqlite_ursula_vfs.so (.dylib on macOS)
+```
+
+The extension calls whatever SQLite loads it, so it works with `node:sqlite` (Node.js 22.19 or later). Load it once per process: it registers the `ursula` VFS as SQLite's default.
+
+```ts
+import { attach, loadUrsulaVfs, status } from "@tonbo-io/sqlite-ursula";
+import { DatabaseSync } from "node:sqlite";
+
+loadUrsulaVfs("/path/to/libsqlite_ursula_vfs.so"); // or set SQLITE_URSULA_VFS
+
+// Catch the file up (from the latest snapshot if it is missing or behind), claim the stream,
+// and attach. No connection to the file may be open yet.
+attach("/data/app.db", "https://ursula.example.com/my-bucket/app-db");
+
+const db = new DatabaseSync("/data/app.db");
+db.exec("PRAGMA journal_mode=WAL");
+db.exec("CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, body TEXT)");
+db.prepare("INSERT INTO notes(body) VALUES (?)").run("replicated"); // returns after Ursula has it
+
+console.log(status("/data/app.db"));
+// { offset, epoch, poisoned, fenced, reason, snapshot, retained }
+```
+
+From SQL, the same functions are `ursula_attach(path, url)`, `ursula_status(path)` and `ursula_stats(path)`.
+
+## Pi Durable
+
+`openUrsulaPiStorage` attaches the file and opens it with Pi's own node driver:
+
+```ts
+import { openUrsulaPiStorage, UrsulaReplicationError } from "@tonbo-io/sqlite-ursula";
+
+const storage = await openUrsulaPiStorage("/data/harness-1.db", "https://ursula.example.com/pi/harness-1");
+// hand `storage` to the Pi harness; storage.close(ctx) on shutdown
+```
+
+A commit the stream does not accept surfaces as `UrsulaReplicationError`; `fenced: true` means another host took the stream over. The storage is then read-only for this process: open it again to take the stream back.
+
+## Rules
+
+- WAL mode only, 4 KiB pages (SQLite's default). `locking_mode=EXCLUSIVE` is not supported.
+- One process owns a database file at a time (a lock file next to it enforces this on the host). Use as many connections inside that process as you like.
+- Treat the local file as a cache: do not copy it elsewhere and attach it to another stream.
+- A commit whose append gets no answer is retried with the same producer sequence for up to 30 s (`URSULA_VFS_RETRY_MS`), then fails, and the file must be attached again.
+- An owner idle for 7 days loses its producer state on the server; its next commit takes the stream back only if nobody else wrote meanwhile.
+- `URSULA_VFS_SNAPSHOT_MIN_BYTES` sets the smallest log between snapshots (default 8 MiB).
+
+## Related
+
+- [Snapshots](/docs/concepts/snapshots)
+- [Exactly-once writes](/docs/concepts/exactly-once-writes)
+- The design: `docs/architecture/sqlite-vfs.md`
