@@ -124,3 +124,51 @@ it("(f) a local failure after the ack poisons the file, keeps the sidecar behind
 	attach(file, ursulaUrl() + path);
 	expect(rows(file)).toEqual(["M-one", "M-two"]);
 });
+
+it("(g) a rate-limited append (429 + Retry-After) is retried with the same producer sequence", async () => {
+	const path = streamPath();
+	const file = freshFile();
+	proxy.limitAt = 2; // the claim and CREATE go through; M-one's first attempt is answered 429
+	const started = performance.now();
+	const child = runChild(file, proxy.url + path, SQL.slice(0, 2), { CHILD_EXIT: "1" });
+	const done = await child.waitFor((l) => l.done === true);
+	expect((await child.exited).code).toBe(0);
+	expect(done).toMatchObject({ attempts: [1, 2], poisoned: false });
+	expect(performance.now() - started).toBeGreaterThan(1000); // waited for Retry-After
+	const fresh = freshFile();
+	attach(fresh, ursulaUrl() + path);
+	expect(rows(fresh)).toEqual(["M-one"]);
+});
+
+// Regression (review of #324/#325): recovery rewrites pages in place; a crash after the new page 1
+// but before the rest left a file SQLite rejects as malformed, and the next attach checkpointed it
+// through SQLite first, so it could never recover. The recovery marker makes the next attach
+// resume the replay without reading the file through SQLite.
+it("(h) killed in the middle of a recovery's page writes: the next attach resumes it", async () => {
+	const url = ursulaUrl() + streamPath();
+	const file = freshFile();
+	// Written by a child: this process keeps the host lock of every file it attaches.
+	const writer = runChild(
+		file,
+		url,
+		["CREATE TABLE t(x TEXT, y TEXT)", "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 500) INSERT INTO t SELECT 'row-' || i, hex(randomblob(40)) FROM c"],
+		{ CHILD_EXIT: "1" },
+	);
+	expect((await writer.exited).code).toBe(0);
+	// The stream moves on: an index (new pages, page 1 rewritten) and more rows.
+	const other = freshFile();
+	attach(other, url);
+	const o = openPlain(other);
+	o.exec("CREATE INDEX t_y ON t(y)");
+	o.exec("INSERT INTO t VALUES ('late', 'z')");
+	o.close();
+	// Re-attaching the first file replays that; the child dies after the first page write (page 1).
+	const child = runChild(file, url, [], { URSULA_VFS_ABORT_IN_REPLAY: "1" });
+	expect((await child.exited).signal).toBe("SIGABRT");
+	expect(readFileSync(`${file}-ursula`, "utf8")).toMatch(/recovering/);
+	attach(file, url);
+	const fresh = freshFile();
+	attach(fresh, url);
+	expect(Buffer.compare(readFileSync(file), readFileSync(fresh))).toBe(0);
+	expect(rows(file, "WHERE x = 'late'")).toEqual(["late"]);
+});

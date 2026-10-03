@@ -16,6 +16,7 @@ libsqlite3-sys = { version = "=0.38.2", features = ["loadable_extension", "bundl
 ureq = { version = "3.4", default-features = false }
 zstd = { version = "0.13", default-features = false }
 crc32c = "0.6"
+libc = "0.2"
 
 # Standalone: not a member of the repository workspace.
 [workspace]

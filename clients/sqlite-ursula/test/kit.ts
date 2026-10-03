@@ -110,13 +110,15 @@ export function runChild(file: string, url: string, sqls: readonly string[], env
 /**
  * HTTP proxy to the node. After `stallAfter` forwarded POSTs it holds every further POST unanswered and
  * unforwarded; after `dropAfter` forwarded POSTs it forwards the next one, waits for the node's answer
- * and then cuts the client connection instead of answering (an append with an unknown outcome).
+ * and then cuts the client connection instead of answering (an append with an unknown outcome); the
+ * POST numbered `limitAt` is answered 429 with `Retry-After: 1` without being forwarded.
  */
 export class StallProxy {
 	private readonly server: Server;
 	private posts = 0;
 	stallAfter = Number.POSITIVE_INFINITY;
 	dropAfter = Number.POSITIVE_INFINITY;
+	limitAt = Number.POSITIVE_INFINITY;
 	/** POSTs whose answer was dropped. */
 	dropped = 0;
 	readonly stalled: Promise<void>;
@@ -144,6 +146,11 @@ export class StallProxy {
 					return; // in flight forever: never forwarded, never answered
 				}
 				drop = n === p.dropAfter;
+				if (n === p.limitAt) {
+					req.resume();
+					res.writeHead(429, { "retry-after": "1" }).end("rate limited");
+					return;
+				}
 			}
 			const up = request({ host: t.hostname, port: t.port, method: req.method, path: req.url, headers: req.headers }, (ur) => {
 				if (drop) {
@@ -172,6 +179,7 @@ export class StallProxy {
 		this.posts = 0;
 		this.stallAfter = Number.POSITIVE_INFINITY;
 		this.dropAfter = Number.POSITIVE_INFINITY;
+		this.limitAt = Number.POSITIVE_INFINITY;
 	}
 
 	async close(): Promise<void> {
