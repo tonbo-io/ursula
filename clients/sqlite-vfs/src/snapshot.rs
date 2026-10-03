@@ -54,8 +54,10 @@ pub fn decode(body: &[u8]) -> Result<Snapshot, String> {
     image
         .try_reserve_exact(len)
         .map_err(|e| format!("snapshot: {len} bytes: {e}"))?;
-    zstd::bulk::decompress_to_buffer(payload, &mut image)
+    image.resize(len, 0); // within the reserved capacity
+    let n = zstd::bulk::decompress_to_buffer(payload, &mut image[..])
         .map_err(|e| format!("snapshot: zstd: {e}"))?;
+    image.truncate(n);
     if image.len() != pages * PAGE || crc32c::crc32c(&image) != crc {
         return Err("snapshot: image does not match its size and checksum".into());
     }
