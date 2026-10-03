@@ -1,7 +1,7 @@
 // The commit barrier: SIGKILL/abort around it in a child process, the cache-spill case, and an append
 // whose outcome is unknown.
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
-import { attach, drainStats, status } from "../src/index.ts";
+import { attach } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
 import { integrity, openPlain, runChild, StallProxy, streamPath, ursulaUrl, walContains } from "./kit.ts";
 
@@ -80,10 +80,10 @@ it("(d) killed right after a spilling commit with in-place rewrites: present, lo
 		"COMMIT",
 	].join(";\n");
 	const child = runChild(file, ursulaUrl() + path, ["CREATE TABLE t(x TEXT)", spill]);
-	await child.waitFor((l) => l.step === 1 && l.ok !== undefined);
+	const committed = await child.waitFor((l) => l.step === 1 && l.ok !== undefined);
 	child.proc.kill("SIGKILL");
 	await child.exited;
-	expect(child.lines.find((l) => l.step === 1)?.ok).toBe(true);
+	expect(committed.ok).toBe(true);
 	attach(file, ursulaUrl() + path);
 	expect(rows(file, "WHERE x LIKE 'spill-%'")).toHaveLength(4000);
 	expect(rows(file, "WHERE x LIKE '%!'")).toHaveLength(400);
@@ -92,19 +92,17 @@ it("(d) killed right after a spilling commit with in-place rewrites: present, lo
 	expect(rows(fresh, "WHERE x LIKE '%!'")).toHaveLength(400);
 });
 
-it("(e) an append whose answer is lost is retried with the same producer sequence and applied once", () => {
+it("(e) an append whose answer is lost is retried with the same producer sequence and applied once", async () => {
 	const path = streamPath();
 	const file = freshFile();
 	proxy.dropAfter = 2; // the claim and CREATE are answered; M-one's first answer is cut
-	attach(file, proxy.url + path);
-	const db = openPlain(file);
-	db.exec(SQL[0] as string);
-	db.exec(SQL[1] as string);
+	const child = runChild(file, proxy.url + path, SQL.slice(0, 2), { CHILD_EXIT: "1" });
+	const done = await child.waitFor((l) => l.done === true);
+	expect((await child.exited).code).toBe(0);
 	expect(proxy.dropped).toBe(1);
-	expect(drainStats(file).commits.map((c) => c.attempts)).toEqual([1, 2]);
+	expect(done.attempts).toEqual([1, 2]);
 	// A second copy on the stream would have acknowledged a different offset and poisoned the file.
-	expect(status(file).poisoned).toBe(false);
-	db.close();
+	expect(done.poisoned).toBe(false);
 	const fresh = freshFile();
 	attach(fresh, ursulaUrl() + path);
 	expect(rows(fresh)).toEqual(["M-one"]);

@@ -20,7 +20,9 @@ for (const [step, sql] of sqls.entries()) {
 		say({ step, ok: false, error: String(error), errcode: error.errcode, errstr: error.errstr });
 	}
 }
-say({ done: true });
+const stats = JSON.parse(control.prepare("SELECT ursula_stats(?) AS s").get(file).s);
+const status = JSON.parse(control.prepare("SELECT ursula_status(?) AS s").get(file).s);
+say({ done: true, attempts: stats.commits.map((c) => c.attempts), poisoned: status.poisoned });
 if (process.env.CHILD_EXIT === "1") {
 	db.close();
 	process.exit(0);

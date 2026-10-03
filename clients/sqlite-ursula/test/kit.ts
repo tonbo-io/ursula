@@ -42,7 +42,18 @@ export function dump(db: DatabaseSync): Record<string, string[]> {
 
 export const walContains = (file: string, marker: string): boolean => existsSync(`${file}-wal`) && readFileSync(`${file}-wal`).includes(Buffer.from(marker));
 
-export type ChildLine = { attached?: number; step?: number; phase?: string; ok?: boolean; error?: string; errcode?: number; done?: boolean };
+export type ChildLine = {
+	attached?: number;
+	step?: number;
+	phase?: string;
+	ok?: boolean;
+	error?: string;
+	errcode?: number;
+	done?: boolean;
+	/** On `done`: append attempts per commit, and whether the file is poisoned. */
+	attempts?: number[];
+	poisoned?: boolean;
+};
 
 export interface Child {
 	readonly proc: ChildProcess;
