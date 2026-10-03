@@ -107,6 +107,7 @@ mod gauges;
 mod hot_buffer;
 mod marks;
 
+pub use self::cold::RETENTION_COLD_GC_GRACE_MS;
 pub use self::cold_refs::SHARED_REF_COMPACTION_THRESHOLD;
 pub use self::cold_refs::SHARED_REF_IDLE_MS;
 pub use self::cold_refs::SharedRefCandidate;

@@ -112,6 +112,7 @@ use ursula_runtime::TidyStreamsResponse;
 use ursula_runtime::TouchStreamAccessResponse;
 use ursula_runtime::UpdateStreamAttrsRequest;
 use ursula_runtime::clipped_entries;
+use ursula_runtime::collect_retained_cold_objects;
 use ursula_runtime::default_snapshot_store;
 use ursula_runtime::repair_cold_index_response;
 use ursula_runtime::repair_cold_index_streams;
@@ -1585,18 +1586,39 @@ impl GroupEngine for RaftGroupEngine {
                 return Ok(RepairColdIndexResponse::default());
             }
             let step = request.clone();
-            let inputs = self
+            let (inputs, retention_targets) = self
                 .with_state_machine(move |state_machine| {
-                    Box::pin(
-                        async move { state_machine.engine.cold_index_repair_inputs_for(&step) },
-                    )
+                    Box::pin(async move {
+                        let engine = &mut state_machine.engine;
+                        let inputs = engine.cold_index_repair_inputs_for(&step);
+                        let retention_targets = engine.retention_gc_targets(&step, &inputs);
+                        (inputs, retention_targets)
+                    })
                 })
                 .await?;
-            let store = ColdStoreColdIndexPageStore::new(cold_store);
+            let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
             let (report, compaction_pages) =
                 repair_cold_index_streams(&store, self.cold_index_cache.as_deref(), &inputs)
                     .await
                     .map_err(|err| GroupEngineError::new(err.to_string()))?;
+            // F14f: reclaim objects wholly below each visited stream's
+            // retained offset once the retention grace has passed.
+            if !retention_targets.is_empty() {
+                let (_, completed) = collect_retained_cold_objects(
+                    &cold_store,
+                    self.cold_index_cache.as_deref(),
+                    &retention_targets,
+                )
+                .await;
+                if !completed.is_empty() {
+                    self.with_state_machine(move |state_machine| {
+                        Box::pin(async move {
+                            state_machine.engine.retention_gc_collected(&completed);
+                        })
+                    })
+                    .await?;
+                }
+            }
             Ok(repair_cold_index_response(
                 &request,
                 &inputs,

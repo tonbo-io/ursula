@@ -1506,6 +1506,7 @@ impl ShardRuntime {
                 after,
                 max_streams: max_streams.max(1),
                 stream: None,
+                retention_gc_now_ms: Some(unix_time_ms()),
             })
             .await?;
         let mut cursors =

@@ -754,3 +754,137 @@ async fn external_create_of_a_live_stream_leaves_its_pages_alone() {
         .expect("read initial payload");
     assert_eq!(read.payload, b"abcd");
 }
+
+async fn cold_object_exists(cold_store: &ColdStore, path: &str) -> bool {
+    let (dir, name) = path.rsplit_once('/').expect("object path has a directory");
+    cold_store
+        .list_file_names(&format!("{dir}/"))
+        .await
+        .expect("list objects")
+        .iter()
+        .any(|listed| listed == name)
+}
+
+/// Regression (AWS EKS run, F14f): exclusive chunks live only in cold-index
+/// pages, so retention released none of them and they stayed in S3 forever.
+/// The leader's repair cursor now deletes the objects wholly below the
+/// retained offset once the retention grace has passed, drops their page
+/// entries, and keeps everything a retained byte still needs.
+#[tokio::test]
+async fn retention_gc_deletes_chunks_below_the_retained_offset_after_the_grace() {
+    let placement = placement();
+    let cold_store = memory_cold_store();
+    let stream = BucketStreamId::new("benchcmp", "retention-gc");
+    let mut engine = InMemoryGroupEngine::with_cold_store(cold_store.clone());
+    engine
+        .create_stream(
+            CreateStreamRequest::new(stream.clone(), DEFAULT_CONTENT_TYPE),
+            placement,
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("create stream");
+    for payload in [b"abcd", b"efgh", b"ijkl"] {
+        engine
+            .append(
+                append_req(&stream, payload, None),
+                placement,
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .expect("append");
+    }
+    let below = "benchcmp/retention-gc/chunks/0-4.bin";
+    let straddling = "benchcmp/retention-gc/chunks/4-8.bin";
+    for (start, end, path, bytes) in [(0, 4, below, b"abcd"), (4, 8, straddling, b"efgh")] {
+        stage(&cold_store, path, bytes).await;
+        engine
+            .flush_cold(
+                FlushColdRequest {
+                    cold_generation: None,
+                    stream_id: stream.clone(),
+                    chunk: ColdChunkRef {
+                        start_offset: start,
+                        end_offset: end,
+                        s3_path: path.to_owned(),
+                        object_size: 4,
+                        ..Default::default()
+                    },
+                },
+                placement,
+            )
+            .await
+            .expect("flush chunk");
+    }
+    engine
+        .publish_snapshot(
+            crate::PublishSnapshotRequest {
+                stream_id: stream.clone(),
+                snapshot_offset: 4,
+                content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+                payload: bytes::Bytes::from_static(b"state"),
+                expected_digest: None,
+                cold_body: None,
+                now_ms: 0,
+            },
+            placement,
+        )
+        .await
+        .expect("publish checkpoint");
+    engine
+        .advance_retention(
+            crate::AdvanceRetentionRequest {
+                stream_id: stream.clone(),
+                retained_offset: 4,
+                now_ms: 0,
+            },
+            placement,
+        )
+        .await
+        .expect("advance retention");
+
+    let step = |now_ms| crate::RepairColdIndexRequest {
+        after: None,
+        max_streams: 16,
+        stream: None,
+        retention_gc_now_ms: Some(now_ms),
+    };
+    let t0 = 1_000_000;
+    let grace = ursula_stream::RETENTION_COLD_GC_GRACE_MS;
+    for now_ms in [t0, t0 + grace - 1] {
+        engine
+            .repair_cold_index(step(now_ms), placement)
+            .await
+            .expect("repair step");
+        assert!(
+            cold_object_exists(&cold_store, below).await,
+            "deleted within the grace"
+        );
+    }
+    engine
+        .repair_cold_index(step(t0 + grace), placement)
+        .await
+        .expect("repair step after the grace");
+    assert!(!cold_object_exists(&cold_store, below).await);
+    assert!(cold_object_exists(&cold_store, straddling).await);
+    let page = ColdStoreColdIndexPageStore::new(cold_store.clone())
+        .get_page(&ColdIndexPageKey {
+            stream_id: stream.clone(),
+            generation: 0,
+            page_id: 0,
+        })
+        .await
+        .expect("read page")
+        .expect("page kept for retained entries");
+    let paths: Vec<_> = page
+        .cold_chunks
+        .iter()
+        .map(|chunk| chunk.s3_path.as_str())
+        .collect();
+    assert_eq!(paths, [straddling]);
+    let read = engine
+        .read_stream(read_req(stream, 4, 64), placement)
+        .await
+        .expect("read retained bytes");
+    assert_eq!(read.payload, b"efghijkl");
+}

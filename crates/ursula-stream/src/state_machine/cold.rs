@@ -18,7 +18,7 @@ use super::stream_is_expired;
 /// (bounded-state F14i, Lb1). It matches the default
 /// `storage.cold.compaction_gc_grace`; apply cannot read node configuration,
 /// so the replicated rule uses this constant.
-pub(super) const RETENTION_COLD_GC_GRACE_MS: u64 = 300_000;
+pub const RETENTION_COLD_GC_GRACE_MS: u64 = 300_000;
 
 /// The body of a snapshot publish: inline bytes, or a staged cold-tier
 /// object with the digest its proposer computed (F16, feature level 5).

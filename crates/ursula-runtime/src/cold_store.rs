@@ -1870,7 +1870,11 @@ mod tests {
     #[tokio::test]
     async fn multipart_upload_sends_sse_headers_on_create_only() {
         for (encryption, kms_key_id, expected) in [
-            (ursula_config::S3ServerSideEncryption::Aes256, None, "AES256"),
+            (
+                ursula_config::S3ServerSideEncryption::Aes256,
+                None,
+                "AES256",
+            ),
             (
                 ursula_config::S3ServerSideEncryption::AwsKms,
                 Some("arn:aws:kms:us-east-1:111122223333:key/test"),
