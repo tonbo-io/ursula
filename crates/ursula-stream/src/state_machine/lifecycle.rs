@@ -691,6 +691,17 @@ impl StreamStateMachine {
                 }
             }
         }
+        // A cold snapshot body is referenced only by state (F16).
+        if let Some(object) = slot
+            .visible_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.object.as_ref())
+        {
+            self.cold_gc.enqueue(
+                stream_id.bucket_id.clone(),
+                ColdGcTarget::Paths(vec![object.s3_path.clone()]),
+            );
+        }
         // A keyed stream's projection namespaces live outside its cold
         // objects and may exist even when it never flushed. Enqueue the
         // removed incarnation's prefix; a recreated stream has a new

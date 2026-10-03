@@ -31,6 +31,50 @@ use crate::ColdConfig;
 use crate::ColdIndexPageKey;
 
 pub(crate) const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// Part size of [`ColdObjectWriter`] uploads (above S3's 5 MiB multipart
+/// minimum).
+pub const COLD_OBJECT_WRITE_PART_BYTES: usize = 8 * 1024 * 1024;
+
+/// A streaming upload of one cold object. Dropping it without
+/// [`Self::close`] leaves no object behind on S3 (the multipart upload is
+/// never completed); [`Self::abort`] also releases the parts.
+pub struct ColdObjectWriter {
+    path: String,
+    writer: opendal::Writer,
+    written: u64,
+}
+
+impl ColdObjectWriter {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub async fn write(&mut self, bytes: Bytes) -> io::Result<()> {
+        self.written = self
+            .written
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        self.writer
+            .write(bytes)
+            .await
+            .map_err(|err| cold_store_io_error(&self.path, err))
+    }
+
+    /// Completes the upload and returns the object size.
+    pub async fn close(mut self) -> io::Result<u64> {
+        self.writer
+            .close()
+            .await
+            .map_err(|err| cold_store_io_error(&self.path, err))?;
+        Ok(self.written)
+    }
+
+    pub async fn abort(mut self) {
+        if let Err(err) = self.writer.abort().await {
+            tracing::warn!(path = %self.path, error = %err, "failed to abort cold object upload");
+        }
+    }
+}
 // Keep this global atomic isolated from unrelated statics. This does not remove
 // contention on the counter itself, but avoids accidental false sharing with
 // adjacent data without adding a per-core sequence scheme to this low-frequency
@@ -554,6 +598,65 @@ impl ColdStore {
             object_size,
         });
         Ok(object_size)
+    }
+
+    /// Opens a streaming writer for one object, such as a cold snapshot
+    /// body (bounded-state F16). The body goes up in parts of
+    /// [`COLD_OBJECT_WRITE_PART_BYTES`], so memory stays bounded whatever
+    /// the object's size.
+    pub async fn open_object_writer(&self, path: &str) -> io::Result<ColdObjectWriter> {
+        if path.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cold object path must not be empty",
+            ));
+        }
+        let _applied_fault = self
+            .maybe_apply_fault_effect(ColdStoreFaultContext {
+                operation: ColdStoreOperation::WriteChunk,
+                stream_id: None,
+                path: path.to_owned(),
+                payload_len: None,
+                read_start_offset: None,
+                len: None,
+                object_start: None,
+                object_end: None,
+                cached: None,
+            })
+            .await?;
+        let writer = self
+            .operator
+            .writer_with(path)
+            .chunk(COLD_OBJECT_WRITE_PART_BYTES)
+            .await
+            .map_err(|err| cold_store_io_error(path, err))?;
+        Ok(ColdObjectWriter {
+            path: path.to_owned(),
+            writer,
+            written: 0,
+        })
+    }
+
+    /// Reads `len` bytes at `start` of a whole-object body of `size` bytes
+    /// (a cold snapshot body) without the read cache: such bodies are read
+    /// once, front to back, and must not evict blocks that serve stream
+    /// reads.
+    pub async fn read_whole_object_range(
+        &self,
+        path: &str,
+        size: u64,
+        start: u64,
+        len: usize,
+    ) -> io::Result<Vec<u8>> {
+        let object = ObjectPayloadRef {
+            start_offset: 0,
+            end_offset: size,
+            s3_path: path.to_owned(),
+            object_size: size,
+            object_offset: 0,
+        };
+        self.read_object_range_inner(None, &object, start, len, false)
+            .await
     }
 
     pub(crate) async fn write_cold_index_page(

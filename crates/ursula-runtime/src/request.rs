@@ -402,9 +402,21 @@ pub struct PublishSnapshotRequest {
     pub stream_id: BucketStreamId,
     pub snapshot_offset: u64,
     pub content_type: String,
+    /// Inline body; empty when `cold_body` is set.
     pub payload: Bytes,
     pub expected_digest: Option<String>,
+    /// A body staged as a cold-tier object (feature level 5, bounded-state
+    /// F16). Proposed as `PublishSnapshotExternal`.
+    pub cold_body: Option<ColdSnapshotBody>,
     pub now_ms: u64,
+}
+
+/// A snapshot body staged in the cold tier with the digest computed while
+/// staging it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColdSnapshotBody {
+    pub object: ExternalPayloadRef,
+    pub digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -546,7 +558,11 @@ pub struct ReadSnapshotResponse {
     pub next_offset: u64,
     pub content_type: String,
     pub snapshot_digest: String,
+    /// Inline body; empty when `object` holds it.
     pub payload: Vec<u8>,
+    /// Cold-tier object holding the body (feature level 5). Callers stream
+    /// it from the cold store.
+    pub object: Option<ExternalPayloadRef>,
     pub up_to_date: bool,
     pub record_range: Option<StreamRecordRange>,
 }
@@ -577,7 +593,10 @@ pub struct BootstrapStreamResponse {
     pub placement: ShardPlacement,
     pub snapshot_offset: Option<u64>,
     pub snapshot_content_type: String,
+    /// Inline snapshot body; empty when `snapshot_object` holds it.
     pub snapshot_payload: Vec<u8>,
+    /// Cold-tier object holding the snapshot body (feature level 5).
+    pub snapshot_object: Option<ExternalPayloadRef>,
     pub updates: Vec<BootstrapUpdate>,
     pub next_offset: u64,
     pub up_to_date: bool,

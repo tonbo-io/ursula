@@ -88,6 +88,19 @@ pub enum StreamCommand {
         expected_digest: Option<String>,
         now_ms: u64,
     },
+    /// Publishes a snapshot whose body the proposer staged as a cold-tier
+    /// object (feature level 5, bounded-state F16). The proposer computed
+    /// `digest` with [`crate::SnapshotDigest`] while staging; replicated
+    /// state keeps the reference, never the body.
+    PublishSnapshotExternal {
+        stream_id: BucketStreamId,
+        snapshot_offset: u64,
+        content_type: String,
+        object: ExternalPayloadRef,
+        digest: String,
+        expected_digest: Option<String>,
+        now_ms: u64,
+    },
     AdvanceRetention {
         stream_id: BucketStreamId,
         retained_offset: u64,
@@ -287,6 +300,16 @@ impl fmt::Display for StreamCommand {
                 f,
                 "publish_snapshot:{stream_id}:{snapshot_offset}:{} bytes",
                 payload.len()
+            ),
+            Self::PublishSnapshotExternal {
+                stream_id,
+                snapshot_offset,
+                object,
+                ..
+            } => write!(
+                f,
+                "publish_snapshot_external:{stream_id}:{snapshot_offset}:{} bytes",
+                object.payload_len
             ),
             Self::AdvanceRetention {
                 stream_id,

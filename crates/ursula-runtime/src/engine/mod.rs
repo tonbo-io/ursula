@@ -953,6 +953,30 @@ pub trait GroupEngine: Send + 'static {
                             content_type,
                             payload,
                             expected_digest,
+                            cold_body: None,
+                            now_ms,
+                        },
+                        placement,
+                    )
+                    .await
+                    .map(GroupWriteResponse::PublishSnapshot),
+                StreamCommand::PublishSnapshotExternal {
+                    stream_id,
+                    snapshot_offset,
+                    content_type,
+                    object,
+                    digest,
+                    expected_digest,
+                    now_ms,
+                } => self
+                    .publish_snapshot(
+                        PublishSnapshotRequest {
+                            stream_id,
+                            snapshot_offset,
+                            content_type,
+                            payload: bytes::Bytes::new(),
+                            expected_digest,
+                            cold_body: Some(crate::request::ColdSnapshotBody { object, digest }),
                             now_ms,
                         },
                         placement,
