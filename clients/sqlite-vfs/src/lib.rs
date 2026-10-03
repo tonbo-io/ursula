@@ -722,7 +722,9 @@ impl Private {
                     (i * CHUNK) as i64,
                 );
                 if rc != OK {
-                    return Err(format!("read db file pages: {rc} (file shorter than {n} pages?)"));
+                    return Err(format!(
+                        "read db file pages: {rc} (file shorter than {n} pages?)"
+                    ));
                 }
             }
             Ok(image)
