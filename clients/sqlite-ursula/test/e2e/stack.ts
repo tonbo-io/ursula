@@ -49,6 +49,11 @@ export async function startNode(): Promise<Node> {
 			"[raft.wal]",
 			'backend = "memory"',
 			"",
+			// No cold store: everything stays hot. The VFS spike's page-image records reach the default
+			// 64 MiB per-group admission limit within a few seconds of the benchmark.
+			"[storage.cold]",
+			'max_hot_size_per_group = "8GiB"',
+			"",
 		].join("\n"),
 	);
 	let tail = "";
