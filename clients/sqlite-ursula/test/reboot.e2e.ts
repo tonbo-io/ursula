@@ -1,7 +1,8 @@
-// The local files are a cache of the stream, never fsynced: attach trusts them only when the sidecar
-// says they were written in this boot (a process crash keeps the page cache) into this db file, and
-// otherwise discards them and rebuilds from snapshot + tail. A reboot is simulated by rewriting the
-// sidecar's boot id to one this kernel never had; the damage a power loss could do is applied by hand.
+// The local files are a cache of the stream: attach trusts them only when the sidecar says they were
+// written in this boot into this db file and the local WAL still holds the frames the sidecar counts
+// on, and otherwise discards them and rebuilds from snapshot + tail. A reboot is simulated by
+// rewriting the sidecar's boot id to one this kernel never had; the damage a power loss or a restored
+// disk image could do is applied by hand.
 import { spawn } from "node:child_process";
 import { readFileSync, renameSync, statSync, truncateSync, writeFileSync } from "node:fs";
 import { expect, it } from "vitest";
@@ -31,23 +32,30 @@ const rebooted = (file: string): void => {
 	writeFileSync(sidecar, readFileSync(sidecar, "utf8").replace(/ boot=\S+/, " boot=before-the-reboot"));
 };
 
-/** An owner that wrote everything and was SIGKILLed with a WAL, and an older image of its db file. */
-async function crashedOwner(): Promise<{ url: string; file: string; older: Buffer; offset: number }> {
+/** An owner that wrote everything and was SIGKILLed with a WAL, and an older image of its db file and sidecar. */
+async function crashedOwner(): Promise<{ url: string; file: string; older: Buffer; olderSidecar: string; offset: number; snapshot: number }> {
 	const url = ursulaUrl() + streamPath();
 	const file = freshFile();
 	const first = runChild(file, url, FIRST, { CHILD_EXIT: "1" });
 	expect((await first.exited).code).toBe(0);
 	const older = readFileSync(file);
+	const olderSidecar = readFileSync(`${file}-ursula`, "utf8");
 	const child = runChild(file, url, REST, { URSULA_VFS_SNAPSHOT_MIN_BYTES: "1" });
 	const done = await child.waitFor((l) => l.done === true);
 	expect(done.snapshots).toBeGreaterThan(0);
 	child.proc.kill("SIGKILL");
 	await child.exited;
-	return { url, file, older, offset: done.offset as number };
+	return { url, file, older, olderSidecar, offset: done.offset as number, snapshot: done.snapshot as number };
 }
 
 it("(a) after a reboot, files a power loss damaged are discarded and rebuilt from snapshot + tail", async () => {
-	const { url, file, older } = await crashedOwner();
+	const { url, file, older, olderSidecar, snapshot } = await crashedOwner();
+	// The power loss rolled the sidecar back with the db file, to an offset below the stream's
+	// retention: the read check before discarding answers 410, which is no reason to keep the files.
+	await fetch(`${url}/retention/${snapshot}`, { method: "PUT" });
+	const retained = Number((await fetch(url, { method: "HEAD" })).headers.get("stream-retained-offset"));
+	expect(retained).toBeGreaterThan(Number(olderSidecar.split(" ")[0]));
+	writeFileSync(`${file}-ursula`, olderSidecar);
 	rebooted(file);
 	// A plain connection in another process (no extension) holds the file open, idle.
 	const reader = spawn(
@@ -123,4 +131,52 @@ it("(e) attaching the cache of one stream to another, or to its stream deleted a
 	rebooted(file);
 	expect(() => attach(file, url)).toThrow(/beyond the stream's end/);
 	expect(statSync(file).size).toBeGreaterThan(0);
+});
+
+/** Runs `sqls` in an owner that is SIGKILLed afterwards: its WAL stays as it is, never checkpointed. */
+async function killedOwner(file: string, url: string, sqls: string[]): Promise<void> {
+	const child = runChild(file, url, sqls);
+	await child.waitFor((l) => l.done === true);
+	child.proc.kill("SIGKILL");
+	await child.exited;
+}
+
+/**
+ * A crash-consistent image of the files on the same boot (a disk snapshot restored, a volume cloned
+ * without a reboot): boot id and inode match, but any write never fsynced may be missing. Two owners
+ * commit into one WAL generation; the WAL and sidecar the first one left are the older image.
+ */
+async function twoOwners(): Promise<{ url: string; file: string; wal: Buffer; sidecar: string }> {
+	const url = ursulaUrl() + streamPath();
+	const file = freshFile();
+	await killedOwner(file, url, ["CREATE TABLE t(k INTEGER PRIMARY KEY, x TEXT)", "INSERT INTO t VALUES (1, 'first')"]);
+	const image = { wal: readFileSync(`${file}-wal`), sidecar: readFileSync(`${file}-ursula`, "utf8") };
+	await killedOwner(file, url, ["INSERT INTO t VALUES (2, 'second')", "INSERT INTO t VALUES (3, 'third')"]);
+	return { url, file, ...image };
+}
+
+// The sidecar's rename reached the disk, the WAL frames it counts on did not. Trusting the files would
+// lose rows 2 and 3 locally, and the next commit would append page images built without them, losing
+// them from the stream itself.
+it("(f) a same-boot image whose WAL is behind its sidecar is rejected and rebuilt; the stream stays intact", async () => {
+	const { url, file, wal } = await twoOwners();
+	writeFileSync(`${file}-wal`, wal);
+	attach(file, url);
+	expect(status(file).local).toBe(0);
+	const db = openPlain(file);
+	db.exec("INSERT INTO t VALUES (4, 'fourth')");
+	db.close();
+	const fresh = freshFile();
+	attach(fresh, url);
+	expect(rows(fresh)).toEqual(["1:fir", "2:sec", "3:thi", "4:fou"]);
+});
+
+// The WAL frames reached the disk, the sidecar's last renames did not: the files hold more than the
+// sidecar says, and replaying from its offset is idempotent.
+it("(g) a same-boot image whose WAL is ahead of its sidecar is trusted", async () => {
+	const { url, file, sidecar } = await twoOwners();
+	writeFileSync(`${file}-ursula`, sidecar);
+	attach(file, url);
+	expect(status(file)).toMatchObject({ local: Number(sidecar.split(" ")[0]), installed: 0 });
+	expect(rows(file)).toEqual(["1:fir", "2:sec", "3:thi"]);
 });
