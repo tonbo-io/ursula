@@ -65,3 +65,29 @@ it("Pi: a fenced commit rejects with UrsulaReplicationError", async () => {
 	await stale.close(ctx);
 	await owner.close(ctx);
 });
+
+// Regression (#324 review): two owners claiming the same epoch both got a 2xx (the second as a
+// duplicate of the first's claim) and both believed they owned it. A claim is verified by its nonce.
+it("a claim answered as a duplicate of another owner's claim is lost, and the owner claims higher", async () => {
+	const url = ursulaUrl() + streamPath();
+	const fileA = freshFile();
+	const a = await openUrsulaPiStorage(fileA, url);
+	const epochA = status(fileA).epoch;
+	const fileB = freshFile();
+	const b = runChild(fileB, url, ["CREATE TABLE b(x TEXT)", "INSERT INTO b VALUES ('b1')"], { URSULA_VFS_FIRST_CLAIM_EPOCH: String(epochA), CHILD_EXIT: "1" });
+	const done = await b.waitFor((l) => l.done === true);
+	expect((await b.exited).code).toBe(0);
+	expect(done).toMatchObject({ poisoned: false, epoch: epochA + 1 });
+	const error = await openHarness(a).then(
+		() => undefined,
+		(e: unknown) => e,
+	);
+	expect(error).toBeInstanceOf(UrsulaReplicationError);
+	expect((error as UrsulaReplicationError).fenced).toBe(true);
+	await a.close(ctx);
+	const fresh = freshFile();
+	attach(fresh, url);
+	const r = openPlain(fresh);
+	expect(r.prepare("SELECT x FROM b").all()).toEqual([{ x: "b1" }]);
+	r.close();
+});

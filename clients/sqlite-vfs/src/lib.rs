@@ -340,6 +340,10 @@ enum Append {
 }
 
 /// One idempotent append: retried with the same producer sequence until the outcome is known.
+///
+/// A duplicate answer (204) is taken as proof of *our* earlier attempt only for commits (seq >= 1):
+/// they are sent after a verified claim (see `claim_once`), which makes this owner the only writer
+/// at its epoch, so whatever holds (epoch, seq) is ours. A claim's answer is verified separately.
 fn append(url: &str, body: &[u8], epoch: u64, seq: u64) -> Append {
     let deadline = Instant::now() + retry_budget();
     let mut backoff = Duration::from_millis(20);
@@ -538,7 +542,7 @@ struct Applier {
 impl Applier {
     fn apply(&mut self, record: Record) {
         match record {
-            Record::Claim { epoch } => self.epoch = self.epoch.max(epoch),
+            Record::Claim { epoch, .. } => self.epoch = self.epoch.max(epoch),
             Record::Commit { size, pages } => {
                 if size < self.size.unwrap_or(u32::MAX) {
                     self.pages.retain(|&p, _| p <= size);
@@ -631,19 +635,74 @@ unsafe fn catch_up(
     Ok(offset)
 }
 
+fn nonce() -> Result<[u8; 16], String> {
+    let mut n = [0u8; 16];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut n))
+        .map_err(|e| format!("/dev/urandom: {e}"))?;
+    Ok(n)
+}
+
+fn first_claim_epoch() -> Option<u64> {
+    static V: OnceLock<Option<u64>> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("URSULA_VFS_FIRST_CLAIM_EPOCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+}
+
+enum Claimed {
+    /// Our claim spans `start..next`: this owner alone writes at `epoch` from here on.
+    Won {
+        start: u64,
+        next: u64,
+    },
+    /// Another owner's claim (or anything else) holds the answered position: a concurrent
+    /// claim at the same epoch was answered as a duplicate of theirs.
+    Lost,
+    Fenced(Option<u64>),
+}
+
+/// Appends a claim at (`epoch`, seq 0) and verifies that the frame ending at the answered offset
+/// is ours. A 2xx alone proves nothing: two owners claiming the same epoch both get one, the
+/// second as a duplicate of the first's receipt. The nonce makes our claim's bytes unique.
+fn claim_once(url: &str, epoch: u64) -> Result<Claimed, String> {
+    let frame = frame::encode_claim(epoch, &nonce()?);
+    match append(url, &frame, epoch, 0) {
+        Append::Acked {
+            next: Some(next), ..
+        } => {
+            let start = next.checked_sub(frame.len() as u64);
+            let ours = match start {
+                Some(start) => read_from(url, start)?.0.get(..frame.len()) == Some(&frame[..]),
+                None => false,
+            };
+            Ok(match start {
+                Some(start) if ours => Claimed::Won { start, next },
+                _ => Claimed::Lost,
+            })
+        }
+        Append::Acked { next: None, .. } => Err(format!("claim {url}: no Stream-Next-Offset")),
+        Append::Fenced { current } => Ok(Claimed::Fenced(current)),
+        Append::ProducerExpired => unreachable!("a claim has sequence 0"),
+        Append::Failed(e) => Err(format!("claim {url}: {e}")),
+    }
+}
+
 /// Claims the stream with an epoch above every earlier owner's; returns it and the claim's end.
-fn claim(url: &str, mut epoch: u64) -> Result<(u64, u64), String> {
+fn claim(url: &str, epoch: u64) -> Result<(u64, u64), String> {
+    // Test hook URSULA_VFS_FIRST_CLAIM_EPOCH: the process's first claim uses this epoch.
+    static HOOKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let mut epoch = match first_claim_epoch() {
+        Some(e) if !HOOKED.swap(true, Ordering::Relaxed) => e,
+        _ => epoch,
+    };
     for _ in 0..16 {
-        match append(url, &frame::encode_claim(epoch), epoch, 0) {
-            Append::Acked {
-                next: Some(next), ..
-            } => return Ok((epoch, next)),
-            Append::Acked { next: None, .. } => {
-                return Err(format!("claim {url}: no Stream-Next-Offset"));
-            }
-            Append::Fenced { current } => epoch = current.unwrap_or(epoch).max(epoch) + 1,
-            Append::ProducerExpired => unreachable!("a claim has sequence 0"),
-            Append::Failed(e) => return Err(format!("claim {url}: {e}")),
+        match claim_once(url, epoch)? {
+            Claimed::Won { next, .. } => return Ok((epoch, next)),
+            Claimed::Lost => epoch += 1,
+            Claimed::Fenced(current) => epoch = current.unwrap_or(epoch).max(epoch) + 1,
         }
     }
     Err(format!("claim {url}: lost 16 claim races"))
@@ -652,7 +711,8 @@ fn claim(url: &str, mut epoch: u64) -> Result<(u64, u64), String> {
 /// The server expired this owner's idle producer (7 days without a write) and forgot its epoch.
 /// Taking the stream back is safe only if nobody wrote since this owner's last frame: the stream
 /// must end at our offset, and our new claim (one epoch up, fencing any later owner's older
-/// epochs) must land exactly there. Otherwise another owner wrote and this one is fenced.
+/// epochs) must be ours (verified) and land exactly there. Otherwise another owner wrote or
+/// claimed, and this one is fenced.
 fn reclaim(db: &mut Db) -> Result<(), String> {
     let (bytes, _) = read_from(&db.url, db.offset)?;
     if !bytes.is_empty() {
@@ -663,24 +723,17 @@ fn reclaim(db: &mut Db) -> Result<(), String> {
         ));
     }
     let epoch = db.epoch + 1;
-    let claim = frame::encode_claim(epoch);
-    match append(&db.url, &claim, epoch, 0) {
-        Append::Acked {
-            next: Some(next), ..
-        } if next == db.offset + claim.len() as u64 => {
+    match claim_once(&db.url, epoch)? {
+        Claimed::Won { start, next } if start == db.offset => {
             db.epoch = epoch;
             db.seq = 0;
             db.offset = next;
             Ok(())
         }
-        Append::Acked { next, .. } | Append::Fenced { current: next } => {
+        _ => {
             db.fenced = true;
-            Err(format!(
-                "fenced: another owner wrote while re-claiming ({next:?})"
-            ))
+            Err("fenced: another owner wrote or claimed while re-claiming".into())
         }
-        Append::ProducerExpired => unreachable!("a claim has sequence 0"),
-        Append::Failed(e) => Err(format!("re-claim: {e}")),
     }
 }
 

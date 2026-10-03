@@ -22,7 +22,7 @@ for (const [step, sql] of sqls.entries()) {
 }
 const stats = JSON.parse(control.prepare("SELECT ursula_stats(?) AS s").get(file).s);
 const status = JSON.parse(control.prepare("SELECT ursula_status(?) AS s").get(file).s);
-say({ done: true, attempts: stats.commits.map((c) => c.attempts), poisoned: status.poisoned, offset: status.offset });
+say({ done: true, attempts: stats.commits.map((c) => c.attempts), poisoned: status.poisoned, offset: status.offset, epoch: status.epoch });
 if (process.env.CHILD_EXIT === "1") {
 	db.close();
 	process.exit(0);

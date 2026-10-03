@@ -4,7 +4,7 @@
 //! ```text
 //! "USQ1" | u32 len | u32 crc32c(payload) | payload = zstd(record)        (integers little-endian)
 //! record = 0u8 | u32 db size after the commit | u32 n | n × (u32 pgno | page image)
-//!        | 1u8 | u64 producer epoch                                        (an owner's claim)
+//!        | 1u8 | u64 producer epoch | 16-byte random nonce                  (an owner's claim)
 //! ```
 use std::collections::BTreeMap;
 
@@ -21,6 +21,8 @@ pub enum Record {
     },
     Claim {
         epoch: u64,
+        /// Random per claim: tells this owner's claim from another's at the same epoch.
+        nonce: [u8; 16],
     },
 }
 
@@ -55,9 +57,10 @@ pub fn encode_commit(size: u32, pages: &BTreeMap<u32, Vec<u8>>) -> (Vec<u8>, usi
     (wrap(&record), record.len())
 }
 
-pub fn encode_claim(epoch: u64) -> Vec<u8> {
+pub fn encode_claim(epoch: u64, nonce: &[u8; 16]) -> Vec<u8> {
     let mut record = vec![1];
     record.extend_from_slice(&epoch.to_le_bytes());
+    record.extend_from_slice(nonce);
     wrap(&record)
 }
 
@@ -101,8 +104,9 @@ pub fn decode(buf: &[u8]) -> Result<Decoded, String> {
             }
             Record::Commit { size, pages }
         }
-        Some(1) if record.len() == 9 => Record::Claim {
+        Some(1) if record.len() == 25 => Record::Claim {
             epoch: u64::from_le_bytes(record[1..9].try_into().unwrap()),
+            nonce: record[9..25].try_into().unwrap(),
         },
         _ => return Err("unknown record".into()),
     };
@@ -123,7 +127,7 @@ mod tests {
         let pages = BTreeMap::from([(1, vec![7u8; PAGE]), (3, vec![9u8; PAGE])]);
         let (mut buf, _) = encode_commit(3, &pages);
         let first = buf.len();
-        buf.extend(encode_claim(5));
+        buf.extend(encode_claim(5, &[3; 16]));
         for cut in 0..first {
             assert_eq!(decode(&buf[..cut]), Ok(Decoded::Partial), "cut at {cut}");
         }
@@ -141,7 +145,10 @@ mod tests {
         assert_eq!(
             decode(&buf[first..]),
             Ok(Decoded::Frame {
-                record: Record::Claim { epoch: 5 },
+                record: Record::Claim {
+                    epoch: 5,
+                    nonce: [3; 16]
+                },
                 len: buf.len() - first
             })
         );

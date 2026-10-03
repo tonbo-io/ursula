@@ -54,6 +54,7 @@ export type ChildLine = {
 	attempts?: number[];
 	poisoned?: boolean;
 	offset?: number;
+	epoch?: number;
 };
 
 export interface Child {
