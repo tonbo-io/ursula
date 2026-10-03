@@ -43,6 +43,7 @@ mod ops;
 mod request;
 mod rt;
 mod runtime;
+mod s3_sse;
 mod snapshot_store;
 pub mod tidy_worker;
 mod trace;
