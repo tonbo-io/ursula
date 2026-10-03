@@ -946,6 +946,7 @@ impl Applier {
             return Ok(());
         };
         let pages = std::mem::take(&mut self.pages);
+        let mut written = self.written;
         let f = unsafe { self.file()? };
         let len = f.metadata().map_err(|e| e.to_string())?.len();
         if len > min as u64 * PAGE as u64 {
@@ -955,14 +956,15 @@ impl Applier {
         for (pgno, data) in pages {
             f.write_all_at(&data, (pgno as u64 - 1) * PAGE as u64)
                 .map_err(|e| e.to_string())?;
-            self.written += 1;
-            if abort_in_replay() == Some(self.written) {
+            written += 1;
+            if abort_in_replay() == Some(written) {
                 eprintln!("sqlite-ursula-vfs: URSULA_VFS_ABORT_IN_REPLAY: aborting mid-replay");
                 std::process::abort();
             }
         }
         f.set_len(size as u64 * PAGE as u64)
             .map_err(|e| e.to_string())?;
+        self.written = written;
         Ok(())
     }
 
