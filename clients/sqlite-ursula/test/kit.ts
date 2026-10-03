@@ -50,9 +50,10 @@ export type ChildLine = {
 	error?: string;
 	errcode?: number;
 	done?: boolean;
-	/** On `done`: append attempts per commit, and whether the file is poisoned. */
+	/** On `done`: append attempts per commit, whether the file is poisoned, its stream offset. */
 	attempts?: number[];
 	poisoned?: boolean;
+	offset?: number;
 };
 
 export interface Child {

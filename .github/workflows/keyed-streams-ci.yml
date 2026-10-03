@@ -191,6 +191,12 @@ jobs:
           cargo build --release
           ldd target/release/libsqlite_ursula_vfs.so
 
+      - name: Upload the resolved Cargo.lock
+        uses: actions/upload-artifact@v6
+        with:
+          name: sqlite-vfs-cargo-lock
+          path: clients/sqlite-vfs/Cargo.lock
+
       - name: Install Node
         uses: actions/setup-node@v6
         with:

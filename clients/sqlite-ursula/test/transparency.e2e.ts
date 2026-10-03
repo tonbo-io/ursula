@@ -77,3 +77,42 @@ it("a rolled-back spill never shadows another connection's commit", () => {
 	a.close();
 	b.close();
 });
+
+// Regression (#324 review, P2-3): only WAL commits are replicated, so a connection that leaves WAL
+// (journal_mode=MEMORY writes the db file directly) must not write the file.
+it("a journal mode other than WAL cannot write the file", () => {
+	const url = ursulaUrl() + streamPath();
+	const file = freshFile();
+	attach(file, url);
+	const db = openPlain(file);
+	db.exec("CREATE TABLE t(x TEXT)");
+	db.exec("INSERT INTO t VALUES ('w1')");
+	const failures = ["PRAGMA journal_mode = MEMORY", "INSERT INTO t VALUES ('m1')"].filter((sql) => {
+		try {
+			db.exec(sql);
+			return false;
+		} catch {
+			return true;
+		}
+	});
+	expect(failures.length).toBeGreaterThan(0);
+	try {
+		db.close();
+	} catch {
+		// the poisoned connection's close
+	}
+	const xs = (f: string): string[] => {
+		const r = openPlain(f);
+		try {
+			expect(integrity(r)).toBe("ok");
+			return (r.prepare("SELECT x FROM t ORDER BY x").all() as { x: string }[]).map((row) => row.x);
+		} finally {
+			r.close();
+		}
+	};
+	attach(file, url);
+	expect(xs(file)).toEqual(["w1"]);
+	const fresh = freshFile();
+	attach(fresh, url);
+	expect(xs(fresh)).toEqual(["w1"]);
+});

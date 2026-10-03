@@ -83,6 +83,14 @@ fn unix() -> *mut ffi::sqlite3_vfs {
     UNIX.load(Ordering::Acquire)
 }
 
+/// Calls method `$m` of the underlying "unix" file.
+macro_rules! fwd {
+    ($f:expr, $m:ident $(, $a:expr)*) => {{
+        let i = inner($f);
+        ((*(*i).pMethods).$m.unwrap())(i $(, $a)*)
+    }};
+}
+
 // ---------------------------------------------------------------------------------------------
 // Attached databases
 
@@ -98,6 +106,7 @@ struct CommitStat {
 struct Db {
     url: String,
     sidecar: String,
+    path: String,
     wal: String,
     epoch: u64,
     /// Producer sequence of the last acknowledged append (the claim is 0).
@@ -115,7 +124,15 @@ struct Db {
     /// The transaction's commit is acknowledged: later writes go straight to the local WAL, and
     /// the sidecar advances once the transaction ends.
     committed: bool,
+    /// WAL frame number (1-based) of the acknowledged commit frame: the transaction is published
+    /// locally once the wal-index header's mxFrame reaches it.
+    commit_frame_no: u32,
+    /// Open WAL handles, and whether a main db handle holds an EXCLUSIVE file lock: together the
+    /// closing connection's checkpoint, the one main-db write that takes no checkpoint shm lock.
+    wal_handles: usize,
+    exclusive: bool,
     acked: u64,
+    fault_fired: bool,
     stats: Vec<CommitStat>,
     checkpoint_started: Option<Instant>,
     checkpoints: Vec<Duration>,
@@ -137,15 +154,71 @@ impl Db {
         );
         self.poisoned = Some(why);
         self.overlay.clear();
+        self.committed = false;
         ffi::SQLITE_IOERR_WRITE
+    }
+
+    /// A local operation of an acknowledged transaction (the rest of its WAL writes, its sync,
+    /// -shm growth) failed: SQLite rolls the transaction back locally, so the file no longer
+    /// reflects the stream offset; poison it (re-attach replays the commit from the stream).
+    fn post_ack(&mut self, what: &str, rc: c_int) -> c_int {
+        if rc != OK && self.committed {
+            self.poison(format!(
+                "{what} failed ({rc}) after the commit was acknowledged"
+            ));
+        }
+        rc
+    }
+
+    /// Test hook `URSULA_VFS_FAIL_POST_ACK=<n>`: fail the first local WAL write or sync after the
+    /// n-th acknowledged commit.
+    fn fault(&mut self) -> bool {
+        if self.committed && !self.fault_fired && fail_post_ack() == Some(self.acked) {
+            self.fault_fired = true;
+            return true;
+        }
+        false
+    }
+
+    /// Whether a write to the main db file is a checkpoint: under the checkpoint lock, or the
+    /// closing connection's checkpoint (EXCLUSIVE file lock with the WAL still open). Anything else
+    /// (a rollback journal mode, journal_mode=MEMORY/OFF) would bypass replication.
+    fn db_write_allowed(&self) -> bool {
+        self.checkpoint_started.is_some() || (self.exclusive && self.wal_handles > 0)
+    }
+
+    /// With synchronous=OFF a checkpoint does not sync the db file; sync it before the WAL frames
+    /// it copied are overwritten (a WAL restart) or truncated away.
+    fn sync_db_file(&mut self) -> Result<(), String> {
+        fs::File::open(&self.path)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| format!("sync {}: {e}", self.path))
     }
 
     /// The write transaction ended (WAL write lock released): drop what never committed; after an
     /// acknowledged commit, sync the local WAL and only then advance the sidecar.
-    fn end_write_transaction(&mut self) {
+    ///
+    /// Runs before the real lock is released (see `x_shm_lock`), on the main db handle `file`,
+    /// whose wal-index header tells whether SQLite published the commit.
+    unsafe fn end_write_transaction(&mut self, file: *mut ffi::sqlite3_file) {
         self.write_locked = false;
         self.overlay.clear();
         if !std::mem::take(&mut self.committed) {
+            return;
+        }
+        // wal-index header (first copy): mxFrame is the u32 at byte 16, native endian.
+        let mut p: *mut c_void = null_mut();
+        let rc = unsafe { fwd!(file, xShmMap, 0, 32 * 1024, 0, &mut p) };
+        let mx_frame = if rc == OK && !p.is_null() {
+            unsafe { std::ptr::read_volatile((p as *const u8).add(16) as *const u32) }
+        } else {
+            0
+        };
+        if mx_frame < self.commit_frame_no {
+            self.poison(format!(
+                "commit acknowledged but not published locally (mxFrame {mx_frame} < frame {})",
+                self.commit_frame_no
+            ));
             return;
         }
         let synced = fs::File::open(&self.wal).and_then(|f| f.sync_data());
@@ -204,8 +277,27 @@ fn retry_budget() -> Duration {
     })
 }
 
+fn fail_post_ack() -> Option<u64> {
+    static V: OnceLock<Option<u64>> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("URSULA_VFS_FAIL_POST_ACK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+}
+
+/// Replaces the sidecar atomically and durably: temp file, fsync, rename, fsync of the directory.
 fn write_sidecar(path: &str, offset: u64, epoch: u64) -> Result<(), String> {
-    fs::write(path, format!("{offset} {epoch}\n")).map_err(|e| format!("sidecar {path}: {e}"))
+    let err = |e: std::io::Error| format!("sidecar {path}: {e}");
+    let tmp = format!("{path}.tmp");
+    let mut f = fs::File::create(&tmp).map_err(err)?;
+    std::io::Write::write_all(&mut f, format!("{offset} {epoch}\n").as_bytes()).map_err(err)?;
+    f.sync_all().map_err(err)?;
+    fs::rename(&tmp, path).map_err(err)?;
+    let dir = std::path::Path::new(path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    fs::File::open(dir).and_then(|d| d.sync_all()).map_err(err)
 }
 
 /// `(offset, epoch)` reflected by the local file.
@@ -241,6 +333,8 @@ enum Append {
     Acked { next: Option<u64>, attempts: u32 },
     /// 403: a newer epoch owns the stream.
     Fenced { current: Option<u64> },
+    /// 409 expecting sequence 0: the server expired this idle producer (7 days).
+    ProducerExpired,
     /// A definite rejection, or no answer within the retry budget.
     Failed(String),
 }
@@ -273,6 +367,9 @@ fn append(url: &str, body: &[u8], epoch: u64, seq: u64) -> Append {
                         return Append::Fenced {
                             current: header_u64(&r, "producer-epoch"),
                         };
+                    }
+                    409 if seq > 0 && header_u64(&r, "producer-expected-seq") == Some(0) => {
+                        return Append::ProducerExpired;
                     }
                     400..=499 => {
                         let text = r.body_mut().read_to_string().unwrap_or_default();
@@ -545,10 +642,72 @@ fn claim(url: &str, mut epoch: u64) -> Result<(u64, u64), String> {
                 return Err(format!("claim {url}: no Stream-Next-Offset"));
             }
             Append::Fenced { current } => epoch = current.unwrap_or(epoch).max(epoch) + 1,
+            Append::ProducerExpired => unreachable!("a claim has sequence 0"),
             Append::Failed(e) => return Err(format!("claim {url}: {e}")),
         }
     }
     Err(format!("claim {url}: lost 16 claim races"))
+}
+
+/// The server expired this owner's idle producer (7 days without a write) and forgot its epoch.
+/// Taking the stream back is safe only if nobody wrote since this owner's last frame: the stream
+/// must end at our offset, and our new claim (one epoch up, fencing any later owner's older
+/// epochs) must land exactly there. Otherwise another owner wrote and this one is fenced.
+fn reclaim(db: &mut Db) -> Result<(), String> {
+    let (bytes, _) = read_from(&db.url, db.offset)?;
+    if !bytes.is_empty() {
+        db.fenced = true;
+        return Err(format!(
+            "fenced: producer expired and the stream moved past {}",
+            db.offset
+        ));
+    }
+    let epoch = db.epoch + 1;
+    let claim = frame::encode_claim(epoch);
+    match append(&db.url, &claim, epoch, 0) {
+        Append::Acked {
+            next: Some(next), ..
+        } if next == db.offset + claim.len() as u64 => {
+            db.epoch = epoch;
+            db.seq = 0;
+            db.offset = next;
+            Ok(())
+        }
+        Append::Acked { next, .. } | Append::Fenced { current: next } => {
+            db.fenced = true;
+            Err(format!(
+                "fenced: another owner wrote while re-claiming ({next:?})"
+            ))
+        }
+        Append::ProducerExpired => unreachable!("a claim has sequence 0"),
+        Append::Failed(e) => Err(format!("re-claim: {e}")),
+    }
+}
+
+/// Gives an empty file its WAL-format page 1 through a private "unix" connection, so no
+/// connection ever commits through a rollback journal (the main-db write guard refuses that).
+unsafe fn init_wal_format(path: &str) -> Result<(), String> {
+    unsafe {
+        let a = api();
+        let c = CString::new(path).unwrap();
+        let mut db: *mut ffi::sqlite3 = null_mut();
+        let flags = ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE;
+        let mut rc = (a.open_v2.unwrap())(c.as_ptr(), &mut db, flags, c"unix".as_ptr());
+        if rc == OK {
+            rc = (a.exec.unwrap())(
+                db,
+                c"PRAGMA journal_mode=WAL".as_ptr(),
+                None,
+                null_mut(),
+                null_mut(),
+            );
+        }
+        (a.close.unwrap())(db);
+        if rc != OK {
+            return Err(format!("journal_mode=WAL on {path}: {rc}"));
+        }
+    }
+    Ok(())
 }
 
 unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
@@ -602,10 +761,14 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
     let (epoch, claimed) = claim(&url, applier.epoch + 1)?;
     let offset = unsafe { catch_up(&url, offset, Some(claimed), &mut applier)? };
     applier.finish()?;
+    if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0 {
+        unsafe { init_wal_format(&path)? };
+    }
     write_sidecar(&sidecar, offset, epoch)?;
     let db = Db {
         url,
         sidecar,
+        path: path.clone(),
         wal: format!("{path}-wal"),
         epoch,
         seq: 0,
@@ -615,7 +778,11 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
         write_locked: false,
         overlay: BTreeMap::new(),
         committed: false,
+        commit_frame_no: 0,
+        wal_handles: 0,
+        exclusive: false,
         acked: 0,
+        fault_fired: false,
         stats: Vec::new(),
         checkpoint_started: None,
         checkpoints: Vec::new(),
@@ -767,17 +934,12 @@ struct Ext {
     path: Option<String>,
     db: Option<Arc<Mutex<Db>>>,
     wal: bool,
+    /// This main db handle holds an EXCLUSIVE file lock.
+    exclusive: bool,
 }
 
 unsafe fn inner(f: *mut ffi::sqlite3_file) -> *mut ffi::sqlite3_file {
     unsafe { &mut (*(f as *mut File)).inner }
-}
-
-macro_rules! fwd {
-    ($f:expr, $m:ident $(, $a:expr)*) => {{
-        let i = inner($f);
-        ((*(*i).pMethods).$m.unwrap())(i $(, $a)*)
-    }};
 }
 
 /// The attached database of a WAL handle.
@@ -818,12 +980,11 @@ unsafe extern "C" fn x_open(
         } else {
             CStr::from_ptr(zname).to_str().ok()
         };
-        // Rollback-journal writes of an attached database would bypass replication; the only one
-        // allowed is on an empty file (the very first `PRAGMA journal_mode=WAL` writing page 1).
+        // Rollback-journal writes of an attached database would bypass replication (attach gives
+        // an empty file its WAL-format page 1, so no commit ever needs a journal).
         if flags & ffi::SQLITE_OPEN_MAIN_JOURNAL != 0
             && let Some(db) = name.and_then(|n| n.strip_suffix("-journal"))
             && lookup(db).is_some()
-            && fs::metadata(db).map(|m| m.len() > 0).unwrap_or(false)
         {
             eprintln!(
                 "sqlite-ursula-vfs: {db}: rollback journal refused (journal_mode must be WAL)"
@@ -844,14 +1005,17 @@ unsafe extern "C" fn x_open(
                     path: Some(name.to_owned()),
                     db,
                     wal: false,
+                    exclusive: false,
                 }));
             } else if flags & ffi::SQLITE_OPEN_WAL != 0
                 && let Some(db) = name.strip_suffix("-wal").and_then(lookup)
             {
+                lock(&db).wal_handles += 1;
                 (*f).ext = Box::into_raw(Box::new(Ext {
                     path: None,
                     db: Some(db),
                     wal: true,
+                    exclusive: false,
                 }));
             }
         }
@@ -867,6 +1031,14 @@ unsafe extern "C" fn x_close(file: *mut ffi::sqlite3_file) -> c_int {
         if !(*f).ext.is_null() {
             let ext = Box::from_raw((*f).ext);
             (*f).ext = null_mut();
+            if let Some(db) = &ext.db {
+                let mut db = lock(db);
+                if ext.wal {
+                    db.wal_handles -= 1;
+                } else if ext.exclusive {
+                    db.exclusive = false;
+                }
+            }
             if let Some(path) = ext.path {
                 let mut reg = registry();
                 if let Some(n) = reg.open.get_mut(&path) {
@@ -949,6 +1121,14 @@ unsafe extern "C" fn x_write(
 ) -> c_int {
     unsafe {
         let Some(db) = wal_db(file) else {
+            if let Some(db) = main_db(file) {
+                let mut db = lock(&db);
+                if !db.db_write_allowed() {
+                    return db.poison(
+                        "db file write outside a checkpoint (journal_mode must stay WAL)".into(),
+                    );
+                }
+            }
             return fwd!(file, xWrite, buf, amt, off);
         };
         let mut db = lock(&db);
@@ -957,7 +1137,12 @@ unsafe extern "C" fn x_write(
         }
         if db.committed {
             // The rest of an acknowledged transaction (checksum rewrites, padding): the local WAL.
-            return fwd!(file, xWrite, buf, amt, off);
+            let rc = if db.fault() {
+                ffi::SQLITE_IOERR_WRITE
+            } else {
+                fwd!(file, xWrite, buf, amt, off)
+            };
+            return db.post_ack("local WAL write", rc);
         }
         if !db.write_locked {
             return db.poison("WAL write outside a write-locked transaction (locking_mode=EXCLUSIVE is not supported)".into());
@@ -1035,9 +1220,15 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
         }
     };
     let (body, raw) = frame::encode_commit(size, &pages);
-    let seq = db.seq + 1;
     let t = Instant::now();
-    let outcome = append(&db.url, &body, db.epoch, seq);
+    let mut outcome = append(&db.url, &body, db.epoch, db.seq + 1);
+    if let Append::ProducerExpired = outcome {
+        if let Err(e) = reclaim(db) {
+            return db.poison(e);
+        }
+        outcome = append(&db.url, &body, db.epoch, db.seq + 1);
+    }
+    let seq = db.seq + 1;
     let append_time = t.elapsed();
     let expected = db.offset + body.len() as u64;
     let attempts = match outcome {
@@ -1055,6 +1246,9 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
                 db.epoch
             ));
         }
+        Append::ProducerExpired => {
+            return db.poison("producer expired again right after a re-claim".into());
+        }
         Append::Failed(e) => return db.poison(e),
     };
     db.seq = seq;
@@ -1067,6 +1261,13 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
         );
         std::process::abort();
     }
+    // A WAL header write restarts the WAL over frames a checkpoint copied into the db file.
+    if db.overlay.contains_key(&0)
+        && let Err(e) = db.sync_db_file()
+    {
+        return db.poison(e);
+    }
+    db.commit_frame_no = ((commit_frame - WAL_HDR) / FRAME + 1) as u32;
     for (o, d) in std::mem::take(&mut db.overlay) {
         let rc = unsafe {
             fwd!(
@@ -1098,15 +1299,41 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
 
 unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3_int64) -> c_int {
     unsafe {
-        if let Some(db) = wal_db(file) {
-            lock(&db).overlay.retain(|&o, _| o < size);
+        if let Some(db) = main_db(file) {
+            let mut db = lock(&db);
+            if !db.db_write_allowed() {
+                return db.poison(
+                    "db file truncate outside a checkpoint (journal_mode must stay WAL)".into(),
+                );
+            }
         }
-        fwd!(file, xTruncate, size)
+        let Some(db) = wal_db(file) else {
+            return fwd!(file, xTruncate, size);
+        };
+        let mut db = lock(&db);
+        db.overlay.retain(|&o, _| o < size);
+        // Truncating drops frames a checkpoint copied into the db file (see `sync_db_file`).
+        if let Err(e) = db.sync_db_file() {
+            return db.poison(e);
+        }
+        let rc = fwd!(file, xTruncate, size);
+        db.post_ack("local WAL truncate", rc)
     }
 }
 
 unsafe extern "C" fn x_sync(file: *mut ffi::sqlite3_file, flags: c_int) -> c_int {
-    unsafe { fwd!(file, xSync, flags) }
+    unsafe {
+        let Some(db) = wal_db(file) else {
+            return fwd!(file, xSync, flags);
+        };
+        let mut db = lock(&db);
+        let rc = if db.fault() {
+            ffi::SQLITE_IOERR_FSYNC
+        } else {
+            fwd!(file, xSync, flags)
+        };
+        db.post_ack("local WAL sync", rc)
+    }
 }
 
 unsafe extern "C" fn x_file_size(
@@ -1124,11 +1351,37 @@ unsafe extern "C" fn x_file_size(
     }
 }
 
+/// Tracks which main db handle holds an EXCLUSIVE file lock (see `Db::db_write_allowed`).
+unsafe fn track_exclusive(file: *mut ffi::sqlite3_file, exclusive: bool) {
+    unsafe {
+        let Some(ext) = (*(file as *mut File)).ext.as_mut() else {
+            return;
+        };
+        if let (false, Some(db)) = (ext.wal, &ext.db)
+            && ext.exclusive != exclusive
+        {
+            ext.exclusive = exclusive;
+            lock(db).exclusive = exclusive;
+        }
+    }
+}
 unsafe extern "C" fn x_lock(file: *mut ffi::sqlite3_file, l: c_int) -> c_int {
-    unsafe { fwd!(file, xLock, l) }
+    unsafe {
+        let rc = fwd!(file, xLock, l);
+        if rc == OK && l == ffi::SQLITE_LOCK_EXCLUSIVE {
+            track_exclusive(file, true);
+        }
+        rc
+    }
 }
 unsafe extern "C" fn x_unlock(file: *mut ffi::sqlite3_file, l: c_int) -> c_int {
-    unsafe { fwd!(file, xUnlock, l) }
+    unsafe {
+        let rc = fwd!(file, xUnlock, l);
+        if l < ffi::SQLITE_LOCK_EXCLUSIVE {
+            track_exclusive(file, false);
+        }
+        rc
+    }
 }
 unsafe extern "C" fn x_check_reserved_lock(file: *mut ffi::sqlite3_file, out: *mut c_int) -> c_int {
     unsafe { fwd!(file, xCheckReservedLock, out) }
@@ -1153,11 +1406,24 @@ unsafe extern "C" fn x_shm_map(
     extend: c_int,
     pp: *mut *mut c_void,
 ) -> c_int {
-    unsafe { fwd!(file, xShmMap, pg, pgsz, extend, pp) }
+    unsafe {
+        let rc = fwd!(file, xShmMap, pg, pgsz, extend, pp);
+        if rc != OK
+            && let Some(db) = main_db(file)
+        {
+            return lock(&db).post_ack("-shm map", rc);
+        }
+        rc
+    }
 }
 
 /// Tracks the write transaction (WAL write lock) and checkpoints (checkpoint lock) of an attached
-/// database; SQLite takes both through the main db handle.
+/// database; SQLite takes both through the main db handle. The end of a write transaction (sync,
+/// publication check, sidecar) runs under the database's mutex *before* the real lock is released:
+/// once it is released, another thread's connection may start its own write transaction, whose
+/// state the bookkeeping would otherwise see (or whose commit the sidecar would cover before its
+/// rewrites reach the WAL). Lock order: the real shm lock may be taken without the mutex, and the
+/// mutex may be held while releasing it, which never blocks.
 unsafe extern "C" fn x_shm_lock(
     file: *mut ffi::sqlite3_file,
     offset: c_int,
@@ -1165,25 +1431,27 @@ unsafe extern "C" fn x_shm_lock(
     flags: c_int,
 ) -> c_int {
     unsafe {
-        let rc = fwd!(file, xShmLock, offset, n, flags);
-        if flags & ffi::SQLITE_SHM_EXCLUSIVE == 0
-            || n != 1
-            || (offset != WAL_WRITE_LOCK && offset != WAL_CKPT_LOCK)
-        {
-            return rc;
-        }
-        let Some(db) = main_db(file) else {
-            return rc;
+        let tracked = flags & ffi::SQLITE_SHM_EXCLUSIVE != 0
+            && n == 1
+            && (offset == WAL_WRITE_LOCK || offset == WAL_CKPT_LOCK);
+        let db = if tracked { main_db(file) } else { None };
+        let Some(db) = db else {
+            return fwd!(file, xShmLock, offset, n, flags);
         };
-        let mut db = lock(&db);
         let locking = flags & ffi::SQLITE_SHM_LOCK != 0;
+        if offset == WAL_WRITE_LOCK && !locking {
+            let mut db = lock(&db);
+            db.end_write_transaction(file);
+            return fwd!(file, xShmLock, offset, n, flags);
+        }
+        let rc = fwd!(file, xShmLock, offset, n, flags);
+        let mut db = lock(&db);
         match (offset, locking) {
             (WAL_WRITE_LOCK, true) if rc == OK => {
                 db.write_locked = true;
                 db.committed = false;
                 db.overlay.clear();
             }
-            (WAL_WRITE_LOCK, false) => db.end_write_transaction(),
             (WAL_CKPT_LOCK, true) if rc == OK => db.checkpoint_started = Some(Instant::now()),
             (WAL_CKPT_LOCK, false) => {
                 if let Some(t) = db.checkpoint_started.take()

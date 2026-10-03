@@ -1,5 +1,6 @@
 // The commit barrier: SIGKILL/abort around it in a child process, the cache-spill case, and an append
 // whose outcome is unknown.
+import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { attach } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
@@ -106,4 +107,20 @@ it("(e) an append whose answer is lost is retried with the same producer sequenc
 	const fresh = freshFile();
 	attach(fresh, ursulaUrl() + path);
 	expect(rows(fresh)).toEqual(["M-one"]);
+});
+
+// Regression (#324 review, P2-1): SQLite can still fail an acknowledged transaction locally (here
+// its FULL-sync of the WAL) and roll it back; the sidecar then must not cover it.
+it("(f) a local failure after the ack poisons the file, keeps the sidecar behind, and re-attach replays the commit", async () => {
+	const path = streamPath();
+	const file = freshFile();
+	const child = runChild(file, ursulaUrl() + path, ["PRAGMA synchronous = FULL", ...SQL], { URSULA_VFS_FAIL_POST_ACK: "3", CHILD_EXIT: "1" });
+	const done = await child.waitFor((l) => l.done === true);
+	await child.exited;
+	expect(child.lines.find((l) => l.step === 3 && l.ok !== undefined)?.ok).toBe(false);
+	expect(done.poisoned).toBe(true);
+	const sidecar = Number(readFileSync(`${file}-ursula`, "utf8").split(" ")[0]);
+	expect(sidecar).toBeLessThan(done.offset as number);
+	attach(file, ursulaUrl() + path);
+	expect(rows(file)).toEqual(["M-one", "M-two"]);
 });
