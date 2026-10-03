@@ -196,3 +196,49 @@ jobs:
           chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
           cd clients/sqlite-ursula
           URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" npm run test:e2e
+
+  sqlite-ursula-vfs:
+    name: sqlite-ursula VFS spike (extension build, then transparency, crash, fencing, Pi conformance + benchmark)
+    needs: build-ursula
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+          cache-workspaces: clients/sqlite-ursula-vfs
+
+      # SQLITE3_LIB_DIR keeps libsqlite3-sys from probing (and linking) a system libsqlite3: the
+      # extension only calls the host's SQLite through sqlite3_api_routines.
+      - name: Build the extension
+        env:
+          SQLITE3_LIB_DIR: /nonexistent
+        run: |
+          cargo build --release --manifest-path clients/sqlite-ursula-vfs/Cargo.toml
+          ls -la clients/sqlite-ursula-vfs/target/release/*.so
+          ldd clients/sqlite-ursula-vfs/target/release/libsqlite_ursula_vfs.so
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Download ursula
+        uses: actions/download-artifact@v7
+        with:
+          name: ursula-release
+          path: ${{ runner.temp }}/ursula-bin
+
+      - name: VFS e2e against real ursula
+        timeout-minutes: 35
+        run: |
+          chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
+          cd clients/sqlite-ursula
+          npm ci
+          npm run typecheck
+          node --version
+          URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$GITHUB_WORKSPACE/clients/sqlite-ursula-vfs/target/release/libsqlite_ursula_vfs.so" npm run test:vfs
