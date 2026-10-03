@@ -452,6 +452,7 @@ async fn external_append_apply_invalidates_a_cached_page_holding_a_stale_entry()
                 after: None,
                 max_streams: 16,
                 stream: None,
+                retention_gc_now_ms: None,
             },
             placement(),
         )

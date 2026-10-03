@@ -84,6 +84,7 @@ impl ShardRuntime {
                 after: None,
                 max_streams: 1,
                 stream: Some(candidate.stream_id.clone()),
+                retention_gc_now_ms: None,
             })
             .await?;
             let outcome = self
@@ -194,6 +195,7 @@ impl ShardRuntime {
                 after: None,
                 max_streams: 1,
                 stream: Some(candidate.stream_id.clone()),
+                retention_gc_now_ms: None,
             })
             .await?;
             match self

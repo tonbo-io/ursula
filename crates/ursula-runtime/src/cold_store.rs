@@ -88,7 +88,28 @@ pub(crate) fn apply_s3_encryption(
     builder: opendal::services::S3,
     s3: &ursula_config::S3Config,
 ) -> io::Result<(opendal::services::S3, &'static str)> {
+    apply_s3_encryption_with_fetcher(builder, s3, crate::s3_sse::default_fetcher())
+}
+
+/// [`apply_s3_encryption`] over an explicit HTTP transport. With SSE on, the
+/// transport is wrapped in [`crate::s3_sse::MultipartSseFetch`], which keeps
+/// the SSE headers off UploadPart / CompleteMultipartUpload (AWS rejects
+/// them there; they belong on CreateMultipartUpload only).
+pub(crate) fn apply_s3_encryption_with_fetcher(
+    builder: opendal::services::S3,
+    s3: &ursula_config::S3Config,
+    fetcher: opendal::raw::HttpClient,
+) -> io::Result<(opendal::services::S3, &'static str)> {
     use ursula_config::S3ServerSideEncryption;
+    let builder = match s3.server_side_encryption {
+        S3ServerSideEncryption::None => builder,
+        S3ServerSideEncryption::Aes256 | S3ServerSideEncryption::AwsKms => {
+            match crate::s3_sse::MultipartSseFetch::new(s3, fetcher) {
+                Some(fetch) => builder.http_client(opendal::raw::HttpClient::with(fetch)),
+                None => builder,
+            }
+        }
+    };
     match s3.server_side_encryption {
         S3ServerSideEncryption::Aes256 => {
             if s3.kms_key_id.is_some() {
@@ -1800,6 +1821,154 @@ mod tests {
         ))
         .expect_err("kms key without aws-kms mode");
         assert!(err.to_string().contains("aws-kms"), "got: {err}");
+    }
+
+    /// Records every S3 request opendal sends and answers it like S3 would.
+    struct RecordingS3 {
+        requests: std::sync::Mutex<Vec<(http::Method, String, http::HeaderMap)>>,
+    }
+
+    impl opendal::raw::HttpFetch for RecordingS3 {
+        async fn fetch(
+            &self,
+            req: http::Request<opendal::Buffer>,
+        ) -> opendal::Result<http::Response<opendal::raw::HttpBody>> {
+            let query = req.uri().query().unwrap_or_default().to_owned();
+            self.requests.lock().expect("requests").push((
+                req.method().clone(),
+                query.clone(),
+                req.headers().clone(),
+            ));
+            let body = if query.contains("uploads") {
+                "<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key>\
+                 <UploadId>upload-1</UploadId></InitiateMultipartUploadResult>"
+            } else if req.method() == http::Method::POST {
+                "<CompleteMultipartUploadResult><Bucket>b</Bucket><Key>k</Key>\
+                 <ETag>\"done\"</ETag></CompleteMultipartUploadResult>"
+            } else {
+                ""
+            };
+            let body = opendal::Buffer::from(Bytes::from_static(body.as_bytes()));
+            let len = body.len() as u64;
+            Ok(http::Response::builder()
+                .status(200)
+                .header("etag", "\"part\"")
+                .header("content-length", len)
+                .body(opendal::raw::HttpBody::new(
+                    futures_util::stream::iter(vec![Ok(body)]),
+                    Some(len),
+                ))
+                .expect("response"))
+        }
+    }
+
+    /// Regression (AWS EKS run): with SSE on, opendal put
+    /// `x-amz-server-side-encryption` on every UploadPart, which real S3
+    /// rejects, so every cold snapshot of 8 MiB or more failed. The SSE
+    /// headers must ride CreateMultipartUpload only, and the stripped
+    /// requests must stay correctly signed.
+    #[tokio::test]
+    async fn multipart_upload_sends_sse_headers_on_create_only() {
+        for (encryption, kms_key_id, expected) in [
+            (
+                ursula_config::S3ServerSideEncryption::Aes256,
+                None,
+                "AES256",
+            ),
+            (
+                ursula_config::S3ServerSideEncryption::AwsKms,
+                Some("arn:aws:kms:us-east-1:111122223333:key/test"),
+                "aws:kms",
+            ),
+        ] {
+            let mut config = s3_test_config(encryption, kms_key_id);
+            let s3 = config.s3.as_mut().expect("s3 config");
+            s3.endpoint = Some("http://127.0.0.1:9".to_owned());
+            s3.access_key_id = Some("AKIDTEST".to_owned());
+            s3.secret_access_key = Some("secret".to_owned());
+            s3.session_token = Some("token".to_owned());
+            let s3 = config.s3.as_ref().expect("s3 config");
+            let recorder = std::sync::Arc::new(RecordingS3 {
+                requests: std::sync::Mutex::default(),
+            });
+            let builder = opendal::services::S3::default()
+                .bucket("test-bucket")
+                .region("us-east-1")
+                .endpoint("http://127.0.0.1:9")
+                .access_key_id("AKIDTEST")
+                .secret_access_key("secret")
+                .session_token("token");
+            let (builder, _) = super::apply_s3_encryption_with_fetcher(
+                builder,
+                s3,
+                opendal::raw::HttpClient::with(recorder.clone()),
+            )
+            .expect("encryption");
+            let store = ColdStore::from_operator(
+                opendal::Operator::new(builder).expect("operator").finish(),
+                super::ColdStoreInfo {
+                    backend: "s3",
+                    root: None,
+                    bucket: None,
+                    region: None,
+                    endpoint: None,
+                    encryption: None,
+                },
+            );
+
+            let mut writer = store.open_object_writer("snap/body").await.expect("open");
+            let body = vec![7u8; super::COLD_OBJECT_WRITE_PART_BYTES + 1];
+            writer.write(Bytes::from(body)).await.expect("write");
+            writer.close().await.expect("close");
+
+            let requests = recorder.requests.lock().expect("requests");
+            let kind = |method: &http::Method, query: &str| match *method {
+                http::Method::POST if query.contains("uploads") => "create",
+                http::Method::PUT if query.contains("partNumber") => "part",
+                http::Method::POST if query.contains("uploadId") => "complete",
+                _ => "other",
+            };
+            let kinds: Vec<_> = requests.iter().map(|(m, q, _)| kind(m, q)).collect();
+            assert_eq!(kinds, ["create", "part", "part", "complete"], "{expected}");
+            for (method, query, headers) in requests.iter() {
+                let sse = headers
+                    .get("x-amz-server-side-encryption")
+                    .map(|v| v.to_str().expect("ascii"));
+                let authorization = headers
+                    .get("authorization")
+                    .expect("signed")
+                    .to_str()
+                    .expect("ascii");
+                let signed = authorization
+                    .split("SignedHeaders=")
+                    .nth(1)
+                    .and_then(|rest| rest.split(',').next())
+                    .expect("signed headers");
+                if kind(method, query) == "create" {
+                    assert_eq!(sse, Some(expected));
+                    if kms_key_id.is_some() {
+                        assert!(
+                            headers.contains_key("x-amz-server-side-encryption-aws-kms-key-id")
+                        );
+                    }
+                    continue;
+                }
+                assert!(
+                    !headers
+                        .keys()
+                        .any(|name| name.as_str().starts_with("x-amz-server-side-encryption")),
+                    "{expected}: {method} ?{query} carries SSE headers: {headers:?}"
+                );
+                // Re-signed: every signed header is present (host is
+                // set by the HTTP client) and none is an SSE header.
+                for name in signed.split(';') {
+                    assert!(
+                        name == "host" || headers.contains_key(name),
+                        "{expected}: {method} ?{query} signs absent header {name}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

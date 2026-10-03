@@ -15,7 +15,10 @@ bytes = { workspace = true, features = ["serde"] }
 crossbeam-utils = { workspace = true }
 crc32fast = { workspace = true }
 futures-util = { workspace = true }
+http = { workspace = true }
 opendal = { workspace = true, features = ["services-memory", "services-s3"] }
+reqsign = { workspace = true }
+reqwest = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }

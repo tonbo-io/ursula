@@ -1461,6 +1461,9 @@ pub struct RepairColdIndexRequest {
     /// Repair only this stream and leave the cursor alone. The F2 driver
     /// repairs a stream's pages right before compacting its shared refs.
     pub stream: Option<BucketStreamId>,
+    /// Wall-clock time of a cursor step, which also runs retention GC
+    /// (F14f) over the streams it visits; `None` skips retention GC.
+    pub retention_gc_now_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
