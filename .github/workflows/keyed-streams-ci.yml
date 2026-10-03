@@ -162,3 +162,37 @@ jobs:
         run: |
           cd clients/pi-durable-ursula
           E2E_NODES=3 E2E_S3=1 URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" npm run test:e2e
+
+  sqlite-ursula-e2e:
+    name: sqlite-ursula spike (units, then Pi conformance + benchmark on single-node ursula)
+    needs: build-ursula
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Download ursula
+        uses: actions/download-artifact@v7
+        with:
+          name: ursula-release
+          path: ${{ runner.temp }}/ursula-bin
+
+      - name: Units (fake Ursula)
+        run: |
+          cd clients/sqlite-ursula
+          npm ci
+          npm run typecheck
+          npm test
+
+      - name: Pi conformance and benchmark against real ursula
+        timeout-minutes: 25
+        run: |
+          chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
+          cd clients/sqlite-ursula
+          URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" npm run test:e2e

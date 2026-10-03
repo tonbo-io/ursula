@@ -45,7 +45,7 @@ export interface ReplicatedSqliteOptions {
 	readonly onCommit?: (info: CommitInfo) => void;
 }
 
-const WRITE_TABLE = /\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|UPDATE|DELETE\s+FROM)\s+(\w+)/gi;
+const WRITE_TABLE = /\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|UPDATE(?!\s+SET\b)|DELETE\s+FROM)\s+(\w+)/gi;
 const DDL = /^\s*(CREATE|ALTER|DROP)\b/i;
 
 interface TxState {
@@ -55,10 +55,12 @@ interface TxState {
 }
 
 class Executor implements SqliteExecutor {
-	constructor(
-		private readonly owner: ReplicatedSqlite,
-		private readonly tx: TxState,
-	) {}
+	private readonly owner: ReplicatedSqlite;
+	private readonly tx: TxState;
+	constructor(owner: ReplicatedSqlite, tx: TxState) {
+		this.owner = owner;
+		this.tx = tx;
+	}
 	private check(sql: string): void {
 		if (!this.tx.active) throw new Error("SQLite transaction handle is no longer active");
 		if (DDL.test(sql)) this.tx.ddl.push(sql);
