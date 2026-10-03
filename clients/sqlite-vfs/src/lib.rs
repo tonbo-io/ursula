@@ -237,10 +237,14 @@ impl Db {
         self.checkpoint_started.is_some() || (self.exclusive && !self.wal_handles.is_empty())
     }
 
-    /// With synchronous=OFF a checkpoint does not sync the db file; sync it before the WAL frames
-    /// it copied are overwritten (a WAL restart), truncated away or deleted (`x_delete`).
+    /// Syncs the db file before WAL frames a checkpoint copied into it are destroyed: overwritten
+    /// (a WAL restart), truncated away or deleted (`x_delete`), and after a checkpoint's final
+    /// truncate (`x_truncate`). A checkpoint under synchronous=OFF does not sync it, nor does one
+    /// that had nothing left to copy. `SQLITE_SYNC_FULL`: on Apple, F_FULLFSYNC, so the drive
+    /// cannot persist the WAL's destruction before the pages (once per checkpoint or WAL restart,
+    /// not per commit).
     unsafe fn sync_db_file(&self) -> Result<(), String> {
-        unsafe { sync_handle(&self.db_handles, &self.path)? };
+        unsafe { sync_handle(&self.db_handles, &self.path, ffi::SQLITE_SYNC_FULL)? };
         if durable_shadow() {
             unsafe {
                 write_shadow(
@@ -290,7 +294,9 @@ impl Db {
             ));
             return;
         }
-        if let Err(e) = unsafe { sync_handle(&self.wal_handles, &self.wal) } {
+        if let Err(e) =
+            unsafe { sync_handle(&self.wal_handles, &self.wal, ffi::SQLITE_SYNC_NORMAL) }
+        {
             self.poison(e);
             return;
         }
@@ -318,11 +324,11 @@ unsafe impl Send for Handle {}
 /// own: closing any descriptor of a file drops every POSIX (fcntl) lock this process holds on it,
 /// SQLite's included, which would let another process take conflicting locks. fsync covers the
 /// file, whichever descriptor issues it.
-unsafe fn sync_handle(handles: &[Handle], what: &str) -> Result<(), String> {
+unsafe fn sync_handle(handles: &[Handle], what: &str, flags: c_int) -> Result<(), String> {
     let Some(&Handle(f)) = handles.first() else {
         return Err(format!("sync {what}: no open handle"));
     };
-    let rc = unsafe { ((*(*f).pMethods).xSync.unwrap())(f, ffi::SQLITE_SYNC_NORMAL) };
+    let rc = unsafe { ((*(*f).pMethods).xSync.unwrap())(f, flags) };
     if rc != OK {
         return Err(format!("sync {what}: {rc}"));
     }
@@ -523,7 +529,7 @@ fn check_unused(path: &str) -> Result<(), String> {
     }
     if l.l_type != libc::F_UNLCK as _ {
         return Err(format!(
-            "{path} is open by another process (pid {}); close it before attaching",
+            "{path} is open by another connection (pid {}); close it before attaching",
             l.l_pid
         ));
     }
@@ -889,22 +895,33 @@ impl Private {
         }
     }
 
-    /// Its close never deletes (or truncates) the WAL: `SQLITE_FCNTL_PERSIST_WAL`. Closing as the
-    /// last connection on the file, it would otherwise delete the WAL through "unix", past
-    /// `x_delete`, while frames an unsynced checkpoint copied may not be durable in the db file.
-    /// The next connection recovers the WAL; the last one closing through this VFS deletes it.
+    /// Its close neither checkpoints nor deletes or truncates the WAL
+    /// (`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`): closing as the last connection on the file, it would
+    /// otherwise do so through "unix", past `x_delete` and `x_truncate`. The WAL stays for the next
+    /// connection; the last one closing through this VFS deletes it.
     unsafe fn keep_wal(&self) -> Result<(), String> {
-        let mut on: c_int = 1;
+        let on: c_int = 1;
         let rc = unsafe {
-            (api().file_control.unwrap())(
+            (api().db_config.unwrap())(
                 self.db,
-                c"main".as_ptr(),
-                ffi::SQLITE_FCNTL_PERSIST_WAL,
-                &mut on as *mut c_int as *mut c_void,
+                ffi::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                on,
+                null_mut::<c_int>(),
             )
         };
         if rc != OK {
-            return Err(format!("persist WAL: {rc}"));
+            return Err(format!("no checkpoint on close: {rc}"));
+        }
+        Ok(())
+    }
+
+    /// Its checkpoints sync the db file (F_FULLFSYNC on Apple) before they record frames as
+    /// backfilled, whatever the host's compiled-in defaults: they bypass `x_truncate`, which does
+    /// that for the connections of this VFS.
+    unsafe fn durable_checkpoints(&self) -> Result<(), String> {
+        unsafe {
+            self.query(c"PRAGMA synchronous=FULL")?;
+            self.query(c"PRAGMA checkpoint_fullfsync=ON")?;
         }
         Ok(())
     }
@@ -954,13 +971,15 @@ impl Drop for Private {
 /// the last one on the file (closing the last connection deletes the WAL; any other connection, in
 /// any process, keeps it), so nothing holds an old WAL or page cache while pages are rewritten.
 ///
-/// `synchronous=FULL`, whatever the host's compiled-in default: the checkpoint then syncs the db
-/// file before it truncates the WAL (it backfills every frame, the wal-index being rebuilt by this
-/// first connection), so the frames the sidecar covers stay durable.
+/// It fails before the TRUNCATE if another process has the file open (`check_unused`). The
+/// checkpoint syncs the db file before it truncates the WAL when it copies frames
+/// (`durable_checkpoints`); frames already backfilled were synced by the checkpoint that copied
+/// them (`x_truncate`), so the frames the sidecar covers stay durable.
 unsafe fn checkpoint_local(path: &str) -> Result<(), String> {
+    check_unused(path)?;
     let complete = unsafe {
         let conn = Private::open(path)?;
-        conn.query(c"PRAGMA synchronous=FULL")?;
+        conn.durable_checkpoints()?;
         conn.checkpoint(c"PRAGMA wal_checkpoint(TRUNCATE)")
     }
     .map_err(|e| format!("checkpoint {path}: {e}"))?;
@@ -1566,7 +1585,10 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
     let started = Instant::now();
     let path = lock(db).path.clone();
     let conn = unsafe { Private::open(&path)? };
-    unsafe { conn.keep_wal()? };
+    unsafe {
+        conn.keep_wal()?;
+        conn.durable_checkpoints()?;
+    }
     // Backfill outside the window, so the checkpoint inside it (which commits wait for) only
     // covers the frames committed in between.
     unsafe { conn.checkpoint(c"PRAGMA wal_checkpoint(PASSIVE)")? };
@@ -2208,11 +2230,32 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
         );
         std::process::abort();
     }
-    // A WAL header write restarts the WAL over frames a checkpoint copied into the db file.
-    if db.overlay.contains_key(&0)
-        && let Err(e) = unsafe { db.sync_db_file() }
-    {
-        return db.poison(e);
+    // A WAL header write (re)starts the WAL, over frames a checkpoint copied into the db file: sync
+    // the db file first. Then the header must be durable before any frame (SQLite's own barrier,
+    // `syncHeader` in `sqlite3WalFrames`, which sees the header still in the overlay): otherwise a
+    // power loss can keep the old header while later frames persist, and recovery replays a stale
+    // prefix of the previous WAL over the newer db file.
+    if let Some(header) = db.overlay.remove(&0) {
+        if let Err(e) = unsafe { db.sync_db_file() } {
+            return db.poison(e);
+        }
+        let mut rc = unsafe {
+            fwd!(
+                file,
+                xWrite,
+                header.as_ptr() as *const c_void,
+                header.len() as c_int,
+                0
+            )
+        };
+        if rc == OK {
+            rc = unsafe { fwd!(file, xSync, ffi::SQLITE_SYNC_FULL) };
+        }
+        if rc != OK {
+            db.poison(format!("WAL header write or sync: {rc}"));
+            return rc;
+        }
+        unsafe { db.shadow_wal() };
     }
     db.commit_frame_no = ((commit_frame - WAL_HDR) / FRAME + 1) as u32;
     for (o, d) in std::mem::take(&mut db.overlay) {
@@ -2250,6 +2293,13 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
     OK
 }
 
+/// A db-file truncate is a checkpoint's last step once it has copied every frame (sized to the
+/// database), and it comes right before the checkpoint records them as backfilled (nBackfill =
+/// mxFrame). Sync the db file here and fail the truncate if that fails: the frames then stay
+/// unbackfilled. So whenever the wal-index says every frame is backfilled, the db file is durable,
+/// and no connection (another process's included, whatever VFS it uses) can restart, truncate or
+/// delete the WAL while the db file lacks frames a checkpoint at synchronous=OFF copied. (The
+/// `SQLITE_FCNTL_CKPT_DONE` hint comes earlier but its result is ignored.)
 unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3_int64) -> c_int {
     unsafe {
         if let Some(db) = main_db(file) {
@@ -2259,6 +2309,15 @@ unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3
                     "db file truncate outside a checkpoint (journal_mode must stay WAL)".into(),
                 );
             }
+            let rc = fwd!(file, xTruncate, size);
+            if rc != OK {
+                return rc;
+            }
+            if let Err(e) = db.sync_db_file() {
+                db.poison(format!("checkpoint: {e}"));
+                return ffi::SQLITE_IOERR_FSYNC;
+            }
+            return OK;
         }
         let Some(db) = wal_db(file) else {
             return fwd!(file, xTruncate, size);
@@ -2463,12 +2522,14 @@ unsafe extern "C" fn x_unfetch(
 }
 
 /// SQLite deletes an attached database's WAL when its last connection closes (or the database
-/// leaves WAL mode), right after checkpointing every frame into the db file. That checkpoint syncs
-/// the db file only under synchronous=NORMAL or above and only if it copied frames itself (one at
-/// OFF, or another connection's, may have copied them all unsynced), while the sidecar already
-/// covers those frames: sync the db file first, through the closing connection's handle (SQLite
-/// closes it after deleting the WAL). If that fails, keep the WAL (SQLite ignores the result; the
-/// next connection recovers from it) and poison the database.
+/// leaves WAL mode), right after checkpointing every frame into the db file, and at open when the
+/// db file has no page. The sidecar already covers those frames, so sync the db file first (a
+/// second safeguard: `x_truncate` syncs after every complete checkpoint), through an open main db
+/// handle (the closing connection closes its own only after deleting the WAL). If the database is
+/// poisoned (an earlier sync may have failed, and a retried fsync can report success for pages
+/// that never reached the disk) or the sync fails, keep the WAL and poison: the next connection
+/// rebuilds the wal-index (SQLite removed -shm first) and copies every frame again. SQLite ignores
+/// the result on close; a failed delete at open fails that read.
 unsafe extern "C" fn x_delete(
     _vfs: *mut ffi::sqlite3_vfs,
     zname: *const c_char,
@@ -2489,16 +2550,18 @@ unsafe extern "C" fn x_delete(
             return ((*u).xDelete.unwrap())(u, zname, sync_dir);
         };
         let mut db = lock(&db);
+        if db.poisoned.is_some() {
+            return ffi::SQLITE_IOERR_DELETE;
+        }
         let synced = if fail_wal_delete_sync() {
             Err("sync failed (URSULA_VFS_TEST_FAIL_WAL_DELETE_SYNC)".to_owned())
         } else {
             db.sync_db_file()
         };
-        // TEMPORARY mutant (expected red for crash test (j)): the WAL is deleted although the sync
-        // failed. The next commit restores the early return.
         if let Err(e) = synced {
             let why = format!("{e}; keeping {}", db.wal);
             db.poison(why);
+            return ffi::SQLITE_IOERR_DELETE;
         }
         ((*u).xDelete.unwrap())(u, zname, sync_dir)
     }

@@ -175,13 +175,25 @@ and the log keeps growing. A superseded cold body stays readable for 5 minutes.
 - Crash of the owner at any point: the sidecar never runs ahead of a synced local WAL; re-attach
   replays from it (or installs a snapshot). Covered: SIGKILL before and after the ack, the cache
   spill with in-place checksum rewrites, a failed local write after the ack.
-- Power loss: the WAL is synced at every commit whatever `synchronous` says; the db file is synced
-  before any WAL frame copied into it is destroyed (a WAL restart, a truncate, or the delete when
-  the last connection closes or leaves WAL mode), so under `synchronous=OFF` too, every frame the
-  sidecar covers survives in the db file or in a WAL SQLite recovers. A failed sync keeps the WAL
-  and poisons the database. The snapshot thread's private connection never deletes the WAL, and
-  recovery's checkpoint runs at `synchronous=FULL`. Covered: a simulated loss of every unsynced
-  db-file write after the last close under `synchronous=OFF`.
+- Power loss, whatever `synchronous` says (the syncs below other than the per-commit WAL sync are
+  full syncs: F_FULLFSYNC on Apple):
+  - The WAL is synced at every commit. A commit that (re)starts the WAL syncs the db file, then
+    writes and syncs the new header before any frame, so recovery never reads a stale prefix of the
+    previous WAL generation over the newer db file.
+  - A checkpoint syncs the db file before it records every frame as backfilled: through this VFS
+    after its final db truncate, which fails (the frames stay unbackfilled) if the sync fails; the
+    private connections checkpoint at `synchronous=FULL`. So when the wal-index says every frame is
+    backfilled the db file is durable, and no connection in any process restarts, truncates or
+    deletes the WAL over frames that are not. The db file is also synced again before this VFS
+    restarts, truncates or deletes the WAL.
+  - Hence every frame the sidecar covers survives in the db file or in a WAL SQLite recovers. A
+    failed sync poisons the database, and a poisoned database keeps its WAL on close.
+  - Exception: a connection in another process that itself runs at `synchronous=OFF` and copies
+    frames in a checkpoint (its own `PRAGMA wal_checkpoint`, or its close as the last connection)
+    does not sync the db file before it truncates or deletes the WAL (§7).
+  - Covered: a simulated loss of every unsynced write after the last close under
+    `synchronous=OFF`, after a foreign reader closes last, and inside a WAL-restart commit; a
+    failed sync before the WAL delete keeps the WAL.
 - Network partition or slow server: commits block up to the retry budget, then poison.
 - Two owners: the later claim wins; the earlier one's next commit fails cleanly
   (`UrsulaReplicationError` with `fenced: true` through the Pi helper).
@@ -192,7 +204,9 @@ and the log keeps growing. A superseded cold body stays readable for 5 minutes.
 
 - 4 KiB pages; WAL mode only; `locking_mode=EXCLUSIVE` unsupported.
 - One owner process per stream at a time; connections in other processes are not replicated (and
-  block recovery).
+  block recovery). Such a connection must not run at `synchronous=OFF` while it may checkpoint:
+  it would copy WAL frames into the db file and destroy the WAL without a sync, so a power loss
+  could lose frames the sidecar covers (§6).
 - Commit frames are at most the server's request limit (32 MiB), about 8000 changed pages per
   transaction.
 - Snapshots hold the database image in memory (twice, briefly: raw and compressed) and are capped
