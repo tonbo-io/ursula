@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { createServer, request, type Server } from "node:http";
+import { createServer, type IncomingMessage, request, type Server, type ServerResponse } from "node:http";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
@@ -111,7 +111,9 @@ export function runChild(file: string, url: string, sqls: readonly string[], env
  * HTTP proxy to the node. After `stallAfter` forwarded POSTs it holds every further POST unanswered and
  * unforwarded; after `dropAfter` forwarded POSTs it forwards the next one, waits for the node's answer
  * and then cuts the client connection instead of answering (an append with an unknown outcome); the
- * POST numbered `limitAt` is answered 429 with `Retry-After: 1` without being forwarded.
+ * POST numbered `limitAt` is answered 429 with `Retry-After: 1` without being forwarded; the POST
+ * numbered `cloneAt` is preceded by a twin with the same headers and length but its last byte flipped
+ * (a cloned writer's append), so the node answers the original as a duplicate.
  */
 export class StallProxy {
 	private readonly server: Server;
@@ -119,6 +121,7 @@ export class StallProxy {
 	stallAfter = Number.POSITIVE_INFINITY;
 	dropAfter = Number.POSITIVE_INFINITY;
 	limitAt = Number.POSITIVE_INFINITY;
+	cloneAt = Number.POSITIVE_INFINITY;
 	/** POSTs whose answer was dropped. */
 	dropped = 0;
 	readonly stalled: Promise<void>;
@@ -151,6 +154,10 @@ export class StallProxy {
 					res.writeHead(429, { "retry-after": "1" }).end("rate limited");
 					return;
 				}
+				if (n === p.cloneAt) {
+					void cloneThenForward(t, req, res);
+					return;
+				}
 			}
 			const up = request({ host: t.hostname, port: t.port, method: req.method, path: req.url, headers: req.headers }, (ur) => {
 				if (drop) {
@@ -180,10 +187,30 @@ export class StallProxy {
 		this.stallAfter = Number.POSITIVE_INFINITY;
 		this.dropAfter = Number.POSITIVE_INFINITY;
 		this.limitAt = Number.POSITIVE_INFINITY;
+		this.cloneAt = Number.POSITIVE_INFINITY;
 	}
 
 	async close(): Promise<void> {
 		this.server.closeAllConnections();
 		await new Promise<void>((r) => this.server.close(() => r()));
 	}
+}
+
+/** Sends a twin of `req` (last body byte flipped) to the node, then the original, answering with the latter's response. */
+async function cloneThenForward(target: URL, req: IncomingMessage, res: ServerResponse): Promise<void> {
+	const chunks: Buffer[] = [];
+	for await (const c of req) chunks.push(c as Buffer);
+	const body = Buffer.concat(chunks);
+	const twin = Buffer.from(body);
+	twin[twin.length - 1] = (twin[twin.length - 1] as number) ^ 0xff;
+	const headers = new Headers();
+	for (const [k, v] of Object.entries(req.headers)) if (typeof v === "string" && (k === "content-type" || k.startsWith("producer-"))) headers.set(k, v);
+	const url = new URL(req.url ?? "/", target);
+	await (await fetch(url, { method: "POST", headers, body: twin })).arrayBuffer();
+	const r = await fetch(url, { method: "POST", headers, body });
+	const out: Record<string, string> = {};
+	r.headers.forEach((v, k) => {
+		out[k] = v;
+	});
+	res.writeHead(r.status, out).end(Buffer.from(await r.arrayBuffer()));
 }

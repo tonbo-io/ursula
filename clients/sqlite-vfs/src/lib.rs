@@ -18,12 +18,18 @@
 //!   "db size after commit") is the commit point: the transaction's final page images become one
 //!   frame, appended. On an ack the overlay is written to the local WAL and every later write of
 //!   that transaction (checksum rewrites, padding) goes straight to it; when the write transaction
-//!   ends (the WAL write lock is released) the WAL is synced and only then does the sidecar
-//!   `<db>-ursula` (stream offset and epoch reflected locally) advance. On a rejection or an
-//!   exhausted retry budget the overlay is dropped, the write fails with SQLITE_IOERR_WRITE (SQLite
-//!   rolls the transaction back) and the database is poisoned until it is re-attached. The overlay
-//!   belongs to the write transaction: it is cleared whenever the WAL write lock is taken or
-//!   released, so a rolled-back transaction's spilled frames never shadow a later one's.
+//!   ends (the WAL write lock is released) the sidecar `<db>-ursula` (stream offset and epoch
+//!   reflected locally) advances. On a rejection or an exhausted retry budget the overlay is
+//!   dropped, the write fails with SQLITE_IOERR_WRITE (SQLite rolls the transaction back) and the
+//!   database is poisoned until it is re-attached. The overlay belongs to the write transaction: it
+//!   is cleared whenever the WAL write lock is taken or released, so a rolled-back transaction's
+//!   spilled frames never shadow a later one's.
+//! * Durability is the stream's acknowledgement alone: the local files (db, -wal, -shm, sidecar)
+//!   are a cache that is never fsynced (`xSync` of an attached database is a no-op, whatever
+//!   `PRAGMA synchronous` says). The sidecar records the kernel's boot id; attach trusts the local
+//!   files only when they were written since this boot (a process crash keeps the page cache, so
+//!   they are exactly what this host wrote) and otherwise discards them and rebuilds from the
+//!   latest snapshot and the tail.
 //! * Snapshots and retention (see [`snapshot`]): once the log since the latest snapshot exceeds the
 //!   database size (and `URSULA_VFS_SNAPSHOT_MIN_BYTES`, default 8 MiB), a background thread per
 //!   attached database checkpoints the local WAL through a private connection, pins the result with
@@ -35,10 +41,12 @@
 //!   `{"offset","epoch","poisoned","fenced","reason","snapshot","retained"}`;
 //!   `SELECT ursula_stats(path)` drains per-commit, per-checkpoint and per-snapshot numbers (bench).
 //!
-//! Test hook: `URSULA_VFS_ABORT_AFTER_ACK=<n>` aborts the process right after the n-th acknowledged
-//! commit of an attachment, before the local WAL write. `URSULA_VFS_RETRY_MS` bounds the retries of
-//! an append with an unknown outcome (default 30000). `URSULA_VFS_SNAPSHOT_MIN_BYTES` sets the
-//! smallest log (bytes since the latest snapshot) that triggers a snapshot.
+//! Test hooks: `URSULA_VFS_ABORT_AFTER_ACK=<n>` aborts the process right after the n-th acknowledged
+//! commit of an attachment, before the local WAL write; `URSULA_VFS_TEST_BOOT_ID` replaces the
+//! kernel's boot id (a reboot, as far as the local files are concerned). `URSULA_VFS_RETRY_MS`
+//! bounds the retries of an append with an unknown outcome (default 30000).
+//! `URSULA_VFS_SNAPSHOT_MIN_BYTES` sets the smallest log (bytes since the latest snapshot) that
+//! triggers a snapshot.
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 pub mod frame;
@@ -119,8 +127,9 @@ struct CommitStat {
 struct Db {
     url: String,
     sidecar: String,
+    /// What the sidecar records besides offset and epoch (see `stamp`).
+    stamp: String,
     path: String,
-    wal: String,
     epoch: u64,
     /// Producer sequence of the last acknowledged append (the claim is 0).
     seq: u64,
@@ -142,10 +151,7 @@ struct Db {
     commit_frame_no: u32,
     /// Open WAL handles, and whether a main db handle holds an EXCLUSIVE file lock: together the
     /// closing connection's checkpoint, the one main-db write that takes no checkpoint shm lock.
-    wal_handles: Vec<Handle>,
-    /// The underlying "unix" files of the open main db handles: the db file is synced through
-    /// them (see `sync_db_file`).
-    db_handles: Vec<Handle>,
+    wal_open: usize,
     exclusive: bool,
     acked: u64,
     fault_fired: bool,
@@ -166,6 +172,10 @@ struct Db {
     /// (up to `WINDOW_WAIT`) until it has, so a writer committing back to back cannot starve it.
     window_wanted: bool,
     snapshot_stats: Vec<SnapshotStat>,
+    /// Stream offset of the local state attach started from (0: rebuilt from nothing), and of the
+    /// snapshot it installed (0: none).
+    attached_from: u64,
+    installed: u64,
 }
 
 struct SnapshotStat {
@@ -202,8 +212,8 @@ impl Db {
         ffi::SQLITE_IOERR_WRITE
     }
 
-    /// A local operation of an acknowledged transaction (the rest of its WAL writes, its sync,
-    /// -shm growth) failed: SQLite rolls the transaction back locally, so the file no longer
+    /// A local operation of an acknowledged transaction (the rest of its WAL writes, -shm growth)
+    /// failed: SQLite rolls the transaction back locally, so the file no longer
     /// reflects the stream offset; poison it (re-attach replays the commit from the stream).
     fn post_ack(&mut self, what: &str, rc: c_int) -> c_int {
         if rc != OK && self.committed {
@@ -214,10 +224,10 @@ impl Db {
         rc
     }
 
-    /// Test hook `URSULA_VFS_FAIL_POST_ACK=<n>`: fail the first local WAL write or sync after the
-    /// n-th acknowledged commit.
+    /// Test hook `URSULA_VFS_FAIL_POST_ACK=<n>`: fail the local WAL write of the n-th acknowledged
+    /// commit.
     fn fault(&mut self) -> bool {
-        if self.committed && !self.fault_fired && fail_post_ack() == Some(self.acked) {
+        if !self.fault_fired && fail_post_ack() == Some(self.acked) {
             self.fault_fired = true;
             return true;
         }
@@ -228,17 +238,11 @@ impl Db {
     /// closing connection's checkpoint (EXCLUSIVE file lock with the WAL still open). Anything else
     /// (a rollback journal mode, journal_mode=MEMORY/OFF) would bypass replication.
     fn db_write_allowed(&self) -> bool {
-        self.checkpoint_started.is_some() || (self.exclusive && !self.wal_handles.is_empty())
-    }
-
-    /// With synchronous=OFF a checkpoint does not sync the db file; sync it before the WAL frames
-    /// it copied are overwritten (a WAL restart) or truncated away.
-    unsafe fn sync_db_file(&self) -> Result<(), String> {
-        unsafe { sync_handle(&self.db_handles, &self.path) }
+        self.checkpoint_started.is_some() || (self.exclusive && self.wal_open > 0)
     }
 
     /// The write transaction ended (WAL write lock released): drop what never committed; after an
-    /// acknowledged commit, sync the local WAL and only then advance the sidecar.
+    /// acknowledged commit that SQLite published, advance the sidecar (no fsync: see the crate docs).
     ///
     /// Runs before the real lock is released (see `x_shm_lock`), on the main db handle `file`,
     /// whose wal-index header tells whether SQLite published the commit.
@@ -266,11 +270,7 @@ impl Db {
             ));
             return;
         }
-        if let Err(e) = unsafe { sync_handle(&self.wal_handles, &self.wal) } {
-            self.poison(e);
-            return;
-        }
-        if let Err(e) = write_sidecar(&self.sidecar, self.offset, self.epoch) {
+        if let Err(e) = write_sidecar(&self.sidecar, self.offset, self.epoch, &self.stamp) {
             self.poison(e);
             return;
         }
@@ -278,30 +278,6 @@ impl Db {
             self.snapper.request();
         }
     }
-}
-
-/// An underlying "unix" file of an open handle of an attached database (owned by SQLite; tracked
-/// from `x_open` to `x_close`, and only used under the database's mutex).
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Handle(*mut ffi::sqlite3_file);
-
-// SAFETY: the pointer is only dereferenced under the database's mutex while the handle is open,
-// and a unix file may be synced from any thread.
-unsafe impl Send for Handle {}
-
-/// Syncs a file through one of SQLite's own open handles on it. Never through a descriptor of our
-/// own: closing any descriptor of a file drops every POSIX (fcntl) lock this process holds on it,
-/// SQLite's included, which would let another process take conflicting locks. fsync covers the
-/// file, whichever descriptor issues it.
-unsafe fn sync_handle(handles: &[Handle], what: &str) -> Result<(), String> {
-    let Some(&Handle(f)) = handles.first() else {
-        return Err(format!("sync {what}: no open handle"));
-    };
-    let rc = unsafe { ((*(*f).pMethods).xSync.unwrap())(f, ffi::SQLITE_SYNC_NORMAL) };
-    if rc != OK {
-        return Err(format!("sync {what}: {rc}"));
-    }
-    Ok(())
 }
 
 #[derive(Default)]
@@ -370,42 +346,171 @@ fn fail_post_ack() -> Option<u64> {
     })
 }
 
-/// Replaces the sidecar atomically and durably: temp file, fsync, rename, fsync of the directory.
-fn write_sidecar(path: &str, offset: u64, epoch: u64) -> Result<(), String> {
-    write_sidecar_line(path, &format!("{offset} {epoch}\n"))
+/// This kernel's boot id (`URSULA_VFS_TEST_BOOT_ID` replaces it); `None` when unknown, which
+/// never matches a recorded one. Within one boot every completed write stays visible (the page
+/// cache survives any process crash), so local files written since this boot are exactly what this
+/// host wrote; across a reboot or power loss they may be anything.
+fn boot_id() -> Option<&'static str> {
+    static V: OnceLock<Option<String>> = OnceLock::new();
+    V.get_or_init(|| {
+        std::env::var("URSULA_VFS_TEST_BOOT_ID")
+            .ok()
+            .or_else(read_boot_id)
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty() && !id.contains(char::is_whitespace))
+    })
+    .as_deref()
+}
+
+#[cfg(target_os = "linux")]
+fn read_boot_id() -> Option<String> {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()
+}
+
+/// `kern.bootsessionuuid` (not `kern.uuid`, the kernel binary's, which never changes).
+#[cfg(target_os = "macos")]
+fn read_boot_id() -> Option<String> {
+    let mut buf = [0u8; 64];
+    let mut len = buf.len();
+    let name = c"kern.bootsessionuuid";
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let id = CStr::from_bytes_until_nul(&buf).ok()?;
+    id.to_str().ok().map(str::to_owned)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_boot_id() -> Option<String> {
+    None
+}
+
+/// The stream's identity in a sidecar: its URL path (the host may differ: a gateway, another node).
+fn stream_key(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    rest.find('/').map_or("", |i| &rest[i..])
+}
+
+/// The db file's identity (device and inode), when it exists.
+fn file_id(path: &str) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path)
+        .ok()
+        .map(|m| format!("{}:{}", m.dev(), m.ino()))
+}
+
+/// What a sidecar records besides offset and epoch: the boot it was written in, the stream, and
+/// the db file it describes (see `trusted`).
+fn stamp(path: &str, url: &str) -> String {
+    let mut s = format!(
+        " boot={} stream={}",
+        boot_id().unwrap_or("unknown"),
+        stream_key(url)
+    );
+    if let Some(id) = file_id(path) {
+        let _ = write!(s, " file={id}");
+    }
+    s
+}
+
+/// Replaces the sidecar atomically against a process crash: temp file, rename. No fsync: after a
+/// reboot attach discards the local files whatever the sidecar says.
+fn write_sidecar(path: &str, offset: u64, epoch: u64, stamp: &str) -> Result<(), String> {
+    write_sidecar_line(path, &format!("{offset} {epoch}{stamp}\n"))
 }
 
 /// The recovery marker: attach is rewriting the db file from the stream, restarting from `offset`.
 /// Until the sidecar is written again the file may be inconsistent (some pages of a later state),
 /// so the next attach must not let SQLite read it before replaying (see `attach`).
-fn write_recovery_marker(path: &str, offset: u64, epoch: u64) -> Result<(), String> {
-    write_sidecar_line(path, &format!("{offset} {epoch} recovering\n"))
+fn write_recovery_marker(path: &str, offset: u64, epoch: u64, stamp: &str) -> Result<(), String> {
+    write_sidecar_line(path, &format!("{offset} {epoch}{stamp} recovering\n"))
 }
 
 fn write_sidecar_line(path: &str, line: &str) -> Result<(), String> {
     let err = |e: std::io::Error| format!("sidecar {path}: {e}");
     let tmp = format!("{path}.tmp");
-    let mut f = fs::File::create(&tmp).map_err(err)?;
-    std::io::Write::write_all(&mut f, line.as_bytes()).map_err(err)?;
-    f.sync_all().map_err(err)?;
-    fs::rename(&tmp, path).map_err(err)?;
-    sync_dir(path).map_err(err)
+    fs::write(&tmp, line).map_err(err)?;
+    fs::rename(&tmp, path).map_err(err)
 }
 
-/// `(offset, epoch, recovering)`: the offset the local file reflects (or, with the recovery
-/// marker, the offset an interrupted recovery restarts from).
-fn read_sidecar(path: &str) -> Result<(u64, u64, bool), String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("sidecar {path}: {e}"))?;
+struct Sidecar {
+    /// The offset the local file reflects (or, with the recovery marker, the offset an interrupted
+    /// recovery restarts from).
+    offset: u64,
+    epoch: u64,
+    recovering: bool,
+    boot: Option<String>,
+    stream: Option<String>,
+    file: Option<String>,
+}
+
+impl Sidecar {
+    /// The local files are exactly what this host wrote: since this boot, into this db file (one
+    /// replaced behind our back would get the old one's WAL applied to it; an interrupted recovery
+    /// may have renamed a snapshot over it). A sidecar of an older version (no boot) is not.
+    fn trusted(&self, path: &str) -> bool {
+        boot_id().is_some_and(|b| self.boot.as_deref() == Some(b))
+            && (self.recovering || (self.file.is_some() && self.file == file_id(path)))
+    }
+}
+
+/// `Ok(None)`: the sidecar exists but does not parse (torn by a power loss, or garbage). `Err`: it
+/// cannot be read (missing included).
+fn read_sidecar(path: &str) -> Result<Option<Sidecar>, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return Ok(None),
+        Err(e) => return Err(format!("sidecar {path}: {e}")),
+    };
     let mut it = text.split_whitespace();
     let mut num = || it.next().and_then(|v| v.parse::<u64>().ok());
-    match (num(), num()) {
-        (Some(offset), Some(epoch)) => match it.next() {
-            None => Ok((offset, epoch, false)),
-            Some("recovering") if it.next().is_none() => Ok((offset, epoch, true)),
-            _ => Err(format!("sidecar {path}: malformed {text:?}")),
-        },
-        _ => Err(format!("sidecar {path}: malformed {text:?}")),
+    let (Some(offset), Some(epoch)) = (num(), num()) else {
+        return Ok(None);
+    };
+    let mut s = Sidecar {
+        offset,
+        epoch,
+        recovering: false,
+        boot: None,
+        stream: None,
+        file: None,
+    };
+    for token in it {
+        match token.split_once('=') {
+            None if token == "recovering" => s.recovering = true,
+            Some(("boot", v)) => s.boot = Some(v.to_owned()),
+            Some(("stream", v)) => s.stream = Some(v.to_owned()),
+            Some(("file", v)) => s.file = Some(v.to_owned()),
+            _ => return Ok(None),
+        }
     }
+    Ok(Some(s))
+}
+
+/// Deletes a database's local files (a cache of the stream) so attach rebuilds them: never while
+/// another process has the file open, and never the host lock (held). The sidecar goes last, as
+/// the fresh attach rewrites it: until then it marks whatever is left untrusted, so a crash midway
+/// discards again.
+fn discard_local(path: &str) -> Result<(), String> {
+    check_unused(path)?;
+    for suffix in ["-wal", "-shm", "-ursula.snap", "-ursula.tmp", ""] {
+        let f = format!("{path}{suffix}");
+        if let Err(e) = fs::remove_file(&f)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(format!("remove {f}: {e}"));
+        }
+    }
+    Ok(())
 }
 
 fn abort_in_replay() -> Option<u64> {
@@ -466,8 +571,13 @@ fn header_u64(r: &ureq::http::Response<ureq::Body>, name: &str) -> Option<u64> {
 }
 
 enum Append {
-    /// Applied (or a duplicate of an applied append); the stream offset after it when known.
-    Acked { next: Option<u64>, attempts: u32 },
+    /// Applied (or, `duplicate`, a duplicate of an applied append: 204); the stream offset after it
+    /// when known.
+    Acked {
+        next: Option<u64>,
+        attempts: u32,
+        duplicate: bool,
+    },
     /// 403: a newer epoch owns the stream.
     Fenced { current: Option<u64> },
     /// 409 expecting sequence 0: the server expired this idle producer (7 days).
@@ -478,9 +588,10 @@ enum Append {
 
 /// One idempotent append: retried with the same producer sequence until the outcome is known.
 ///
-/// A duplicate answer (204) is taken as proof of *our* earlier attempt only for commits (seq >= 1):
-/// they are sent after a verified claim (see `claim_once`), which makes this owner the only writer
-/// at its epoch, so whatever holds (epoch, seq) is ours. A claim's answer is verified separately.
+/// A duplicate answer (204) proves nothing by itself: whatever holds (epoch, seq) answers it. A
+/// verified claim (see `claim_once`) makes this owner the only writer at its epoch, unless the
+/// process was cloned (a VM or CRIU snapshot restored twice, a fork after attach): so the caller
+/// reads a duplicate's bytes back (see `stream_holds`).
 fn append(url: &str, body: &[u8], epoch: u64, seq: u64) -> Append {
     let deadline = Instant::now() + retry_budget();
     let mut backoff = Duration::from_millis(20);
@@ -506,6 +617,7 @@ fn append(url: &str, body: &[u8], epoch: u64, seq: u64) -> Append {
                         return Append::Acked {
                             next: header_u64(&r, "stream-next-offset"),
                             attempts,
+                            duplicate: status == 204,
                         };
                     }
                     403 => {
@@ -603,6 +715,12 @@ fn read_from(url: &str, offset: u64) -> Result<(Vec<u8>, u64), Fail> {
             "read {url} at {offset}: below the stream's retention"
         )));
     }
+    if status == 416 {
+        return Err(Fail::Other(format!(
+            "read {url} at {offset}: beyond the stream's end (was the stream deleted and \
+             recreated? delete the local file to rebuild it)"
+        )));
+    }
     if status != 200 {
         return Err(Fail::Other(format!(
             "read {url} at {offset}: {status} {}",
@@ -617,6 +735,19 @@ fn read_from(url: &str, offset: u64) -> Result<(Vec<u8>, u64), Fail> {
         )));
     }
     Ok((body, next))
+}
+
+/// Whether the stream holds exactly `bytes` at `at`.
+fn stream_holds(url: &str, at: u64, bytes: &[u8]) -> Result<bool, String> {
+    let mut got = Vec::new();
+    while got.len() < bytes.len() {
+        let (b, _) = read_from(url, at + got.len() as u64)?;
+        if b.is_empty() {
+            break;
+        }
+        got.extend_from_slice(&b);
+    }
+    Ok(got.get(..bytes.len()) == Some(bytes))
 }
 
 /// Snapshot transfers move whole databases: a longer timeout than appends.
@@ -740,7 +871,8 @@ enum Checkpoint {
 }
 
 /// A private connection on the "unix" VFS, outside this VFS's bookkeeping: recovery's checkpoint,
-/// and the snapshot thread's checkpoint, read transaction and page copy.
+/// and the snapshot thread's checkpoint, read transaction and page copy. `synchronous=OFF`: the
+/// local files are a cache (see the crate docs), so its checkpoints never fsync.
 struct Private {
     db: *mut ffi::sqlite3,
 }
@@ -760,6 +892,7 @@ impl Private {
             if rc != OK {
                 return Err(format!("open {path}: {}", conn.errmsg()));
             }
+            conn.query(c"PRAGMA synchronous=OFF")?;
             Ok(conn)
         }
     }
@@ -866,28 +999,24 @@ unsafe fn checkpoint_local(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn sync_dir(path: &str) -> std::io::Result<()> {
-    let dir = std::path::Path::new(path)
-        .parent()
-        .unwrap_or(std::path::Path::new("."));
-    fs::File::open(dir).and_then(|d| d.sync_all())
-}
-
 /// Applies records to the db file, deduplicating page writes per batch.
 ///
 /// Runs only inside `ursula_attach`, which refuses while any connection of this process has the
 /// file open and has stopped the previous attachment's snapshot thread; `checkpoint_local` proves
 /// no other process holds it either. So its own descriptors on the db file (and the temp file and
 /// rename of `install`) cannot drop anyone's POSIX locks when they close. Everywhere else the
-/// extension touches the db file, -wal or -shm only through SQLite's handles (`sync_handle`, the
-/// private connections of `Private`).
+/// extension touches the db file, -wal or -shm only through SQLite's handles (the private
+/// connections of `Private`).
 struct Applier {
     path: String,
+    url: String,
     sidecar: String,
     /// Offset and epoch a recovery restarts from, recorded in the recovery marker.
     restart: (u64, u64),
-    /// The recovery marker is durable: the file may be rewritten.
+    /// The recovery marker is written: the file may be rewritten.
     recovering: bool,
+    /// Offset of the snapshot installed (0: none).
+    installed: u64,
     /// Page images written (for the `URSULA_VFS_ABORT_IN_REPLAY` test hook).
     written: u64,
     file: Option<fs::File>,
@@ -918,15 +1047,16 @@ impl Applier {
     }
 
     /// The db file, opened once. Before its first write: a file with content is checkpointed
-    /// (`checkpoint_local`; the WAL is empty after it) and the recovery marker is made durable,
-    /// unless an interrupted recovery is being resumed (marker already set).
+    /// (`checkpoint_local`; the WAL is empty after it) and the recovery marker is written, unless
+    /// an interrupted recovery is being resumed (marker already set).
     unsafe fn file(&mut self) -> Result<&fs::File, String> {
         if self.file.is_none() {
             if !self.recovering {
                 if fs::metadata(&self.path).is_ok_and(|m| m.len() > 0) {
                     unsafe { checkpoint_local(&self.path)? };
                 }
-                write_recovery_marker(&self.sidecar, self.restart.0, self.restart.1)?;
+                let stamp = stamp(&self.path, &self.url);
+                write_recovery_marker(&self.sidecar, self.restart.0, self.restart.1, &stamp)?;
                 self.recovering = true;
             }
             let f = OpenOptions::new()
@@ -968,34 +1098,23 @@ impl Applier {
         Ok(())
     }
 
-    /// Replaces the db file with a snapshot's image (temp file, fsync, rename, fsync of the
-    /// directory) and continues the batch from it. A crash before the sidecar records the new
-    /// offset leaves the old one, from which a re-attach installs the snapshot again.
+    /// Replaces the db file with a snapshot's image (temp file, rename) and continues the batch
+    /// from it. A crash before the sidecar records the new offset leaves the old one (with the
+    /// recovery marker), from which a re-attach installs the snapshot again.
     unsafe fn install(&mut self, snap: snapshot::Snapshot) -> Result<(), String> {
         unsafe { self.file()? };
         self.file = None;
         let err = |e: std::io::Error| format!("install snapshot into {}: {e}", self.path);
         let tmp = format!("{}-ursula.snap", self.path);
-        let mut f = fs::File::create(&tmp).map_err(err)?;
-        std::io::Write::write_all(&mut f, &snap.image).map_err(err)?;
-        f.sync_all().map_err(err)?;
-        drop(f);
+        fs::write(&tmp, &snap.image).map_err(err)?;
         fs::rename(&tmp, &self.path).map_err(err)?;
-        sync_dir(&self.path).map_err(err)?;
         let f = OpenOptions::new().read(true).write(true).open(&self.path);
         self.file = Some(f.map_err(err)?);
         self.pages.clear();
         self.min_size = None;
         self.size = Some((snap.image.len() / PAGE) as u32);
         self.epoch = self.epoch.max(snap.epoch);
-        Ok(())
-    }
-
-    fn finish(self) -> Result<(), String> {
-        if let Some(f) = self.file {
-            f.sync_all()
-                .map_err(|e| format!("sync {}: {e}", self.path))?;
-        }
+        self.installed = snap.offset;
         Ok(())
     }
 }
@@ -1078,7 +1197,7 @@ fn claim_once(url: &str, epoch: u64) -> Result<Claimed, String> {
         } => {
             let start = next.checked_sub(frame.len() as u64);
             let ours = match start {
-                Some(start) => read_from(url, start)?.0.get(..frame.len()) == Some(&frame[..]),
+                Some(start) => stream_holds(url, start, &frame)?,
                 None => false,
             };
             Ok(match start {
@@ -1152,7 +1271,7 @@ unsafe fn init_wal_format(path: &str) -> Result<(), String> {
         if rc == OK {
             rc = (a.exec.unwrap())(
                 db,
-                c"PRAGMA journal_mode=WAL".as_ptr(),
+                c"PRAGMA synchronous=OFF; PRAGMA journal_mode=WAL".as_ptr(),
                 None,
                 null_mut(),
                 null_mut(),
@@ -1232,20 +1351,45 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
     }
     create_stream(&url)?;
     let sidecar = format!("{path}-ursula");
-    let db_len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    let (from, epoch, recovering) = if db_len == 0 {
-        // Nothing local: a WAL next to an empty db file holds nothing committed. The sidecar is
-        // written before anything lands in the file, so an attach that fails halfway leaves a
-        // file the next one resumes (replaying page images from an older offset is idempotent).
-        let _ = fs::remove_file(format!("{path}-wal"));
-        let _ = fs::remove_file(format!("{path}-shm"));
-        write_sidecar(&sidecar, 0, 0)?;
-        (0, 0, false)
-    } else {
+    let mut local = None;
+    if fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
         // A file with content but no sidecar was never attached: its pages are not in the stream.
-        read_sidecar(&sidecar).map_err(|e| {
-            format!("{path} has content but no valid sidecar ({e}); refusing to attach")
-        })?
+        let s = read_sidecar(&sidecar).map_err(|e| {
+            format!("{path} has content but no readable sidecar ({e}); refusing to attach")
+        })?;
+        if let Some(k) = s.as_ref().and_then(|s| s.stream.as_deref())
+            && k != stream_key(&url)
+        {
+            return Err(format!(
+                "{path} is a cache of stream {k}, not {}; delete it to attach it there",
+                stream_key(&url)
+            ));
+        }
+        match s {
+            Some(s) if s.trusted(&path) => local = Some(s),
+            // Written before a reboot (a power loss may have left any prefix of any write), by an
+            // older version, torn, or for another db file: the stream has everything committed.
+            _ => {
+                eprintln!(
+                    "sqlite-ursula-vfs: {path}: local files untrusted (another boot, torn, or \
+                     replaced); discarding them and rebuilding from the stream"
+                );
+                discard_local(&path)?;
+            }
+        }
+    }
+    let (from, epoch, recovering) = match &local {
+        Some(s) => (s.offset, s.epoch, s.recovering),
+        None => {
+            // Nothing local: a WAL next to an empty db file holds nothing committed. The sidecar
+            // is written before anything lands in the file, so an attach that fails halfway leaves
+            // a file the next one resumes (replaying page images from an older offset is
+            // idempotent).
+            let _ = fs::remove_file(format!("{path}-wal"));
+            let _ = fs::remove_file(format!("{path}-shm"));
+            write_sidecar(&sidecar, 0, 0, &stamp(&path, &url))?;
+            (0, 0, false)
+        }
     };
     if recovering {
         // An earlier recovery died mid-rewrite: the file may be inconsistent, so SQLite must not
@@ -1258,9 +1402,11 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
     }
     let mut applier = Applier {
         path: path.clone(),
+        url: url.clone(),
         sidecar: sidecar.clone(),
         restart: (from, epoch),
         recovering,
+        installed: 0,
         written: 0,
         file: None,
         pages: BTreeMap::new(),
@@ -1284,18 +1430,20 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
         }
     };
     let offset = pos;
-    applier.finish()?;
+    let installed = applier.installed;
+    drop(applier);
     if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0 {
         unsafe { init_wal_format(&path)? };
     }
-    write_sidecar(&sidecar, offset, epoch)?;
+    let stamp = stamp(&path, &url);
+    write_sidecar(&sidecar, offset, epoch, &stamp)?;
     let pages = (fs::metadata(&path).map(|m| m.len()).unwrap_or(0) / PAGE as u64) as u32;
     let snapper = Arc::new(Snapper::default());
     let db = Arc::new(Mutex::new(Db {
         url,
         sidecar,
+        stamp,
         path: path.clone(),
-        wal: format!("{path}-wal"),
         epoch,
         seq: 0,
         offset,
@@ -1305,8 +1453,7 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
         overlay: BTreeMap::new(),
         committed: false,
         commit_frame_no: 0,
-        wal_handles: Vec::new(),
-        db_handles: Vec::new(),
+        wal_open: 0,
         exclusive: false,
         acked: 0,
         fault_fired: false,
@@ -1320,6 +1467,8 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
         window: false,
         window_wanted: false,
         snapshot_stats: Vec::new(),
+        attached_from: from,
+        installed,
     }));
     let thread = {
         let (db, snapper) = (db.clone(), snapper.clone());
@@ -1587,14 +1736,16 @@ unsafe fn status(path: &str) -> Result<String, String> {
     let db = lookup(&path).ok_or_else(|| format!("{path} is not attached"))?;
     let db = lock(&db);
     Ok(format!(
-        "{{\"offset\":{},\"epoch\":{},\"poisoned\":{},\"fenced\":{},\"reason\":{},\"snapshot\":{},\"retained\":{}}}",
+        "{{\"offset\":{},\"epoch\":{},\"poisoned\":{},\"fenced\":{},\"reason\":{},\"snapshot\":{},\"retained\":{},\"local\":{},\"installed\":{}}}",
         db.offset,
         db.epoch,
         db.poisoned.is_some(),
         db.fenced,
         db.poisoned.as_deref().map_or("null".to_owned(), json_str),
         db.snapshot,
-        db.retained
+        db.retained,
+        db.attached_from,
+        db.installed
     ))
 }
 
@@ -1794,9 +1945,6 @@ unsafe extern "C" fn x_open(
                 *reg.open.entry(name.to_owned()).or_default() += 1;
                 let db = reg.dbs.get(name).cloned();
                 drop(reg);
-                if let Some(db) = &db {
-                    lock(db).db_handles.push(Handle(inner(file)));
-                }
                 (*f).ext = Box::into_raw(Box::new(Ext {
                     path: Some(name.to_owned()),
                     db,
@@ -1806,7 +1954,7 @@ unsafe extern "C" fn x_open(
             } else if flags & ffi::SQLITE_OPEN_WAL != 0
                 && let Some(db) = name.strip_suffix("-wal").and_then(lookup)
             {
-                lock(&db).wal_handles.push(Handle(inner(file)));
+                lock(&db).wal_open += 1;
                 (*f).ext = Box::into_raw(Box::new(Ext {
                     path: None,
                     db: Some(db),
@@ -1822,7 +1970,6 @@ unsafe extern "C" fn x_open(
 
 unsafe extern "C" fn x_close(file: *mut ffi::sqlite3_file) -> c_int {
     unsafe {
-        // Untracked before the underlying file closes: nothing syncs through it afterwards.
         let f = file as *mut File;
         let ext = if (*f).ext.is_null() {
             None
@@ -1831,14 +1978,10 @@ unsafe extern "C" fn x_close(file: *mut ffi::sqlite3_file) -> c_int {
         };
         if let Some(db) = ext.as_ref().and_then(|e| e.db.as_ref()) {
             let mut db = lock(db);
-            let h = Handle(inner(file));
             if ext.as_ref().is_some_and(|e| e.wal) {
-                db.wal_handles.retain(|&x| x != h);
-            } else {
-                db.db_handles.retain(|&x| x != h);
-                if ext.as_ref().is_some_and(|e| e.exclusive) {
-                    db.exclusive = false;
-                }
+                db.wal_open -= 1;
+            } else if ext.as_ref().is_some_and(|e| e.exclusive) {
+                db.exclusive = false;
             }
         }
         let rc = fwd!(file, xClose);
@@ -1939,11 +2082,7 @@ unsafe extern "C" fn x_write(
         }
         if db.committed {
             // The rest of an acknowledged transaction (checksum rewrites, padding): the local WAL.
-            let rc = if db.fault() {
-                ffi::SQLITE_IOERR_WRITE
-            } else {
-                fwd!(file, xWrite, buf, amt, off)
-            };
+            let rc = fwd!(file, xWrite, buf, amt, off);
             return db.post_ack("local WAL write", rc);
         }
         if !db.write_locked {
@@ -2056,7 +2195,27 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
     let append_time = t.elapsed();
     let expected = db.offset + body.len() as u64;
     let attempts = match outcome {
-        Append::Acked { next, attempts } if next.is_none_or(|n| n == expected) => attempts,
+        Append::Acked {
+            next,
+            attempts,
+            duplicate,
+        } if next.is_none_or(|n| n == expected) => {
+            // A duplicate is ours only if the stream holds our bytes (see `append`).
+            match duplicate.then(|| stream_holds(&db.url, db.offset, &body)) {
+                None | Some(Ok(true)) => attempts,
+                Some(Ok(false)) => {
+                    db.fenced = true;
+                    return db.poison(format!(
+                        "append at {} answered as a duplicate of other bytes: another writer \
+                         holds epoch {} (a cloned process?)",
+                        db.offset, db.epoch
+                    ));
+                }
+                Some(Err(e)) => {
+                    return db.poison(format!("reading back a duplicate append: {e}"));
+                }
+            }
+        }
         Append::Acked { next, .. } => {
             return db.poison(format!(
                 "append at {} acknowledged with next offset {next:?}, expected {expected}",
@@ -2086,22 +2245,20 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
         );
         std::process::abort();
     }
-    // A WAL header write restarts the WAL over frames a checkpoint copied into the db file.
-    if db.overlay.contains_key(&0)
-        && let Err(e) = unsafe { db.sync_db_file() }
-    {
-        return db.poison(e);
-    }
     db.commit_frame_no = ((commit_frame - WAL_HDR) / FRAME + 1) as u32;
     for (o, d) in std::mem::take(&mut db.overlay) {
-        let rc = unsafe {
-            fwd!(
-                file,
-                xWrite,
-                d.as_ptr() as *const c_void,
-                d.len() as c_int,
-                o
-            )
+        let rc = if db.fault() {
+            ffi::SQLITE_IOERR_WRITE
+        } else {
+            unsafe {
+                fwd!(
+                    file,
+                    xWrite,
+                    d.as_ptr() as *const c_void,
+                    d.len() as c_int,
+                    o
+                )
+            }
         };
         if rc != OK {
             db.poison(format!("local WAL write: {rc}"));
@@ -2137,27 +2294,25 @@ unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3
         };
         let mut db = lock(&db);
         db.overlay.retain(|&o, _| o < size);
-        // Truncating drops frames a checkpoint copied into the db file (see `sync_db_file`).
-        if let Err(e) = db.sync_db_file() {
-            return db.poison(e);
-        }
         let rc = fwd!(file, xTruncate, size);
         db.post_ack("local WAL truncate", rc)
     }
 }
 
+/// A no-op for the db file and WAL of an attached database, whatever `PRAGMA synchronous` says:
+/// they are a cache of the stream, rebuilt after a reboot (see the crate docs), so an fsync would
+/// only add latency to commits and checkpoints.
 unsafe extern "C" fn x_sync(file: *mut ffi::sqlite3_file, flags: c_int) -> c_int {
     unsafe {
-        let Some(db) = wal_db(file) else {
-            return fwd!(file, xSync, flags);
-        };
-        let mut db = lock(&db);
-        let rc = if db.fault() {
-            ffi::SQLITE_IOERR_FSYNC
+        let attached = (*(file as *mut File))
+            .ext
+            .as_ref()
+            .is_some_and(|e| e.db.is_some());
+        if attached {
+            OK
         } else {
             fwd!(file, xSync, flags)
-        };
-        db.post_ack("local WAL sync", rc)
+        }
     }
 }
 
@@ -2243,8 +2398,8 @@ unsafe extern "C" fn x_shm_map(
 }
 
 /// Tracks the write transaction (WAL write lock) and checkpoints (checkpoint lock) of an attached
-/// database; SQLite takes both through the main db handle. The end of a write transaction (sync,
-/// publication check, sidecar) runs under the database's mutex *before* the real lock is released:
+/// database; SQLite takes both through the main db handle. The end of a write transaction
+/// (publication check, sidecar) runs under the database's mutex *before* the real lock is released:
 /// once it is released, another thread's connection may start its own write transaction, whose
 /// state the bookkeeping would otherwise see (or whose commit the sidecar would cover before its
 /// rewrites reach the WAL). Lock order: the real shm lock may be taken without the mutex, and the
@@ -2397,5 +2552,45 @@ pub unsafe extern "C" fn sqlite3_extension_init(
             }
         }
         ffi::SQLITE_OK_LOAD_PERMANENTLY
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Attach trusts local files only when the sidecar was written in this boot, for this db file
+    // (or by an interrupted recovery); a legacy, torn or other-boot sidecar is discarded, and a
+    // missing one is an error (the file may be a database that was never attached).
+    #[test]
+    fn sidecar_trust() {
+        let dir = std::env::temp_dir().join(format!("ursula-sidecar-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("db").to_str().unwrap().to_owned();
+        let sidecar = format!("{db}-ursula");
+        fs::write(&db, b"x").unwrap();
+        let trust = |line: &[u8]| {
+            fs::write(&sidecar, line).unwrap();
+            read_sidecar(&sidecar).unwrap().map(|s| s.trusted(&db))
+        };
+        let known = boot_id().is_some();
+        let here = stamp(&db, "http://h:1/b/s");
+        assert!(here.contains(" stream=/b/s "));
+        assert_eq!(trust(format!("7 2{here}\n").as_bytes()), Some(known));
+        let other_boot = here.replace(boot_id().unwrap_or("unknown"), "other");
+        assert_eq!(trust(format!("7 2{other_boot}\n").as_bytes()), Some(false));
+        let other_file = format!(" boot={} stream=/b/s file=0:0", boot_id().unwrap_or("x"));
+        assert_eq!(trust(format!("7 2{other_file}\n").as_bytes()), Some(false));
+        let marker = format!("7 2{other_file} recovering\n");
+        assert_eq!(trust(marker.as_bytes()), Some(known));
+        assert_eq!(trust(b"7 2\n"), Some(false));
+        assert_eq!(trust(b"7 2 recovering\n"), Some(false));
+        for torn in ["", "7", "7 2 boot", "7 2 x=1"] {
+            assert_eq!(trust(torn.as_bytes()), None);
+        }
+        assert_eq!(trust(b"\xff\xfe 7 2"), None);
+        fs::remove_file(&sidecar).unwrap();
+        assert!(read_sidecar(&sidecar).is_err());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

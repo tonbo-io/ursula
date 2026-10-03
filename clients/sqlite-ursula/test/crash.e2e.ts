@@ -110,14 +110,14 @@ it("(e) an append whose answer is lost is retried with the same producer sequenc
 });
 
 // Regression (#324 review, P2-1): SQLite can still fail an acknowledged transaction locally (here
-// its FULL-sync of the WAL) and roll it back; the sidecar then must not cover it.
+// the local WAL write of its frames) and roll it back; the sidecar then must not cover it.
 it("(f) a local failure after the ack poisons the file, keeps the sidecar behind, and re-attach replays the commit", async () => {
 	const path = streamPath();
 	const file = freshFile();
-	const child = runChild(file, ursulaUrl() + path, ["PRAGMA synchronous = FULL", ...SQL], { URSULA_VFS_FAIL_POST_ACK: "3", CHILD_EXIT: "1" });
+	const child = runChild(file, ursulaUrl() + path, SQL, { URSULA_VFS_FAIL_POST_ACK: "3", CHILD_EXIT: "1" });
 	const done = await child.waitFor((l) => l.done === true);
 	await child.exited;
-	expect(child.lines.find((l) => l.step === 3 && l.ok !== undefined)?.ok).toBe(false);
+	expect(child.lines.find((l) => l.step === 2 && l.ok !== undefined)?.ok).toBe(false);
 	expect(done.poisoned).toBe(true);
 	const sidecar = Number(readFileSync(`${file}-ursula`, "utf8").split(" ")[0]);
 	expect(sidecar).toBeLessThan(done.offset as number);
@@ -171,4 +171,20 @@ it("(h) killed in the middle of a recovery's page writes: the next attach resume
 	attach(fresh, url);
 	expect(Buffer.compare(readFileSync(file), readFileSync(fresh))).toBe(0);
 	expect(rows(file, "WHERE x = 'late'")).toEqual(["late"]);
+});
+
+// Regression: a duplicate answer was taken as proof of this owner's earlier attempt. A cloned process
+// (a VM or CRIU snapshot restored twice, a fork after attach) shares epoch and sequence: the server
+// answers its append as a duplicate of the clone's same-length frame, and the commit showed locally
+// although the stream holds other bytes. Now the bytes are read back.
+it("(i) an append answered as a duplicate of another writer's bytes fails and stays out of the file", async () => {
+	const path = streamPath();
+	const file = freshFile();
+	proxy.cloneAt = 2; // the claim and CREATE go through; a twin of M-one (one byte flipped) lands first
+	const child = runChild(file, proxy.url + path, SQL.slice(0, 2), { CHILD_EXIT: "1" });
+	const done = await child.waitFor((l) => l.done === true);
+	expect((await child.exited).code).toBe(0);
+	expect(child.lines.find((l) => l.step === 1 && l.ok !== undefined)?.ok).toBe(false);
+	expect(done.poisoned).toBe(true);
+	expect(walContains(file, "M-one")).toBe(false);
 });
