@@ -1151,13 +1151,12 @@ impl GrpcRaftNetwork {
         let deadline = tokio::time::Instant::now() + option.hard_ttl();
         let admitted = match session.budget.clone().try_acquire_many_owned(charge) {
             Ok(permit) => Some(permit),
-            Err(_) => tokio::time::timeout_at(
-                deadline,
-                session.budget.clone().acquire_many_owned(charge),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok),
+            Err(_) => {
+                tokio::time::timeout_at(deadline, session.budget.clone().acquire_many_owned(charge))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+            }
         };
         let Some(permit) = admitted else {
             GRPC_APPEND_STREAM_BACKPRESSURE_REJECTIONS.fetch_add(1, Ordering::Relaxed);
