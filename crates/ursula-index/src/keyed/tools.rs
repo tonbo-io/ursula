@@ -471,8 +471,7 @@ pub async fn rebuild(
     if !(1..=MAX_REBUILD_PARALLELISM).contains(&options.parallelism) {
         bail!("parallelism must be in 1..={MAX_REBUILD_PARALLELISM}");
     }
-    let namespace = KeyedNamespace::with_format(store, source.clone(), options.projection_format)
-        .with_grace(options.gc_grace);
+    let namespace = KeyedNamespace::with_format(store, source.clone(), options.projection_format);
     let mut base = namespace.load().await.context("load CURRENT")?;
     let target = match &base {
         Some(base) => base.manifest.through_record,
@@ -637,7 +636,6 @@ pub async fn sweep(
     dry_run: bool,
 ) -> anyhow::Result<SweepReport> {
     KeyedNamespace::new(store, source.clone())
-        .with_grace(grace)
         .sweep(&SystemClock, grace, dry_run)
         .await
         .context("sweep the namespace")
