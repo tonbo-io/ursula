@@ -47,7 +47,6 @@ use tracing::debug;
 use tracing::error;
 use ursula_shard::BucketStreamId;
 use ursula_shard::StaticShardMap;
-use ursula_shard::is_reserved_affinity_stream_id;
 
 pub mod admission;
 pub mod auth;
@@ -414,7 +413,7 @@ impl Gateway {
     }
 
     fn pick_upstream(&self, uri: &Uri) -> Option<String> {
-        if let Some(key) = stream_affinity_key(uri, self.shard_map.as_ref())
+        if let Some(key) = upstream_pin_key(uri, self.shard_map.as_ref())
             && let Some(upstream) = self
                 .leader_affinity
                 .lock()
@@ -464,7 +463,7 @@ impl Gateway {
                 self.metrics
                     .leader_redirects
                     .fetch_add(1, Ordering::Relaxed);
-                if let Some(key) = stream_affinity_key(&parts.uri, self.shard_map.as_ref()) {
+                if let Some(key) = upstream_pin_key(&parts.uri, self.shard_map.as_ref()) {
                     self.remember_leader(key, leader_upstream.to_owned());
                 }
                 // Drop the follower response; it has no meaningful body.
@@ -492,7 +491,7 @@ impl Gateway {
         // fresh random/redirect lookup.
         if upstream_resp.status() == StatusCode::SERVICE_UNAVAILABLE
             && upstream_resp.headers().contains_key(RETRY_AFTER)
-            && let Some(key) = stream_affinity_key(&parts.uri, self.shard_map.as_ref())
+            && let Some(key) = upstream_pin_key(&parts.uri, self.shard_map.as_ref())
         {
             self.forget_leader_if_matches(&key, upstream);
         }
@@ -660,25 +659,17 @@ impl Gateway {
     }
 }
 
-fn stream_affinity_key(uri: &Uri, shard_map: Option<&StaticShardMap>) -> Option<String> {
+/// The leader-cache key of a stream route: its Raft group when the topology
+/// is known, else the `/{bucket}/{stream}` prefix. Subresource segments after
+/// the stream share the stream's key.
+fn upstream_pin_key(uri: &Uri, shard_map: Option<&StaticShardMap>) -> Option<String> {
     let mut segments = uri.path().split('/').filter(|segment| !segment.is_empty());
     let bucket = percent_decode_str(segments.next()?).decode_utf8().ok()?;
-    let second = percent_decode_str(segments.next()?).decode_utf8().ok()?;
+    let stream = percent_decode_str(segments.next()?).decode_utf8().ok()?;
     if bucket.starts_with("__ursula") {
         return None;
     }
-    let third = segments
-        .next()
-        .and_then(|segment| percent_decode_str(segment).decode_utf8().ok());
-    let stream_id = match third {
-        Some(stream) if stream.as_ref() == "$transaction" => {
-            BucketStreamId::with_affinity(bucket.as_ref(), second.as_ref(), "$transaction")
-        }
-        Some(stream) if !is_reserved_affinity_stream_id(stream.as_ref()) => {
-            BucketStreamId::with_affinity(bucket.as_ref(), second.as_ref(), stream.as_ref())
-        }
-        _ => BucketStreamId::new(bucket.as_ref(), second.as_ref()),
-    };
+    let stream_id = BucketStreamId::new(bucket.as_ref(), stream.as_ref());
     if let Some(shard_map) = shard_map {
         let placement = shard_map.locate(&stream_id);
         return Some(format!("group:{}", placement.raft_group_id.0));
@@ -856,34 +847,8 @@ fn classify_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<C
         });
     }
 
-    if segments.len() == 3
-        && segments
-            .get(2)
-            .is_some_and(|segment| segment == "$transaction")
-        && *method == Method::POST
-    {
-        let affinity = segments.get(1)?;
-        return Some(ClassifiedRequest {
-            resource: Resource {
-                bucket_id,
-                stream_id: Some(format!("{}/$transaction", affinity)),
-            },
-            action: Action::Append,
-        });
-    }
-
-    let stream = segments.get(1)?;
-    let grouped = segments
-        .get(2)
-        .is_some_and(|segment| !is_reserved_affinity_stream_id(segment));
-    let (stream_id, suffix) = if grouped {
-        (
-            format!("{stream}/{}", segments.get(2)?),
-            segments.get(3..).unwrap_or_default(),
-        )
-    } else {
-        (stream.clone(), segments.get(2..).unwrap_or_default())
-    };
+    let stream_id = segments.get(1)?.clone();
+    let suffix = segments.get(2..).unwrap_or_default();
 
     let action = match suffix {
         [] if *method == Method::PUT => {

@@ -200,7 +200,7 @@ async fn w1(args: &L2Args, sink: &mut Sink) -> Result<Outcome> {
     let admission = (args.admission_mib > 0).then_some(args.admission_mib << 20);
     let cold: ColdStoreHandle = Arc::new(ColdStore::memory().context("memory cold store")?);
     let rt = spawn(args.engine, cold, admission)?;
-    let id = BucketStreamId::with_affinity("bkt1", "h0001", "log");
+    let id = BucketStreamId::new("bkt1", "h0001-log");
     create(&rt, &id).await?;
     let mut rng = payload::Rng::new(1);
     let started = Instant::now();
@@ -261,7 +261,7 @@ async fn w2(args: &L2Args, sink: &mut Sink) -> Result<Outcome> {
     let cold: ColdStoreHandle = Arc::new(ColdStore::memory().context("memory cold store")?);
     let rt = spawn(args.engine, cold, None)?;
     let ids: Vec<_> = (0..args.streams)
-        .map(|i| BucketStreamId::with_affinity("bkt1", format!("h{i:05}"), format!("log{i:05}")))
+        .map(|i| BucketStreamId::new("bkt1", format!("h{i:05}-log{i:05}")))
         .collect();
     for id in &ids {
         create(&rt, id).await?;
@@ -336,8 +336,8 @@ async fn w2(args: &L2Args, sink: &mut Sink) -> Result<Outcome> {
 async fn compact_on(engine: Engine) -> Result<(Value, bool)> {
     let cold: ColdStoreHandle = Arc::new(ColdStore::memory().context("memory cold store")?);
     let rt = spawn(engine, cold.clone(), None)?;
-    let a = BucketStreamId::with_affinity("bkt1", "h1", "log-a");
-    let b = BucketStreamId::with_affinity("bkt1", "h2", "log-b");
+    let a = BucketStreamId::new("bkt1", "h1-log-a");
+    let b = BucketStreamId::new("bkt1", "h2-log-b");
     create(&rt, &a).await?;
     create(&rt, &b).await?;
     let mut rng = payload::Rng::new(3);
@@ -447,7 +447,7 @@ async fn compact(sink: &mut Sink) -> Result<Outcome> {
 async fn legacy_on(engine: Engine) -> Result<(Value, bool)> {
     let cold: ColdStoreHandle = Arc::new(ColdStore::memory().context("memory cold store")?);
     let rt = spawn(engine, cold.clone(), None)?;
-    let a = BucketStreamId::with_affinity("bkt1", "h1", "log");
+    let a = BucketStreamId::new("bkt1", "h1-log");
     create(&rt, &a).await?;
     let mut rng = payload::Rng::new(4);
     let record = payload::json_record(&mut rng, 0, 200);

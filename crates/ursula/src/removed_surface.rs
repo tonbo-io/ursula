@@ -8,6 +8,10 @@
 //!   router registers only `PUT` on that path, so axum answers 405 with
 //!   `Allow: PUT`. Clients read the latest snapshot's offset from HEAD and
 //!   fetch `GET {stream}/snapshot/{offset}`.
+//! - Three-segment stream paths (path affinity) and
+//!   `POST /{bucket}/{group}/$transaction` answer 404: no route matches. A
+//!   two-segment stream ID may not start with `$` (400), so a future
+//!   bucket-level `$` subresource cannot collide with an existing stream.
 //!
 //! The removed names live only in this file, which the release's "nothing
 //! left" check allowlists.
@@ -114,5 +118,28 @@ mod tests {
         let head = send(&app, "HEAD", uri, &[], "").await;
         assert_eq!(head.status(), StatusCode::OK);
         assert!(!head.headers().contains_key(HEADER_STREAM_SNAPSHOT_OFFSET));
+    }
+
+    #[tokio::test]
+    async fn three_segment_paths_answer_404_and_dollar_stream_ids_400() {
+        let app = app();
+        let text = [(CONTENT_TYPE.as_str(), "text/plain")];
+        for method in ["PUT", "POST", "GET", "HEAD", "DELETE"] {
+            let response = send(&app, method, "/removed/run-42/journal", &text, "event").await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method}");
+        }
+        let json = [(CONTENT_TYPE.as_str(), "application/json")];
+        let response = send(
+            &app,
+            "POST",
+            "/removed/run-42/$transaction",
+            &json,
+            r#"{"operations":[]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = send(&app, "PUT", "/removed/$transaction", &json, "").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

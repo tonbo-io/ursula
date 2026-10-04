@@ -1,5 +1,4 @@
 use ursula_shard::BucketStreamId;
-use ursula_shard::is_reserved_affinity_stream_id;
 
 pub fn validate_bucket_id(bucket_id: &str) -> Result<(), String> {
     if !(4..=64).contains(&bucket_id.len()) {
@@ -18,29 +17,20 @@ pub fn validate_bucket_id(bucket_id: &str) -> Result<(), String> {
 
 /// Validates a stream identity on apply.
 pub fn validate_stream_id(stream_id: &BucketStreamId) -> Result<(), String> {
-    if let Some(affinity_key) = &stream_id.affinity_key {
-        validate_path_segment("affinity_key", affinity_key)?;
-    }
     let local = stream_id.stream_id.as_str();
     validate_path_segment("stream_id", local)?;
     if local == "streams" {
         return Err("stream_id 'streams' is reserved".to_owned());
     }
-    if stream_id.affinity_key.is_some() && is_reserved_affinity_stream_id(local) {
-        return Err(format!(
-            "stream_id '{local}' is reserved under an affinity path"
-        ));
+    // `$`-prefixed names stay free for future bucket-level subresources
+    // (see `RESERVED_SUBRESOURCE_NAMES`).
+    if local.starts_with('$') {
+        return Err("stream_id must not start with '$'".to_owned());
     }
-    let combined_len = stream_id.bucket_id.len()
-        + 1
-        + stream_id
-            .affinity_key
-            .as_ref()
-            .map_or(0, |affinity_key| affinity_key.len() + 1)
-        + local.len();
+    let combined_len = stream_id.bucket_id.len() + 1 + local.len();
     if combined_len > 122 {
         return Err(format!(
-            "bucket/affinity/stream identity must not exceed 122 bytes, got {combined_len} bytes"
+            "bucket/stream identity must not exceed 122 bytes, got {combined_len} bytes"
         ));
     }
     Ok(())
@@ -67,39 +57,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn affinity_identity_uses_the_existing_total_length_limit() {
-        let valid = BucketStreamId::with_affinity("test", "run-42", "queue");
-        assert_eq!(validate_stream_id(&valid), Ok(()));
-
-        let too_long = BucketStreamId::with_affinity("test", "a".repeat(112), "queue");
-        assert!(
-            validate_stream_id(&too_long)
-                .expect_err("identity exceeds limit")
-                .contains("must not exceed 122 bytes")
-        );
-    }
-
-    #[test]
-    fn affinity_rejects_ambiguous_subresource_names() {
-        for stream in [
-            "$transaction",
-            "append-batch",
-            "attrs",
-            "bootstrap",
-            "retention",
-            "snapshot",
-        ] {
-            let stream_id = BucketStreamId::with_affinity("test", "run-42", stream);
+    fn stream_ids_starting_with_dollar_are_reserved() {
+        for stream in ["$", "$x", "$txn"] {
             assert!(
-                validate_stream_id(&stream_id)
+                validate_stream_id(&BucketStreamId::new("test", stream))
                     .expect_err("reserved stream")
-                    .contains("reserved under an affinity path")
+                    .contains("must not start with '$'")
             );
         }
-
-        assert_eq!(
-            validate_stream_id(&BucketStreamId::new("test", "snapshot")),
-            Ok(())
-        );
+        // Subresource names are reserved as path segments only, so a
+        // two-segment stream may still use them.
+        for stream in ["snapshot", "a$b"] {
+            assert_eq!(
+                validate_stream_id(&BucketStreamId::new("test", stream)),
+                Ok(())
+            );
+        }
     }
 }

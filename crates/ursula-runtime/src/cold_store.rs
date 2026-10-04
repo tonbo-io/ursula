@@ -375,11 +375,6 @@ impl ColdStore {
             left.stream_id
                 .bucket_id
                 .cmp(&right.stream_id.bucket_id)
-                .then_with(|| {
-                    left.stream_id
-                        .affinity_key
-                        .cmp(&right.stream_id.affinity_key)
-                })
                 .then_with(|| left.stream_id.stream_id.cmp(&right.stream_id.stream_id))
                 .then_with(|| left.generation.cmp(&right.generation))
                 .then_with(|| left.page_id.cmp(&right.page_id))
@@ -1236,20 +1231,9 @@ fn parse_cold_index_page_path(path: &str) -> Option<ColdIndexPageKey> {
         [bucket, stream, "cold-index", generation, page] => {
             (BucketStreamId::new(*bucket, *stream), *generation, *page)
         }
-        [bucket, affinity, stream, "cold-index", generation, page] => (
-            BucketStreamId::with_affinity(*bucket, *affinity, *stream),
-            *generation,
-            *page,
-        ),
         _ => return None,
     };
-    if stream_id.bucket_id.is_empty()
-        || stream_id
-            .affinity_key
-            .as_ref()
-            .is_some_and(String::is_empty)
-        || stream_id.stream_id.is_empty()
-    {
+    if stream_id.bucket_id.is_empty() || stream_id.stream_id.is_empty() {
         return None;
     }
     Some(ColdIndexPageKey {
@@ -1657,9 +1641,8 @@ pub fn cold_bucket_prefix(bucket_id: &str) -> String {
 }
 
 /// The directory of a stream's legacy (generation-0) exclusive chunks.
-/// Mirrors the layout of [`new_cold_chunk_path`]. Never remove it
-/// recursively: an affinity stream named `chunks` under this stream's name
-/// lives below it (D4); stream GC lists it one level at a time instead.
+/// Mirrors the layout of [`new_cold_chunk_path`]. Stream GC lists it one
+/// level at a time and deletes only object names Ursula writes there.
 pub fn cold_chunk_prefix(stream_id: &BucketStreamId) -> String {
     format!("{stream_id}/chunks/")
 }
@@ -1700,20 +1683,19 @@ mod tests {
     }
 
     #[test]
-    fn cold_index_paths_preserve_optional_affinity() {
+    fn cold_index_paths_parse_only_bucket_and_stream() {
         let plain = parse_cold_index_page_path(
             "benchcmp/journal/cold-index/00000000000000000007/00000000000000000042.idx",
         )
         .expect("plain path");
         assert_eq!(plain.stream_id, BucketStreamId::new("benchcmp", "journal"));
 
-        let grouped = parse_cold_index_page_path(
-            "benchcmp/run-42/journal/cold-index/00000000000000000007/00000000000000000042.idx",
-        )
-        .expect("grouped path");
+        // The six-part grouped-stream layout is gone.
         assert_eq!(
-            grouped.stream_id,
-            BucketStreamId::with_affinity("benchcmp", "run-42", "journal")
+            parse_cold_index_page_path(
+                "benchcmp/run-42/journal/cold-index/00000000000000000007/00000000000000000042.idx",
+            ),
+            None
         );
     }
 

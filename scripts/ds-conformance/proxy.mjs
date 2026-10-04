@@ -1,11 +1,11 @@
 // Path adapter between the official Durable Streams conformance suite and Ursula.
 //
 // The suite addresses streams as `/v1/stream/<name>`. Ursula serves streams as
-// `/{bucket}/{stream}` or `/{bucket}/{affinity}/{stream}`, and bucket IDs must
-// be 4-64 bytes, so `/v1/...` is not a valid Ursula path. This proxy rewrites
-// the `/v1/` prefix to `/<bucket>/` (so `/v1/stream/<name>` becomes the
-// path-affinity stream `/<bucket>/stream/<name>`) and rewrites `Location`
-// headers back. Bodies stream through unbuffered, so SSE and long-poll work.
+// `/{bucket}/{stream}`, and bucket IDs must be 4-64 bytes, so `/v1/...` is not
+// a valid Ursula path. This proxy rewrites `/v1/stream/<name>` to
+// `/<bucket>/<name>` (any other `/v1/<rest>` to `/<bucket>/<rest>`) and
+// rewrites `Location` headers back to `/v1/stream/<name>`. Bodies stream
+// through unbuffered, so SSE and long-poll work.
 //
 // Usage: node proxy.mjs <listen-port> <upstream-base-url> [bucket]
 import http from "node:http";
@@ -17,7 +17,12 @@ if (!listenPort || !upstreamBase) {
 }
 const upstream = new URL(upstreamBase);
 
+const SUITE_STREAM_PREFIX = "/v1/stream/";
+
 function toUpstream(path) {
+  if (path.startsWith(SUITE_STREAM_PREFIX)) {
+    return `/${bucket}/${path.slice(SUITE_STREAM_PREFIX.length)}`;
+  }
   return path.startsWith("/v1/") ? `/${bucket}/${path.slice(4)}` : path;
 }
 
@@ -25,7 +30,7 @@ function fromUpstream(location) {
   try {
     const url = new URL(location, upstream);
     if (url.pathname.startsWith(`/${bucket}/`)) {
-      return `/v1/${url.pathname.slice(bucket.length + 2)}${url.search}`;
+      return `${SUITE_STREAM_PREFIX}${url.pathname.slice(bucket.length + 2)}${url.search}`;
     }
   } catch {
     // Leave an unparseable Location untouched.

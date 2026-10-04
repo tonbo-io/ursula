@@ -9,7 +9,6 @@
 //! Nothing here mutates replicated state. The idle tracker is leader-local
 //! and is rebuilt from scratch after a restart or leader change.
 
-use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -169,19 +168,6 @@ pub fn plan_shared_ref_run(refs: &[ColdChunkRef], max_bytes: u64) -> Vec<ColdChu
     run
 }
 
-fn stream_order(left: &BucketStreamId, right: &BucketStreamId) -> Ordering {
-    (
-        left.bucket_id.as_str(),
-        left.affinity_key.as_deref(),
-        left.stream_id.as_str(),
-    )
-        .cmp(&(
-            right.bucket_id.as_str(),
-            right.affinity_key.as_deref(),
-            right.stream_id.as_str(),
-        ))
-}
-
 impl StreamStateMachine {
     /// F2 discovery (`shared_ref_candidates`): streams with at least
     /// `min_refs` shared refs, or with at least one and a tail that has not
@@ -252,7 +238,7 @@ impl StreamStateMachine {
         candidates.sort_by(|left, right| {
             left.min_pack_live_slices
                 .cmp(&right.min_pack_live_slices)
-                .then_with(|| stream_order(&left.stream_id, &right.stream_id))
+                .then_with(|| super::compare_stream_ids(&left.stream_id, &right.stream_id))
         });
         candidates.truncate(request.limit);
         candidates

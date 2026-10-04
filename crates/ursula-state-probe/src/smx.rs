@@ -27,11 +27,10 @@ pub fn ok(response: StreamResponse, what: &str) -> Result<StreamResponse> {
     Ok(response)
 }
 
-/// A stream id with a distinct name per stream. Streams that differ only by
-/// affinity fall back to `HashMap` order in the flush planner, which makes
-/// multi-stream runs differ between processes (§7.1).
-pub fn sid(bucket: &str, affinity: &str, name: &str) -> BucketStreamId {
-    BucketStreamId::with_affinity(bucket, affinity, name)
+/// A stream id named `{group}-{name}`, distinct per stream so multi-stream
+/// runs order the same in every process (§7.1).
+pub fn sid(bucket: &str, group: &str, name: &str) -> BucketStreamId {
+    BucketStreamId::new(bucket, format!("{group}-{name}"))
 }
 
 /// Raises the group to `level` (C0) so level-gated bounds apply, as on a

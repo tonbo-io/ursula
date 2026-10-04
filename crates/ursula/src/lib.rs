@@ -65,8 +65,6 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
 use axum::routing::put;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 pub use bootstrap::Persistence;
 pub use bootstrap::SpawnedRuntime;
 pub use bootstrap::Topology;
@@ -97,7 +95,6 @@ use ursula_runtime::AdvanceRetentionRequest;
 use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::AppendResponse;
-use ursula_runtime::AppendTransactionRequest;
 use ursula_runtime::BootstrapStreamRequest;
 use ursula_runtime::CloseStreamRequest;
 use ursula_runtime::CreateStreamExternalRequest;
@@ -119,7 +116,6 @@ use ursula_runtime::ShardRuntime;
 use ursula_runtime::new_external_payload_path;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
-use ursula_shard::is_reserved_affinity_stream_id;
 use wal_disk::WalDiskMonitor;
 
 use crate::render::apply_record_envelope;
@@ -179,8 +175,6 @@ const HEADER_STREAM_SEQ: &str = "stream-seq";
 const HEADER_STREAM_TTL: &str = "stream-ttl";
 const HEADER_STREAM_UP_TO_DATE: &str = "stream-up-to-date";
 const JSON_RECORD_COORDINATES_EXTENSION: &str = "json-record-coordinates-v1";
-const PATH_AFFINITY_EXTENSION: &str = "path-affinity-v1";
-const GROUP_APPEND_TRANSACTION_EXTENSION: &str = "group-append-transaction-v1";
 const HEADER_PRODUCER_ID: &str = "producer-id";
 const HEADER_PRODUCER_EPOCH: &str = "producer-epoch";
 const HEADER_PRODUCER_SEQ: &str = "producer-seq";
@@ -210,63 +204,25 @@ const MAX_LONG_POLL_TIMEOUT_MS: u64 = 60_000;
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct StreamPath {
     bucket: String,
-    #[serde(default)]
-    affinity: Option<String>,
     stream: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub(crate) struct AffinityPath {
-    bucket: String,
-    affinity: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AppendTransactionHttpRequest {
-    operations: Vec<AppendTransactionHttpOperation>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AppendTransactionHttpOperation {
-    stream: String,
-    content_type: String,
-    payload_base64: String,
-    #[serde(default)]
-    close_after: bool,
-    #[serde(default)]
-    stream_seq: Option<String>,
-    #[serde(default)]
-    producer: Option<ProducerRequest>,
-    #[serde(default)]
-    record_match: Option<u64>,
 }
 
 impl StreamPath {
     fn into_stream_id(self) -> BucketStreamId {
-        match self.affinity {
-            Some(affinity) => BucketStreamId::with_affinity(self.bucket, affinity, self.stream),
-            None => BucketStreamId::new(self.bucket, self.stream),
-        }
+        BucketStreamId::new(self.bucket, self.stream)
     }
 }
 
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct SnapshotPath {
     bucket: String,
-    #[serde(default)]
-    affinity: Option<String>,
     stream: String,
     snapshot_offset: String,
 }
 
 impl SnapshotPath {
     fn into_parts(self) -> (BucketStreamId, String) {
-        let stream_id = match self.affinity {
-            Some(affinity) => BucketStreamId::with_affinity(self.bucket, affinity, self.stream),
-            None => BucketStreamId::new(self.bucket, self.stream),
-        };
+        let stream_id = BucketStreamId::new(self.bucket, self.stream);
         (stream_id, self.snapshot_offset)
     }
 }
@@ -274,18 +230,13 @@ impl SnapshotPath {
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct RetentionPath {
     bucket: String,
-    #[serde(default)]
-    affinity: Option<String>,
     stream: String,
     retained_offset: String,
 }
 
 impl RetentionPath {
     fn into_parts(self) -> (BucketStreamId, String) {
-        let stream_id = match self.affinity {
-            Some(affinity) => BucketStreamId::with_affinity(self.bucket, affinity, self.stream),
-            None => BucketStreamId::new(self.bucket, self.stream),
-        };
+        let stream_id = BucketStreamId::new(self.bucket, self.stream);
         (stream_id, self.retained_offset)
     }
 }
@@ -892,10 +843,6 @@ fn admin_ops_router(state: HttpState) -> Router {
             "/__ursula/flush-cold/{bucket}/{stream}",
             post(flush_cold_stream),
         )
-        .route(
-            "/__ursula/flush-cold/{bucket}/{affinity}/{stream}",
-            post(flush_cold_stream),
-        )
         .route("/__ursula/backup/info", get(backup_info))
         .route(
             "/__ursula/backup/group/{raft_group_id}",
@@ -1090,42 +1037,6 @@ async fn ingress_admission_middleware(
     };
 
     next.run(request).await
-}
-
-async fn path_affinity_extension_middleware(request: Request<Body>, next: Next) -> Response {
-    let transaction_path = is_group_append_transaction_uri(request.uri());
-    let affinity_path = transaction_path || is_path_affinity_uri(request.uri());
-    let mut response = next.run(request).await;
-    if affinity_path {
-        insert_extension_token(response.headers_mut(), PATH_AFFINITY_EXTENSION);
-    }
-    if transaction_path {
-        insert_extension_token(response.headers_mut(), GROUP_APPEND_TRANSACTION_EXTENSION);
-    }
-    response
-}
-
-fn is_group_append_transaction_uri(uri: &Uri) -> bool {
-    let segments = uri
-        .path()
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    matches!(segments.as_slice(), [bucket, _affinity, "$transaction"] if !bucket.starts_with("__ursula"))
-}
-
-fn is_path_affinity_uri(uri: &Uri) -> bool {
-    let mut segments = uri.path().split('/').filter(|segment| !segment.is_empty());
-    let Some(bucket) = segments.next() else {
-        return false;
-    };
-    let Some(_affinity) = segments.next() else {
-        return false;
-    };
-    let Some(stream) = segments.next() else {
-        return false;
-    };
-    !bucket.starts_with("__ursula") && !is_reserved_affinity_stream_id(stream)
 }
 
 fn request_write_body_bytes(request: &Request<Body>) -> Option<u64> {
@@ -1367,40 +1278,7 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
                 .delete(delete_stream)
                 .head(head_stream),
         )
-        .route(
-            "/{bucket}/{affinity}/$transaction",
-            post(append_transaction),
-        )
-        .route(
-            "/{bucket}/{affinity}/{stream}/snapshot",
-            put(publish_snapshot_at_record),
-        )
-        .route(
-            "/{bucket}/{affinity}/{stream}/snapshot/{snapshot_offset}",
-            put(publish_snapshot).get(read_snapshot),
-        )
-        .route(
-            "/{bucket}/{affinity}/{stream}/retention",
-            put(advance_retention_at_record),
-        )
-        .route(
-            "/{bucket}/{affinity}/{stream}/retention/{retained_offset}",
-            put(advance_retention),
-        )
-        .route(
-            "/{bucket}/{affinity}/{stream}/bootstrap",
-            get(bootstrap_stream),
-        )
-        .route(
-            "/{bucket}/{affinity}/{stream}",
-            put(create_stream)
-                .post(append_stream)
-                .get(read_stream)
-                .delete(delete_stream)
-                .head(head_stream),
-        )
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
-        .layer(middleware::from_fn(path_affinity_extension_middleware))
         .layer(middleware::from_fn_with_state(
             admission,
             ingress_admission_middleware,
@@ -1466,7 +1344,6 @@ pub(crate) fn staged_external_definitely_unreferenced(err: &RuntimeError) -> boo
             error.code().is_some() || error.is_forward_before_proposal() || error.is_backpressure()
         }
         RuntimeError::EmptyAppend
-        | RuntimeError::InvalidAppendTransaction { .. }
         | RuntimeError::InvalidRaftGroup { .. }
         | RuntimeError::GroupNotHosted { .. } => true,
         RuntimeError::InvalidConfig(_)
@@ -2865,100 +2742,6 @@ pub(crate) async fn append_stream_external_by_id(
     }
 }
 
-#[tracing::instrument(
-    name = "http.append_transaction",
-    skip_all,
-    fields(bucket = %path.bucket, affinity = %path.affinity, bytes = body.len()),
-)]
-pub(crate) async fn append_transaction(
-    State(state): State<HttpState>,
-    OriginalUri(uri): OriginalUri,
-    Path(path): Path<AffinityPath>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    if !render::is_json_content_type(&request_content_type(&headers)) {
-        return (
-            StatusCode::BAD_REQUEST,
-            "append transaction body must be application/json",
-        )
-            .into_response();
-    }
-    let transaction = match serde_json::from_slice::<AppendTransactionHttpRequest>(&body) {
-        Ok(transaction) => transaction,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("invalid append transaction JSON: {err}"),
-            )
-                .into_response();
-        }
-    };
-    let now_ms = state.unix_time_ms();
-    let mut operations = Vec::with_capacity(transaction.operations.len());
-    for operation in transaction.operations {
-        if let Err(message) = check_transaction_operation_identifiers(&operation) {
-            return (StatusCode::BAD_REQUEST, message).into_response();
-        }
-        // U10: op content types are normalized like the Content-Type header,
-        // so apply compares them to the stream's stored (normalized) type.
-        let content_type = normalize_content_type(&operation.content_type);
-        let payload = match BASE64_STANDARD.decode(operation.payload_base64) {
-            Ok(payload) => Bytes::from(payload),
-            Err(err) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid payload_base64 for '{}': {err}", operation.stream),
-                )
-                    .into_response();
-            }
-        };
-        let payload = match normalize_http_write_payload(&content_type, payload, false) {
-            Ok(payload) => payload,
-            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-        };
-        operations.push(AppendRequest {
-            stream_id: BucketStreamId::with_affinity(
-                path.bucket.clone(),
-                path.affinity.clone(),
-                operation.stream,
-            ),
-            content_type,
-            payload,
-            close_after: operation.close_after,
-            stream_seq: operation.stream_seq,
-            producer: operation.producer,
-            now_ms,
-            record_match: operation.record_match,
-        });
-    }
-    let response = match state
-        .runtime
-        .append_transaction(AppendTransactionRequest { operations })
-        .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            return runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri))
-                .await;
-        }
-    };
-    let body = match serde_json::to_vec(&response.items) {
-        Ok(body) => body,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("render append transaction JSON: {err}"),
-            )
-                .into_response();
-        }
-    };
-    let mut response_headers = HeaderMap::new();
-    insert_default_response_headers(&mut response_headers);
-    insert_content_type(&mut response_headers, "application/json");
-    (StatusCode::OK, response_headers, body).into_response()
-}
-
 pub(crate) async fn delete_stream(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
@@ -3383,7 +3166,7 @@ async fn read_record_start(
 #[tracing::instrument(
     name = "http.snapshot_publish",
     skip_all,
-    fields(bucket = %path.bucket, affinity = ?path.affinity, stream = %path.stream, snapshot_offset = %path.snapshot_offset),
+    fields(bucket = %path.bucket, stream = %path.stream, snapshot_offset = %path.snapshot_offset),
 )]
 pub(crate) async fn publish_snapshot(
     State(state): State<HttpState>,
@@ -3683,7 +3466,7 @@ async fn advance_retention_by_offset(
 #[tracing::instrument(
     name = "http.snapshot_read",
     skip_all,
-    fields(bucket = %path.bucket, affinity = ?path.affinity, stream = %path.stream, snapshot_offset = %path.snapshot_offset),
+    fields(bucket = %path.bucket, stream = %path.stream, snapshot_offset = %path.snapshot_offset),
 )]
 pub(crate) async fn read_snapshot(
     State(state): State<HttpState>,
@@ -4285,7 +4068,7 @@ pub(crate) fn stream_closed(headers: &HeaderMap) -> bool {
 }
 
 /// Maximum length in bytes of a `Producer-Id` or `Stream-Seq` value on every
-/// HTTP write path, `$transaction` JSON included (bounded-stream-state F3).
+/// HTTP write path (bounded-stream-state F3).
 /// Both values are kept in replicated per-stream state, so their length must
 /// be bounded at the edge.
 pub(crate) const WRITE_IDENTIFIER_MAX_BYTES: usize = 256;
@@ -4309,18 +4092,6 @@ pub(crate) fn stream_seq(headers: &HeaderMap) -> Result<Option<String>, String> 
     };
     check_write_identifier_len(HEADER_STREAM_SEQ, value)?;
     Ok(Some(value.to_owned()))
-}
-
-fn check_transaction_operation_identifiers(
-    operation: &AppendTransactionHttpOperation,
-) -> Result<(), String> {
-    if let Some(stream_seq) = operation.stream_seq.as_deref() {
-        check_write_identifier_len("stream_seq", stream_seq)?;
-    }
-    if let Some(producer) = operation.producer.as_ref() {
-        check_write_identifier_len("producer_id", &producer.producer_id)?;
-    }
-    Ok(())
 }
 
 fn stream_record_match(headers: &HeaderMap) -> Result<Option<u64>, BoxResponse> {

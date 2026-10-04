@@ -2,7 +2,6 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use tracing::Instrument;
-use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::ColdFlushCandidate;
@@ -26,8 +25,6 @@ use crate::request::AdvanceRetentionResponse;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
 use crate::request::AppendResponse;
-use crate::request::AppendTransactionRequest;
-use crate::request::AppendTransactionResponse;
 use crate::request::BootstrapStreamRequest;
 use crate::request::BootstrapStreamResponse;
 use crate::request::CloseStreamRequest;
@@ -609,57 +606,6 @@ impl GroupActor {
                         self.placement,
                     )
                     .await;
-                }
-            }
-            Err(err) => {
-                let _ = response_tx.send(Err(err));
-            }
-        }
-        ControlFlow::Continue(())
-    }
-
-    async fn handle_append_transaction(
-        &mut self,
-        request: AppendTransactionRequest,
-        response_tx: oneshot::Sender<Result<AppendTransactionResponse, RuntimeError>>,
-        raft_uncommitted: Option<UncommittedBytesGuard>,
-    ) -> ControlFlow<()> {
-        let stream_ids = request
-            .operations
-            .iter()
-            .map(|operation| operation.stream_id.clone())
-            .collect::<Vec<_>>();
-        let response = CoreWorker::commit_append_transaction(
-            &mut self.engine,
-            self.metrics.clone(),
-            request,
-            self.placement,
-            self.cold_write_admission,
-        )
-        .await;
-        drop(raft_uncommitted);
-        match response {
-            Ok(response) => {
-                let changed = response
-                    .items
-                    .iter()
-                    .map(|item| !item.deduplicated)
-                    .collect::<Vec<_>>();
-                let _ = response_tx.send(Ok(response));
-                let mut notified = Vec::<BucketStreamId>::new();
-                for (stream_id, changed) in stream_ids.into_iter().zip(changed) {
-                    if changed && !notified.contains(&stream_id) {
-                        CoreWorker::finish_append(
-                            &mut self.engine,
-                            self.metrics.clone(),
-                            self.read_materialization.clone(),
-                            &mut self.read_watchers,
-                            stream_id.clone(),
-                            self.placement,
-                        )
-                        .await;
-                        notified.push(stream_id);
-                    }
                 }
             }
             Err(err) => {

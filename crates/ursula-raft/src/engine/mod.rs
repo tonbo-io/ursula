@@ -29,8 +29,6 @@ use openraft::storage::RaftLogStorage;
 use ursula_runtime::AdvanceRetentionRequest;
 use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
-use ursula_runtime::AppendTransactionRequest;
-use ursula_runtime::AppendTransactionResponse;
 use ursula_runtime::BootstrapStreamRequest;
 use ursula_runtime::CloseStreamRequest;
 use ursula_runtime::ColdIndexPageCache;
@@ -47,7 +45,6 @@ use ursula_runtime::FlushColdRequest;
 use ursula_runtime::GroupAckColdGcFuture;
 use ursula_runtime::GroupAdvanceRetentionFuture;
 use ursula_runtime::GroupAppendFuture;
-use ursula_runtime::GroupAppendTransactionFuture;
 use ursula_runtime::GroupBootstrapStreamFuture;
 use ursula_runtime::GroupBucketUsageFuture;
 use ursula_runtime::GroupCloseStreamFuture;
@@ -1661,46 +1658,6 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
-    fn append_transaction<'a>(
-        &'a mut self,
-        request: AppendTransactionRequest,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> GroupAppendTransactionFuture<'a> {
-        Box::pin(async move {
-            let command = GroupWriteCommand::Transaction {
-                commands: request
-                    .operations
-                    .iter()
-                    .cloned()
-                    .map(StreamCommand::from)
-                    .collect(),
-            };
-            if let Some(response) = self
-                .forward_write_to_leader_if_follower(command.clone())
-                .await?
-            {
-                return append_transaction_response(response, placement);
-            }
-            if admission.max_hot_bytes_per_group.is_some() {
-                self.with_state_machine({
-                    let request = request.clone();
-                    move |state_machine| {
-                        Box::pin(async move {
-                            state_machine
-                                .check_append_transaction_cold_admission(
-                                    request, placement, admission,
-                                )
-                                .await
-                        })
-                    }
-                })
-                .await??;
-            }
-            append_transaction_response(self.write(command).await?, placement)
-        })
-    }
-
     fn flush_cold<'a>(
         &'a mut self,
         request: FlushColdRequest,
@@ -1879,27 +1836,6 @@ impl GroupEngine for RaftGroupEngine {
     fn shutdown<'a>(&'a mut self) -> ursula_runtime::GroupShutdownFuture<'a> {
         Box::pin(async move { RaftGroupEngine::shutdown(self).await })
     }
-}
-
-fn append_transaction_response(
-    response: GroupWriteResponse,
-    placement: ShardPlacement,
-) -> Result<AppendTransactionResponse, GroupEngineError> {
-    let GroupWriteResponse::Batch(items) = response else {
-        return Err(GroupEngineError::new(
-            "unexpected append transaction write response",
-        ));
-    };
-    let items = items
-        .into_iter()
-        .map(|item| match item? {
-            GroupWriteResponse::Append(response) => Ok(response),
-            other => Err(GroupEngineError::new(format!(
-                "unexpected append transaction item response: {other:?}"
-            ))),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(AppendTransactionResponse { placement, items })
 }
 
 pub(crate) fn group_engine_io_error(err: ursula_runtime::GroupEngineError) -> io::Error {

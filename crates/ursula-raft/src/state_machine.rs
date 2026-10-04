@@ -23,7 +23,6 @@ use openraft::storage::RaftStateMachine;
 use serde::Deserialize;
 use serde::Serialize;
 use ursula_runtime::AppendRequest;
-use ursula_runtime::AppendTransactionRequest;
 use ursula_runtime::BootstrapStreamRequest;
 use ursula_runtime::BootstrapStreamResponse;
 use ursula_runtime::ColdFlushCandidate;
@@ -573,25 +572,6 @@ impl RaftGroupStateMachine {
             &request.stream_id,
             admission,
             u64::try_from(request.payload.len()).expect("payload len fits u64"),
-        )?;
-        Ok(())
-    }
-
-    pub async fn check_append_transaction_cold_admission(
-        &mut self,
-        request: AppendTransactionRequest,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> Result<(), GroupEngineError> {
-        let _ = placement;
-        let Some(first) = request.operations.first() else {
-            return Ok(());
-        };
-        self.engine.check_cold_write_admission(
-            &first.stream_id,
-            admission,
-            request.payload_bytes(),
-            u64::try_from(request.operations.len()).unwrap_or(u64::MAX),
         )?;
         Ok(())
     }

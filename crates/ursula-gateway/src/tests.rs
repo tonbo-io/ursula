@@ -192,67 +192,34 @@ async fn gateway_evicts_cached_leader_on_retryable_leader_unknown_response() {
 }
 
 #[test]
-fn stream_affinity_key_ignores_subresource_and_internal_routes() {
+fn upstream_pin_key_ignores_subresource_and_internal_routes() {
     let bootstrap: Uri = "/bucket/stream/bootstrap".parse().expect("uri");
     let metrics: Uri = "/__ursula/gateway/metrics".parse().expect("uri");
 
     assert_eq!(
-        stream_affinity_key(&bootstrap, None).as_deref(),
+        upstream_pin_key(&bootstrap, None).as_deref(),
         Some("/bucket/stream")
     );
-    assert_eq!(stream_affinity_key(&metrics, None), None);
+    assert_eq!(upstream_pin_key(&metrics, None), None);
 }
 
 #[test]
-fn stream_affinity_key_uses_the_middle_path_segment() {
-    let journal: Uri = "/bucket/run-42/journal".parse().expect("uri");
-    let queue: Uri = "/bucket/run-42/queue/bootstrap".parse().expect("uri");
-    let transaction: Uri = "/bucket/run-42/$transaction".parse().expect("uri");
-    let unrelated: Uri = "/bucket/run-43/queue".parse().expect("uri");
-
-    assert_eq!(
-        stream_affinity_key(&journal, None).as_deref(),
-        Some("/bucket/run-42/journal")
-    );
-
-    let shard_map = StaticShardMap::new(1, 64).expect("valid shard map");
-    assert_eq!(
-        stream_affinity_key(&journal, Some(&shard_map)),
-        stream_affinity_key(&queue, Some(&shard_map))
-    );
-    assert_eq!(
-        stream_affinity_key(&journal, Some(&shard_map)),
-        stream_affinity_key(&transaction, Some(&shard_map))
-    );
-    assert_ne!(
-        stream_affinity_key(&journal, None),
-        stream_affinity_key(&unrelated, None)
-    );
-
-    let ungrouped_snapshot: Uri = "/bucket/run-42/snapshot/0001".parse().expect("uri");
-    assert_eq!(
-        stream_affinity_key(&ungrouped_snapshot, None).as_deref(),
-        Some("/bucket/run-42")
-    );
-}
-
-#[test]
-fn group_affinity_key_is_shared_by_streams_in_the_same_group() {
+fn group_pin_key_is_shared_by_streams_in_the_same_group() {
     let shard_map = StaticShardMap::new(1, 16).expect("valid shard map");
     let first: Uri = "/bucket/stream-1".parse().expect("uri");
-    let first_key = stream_affinity_key(&first, Some(&shard_map)).expect("first key");
+    let first_key = upstream_pin_key(&first, Some(&shard_map)).expect("first key");
     let second = (2..10_000)
         .map(|index| {
             format!("/bucket/stream-{index}")
                 .parse::<Uri>()
                 .expect("uri")
         })
-        .find(|uri| stream_affinity_key(uri, Some(&shard_map)).as_ref() == Some(&first_key))
+        .find(|uri| upstream_pin_key(uri, Some(&shard_map)).as_ref() == Some(&first_key))
         .expect("stream in same group");
 
     assert_ne!(first.path(), second.path());
     assert_eq!(
-        stream_affinity_key(&second, Some(&shard_map)).as_deref(),
+        upstream_pin_key(&second, Some(&shard_map)).as_deref(),
         Some(first_key.as_str())
     );
 
@@ -377,36 +344,6 @@ fn request_classifier_maps_durable_stream_routes_to_bucket_resources() {
             "/owner-a/orders/snapshot/42",
             Action::PublishSnapshot,
             Some("orders"),
-        ),
-        (
-            "POST",
-            "/owner-a/run-42/queue",
-            Action::Append,
-            Some("run-42/queue"),
-        ),
-        (
-            "GET",
-            "/owner-a/run-42/journal?record=now&live=sse",
-            Action::Tail,
-            Some("run-42/journal"),
-        ),
-        (
-            "PUT",
-            "/owner-a/run-42/journal/snapshot/42",
-            Action::PublishSnapshot,
-            Some("run-42/journal"),
-        ),
-        (
-            "PUT",
-            "/owner-a/run-42/journal/retention?record=3",
-            Action::Update,
-            Some("run-42/journal"),
-        ),
-        (
-            "POST",
-            "/owner-a/run-42/$transaction",
-            Action::Append,
-            Some("run-42/$transaction"),
         ),
     ];
 
@@ -672,6 +609,39 @@ async fn access_control_fails_closed_for_unclassified_routes() {
             .expect("request");
         let response = gateway.handle(request).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn access_control_answers_404_for_three_segment_paths() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream_hits = Arc::clone(&hits);
+    let upstream = spawn_upstream(Router::new().fallback(any(move || {
+        let upstream_hits = Arc::clone(&upstream_hits);
+        async move {
+            upstream_hits.fetch_add(1, Ordering::Relaxed);
+            StatusCode::OK
+        }
+    })))
+    .await;
+    let resolver = Arc::new(FixedPrincipalResolver::valid());
+    let authorizer = Arc::new(RecordingAuthorizer::new(AuthorizationDecision::Allow));
+    let gateway = gateway_with_access_control(upstream.url.clone(), resolver, authorizer);
+
+    for (method, uri) in [
+        ("PUT", "/owner-a/run-42/queue"),
+        ("POST", "/owner-a/run-42/queue"),
+        ("GET", "/owner-a/run-42/queue"),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(AUTHORIZATION, "Bearer valid-token")
+            .body(Body::empty())
+            .expect("request");
+        let response = gateway.handle(request).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
     }
     assert_eq!(hits.load(Ordering::Relaxed), 0);
 }
