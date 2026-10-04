@@ -8,7 +8,7 @@ import { readFileSync, renameSync, statSync, truncateSync, writeFileSync } from 
 import { expect, it } from "vitest";
 import { attach, status } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
-import { integrity, openPlain, runChild, streamPath, ursulaUrl } from "./kit.ts";
+import { expectPast, integrity, openPlain, runChild, sidecarOffset, streamPath, ursulaUrl } from "./kit.ts";
 
 // Row 2 is replaced 30 times with incompressible text, so the log outgrows the database and (with a
 // 1-byte minimum) snapshots are taken; row 3 lands after them.
@@ -33,7 +33,7 @@ const rebooted = (file: string): void => {
 };
 
 /** An owner that wrote everything and was SIGKILLed with a WAL, and an older image of its db file and sidecar. */
-async function crashedOwner(): Promise<{ url: string; file: string; older: Buffer; olderSidecar: string; offset: number; snapshot: number }> {
+async function crashedOwner(): Promise<{ url: string; file: string; older: Buffer; olderSidecar: string; offset: string; snapshot: string }> {
 	const url = ursulaUrl() + streamPath();
 	const file = freshFile();
 	const first = runChild(file, url, FIRST, { CHILD_EXIT: "1" });
@@ -45,7 +45,7 @@ async function crashedOwner(): Promise<{ url: string; file: string; older: Buffe
 	expect(done.snapshots).toBeGreaterThan(0);
 	child.proc.kill("SIGKILL");
 	await child.exited;
-	return { url, file, older, olderSidecar, offset: done.offset as number, snapshot: done.snapshot as number };
+	return { url, file, older, olderSidecar, offset: done.offset as string, snapshot: done.snapshot as string };
 }
 
 it("(a) after a reboot, files a power loss damaged are discarded and rebuilt from snapshot + tail", async () => {
@@ -53,8 +53,8 @@ it("(a) after a reboot, files a power loss damaged are discarded and rebuilt fro
 	// The power loss rolled the sidecar back with the db file, to an offset below the stream's
 	// retention: the read check before discarding answers 410, which is no reason to keep the files.
 	await fetch(`${url}/retention/${snapshot}`, { method: "PUT" });
-	const retained = Number((await fetch(url, { method: "HEAD" })).headers.get("stream-retained-offset"));
-	expect(retained).toBeGreaterThan(Number(olderSidecar.split(" ")[0]));
+	const retained = (await fetch(url, { method: "HEAD" })).headers.get("stream-retained-offset") ?? "";
+	expectPast(retained, sidecarOffset(olderSidecar));
 	writeFileSync(`${file}-ursula`, olderSidecar);
 	rebooted(file);
 	// A plain connection in another process (no extension) holds the file open, idle.
@@ -74,22 +74,22 @@ it("(a) after a reboot, files a power loss damaged are discarded and rebuilt fro
 	await new Promise((r) => reader.once("exit", r));
 	attach(file, url);
 	const s = status(file);
-	expect(s.local).toBe(0);
-	expect(s.installed).toBeGreaterThan(0);
+	expect(s.local).toBe("-1");
+	expectPast(s.installed, "-1");
 	const fresh = freshFile();
 	attach(fresh, url);
 	expect(Buffer.compare(readFileSync(file), readFileSync(fresh))).toBe(0);
 	expect(rows(file)).toEqual(ACKED);
 	// The rebuilt file (a snapshot written over the emptied one) is trusted again in this boot.
 	attach(file, url);
-	expect(status(file)).toMatchObject({ local: s.offset, installed: 0 });
+	expect(status(file)).toMatchObject({ local: s.offset, installed: "-1" });
 });
 
 it("(b) in the same boot, a crashed owner's files are used as they are: no snapshot, no replay from scratch", async () => {
 	const { url, file, offset } = await crashedOwner();
-	expect(Number(readFileSync(`${file}-ursula`, "utf8").split(" ")[0])).toBe(offset);
+	expect(sidecarOffset(readFileSync(`${file}-ursula`, "utf8"))).toBe(offset);
 	attach(file, url);
-	expect(status(file)).toMatchObject({ local: offset, installed: 0 });
+	expect(status(file)).toMatchObject({ local: offset, installed: "-1" });
 	expect(rows(file)).toEqual(ACKED);
 });
 
@@ -100,7 +100,7 @@ it("(c) a db file replaced behind the extension's back is discarded and rebuilt"
 	writeFileSync(`${file}.restore`, older);
 	renameSync(`${file}.restore`, file);
 	attach(file, url);
-	expect(status(file).local).toBe(0);
+	expect(status(file).local).toBe("-1");
 	expect(rows(file)).toEqual(ACKED);
 });
 
@@ -126,10 +126,11 @@ it("(e) attaching the cache of one stream to another, or to its stream that lost
 	const child = runChild(file, url, FIRST, { CHILD_EXIT: "1" });
 	expect((await child.exited).code).toBe(0);
 	expect(() => attach(file, ursulaUrl() + streamPath())).toThrow(/is a cache of stream/);
-	// A sidecar offset beyond the stream's end. Trusted files (same boot and incarnation): the
+	// A sidecar offset beyond the stream's end (made up here from the server's internal byte
+	// offsets; the extension never computes one). Trusted files (same boot and incarnation): the
 	// catch-up from the sidecar's offset answers 416.
 	const sidecar = `${file}-ursula`;
-	writeFileSync(sidecar, readFileSync(sidecar, "utf8").replace(/^\d+/, (n) => `${Number(n) + 1_000_000}`));
+	writeFileSync(sidecar, readFileSync(sidecar, "utf8").replace(/^\d+/, (n) => String(Number(n) + 1_000_000).padStart(20, "0")));
 	expect(() => attach(file, url)).toThrow(/lost acknowledged data/);
 	// After a reboot (untrusted, same incarnation): the check before discarding refuses too.
 	rebooted(file);
@@ -169,7 +170,7 @@ it("(f) a same-boot image whose WAL is behind its sidecar is rejected and rebuil
 	const { url, file, wal } = await twoOwners();
 	writeFileSync(`${file}-wal`, wal);
 	attach(file, url);
-	expect(status(file).local).toBe(0);
+	expect(status(file).local).toBe("-1");
 	const db = openPlain(file);
 	db.exec("INSERT INTO t VALUES (4, 'fourth')");
 	db.close();
@@ -184,7 +185,7 @@ it("(g) a same-boot image whose WAL is ahead of its sidecar is trusted", async (
 	const { url, file, sidecar } = await twoOwners();
 	writeFileSync(`${file}-ursula`, sidecar);
 	attach(file, url);
-	expect(status(file)).toMatchObject({ local: Number(sidecar.split(" ")[0]), installed: 0 });
+	expect(status(file)).toMatchObject({ local: sidecarOffset(sidecar), installed: "-1" });
 	expect(rows(file)).toEqual(["1:fir", "2:sec", "3:thi"]);
 });
 
@@ -200,7 +201,7 @@ it("(h) the cache of a deleted stream is rebuilt from the stream recreated at it
 	db.exec("INSERT INTO t VALUES (1, 'old'), (2, 'old-' || hex(randomblob(4000)))");
 	db.close();
 	/** Deletes the stream and recreates it through another file, with rows until it ends past `past`. */
-	const recreate = async (past: number): Promise<{ offset: number; rows: string[] }> => {
+	const recreate = async (past: string): Promise<{ offset: string; rows: string[] }> => {
 		expect((await fetch(url, { method: "DELETE" })).ok).toBe(true);
 		const other = freshFile();
 		attach(other, url);
@@ -210,13 +211,13 @@ it("(h) the cache of a deleted stream is rebuilt from the stream recreated at it
 		o.close();
 		return { offset: status(other).offset, rows: rows(other) };
 	};
-	const shorter = await recreate(0);
-	expect(shorter.offset).toBeLessThan(status(file).offset);
+	const shorter = await recreate("-1");
+	expectPast(status(file).offset, shorter.offset);
 	attach(file, url);
-	expect(status(file).local).toBe(0);
+	expect(status(file).local).toBe("-1");
 	expect(rows(file)).toEqual(shorter.rows);
 	const longer = await recreate(status(file).offset);
 	attach(file, url);
-	expect(status(file).local).toBe(0);
+	expect(status(file).local).toBe("-1");
 	expect(rows(file)).toEqual(longer.rows);
 });

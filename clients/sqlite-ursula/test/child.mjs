@@ -10,7 +10,7 @@ control.loadExtension(ext);
 const tail = control.prepare("SELECT ursula_attach(?, ?) AS n").get(file, url).n;
 const db = new DatabaseSync(file);
 db.exec("PRAGMA journal_mode=WAL");
-say({ attached: Number(tail) });
+say({ attached: tail });
 for (const [step, sql] of sqls.entries()) {
 	say({ step, phase: "start" });
 	if (sql.startsWith("@sleep:")) {
