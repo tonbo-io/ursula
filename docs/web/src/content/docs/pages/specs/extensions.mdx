@@ -653,7 +653,7 @@ For one stream:
 - `F` is the first retained record ordinal.
 - `N` is the next record ordinal and record tail.
 - Retained records occupy `[F, N)`.
-- `O(r)` is the canonical Durable Streams offset at the first byte of record `r`.
+- `O(r)` is the canonical Durable Streams offset at the start of record `r`.
 
 A new empty stream has `F = N = 0`. An ordinal MUST NOT be reused or changed after it becomes externally visible. Retention MAY advance `F`, but MUST NOT renumber surviving records.
 

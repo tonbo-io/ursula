@@ -12,7 +12,7 @@ api: "GET /{bucket}/{stream}"
 </ParamField>
 
 <ParamField query="offset" type="string">
- Starting offset. Use `-1` to read from the beginning, or a numeric offset.
+ Starting offset: `-1` for the beginning, `now` for the current tail, or a `Stream-Next-Offset` value from an earlier response.
 </ParamField>
 
 <ParamField query="cursor" type="string">
@@ -63,7 +63,7 @@ api: "GET /{bucket}/{stream}"
  `live=long-poll`. Returns immediately if data is available, otherwise holds the connection until new data arrives or `timeout_ms` elapses (default 1000, at most 60000).
 
     ```bash
-    curl 'http://127.0.0.1:4437/demo/hello?offset=42&live=long-poll'
+    curl 'http://127.0.0.1:4437/demo/hello?offset=00000000000000000042&live=long-poll'
     ```
  </Tab>
  <Tab title="SSE">
@@ -107,7 +107,7 @@ curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
 ```
 
 ```bash Long-poll
-curl 'http://127.0.0.1:4437/demo/hello?offset=42&live=long-poll'
+curl 'http://127.0.0.1:4437/demo/hello?offset=00000000000000000042&live=long-poll'
 ```
 
 ```bash SSE tail

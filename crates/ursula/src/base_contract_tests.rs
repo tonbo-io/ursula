@@ -1,7 +1,8 @@
 //! Pins of the base protocol contract that the 0.6.0 removals must keep:
 //! `Stream-Seq` as a compare-and-set, `Stream-Next-Offset` as the exact
-//! resume point, the HEAD snapshot and retention headers, and `Retry-After`
-//! on an append's temporary 503. The other error headers are pinned in
+//! resume point, the HEAD snapshot and retention headers, `Stream-Incarnation`
+//! as a token that changes on delete and recreate, and `Retry-After` on an
+//! append's temporary 503. The other error headers are pinned in
 //! `tests.rs`: `producer_headers_deduplicate_retries_and_fence_stale_epochs`,
 //! `long_poll_returns_service_unavailable_when_live_waiters_are_full` (a
 //! read's temporary 503) and
@@ -369,6 +370,40 @@ async fn head_reports_snapshot_and_retention_after_publish_and_advance() {
     assert_eq!(header(&response, HEADER_STREAM_SNAPSHOT_OFFSET), at);
     assert_eq!(header(&response, HEADER_STREAM_SNAPSHOT_DIGEST), digest);
     assert_eq!(header(&response, HEADER_STREAM_RETAINED_OFFSET), at);
+}
+
+/// The group is raised to feature level 1, where incarnations are unique
+/// per group even when both creates land in the same millisecond.
+#[tokio::test]
+async fn stream_incarnation_changes_on_delete_and_recreate() {
+    async fn incarnation(app: &Router, uri: &str) -> String {
+        let response = send(app, "HEAD", uri, &[], "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        header(&response, HEADER_STREAM_INCARNATION).to_owned()
+    }
+
+    let app = app();
+    let response = send(
+        &app,
+        "POST",
+        "/__ursula/feature-level",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        r#"{"level":1}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let uri = "/contract/incarnation";
+
+    let response = create(&app, uri, &[], "").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let first = incarnation(&app, uri).await;
+    assert_eq!(incarnation(&app, uri).await, first);
+
+    let response = send(&app, "DELETE", uri, &[], "").await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = create(&app, uri, &[], "").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_ne!(incarnation(&app, uri).await, first);
 }
 
 #[tokio::test]
