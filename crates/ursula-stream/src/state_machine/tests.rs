@@ -3002,6 +3002,53 @@ fn stream_ttl_uses_sliding_access_window() {
 }
 
 #[test]
+fn ttl_renewal_with_earlier_clock_does_not_move_expiry_earlier() {
+    let mut machine = machine();
+    let stream_id = stream("ttl-skew");
+
+    assert!(matches!(
+        machine.apply(create_cmd(stream_id.clone(), Create {
+            payload: b"hi".to_vec(),
+            ttl_seconds: Some(1),
+            now_ms: 1_000,
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+    assert_eq!(
+        machine.apply(touch_cmd(stream_id.clone(), 1_600)),
+        StreamResponse::Accessed {
+            changed: true,
+            expired: false,
+        }
+    );
+    // A forwarding node whose clock lags proposes earlier timestamps.
+    assert_eq!(
+        machine.apply(touch_cmd(stream_id.clone(), 1_300)),
+        StreamResponse::Accessed {
+            changed: false,
+            expired: false,
+        }
+    );
+    assert_eq!(
+        machine.apply(append_cmd(stream_id.clone(), b"!", Append {
+            now_ms: 1_200,
+            ..Append::default()
+        })),
+        appended(2, 3)
+    );
+
+    assert_eq!(
+        machine
+            .head_at(&stream_id, 2_599)
+            .expect("expiry still follows the latest touch")
+            .last_ttl_touch_at_ms,
+        1_600
+    );
+    assert!(machine.head_at(&stream_id, 2_600).is_none());
+}
+
+#[test]
 fn renewed_ttl_ignores_stale_expiry_index_entry() {
     let mut machine = machine();
     let stream_id = stream("ttl-renew-stale");

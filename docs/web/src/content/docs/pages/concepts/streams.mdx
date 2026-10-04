@@ -26,6 +26,12 @@ Every stream is in one of these states:
 
 `Stream-TTL` (seconds, relative) and `Stream-Expires-At` (RFC 3339 absolute) are mutually exclusive. Sending both yields `400`.
 
+`Stream-TTL` is a sliding window, not a deadline fixed at creation:
+
+- Every accepted append or close renews it; a deduplicated retry or a repeat close does not.
+- Reads renew it at most once per quarter of the TTL, so a stream that is only read can expire after about 0.75×TTL of idleness following the last read. `HEAD` does not renew it.
+- Renewal never moves expiry earlier, even when the node that handled the request has a slower clock than the one that last renewed it.
+
 ## Related
 
 - [Buckets](/docs/concepts/buckets): how streams are grouped
