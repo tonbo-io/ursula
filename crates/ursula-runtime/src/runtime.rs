@@ -422,10 +422,7 @@ impl ShardRuntime {
     /// Whether the local replica of the stream's group currently leads, by
     /// its own view. Unlike `require_local_live_read_owner` this takes no
     /// quorum round trip; it gates background leader-side work only.
-    pub async fn accepts_local_writes(
-        &self,
-        stream_id: &BucketStreamId,
-    ) -> Result<bool, RuntimeError> {
+    async fn accepts_local_writes(&self, stream_id: &BucketStreamId) -> Result<bool, RuntimeError> {
         let placement = self.shard_map.locate(stream_id);
         let (response_tx, response_rx) = oneshot::channel();
         self.group_rpc(

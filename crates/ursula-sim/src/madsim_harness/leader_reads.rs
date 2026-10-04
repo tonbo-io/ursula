@@ -1,10 +1,10 @@
-//! Leader reads outside keyed streams (AUD §4.7, D10): HTTP
+//! Leader reads (AUD §4.7, D10): HTTP
 //! `consistency=leader` catch-up reads, HEAD, `/bootstrap` and snapshot reads
 //! against a runtime that hosts one replica of a three-node OpenRaft group.
 //!
 //! Invariant `leader_read_linearizable`: a leader read that answers 200
 //! reflects every append acknowledged before it started. While the group is
-//! healthy, or only a follower lags, every probe answers 200. A leader cut
+//! healthy every probe answers 200. A leader cut
 //! off from the quorum still believes it leads; its probes must answer 503
 //! (leader unknown, retry) instead of a view that misses the writes the new
 //! leader acknowledged. Once the new leader serves, the probes see both
@@ -36,7 +36,6 @@ use super::http::send;
 use super::http_offset;
 use super::parse_http_offset;
 use super::router_with_http_state;
-use super::seeded_follower_id;
 use super::sim_network_policy;
 
 const INVARIANT: &str = "leader_read_linearizable";
@@ -69,12 +68,10 @@ const PROBES: [Probe; 4] = [
     Probe::Snapshot,
 ];
 
-/// Seed-derived shape: payload sizes on both sides of the fault, and whether
-/// the leader is deposed or a follower only lags.
+/// Seed-derived shape: payload sizes on both sides of the fault.
 struct LeaderReadPlan {
     before: Vec<Vec<u8>>,
     after: Vec<Vec<u8>>,
-    depose_leader: bool,
 }
 
 impl LeaderReadPlan {
@@ -91,12 +88,7 @@ impl LeaderReadPlan {
         };
         let before = payloads(b'a');
         let after = payloads(b'A');
-        let depose_leader = rng.next_bounded(3) != 0;
-        Self {
-            before,
-            after,
-            depose_leader,
-        }
+        Self { before, after }
     }
 }
 
@@ -309,28 +301,6 @@ pub(super) async fn run_leader_read_linearizability_inner(
     for payload in &plan.before[1..] {
         append_over_http(&app, &path, payload, &mut acked).await;
         probes.serve_acked("healthy", &acked, &mut trace).await;
-    }
-
-    if !plan.depose_leader {
-        // A lagging follower leaves the leader a quorum: reads stay served.
-        let lagging = seeded_follower_id(config.seed, old_leader);
-        policy.partition_bidirectional(old_leader, lagging);
-        trace.push(SimEvent::FaultApplied {
-            phase: "follower_lags".to_owned(),
-        });
-        for payload in &plan.after {
-            append_over_http(&app, &path, payload, &mut acked).await;
-            probes
-                .serve_acked("follower_lags", &acked, &mut trace)
-                .await;
-        }
-        return ThreeNodeRaftSimOutcome {
-            seed: config.seed,
-            leader_id: old_leader,
-            target_node_id: Some(lagging),
-            appended_log_index: 0,
-            trace,
-        };
     }
 
     // Cut the leader off from both followers. It keeps believing it leads

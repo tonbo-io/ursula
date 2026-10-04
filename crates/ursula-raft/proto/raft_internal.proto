@@ -131,7 +131,7 @@ message ReadStreamReadV1 {
   // Leaders that do not know the field ignore it and resolve from the mark.
   optional RecordAnchorV1 record_anchor = 5;
   // `consistency=leader`: the leader linearizes the read (ReadIndex) before
-  // serving it. Leaders that do not know the field serve it unlinearized.
+  // serving it.
   bool leader_only = 6;
 }
 

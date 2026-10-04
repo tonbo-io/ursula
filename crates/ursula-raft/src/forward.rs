@@ -383,7 +383,16 @@ pub(crate) fn group_engine_linearizable_read_error(
             )
         }
         Some(openraft::error::LinearizableReadError::QuorumNotEnough(_)) => {
-            group_engine_forward_to_leader_error(message, None, None, self_id, true)
+            // The quorum error lists every member's internal address; the
+            // client sees a fixed message.
+            tracing::debug!("{message}");
+            group_engine_forward_to_leader_error(
+                format!("OpenRaft {operation} could not confirm leadership with a quorum"),
+                None,
+                None,
+                self_id,
+                true,
+            )
         }
         None => GroupEngineError::new(message),
     }

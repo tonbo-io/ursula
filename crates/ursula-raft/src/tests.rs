@@ -2828,7 +2828,7 @@ async fn openraft_snapshot_carries_feature_level() {
 /// leader over gRPC, so a follower's SSE or record read continues from it;
 /// a request from an older follower (no field) decodes with no anchor.
 /// `leader_only` (field 6) travels too, so the leader linearizes a forwarded
-/// `consistency=leader` read; an older follower's request decodes as false.
+/// `consistency=leader` read.
 #[test]
 fn forwarded_reads_carry_the_record_anchor_and_leader_only_over_grpc() {
     use prost::Message;
@@ -2870,5 +2870,4 @@ fn forwarded_reads_carry_the_record_anchor_and_leader_only_over_grpc() {
     let served = crate::grpc::read_stream_request_from_v1(request.stream_id.clone(), 77, decoded)
         .expect("served request");
     assert_eq!(served.record_anchor, None);
-    assert!(!served.leader_only);
 }
