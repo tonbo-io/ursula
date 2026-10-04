@@ -18,7 +18,8 @@
 //!   `Producer-Seq` per append): an append whose outcome is unknown is retried with the same
 //!   sequence until the server answers (a duplicate is acknowledged without being applied twice);
 //!   403 means another owner claimed the stream. An owner of a deleted stream is an unknown
-//!   producer in the stream recreated at its path: its next append is answered as an expired
+//!   producer in the stream recreated at its path (unless an attach racing the recreate claimed
+//!   there under the old id; see the design doc, §6): its next append is answered as an expired
 //!   producer's, and the re-claim that follows finds the incarnation changed and fences it.
 //! * WAL writes of an attached database go to a per-database overlay (reads and the file size see
 //!   it). The write of the commit frame's page data (the frame whose header carries a non-zero
@@ -2117,10 +2118,10 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
     // the same path since: never publish it there (the snapshot endpoint knows no producer), and
     // stop this owner's commits now rather than at its next append (which the recreated stream
     // answers as an unknown producer's, and `reclaim` fences).
-    if let Some(e) = recreated(&url, &incarnation, &stopped)? {
+    let fence = |what: String, e: String| {
         // Not `poison()`: the overlay belongs to a write transaction that may be in flight; it
         // clears it itself when it ends, and `x_write` refuses its commit (`poisoned`).
-        let why = format!("fenced: snapshot at {offset} not published: {e}");
+        let why = format!("fenced: {what}: {e}");
         let mut d = lock(db);
         eprintln!(
             "sqlite-ursula-vfs: {}: {why}; database poisoned (re-attach to recover)",
@@ -2128,6 +2129,9 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
         );
         d.fenced = true;
         d.poisoned = Some(why);
+    };
+    if let Some(e) = recreated(&url, &incarnation, &stopped)? {
+        fence(format!("snapshot at {offset} not published"), e);
         return Ok(true);
     }
     match put_idempotent(&format!("{url}/snapshot/{offset}"), &body, &stopped)? {
@@ -2179,6 +2183,11 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
     // Retention trails one snapshot behind: a host that read the previous snapshot (or whose file
     // is past it) still finds the frames after it, and the newer snapshot has read back.
     if previous > retained && previous < offset {
+        // Checked again: the publish and its read-back are a window for a recreate too.
+        if let Some(e) = recreated(&url, &incarnation, &stopped)? {
+            fence(format!("retention not moved to {previous}"), e);
+            return Ok(true);
+        }
         match put_idempotent(&format!("{url}/retention/{previous}"), &[], &stopped)? {
             (200..=299, r) => {
                 let effective = header_u64(&r, "stream-retained-offset").unwrap_or(previous);

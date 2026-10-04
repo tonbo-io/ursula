@@ -42,8 +42,8 @@ after commit") is the commit point: the transaction's final page images become o
 appended with the idempotent producer (`Producer-Id` `sqlite-ursula-vfs/<Stream-Incarnation>`,
 `Producer-Epoch` per owner, `Producer-Seq` per append). The id names the stream incarnation, an
 opaque token compared for equality only: the owners of one incarnation fence each other by epoch,
-and to a stream recreated at the same path an owner of the deleted one is an unknown producer (§6,
-wrong stream).
+and to a stream recreated at the same path an owner of the deleted one is an unknown producer,
+unless an attach racing the recreate claimed under the old id (§6, wrong stream).
 
 - **Acknowledged**: the overlay goes to the local WAL, later writes of the transaction (checksum
   rewrites of spilled frames, padding) go straight to it, and when the write transaction ends (the
@@ -223,13 +223,14 @@ WAL (the old pages may predate the offset) and the files are rebuilt. A tail rea
 
 Any owner may publish a snapshot of its own offset, a fenced one included: its state at its offset
 is a true prefix of the incarnation it attached to. The snapshot and retention endpoints know no
-producer, so the thread `HEAD`s the stream before the snapshot `PUT` and, if it was recreated, does
-not publish and fences the owner (§6, wrong stream). That check is not atomic with the `PUT`s: a
-stream deleted and recreated between it and the snapshot `PUT` gets the old database's image as
-its snapshot at `W`, which an attach of a file behind `W` would install, and one recreated before
-the retention `PUT` gets its retention set to `P`, dropping its frames below `P` (the new stream's
-own snapshot permitting). The window is the length of one snapshot publish and read-back; closing
-it needs an incarnation precondition on both endpoints at the server. Retention never passes the
+producer, so the thread `HEAD`s the stream before the snapshot `PUT` and again before the
+retention `PUT` and, if it was recreated, does not publish (or move retention) and fences the
+owner (§6, wrong stream). Neither check is atomic with its `PUT`: a stream deleted and recreated
+between the first and the snapshot `PUT` gets the old database's image as its snapshot at `W`,
+which an attach of a file behind `W` would install, and one recreated between the second and the
+retention `PUT` gets its retention set to `P`, dropping its frames below `P` (the new stream's own
+snapshot permitting). Each window is one `HEAD` round trip; closing them needs an incarnation
+precondition on both endpoints at the server. Retention never passes the
 latest snapshot (the server refuses).
 
 ### 4.4 Snapshot bodies on the server
@@ -342,7 +343,8 @@ What attach does in each case:
   `<db>` (it is rebuilt from the stream). Versions before the incarnation-scoped `Producer-Id`
   (§2) append as `sqlite-ursula-vfs`, a producer this version's claims do not fence: stop every
   owner of a stream that runs an older version before attaching it with this one (and the reverse
-  on a downgrade), or two owners can both commit.
+  on a downgrade), or two owners can both commit and corrupt the database (replay then mixes page
+  images of two diverged states).
 - **Container runtimes with their own boot id**: LXC/LXD/Incus and systemd-nspawn bind-mount a new
   random boot id at every container start, and gVisor generates one per procfs instance, so a
   container restart there rebuilds; sandboxes with their own kernel (Kata, Firecracker, WSL2,
@@ -360,17 +362,28 @@ What attach does in each case:
   (logged) and rebuilt from it, also after a reboot. A sidecar of the same incarnation, or an older
   version's (which records no incarnation, so may be of the same one), whose offset lies beyond the
   stream's end means the stream lost acknowledged data: attach refuses and keeps the files (delete
-  `<db>` to rebuild). A recreate during attach fails it, and the next attach
-  rebuilds (§3).
-  While attached, the owner's appends carry its incarnation's `Producer-Id` (§2), a producer the
-  recreated stream never had: a commit (seq >= 1) gets 409 expecting seq 0, as for an expired
-  producer, and the re-claim finds the incarnation changed and fences and poisons the owner, before
-  anything of it lands. Two things can still land: the stray claim of an attach or re-claim racing
-  the recreate (a new producer's seq 0 is accepted; the `HEAD` after it then fails the attach or
-  fences the owner), which changes no page but raises the epoch later claims start from, and, when
-  the recreated stream already has an owner, makes that owner's next commit see an unexpected next
-  offset, which poisons it (re-attach to recover); and a snapshot, or a retention move, from the
-  snapshot thread (§4.3, a window of one publish).
+  `<db>` to rebuild). After an operator restore from backup (same incarnation), delete `<db>`:
+  attach refuses while the stream ends before the sidecar's offset, but trusts the files once it
+  has grown past it. Attach creates a missing stream, so attaching after the stream was deleted
+  (by mistake, or by a fresh install that did not carry it over) creates an empty one and discards
+  the local files, which may be the only copy left: copy `<db>` aside first. A recreate during
+  attach fails it, and the next attach rebuilds (§3).
+  While attached, the owner's appends carry its incarnation's `Producer-Id` (§2), normally a
+  producer the recreated stream never had: a commit (seq >= 1) gets 409 expecting seq 0, as for an
+  expired producer, and the re-claim finds the incarnation changed and fences and poisons the
+  owner, before anything of it lands. Three things can still land. The stray claim of an attach or
+  re-claim racing the recreate (a new producer's seq 0 is accepted; the `HEAD` after it then fails
+  the attach or fences the owner) changes no page but raises the epoch later claims start from,
+  and, when the recreated stream already has an owner, makes that owner's next commit see an
+  unexpected next offset, which poisons it (re-attach to recover). The stray claim also registers
+  the deleted incarnation's `Producer-Id` in the recreated stream at its epoch: an owner of the
+  deleted stream still attached at that epoch, with no commit since its claim, then has its
+  commits accepted there (undetected while its offsets happen to match, as when both claims were
+  their streams' first frames, until its snapshot thread's `HEAD`), and owners of the recreated
+  stream, under another `Producer-Id`, do not fence it. And the snapshot thread can publish a
+  snapshot, or move retention (§4.3, a window of one `HEAD` round trip each). Stop every owner
+  before deleting a stream you will recreate; closing these windows needs an incarnation
+  precondition on appends and on the snapshot and retention endpoints at the server.
   At feature level 0 incarnations come from the create's clock and can repeat (a delete and
   recreate in the same millisecond, or a clock stepped back); such a recreate is not recognized:
   the old files are trusted and both owners share a producer, so the old owner's commits can land.

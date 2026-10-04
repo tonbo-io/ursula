@@ -126,10 +126,13 @@ it("(e) attaching the cache of one stream to another, or to its stream that lost
 	const child = runChild(file, url, FIRST, { CHILD_EXIT: "1" });
 	expect((await child.exited).code).toBe(0);
 	expect(() => attach(file, ursulaUrl() + streamPath())).toThrow(/is a cache of stream/);
-	// Untrusted files of the same incarnation whose sidecar offset lies beyond the stream's end.
-	rebooted(file);
+	// A sidecar offset beyond the stream's end. Trusted files (same boot and incarnation): the
+	// catch-up from the sidecar's offset answers 416.
 	const sidecar = `${file}-ursula`;
 	writeFileSync(sidecar, readFileSync(sidecar, "utf8").replace(/^\d+/, (n) => `${Number(n) + 1_000_000}`));
+	expect(() => attach(file, url)).toThrow(/lost acknowledged data/);
+	// After a reboot (untrusted, same incarnation): the check before discarding refuses too.
+	rebooted(file);
 	expect(() => attach(file, url)).toThrow(/lost acknowledged data/);
 	// An older version's sidecar (no incarnation recorded) may be of the same stream: also refused.
 	writeFileSync(sidecar, readFileSync(sidecar, "utf8").replace(/ incarnation=\S+/, ""));
