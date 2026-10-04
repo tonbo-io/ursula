@@ -77,102 +77,17 @@ Every stream belongs to a bucket. The stream URL takes the form `{base_url}/{buc
 
 - `bucket_id`: MUST match `^[a-z0-9_-]{4,64}$`. Globally unique within the service.
 - `stream_id`: Any UTF-8 string. MUST NOT exceed 122 bytes. MUST NOT contain `/`, `\0`, or `..`. On the bucketed `/` surface, the combined `{bucket_id}/{stream_id}` key MUST also not exceed 122 bytes.
-- The literal local stream ID `streams` is reserved for the bucket listing endpoint `/{bucket_id}/streams`.
+- The literal local stream ID `streams` is reserved.
 
-### 1.2. Create Bucket
+### 1.2. Bucket Lifecycle
 
-```
-PUT /{bucket_id}
-```
+In Ursula, buckets are implicit namespaces. A bucket exists once a stream has been created in it; `PUT /{bucket_id}/{stream_id}` needs no earlier bucket create. `PUT /{bucket_id}` is kept for clients that create the bucket first: it validates `bucket_id`, changes no state, and answers `201 Created` for a valid ID or `400 Bad Request` for an invalid one. The client surface has no bucket metadata read, stream listing or bucket delete. Removing a bucket with everything in it is an operator action, the admin-plane [bucket purge](/docs/operations#tenant-offboarding-bucket-purge), which permanently fences the bucket ID: later stream creates in it answer `404`. It is not a protocol operation.
 
-Buckets MUST be created explicitly. `PUT /{bucket_id}/{stream_id}` MUST NOT implicitly create a bucket.
-
-**Response Codes:**
-
-- `201 Created`: Bucket created successfully.
-- `400 Bad Request`: `bucket_id` is invalid.
-- `409 Conflict`: Bucket already exists.
-
-### 1.3. Get Bucket Metadata
-
-```
-GET /{bucket_id}
-```
-
-**Response Codes:**
-
-- `200 OK`: Bucket exists. Returns a JSON object with at least `bucket_id` (string) and `streams` (integer, count of streams in the bucket).
-- `400 Bad Request`: `bucket_id` is invalid.
-- `404 Not Found`: Bucket does not exist.
-
-### 1.4. List Bucket Streams
-
-```
-GET /{bucket_id}/streams?prefix={prefix}&after={cursor}&limit={n}
-```
-
-- `prefix` filters bucket-local stream IDs by prefix. When omitted, all bucket-local stream IDs are eligible.
-- `after` is an exclusive cursor over bucket-local stream IDs.
-- `limit` defaults to `1000` and must be in `1..=1000`.
-
-The response body is:
-
-```json
-{
-  "bucket_id": "agents",
-  "prefix": "user-",
-  "stream_count": 1,
-  "streams": [
-    {
-      "stream_id": "user-1",
-      "status": "Open",
-      "content_type": "text/plain",
-      "tail_offset": 42,
-      "created_at_ms": 1735689600000,
-      "last_write_at_ms": 1735689601000
-    }
-  ],
-  "next_cursor": "user-1",
-  "has_more": true
-}
-```
-
-`streams` is sorted lexicographically by `stream_id`.
-
-- `stream_id` is the bucket-local path of the stream: what follows `/{bucket_id}/` in its URL. For a stream addressed through the affinity form (Section 1.7) it is `{affinity_key}/{stream_id}`, so `prefix` and `after` also apply to that path.
-- `prefix` echoes the request's prefix, and is the empty string when the request has none.
-- `stream_count` is the number of entries in `streams` on this page, not the number of streams in the bucket.
-- `has_more` is `true` when more matching streams sort after the last entry. `next_cursor` is then that entry's `stream_id`, to be passed as `after`; otherwise it is `null`.
-- `status` is `Open` or `Closed`. `tail_offset` is the stream's tail offset, as an integer. Streams whose TTL or expiry time has passed are not listed.
-
-Each entry MUST include `stream_id`, `status`, `content_type`, `tail_offset` and `created_at_ms`. `last_write_at_ms` is OPTIONAL: a server that does not track the time of the last write MUST omit it rather than report a substitute value, and clients MUST tolerate its absence.
-
-> **Note (informative).** Ursula omits `last_write_at_ms`. It assembles a page from every Raft group's local replica on the node that serves the request, so a stream created a moment earlier may be missing from a page served by a follower.
-
-**Response Codes:**
-
-- `200 OK`: Matching streams returned.
-- `400 Bad Request`: `bucket_id` or query parameters are invalid.
-- `404 Not Found`: Bucket does not exist.
-
-### 1.5. Delete Bucket
-
-```
-DELETE /{bucket_id}
-```
-
-A bucket MUST be empty (zero streams) before deletion.
-
-**Response Codes:**
-
-- `204 No Content`: Bucket deleted.
-- `400 Bad Request`: `bucket_id` is invalid.
-- `404 Not Found`: Bucket does not exist.
-- `409 Conflict`: Bucket is not empty.
+This section describes Ursula's server profile. Earlier drafts of this document required explicit bucket creation and defined bucket metadata, stream listing and bucket deletion in Sections 1.3 to 1.5. Those section numbers stay unused so that later section numbers do not change.
 
 ### 1.6. Stream Operations
 
-All stream operations defined in the base protocol apply under `{base_url}/{bucket_id}/{stream_id}`. When the bucket does not exist, the server MUST return `404 Not Found`.
+All stream operations defined in the base protocol apply under `{base_url}/{bucket_id}/{stream_id}`.
 
 ### 1.7. Path Affinity
 
@@ -221,7 +136,7 @@ Content-Type: application/json
 }
 ```
 
-The server MUST commit every operation in one Raft entry or commit none of them. A failed content-type check, producer check, sequence check, record precondition, quota check, closed-stream check, or missing-stream check MUST leave every targeted stream unchanged. The endpoint does not create streams, accept empty append payloads, or coordinate across affinity keys. The first version permits at most 64 operations and a 32 MiB request body.
+The server MUST commit every operation in one Raft entry or commit none of them. A failed content-type check, producer check, sequence check, record precondition, closed-stream check, or missing-stream check MUST leave every targeted stream unchanged. The endpoint does not create streams, accept empty append payloads, or coordinate across affinity keys. The first version permits at most 64 operations and a 32 MiB request body.
 
 Each operation accepts `stream`, `content_type`, `payload_base64`, and the optional fields `close_after`, `stream_seq`, `producer`, and `record_match`. `producer` uses the same `producer_id`, `producer_epoch`, and `producer_seq` fields as the producer extension. Payload bytes use standard padded base64 so the transaction envelope can carry arbitrary stream content without JSON reinterpretation.
 

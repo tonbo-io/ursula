@@ -13,12 +13,6 @@ pub enum StreamResponse {
     BucketAlreadyExists {
         bucket_id: String,
     },
-    BucketDeleted {
-        bucket_id: String,
-    },
-    BucketQuotaSet {
-        bucket_id: String,
-    },
     Created {
         stream_id: BucketStreamId,
         next_offset: u64,
@@ -140,7 +134,6 @@ pub enum StreamErrorCode {
     BucketNotFound,
     /// The bucket was permanently purged and its name is fenced from reuse.
     BucketErased,
-    BucketNotEmpty,
     StreamNotFound,
     StreamGone,
     StreamAlreadyExistsConflict,
@@ -165,7 +158,6 @@ pub enum StreamErrorCode {
     ImportConflict,
     /// A state import payload failed snapshot validation.
     ImportInvalid,
-    QuotaExceeded,
     /// The command needs a higher group feature level than the group holds.
     /// Deterministic: every replica rejects it the same way.
     FeatureNotEnabled,

@@ -4,7 +4,7 @@ api: "PUT /{bucket}/{stream}"
 ---
 
 <ParamField path="bucket" type="string" required>
- Bucket ID. The Durable Streams Protocol specifies `[a-z0-9_-]{4,64}`. Ursula does not currently enforce this regex but client-side conformance is recommended.
+ Bucket ID. Must match `[a-z0-9_-]{4,64}`; an invalid ID answers `400`.
 </ParamField>
 
 <ParamField path="stream" type="string" required>
@@ -57,7 +57,8 @@ api: "PUT /{bucket}/{stream}"
 | ------ | ------------------------------------------------------------------------- |
 | `201` | Stream created. |
 | `200` | Stream already exists (idempotent). |
-| `400` | Invalid stream ID (including a reserved name such as `snapshot` under an affinity path), invalid headers, or bad JSON payload. |
+| `400` | Invalid bucket ID, invalid stream ID (including a reserved name such as `snapshot` under an affinity path), invalid headers, or bad JSON payload. |
+| `404` | The bucket was purged; its ID is permanently fenced. |
 | `409` | Stream already exists with different content type, or sequence conflict. |
 
 Response headers include `Location`, `Content-Type`, `Stream-Next-Offset`, and lifetime headers (`Stream-TTL` / `Stream-Expires-At`) when set. `Stream-Closed: true` is set if the create request also closed the stream. `ETag` is set on reads only.

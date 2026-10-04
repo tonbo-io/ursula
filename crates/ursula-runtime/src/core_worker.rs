@@ -67,7 +67,6 @@ use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
 use crate::request::ImportGroupStateRequest;
 use crate::request::ImportGroupStateResponse;
-use crate::request::ListBucketStreamsRequest;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
@@ -77,8 +76,6 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
-use crate::request::SetBucketQuotaRequest;
-use crate::request::SetBucketQuotaResponse;
 use crate::request::SetFeatureLevelRequest;
 use crate::request::SetFeatureLevelResponse;
 use crate::request::TidyStreamsRequest;
@@ -1202,25 +1199,6 @@ impl CoreWorker {
         response
     }
 
-    pub(crate) async fn list_bucket_streams(
-        group: &mut Box<dyn GroupEngine>,
-        metrics: Arc<RuntimeMetricsInner>,
-        request: ListBucketStreamsRequest,
-        placement: ShardPlacement,
-    ) -> Result<Option<Vec<ursula_stream::BucketStreamListing>>, RuntimeError> {
-        let exec_started_at = Instant::now();
-        let response = group
-            .list_bucket_streams(request, placement)
-            .await
-            .map_err(|err| RuntimeError::group_engine(placement, err));
-        metrics.record_group_engine_exec(
-            placement.core_id,
-            placement.raft_group_id,
-            elapsed_ns(exec_started_at),
-        );
-        response
-    }
-
     pub(crate) async fn feature_level(
         group: &mut Box<dyn GroupEngine>,
         metrics: Arc<RuntimeMetricsInner>,
@@ -1324,32 +1302,6 @@ impl CoreWorker {
             placement.raft_group_id,
             elapsed_ns(exec_started_at),
         );
-        response
-    }
-
-    pub(crate) async fn set_bucket_quota(
-        group: &mut Box<dyn GroupEngine>,
-        metrics: Arc<RuntimeMetricsInner>,
-        request: SetBucketQuotaRequest,
-        placement: ShardPlacement,
-    ) -> Result<SetBucketQuotaResponse, RuntimeError> {
-        let exec_started_at = Instant::now();
-        let response = group
-            .set_bucket_quota(request, placement)
-            .await
-            .map_err(|err| RuntimeError::group_engine(placement, err));
-        metrics.record_group_engine_exec(
-            placement.core_id,
-            placement.raft_group_id,
-            elapsed_ns(exec_started_at),
-        );
-        if response.is_ok() {
-            metrics.record_applied_mutation(
-                placement.core_id,
-                placement.raft_group_id,
-                elapsed_ns(exec_started_at),
-            );
-        }
         response
     }
 

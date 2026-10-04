@@ -106,7 +106,6 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         StreamErrorCode::OffsetOutOfRange => StatusCode::RANGE_NOT_SATISFIABLE,
         StreamErrorCode::InvalidBucketId
         | StreamErrorCode::InvalidStreamId
-        | StreamErrorCode::BucketNotEmpty
         | StreamErrorCode::MissingContentType
         | StreamErrorCode::EmptyAppend
         | StreamErrorCode::InvalidProducer
@@ -116,10 +115,6 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         | StreamErrorCode::InvalidStreamAttrs
         | StreamErrorCode::InvalidRecordBoundaries
         | StreamErrorCode::ImportInvalid => StatusCode::BAD_REQUEST,
-        // Data-plane quota rejections are not time-based rate limits, so no
-        // Retry-After accompanies them; 429 still tells the client which
-        // class of rejection this is versus 503 backpressure.
-        StreamErrorCode::QuotaExceeded => StatusCode::TOO_MANY_REQUESTS,
         // F3 producer cap; the plain-text body starts with `producer_limit`.
         StreamErrorCode::ProducerLimit => StatusCode::TOO_MANY_REQUESTS,
     }

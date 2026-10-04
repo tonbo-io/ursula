@@ -454,41 +454,6 @@ pub struct AdvanceRetentionResponse {
     pub hot_backlog: Option<WriteHotBacklog>,
 }
 
-/// Sets or clears one bucket's data-plane quota record on a group. The
-/// caller replicates the same request to every group.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SetBucketQuotaRequest {
-    pub bucket_id: String,
-    pub max_streams: Option<u64>,
-    pub max_retained_bytes: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SetBucketQuotaResponse {
-    pub placement: ShardPlacement,
-    pub group_commit_index: u64,
-}
-
-/// One group's share of a bucket listing (`extensions.md` §1.4); see
-/// `StreamStateMachine::list_bucket_streams`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListBucketStreamsRequest {
-    pub bucket_id: String,
-    pub prefix: String,
-    pub after: Option<String>,
-    pub limit: usize,
-    pub now_ms: u64,
-}
-
-/// A bucket listing merged across every Raft group.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListBucketStreamsResponse {
-    /// At most the requested limit, sorted by bucket-local stream path.
-    pub streams: Vec<ursula_stream::BucketStreamListing>,
-    /// More eligible streams sort after the last returned one.
-    pub has_more: bool,
-}
-
 /// Raises one group's replicated feature level (C0) to
 /// `max(current, level)`. The caller replicates the same request to every
 /// group, and must only send levels every replica supports.

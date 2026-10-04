@@ -48,45 +48,12 @@ impl StreamStateMachine {
         StreamResponse::BucketCreated { bucket_id }
     }
 
-    pub(super) fn delete_bucket(&mut self, bucket_id: &str) -> StreamResponse {
-        if let Err(message) = validate_bucket_id(bucket_id) {
-            return StreamResponse::error(StreamErrorCode::InvalidBucketId, message);
-        }
-        if !self.buckets.contains(bucket_id) {
-            return StreamResponse::error(
-                StreamErrorCode::BucketNotFound,
-                format!("bucket '{bucket_id}' does not exist"),
-            );
-        }
-        if self
-            .registry
-            .stream_ids()
-            .any(|stream_id| stream_id.bucket_id == bucket_id)
-        {
-            return StreamResponse::error(
-                StreamErrorCode::BucketNotEmpty,
-                format!("bucket '{bucket_id}' is not empty"),
-            );
-        }
-        self.buckets.remove(bucket_id);
-        // The content namespace is gone, but committed counters are a
-        // monotonic accounting ledger. Keep the zero-gauge entry so a write
-        // followed by deletion cannot disappear before an external meter has
-        // observed it. Recreating the same bucket continues the counter.
-        self.bucket_quotas.remove(bucket_id);
-        StreamResponse::BucketDeleted {
-            bucket_id: bucket_id.to_owned(),
-        }
-    }
-
     /// Tenant offboarding: removes every stream the bucket owns in this
     /// group (each removal enqueues its cold-object prefixes for the GC
-    /// worker), then the bucket and its quota, and installs a permanent
-    /// erasure fence. The aggregate usage ledger is
-    /// retained with zero gauges until an external accounting system has had
-    /// a chance to observe its monotonic counters. Unlike
-    /// [`Self::delete_bucket`] this does not require the bucket to be empty,
-    /// and purging an absent bucket succeeds with zero removals so a crashed
+    /// worker), then the bucket, and installs a permanent erasure fence. The
+    /// aggregate usage ledger is retained with zero gauges until an external
+    /// accounting system has had a chance to observe its monotonic counters.
+    /// Purging an absent bucket succeeds with zero removals so a crashed
     /// purge can be re-run to convergence.
     pub(super) fn purge_bucket(&mut self, bucket_id: &str) -> StreamResponse {
         if let Err(message) = validate_bucket_id(bucket_id) {
@@ -105,7 +72,6 @@ impl StreamStateMachine {
             }
         }
         self.buckets.remove(bucket_id);
-        self.bucket_quotas.remove(bucket_id);
         self.erased_buckets.insert(bucket_id.to_owned());
         StreamResponse::BucketPurged {
             bucket_id: bucket_id.to_owned(),
@@ -183,10 +149,6 @@ impl StreamStateMachine {
                     input.stream_id
                 ),
             );
-        }
-
-        if let Err(response) = self.check_create_quota(&input.stream_id.bucket_id, initial_len) {
-            return response;
         }
 
         let created_at_ms = self.next_created_at_ms(input.now_ms);
@@ -358,9 +320,6 @@ impl StreamStateMachine {
         }
 
         let initial_len = input.initial_payload.payload_len;
-        if let Err(response) = self.check_create_quota(&input.stream_id.bucket_id, initial_len) {
-            return response;
-        }
         let created_at_ms = self.next_created_at_ms(input.now_ms);
         let metadata = StreamMetadata {
             stream_id: input.stream_id.clone(),

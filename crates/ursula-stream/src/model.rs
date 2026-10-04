@@ -384,11 +384,10 @@ pub struct StreamBootstrapPlan {
 /// committed (non-deduplicated) appends and survive restarts through the
 /// snapshot. `retained_bytes` and `stream_count` are gauges derived from live
 /// stream state and are recomputed from the restored slots, so drift cannot
-/// accumulate across snapshot cycles. Deleting or purging a bucket zeros the
-/// gauges but retains the monotonic counters: otherwise committed writes can
-/// disappear before an asynchronous accounting reader observes them. A bucket
-/// recreated under the same ID continues the counters. A bucket-wide total is
-/// the sum of this value across every Raft group.
+/// accumulate across snapshot cycles. Purging a bucket zeros the gauges but
+/// retains the monotonic counters: otherwise committed writes can disappear
+/// before an asynchronous accounting reader observes them. A bucket-wide total
+/// is the sum of this value across every Raft group.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketUsage {
     pub committed_append_bytes: u64,
@@ -409,52 +408,4 @@ pub struct BucketUsage {
 pub struct BucketUsageSnapshot {
     pub bucket_id: String,
     pub usage: BucketUsage,
-}
-
-/// One stream in a bucket listing (`extensions.md` §1.4). `stream_id` is the
-/// bucket-local path: the plain stream ID, or `{affinity_key}/{stream_id}`
-/// for a stream addressed through path affinity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BucketStreamListing {
-    pub stream_id: String,
-    pub status: StreamStatus,
-    pub content_type: String,
-    pub tail_offset: u64,
-    pub created_at_ms: u64,
-}
-
-/// Returns the bucket-local path of a stream: what follows `/{bucket_id}/` in
-/// its URL.
-pub fn bucket_local_stream_path(stream_id: &BucketStreamId) -> String {
-    match &stream_id.affinity_key {
-        Some(affinity_key) => format!("{affinity_key}/{}", stream_id.stream_id),
-        None => stream_id.stream_id.clone(),
-    }
-}
-
-/// Per-bucket data-plane quota stored in replicated state. `None` means
-/// unlimited. Every Raft group stores the same record and enforces it
-/// against its own local [`BucketUsage`], so the cluster-wide bound is
-/// `limit × group_count`: an abuse backstop, not exact tenant accounting.
-/// Exact tenant-level enforcement happens at the gateway from aggregated
-/// usage.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BucketQuota {
-    pub max_streams: Option<u64>,
-    pub max_retained_bytes: Option<u64>,
-}
-
-impl BucketQuota {
-    /// A quota with no limits carries no information; setting it clears the
-    /// stored record.
-    pub fn is_unlimited(&self) -> bool {
-        self.max_streams.is_none() && self.max_retained_bytes.is_none()
-    }
-}
-
-/// One bucket's quota as stored in a group or persisted in a snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BucketQuotaSnapshot {
-    pub bucket_id: String,
-    pub quota: BucketQuota,
 }

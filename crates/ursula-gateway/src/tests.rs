@@ -1214,7 +1214,7 @@ mod tenant_boundary {
     }
 }
 
-// Gateway-half quota enforcement and usage accounting (#134/#135).
+// Gateway quota enforcement and usage accounting (#134/#135).
 mod admission_and_usage {
     use super::*;
     use crate::admission::StaticQuotaProvider;
@@ -1696,37 +1696,4 @@ mod credential_deadline {
             "an already-expired credential must not rewrite a finite response"
         );
     }
-}
-
-#[test]
-fn request_classifier_treats_bucket_listing_as_bucket_read() {
-    let request = Request::builder()
-        .method("GET")
-        .uri("/owner-a/streams?prefix=user-&limit=10")
-        .body(Body::empty())
-        .expect("request");
-    let classified = classify_request(request.method(), request.uri(), request.headers())
-        .expect("classified bucket listing");
-    assert_eq!(classified.resource.bucket_id, "owner-a");
-    assert_eq!(classified.resource.stream_id, None);
-    assert_eq!(classified.action, Action::Read);
-
-    // Only GET lists; `streams` is a reserved stream ID for every other method.
-    for method in ["PUT", "POST", "DELETE", "HEAD"] {
-        let request = Request::builder()
-            .method(method)
-            .uri("/owner-a/streams")
-            .body(Body::empty())
-            .expect("request");
-        assert!(
-            classify_request(request.method(), request.uri(), request.headers()).is_none(),
-            "{method}"
-        );
-    }
-}
-
-#[test]
-fn stream_affinity_key_skips_bucket_listing() {
-    let listing: Uri = "/bucket/streams?limit=5".parse().expect("uri");
-    assert_eq!(stream_affinity_key(&listing, None), None);
 }

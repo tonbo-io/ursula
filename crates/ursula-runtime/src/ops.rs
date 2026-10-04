@@ -317,20 +317,6 @@ macro_rules! runtime_operations {
                 handle { call bucket_usage(engine, metrics, placement) }
                 client { pub group fn bucket_usage }
             }
-            op SetBucketQuota {
-                fields { request: SetBucketQuotaRequest }
-                reply { response_tx: SetBucketQuotaResponse }
-                guard { none }
-                handle { call set_bucket_quota(engine, metrics, request, placement) }
-                client { pub group fn set_bucket_quota }
-            }
-            op ListBucketStreams {
-                fields { request: ListBucketStreamsRequest }
-                reply { response_tx: Option<Vec<ursula_stream::BucketStreamListing>> }
-                guard { none }
-                handle { call list_bucket_streams(engine, metrics, request, placement) }
-                client { pub group fn list_bucket_streams }
-            }
             op FeatureLevel {
                 fields {}
                 reply { response_tx: u32 }
