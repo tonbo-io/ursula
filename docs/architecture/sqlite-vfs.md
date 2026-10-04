@@ -82,8 +82,9 @@ wrong stream).
    incarnation, an older version's sidecar, a torn one, a replaced db file, a WAL behind its
    sidecar) means the local files are discarded (§6) and the attach proceeds as on a fresh host.
    A sidecar of another incarnation is always discarded, whatever the recreated stream's length
-   (logged as a recreate). For one of the same incarnation, a read at its offset first checks
-   that the stream did not lose acknowledged data (§6, wrong stream).
+   (logged as a recreate). For one of the same incarnation, or an older version's (which records
+   no incarnation), a read at its offset first checks that the stream did not lose acknowledged
+   data (§6, wrong stream).
 3. Recovery (only when it rewrites pages) never opens the local files through SQLite before
    replaying onto them: trust (§6) says every page holds the state at the sidecar's offset or a
    later commit's, not that SQLite can read the file (a disk image may hold a torn page 1 that
@@ -356,9 +357,10 @@ What attach does in each case:
 - **Wrong stream**: the sidecar names the stream's path and its incarnation; attaching the file
   to another stream is refused. A stream deleted and recreated at the same path is another
   incarnation, so the files are never trusted for it: whatever its length, they are discarded
-  (logged) and rebuilt from it, also after a reboot. A sidecar of the same incarnation whose offset
-  lies beyond the stream's end means the stream lost acknowledged data: attach refuses and keeps
-  the files (delete `<db>` to rebuild). A recreate during attach fails it, and the next attach
+  (logged) and rebuilt from it, also after a reboot. A sidecar of the same incarnation, or an older
+  version's (which records no incarnation, so may be of the same one), whose offset lies beyond the
+  stream's end means the stream lost acknowledged data: attach refuses and keeps the files (delete
+  `<db>` to rebuild). A recreate during attach fails it, and the next attach
   rebuilds (§3).
   While attached, the owner's appends carry its incarnation's `Producer-Id` (§2), a producer the
   recreated stream never had: a commit (seq >= 1) gets 409 expecting seq 0, as for an expired
@@ -370,14 +372,8 @@ What attach does in each case:
   offset, which poisons it (re-attach to recover); and a snapshot, or a retention move, from the
   snapshot thread (§4.3, a window of one publish).
   At feature level 0 incarnations come from the create's clock and can repeat (a delete and
-  recreate in the same millisecond, or a clock stepped back): the two incarnations then share a
-  token, the files are trusted, and both share a producer. An owner of the deleted stream at
-  another epoch than the new stream's owner then gets 403 (fenced) or 400 (poisoned); at the same
-  epoch: with more appends than the new owner, 409 (poisoned); with as many, its commit is
-  accepted and lands, and its receipt's offset differs from its own (unless neither had
-  committed), which poisons it; with fewer, a duplicate whose receipt's offset differs, or a 409
-  for a receipt the server no longer holds (poisoned either way; a duplicate answered without a
-  receipt, from feature level 1, fences, §2).
+  recreate in the same millisecond, or a clock stepped back); such a recreate is not recognized:
+  the old files are trusted and both owners share a producer, so the old owner's commits can land.
 - A rollback journal next to an attached file can only be left by a crash while attach switched
   an empty file to WAL; attach deletes it in every case (rolling it back would truncate the file
   under the pages attach writes next).
@@ -442,14 +438,14 @@ rebuild, delete `<db>`.
   disk image whose WAL is behind its sidecar is rebuilt and the stream stays intact, one whose WAL
   is ahead is trusted; discarding is refused while another process has the file open; a replaced db
   file is rebuilt; a file without a sidecar, the cache of another stream, and files whose sidecar
-  offset lies beyond their stream's end are refused; the cache of a deleted stream is rebuilt from
-  the stream recreated at its path, both shorter than the file's offset and grown past it), a file
-  with a sidecar opening only while attached in the process (refused before an attach, and after a
-  failed re-attach of an attached file, until an attach succeeds; then commits replicate again),
-  snapshots and retention (a ~160 MB run; CI also runs it without a cold tier under the default hot
-  limit; fresh and lagging hosts rebuild byte-identical from snapshot + tail; the takeover after
-  the trim fences the old owner), Pi conformance in three modes, and a benchmark (sanity numbers
-  only).
+  offset lies beyond their stream's end are refused (also with an older version's sidecar); the
+  cache of a deleted stream is rebuilt from the stream recreated at its path, both shorter than the
+  file's offset and grown past it), a file with a sidecar opening only while attached in the process
+  (refused before an attach, and after a failed re-attach of an attached file, until an attach
+  succeeds; then commits replicate again), snapshots and retention (a ~160 MB run; CI also runs it
+  without a cold tier under the default hot limit; fresh and lagging hosts rebuild byte-identical
+  from snapshot + tail; the takeover after the trim fences the old owner), Pi conformance in three
+  modes, and a benchmark (sanity numbers only).
 - The same Pi conformance, snapshot and benchmark suites on 3 nodes + gateway + MinIO at feature
   level 5 (the snapshot run's ~3.5 MB bodies go to the cold tier), with a 64 KiB snapshot minimum
   so the benchmark's Pi workload snapshots and trims at its database size.

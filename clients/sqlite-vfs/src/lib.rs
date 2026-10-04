@@ -1760,7 +1760,7 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
 }
 
 /// Decides whether the local files can be trusted (or discards them), brings them to the stream's
-/// tail and claims it (`sync`), then binds a new attachment to them.
+/// tail and claims it (`sync`), then builds the new attachment for `attach` to bind.
 unsafe fn attach_files(
     path: &str,
     url: &str,
@@ -1793,33 +1793,37 @@ unsafe fn attach_files(
             // or a disk image whose WAL lost frames the sidecar counts on: the stream has
             // everything committed.
             s => {
-                match s.as_ref().map(|s| (s.incarnation.as_deref(), s.offset)) {
+                let why: String = match s.as_ref().map(|s| (s.incarnation.as_deref(), s.offset)) {
                     // The stream at the path is another one: nothing of the old one is wanted,
                     // whatever the new one's length.
-                    Some((Some(old), _)) if old != incarnation => eprintln!(
-                        "sqlite-ursula-vfs: {path}: the local files are a cache of stream \
-                         incarnation {old}, but {url} is now incarnation {incarnation} (deleted \
-                         and recreated): discarding them"
+                    Some((Some(old), _)) if old != incarnation => format!(
+                        "a cache of stream incarnation {old}, but {url} is now incarnation \
+                         {incarnation}: deleted and recreated"
                     ),
-                    Some((None, _)) => eprintln!(
-                        "sqlite-ursula-vfs: {path}: the sidecar is from an older version (no \
-                         stream incarnation recorded): discarding the local files"
-                    ),
-                    // The same incarnation, unless it lost acknowledged data: a sidecar offset
-                    // never exceeds an acknowledged one, so a read there answering 416 (beyond the
-                    // end) refuses, as for trusted files, instead of rebuilding an older database.
-                    // `Gone` (below retention) is fine: the rebuild starts from a snapshot.
-                    Some((Some(_), offset)) if offset > 0 => {
-                        if let Err(Fail::Other(e)) = read_from(url, offset) {
+                    // The same incarnation, or an older version's sidecar (incarnation unknown:
+                    // possibly the same stream), unless the stream lost acknowledged data: a
+                    // sidecar offset never exceeds an acknowledged one, so a read there answering
+                    // 416 (beyond the end) refuses, as for trusted files, instead of rebuilding an
+                    // older database. `Gone` (below retention) is fine: the rebuild starts from a
+                    // snapshot.
+                    Some((old, offset)) => {
+                        if offset > 0
+                            && let Err(Fail::Other(e)) = read_from(url, offset)
+                        {
                             return Err(e);
                         }
+                        if old.is_none() {
+                            "an older version's sidecar, without the stream incarnation".into()
+                        } else {
+                            "another boot, a replaced db file, or a WAL behind the sidecar".into()
+                        }
                     }
-                    _ => {}
-                }
+                    None => "a torn sidecar".into(),
+                };
                 emptied = Some(discard_local(path)?);
                 eprintln!(
-                    "sqlite-ursula-vfs: {path}: local files untrusted (another boot, torn, \
-                     replaced, or behind their sidecar); discarded them, rebuilding from the stream"
+                    "sqlite-ursula-vfs: {path}: local files untrusted ({why}); discarded them, \
+                     rebuilding from the stream"
                 );
             }
         }

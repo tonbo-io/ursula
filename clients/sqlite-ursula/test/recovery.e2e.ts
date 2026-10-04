@@ -57,8 +57,9 @@ it("attach refuses to recover while another connection has the file open", async
 });
 
 // Regression (#345): a file with a sidecar passed through to the plain "unix" VFS without a
-// binding (in a process that never attached it), and a failed re-attach left the old binding in
-// place over files it may have rewritten, so commits went out from a state the stream never had.
+// binding: in a process that never attached it, and after a failed re-attach, which dropped the
+// binding before it could fail. The fix must not keep the old binding either (the failed attach
+// may have rewritten the files).
 it("a file with a sidecar opens only while attached here: not before an attach, nor after a failed one", async () => {
 	const path = streamPath();
 	const url = ursulaUrl() + path;
@@ -78,7 +79,10 @@ it("a file with a sidecar opens only while attached here: not before an attach, 
 	expect(() => status(file)).toThrow(/last attach failed/);
 	attach(file, url);
 	expect(xs(file)).toEqual(["r1", "r2"]);
+	const back = openPlain(file);
+	back.exec("INSERT INTO t VALUES ('r3')");
+	back.close();
 	const fresh = freshFile();
 	attach(fresh, url);
-	expect(xs(fresh)).toEqual(["r1", "r2"]);
+	expect(xs(fresh)).toEqual(["r1", "r2", "r3"]);
 });

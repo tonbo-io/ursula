@@ -100,7 +100,10 @@ export function drainStats(file: string): VfsStats {
 	return JSON.parse(row.s) as VfsStats;
 }
 
-/** A commit the VFS could not replicate: fenced by a newer owner, rejected, or with no answer in time. */
+/**
+ * A commit the VFS could not replicate: fenced (by a newer owner, or because the stream was deleted and
+ * recreated), rejected, or with no answer in time.
+ */
 export class UrsulaReplicationError extends Error {
 	readonly fenced: boolean;
 	constructor(message: string, fenced: boolean, cause: unknown) {
@@ -115,7 +118,8 @@ export class UrsulaReplicationError extends Error {
  * opens it with Pi's node driver, unmodified. A commit the VFS fails surfaces as an
  * `UrsulaReplicationError` (SQLite has already rolled the transaction back, so the driver's own
  * rollback attempt would otherwise turn it into an AggregateError). The storage is unusable for
- * writes after that; re-open it to take the stream over again.
+ * writes after that; re-open it to take the stream over again (after a delete and recreate, re-opening
+ * rebuilds the file from the new stream).
  */
 export async function openUrsulaPiStorage(file: string, streamUrl: string, options: NodeSqliteStorageOptions = {}): Promise<SqliteStorage> {
 	attach(file, streamUrl);

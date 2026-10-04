@@ -131,6 +131,9 @@ it("(e) attaching the cache of one stream to another, or to its stream that lost
 	const sidecar = `${file}-ursula`;
 	writeFileSync(sidecar, readFileSync(sidecar, "utf8").replace(/^\d+/, (n) => `${Number(n) + 1_000_000}`));
 	expect(() => attach(file, url)).toThrow(/lost acknowledged data/);
+	// An older version's sidecar (no incarnation recorded) may be of the same stream: also refused.
+	writeFileSync(sidecar, readFileSync(sidecar, "utf8").replace(/ incarnation=\S+/, ""));
+	expect(() => attach(file, url)).toThrow(/lost acknowledged data/);
 	expect(statSync(file).size).toBeGreaterThan(0);
 });
 
