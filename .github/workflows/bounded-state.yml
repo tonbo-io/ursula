@@ -5,8 +5,6 @@ name: Bounded state
 #   counters, snapshot sizes and heap figures compared with
 #   crates/ursula-state-probe/ratchet.json, plus the §7.2 formula checks.
 # - nightly: full-scale W1 to W6 and L2 runs, JSONL published as artifacts.
-#   (Scheduled workflows run from the default branch once this file lands there;
-#   until then trigger it with workflow_dispatch.)
 # - write_ratchet (workflow_dispatch): runs the reduced-scale suite, rewrites ratchet.json from it
 #   instead of comparing, and uploads the new file as an artifact.
 
@@ -70,15 +68,15 @@ jobs:
       - name: Run reduced-scale suite against the ratchet
         if: ${{ !inputs.write_ratchet }}
         run: |
-          ./target/state-probe/ursula-state-probe --quiet --out-dir target/state-probe \
+          ./target/state-probe/ursula-state-probe --quiet --out-dir target/state-probe-results \
             gate --suite pr --ratchet crates/ursula-state-probe/ratchet.json
 
       - name: Rewrite the ratchet from the reduced-scale suite
         if: ${{ inputs.write_ratchet }}
         run: |
-          ./target/state-probe/ursula-state-probe --quiet --out-dir target/state-probe \
+          ./target/state-probe/ursula-state-probe --quiet --out-dir target/state-probe-results \
             gate --suite pr --ratchet crates/ursula-state-probe/ratchet.json --write-ratchet
-          git diff --stat -- crates/ursula-state-probe/ratchet.json
+          git diff -- crates/ursula-state-probe/ratchet.json
 
       - name: Upload the rewritten ratchet
         if: ${{ inputs.write_ratchet }}
@@ -91,14 +89,14 @@ jobs:
 
       - name: Summarize
         if: always()
-        run: python3 crates/ursula-state-probe/summarize.py target/state-probe || true
+        run: python3 crates/ursula-state-probe/summarize.py target/state-probe-results || true
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v6
         with:
           name: state-growth-${{ github.sha }}
-          path: target/state-probe
+          path: target/state-probe-results
           if-no-files-found: warn
           retention-days: 14
 

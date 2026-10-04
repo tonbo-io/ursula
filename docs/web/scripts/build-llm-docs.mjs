@@ -51,6 +51,7 @@ const PAGE_ORDER = new Map([
   ["examples/resumable-ai-stream", ["Examples", 1]],
   ["examples/chat-room", ["Examples", 2]],
   ["examples/browser-telemetry", ["Examples", 3]],
+  ["examples/sqlite-vfs", ["Examples", 4]],
 
   ["concepts/streams", ["Concepts", 1]],
   ["concepts/buckets", ["Concepts", 2]],

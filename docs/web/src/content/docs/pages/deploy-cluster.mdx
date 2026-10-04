@@ -85,6 +85,7 @@ curl http://127.0.0.1:4437/__ursula/metrics
   comes from `helm test` or `ursulactl wait-ready`. The mutating admin surface
   is bound to pod loopback (`127.0.0.1:4438`) and is reached with
   `kubectl port-forward`.
+- Clusters that serve the [SQLite VFS](/docs/examples/sqlite-vfs) need per-group admission caps of at least 64 MiB (`standard` or `large` preset) so a 32 MiB commit can be admitted.
 
 ## Optional: event-time indexer
 
@@ -142,8 +143,6 @@ This is availability only: one pod takes all the traffic. Spreading streams over
 To point the nodes at an indexer the chart does not manage, leave `keyedIndexer.enabled=false` and set `keyedState.indexerUrls` to its pods, primary first, or `keyedState.upstream` for a single pod or load balancer. A non-empty pod list takes precedence over the upstream for reads. `keyedIndexer.sourceUrl` reads records through a gateway instead of the node Service. See [Configuration](/docs/configuration#keyed-indexer-flags) for every indexer flag and the [chart README](https://github.com/tonbo-io/ursula/tree/main/charts/ursula#keyed-state-indexer) for every value.
 
 Outside Kubernetes, run the same command by hand on each indexer host and set `[keyed_state] indexer_urls` (primary first) in every node's config, or `[server] keyed_state_upstream` for a single indexer.
-
-Clusters that serve the [SQLite VFS](/docs/examples/sqlite-vfs) also need per-group admission caps of at least 64 MiB (`standard` or `large` preset) so a 32 MiB commit can be admitted.
 
 ## Without Kubernetes (bare metal / VMs)
 
