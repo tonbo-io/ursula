@@ -424,6 +424,9 @@ Where one database's commit goes (agent pace, p50, ms):
 | measured Pi commit | 9.7 | 16.5 |
 | for reference: raw append, same frame sizes (B3, gateway, 1 writer) | 1.15 | 8.2 |
 
+Measured before #332, which removed the local WAL fsync and the sidecar's fsyncs from the commit
+path (about 4.7 ms of these p50s); not re-measured.
+
 The VFS's append request was 1.4 to 2.8 ms above the raw floor: 4.0 and 10.9 ms at agent pace, and
 3.8 and 9.6 ms for one database flat out. It reuses its connection (one `TIME_WAIT` socket in 15 s of commits), so connection
 setup is not the cause; each of these is a single stream, so the leader's placement differs between
