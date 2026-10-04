@@ -49,7 +49,7 @@ it("attach refuses to recover while another connection has the file open", async
 		{ stdio: ["ignore", "pipe", "inherit"] },
 	);
 	await new Promise<void>((res) => reader.stdout?.once("data", () => res()));
-	expect(() => attach(file, url)).toThrow(/another connection/);
+	expect(() => attach(file, url)).toThrow(/open by another process/);
 	reader.kill("SIGKILL");
 	await new Promise((r) => reader.once("exit", r));
 	attach(file, url);

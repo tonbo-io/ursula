@@ -98,6 +98,30 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # The extension's macOS-only code (the kernel boot id from `kern.bootsessionuuid`) compiles and its
+  # unit test runs only here.
+  sqlite-vfs-macos:
+    name: sqlite-vfs on macOS (extension lint + units)
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      SQLITE3_LIB_DIR: /nonexistent
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+          cache-workspaces: clients/sqlite-vfs
+
+      - name: Lint and unit-test the extension
+        run: |
+          cd clients/sqlite-vfs
+          cargo clippy --locked --release --all-targets -- -D warnings
+          cargo test --locked --release
+
   sqlite-vfs-e2e:
     name: sqlite-vfs e2e (single-node ursula)
     needs: [build-ursula, sqlite-vfs]
@@ -124,7 +148,7 @@ jobs:
           name: sqlite-ursula-vfs
           path: ${{ runner.temp }}/vfs
 
-      - name: e2e (transparency, crash matrix, fencing, recovery, snapshots, Pi conformance, benchmark)
+      - name: e2e (transparency, crash matrix, fencing, recovery, local cache, snapshots, Pi conformance, benchmark)
         timeout-minutes: 30
         run: |
           chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
