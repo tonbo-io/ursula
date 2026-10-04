@@ -7624,9 +7624,10 @@ async fn duplicate_beyond_receipt_window_answers_204_without_ranges() {
 }
 
 /// bounded-stream-state F11: ordinary reads are capped at 8 MiB, like
-/// bootstrap. An offset read ends at the cap whatever the content type; a
-/// record read ends at a record; a capped response is partial and the
-/// continuation from `Stream-Next-Offset` returns the rest.
+/// bootstrap. A capped offset read is partial and the continuation from
+/// `Stream-Next-Offset` returns the rest; a record read ends at a record.
+/// JSON offset reads at the cap are covered by
+/// `capped_and_uncapped_offset_reads_continue_exactly`.
 #[tokio::test]
 async fn reads_are_capped_at_the_server_response_limit() {
     const CAP: usize = 8 * 1024 * 1024;
@@ -7686,27 +7687,6 @@ async fn reads_are_capped_at_the_server_response_limit() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let mut offset = "-1".to_owned();
-    let mut seen = Vec::new();
-    loop {
-        let response = http_get(&app, &format!("/benchcmp/capped-json?offset={offset}")).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let up_to_date = response.headers().get(HEADER_STREAM_UP_TO_DATE).is_some();
-        offset = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
-        let body = body_bytes(response).await;
-        if !up_to_date {
-            assert_eq!(body.len(), CAP, "a capped page fills the cap");
-        }
-        seen.extend_from_slice(&body);
-        if up_to_date {
-            break;
-        }
-    }
-    let expected = records
-        .iter()
-        .map(|record| format!("{record}\n"))
-        .collect::<String>();
-    assert_eq!(seen, expected.as_bytes());
 
     // Record read without max_records stops at a record within the cap.
     let response = http_get(&app, "/benchcmp/capped-json?record=0").await;

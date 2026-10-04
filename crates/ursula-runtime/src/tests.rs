@@ -2833,7 +2833,7 @@ async fn repeated_cold_flush_keeps_hot_bytes_bounded_while_writes_continue() {
 
         let metrics_before_flush = runtime.metrics().snapshot();
         assert!(
-            metrics_before_flush.cold_hot_bytes <= 4 * (16),
+            metrics_before_flush.cold_hot_bytes <= 4 * 16,
             "hot bytes should stay within one unflushed batch per group before flush: {}",
             metrics_before_flush.cold_hot_bytes
         );

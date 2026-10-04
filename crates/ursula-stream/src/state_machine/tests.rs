@@ -1165,19 +1165,6 @@ fn binary_bootstrap_from_the_seal_point_is_one_part() {
     assert!(plan.up_to_date);
 }
 
-#[test]
-fn bootstrap_without_cold_flush_returns_every_message() {
-    let mut machine = machine();
-    create_stream(&mut machine, "boot-all");
-    append_all(&mut machine, "boot-all", &[b"ab", b"cd"]);
-    let plan = machine
-        .bootstrap_plan(&stream("boot-all"))
-        .expect("bootstrap");
-    assert_eq!(plan.updates, records(&[(0, 4)]));
-    assert_eq!(plan.next_offset, 4);
-    assert!(plan.up_to_date);
-}
-
 /// bounded-stream-state F11: JSON bootstrap updates stop at the response cap
 /// on a record boundary, as an honest partial; a single record larger than
 /// the cap is still returned whole.

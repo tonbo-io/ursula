@@ -217,17 +217,17 @@ GET {stream_url}/bootstrap
 
 - `Content-Type: multipart/mixed; boundary=<token>`
 - `Stream-Snapshot-Offset`: The snapshot offset, or `-1` if no snapshot exists.
-- `Stream-Next-Offset`: The offset immediately after the last returned update message. When the response contains no update parts, it is the snapshot point (defined below).
+- `Stream-Next-Offset`: The offset immediately after the last returned update byte. When the response contains no update parts, it is the snapshot point (defined below).
 - `Stream-Up-To-Date: true`: Present when `Stream-Next-Offset` equals the stream's tail offset at the time the response was produced. Otherwise the server MUST either omit the header, as for ordinary reads in the base protocol, or send `false`. Clients MUST treat an absent header as `false`.
 
-The **snapshot point** `S` is the visible snapshot's offset when a snapshot exists, and otherwise the offset of the earliest retained message.
+The **snapshot point** `S` is the visible snapshot's offset when a snapshot exists, and otherwise the earliest retained offset.
 
 **Completeness:**
 
 A server MUST return one of the following:
 
-- **Complete:** one update part for every retained message in `[S, tail)`, with `Stream-Next-Offset` equal to the tail and `Stream-Up-To-Date: true`.
-- **Partial:** one update part for every retained message in `[S, P)` for some boundary `P` with `S ≤ P < tail`, with `Stream-Next-Offset: P` and no `Stream-Up-To-Date: true`. `P` MAY equal `S`, in which case the response contains the snapshot part and no update parts.
+- **Complete:** update parts holding every retained byte in `[S, tail)`, with `Stream-Next-Offset` equal to the tail and `Stream-Up-To-Date: true`.
+- **Partial:** update parts holding the retained bytes in `[S, P)` for some offset `P` with `S ≤ P < tail`, with `Stream-Next-Offset: P` and no `Stream-Up-To-Date: true`. `P` MAY equal `S`, in which case the response contains the snapshot part and no update parts.
 
 In both cases the update parts MUST hold the retained bytes starting exactly at `S`, contiguous and in stream order: a server MUST NOT skip or duplicate any byte between `S` and `Stream-Next-Offset`. For a JSON stream each part MUST be exactly one record. For a non-JSON stream a part MAY contain several consecutive messages, and a part boundary carries no meaning. `Stream-Next-Offset` MUST be an offset that ordinary reads accept, and MUST NOT be below `S`.
 
