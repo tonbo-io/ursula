@@ -1861,38 +1861,30 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
         };
         // Prefix: "quiet" writes twice, "busy" fills and overflows the
         // window, so the snapshot carries evicted state.
-        let mut last_index = 0;
         for seq in 0..2 {
-            last_index = engines[leader_index]
+            engines[leader_index]
                 .append(
                     append(seq, "quiet", 5),
                     placement(),
                     ColdWriteAdmission::default(),
                 )
                 .await
-                .expect("quiet append")
-                .group_commit_index;
+                .expect("quiet append");
         }
         for seq in 0..1_100 {
-            last_index = engines[leader_index]
+            engines[leader_index]
                 .append(
                     append(seq, "busy", 10 + seq),
                     placement(),
                     ColdWriteAdmission::default(),
                 )
                 .await
-                .expect("busy append")
-                .group_commit_index;
+                .expect("busy append");
         }
-        // Raft log index of the prefix (the engine's commit index counts
-        // mutations only).
+        // A lower bound on the prefix's Raft log index; it only sizes the
+        // snapshot and the purge.
+        let last_index = leader_applied_index(&engines[leader_index]);
         let leader = engines[leader_index].raft_handle();
-        last_index = last_index.max(
-            openraft::rt::WatchReceiver::borrow_watched(&leader.metrics())
-                .last_applied
-                .map(|log_id| log_id.index)
-                .expect("leader applied index"),
-        );
         for engine in &engines[..2] {
             engine
                 .raft_handle()
@@ -1949,15 +1941,14 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
         // newest sequence, a duplicate beyond the window and an idle
         // expiry; every replica applies it from its own state.
         for seq in 1_100..1_300 {
-            last_index = engines[leader_index]
+            engines[leader_index]
                 .append(
                     append(seq, "busy", 10 + seq),
                     placement(),
                     ColdWriteAdmission::default(),
                 )
                 .await
-                .expect("busy suffix append")
-                .group_commit_index;
+                .expect("busy suffix append");
         }
         let newest = engines[leader_index]
             .append(
@@ -1986,21 +1977,7 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
             )
             .await
             .expect("quiet after idle expiry");
-        // Wait on the leader's applied Raft log index, which covers every
-        // entry above (the engine's commit index counts mutations only).
-        let leader_applied = openraft::rt::WatchReceiver::borrow_watched(&leader.metrics())
-            .last_applied
-            .map(|log_id| log_id.index)
-            .expect("leader applied index");
-        last_index = leader_applied;
-        for engine in &engines {
-            engine
-                .raft_handle()
-                .wait(Some(Duration::from_secs(10)))
-                .applied_index_at_least(Some(last_index), "every replica applied suffix")
-                .await
-                .expect("wait for replica apply");
-        }
+        apply_barrier(&engines, leader_index, "every replica applied suffix").await;
         let mut producer_states = Vec::new();
         for engine in &engines {
             let snapshot = engine
@@ -2221,17 +2198,8 @@ async fn sparse_marks_scenario(seed: u64) {
         format!("{seed}-{chunk}"),
     )
     .await;
-    // The leader's metrics can lag its own apply; the append's commit index
-    // is the suffix's last entry.
-    let last_index = sparse_marks_append(leader_engine, &stream, &mut next, 25).await;
-    for engine in &engines {
-        engine
-            .raft_handle()
-            .wait(Some(Duration::from_secs(10)))
-            .applied_index_at_least(Some(last_index), "every replica applied suffix")
-            .await
-            .expect("wait for replica apply");
-    }
+    sparse_marks_append(leader_engine, &stream, &mut next, 25).await;
+    apply_barrier(&engines, leader_index, "every replica applied suffix").await;
 
     let model = body(0, next);
     let mut indexes = Vec::new();
@@ -2312,14 +2280,13 @@ fn sparse_marks_body(from: u64, to: u64) -> Vec<u8> {
 }
 
 /// Appends `count` records through the leader and checks the
-/// acknowledgement range comes from apply (Invariant 10). Returns the
-/// append's group commit index.
+/// acknowledgement range comes from apply (Invariant 10).
 async fn sparse_marks_append(
     leader: &mut RaftGroupEngine,
     stream: &BucketStreamId,
     next: &mut u64,
     count: u64,
-) -> u64 {
+) {
     let from = *next;
     *next += count;
     let mut request = AppendRequest::from_bytes(stream.clone(), sparse_marks_body(from, *next));
@@ -2335,7 +2302,6 @@ async fn sparse_marks_append(
             next_record: *next,
         })
     );
-    response.group_commit_index
 }
 
 /// Flushes the whole hot prefix in cuts of at most `max` bytes.
@@ -2677,8 +2643,7 @@ async fn external_locator_ambiguity(variant: LocatorAmbiguity) {
         }
     }
 
-    let applied = leader_applied_index(&engines[leader]);
-    wait_all_nodes_applied(&engines, applied, "every replica applied the offloads").await;
+    apply_barrier(&engines, leader, "every replica applied the offloads").await;
     let mut acknowledged = b"base;".to_vec();
     if ambiguous_committed {
         acknowledged.extend_from_slice(&ambiguous);
@@ -2751,22 +2716,24 @@ fn external_locators_survive_ambiguous_commits() {
 }
 
 /// Waits until every replica applied everything the leader committed so
-/// far: creates a fresh stream (its commit index follows every earlier
-/// entry) and waits for all nodes to apply it. The leader's metrics can lag
-/// its own apply, so they are not a reliable barrier.
-async fn apply_barrier(engines: &mut [RaftGroupEngine], leader_index: usize, name: &str) {
-    let created = engines[leader_index]
-        .create_stream(
-            CreateStreamRequest::new(
-                BucketStreamId::new("simulated", name),
-                "application/octet-stream",
-            ),
-            placement(),
-            ColdWriteAdmission::default(),
-        )
+/// far. The barrier is the leader's read log id (`ReadIndex`), a Raft log
+/// index. A response's `group_commit_index` is not one: it counts mutating
+/// stream outcomes (a batch adds one per item; blank, membership and no-op
+/// entries add nothing), so it can trail or lead the entry's log index. The
+/// leader's metrics can lag its own apply, so they are not a reliable
+/// barrier either.
+async fn apply_barrier(
+    engines: &[RaftGroupEngine],
+    leader_index: usize,
+    description: &'static str,
+) {
+    let read_log_id = engines[leader_index]
+        .raft_handle()
+        .ensure_linearizable(openraft::ReadPolicy::ReadIndex)
         .await
-        .expect("barrier stream");
-    wait_all_nodes_applied(engines, created.group_commit_index, "apply barrier").await;
+        .expect("leader read index")
+        .expect("leader committed log id");
+    wait_all_nodes_applied(engines, read_log_id.index(), description).await;
 }
 
 /// Seeds of the level-3 snapshot-install family: a learner installs a
@@ -2896,7 +2863,7 @@ async fn external_locator_snapshot_install(seed: u64) {
         .await
         .expect("add learner");
     assert!(registry.full_snapshot_count(learner_id) >= 1);
-    apply_barrier(&mut engines, leader_index, "barrier-install").await;
+    apply_barrier(&engines, leader_index, "barrier-install").await;
 
     // Invariants 11 and 12 with the refs still staged.
     let tail = acknowledged.len();
@@ -2953,7 +2920,7 @@ async fn external_locator_snapshot_install(seed: u64) {
             break;
         }
     }
-    apply_barrier(&mut engines, leader_index, "barrier-offload").await;
+    apply_barrier(&engines, leader_index, "barrier-offload").await;
     for (index, engine) in engines.iter_mut().enumerate() {
         let node_id = u64::try_from(index + 1).expect("node id fits u64");
         read_local_payload_eventually(
@@ -3117,7 +3084,7 @@ async fn ambiguous_compaction_at_level_three(commits: bool) {
         },
         gc_not_before_ms: u64::MAX,
     };
-    apply_barrier(&mut engines, leader, "barrier-prefix").await;
+    apply_barrier(&engines, leader, "barrier-prefix").await;
     if commits {
         // The compaction commits; then its leader loses quorum.
         engines[leader]
@@ -3170,7 +3137,7 @@ async fn ambiguous_compaction_at_level_three(commits: bool) {
     }
     assert!(appended, "the current leader accepts appends");
     acknowledged.extend_from_slice(&tail_part);
-    apply_barrier(&mut engines, leader, "barrier-suffix").await;
+    apply_barrier(&engines, leader, "barrier-suffix").await;
 
     // Invariant 11 on every replica.
     let tail = acknowledged.len();
