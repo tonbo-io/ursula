@@ -325,7 +325,7 @@ Servers SHOULD include `Stream-Snapshot-Offset` when a latest visible snapshot e
 
 - Absence of `Stream-Snapshot-Offset` means the stream has no visible snapshot.
 - When present, the value MUST refer to the same latest visible snapshot that `GET {stream_url}/snapshot` would resolve to.
-- `Stream-Incarnation` MUST change when the stream is deleted and recreated at the same URL, and MUST NOT change otherwise. Clients MUST compare it only for equality. Offsets do not identify an incarnation, so a client that stores offsets and snapshot offsets across a possible recreate SHOULD store the incarnation with them and check it on `HEAD` before resuming.
+- A server implementing this extension MUST send `Stream-Incarnation` on every successful `HEAD`. It MUST change when the stream is deleted and recreated at the same URL, and MUST NOT change otherwise. Clients MUST compare it only for equality. Offsets do not identify an incarnation, so a client that stores offsets and snapshot offsets across a possible recreate SHOULD store the incarnation with them and check it on `HEAD` before resuming. An operator restore from backup keeps each stream's incarnation although it can rewind the stream to the backup's tail; offsets read after the backup was taken are not valid on the restored stream.
 
 ### 2.5. Read Snapshot
 

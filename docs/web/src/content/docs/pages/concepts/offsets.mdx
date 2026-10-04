@@ -29,7 +29,7 @@ Offsets are stable across snapshot publishes. Publishing a snapshot at an offset
 
 ## Recreated streams
 
-An offset doesn't identify which stream it came from. If a stream is deleted and recreated at the same URL, an offset saved from the old stream may be accepted by the new one and return the new stream's data. `HEAD` returns a `Stream-Incarnation` token that changes when a stream is deleted and recreated. A client that keeps offsets across a possible recreate should store the incarnation with them and compare it for equality before resuming.
+An offset doesn't identify which stream it came from. If a stream is deleted and recreated at the same URL, an offset saved from the old stream may be accepted by the new one and return the new stream's data. `HEAD` returns a `Stream-Incarnation` token that changes when a stream is deleted and recreated. A client that keeps offsets across a possible recreate should store the incarnation with them and compare it for equality before resuming. A restore from backup keeps the incarnation but can rewind the stream to the backup's tail, so offsets read after that backup was taken are not valid on the restored stream.
 
 ## Related
 
