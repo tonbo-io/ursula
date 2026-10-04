@@ -22,23 +22,17 @@ use crate::engine::GroupEngine;
 use crate::engine::GroupEngineError;
 use crate::engine::GroupEngineFactory;
 use crate::engine::GroupEngineMetrics;
-use crate::engine::GroupWriteResponse;
 use crate::error::RuntimeError;
-use crate::group_actor::AppendBatchEntry;
 use crate::group_actor::GroupActor;
 use crate::group_actor::GroupCommand;
 use crate::group_actor::GroupMailbox;
-use crate::group_actor::PendingAppendBatch;
 use crate::metrics::RuntimeMetricsInner;
-use crate::metrics::append_batch_payload_bytes;
 use crate::metrics::elapsed_ns;
 use crate::metrics::record_cold_backpressure_error;
 use crate::metrics::record_write_hot_backlog;
 use crate::request::AckColdGcResponse;
 use crate::request::AdvanceRetentionRequest;
 use crate::request::AdvanceRetentionResponse;
-use crate::request::AppendBatchRequest;
-use crate::request::AppendBatchResponse;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
 use crate::request::AppendResponse;
@@ -148,13 +142,6 @@ pub(crate) struct CoreWorker {
     pub(crate) raft_uncommitted_bytes: SharedRaftUncommittedBytes,
     pub(crate) live_read_max_waiters_per_core: Option<u64>,
     pub(crate) read_materialization: Arc<Semaphore>,
-}
-
-#[derive(Clone)]
-pub(crate) struct AppendBatchRuntime {
-    pub(crate) metrics: Arc<RuntimeMetricsInner>,
-    pub(crate) read_materialization: Arc<Semaphore>,
-    pub(crate) placement: ShardPlacement,
 }
 
 pub(crate) type ReadWatchers = HashMap<BucketStreamId, Vec<ReadWatcher>>;
@@ -1605,172 +1592,6 @@ impl CoreWorker {
             .await;
         }
         Ok(response)
-    }
-
-    pub(crate) fn prepare_append_batch_requests(
-        batch: Vec<AppendBatchEntry>,
-    ) -> (Vec<AppendBatchRequest>, Vec<PendingAppendBatch>) {
-        let mut requests = Vec::with_capacity(batch.len());
-        let mut pending = Vec::with_capacity(batch.len());
-        for (request, response_tx, raft_uncommitted) in batch {
-            pending.push(PendingAppendBatch {
-                stream_id: request.stream_id.clone(),
-                incoming_bytes: append_batch_payload_bytes(&request),
-                response_tx,
-                started_at: Instant::now(),
-                raft_uncommitted,
-            });
-            requests.push(request);
-        }
-        (requests, pending)
-    }
-
-    // The `core.append_batch` span is created by the caller so it can link
-    // (follows_from) every coalesced request, not just the triggering one.
-    pub(crate) async fn apply_prepared_append_batch_requests(
-        group: &mut Box<dyn GroupEngine>,
-        runtime: AppendBatchRuntime,
-        read_watchers: &mut ReadWatchers,
-        pending: Vec<PendingAppendBatch>,
-        requests: Vec<AppendBatchRequest>,
-        admission: ColdWriteAdmission,
-    ) {
-        let exec_started_at = Instant::now();
-        let responses = group
-            .append_batch_many(requests, runtime.placement, admission)
-            .await
-            .map_err(|err| RuntimeError::group_engine(runtime.placement, err));
-        runtime.metrics.record_group_engine_exec(
-            runtime.placement.core_id,
-            runtime.placement.raft_group_id,
-            elapsed_ns(exec_started_at),
-        );
-        Self::finish_append_batch_commands(
-            group,
-            runtime,
-            read_watchers,
-            pending,
-            responses,
-            admission,
-        )
-        .await;
-    }
-
-    pub(crate) async fn finish_append_batch_commands(
-        group: &mut Box<dyn GroupEngine>,
-        runtime: AppendBatchRuntime,
-        read_watchers: &mut ReadWatchers,
-        pending: Vec<PendingAppendBatch>,
-        responses: Result<Vec<Result<GroupWriteResponse, GroupEngineError>>, RuntimeError>,
-        admission: ColdWriteAdmission,
-    ) {
-        let placement = runtime.placement;
-        let responses = match responses {
-            Ok(responses) => responses,
-            Err(err) => {
-                for pending in pending {
-                    if admission.is_enabled()
-                        && let RuntimeError::GroupEngine { error, .. } = &err
-                        && error.is_cold_backpressure()
-                    {
-                        runtime.metrics.record_cold_backpressure(
-                            placement.core_id,
-                            placement.raft_group_id,
-                            pending.incoming_bytes,
-                            admission.max_hot_bytes_per_group.unwrap_or(0),
-                        );
-                    }
-                    let _ = pending.response_tx.send(Err(err.clone()));
-                }
-                return;
-            }
-        };
-
-        if responses.len() != pending.len() {
-            let err = RuntimeError::GroupEngine {
-                core_id: placement.core_id,
-                raft_group_id: placement.raft_group_id,
-                error: GroupEngineError::new(format!(
-                    "batched append response count {} does not match request count {}",
-                    responses.len(),
-                    pending.len()
-                )),
-            };
-            for pending in pending {
-                let _ = pending.response_tx.send(Err(err.clone()));
-            }
-            return;
-        }
-
-        for (pending, response) in pending.into_iter().zip(responses) {
-            let response = match response {
-                Ok(GroupWriteResponse::AppendBatch(response)) => Ok(response),
-                Ok(other) => Err(RuntimeError::GroupEngine {
-                    core_id: placement.core_id,
-                    raft_group_id: placement.raft_group_id,
-                    error: GroupEngineError::new(format!(
-                        "unexpected batched append response: {other:?}"
-                    )),
-                }),
-                Err(err) => Err(RuntimeError::group_engine(placement, err)),
-            };
-
-            match response {
-                Ok(response) => {
-                    let success_count = response
-                        .items
-                        .iter()
-                        .filter(|item| matches!(item, Ok(response) if !response.deduplicated))
-                        .count();
-                    if success_count > 0 {
-                        let success_count = u64::try_from(success_count).expect("count fits u64");
-                        runtime.metrics.record_append_batch(
-                            placement.core_id,
-                            placement.raft_group_id,
-                            success_count,
-                        );
-                        runtime.metrics.record_applied_mutation_batch(
-                            placement.core_id,
-                            placement.raft_group_id,
-                            success_count,
-                            elapsed_ns(pending.started_at),
-                        );
-                        Self::notify_read_watchers(
-                            group,
-                            runtime.metrics.clone(),
-                            runtime.read_materialization.clone(),
-                            read_watchers,
-                            &pending.stream_id,
-                            placement,
-                        )
-                        .await;
-                    }
-
-                    let items = response
-                        .items
-                        .into_iter()
-                        .map(|item| item.map_err(|err| RuntimeError::group_engine(placement, err)))
-                        .collect();
-                    let _ = pending
-                        .response_tx
-                        .send(Ok(AppendBatchResponse { placement, items }));
-                }
-                Err(err) => {
-                    if admission.is_enabled()
-                        && let RuntimeError::GroupEngine { error, .. } = &err
-                        && error.is_cold_backpressure()
-                    {
-                        runtime.metrics.record_cold_backpressure(
-                            placement.core_id,
-                            placement.raft_group_id,
-                            pending.incoming_bytes,
-                            admission.max_hot_bytes_per_group.unwrap_or(0),
-                        );
-                    }
-                    let _ = pending.response_tx.send(Err(err));
-                }
-            }
-        }
     }
 
     pub(crate) async fn notify_read_watchers(

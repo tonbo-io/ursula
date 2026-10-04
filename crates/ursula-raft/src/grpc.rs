@@ -697,7 +697,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 .map(|payload| decode_wire(&payload, "group command"))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
-            let results = write_commands_on_raft(raft, placement, None, commands)
+            let results = write_commands_on_raft(raft, commands)
                 .await
                 .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?
                 .into_iter()
@@ -772,7 +772,6 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             let mut engine = RaftGroupEngine {
                 raft,
                 placement,
-                metrics: None,
                 cold_store: self.cold_store.clone(),
                 // The group's shared page cache (bounded-state F13), which
                 // apply-time invalidation reaches; a request-scoped cache only

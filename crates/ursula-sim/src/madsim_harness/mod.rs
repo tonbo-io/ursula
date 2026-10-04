@@ -36,7 +36,6 @@ use ursula_raft::RaftGroupEngineFactory;
 use ursula_raft::RaftGroupLogStore;
 use ursula_raft::RaftGroupStateMachine;
 use ursula_raft::UrsulaRaftTypeConfig;
-use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::AppendResponse;
@@ -53,7 +52,6 @@ use ursula_runtime::CreateStreamExternalRequest;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::DeleteStreamRequest;
 use ursula_runtime::FlushColdRequest;
-use ursula_runtime::GroupAppendBatchFuture;
 use ursula_runtime::GroupAppendFuture;
 use ursula_runtime::GroupBootstrapStreamFuture;
 use ursula_runtime::GroupBucketUsageFuture;
@@ -84,7 +82,7 @@ use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
 use ursula_runtime::GroupStateGaugesFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
-use ursula_runtime::GroupWriteBatchFuture;
+#[cfg(test)]
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::InMemoryGroupEngineFactory;
@@ -1297,30 +1295,6 @@ impl GroupEngine for MadsimScopedGroupEngine {
         }))
     }
 
-    fn append_batch<'a>(
-        &'a mut self,
-        request: AppendBatchRequest,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> GroupAppendBatchFuture<'a> {
-        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
-            self.inner.append_batch(request, placement, admission).await
-        }))
-    }
-
-    fn append_batch_many<'a>(
-        &'a mut self,
-        requests: Vec<AppendBatchRequest>,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> GroupWriteBatchFuture<'a> {
-        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
-            self.inner
-                .append_batch_many(requests, placement, admission)
-                .await
-        }))
-    }
-
     fn flush_cold<'a>(
         &'a mut self,
         request: FlushColdRequest,
@@ -1382,16 +1356,6 @@ impl GroupEngine for MadsimScopedGroupEngine {
     fn shutdown<'a>(&'a mut self) -> GroupShutdownFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
             self.inner.shutdown().await
-        }))
-    }
-
-    fn write_batch<'a>(
-        &'a mut self,
-        commands: Vec<GroupWriteCommand>,
-        placement: ShardPlacement,
-    ) -> GroupWriteBatchFuture<'a> {
-        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
-            self.inner.write_batch(commands, placement).await
         }))
     }
 }
@@ -1531,26 +1495,50 @@ pub(super) fn runtime_raft_network_streams(
         .collect()
 }
 
-pub(super) fn runtime_raft_network_batch_payloads(
+/// Payloads of one workload round on one stream, each appended on its own.
+/// The `b{round}` text predates single appends and is kept so recorded
+/// offsets stay comparable.
+pub(super) fn runtime_raft_network_payloads(
     stream_index: usize,
-    batch_index: usize,
-    batch_len: usize,
+    round: usize,
+    count: usize,
 ) -> Vec<Vec<u8>> {
-    (0..batch_len.max(1))
-        .map(|item_index| format!("s{stream_index}:b{batch_index}:i{item_index};").into_bytes())
+    (0..count.max(1))
+        .map(|item_index| format!("s{stream_index}:b{round}:i{item_index};").into_bytes())
         .collect()
 }
 
 pub(super) fn runtime_raft_network_duplicate_payloads(
     stream_index: usize,
-    batch_index: usize,
-    batch_len: usize,
+    round: usize,
+    count: usize,
 ) -> Vec<Vec<u8>> {
-    (0..batch_len.max(1))
-        .map(|item_index| {
-            format!("duplicate:s{stream_index}:b{batch_index}:i{item_index};").into_bytes()
-        })
+    (0..count.max(1))
+        .map(|item_index| format!("duplicate:s{stream_index}:b{round}:i{item_index};").into_bytes())
         .collect()
+}
+
+/// Appends `payloads` in order, one single append each (the path the SQLite
+/// VFS uses). With a producer, payload `i` carries sequence
+/// `producer.producer_seq + i`, so a retry of the same payload list under the
+/// same producer is answered item by item from the producer receipts.
+pub(super) async fn append_payloads(
+    runtime: &ShardRuntime,
+    stream: &BucketStreamId,
+    payloads: &[Vec<u8>],
+    producer: Option<&ProducerRequest>,
+) -> Result<Vec<AppendResponse>, RuntimeError> {
+    let mut responses = Vec::with_capacity(payloads.len());
+    for (item_index, payload) in payloads.iter().enumerate() {
+        let mut request = AppendRequest::from_bytes(stream.clone(), payload.clone());
+        request.producer = producer.map(|producer| ProducerRequest {
+            producer_seq: producer.producer_seq
+                + u64::try_from(item_index).expect("payload index fits u64"),
+            ..producer.clone()
+        });
+        responses.push(runtime.append(request).await?);
+    }
+    Ok(responses)
 }
 
 pub(super) async fn verify_runtime_raft_partial_read(
@@ -1953,33 +1941,18 @@ pub(super) fn assert_runtime_raft_producer_duplicate(
 
 pub(super) fn assert_runtime_raft_producer_stale_epoch(
     stream: &BucketStreamId,
-    result: Result<ursula_runtime::AppendBatchResponse, RuntimeError>,
+    result: Result<Vec<AppendResponse>, RuntimeError>,
 ) {
     match result {
-        Ok(batch) => {
-            assert!(
-                !batch.items.is_empty(),
-                "runtime raft stale producer epoch returned an empty batch for {stream}"
-            );
-            for (item_index, item) in batch.items.into_iter().enumerate() {
-                match item {
-                    Ok(response) => panic!(
-                        "runtime raft stale producer epoch item {item_index} for {stream} unexpectedly appended at offset {}",
-                        response.start_offset
-                    ),
-                    Err(err) => assert_runtime_raft_stale_epoch_error(stream, &err),
-                }
-            }
-        }
-        Err(err) => assert_runtime_raft_stale_epoch_error(stream, &err),
+        Ok(items) => panic!(
+            "runtime raft stale producer epoch for {stream} unexpectedly appended {} item(s)",
+            items.len()
+        ),
+        Err(err) => assert!(
+            err.to_string().contains("ProducerEpochStale"),
+            "runtime raft stale producer epoch for {stream} returned unexpected error: {err}"
+        ),
     }
-}
-
-fn assert_runtime_raft_stale_epoch_error(stream: &BucketStreamId, err: &RuntimeError) {
-    assert!(
-        err.to_string().contains("ProducerEpochStale"),
-        "runtime raft stale producer epoch for {stream} returned unexpected error: {err}"
-    );
 }
 
 pub(super) async fn wait_raft_applied_index_at_least(

@@ -49,7 +49,7 @@ pub struct GroupStateGauges {
     pub max_producers_per_stream: u64,
     /// Producer receipts across streams (F3).
     pub receipts: u64,
-    /// Receipt items (one per batch item, at least one per receipt) plus each
+    /// Receipt items (one per receipt; legacy receipts may hold more) plus each
     /// producer's `last_items` (F3 window target: 1,024 per stream).
     pub receipt_items: u64,
     /// Largest receipt-item count held by one stream.

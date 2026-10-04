@@ -1,9 +1,7 @@
-use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use tracing::Instrument;
-use tracing::Span;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
@@ -16,19 +14,15 @@ use crate::cold_index::RepairColdIndexResponse;
 use crate::cold_refs::ColdOrphanSweepPlan;
 use crate::cold_refs::ColdOrphanSweepRequest;
 use crate::command::GroupSnapshot;
-use crate::core_worker::AppendBatchRuntime;
 use crate::core_worker::CoreWorker;
 use crate::core_worker::ReadWatcher;
 use crate::core_worker::ReadWatchers;
 use crate::engine::GroupEngine;
 use crate::error::RuntimeError;
-use crate::metrics::GROUP_ACTOR_MAX_WRITE_BATCH;
 use crate::metrics::RuntimeMetricsInner;
 use crate::request::AckColdGcResponse;
 use crate::request::AdvanceRetentionRequest;
 use crate::request::AdvanceRetentionResponse;
-use crate::request::AppendBatchRequest;
-use crate::request::AppendBatchResponse;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
 use crate::request::AppendResponse;
@@ -69,7 +63,6 @@ use crate::request::TidyStreamsResponse;
 use crate::rt::sync::Semaphore;
 use crate::rt::sync::mpsc;
 use crate::rt::sync::oneshot;
-use crate::rt::time::Instant;
 use crate::trace::Traced;
 
 #[derive(Clone)]
@@ -105,58 +98,33 @@ impl GroupMailbox {
     }
 }
 
-/// (request, response channel, optional raft-uncommitted credit) tuple
-/// passed through the append-batch hot path. Aliased to keep clippy's
-/// type-complexity lint happy.
-pub(crate) type AppendBatchEntry = (
-    AppendBatchRequest,
-    oneshot::Sender<Result<AppendBatchResponse, RuntimeError>>,
-    Option<UncommittedBytesGuard>,
-);
-
-pub(crate) struct PendingAppendBatch {
-    pub(crate) stream_id: BucketStreamId,
-    pub(crate) incoming_bytes: u64,
-    pub(crate) response_tx: oneshot::Sender<Result<AppendBatchResponse, RuntimeError>>,
-    pub(crate) started_at: Instant,
-    /// Released when this pending entry resolves (success or error), so the
-    /// per-group raft uncommitted-bytes counter decrements once apply
-    /// completes. The field is "unused" — its Drop is the load-bearing side
-    /// effect.
-    #[allow(dead_code)]
-    pub(crate) raft_uncommitted: Option<UncommittedBytesGuard>,
-}
-
 /// Resolves a `handle { ... }` argument keyword from the operation manifest
 /// ([`crate::ops::runtime_operations`]) to the matching group-actor
 /// expression. Any identifier that is not a context keyword falls through to
 /// the like-named binding destructured from the command variant.
 macro_rules! group_op_arg {
-    ($actor:ident, $pending:ident, engine) => {
+    ($actor:ident, engine) => {
         &mut $actor.engine
     };
-    ($actor:ident, $pending:ident, metrics) => {
+    ($actor:ident, metrics) => {
         $actor.metrics.clone()
     };
-    ($actor:ident, $pending:ident, read_materialization) => {
+    ($actor:ident, read_materialization) => {
         $actor.read_materialization.clone()
     };
-    ($actor:ident, $pending:ident, read_watchers) => {
+    ($actor:ident, read_watchers) => {
         &mut $actor.read_watchers
     };
-    ($actor:ident, $pending:ident, placement) => {
+    ($actor:ident, placement) => {
         $actor.placement
     };
-    ($actor:ident, $pending:ident, core_id) => {
+    ($actor:ident, core_id) => {
         $actor.placement.core_id
     };
-    ($actor:ident, $pending:ident, cold_admission) => {
+    ($actor:ident, cold_admission) => {
         $actor.cold_write_admission
     };
-    ($actor:ident, $pending:ident, pending) => {
-        $pending
-    };
-    ($actor:ident, $pending:ident, $field:ident) => {
+    ($actor:ident, $field:ident) => {
         $field
     };
 }
@@ -170,7 +138,7 @@ macro_rules! group_op_arg {
 macro_rules! group_operations {
     // `call` without an admission guard: await the worker, send the result.
     (@munch
-        ctx { $actor:ident $pending:ident $err:ident $guard:ident }
+        ctx { $actor:ident $err:ident $guard:ident }
         variants { $($variants:tt)* }
         rejects { $($rejects:tt)* }
         attach { $($attach:tt)* }
@@ -189,7 +157,7 @@ macro_rules! group_operations {
     ) => {
         group_operations! {
             @munch
-            ctx { $actor $pending $err $guard }
+            ctx { $actor $err $guard }
             variants {
                 $($variants)*
                 $(#[$attr])*
@@ -211,7 +179,7 @@ macro_rules! group_operations {
                 $(#[$attr])*
                 GroupCommand::$Variant { $($field,)* $tx } => {
                     let response =
-                        CoreWorker::$worker($(group_op_arg!($actor, $pending, $arg)),*).await;
+                        CoreWorker::$worker($(group_op_arg!($actor, $arg)),*).await;
                     let _ = $tx.send(response);
                     ControlFlow::Continue(())
                 }
@@ -222,7 +190,7 @@ macro_rules! group_operations {
     // `call` with an admission guard: hold the guard across apply, drop it
     // before sending the result.
     (@munch
-        ctx { $actor:ident $pending:ident $err:ident $guard:ident }
+        ctx { $actor:ident $err:ident $guard:ident }
         variants { $($variants:tt)* }
         rejects { $($rejects:tt)* }
         attach { $($attach:tt)* }
@@ -241,7 +209,7 @@ macro_rules! group_operations {
     ) => {
         group_operations! {
             @munch
-            ctx { $actor $pending $err $guard }
+            ctx { $actor $err $guard }
             variants {
                 $($variants)*
                 $(#[$attr])*
@@ -272,7 +240,7 @@ macro_rules! group_operations {
                 $(#[$attr])*
                 GroupCommand::$Variant { $($field,)* $tx, $g } => {
                     let response =
-                        CoreWorker::$worker($(group_op_arg!($actor, $pending, $arg)),*).await;
+                        CoreWorker::$worker($(group_op_arg!($actor, $arg)),*).await;
                     drop($g);
                     let _ = $tx.send(response);
                     ControlFlow::Continue(())
@@ -283,7 +251,7 @@ macro_rules! group_operations {
     };
     // `tail`: the worker consumes the reply channel itself.
     (@munch
-        ctx { $actor:ident $pending:ident $err:ident $guard:ident }
+        ctx { $actor:ident $err:ident $guard:ident }
         variants { $($variants:tt)* }
         rejects { $($rejects:tt)* }
         attach { $($attach:tt)* }
@@ -302,7 +270,7 @@ macro_rules! group_operations {
     ) => {
         group_operations! {
             @munch
-            ctx { $actor $pending $err $guard }
+            ctx { $actor $err $guard }
             variants {
                 $($variants)*
                 $(#[$attr])*
@@ -323,7 +291,7 @@ macro_rules! group_operations {
                 $($handles)*
                 $(#[$attr])*
                 GroupCommand::$Variant { $($field,)* $tx } => {
-                    CoreWorker::$worker($(group_op_arg!($actor, $pending, $arg)),*).await;
+                    CoreWorker::$worker($(group_op_arg!($actor, $arg)),*).await;
                     ControlFlow::Continue(())
                 }
             }
@@ -332,7 +300,7 @@ macro_rules! group_operations {
     };
     // `sync`: synchronous worker call, no reply channel to reject on error.
     (@munch
-        ctx { $actor:ident $pending:ident $err:ident $guard:ident }
+        ctx { $actor:ident $err:ident $guard:ident }
         variants { $($variants:tt)* }
         rejects { $($rejects:tt)* }
         attach { $($attach:tt)* }
@@ -351,7 +319,7 @@ macro_rules! group_operations {
     ) => {
         group_operations! {
             @munch
-            ctx { $actor $pending $err $guard }
+            ctx { $actor $err $guard }
             variants {
                 $($variants)*
                 $(#[$attr])*
@@ -369,7 +337,7 @@ macro_rules! group_operations {
                 $($handles)*
                 $(#[$attr])*
                 GroupCommand::$Variant { $($field),* } => {
-                    CoreWorker::$worker($(group_op_arg!($actor, $pending, $arg)),*);
+                    CoreWorker::$worker($(group_op_arg!($actor, $arg)),*);
                     ControlFlow::Continue(())
                 }
             }
@@ -380,7 +348,7 @@ macro_rules! group_operations {
     // method returning the loop `ControlFlow`. Must precede the guarded
     // `actor` rule so `guard { none }` is not captured as a guard name.
     (@munch
-        ctx { $actor:ident $pending:ident $err:ident $guard:ident }
+        ctx { $actor:ident $err:ident $guard:ident }
         variants { $($variants:tt)* }
         rejects { $($rejects:tt)* }
         attach { $($attach:tt)* }
@@ -399,7 +367,7 @@ macro_rules! group_operations {
     ) => {
         group_operations! {
             @munch
-            ctx { $actor $pending $err $guard }
+            ctx { $actor $err $guard }
             variants {
                 $($variants)*
                 $(#[$attr])*
@@ -420,16 +388,16 @@ macro_rules! group_operations {
                 $($handles)*
                 $(#[$attr])*
                 GroupCommand::$Variant { $($field,)* $tx } => {
-                    $actor.$method($(group_op_arg!($actor, $pending, $arg)),*).await
+                    $actor.$method($(group_op_arg!($actor, $arg)),*).await
                 }
             }
             rest { $($rest)* }
         }
     };
     // `actor` with an admission guard: delegate to a hand-written
-    // `GroupActor` method that owns the guard (append-batch coalescing).
+    // `GroupActor` method that owns the guard.
     (@munch
-        ctx { $actor:ident $pending:ident $err:ident $guard:ident }
+        ctx { $actor:ident $err:ident $guard:ident }
         variants { $($variants:tt)* }
         rejects { $($rejects:tt)* }
         attach { $($attach:tt)* }
@@ -448,7 +416,7 @@ macro_rules! group_operations {
     ) => {
         group_operations! {
             @munch
-            ctx { $actor $pending $err $guard }
+            ctx { $actor $err $guard }
             variants {
                 $($variants)*
                 $(#[$attr])*
@@ -478,14 +446,14 @@ macro_rules! group_operations {
                 $($handles)*
                 $(#[$attr])*
                 GroupCommand::$Variant { $($field,)* $tx, $g } => {
-                    $actor.$method($(group_op_arg!($actor, $pending, $arg)),*).await
+                    $actor.$method($(group_op_arg!($actor, $arg)),*).await
                 }
             }
             rest { $($rest)* }
         }
     };
     (@munch
-        ctx { $actor:ident $pending:ident $err:ident $guard:ident }
+        ctx { $actor:ident $err:ident $guard:ident }
         variants { $($variants:tt)* }
         rejects { $($rejects:tt)* }
         attach { $($attach:tt)* }
@@ -522,13 +490,8 @@ macro_rules! group_operations {
         }
 
         impl GroupActor {
-            pub(crate) async fn handle(
-                &mut self,
-                command: GroupCommand,
-                pending: &mut VecDeque<Traced<GroupCommand>>,
-            ) -> ControlFlow<()> {
+            pub(crate) async fn handle(&mut self, command: GroupCommand) -> ControlFlow<()> {
                 let $actor = self;
-                let $pending = pending;
                 match command {
                     $($handles)*
                 }
@@ -538,7 +501,7 @@ macro_rules! group_operations {
     ($($manifest:tt)*) => {
         group_operations! {
             @munch
-            ctx { actor pending err raft_uncommitted }
+            ctx { actor err raft_uncommitted }
             variants {}
             rejects {}
             attach {}
@@ -563,24 +526,18 @@ pub(crate) struct GroupActor {
 
 impl GroupActor {
     pub(crate) async fn run(mut self) {
-        let mut pending = VecDeque::new();
         let mut explicitly_shutdown = false;
         loop {
             let Some(Traced {
                 value: command,
                 parent,
-            }) = self.next_command(&mut pending).await
+            }) = self.next_command().await
             else {
                 break;
             };
             // Re-establish the sender's span so on-core apply work links back to
             // the originating request.
-            if self
-                .handle(command, &mut pending)
-                .instrument(parent)
-                .await
-                .is_break()
-            {
+            if self.handle(command).instrument(parent).await.is_break() {
                 explicitly_shutdown = true;
                 break;
             }
@@ -661,47 +618,6 @@ impl GroupActor {
         ControlFlow::Continue(())
     }
 
-    async fn handle_append_batch(
-        &mut self,
-        request: AppendBatchRequest,
-        response_tx: oneshot::Sender<Result<AppendBatchResponse, RuntimeError>>,
-        raft_uncommitted: Option<UncommittedBytesGuard>,
-        pending: &mut VecDeque<Traced<GroupCommand>>,
-    ) -> ControlFlow<()> {
-        let mut batch = vec![(request, response_tx, raft_uncommitted)];
-        let mut coalesced_parents = Vec::new();
-        self.collect_append_batch_commands(pending, &mut batch, &mut coalesced_parents);
-        // One apply span for the coalesced batch: a child of the
-        // triggering request (the current span), linked via
-        // follows_from to every other coalesced request so their
-        // traces show the shared apply instead of being silently
-        // attributed to the triggering request alone.
-        let span = tracing::debug_span!(
-            "core.append_batch",
-            group = self.placement.raft_group_id.0,
-            batch = batch.len(),
-        );
-        for parent in &coalesced_parents {
-            span.follows_from(parent);
-        }
-        let (requests, pending_batch) = CoreWorker::prepare_append_batch_requests(batch);
-        CoreWorker::apply_prepared_append_batch_requests(
-            &mut self.engine,
-            AppendBatchRuntime {
-                metrics: self.metrics.clone(),
-                read_materialization: self.read_materialization.clone(),
-                placement: self.placement,
-            },
-            &mut self.read_watchers,
-            pending_batch,
-            requests,
-            self.cold_write_admission,
-        )
-        .instrument(span)
-        .await;
-        ControlFlow::Continue(())
-    }
-
     async fn handle_append_transaction(
         &mut self,
         request: AppendTransactionRequest,
@@ -766,62 +682,12 @@ impl GroupActor {
         ControlFlow::Break(())
     }
 
-    pub(crate) async fn next_command(
-        &mut self,
-        pending: &mut VecDeque<Traced<GroupCommand>>,
-    ) -> Option<Traced<GroupCommand>> {
-        match pending.pop_front() {
-            Some(command) => Some(command),
-            None => {
-                let command = self.rx.recv().await;
-                if command.is_some() {
-                    self.metrics
-                        .record_group_mailbox_dequeued(self.placement.raft_group_id);
-                }
-                command
-            }
+    pub(crate) async fn next_command(&mut self) -> Option<Traced<GroupCommand>> {
+        let command = self.rx.recv().await;
+        if command.is_some() {
+            self.metrics
+                .record_group_mailbox_dequeued(self.placement.raft_group_id);
         }
-    }
-
-    pub(crate) fn collect_append_batch_commands(
-        &mut self,
-        pending: &mut VecDeque<Traced<GroupCommand>>,
-        batch: &mut Vec<AppendBatchEntry>,
-        coalesced_parents: &mut Vec<Span>,
-    ) {
-        while batch.len() < GROUP_ACTOR_MAX_WRITE_BATCH {
-            let command = match pending.pop_front() {
-                Some(command) => Some(command),
-                None => match self.rx.try_recv() {
-                    Ok(command) => {
-                        self.metrics
-                            .record_group_mailbox_dequeued(self.placement.raft_group_id);
-                        Some(command)
-                    }
-                    Err(_) => None,
-                },
-            };
-            match command {
-                // Coalesced appends carry distinct parent spans; keep each so
-                // the batch apply span can follows_from-link them all.
-                Some(Traced {
-                    value:
-                        GroupCommand::AppendBatch {
-                            request,
-                            response_tx,
-                            raft_uncommitted,
-                        },
-                    parent,
-                }) => {
-                    batch.push((request, response_tx, raft_uncommitted));
-                    coalesced_parents.push(parent);
-                }
-                Some(other) => {
-                    pending.push_front(other);
-                    break;
-                }
-                None => break,
-            }
-        }
+        command
     }
 }

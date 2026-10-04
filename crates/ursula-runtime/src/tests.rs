@@ -284,12 +284,15 @@ fn placement() -> ShardPlacement {
 
 #[test]
 fn group_write_command_round_trips_as_log_payload() {
-    let command = GroupWriteCommand::Stream(StreamCommand::AppendBatch {
+    let command = GroupWriteCommand::Stream(StreamCommand::Append {
         stream_id: BucketStreamId::new("benchcmp", "raft-log"),
         content_type: Some(DEFAULT_CONTENT_TYPE.to_owned()),
-        payloads: vec![Bytes::from_static(b"ab"), Bytes::from_static(b"cd")],
+        payload: Bytes::from_static(b"abcd"),
+        close_after: false,
+        stream_seq: None,
         producer: Some(producer("writer-1", 7, 42)),
         now_ms: 0,
+        record_match: None,
     });
 
     let encoded = serde_json::to_vec(&command).expect("encode command");
@@ -1077,73 +1080,6 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
     assert!(!recreated.already_exists);
 }
 
-#[test]
-fn committed_write_batch_preserves_logical_command_responses() {
-    let placement = placement();
-    let stream = BucketStreamId::new("benchcmp", "apply-command-batch");
-    let mut engine = InMemoryGroupEngine::default();
-
-    let response = engine
-        .apply_committed_write(
-            GroupWriteCommand::Batch {
-                commands: vec![
-                    StreamCommand::from(CreateStreamRequest::new(
-                        stream.clone(),
-                        DEFAULT_CONTENT_TYPE,
-                    )),
-                    StreamCommand::from(AppendBatchRequest::new(stream.clone(), vec![
-                        Bytes::from_static(b"ab"),
-                        Bytes::from_static(b"cd"),
-                    ])),
-                ],
-            },
-            placement,
-        )
-        .expect("apply command batch");
-
-    let GroupWriteResponse::Batch(items) = response else {
-        panic!("unexpected batch response: {response:?}");
-    };
-    assert_eq!(items.len(), 2);
-    assert!(matches!(
-        &items[0],
-        Ok(GroupWriteResponse::CreateStream(CreateStreamResponse {
-            group_commit_index: 1,
-            ..
-        }))
-    ));
-    match &items[1] {
-        Ok(GroupWriteResponse::AppendBatch(response)) => {
-            assert_eq!(response.items.len(), 2);
-            assert_eq!(
-                response.items[0].as_ref().expect("first item").start_offset,
-                0
-            );
-            assert_eq!(
-                response.items[1]
-                    .as_ref()
-                    .expect("second item")
-                    .start_offset,
-                2
-            );
-            assert_eq!(
-                response.items[1]
-                    .as_ref()
-                    .expect("second item")
-                    .group_commit_index,
-                3
-            );
-        }
-        other => panic!("unexpected append batch response: {other:?}"),
-    }
-
-    let read = engine
-        .state_machine
-        .read(&stream, 0, 16)
-        .expect("read applied command batch");
-    assert_eq!(read.payload, b"abcd");
-}
-
 /// Poll `current` until it equals `expected` (up to ~1s), then panic with
 /// `what` in the message if it never converges.
 async fn wait_for_eq<T, F>(what: &str, expected: T, current: F)
@@ -1257,76 +1193,6 @@ async fn empty_append_is_rejected_before_routing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn append_batch_routes_once_and_applies_each_payload_on_owner_core() {
-    let runtime = runtime(2, 8);
-    let stream = BucketStreamId::new("benchcmp", "batch-runtime");
-    let owner_core = usize::from(runtime.locate(&stream).core_id.0);
-    let owner_group =
-        usize::try_from(runtime.locate(&stream).raft_group_id.0).expect("u32 fits usize");
-
-    create_stream(&runtime, &stream).await;
-    let response = runtime
-        .append_batch(AppendBatchRequest::new(stream.clone(), vec![
-            b"ab".to_vec(),
-            b"c".to_vec(),
-            b"def".to_vec(),
-        ]))
-        .await
-        .expect("append batch");
-    assert_eq!(response.items.len(), 3);
-    assert_eq!(response.items[0].as_ref().expect("first").start_offset, 0);
-    assert_eq!(response.items[1].as_ref().expect("second").start_offset, 2);
-    assert_eq!(response.items[2].as_ref().expect("third").start_offset, 3);
-
-    let read = runtime
-        .read_stream(read_req(stream.clone(), 0, 16))
-        .await
-        .expect("read");
-    assert_eq!(read.payload, b"abcdef");
-
-    let snapshot = runtime.metrics().snapshot();
-    assert_eq!(snapshot.accepted_appends, 3);
-    assert_eq!(snapshot.applied_mutations, 4);
-    assert_eq!(snapshot.routed_requests, 3);
-    assert_eq!(snapshot.per_core_appends[owner_core], 3);
-    assert_eq!(snapshot.per_group_appends[owner_group], 3);
-    assert_eq!(snapshot.per_core_applied_mutations[owner_core], 4);
-    assert_eq!(snapshot.per_group_applied_mutations[owner_group], 4);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn append_batch_reports_item_errors_without_stopping_later_payloads() {
-    let runtime = runtime(2, 8);
-    let stream = BucketStreamId::new("benchcmp", "batch-partial");
-    create_stream(&runtime, &stream).await;
-
-    let response = runtime
-        .append_batch(AppendBatchRequest::new(stream.clone(), vec![
-            b"a".to_vec(),
-            Vec::new(),
-            b"b".to_vec(),
-        ]))
-        .await
-        .expect("append batch");
-    assert!(response.items[0].is_ok());
-    assert!(response.items[1].is_err());
-    assert!(response.items[2].is_ok());
-    assert_eq!(response.items[0].as_ref().expect("first").start_offset, 0);
-    assert_eq!(response.items[2].as_ref().expect("third").start_offset, 1);
-
-    let read = runtime
-        .read_stream(read_req(stream, 0, 16))
-        .await
-        .expect("read");
-    assert_eq!(read.payload, b"ab");
-
-    let snapshot = runtime.metrics().snapshot();
-    assert_eq!(snapshot.accepted_appends, 2);
-    assert_eq!(snapshot.applied_mutations, 3);
-    assert_eq!(snapshot.routed_requests, 3);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn producer_duplicate_append_returns_prior_offsets_without_mutating_metrics() {
     let runtime = runtime(2, 8);
     let stream = BucketStreamId::new("benchcmp", "producer-runtime");
@@ -1365,77 +1231,6 @@ async fn producer_duplicate_append_returns_prior_offsets_without_mutating_metric
     let metrics = runtime.metrics().snapshot();
     assert_eq!(metrics.accepted_appends, 2);
     assert_eq!(metrics.applied_mutations, 3);
-    assert_eq!(metrics.routed_requests, 5);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn producer_duplicate_append_batch_returns_prior_offsets_without_mutating_metrics() {
-    let runtime = runtime(2, 8);
-    let stream = BucketStreamId::new("benchcmp", "producer-batch-runtime");
-    create_stream(&runtime, &stream).await;
-
-    let mut first = AppendBatchRequest::new(stream.clone(), vec![b"ab".to_vec(), b"c".to_vec()]);
-    first.producer = Some(producer("writer-1", 0, 0));
-    let first = runtime.append_batch(first).await.expect("first batch");
-    assert_eq!(first.items.len(), 2);
-    let first_item = first.items[0].as_ref().expect("first item");
-    let second_item = first.items[1].as_ref().expect("second item");
-    assert_eq!(first_item.start_offset, 0);
-    assert_eq!(first_item.next_offset, 2);
-    assert_eq!(first_item.stream_append_count, 1);
-    assert!(!first_item.deduplicated);
-    assert_eq!(second_item.start_offset, 2);
-    assert_eq!(second_item.next_offset, 3);
-    assert_eq!(second_item.stream_append_count, 2);
-    assert!(!second_item.deduplicated);
-
-    let mut duplicate =
-        AppendBatchRequest::new(stream.clone(), vec![b"ignored".to_vec(), b"body".to_vec()]);
-    duplicate.producer = Some(producer("writer-1", 0, 0));
-    let duplicate = runtime
-        .append_batch(duplicate)
-        .await
-        .expect("duplicate batch");
-    assert_eq!(duplicate.items.len(), 2);
-    assert!(
-        duplicate
-            .items
-            .iter()
-            .all(|item| { item.as_ref().expect("deduplicated item").deduplicated })
-    );
-    assert_eq!(
-        duplicate.items[0]
-            .as_ref()
-            .expect("first duplicate")
-            .start_offset,
-        0
-    );
-    assert_eq!(
-        duplicate.items[1]
-            .as_ref()
-            .expect("second duplicate")
-            .next_offset,
-        3
-    );
-
-    let mut next = AppendBatchRequest::new(stream.clone(), vec![b"d".to_vec()]);
-    next.producer = Some(producer("writer-1", 0, 1));
-    let next = runtime.append_batch(next).await.expect("next batch");
-    let next_item = next.items[0].as_ref().expect("next item");
-    assert_eq!(next_item.start_offset, 3);
-    assert_eq!(next_item.next_offset, 4);
-    assert_eq!(next_item.stream_append_count, 3);
-    assert!(!next_item.deduplicated);
-
-    let read = runtime
-        .read_stream(read_req(stream, 0, 16))
-        .await
-        .expect("read");
-    assert_eq!(read.payload, b"abcd");
-
-    let metrics = runtime.metrics().snapshot();
-    assert_eq!(metrics.accepted_appends, 3);
-    assert_eq!(metrics.applied_mutations, 4);
     assert_eq!(metrics.routed_requests, 5);
 }
 
@@ -1686,90 +1481,6 @@ async fn runtime_metrics_track_owner_core_routing_and_mailbox_wait() {
     assert_eq!(
         snapshot.group_engine_exec_ns,
         snapshot.per_group_group_engine_exec_ns.iter().sum::<u64>()
-    );
-    assert_eq!(
-        snapshot.raft_write_many_batches,
-        snapshot
-            .per_core_raft_write_many_batches
-            .iter()
-            .sum::<u64>()
-    );
-    assert_eq!(
-        snapshot.raft_write_many_batches,
-        snapshot
-            .per_group_raft_write_many_batches
-            .iter()
-            .sum::<u64>()
-    );
-    assert_eq!(
-        snapshot.raft_write_many_commands,
-        snapshot
-            .per_core_raft_write_many_commands
-            .iter()
-            .sum::<u64>()
-    );
-    assert_eq!(
-        snapshot.raft_write_many_commands,
-        snapshot
-            .per_group_raft_write_many_commands
-            .iter()
-            .sum::<u64>()
-    );
-    assert_eq!(
-        snapshot.raft_write_many_logical_commands,
-        snapshot
-            .per_core_raft_write_many_logical_commands
-            .iter()
-            .sum::<u64>()
-    );
-    assert_eq!(
-        snapshot.raft_write_many_logical_commands,
-        snapshot
-            .per_group_raft_write_many_logical_commands
-            .iter()
-            .sum::<u64>()
-    );
-    assert_eq!(
-        snapshot.raft_write_many_responses,
-        snapshot
-            .per_core_raft_write_many_responses
-            .iter()
-            .sum::<u64>()
-    );
-    assert_eq!(
-        snapshot.raft_write_many_responses,
-        snapshot
-            .per_group_raft_write_many_responses
-            .iter()
-            .sum::<u64>()
-    );
-    assert_eq!(
-        snapshot.raft_write_many_submit_ns,
-        snapshot
-            .per_core_raft_write_many_submit_ns
-            .iter()
-            .sum::<u64>()
-    );
-    assert_eq!(
-        snapshot.raft_write_many_submit_ns,
-        snapshot
-            .per_group_raft_write_many_submit_ns
-            .iter()
-            .sum::<u64>()
-    );
-    assert_eq!(
-        snapshot.raft_write_many_response_ns,
-        snapshot
-            .per_core_raft_write_many_response_ns
-            .iter()
-            .sum::<u64>()
-    );
-    assert_eq!(
-        snapshot.raft_write_many_response_ns,
-        snapshot
-            .per_group_raft_write_many_response_ns
-            .iter()
-            .sum::<u64>()
     );
     assert_eq!(
         snapshot.raft_apply_entries,
@@ -2880,42 +2591,6 @@ async fn cold_write_admission_allows_deduplicated_append_retry_at_hot_limit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cold_write_admission_allows_deduplicated_append_batch_retry_at_hot_limit() {
-    let cold_store = Arc::new(memory_cold_store());
-    let runtime = spawn_with_cold_store(
-        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4 + 4 * R)),
-        cold_store,
-    );
-    let stream = BucketStreamId::new("benchcmp", "cold-admission-dedup-batch");
-    create_stream(&runtime, &stream).await;
-
-    let mut first = AppendBatchRequest::new(stream.clone(), vec![
-        b"a".to_vec(),
-        b"b".to_vec(),
-        b"c".to_vec(),
-        b"d".to_vec(),
-    ]);
-    first.producer = Some(producer("writer", 0, 0));
-    runtime
-        .append_batch(first)
-        .await
-        .expect("batch at hot limit");
-
-    let mut retry = AppendBatchRequest::new(stream.clone(), vec![b"ignored".to_vec()]);
-    retry.producer = Some(producer("writer", 0, 0));
-    let retry = runtime
-        .append_batch(retry)
-        .await
-        .expect("deduplicated batch retry should bypass cold admission");
-    assert!(
-        retry
-            .items
-            .iter()
-            .all(|item| item.as_ref().expect("deduplicated item").deduplicated)
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_write_admission_allows_existing_create_retry_at_hot_limit() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(
@@ -2987,55 +2662,6 @@ async fn raft_uncommitted_admission_rejects_when_incoming_would_exceed_limit() {
 
     // A within-budget append still succeeds.
     append_bytes(&runtime, &stream, b"abcd").await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cold_write_admission_rejects_append_batch_without_partial_mutation() {
-    let cold_store = Arc::new(memory_cold_store());
-    let runtime = spawn_with_cold_store(
-        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4 + R)),
-        cold_store,
-    );
-    let stream = BucketStreamId::new("benchcmp", "cold-admission-batch");
-    create_stream(&runtime, &stream).await;
-    append_bytes(&runtime, &stream, b"abc").await;
-
-    let err = runtime
-        .append_batch(AppendBatchRequest::new(stream.clone(), vec![
-            b"d".to_vec(),
-            b"e".to_vec(),
-        ]))
-        .await
-        .expect_err("batch should be backpressured");
-    match err {
-        RuntimeError::GroupEngine {
-            error:
-                GroupEngineError::Infra(GroupInfraError::ColdBackpressure {
-                    stream_id,
-                    before_group_hot_bytes,
-                    after_group_hot_bytes,
-                    limit,
-                    ..
-                }),
-            ..
-        } => {
-            assert_eq!(stream_id, stream);
-            // F6c: each batch item is charged one record's overhead.
-            assert_eq!(before_group_hot_bytes, 3 + R);
-            assert_eq!(after_group_hot_bytes, 5 + 3 * R);
-            assert_eq!(limit, 4 + R);
-        }
-        other => panic!("expected cold backpressure, got {other:?}"),
-    }
-    let read = runtime
-        .read_stream(read_req(stream.clone(), 0, 8))
-        .await
-        .expect("read");
-    assert_eq!(read.payload, b"abc");
-    let metrics = runtime.metrics().snapshot();
-    assert_eq!(metrics.accepted_appends, 1);
-    assert_eq!(metrics.cold_backpressure_events, 1);
-    assert_eq!(metrics.cold_backpressure_bytes, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4241,15 +3867,6 @@ impl GroupEngine for BlockingReadEngine {
         self.inner.append(request, placement, admission)
     }
 
-    fn append_batch<'a>(
-        &'a mut self,
-        request: AppendBatchRequest,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> GroupAppendBatchFuture<'a> {
-        self.inner.append_batch(request, placement, admission)
-    }
-
     fn snapshot<'a>(&'a mut self, placement: ShardPlacement) -> GroupSnapshotFuture<'a> {
         Box::pin(async move {
             Ok(GroupSnapshot {
@@ -4436,46 +4053,6 @@ impl GroupEngine for RecordingEngine {
         })
     }
 
-    fn append_batch<'a>(
-        &'a mut self,
-        request: AppendBatchRequest,
-        placement: ShardPlacement,
-        _admission: ColdWriteAdmission,
-    ) -> GroupAppendBatchFuture<'a> {
-        Box::pin(async move {
-            assert_eq!(placement, self.placement);
-            let AppendBatchRequest {
-                stream_id: _,
-                content_type: _,
-                payloads,
-                producer: _,
-                now_ms: _,
-            } = request;
-            let mut items = Vec::with_capacity(payloads.len());
-            for payload in payloads {
-                let start_offset = self.commit_index;
-                let next_offset =
-                    start_offset + u64::try_from(payload.len()).expect("payload len fits u64");
-                self.commit_index += 1;
-                items.push(Ok(AppendResponse {
-                    placement,
-                    start_offset,
-                    next_offset,
-                    stream_append_count: self.commit_index,
-                    group_commit_index: self.commit_index,
-                    closed: false,
-                    deduplicated: false,
-                    producer: None,
-                    record_range: None,
-                    stream_hot_bytes: 0,
-                    group_hot_bytes: 0,
-                    receipt_evicted: false,
-                }));
-            }
-            Ok(GroupAppendBatchResponse { placement, items })
-        })
-    }
-
     fn cold_hot_backlog<'a>(
         &'a mut self,
         stream_id: BucketStreamId,
@@ -4644,15 +4221,6 @@ impl GroupEngine for BlockingFirstCreateEngine {
         self.inner.append(request, placement, admission)
     }
 
-    fn append_batch<'a>(
-        &'a mut self,
-        request: AppendBatchRequest,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> GroupAppendBatchFuture<'a> {
-        self.inner.append_batch(request, placement, admission)
-    }
-
     fn snapshot<'a>(&'a mut self, placement: ShardPlacement) -> GroupSnapshotFuture<'a> {
         self.inner.snapshot(placement)
     }
@@ -4779,15 +4347,6 @@ impl GroupEngine for FailingEngine {
         _placement: ShardPlacement,
         _admission: ColdWriteAdmission,
     ) -> GroupAppendFuture<'a> {
-        Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
-    }
-
-    fn append_batch<'a>(
-        &'a mut self,
-        _request: AppendBatchRequest,
-        _placement: ShardPlacement,
-        _admission: ColdWriteAdmission,
-    ) -> GroupAppendBatchFuture<'a> {
         Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
     }
 

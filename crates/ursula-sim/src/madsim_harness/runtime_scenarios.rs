@@ -1,7 +1,6 @@
 //! Runtime-actor + runtime/Raft scenarios extracted from `madsim_harness/mod.rs`
 //! (DoD #3 modularity refactor — workloads axis).
 
-use super::AppendBatchRequest;
 use super::AppendRequest;
 use super::Arc;
 use super::BTreeSet;
@@ -25,6 +24,7 @@ use super::SimEvent;
 use super::SimTrace;
 use super::ThreeNodeRaftSimConfig;
 use super::ThreeNodeRaftSimOutcome;
+use super::append_payloads;
 use super::assert_cold_live_read_consistency;
 use super::assert_runtime_interleaving_read_your_write;
 use super::assert_runtime_raft_leader_failover_read_consistency;
@@ -35,8 +35,8 @@ use super::choose_runtime_streams_spanning_placement;
 use super::duration_ms;
 use super::maybe_panic_after_runtime_interleaving_event;
 use super::runtime_interleaving_payload;
-use super::runtime_raft_network_batch_payloads;
 use super::runtime_raft_network_duplicate_payloads;
+use super::runtime_raft_network_payloads;
 use super::runtime_raft_network_producer;
 use super::runtime_raft_network_producer_with_lane;
 use super::runtime_raft_network_streams;
@@ -184,27 +184,23 @@ pub(super) async fn run_runtime_raft_engine_inner(
         stream: config.stream.clone(),
     });
 
-    let append_batch = runtime
-        .append_batch(AppendBatchRequest::new(config.stream.clone(), vec![
-            b"raft-".to_vec(),
-            b"runtime".to_vec(),
-        ]))
-        .await
-        .expect("append through runtime-owned raft engine");
-    let append_items = append_batch
-        .items
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()
-        .expect("runtime raft append batch items");
+    let append_items = append_payloads(
+        &runtime,
+        &config.stream,
+        &[b"raft-".to_vec(), b"runtime".to_vec()],
+        None,
+    )
+    .await
+    .expect("append through runtime-owned raft engine");
     let append = append_items
         .last()
         .cloned()
-        .expect("runtime raft append batch response");
+        .expect("runtime raft append response");
     trace.push(SimEvent::RuntimeRaftEngineAppendCommitted {
         stream: config.stream.clone(),
         start_offset: append_items
             .first()
-            .expect("runtime raft first append batch response")
+            .expect("runtime raft first append response")
             .start_offset,
         next_offset: append.next_offset,
         group_commit_index: append.group_commit_index,
@@ -228,17 +224,12 @@ pub(super) async fn run_runtime_raft_engine_inner(
 
     let metrics = runtime.metrics().snapshot();
     assert!(
-        metrics.raft_write_many_batches > 0,
-        "runtime raft engine scenario should submit writes through OpenRaft"
-    );
-    assert!(
         metrics.raft_apply_entries > 0,
         "runtime raft engine scenario should apply OpenRaft entries"
     );
     trace.push(SimEvent::RuntimeRaftEngineReadVerified {
         stream: config.stream,
         next_offset: read.next_offset,
-        raft_write_many_batches: metrics.raft_write_many_batches,
         raft_apply_entries: metrics.raft_apply_entries,
     });
 
@@ -287,18 +278,14 @@ pub(super) async fn run_runtime_raft_snapshot_install_inner(
         leader_id: source_leader_id,
     });
 
-    let append_batch = source_runtime
-        .append_batch(AppendBatchRequest::new(config.stream.clone(), vec![
-            b"snapshot-".to_vec(),
-            b"runtime".to_vec(),
-        ]))
-        .await
-        .expect("append before runtime raft snapshot");
-    let append_items = append_batch
-        .items
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()
-        .expect("runtime raft snapshot source append batch items");
+    let append_items = append_payloads(
+        &source_runtime,
+        &config.stream,
+        &[b"snapshot-".to_vec(), b"runtime".to_vec()],
+        None,
+    )
+    .await
+    .expect("append before runtime raft snapshot");
     let append = append_items
         .last()
         .cloned()
@@ -332,7 +319,6 @@ pub(super) async fn run_runtime_raft_snapshot_install_inner(
     trace.push(SimEvent::RuntimeRaftNetworkReadVerified {
         stream: config.stream.clone(),
         next_offset: source_read.next_offset,
-        raft_write_many_batches: u64::from(source_metrics.raft_write_many_batches > 0),
         raft_apply_entries: u64::from(source_metrics.raft_apply_entries > 0),
         delivered_rpc_count: usize::from(
             SimTrace::last_recorded()
@@ -452,21 +438,13 @@ pub(super) async fn run_runtime_raft_snapshot_install_inner(
     assert_eq!(restored_read.payload, b"snapshot-runtime");
     assert_eq!(restored_read.next_offset, append.next_offset);
 
-    let restore_append_batch = restore_runtime
-        .append_batch(AppendBatchRequest::new(config.stream.clone(), vec![
+    let restore_append = restore_runtime
+        .append(AppendRequest::from_bytes(
+            config.stream.clone(),
             b"-restored".to_vec(),
-        ]))
+        ))
         .await
         .expect("append after runtime raft snapshot install");
-    let restore_append_items = restore_append_batch
-        .items
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()
-        .expect("runtime raft snapshot restore append batch items");
-    let restore_append = restore_append_items
-        .last()
-        .cloned()
-        .expect("runtime raft snapshot restore append response");
     let expected_restore_append_count = 3;
     if restore_append.stream_append_count != expected_restore_append_count {
         let message = format!(
@@ -604,35 +582,27 @@ pub(super) async fn run_runtime_raft_network_inner(
     });
     let mut latest_partition_raft_applied_index = None;
     for (stream_index, stream) in streams.iter().enumerate() {
-        let payloads = runtime_raft_network_batch_payloads(
+        let payloads = runtime_raft_network_payloads(
             stream_index,
             0,
-            workload_plan.append_batch_len(stream_index),
+            workload_plan.append_payload_count(stream_index),
         );
         let producer = workload_plan
             .producer_sessions
             .then(|| runtime_raft_network_producer(config.seed, stream_index, 0, 0));
-        let mut append_request = AppendBatchRequest::new(stream.clone(), payloads.clone());
-        append_request.producer = producer.clone();
-        let append_batch = runtime
-            .append_batch(append_request)
+        let append_items = append_payloads(&runtime, stream, &payloads, producer.as_ref())
             .await
             .expect("append through runtime-owned multi-node raft engine");
-        let append_items = append_batch
-            .items
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .expect("runtime raft network append batch items");
         let append = append_items
             .last()
             .cloned()
-            .expect("runtime raft network append batch response");
+            .expect("runtime raft network append response");
         latest_group_commit_index = append.group_commit_index;
         trace.push(SimEvent::RuntimeRaftEngineAppendCommitted {
             stream: stream.clone(),
             start_offset: append_items
                 .first()
-                .expect("runtime raft network first append batch response")
+                .expect("runtime raft network first append response")
                 .start_offset,
             next_offset: append.next_offset,
             group_commit_index: append.group_commit_index,
@@ -653,17 +623,10 @@ pub(super) async fn run_runtime_raft_network_inner(
         if let Some(producer) = producer {
             let duplicate_payloads =
                 runtime_raft_network_duplicate_payloads(stream_index, 0, payloads.len());
-            let mut duplicate_request = AppendBatchRequest::new(stream.clone(), duplicate_payloads);
-            duplicate_request.producer = Some(producer.clone());
-            let duplicate_batch = runtime
-                .append_batch(duplicate_request)
-                .await
-                .expect("duplicate producer append through runtime-owned raft engine");
-            let duplicate_items = duplicate_batch
-                .items
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()
-                .expect("runtime raft duplicate producer append items");
+            let duplicate_items =
+                append_payloads(&runtime, stream, &duplicate_payloads, Some(&producer))
+                    .await
+                    .expect("duplicate producer append through runtime-owned raft engine");
             assert_runtime_raft_producer_duplicate(
                 stream,
                 &append_items,
@@ -693,19 +656,12 @@ pub(super) async fn run_runtime_raft_network_inner(
         let mut expected_payload = payloads.into_iter().flatten().collect::<Vec<_>>();
         let mut expected_next_offset = append.next_offset;
         if workload_plan.producer_epoch_bumps {
-            let epoch_payloads = runtime_raft_network_batch_payloads(stream_index, 2, 1);
+            let epoch_payloads = runtime_raft_network_payloads(stream_index, 2, 1);
             let epoch_producer = runtime_raft_network_producer(config.seed, stream_index, 1, 0);
-            let mut epoch_request = AppendBatchRequest::new(stream.clone(), epoch_payloads.clone());
-            epoch_request.producer = Some(epoch_producer.clone());
-            let epoch_batch = runtime
-                .append_batch(epoch_request)
-                .await
-                .expect("producer epoch bump append through runtime-owned raft engine");
-            let epoch_items = epoch_batch
-                .items
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()
-                .expect("runtime raft producer epoch bump append items");
+            let epoch_items =
+                append_payloads(&runtime, stream, &epoch_payloads, Some(&epoch_producer))
+                    .await
+                    .expect("producer epoch bump append through runtime-owned raft engine");
             let epoch_append = epoch_items
                 .last()
                 .cloned()
@@ -738,9 +694,8 @@ pub(super) async fn run_runtime_raft_network_inner(
 
             let stale_payloads = runtime_raft_network_duplicate_payloads(stream_index, 2, 1);
             let stale_producer = runtime_raft_network_producer(config.seed, stream_index, 0, 1);
-            let mut stale_request = AppendBatchRequest::new(stream.clone(), stale_payloads);
-            stale_request.producer = Some(stale_producer.clone());
-            let stale_result = runtime.append_batch(stale_request).await;
+            let stale_result =
+                append_payloads(&runtime, stream, &stale_payloads, Some(&stale_producer)).await;
             assert_runtime_raft_producer_stale_epoch(stream, stale_result);
             trace.push(SimEvent::RuntimeRaftNetworkProducerStaleEpochRejected {
                 stream: stream.clone(),
@@ -768,8 +723,7 @@ pub(super) async fn run_runtime_raft_network_inner(
             for producer_index in 0..producer_count {
                 let runtime = runtime.clone();
                 let stream = stream.clone();
-                let payloads =
-                    runtime_raft_network_batch_payloads(stream_index, 3 + producer_index, 1);
+                let payloads = runtime_raft_network_payloads(stream_index, 3 + producer_index, 1);
                 let producer = runtime_raft_network_producer_with_lane(
                     config.seed,
                     stream_index,
@@ -778,17 +732,9 @@ pub(super) async fn run_runtime_raft_network_inner(
                     0,
                 );
                 tasks.push(madsim::task::spawn(async move {
-                    let mut request = AppendBatchRequest::new(stream, payloads.clone());
-                    request.producer = Some(producer.clone());
-                    let batch = runtime
-                        .append_batch(request)
+                    let items = append_payloads(&runtime, &stream, &payloads, Some(&producer))
                         .await
                         .expect("concurrent producer append through runtime-owned raft engine");
-                    let items = batch
-                        .items
-                        .into_iter()
-                        .collect::<Result<Vec<_>, _>>()
-                        .expect("runtime raft concurrent producer append items");
                     let append = items
                         .last()
                         .cloned()
@@ -941,15 +887,9 @@ pub(super) async fn run_runtime_raft_network_inner(
                 .first_mut()
                 .expect("runtime raft network primary stream expectation");
             let payloads = vec![b"recovery-probe;".to_vec()];
-            let recovery_batch = runtime
-                .append_batch(AppendBatchRequest::new(stream.clone(), payloads.clone()))
+            let recovery_items = append_payloads(&runtime, stream, &payloads, None)
                 .await
                 .expect("append runtime raft recovery probe after heal");
-            let recovery_items = recovery_batch
-                .items
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()
-                .expect("runtime raft recovery probe append items");
             let recovery_append = recovery_items
                 .last()
                 .cloned()
@@ -1008,10 +948,6 @@ pub(super) async fn run_runtime_raft_network_inner(
 
     let metrics = runtime.metrics().snapshot();
     assert!(
-        metrics.raft_write_many_batches > 0,
-        "runtime raft network scenario should submit writes through OpenRaft"
-    );
-    assert!(
         metrics.raft_apply_entries >= 2,
         "runtime raft network scenario should apply OpenRaft entries"
     );
@@ -1053,7 +989,6 @@ pub(super) async fn run_runtime_raft_network_inner(
         trace.push(SimEvent::RuntimeRaftNetworkReadVerified {
             stream: stream.clone(),
             next_offset: read.next_offset,
-            raft_write_many_batches: metrics.raft_write_many_batches,
             raft_apply_entries: metrics.raft_apply_entries,
             delivered_rpc_count: usize::from(delivered_rpc_count > 0),
         });
@@ -1129,31 +1064,32 @@ pub(super) async fn run_runtime_raft_network_inner(
         for (stream_index, (stream, expected_payload, expected_next_offset)) in
             expected_streams.iter_mut().enumerate()
         {
-            let payloads = runtime_raft_network_batch_payloads(
+            let payloads = runtime_raft_network_payloads(
                 stream_index,
                 1,
-                workload_plan.failover_batch_len(stream_index),
+                workload_plan.failover_payload_count(stream_index),
             );
             let payload_count = payloads.len();
             let producer = workload_plan.producer_sessions.then(|| {
+                // The session's next sequence: the epoch-bump round appended
+                // one payload at seq 0 of the new epoch; otherwise the first
+                // round used one sequence per payload.
+                let next_seq = if workload_plan.producer_epoch_bumps {
+                    1
+                } else {
+                    u64::try_from(workload_plan.append_payload_count(stream_index))
+                        .expect("payload count fits u64")
+                };
                 runtime_raft_network_producer(
                     config.seed,
                     stream_index,
                     u64::from(workload_plan.producer_epoch_bumps),
-                    1,
+                    next_seq,
                 )
             });
-            let mut failover_request = AppendBatchRequest::new(stream.clone(), payloads.clone());
-            failover_request.producer = producer.clone();
-            let failover_batch = runtime
-                .append_batch(failover_request)
+            let failover_items = append_payloads(&runtime, stream, &payloads, producer.as_ref())
                 .await
                 .expect("append through replacement runtime-owned raft leader");
-            let failover_items = failover_batch
-                .items
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()
-                .expect("runtime raft failover append batch items");
             let failover_append = failover_items
                 .last()
                 .cloned()
@@ -1182,18 +1118,10 @@ pub(super) async fn run_runtime_raft_network_inner(
             if let Some(producer) = producer {
                 let duplicate_payloads =
                     runtime_raft_network_duplicate_payloads(stream_index, 1, payload_count);
-                let mut duplicate_request =
-                    AppendBatchRequest::new(stream.clone(), duplicate_payloads);
-                duplicate_request.producer = Some(producer.clone());
-                let duplicate_batch = runtime
-                    .append_batch(duplicate_request)
-                    .await
-                    .expect("duplicate producer append through replacement raft leader");
-                let duplicate_items = duplicate_batch
-                    .items
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>()
-                    .expect("runtime raft failover duplicate producer append items");
+                let duplicate_items =
+                    append_payloads(&runtime, stream, &duplicate_payloads, Some(&producer))
+                        .await
+                        .expect("duplicate producer append through replacement raft leader");
                 assert_runtime_raft_producer_duplicate(
                     stream,
                     &failover_items,

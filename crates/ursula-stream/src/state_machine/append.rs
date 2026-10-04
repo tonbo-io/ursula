@@ -1,4 +1,4 @@
-//! Append paths (inline/external/batch) and idempotent producer bookkeeping.
+//! Append paths (inline/external) and idempotent producer bookkeeping.
 
 use super::AppendExternalInput;
 use super::AppendStreamInput;
@@ -10,8 +10,6 @@ use super::ProducerAppendRecord;
 use super::ProducerReceipt;
 use super::ProducerRequest;
 use super::ProducerState;
-use super::StreamBatchAppend;
-use super::StreamBatchAppendItem;
 use super::StreamCommand;
 use super::StreamErrorCode;
 use super::StreamErrorContext;
@@ -427,13 +425,6 @@ impl StreamStateMachine {
                     record_start: record_range.map(|range| range.first_record),
                     record_next: record_range.map(|range| range.next_record),
                 },
-                vec![ProducerAppendRecord {
-                    start_offset: offset,
-                    next_offset,
-                    closed,
-                    record_start: record_range.map(|range| range.first_record),
-                    record_next: record_range.map(|range| range.next_record),
-                }],
             );
         }
 
@@ -644,13 +635,6 @@ impl StreamStateMachine {
                     record_start: record_range.map(|range| range.first_record),
                     record_next: record_range.map(|range| range.next_record),
                 },
-                vec![ProducerAppendRecord {
-                    start_offset: offset,
-                    next_offset,
-                    closed,
-                    record_start: record_range.map(|range| range.first_record),
-                    record_next: record_range.map(|range| range.next_record),
-                }],
             );
         }
         let external_locators_in_state = self.external_locators_in_state();
@@ -708,275 +692,6 @@ impl StreamStateMachine {
         }
     }
 
-    /// Applies one append batch, then enforces the F3 receipt window once.
-    pub fn append_batch_borrowed(
-        &mut self,
-        stream_id: BucketStreamId,
-        content_type: Option<&str>,
-        payloads: &[&[u8]],
-        producer: Option<ProducerRequest>,
-        now_ms: u64,
-    ) -> Result<StreamBatchAppend, StreamResponse> {
-        let enforce = producer.is_some();
-        let enforce_on = stream_id.clone();
-        let response = self.append_batch_borrowed_unenforced(
-            stream_id,
-            content_type,
-            payloads,
-            producer,
-            now_ms,
-        );
-        if enforce {
-            self.enforce_producer_window(&enforce_on, now_ms);
-        }
-        response
-    }
-
-    fn append_batch_borrowed_unenforced(
-        &mut self,
-        stream_id: BucketStreamId,
-        content_type: Option<&str>,
-        payloads: &[&[u8]],
-        producer: Option<ProducerRequest>,
-        now_ms: u64,
-    ) -> Result<StreamBatchAppend, StreamResponse> {
-        if payloads.is_empty() {
-            return Err(StreamResponse::error(
-                StreamErrorCode::EmptyAppend,
-                "append batch must contain at least one payload",
-            ));
-        }
-        self.validate_stream_scope(&stream_id)?;
-        self.migrate_message_records(&stream_id);
-        validate_producer_request(producer.as_ref())?;
-        if self.expire_stream_if_due(&stream_id, now_ms) {
-            return Err(StreamResponse::error(
-                StreamErrorCode::StreamNotFound,
-                format!("stream '{stream_id}' does not exist"),
-            ));
-        }
-        if let Some(producer) = producer.as_ref() {
-            self.expire_idle_producer(&stream_id, &producer.producer_id, now_ms);
-        }
-        let producer_decision = self.evaluate_producer(&stream_id, producer.as_ref(), now_ms)?;
-        if let ProducerDecision::DuplicateEvicted { .. } = producer_decision {
-            return Ok(StreamBatchAppend {
-                items: Vec::new(),
-                deduplicated: true,
-                receipt_evicted: true,
-            });
-        }
-        if let ProducerDecision::Duplicate { items, .. } = producer_decision {
-            return Ok(StreamBatchAppend {
-                items: items
-                    .into_iter()
-                    .map(|item| StreamBatchAppendItem {
-                        offset: item.start_offset,
-                        next_offset: item.next_offset,
-                        closed: item.closed,
-                        deduplicated: true,
-                        record_range: item_record_range(&item),
-                    })
-                    .collect(),
-                deduplicated: true,
-                receipt_evicted: false,
-            });
-        }
-
-        let Some(stream) = self.stream_metadata(&stream_id) else {
-            return Err(StreamResponse::error(
-                StreamErrorCode::StreamNotFound,
-                format!("stream '{stream_id}' does not exist"),
-            ));
-        };
-        if stream.status == StreamStatus::Closed {
-            return Err(StreamResponse::error_with_next_offset_and_context(
-                StreamErrorCode::StreamClosed,
-                format!("stream '{stream_id}' is closed"),
-                stream.tail_offset,
-                vec![StreamErrorContext::StreamClosed],
-            ));
-        }
-        let Some(content_type) = content_type else {
-            return Err(StreamResponse::error(
-                StreamErrorCode::MissingContentType,
-                "append batch must include content type",
-            ));
-        };
-        if content_type != stream.content_type {
-            return Err(StreamResponse::error_with_next_offset(
-                StreamErrorCode::ContentTypeMismatch,
-                format!(
-                    "append content type '{content_type}' does not match stream content type '{}'",
-                    stream.content_type
-                ),
-                stream.tail_offset,
-            ));
-        }
-        if payloads.iter().any(|payload| payload.is_empty()) {
-            return Err(StreamResponse::error(
-                StreamErrorCode::EmptyAppend,
-                "append batch payloads must be non-empty",
-            ));
-        }
-
-        let base_offset = stream.tail_offset;
-        let mut total_payload_len = 0_u64;
-        let mut combined_record_ends = Vec::new();
-        let mut record_counts = Vec::with_capacity(payloads.len());
-        let mut all_record_ends = Vec::with_capacity(payloads.len());
-        for payload in payloads {
-            let payload_len = u64::try_from(payload.len()).expect("payload len fits u64");
-            let record_ends = canonical_json_record_ends(content_type, payload).map_err(|_| {
-                StreamResponse::error(
-                    StreamErrorCode::InvalidRecordBoundaries,
-                    "application/json append payload must use canonical newline boundaries",
-                )
-            })?;
-            record_counts.push(u64::try_from(record_ends.len()).map_err(|_| {
-                StreamResponse::error(
-                    StreamErrorCode::InvalidRecordBoundaries,
-                    "record count exceeds the supported range",
-                )
-            })?);
-            for end in &record_ends {
-                combined_record_ends.push(total_payload_len.checked_add(*end).ok_or_else(
-                    || {
-                        StreamResponse::error(
-                            StreamErrorCode::InvalidRecordBoundaries,
-                            "append batch payload length exceeds the supported range",
-                        )
-                    },
-                )?);
-            }
-            total_payload_len = total_payload_len.checked_add(payload_len).ok_or_else(|| {
-                StreamResponse::error(
-                    StreamErrorCode::InvalidRecordBoundaries,
-                    "append batch payload length exceeds the supported range",
-                )
-            })?;
-            all_record_ends.push(record_ends);
-        }
-        let prepared_record_append = {
-            let slot = self
-                .stream_slot(&stream_id)
-                .expect("stream existence checked before record validation");
-            prepare_record_append(
-                slot.record_index.as_ref(),
-                super::is_json_record_content_type(content_type),
-                base_offset,
-                total_payload_len,
-                &combined_record_ends,
-            )?
-        };
-        let mut next_record = prepared_record_append
-            .as_ref()
-            .map(crate::PreparedRecordAppend::range)
-            .map(|range| range.first_record);
-        let mut item_record_ranges = Vec::with_capacity(record_counts.len());
-        for count in record_counts {
-            let range = match next_record {
-                Some(first_record) => {
-                    let next = first_record.checked_add(count).ok_or_else(|| {
-                        StreamResponse::error(
-                            StreamErrorCode::InvalidRecordBoundaries,
-                            "append batch record count exceeds the supported range",
-                        )
-                    })?;
-                    next_record = Some(next);
-                    Some(crate::StreamRecordRange {
-                        first_record,
-                        next_record: next,
-                    })
-                }
-                None => None,
-            };
-            item_record_ranges.push(range);
-        }
-
-        let stream = self
-            .stream_metadata_mut(&stream_id)
-            .expect("stream existence checked before batch append mutation");
-
-        let mut items = Vec::with_capacity(payloads.len());
-        for (payload, record_range) in payloads.iter().zip(item_record_ranges) {
-            let offset = stream.tail_offset;
-            let payload_len = u64::try_from(payload.len()).expect("payload len fits u64");
-            stream.tail_offset = stream.tail_offset.saturating_add(payload_len);
-            items.push(ProducerAppendRecord {
-                start_offset: offset,
-                next_offset: stream.tail_offset,
-                closed: false,
-                record_start: record_range.map(|range| range.first_record),
-                record_next: record_range.map(|range| range.next_record),
-            });
-        }
-        let last = items
-            .last()
-            .expect("payloads checked non-empty before append")
-            .clone();
-        renew_stream_ttl(stream, now_ms);
-        self.refresh_ttl_entry(&stream_id);
-        if let Some(producer) = producer {
-            self.record_producer_success(
-                stream_id.clone(),
-                producer,
-                now_ms,
-                last.clone(),
-                items.clone(),
-            );
-        }
-        let records_removed = self.message_records_removed();
-        let slot = self
-            .stream_slot_mut(&stream_id)
-            .expect("stream existence checked before batch append mutation");
-        if let (Some(index), Some(prepared)) = (slot.record_index.as_mut(), prepared_record_append)
-        {
-            let _range = index.commit_append(prepared);
-        }
-        for (item, payload) in items.iter().zip(payloads.iter()) {
-            slot.hot_buffer
-                .push(item.start_offset, item.next_offset, payload);
-        }
-        for (item, payload) in items.iter().zip(payloads.iter()) {
-            slot.integrity
-                .append_payload(&stream_id, item.start_offset, item.next_offset, payload);
-        }
-        for (item, record_ends) in items.iter().zip(all_record_ends.iter()) {
-            slot.record_message_boundaries(
-                records_removed,
-                item.start_offset,
-                item.next_offset,
-                record_ends,
-            );
-        }
-        let mut appended_bytes: u64 = 0;
-        let mut appended_records: u64 = 0;
-        for (item, record_ends) in items.iter().zip(all_record_ends.iter()) {
-            let item_bytes = item.next_offset.saturating_sub(item.start_offset);
-            appended_bytes = appended_bytes.saturating_add(item_bytes);
-            appended_records = appended_records
-                .saturating_add(Self::appended_record_count(record_ends, item_bytes));
-        }
-        self.add_hot_payload_bytes(appended_bytes);
-        self.sync_hot_index(&stream_id);
-        self.usage_on_append(&stream_id.bucket_id, appended_bytes, appended_records);
-        Ok(StreamBatchAppend {
-            items: items
-                .into_iter()
-                .map(|item| StreamBatchAppendItem {
-                    record_range: item_record_range(&item),
-                    offset: item.start_offset,
-                    next_offset: item.next_offset,
-                    closed: item.closed,
-                    deduplicated: false,
-                })
-                .collect(),
-            deduplicated: false,
-            receipt_evicted: false,
-        })
-    }
-
     fn validate_record_match(
         &self,
         stream_id: &BucketStreamId,
@@ -1016,7 +731,7 @@ impl StreamStateMachine {
         ))
     }
 
-    /// Read-only: whether an append (or append batch) from `producer` would be
+    /// Read-only: whether an append from `producer` would be
     /// answered as a duplicate without mutating the stream. Lets admission
     /// control bypass backpressure for idempotent retries without previewing
     /// the write on a copy of the group (F9).
@@ -1174,7 +889,6 @@ impl StreamStateMachine {
         producer: ProducerRequest,
         now_ms: u64,
         last: ProducerAppendRecord,
-        last_items: Vec<ProducerAppendRecord>,
     ) {
         let bounded = self.producer_bounds_enabled();
         let receipt = ProducerReceipt {
@@ -1182,11 +896,15 @@ impl StreamStateMachine {
             start_offset: last.start_offset,
             next_offset: last.next_offset,
             closed: last.closed,
-            items: last_items.clone(),
+            items: vec![last.clone()],
         };
         // Level 1 answers from the newest receipt and keeps no copy (F3);
         // level 0 keeps `last_items` exactly as earlier releases do.
-        let last_items = if bounded { Vec::new() } else { last_items };
+        let last_items = if bounded {
+            Vec::new()
+        } else {
+            vec![last.clone()]
+        };
         let last_seen_ms = bounded.then_some(now_ms);
         let Some(slot) = self.stream_slot_mut(&stream_id) else {
             return;

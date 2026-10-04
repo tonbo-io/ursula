@@ -23,7 +23,6 @@ use serde_json::json;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_raft::RaftGrpcMetricsSnapshot;
 use ursula_raft::raft_grpc_metrics_snapshot;
-use ursula_runtime::AppendResponse;
 use ursula_runtime::BootstrapStreamResponse;
 use ursula_runtime::ColdStoreInfo;
 use ursula_runtime::ProducerRequest;
@@ -272,61 +271,6 @@ pub(crate) fn insert_location(headers: &mut HeaderMap, stream_id: &BucketStreamI
 
 pub(crate) fn insert_static(headers: &mut HeaderMap, name: &'static str, value: &'static str) {
     headers.insert(name, HeaderValue::from_static(value));
-}
-
-pub(crate) fn parse_append_batch(body: &Bytes) -> Result<Vec<Bytes>, String> {
-    let mut payloads = Vec::new();
-    let mut cursor = 0usize;
-    while cursor < body.len() {
-        let Some(header_end) = cursor.checked_add(4) else {
-            return Err("append batch frame offset overflow".to_owned());
-        };
-        if header_end > body.len() {
-            return Err("append batch frame is missing length header".to_owned());
-        }
-        let len = u32::from_be_bytes(
-            body[cursor..header_end]
-                .try_into()
-                .expect("slice length is exactly 4"),
-        ) as usize;
-        cursor = header_end;
-        let Some(payload_end) = cursor.checked_add(len) else {
-            return Err("append batch payload length overflow".to_owned());
-        };
-        if payload_end > body.len() {
-            return Err("append batch frame payload is truncated".to_owned());
-        }
-        payloads.push(body.slice(cursor..payload_end));
-        cursor = payload_end;
-    }
-    if payloads.is_empty() {
-        return Err("append batch must contain at least one frame".to_owned());
-    }
-    Ok(payloads)
-}
-
-pub(crate) fn render_batch_results(results: &[Result<AppendResponse, RuntimeError>]) -> String {
-    let acks = results
-        .iter()
-        .map(|result| {
-            let status = match result {
-                Ok(_) => StatusCode::NO_CONTENT.as_u16(),
-                Err(err) => runtime_error_status(err).as_u16(),
-            };
-            match result {
-                Ok(response) => match response.record_range {
-                    Some(range) => json!({
-                        "status": status,
-                        "stream_record_start": range.first_record,
-                        "stream_record_next": range.next_record,
-                    }),
-                    None => json!({ "status": status }),
-                },
-                Err(_) => json!({ "status": status }),
-            }
-        })
-        .collect::<Vec<Value>>();
-    Value::Array(acks).to_string()
 }
 
 pub(crate) fn render_metrics(

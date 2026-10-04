@@ -214,8 +214,8 @@ jobs:
             and .minimized.outcome.status == "passed"
             and (.minimized.record != null)
             and (.minimized.schedule.fault_plan.steps[2].action.plan.stream_count == 1)
-            and (.minimized.schedule.fault_plan.steps[2].action.plan.append_batch_lens == [1])
-            and (.minimized.schedule.fault_plan.steps[2].action.plan.failover_batch_lens == [1])
+            and (.minimized.schedule.fault_plan.steps[2].action.plan.append_payload_counts == [1])
+            and (.minimized.schedule.fault_plan.steps[2].action.plan.failover_payload_counts == [1])
             and (.minimized.record.outcome.trace.events | any(.event == "runtime_raft_network_leader_failover_cold_live_read_verified" and .stream_count == 1))
           ' target/ursula-sim-seed-155-leader-cold-live-minimize/seed-155-minimized.json
           RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- assert-shape \
@@ -425,8 +425,8 @@ jobs:
             and .minimized.outcome.status == "reproduced_panic"
             and (.minimized.failure != null)
             and (.minimized.schedule.fault_plan.steps[2].action.plan.stream_count == 1)
-            and (.minimized.schedule.fault_plan.steps[2].action.plan.append_batch_lens == [1])
-            and (.minimized.schedule.fault_plan.steps[2].action.plan.failover_batch_lens == [1])
+            and (.minimized.schedule.fault_plan.steps[2].action.plan.append_payload_counts == [1])
+            and (.minimized.schedule.fault_plan.steps[2].action.plan.failover_payload_counts == [1])
             and (.minimized.schedule.fault_plan.steps[4].action.returned_len == 0)
             and (.minimized.failure.stable_trace.events | any(.event == "invariant_failed" and .invariant == "runtime_raft_network_leader_failover_cold_live_read_integrity"))
             and ([.minimized.failure.stable_trace.events[] | select(.event == "runtime_raft_network_leader_failover_stage_reached") | .stage] == [

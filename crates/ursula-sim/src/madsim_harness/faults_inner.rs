@@ -406,8 +406,8 @@ pub struct RuntimeInterleavingPlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeRaftNetworkWorkloadPlan {
     pub stream_count: usize,
-    pub append_batch_lens: Vec<usize>,
-    pub failover_batch_lens: Vec<usize>,
+    pub append_payload_counts: Vec<usize>,
+    pub failover_payload_counts: Vec<usize>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub producer_sessions: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -440,8 +440,8 @@ impl RuntimeRaftNetworkWorkloadPlan {
     fn single_stream_default() -> Self {
         Self {
             stream_count: 1,
-            append_batch_lens: vec![2],
-            failover_batch_lens: vec![1],
+            append_payload_counts: vec![2],
+            failover_payload_counts: vec![1],
             producer_sessions: false,
             producer_epoch_bumps: false,
             concurrent_producers: false,
@@ -461,17 +461,17 @@ impl RuntimeRaftNetworkWorkloadPlan {
     pub(super) fn from_seed(seed: u64) -> Self {
         let mut rng = SplitMix64::new(seed ^ 0x7274_776f_726b_6c64);
         let stream_count = 1 + rng.next_bounded(3) as usize;
-        let mut append_batch_lens = Vec::with_capacity(stream_count);
-        let mut failover_batch_lens = Vec::with_capacity(stream_count);
+        let mut append_payload_counts = Vec::with_capacity(stream_count);
+        let mut failover_payload_counts = Vec::with_capacity(stream_count);
         for _ in 0..stream_count {
-            append_batch_lens.push(1 + rng.next_bounded(3) as usize);
-            failover_batch_lens.push(1 + rng.next_bounded(2) as usize);
+            append_payload_counts.push(1 + rng.next_bounded(3) as usize);
+            failover_payload_counts.push(1 + rng.next_bounded(2) as usize);
         }
         let producer_sessions = rng.next_bounded(2) == 0;
         Self {
             stream_count,
-            append_batch_lens,
-            failover_batch_lens,
+            append_payload_counts,
+            failover_payload_counts,
             producer_sessions,
             producer_epoch_bumps: producer_sessions && rng.next_bounded(2) == 0,
             concurrent_producers: producer_sessions && rng.next_bounded(2) == 0,
@@ -488,16 +488,16 @@ impl RuntimeRaftNetworkWorkloadPlan {
         }
     }
 
-    pub(super) fn append_batch_len(&self, stream_index: usize) -> usize {
-        self.append_batch_lens
+    pub(super) fn append_payload_count(&self, stream_index: usize) -> usize {
+        self.append_payload_counts
             .get(stream_index)
             .copied()
             .unwrap_or(1)
             .max(1)
     }
 
-    pub(super) fn failover_batch_len(&self, stream_index: usize) -> usize {
-        self.failover_batch_lens
+    pub(super) fn failover_payload_count(&self, stream_index: usize) -> usize {
+        self.failover_payload_counts
             .get(stream_index)
             .copied()
             .unwrap_or(1)

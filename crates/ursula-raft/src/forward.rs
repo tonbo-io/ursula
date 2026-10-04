@@ -9,7 +9,6 @@ use serde::de::DeserializeOwned;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 use ursula_runtime::GroupEngineError;
-use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
@@ -25,9 +24,7 @@ use crate::codec::encode_wire;
 use crate::grpc::GRPC_LEADER_CHANNELS;
 use crate::grpc::RAFT_GRPC_MAX_MESSAGE_BYTES;
 use crate::grpc::RaftClient;
-use crate::log_store::elapsed_ns;
 use crate::raft_internal_proto;
-use crate::rt::time::Instant;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::types::RaftGroupResponse;
 use crate::types::UrsulaRaftTypeConfig;
@@ -232,60 +229,20 @@ pub(crate) async fn grpc_leader_channel(addr: &str) -> Result<Channel, GroupEngi
 
 pub(crate) async fn write_commands_on_raft(
     raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
-    placement: ShardPlacement,
-    metrics: Option<GroupEngineMetrics>,
     commands: Vec<GroupWriteCommand>,
 ) -> Result<Vec<Result<GroupWriteResponse, GroupEngineError>>, GroupEngineError> {
     if commands.is_empty() {
         return Ok(Vec::new());
     }
     let expected_responses = commands.len();
-    let logical_command_count = commands
-        .iter()
-        .map(logical_group_write_command_count)
-        .sum::<usize>();
-    let submit_started_at = Instant::now();
-    let mut stream = match raft.client_write_many(commands).await {
-        Ok(stream) => stream,
-        Err(err) => {
-            if let Some(metrics) = &metrics {
-                metrics.record_raft_write_many(
-                    placement,
-                    expected_responses,
-                    logical_command_count,
-                    0,
-                    elapsed_ns(submit_started_at),
-                    0,
-                );
-            }
-            return Err(GroupEngineError::new(format!(
-                "OpenRaft client_write_many: {err}"
-            )));
-        }
-    };
-    let submit_ns = elapsed_ns(submit_started_at);
-    let response_started_at = Instant::now();
+    let mut stream = raft
+        .client_write_many(commands)
+        .await
+        .map_err(|err| GroupEngineError::new(format!("OpenRaft client_write_many: {err}")))?;
     let mut responses = Vec::with_capacity(expected_responses);
-    loop {
-        let result = match stream.try_next().await {
-            Ok(Some(result)) => result,
-            Ok(None) => break,
-            Err(err) => {
-                if let Some(metrics) = &metrics {
-                    metrics.record_raft_write_many(
-                        placement,
-                        expected_responses,
-                        logical_command_count,
-                        responses.len(),
-                        submit_ns,
-                        elapsed_ns(response_started_at),
-                    );
-                }
-                return Err(GroupEngineError::new(format!(
-                    "OpenRaft client_write_many response stream: {err}"
-                )));
-            }
-        };
+    while let Some(result) = stream.try_next().await.map_err(|err| {
+        GroupEngineError::new(format!("OpenRaft client_write_many response stream: {err}"))
+    })? {
         let response = match result {
             Ok(response) => write_result_from_raft_response(response.response)?,
             Err(err) => Err(group_engine_forward_to_leader_error(
@@ -298,16 +255,6 @@ pub(crate) async fn write_commands_on_raft(
         };
         responses.push(response);
     }
-    if let Some(metrics) = &metrics {
-        metrics.record_raft_write_many(
-            placement,
-            expected_responses,
-            logical_command_count,
-            responses.len(),
-            submit_ns,
-            elapsed_ns(response_started_at),
-        );
-    }
     if responses.len() != expected_responses {
         return Err(GroupEngineError::new(format!(
             "OpenRaft client_write_many returned {} responses for {} commands",
@@ -316,15 +263,6 @@ pub(crate) async fn write_commands_on_raft(
         )));
     }
     Ok(responses)
-}
-
-pub(crate) fn logical_group_write_command_count(command: &GroupWriteCommand) -> usize {
-    match command {
-        GroupWriteCommand::Batch { commands } | GroupWriteCommand::Transaction { commands } => {
-            commands.len()
-        }
-        GroupWriteCommand::Stream(_) => 1,
-    }
 }
 
 /// Unwraps a raft-applied response into the write outcome it carries.

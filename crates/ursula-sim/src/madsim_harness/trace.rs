@@ -434,7 +434,6 @@ pub enum SimEvent {
     RuntimeRaftEngineReadVerified {
         stream: BucketStreamId,
         next_offset: u64,
-        raft_write_many_batches: u64,
         raft_apply_entries: u64,
     },
     RuntimeRaftSnapshotCaptured {
@@ -456,7 +455,6 @@ pub enum SimEvent {
     RuntimeRaftNetworkReadVerified {
         stream: BucketStreamId,
         next_offset: u64,
-        raft_write_many_batches: u64,
         raft_apply_entries: u64,
         delivered_rpc_count: usize,
     },
@@ -647,13 +645,11 @@ impl SimEvent {
             Self::RuntimeRaftNetworkReadVerified {
                 stream,
                 next_offset,
-                raft_write_many_batches,
                 raft_apply_entries,
                 delivered_rpc_count,
             } => Some(Self::RuntimeRaftNetworkReadVerified {
                 stream,
                 next_offset,
-                raft_write_many_batches: u64::from(raft_write_many_batches > 0),
                 raft_apply_entries: u64::from(raft_apply_entries > 0),
                 delivered_rpc_count: usize::from(delivered_rpc_count > 0),
             }),

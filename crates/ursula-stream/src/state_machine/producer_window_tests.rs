@@ -2,6 +2,8 @@
 //! feature level 1 (`docs/architecture/bounded-stream-state.md` §5.1, §5.4,
 //! §5.5).
 
+use bytes::Bytes;
+
 use super::producers::PRODUCER_IDLE_EXPIRY_MS;
 use super::producers::RECEIPT_TRIM_BUDGET;
 use super::producers::RECEIPT_WINDOW_ITEMS;
@@ -218,62 +220,12 @@ fn duplicate_beyond_window_is_deduplicated_without_ranges_and_never_appends() {
     assert_eq!(machine.head(&stream_id).unwrap().tail_offset, tail);
     assert!(machine.append_would_deduplicate(&stream_id, Some(&producer("p", 0)), 2));
 
-    // A batch duplicate beyond the window carries no per-frame ranges.
-    let batch = machine
-        .append_batch_borrowed(
-            stream_id.clone(),
-            Some(OCTET),
-            &[b"x"],
-            Some(producer("p", 1)),
-            2,
-        )
-        .unwrap();
-    assert!(batch.deduplicated);
-    assert!(batch.receipt_evicted);
-    assert!(batch.items.is_empty());
-    assert_eq!(machine.head(&stream_id).unwrap().tail_offset, tail);
-
     // Retrying the newest sequence still answers with its exact ranges.
     let (offset, next, deduplicated, evicted) =
         appended(append(&mut machine, &stream_id, "p", R + 4, 2));
     assert!(deduplicated);
     assert!(!evicted);
     assert_eq!((offset, next), (tail - 4, tail));
-}
-
-#[test]
-fn batch_receipts_count_one_item_per_frame() {
-    let mut machine = machine_at(1);
-    let stream_id = create(&mut machine, "batch", OCTET);
-    let frames: Vec<&[u8]> = vec![b"a"; 100];
-    for seq in 0..20 {
-        machine
-            .append_batch_borrowed(
-                stream_id.clone(),
-                Some(OCTET),
-                &frames,
-                Some(producer("p", seq)),
-                1,
-            )
-            .unwrap();
-    }
-    // 20 batches of 100 items: the window keeps the newest receipt plus
-    // whole receipts while the total stays within R.
-    let held = receipts(&machine, &stream_id, "p");
-    assert_eq!(held.len(), 10);
-    assert_eq!(window_items(&machine, &stream_id), 1_000);
-    // A duplicate of a retained batch gets per-frame ranges.
-    let batch = machine
-        .append_batch_borrowed(
-            stream_id.clone(),
-            Some(OCTET),
-            &frames,
-            Some(producer("p", 15)),
-            1,
-        )
-        .unwrap();
-    assert!(batch.deduplicated && !batch.receipt_evicted);
-    assert_eq!(batch.items.len(), 100);
 }
 
 #[test]

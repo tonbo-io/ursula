@@ -14,19 +14,15 @@ use ursula_shard::ShardPlacement;
 use ursula_stream::BucketUsageSnapshot;
 use ursula_stream::ColdFlushCandidate;
 use ursula_stream::ColdGcPlanEntry;
-use ursula_stream::StreamCommand;
 use ursula_stream::StreamErrorCode;
 use ursula_stream::StreamErrorContext;
 
 use crate::command::GroupSnapshot;
-use crate::command::GroupWriteCommand;
 use crate::metrics::RaftSnapshotBuildSample;
-use crate::metrics::RaftWriteManySample;
 use crate::metrics::RuntimeMetricsInner;
 use crate::request::AckColdGcResponse;
 use crate::request::AdvanceRetentionRequest;
 use crate::request::AdvanceRetentionResponse;
-use crate::request::AppendBatchRequest;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
 use crate::request::AppendResponse;
@@ -67,8 +63,6 @@ use crate::request::TouchStreamAccessResponse;
 
 pub type GroupAppendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AppendResponse, GroupEngineError>> + Send + 'a>>;
-pub type GroupAppendBatchFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<GroupAppendBatchResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupAppendTransactionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AppendTransactionResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupFlushColdFuture<'a> =
@@ -177,33 +171,13 @@ pub type GroupInstallSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), GroupEngineError>> + Send + 'a>>;
 pub type GroupShutdownFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), GroupEngineError>> + Send + 'a>>;
-pub type GroupWriteFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<GroupWriteResponse, GroupEngineError>> + Send + 'a>>;
-pub type GroupWriteBatchFuture<'a> = Pin<
-    Box<
-        dyn Future<
-                Output = Result<
-                    Vec<Result<GroupWriteResponse, GroupEngineError>>,
-                    GroupEngineError,
-                >,
-            > + Send
-            + 'a,
-    >,
->;
 pub type GroupEngineCreateFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Box<dyn GroupEngine>, GroupEngineError>> + Send + 'a>>;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GroupAppendBatchResponse {
-    pub placement: ShardPlacement,
-    pub items: Vec<Result<AppendResponse, GroupEngineError>>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupWriteResponse {
     CreateStream(CreateStreamResponse),
     Append(AppendResponse),
-    AppendBatch(GroupAppendBatchResponse),
     PublishSnapshot(PublishSnapshotResponse),
     AdvanceRetention(AdvanceRetentionResponse),
     TouchStreamAccess(TouchStreamAccessResponse),
@@ -552,32 +526,6 @@ pub trait GroupEngine: Send + 'static {
         })
     }
 
-    fn append_batch<'a>(
-        &'a mut self,
-        request: AppendBatchRequest,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> GroupAppendBatchFuture<'a>;
-
-    fn append_batch_many<'a>(
-        &'a mut self,
-        requests: Vec<AppendBatchRequest>,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> GroupWriteBatchFuture<'a> {
-        Box::pin(async move {
-            let mut responses = Vec::with_capacity(requests.len());
-            for request in requests {
-                let response = self
-                    .append_batch(request, placement, admission)
-                    .await
-                    .map(GroupWriteResponse::AppendBatch);
-                responses.push(response);
-            }
-            Ok(responses)
-        })
-    }
-
     fn append_transaction<'a>(
         &'a mut self,
         _request: AppendTransactionRequest,
@@ -665,327 +613,6 @@ pub trait GroupEngine: Send + 'static {
     fn shutdown<'a>(&'a mut self) -> GroupShutdownFuture<'a> {
         Box::pin(async { Ok(()) })
     }
-
-    fn write_batch<'a>(
-        &'a mut self,
-        commands: Vec<GroupWriteCommand>,
-        placement: ShardPlacement,
-    ) -> GroupWriteBatchFuture<'a> {
-        Box::pin(async move {
-            let mut responses = Vec::with_capacity(commands.len());
-            for command in commands {
-                let response = match command {
-                    GroupWriteCommand::Stream(command) => {
-                        self.dispatch_stream_command(command, placement).await
-                    }
-                    GroupWriteCommand::Batch { commands } => {
-                        let mut batched = Vec::with_capacity(commands.len());
-                        for command in commands {
-                            batched.push(self.dispatch_stream_command(command, placement).await);
-                        }
-                        Ok(GroupWriteResponse::Batch(batched))
-                    }
-                    GroupWriteCommand::Transaction { .. } => Err(GroupEngineError::new(
-                        "append transactions require an atomic group engine",
-                    )),
-                };
-                responses.push(response);
-            }
-            Ok(responses)
-        })
-    }
-
-    /// Routes one canonical [`StreamCommand`] to the matching typed engine
-    /// method. This is the only spelling of the command-to-operation mapping;
-    /// engines that replicate commands wholesale (raft) bypass it.
-    fn dispatch_stream_command<'a>(
-        &'a mut self,
-        command: StreamCommand,
-        placement: ShardPlacement,
-    ) -> GroupWriteFuture<'a> {
-        Box::pin(async move {
-            match command {
-                StreamCommand::CreateStream {
-                    stream_id,
-                    content_type,
-                    initial_payload,
-                    close_after,
-                    stream_seq,
-                    producer,
-                    stream_ttl_seconds,
-                    stream_expires_at_ms,
-                    now_ms,
-                } => self
-                    .create_stream(
-                        CreateStreamRequest {
-                            stream_id,
-                            content_type,
-                            content_type_explicit: true,
-                            initial_payload,
-                            close_after,
-                            stream_seq,
-                            producer,
-                            stream_ttl_seconds,
-                            stream_expires_at_ms,
-                            now_ms,
-                        },
-                        placement,
-                        ColdWriteAdmission::default(),
-                    )
-                    .await
-                    .map(GroupWriteResponse::CreateStream),
-                StreamCommand::CreateExternal {
-                    stream_id,
-                    content_type,
-                    initial_payload,
-                    record_ends,
-                    close_after,
-                    stream_seq,
-                    producer,
-                    stream_ttl_seconds,
-                    stream_expires_at_ms,
-                    now_ms,
-                } => self
-                    .create_stream_external(
-                        CreateStreamExternalRequest {
-                            stream_id,
-                            content_type,
-                            initial_payload,
-                            record_ends,
-                            close_after,
-                            stream_seq,
-                            producer,
-                            stream_ttl_seconds,
-                            stream_expires_at_ms,
-                            now_ms,
-                        },
-                        placement,
-                    )
-                    .await
-                    .map(GroupWriteResponse::CreateStream),
-                StreamCommand::Append {
-                    stream_id,
-                    content_type,
-                    payload,
-                    close_after,
-                    stream_seq,
-                    producer,
-                    now_ms,
-                    record_match,
-                } => self
-                    .append(
-                        AppendRequest {
-                            stream_id,
-                            content_type: content_type.unwrap_or_default(),
-                            payload,
-                            close_after,
-                            stream_seq,
-                            producer,
-                            now_ms,
-                            record_match,
-                        },
-                        placement,
-                        ColdWriteAdmission::default(),
-                    )
-                    .await
-                    .map(GroupWriteResponse::Append),
-                StreamCommand::AppendExternal {
-                    stream_id,
-                    content_type,
-                    payload,
-                    record_ends,
-                    close_after,
-                    stream_seq,
-                    producer,
-                    now_ms,
-                    record_match,
-                } => self
-                    .append_external(
-                        AppendExternalRequest {
-                            stream_id,
-                            content_type: content_type.unwrap_or_default(),
-                            payload,
-                            record_ends,
-                            close_after,
-                            stream_seq,
-                            producer,
-                            now_ms,
-                            record_match,
-                        },
-                        placement,
-                    )
-                    .await
-                    .map(GroupWriteResponse::Append),
-                StreamCommand::AppendBatch {
-                    stream_id,
-                    content_type,
-                    payloads,
-                    producer,
-                    now_ms,
-                } => self
-                    .append_batch(
-                        AppendBatchRequest {
-                            stream_id,
-                            content_type: content_type.unwrap_or_default(),
-                            payloads,
-                            producer,
-                            now_ms,
-                        },
-                        placement,
-                        ColdWriteAdmission::default(),
-                    )
-                    .await
-                    .map(GroupWriteResponse::AppendBatch),
-                StreamCommand::PublishSnapshot {
-                    stream_id,
-                    snapshot_offset,
-                    content_type,
-                    payload,
-                    now_ms,
-                } => self
-                    .publish_snapshot(
-                        PublishSnapshotRequest {
-                            stream_id,
-                            snapshot_offset,
-                            content_type,
-                            payload,
-                            cold_body: None,
-                            now_ms,
-                        },
-                        placement,
-                    )
-                    .await
-                    .map(GroupWriteResponse::PublishSnapshot),
-                StreamCommand::PublishSnapshotExternal {
-                    stream_id,
-                    snapshot_offset,
-                    content_type,
-                    object,
-                    digest,
-                    now_ms,
-                } => self
-                    .publish_snapshot(
-                        PublishSnapshotRequest {
-                            stream_id,
-                            snapshot_offset,
-                            content_type,
-                            payload: bytes::Bytes::new(),
-                            cold_body: Some(crate::request::ColdSnapshotBody { object, digest }),
-                            now_ms,
-                        },
-                        placement,
-                    )
-                    .await
-                    .map(GroupWriteResponse::PublishSnapshot),
-                StreamCommand::AdvanceRetention {
-                    stream_id,
-                    retained_offset,
-                    now_ms,
-                } => self
-                    .advance_retention(
-                        AdvanceRetentionRequest {
-                            stream_id,
-                            retained_offset,
-                            now_ms,
-                        },
-                        placement,
-                    )
-                    .await
-                    .map(GroupWriteResponse::AdvanceRetention),
-                StreamCommand::TouchStreamAccess {
-                    stream_id,
-                    now_ms,
-                    renew_ttl,
-                } => self
-                    .touch_stream_access(stream_id, now_ms, renew_ttl, placement)
-                    .await
-                    .map(GroupWriteResponse::TouchStreamAccess),
-                StreamCommand::FlushCold {
-                    stream_id,
-                    chunk,
-                    cold_generation,
-                } => self
-                    .flush_cold(
-                        FlushColdRequest {
-                            stream_id,
-                            chunk,
-                            cold_generation,
-                        },
-                        placement,
-                    )
-                    .await
-                    .map(GroupWriteResponse::FlushCold),
-                StreamCommand::CompactCold {
-                    stream_id,
-                    old_chunks,
-                    replacement,
-                    gc_not_before_ms,
-                } => self
-                    .compact_cold(
-                        CompactColdRequest {
-                            stream_id,
-                            old_chunks,
-                            replacement,
-                            gc_not_before_ms,
-                        },
-                        placement,
-                    )
-                    .await
-                    .map(GroupWriteResponse::CompactCold),
-                StreamCommand::Close {
-                    stream_id,
-                    stream_seq,
-                    producer,
-                    now_ms,
-                } => self
-                    .close_stream(
-                        CloseStreamRequest {
-                            stream_id,
-                            stream_seq,
-                            producer,
-                            now_ms,
-                        },
-                        placement,
-                    )
-                    .await
-                    .map(GroupWriteResponse::CloseStream),
-                StreamCommand::DeleteStream { stream_id } => self
-                    .delete_stream(DeleteStreamRequest { stream_id }, placement)
-                    .await
-                    .map(GroupWriteResponse::DeleteStream),
-                StreamCommand::AckColdGc { up_to_seq } => self
-                    .ack_cold_gc(up_to_seq, placement)
-                    .await
-                    .map(GroupWriteResponse::AckColdGc),
-                StreamCommand::DeferColdGc { seq, not_before_ms } => self
-                    .defer_cold_gc(seq, not_before_ms, placement)
-                    .await
-                    .map(GroupWriteResponse::DeferColdGc),
-                StreamCommand::PurgeBucket { bucket_id } => self
-                    .purge_bucket(bucket_id, placement)
-                    .await
-                    .map(GroupWriteResponse::PurgeBucket),
-                StreamCommand::ImportSnapshot { snapshot } => self
-                    .import_group_state(ImportGroupStateRequest { snapshot }, placement)
-                    .await
-                    .map(GroupWriteResponse::ImportGroupState),
-                StreamCommand::SetFeatureLevel { level } => self
-                    .set_feature_level(SetFeatureLevelRequest { level }, placement)
-                    .await
-                    .map(GroupWriteResponse::SetFeatureLevel),
-                StreamCommand::TidyStream { stream_id, now_ms } => self
-                    .tidy_stream(stream_id, now_ms, placement)
-                    .await
-                    .map(GroupWriteResponse::TidyStream),
-                StreamCommand::CreateBucket { .. } => Err(GroupEngineError::new(
-                    "CreateBucket is not a valid group write",
-                )),
-                StreamCommand::OffloadColdRefs { .. } => Err(GroupEngineError::new(
-                    "OffloadColdRefs is proposed only by the leader's offload pass",
-                )),
-            }
-        })
-    }
 }
 
 pub trait GroupEngineFactory: Send + Sync + 'static {
@@ -1058,29 +685,6 @@ impl GroupEngineMetrics {
             records,
             bytes,
             live_entries,
-        );
-    }
-
-    pub fn record_raft_write_many(
-        &self,
-        placement: ShardPlacement,
-        command_count: usize,
-        logical_command_count: usize,
-        response_count: usize,
-        submit_ns: u64,
-        response_ns: u64,
-    ) {
-        self.inner.record_raft_write_many(
-            placement.core_id,
-            placement.raft_group_id,
-            RaftWriteManySample {
-                command_count: u64::try_from(command_count).expect("command count fits u64"),
-                logical_command_count: u64::try_from(logical_command_count)
-                    .expect("logical command count fits u64"),
-                response_count: u64::try_from(response_count).expect("response count fits u64"),
-                submit_ns,
-                response_ns,
-            },
         );
     }
 
