@@ -2221,17 +2221,8 @@ async fn sparse_marks_scenario(seed: u64) {
         format!("{seed}-{chunk}"),
     )
     .await;
-    // The leader's metrics can lag its own apply; the append's commit index
-    // is the suffix's last entry.
-    let last_index = sparse_marks_append(leader_engine, &stream, &mut next, 25).await;
-    for engine in &engines {
-        engine
-            .raft_handle()
-            .wait(Some(Duration::from_secs(10)))
-            .applied_index_at_least(Some(last_index), "every replica applied suffix")
-            .await
-            .expect("wait for replica apply");
-    }
+    sparse_marks_append(leader_engine, &stream, &mut next, 25).await;
+    apply_barrier(&engines, leader_index, "every replica applied suffix").await;
 
     let model = body(0, next);
     let mut indexes = Vec::new();
@@ -2751,22 +2742,23 @@ fn external_locators_survive_ambiguous_commits() {
 }
 
 /// Waits until every replica applied everything the leader committed so
-/// far: creates a fresh stream (its commit index follows every earlier
-/// entry) and waits for all nodes to apply it. The leader's metrics can lag
-/// its own apply, so they are not a reliable barrier.
-async fn apply_barrier(engines: &mut [RaftGroupEngine], leader_index: usize, name: &str) {
-    let created = engines[leader_index]
-        .create_stream(
-            CreateStreamRequest::new(
-                BucketStreamId::new("simulated", name),
-                "application/octet-stream",
-            ),
-            placement(),
-            ColdWriteAdmission::default(),
-        )
+/// far. The barrier is the leader's read log id (`ReadIndex`), a Raft log
+/// index. A response's `group_commit_index` is not one: it counts applied
+/// stream commands and skips the blank and membership entries the log also
+/// holds, so it trails the entry's log index. The leader's metrics can lag
+/// its own apply, so they are not a reliable barrier either.
+async fn apply_barrier(
+    engines: &[RaftGroupEngine],
+    leader_index: usize,
+    description: &'static str,
+) {
+    let read_log_id = engines[leader_index]
+        .raft_handle()
+        .ensure_linearizable(openraft::ReadPolicy::ReadIndex)
         .await
-        .expect("barrier stream");
-    wait_all_nodes_applied(engines, created.group_commit_index, "apply barrier").await;
+        .expect("leader read index")
+        .expect("leader committed log id");
+    wait_all_nodes_applied(engines, read_log_id.index(), description).await;
 }
 
 /// Seeds of the level-3 snapshot-install family: a learner installs a
@@ -2896,7 +2888,7 @@ async fn external_locator_snapshot_install(seed: u64) {
         .await
         .expect("add learner");
     assert!(registry.full_snapshot_count(learner_id) >= 1);
-    apply_barrier(&mut engines, leader_index, "barrier-install").await;
+    apply_barrier(&engines, leader_index, "barrier-install").await;
 
     // Invariants 11 and 12 with the refs still staged.
     let tail = acknowledged.len();
@@ -2953,7 +2945,7 @@ async fn external_locator_snapshot_install(seed: u64) {
             break;
         }
     }
-    apply_barrier(&mut engines, leader_index, "barrier-offload").await;
+    apply_barrier(&engines, leader_index, "barrier-offload").await;
     for (index, engine) in engines.iter_mut().enumerate() {
         let node_id = u64::try_from(index + 1).expect("node id fits u64");
         read_local_payload_eventually(
@@ -3117,7 +3109,7 @@ async fn ambiguous_compaction_at_level_three(commits: bool) {
         },
         gc_not_before_ms: u64::MAX,
     };
-    apply_barrier(&mut engines, leader, "barrier-prefix").await;
+    apply_barrier(&engines, leader, "barrier-prefix").await;
     if commits {
         // The compaction commits; then its leader loses quorum.
         engines[leader]
@@ -3170,7 +3162,7 @@ async fn ambiguous_compaction_at_level_three(commits: bool) {
     }
     assert!(appended, "the current leader accepts appends");
     acknowledged.extend_from_slice(&tail_part);
-    apply_barrier(&mut engines, leader, "barrier-suffix").await;
+    apply_barrier(&engines, leader, "barrier-suffix").await;
 
     // Invariant 11 on every replica.
     let tail = acknowledged.len();
