@@ -110,7 +110,6 @@ use ursula_runtime::ProducerRequest;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
-use ursula_runtime::ReadStreamResponse;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::new_external_payload_path;
