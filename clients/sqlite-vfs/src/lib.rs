@@ -118,7 +118,7 @@ const CONTENT_TYPE: &str = "application/octet-stream";
 /// The protocol's offset for the beginning of a stream, and "none" for an offset that may be absent
 /// (a snapshot, retention, the local state): it sorts before every offset the server mints.
 const START: &str = "-1";
-/// The sidecar format (`write_sidecar`): 2 records offsets as the server's strings.
+/// The sidecar format (`sidecar_line`): 2 records offsets as the server's strings.
 const SIDECAR_VERSION: u32 = 2;
 
 static API: AtomicPtr<ffi::sqlite3_api_routines> = AtomicPtr::new(null_mut());
@@ -160,7 +160,8 @@ struct Db {
     /// `producer_id(incarnation)`.
     producer: String,
     sidecar: String,
-    /// What the sidecar records besides offset, epoch and the WAL claim (see `stamp`).
+    /// What the sidecar records besides offset, epoch, format, log count and the WAL claim (see
+    /// `stamp`).
     stamp: String,
     path: String,
     epoch: u64,
@@ -515,9 +516,9 @@ fn file_id(path: &str) -> Option<String> {
     fs::metadata(path).ok().map(|m| m.ino().to_string())
 }
 
-/// What a sidecar records besides offset, epoch and the WAL claim: the boot it was written in
-/// (`boot`, from `boot_id`), the stream and its incarnation (`Head::incarnation`), and the db file
-/// it describes (see `trusted`).
+/// What a sidecar records besides offset, epoch, format (`v=`), log count (`log=`) and the WAL
+/// claim: the boot it was written in (`boot`, from `boot_id`), the stream and its incarnation
+/// (`Head::incarnation`), and the db file it describes (see `trusted`).
 fn stamp(path: &str, url: &str, boot: Option<&str>, incarnation: &str) -> String {
     let mut s = format!(
         " boot={} stream={}",
@@ -1113,13 +1114,19 @@ fn read_from(url: &str, offset: &str) -> Result<(Vec<u8>, String), Fail> {
             "read {url} at {offset}: no Stream-Next-Offset"
         )));
     };
-    if !body.is_empty() && next.as_str() <= offset {
-        return Err(Fail::Other(format!(
-            "read {url} at {offset}: {} bytes but next offset {next}",
-            body.len()
-        )));
-    }
     Ok((body, next))
+}
+
+/// A read loop's step: `next`, answered by a read at `at` that returned bytes, must sort past `at`.
+/// Checked in the loops only, where both are server offsets (or `START`): an older sidecar's
+/// unpadded offset, read once to probe for a 416, compares meaninglessly.
+fn advanced(url: &str, at: &str, len: usize, next: &str) -> Result<(), String> {
+    if next <= at {
+        return Err(format!(
+            "read {url} at {at}: {len} bytes but next offset {next}"
+        ));
+    }
+    Ok(())
 }
 
 /// Snapshot transfers move whole databases: a longer timeout than appends.
@@ -1559,6 +1566,7 @@ unsafe fn catch_up(
             }
             break;
         }
+        advanced(url, &at, bytes.len(), &next)?;
         buf.extend_from_slice(&bytes);
         at = next;
         let mut used = 0;
@@ -1639,6 +1647,7 @@ fn claim_once(url: &str, producer: &str, epoch: u64, from: &str) -> Result<Claim
                 "claim {url}: the stream ends at {at}, before the claim's end {next}"
             ));
         }
+        advanced(url, &at, bytes.len(), &n)?;
         buf.extend_from_slice(&bytes);
         at = n;
     }
@@ -2852,9 +2861,9 @@ unsafe fn final_pages(
 /// so it sorts like the pair. Owners of one incarnation claim ever higher epochs and number commits
 /// upwards within one, so every commit's is above every earlier commit's: the server's check
 /// (refused unless above the stream's last `Stream-Seq`) then fences a writer outside this protocol
-/// that appended with a higher one since this owner's last commit. Writers without `Stream-Seq`
-/// (and lower ones) go unnoticed: offsets are opaque, so the VFS does not check where its frame
-/// landed.
+/// that appended with a higher one since this owner's last commit (one with a lower or equal
+/// `Stream-Seq` is itself refused). Writers without `Stream-Seq` go unnoticed: offsets are opaque,
+/// so the VFS does not check where its frame landed.
 fn stream_seq((epoch, seq): (u64, u64)) -> String {
     format!("{epoch:020}{seq:020}")
 }

@@ -59,7 +59,7 @@ const storage = await openUrsulaPiStorage("/data/harness-1.db", "https://ursula.
 // hand `storage` to the Pi harness; storage.close(ctx) on shutdown
 ```
 
-A commit the stream does not accept surfaces as `UrsulaReplicationError`; `fenced: true` means another host took the stream over, or the stream was deleted and recreated (opening it again then rebuilds the file from the new stream; see Rules). The storage is then read-only for this process: open it again to take the stream back.
+A commit the stream does not accept surfaces as `UrsulaReplicationError`; `fenced: true` means another host took the stream over, the stream was deleted and recreated (opening it again then rebuilds the file from the new stream; see Rules), or another writer appended to it with a higher `Stream-Seq`. The storage is then read-only for this process: open it again to take the stream back.
 
 ## Rules
 

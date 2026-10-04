@@ -221,3 +221,17 @@ it("(h) the cache of a deleted stream is rebuilt from the stream recreated at it
 	expect(status(file).local).toBe("-1");
 	expect(rows(file)).toEqual(longer.rows);
 });
+
+// An older format's sidecar is parsed but never trusted: the first attach after an upgrade rebuilds.
+// Format 1 wrote the offset as an unpadded decimal number (made up here from the server's internal
+// byte offset) and had no `v=` or `log=`; the read check at it must not compare that number with the
+// server's padded answer, or a stream that moved past it would refuse the attach for good.
+it("(i) a format-1 sidecar behind a stream another owner extended is discarded and rebuilt", async () => {
+	const { url, file, sidecar } = await twoOwners();
+	const old = sidecar.replace(/^\d+/, (n) => String(Number(n))).replace(/ v=\d+ log=\d+/, "");
+	expect(old).not.toMatch(/ v=| log=|^0/);
+	writeFileSync(`${file}-ursula`, old);
+	attach(file, url);
+	expect(status(file).local).toBe("-1");
+	expect(rows(file)).toEqual(["1:fir", "2:sec", "3:thi"]);
+});

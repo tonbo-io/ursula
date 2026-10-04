@@ -46,7 +46,7 @@ export interface AttachStatus {
 	readonly epoch: number;
 	/** Every later commit fails until the file is re-attached. */
 	readonly poisoned: boolean;
-	/** Poisoned because a newer owner claimed the stream, or the stream was deleted and recreated. */
+	/** Poisoned because a newer owner claimed the stream, the stream was deleted and recreated, or another writer appended with a higher `Stream-Seq`. */
 	readonly fenced: boolean;
 	readonly reason: string | null;
 	/** Offset of the latest snapshot known readable (published and read back, or found at attach); `"-1"` for none. */
@@ -108,8 +108,9 @@ export function drainStats(file: string): VfsStats {
 }
 
 /**
- * A commit the VFS could not replicate: fenced (by a newer owner, or because the stream was deleted and
- * recreated), rejected, or with no answer in time.
+ * A commit the VFS could not replicate: fenced (by a newer owner, because the stream was deleted and
+ * recreated, or by another writer's append with a higher `Stream-Seq`), rejected, or with no answer in
+ * time.
  */
 export class UrsulaReplicationError extends Error {
 	readonly fenced: boolean;
