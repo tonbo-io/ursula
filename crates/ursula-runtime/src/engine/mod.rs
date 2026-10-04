@@ -56,8 +56,6 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
-use crate::request::SetFeatureLevelRequest;
-use crate::request::SetFeatureLevelResponse;
 use crate::request::TouchStreamAccessResponse;
 
 pub type GroupAppendFuture<'a> =
@@ -88,8 +86,6 @@ pub type GroupPublishSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = Result<PublishSnapshotResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupAdvanceRetentionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AdvanceRetentionResponse, GroupEngineError>> + Send + 'a>>;
-pub type GroupSetFeatureLevelFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<SetFeatureLevelResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupTidyStreamFuture<'a> = Pin<
     Box<
         dyn Future<Output = Result<crate::request::TidyStreamResponse, GroupEngineError>>
@@ -111,8 +107,6 @@ pub type GroupTidyStreamsFuture<'a> = Pin<
             + 'a,
     >,
 >;
-pub type GroupFeatureLevelFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<u32, GroupEngineError>> + Send + 'a>>;
 pub type GroupStateGaugesFuture<'a> = Pin<
     Box<dyn Future<Output = Result<ursula_stream::GroupStateGauges, GroupEngineError>> + Send + 'a>,
 >;
@@ -185,7 +179,6 @@ pub enum GroupWriteResponse {
     AckColdGc(AckColdGcResponse),
     PurgeBucket(PurgeBucketResponse),
     ImportGroupState(crate::request::ImportGroupStateResponse),
-    SetFeatureLevel(SetFeatureLevelResponse),
     TidyStream(crate::request::TidyStreamResponse),
     DeferColdGc(DeferColdGcResponse),
     OffloadColdRefs(crate::cold_refs::OffloadStreamColdRefsResponse),
@@ -303,23 +296,9 @@ pub trait GroupEngine: Send + 'static {
         })
     }
 
-    /// Replicated group feature level (C0) held by this replica's applied
-    /// state. Like [`GroupEngine::bucket_usage`] it is served from local
-    /// state, leader or follower, so operators can verify every replica.
-    /// Default unsupported: an engine that cannot report its level must not
-    /// be counted as having reached one.
-    fn feature_level<'a>(&'a mut self, placement: ShardPlacement) -> GroupFeatureLevelFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "feature levels are not supported for group {}",
-                placement.raft_group_id.0
-            )))
-        })
-    }
-
     /// Bounded-state gauges of this replica's applied state
     /// (`docs/architecture/bounded-stream-state.md` §7.5). Served from local
-    /// state, leader or follower, like [`GroupEngine::feature_level`].
+    /// state, leader or follower, like [`GroupEngine::bucket_usage`].
     /// Default unsupported.
     fn state_gauges<'a>(&'a mut self, placement: ShardPlacement) -> GroupStateGaugesFuture<'a> {
         Box::pin(async move {
@@ -357,32 +336,17 @@ pub trait GroupEngine: Send + 'static {
         Box::pin(async move { Ok(crate::request::TidyStreamsResponse::default()) })
     }
 
-    /// One leader-side external-locator offload pass (bounded-state F5,
-    /// feature level 3): for each stream whose state-held external refs are
-    /// due, writes their cold-index page entries (clipping overlapping
-    /// entries) and then proposes `OffloadColdRefs`. A follower, a group below
-    /// level 3, or an engine without a cold store offloads nothing.
+    /// One leader-side external-locator offload pass (bounded-state F5): for
+    /// each stream whose state-held external refs are due, writes their
+    /// cold-index page entries (clipping overlapping entries) and then
+    /// proposes `OffloadColdRefs`. A follower or an engine without a cold
+    /// store offloads nothing.
     fn offload_cold_refs<'a>(
         &'a mut self,
         _request: crate::cold_refs::OffloadColdRefsRequest,
         _placement: ShardPlacement,
     ) -> GroupOffloadColdRefsFuture<'a> {
         Box::pin(async move { Ok(crate::cold_refs::OffloadColdRefsResponse::default()) })
-    }
-
-    /// Replicated `SetFeatureLevel` write (C0); see
-    /// `StreamCommand::SetFeatureLevel`. Default unsupported.
-    fn set_feature_level<'a>(
-        &'a mut self,
-        _request: SetFeatureLevelRequest,
-        placement: ShardPlacement,
-    ) -> GroupSetFeatureLevelFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "feature levels are not supported for group {}",
-                placement.raft_group_id.0
-            )))
-        })
     }
 
     fn read_snapshot<'a>(
@@ -441,7 +405,7 @@ pub trait GroupEngine: Send + 'static {
         Box::pin(async { Err(GroupEngineError::new("cold GC ack is not supported")) })
     }
 
-    /// Replicated `DeferColdGc` (bounded-state F14b, feature level 1): moves
+    /// Replicated `DeferColdGc` (bounded-state F14b): moves
     /// the failing cold-GC entry `seq` to the tail of the queue, due no
     /// earlier than `not_before_ms`. Default unsupported.
     fn defer_cold_gc<'a>(

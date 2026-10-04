@@ -1,9 +1,8 @@
-//! Bounded-state F16 (feature level 5): visible snapshot bodies held as
+//! Bounded-state F16: visible snapshot bodies held as
 //! cold-tier objects. State keeps the reference; superseded, unreferenced
 //! and deleted bodies are queued for cold GC.
 
 use super::*;
-use crate::feature::FEATURE_LEVEL_COLD_SNAPSHOTS;
 
 const BUCKET: &str = "f16snapshots";
 const OCTET: &str = "application/octet-stream";
@@ -12,12 +11,11 @@ fn stream() -> BucketStreamId {
     BucketStreamId::new(BUCKET, "s")
 }
 
-fn machine_at(level: u32) -> StreamStateMachine {
+fn machine() -> StreamStateMachine {
     let mut machine = StreamStateMachine::new();
     machine.apply(StreamCommand::CreateBucket {
         bucket_id: BUCKET.to_owned(),
     });
-    machine.apply(StreamCommand::SetFeatureLevel { level });
     let response = machine.apply(StreamCommand::CreateStream {
         stream_id: stream(),
         content_type: OCTET.to_owned(),
@@ -72,7 +70,7 @@ fn gc_paths(machine: &StreamStateMachine) -> Vec<(String, u64)> {
 
 #[test]
 fn cold_snapshot_keeps_a_reference_and_queues_unreferenced_bodies() {
-    let mut machine = machine_at(FEATURE_LEVEL_COLD_SNAPSHOTS);
+    let mut machine = machine();
     let response = publish_cold(&mut machine, 2, "s/external/a.bin", "da");
     assert!(
         matches!(response, StreamResponse::SnapshotPublished { ref snapshot_digest, .. } if snapshot_digest == "da"),

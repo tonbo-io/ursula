@@ -81,37 +81,6 @@ enum Command {
     /// Restore a verified backup into a fresh, empty cluster with the same
     /// raft group count.
     Restore(BackupCreateArgs),
-    /// Cluster-wide replicated settings.
-    #[command(subcommand)]
-    Cluster(ClusterCommand),
-}
-
-#[derive(Subcommand, Debug)]
-enum ClusterCommand {
-    /// Raise every Raft group's replicated feature level. Refuses unless
-    /// every voter and learner reports support for the level, then proposes
-    /// it through each group's leader and verifies every replica. Levels are
-    /// never lowered; binaries that cannot apply the level must not rejoin.
-    EnableFeature(EnableFeatureArgs),
-    /// Print each node's supported feature level and each group's level.
-    FeatureLevel(ObserveArgs),
-}
-
-#[derive(Args, Debug)]
-struct EnableFeatureArgs {
-    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
-    /// Feature level to enable.
-    #[arg(long)]
-    level: u32,
-    /// Seconds to wait until every group replica reports the level.
-    #[arg(long, default_value_t = 60)]
-    timeout_secs: u64,
-    #[arg(long, default_value_t = 1)]
-    poll_interval_secs: u64,
-    #[arg(long, default_value_t = 10)]
-    http_timeout_secs: u64,
 }
 
 #[derive(Args, Debug)]
@@ -303,12 +272,6 @@ async fn main() -> Result<()> {
         Command::BackupCreate(args) => run_backup_create_subcommand(args).await,
         Command::BackupVerify(args) => run_backup_verify_subcommand(args).await,
         Command::Restore(args) => run_restore_subcommand(args).await,
-        Command::Cluster(ClusterCommand::EnableFeature(args)) => {
-            run_enable_feature_subcommand(args).await
-        }
-        Command::Cluster(ClusterCommand::FeatureLevel(args)) => {
-            run_feature_level_subcommand(args).await
-        }
     }
 }
 
@@ -646,49 +609,5 @@ async fn run_verify_cluster_subcommand(args: VerifyClusterArgs) -> Result<()> {
     )
     .await?;
     println!("cluster verified: {} node(s) fully ready", nodes.len());
-    Ok(())
-}
-
-async fn run_enable_feature_subcommand(args: EnableFeatureArgs) -> Result<()> {
-    let nodes = load_nodes(&args.config).await?;
-    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
-    let outcome = ursula_ctl::enable_feature(&client, &nodes, &ursula_ctl::EnableFeatureOptions {
-        level: args.level,
-        timeout: Duration::from_secs(args.timeout_secs),
-        poll_interval: Duration::from_secs(args.poll_interval_secs),
-    })
-    .await?;
-    println!(
-        "feature level {} enabled: {} group(s) verified on {} node(s)",
-        outcome.level, outcome.groups, outcome.nodes
-    );
-    Ok(())
-}
-
-async fn run_feature_level_subcommand(args: ObserveArgs) -> Result<()> {
-    let nodes = load_nodes(&args.config).await?;
-    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
-    for node in &nodes {
-        match client.feature_level_report(node).await {
-            Ok(Some(report)) => {
-                let levels = report
-                    .groups
-                    .iter()
-                    .map(|group| match (group.hosted, group.level) {
-                        (false, _) => format!("{}=-", group.raft_group_id),
-                        (true, Some(level)) => format!("{}={level}", group.raft_group_id),
-                        (true, None) => format!("{}=?", group.raft_group_id),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                println!(
-                    "node {}: supported={} groups: {levels}",
-                    node.id, report.supported_level
-                );
-            }
-            Ok(None) => println!("node {}: supported=0 (no feature-level endpoint)", node.id),
-            Err(err) => println!("node {}: unreachable ({err:#})", node.id),
-        }
-    }
     Ok(())
 }

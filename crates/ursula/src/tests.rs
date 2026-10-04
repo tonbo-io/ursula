@@ -3843,7 +3843,7 @@ async fn static_grpc_raft_durable_cold_flush_replicates_manifest() {
                 .find(|entry| entry.metadata.stream_id == stream_id)
                 .cloned()
                 .expect("stream snapshot entry");
-            if entry.cold_frontier_offset > 0 && entry.payload.len() < payload.len() {
+            if entry.payload.len() < payload.len() {
                 last_snapshot = Some(entry);
                 break;
             }
@@ -3851,10 +3851,6 @@ async fn static_grpc_raft_durable_cold_flush_replicates_manifest() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let entry = last_snapshot.expect("stream snapshot entry");
-        assert!(
-            entry.cold_frontier_offset > 0,
-            "replicated stream should advance cold frontier"
-        );
         assert!(
             entry.payload.len() < payload.len(),
             "replicated hot payload should shrink after cold flush"
@@ -4282,9 +4278,8 @@ async fn cold_backpressure_returns_service_unavailable_and_metrics() {
     let cold_store = std::sync::Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
         // F6c/F4b: the cap counts payload plus 8 B per-record overhead.
-        RuntimeConfig::new(1, 1).with_cold_max_hot_bytes_per_group(Some(
-            4 + ursula_runtime::HOT_RECORD_OVERHEAD_BYTES_LB4,
-        )),
+        RuntimeConfig::new(1, 1)
+            .with_cold_max_hot_bytes_per_group(Some(4 + ursula_runtime::HOT_RECORD_OVERHEAD_BYTES)),
         InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
         Some(cold_store),
     )
@@ -4330,7 +4325,7 @@ async fn cold_backpressure_returns_service_unavailable_and_metrics() {
     let body = std::str::from_utf8(&body).expect("utf8 body");
     assert!(body.contains(&format!(
         "\"cold_hot_bytes\":{}",
-        4 + ursula_runtime::HOT_RECORD_OVERHEAD_BYTES_LB4
+        4 + ursula_runtime::HOT_RECORD_OVERHEAD_BYTES
     )));
     assert!(body.contains("\"cold_backpressure_events\":1"));
     assert!(body.contains("\"cold_backpressure_bytes\":1"));
@@ -7103,13 +7098,7 @@ async fn metrics_expose_per_group_state_gauges() {
         .as_array()
         .expect("group_state_gauges array");
     assert_eq!(groups.len(), 8, "{metrics}");
-    // Format epoch 2: every router-built group is born at the top level.
-    let max = u64::from(ursula_runtime::MAX_SUPPORTED_FEATURE_LEVEL);
-    assert!(
-        groups
-            .iter()
-            .all(|group| group["hosted"] == true && group["feature_level"] == max)
-    );
+    assert!(groups.iter().all(|group| group["hosted"] == true));
     let streams: u64 = groups.iter().filter_map(|g| g["streams"].as_u64()).sum();
     assert_eq!(streams, 1);
     let group = groups
@@ -7126,7 +7115,6 @@ async fn metrics_expose_per_group_state_gauges() {
     assert_eq!(group["hot_chunks"], 1);
     assert_eq!(group["hot_records"], 6);
     for key in [
-        "message_records",
         "shared_refs",
         "live_packs",
         "staged_external_refs",
@@ -7139,93 +7127,6 @@ async fn metrics_expose_per_group_state_gauges() {
     ] {
         assert!(group[key].is_u64(), "missing {key}: {group}");
     }
-}
-
-// Replicated group feature level admin surface (C0). Since format epoch 2
-// every group is born at the top level and the POST proposes nothing.
-#[tokio::test]
-async fn feature_level_endpoint_reports_and_raises_every_group() {
-    let max = u64::from(ursula_runtime::MAX_SUPPORTED_FEATURE_LEVEL);
-    let app = test_router();
-
-    let response = http_get(&app, "/__ursula/feature-level").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let report: serde_json::Value =
-        serde_json::from_slice(&body_bytes(response).await).expect("report json");
-    assert_eq!(report["version"], 1);
-    assert_eq!(
-        report["supported_level"],
-        u64::from(ursula_runtime::MAX_SUPPORTED_FEATURE_LEVEL)
-    );
-    let groups = report["groups"].as_array().expect("groups");
-    assert_eq!(groups.len(), 8);
-    assert!(groups.iter().all(|group| group["level"] == max));
-
-    let response = http_post(
-        &app,
-        "/__ursula/feature-level",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(r#"{"level":1}"#),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let outcome: serde_json::Value =
-        serde_json::from_slice(&body_bytes(response).await).expect("outcome json");
-    let groups = outcome["groups"].as_array().expect("groups");
-    assert_eq!(groups.len(), 8);
-    assert!(
-        groups
-            .iter()
-            .all(|group| group["status"] == "set" && group["level"] == max),
-        "{outcome}"
-    );
-
-    // Lower levels are accepted as no-ops: never lowered.
-    let response = http_post(
-        &app,
-        "/__ursula/feature-level",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(r#"{"level":0}"#),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = http_get(&app, "/__ursula/feature-level").await;
-    let report: serde_json::Value =
-        serde_json::from_slice(&body_bytes(response).await).expect("report json");
-    let groups = report["groups"].as_array().expect("groups");
-    assert!(groups.iter().all(|group| group["level"] == max), "{report}");
-}
-
-#[tokio::test]
-async fn feature_level_endpoint_refuses_levels_this_node_cannot_apply() {
-    let app = test_router();
-    let level = ursula_runtime::MAX_SUPPORTED_FEATURE_LEVEL + 1;
-    let response = http_post(
-        &app,
-        "/__ursula/feature-level",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(format!(r#"{{"level":{level}}}"#)),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
-    assert!(body.contains("supported level"), "{body}");
-
-    let response = http_get(&app, "/__ursula/feature-level").await;
-    let report: serde_json::Value =
-        serde_json::from_slice(&body_bytes(response).await).expect("report json");
-    let groups = report["groups"].as_array().expect("groups");
-    let max = u64::from(ursula_runtime::MAX_SUPPORTED_FEATURE_LEVEL);
-    assert!(groups.iter().all(|group| group["level"] == max), "{report}");
-}
-
-#[test]
-fn feature_not_enabled_maps_to_conflict() {
-    assert_eq!(
-        crate::render::stream_error_code_status(ursula_runtime::StreamErrorCode::FeatureNotEnabled),
-        StatusCode::CONFLICT
-    );
 }
 
 // --- P7: byte-bounded record-aware reads (extensions.md §6.6) ---
@@ -7611,20 +7512,12 @@ async fn producer_id_and_stream_seq_length_caps_reject_with_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
-/// bounded-stream-state F3 at feature level 1: a duplicate whose receipt
-/// the stream's receipt window evicted answers `204` with `Producer-Seq` and
-/// without byte or record range headers, and never appends.
+/// bounded-stream-state F3: a duplicate whose receipt the stream's receipt
+/// window evicted answers `204` with `Producer-Seq` and without byte or
+/// record range headers, and never appends.
 #[tokio::test]
 async fn duplicate_beyond_receipt_window_answers_204_without_ranges() {
     let app = test_router();
-    let response = http_post(
-        &app,
-        "/__ursula/feature-level",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(r#"{"level":1}"#),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
     let response = http_put(
         &app,
         "/benchcmp/receipt-window",

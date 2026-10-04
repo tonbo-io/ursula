@@ -1,9 +1,7 @@
-//! Bounded-state F5 (feature level 3): external payload locators committed
-//! in state at apply and removed by `OffloadColdRefs`. Since format epoch 2
-//! every group runs at the top level, so the below-level-3 halves are gone.
+//! Bounded-state F5: external payload locators committed in state at apply
+//! and removed by `OffloadColdRefs`.
 
 use super::*;
-use crate::feature::FEATURE_LEVEL_EXTERNAL_LOCATORS;
 
 const BUCKET: &str = "f5locators";
 const OCTET: &str = "application/octet-stream";
@@ -12,17 +10,13 @@ fn stream(id: &str) -> BucketStreamId {
     BucketStreamId::new(BUCKET, id)
 }
 
-fn machine_at(level: u32) -> StreamStateMachine {
+fn machine() -> StreamStateMachine {
     let mut machine = StreamStateMachine::new();
     assert!(matches!(
         machine.apply(StreamCommand::CreateBucket {
             bucket_id: BUCKET.to_owned(),
         }),
         StreamResponse::BucketCreated { .. }
-    ));
-    assert!(matches!(
-        machine.apply(StreamCommand::SetFeatureLevel { level }),
-        StreamResponse::FeatureLevelSet { .. }
     ));
     let response = machine.apply(StreamCommand::CreateStream {
         stream_id: stream("s"),
@@ -109,7 +103,7 @@ fn offload(machine: &mut StreamStateMachine, refs: Vec<ObjectPayloadRef>) -> Str
 
 #[test]
 fn external_append_keeps_its_locator_in_state() {
-    let mut machine = machine_at(FEATURE_LEVEL_EXTERNAL_LOCATORS);
+    let mut machine = machine();
     append_external(&mut machine, "s/external/a.bin", 10);
     assert_eq!(machine.external_segments(&stream("s")), &[object(
         0,
@@ -127,7 +121,7 @@ fn external_append_keeps_its_locator_in_state() {
 
 #[test]
 fn rejected_external_append_leaves_no_locator() {
-    let mut machine = machine_at(FEATURE_LEVEL_EXTERNAL_LOCATORS);
+    let mut machine = machine();
     // A record match that does not hold rejects the append on every replica.
     let response = append_external_with_match(&mut machine, "s/external/lost.bin", 10, Some(7));
     assert!(
@@ -140,7 +134,7 @@ fn rejected_external_append_leaves_no_locator() {
 
 #[test]
 fn offload_removes_exactly_the_listed_refs_and_is_idempotent() {
-    let mut machine = machine_at(FEATURE_LEVEL_EXTERNAL_LOCATORS);
+    let mut machine = machine();
     append_external(&mut machine, "s/external/a.bin", 10);
     append_inline(&mut machine, b"hot");
     append_external(&mut machine, "s/external/b.bin", 5);
@@ -200,7 +194,7 @@ fn offload_removes_exactly_the_listed_refs_and_is_idempotent() {
 
 #[test]
 fn offload_is_refused_for_missing_streams() {
-    let mut machine = machine_at(FEATURE_LEVEL_EXTERNAL_LOCATORS);
+    let mut machine = machine();
     let response = machine.apply(StreamCommand::OffloadColdRefs {
         stream_id: stream("missing"),
         refs: Vec::new(),
@@ -217,7 +211,7 @@ fn offload_is_refused_for_missing_streams() {
 #[test]
 fn candidates_follow_the_count_bound_and_the_due_predicate() {
     let never_due = |_: &ObjectPayloadRef| false;
-    let mut machine = machine_at(FEATURE_LEVEL_EXTERNAL_LOCATORS);
+    let mut machine = machine();
     for index in 0..MAX_STAGED_EXTERNAL_REFS {
         append_external(&mut machine, &format!("s/external/{index:02}.bin"), 4);
     }
@@ -263,7 +257,7 @@ fn candidates_follow_the_count_bound_and_the_due_predicate() {
 
 #[test]
 fn delete_queues_state_held_external_refs_for_gc() {
-    let mut machine = machine_at(FEATURE_LEVEL_EXTERNAL_LOCATORS);
+    let mut machine = machine();
     append_external(&mut machine, "s/external/a.bin", 10);
     let response = machine.apply(StreamCommand::DeleteStream {
         stream_id: stream("s"),
@@ -281,18 +275,16 @@ fn delete_queues_state_held_external_refs_for_gc() {
     );
 }
 
-/// Now that this binary supports level 3, a level-3 snapshot holding staged
-/// locators restores to the same state, and the restored machine still
-/// offloads them.
+/// A snapshot holding staged locators restores to the same state, and the
+/// restored machine still offloads them.
 #[test]
-fn level_three_snapshot_with_staged_locators_round_trips() {
-    let mut machine = machine_at(FEATURE_LEVEL_EXTERNAL_LOCATORS);
+fn snapshot_with_staged_locators_round_trips() {
+    let mut machine = machine();
     append_inline(&mut machine, b"abcd");
     append_external(&mut machine, "s/external/a.bin", 10);
     append_external(&mut machine, "s/external/b.bin", 6);
     let snapshot = machine.snapshot();
-    let mut restored = StreamStateMachine::restore(snapshot.clone()).expect("restore level 3");
-    assert_eq!(restored.feature_level(), crate::MAX_SUPPORTED_FEATURE_LEVEL);
+    let mut restored = StreamStateMachine::restore(snapshot.clone()).expect("restore");
     assert_eq!(restored.snapshot(), snapshot);
     assert_eq!(restored.external_segments(&stream("s")), &[
         object(4, 14, "s/external/a.bin"),

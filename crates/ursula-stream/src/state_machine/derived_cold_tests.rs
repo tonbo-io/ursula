@@ -1,18 +1,17 @@
-//! Bounded-state level Lb1 cold hygiene (feature level 1): F18 step 2
-//! derived cold coverage, F14b `DeferColdGc`, F14i retention grace, and the
-//! incarnation check on `FlushCold`. Since format epoch 2 every group runs at
-//! the top level, so the level-0 halves these tests once pinned are gone.
+//! Bounded-state cold hygiene: F18 step 2 derived cold coverage, F14b
+//! `DeferColdGc`, F14i retention grace, and the incarnation check on
+//! `FlushCold`.
 
 use super::*;
 
-const BUCKET: &str = "lb1cold";
+const BUCKET: &str = "derivedcold";
 const OCTET: &str = "application/octet-stream";
 
 fn stream(id: &str) -> BucketStreamId {
     BucketStreamId::new(BUCKET, id)
 }
 
-fn machine_at(level: u32) -> StreamStateMachine {
+fn machine() -> StreamStateMachine {
     let mut machine = StreamStateMachine::new();
     assert!(matches!(
         machine.apply(StreamCommand::CreateBucket {
@@ -20,12 +19,6 @@ fn machine_at(level: u32) -> StreamStateMachine {
         }),
         StreamResponse::BucketCreated { .. }
     ));
-    if level > 0 {
-        assert!(matches!(
-            machine.apply(StreamCommand::SetFeatureLevel { level }),
-            StreamResponse::FeatureLevelSet { .. }
-        ));
-    }
     machine
 }
 
@@ -104,7 +97,9 @@ fn flush(
             shared_object: false,
             payload_digest: String::new(),
         },
-        cold_generation: None,
+        cold_generation: machine
+            .cold_index_generation(&stream(id))
+            .unwrap_or_default(),
     })
 }
 
@@ -126,14 +121,6 @@ fn retain(machine: &mut StreamStateMachine, id: &str, offset: u64, now_ms: u64) 
     })
 }
 
-fn entry<'a>(snapshot: &'a StreamSnapshot, id: &str) -> &'a StreamSnapshotEntry {
-    snapshot
-        .streams
-        .iter()
-        .find(|entry| entry.metadata.stream_id == stream(id))
-        .expect("snapshot entry")
-}
-
 #[track_caller]
 fn assert_code(response: &StreamResponse, code: StreamErrorCode) {
     match response {
@@ -142,20 +129,18 @@ fn assert_code(response: &StreamResponse, code: StreamErrorCode) {
     }
 }
 
-/// Hot message `[0, 4)` with an external append `[4, 7)` above it: the
-/// level-0 scalar frontier is raised to 7 by the external, which made the
-/// frontier clause accept the intra-message offset 2.
-fn hot_message_below_external(level: u32, id: &str) -> StreamStateMachine {
-    let mut machine = machine_at(level);
+/// Hot message `[0, 4)` with an external append `[4, 7)` above it.
+fn hot_message_below_external(id: &str) -> StreamStateMachine {
+    let mut machine = machine();
     create(&mut machine, id, 1);
     append(&mut machine, id, b"abcd");
-    append_external(&mut machine, id, "lb1/external/x.bin", 3);
+    append_external(&mut machine, id, "derived/external/x.bin", 3);
     machine
 }
 
 #[test]
-fn f18_snapshot_at_intra_message_hot_offset_below_external_is_rejected_at_lb1() {
-    let mut machine = hot_message_below_external(1, "align");
+fn f18_snapshot_at_intra_message_hot_offset_below_external_is_rejected() {
+    let mut machine = hot_message_below_external("align");
     assert_code(
         &publish_snapshot(&mut machine, "align", 2),
         StreamErrorCode::InvalidSnapshot,
@@ -172,16 +157,16 @@ fn f18_snapshot_at_intra_message_hot_offset_below_external_is_rejected_at_lb1() 
 }
 
 #[test]
-fn f18_offsets_at_or_below_the_seal_point_are_aligned_at_lb1() {
-    let mut machine = hot_message_below_external(1, "seal");
+fn f18_offsets_at_or_below_the_seal_point_are_aligned() {
+    let mut machine = hot_message_below_external("seal");
     // Flush the hot message: nothing is hot, so p(s) is the tail.
     assert!(matches!(
-        flush(&mut machine, "seal", 0, 4, "lb1/chunks/a.bin"),
+        flush(&mut machine, "seal", 0, 4, "derived/chunks/a.bin"),
         StreamResponse::ColdFlushed { .. }
     ));
     assert_eq!(machine.seal_point(&stream("seal")), 7);
-    // Intra-record cold offsets below p(s) stay accepted at Lb1 (F1 rejects
-    // them for JSON leader-side, later).
+    // Intra-record cold offsets below p(s) stay accepted (F1 rejects them
+    // for JSON leader-side, later).
     assert!(matches!(
         publish_snapshot(&mut machine, "seal", 5),
         StreamResponse::SnapshotPublished { .. }
@@ -189,12 +174,12 @@ fn f18_offsets_at_or_below_the_seal_point_are_aligned_at_lb1() {
 }
 
 #[test]
-fn f18_retention_collapse_stops_at_the_seal_point_at_lb1() {
-    let mut machine = machine_at(1);
+fn f18_retention_keeps_hot_messages_above_the_seal_point() {
+    let mut machine = machine();
     create(&mut machine, "collapse", 1);
     append(&mut machine, "collapse", b"ab");
     append(&mut machine, "collapse", b"cd");
-    append_external(&mut machine, "collapse", "lb1/external/y.bin", 3);
+    append_external(&mut machine, "collapse", "derived/external/y.bin", 3);
     assert!(matches!(
         publish_snapshot(&mut machine, "collapse", 2),
         StreamResponse::SnapshotPublished { .. }
@@ -214,13 +199,13 @@ fn f18_retention_collapse_stops_at_the_seal_point_at_lb1() {
 
 #[test]
 fn f18_bootstrap_after_a_d1_flush_uses_the_seal_point() {
-    // D1 at Lb1: hot `ab`, external `[2, 5)`, flush of the hot prefix.
-    let mut machine = machine_at(1);
+    // D1: hot `ab`, external `[2, 5)`, flush of the hot prefix.
+    let mut machine = machine();
     create(&mut machine, "boot", 1);
     append(&mut machine, "boot", b"ab");
-    append_external(&mut machine, "boot", "lb1/external/z.bin", 3);
+    append_external(&mut machine, "boot", "derived/external/z.bin", 3);
     assert!(matches!(
-        flush(&mut machine, "boot", 0, 2, "lb1/chunks/ab.bin"),
+        flush(&mut machine, "boot", 0, 2, "derived/chunks/ab.bin"),
         StreamResponse::ColdFlushed { .. }
     ));
     // Everything below p(s) = 5 is cold, so a bootstrap from 0 is partial.
@@ -238,36 +223,8 @@ fn f18_bootstrap_after_a_d1_flush_uses_the_seal_point() {
 }
 
 #[test]
-fn f18_snapshot_field_six_is_the_seal_point_and_ignored_at_restore() {
-    let mut machine = machine_at(1);
-    create(&mut machine, "field", 1);
-    append(&mut machine, "field", b"ab");
-    append_external(&mut machine, "field", "lb1/external/w.bin", 3);
-    assert!(matches!(
-        flush(&mut machine, "field", 0, 2, "lb1/chunks/ab.bin"),
-        StreamResponse::ColdFlushed { .. }
-    ));
-    append(&mut machine, "field", b"cd");
-    let snapshot = machine.snapshot();
-    // p(s) is the first hot byte, 5.
-    assert_eq!(entry(&snapshot, "field").cold_frontier_offset, 5);
-
-    // Restore ignores the field: any value restores to the same state.
-    let mut tampered = snapshot.clone();
-    for stream_entry in &mut tampered.streams {
-        stream_entry.cold_frontier_offset = 1;
-    }
-    let restored = StreamStateMachine::restore(tampered).expect("restore");
-    assert_eq!(restored.snapshot(), snapshot);
-    let restored_plan = restored
-        .read_plan(&stream("field"), 0, 64)
-        .expect("restored read plan");
-    assert_eq!(restored_plan.next_offset, 7);
-}
-
-#[test]
 fn f18_delete_enqueues_stream_gc_only_when_bytes_left_the_hot_buffer() {
-    let mut machine = machine_at(1);
+    let mut machine = machine();
     create(&mut machine, "hot-only", 1);
     append(&mut machine, "hot-only", b"abcd");
     assert!(matches!(
@@ -281,7 +238,7 @@ fn f18_delete_enqueues_stream_gc_only_when_bytes_left_the_hot_buffer() {
     create(&mut machine, "flushed", 2);
     append(&mut machine, "flushed", b"abcd");
     assert!(matches!(
-        flush(&mut machine, "flushed", 0, 2, "lb1/chunks/ab.bin"),
+        flush(&mut machine, "flushed", 0, 2, "derived/chunks/ab.bin"),
         StreamResponse::ColdFlushed { .. }
     ));
     assert!(matches!(
@@ -294,8 +251,8 @@ fn f18_delete_enqueues_stream_gc_only_when_bytes_left_the_hot_buffer() {
 }
 
 /// Appends `abcd` and publishes `[0, 4)` as a slice of a shared pack.
-fn shared_pack_stream(level: u32, id: &str) -> StreamStateMachine {
-    let mut machine = machine_at(level);
+fn shared_pack_stream(id: &str) -> StreamStateMachine {
+    let mut machine = machine();
     create(&mut machine, id, 1);
     append(&mut machine, id, b"abcd");
     let response = machine.apply(StreamCommand::FlushCold {
@@ -309,7 +266,9 @@ fn shared_pack_stream(level: u32, id: &str) -> StreamStateMachine {
             shared_object: true,
             payload_digest: String::new(),
         },
-        cold_generation: None,
+        cold_generation: machine
+            .cold_index_generation(&stream(id))
+            .unwrap_or_default(),
     });
     assert!(
         matches!(response, StreamResponse::ColdFlushed { .. }),
@@ -324,9 +283,9 @@ fn shared_pack_stream(level: u32, id: &str) -> StreamStateMachine {
 }
 
 #[test]
-fn f14i_retention_keeps_dropped_pack_slices_for_the_grace_at_lb1() {
+fn f14i_retention_keeps_dropped_pack_slices_for_the_grace() {
     const NOW_MS: u64 = 1_000_000;
-    let mut machine = shared_pack_stream(1, "pack");
+    let mut machine = shared_pack_stream("pack");
     assert!(matches!(
         retain(&mut machine, "pack", 4, NOW_MS),
         StreamResponse::RetentionAdvanced { .. }
@@ -346,13 +305,13 @@ fn f14i_retention_keeps_dropped_pack_slices_for_the_grace_at_lb1() {
     assert_eq!(restored.pending_cold_gc_batch(8), pending);
 }
 
-fn gc_queue_with_two_entries(level: u32) -> StreamStateMachine {
-    let mut machine = machine_at(level);
+fn gc_queue_with_two_entries() -> StreamStateMachine {
+    let mut machine = machine();
     for (index, id) in ["gc-a", "gc-b"].into_iter().enumerate() {
         create(&mut machine, id, 10 + index as u64);
         append(&mut machine, id, b"abcd");
         assert!(matches!(
-            flush(&mut machine, id, 0, 4, &format!("lb1/chunks/{id}.bin")),
+            flush(&mut machine, id, 0, 4, &format!("derived/chunks/{id}.bin")),
             StreamResponse::ColdFlushed { .. }
         ));
         assert!(matches!(
@@ -368,7 +327,7 @@ fn gc_queue_with_two_entries(level: u32) -> StreamStateMachine {
 
 #[test]
 fn f14b_defer_cold_gc_moves_the_failing_head_behind_the_queue() {
-    let mut machine = gc_queue_with_two_entries(1);
+    let mut machine = gc_queue_with_two_entries();
     let before = machine.pending_cold_gc_batch(8);
     let (head, second) = (before[0].clone(), before[1].clone());
     let response = machine.apply(StreamCommand::DeferColdGc {
@@ -417,8 +376,8 @@ fn f14b_defer_cold_gc_moves_the_failing_head_behind_the_queue() {
 /// the same bytes (its chunk lives under the old generation, which stream GC
 /// of the old incarnation deletes).
 #[test]
-fn flush_cold_from_a_removed_incarnation_is_stale_at_lb1() {
-    let mut machine = machine_at(1);
+fn flush_cold_from_a_removed_incarnation_is_stale() {
+    let mut machine = machine();
     create(&mut machine, "reborn", 100);
     append(&mut machine, "reborn", b"abcd");
     let candidate = machine
@@ -441,7 +400,7 @@ fn flush_cold_from_a_removed_incarnation_is_stale_at_lb1() {
     let stale_chunk = ColdChunkRef {
         start_offset: candidate.start_offset,
         end_offset: candidate.end_offset,
-        s3_path: "lb1/chunks/old-incarnation.bin".to_owned(),
+        s3_path: "derived/chunks/old-incarnation.bin".to_owned(),
         object_size: 4,
         object_offset: 0,
         shared_object: false,
@@ -456,7 +415,7 @@ fn flush_cold_from_a_removed_incarnation_is_stale_at_lb1() {
     let response = machine.apply(StreamCommand::FlushCold {
         stream_id: stream("reborn"),
         chunk: stale_chunk.clone(),
-        cold_generation: Some(candidate.cold_generation),
+        cold_generation: candidate.cold_generation,
     });
     match &response {
         StreamResponse::Error { code, context, .. } => {
@@ -467,8 +426,7 @@ fn flush_cold_from_a_removed_incarnation_is_stale_at_lb1() {
     }
     assert_eq!(machine.hot_start_offset(&stream("reborn")), 0);
 
-    // The live incarnation's own flush, and a proposer without the field,
-    // still apply.
+    // The live incarnation's own flushes still apply.
     assert!(matches!(
         machine.apply(StreamCommand::FlushCold {
             stream_id: stream("reborn"),
@@ -478,12 +436,12 @@ fn flush_cold_from_a_removed_incarnation_is_stale_at_lb1() {
                 payload_digest: String::new(),
                 ..stale_chunk.clone()
             },
-            cold_generation: Some(live),
+            cold_generation: live,
         }),
         StreamResponse::ColdFlushed { .. }
     ));
     assert!(matches!(
-        flush(&mut machine, "reborn", 2, 4, "lb1/chunks/cd.bin"),
+        flush(&mut machine, "reborn", 2, 4, "derived/chunks/cd.bin"),
         StreamResponse::ColdFlushed { .. }
     ));
 }
@@ -491,7 +449,7 @@ fn flush_cold_from_a_removed_incarnation_is_stale_at_lb1() {
 /// A whole hot message at the seal point stays a complete bootstrap.
 #[test]
 fn bootstrap_keeps_whole_hot_messages_at_the_seal_point() {
-    let mut fresh = machine_at(1);
+    let mut fresh = machine();
     create(&mut fresh, "fresh", 1);
     append(&mut fresh, "fresh", b"ab");
     append(&mut fresh, "fresh", b"cd");
@@ -500,23 +458,14 @@ fn bootstrap_keeps_whole_hot_messages_at_the_seal_point() {
     assert_eq!(plan.updates.len(), 2);
 }
 
-/// Bootstrap after a raise from level 0 never merges or skips messages,
-/// whatever level-0 history built the stream (B6 follow-up).
-///
-/// B6 hot blocks keep no per-append boundaries, so the legacy-collapse check
-/// in `exact_message_frontier` compares against the end of the first
-/// contiguous hot run. That is exact: a level-0 collapse reaches past the
-/// seal point only through the scalar cold frontier, which only an external
-/// append raises above hot bytes, and an external is never hot, so a
-/// collapsed record that starts at the seal point always ends past the first
-/// hot run. A collapse over hot-only messages with no external gap cannot be
-/// built. This test sweeps random level-0 histories of hot appends, external
-/// appends, cold flushes (also at intra-message offsets), snapshots and
-/// retention, raises to level 1, keeps appending, and checks that every
-/// bootstrap update is exactly one appended message and that a complete
-/// bootstrap covers `[snapshot, tail)` with no gap.
+/// Bootstrap never merges or skips messages, whatever history built the
+/// stream (B6 follow-up). This test sweeps random histories of hot appends,
+/// external appends, cold flushes (also at intra-message offsets), snapshots
+/// and retention, and checks that every bootstrap update is exactly one
+/// appended message and that a complete bootstrap covers `[snapshot, tail)`
+/// with no gap.
 #[test]
-fn bootstrap_after_a_raise_never_merges_or_skips_messages_for_any_level_zero_history() {
+fn bootstrap_never_merges_or_skips_messages_for_any_history() {
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -530,12 +479,7 @@ fn bootstrap_after_a_raise_never_merges_or_skips_messages_for_any_level_zero_his
         }
     }
 
-    fn check(
-        machine: &StreamStateMachine,
-        messages: &[(u64, u64)],
-        seed: u64,
-        phase: &str,
-    ) -> bool {
+    fn check(machine: &StreamStateMachine, messages: &[(u64, u64)], seed: u64, phase: &str) {
         let plan = machine
             .bootstrap_plan(&stream("sweep"))
             .expect("bootstrap plan");
@@ -550,29 +494,6 @@ fn bootstrap_after_a_raise_never_merges_or_skips_messages_for_any_level_zero_his
                     .expect("slot")
                     .retained_offset
             });
-        // The invariant the legacy-collapse check relies on: a record at the
-        // seal point that folds several messages ends past the first
-        // contiguous hot run.
-        let slot = machine.stream_slot(&stream("sweep")).expect("slot");
-        let seal_point = slot.seal_point();
-        let folded = if let (Some(record), Some(first_run_end)) = (
-            slot.message_records
-                .iter()
-                .find(|record| record.start_offset == seal_point),
-            slot.hot_buffer.first_end_offset(),
-        ) && messages
-            .iter()
-            .any(|message| record.start_offset < message.1 && message.1 < record.end_offset)
-        {
-            assert!(
-                record.end_offset > first_run_end,
-                "seed {seed} {phase}: collapsed record {record:?} within the first hot run \
-                 ending at {first_run_end}; messages {messages:?}"
-            );
-            true
-        } else {
-            false
-        };
         let mut expected_start = start;
         for update in &plan.updates {
             assert!(
@@ -592,30 +513,17 @@ fn bootstrap_after_a_raise_never_merges_or_skips_messages_for_any_level_zero_his
         } else if plan.updates.is_empty() {
             assert_eq!(plan.next_offset, start, "seed {seed} {phase}: {plan:?}");
         }
-        folded
     }
-
-    let mut folds = 0_u32;
 
     for seed in 1..=3_000_u64 {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-        let mut machine = machine_at(0);
+        let mut machine = machine();
         create(&mut machine, "sweep", 1);
         let mut messages: Vec<(u64, u64)> = Vec::new();
         let mut tail = 0_u64;
         let mut external = 0_u64;
-        let mut raised = false;
         let steps = 4 + rng.below(12);
         for step in 0..steps {
-            if !raised && step >= steps / 2 && rng.below(3) == 0 {
-                folds += u32::from(check(&machine, &messages, seed, "level 0"));
-                assert!(matches!(
-                    machine.apply(StreamCommand::SetFeatureLevel { level: 1 }),
-                    StreamResponse::FeatureLevelSet { .. }
-                ));
-                raised = true;
-                folds += u32::from(check(&machine, &messages, seed, "after raise"));
-            }
             match rng.below(10) {
                 0..=3 => {
                     let len = 1 + rng.below(3);
@@ -630,7 +538,7 @@ fn bootstrap_after_a_raise_never_merges_or_skips_messages_for_any_level_zero_his
                     append_external(
                         &mut machine,
                         "sweep",
-                        &format!("lb1/external/sweep-{seed}-{external}.bin"),
+                        &format!("derived/external/sweep-{seed}-{external}.bin"),
                         len,
                     );
                     messages.push((tail, tail + len));
@@ -645,7 +553,7 @@ fn bootstrap_after_a_raise_never_merges_or_skips_messages_for_any_level_zero_his
                             "sweep",
                             hot_start,
                             end,
-                            &format!("lb1/chunks/sweep-{seed}-{step}.bin"),
+                            &format!("derived/chunks/sweep-{seed}-{step}.bin"),
                         );
                     }
                 }
@@ -663,21 +571,10 @@ fn bootstrap_after_a_raise_never_merges_or_skips_messages_for_any_level_zero_his
                     }
                 }
             }
-            if raised {
-                folds += u32::from(check(&machine, &messages, seed, "level 1"));
-            }
+            check(&machine, &messages, seed, "step");
         }
-        if !raised {
-            assert!(matches!(
-                machine.apply(StreamCommand::SetFeatureLevel { level: 1 }),
-                StreamResponse::FeatureLevelSet { .. }
-            ));
-        }
-        folds += u32::from(check(&machine, &messages, seed, "final"));
+        check(&machine, &messages, seed, "final");
     }
-    // F4: the top level keeps no per-message records, so no history builds a
-    // collapsed record at the seal point.
-    assert_eq!(folds, 0);
 }
 
 fn len_u64(len: usize) -> u64 {

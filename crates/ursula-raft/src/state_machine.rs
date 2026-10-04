@@ -45,11 +45,12 @@ use ursula_runtime::ReadSnapshotResponse;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::ReadStreamResponse;
 use ursula_runtime::SharedSnapshotStore;
-use ursula_runtime::SnapshotEnvelope;
 use ursula_runtime::SnapshotKey;
 use ursula_runtime::SnapshotLocation;
 use ursula_runtime::SnapshotPointer;
+use ursula_runtime::decode_snapshot_envelope;
 use ursula_runtime::default_snapshot_store;
+use ursula_runtime::encode_binary_envelope;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 
@@ -340,9 +341,8 @@ pub struct RaftGroupStateMachine {
     log_gauge: Arc<GroupLogGauge>,
 }
 
-/// Node-local record of the current snapshot (`group-N.snapshot.json`).
-/// Written in the JSON envelope below feature level 1 and in MessagePack
-/// from it (bounded-state F12a); read in either.
+/// Node-local record of the current snapshot (`group-N.snapshot.json`),
+/// in the MessagePack envelope (bounded-state F12a).
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedSnapshot {
     meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
@@ -423,7 +423,7 @@ impl RaftGroupStateMachine {
             return Ok(());
         }
 
-        let persisted = SnapshotEnvelope::decode::<PersistedSnapshot>(&std::fs::read(path)?)
+        let persisted = decode_snapshot_envelope::<PersistedSnapshot>(&std::fs::read(path)?)
             .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
         let pointer = SnapshotPointer::decode(&persisted.pointer_bytes)
             .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
@@ -742,7 +742,6 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         let pointer_bytes = snapshot.into_inner();
         let pointer = SnapshotPointer::decode(&pointer_bytes)
             .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
-        let envelope = SnapshotEnvelope::detect(&pointer_bytes);
         // Decode exactly once (bounded-stream-state F12c): inline bytes are
         // decoded in place, and a prefetched external snapshot arrives
         // already decoded.
@@ -766,12 +765,7 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             .install_snapshot(group_snapshot)
             .await
             .map_err(group_engine_io_error)?;
-        persist_snapshot_metadata(
-            self.snapshot_metadata_path.as_deref(),
-            envelope,
-            meta,
-            &pointer_bytes,
-        )?;
+        persist_snapshot_metadata(self.snapshot_metadata_path.as_deref(), meta, &pointer_bytes)?;
         if matches!(pointer.location, SnapshotLocation::S3 { .. }) {
             self.snapshot_store
                 .publish_reference(self.placement.raft_group_id.0, &pointer.location)
@@ -879,12 +873,9 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             snapshot_id: snapshot_id.clone(),
             location,
         };
-        // F12a: format epoch 2 writes only the MessagePack envelope.
-        let envelope = SnapshotEnvelope::MessagePack;
-        let mut pointer_bytes = envelope.encode(&pointer).map_err(|err| err.into_io())?;
+        let mut pointer_bytes = pointer.encode_binary().map_err(|err| err.into_io())?;
         persist_snapshot_metadata(
             self.snapshot_metadata_path.as_deref(),
-            envelope,
             &self.meta,
             &pointer_bytes,
         )?;
@@ -968,7 +959,6 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
 
 fn persist_snapshot_metadata(
     path: Option<&Path>,
-    envelope: SnapshotEnvelope,
     meta: &SnapshotMetaOf<UrsulaRaftTypeConfig>,
     pointer_bytes: &[u8],
 ) -> Result<(), io::Error> {
@@ -978,12 +968,11 @@ fn persist_snapshot_metadata(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let encoded = envelope
-        .encode(&PersistedSnapshot {
-            meta: meta.clone(),
-            pointer_bytes: pointer_bytes.to_vec(),
-        })
-        .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
+    let encoded = encode_binary_envelope(&PersistedSnapshot {
+        meta: meta.clone(),
+        pointer_bytes: pointer_bytes.to_vec(),
+    })
+    .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
     let temporary = path.with_extension("json.tmp");
     {
         use std::io::Write;
@@ -1116,7 +1105,6 @@ mod tests {
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn persisted_snapshot_restores_from_the_binary_envelope() {
-        use ursula_runtime::is_json_snapshot_envelope;
         use ursula_shard::CoreId;
         use ursula_shard::RaftGroupId;
         use ursula_shard::ShardId;
@@ -1148,10 +1136,8 @@ mod tests {
         builder.build_snapshot().await.expect("persist snapshot");
 
         let binary = std::fs::read(&metadata_path).expect("persisted record");
-        assert!(!is_json_snapshot_envelope(&binary));
         let persisted =
-            SnapshotEnvelope::decode::<PersistedSnapshot>(&binary).expect("decode binary record");
-        assert!(!is_json_snapshot_envelope(&persisted.pointer_bytes));
+            decode_snapshot_envelope::<PersistedSnapshot>(&binary).expect("decode binary record");
         SnapshotPointer::decode(&persisted.pointer_bytes).expect("binary pointer");
 
         let mut restored = RaftGroupStateMachine::new_with_stores_and_snapshot_install(

@@ -30,19 +30,19 @@ impl ColdGcQueue {
         self.enqueue_after(bucket_id, target, 0);
     }
 
-    /// Append the removal of one stream incarnation. `cold_generation` is
-    /// `Some` only for entries enqueued at feature level 1 or later (F14g).
+    /// Append the removal of one stream incarnation, scoped to its cold
+    /// generation (F14g).
     pub(super) fn enqueue_stream(
         &mut self,
         bucket_id: String,
         stream_id: ursula_shard::BucketStreamId,
-        cold_generation: Option<u64>,
+        cold_generation: u64,
     ) {
         self.push(
             bucket_id,
             ColdGcTarget::Stream(stream_id),
             0,
-            cold_generation,
+            Some(cold_generation),
         );
     }
 

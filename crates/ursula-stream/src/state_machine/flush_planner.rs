@@ -162,16 +162,8 @@ fn rotated_order(
 impl StreamStateMachine {
     /// Messages of `stream_id` that start in `[start, end)`.
     fn hot_records_between(&self, stream_id: &BucketStreamId, start: u64, end: u64) -> u64 {
-        let Some(slot) = self.stream_slot(stream_id) else {
-            return 0;
-        };
-        if self.derived_boundaries(slot) {
-            return slot.derived_starts_between(start, end);
-        }
-        let records = &slot.message_records;
-        let from = records.partition_point(|record| record.start_offset < start);
-        let to = records.partition_point(|record| record.start_offset < end);
-        u64::try_from(to.saturating_sub(from)).unwrap_or(u64::MAX)
+        self.stream_slot(stream_id)
+            .map_or(0, |slot| slot.derived_starts_between(start, end))
     }
 
     /// Leader path: plans one pass and advances the rotation cursor.

@@ -1,4 +1,4 @@
-//! F1 sparse cold record marks (bounded-stream-state §5.2, feature level 2):
+//! F1 sparse cold record marks (bounded-stream-state §5.2):
 //! sealing at cold transitions, record lookups, and the record read plan both
 //! engines share.
 
@@ -56,19 +56,11 @@ fn index_error(context: &str, err: RecordIndexError) -> RecordPlanError {
 }
 
 impl StreamStateMachine {
-    /// Whether F1 sparse marks are active (feature level 2).
-    pub(super) fn sparse_marks_enabled(&self) -> bool {
-        self.feature_level >= crate::feature::FEATURE_LEVEL_SPARSE_MARKS
-    }
-
     /// Seals up to [`SEAL_BUDGET_RECORDS`] dense records whose bytes lie
     /// below the stream's seal point. Called at the end of `FlushCold`,
-    /// `AppendExternal`, external creates and `TidyStream`; a no-op below
-    /// level 2. Returns the number of records sealed.
+    /// `AppendExternal`, external creates and `TidyStream`. Returns the
+    /// number of records sealed.
     pub(super) fn seal_record_index(&mut self, stream_id: &BucketStreamId) -> u64 {
-        if !self.sparse_marks_enabled() {
-            return 0;
-        }
         let Some(slot) = self.stream_slot_mut(stream_id) else {
             return 0;
         };
@@ -80,11 +72,8 @@ impl StreamStateMachine {
     }
 
     /// Whether the stream holds dense records that sealing would move (F1
-    /// `TidyStream` debt, level 2).
+    /// `TidyStream` debt).
     pub(super) fn stream_has_seal_debt(&self, stream_id: &BucketStreamId) -> bool {
-        if !self.sparse_marks_enabled() {
-            return false;
-        }
         self.stream_slot(stream_id).is_some_and(|slot| {
             slot.record_index.as_ref().is_some_and(|index| {
                 index.sealable_records(slot.seal_point(), slot.metadata.tail_offset) > 0

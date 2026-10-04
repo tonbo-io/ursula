@@ -95,12 +95,6 @@ fn new_group(index: usize, streams_per_group: usize) -> Result<Group> {
         flush: smx::FlushStats::default(),
     };
     group.apply(
-        StreamCommand::SetFeatureLevel {
-            level: ursula_stream::FEATURE_LEVEL_KEYED_STREAMS,
-        },
-        "set feature level",
-    )?;
-    group.apply(
         StreamCommand::CreateBucket {
             bucket_id: "bkt1".to_owned(),
         },
@@ -143,9 +137,12 @@ fn maybe_flush(group: &mut Group, flush_bytes: usize) -> Result<()> {
     for (stream_id, chunk) in published {
         group.gauge.record_applied(
             StreamCommand::FlushCold {
+                cold_generation: group
+                    .machine
+                    .cold_index_generation(&stream_id)
+                    .unwrap_or_default(),
                 stream_id,
                 chunk,
-                cold_generation: None,
             }
             .log_bytes_estimate(),
         );

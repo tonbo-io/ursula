@@ -1,5 +1,5 @@
 //! Capacity hygiene (F7) measured through the state machine: after a
-//! flush, retention or collapse, retained containers hold at most
+//! flush or retention, retained containers hold at most
 //! `2 * len + 64` elements of capacity.
 
 use super::*;
@@ -42,7 +42,7 @@ fn slot<'a>(machine: &'a StreamStateMachine, stream_id: &BucketStreamId) -> &'a 
 }
 
 #[test]
-fn retention_shrinks_record_index_and_message_records() {
+fn retention_shrinks_record_index() {
     // Measured before F7: trimming 990k of 1M records kept 8.04 MB of index.
     let (mut machine, stream_id) = machine_with_json_stream("retention");
     let keep = 10u64;
@@ -72,12 +72,6 @@ fn retention_shrinks_record_index_and_message_records() {
         bounded(10, index.record_offsets_capacity()),
         "record index capacity {}",
         index.record_offsets_capacity()
-    );
-    assert!(
-        bounded(slot.message_records.len(), slot.message_records.capacity()),
-        "message records: len {} capacity {}",
-        slot.message_records.len(),
-        slot.message_records.capacity()
     );
 }
 
@@ -146,7 +140,9 @@ fn compaction_shrinks_cold_ref_vectors() {
     for index in 0..SLICES {
         assert!(matches!(
             machine.apply(StreamCommand::FlushCold {
-                cold_generation: None,
+                cold_generation: machine
+                    .cold_index_generation(&stream_id)
+                    .unwrap_or_default(),
                 stream_id: stream_id.clone(),
                 chunk: slice(index),
             }),

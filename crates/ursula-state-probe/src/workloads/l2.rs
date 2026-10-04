@@ -236,19 +236,17 @@ async fn w1(args: &L2Args, sink: &mut Sink) -> Result<Outcome> {
         let record_index_len = entry
             .and_then(|e| e.record_index.as_ref())
             .map_or(0, |r| r.dense_len());
-        let message_records = entry.map_or(0, |e| e.message_records.len());
         let cold_chunks = entry.map_or(0, |e| e.cold_chunks.len());
         sink.row(&json!({
             "mode": "w1", "engine": args.engine.label(), "admission_mib": args.admission_mib,
             "records": n, "flushes": flushed,
             "elapsed_s": round3(started.elapsed().as_secs_f64()),
-            "record_index_len": record_index_len, "message_records": message_records,
+            "record_index_len": record_index_len,
             "cold_chunks": cold_chunks, "group_commit_index": snapshot.group_commit_index,
             "snapshot": stats,
         }))?;
         if n == args.records {
             outcome.metric_u64("record_index_len", record_index_len as u64);
-            outcome.metric_u64("message_records", message_records as u64);
             outcome.metric_u64("snapshot_bytes", stats.total_bytes);
             outcome.metric_u64("snapshot_record_offsets_bytes", stats.record_offsets_bytes);
             outcome.metric_u64("flushes", flushed as u64);
@@ -365,12 +363,12 @@ async fn compact_on(engine: Engine) -> Result<(Value, bool)> {
             .map_err(|err| anyhow::anyhow!("flush: {err}"))?;
     }
     let (snapshot, _) = snap(&rt).await?;
-    let old: Vec<ColdChunkRef> = snapshot
+    let (generation, old): (u64, Vec<ColdChunkRef>) = snapshot
         .stream_snapshot
         .streams
         .iter()
         .find(|e| e.metadata.stream_id == a)
-        .map(|e| e.cold_chunks.clone())
+        .map(|e| (e.cold_index_generation, e.cold_chunks.clone()))
         .context("stream a in snapshot")?;
     let shared = old.iter().filter(|c| c.shared_object).count();
     let start = old.first().map_or(0, |c| c.start_offset);
@@ -385,7 +383,7 @@ async fn compact_on(engine: Engine) -> Result<(Value, bool)> {
                 .context("read slice")?,
         );
     }
-    let path = ursula_runtime::new_cold_chunk_path(&a, start, end);
+    let path = ursula_runtime::new_cold_chunk_path_in_generation(&a, generation, start, end);
     let size = cold
         .write_chunk(&path, &body)
         .await
@@ -452,6 +450,14 @@ async fn legacy_on(engine: Engine) -> Result<(Value, bool)> {
     let mut rng = payload::Rng::new(4);
     let record = payload::json_record(&mut rng, 0, 200);
     append(&rt, &a, record.clone(), T0).await?;
+    let (snapshot, _) = snap(&rt).await?;
+    let generation = snapshot
+        .stream_snapshot
+        .streams
+        .iter()
+        .find(|e| e.metadata.stream_id == a)
+        .map(|e| e.cold_index_generation)
+        .context("stream a in snapshot")?;
     let path = "_packs/00000000/legacy-cross-bucket.bin".to_owned();
     let size = cold
         .write_chunk(&path, &record)
@@ -459,7 +465,7 @@ async fn legacy_on(engine: Engine) -> Result<(Value, bool)> {
         .context("write legacy pack")?;
     let flush = rt
         .flush_cold(FlushColdRequest {
-            cold_generation: None,
+            cold_generation: generation,
             stream_id: a.clone(),
             chunk: ColdChunkRef {
                 start_offset: 0,

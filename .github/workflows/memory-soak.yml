@@ -1,6 +1,6 @@
 name: Memory soak
 
-# Write-overload memory soak: 3 nodes + gateway + MinIO at feature level 5, many SQLite-VFS-shaped
+# Write-overload memory soak: 3 nodes + gateway + MinIO, many SQLite-VFS-shaped
 # owners appending flat out (clients/sqlite-ursula/test/soak.e2e.ts). Node RSS must stay bounded —
 # overload has to reach clients as 503/429 pushback, not as server memory growth (the EKS OOM of
 # 2026-10: ~0.7 GB/min per node at 128 owners; here, before the fix, ~4 GB/min to 6 GB in 80 s).

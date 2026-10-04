@@ -1546,19 +1546,9 @@ fn cold_object_unix_nanos() -> u128 {
     0
 }
 
-pub fn new_cold_chunk_path(
-    stream_id: &BucketStreamId,
-    start_offset: u64,
-    end_offset: u64,
-) -> String {
-    new_cold_chunk_path_in_generation(stream_id, 0, start_offset, end_offset)
-}
-
 /// Names a new exclusive chunk of the stream incarnation whose cold
-/// generation is `generation` (F14g). Generation 0 keeps the legacy name
-/// directly under `{stream}/chunks/`; any other generation adds a
-/// `{generation:016x}/` component, so stream GC can delete one incarnation's
-/// chunks without touching another's.
+/// generation is `generation` (F14g). The `{generation:016x}/` component lets
+/// stream GC delete one incarnation's chunks without touching another's.
 pub fn new_cold_chunk_path_in_generation(
     stream_id: &BucketStreamId,
     generation: u64,
@@ -1574,14 +1564,9 @@ pub fn new_cold_chunk_path_in_generation(
 }
 
 /// The directory holding the exclusive chunks of one stream incarnation
-/// (F14g): `{stream}/chunks/` for generation 0, otherwise
-/// `{stream}/chunks/{generation:016x}/`.
+/// (F14g): `{stream}/chunks/{generation:016x}/`.
 pub fn cold_chunk_dir(stream_id: &BucketStreamId, generation: u64) -> String {
-    if generation == 0 {
-        cold_chunk_prefix(stream_id)
-    } else {
-        format!("{stream_id}/chunks/{generation:016x}/")
-    }
+    format!("{}{generation:016x}/", cold_chunk_prefix(stream_id))
 }
 
 /// The directory holding a stream's staged external payloads.
@@ -1644,9 +1629,8 @@ pub fn cold_bucket_prefix(bucket_id: &str) -> String {
     format!("{bucket_id}/")
 }
 
-/// The directory of a stream's legacy (generation-0) exclusive chunks.
-/// Mirrors the layout of [`new_cold_chunk_path`]. Stream GC lists it one
-/// level at a time and deletes only object names Ursula writes there.
+/// The directory under which every incarnation of a stream keeps its
+/// exclusive chunks, one [`cold_chunk_dir`] per cold generation.
 pub fn cold_chunk_prefix(stream_id: &BucketStreamId) -> String {
     format!("{stream_id}/chunks/")
 }

@@ -4,11 +4,9 @@
 //! its own start offset, so the buffer carries no per-append header. A block
 //! ends where the next append is not contiguous (an external append above hot
 //! bytes leaves a gap, F18) or where it is full. Per-message boundaries live
-//! in one place per stream: below feature level 4 the message records (and,
-//! for JSON, the record index's dense offsets); from level 4 (F4b) the dense
-//! offsets for streams with a record index and, for every other stream, the
-//! append starts this buffer keeps for each message at or above the seal
-//! point. Reads binary-search blocks and a flush drops whole
+//! in one place per stream (F4b): the dense offsets for streams with a record
+//! index and, for every other stream, the append starts this buffer keeps for
+//! each message at or above the seal point. Reads binary-search blocks and a flush drops whole
 //! blocks and trims at most one. Snapshots emit one hot segment per block and restore
 //! segments one-to-one, so every replica holds the same block layout after
 //! the same history.
@@ -31,11 +29,11 @@ pub(super) struct HotBuffer {
     /// Maintained by the state machine, which owns the record boundaries;
     /// the buffer only stores it next to the bytes it describes.
     accounted_records: u64,
-    /// F4b (level 4), streams without a record index: start offsets of the
-    /// messages that start at or above the seal point, strictly increasing.
-    /// Includes external appends that sit above hot bytes. A flush or
-    /// retention drops the starts below the new seal point; empty below
-    /// level 4 and for streams with a record index.
+    /// F4b, streams without a record index: start offsets of the messages
+    /// that start at or above the seal point, strictly increasing. Includes
+    /// external appends that sit above hot bytes. A flush or retention drops
+    /// the starts below the new seal point; empty for streams with a record
+    /// index.
     append_starts: VecDeque<u64>,
 }
 

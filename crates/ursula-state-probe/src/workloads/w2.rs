@@ -365,7 +365,12 @@ fn compact_all(
         let replacement = ColdChunkRef {
             start_offset: start,
             end_offset: end,
-            s3_path: ursula_runtime::new_cold_chunk_path(id, start, end),
+            s3_path: ursula_runtime::new_cold_chunk_path_in_generation(
+                id,
+                m.cold_index_generation(id).unwrap_or_default(),
+                start,
+                end,
+            ),
             object_size: end - start,
             object_offset: 0,
             shared_object: false,
@@ -439,7 +444,13 @@ fn driver_pass(
         let replacement = ColdChunkRef {
             start_offset: start,
             end_offset: end,
-            s3_path: ursula_runtime::new_cold_chunk_path(&candidate.stream_id, start, end),
+            s3_path: ursula_runtime::new_cold_chunk_path_in_generation(
+                &candidate.stream_id,
+                m.cold_index_generation(&candidate.stream_id)
+                    .unwrap_or_default(),
+                start,
+                end,
+            ),
             object_size: end - start,
             object_offset: 0,
             shared_object: false,

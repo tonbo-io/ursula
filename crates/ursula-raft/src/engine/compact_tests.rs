@@ -11,6 +11,7 @@ use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::CompactColdRequest;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::FlushColdRequest;
+use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::ShardRuntime;
@@ -39,6 +40,21 @@ fn stream_in_bucket_on_group(
         .map(|index| BucketStreamId::new(bucket_id, format!("{prefix}-{index}")))
         .find(|stream| runtime.locate(stream).raft_group_id == group_id)
         .expect("stream on group")
+}
+
+/// C7/F14g: the cold generation of the stream's live incarnation.
+async fn cold_generation(runtime: &ShardRuntime, stream: &BucketStreamId) -> u64 {
+    runtime
+        .head_stream(HeadStreamRequest {
+            stream_id: stream.clone(),
+            now_ms: 0,
+            linearizable: false,
+            read_index: None,
+        })
+        .await
+        .expect("head stream")
+        .created_at_ms
+        .expect("incarnation")
 }
 
 async fn create_and_append(runtime: &ShardRuntime, stream: &BucketStreamId, payload: &[u8]) {
@@ -97,7 +113,7 @@ async fn raft_compacts_shared_slice_into_exclusive_chunk() {
     let slice = shared_slice(pack, 0, b"aaaa");
     runtime
         .flush_cold(FlushColdRequest {
-            cold_generation: None,
+            cold_generation: cold_generation(&runtime, &stream).await,
             stream_id: stream.clone(),
             chunk: slice.clone(),
         })
@@ -170,7 +186,7 @@ async fn raft_legacy_cross_bucket_pack_migration_and_bucket_purge() {
     ] {
         runtime
             .flush_cold(FlushColdRequest {
-                cold_generation: None,
+                cold_generation: cold_generation(&runtime, stream).await,
                 stream_id: stream.clone(),
                 chunk: shared_slice(legacy_path, object_offset, payload),
             })

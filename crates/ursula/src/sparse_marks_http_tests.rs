@@ -65,21 +65,10 @@ fn spawn_with_cold_store() -> (ShardRuntime, Router) {
     (runtime, app)
 }
 
-async fn complete_repair_cycle(runtime: &ShardRuntime) {
-    for _ in 0..16 {
-        runtime.repair_cold_index_all_groups_once(64).await;
-        if runtime.cold_index_repair_completed(RaftGroupId(0)) {
-            return;
-        }
-    }
-    panic!("repair cycle did not complete");
-}
-
 /// A JSON stream of `count` records of [`RECORD`] bytes, flushed
 /// cold and sealed except for a hot tail of `hot` records.
 async fn sealed_stream(count: u64, hot: u64) -> (ShardRuntime, Router, Vec<u8>) {
     let (runtime, app) = spawn_with_cold_store();
-    complete_repair_cycle(&runtime).await;
     let record = |index: u64| {
         let mut line = format!("{{\"i\":{index},\"pad\":\"");
         line.push_str(&"p".repeat(usize::try_from(RECORD).unwrap() - line.len() - 3));

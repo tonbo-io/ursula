@@ -4,8 +4,6 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::AppendStreamInput;
 use ursula_stream::ColdFlushPassRequest;
-use ursula_stream::FEATURE_LEVEL_EXTERNAL_LOCATORS;
-use ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
 use ursula_stream::ObjectPayloadRef;
 use ursula_stream::ProducerRequest;
 use ursula_stream::RecordPlanError;
@@ -40,7 +38,6 @@ use super::GroupEngineCreateFuture;
 use super::GroupEngineError;
 use super::GroupEngineFactory;
 use super::GroupEngineMetrics;
-use super::GroupFeatureLevelFuture;
 use super::GroupFlushColdFuture;
 use super::GroupHeadStreamFuture;
 use super::GroupInstallSnapshotFuture;
@@ -55,7 +52,6 @@ use super::GroupReadSnapshotFuture;
 use super::GroupReadStreamFuture;
 use super::GroupReadStreamPartsFuture;
 use super::GroupRepairColdIndexFuture;
-use super::GroupSetFeatureLevelFuture;
 use super::GroupSnapshotFuture;
 use super::GroupStateGaugesFuture;
 use super::GroupTidyStreamFuture;
@@ -74,8 +70,6 @@ use crate::cold_index::repair_cold_index_streams;
 use crate::cold_index::replace_cold_chunk_index_pages_with_rollback_in_generation;
 use crate::cold_index::rollback_cold_index_pages;
 use crate::cold_index::write_cold_chunk_index_pages_with_rollback_in_generation;
-use crate::cold_index::write_external_segment_index_pages;
-use crate::cold_index::write_external_segment_index_pages_in_generation;
 use crate::cold_refs::ColdOrphanSweepPlan;
 use crate::cold_refs::ColdOrphanSweepRequest;
 use crate::cold_refs::ColdOrphanSweepStream;
@@ -120,8 +114,6 @@ use crate::request::PurgeBucketResponse;
 use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
-use crate::request::SetFeatureLevelRequest;
-use crate::request::SetFeatureLevelResponse;
 use crate::request::StreamAppendCount;
 use crate::request::TidyStreamsRequest;
 use crate::request::TidyStreamsResponse;
@@ -237,12 +229,11 @@ impl InMemoryGroupEngine {
                 let stream_id = command_stream_id(&command);
                 let command_producer = command_producer(&command);
                 // Commands whose pages the leader rewrote before proposing:
-                // compaction, F5 offloads (which may clip entries), and
-                // external appends and creates, whose entries the leader
-                // writes straight to the page store below level 3 (bounded-
-                // state F13). Every replica drops the stream's cached pages,
-                // so a page cached earlier (possibly holding a stale entry over
-                // the same offsets) is reloaded.
+                // compaction and F5 offloads (which may clip entries), plus
+                // external appends and creates (bounded-state F13). Every
+                // replica drops the stream's cached pages, so a page cached
+                // earlier (possibly holding a stale entry over the same
+                // offsets) is reloaded.
                 let compacted_stream_id = match &command {
                     StreamCommand::CompactCold { stream_id, .. }
                     | StreamCommand::AppendExternal { stream_id, .. }
@@ -402,20 +393,6 @@ impl InMemoryGroupEngine {
                     crate::request::TidyStreamResponse {
                         placement,
                         debt_remaining,
-                        group_commit_index: self.commit_index,
-                    },
-                ))
-            }
-            StreamResponse::FeatureLevelSet {
-                level,
-                previous_level,
-            } => {
-                self.commit_index += 1;
-                Ok(GroupWriteResponse::SetFeatureLevel(
-                    SetFeatureLevelResponse {
-                        placement,
-                        level,
-                        previous_level,
                         group_commit_index: self.commit_index,
                     },
                 ))
@@ -873,11 +850,6 @@ impl InMemoryGroupEngine {
         self.state_machine.bucket_usage_report()
     }
 
-    /// Replicated group feature level (C0) of the applied state.
-    pub fn feature_level(&self) -> u32 {
-        self.state_machine.feature_level()
-    }
-
     /// Bounded-state gauges of the applied state (§7.5 of
     /// `bounded-stream-state.md`). Public so the Raft engine can serve them.
     pub fn state_gauges(&self) -> ursula_stream::GroupStateGauges {
@@ -1210,7 +1182,7 @@ impl InMemoryGroupEngine {
     }
 
     /// F5 offload discovery on this replica: streams whose state-held
-    /// external refs `request` makes due (empty below feature level 3).
+    /// external refs `request` makes due.
     pub fn staged_external_ref_candidates(
         &self,
         request: &crate::cold_refs::OffloadColdRefsRequest,
@@ -1220,14 +1192,6 @@ impl InMemoryGroupEngine {
             &|object| request.is_due(object),
             request.max_streams.max(1),
         )
-    }
-
-    /// Whether external appends keep their locator in replicated state at
-    /// this replica's applied level (F5, feature level 3). Levels only rise,
-    /// so a proposal applied later sees at least this level: when this holds
-    /// the engine must not write a page entry before proposing.
-    pub fn external_locators_in_state(&self) -> bool {
-        self.state_machine.feature_level() >= FEATURE_LEVEL_EXTERNAL_LOCATORS
     }
 
     /// What applied state references for one orphan-sweep step (F14h): the
@@ -1392,19 +1356,6 @@ impl InMemoryGroupEngine {
         })
     }
 
-    /// Whether `stream_id` exists and has not expired at `now_ms`. A create
-    /// of a live stream never applies its initial payload (it answers
-    /// already-exists or a conflict), so the external create path must not
-    /// write a page entry for it: the entry would land at offset 0 of the
-    /// existing stream.
-    pub fn stream_is_live(&self, stream_id: &BucketStreamId, now_ms: u64) -> bool {
-        matches!(
-            self.state_machine
-                .access_requires_write(stream_id, now_ms, false),
-            Ok(false)
-        )
-    }
-
     pub(crate) fn install_snapshot_inner(
         &mut self,
         snapshot: GroupSnapshot,
@@ -1472,25 +1423,8 @@ impl GroupEngine for InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> GroupCreateStreamFuture<'a> {
         Box::pin(async move {
-            // From feature level 1 the state keeps the initial payload as a
-            // direct reference (F14g); the level never drops between this
-            // check and apply, so skipping the page is always safe. A create
-            // of a live stream never writes a page either, so a conflicting
-            // or retried create cannot replace the live stream's entry.
-            if let Some(cold_store) = self.cold_store.as_ref()
-                && self.state_machine.feature_level() < FEATURE_LEVEL_KEYED_STREAMS
-                && !self.stream_is_live(&request.stream_id, request.now_ms)
-            {
-                let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-                write_external_segment_index_pages(
-                    &store,
-                    &request.stream_id,
-                    0,
-                    &request.initial_payload,
-                )
-                .await
-                .map_err(|err| GroupEngineError::new(err.to_string()))?;
-            }
+            // The state keeps the initial payload as a direct reference
+            // (F14g), so the engine writes no page entry before proposing.
             let command = GroupWriteCommand::from(request);
             match self.apply_committed_write(command, placement)? {
                 GroupWriteResponse::CreateStream(response) => Ok(response),
@@ -1580,10 +1514,6 @@ impl GroupEngine for InMemoryGroupEngine {
                 ))),
             }
         })
-    }
-
-    fn feature_level<'a>(&'a mut self, _placement: ShardPlacement) -> GroupFeatureLevelFuture<'a> {
-        Box::pin(async move { Ok(self.state_machine.feature_level()) })
     }
 
     fn state_gauges<'a>(&'a mut self, _placement: ShardPlacement) -> GroupStateGaugesFuture<'a> {
@@ -1678,22 +1608,6 @@ impl GroupEngine for InMemoryGroupEngine {
                 }
             }
             Ok(report)
-        })
-    }
-
-    fn set_feature_level<'a>(
-        &'a mut self,
-        request: SetFeatureLevelRequest,
-        placement: ShardPlacement,
-    ) -> GroupSetFeatureLevelFuture<'a> {
-        Box::pin(async move {
-            let command = GroupWriteCommand::from(request);
-            match self.apply_committed_write(command, placement)? {
-                GroupWriteResponse::SetFeatureLevel(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected set feature level write response: {other:?}"
-                ))),
-            }
         })
     }
 
@@ -1998,40 +1912,9 @@ impl GroupEngine for InMemoryGroupEngine {
     ) -> GroupAppendFuture<'a> {
         Box::pin(async move {
             self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
-            // F5 (level 3): commit first, index after. Apply keeps the
-            // locator in state; the offload pass writes the page entry once
-            // the append committed. Below level 3 the page entry written
-            // here, before proposing, is the only locator.
-            if let Some(cold_store) = self
-                .cold_store
-                .as_ref()
-                .filter(|_| !self.external_locators_in_state())
-            {
-                let start_offset = self
-                    .state_machine
-                    .head(&request.stream_id)
-                    .map(|metadata| metadata.tail_offset)
-                    .ok_or_else(|| {
-                        GroupEngineError::stream(
-                            ursula_stream::StreamErrorCode::StreamNotFound,
-                            format!("stream '{}' does not exist", request.stream_id),
-                        )
-                    })?;
-                let generation = self
-                    .state_machine
-                    .cold_index_generation(&request.stream_id)
-                    .unwrap_or(0);
-                let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-                write_external_segment_index_pages_in_generation(
-                    &store,
-                    &request.stream_id,
-                    generation,
-                    start_offset,
-                    &request.payload,
-                )
-                .await
-                .map_err(|err| GroupEngineError::new(err.to_string()))?;
-            }
+            // F5: commit first, index after. Apply keeps the locator in
+            // state; the offload pass writes the page entry once the append
+            // committed.
             let command = GroupWriteCommand::from(request);
             match self.apply_committed_write(command, placement)? {
                 GroupWriteResponse::Append(response) => Ok(response),
@@ -2305,8 +2188,7 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::PurgeBucket { .. }
         | StreamCommand::AckColdGc { .. }
         | StreamCommand::DeferColdGc { .. }
-        | StreamCommand::ImportSnapshot { .. }
-        | StreamCommand::SetFeatureLevel { .. } => None,
+        | StreamCommand::ImportSnapshot { .. } => None,
         StreamCommand::CreateStream { stream_id, .. }
         | StreamCommand::CreateExternal { stream_id, .. }
         | StreamCommand::Append { stream_id, .. }

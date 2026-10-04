@@ -64,7 +64,6 @@ use ursula_runtime::GroupEngineCreateFuture;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineFactory;
 use ursula_runtime::GroupEngineMetrics;
-use ursula_runtime::GroupFeatureLevelFuture;
 use ursula_runtime::GroupFlushColdFuture;
 use ursula_runtime::GroupHeadStreamFuture;
 use ursula_runtime::GroupInstallSnapshotFuture;
@@ -76,7 +75,6 @@ use ursula_runtime::GroupReadSnapshotFuture;
 use ursula_runtime::GroupReadStreamFuture;
 use ursula_runtime::GroupReadStreamPartsFuture;
 use ursula_runtime::GroupRequireLiveReadOwnerFuture;
-use ursula_runtime::GroupSetFeatureLevelFuture;
 use ursula_runtime::GroupShutdownFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
@@ -96,7 +94,6 @@ use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::RuntimeThreading;
-use ursula_runtime::SetFeatureLevelRequest;
 use ursula_runtime::ShardRuntime;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
@@ -1154,25 +1151,9 @@ impl GroupEngine for MadsimScopedGroupEngine {
         }))
     }
 
-    fn feature_level<'a>(&'a mut self, placement: ShardPlacement) -> GroupFeatureLevelFuture<'a> {
-        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
-            self.inner.feature_level(placement).await
-        }))
-    }
-
     fn state_gauges<'a>(&'a mut self, placement: ShardPlacement) -> GroupStateGaugesFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
             self.inner.state_gauges(placement).await
-        }))
-    }
-
-    fn set_feature_level<'a>(
-        &'a mut self,
-        request: SetFeatureLevelRequest,
-        placement: ShardPlacement,
-    ) -> GroupSetFeatureLevelFuture<'a> {
-        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
-            self.inner.set_feature_level(request, placement).await
         }))
     }
 

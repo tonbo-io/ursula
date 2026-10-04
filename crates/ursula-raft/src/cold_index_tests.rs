@@ -189,7 +189,8 @@ async fn openraft_snapshot_with_regressed_frontier_builds_and_installs() {
             record_match: None,
         },
         StreamCommand::FlushCold {
-            cold_generation: None,
+            // C7: the group's first incarnation, created at 0, is 1.
+            cold_generation: 1,
             stream_id: stream_id.clone(),
             chunk: chunk(0, 2, "chunks/ab.bin"),
         },
@@ -232,6 +233,10 @@ async fn stale_flush_leaves_no_page_entry() {
         )
         .await
         .expect("create stream");
+    let generation = engine
+        .local_cold_index_generation(stream_id.clone())
+        .await
+        .expect("cold generation");
     engine
         .append(
             append_req(&stream_id, b"abcd", None),
@@ -249,7 +254,7 @@ async fn stale_flush_leaves_no_page_entry() {
     engine
         .flush_cold(
             FlushColdRequest {
-                cold_generation: None,
+                cold_generation: generation,
                 stream_id: stream_id.clone(),
                 chunk: chunk(0, 4, "benchcmp/raft-stale-flush/chunks/live.bin"),
             },
@@ -266,7 +271,7 @@ async fn stale_flush_leaves_no_page_entry() {
     let err = engine
         .flush_cold(
             FlushColdRequest {
-                cold_generation: None,
+                cold_generation: generation,
                 stream_id: stream_id.clone(),
                 chunk: chunk(0, 2, "benchcmp/raft-stale-flush/chunks/stale.bin"),
             },
@@ -315,6 +320,10 @@ async fn raft_read_path_shares_the_page_cache_that_apply_invalidates() {
         )
         .await
         .expect("create stream");
+    let generation = engine
+        .local_cold_index_generation(stream_id.clone())
+        .await
+        .expect("cold generation");
     engine
         .append(
             append_req(&stream_id, b"abcdefgh", None),
@@ -343,7 +352,7 @@ async fn raft_read_path_shares_the_page_cache_that_apply_invalidates() {
         engine
             .flush_cold(
                 FlushColdRequest {
-                    cold_generation: None,
+                    cold_generation: generation,
                     stream_id: stream_id.clone(),
                     chunk: chunk(start, end, path),
                 },

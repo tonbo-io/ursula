@@ -149,8 +149,7 @@ pub struct HeadStreamResponse {
     pub snapshot_digest: Option<String>,
     pub retained_offset: u64,
     pub record_range: Option<StreamRecordRange>,
-    /// The stream incarnation's `created_at_ms`, unique per group from
-    /// feature level 1 (C7). HEAD renders it as the public
+    /// The stream incarnation's `created_at_ms`, unique per group (C7). HEAD renders it as the public
     /// `Stream-Incarnation` header, an opaque token that changes when the
     /// stream is deleted and recreated. `default` keeps HEAD responses
     /// forwarded by older followers decodable.
@@ -388,8 +387,7 @@ pub struct PublishSnapshotRequest {
     pub content_type: String,
     /// Inline body; empty when `cold_body` is set.
     pub payload: Bytes,
-    /// A body staged as a cold-tier object (feature level 5, bounded-state
-    /// F16). Proposed as `PublishSnapshotExternal`.
+    /// A body staged as a cold-tier object (bounded-state F16). Proposed as `PublishSnapshotExternal`.
     pub cold_body: Option<ColdSnapshotBody>,
     pub now_ms: u64,
 }
@@ -436,14 +434,6 @@ pub struct AdvanceRetentionResponse {
     pub hot_backlog: Option<WriteHotBacklog>,
 }
 
-/// Raises one group's replicated feature level (C0) to
-/// `max(current, level)`. The caller replicates the same request to every
-/// group, and must only send levels every replica supports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SetFeatureLevelRequest {
-    pub level: u32,
-}
-
 /// One leader-side `TidyStream` pass over a group (bounded-state F0): the
 /// engine proposes `TidyStream` for at most `max_streams` streams with
 /// normalization debt at `now_ms`. Followers propose nothing.
@@ -466,16 +456,6 @@ pub struct TidyStreamsResponse {
 pub struct TidyStreamResponse {
     pub placement: ShardPlacement,
     pub debt_remaining: bool,
-    pub group_commit_index: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SetFeatureLevelResponse {
-    pub placement: ShardPlacement,
-    /// The group's level after apply.
-    pub level: u32,
-    /// The group's level before apply.
-    pub previous_level: u32,
     pub group_commit_index: u64,
 }
 
@@ -510,7 +490,7 @@ pub struct ReadSnapshotResponse {
     pub snapshot_digest: String,
     /// Inline body; empty when `object` holds it.
     pub payload: Vec<u8>,
-    /// Cold-tier object holding the body (feature level 5). Callers stream
+    /// Cold-tier object holding the body (F16). Callers stream
     /// it from the cold store.
     pub object: Option<ExternalPayloadRef>,
     pub up_to_date: bool,
@@ -540,7 +520,7 @@ pub struct BootstrapStreamResponse {
     pub snapshot_content_type: String,
     /// Inline snapshot body; empty when `snapshot_object` holds it.
     pub snapshot_payload: Vec<u8>,
-    /// Cold-tier object holding the snapshot body (feature level 5).
+    /// Cold-tier object holding the snapshot body (F16).
     pub snapshot_object: Option<ExternalPayloadRef>,
     pub updates: Vec<BootstrapUpdate>,
     pub next_offset: u64,
@@ -622,8 +602,8 @@ pub struct FlushColdRequest {
     pub chunk: ColdChunkRef,
     /// Cold generation the chunk was planned from
     /// ([`ursula_stream::ColdFlushCandidate::cold_generation`]); see
-    /// `StreamCommand::FlushCold`. `None` skips the incarnation check.
-    pub cold_generation: Option<u64>,
+    /// `StreamCommand::FlushCold`.
+    pub cold_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

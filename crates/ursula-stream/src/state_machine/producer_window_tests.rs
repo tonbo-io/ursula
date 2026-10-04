@@ -1,5 +1,4 @@
-//! F3 producer bounds, F4a message-record collapse and F0 `TidyStream` at
-//! the top feature level (`docs/architecture/bounded-stream-state.md` §5.1, §5.4,
+//! F3 producer bounds and `TidyStream` (`docs/architecture/bounded-stream-state.md` §5.1, §5.4,
 //! §5.5).
 
 use bytes::Bytes;
@@ -12,9 +11,8 @@ const OCTET: &str = "application/octet-stream";
 const BUCKET: &str = "window";
 const R: u64 = RECEIPT_WINDOW_ITEMS;
 
-fn machine_at(level: u32) -> StreamStateMachine {
+fn machine() -> StreamStateMachine {
     let mut machine = StreamStateMachine::new();
-    machine.apply(StreamCommand::SetFeatureLevel { level });
     assert!(matches!(
         machine.apply(StreamCommand::CreateBucket {
             bucket_id: BUCKET.to_owned(),
@@ -126,7 +124,7 @@ fn producer_snapshot(machine: &StreamStateMachine) -> Vec<Vec<ProducerSnapshot>>
 #[test]
 fn window_edges_at_r_minus_one_r_and_r_plus_one() {
     for (appends, expected_front) in [(R - 1, 0), (R, 0), (R + 1, 1)] {
-        let mut machine = machine_at(1);
+        let mut machine = machine();
         let stream_id = create(&mut machine, "edges", OCTET);
         for seq in 0..appends {
             appended(append(&mut machine, &stream_id, "p", seq, 1));
@@ -144,7 +142,7 @@ fn window_edges_at_r_minus_one_r_and_r_plus_one() {
 
 #[test]
 fn interleaved_producers_evict_in_commit_order_and_keep_each_newest() {
-    let mut machine = machine_at(1);
+    let mut machine = machine();
     let stream_id = create(&mut machine, "interleaved", OCTET);
     // One early write from "quiet", then R + 100 writes from "busy".
     let (quiet_offset, quiet_next, _, _) =
@@ -171,7 +169,7 @@ fn interleaved_producers_evict_in_commit_order_and_keep_each_newest() {
 
     // Interleaving: alternate two producers; eviction follows commit order,
     // so both lose their oldest receipts at the same pace.
-    let mut machine = machine_at(1);
+    let mut machine = machine();
     let stream_id = create(&mut machine, "alternate", OCTET);
     for seq in 0..R {
         appended(append(&mut machine, &stream_id, "a", seq, 1));
@@ -186,7 +184,7 @@ fn interleaved_producers_evict_in_commit_order_and_keep_each_newest() {
 
 #[test]
 fn duplicate_beyond_window_is_deduplicated_without_ranges_and_never_appends() {
-    let mut machine = machine_at(1);
+    let mut machine = machine();
     let stream_id = create(&mut machine, "beyond", OCTET);
     for seq in 0..(R + 5) {
         appended(append(&mut machine, &stream_id, "p", seq, 1));
@@ -210,7 +208,7 @@ fn duplicate_beyond_window_is_deduplicated_without_ranges_and_never_appends() {
 
 #[test]
 fn idle_producer_expires_at_its_own_next_write() {
-    let mut machine = machine_at(1);
+    let mut machine = machine();
     let stream_id = create(&mut machine, "idle", OCTET);
     let t0 = 1_000;
     for seq in 0..3 {
@@ -250,13 +248,12 @@ fn idle_producer_expires_at_its_own_next_write() {
         .get("p")
         .unwrap()
         .clone();
-    assert_eq!(state.last_seen_ms, Some(idle_at));
-    assert!(state.last_items.is_empty());
+    assert_eq!(state.last_seen_ms, idle_at);
 }
 
 #[test]
 fn snapshot_round_trip_and_restore_versus_live_differential() {
-    let mut live = machine_at(1);
+    let mut live = machine();
     let stream_id = create(&mut live, "diff", OCTET);
     // A producer that is fully evicted down to its newest receipt, another
     // with a full window, and a batch producer.
@@ -300,19 +297,8 @@ fn snapshot_round_trip_and_restore_versus_live_differential() {
 }
 
 #[test]
-fn level_one_restore_does_not_synthesize_receipts() {
-    let mut machine = machine_at(1);
-    let stream_id = create(&mut machine, "synth", OCTET);
-    appended(append(&mut machine, &stream_id, "p", 0, 5));
-    let mut snapshot = machine.snapshot();
-    snapshot.streams[0].producer_states[0].receipts.clear();
-    let restored = StreamStateMachine::restore(snapshot).unwrap();
-    assert!(receipts(&restored, &stream_id, "p").is_empty());
-}
-
-#[test]
 fn tidy_stream_is_idempotent() {
-    let mut machine = machine_at(1);
+    let mut machine = machine();
     let stream_id = create(&mut machine, "tidy", OCTET);
     assert_eq!(
         machine.apply(StreamCommand::TidyStream {
@@ -370,8 +356,8 @@ fn duplicate_lookup_is_direct_at_a_million_receipts() {
 }
 
 #[test]
-fn bootstrap_stays_honest_after_external_collapse() {
-    let mut machine = machine_at(1);
+fn bootstrap_stays_honest_after_external_appends() {
+    let mut machine = machine();
     let stream_id = create(&mut machine, "boot", OCTET);
     let ext = |machine: &mut StreamStateMachine, path: &str| {
         let response = machine.apply(StreamCommand::AppendExternal {
@@ -394,7 +380,7 @@ fn bootstrap_stays_honest_after_external_collapse() {
     ext(&mut machine, "a");
     ext(&mut machine, "b");
     ext(&mut machine, "c");
-    // A snapshot inside the collapsed cold region is still accepted (F18),
+    // A snapshot inside the cold region is still accepted (F18),
     // and bootstrap from it is an honest partial: no update parts.
     assert!(matches!(
         machine.apply(StreamCommand::PublishSnapshot {
@@ -428,11 +414,11 @@ fn bootstrap_stays_honest_after_external_collapse() {
 }
 
 #[test]
-fn bootstrap_is_partial_when_the_cold_frontier_regressed_below_the_seal_point() {
+fn bootstrap_is_partial_when_a_hot_prefix_flush_leaves_an_external_below_the_seal_point() {
     // D1 shape: small hot bytes, an external append, then a flush of only
-    // the hot prefix moves the scalar frontier back. Every byte below the
-    // seal point is still cold, so bootstrap from inside it must be partial.
-    let mut machine = machine_at(1);
+    // the hot prefix. Every byte below the seal point is cold, so bootstrap
+    // from inside it must be partial.
+    let mut machine = machine();
     let stream_id = create(&mut machine, "d1", OCTET);
     assert!(matches!(
         machine.apply(StreamCommand::Append {
@@ -468,7 +454,9 @@ fn bootstrap_is_partial_when_the_cold_frontier_regressed_below_the_seal_point() 
     assert!(matches!(
         machine.apply(StreamCommand::FlushCold {
             stream_id: stream_id.clone(),
-            cold_generation: None,
+            cold_generation: machine
+                .cold_index_generation(&stream_id)
+                .unwrap_or_default(),
             chunk: ColdChunkRef {
                 start_offset: 0,
                 end_offset: 10,
@@ -513,7 +501,7 @@ fn tidy_stream_command_round_trips_through_serde() {
 fn producer_cap_evicts_hour_idle_producers_and_rejects_otherwise() {
     use super::producers::MAX_PRODUCERS_PER_STREAM;
     use super::producers::PRODUCER_CAP_EVICT_IDLE_MS;
-    let mut machine = machine_at(1);
+    let mut machine = machine();
     let stream_id = create(&mut machine, "cap", OCTET);
     // Producer `p0000` writes first, so it is the least recently seen.
     for index in 0..MAX_PRODUCERS_PER_STREAM {

@@ -163,16 +163,6 @@ async fn d1_runtime_reads_and_installs_external_above_a_flushed_hot_prefix() {
         .snapshot_group(runtime.locate(&stream).raft_group_id)
         .await
         .expect("snapshot group");
-    let entry = snapshot
-        .stream_snapshot
-        .streams
-        .iter()
-        .find(|entry| entry.metadata.stream_id == stream)
-        .expect("snapshot entry");
-    // F5: with the external's locator in state the flush no longer
-    // regresses the replicated frontier below the external.
-    assert_eq!(entry.cold_frontier_offset, 5);
-
     let target = spawn_with_cold_store(cold_store);
     target
         .install_group_snapshot(snapshot)
@@ -243,7 +233,10 @@ async fn d3_flush_clips_the_page_entry_of_a_rejected_external_append() {
     engine
         .flush_cold(
             FlushColdRequest {
-                cold_generation: None,
+                cold_generation: engine
+                    .state_machine
+                    .cold_index_generation(&stream)
+                    .expect("live stream"),
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -296,22 +289,12 @@ async fn repair_cursor_walks_streams_in_bounded_steps() {
         .expect("first step");
     assert_eq!(first.report.streams_scanned, 2);
     assert!(!first.cycle_completed);
-    assert!(
-        runtime
-            .cold_index_repair_last_full_cycle_ms(group)
-            .is_none()
-    );
     let second = runtime
         .repair_cold_index_group_once(group, 2)
         .await
         .expect("second step");
     assert_eq!(second.report.streams_scanned, 1);
     assert!(second.cycle_completed);
-    assert!(
-        runtime
-            .cold_index_repair_last_full_cycle_ms(group)
-            .is_some()
-    );
 }
 
 fn object(start_offset: u64, end_offset: u64, s3_path: &str) -> ObjectPayloadRef {
@@ -704,7 +687,10 @@ async fn retention_gc_never_touches_the_boundary_page() {
         engine
             .flush_cold(
                 FlushColdRequest {
-                    cold_generation: None,
+                    cold_generation: engine
+                        .state_machine
+                        .cold_index_generation(&stream)
+                        .expect("live stream"),
                     stream_id: stream.clone(),
                     chunk: ColdChunkRef {
                         start_offset: start,

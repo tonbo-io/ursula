@@ -8,7 +8,6 @@ use crate::model::ColdGcEntry;
 use crate::model::HotPayloadSegment;
 use crate::model::ObjectPayloadRef;
 use crate::model::ProducerSnapshot;
-use crate::model::StreamMessageRecord;
 use crate::model::StreamMetadata;
 use crate::model::StreamVisibleSnapshot;
 use crate::record_index::StreamRecordIndex;
@@ -37,18 +36,12 @@ pub struct StreamSnapshot {
     /// which case the monotonic counters restart from the restored gauges.
     #[serde(default)]
     pub bucket_usage: Vec<BucketUsageSnapshot>,
-    /// Replicated group feature level (C0). Absent in legacy snapshots,
-    /// which decode as level 0.
-    #[serde(default)]
-    pub feature_level: u32,
-    /// Largest `created_at_ms` assigned at feature level 1 or later (C7,
-    /// F14g). Absent in legacy snapshots, which decode as 0.
+    /// Largest `created_at_ms` this group assigned (C7, F14g).
     #[serde(default)]
     pub last_created_at_ms: u64,
 }
 
-/// An empty snapshot of this binary's epoch at the top feature level, the
-/// only level an epoch-2 snapshot can hold. Fixtures restore from it.
+/// An empty snapshot of this binary's epoch. Fixtures restore from it.
 impl Default for StreamSnapshot {
     fn default() -> Self {
         Self {
@@ -60,7 +53,6 @@ impl Default for StreamSnapshot {
             next_cold_gc_seq: 0,
             shared_cold_object_owners: Vec::new(),
             bucket_usage: Vec::new(),
-            feature_level: crate::MAX_SUPPORTED_FEATURE_LEVEL,
             last_created_at_ms: 0,
         }
     }
@@ -79,17 +71,11 @@ pub struct StreamSnapshotEntry {
     pub payload: Vec<u8>,
     pub hot_segments: Vec<HotPayloadSegment>,
     #[serde(default)]
-    pub cold_frontier_offset: u64,
-    #[serde(default)]
     pub cold_index_generation: u64,
     pub cold_chunks: Vec<ColdChunkRef>,
     pub external_segments: Vec<ObjectPayloadRef>,
-    /// Legacy message boundaries. Empty from feature level 4 (F4b) once
-    /// the stream converted; snapshots then carry `hot_append_starts`.
-    pub message_records: Vec<StreamMessageRecord>,
-    /// F4b (level 4): start offsets of the messages at or above the seal
-    /// point, for streams without a record index. Absent in older
-    /// snapshots.
+    /// F4b: start offsets of the messages at or above the seal point, for
+    /// streams without a record index.
     #[serde(default)]
     pub hot_append_starts: Vec<u64>,
     #[serde(default)]
@@ -139,11 +125,6 @@ pub enum StreamSnapshotError {
         snapshot_offset: u64,
         tail_offset: u64,
     },
-    #[error(
-        "snapshot feature level {level} is not this binary's level {supported}; every \
-         format-epoch-2 snapshot is written at level {supported}"
-    )]
-    UnsupportedFeatureLevel { level: u32, supported: u32 },
     #[error("{}", snapshot_format_epoch_message(.found))]
     FormatEpoch { found: u32 },
 }

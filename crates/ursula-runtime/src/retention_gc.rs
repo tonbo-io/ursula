@@ -1,6 +1,6 @@
 //! Retention GC (bounded-stream-state F14f).
 //!
-//! From feature level 1 a stream's exclusive cold chunks and its offloaded
+//! A stream's exclusive cold chunks and its offloaded
 //! external payloads are referenced only by its cold-index pages in S3, not
 //! by replicated state. `AdvanceRetention` therefore could release only the
 //! shared pack slices state holds; every exclusive object below the retained
@@ -23,7 +23,7 @@
 //! deletes an object that page, or any page it keeps, names. Page writes are
 //! unconditional PUTs and `is_leader` is checked only when a step starts, so
 //! a deposed leader rewriting the boundary page could overwrite an entry a
-//! new leader just flushed into it, and at Lb1 that entry is the chunk's only
+//! new leader just flushed into it, and that entry is the chunk's only
 //! reference. Pages wholly below the offset take no new entries. The cost is
 //! at most about one page span (64 MiB) of objects below the offset per
 //! stream, left until retention moves past that page. Conditional page PUTs

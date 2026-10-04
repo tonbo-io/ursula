@@ -1815,7 +1815,7 @@ fn smoke_corpus_replays() {
 /// Bounded-state Invariant 12 (§7.4): after the same log prefix every
 /// replica holds the same producers, receipt windows and newest
 /// acknowledgements, whether it replayed the log or installed a snapshot.
-/// A learner installs a level-1 snapshot taken mid-stream (receipt window
+/// A learner installs a snapshot taken mid-stream (receipt window
 /// already evicting), then every replica applies the same suffix.
 #[test]
 fn producer_state_matches_after_snapshot_install_mid_stream() {
@@ -1829,10 +1829,6 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
         let learner_index = usize::try_from(learner_id - 1).expect("learner id fits usize");
         let stream = BucketStreamId::new("simulated", "producers");
 
-        engines[leader_index]
-            .set_feature_level(SetFeatureLevelRequest { level: 1 }, placement())
-            .await
-            .expect("raise feature level");
         engines[leader_index]
             .create_stream(
                 CreateStreamRequest::new(stream.clone(), "application/octet-stream"),
@@ -2025,7 +2021,7 @@ fn seeds_from_env(var: &str, default: &[u64]) -> Vec<u64> {
 
 /// Bounded-state F1 seed family (§7.4): cold-path record reads across flush
 /// and seal boundaries, retention by record into sealed history, and a
-/// learner that installs a level-2 snapshot with marks mid-stream.
+/// learner that installs a snapshot with marks mid-stream.
 ///
 /// - Invariant 9: every replica's marks stay within `ceil(cold MiB) + 2`
 ///   and its dense part within the unflushed records plus one.
@@ -2054,15 +2050,6 @@ async fn sparse_marks_scenario(seed: u64) {
     let learner_id = 3;
     let learner_index = usize::try_from(learner_id - 1).expect("learner id fits usize");
     let stream = BucketStreamId::new("simulated", "marks");
-    engines[leader_index]
-        .set_feature_level(
-            SetFeatureLevelRequest {
-                level: ursula_runtime::FEATURE_LEVEL_SPARSE_MARKS,
-            },
-            placement(),
-        )
-        .await
-        .expect("raise feature level");
     engines[leader_index]
         .create_stream(
             CreateStreamRequest::new(stream.clone(), "application/json"),
@@ -2327,7 +2314,7 @@ async fn sparse_marks_flush(
         leader
             .flush_cold(
                 FlushColdRequest {
-                    cold_generation: Some(candidate.cold_generation),
+                    cold_generation: candidate.cold_generation,
                     stream_id: stream.clone(),
                     chunk: ursula_runtime::ColdChunkRef {
                         start_offset: candidate.start_offset,
@@ -2495,7 +2482,7 @@ async fn replacement_leader(engines: &[RaftGroupEngine], leader_id: u64) -> u64 
         .expect("replacement leader id")
 }
 
-/// One run of the F5 ambiguous-commit family at feature level 3, checking
+/// One run of the F5 ambiguous-commit family, checking
 /// Invariant 11: after the ambiguity, readable bytes equal acknowledged bytes
 /// on every replica, no page entry overlaps differing bytes, no page entry
 /// names an object that never committed, and the ambiguous staged object was
@@ -2507,15 +2494,6 @@ async fn external_locator_ambiguity(variant: LocatorAmbiguity) {
         build_three_node_cluster_with_cold_store(policy.clone(), Some(cold_store.clone())).await;
     let stream = BucketStreamId::new("simulated", "external-locators");
     let leader = engine_index(leader_id);
-    engines[leader]
-        .set_feature_level(
-            SetFeatureLevelRequest {
-                level: ursula_runtime::FEATURE_LEVEL_EXTERNAL_LOCATORS,
-            },
-            placement(),
-        )
-        .await
-        .expect("raise to level 3");
     engines[leader]
         .create_stream(
             CreateStreamRequest::new(stream.clone(), "application/octet-stream"),
@@ -2708,16 +2686,16 @@ fn external_locators_survive_ambiguous_commits() {
     }
 }
 
-/// Seeds of the level-3 snapshot-install family: a learner installs a
+/// Seeds of the F5 snapshot-install family: a learner installs a
 /// group snapshot that holds staged external refs (not yet offloaded).
 const EXTERNAL_LOCATOR_SNAPSHOT_SEEDS: [u64; 2] = [5, 23];
 
 /// Bounded-state F5 follow-up (§7.4, Invariants 11 and 12): a learner that
-/// installs a level-3 snapshot holding staged external refs reads the
+/// installs a snapshot holding staged external refs reads the
 /// acknowledged bytes, holds the same refs as the voters, and converges with
 /// them after the offload commits.
 #[test]
-fn external_locators_survive_level_three_snapshot_install_with_staged_refs() {
+fn external_locators_survive_snapshot_install_with_staged_refs() {
     let _guard = sim_test_guard();
     for seed in seeds_from_env(
         "EXTERNAL_LOCATOR_SNAPSHOT_SEEDS",
@@ -2736,15 +2714,6 @@ async fn external_locator_snapshot_install(seed: u64) {
     let leader_index = engine_index(leader_id);
     let learner_id = 3;
     let stream = BucketStreamId::new("simulated", "locator-install");
-    engines[leader_index]
-        .set_feature_level(
-            SetFeatureLevelRequest {
-                level: ursula_runtime::FEATURE_LEVEL_EXTERNAL_LOCATORS,
-            },
-            placement(),
-        )
-        .await
-        .expect("raise to level 3");
     engines[leader_index]
         .create_stream(
             CreateStreamRequest::new(stream.clone(), "application/octet-stream"),
@@ -2868,8 +2837,7 @@ async fn external_locator_snapshot_install(seed: u64) {
         entries.push((
             entry.external_segments,
             entry.cold_chunks,
-            entry.cold_frontier_offset,
-            entry.message_records,
+            entry.hot_append_starts,
         ));
     }
     assert_eq!(entries[0], entries[1]);
@@ -2910,40 +2878,31 @@ async fn external_locator_snapshot_install(seed: u64) {
     }
 }
 
-/// Seeds of the level-3 ambiguous `CompactCold` family: `seed % 2` picks
+/// Seeds of the F5 ambiguous `CompactCold` family: `seed % 2` picks
 /// whether the compaction commits.
 const AMBIGUOUS_COMPACTION_SEEDS: [u64; 2] = [8, 13];
 
 /// Bounded-state F5/F14 follow-up (§7.4, Invariant 11): a `CompactCold` whose
-/// outcome is ambiguous to its caller at level 3 (the leader rewrote the
-/// page entries, then lost quorum) never changes readable bytes: every
-/// replica reads the acknowledged bytes, around an offloaded external ref,
-/// before and after a new leader keeps writing, and the compaction inputs
-/// are not deleted when the compaction never committed.
+/// outcome is ambiguous to its caller (the leader rewrote the page entries,
+/// then lost quorum) never changes readable bytes: every replica reads the
+/// acknowledged bytes, around an offloaded external ref, before and after a
+/// new leader keeps writing, and the compaction inputs are not deleted when
+/// the compaction never committed.
 #[test]
-fn external_locators_survive_ambiguous_compaction_at_level_three() {
+fn external_locators_survive_ambiguous_compaction() {
     let _guard = sim_test_guard();
     for seed in seeds_from_env("AMBIGUOUS_COMPACTION_SEEDS", &AMBIGUOUS_COMPACTION_SEEDS) {
-        run_with_madsim(seed, ambiguous_compaction_at_level_three(seed % 2 == 0));
+        run_with_madsim(seed, ambiguous_compaction(seed % 2 == 0));
     }
 }
 
-async fn ambiguous_compaction_at_level_three(commits: bool) {
+async fn ambiguous_compaction(commits: bool) {
     let cold_store: Arc<ColdStore> = Arc::new(sim_cold_store());
     let policy = sim_network_policy();
     let (_registry, mut engines, mut leader_id) =
         build_three_node_cluster_with_cold_store(policy.clone(), Some(cold_store.clone())).await;
     let stream = BucketStreamId::new("simulated", "ambiguous-compaction");
     let leader = engine_index(leader_id);
-    engines[leader]
-        .set_feature_level(
-            SetFeatureLevelRequest {
-                level: ursula_runtime::FEATURE_LEVEL_EXTERNAL_LOCATORS,
-            },
-            placement(),
-        )
-        .await
-        .expect("raise to level 3");
     engines[leader]
         .create_stream(
             CreateStreamRequest::new(stream.clone(), "application/octet-stream"),
@@ -2996,7 +2955,7 @@ async fn ambiguous_compaction_at_level_three(commits: bool) {
         engines[leader]
             .flush_cold(
                 FlushColdRequest {
-                    cold_generation: Some(candidate.cold_generation),
+                    cold_generation: candidate.cold_generation,
                     stream_id: stream.clone(),
                     chunk: chunk.clone(),
                 },
