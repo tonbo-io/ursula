@@ -254,7 +254,7 @@ impl AppendScenario {
             Self::SingleStream => "single_stream_append",
             Self::ManyStreams => "many_streams_append",
             Self::ProducerDedup => "producer_dedup_retry",
-            Self::SnapshotCompaction => "snapshot_compaction_setsums",
+            Self::SnapshotCompaction => "snapshot_compaction",
         }
     }
 }

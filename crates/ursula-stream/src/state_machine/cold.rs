@@ -813,7 +813,6 @@ impl StreamStateMachine {
         {
             record_index.commit_retain(prepared);
         }
-        slot.integrity.evict_before(retained_offset);
         let dropped_cold_paths = slot.cold.compact_before(retained_offset);
         self.release_shared_cold_objects(
             &stream_id.bucket_id,

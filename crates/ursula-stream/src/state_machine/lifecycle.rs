@@ -14,7 +14,6 @@ use super::ProducerRequest;
 use super::ProducerState;
 use super::StreamErrorCode;
 use super::StreamErrorContext;
-use super::StreamIntegrity;
 use super::StreamMetadata;
 use super::StreamResponse;
 use super::StreamSlot;
@@ -156,11 +155,6 @@ impl StreamStateMachine {
             last_ttl_touch_at_ms: input.now_ms,
         };
         let hot_buffer = HotBuffer::from_payload(0, input.initial_payload);
-        let mut integrity = StreamIntegrity::default();
-        if initial_len > 0 {
-            let payload = hot_buffer.payload();
-            integrity.append_payload(&input.stream_id, 0, initial_len, &payload);
-        }
         let records_removed = self.message_records_removed();
         let mut producer_states = HashMap::new();
         let bounded = self.producer_bounds_enabled();
@@ -200,7 +194,6 @@ impl StreamStateMachine {
             cold: self.new_incarnation_cold_state(created_at_ms),
             message_records: Vec::new(),
             record_index,
-            integrity,
             retained_offset: 0,
             visible_snapshot: None,
             receipt_window: super::producers::ReceiptWindow::rebuild(&producer_states),
@@ -333,16 +326,6 @@ impl StreamStateMachine {
         } else {
             cold.push_external_segment(object.clone());
         }
-        let mut integrity = StreamIntegrity::default();
-        if initial_len > 0 {
-            integrity.append_external(
-                &input.stream_id,
-                object.start_offset,
-                object.end_offset,
-                &object.s3_path,
-                object.object_size,
-            );
-        }
         let records_removed = self.message_records_removed();
         let mut producer_states = HashMap::new();
         let bounded = self.producer_bounds_enabled();
@@ -382,7 +365,6 @@ impl StreamStateMachine {
             cold,
             message_records: Vec::new(),
             record_index,
-            integrity,
             retained_offset: 0,
             visible_snapshot: None,
             receipt_window: super::producers::ReceiptWindow::rebuild(&producer_states),

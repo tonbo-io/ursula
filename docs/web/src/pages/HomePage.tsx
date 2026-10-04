@@ -62,7 +62,7 @@ function useLiveChaos(): LiveChaos | null {
         const startedAt = data?.started_at ? new Date(data.started_at).getTime() : NaN;
         if (!Number.isFinite(startedAt)) return;
         const faults = data?.chaos?.injection_count;
-        const corruptions = data?.integrity?.setsum_mismatch_count;
+        const corruptions = data?.integrity?.mismatch_count;
         if (typeof faults !== "number" || typeof corruptions !== "number") return;
         const verified = data?.integrity?.verified_offsets;
         const updatedAt = data?.updated_at ? new Date(data.updated_at).getTime() : NaN;
@@ -426,7 +426,7 @@ function HomePage() {
             </h3>
             <p className="home-lede">
               A 3-node cluster on EKS takes voter Pod failures around the clock. Kubernetes
-              recreates each voter while every read is verified against a running checksum.
+              recreates each voter while sampled appends are read back and compared byte for byte.
             </p>
             <div className="hp-cluster">
               <div className="hp-head">

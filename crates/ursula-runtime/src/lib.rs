@@ -274,7 +274,6 @@ pub use ursula_stream::ProducerRequest;
 pub use ursula_stream::SnapshotDigest;
 pub use ursula_stream::StreamErrorCode;
 pub use ursula_stream::StreamErrorContext;
-pub use ursula_stream::StreamIntegritySnapshot;
 pub use ursula_stream::StreamRecordRange;
 pub use ursula_stream::StreamSnapshot;
 pub use ursula_stream::validate_bucket_id;
