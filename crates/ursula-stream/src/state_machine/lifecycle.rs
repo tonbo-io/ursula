@@ -182,7 +182,7 @@ impl StreamStateMachine {
             });
         }
         let stream_id = input.stream_id.clone();
-        let mut slot = StreamSlot {
+        let slot = StreamSlot {
             metadata,
             hot_buffer,
             cold: StreamColdState::with_generation(created_at_ms),
@@ -193,9 +193,6 @@ impl StreamStateMachine {
             producers: producer_states,
             append_count: 0,
         };
-        // F4b: the initial body's message boundaries (append starts at or
-        // above the seal point).
-        slot.record_message_boundaries(0, initial_len, &input.record_ends);
         if self.insert_stream_slot(slot).is_none() {
             return StreamResponse::error(
                 StreamErrorCode::StreamAlreadyExistsConflict,
@@ -341,7 +338,7 @@ impl StreamStateMachine {
             });
         }
         let stream_id = input.stream_id.clone();
-        let mut slot = StreamSlot {
+        let slot = StreamSlot {
             metadata,
             hot_buffer: HotBuffer::default(),
             cold,
@@ -352,9 +349,6 @@ impl StreamStateMachine {
             producers: producer_states,
             append_count: 0,
         };
-        // F4b: the initial body's message boundaries (append starts at or
-        // above the seal point).
-        slot.record_message_boundaries(0, initial_len, &input.record_ends);
         if self.insert_stream_slot(slot).is_none() {
             return StreamResponse::error(
                 StreamErrorCode::StreamAlreadyExistsConflict,

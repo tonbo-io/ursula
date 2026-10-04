@@ -2834,11 +2834,7 @@ async fn external_locator_snapshot_install(seed: u64) {
             .find(|entry| entry.metadata.stream_id == stream)
             .expect("stream entry")
             .clone();
-        entries.push((
-            entry.external_segments,
-            entry.cold_chunks,
-            entry.hot_append_starts,
-        ));
+        entries.push((entry.external_segments, entry.cold_chunks));
     }
     assert_eq!(entries[0], entries[1]);
     assert_eq!(

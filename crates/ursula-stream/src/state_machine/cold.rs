@@ -715,8 +715,9 @@ impl StreamStateMachine {
         retained_offset: u64,
     ) -> bool {
         // F18 step 2: the retained offset, any offset at or below the seal
-        // point, or a derived message start at or above it (F4b), or the
-        // tail.
+        // point, or a record start at or above it (F4b), or the tail. A
+        // stream without a record index has no message boundaries, so any
+        // offset in `[retained, tail]` is aligned (callers check the range).
         snapshot_offset == retained_offset
             || snapshot_offset <= self.seal_point(stream_id)
             || self
@@ -731,8 +732,6 @@ impl StreamStateMachine {
         prepared_record_retain: Option<crate::record_index::PreparedRetain>,
         gc_not_before_ms: u64,
     ) {
-        // F4b: retention only moves the hot buffer, which prunes the append
-        // starts.
         let slot = self
             .stream_slot_mut(stream_id)
             .expect("stream existence checked before retained-prefix compaction");
@@ -758,11 +757,11 @@ impl StreamStateMachine {
         self.sync_hot_index(stream_id);
     }
 
-    /// Lowest offset from which every retained message is known to be one
-    /// exact, whole message whose bytes are still hot (F4b): the first
-    /// derived message start at or above the seal point. A message that
-    /// straddles the seal point has no start there, so the frontier moves
-    /// past it.
+    /// Lowest offset from which bootstrap answers exactly from hot bytes
+    /// (F4b). For a JSON stream: the first record start at or above the seal
+    /// point; a record that straddles the seal point has no start there, so
+    /// the frontier moves past it. For any other stream: `max(seal point,
+    /// retained)`.
     pub(super) fn exact_message_frontier(&self, stream_id: &BucketStreamId) -> u64 {
         self.stream_slot(stream_id)
             .map_or(0, |slot| slot.derived_exact_frontier())

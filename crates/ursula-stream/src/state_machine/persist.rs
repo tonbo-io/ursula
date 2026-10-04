@@ -42,7 +42,6 @@ impl StreamStateMachine {
                     cold_index_generation: slot.cold.cold_generation(),
                     cold_chunks: slot.cold.cold_chunks().to_vec(),
                     external_segments: slot.cold.external_segments().to_vec(),
-                    hot_append_starts: slot.hot_buffer.append_starts().iter().copied().collect(),
                     record_index: slot.record_index.clone(),
                     retained_offset: Some(slot.retained_offset),
                     visible_snapshot: slot.visible_snapshot.clone(),
@@ -222,19 +221,6 @@ impl StreamStateMachine {
                     payload_len: entry.payload.len(),
                 });
             }
-            // F4b: a stream's boundaries are the dense offsets or the append
-            // starts, which must lie at or above the seal point.
-            let seal_point = hot_segments
-                .first()
-                .map_or(entry.metadata.tail_offset, |segment| segment.start_offset);
-            if !super::boundaries::append_starts_valid(
-                &entry.hot_append_starts,
-                seal_point,
-                entry.metadata.tail_offset,
-                entry.record_index.is_some(),
-            ) {
-                return Err(StreamSnapshotError::MessageBoundaryMismatch { stream_id });
-            }
             if machine.registry.contains_key(&stream_id) {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));
             }
@@ -252,8 +238,7 @@ impl StreamStateMachine {
                 .filter(|chunk| chunk.shared_object)
                 .map(|chunk| chunk.s3_path.clone())
                 .collect::<Vec<_>>();
-            let mut hot_buffer = HotBuffer::from_snapshot(entry.payload, &hot_segments);
-            hot_buffer.restore_append_starts(entry.hot_append_starts);
+            let hot_buffer = HotBuffer::from_snapshot(entry.payload, &hot_segments);
             let slot = StreamSlot {
                 metadata: entry.metadata,
                 hot_buffer,

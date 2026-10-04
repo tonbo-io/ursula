@@ -4346,6 +4346,7 @@ dependencies = [
  "openraft",
  "opentelemetry",
  "proptest",
+ "rand 0.10.1",
  "reqwest",
  "rmp-serde",
  "serde",

@@ -121,14 +121,6 @@ fn retain(machine: &mut StreamStateMachine, id: &str, offset: u64, now_ms: u64) 
     })
 }
 
-#[track_caller]
-fn assert_code(response: &StreamResponse, code: StreamErrorCode) {
-    match response {
-        StreamResponse::Error { code: actual, .. } if *actual == code => {}
-        other => panic!("expected {code:?}, got {other:?}"),
-    }
-}
-
 /// Hot message `[0, 4)` with an external append `[4, 7)` above it.
 fn hot_message_below_external(id: &str) -> StreamStateMachine {
     let mut machine = fresh_machine();
@@ -136,24 +128,6 @@ fn hot_message_below_external(id: &str) -> StreamStateMachine {
     append(&mut machine, id, b"abcd");
     append_external(&mut machine, id, "derived/external/x.bin", 3);
     machine
-}
-
-#[test]
-fn f18_snapshot_at_intra_message_hot_offset_below_external_is_rejected() {
-    let mut machine = hot_message_below_external("align");
-    assert_code(
-        &publish_snapshot(&mut machine, "align", 2),
-        StreamErrorCode::InvalidSnapshot,
-    );
-    // Message ends and the retained offset stay valid.
-    assert!(matches!(
-        publish_snapshot(&mut machine, "align", 4),
-        StreamResponse::SnapshotPublished { .. }
-    ));
-    assert!(matches!(
-        publish_snapshot(&mut machine, "align", 7),
-        StreamResponse::SnapshotPublished { .. }
-    ));
 }
 
 #[test]
@@ -188,13 +162,16 @@ fn f18_retention_keeps_hot_messages_above_the_seal_point() {
         retain(&mut machine, "collapse", 2, 0),
         StreamResponse::RetentionAdvanced { .. }
     ));
+    // `[2, 4)` stays hot, at p(s) = 2.
+    assert_eq!(machine.seal_point(&stream("collapse")), 2);
+    // The external append `[4, 7)` above it is cold, so bootstrap from 2 is
+    // an honest partial rather than a part that would need cold bytes.
     let plan = machine
         .bootstrap_plan(&stream("collapse"))
         .expect("bootstrap plan");
-    // Both messages are kept: `[2, 4)` is hot, above p(s) = 2.
-    assert_eq!(plan.updates.len(), 2, "{plan:?}");
-    assert!(plan.up_to_date);
-    assert_eq!(plan.next_offset, 7);
+    assert!(plan.updates.is_empty(), "{plan:?}");
+    assert!(!plan.up_to_date);
+    assert_eq!(plan.next_offset, 2);
 }
 
 #[test]
@@ -444,139 +421,4 @@ fn flush_cold_from_a_removed_incarnation_is_stale() {
         flush(&mut machine, "reborn", 2, 4, "derived/chunks/cd.bin"),
         StreamResponse::ColdFlushed { .. }
     ));
-}
-
-/// A whole hot message at the seal point stays a complete bootstrap.
-#[test]
-fn bootstrap_keeps_whole_hot_messages_at_the_seal_point() {
-    let mut fresh = fresh_machine();
-    create(&mut fresh, "fresh", 1);
-    append(&mut fresh, "fresh", b"ab");
-    append(&mut fresh, "fresh", b"cd");
-    let plan = fresh.bootstrap_plan(&stream("fresh")).expect("plan");
-    assert!(plan.up_to_date);
-    assert_eq!(plan.updates.len(), 2);
-}
-
-/// Bootstrap never merges or skips messages, whatever history built the
-/// stream (B6 follow-up). This test sweeps random histories of hot appends,
-/// external appends, cold flushes (also at intra-message offsets), snapshots
-/// and retention, and checks that every bootstrap update is exactly one
-/// appended message and that a complete bootstrap covers `[snapshot, tail)`
-/// with no gap.
-#[test]
-fn bootstrap_never_merges_or_skips_messages_for_any_history() {
-    struct Rng(u64);
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-        fn below(&mut self, bound: u64) -> u64 {
-            self.next() % bound.max(1)
-        }
-    }
-
-    fn check(machine: &StreamStateMachine, messages: &[(u64, u64)], seed: u64, phase: &str) {
-        let plan = machine
-            .bootstrap_plan(&stream("sweep"))
-            .expect("bootstrap plan");
-        let tail = messages.last().map_or(0, |message| message.1);
-        let start = plan
-            .snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.offset)
-            .unwrap_or_else(|| {
-                machine
-                    .stream_slot(&stream("sweep"))
-                    .expect("slot")
-                    .retained_offset
-            });
-        let mut expected_start = start;
-        for update in &plan.updates {
-            assert!(
-                messages.contains(&(update.start_offset, update.end_offset)),
-                "seed {seed} {phase}: update {update:?} is not exactly one message; \
-                 messages {messages:?}, plan {plan:?}"
-            );
-            assert_eq!(
-                update.start_offset, expected_start,
-                "seed {seed} {phase}: bootstrap skipped bytes; plan {plan:?}"
-            );
-            expected_start = update.end_offset;
-        }
-        if plan.up_to_date {
-            assert_eq!(expected_start, tail, "seed {seed} {phase}: {plan:?}");
-            assert_eq!(plan.next_offset, tail);
-        } else if plan.updates.is_empty() {
-            assert_eq!(plan.next_offset, start, "seed {seed} {phase}: {plan:?}");
-        }
-    }
-
-    for seed in 1..=3_000_u64 {
-        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-        let mut machine = fresh_machine();
-        create(&mut machine, "sweep", 1);
-        let mut messages: Vec<(u64, u64)> = Vec::new();
-        let mut tail = 0_u64;
-        let mut external = 0_u64;
-        let steps = 4 + rng.below(12);
-        for step in 0..steps {
-            match rng.below(10) {
-                0..=3 => {
-                    let len = 1 + rng.below(3);
-                    let payload = vec![b'h'; usize::try_from(len).unwrap()];
-                    append(&mut machine, "sweep", &payload);
-                    messages.push((tail, tail + len));
-                    tail += len;
-                }
-                4..=5 => {
-                    let len = 1 + rng.below(3);
-                    external += 1;
-                    append_external(
-                        &mut machine,
-                        "sweep",
-                        &format!("derived/external/sweep-{seed}-{external}.bin"),
-                        len,
-                    );
-                    messages.push((tail, tail + len));
-                    tail += len;
-                }
-                6..=7 => {
-                    let hot_start = machine.hot_start_offset(&stream("sweep"));
-                    if hot_start < tail {
-                        let end = hot_start + 1 + rng.below(tail - hot_start);
-                        let _ = flush(
-                            &mut machine,
-                            "sweep",
-                            hot_start,
-                            end,
-                            &format!("derived/chunks/sweep-{seed}-{step}.bin"),
-                        );
-                    }
-                }
-                _ => {
-                    // Snapshots at message boundaries, then retention to them.
-                    if let Some(&(_, end)) =
-                        messages.get(usize::try_from(rng.below(len_u64(messages.len()))).unwrap())
-                        && matches!(
-                            publish_snapshot(&mut machine, "sweep", end),
-                            StreamResponse::SnapshotPublished { .. }
-                        )
-                        && rng.below(2) == 0
-                    {
-                        let _ = retain(&mut machine, "sweep", end, 0);
-                    }
-                }
-            }
-            check(&machine, &messages, seed, "step");
-        }
-        check(&machine, &messages, seed, "final");
-    }
-}
-
-fn len_u64(len: usize) -> u64 {
-    u64::try_from(len).unwrap()
 }

@@ -44,7 +44,7 @@ api: "GET /{bucket}/{stream}"
 </ParamField>
 
 <ParamField query="max_bytes" type="number">
- On an offset read, the maximum bytes to read in one response or SSE data batch. Every response is capped at 8 MiB; a larger value is clamped, and a value that is not a decimal integer is ignored. A shortened response has no `Stream-Up-To-Date`; continue from `Stream-Next-Offset`. For UTF-8 SSE data, Ursula may shorten the emitted batch so `Stream-Next-Offset` lands on a valid text boundary.
+ On an offset read, the maximum bytes to read in one response or SSE data batch. Every response is capped at 8 MiB; a larger value is clamped, and a value that is not a decimal integer is ignored. A shortened response has no `Stream-Up-To-Date` and may end inside a message, on a JSON stream too; continue from `Stream-Next-Offset`. For UTF-8 SSE data, Ursula may shorten the emitted batch so `Stream-Next-Offset` lands on a valid text boundary.
 
  With `record` or `tail_records`, a positive integer that bounds complete records instead: the response holds the longest run of whole records whose stored size (each message plus its LF) is at most `max_bytes`, and always at least one record when one exists, even if it alone is larger. It never ends inside a record.
 </ParamField>

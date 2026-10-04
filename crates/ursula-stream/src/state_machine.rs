@@ -13,7 +13,7 @@
 //! - [`marks`]: F1 sparse cold record marks — sealing at cold transitions and
 //!   record lookups.
 //! - [`boundaries`]: F4b message boundaries without message records — dense
-//!   record offsets or hot append starts.
+//!   record offsets for JSON; other content types have none.
 //! - [`external_locators`]: F5 state-held external payload locators and
 //!   `OffloadColdRefs`, plus the offload pass's query.
 //! - [`hot_buffer`], [`cold_state`], [`ttl`]: internal per-stream data structures.
@@ -127,16 +127,17 @@ const TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE: usize = 256;
 /// validate the interpretation before using the derived counter.
 pub const COMMITTED_WRITE_UNIT_BYTES: u64 = 10 * 1024;
 
-/// Replicated bookkeeping per unflushed record beyond its payload (F4b):
-/// each hot message costs one 8-byte boundary (a dense record offset for
-/// JSON, an append start otherwise). Admission and flush thresholds count hot
-/// payload plus this much per hot record (F6c), so a window of tiny records
-/// is charged for its real memory.
+/// Replicated bookkeeping per unflushed JSON record beyond its payload
+/// (F4b): each hot record costs one 8-byte dense record offset. Admission and
+/// flush thresholds count hot payload plus this much per hot record (F6c), so
+/// a window of tiny records is charged for its real memory. Streams without
+/// a record index keep nothing per message and are charged payload only.
 pub const HOT_RECORD_OVERHEAD_BYTES: u64 = 8;
 
-/// Hot records of one stream (F6c): messages that start at or above its
+/// Hot records of one stream (F6c): JSON records that start at or above its
 /// first hot byte. Records of external appends that sit above hot bytes
-/// count too; they occupy the same bookkeeping until the next flush.
+/// count too; they occupy the same bookkeeping until the next flush. Zero
+/// for a stream without a record index.
 fn slot_hot_records(slot: &StreamSlot) -> u64 {
     if slot.hot_buffer.first_start_offset().is_none() {
         return 0;
@@ -415,35 +416,6 @@ impl StreamStateMachine {
 
     fn refresh_ttl_entry(&mut self, stream_id: &BucketStreamId) {
         self.registry.refresh_ttl(stream_id);
-    }
-
-    fn message_spans_for_append(
-        start_offset: u64,
-        end_offset: u64,
-        record_ends: &[u64],
-    ) -> Vec<StreamMessageRecord> {
-        if record_ends.is_empty() {
-            return (start_offset < end_offset)
-                .then_some(StreamMessageRecord {
-                    start_offset,
-                    end_offset,
-                })
-                .into_iter()
-                .collect();
-        }
-        let mut start = start_offset;
-        record_ends
-            .iter()
-            .map(|relative_end| {
-                let end = start_offset.saturating_add(*relative_end);
-                let record = StreamMessageRecord {
-                    start_offset: start,
-                    end_offset: end,
-                };
-                start = end;
-                record
-            })
-            .collect()
     }
 
     pub fn apply(&mut self, command: StreamCommand) -> StreamResponse {

@@ -97,7 +97,7 @@ A snapshot is a materialized representation of a stream's content from offset `-
 
 - Offsets are opaque tokens as defined in the base protocol. Clients MUST use server-returned `Stream-Next-Offset` values.
 
-Servers that expose snapshots and `/bootstrap` as message sequences MUST use one consistent retained-message boundary model across ordinary reads, snapshot-offset validation, and bootstrap responses. This extension does not require any particular binary framing format.
+The messages of a JSON stream are its LF-terminated records ([JSON Message Text](#json-message-text)); servers MUST use the same record boundaries for ordinary reads, snapshot-offset validation and bootstrap parts. A non-JSON stream has no message boundaries that this extension exposes: any committed offset is a valid snapshot or retention offset, and a bootstrap part MAY contain several consecutive messages. This extension does not require any particular binary framing format.
 
 ### 2.2. Publish Snapshot
 
@@ -114,7 +114,7 @@ Creates a snapshot at the specified offset. The snapshot represents the material
 **Response Codes:**
 
 - `204 No Content`: Snapshot published successfully.
-- `400 Bad Request`: `snapshot_offset` is invalid or not aligned to a committed message boundary.
+- `400 Bad Request`: `snapshot_offset` is invalid or, for a JSON stream, not aligned to a committed record boundary.
 - `404 Not Found`: Stream does not exist.
 - `409 Conflict`: `snapshot_offset` exceeds the current tail, or the server cannot produce a consistent view at that offset.
 - `410 Gone`: `snapshot_offset` is older than the current earliest retained offset.
@@ -217,34 +217,34 @@ GET {stream_url}/bootstrap
 
 - `Content-Type: multipart/mixed; boundary=<token>`
 - `Stream-Snapshot-Offset`: The snapshot offset, or `-1` if no snapshot exists.
-- `Stream-Next-Offset`: The offset immediately after the last returned update message. When the response contains no update parts, it is the snapshot point (defined below).
+- `Stream-Next-Offset`: The offset immediately after the last returned update byte. When the response contains no update parts, it is the snapshot point (defined below).
 - `Stream-Up-To-Date: true`: Present when `Stream-Next-Offset` equals the stream's tail offset at the time the response was produced. Otherwise the server MUST either omit the header, as for ordinary reads in the base protocol, or send `false`. Clients MUST treat an absent header as `false`.
 
-The **snapshot point** `S` is the visible snapshot's offset when a snapshot exists, and otherwise the offset of the earliest retained message.
+The **snapshot point** `S` is the visible snapshot's offset when a snapshot exists, and otherwise the earliest retained offset.
 
 **Completeness:**
 
 A server MUST return one of the following:
 
-- **Complete:** one update part for every retained message in `[S, tail)`, with `Stream-Next-Offset` equal to the tail and `Stream-Up-To-Date: true`.
-- **Partial:** one update part for every retained message in `[S, P)` for some boundary `P` with `S ≤ P < tail`, with `Stream-Next-Offset: P` and no `Stream-Up-To-Date: true`. `P` MAY equal `S`, in which case the response contains the snapshot part and no update parts.
+- **Complete:** update parts holding every retained byte in `[S, tail)`, with `Stream-Next-Offset` equal to the tail and `Stream-Up-To-Date: true`.
+- **Partial:** update parts holding the retained bytes in `[S, P)` for some offset `P` with `S ≤ P < tail`, with `Stream-Next-Offset: P` and no `Stream-Up-To-Date: true`. `P` MAY equal `S`, in which case the response contains the snapshot part and no update parts.
 
-In both cases the update parts MUST be the retained messages starting exactly at `S`, contiguous and in stream order: a server MUST NOT skip any message between `S` and `Stream-Next-Offset`, MUST NOT duplicate a message, and MUST NOT place more than one message in a part. `Stream-Next-Offset` MUST be a committed message boundary that ordinary reads accept, and MUST NOT be below `S`.
+In both cases the update parts MUST hold the retained bytes starting exactly at `S`, contiguous and in stream order: a server MUST NOT skip or duplicate any byte between `S` and `Stream-Next-Offset`. For a JSON stream each part MUST be exactly one record. For a non-JSON stream a part MAY contain several consecutive messages, and a part boundary carries no meaning. `Stream-Next-Offset` MUST be an offset that ordinary reads accept, and MUST NOT be below `S`.
 
 A server MAY choose the partial form for any reason, for example because some messages after `S` are held only in a storage tier that does not keep per-message boundaries in memory. Serving `/bootstrap` never requires a server to read such a tier. A client MUST NOT treat a partial response as an error.
 
-> **Note (informative).** Ursula returns the complete form when every message in `[S, tail)` is above the stream's cold frontier, and otherwise the partial form with `P = S` (the snapshot part only). It never reads cold storage for update parts while serving `/bootstrap` (a snapshot body stored in the cold tier is streamed from it as the first part), and it omits `Stream-Up-To-Date` from a partial response. It also caps the update parts of one response at 8 MiB: when the updates exceed the cap it returns the partial form with `P` at the last message boundary that keeps the parts within the cap, and always includes at least one message, even when that message alone exceeds the cap.
+> **Note (informative).** Ursula never reads cold storage for update parts while serving `/bootstrap` (a snapshot body stored in the cold tier is streamed from it as the first part), and it omits `Stream-Up-To-Date` from a partial response. For a non-JSON stream it returns `[S, tail)` as one part when `S` is at or above the stream's cold frontier, every byte of that range is still hot and the range is at most 8 MiB; otherwise it returns the partial form with `P = S` (the snapshot part only). For a JSON stream it returns one part per record when every record in `[S, tail)` is above the cold frontier, and otherwise the partial form with `P = S`; it caps the update parts of one response at 8 MiB, returning the partial form with `P` at the last record boundary that keeps the parts within the cap, and always includes at least one record, even when that record alone exceeds the cap. Each response uses a fresh 128-bit random multipart boundary.
 
 **Response Body:**
 
-The body is an RFC 2046 `multipart/mixed` entity. Each MIME part is one logical bootstrap message. The multipart boundary, not any outer binary framing, defines the bootstrap message boundaries.
+The body is an RFC 2046 `multipart/mixed` entity. The multipart boundary, not any outer binary framing, delimits the parts. Servers SHOULD choose an unpredictable boundary for every response, so that no stream content can contain it.
 
 1. **First part**: Snapshot message. If a snapshot exists, the part body MUST be the raw snapshot bytes and the part `Content-Type` MUST equal the snapshot blob's stored content type.
-2. **Subsequent parts**: Zero or more retained updates starting at the snapshot point, one update message per part, as required by the completeness rules above. Each part body MUST be exactly one retained update message, and the part `Content-Type` MUST be the content type of that update. For streams with a fixed stream-level content type, all update parts will normally share that value.
+2. **Subsequent parts**: Zero or more parts of retained updates starting at the snapshot point, as required by the completeness rules above: one record per part for a JSON stream; one or more consecutive messages per part for any other stream. The part `Content-Type` MUST be the content type of the update. For streams with a fixed stream-level content type, all update parts will normally share that value.
 
 If no snapshot exists, the server MUST still emit an empty first part, `Stream-Snapshot-Offset` MUST be `-1`, and that empty part's `Content-Type` MUST be `application/octet-stream`. Update parts, if any, then begin at the earliest retained offset.
 
-Servers MUST NOT wrap the entire bootstrap response in an outer binary framing container. Each update part contains exactly one retained update message from the stream. Implementations MUST preserve the same retained-message boundaries they use for ordinary reads and snapshot-offset validation, and they MUST NOT reinterpret or reframe binary payloads when constructing bootstrap parts.
+Servers MUST NOT wrap the entire bootstrap response in an outer binary framing container, and they MUST NOT reinterpret or reframe binary payloads when constructing bootstrap parts.
 
 **Example:**
 
@@ -307,7 +307,7 @@ Bootstrap is one-shot only:
 - Regular `GET {stream_url}?offset=...` MUST NOT return snapshot bytes. Snapshots are only delivered through `/bootstrap`.
 - When a server returns `410 Gone` for a read (because retention has advanced), clients SHOULD call `/bootstrap` to rebuild state, then continue tailing from the returned `Stream-Next-Offset` through the ordinary read APIs.
 - If a server has begun returning `410 Gone` for a stream (i.e., earliest retained offset > `-1`), the server MUST ensure `/bootstrap` is available and can provide a snapshot covering that earliest retained offset.
-- Clients MUST parse `/bootstrap` as an ordered message sequence. Message boundaries come from MIME parts.
+- Clients MUST parse `/bootstrap` as an ordered sequence of parts. For a JSON stream each update part is one record; for any other stream, clients MUST NOT treat a part boundary as a message boundary.
 
 ---
 

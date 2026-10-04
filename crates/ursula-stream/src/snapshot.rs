@@ -74,10 +74,6 @@ pub struct StreamSnapshotEntry {
     pub cold_index_generation: u64,
     pub cold_chunks: Vec<ColdChunkRef>,
     pub external_segments: Vec<ObjectPayloadRef>,
-    /// F4b: start offsets of the messages at or above the seal point, for
-    /// streams without a record index.
-    #[serde(default)]
-    pub hot_append_starts: Vec<u64>,
     #[serde(default)]
     pub record_index: Option<StreamRecordIndex>,
     /// Independent destructive-retention floor. `None` denotes a legacy
@@ -113,8 +109,6 @@ pub enum StreamSnapshotError {
         tail_offset: u64,
         payload_len: usize,
     },
-    #[error("snapshot stream '{stream_id}' has inconsistent message boundaries")]
-    MessageBoundaryMismatch { stream_id: BucketStreamId },
     #[error("snapshot stream '{stream_id}' has inconsistent record boundaries")]
     RecordBoundaryMismatch { stream_id: BucketStreamId },
     #[error(

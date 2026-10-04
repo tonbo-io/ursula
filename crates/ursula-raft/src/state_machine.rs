@@ -555,6 +555,7 @@ impl RaftGroupStateMachine {
         let _ = placement;
         self.engine.check_cold_write_admission(
             &request.stream_id,
+            &request.content_type,
             admission,
             u64::try_from(request.initial_payload.len()).expect("payload len fits u64"),
         )?;
@@ -570,6 +571,7 @@ impl RaftGroupStateMachine {
         let _ = placement;
         self.engine.check_cold_write_admission(
             &request.stream_id,
+            &request.content_type,
             admission,
             u64::try_from(request.payload.len()).expect("payload len fits u64"),
         )?;

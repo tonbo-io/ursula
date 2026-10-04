@@ -103,9 +103,8 @@ pub fn per_stream_checks(outcome: &mut Outcome, m: &Measured, shared_refs_interv
     );
     let unflushed: u64 = m.snap.streams.iter().map(|s| s.unflushed_records).sum();
     if unflushed > 0 {
-        // Hot overhead per unflushed record: hot-buffer headers and append
-        // starts (8 B each, F4b) + dense offsets (8 B) for records above the
-        // seal point. With F6b the hot buffer holds one header per block of
+        // Hot overhead per unflushed record: hot-buffer headers (8 B, F4b)
+        // + dense offsets (8 B) for records above the seal point. With F6b the hot buffer holds one header per block of
         // up to 64 KiB, which is per payload byte rather than per record: the
         // bound allows one header per started block of each stream's hot
         // bytes, so per-append headers would still fail it.

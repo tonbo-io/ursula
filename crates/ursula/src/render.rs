@@ -545,19 +545,26 @@ pub(crate) fn bootstrap_head(response: &BootstrapStreamResponse) -> (String, Hea
     (boundary, headers)
 }
 
+/// A fresh 128-bit random multipart boundary (D10). A boundary derived from
+/// the response was predictable, so a writer could embed it in a part and
+/// forge part breaks. No in-memory part (an inline snapshot body or an
+/// update) contains the boundary; a cold snapshot body (F16, up to 1 GiB) is
+/// streamed and not scanned, and 128 random bits make a collision there
+/// negligible.
 pub(crate) fn bootstrap_boundary(response: &BootstrapStreamResponse) -> String {
-    let mut hasher = DefaultHasher::new();
-    response.snapshot_offset.hash(&mut hasher);
-    response.next_offset.hash(&mut hasher);
-    response.updates.len().hash(&mut hasher);
-    let snapshot_len = response.snapshot_object.as_ref().map_or(
-        u64::try_from(response.snapshot_payload.len()).unwrap_or(u64::MAX),
-        |object| object.payload_len,
-    );
-    usize::try_from(snapshot_len)
-        .unwrap_or(usize::MAX)
-        .hash(&mut hasher);
-    format!("ursula-bootstrap-{:016x}", hasher.finish())
+    loop {
+        let boundary = format!("ursula-bootstrap-{:032x}", rand::random::<u128>());
+        let finder = memchr::memmem::Finder::new(boundary.as_bytes());
+        let mut in_memory_parts = std::iter::once(response.snapshot_payload.as_slice()).chain(
+            response
+                .updates
+                .iter()
+                .map(|update| update.payload.as_slice()),
+        );
+        if in_memory_parts.all(|part| finder.find(part).is_none()) {
+            return boundary;
+        }
+    }
 }
 
 pub(crate) fn render_bootstrap_multipart(

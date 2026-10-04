@@ -242,7 +242,6 @@ impl StreamStateMachine {
                     let _range = index.commit_append(prepared);
                 }
                 slot.hot_buffer.push(offset, next_offset, payload);
-                slot.record_message_boundaries(offset, next_offset, &record_ends);
                 self.add_hot_payload_bytes(payload_len);
                 self.sync_hot_index(&stream_id);
                 self.usage_on_append(
@@ -453,7 +452,6 @@ impl StreamStateMachine {
         // F5: commit first, index after. State holds the locator until the
         // leader's offload pass writes its page entry.
         slot.cold.push_direct_external_segment(object.clone());
-        slot.record_message_boundaries(offset, next_offset, &record_ends);
         self.sync_hot_index(&stream_id);
         // F1: an external append is a cold transition; it seals the records
         // below the seal point, which may include its own. The

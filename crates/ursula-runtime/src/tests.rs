@@ -34,9 +34,6 @@ use crate::core_worker::ReadWatchers;
 use crate::error::ErrorStatus;
 use crate::metrics::RuntimeMetricsInner;
 
-/// F4b: hot overhead per record.
-const R: u64 = ursula_stream::HOT_RECORD_OVERHEAD_BYTES;
-
 /// C7/F14g: the incarnation generation a stream's chunks and pages live
 /// under (its `created_at_ms`).
 async fn live_cold_generation(runtime: &ShardRuntime, stream_id: &BucketStreamId) -> u64 {
@@ -371,9 +368,9 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             deduplicated: false,
             producer: None,
             record_range: None,
-            // F6c: real hot bytes, payload plus one record's overhead.
-            stream_hot_bytes: 3 + R,
-            group_hot_bytes: 3 + R,
+            // F6c: a binary stream's real hot bytes are its payload.
+            stream_hot_bytes: 3,
+            group_hot_bytes: 3,
             receipt_evicted: false,
         })
     );
@@ -403,10 +400,10 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             placement,
             hot_start_offset: 2,
             group_commit_index: 3,
-            // F6a: the write response carries the backlog it left. F4b: the
-            // message's start was flushed, so the hot fragment [2, 3) keeps
-            // no append start and costs its payload only; a replica restored
-            // from a snapshot counts the same.
+            // F6a: the write response carries the backlog it left. F6c: a
+            // binary stream keeps nothing per message, so the hot fragment
+            // [2, 3) costs its payload only; a replica restored from a
+            // snapshot counts the same.
             hot_backlog: Some(crate::request::WriteHotBacklog {
                 stream_hot_bytes: 1,
                 group_hot_bytes: 1,
@@ -894,8 +891,8 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
     assert_eq!(read.payload, b"abcdef");
 }
 
-/// bounded-stream-state F11: bootstrap plans one read window for all hot
-/// updates instead of one plan per message (O(hot records²) before).
+/// bounded-stream-state F11: JSON bootstrap plans one read window for all
+/// hot record parts instead of one plan per record (O(hot records²) before).
 #[tokio::test]
 async fn bootstrap_issues_one_read_plan_for_all_updates() {
     let placement = placement();
@@ -903,22 +900,20 @@ async fn bootstrap_issues_one_read_plan_for_all_updates() {
     let mut engine = InMemoryGroupEngine::default();
     engine
         .create_stream(
-            CreateStreamRequest::new(stream.clone(), DEFAULT_CONTENT_TYPE),
+            CreateStreamRequest::new(stream.clone(), "application/json"),
             placement,
             ColdWriteAdmission::default(),
         )
         .await
         .expect("create stream");
     let payloads = (0..64)
-        .map(|index| format!("message-{index}").into_bytes())
+        .map(|index| format!("{{\"i\":{index}}}\n").into_bytes())
         .collect::<Vec<_>>();
     for payload in &payloads {
+        let mut request = AppendRequest::from_bytes(stream.clone(), payload.clone());
+        request.content_type = "application/json".to_owned();
         engine
-            .append(
-                AppendRequest::from_bytes(stream.clone(), payload.clone()),
-                placement,
-                ColdWriteAdmission::default(),
-            )
+            .append(request, placement, ColdWriteAdmission::default())
             .await
             .expect("append");
     }
@@ -2550,10 +2545,10 @@ async fn stale_cold_flush_batch_after_delete_recreate_is_classified_for_cleanup(
 async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(
-        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4 + R)),
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
         cold_store,
     );
-    // F6c: admission counts payload plus per-record overhead.
+    // F6c: admission counts real hot bytes (payload only for binary).
     let stream = BucketStreamId::new("benchcmp", "cold-admission");
     create_stream(&runtime, &stream).await;
     append_bytes(&runtime, &stream, b"abcd").await;
@@ -2575,19 +2570,19 @@ async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
             ..
         } => {
             assert_eq!(stream_id, stream);
-            assert_eq!(before_group_hot_bytes, 4 + R);
-            assert_eq!(after_group_hot_bytes, 5 + 2 * R);
-            assert_eq!(limit, 4 + R);
+            assert_eq!(before_group_hot_bytes, 4);
+            assert_eq!(after_group_hot_bytes, 5);
+            assert_eq!(limit, 4);
         }
         other => panic!("expected cold backpressure, got {other:?}"),
     }
     let metrics = runtime.metrics().snapshot();
     let group_index = usize::try_from(runtime.locate(&stream).raft_group_id.0).unwrap();
     assert_eq!(metrics.accepted_appends, 1);
-    assert_eq!(metrics.cold_hot_bytes, 4 + R);
-    assert_eq!(metrics.per_group_cold_hot_bytes[group_index], 4 + R);
-    assert_eq!(metrics.cold_hot_group_bytes_max, 4 + R);
-    assert_eq!(metrics.cold_hot_stream_bytes_max, 4 + R);
+    assert_eq!(metrics.cold_hot_bytes, 4);
+    assert_eq!(metrics.per_group_cold_hot_bytes[group_index], 4);
+    assert_eq!(metrics.cold_hot_group_bytes_max, 4);
+    assert_eq!(metrics.cold_hot_stream_bytes_max, 4);
     assert_eq!(metrics.cold_backpressure_events, 1);
     assert_eq!(metrics.per_group_cold_backpressure_events[group_index], 1);
     assert_eq!(metrics.cold_backpressure_bytes, 1);
@@ -2605,8 +2600,7 @@ async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
     assert_eq!(metrics_after_flush.cold_hot_bytes, 0);
     assert_eq!(metrics_after_flush.cold_hot_group_bytes_max, 0);
     assert_eq!(
-        metrics_after_flush.per_group_cold_hot_bytes_max[group_index],
-        4 + R,
+        metrics_after_flush.per_group_cold_hot_bytes_max[group_index], 4,
         "the diagnostic high-water mark remains monotonic"
     );
 
@@ -2622,7 +2616,7 @@ async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
 async fn cold_write_admission_allows_deduplicated_append_retry_at_hot_limit() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(
-        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4 + R)),
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
         cold_store,
     );
     let stream = BucketStreamId::new("benchcmp", "cold-admission-dedup-append");
@@ -2647,7 +2641,7 @@ async fn cold_write_admission_allows_deduplicated_append_retry_at_hot_limit() {
 async fn cold_write_admission_allows_existing_create_retry_at_hot_limit() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(
-        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4 + R)),
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
         cold_store,
     );
     let stream = BucketStreamId::new("benchcmp", "cold-admission-existing-create");
@@ -2813,7 +2807,7 @@ async fn flush_cold_all_groups_once_bounded_flushes_multiple_groups() {
 async fn repeated_cold_flush_keeps_hot_bytes_bounded_while_writes_continue() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(
-        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(16 + 4 * R)),
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(16)),
         cold_store,
     );
     let streams = [
@@ -2839,7 +2833,7 @@ async fn repeated_cold_flush_keeps_hot_bytes_bounded_while_writes_continue() {
 
         let metrics_before_flush = runtime.metrics().snapshot();
         assert!(
-            metrics_before_flush.cold_hot_bytes <= 4 * (16 + 4 * R),
+            metrics_before_flush.cold_hot_bytes <= 4 * 16,
             "hot bytes should stay within one unflushed batch per group before flush: {}",
             metrics_before_flush.cold_hot_bytes
         );
