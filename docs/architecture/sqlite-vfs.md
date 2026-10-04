@@ -145,7 +145,7 @@ unless an attach racing the recreate claimed under the old id (§6, wrong stream
    accepts from this producer only after ours), the attach fails as fenced and the application
    retries it: this owner is already fenced, and a snapshot it took would record an epoch below
    the highest one claimed before it (§4.2).
-   `HEAD` is a leader read and incarnations never repeat (unique per group from feature level 1),
+   `HEAD` is a leader read and incarnations never repeat (unique per group),
    so a match means every read and the claim in between hit that incarnation. Then, if attach
    wrote the db file, fsyncs it; writes the sidecar (with the incarnation), and swaps the path's
    binding to the new attachment.
@@ -267,8 +267,8 @@ latest snapshot (the server refuses).
 
 ### 4.4 Snapshot bodies on the server
 
-Bodies of at least `runtime.external_payload_min_size` (1 MiB) are stored in the cold tier at
-feature level 5, up to 1 GiB; inline otherwise (up to 32 MiB). Through `ursulagw` a body above its
+Bodies of at least `runtime.external_payload_min_size` (1 MiB) are stored in the cold tier when
+a cold backend is configured, up to 1 GiB; inline otherwise (up to 32 MiB). Through `ursulagw` a body above its
 `--max-request-body-bytes` (32 MiB) is refused: the snapshot thread logs and retries with backoff,
 and the log keeps growing. A superseded cold body stays readable for 5 minutes.
 
@@ -421,9 +421,6 @@ What attach does in each case:
   snapshot, or move retention (§4.3, a window of one `HEAD` round trip each). Stop every owner
   before deleting a stream you will recreate; closing these windows needs an incarnation
   precondition on appends and on the snapshot and retention endpoints at the server.
-  At feature level 0 incarnations come from the create's clock and can repeat (a delete and
-  recreate in the same millisecond, or a clock stepped back); such a recreate is not recognized:
-  the old files are trusted and both owners share a producer, so the old owner's commits can land.
 - A rollback journal next to an attached file can only be left by a crash while attach switched
   an empty file to WAL; attach deletes it in every case (rolling it back would truncate the file
   under the pages attach writes next).
@@ -499,8 +496,8 @@ rebuild, delete `<db>`.
   and retention (a ~160 MB run; CI also runs it without a cold tier under the default hot limit;
   fresh and lagging hosts rebuild byte-identical from snapshot + tail; the takeover after the trim
   fences the old owner), Pi conformance in three modes, and a benchmark (sanity numbers only).
-- The same Pi conformance, snapshot and benchmark suites on 3 nodes + gateway + MinIO at feature
-  level 5 (the snapshot run's ~3.5 MB bodies go to the cold tier), with a 64 KiB snapshot minimum
+- The same Pi conformance, snapshot and benchmark suites on 3 nodes + gateway + MinIO (the
+  snapshot run's ~3.5 MB bodies go to the cold tier), with a 64 KiB snapshot minimum
   so the benchmark's Pi workload snapshots and trims at its database size.
 
 ## 9. Performance
@@ -508,7 +505,7 @@ rebuild, delete `<db>`.
 One run, 2026-10-03. EKS 1.33 in us-east-1: three `m6i.xlarge` Ursula nodes, one per AZ (the chart's
 `examples/production-eks.yaml` shape: 256 groups, 4 cores, 8 GiB limit), three gateways, real S3
 for the cold tier and snapshots with Ursula's default S3 settings (`server_side_encryption =
-"aes256"`), feature level 5. Server image: main `05132e0`. Extension: `05132e0` for the memory-WAL
+"aes256"`), snapshot bodies in the cold tier. Server image: main `05132e0`. Extension: `05132e0` for the memory-WAL
 cells, `6ba4e60` for the disk-WAL cells (the difference is 429/503 retry and recovery, not the
 commit path). Both builds predate #332, which removed the local WAL fsync and the sidecar's fsyncs
 from the commit path (about 4.7 ms of the agent-pace p50s, per the breakdown below); every VFS

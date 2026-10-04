@@ -54,8 +54,6 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
-use crate::request::SetFeatureLevelRequest;
-use crate::request::SetFeatureLevelResponse;
 use crate::request::TidyStreamsRequest;
 use crate::request::TidyStreamsResponse;
 use crate::rt::sync::Semaphore;

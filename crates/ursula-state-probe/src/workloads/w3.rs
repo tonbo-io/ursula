@@ -3,12 +3,10 @@
 //! into K records. `--inline-every=N` adds one small inline append plus a flush
 //! pass every N external appends. `--retain-every=N` (W6): checkpoint and
 //! retention every N external appends, keeping the last `--retain-keep` records.
-//! Runs at the top feature level, like every group since format epoch 2:
-//! external appends seal their records into sparse marks (F1), and each
+//! External appends seal their records into sparse marks (F1), and each
 //! external append keeps its locator in state (F5). The workload models the
 //! leader's offload pass after every append, offloading a stream's staged refs
 //! once it holds more than T_ext = 16 or one is 10 s old.
-//! `--external-locators` also reports the staged-ref maximum and its check.
 
 use std::collections::HashMap;
 
@@ -50,10 +48,6 @@ pub struct W3Args {
     pub checkpoints: Vec<u64>,
     #[arg(long)]
     pub zstd: bool,
-    /// Report the F5 staged-ref maximum and its check (the offload pass
-    /// always runs).
-    #[arg(long)]
-    pub external_locators: bool,
     #[arg(long)]
     pub name: Option<String>,
 }
@@ -61,9 +55,7 @@ pub struct W3Args {
 pub fn default_name(args: &W3Args) -> String {
     let recs = args.recs_per_append;
     args.name.clone().unwrap_or_else(|| {
-        if args.external_locators {
-            format!("w3_lb3_external_r{recs}")
-        } else if args.retain_every > 0 {
+        if args.retain_every > 0 {
             format!("w6_w3_retention_r{recs}")
         } else if args.inline_every > 0 {
             format!("w3_external_r{recs}_inline{}", args.inline_every)
@@ -176,22 +168,8 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
             outcome.metric_u64("records", records);
             outcome.metric_i64("heap_bytes", measured.heap.bytes);
             outcome.metric_u64("snapshot_bytes", measured.snap.total_bytes);
-            outcome.metric_u64("message_records", measured.gauges.message_records);
-            outcome.metric_u64(
-                "snapshot_message_records_bytes",
-                measured.snap.message_records_bytes,
-            );
             outcome.metric_u64("dense_entries", measured.gauges.dense_record_entries);
             outcome.metric_u64("staged_external_refs", measured.gauges.staged_external_refs);
-            if args.external_locators {
-                outcome.metric_u64("max_staged_external_refs", max_staged);
-                outcome.check(
-                    "f5_max_staged_external_refs",
-                    "staged external refs per stream stay <= 16 at every append (F5)",
-                    max_staged as f64,
-                    ursula_stream::MAX_STAGED_EXTERNAL_REFS as f64,
-                );
-            }
         }
     }
     Ok(outcome)

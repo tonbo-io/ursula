@@ -32,7 +32,7 @@ pub enum StreamResponse {
         deduplicated: bool,
         producer: Option<ProducerRequest>,
         /// A duplicate whose receipt the stream's receipt window evicted
-        /// (F3, feature level 1). It is answered as deduplicated without
+        /// (F3). It is answered as deduplicated without
         /// byte or record ranges: `offset` and `next_offset` are the stream
         /// tail and carry no information about the original append.
         receipt_evicted: bool,
@@ -92,14 +92,6 @@ pub enum StreamResponse {
         buckets: u64,
         streams: u64,
     },
-    /// Result of [`StreamCommand::SetFeatureLevel`]: the group's level after
-    /// apply and the level it held before.
-    ///
-    /// [`StreamCommand::SetFeatureLevel`]: crate::StreamCommand::SetFeatureLevel
-    FeatureLevelSet {
-        level: u32,
-        previous_level: u32,
-    },
     /// Result of [`StreamCommand::TidyStream`]: whether the stream still has
     /// normalization debt after this bounded step.
     ///
@@ -154,11 +146,8 @@ pub enum StreamErrorCode {
     ImportConflict,
     /// A state import payload failed snapshot validation.
     ImportInvalid,
-    /// The command needs a higher group feature level than the group holds.
-    /// Deterministic: every replica rejects it the same way.
-    FeatureNotEnabled,
     /// A new producer would exceed the stream's producer cap and no producer
-    /// has been idle long enough to evict (F3, feature level 1).
+    /// has been idle long enough to evict (F3).
     ProducerLimit,
 }
 

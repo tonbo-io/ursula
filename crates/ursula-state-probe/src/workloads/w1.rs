@@ -58,10 +58,6 @@ pub struct W1Args {
     /// Also restore the final snapshot and report restored heap.
     #[arg(long)]
     pub restore: bool,
-    /// Group feature level to run at (2 = F1 sparse record marks, 4 = F4b
-    /// message records removed).
-    #[arg(long, default_value_t = 0)]
-    pub level: u32,
     /// Output name (JSONL file stem).
     #[arg(long)]
     pub name: Option<String>,
@@ -93,15 +89,12 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
         &json!({"workload": name, "records": args.records, "rec_bytes": args.rec_bytes,
         "recs_per_append": args.recs_per_append, "retain_every": args.retain_every,
         "retain_keep": args.retain_keep, "flush_threshold_mib": args.flush_mib,
-        "forced_flush": args.forced_flush, "level": args.level}),
+        "forced_flush": args.forced_flush}),
     )?;
 
     let mut rng = payload::Rng::new(1);
     let base = Baseline::now();
     let mut m = StreamStateMachine::new();
-    if args.level > 0 {
-        smx::raise_feature_level(&mut m, args.level)?;
-    }
     smx::create_bucket(&mut m, "bkt1")?;
     let id = smx::sid("bkt1", "h0001", "log");
     smx::create_stream(&mut m, &id, None, None, smx::T0)?;
@@ -218,7 +211,6 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
             "snapshot_record_marks_bytes",
             measured.snap.record_marks_bytes,
         );
-        outcome.metric_u64("message_records", measured.gauges.message_records);
         outcome.metric_u64("flush_passes", stats.passes);
         outcome.metric_u64("hot_chunks", measured.gauges.hot_chunks);
         if let Some(&(_, residual)) = residuals.last() {

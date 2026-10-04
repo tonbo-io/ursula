@@ -85,7 +85,9 @@ pub fn build_state(scenario: FlushScenario) -> StreamStateMachine {
                 .expect("cold bytes fit u64");
             assert!(matches!(
                 machine.apply(StreamCommand::FlushCold {
-                    cold_generation: None,
+                    cold_generation: machine
+                        .cold_index_generation(&stream_id)
+                        .unwrap_or_default(),
                     stream_id: stream_id.clone(),
                     chunk: ColdChunkRef {
                         start_offset: 0,

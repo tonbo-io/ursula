@@ -15,7 +15,7 @@ How it works:
 ## What the cluster needs
 
 - Room for one transaction per append: up to 32 MiB of compressed page images.
-- For databases whose snapshots exceed 1 MiB, a cold backend and [feature level 5](/docs/operations#feature-levels), so snapshot bodies are stored in the cold tier (up to 1 GiB). Without it, snapshots are kept inline, up to 32 MiB.
+- For databases whose snapshots exceed 1 MiB, a cold backend, so snapshot bodies are stored in the cold tier (up to 1 GiB). Without it, snapshots are kept inline, up to 32 MiB.
 - Snapshots above 32 MiB must go straight to a node, or through a gateway whose `--max-request-body-bytes` is raised.
 
 ## Build and load

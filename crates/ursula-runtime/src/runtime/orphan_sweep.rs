@@ -34,9 +34,9 @@
 //! External payloads carry no range in their name, so the same guard works
 //! per stream: an unreferenced external payload of a stream is deleted only
 //! when the stream's retained bytes `[retained, tail)` are fully covered by
-//! its hot buffer, state refs and page entries. At feature level 3 the
-//! offload pass moves external refs into pages, so a lost page entry would
-//! otherwise make the sole payload look like an orphan. While coverage has a
+//! its hot buffer, state refs and page entries. The offload pass moves
+//! external refs into pages (F5), so a lost page entry would otherwise make
+//! the sole payload look like an orphan. While coverage has a
 //! gap, every unreferenced external payload of the stream is kept, counted
 //! and logged as an error.
 

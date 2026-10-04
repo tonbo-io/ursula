@@ -1,13 +1,11 @@
-//! Snapshot bodies in the cold tier (bounded-stream-state F16, feature
-//! level 5).
+//! Snapshot bodies in the cold tier (bounded-stream-state F16).
 //!
 //! Publish streams a large body into an object under the stream's external
 //! prefix (the F5 staging path) while hashing it, then proposes
 //! `PublishSnapshotExternal` with the object reference and digest, so
 //! replicated state never holds the body. Reads and `/bootstrap` stream the
-//! object back in bounded pieces. Below level 5, without a cold store, or
-//! for bodies under the staging threshold, publish keeps the inline path and
-//! its 32 MiB cap.
+//! object back in bounded pieces. Without a cold store, or for bodies under
+//! the staging threshold, publish keeps the inline path and its 32 MiB cap.
 
 use std::io;
 
@@ -26,7 +24,6 @@ use ursula_runtime::BootstrapStreamResponse;
 use ursula_runtime::ColdSnapshotBody;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::ExternalPayloadRef;
-use ursula_runtime::FEATURE_LEVEL_COLD_SNAPSHOTS;
 use ursula_runtime::MAX_COLD_SNAPSHOT_BYTES;
 use ursula_runtime::SnapshotDigest;
 use ursula_runtime::new_external_payload_path;
@@ -76,21 +73,6 @@ pub(crate) fn max_admitted_body_bytes(method: &Method, uri: &Uri) -> u64 {
     }
 }
 
-/// Whether publishes to `stream_id` may stage their body in the cold tier:
-/// a cold store is configured and the stream's group (as this replica sees
-/// it) is at feature level 5. Apply checks the level again.
-async fn cold_snapshots_enabled(state: &HttpState, stream_id: &BucketStreamId) -> bool {
-    if !state.runtime.has_cold_store() {
-        return false;
-    }
-    let group = state.runtime.locate(stream_id).raft_group_id;
-    state
-        .runtime
-        .feature_level(group)
-        .await
-        .is_ok_and(|level| level >= FEATURE_LEVEL_COLD_SNAPSHOTS)
-}
-
 fn payload_too_large() -> Response {
     (StatusCode::PAYLOAD_TOO_LARGE, "snapshot body is too large").into_response()
 }
@@ -114,7 +96,9 @@ pub(crate) async fn receive_snapshot_body(
     content_type: &str,
     body: Body,
 ) -> Result<SnapshotUpload, Response> {
-    let cold = cold_snapshots_enabled(state, stream_id).await;
+    // F16: publishes stage their body in the cold tier whenever a cold
+    // store is configured.
+    let cold = state.runtime.has_cold_store();
     let threshold = if cold {
         state
             .external_payload_min_bytes

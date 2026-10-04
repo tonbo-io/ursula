@@ -42,12 +42,11 @@ message SnapshotHeaderV1 {
   // Permanent bucket-erasure fences. Absent in snapshots written before
   // tenant physical-erasure proof became part of the contract.
   repeated string erased_buckets = 9;
-  // Replicated group feature level (C0). Every format-epoch-2 snapshot is
-  // written at the top level, and a binary refuses any other level.
-  uint32 feature_level = 10;
-  // Largest stream created_at_ms the group assigned at feature level 1 or
-  // later (C7). Absent in older snapshots, which decode as 0;
-  // restore raises it to every live stream's created_at_ms at level 1.
+  // Field 10 held a removed replicated per-group version (C0).
+  reserved 10;
+  reserved "feature_level";
+  // Largest stream created_at_ms the group assigned (C7). Restore raises it
+  // to every live stream's created_at_ms.
   uint64 last_created_at_ms = 11;
 }
 
@@ -78,11 +77,16 @@ message StreamSnapshotEntryV1 {
   uint64 hot_start_offset = 3;
   bytes payload = 4;
   repeated HotPayloadSegmentV1 hot_segments = 5;
-  uint64 cold_frontier_offset = 6;
+  // Field 6 held the removed scalar cold frontier; cold coverage is derived
+  // from the hot buffer (bounded-state F18).
+  reserved 6;
+  reserved "cold_frontier_offset";
   uint64 cold_index_generation = 7;
   repeated ColdChunkRefV1 cold_chunks = 8;
   repeated ObjectPayloadRefV1 external_segments = 9;
-  repeated StreamMessageRecordV1 message_records = 10;
+  // Field 10 held the removed per-message records (bounded-state F4b).
+  reserved 10;
+  reserved "message_records";
   // Field 11 held the removed per-stream integrity tally.
   reserved 11;
   reserved "integrity";
@@ -93,7 +97,7 @@ message StreamSnapshotEntryV1 {
   // dense_first_record (field 19) when present, else from first_record.
   repeated uint64 record_offsets = 15;
   optional uint64 retained_offset = 16;
-  // Sparse cold record marks (bounded-state F1, feature level 2): one
+  // Sparse cold record marks (bounded-state F1): one
   // (record, offset) pair per 1 MiB block of sealed log that holds a record
   // start, as two parallel lists. Absent means all-dense.
   repeated uint64 record_mark_records = 17;
@@ -101,8 +105,7 @@ message StreamSnapshotEntryV1 {
   // First record with a dense offset. Absent means first_record.
   optional uint64 dense_first_record = 19;
   // Start offsets of the messages at or above the seal point, for streams
-  // without a record index (bounded-state F4b, feature level 4). From that
-  // level message_records (field 10) is empty once a stream converted.
+  // without a record index (bounded-state F4b).
   repeated uint64 hot_append_starts = 20;
 }
 
@@ -141,19 +144,14 @@ message ObjectPayloadRefV1 {
   uint64 object_size = 4;
 }
 
-message StreamMessageRecordV1 {
-  uint64 start_offset = 1;
-  uint64 end_offset = 2;
-}
-
 message StreamVisibleSnapshotV1 {
   uint64 offset = 1;
   string content_type = 2;
   // Inline body; empty when `object` holds it.
   bytes payload = 3;
   string digest = 4;
-  // Cold-tier object holding the whole body (bounded-state F16, feature
-  // level 5). Absent for inline snapshots.
+  // Cold-tier object holding the whole body (bounded-state F16). Absent for
+  // inline snapshots.
   ExternalPayloadRefV1 object = 5;
 }
 
@@ -164,13 +162,15 @@ message ProducerSnapshotV1 {
   uint64 last_start_offset = 4;
   uint64 last_next_offset = 5;
   bool last_closed = 6;
-  // Written only below feature level 1; level 1 answers from the newest
-  // receipt, which the receipt window never evicts (bounded-state F3).
-  repeated ProducerAppendRecordV1 last_items = 7;
+  // Field 7 held the removed copy of the newest receipt's items; the newest
+  // receipt, which the receipt window never evicts, answers instead
+  // (bounded-state F3).
+  reserved 7;
+  reserved "last_items";
   repeated ProducerReceiptV1 receipts = 8;
-  // now_ms of the producer's newest accepted write, kept from feature level
-  // 1 on for idle expiry (bounded-state F3). Absent for producers last
-  // written below level 1 and in older snapshots.
+  // now_ms of the producer's newest accepted write, for idle expiry
+  // (bounded-state F3). Always written; decoding an absent value is an
+  // error.
   optional uint64 last_seen_ms = 9;
 }
 
@@ -203,12 +203,12 @@ message ColdGcEntryV1 {
   }
   uint64 not_before_ms = 4;
   string bucket_id = 5;
-  // Cold generation of the removed stream incarnation for a stream target
-  // enqueued at feature level 1 or later (bounded-state F14g). Absent marks
-  // a legacy entry.
+  // Cold generation of the removed stream incarnation (bounded-state F14g).
+  // Always set for a stream target and absent for a paths target; the GC
+  // worker refuses a stream target without it and deletes nothing.
   optional uint64 cold_generation = 6;
-  // Failed attempts the leader's GC worker deferred (DeferColdGc, F14b,
-  // feature level 1); it backs off exponentially in it.
+  // Failed attempts the leader's GC worker deferred (DeferColdGc, F14b); it
+  // backs off exponentially in it.
   uint32 defer_attempts = 7;
 }
 

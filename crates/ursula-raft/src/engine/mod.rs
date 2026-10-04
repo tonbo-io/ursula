@@ -56,7 +56,6 @@ use ursula_runtime::GroupDeleteStreamFuture;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
-use ursula_runtime::GroupFeatureLevelFuture;
 use ursula_runtime::GroupFlushColdFuture;
 use ursula_runtime::GroupHeadStreamFuture;
 use ursula_runtime::GroupInstallSnapshotFuture;
@@ -72,7 +71,6 @@ use ursula_runtime::GroupReadStreamFuture;
 use ursula_runtime::GroupReadStreamParts;
 use ursula_runtime::GroupReadStreamPartsFuture;
 use ursula_runtime::GroupRepairColdIndexFuture;
-use ursula_runtime::GroupSetFeatureLevelFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
 use ursula_runtime::GroupStateGaugesFuture;
@@ -90,7 +88,6 @@ use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RepairColdIndexRequest;
 use ursula_runtime::RepairColdIndexResponse;
-use ursula_runtime::SetFeatureLevelRequest;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::StreamErrorCode;
 use ursula_runtime::TidyStreamsRequest;
@@ -104,8 +101,6 @@ use ursula_runtime::repair_cold_index_streams;
 use ursula_runtime::replace_cold_chunk_index_pages_with_rollback_in_generation;
 use ursula_runtime::rollback_cold_index_pages;
 use ursula_runtime::write_cold_chunk_index_pages_with_rollback_in_generation;
-use ursula_runtime::write_external_segment_index_pages;
-use ursula_runtime::write_external_segment_index_pages_in_generation;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::SharedRefCompactionRequest;
@@ -550,22 +545,19 @@ impl RaftGroupEngine {
             .map_err(|err| GroupEngineError::new(format!("OpenRaft state-machine access: {err}")))
     }
 
-    /// The local applied feature level and, for `stream_id`, the live
-    /// stream's cold-index generation (F14g; 0 when absent). Pre-proposal
-    /// cold-index page writes use them; both are monotone with respect to
-    /// what apply later sees for the same incarnation.
+    /// The live stream's cold-index generation (F14g; 0 when absent).
+    /// Pre-proposal cold-index page writes use it; it is what apply later
+    /// sees for the same incarnation.
     pub(crate) async fn local_cold_index_generation(
         &self,
-        stream_id: Option<BucketStreamId>,
-    ) -> Result<(u32, u64), GroupEngineError> {
+        stream_id: BucketStreamId,
+    ) -> Result<u64, GroupEngineError> {
         self.with_state_machine(move |state_machine| {
             Box::pin(async move {
-                let engine = &state_machine.engine;
-                let generation = stream_id
-                    .as_ref()
-                    .and_then(|stream_id| engine.cold_index_generation(stream_id))
-                    .unwrap_or(0);
-                (engine.feature_level(), generation)
+                state_machine
+                    .engine
+                    .cold_index_generation(&stream_id)
+                    .unwrap_or(0)
             })
         })
         .await
@@ -753,34 +745,8 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupCreateStreamFuture<'a> {
         Box::pin(async move {
-            // A create of a live stream never applies its initial payload, so
-            // it must not write a page entry at offset 0 of that stream.
-            let stream_is_live = {
-                let stream_id = request.stream_id.clone();
-                let now_ms = request.now_ms;
-                self.with_state_machine(move |state_machine| {
-                    Box::pin(async move { state_machine.engine.stream_is_live(&stream_id, now_ms) })
-                })
-                .await?
-            };
-            // From feature level 1 the state keeps the initial payload as a
-            // direct reference (F14g). The local level never exceeds the
-            // level at apply, so skipping the page is always safe.
-            if let Some(cold_store) = self.cold_store.as_ref()
-                && !stream_is_live
-                && self.local_cold_index_generation(None).await?.0
-                    < ursula_runtime::FEATURE_LEVEL_KEYED_STREAMS
-            {
-                let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-                write_external_segment_index_pages(
-                    &store,
-                    &request.stream_id,
-                    0,
-                    &request.initial_payload,
-                )
-                .await
-                .map_err(|err| GroupEngineError::new(err.to_string()))?;
-            }
+            // The state keeps the initial payload as a direct reference
+            // (F14g), so the engine writes no page entry before proposing.
             match self.write(GroupWriteCommand::from(request)).await? {
                 GroupWriteResponse::CreateStream(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
@@ -833,20 +799,9 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
-    fn feature_level<'a>(&'a mut self, _placement: ShardPlacement) -> GroupFeatureLevelFuture<'a> {
-        Box::pin(async move {
-            // Local applied state, follower or leader: `ursulactl cluster
-            // enable-feature` verifies every replica, not just leaders.
-            self.with_state_machine(move |state_machine| {
-                Box::pin(async move { Ok(state_machine.engine.feature_level()) })
-            })
-            .await?
-        })
-    }
-
     fn state_gauges<'a>(&'a mut self, _placement: ShardPlacement) -> GroupStateGaugesFuture<'a> {
         Box::pin(async move {
-            // Local applied state, follower or leader, like `feature_level`.
+            // Local applied state, follower or leader, like `bucket_usage`.
             self.with_state_machine(move |state_machine| {
                 Box::pin(async move { Ok(state_machine.engine.state_gauges()) })
             })
@@ -1188,33 +1143,6 @@ impl GroupEngine for RaftGroupEngine {
                 }
             }
             Ok(report)
-        })
-    }
-
-    fn set_feature_level<'a>(
-        &'a mut self,
-        request: SetFeatureLevelRequest,
-        _placement: ShardPlacement,
-    ) -> GroupSetFeatureLevelFuture<'a> {
-        Box::pin(async move {
-            let command = GroupWriteCommand::from(request);
-            if let Some(response) = self
-                .forward_write_to_leader_if_follower(command.clone())
-                .await?
-            {
-                return match response {
-                    GroupWriteResponse::SetFeatureLevel(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected set feature level write response: {other:?}"
-                    ))),
-                };
-            }
-            match self.write(command).await? {
-                GroupWriteResponse::SetFeatureLevel(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected set feature level write response: {other:?}"
-                ))),
-            }
         })
     }
 
@@ -1570,47 +1498,9 @@ impl GroupEngine for RaftGroupEngine {
             }
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
                 .await?;
-            // F5 (level 3): commit first, index after. Apply keeps the locator
-            // in state and the offload pass writes the page entry once the
-            // append committed. The leader's applied level never exceeds the
-            // level at apply, so skipping the write here is always safe.
-            // Below level 3 the page entry written here is the only locator.
-            let locators_in_state = self
-                .with_state_machine(move |state_machine| {
-                    Box::pin(async move { state_machine.engine.external_locators_in_state() })
-                })
-                .await?;
-            if let Some(cold_store) = self.cold_store.as_ref().filter(|_| !locators_in_state) {
-                let stream_id = request.stream_id.clone();
-                let (start_offset, generation) = self
-                    .with_state_machine(move |state_machine| {
-                        Box::pin(async move {
-                            let engine = &state_machine.engine;
-                            engine
-                                .stream_tail_offset(&stream_id)
-                                .map(|tail| {
-                                    (tail, engine.cold_index_generation(&stream_id).unwrap_or(0))
-                                })
-                                .ok_or_else(|| {
-                                    GroupEngineError::stream(
-                                        StreamErrorCode::StreamNotFound,
-                                        format!("stream '{stream_id}' does not exist"),
-                                    )
-                                })
-                        })
-                    })
-                    .await??;
-                let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-                write_external_segment_index_pages_in_generation(
-                    &store,
-                    &request.stream_id,
-                    generation,
-                    start_offset,
-                    &request.payload,
-                )
-                .await
-                .map_err(|err| GroupEngineError::new(err.to_string()))?;
-            }
+            // F5: commit first, index after. Apply keeps the locator in
+            // state and the offload pass writes the page entry once the
+            // append committed.
             match self.write(GroupWriteCommand::from(request)).await? {
                 GroupWriteResponse::Append(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
@@ -1676,8 +1566,8 @@ impl GroupEngine for RaftGroupEngine {
                     Box::pin(async move { state_machine.engine.check_cold_flush(&check) })
                 })
                 .await??;
-                let (_, generation) = self
-                    .local_cold_index_generation(Some(request.stream_id.clone()))
+                let generation = self
+                    .local_cold_index_generation(request.stream_id.clone())
                     .await?;
                 let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
                 let rollback = write_cold_chunk_index_pages_with_rollback_in_generation(
@@ -1739,8 +1629,8 @@ impl GroupEngine for RaftGroupEngine {
                 .await?;
             let mut index_rollback = None;
             if let Some(cold_store) = self.cold_store.as_ref() {
-                let (_, generation) = self
-                    .local_cold_index_generation(Some(request.stream_id.clone()))
+                let generation = self
+                    .local_cold_index_generation(request.stream_id.clone())
                     .await?;
                 let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
                 // Shared pack slices live only in replicated state, never in

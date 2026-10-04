@@ -1,4 +1,4 @@
-//! Bounded-stream-state F5 at feature level 3 on the in-memory engine:
+//! Bounded-stream-state F5 on the in-memory engine:
 //! external locators committed first and indexed after. No page entry is
 //! written before a proposal; the offload pass writes entries only for
 //! committed refs, clipping whatever overlapped them (Invariant 11); state
@@ -11,7 +11,6 @@ use std::time::Duration;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 use ursula_stream::ExternalPayloadRef;
-use ursula_stream::FEATURE_LEVEL_EXTERNAL_LOCATORS;
 use ursula_stream::MAX_STAGED_EXTERNAL_REFS;
 use ursula_stream::ObjectPayloadRef;
 
@@ -43,12 +42,6 @@ fn spawn(cold_store: Arc<ColdStore>) -> ShardRuntime {
 
 fn stream(name: &str) -> BucketStreamId {
     BucketStreamId::new(BUCKET, name)
-}
-
-async fn raise(runtime: &ShardRuntime, level: u32) {
-    for (_, result) in runtime.set_feature_level_all_groups(level).await {
-        result.expect("raise feature level");
-    }
 }
 
 async fn create(runtime: &ShardRuntime, stream_id: &BucketStreamId) {
@@ -179,7 +172,7 @@ fn offload_now(max_streams: usize) -> OffloadColdRefsRequest {
 /// before its proposal (F5); the committed one is served from state until
 /// the offload pass indexes it.
 #[tokio::test]
-async fn no_page_entry_is_written_before_a_proposal_at_level_three() {
+async fn no_page_entry_is_written_before_a_proposal() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = spawn(cold_store.clone());
     let s = stream("no-pre-proposal");
@@ -226,7 +219,6 @@ async fn no_page_entry_is_written_before_a_proposal_at_level_three() {
 async fn staged_refs_stay_within_t_ext_on_an_external_only_stream() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = spawn(cold_store.clone());
-    raise(&runtime, FEATURE_LEVEL_EXTERNAL_LOCATORS).await;
     let s = stream("w3");
     create(&runtime, &s).await;
     let fresh_only = OffloadColdRefsRequest {
@@ -264,7 +256,6 @@ async fn staged_refs_stay_within_t_ext_on_an_external_only_stream() {
 async fn orphan_sweep_keeps_state_and_page_referenced_staged_objects() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = spawn(cold_store.clone());
-    raise(&runtime, FEATURE_LEVEL_EXTERNAL_LOCATORS).await;
     let s = stream("sweep");
     create(&runtime, &s).await;
     let (offloaded, result) = append_external(&runtime, &cold_store, &s, b"PAGE", None).await;
@@ -304,7 +295,6 @@ async fn orphan_sweep_keeps_state_and_page_referenced_staged_objects() {
 async fn orphan_sweep_keeps_an_external_payload_whose_page_entry_was_lost() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = spawn(cold_store.clone());
-    raise(&runtime, FEATURE_LEVEL_EXTERNAL_LOCATORS).await;
     let s = stream("lost-external-entry");
     create(&runtime, &s).await;
     let (offloaded, result) = append_external(&runtime, &cold_store, &s, b"PAGE", None).await;

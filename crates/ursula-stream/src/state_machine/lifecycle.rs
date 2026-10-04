@@ -12,6 +12,7 @@ use super::ProducerAppendRecord;
 use super::ProducerReceipt;
 use super::ProducerRequest;
 use super::ProducerState;
+use super::StreamColdState;
 use super::StreamErrorCode;
 use super::StreamErrorContext;
 use super::StreamMetadata;
@@ -155,9 +156,7 @@ impl StreamStateMachine {
             last_ttl_touch_at_ms: input.now_ms,
         };
         let hot_buffer = HotBuffer::from_payload(0, input.initial_payload);
-        let records_removed = self.message_records_removed();
         let mut producer_states = HashMap::new();
-        let bounded = self.producer_bounds_enabled();
         if let Some(producer) = input.producer {
             let last_item = ProducerAppendRecord {
                 start_offset: 0,
@@ -172,11 +171,6 @@ impl StreamStateMachine {
                 last_start_offset: last_item.start_offset,
                 last_next_offset: last_item.next_offset,
                 last_closed: last_item.closed,
-                last_items: if bounded {
-                    Vec::new()
-                } else {
-                    vec![last_item.clone()]
-                },
                 receipts: std::collections::VecDeque::from([ProducerReceipt {
                     producer_seq: producer.producer_seq,
                     start_offset: last_item.start_offset,
@@ -184,15 +178,14 @@ impl StreamStateMachine {
                     closed: last_item.closed,
                     items: vec![last_item],
                 }]),
-                last_seen_ms: bounded.then_some(input.now_ms),
+                last_seen_ms: input.now_ms,
             });
         }
         let stream_id = input.stream_id.clone();
         let mut slot = StreamSlot {
             metadata,
             hot_buffer,
-            cold: self.new_incarnation_cold_state(created_at_ms),
-            message_records: Vec::new(),
+            cold: StreamColdState::with_generation(created_at_ms),
             record_index,
             retained_offset: 0,
             visible_snapshot: None,
@@ -200,9 +193,9 @@ impl StreamStateMachine {
             producers: producer_states,
             append_count: 0,
         };
-        // F4b: the initial body's message boundaries (message records below
-        // level 4, append starts at or above the seal point from it).
-        slot.record_message_boundaries(records_removed, 0, initial_len, &input.record_ends);
+        // F4b: the initial body's message boundaries (append starts at or
+        // above the seal point).
+        slot.record_message_boundaries(0, initial_len, &input.record_ends);
         if self.insert_stream_slot(slot).is_none() {
             return StreamResponse::error(
                 StreamErrorCode::StreamAlreadyExistsConflict,
@@ -318,17 +311,11 @@ impl StreamStateMachine {
             object_size: input.initial_payload.object_size,
             object_offset: 0,
         };
-        let mut cold = self.new_incarnation_cold_state(created_at_ms);
-        if self.incarnation_scoped_cold_objects() {
-            // The payload was staged before apply chose the incarnation, so
-            // no page of this generation can reference it; keep it in state.
-            cold.push_direct_external_segment(object.clone());
-        } else {
-            cold.push_external_segment(object.clone());
-        }
-        let records_removed = self.message_records_removed();
+        let mut cold = StreamColdState::with_generation(created_at_ms);
+        // The payload was staged before apply chose the incarnation, so no
+        // page of this generation can reference it; keep it in state.
+        cold.push_direct_external_segment(object.clone());
         let mut producer_states = HashMap::new();
-        let bounded = self.producer_bounds_enabled();
         if let Some(producer) = input.producer {
             let last_item = ProducerAppendRecord {
                 start_offset: 0,
@@ -343,11 +330,6 @@ impl StreamStateMachine {
                 last_start_offset: last_item.start_offset,
                 last_next_offset: last_item.next_offset,
                 last_closed: last_item.closed,
-                last_items: if bounded {
-                    Vec::new()
-                } else {
-                    vec![last_item.clone()]
-                },
                 receipts: std::collections::VecDeque::from([ProducerReceipt {
                     producer_seq: producer.producer_seq,
                     start_offset: last_item.start_offset,
@@ -355,7 +337,7 @@ impl StreamStateMachine {
                     closed: last_item.closed,
                     items: vec![last_item],
                 }]),
-                last_seen_ms: bounded.then_some(input.now_ms),
+                last_seen_ms: input.now_ms,
             });
         }
         let stream_id = input.stream_id.clone();
@@ -363,7 +345,6 @@ impl StreamStateMachine {
             metadata,
             hot_buffer: HotBuffer::default(),
             cold,
-            message_records: Vec::new(),
             record_index,
             retained_offset: 0,
             visible_snapshot: None,
@@ -371,9 +352,9 @@ impl StreamStateMachine {
             producers: producer_states,
             append_count: 0,
         };
-        // F4b: the initial body's message boundaries (message records below
-        // level 4, append starts at or above the seal point from it).
-        slot.record_message_boundaries(records_removed, 0, initial_len, &input.record_ends);
+        // F4b: the initial body's message boundaries (append starts at or
+        // above the seal point).
+        slot.record_message_boundaries(0, initial_len, &input.record_ends);
         if self.insert_stream_slot(slot).is_none() {
             return StreamResponse::error(
                 StreamErrorCode::StreamAlreadyExistsConflict,
@@ -384,9 +365,7 @@ impl StreamStateMachine {
             );
         }
         self.record_created_at_ms(created_at_ms);
-        // F4a: the external body is cold at once; collapse its records.
-        self.collapse_sealed_message_records(&stream_id);
-        // F1 (level 2): and seal them.
+        // F1: the external body is cold at once; seal its records.
         self.seal_record_index(&stream_id);
         self.usage_on_stream_created(
             &stream_id.bucket_id,
@@ -527,39 +506,31 @@ impl StreamStateMachine {
         // The cold objects we wrote for this stream are now unreferenced.
         // Enqueue the whole prefix for the background GC worker to reclaim;
         // A prefix sweep is safe and keeps the queue O(streams), not O(chunks).
-        let has_cold_objects = if self.bounded_lb1() {
-            // F18 step 2: any byte of `[0, tail)` the hot buffer does not hold
-            // may have been written to cold storage.
-            u64::try_from(slot.hot_buffer.len()).unwrap_or(u64::MAX) < slot.metadata.tail_offset
-                || slot.cold.has_state_refs()
-        } else {
-            slot.cold.has_cold_objects()
-        };
+        // F18 step 2: any byte of `[0, tail)` the hot buffer does not hold
+        // may have been written to cold storage.
+        let has_cold_objects = u64::try_from(slot.hot_buffer.len()).unwrap_or(u64::MAX)
+            < slot.metadata.tail_offset
+            || slot.cold.has_state_refs();
         if has_cold_objects {
-            // At feature level 1 the entry names the removed incarnation's
-            // generation, so the worker deletes only that incarnation's
-            // objects, its external payloads included (F14a, F14g step 2).
-            let cold_generation = self
-                .incarnation_scoped_cold_objects()
-                .then(|| slot.cold.cold_generation());
+            // The entry names the removed incarnation's generation, so the
+            // worker deletes only that incarnation's objects, its external
+            // payloads included (F14a, F14g step 2).
             self.cold_gc.enqueue_stream(
                 stream_id.bucket_id.clone(),
                 stream_id.clone(),
-                cold_generation,
+                slot.cold.cold_generation(),
             );
-            if cold_generation.is_some() {
-                let direct_external_paths = slot
-                    .cold
-                    .external_segments()
-                    .iter()
-                    .map(|object| object.s3_path.clone())
-                    .collect::<Vec<_>>();
-                if !direct_external_paths.is_empty() {
-                    self.cold_gc.enqueue(
-                        stream_id.bucket_id.clone(),
-                        ColdGcTarget::Paths(direct_external_paths),
-                    );
-                }
+            let direct_external_paths = slot
+                .cold
+                .external_segments()
+                .iter()
+                .map(|object| object.s3_path.clone())
+                .collect::<Vec<_>>();
+            if !direct_external_paths.is_empty() {
+                self.cold_gc.enqueue(
+                    stream_id.bucket_id.clone(),
+                    ColdGcTarget::Paths(direct_external_paths),
+                );
             }
         }
         // A cold snapshot body is referenced only by state (F16).

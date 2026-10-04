@@ -7,12 +7,10 @@ use super::HashMap;
 use super::HotBuffer;
 use super::HotPayloadSegment;
 use super::ObjectPayloadRef;
-use super::ProducerReceipt;
 use super::ProducerSnapshot;
 use super::ProducerState;
 use super::StreamColdState;
 use super::StreamErrorCode;
-use super::StreamMessageRecord;
 use super::StreamResponse;
 use super::StreamSlot;
 use super::StreamSnapshot;
@@ -41,20 +39,9 @@ impl StreamStateMachine {
                     hot_start_offset: self.hot_start_offset(&stream_id),
                     payload,
                     hot_segments: slot.hot_buffer.hot_segments(),
-                    // F18 step 2: at Lb1 field 6 is the seal point, written
-                    // for tooling and ignored at restore.
-                    cold_frontier_offset: if self.bounded_lb1() {
-                        self.seal_point(&stream_id)
-                    } else {
-                        self.cold_frontier_offset(
-                            &stream_id,
-                            self.earliest_retained_offset(&stream_id),
-                        )
-                    },
                     cold_index_generation: slot.cold.cold_generation(),
                     cold_chunks: slot.cold.cold_chunks().to_vec(),
                     external_segments: slot.cold.external_segments().to_vec(),
-                    message_records: slot.message_records.clone(),
                     hot_append_starts: slot.hot_buffer.append_starts().iter().copied().collect(),
                     record_index: slot.record_index.clone(),
                     retained_offset: Some(slot.retained_offset),
@@ -91,7 +78,6 @@ impl StreamStateMachine {
             next_cold_gc_seq: self.cold_gc.next_seq(),
             shared_cold_object_owners,
             bucket_usage: self.bucket_usage_report(),
-            feature_level: self.feature_level,
             last_created_at_ms: self.last_created_at_ms,
         }
     }
@@ -124,24 +110,10 @@ impl StreamStateMachine {
                 ),
             );
         }
-        if snapshot.feature_level > self.feature_level {
-            // Unreachable at format epoch 2: every group is at the top level
-            // and `restore` refuses any other. PR14 removes the level.
-            return StreamResponse::error(
-                StreamErrorCode::ImportConflict,
-                format!(
-                    "snapshot is at feature level {}, above this group's level {}; raise the group's feature level first",
-                    snapshot.feature_level, self.feature_level
-                ),
-            );
-        }
         let buckets = u64::try_from(snapshot.buckets.len()).unwrap_or(u64::MAX);
         let streams = u64::try_from(snapshot.streams.len()).unwrap_or(u64::MAX);
         match Self::restore(snapshot) {
             Ok(mut restored) => {
-                // A no-op at format epoch 2 (`restore` refuses any level but
-                // the top one); PR14 removes the level.
-                restored.feature_level = self.feature_level;
                 // C7: the counter never goes backwards, so a later create
                 // never reuses an incarnation this group already assigned.
                 restored.last_created_at_ms =
@@ -157,14 +129,11 @@ impl StreamStateMachine {
         }
     }
 
-    /// Keeps C7's invariant after a restore or import: at feature level 1 or
-    /// later, `last_created_at_ms` is at least every live stream's
-    /// `created_at_ms`, so the next create is unique even when the snapshot
-    /// predates the field or comes from a lower-level backup.
+    /// Keeps C7's invariant after a restore or import: `last_created_at_ms`
+    /// is at least every live stream's `created_at_ms`, so the next create is
+    /// unique whatever the snapshot recorded.
     fn normalize_last_created_at_ms(&mut self) {
-        if self.incarnation_scoped_cold_objects() {
-            self.last_created_at_ms = self.max_live_created_at_ms(self.last_created_at_ms);
-        }
+        self.last_created_at_ms = self.max_live_created_at_ms(self.last_created_at_ms);
     }
 
     pub fn restore(snapshot: StreamSnapshot) -> Result<Self, StreamSnapshotError> {
@@ -173,16 +142,7 @@ impl StreamStateMachine {
                 found: snapshot.format_epoch,
             });
         }
-        // Every epoch-2 writer runs at the top level, so any other level is a
-        // fixture bug or a snapshot from a later build that dropped the field.
-        if snapshot.feature_level != crate::feature::MAX_SUPPORTED_FEATURE_LEVEL {
-            return Err(StreamSnapshotError::UnsupportedFeatureLevel {
-                level: snapshot.feature_level,
-                supported: crate::feature::MAX_SUPPORTED_FEATURE_LEVEL,
-            });
-        }
         let mut machine = Self {
-            feature_level: snapshot.feature_level,
             last_created_at_ms: snapshot.last_created_at_ms,
             ..Self::default()
         };
@@ -230,13 +190,10 @@ impl StreamStateMachine {
                     tail_offset: entry.metadata.tail_offset,
                 });
             }
-            // Sealed records (marks) exist only at feature level 2 (F1).
             if let Some(record_index) = entry.record_index.as_ref()
-                && (record_index
+                && record_index
                     .validate(retained_offset, entry.metadata.tail_offset)
                     .is_err()
-                    || (!record_index.marks().is_empty()
-                        && snapshot.feature_level < crate::feature::FEATURE_LEVEL_SPARSE_MARKS))
             {
                 return Err(StreamSnapshotError::RecordBoundaryMismatch { stream_id });
             }
@@ -265,39 +222,23 @@ impl StreamStateMachine {
                     payload_len: entry.payload.len(),
                 });
             }
-            // F4b (level 4): a converted stream holds no message records;
-            // its boundaries are the dense offsets or the append starts,
-            // which must lie at or above the seal point. A stream that
-            // still holds legacy records restores them as before.
-            let records_removed =
-                snapshot.feature_level >= crate::feature::FEATURE_LEVEL_HOT_REPRESENTATION;
+            // F4b: a stream's boundaries are the dense offsets or the append
+            // starts, which must lie at or above the seal point.
             let seal_point = hot_segments
                 .first()
                 .map_or(entry.metadata.tail_offset, |segment| segment.start_offset);
-            let boundaries_valid = if records_removed && entry.message_records.is_empty() {
-                super::boundaries::append_starts_valid(
-                    &entry.hot_append_starts,
-                    seal_point,
-                    entry.metadata.tail_offset,
-                    entry.record_index.is_some(),
-                    records_removed,
-                )
-            } else {
-                entry.hot_append_starts.is_empty()
-                    && message_records_cover_retained_suffix(
-                        &entry.message_records,
-                        retained_offset,
-                        entry.metadata.tail_offset,
-                    )
-            };
-            if !boundaries_valid {
+            if !super::boundaries::append_starts_valid(
+                &entry.hot_append_starts,
+                seal_point,
+                entry.metadata.tail_offset,
+                entry.record_index.is_some(),
+            ) {
                 return Err(StreamSnapshotError::MessageBoundaryMismatch { stream_id });
             }
             if machine.registry.contains_key(&stream_id) {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));
             }
-            let producer_states =
-                restore_producer_states(&stream_id, entry.producer_states, snapshot.feature_level)?;
+            let producer_states = restore_producer_states(&stream_id, entry.producer_states)?;
             let visible_snapshot = entry.visible_snapshot.map(|mut snapshot| {
                 if snapshot.digest.is_empty() {
                     snapshot.digest =
@@ -317,18 +258,10 @@ impl StreamStateMachine {
                 metadata: entry.metadata,
                 hot_buffer,
                 cold: StreamColdState::restore(
-                    // F18 step 2: Lb1 derives coverage from the hot buffer and
-                    // never reads the scalar, so field 6 is ignored.
-                    if machine.bounded_lb1() {
-                        0
-                    } else {
-                        entry.cold_frontier_offset
-                    },
                     entry.cold_index_generation,
                     entry.cold_chunks,
                     entry.external_segments,
                 ),
-                message_records: entry.message_records,
                 record_index: entry.record_index,
                 retained_offset,
                 visible_snapshot,
@@ -404,7 +337,6 @@ fn producer_snapshot(states: &HashMap<String, ProducerState>) -> Vec<ProducerSna
             last_start_offset: state.last_start_offset,
             last_next_offset: state.last_next_offset,
             last_closed: state.last_closed,
-            last_items: state.last_items.clone(),
             receipts: state.receipts.iter().cloned().collect(),
             last_seen_ms: state.last_seen_ms,
         })
@@ -416,25 +348,10 @@ fn producer_snapshot(states: &HashMap<String, ProducerState>) -> Vec<ProducerSna
 fn restore_producer_states(
     stream_id: &BucketStreamId,
     snapshots: Vec<ProducerSnapshot>,
-    feature_level: u32,
 ) -> Result<HashMap<String, ProducerState>, StreamSnapshotError> {
     let mut states = HashMap::with_capacity(snapshots.len());
     for snapshot in snapshots {
-        // Only level-0 snapshots synthesize a receipt from `last_*`; at level
-        // 1 an empty list restores as empty, as a live replica holds it (F3).
-        let receipts = if snapshot.receipts.is_empty()
-            && feature_level < crate::feature::FEATURE_LEVEL_KEYED_STREAMS
-        {
-            vec![ProducerReceipt {
-                producer_seq: snapshot.producer_seq,
-                start_offset: snapshot.last_start_offset,
-                next_offset: snapshot.last_next_offset,
-                closed: snapshot.last_closed,
-                items: snapshot.last_items.clone(),
-            }]
-        } else {
-            snapshot.receipts
-        };
+        let receipts = snapshot.receipts;
         if states
             .insert(snapshot.producer_id.clone(), ProducerState {
                 producer_epoch: snapshot.producer_epoch,
@@ -442,7 +359,6 @@ fn restore_producer_states(
                 last_start_offset: snapshot.last_start_offset,
                 last_next_offset: snapshot.last_next_offset,
                 last_closed: snapshot.last_closed,
-                last_items: snapshot.last_items,
                 receipts: receipts.into(),
                 last_seen_ms: snapshot.last_seen_ms,
             })
@@ -532,19 +448,4 @@ fn payload_sources_cover_retained_suffix(
         previous_end = segment.end_offset;
     }
     true
-}
-
-pub(super) fn message_records_cover_retained_suffix(
-    records: &[StreamMessageRecord],
-    retained_offset: u64,
-    tail_offset: u64,
-) -> bool {
-    let mut expected_start = retained_offset;
-    for record in records {
-        if record.start_offset != expected_start || record.end_offset <= record.start_offset {
-            return false;
-        }
-        expected_start = record.end_offset;
-    }
-    expected_start == tail_offset
 }

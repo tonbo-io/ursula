@@ -1,5 +1,4 @@
-//! Bounded-state level Lb4 (feature level 4, F4b): message records are
-//! removed. Binary streams keep append starts in the hot buffer, JSON streams
+//! Bounded-state F4b: no message records in replicated state. Binary streams keep append starts in the hot buffer, JSON streams
 //! use the dense record offsets. Every test checks bootstrap against an
 //! oracle of the messages actually appended: one part per message from the
 //! snapshot offset when that offset is at or above the first exact boundary,
@@ -7,16 +6,15 @@
 
 use super::*;
 
-const BUCKET: &str = "lb4bounds";
+const BUCKET: &str = "derivedbounds";
 const OCTET: &str = "application/octet-stream";
 const JSON: &str = "application/json";
-const LB4: u32 = crate::feature::FEATURE_LEVEL_HOT_REPRESENTATION;
 
 fn stream(id: &str) -> BucketStreamId {
     BucketStreamId::new(BUCKET, id)
 }
 
-fn machine_at(level: u32) -> StreamStateMachine {
+fn fresh_machine() -> StreamStateMachine {
     let mut machine = StreamStateMachine::new();
     assert!(matches!(
         machine.apply(StreamCommand::CreateBucket {
@@ -24,18 +22,7 @@ fn machine_at(level: u32) -> StreamStateMachine {
         }),
         StreamResponse::BucketCreated { .. }
     ));
-    if level > 0 {
-        raise(&mut machine, level);
-    }
     machine
-}
-
-fn raise(machine: &mut StreamStateMachine, level: u32) {
-    let response = machine.apply(StreamCommand::SetFeatureLevel { level });
-    assert!(
-        matches!(response, StreamResponse::FeatureLevelSet { .. }),
-        "{response:?}"
-    );
 }
 
 fn create(machine: &mut StreamStateMachine, id: &str, content_type: &str, initial: &[u8]) {
@@ -111,7 +98,9 @@ fn flush(machine: &mut StreamStateMachine, id: &str, start: u64, end: u64, path:
             shared_object: false,
             payload_digest: String::new(),
         },
-        cold_generation: None,
+        cold_generation: machine
+            .cold_index_generation(&stream(id))
+            .unwrap_or_default(),
     });
     assert!(
         matches!(response, StreamResponse::ColdFlushed { .. }),
@@ -258,37 +247,35 @@ fn assert_restore_matches_live(machine: &StreamStateMachine, id: &str) -> Stream
 }
 
 #[test]
-fn binary_stream_keeps_append_starts_instead_of_message_records() {
-    let mut machine = machine_at(LB4);
+fn binary_stream_keeps_append_starts() {
+    let mut machine = fresh_machine();
     create(&mut machine, "bin", OCTET, b"ab");
     append(&mut machine, "bin", OCTET, b"cde");
     append(&mut machine, "bin", OCTET, b"f");
     let entry = entry(&machine, "bin");
-    assert!(entry.message_records.is_empty());
     assert_eq!(entry.hot_append_starts, vec![0, 2, 5]);
     let mut oracle = Oracle::default();
     oracle.push(0, 2);
     oracle.push(2, 5);
     oracle.push(5, 6);
     oracle.check_bootstrap(&machine, "bin");
-    // Each hot message costs 8 bytes of boundary at level 4 (F6c).
+    // Each hot message costs 8 bytes of boundary (F6c).
     assert_eq!(machine.total_hot_records(), 3);
     assert_eq!(
         machine.total_hot_real_bytes(),
-        6 + 3 * crate::HOT_RECORD_OVERHEAD_BYTES_LB4
+        6 + 3 * crate::HOT_RECORD_OVERHEAD_BYTES
     );
     assert_restore_matches_live(&machine, "bin");
 }
 
 #[test]
 fn json_stream_uses_dense_offsets_and_keeps_no_starts() {
-    let mut machine = machine_at(LB4);
+    let mut machine = fresh_machine();
     let first = json_records(2, 1);
     create(&mut machine, "json", JSON, &first);
     let second = json_records(3, 2);
     append(&mut machine, "json", JSON, &second);
     let entry = entry(&machine, "json");
-    assert!(entry.message_records.is_empty());
     assert!(entry.hot_append_starts.is_empty());
     let mut oracle = Oracle::default();
     oracle.push_json(0, &first);
@@ -301,7 +288,7 @@ fn json_stream_uses_dense_offsets_and_keeps_no_starts() {
 #[test]
 fn flush_that_splits_a_message_moves_the_exact_frontier_past_it() {
     for content_type in [OCTET, JSON] {
-        let mut machine = machine_at(LB4);
+        let mut machine = fresh_machine();
         let mut oracle = Oracle::default();
         create(&mut machine, "s", content_type, b"");
         let payloads = if content_type == JSON {
@@ -345,7 +332,7 @@ fn flush_that_splits_a_message_moves_the_exact_frontier_past_it() {
 
 #[test]
 fn flush_at_a_message_boundary_keeps_the_next_message_exact() {
-    let mut machine = machine_at(LB4);
+    let mut machine = fresh_machine();
     create(&mut machine, "bin", OCTET, b"");
     append(&mut machine, "bin", OCTET, b"aaaa");
     append(&mut machine, "bin", OCTET, b"bbbb");
@@ -365,7 +352,7 @@ fn flush_at_a_message_boundary_keeps_the_next_message_exact() {
 
 #[test]
 fn external_append_above_hot_bytes_is_a_message_until_the_hot_prefix_flushes() {
-    let mut machine = machine_at(LB4);
+    let mut machine = fresh_machine();
     let mut oracle = Oracle::default();
     create(&mut machine, "bin", OCTET, b"");
     append(&mut machine, "bin", OCTET, b"hot!");
@@ -391,7 +378,7 @@ fn external_append_above_hot_bytes_is_a_message_until_the_hot_prefix_flushes() {
 
 #[test]
 fn retention_prunes_append_starts_below_the_new_seal_point() {
-    let mut machine = machine_at(LB4);
+    let mut machine = fresh_machine();
     let mut oracle = Oracle::default();
     create(&mut machine, "bin", OCTET, b"");
     for payload in [b"aa".as_slice(), b"bbb", b"c", b"dddd"] {
@@ -415,7 +402,7 @@ fn retention_prunes_append_starts_below_the_new_seal_point() {
 
 #[test]
 fn restore_rejects_inconsistent_append_starts() {
-    let mut machine = machine_at(LB4);
+    let mut machine = fresh_machine();
     create(&mut machine, "bin", OCTET, b"");
     append(&mut machine, "bin", OCTET, b"aaaa");
     append(&mut machine, "bin", OCTET, b"bbbb");
@@ -473,11 +460,11 @@ fn restore_rejects_inconsistent_append_starts() {
     ));
 }
 
-/// Restore-versus-live differential at level 4 over a seeded random
+/// Restore-versus-live differential over a seeded random
 /// workload of binary and JSON appends, external appends, flushes that cut
 /// anywhere in the hot prefix, snapshot publishes and retention. After every
 /// step the restored machine matches the live one, bootstrap matches the
-/// oracle, and no message record is ever kept.
+/// oracle.
 #[test]
 fn restore_matches_live_and_bootstrap_matches_oracle_under_random_workload() {
     for seed in 1..=24u64 {
@@ -490,7 +477,7 @@ fn restore_matches_live_and_bootstrap_matches_oracle_under_random_workload() {
         };
         let json = seed % 2 == 0;
         let content_type = if json { JSON } else { OCTET };
-        let mut machine = machine_at(LB4);
+        let mut machine = fresh_machine();
         let mut oracle = Oracle::default();
         create(&mut machine, "s", content_type, b"");
         let mut objects = 0u64;
@@ -581,7 +568,6 @@ fn restore_matches_live_and_bootstrap_matches_oracle_under_random_workload() {
                 }
             }
             let current = entry(&machine, "s");
-            assert!(current.message_records.is_empty());
             if json {
                 assert!(current.hot_append_starts.is_empty());
             }

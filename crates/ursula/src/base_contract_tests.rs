@@ -374,8 +374,7 @@ async fn head_reports_snapshot_and_retention_after_publish_and_advance() {
 }
 
 /// Incarnations are unique per group even when both creates land in the
-/// same millisecond; every group runs at the top level, so no raise is
-/// needed (format epoch 2).
+/// same millisecond (C7).
 #[tokio::test]
 async fn stream_incarnation_changes_on_delete_and_recreate() {
     async fn incarnation(app: &Router, uri: &str) -> String {

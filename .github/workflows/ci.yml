@@ -229,8 +229,8 @@ jobs:
 
       # Bounded-state DST PR subset (bounded-stream-state §7.4): sparse marks (F1), producer
       # state across a mid-stream snapshot install (F3, Invariant 12; fixed seed), external
-      # locators at level 3 (F5: ambiguous appends and offloads, a learner installing a snapshot
-      # with staged refs, ambiguous CompactCold). A few seeds each, a few seconds of virtual time;
+      # locators (F5: ambiguous appends and offloads, a learner installing a snapshot with
+      # staged refs, ambiguous CompactCold). A few seeds each, a few seconds of virtual time;
       # DST Nightly sweeps larger ranges through the *_SEEDS variables.
       - name: Run bounded-state seed families (PR subset)
         run: |

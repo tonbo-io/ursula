@@ -9,7 +9,6 @@ use std::sync::Mutex;
 
 use ursula_shard::BucketStreamId;
 use ursula_stream::ColdChunkRef;
-use ursula_stream::ExternalPayloadRef;
 use ursula_stream::ObjectPayloadRef;
 use ursula_stream::StreamReadColdIndexSegment;
 
@@ -408,16 +407,8 @@ pub trait ColdIndexPageStore: Send + Sync {
     ) -> ColdIndexPageStoreFuture<'a, Option<ColdIndexPage>>;
 }
 
-pub async fn write_cold_chunk_index_pages<S: ColdIndexPageStore + ?Sized>(
-    store: &S,
-    stream_id: &BucketStreamId,
-    chunk: &ColdChunkRef,
-) -> io::Result<()> {
-    write_cold_chunk_index_pages_in_generation(store, stream_id, 0, chunk).await
-}
-
-/// [`write_cold_chunk_index_pages`] for the stream incarnation whose pages
-/// live under `generation` (F14g; 0 for streams created below level 1).
+/// Writes `chunk` into the pages of the stream incarnation whose pages live
+/// under `generation` (F14g).
 pub async fn write_cold_chunk_index_pages_in_generation<S: ColdIndexPageStore + ?Sized>(
     store: &S,
     stream_id: &BucketStreamId,
@@ -433,14 +424,6 @@ pub async fn write_cold_chunk_index_pages_in_generation<S: ColdIndexPageStore + 
 /// state proves (a flush of hot bytes, or a replacement of state-held refs):
 /// the write clips every other overlapping entry in the same
 /// read-modify-write (F19 step 1). Rollback restores the previous pages.
-pub async fn write_cold_chunk_index_pages_with_rollback<S: ColdIndexPageStore + ?Sized>(
-    store: &S,
-    stream_id: &BucketStreamId,
-    chunk: &ColdChunkRef,
-) -> io::Result<Vec<ColdIndexPageRollback>> {
-    write_cold_chunk_index_pages_with_rollback_in_generation(store, stream_id, 0, chunk).await
-}
-
 pub async fn write_cold_chunk_index_pages_with_rollback_in_generation<
     S: ColdIndexPageStore + ?Sized,
 >(
@@ -521,35 +504,6 @@ pub async fn rollback_cold_index_pages<S: ColdIndexPageStore + ?Sized>(
     Ok(())
 }
 
-pub async fn write_external_segment_index_pages<S: ColdIndexPageStore + ?Sized>(
-    store: &S,
-    stream_id: &BucketStreamId,
-    start_offset: u64,
-    payload: &ExternalPayloadRef,
-) -> io::Result<()> {
-    write_external_segment_index_pages_in_generation(store, stream_id, 0, start_offset, payload)
-        .await
-}
-
-/// [`write_external_segment_index_pages`] for the stream incarnation whose
-/// pages live under `generation` (F14g).
-pub async fn write_external_segment_index_pages_in_generation<S: ColdIndexPageStore + ?Sized>(
-    store: &S,
-    stream_id: &BucketStreamId,
-    generation: u64,
-    start_offset: u64,
-    payload: &ExternalPayloadRef,
-) -> io::Result<()> {
-    let object = ObjectPayloadRef {
-        start_offset,
-        end_offset: start_offset.saturating_add(payload.payload_len),
-        s3_path: payload.s3_path.clone(),
-        object_size: payload.object_size,
-        object_offset: 0,
-    };
-    write_object_index_pages(store, stream_id, generation, object).await
-}
-
 /// Bounded-state F5 offload: writes the page entries of a *committed*
 /// state-held external ref under `generation`. State proves its bytes, so the
 /// same read-modify-write clips every other entry overlapping it, chunk or
@@ -613,45 +567,6 @@ pub async fn write_proven_external_index_pages<S: ColdIndexPageStore + ?Sized>(
         }
     }
     Ok(clipped)
-}
-
-async fn write_object_index_pages<S: ColdIndexPageStore + ?Sized>(
-    store: &S,
-    stream_id: &BucketStreamId,
-    generation: u64,
-    object: ObjectPayloadRef,
-) -> io::Result<()> {
-    if object.end_offset <= object.start_offset {
-        return Ok(());
-    }
-    let first_page_id = object.start_offset / ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
-    let last_page_id = (object.end_offset - 1) / ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
-    for page_id in first_page_id..=last_page_id {
-        let key = ColdIndexPageKey {
-            stream_id: stream_id.clone(),
-            generation,
-            page_id,
-        };
-        let page_start = page_id.saturating_mul(ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES);
-        let page_end = page_start.saturating_add(ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES);
-        let mut page = store
-            .get_page(&key)
-            .await?
-            .unwrap_or_else(|| ColdIndexPage {
-                start_offset: page_start,
-                end_offset: page_end,
-                cold_chunks: Vec::new(),
-                external_segments: Vec::new(),
-            });
-        page.external_segments.retain(|existing| {
-            existing.start_offset != object.start_offset || existing.end_offset != object.end_offset
-        });
-        page.external_segments.push(object.clone());
-        page.external_segments
-            .sort_by_key(|object| object.start_offset);
-        store.put_page(&key, &page).await?;
-    }
-    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -1204,35 +1119,6 @@ pub fn select_cold_chunk_compaction(
 /// references with one equivalent object. Every rewritten page always points
 /// at readable old or new bytes, so a retry after a partial S3 failure remains
 /// safe.
-pub async fn replace_cold_chunk_index_pages<S: ColdIndexPageStore + ?Sized>(
-    store: &S,
-    stream_id: &BucketStreamId,
-    old_chunks: &[ColdChunkRef],
-    replacement: &ColdChunkRef,
-) -> io::Result<bool> {
-    replace_cold_chunk_index_pages_with_rollback(store, stream_id, old_chunks, replacement)
-        .await
-        .map(|rollback| rollback.is_some())
-}
-
-pub async fn replace_cold_chunk_index_pages_with_rollback<S: ColdIndexPageStore + ?Sized>(
-    store: &S,
-    stream_id: &BucketStreamId,
-    old_chunks: &[ColdChunkRef],
-    replacement: &ColdChunkRef,
-) -> io::Result<Option<Vec<ColdIndexPageRollback>>> {
-    replace_cold_chunk_index_pages_with_rollback_in_generation(
-        store,
-        stream_id,
-        0,
-        old_chunks,
-        replacement,
-    )
-    .await
-}
-
-/// [`replace_cold_chunk_index_pages_with_rollback`] for the stream
-/// incarnation whose pages live under `generation` (F14g).
 pub async fn replace_cold_chunk_index_pages_with_rollback_in_generation<
     S: ColdIndexPageStore + ?Sized,
 >(
@@ -1382,8 +1268,8 @@ const REPAIR_PREDATING_SLACK_MS: u64 = 60_000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColdIndexRepairInput {
     pub stream_id: BucketStreamId,
-    /// Cold-index generation of the live incarnation (0 for streams created
-    /// below feature level 1); repair reads and writes only its pages.
+    /// Cold-index generation of the live incarnation; repair reads and
+    /// writes only its pages.
     pub generation: u64,
     pub retained_offset: u64,
     pub tail_offset: u64,
@@ -1800,13 +1686,14 @@ mod tests {
             object_size: 128,
             ..Default::default()
         };
-        write_cold_chunk_index_pages(&store, &stream_id, &first)
+        write_cold_chunk_index_pages_in_generation(&store, &stream_id, 0, &first)
             .await
             .expect("write first chunk");
-        let rollback = write_cold_chunk_index_pages_with_rollback(&store, &stream_id, &stale)
-            .await
-            .expect("write stale chunk");
-        write_cold_chunk_index_pages(&store, &stream_id, &newer)
+        let rollback =
+            write_cold_chunk_index_pages_with_rollback_in_generation(&store, &stream_id, 0, &stale)
+                .await
+                .expect("write stale chunk");
+        write_cold_chunk_index_pages_in_generation(&store, &stream_id, 0, &newer)
             .await
             .expect("write newer chunk");
 
@@ -1852,14 +1739,15 @@ mod tests {
             ..Default::default()
         };
         for chunk in [&first, &second] {
-            write_cold_chunk_index_pages(&store, &stream_id, chunk)
+            write_cold_chunk_index_pages_in_generation(&store, &stream_id, 0, chunk)
                 .await
                 .expect("write input chunk");
         }
 
-        let rollback = replace_cold_chunk_index_pages_with_rollback(
+        let rollback = replace_cold_chunk_index_pages_with_rollback_in_generation(
             &store,
             &stream_id,
+            0,
             &[first.clone(), second.clone()],
             &replacement,
         )
@@ -1979,7 +1867,7 @@ mod tests {
             object_size: 128,
             ..Default::default()
         };
-        write_cold_chunk_index_pages(store.as_ref(), &stream_id, &first)
+        write_cold_chunk_index_pages_in_generation(store.as_ref(), &stream_id, 0, &first)
             .await
             .expect("write first chunk");
         assert_eq!(
@@ -2003,7 +1891,7 @@ mod tests {
             object_size: 128,
             ..Default::default()
         };
-        write_cold_chunk_index_pages(store.as_ref(), &stream_id, &second)
+        write_cold_chunk_index_pages_in_generation(store.as_ref(), &stream_id, 0, &second)
             .await
             .expect("write second chunk behind cache");
 
@@ -2153,7 +2041,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         for chunk in &chunks {
-            write_cold_chunk_index_pages(&store, &stream_id, chunk)
+            write_cold_chunk_index_pages_in_generation(&store, &stream_id, 0, chunk)
                 .await
                 .expect("write chunk index");
         }
@@ -2168,9 +2056,16 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            replace_cold_chunk_index_pages(&store, &stream_id, &selected, &replacement)
-                .await
-                .expect("replace chunks")
+            replace_cold_chunk_index_pages_with_rollback_in_generation(
+                &store,
+                &stream_id,
+                0,
+                &selected,
+                &replacement,
+            )
+            .await
+            .expect("replace chunks")
+            .is_some()
         );
         let loaded = load_cold_chunks_from_pages(&store, &[ColdIndexPageKey {
             stream_id,

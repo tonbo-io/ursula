@@ -66,8 +66,6 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
-use crate::request::SetFeatureLevelRequest;
-use crate::request::SetFeatureLevelResponse;
 use crate::request::TidyStreamsRequest;
 use crate::request::TidyStreamsResponse;
 use crate::rt::sync::Semaphore;
@@ -1176,24 +1174,6 @@ impl CoreWorker {
         response
     }
 
-    pub(crate) async fn feature_level(
-        group: &mut Box<dyn GroupEngine>,
-        metrics: Arc<RuntimeMetricsInner>,
-        placement: ShardPlacement,
-    ) -> Result<u32, RuntimeError> {
-        let exec_started_at = Instant::now();
-        let response = group
-            .feature_level(placement)
-            .await
-            .map_err(|err| RuntimeError::group_engine(placement, err));
-        metrics.record_group_engine_exec(
-            placement.core_id,
-            placement.raft_group_id,
-            elapsed_ns(exec_started_at),
-        );
-        response
-    }
-
     pub(crate) async fn state_gauges(
         group: &mut Box<dyn GroupEngine>,
         metrics: Arc<RuntimeMetricsInner>,
@@ -1212,33 +1192,7 @@ impl CoreWorker {
         response
     }
 
-    pub(crate) async fn set_feature_level(
-        group: &mut Box<dyn GroupEngine>,
-        metrics: Arc<RuntimeMetricsInner>,
-        request: SetFeatureLevelRequest,
-        placement: ShardPlacement,
-    ) -> Result<SetFeatureLevelResponse, RuntimeError> {
-        let exec_started_at = Instant::now();
-        let response = group
-            .set_feature_level(request, placement)
-            .await
-            .map_err(|err| RuntimeError::group_engine(placement, err));
-        metrics.record_group_engine_exec(
-            placement.core_id,
-            placement.raft_group_id,
-            elapsed_ns(exec_started_at),
-        );
-        if response.is_ok() {
-            metrics.record_applied_mutation(
-                placement.core_id,
-                placement.raft_group_id,
-                elapsed_ns(exec_started_at),
-            );
-        }
-        response
-    }
-
-    /// One F5 external-locator offload pass (feature level 3). Offloading
+    /// One F5 external-locator offload pass. Offloading
     /// writes cold-index pages and proposes, so only the local leader runs
     /// it; a follower reports an empty pass.
     pub(crate) async fn offload_cold_refs(

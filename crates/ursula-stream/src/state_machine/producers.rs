@@ -1,5 +1,4 @@
-//! Producer-state bounds (bounded-stream-state F3) and `TidyStream` (F0), both
-//! at feature level 1.
+//! Producer-state bounds (bounded-stream-state F3) and `TidyStream`.
 //!
 //! - **Receipt window.** A stream keeps at most [`RECEIPT_WINDOW_ITEMS`]
 //!   receipt items (one per append; legacy receipts may hold more) beyond each
@@ -11,8 +10,8 @@
 //!   snapshot evicts exactly what a replica that replayed the log evicts.
 //! - **One enforcement point.** The window is enforced once per command
 //!   after the whole command applied, at most [`RECEIPT_TRIM_BUDGET`]
-//!   receipts per command, so a legacy producer with a million receipts
-//!   drains over several commands without stalling apply.
+//!   receipts per command, so a producer with a large excess drains over
+//!   several commands without stalling apply.
 //! - **Idle expiry.** A producer whose newest write is at least
 //!   [`PRODUCER_IDLE_EXPIRY_MS`] old (by the persisted `last_seen_ms` and the
 //!   command's `now_ms`) is treated as absent at its own next write and
@@ -21,11 +20,11 @@
 //!   producers. A new producer beyond it evicts the least recently seen
 //!   producers idle for at least an hour, at the enforcement point, at most
 //!   [`PRODUCER_CAP_EVICT_BUDGET`] per command (`TidyStream` drains a larger
-//!   excess, such as a level-0 stream's after the raise); when none is idle
-//!   that long the write fails with `ProducerLimit` (`429`).
-//! - **`TidyStream`.** Converges one stream in bounded steps: message-record
-//!   collapse below the seal point (F4a), idle-producer stamping and expiry,
-//!   producer-cap eviction, receipt trimming and dropping the level-0 `last_items` copy.
+//!   excess); when none is idle that long the write fails with
+//!   `ProducerLimit` (`429`).
+//! - **`TidyStream`.** Converges one stream in bounded steps: F1 record
+//!   sealing, idle-producer expiry, producer-cap eviction and receipt
+//!   trimming.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -57,7 +56,7 @@ pub const PRODUCER_CAP_EVICT_IDLE_MS: u64 = 60 * 60 * 1_000;
 /// drains the rest of the excess (F3 bounded catch-up).
 pub const PRODUCER_CAP_EVICT_BUDGET: usize = 1_024;
 
-/// Producers one `TidyStream` may stamp, expire or strip of `last_items`.
+/// Idle producers one `TidyStream` may expire.
 pub const TIDY_PRODUCER_BUDGET: usize = 4_096;
 
 /// Items a receipt counts against the window: one per append, at least one.
@@ -66,21 +65,14 @@ pub(super) fn receipt_items(receipt: &crate::model::ProducerReceipt) -> u64 {
 }
 
 /// Whether a producer last written at `last_seen_ms` is idle at `now_ms`.
-/// Producers never stamped (written below level 1) are not idle until a
-/// `TidyStream` stamps them.
 pub(super) fn producer_is_idle(state: &ProducerState, now_ms: u64) -> bool {
-    state
-        .last_seen_ms
-        .is_some_and(|seen| now_ms.saturating_sub(seen) >= PRODUCER_IDLE_EXPIRY_MS)
+    now_ms.saturating_sub(state.last_seen_ms) >= PRODUCER_IDLE_EXPIRY_MS
 }
 
 /// Whether the producer cap may evict `state` at `now_ms`: idle for at least
-/// [`PRODUCER_CAP_EVICT_IDLE_MS`]. Unstamped producers (written below level 1)
-/// are never evicted by the cap.
+/// [`PRODUCER_CAP_EVICT_IDLE_MS`].
 fn producer_cap_evictable(state: &ProducerState, now_ms: u64) -> bool {
-    state
-        .last_seen_ms
-        .is_some_and(|seen| now_ms.saturating_sub(seen) >= PRODUCER_CAP_EVICT_IDLE_MS)
+    now_ms.saturating_sub(state.last_seen_ms) >= PRODUCER_CAP_EVICT_IDLE_MS
 }
 
 /// Derived per-stream receipt window: the total receipt items held and, for
@@ -209,8 +201,8 @@ impl StreamSlot {
     /// `(last_seen_ms, producer_id)` first, until the stream holds at most
     /// [`MAX_PRODUCERS_PER_STREAM`] or `budget` producers were evicted.
     /// One O(P) pass collects the candidates and selects the oldest excess,
-    /// so a stream far over the cap (raised from level 0) costs O(P) per
-    /// command, and `TidyStream` drains what the budget leaves.
+    /// so a stream far over the cap costs O(P) per command, and `TidyStream`
+    /// drains what the budget leaves.
     pub(super) fn evict_producers_over_cap(&mut self, now_ms: u64, budget: usize) {
         let excess = self
             .producers
@@ -255,17 +247,9 @@ impl StreamSlot {
 }
 
 impl StreamStateMachine {
-    /// Whether F3 producer bounds apply (feature level 1).
-    pub(super) fn producer_bounds_enabled(&self) -> bool {
-        self.feature_level >= crate::feature::FEATURE_LEVEL_KEYED_STREAMS
-    }
-
     /// F3 enforcement point, run once per command after it fully applied:
     /// the producer cap, then the receipt window.
     pub(super) fn enforce_producer_window(&mut self, stream_id: &BucketStreamId, now_ms: u64) {
-        if !self.producer_bounds_enabled() {
-            return;
-        }
         if let Some(slot) = self.stream_slot_mut(stream_id) {
             slot.evict_producers_over_cap(now_ms, PRODUCER_CAP_EVICT_BUDGET);
             slot.trim_receipt_window(RECEIPT_TRIM_BUDGET);
@@ -280,9 +264,6 @@ impl StreamStateMachine {
         producer_id: &str,
         now_ms: u64,
     ) {
-        if !self.producer_bounds_enabled() {
-            return;
-        }
         let Some(slot) = self.stream_slot_mut(stream_id) else {
             return;
         };
@@ -297,37 +278,22 @@ impl StreamStateMachine {
 
     /// Whether `TidyStream` would change this stream at `now_ms`.
     pub fn stream_has_tidy_debt(&self, stream_id: &BucketStreamId, now_ms: u64) -> bool {
-        if !self.producer_bounds_enabled() {
-            return false;
-        }
         let Some(slot) = self.stream_slot(stream_id) else {
             return false;
         };
-        let seal_point = slot.seal_point();
-        let collapsible = if self.message_records_removed() {
-            // F4b: legacy records left after the raise are debt; tidy
-            // converts them.
-            !slot.message_records.is_empty()
-        } else {
-            slot.message_records
-                .get(1)
-                .is_some_and(|record| record.end_offset <= seal_point)
-        };
-        collapsible
-            || self.stream_has_seal_debt(stream_id)
+        self.stream_has_seal_debt(stream_id)
             || slot.receipt_window_over()
             || slot.producer_cap_over(now_ms)
-            || slot.producers.values().any(|state| {
-                state.last_seen_ms.is_none()
-                    || !state.last_items.is_empty()
-                    || producer_is_idle(state, now_ms)
-            })
+            || slot
+                .producers
+                .values()
+                .any(|state| producer_is_idle(state, now_ms))
     }
 
     /// Up to `limit` streams with `TidyStream` debt at `now_ms`, in stream-id
     /// order. Read-only; a leader-side driver proposes `TidyStream` for them.
     pub fn tidy_candidates(&self, now_ms: u64, limit: usize) -> Vec<BucketStreamId> {
-        if !self.producer_bounds_enabled() || limit == 0 {
+        if limit == 0 {
             return Vec::new();
         }
         let mut candidates = self
@@ -348,11 +314,6 @@ impl StreamStateMachine {
         stream_id: &BucketStreamId,
         now_ms: u64,
     ) -> StreamResponse {
-        if let Err(response) =
-            self.require_feature_level(crate::feature::FEATURE_LEVEL_KEYED_STREAMS, "stream tidy")
-        {
-            return response;
-        }
         if let Err(response) = self.validate_stream_scope(stream_id) {
             return response;
         }
@@ -362,9 +323,8 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             );
         }
-        self.collapse_sealed_message_records(stream_id);
-        // F1 (level 2): legacy and idle streams seal here, at most
-        // `SEAL_BUDGET_RECORDS` per command.
+        // F1: idle streams seal here, at most `SEAL_BUDGET_RECORDS` per
+        // command.
         self.seal_record_index(stream_id);
         let Some(slot) = self.stream_slot_mut(stream_id) else {
             return StreamResponse::error(
@@ -372,35 +332,18 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             );
         };
-        // Producer hygiene in producer-id order so every replica does the
-        // same bounded work.
+        // Idle-producer expiry in producer-id order so every replica does
+        // the same bounded work.
         let mut producer_ids = slot
             .producers
             .iter()
-            .filter(|(_, state)| {
-                state.last_seen_ms.is_none()
-                    || !state.last_items.is_empty()
-                    || producer_is_idle(state, now_ms)
-            })
+            .filter(|(_, state)| producer_is_idle(state, now_ms))
             .map(|(producer_id, _)| producer_id.clone())
             .collect::<Vec<_>>();
         producer_ids.sort();
         producer_ids.truncate(TIDY_PRODUCER_BUDGET);
         for producer_id in producer_ids {
-            let idle = slot
-                .producers
-                .get(&producer_id)
-                .is_some_and(|state| producer_is_idle(state, now_ms));
-            if idle {
-                slot.remove_producer(&producer_id);
-                continue;
-            }
-            if let Some(state) = slot.producers.get_mut(&producer_id) {
-                // Producers written before level 1 count their idle period
-                // from the first tidy after the raise.
-                state.last_seen_ms.get_or_insert(now_ms);
-                state.last_items = Vec::new();
-            }
+            slot.remove_producer(&producer_id);
         }
         slot.evict_producers_over_cap(now_ms, PRODUCER_CAP_EVICT_BUDGET);
         slot.trim_receipt_window(RECEIPT_TRIM_BUDGET);
@@ -409,32 +352,6 @@ impl StreamStateMachine {
         }
         StreamResponse::StreamTidied {
             debt_remaining: self.stream_has_tidy_debt(stream_id, now_ms),
-        }
-    }
-
-    /// F4a: collapses every message record that ends at or below the seal
-    /// point into one `[retained, p)` record. Feature level 1.
-    /// From level 4 (F4b) there is nothing to collapse: the call converts
-    /// any legacy records instead.
-    pub(super) fn collapse_sealed_message_records(&mut self, stream_id: &BucketStreamId) {
-        if self.message_records_removed() {
-            self.migrate_message_records(stream_id);
-            return;
-        }
-        if !self.producer_bounds_enabled() {
-            return;
-        }
-        let Some(slot) = self.stream_slot(stream_id) else {
-            return;
-        };
-        let seal_point = slot.seal_point();
-        let retained_offset = slot.retained_offset;
-        if slot
-            .message_records
-            .get(1)
-            .is_some_and(|record| record.end_offset <= seal_point)
-        {
-            self.compact_message_records_before(stream_id, retained_offset, seal_point);
         }
     }
 }

@@ -3,7 +3,6 @@
 //! Module map:
 //!
 //! - [`command`]: replicated command variants applied to the state machine.
-//! - [`feature`]: replicated group feature levels and the apply-time gate.
 //! - [`format`]: the format epoch every persisted format and the Raft RPC
 //!   protocol share, and its policy.
 //! - [`response`]: result variants and error codes returned per command.
@@ -21,7 +20,6 @@
 //! - [`validate`]: bucket/stream id validation used by HTTP and Raft entry points.
 
 mod command;
-mod feature;
 mod format;
 mod model;
 mod record_index;
@@ -32,14 +30,6 @@ mod validate;
 
 pub use command::COMMAND_LOG_OVERHEAD_BYTES;
 pub use command::StreamCommand;
-pub use feature::FEATURE_LEVEL_BASELINE;
-pub use feature::FEATURE_LEVEL_COLD_SNAPSHOTS;
-pub use feature::FEATURE_LEVEL_EXTERNAL_LOCATORS;
-pub use feature::FEATURE_LEVEL_HOT_REPRESENTATION;
-pub use feature::FEATURE_LEVEL_KEYED_STREAMS;
-pub use feature::FEATURE_LEVEL_SPARSE_MARKS;
-pub use feature::MAX_SUPPORTED_FEATURE_LEVEL;
-pub use feature::check_feature_level;
 pub use format::FORMAT_EPOCH;
 pub use format::format_epoch_refusal;
 pub use model::AppendStreamInput;
@@ -105,7 +95,6 @@ pub use state_machine::ColdFlushPlanStats;
 pub use state_machine::ColdFlushPressure;
 pub use state_machine::GroupStateGauges;
 pub use state_machine::HOT_RECORD_OVERHEAD_BYTES;
-pub use state_machine::HOT_RECORD_OVERHEAD_BYTES_LB4;
 pub use state_machine::MAX_STAGED_EXTERNAL_REFS;
 pub use state_machine::RETENTION_COLD_GC_GRACE_MS;
 pub use state_machine::RecordPlanError;
@@ -119,7 +108,6 @@ pub use state_machine::SharedRefCompactionRequest;
 pub use state_machine::SharedRefIdleTracker;
 pub use state_machine::StagedExternalRefCandidate;
 pub use state_machine::StreamStateMachine;
-pub use state_machine::hot_real_bytes;
 pub use state_machine::is_legacy_cross_bucket_pack;
 pub use state_machine::plan_shared_ref_run;
 pub use validate::validate_bucket_id;

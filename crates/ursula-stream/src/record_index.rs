@@ -1,8 +1,7 @@
 //! Retained record-ordinal to canonical-offset boundaries for JSON streams.
 //!
 //! Records that are not yet flushed keep exact start offsets (the dense
-//! part). From feature level 2 (bounded-stream-state F1) records whose bytes
-//! are cold are *sealed*: the index keeps one [`RecordMark`] per 1 MiB block
+//! part). Records whose bytes are cold are *sealed* (bounded-stream-state F1): the index keeps one [`RecordMark`] per 1 MiB block
 //! of cold log that contains a record start, and a lookup of a sealed record
 //! returns a [`RecordBracket`] that a reader resolves by counting LFs in at
 //! most one block. Stored JSON records are one compact value plus one LF and
@@ -29,7 +28,7 @@ use std::collections::VecDeque;
 use serde::Deserialize;
 use serde::Serialize;
 
-/// Log2 of the mark block size. Fixed by feature level 2.
+/// Log2 of the mark block size. Fixed by the format (F1).
 pub const MARK_BLOCK_SHIFT: u32 = 20;
 /// Mark block size: 1 MiB.
 pub const MARK_BLOCK_BYTES: u64 = 1 << MARK_BLOCK_SHIFT;

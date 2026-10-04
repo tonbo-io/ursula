@@ -34,8 +34,8 @@ use crate::core_worker::ReadWatchers;
 use crate::error::ErrorStatus;
 use crate::metrics::RuntimeMetricsInner;
 
-/// F4b: hot overhead per record at the top level.
-const R: u64 = ursula_stream::HOT_RECORD_OVERHEAD_BYTES_LB4;
+/// F4b: hot overhead per record.
+const R: u64 = ursula_stream::HOT_RECORD_OVERHEAD_BYTES;
 
 /// C7/F14g: the incarnation generation a stream's chunks and pages live
 /// under (its `created_at_ms`).
@@ -381,7 +381,10 @@ fn committed_write_command_is_state_machine_apply_boundary() {
     let flushed = engine
         .apply_committed_write(
             GroupWriteCommand::Stream(StreamCommand::FlushCold {
-                cold_generation: None,
+                cold_generation: engine
+                    .state_machine
+                    .cold_index_generation(&stream)
+                    .expect("live stream"),
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -470,7 +473,10 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
     engine
         .flush_cold(
             FlushColdRequest {
-                cold_generation: None,
+                cold_generation: engine
+                    .state_machine
+                    .cold_index_generation(&stream)
+                    .expect("live stream"),
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -683,7 +689,10 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
     engine
         .flush_cold(
             FlushColdRequest {
-                cold_generation: None,
+                cold_generation: engine
+                    .state_machine
+                    .cold_index_generation(&stream)
+                    .expect("live stream"),
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -701,7 +710,10 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
     let stale_flush = engine
         .flush_cold(
             FlushColdRequest {
-                cold_generation: None,
+                cold_generation: engine
+                    .state_machine
+                    .cold_index_generation(&stream)
+                    .expect("live stream"),
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -762,7 +774,7 @@ async fn failed_cold_compaction_publish_rolls_back_index_replacement() {
         ..Default::default()
     };
     for chunk in [&first, &second] {
-        write_cold_chunk_index_pages(&page_store, &stream, chunk)
+        write_cold_chunk_index_pages_in_generation(&page_store, &stream, 0, chunk)
             .await
             .expect("index input chunk");
     }
@@ -1425,7 +1437,6 @@ async fn install_group_snapshot_rejects_mismatched_placement_before_routing() {
             next_cold_gc_seq: 0,
             shared_cold_object_owners: Vec::new(),
             bucket_usage: Vec::new(),
-            feature_level: ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL,
             last_created_at_ms: 0,
             format_epoch: ursula_stream::FORMAT_EPOCH,
         },
@@ -1661,7 +1672,7 @@ async fn flush_cold_publishes_chunk_metadata_on_owner_group() {
 
     let flushed = runtime
         .flush_cold(FlushColdRequest {
-            cold_generation: None,
+            cold_generation: live_cold_generation(&runtime, &stream).await,
             stream_id: stream.clone(),
             chunk: ColdChunkRef {
                 start_offset: 0,
@@ -1786,7 +1797,6 @@ async fn flush_cold_group_batch_once_publishes_multiple_chunks() {
         .iter()
         .find(|entry| entry.metadata.stream_id == stream)
         .expect("stream snapshot");
-    assert_eq!(entry.cold_frontier_offset, 4);
     assert_eq!(entry.cold_chunks.len(), 4);
     assert!(
         entry
@@ -2092,7 +2102,7 @@ async fn legacy_cross_bucket_pack_is_rewritten_before_bucket_erasure_proof() {
         };
         runtime
             .flush_cold(FlushColdRequest {
-                cold_generation: None,
+                cold_generation: live_cold_generation(&runtime, stream).await,
                 stream_id: stream.clone(),
                 chunk,
             })
@@ -2283,7 +2293,7 @@ async fn cold_gc_worker_physically_reclaims_deleted_stream_chunks() {
         .expect("write cold chunk");
     runtime
         .flush_cold(FlushColdRequest {
-            cold_generation: None,
+            cold_generation: live_cold_generation(&runtime, &stream).await,
             stream_id: stream.clone(),
             chunk: chunk.clone(),
         })
@@ -2356,7 +2366,7 @@ async fn purge_report_proves_cold_gc_queue_is_empty_only_after_reclamation() {
         .expect("write cold chunk");
     runtime
         .flush_cold(FlushColdRequest {
-            cold_generation: None,
+            cold_generation: live_cold_generation(&runtime, &stream).await,
             stream_id: stream,
             chunk: chunk.clone(),
         })
@@ -2409,7 +2419,7 @@ async fn cold_compaction_preserves_reads_and_reclaims_inputs_after_grace() {
             .expect("write input chunk");
         runtime
             .flush_cold(FlushColdRequest {
-                cold_generation: None,
+                cold_generation: live_cold_generation(&runtime, &stream).await,
                 stream_id: stream.clone(),
                 chunk,
             })
@@ -3931,7 +3941,6 @@ impl GroupEngine for BlockingReadEngine {
                     next_cold_gc_seq: 0,
                     shared_cold_object_owners: Vec::new(),
                     bucket_usage: Vec::new(),
-                    feature_level: ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL,
                     last_created_at_ms: 0,
                     format_epoch: ursula_stream::FORMAT_EPOCH,
                 },
@@ -4133,7 +4142,6 @@ impl GroupEngine for RecordingEngine {
                     next_cold_gc_seq: 0,
                     shared_cold_object_owners: Vec::new(),
                     bucket_usage: Vec::new(),
-                    feature_level: ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL,
                     last_created_at_ms: 0,
                     format_epoch: ursula_stream::FORMAT_EPOCH,
                 },

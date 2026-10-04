@@ -95,8 +95,6 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
-use crate::request::SetFeatureLevelRequest;
-use crate::request::SetFeatureLevelResponse;
 use crate::request::TidyStreamsRequest;
 use crate::request::TidyStreamsResponse;
 use crate::rt::sync::Semaphore;
@@ -128,7 +126,7 @@ const COMPACTION_DEBT_PAGES_PER_PASS: usize = 4_096;
 pub use orphan_sweep::COLD_ORPHAN_SWEEP_GRACE_MS;
 
 /// Backoff before the cold GC retries an entry it deferred after its first
-/// failure (bounded-state F14b, feature level 1). Each further deferral
+/// failure (bounded-state F14b). Each further deferral
 /// doubles it, up to [`COLD_GC_DEFER_MAX_BACKOFF_MS`].
 pub const COLD_GC_DEFER_BACKOFF_MS: u64 = 60_000;
 
@@ -229,7 +227,6 @@ pub struct ShardRuntime {
 #[derive(Debug, Clone, Default)]
 struct ColdIndexRepairCursor {
     after: Option<BucketStreamId>,
-    last_full_cycle_ms: Option<u64>,
 }
 
 /// Result of one repair step for one group.
@@ -612,7 +609,7 @@ impl ShardRuntime {
             .flush_cold(FlushColdRequest {
                 stream_id: candidate.stream_id,
                 chunk,
-                cold_generation: Some(candidate.cold_generation),
+                cold_generation: candidate.cold_generation,
             })
             .await;
         match publish {
@@ -768,7 +765,7 @@ impl ShardRuntime {
                         shared_object: true,
                         payload_digest: candidate.payload_digest,
                     },
-                    cold_generation: Some(candidate.cold_generation),
+                    cold_generation: candidate.cold_generation,
                 })
                 .await;
             match publish {
@@ -892,23 +889,10 @@ impl ShardRuntime {
         Ok(report)
     }
 
-    /// Replicated feature level (C0) of every Raft group as held by this
-    /// node's applied replica state. Per-group results, so a group this node
-    /// does not host reports its own error instead of hiding the others.
-    pub async fn feature_levels_all_groups(&self) -> Vec<(RaftGroupId, Result<u32, RuntimeError>)> {
-        let group_count = self.shard_map.raft_group_count();
-        let mut levels = Vec::new();
-        for group_id in 0..group_count {
-            let group = RaftGroupId(group_id);
-            levels.push((group, self.feature_level(group).await));
-        }
-        levels
-    }
-
     /// Bounded-state gauges (`docs/architecture/bounded-stream-state.md`
     /// §7.5) of every Raft group as held by this node's applied replica state.
-    /// Groups are asked concurrently; per-group results, like
-    /// [`Self::feature_levels_all_groups`].
+    /// Groups are asked concurrently; per-group results, so a group this
+    /// node does not host reports its own error instead of hiding the others.
     pub async fn state_gauges_all_groups(
         &self,
     ) -> Vec<(
@@ -923,36 +907,11 @@ impl ShardRuntime {
         futures_util::future::join_all(requests).await
     }
 
-    /// Proposes `SetFeatureLevel { level }` to every Raft group (C0), serially
-    /// like the other all-group admin sweeps. Each group ends at
-    /// `max(current, level)`, so re-running after a partial failure is safe.
-    /// Results are per group: on a Raft cluster a group led by another node
-    /// fails with a forward-to-leader error, and the operator (`ursulactl
-    /// cluster enable-feature`) asks every node so each leader proposes for
-    /// its own groups. Callers must ensure every voter and learner supports
-    /// `level`.
-    pub async fn set_feature_level_all_groups(
-        &self,
-        level: u32,
-    ) -> Vec<(RaftGroupId, Result<SetFeatureLevelResponse, RuntimeError>)> {
-        let group_count = self.shard_map.raft_group_count();
-        let mut responses = Vec::new();
-        for group_id in 0..group_count {
-            let group = RaftGroupId(group_id);
-            responses.push((
-                group,
-                self.set_feature_level(group, SetFeatureLevelRequest { level })
-                    .await,
-            ));
-        }
-        responses
-    }
-
     /// One leader-side external-locator offload pass (bounded-state F5) in
     /// every group this node leads: each offloads up to
     /// `max_streams_per_group` streams whose state-held external refs are
     /// due. A failing group is logged and skipped, so it cannot stall the
-    /// others. Groups below feature level 3 hold no staged refs.
+    /// others.
     pub async fn offload_cold_refs_all_groups_once(
         &self,
         max_streams_per_group: usize,
@@ -1288,13 +1247,8 @@ impl ShardRuntime {
         if planned.is_empty() {
             return Ok(0);
         }
-        // F14b (feature level 1): a failing entry is moved to the tail with a
-        // backoff, so it no longer blocks every entry behind it. Below level 1
-        // the worker stops at the first failure, as before.
-        let defer_failures = self
-            .feature_level(raft_group_id)
-            .await
-            .is_ok_and(|level| level >= crate::FEATURE_LEVEL_KEYED_STREAMS);
+        // F14b: a failing entry is moved to the tail with a backoff, so it
+        // no longer blocks every entry behind it.
         let mut acked_seq = None;
         let mut reclaimed = 0usize;
         let mut deferred = 0usize;
@@ -1341,32 +1295,30 @@ impl ShardRuntime {
                     let error = RuntimeError::ColdStoreIo {
                         message: err.to_string(),
                     };
-                    if defer_failures {
-                        let not_before_ms = unix_time_ms()
-                            .saturating_add(cold_gc_defer_backoff_ms(entry.defer_attempts));
-                        match self
-                            .defer_cold_gc(raft_group_id, entry.seq, not_before_ms)
-                            .await
-                        {
-                            Ok(_) => {
-                                tracing::warn!(
-                                    raft_group_id = raft_group_id.0,
-                                    seq = entry.seq,
-                                    error = %err,
-                                    "cold GC entry failed; deferred to the tail of the queue"
-                                );
-                                deferred += 1;
-                                first_error.get_or_insert(error);
-                                continue;
-                            }
-                            Err(defer_err) => {
-                                tracing::warn!(
-                                    raft_group_id = raft_group_id.0,
-                                    seq = entry.seq,
-                                    error = %defer_err,
-                                    "failed to defer a failing cold GC entry"
-                                );
-                            }
+                    let not_before_ms = unix_time_ms()
+                        .saturating_add(cold_gc_defer_backoff_ms(entry.defer_attempts));
+                    match self
+                        .defer_cold_gc(raft_group_id, entry.seq, not_before_ms)
+                        .await
+                    {
+                        Ok(_) => {
+                            tracing::warn!(
+                                raft_group_id = raft_group_id.0,
+                                seq = entry.seq,
+                                error = %err,
+                                "cold GC entry failed; deferred to the tail of the queue"
+                            );
+                            deferred += 1;
+                            first_error.get_or_insert(error);
+                            continue;
+                        }
+                        Err(defer_err) => {
+                            tracing::warn!(
+                                raft_group_id = raft_group_id.0,
+                                seq = entry.seq,
+                                error = %defer_err,
+                                "failed to defer a failing cold GC entry"
+                            );
                         }
                     }
                     if acked_seq.is_none() {
@@ -1399,15 +1351,10 @@ impl ShardRuntime {
     /// stream of the same name uses, and checks that again before deleting
     /// pages, which are the last objects removed.
     ///
-    /// - Legacy entries (no generation, enqueued below level 1) delete
-    ///   legacy-format chunk names directly under `{stream}/chunks/` and
-    ///   generation-0 pages, and are acknowledged without deleting anything
-    ///   while a stream with the name exists again (step 1).
-    /// - Entries naming generation `g` (level 1) delete the external
-    ///   payloads that generation's pages reference inside
-    ///   `{stream}/external/` (F14a), the chunks of that generation (legacy
-    ///   names for `g = 0`, `{stream}/chunks/{g:016x}/` otherwise), and its
-    ///   pages.
+    /// An entry naming generation `g` deletes the external payloads that
+    /// generation's pages reference inside `{stream}/external/` (F14a), the
+    /// chunks under `{stream}/chunks/{g:016x}/`, and its pages. An entry
+    /// without a generation is corrupt: it fails and deletes nothing.
     async fn reclaim_stream_incarnation(
         &self,
         cold_store: &ColdStoreHandle,
@@ -1416,11 +1363,17 @@ impl ShardRuntime {
         planned: &ColdGcPlanEntry,
         stream_id: &BucketStreamId,
     ) -> io::Result<()> {
-        let generation = planned.entry.cold_generation.unwrap_or(0);
-        if stream_gc_blocked_by_live_stream(
-            planned.entry.cold_generation,
-            planned.live_cold_generation,
-        ) {
+        let Some(generation) = planned.entry.cold_generation else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cold GC entry {} for stream '{stream_id}' has no cold generation; \
+                     refusing to delete anything",
+                    planned.entry.seq
+                ),
+            ));
+        };
+        if planned.live_cold_generation == Some(generation) {
             tracing::debug!(
                 stream = %stream_id,
                 seq = planned.entry.seq,
@@ -1429,34 +1382,32 @@ impl ShardRuntime {
             return Ok(());
         }
 
-        if planned.entry.cold_generation.is_some() {
-            let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-            let external_dir = cold_external_dir(stream_id);
-            let mut referenced = BTreeSet::new();
-            for page_id in list_cold_index_page_ids(cold_store, stream_id, generation).await? {
-                let key = ColdIndexPageKey {
-                    stream_id: stream_id.clone(),
-                    generation,
-                    page_id,
-                };
-                let Some(page) = store.get_page(&key).await? else {
-                    continue;
-                };
-                referenced.extend(
-                    page.external_segments
-                        .iter()
-                        .filter(|object| {
-                            object
-                                .s3_path
-                                .strip_prefix(&external_dir)
-                                .is_some_and(is_external_payload_file_name)
-                        })
-                        .map(|object| object.s3_path.clone()),
-                );
-            }
-            for path in referenced {
-                cold_store.delete_chunk(&path).await?;
-            }
+        let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+        let external_dir = cold_external_dir(stream_id);
+        let mut referenced = BTreeSet::new();
+        for page_id in list_cold_index_page_ids(cold_store, stream_id, generation).await? {
+            let key = ColdIndexPageKey {
+                stream_id: stream_id.clone(),
+                generation,
+                page_id,
+            };
+            let Some(page) = store.get_page(&key).await? else {
+                continue;
+            };
+            referenced.extend(
+                page.external_segments
+                    .iter()
+                    .filter(|object| {
+                        object
+                            .s3_path
+                            .strip_prefix(&external_dir)
+                            .is_some_and(is_external_payload_file_name)
+                    })
+                    .map(|object| object.s3_path.clone()),
+            );
+        }
+        for path in referenced {
+            cold_store.delete_chunk(&path).await?;
         }
 
         let chunk_dir = cold_chunk_dir(stream_id, generation);
@@ -1477,7 +1428,7 @@ impl ShardRuntime {
             .into_iter()
             .find(|candidate| candidate.entry.seq == planned.entry.seq)
             .and_then(|candidate| candidate.live_cold_generation);
-        if stream_gc_blocked_by_live_stream(planned.entry.cold_generation, live) {
+        if live == Some(generation) {
             return Ok(());
         }
         let page_dir = cold_index_generation_dir(stream_id, generation);
@@ -1524,38 +1475,13 @@ impl ShardRuntime {
                 .map_err(|_| RuntimeError::ColdStoreConfig {
                     message: "cold-index repair cursor lock poisoned".to_owned(),
                 })?;
-        let cursor = cursors.entry(raft_group_id).or_default();
-        cursor.after = response.next_after;
-        if response.cycle_completed {
-            cursor.last_full_cycle_ms = Some(unix_time_ms());
-        }
+        cursors.entry(raft_group_id).or_default().after = response.next_after;
         drop(cursors);
         self.record_compaction_debt_pages(response.compaction_pages);
         Ok(ColdIndexRepairStep {
             report: response.report,
             cycle_completed: response.cycle_completed,
         })
-    }
-
-    /// When this node, as leader of `raft_group_id`, last completed a full
-    /// cold-index repair cycle over the group's streams.
-    pub fn cold_index_repair_last_full_cycle_ms(&self, raft_group_id: RaftGroupId) -> Option<u64> {
-        self.cold_index_repair
-            .lock()
-            .ok()?
-            .get(&raft_group_id)
-            .and_then(|cursor| cursor.last_full_cycle_ms)
-    }
-
-    /// Whether this node has completed a cold-index page-repair cycle as
-    /// leader of `raft_group_id` (F19), which the raise to feature level 2
-    /// (F1 sparse marks) requires. Without a cold store no page exists, so
-    /// the cycle is vacuously complete.
-    pub fn cold_index_repair_completed(&self, raft_group_id: RaftGroupId) -> bool {
-        self.cold_store.is_none()
-            || self
-                .cold_index_repair_last_full_cycle_ms(raft_group_id)
-                .is_some()
     }
 
     /// One repair step in every group. A failing group is logged and
@@ -1857,20 +1783,6 @@ impl ShardRuntime {
             .map(CoreMailbox::capacity)
             .collect::<Vec<_>>();
         RuntimeMailboxSnapshot { depths, capacities }
-    }
-}
-
-/// F14g: a stream GC entry deletes nothing while a live stream of the same
-/// name uses its objects. A legacy entry (no generation) shares names with
-/// any recreated stream, so it waits for none; an entry naming generation
-/// `g` only conflicts with a live incarnation in `g`, which C7 rules out.
-fn stream_gc_blocked_by_live_stream(
-    entry_generation: Option<u64>,
-    live_generation: Option<u64>,
-) -> bool {
-    match entry_generation {
-        None => live_generation.is_some(),
-        Some(generation) => live_generation == Some(generation),
     }
 }
 

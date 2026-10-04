@@ -552,10 +552,10 @@ fn retention_advances_first_without_renumbering_survivors() {
 }
 
 /// F1 sparse cold record marks (bounded-stream-state §6) against this
-/// reference model: a real [`ursula_stream::StreamStateMachine`] (born at the
-/// top feature level), with an in-memory byte store standing in for S3, must agree with
-/// [`ReferenceStream`] on every acknowledgement, record range, record read
-/// (exact and bracketed), retention and persistence path.
+/// reference model: a real [`ursula_stream::StreamStateMachine`], with an
+/// in-memory byte store standing in for S3, must agree with [`ReferenceStream`]
+/// on every acknowledgement, record range, record read (exact and bracketed),
+/// retention and persistence path.
 mod sparse_marks_differential {
     use std::collections::BTreeMap;
 
@@ -859,7 +859,7 @@ mod sparse_marks_differential {
                         shared_object: false,
                         payload_digest: String::new(),
                     },
-                    cold_generation: Some(candidate.cold_generation),
+                    cold_generation: candidate.cold_generation,
                 }),
                 "flush",
             );
@@ -932,7 +932,7 @@ mod sparse_marks_differential {
                 assert!(offset - retained_offset < MARK_BLOCK_BYTES * 4);
             }
             self.oracle.retain_from(range.first_record).unwrap();
-            // Retention seals (Lb2 sparse marks): dropping the hot bytes below dense
+            // Retention seals (F1 sparse marks): dropping the hot bytes below dense
             // records leaves no seal debt for the tidy driver.
             self.assert_dense_bound(&self.machine);
         }

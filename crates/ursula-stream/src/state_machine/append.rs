@@ -39,7 +39,6 @@ impl StreamStateMachine {
             if let Err(response) = self.validate_stream_scope(&stream_id) {
                 break 'append response;
             }
-            self.migrate_message_records(&stream_id);
             if let Err(response) = validate_producer_request(producer.as_ref()) {
                 break 'append response;
             }
@@ -234,7 +233,6 @@ impl StreamStateMachine {
                     producer: producer_ack,
                 }
             } else {
-                let records_removed = self.message_records_removed();
                 let slot = self
                     .stream_slot_mut(&stream_id)
                     .expect("stream existence checked before append mutation");
@@ -244,7 +242,7 @@ impl StreamStateMachine {
                     let _range = index.commit_append(prepared);
                 }
                 slot.hot_buffer.push(offset, next_offset, payload);
-                slot.record_message_boundaries(records_removed, offset, next_offset, &record_ends);
+                slot.record_message_boundaries(offset, next_offset, &record_ends);
                 self.add_hot_payload_bytes(payload_len);
                 self.sync_hot_index(&stream_id);
                 self.usage_on_append(
@@ -297,7 +295,6 @@ impl StreamStateMachine {
         if let Err(response) = self.validate_stream_scope(&stream_id) {
             return response;
         }
-        self.migrate_message_records(&stream_id);
         if let Err(response) = validate_producer_request(producer.as_ref()) {
             return response;
         }
@@ -439,7 +436,6 @@ impl StreamStateMachine {
                 },
             );
         }
-        let external_locators_in_state = self.external_locators_in_state();
         let object = ObjectPayloadRef {
             start_offset: offset,
             end_offset: next_offset,
@@ -447,7 +443,6 @@ impl StreamStateMachine {
             object_size: payload.object_size,
             object_offset: 0,
         };
-        let records_removed = self.message_records_removed();
         let slot = self
             .stream_slot_mut(&stream_id)
             .expect("stream existence checked before external append mutation");
@@ -455,20 +450,15 @@ impl StreamStateMachine {
         {
             let _range = index.commit_append(prepared);
         }
-        if external_locators_in_state {
-            // F5 (level 3): commit first, index after. State holds the
-            // locator until the leader's offload pass writes its page entry.
-            slot.cold.push_direct_external_segment(object.clone());
-        } else {
-            slot.cold.push_external_segment(object.clone());
-        }
-        slot.record_message_boundaries(records_removed, offset, next_offset, &record_ends);
-        // F4a: an external append is a cold transition.
-        self.collapse_sealed_message_records(&stream_id);
+        // F5: commit first, index after. State holds the locator until the
+        // leader's offload pass writes its page entry.
+        slot.cold.push_direct_external_segment(object.clone());
+        slot.record_message_boundaries(offset, next_offset, &record_ends);
         self.sync_hot_index(&stream_id);
-        // F1 (level 2): and it seals the records below the seal point, which
-        // may include its own; the acknowledgement uses the range computed
-        // above, never the index (RC-10).
+        // F1: an external append is a cold transition; it seals the records
+        // below the seal point, which may include its own. The
+        // acknowledgement uses the range computed above, never the index
+        // (RC-10).
         self.seal_record_index(&stream_id);
         let appended_bytes = next_offset.saturating_sub(offset);
         self.usage_on_append(
@@ -561,17 +551,15 @@ impl StreamStateMachine {
         let Some(states) = self.stream_slot(stream_id).map(|slot| &slot.producers) else {
             return Ok(ProducerDecision::Accept);
         };
-        let bounded = self.producer_bounds_enabled();
         // F3: an idle producer is treated as absent at its own next write.
         let state = states
             .get(&producer.producer_id)
-            .filter(|state| !(bounded && super::producers::producer_is_idle(state, now_ms)));
+            .filter(|state| !super::producers::producer_is_idle(state, now_ms));
         let Some(state) = state else {
             if producer.producer_seq == 0 {
                 // F3 producer cap: a new producer needs room, either below
                 // the cap or by evicting producers idle for an hour.
-                if bounded
-                    && let Some(slot) = self.stream_slot(stream_id)
+                if let Some(slot) = self.stream_slot(stream_id)
                     && !slot.producer_cap_admits(&producer.producer_id, now_ms)
                 {
                     return Err(StreamResponse::error(
@@ -624,29 +612,15 @@ impl StreamStateMachine {
 
         if producer.producer_seq <= state.producer_seq {
             let Some(receipt) = find_receipt(&state.receipts, producer.producer_seq) else {
-                if bounded {
-                    // F3: beyond the receipt window a duplicate is still a
-                    // duplicate (never accepted twice), answered without
-                    // ranges.
-                    return Ok(ProducerDecision::DuplicateEvicted {
-                        producer: ProducerRequest {
-                            producer_id: producer.producer_id.clone(),
-                            producer_epoch: state.producer_epoch,
-                            producer_seq: producer.producer_seq,
-                        },
-                    });
-                }
-                return Err(StreamResponse::error_with_context(
-                    StreamErrorCode::ProducerSeqConflict,
-                    format!(
-                        "producer '{}' sequence {} is older than the retained receipt window ending at {}",
-                        producer.producer_id, producer.producer_seq, state.producer_seq
-                    ),
-                    vec![StreamErrorContext::ProducerSeqConflict {
-                        expected_seq: state.producer_seq.saturating_add(1),
-                        received_seq: producer.producer_seq,
-                    }],
-                ));
+                // F3: beyond the receipt window a duplicate is still a
+                // duplicate (never accepted twice), answered without ranges.
+                return Ok(ProducerDecision::DuplicateEvicted {
+                    producer: ProducerRequest {
+                        producer_id: producer.producer_id.clone(),
+                        producer_epoch: state.producer_epoch,
+                        producer_seq: producer.producer_seq,
+                    },
+                });
             };
             return Ok(ProducerDecision::Duplicate {
                 offset: receipt.start_offset,
@@ -685,7 +659,6 @@ impl StreamStateMachine {
         now_ms: u64,
         last: ProducerAppendRecord,
     ) {
-        let bounded = self.producer_bounds_enabled();
         let receipt = ProducerReceipt {
             producer_seq: producer.producer_seq,
             start_offset: last.start_offset,
@@ -693,14 +666,6 @@ impl StreamStateMachine {
             closed: last.closed,
             items: vec![last.clone()],
         };
-        // Level 1 answers from the newest receipt and keeps no copy (F3);
-        // level 0 keeps `last_items` exactly as earlier releases do.
-        let last_items = if bounded {
-            Vec::new()
-        } else {
-            vec![last.clone()]
-        };
-        let last_seen_ms = bounded.then_some(now_ms);
         let Some(slot) = self.stream_slot_mut(&stream_id) else {
             return;
         };
@@ -711,15 +676,12 @@ impl StreamStateMachine {
             state.last_start_offset = last.start_offset;
             state.last_next_offset = last.next_offset;
             state.last_closed = last.closed;
-            state.last_items = last_items;
             // O(1) window update: the front is unchanged by a push and
             // becomes evictable once the producer holds two receipts.
             slot.receipt_window
                 .push_receipt(&producer.producer_id, state, &receipt);
             state.receipts.push_back(receipt);
-            if last_seen_ms.is_some() {
-                state.last_seen_ms = last_seen_ms;
-            }
+            state.last_seen_ms = now_ms;
             return;
         }
         // A new producer or a new epoch: the previous state (and its
@@ -731,9 +693,8 @@ impl StreamStateMachine {
             last_start_offset: last.start_offset,
             last_next_offset: last.next_offset,
             last_closed: last.closed,
-            last_items,
             receipts: std::collections::VecDeque::from([receipt]),
-            last_seen_ms,
+            last_seen_ms: now_ms,
         };
         slot.receipt_window
             .add_producer(&producer.producer_id, &state);
@@ -797,7 +758,7 @@ enum ProducerDecision {
         producer: ProducerRequest,
         items: Vec<ProducerAppendRecord>,
     },
-    /// A duplicate whose receipt the window evicted (F3, level 1).
+    /// A duplicate whose receipt the window evicted (F3).
     DuplicateEvicted {
         producer: ProducerRequest,
     },

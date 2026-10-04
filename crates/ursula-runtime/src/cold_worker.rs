@@ -193,14 +193,13 @@ const COLD_REF_OFFLOAD_INTERVAL: std::time::Duration = std::time::Duration::from
 /// Streams per group one offload pass moves into pages.
 const COLD_REF_OFFLOAD_MAX_STREAMS_PER_GROUP: usize = 64;
 
-/// Start the leader-side external-locator offload (bounded-stream-state F5,
-/// feature level 3). Every interval each group the node leads writes the
+/// Start the leader-side external-locator offload (bounded-stream-state F5).
+/// Every interval each group the node leads writes the
 /// cold-index page entries of its due state-held external refs (more than
 /// T_ext = 16 on a stream, or one older than 10 s) and removes them from
 /// state with `OffloadColdRefs`, which keeps at most T_ext plus in-flight
-/// refs per stream. Below level 3 no stream holds staged refs and a pass
-/// does nothing. It bounds replicated state, so it is not behind a config
-/// switch.
+/// refs per stream. It bounds replicated state, so it is not behind a
+/// config switch.
 pub fn spawn_cold_ref_offload_worker(runtime: &ShardRuntime) {
     if !runtime.has_cold_store() {
         return;

@@ -63,29 +63,25 @@ pub fn pr_suite() -> Result<Vec<Job>> {
         job(
             "w1",
             Workload::W1(parse::<W1Args>(
-                "--records=300000 --checkpoints=75000,300000 --forced-flush --level=2 --name=w1_inline",
+                "--records=300000 --checkpoints=75000,300000 --forced-flush --name=w1_inline",
             )?),
         ),
         job(
-            "w1_lb4",
+            "w1_hot",
             Workload::W1(parse::<W1Args>(
-                "--records=300000 --checkpoints=75000,300000 --level=4 --name=w1_lb4",
+                "--records=300000 --checkpoints=75000,300000 --name=w1_hot",
             )?),
         ),
         job(
             "w6_w1",
             Workload::W1(parse::<W1Args>(
-                "--records=200000 --retain-every=10000 --retain-keep=2000 --checkpoints=100000,200000 --level=2",
+                "--records=200000 --retain-every=10000 --retain-keep=2000 --checkpoints=100000,200000",
             )?),
         ),
         job("w3_r1", Workload::W3(parse::<W3Args>("--appends=1000")?)),
         job(
             "w3_r5000",
             Workload::W3(parse::<W3Args>("--appends=100 --recs-per-append=5000")?),
-        ),
-        job(
-            "w3_lb3_r1",
-            Workload::W3(parse::<W3Args>("--appends=1000 --external-locators")?),
         ),
         job("w4_p1", Workload::W4(parse::<W4Args>("--appends=100000")?)),
         job(
@@ -163,14 +159,12 @@ pub fn nightly_suite() -> Result<Vec<Job>> {
     Ok(vec![
         job(
             "w1",
-            Workload::W1(parse::<W1Args>(
-                "--records=3000000 --zstd --restore --level=2",
-            )?),
+            Workload::W1(parse::<W1Args>("--records=3000000 --zstd --restore")?),
         ),
         job(
-            "w1_lb4",
+            "w1_hot",
             Workload::W1(parse::<W1Args>(
-                "--records=3000000 --restore --level=4 --name=w1_lb4",
+                "--records=3000000 --restore --name=w1_hot",
             )?),
         ),
         job(
@@ -230,10 +224,6 @@ pub fn nightly_suite() -> Result<Vec<Job>> {
         job("planner", Workload::Planner(parse::<PlannerArgs>("")?)),
         job("w3_r1", Workload::W3(parse::<W3Args>("--appends=100000")?)),
         job(
-            "w3_lb3_r1",
-            Workload::W3(parse::<W3Args>("--appends=100000 --external-locators")?),
-        ),
-        job(
             "w3_r5000",
             Workload::W3(parse::<W3Args>("--appends=1000 --recs-per-append=5000")?),
         ),
@@ -286,7 +276,7 @@ pub fn nightly_suite() -> Result<Vec<Job>> {
         job(
             "w6_w1",
             Workload::W1(parse::<W1Args>(
-                "--records=1000000 --retain-every=10000 --retain-keep=2000 --level=2",
+                "--records=1000000 --retain-every=10000 --retain-keep=2000",
             )?),
         ),
         job(

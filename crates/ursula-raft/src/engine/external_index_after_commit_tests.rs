@@ -1,4 +1,4 @@
-//! Raft-engine wiring for bounded-stream-state F5 at feature level 3:
+//! Raft-engine wiring for bounded-stream-state F5:
 //! external locators committed first and indexed after (the leader skips its
 //! pre-proposal page write; the offload pass indexes the committed append).
 //! The contracts (stale-entry clipping, the staged-refs bound T_ext, orphan
@@ -14,7 +14,6 @@ use ursula_runtime::ColdStore;
 use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::ExternalPayloadRef;
-use ursula_runtime::FEATURE_LEVEL_EXTERNAL_LOCATORS;
 use ursula_runtime::OffloadColdRefsRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeConfig;
@@ -39,16 +38,9 @@ fn spawn(cold_store: Arc<ColdStore>) -> ShardRuntime {
     .expect("spawn raft runtime")
 }
 
-async fn raise(runtime: &ShardRuntime, level: u32) {
-    for (_, result) in runtime.set_feature_level_all_groups(level).await {
-        result.expect("raise feature level");
-    }
-}
-
-async fn setup(level: u32, name: &str) -> (Arc<ColdStore>, ShardRuntime, BucketStreamId) {
+async fn setup(name: &str) -> (Arc<ColdStore>, ShardRuntime, BucketStreamId) {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = spawn(cold_store.clone());
-    raise(&runtime, level).await;
     let stream_id = BucketStreamId::new(BUCKET, name);
     runtime
         .create_stream(CreateStreamRequest::new(stream_id.clone(), CONTENT_TYPE))
@@ -140,8 +132,8 @@ fn offload_now() -> OffloadColdRefsRequest {
 }
 
 #[tokio::test]
-async fn level_three_writes_no_page_entry_before_a_proposal() {
-    let (cold_store, runtime, s) = setup(FEATURE_LEVEL_EXTERNAL_LOCATORS, "lb3").await;
+async fn writes_no_page_entry_before_a_proposal() {
+    let (cold_store, runtime, s) = setup("locators").await;
     let (_, ok) = append_external(&runtime, &cold_store, &s, &[b'#'; 30], Some("1")).await;
     assert!(!ok, "a regressed stream seq rejects the external append");
     assert!(page_external_entries(&cold_store, &s).await.is_empty());

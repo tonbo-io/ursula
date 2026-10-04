@@ -9,15 +9,13 @@
 //! - [`cold`]: cold-tier flush candidates, GC, retention compaction, snapshot publishing.
 //! - [`flush_planner`]: leader-side flush passes over a derived hot-stream index.
 //! - [`persist`]: snapshot / restore serialization.
-//! - [`producers`]: F3 receipt window, idle-producer expiry, F4a collapse and
-//!   `TidyStream` (feature level 1).
+//! - [`producers`]: F3 receipt window, idle-producer expiry and `TidyStream`.
 //! - [`marks`]: F1 sparse cold record marks — sealing at cold transitions and
-//!   record lookups (feature level 2).
+//!   record lookups.
 //! - [`boundaries`]: F4b message boundaries without message records — dense
-//!   record offsets or hot append starts, and the legacy conversion (feature
-//!   level 4).
+//!   record offsets or hot append starts.
 //! - [`external_locators`]: F5 state-held external payload locators and
-//!   `OffloadColdRefs` (feature level 3), plus the offload pass's query.
+//!   `OffloadColdRefs`, plus the offload pass's query.
 //! - [`hot_buffer`], [`cold_state`], [`ttl`]: internal per-stream data structures.
 //!
 //! The root keeps the [`StreamStateMachine`] type, its core slot/TTL accessors,
@@ -129,47 +127,28 @@ const TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE: usize = 256;
 /// validate the interpretation before using the derived counter.
 pub const COMMITTED_WRITE_UNIT_BYTES: u64 = 10 * 1024;
 
-/// Replicated bookkeeping per unflushed record beyond its payload, with hot
-/// blocks (F6b): a 16-byte message record plus an 8-byte dense record offset.
-/// Admission and flush thresholds count hot payload plus this much per hot
-/// record (F6c), so a window of tiny records is charged for its real memory.
-pub const HOT_RECORD_OVERHEAD_BYTES: u64 = 24;
-
-/// Per-record hot overhead from feature level 4 (F4b): message records are
-/// gone, and each hot message costs one 8-byte boundary (a dense record
-/// offset for JSON, an append start otherwise).
-pub const HOT_RECORD_OVERHEAD_BYTES_LB4: u64 = 8;
+/// Replicated bookkeeping per unflushed record beyond its payload (F4b):
+/// each hot message costs one 8-byte boundary (a dense record offset for
+/// JSON, an append start otherwise). Admission and flush thresholds count hot
+/// payload plus this much per hot record (F6c), so a window of tiny records
+/// is charged for its real memory.
+pub const HOT_RECORD_OVERHEAD_BYTES: u64 = 8;
 
 /// Hot records of one stream (F6c): messages that start at or above its
 /// first hot byte. Records of external appends that sit above hot bytes
 /// count too; they occupy the same bookkeeping until the next flush.
-fn slot_hot_records(slot: &StreamSlot, derived: bool) -> u64 {
-    let Some(hot_start) = slot.hot_buffer.first_start_offset() else {
+fn slot_hot_records(slot: &StreamSlot) -> u64 {
+    if slot.hot_buffer.first_start_offset().is_none() {
         return 0;
-    };
-    if derived {
-        return slot.derived_hot_messages();
     }
-    let below = slot
-        .message_records
-        .partition_point(|record| record.start_offset < hot_start);
-    u64::try_from(slot.message_records.len().saturating_sub(below)).unwrap_or(u64::MAX)
-}
-
-/// Payload plus per-record overhead (F6c), below feature level 4.
-pub fn hot_real_bytes(payload_bytes: u64, records: u64) -> u64 {
-    hot_real_bytes_with(payload_bytes, records, HOT_RECORD_OVERHEAD_BYTES)
-}
-
-fn hot_real_bytes_with(payload_bytes: u64, records: u64, per_record: u64) -> u64 {
-    payload_bytes.saturating_add(records.saturating_mul(per_record))
+    slot.derived_hot_messages()
 }
 
 new_key_type! {
     struct StreamKey;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StreamStateMachine {
     buckets: HashSet<String>,
     /// Permanent tenant-erasure fences. A purged bucket name can never be
@@ -200,14 +179,10 @@ pub struct StreamStateMachine {
     /// that hold hot bytes and the leader-local rotation cursor. Neither is
     /// replicated nor part of snapshots; restore rebuilds the index.
     flush_planner: flush_planner::FlushPlannerState,
-    /// Replicated group feature level (C0). Raised only by
-    /// [`StreamCommand::SetFeatureLevel`], never lowered; gated apply-time
-    /// behavior checks it through [`StreamStateMachine::require_feature_level`].
-    feature_level: u32,
     /// Largest stream `created_at_ms` this group assigned (C7, F14a/F14g).
-    /// Maintained only at feature level 1 or later, where every create
-    /// assigns `max(now_ms, last_created_at_ms + 1)`, so stream incarnations
-    /// are unique per group even under a frozen or skewed clock.
+    /// Every create assigns `max(now_ms, last_created_at_ms + 1)`, so stream
+    /// incarnations are unique per group even under a frozen or skewed
+    /// clock.
     last_created_at_ms: u64,
 }
 
@@ -216,7 +191,6 @@ struct StreamSlot {
     metadata: StreamMetadata,
     hot_buffer: HotBuffer,
     cold: StreamColdState,
-    message_records: Vec<StreamMessageRecord>,
     record_index: Option<StreamRecordIndex>,
     retained_offset: u64,
     visible_snapshot: Option<StreamVisibleSnapshot>,
@@ -227,29 +201,6 @@ struct StreamSlot {
     /// engine, not in [`StreamSnapshot`]; living in the slot makes it die with
     /// the stream on every removal path (delete, TTL expiry, bucket purge).
     append_count: u64,
-}
-
-/// Every group starts at the top level. No engine calls
-/// [`StreamStateMachine::new`]; they all build the state machine through
-/// `Default` (in-memory engines derive it, Raft groups construct it), so the
-/// level is set here rather than in `new`.
-impl Default for StreamStateMachine {
-    fn default() -> Self {
-        Self {
-            buckets: HashSet::new(),
-            erased_buckets: HashSet::new(),
-            registry: StreamRegistry::default(),
-            hot_payload_bytes: 0,
-            hot_records: 0,
-            cold_gc: ColdGcQueue::default(),
-            shared_cold_object_refs: HashMap::new(),
-            shared_cold_object_owners: HashMap::new(),
-            bucket_usage: HashMap::new(),
-            flush_planner: flush_planner::FlushPlannerState::default(),
-            feature_level: crate::feature::MAX_SUPPORTED_FEATURE_LEVEL,
-            last_created_at_ms: 0,
-        }
-    }
 }
 
 impl StreamStateMachine {
@@ -325,7 +276,7 @@ impl StreamStateMachine {
 
     fn insert_stream_slot(&mut self, mut slot: StreamSlot) -> Option<StreamKey> {
         let hot_payload_bytes = u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64");
-        let hot_records = slot_hot_records(&slot, self.derived_boundaries(&slot));
+        let hot_records = slot_hot_records(&slot);
         slot.hot_buffer.set_accounted_records(hot_records);
         let stream_id = (!slot.hot_buffer.is_empty()).then(|| slot.metadata.stream_id.clone());
         let key = self.registry.insert(slot)?;
@@ -339,15 +290,13 @@ impl StreamStateMachine {
 
     /// Re-derives one stream's membership in the flush planner's hot index
     /// and its share of the group's hot-record gauge (F6c) after its hot
-    /// buffer or message records changed.
+    /// buffer or message boundaries changed.
     fn sync_hot_index(&mut self, stream_id: &BucketStreamId) {
         let mut hot = false;
-        let records_removed = self.message_records_removed();
         if let Some(slot) = self.registry.slot_mut(stream_id) {
             hot = !slot.hot_buffer.is_empty();
             let previous = slot.hot_buffer.accounted_records();
-            let derived = records_removed && slot.message_records.is_empty();
-            let current = slot_hot_records(slot, derived);
+            let current = slot_hot_records(slot);
             slot.hot_buffer.set_accounted_records(current);
             self.hot_records = self
                 .hot_records
@@ -425,13 +374,7 @@ impl StreamStateMachine {
         usage.retained_bytes = usage.retained_bytes.saturating_sub(retained_bytes);
     }
 
-    /// This group's replicated feature level (C0).
-    pub fn feature_level(&self) -> u32 {
-        self.feature_level
-    }
-
-    /// Largest `created_at_ms` assigned by this group at feature level 1 or
-    /// later (C7).
+    /// Largest `created_at_ms` assigned by this group (C7).
     pub fn last_created_at_ms(&self) -> u64 {
         self.last_created_at_ms
     }
@@ -443,72 +386,16 @@ impl StreamStateMachine {
             .fold(floor, u64::max)
     }
 
-    /// The `created_at_ms` of a new stream incarnation (C7). At feature
-    /// level 1 or later it is `max(now_ms, last_created_at_ms + 1)`, unique
-    /// and strictly increasing per group; below it the command's `now_ms` is
-    /// used unchanged, as every earlier release does. The create records it
-    /// with [`Self::record_created_at_ms`] once the stream is inserted.
+    /// The `created_at_ms` of a new stream incarnation (C7):
+    /// `max(now_ms, last_created_at_ms + 1)`, unique and strictly increasing
+    /// per group. The create records it with [`Self::record_created_at_ms`]
+    /// once the stream is inserted.
     fn next_created_at_ms(&self, now_ms: u64) -> u64 {
-        if self.incarnation_scoped_cold_objects() {
-            now_ms.max(self.last_created_at_ms.saturating_add(1))
-        } else {
-            now_ms
-        }
+        now_ms.max(self.last_created_at_ms.saturating_add(1))
     }
 
     fn record_created_at_ms(&mut self, created_at_ms: u64) {
-        if self.incarnation_scoped_cold_objects() {
-            self.last_created_at_ms = self.last_created_at_ms.max(created_at_ms);
-        }
-    }
-
-    /// Cold state for a new incarnation created at `created_at_ms`: scoped
-    /// to its incarnation at feature level 1 or later (F14g step 2),
-    /// generation 0 below it.
-    fn new_incarnation_cold_state(&self, created_at_ms: u64) -> StreamColdState {
-        if self.incarnation_scoped_cold_objects() {
-            StreamColdState::with_generation(created_at_ms)
-        } else {
-            StreamColdState::default()
-        }
-    }
-
-    /// Whether objects of new incarnations are scoped to their incarnation
-    /// (F14g step 2, feature level 1).
-    fn incarnation_scoped_cold_objects(&self) -> bool {
-        self.feature_level >= crate::feature::FEATURE_LEVEL_KEYED_STREAMS
-    }
-
-    /// Apply-time feature gate (C0). Gated commands call this before any
-    /// mutation; below `required` the command fails deterministically on
-    /// every replica with [`StreamErrorCode::FeatureNotEnabled`], whose
-    /// plain-text message names the required level.
-    pub fn require_feature_level(
-        &self,
-        required: u32,
-        operation: &str,
-    ) -> Result<(), StreamResponse> {
-        crate::feature::check_feature_level(self.feature_level, required, operation)
-            .map_err(|message| StreamResponse::error(StreamErrorCode::FeatureNotEnabled, message))
-    }
-
-    /// Applies [`StreamCommand::SetFeatureLevel`]: `max(current, level)`.
-    /// Lower or equal levels are accepted as no-ops so replays and repeated
-    /// operator runs are idempotent.
-    fn set_feature_level(&mut self, level: u32) -> StreamResponse {
-        let previous_level = self.feature_level;
-        self.feature_level = previous_level.max(level);
-        if previous_level < crate::feature::FEATURE_LEVEL_KEYED_STREAMS
-            && self.feature_level >= crate::feature::FEATURE_LEVEL_KEYED_STREAMS
-        {
-            // C7 starts at the raise from the live streams' creation times,
-            // so the first unique incarnation follows every existing one.
-            self.last_created_at_ms = self.max_live_created_at_ms(self.last_created_at_ms);
-        }
-        StreamResponse::FeatureLevelSet {
-            level: self.feature_level,
-            previous_level,
-        }
+        self.last_created_at_ms = self.last_created_at_ms.max(created_at_ms);
     }
 
     /// Current per-bucket usage for this group, sorted for deterministic
@@ -530,7 +417,7 @@ impl StreamStateMachine {
         self.registry.refresh_ttl(stream_id);
     }
 
-    fn message_records_for_append(
+    fn message_spans_for_append(
         start_offset: u64,
         end_offset: u64,
         record_ends: &[u64],
@@ -694,12 +581,6 @@ impl StreamStateMachine {
                 digest,
                 now_ms,
             } => {
-                if let Err(response) = self.require_feature_level(
-                    crate::feature::FEATURE_LEVEL_COLD_SNAPSHOTS,
-                    "cold snapshot publish",
-                ) {
-                    return response;
-                }
                 let response = self.publish_snapshot(
                     stream_id,
                     snapshot_offset,
@@ -756,7 +637,6 @@ impl StreamStateMachine {
                 self.defer_cold_gc(seq, not_before_ms)
             }
             StreamCommand::ImportSnapshot { snapshot } => self.import_snapshot(*snapshot),
-            StreamCommand::SetFeatureLevel { level } => self.set_feature_level(level),
             StreamCommand::TidyStream { stream_id, now_ms } => self.tidy_stream(&stream_id, now_ms),
             StreamCommand::OffloadColdRefs { stream_id, refs } => {
                 self.offload_cold_refs(&stream_id, &refs)
@@ -964,13 +844,13 @@ fn snapshot_digest(content_type: &str, payload: &[u8]) -> String {
 #[cfg(test)]
 mod cold_snapshot_tests;
 #[cfg(test)]
+mod derived_boundaries_tests;
+#[cfg(test)]
+mod derived_cold_tests;
+#[cfg(test)]
 mod external_locators_tests;
 #[cfg(test)]
 mod hygiene_tests;
-#[cfg(test)]
-mod lb1_cold_tests;
-#[cfg(test)]
-mod lb4_boundaries_tests;
 #[cfg(test)]
 mod producer_window_tests;
 #[cfg(test)]

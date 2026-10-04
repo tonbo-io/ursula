@@ -39,7 +39,6 @@ use ursula_runtime::ColdIndexPageCache;
 use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::SharedSnapshotStore;
-use ursula_runtime::SnapshotEnvelope;
 use ursula_runtime::SnapshotLocation;
 use ursula_runtime::SnapshotPointer;
 use ursula_runtime::default_snapshot_store;
@@ -1213,9 +1212,6 @@ impl RaftGroupHandleRegistry {
         let pointer = SnapshotPointer::decode(&pointer_bytes).map_err(|err| {
             GroupEngineError::new(format!("decode OpenRaft snapshot pointer: {err}"))
         })?;
-        // Re-encode in the envelope the leader sent (F12a), so the installed
-        // pointer and its persisted record keep the group's envelope.
-        let envelope = SnapshotEnvelope::detect(&pointer_bytes);
         let SnapshotPointer {
             snapshot_id,
             location,
@@ -1259,7 +1255,7 @@ impl RaftGroupHandleRegistry {
             snapshot_install: self.snapshot_install.clone(),
             cache_key,
         };
-        let pointer_bytes = envelope.encode(&pointer).map_err(|err| {
+        let pointer_bytes = pointer.encode_binary().map_err(|err| {
             GroupEngineError::new(format!(
                 "encode prefetched OpenRaft snapshot pointer: {err}"
             ))

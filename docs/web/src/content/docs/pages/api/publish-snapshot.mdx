@@ -24,7 +24,7 @@ For JSON streams, `PUT /{bucket}/{stream}/snapshot?record={record}` resolves a s
 </ParamField>
 
 <ParamField body="body" type="binary" required>
- The snapshot blob bytes. Bodies of up to **32 MiB** are stored inline in the stream's replicated state. On a node with a cold backend whose group is at [feature level 5](/docs/operations#feature-levels), a body of at least `runtime.external_payload_min_size` (1 MiB by default) is streamed into the cold tier instead, and bodies of up to **1 GiB** are accepted. Larger bodies return `413`.
+ The snapshot blob bytes. Bodies of up to **32 MiB** are stored inline in the stream's replicated state. On a node with a cold backend, a body of at least `runtime.external_payload_min_size` (1 MiB by default) is streamed into the cold tier instead, and bodies of up to **1 GiB** are accepted. Larger bodies return `413`.
 </ParamField>
 
 ## Response

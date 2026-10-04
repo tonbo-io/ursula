@@ -6,7 +6,6 @@ use std::sync::Arc;
 use ursula_shard::BucketStreamId;
 use ursula_stream::ColdChunkRef;
 use ursula_stream::ExternalPayloadRef;
-use ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
 
 use crate::AppendExternalRequest;
 use crate::AppendRequest;
@@ -33,15 +32,6 @@ fn spawn(cold_store: Arc<ColdStore>) -> ShardRuntime {
         Some(cold_store),
     )
     .expect("spawn runtime")
-}
-
-async fn raise_to_level_one(runtime: &ShardRuntime) {
-    for (group, result) in runtime
-        .set_feature_level_all_groups(FEATURE_LEVEL_KEYED_STREAMS)
-        .await
-    {
-        result.unwrap_or_else(|err| panic!("raise group {group:?}: {err}"));
-    }
 }
 
 async fn create(runtime: &ShardRuntime, stream: &BucketStreamId) {
@@ -190,7 +180,6 @@ async fn d4_recreate_with_gc_pending_keeps_new_incarnation_objects() {
 async fn incarnation_scoped_recreate_reads_its_own_pages_and_gc_reclaims_the_old_incarnation() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = spawn(cold_store.clone());
-    raise_to_level_one(&runtime).await;
     let stream = BucketStreamId::new("d4-bucket", "scoped");
 
     create(&runtime, &stream).await;
@@ -247,7 +236,6 @@ async fn incarnation_scoped_recreate_reads_its_own_pages_and_gc_reclaims_the_old
 async fn incarnation_scoped_stream_gc_reclaims_external_payloads() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = spawn(cold_store.clone());
-    raise_to_level_one(&runtime).await;
     let stream = BucketStreamId::new("d4-bucket", "external");
 
     let stage = |payload: &'static [u8]| {
