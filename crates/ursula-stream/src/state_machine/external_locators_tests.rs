@@ -1,11 +1,9 @@
 //! Bounded-state F5 (feature level 3): external payload locators committed
-//! in state at apply and removed by `OffloadColdRefs`. Each test pins the
-//! level-1 behavior next to the level-3 one, because below level 3 apply must
-//! stay what older binaries apply.
+//! in state at apply and removed by `OffloadColdRefs`. Since format epoch 2
+//! every group runs at the top level, so the below-level-3 halves are gone.
 
 use super::*;
 use crate::feature::FEATURE_LEVEL_EXTERNAL_LOCATORS;
-use crate::feature::FEATURE_LEVEL_KEYED_STREAMS;
 
 const BUCKET: &str = "f5locators";
 const OCTET: &str = "application/octet-stream";
@@ -110,14 +108,7 @@ fn offload(machine: &mut StreamStateMachine, refs: Vec<ObjectPayloadRef>) -> Str
 }
 
 #[test]
-fn external_append_keeps_its_locator_in_state_only_at_level_three() {
-    let mut legacy = machine_at(FEATURE_LEVEL_KEYED_STREAMS);
-    append_external(&mut legacy, "s/external/a.bin", 10);
-    assert!(
-        legacy.external_segments(&stream("s")).is_empty(),
-        "below level 3 the page entry written before proposing is the only locator"
-    );
-
+fn external_append_keeps_its_locator_in_state() {
     let mut machine = machine_at(FEATURE_LEVEL_EXTERNAL_LOCATORS);
     append_external(&mut machine, "s/external/a.bin", 10);
     assert_eq!(machine.external_segments(&stream("s")), &[object(
@@ -208,17 +199,7 @@ fn offload_removes_exactly_the_listed_refs_and_is_idempotent() {
 }
 
 #[test]
-fn offload_is_refused_below_level_three_and_for_missing_streams() {
-    let mut legacy = machine_at(FEATURE_LEVEL_KEYED_STREAMS);
-    let response = offload(&mut legacy, vec![object(0, 1, "x")]);
-    assert!(
-        matches!(response, StreamResponse::Error {
-            code: StreamErrorCode::FeatureNotEnabled,
-            ..
-        }),
-        "{response:?}"
-    );
-
+fn offload_is_refused_for_missing_streams() {
     let mut machine = machine_at(FEATURE_LEVEL_EXTERNAL_LOCATORS);
     let response = machine.apply(StreamCommand::OffloadColdRefs {
         stream_id: stream("missing"),
@@ -236,15 +217,6 @@ fn offload_is_refused_below_level_three_and_for_missing_streams() {
 #[test]
 fn candidates_follow_the_count_bound_and_the_due_predicate() {
     let never_due = |_: &ObjectPayloadRef| false;
-    let mut legacy = machine_at(FEATURE_LEVEL_KEYED_STREAMS);
-    append_external(&mut legacy, "s/external/a.bin", 10);
-    assert!(
-        legacy
-            .staged_external_ref_candidates(0, &|_| true, 8)
-            .is_empty(),
-        "below level 3 there is nothing to offload"
-    );
-
     let mut machine = machine_at(FEATURE_LEVEL_EXTERNAL_LOCATORS);
     for index in 0..MAX_STAGED_EXTERNAL_REFS {
         append_external(&mut machine, &format!("s/external/{index:02}.bin"), 4);
@@ -320,7 +292,7 @@ fn level_three_snapshot_with_staged_locators_round_trips() {
     append_external(&mut machine, "s/external/b.bin", 6);
     let snapshot = machine.snapshot();
     let mut restored = StreamStateMachine::restore(snapshot.clone()).expect("restore level 3");
-    assert_eq!(restored.feature_level(), FEATURE_LEVEL_EXTERNAL_LOCATORS);
+    assert_eq!(restored.feature_level(), crate::MAX_SUPPORTED_FEATURE_LEVEL);
     assert_eq!(restored.snapshot(), snapshot);
     assert_eq!(restored.external_segments(&stream("s")), &[
         object(4, 14, "s/external/a.bin"),

@@ -33,12 +33,15 @@ use serde::Serialize;
 use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamStateMachine;
 
-pub const BACKUP_FORMAT_VERSION: u32 = 1;
+/// The backup format is the format epoch. A 0.5.x ursulactl refuses this
+/// version through its own check; this tool refuses 0.5.x backups and
+/// clusters (E9).
+pub const BACKUP_FORMAT_VERSION: u32 = ursula_stream::FORMAT_EPOCH;
 const MANIFEST_OBJECT: &str = "manifest.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupManifest {
-    /// Backup format, versioned independently from the server binary.
+    /// Backup format: the format epoch of the cluster that wrote it.
     pub format_version: u32,
     /// Caller-supplied wall-clock creation time (unix milliseconds).
     pub created_unix_ms: u64,
@@ -111,6 +114,26 @@ impl BackupStore {
 
 fn group_object_name(raft_group_id: u32) -> String {
     format!("group-{raft_group_id:04}.snapshot")
+}
+
+fn e9_epoch_only() -> String {
+    format!(
+        "this ursulactl reads and writes format epoch {BACKUP_FORMAT_VERSION} only (Ursula 0.5.x \
+         backups and clusters cannot be mixed with 0.6)"
+    )
+}
+
+/// E9: the target cluster must speak this tool's backup format (the format
+/// epoch), checked before the first export or import.
+fn check_cluster_format(info: &BackupInfo) -> Result<()> {
+    if info.format_version != BACKUP_FORMAT_VERSION {
+        bail!(
+            "target cluster speaks backup format {}; {}",
+            info.format_version,
+            e9_epoch_only()
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,13 +276,7 @@ pub async fn create(
     created_unix_ms: u64,
 ) -> Result<BackupManifest> {
     let info = client.info().await?;
-    if info.format_version != BACKUP_FORMAT_VERSION {
-        bail!(
-            "cluster speaks backup format {}, this tool supports {}",
-            info.format_version,
-            BACKUP_FORMAT_VERSION
-        );
-    }
+    check_cluster_format(&info)?;
     let mut groups = Vec::with_capacity(info.raft_group_count as usize);
     for raft_group_id in 0..info.raft_group_count {
         let (body, group_commit_index) = client.export_group(raft_group_id).await?;
@@ -304,11 +321,11 @@ pub async fn verify(store: &BackupStore) -> Result<VerifyReport> {
     let manifest_bytes = store.read(MANIFEST_OBJECT).await?;
     let manifest: BackupManifest =
         serde_json::from_slice(&manifest_bytes).context("decode manifest")?;
-    if manifest.format_version > BACKUP_FORMAT_VERSION {
+    if manifest.format_version != BACKUP_FORMAT_VERSION {
         bail!(
-            "backup format {} is newer than this tool supports ({})",
+            "backup manifest format_version {}; {}",
             manifest.format_version,
-            BACKUP_FORMAT_VERSION
+            e9_epoch_only()
         );
     }
     let expected = u32::try_from(manifest.groups.len()).unwrap_or(u32::MAX);
@@ -372,6 +389,8 @@ pub async fn restore(client: &BackupClient, store: &BackupStore) -> Result<Verif
     // whole backup first and fails closed before the first import.
     let report = verify(store).await?;
     let info = client.info().await?;
+    // E9: never push epoch-2 snapshots into a cluster of another epoch.
+    check_cluster_format(&info)?;
     let manifest_bytes = store.read(MANIFEST_OBJECT).await?;
     let manifest: BackupManifest =
         serde_json::from_slice(&manifest_bytes).context("decode manifest")?;
@@ -473,9 +492,9 @@ mod tests {
         let err = verify(&store).await.expect_err("corrupt checksum rejected");
         assert!(err.to_string().contains("checksum"), "{err}");
 
-        // Future format version.
+        // E9: a manifest of another format epoch (Ursula 0.5.x).
         let mut manifest = manifest_for(&[(0, &body)]);
-        manifest.format_version = BACKUP_FORMAT_VERSION + 1;
+        manifest.format_version = BACKUP_FORMAT_VERSION - 1;
         store
             .write(
                 MANIFEST_OBJECT,
@@ -483,7 +502,74 @@ mod tests {
             )
             .await
             .expect("write manifest");
-        let err = verify(&store).await.expect_err("future format rejected");
-        assert!(err.to_string().contains("newer"), "{err}");
+        let err = verify(&store).await.expect_err("epoch-1 manifest rejected");
+        assert!(err.to_string().contains("format epoch 2 only"), "{err}");
+    }
+
+    /// E9: restore checks the target's format before the first import, so a
+    /// 0.6 ursulactl never pushes epoch-2 snapshots into a 0.5.x cluster.
+    #[tokio::test]
+    async fn restore_refuses_a_cluster_of_another_format_before_any_import() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::get;
+        use axum::routing::post;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_in(dir.path()).await;
+        let body = snapshot_bytes(vec!["tenant-a".to_owned()]);
+        store
+            .write(&group_object_name(0), body.clone())
+            .await
+            .expect("write group");
+        let manifest = manifest_for(&[(0, &body)]);
+        store
+            .write(
+                MANIFEST_OBJECT,
+                serde_json::to_vec(&manifest).expect("encode"),
+            )
+            .await
+            .expect("write manifest");
+
+        let imports = Arc::new(AtomicUsize::new(0));
+        let counted = imports.clone();
+        let app = Router::new()
+            .route(
+                "/__ursula/backup/info",
+                get(|| async {
+                    Json(serde_json::json!({"format_version": 1, "raft_group_count": 1}))
+                }),
+            )
+            .route(
+                "/__ursula/backup/group/{group}/import",
+                post(move || {
+                    let counted = counted.clone();
+                    async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        "ok"
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            BackupClient::new(reqwest::Client::new(), vec![format!("http://{address}")]).unwrap();
+
+        let err = restore(&client, &store)
+            .await
+            .expect_err("a format-1 cluster is refused");
+        assert!(
+            err.to_string()
+                .contains("target cluster speaks backup format 1"),
+            "{err}"
+        );
+        assert_eq!(imports.load(Ordering::SeqCst), 0);
     }
 }

@@ -40,25 +40,25 @@ fn tiny_workloads_produce_metrics_and_checks() {
     .run(&dir, false)
     .expect("w1");
     assert_eq!(w1.metrics["records"], 4000.0);
-    assert_eq!(w1.metrics["dense_entries"], 4000.0);
     assert!(
         w1.metrics["heap_bytes"] > 0.0,
         "counting allocator installed"
     );
-    // The dense index keeps every record today (F1 not built).
-    assert!(!check_met(&w1, "f1_dense_entries_eq_unflushed"));
-    assert!(!check_met(&w1, "residual_growth_n_to_4n"));
+    // F1 (every group at the top level): flushed records seal into sparse
+    // marks, so the dense index keeps only the unflushed ones.
+    assert!(w1.metrics["dense_entries"] < 4000.0);
+    assert!(check_met(&w1, "f1_dense_entries_eq_unflushed"));
     assert!(dir.join("w1_inline.jsonl").exists());
 
     let w3 = Workload::W3(parse::<W3Args>("--appends=20 --recs-per-append=10"))
         .run(&dir, false)
         .expect("w3");
-    // F4a (level 1): external appends collapse the cold message records.
-    assert_eq!(w3.metrics["message_records"], 1.0);
+    // F4b: the top level keeps no message records.
+    assert_eq!(w3.metrics["message_records"], 0.0);
     assert!(check_met(&w3, "f4_message_records_per_stream"));
     assert!(check_met(&w3, "f5_staged_external_refs_per_stream"));
 
-    // F5 (level 3): locators stay in state until the modeled offload pass
+    // F5: locators stay in state until the modeled offload pass
     // moves them into pages; never more than T_ext = 16 per stream.
     let w3_lb3 = Workload::W3(parse::<W3Args>("--appends=60 --external-locators"))
         .run(&dir, false)
@@ -71,7 +71,7 @@ fn tiny_workloads_produce_metrics_and_checks() {
     let w4 = Workload::W4(parse::<W4Args>("--appends=2000 --checkpoints=2000"))
         .run(&dir, false)
         .expect("w4");
-    // F3 (level 1): the receipt window keeps 1,024 items.
+    // F3: the receipt window keeps 1,024 items.
     assert_eq!(w4.metrics["receipts"], 1024.0);
     assert!(check_met(&w4, "f3_receipt_items_per_stream"));
 

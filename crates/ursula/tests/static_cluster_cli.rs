@@ -717,120 +717,6 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
     std::fs::remove_dir_all(&root).expect("remove temp root");
 }
 
-/// Feature levels (C0) end to end: `ursulactl cluster enable-feature` against a
-/// real three-node gRPC Raft cluster raises every group's level through each
-/// group's leader and verifies every replica.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cli_static_cluster_enable_feature_raises_every_group_replica() {
-    let _guard = static_cluster_cli_test_guard().await;
-    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
-        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping enable-feature test");
-        return;
-    };
-    let ports = [free_port(), free_port(), free_port()];
-    let peers: Vec<(u64, String)> = ports
-        .iter()
-        .enumerate()
-        .map(|(index, port)| {
-            (
-                u64::try_from(index + 1).expect("node id fits u64"),
-                format!("http://127.0.0.1:{port}"),
-            )
-        })
-        .collect();
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after unix epoch")
-        .as_nanos();
-    let mut children = Vec::new();
-    let mut nodes = Vec::new();
-    // Start followers first, then the node that initializes membership.
-    for index in [1usize, 2, 0] {
-        let (node_id, base_url) = &peers[index];
-        let config_path = std::env::temp_dir().join(format!(
-            "ursula-feature-node-{node_id}-{}-{stamp}.toml",
-            ports[index]
-        ));
-        let admin_port = write_node_toml(
-            &config_path,
-            ports[index],
-            *node_id,
-            4,
-            &peers,
-            index == 0,
-            "memory",
-            None,
-            "memory",
-            None,
-        );
-        let mut command = Command::new(binary);
-        command.arg("server").arg("--config").arg(&config_path);
-        let mut child = spawn_child(command, format!("feature-node-{node_id}-{}", ports[index]));
-        child.config_path = Some(config_path);
-        children.push(child);
-        nodes.push(ursula_ctl::NodeInfo {
-            id: *node_id,
-            admin_url: url::Url::parse(&format!("http://127.0.0.1:{admin_port}"))
-                .expect("admin url"),
-            host: "127.0.0.1".to_owned(),
-            http_url: Some(url::Url::parse(base_url).expect("client url")),
-        });
-    }
-    nodes.sort_by_key(|node| node.id);
-
-    let client = reqwest::Client::new();
-    for (_, base_url) in &peers {
-        wait_until_ready(&client, base_url, &mut children).await;
-    }
-    // Every group must have elected a leader before proposals can land.
-    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client");
-    ursula_ctl::wait_ready(
-        &ctl,
-        &nodes,
-        4,
-        Duration::from_secs(60),
-        Duration::from_millis(200),
-    )
-    .await
-    .expect("cluster ready");
-
-    // A level above what the binaries support is refused before proposing.
-    let refused = ursula_ctl::enable_feature(&ctl, &nodes, &ursula_ctl::EnableFeatureOptions {
-        level: ursula_runtime::MAX_SUPPORTED_FEATURE_LEVEL + 1,
-        timeout: Duration::from_secs(5),
-        poll_interval: Duration::from_millis(200),
-    })
-    .await
-    .expect_err("unsupported level refused");
-    assert!(refused.to_string().contains("refusing"), "{refused:#}");
-
-    let outcome = ursula_ctl::enable_feature(&ctl, &nodes, &ursula_ctl::EnableFeatureOptions {
-        level: 1,
-        timeout: Duration::from_secs(60),
-        poll_interval: Duration::from_millis(200),
-    })
-    .await
-    .expect("enable feature level 1");
-    assert_eq!(outcome.level, 1);
-    assert_eq!(outcome.groups, 4);
-    assert_eq!(outcome.nodes, 3);
-
-    for node in &nodes {
-        let report = ctl
-            .feature_level_report(node)
-            .await
-            .expect("feature report")
-            .expect("endpoint present");
-        assert_eq!(report.groups.len(), 4);
-        assert!(
-            report.groups.iter().all(|group| group.level == Some(1)),
-            "node {} report {report:?}",
-            node.id
-        );
-    }
-    drop(children);
-}
-
 async fn static_cluster_cli_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
     // These tests spawn real Ursula clusters on localhost. Keep them serial so
     // small CI runners do not race several multi-process clusters at once, and
@@ -965,6 +851,11 @@ gc_interval = "1s"
                 let escaped = toml::Value::String(value).to_string();
                 writeln!(config, "{key} = {escaped}").unwrap();
             }
+        }
+        // MinIO without a KMS rejects the default SSE-S3 header.
+        if let Ok(value) = std::env::var("URSULA_COLD_S3_SSE") {
+            let escaped = toml::Value::String(value).to_string();
+            writeln!(config, "server_side_encryption = {escaped}").unwrap();
         }
     }
 

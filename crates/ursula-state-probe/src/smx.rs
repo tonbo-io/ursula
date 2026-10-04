@@ -258,10 +258,18 @@ pub fn checkpoint_and_retain(
     checkpoint: &[u8],
     now_ms: u64,
 ) -> Result<()> {
-    let offset = m
-        .offset_for_record(id, record)
+    // F1 (every group runs at the top level): a sealed target resolves to
+    // the record mark at or below it, an exact record start. The server
+    // would scan one cold block for the exact offset; the model retains
+    // conservatively from the mark instead.
+    let offset = match m
+        .locate_record(id, record)
         .map_err(|err| anyhow::anyhow!("record index: {err:?}"))?
-        .context("not a JSON stream")?;
+        .context("not a JSON stream")?
+    {
+        ursula_stream::RecordOffset::Exact(offset) => offset,
+        ursula_stream::RecordOffset::Bracket(bracket) => bracket.from_offset,
+    };
     ok(
         m.apply(StreamCommand::PublishSnapshot {
             stream_id: id.clone(),

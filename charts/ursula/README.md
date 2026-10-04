@@ -293,6 +293,13 @@ plus `snapshotStore.prefix`.
 
 ## Upgrade Limitations
 
+Ursula 0.6 (format epoch 2) cannot upgrade a 0.5.x release in place. Install it
+fresh: `helm uninstall`, delete the PVCs, and install with a new `s3.prefix`
+(and, with cold storage off and S3 snapshots, a new `snapshotStore.prefix`).
+`helm upgrade` from 0.5.x stalls at the first new pod, which exits at startup
+or reports not ready, so no second voter is replaced; recover with
+`helm rollback`. See the operations guide's "Upgrading to 0.6".
+
 Until the operator exists, Kubernetes StatefulSet rolling updates do not
 transfer leaders, coordinate applied-index catch-up, or mutate Raft membership.
 Use `ursulactl restart` manually for drain-aware rolling restarts when you need
@@ -357,7 +364,7 @@ operationally safe restarts on an initialized cluster.
 | `server.podSecurityContext` | `{fsGroup: 10001, fsGroupChangePolicy: OnRootMismatch}` | Pod-level securityContext for Ursula server pods. |
 | `server.securityContext` | `{runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}` | Container-level securityContext for the Ursula server container. |
 | `server.probes.startup` | `{enabled: true, failureThreshold: 180, periodSeconds: 5, timeoutSeconds: 2}` | TCP startup probe. The 15-minute budget allows S3 snapshot restore before Kubernetes enables liveness checks. |
-| `server.probes.readiness` | `{enabled: true, periodSeconds: 5, timeoutSeconds: 2}` | HTTP `GET /__ursula/ready` probe. It removes the pod from service while the disk-WAL free-space guard is active. |
+| `server.probes.readiness` | `{enabled: true, periodSeconds: 5, timeoutSeconds: 2}` | HTTP `GET /__ursula/ready` probe. It removes the pod from service while the disk-WAL free-space guard is active, or after a Raft protocol (format-epoch) mismatch with a peer until the pod restarts (`format_epoch_mismatch`). |
 | `server.probes.liveness` | `{enabled: true, periodSeconds: 10, timeoutSeconds: 2}` | TCP liveness probe enabled after startup succeeds. |
 | `server.podDisruptionBudget.enabled` | `true` | Render a PDB for multi-node clusters. The chart omits the PDB when `server.replicaCount=1`. |
 | `server.podDisruptionBudget.maxUnavailable` | `1` | Maximum voluntary disruptions. The template fails if this value would allow loss of Raft quorum. |

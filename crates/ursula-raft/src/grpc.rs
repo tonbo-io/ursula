@@ -53,6 +53,9 @@ use crate::codec::encode_wire;
 use crate::codec::placement_from_parts;
 use crate::codec::required;
 use crate::engine::RaftGroupEngine;
+use crate::format_epoch::PROTOCOL_MISMATCH_TEXT;
+use crate::format_epoch::observe_outbound_status;
+use crate::format_epoch::record_format_epoch_mismatch;
 use crate::forward::write_commands_on_raft;
 use crate::raft_internal_proto;
 use crate::types::UrsulaAppendEntriesRequest;
@@ -371,7 +374,10 @@ pub const RAFT_GRPC_GROUP_WRITE_PATH: &str = "/ursula.raft.v1.RaftInternal/Group
 pub const RAFT_GRPC_GROUP_READ_PATH: &str = "/ursula.raft.v1.RaftInternal/GroupRead";
 pub const RAFT_GRPC_TRANSFER_LEADER_PATH: &str = "/ursula.raft.v1.RaftInternal/TransferLeader";
 pub const RAFT_GRPC_MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
-pub(crate) const RAFT_GRPC_PROTOCOL_VERSION: u32 = 1;
+/// The Raft gRPC protocol version is the format epoch: Ursula 0.5.x speaks
+/// protocol 1 and refuses this one with its own check, and this binary refuses
+/// theirs.
+pub(crate) const RAFT_GRPC_PROTOCOL_VERSION: u32 = ursula_stream::FORMAT_EPOCH;
 const RAFT_GRPC_APPEND_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const RAFT_GRPC_APPEND_STREAM_MAX_BATCH_ITEMS: usize = 32;
 /// Leader side, per peer: bytes of Append calls queued (not yet taken by the HTTP/2 encoder).
@@ -680,6 +686,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         span.set_parent(crate::telemetry::extract_parent_context(request.metadata()));
         async move {
             let request = request.into_inner();
+            validate_grpc_metadata(request.protocol_version)?;
             let placement = placement_from_parts(
                 request.core_id,
                 request.shard_id,
@@ -758,6 +765,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         span.set_parent(crate::telemetry::extract_parent_context(request.metadata()));
         async move {
             let request = request.into_inner();
+            validate_grpc_metadata(request.protocol_version)?;
             let placement = placement_from_parts(
                 request.core_id,
                 request.shard_id,
@@ -907,10 +915,15 @@ pub(crate) fn validate_raft_rpc_preamble(
 
 pub(crate) fn validate_grpc_metadata(protocol_version: u32) -> Result<(), GrpcRpcError> {
     if protocol_version != RAFT_GRPC_PROTOCOL_VERSION {
-        return Err(GrpcRpcError::failed_precondition(format!(
-            "raft grpc protocol mismatch: local={}, remote={protocol_version}",
-            RAFT_GRPC_PROTOCOL_VERSION
-        )));
+        // E8 at runtime. A sender before format epoch 2 omits the field on
+        // GroupWrite/GroupRead, so it reads as 0 here.
+        let message = format!(
+            "{PROTOCOL_MISMATCH_TEXT}: local={RAFT_GRPC_PROTOCOL_VERSION}, \
+             remote={protocol_version} (format epochs differ; an Ursula 0.6 node cannot join a \
+             0.5.x cluster)"
+        );
+        record_format_epoch_mismatch("inbound", &message);
+        return Err(GrpcRpcError::failed_precondition(message));
     }
     Ok(())
 }
@@ -1085,6 +1098,7 @@ impl GrpcRaftNetwork {
         route: &str,
         status: tonic::Status,
     ) -> RPCError<UrsulaRaftTypeConfig> {
+        observe_outbound_status(route, &status);
         let message = format!(
             "{route} to node {} at {} failed: {}",
             self.target, self.endpoint, status

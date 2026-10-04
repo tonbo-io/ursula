@@ -3,12 +3,12 @@
 //! into K records. `--inline-every=N` adds one small inline append plus a flush
 //! pass every N external appends. `--retain-every=N` (W6): checkpoint and
 //! retention every N external appends, keeping the last `--retain-keep` records.
-//! Runs at feature level 2: external appends collapse message records below
-//! the seal point (F4a, level 1) and seal their records into sparse marks
-//! (F1). `--external-locators` runs at feature level 3 instead (F5): each
-//! external append keeps its locator in state, and the workload models the
+//! Runs at the top feature level, like every group since format epoch 2:
+//! external appends seal their records into sparse marks (F1), and each
+//! external append keeps its locator in state (F5). The workload models the
 //! leader's offload pass after every append, offloading a stream's staged refs
 //! once it holds more than T_ext = 16 or one is 10 s old.
+//! `--external-locators` also reports the staged-ref maximum and its check.
 
 use std::collections::HashMap;
 
@@ -50,7 +50,8 @@ pub struct W3Args {
     pub checkpoints: Vec<u64>,
     #[arg(long)]
     pub zstd: bool,
-    /// Run at feature level 3 (F5) and model the offload pass.
+    /// Report the F5 staged-ref maximum and its check (the offload pass
+    /// always runs).
     #[arg(long)]
     pub external_locators: bool,
     #[arg(long)]
@@ -94,12 +95,6 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
     let mut rng = payload::Rng::new(5);
     let base = Baseline::now();
     let mut m = StreamStateMachine::new();
-    let level = if args.external_locators {
-        ursula_stream::FEATURE_LEVEL_EXTERNAL_LOCATORS
-    } else {
-        ursula_stream::FEATURE_LEVEL_SPARSE_MARKS
-    };
-    smx::raise_feature_level(&mut m, level)?;
     let mut staged_at: HashMap<String, u64> = HashMap::new();
     let mut max_staged = 0_u64;
     let mut offloads = 0_u64;
@@ -121,13 +116,11 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
                 smx::append_external(&mut m, &id, payload_bytes, ends.clone(), now),
                 "append external",
             )?;
-            if args.external_locators {
-                for object in m.external_segments(&id) {
-                    staged_at.entry(object.s3_path.clone()).or_insert(now);
-                }
-                max_staged = max_staged.max(m.external_segments(&id).len() as u64);
-                offloads += offload_pass(&mut m, &mut staged_at, now)?;
+            for object in m.external_segments(&id) {
+                staged_at.entry(object.s3_path.clone()).or_insert(now);
             }
+            max_staged = max_staged.max(m.external_segments(&id).len() as u64);
+            offloads += offload_pass(&mut m, &mut staged_at, now)?;
             n += 1;
             records += recs;
             if args.inline_every > 0 && n.is_multiple_of(args.inline_every) {

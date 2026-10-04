@@ -169,10 +169,9 @@ async fn d1_runtime_reads_and_installs_external_above_a_flushed_hot_prefix() {
         .iter()
         .find(|entry| entry.metadata.stream_id == stream)
         .expect("snapshot entry");
-    assert_eq!(
-        entry.cold_frontier_offset, 2,
-        "replicated frontier still regresses"
-    );
+    // F5: with the external's locator in state the flush no longer
+    // regresses the replicated frontier below the external.
+    assert_eq!(entry.cold_frontier_offset, 5);
 
     let target = spawn_with_cold_store(cold_store);
     target
@@ -273,93 +272,6 @@ async fn d3_flush_clips_the_page_entry_of_a_rejected_external_append() {
         .await
         .expect("read cold history");
     assert_eq!(read.payload, b"abcdefghWXYZ");
-}
-
-/// D3: a rejected external append and a committed external append at the
-/// same start leave two page entries; the earlier (rejected) one used to win
-/// reads. Page repair keeps only the last-written entry at each start and
-/// reports what it dropped; a second pass finds nothing to do.
-#[tokio::test]
-async fn d3_repair_keeps_the_last_written_external_entry_at_each_start() {
-    let cold_store = memory_cold_store();
-    let runtime = spawn_with_cold_store(cold_store.clone());
-    let stream = BucketStreamId::new("benchcmp", "d3-repair");
-    runtime
-        .create_stream(CreateStreamRequest::new(
-            stream.clone(),
-            DEFAULT_CONTENT_TYPE,
-        ))
-        .await
-        .expect("create stream");
-    runtime
-        .append(append_req(&stream, b"ab", Some("5")))
-        .await
-        .expect("append with stream seq");
-    stage(
-        &cold_store,
-        "benchcmp/d3-repair/external/rejected.bin",
-        b"0123456789",
-    )
-    .await;
-    runtime
-        .append_external(append_external_req(
-            &stream,
-            "benchcmp/d3-repair/external/rejected.bin",
-            10,
-            Some("1"),
-        ))
-        .await
-        .expect_err("a regressed stream seq rejects the external append");
-    stage(&cold_store, "benchcmp/d3-repair/external/live.bin", b"WXYZ").await;
-    runtime
-        .append_external(append_external_req(
-            &stream,
-            "benchcmp/d3-repair/external/live.bin",
-            4,
-            None,
-        ))
-        .await
-        .expect("append external");
-    runtime
-        .flush_cold_once(PlanColdFlushRequest {
-            stream_id: stream.clone(),
-            min_hot_bytes: 1,
-            max_flush_bytes: 1024,
-        })
-        .await
-        .expect("flush hot prefix")
-        .expect("a flush candidate exists");
-
-    let group = runtime.locate(&stream).raft_group_id;
-    let step = runtime
-        .repair_cold_index_group_once(group, 16)
-        .await
-        .expect("repair step");
-    assert!(step.cycle_completed);
-    assert_eq!(step.report.streams_scanned, 1);
-    assert_eq!(step.report.pages_scanned, 1);
-    assert_eq!(step.report.pages_rewritten, 1);
-    assert_eq!(step.report.superseded_entries_dropped, 1);
-    assert_eq!(step.report.entries_dropped(), 1);
-    assert!(
-        runtime
-            .cold_index_repair_last_full_cycle_ms(group)
-            .is_some()
-    );
-
-    let read = runtime
-        .read_stream(read_req(stream.clone(), 0, 64))
-        .await
-        .expect("read cold history");
-    assert_eq!(read.payload, b"abWXYZ");
-
-    let again = runtime
-        .repair_cold_index_group_once(group, 16)
-        .await
-        .expect("second repair step");
-    assert_eq!(again.report.pages_scanned, 1);
-    assert_eq!(again.report.pages_rewritten, 0);
-    assert_eq!(again.report.entries_dropped(), 0);
 }
 
 /// The repair cursor walks a group in bounded steps and completes a cycle
@@ -605,17 +517,8 @@ async fn f14b_cold_gc_continues_past_a_failing_group() {
             .await
             .expect("list failing prefix")
     );
-    cold_store.clear_fault_policy();
-    runtime
-        .run_cold_gc_all_groups_once(256)
-        .await
-        .expect("gc after the fault clears");
-    assert!(
-        cold_store
-            .prefix_is_empty(&crate::cold_store::cold_chunk_prefix(&failing))
-            .await
-            .expect("list failing prefix")
-    );
+    // F14b: the failing entry is deferred with a backoff instead of being
+    // retried on the next pass; `cold_gc_hygiene_tests` covers the backoff.
 }
 
 /// F14e: the chunk of a definitely rejected (stale) flush is deleted, and
@@ -861,7 +764,8 @@ async fn retention_gc_never_touches_the_boundary_page() {
     let page = ColdStoreColdIndexPageStore::new(cold_store.clone())
         .get_page(&ColdIndexPageKey {
             stream_id: stream.clone(),
-            generation: 0,
+            // C7/F14g: the group's first incarnation is `created_at_ms` 1.
+            generation: 1,
             page_id: 0,
         })
         .await

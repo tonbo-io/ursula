@@ -23,6 +23,7 @@ use crate::codec::decode_wire;
 use crate::codec::encode_wire;
 use crate::grpc::GRPC_LEADER_CHANNELS;
 use crate::grpc::RAFT_GRPC_MAX_MESSAGE_BYTES;
+use crate::grpc::RAFT_GRPC_PROTOCOL_VERSION;
 use crate::grpc::RaftClient;
 use crate::raft_internal_proto;
 use crate::state_machine::RaftGroupStateMachine;
@@ -148,6 +149,7 @@ pub(crate) async fn forward_group_read_to_leader(
         stream_id: stream_id.stream_id,
         now_ms,
         read: Some(read),
+        protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
     });
     // Carry this request's trace context to the leader so the forwarded read
     // joins the originating trace. No-op when no propagator is installed.
@@ -156,7 +158,10 @@ pub(crate) async fn forward_group_read_to_leader(
         .group_read(grpc_request)
         .await
         .map(|response| response.into_inner())
-        .map_err(|err| GroupEngineError::new(format!("forward group read to leader: {err}")))
+        .map_err(|err| {
+            crate::format_epoch::observe_outbound_status("GroupRead", &err);
+            GroupEngineError::new(format!("forward group read to leader: {err}"))
+        })
 }
 
 /// Forward the cluster-wide administrative bucket purge to the known
@@ -180,12 +185,16 @@ pub(crate) async fn forward_purge_bucket_to_leader(
         command_payloads: vec![encode_wire(&GroupWriteCommand::Stream(
             ursula_stream::StreamCommand::PurgeBucket { bucket_id },
         ))],
+        protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
     });
     crate::telemetry::inject_current_context(grpc_request.metadata_mut());
     let response = client
         .group_write(grpc_request)
         .await
-        .map_err(|err| GroupEngineError::new(format!("forward group write to leader: {err}")))?
+        .map_err(|err| {
+            crate::format_epoch::observe_outbound_status("GroupWrite", &err);
+            GroupEngineError::new(format!("forward group write to leader: {err}"))
+        })?
         .into_inner();
     let mut results = response.results.into_iter();
     let result = results

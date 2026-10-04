@@ -283,7 +283,8 @@ pub fn measure(snapshot: GroupSnapshot, with_zstd: bool) -> Result<SnapStats> {
                 st.cold_gc_frames += 1;
                 st.cold_gc_bytes += len;
             }
-            proto::snapshot_frame_v1::Frame::Footer(_) => {}
+            proto::snapshot_frame_v1::Frame::FormatEpoch(_)
+            | proto::snapshot_frame_v1::Frame::Footer(_) => {}
         }
     }
     if with_zstd {

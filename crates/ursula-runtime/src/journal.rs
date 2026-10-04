@@ -17,10 +17,12 @@ use std::io::Seek;
 use std::io::Write;
 use std::marker::PhantomData;
 use std::path::Path;
-use std::path::PathBuf;
 
 const JOURNAL_MAGIC: [u8; 8] = *b"URSJWAL\0";
-const JOURNAL_VERSION: u16 = 1;
+/// The journal header version is the format epoch (`ursula_stream::FORMAT_EPOCH`):
+/// Ursula 0.5.x wrote version 1 and refuses this one with its own exact check.
+const JOURNAL_VERSION: u16 = ursula_stream::FORMAT_EPOCH as u16;
+const _: () = assert!(ursula_stream::FORMAT_EPOCH <= u16::MAX as u32);
 const JOURNAL_HEADER_LEN: usize = 16;
 const FRAME_HEADER_LEN: usize = 8;
 
@@ -194,8 +196,10 @@ pub fn replay_each<C: FrameCodec>(
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "journal '{}' has no complete Ursula WAL header; legacy unversioned journals require an explicit reset or migration",
-                path.display()
+                "journal '{}' has no complete Ursula WAL header; it is not an Ursula journal \
+                 this binary can read (format epoch {}). Start on an empty raft.wal.path",
+                path.display(),
+                ursula_stream::FORMAT_EPOCH
             ),
         ));
     }
@@ -275,120 +279,6 @@ pub fn replay_each<C: FrameCodec>(
                 io::Error::new(io::ErrorKind::InvalidData, "journal offset exceeds usize")
             })?,
         )?;
-    }
-    Ok(())
-}
-
-/// Migrate the legacy `[length][payload]` journal format to the current
-/// checksummed format, retaining a hard-linked `.v0.bak` rollback copy.
-///
-/// A current-format or empty journal is left untouched. Unsupported future
-/// versions are also left for [`replay`] to reject explicitly.
-pub fn migrate_legacy<C: FrameCodec>(path: &Path) -> io::Result<bool> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    let mut source = File::open(path)?;
-    let file_len = source.metadata()?.len();
-    if file_len == 0 {
-        return Ok(false);
-    }
-    let mut prefix = [0_u8; JOURNAL_MAGIC.len()];
-    let prefix_len = source.read(&mut prefix)?;
-    source.rewind()?;
-    if prefix_len == JOURNAL_MAGIC.len() && prefix == JOURNAL_MAGIC {
-        return Ok(false);
-    }
-
-    let migrate_path = suffixed_path(path, ".migrate-v1");
-    let backup_path = suffixed_path(path, ".v0.bak");
-    if migrate_path.exists() {
-        fs::remove_file(&migrate_path)?;
-    }
-    let mut writer = JournalWriter::new(true);
-    let mut valid_len = 0_u64;
-    let mut frame_index = 0_u64;
-    while valid_len < file_len {
-        let remaining = file_len.saturating_sub(valid_len);
-        if remaining < 4 {
-            break;
-        }
-        let mut len_bytes = [0_u8; 4];
-        source.read_exact(&mut len_bytes)?;
-        let payload_len = u64::from(u32::from_le_bytes(len_bytes));
-        if payload_len > u64::try_from(MAX_FRAME_PAYLOAD_BYTES).expect("frame limit fits u64") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "legacy journal '{}' frame {} declares {} bytes, exceeding the {} byte limit",
-                    path.display(),
-                    frame_index + 1,
-                    payload_len,
-                    MAX_FRAME_PAYLOAD_BYTES
-                ),
-            ));
-        }
-        if remaining.saturating_sub(4) < payload_len {
-            break;
-        }
-        let payload_len = usize::try_from(payload_len).expect("u32 fits usize");
-        let mut payload = vec![0_u8; payload_len];
-        source.read_exact(&mut payload)?;
-        let record = C::decode(&payload).map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!(
-                    "legacy journal '{}' frame {} decode failed: {err}",
-                    path.display(),
-                    frame_index + 1
-                ),
-            )
-        })?;
-        writer.append::<C>(&migrate_path, &record)?;
-        valid_len = valid_len
-            .checked_add(4_u64.saturating_add(u64::try_from(payload_len).expect("usize fits u64")))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "journal offset overflow"))?;
-        frame_index = frame_index.saturating_add(1);
-    }
-    if frame_index == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "journal '{}' has neither the Ursula WAL header nor a complete legacy frame",
-                path.display()
-            ),
-        ));
-    }
-    if valid_len < file_len {
-        tracing::warn!(
-            path = %path.display(),
-            valid_bytes = valid_len,
-            discarded_torn_bytes = file_len.saturating_sub(valid_len),
-            "discarding a torn legacy WAL tail during format migration"
-        );
-    }
-    writer.sync(&migrate_path)?;
-    drop(writer);
-
-    if backup_path.exists() {
-        fs::remove_file(&backup_path)?;
-    }
-    fs::hard_link(path, &backup_path)?;
-    sync_parent(path)?;
-    fs::rename(&migrate_path, path)?;
-    sync_parent(path)?;
-    Ok(true)
-}
-
-fn suffixed_path(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(suffix);
-    PathBuf::from(name)
-}
-
-fn sync_parent(path: &Path) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
     }
     Ok(())
 }
@@ -475,7 +365,9 @@ fn validate_header_bytes(header: &[u8], description: &str) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{description} has no Ursula WAL magic; legacy unversioned journals require an explicit reset or migration"
+                "{description} has no Ursula WAL magic; it is not an Ursula journal this binary \
+                 can read (format epoch {}). Start on an empty raft.wal.path",
+                ursula_stream::FORMAT_EPOCH
             ),
         ));
     }
@@ -488,7 +380,10 @@ fn validate_header_bytes(header: &[u8], description: &str) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{description} uses unsupported Ursula WAL version {version}; this binary supports version {JOURNAL_VERSION}"
+                "{description} uses Ursula WAL version {version}; this binary reads version \
+                 {JOURNAL_VERSION} (format epoch {}) only. There is no in-place upgrade from \
+                 Ursula 0.5.x",
+                ursula_stream::FORMAT_EPOCH
             ),
         ));
     }
@@ -648,36 +543,10 @@ mod tests {
 
         let err = replay::<JsonCodec<String>>(&path).expect_err("legacy format must be refused");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("explicit reset or migration"));
-    }
-
-    #[test]
-    fn legacy_migration_preserves_records_and_a_rollback_copy() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("journal");
-        let records = ["first".to_owned(), "second".to_owned()];
-        let mut legacy = File::create(&path).expect("create legacy journal");
-        for record in &records {
-            let payload = serde_json::to_vec(record).expect("encode legacy payload");
-            legacy
-                .write_all(
-                    &u32::try_from(payload.len())
-                        .expect("payload length fits u32")
-                        .to_le_bytes(),
-                )
-                .expect("write legacy length");
-            legacy.write_all(&payload).expect("write legacy payload");
-        }
-        legacy.sync_data().expect("sync legacy journal");
-        drop(legacy);
-
-        assert!(migrate_legacy::<JsonCodec<String>>(&path).expect("migrate legacy journal"));
-        assert_eq!(
-            replay::<JsonCodec<String>>(&path).expect("replay migrated journal"),
-            records
+        assert!(
+            err.to_string()
+                .contains("not an Ursula journal this binary can read")
         );
-        assert!(suffixed_path(&path, ".v0.bak").exists());
-        assert!(!migrate_legacy::<JsonCodec<String>>(&path).expect("migration is idempotent"));
     }
 
     #[test]
@@ -691,12 +560,13 @@ mod tests {
             .open(&path)
             .expect("open journal");
         file.seek(SeekFrom::Start(8)).expect("seek version");
-        file.write_all(&2_u16.to_le_bytes())
+        file.write_all(&1_u16.to_le_bytes())
             .expect("write unsupported version");
         file.sync_data().expect("sync unsupported version");
 
+        // E7: a format-epoch-1 (Ursula 0.5.x) journal is refused.
         let err = replay::<JsonCodec<String>>(&path).expect_err("version must fail closed");
-        assert!(err.to_string().contains("unsupported Ursula WAL version 2"));
+        assert!(err.to_string().contains("uses Ursula WAL version 1"));
     }
 
     #[test]

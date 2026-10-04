@@ -92,6 +92,9 @@ message GroupWriteRequestV1 {
   uint32 core_id = 2;
   uint32 shard_id = 3;
   repeated bytes command_payloads = 4;
+  // Raft gRPC protocol version (the format epoch), checked before anything
+  // else. Senders before format epoch 2 omit it, so it decodes as 0.
+  uint32 protocol_version = 5;
 }
 
 message GroupWriteResultV1 {
@@ -120,6 +123,9 @@ message GroupReadRequestV1 {
   // Field 10 was the removed affinity key.
   reserved 10;
   reserved "affinity_key";
+  // Raft gRPC protocol version (the format epoch), checked before anything
+  // else. Senders before format epoch 2 omit it, so it decodes as 0.
+  uint32 protocol_version = 11;
 }
 
 message HeadStreamReadV1 {

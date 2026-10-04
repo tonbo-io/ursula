@@ -13,8 +13,13 @@ use crate::model::StreamMetadata;
 use crate::model::StreamVisibleSnapshot;
 use crate::record_index::StreamRecordIndex;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamSnapshot {
+    /// Format epoch of the binary that wrote this snapshot
+    /// ([`crate::FORMAT_EPOCH`]). Deliberately not `serde(default)`: a
+    /// MessagePack snapshot from Ursula 0.5.x (epoch 1) has no such field and
+    /// fails to decode instead of being misread.
+    pub format_epoch: u32,
     pub buckets: Vec<String>,
     /// Permanent bucket-erasure fences. Absent in legacy snapshots.
     #[serde(default)]
@@ -40,6 +45,25 @@ pub struct StreamSnapshot {
     /// F14g). Absent in legacy snapshots, which decode as 0.
     #[serde(default)]
     pub last_created_at_ms: u64,
+}
+
+/// An empty snapshot of this binary's epoch at the top feature level, the
+/// only level an epoch-2 snapshot can hold. Fixtures restore from it.
+impl Default for StreamSnapshot {
+    fn default() -> Self {
+        Self {
+            format_epoch: crate::FORMAT_EPOCH,
+            buckets: Vec::new(),
+            erased_buckets: Vec::new(),
+            streams: Vec::new(),
+            pending_cold_gc: Vec::new(),
+            next_cold_gc_seq: 0,
+            shared_cold_object_owners: Vec::new(),
+            bucket_usage: Vec::new(),
+            feature_level: crate::MAX_SUPPORTED_FEATURE_LEVEL,
+            last_created_at_ms: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,8 +140,14 @@ pub enum StreamSnapshotError {
         tail_offset: u64,
     },
     #[error(
-        "snapshot feature level {level} exceeds this binary's supported level {supported}; \
-         a binary that cannot apply that level must not run this group"
+        "snapshot feature level {level} is not this binary's level {supported}; every \
+         format-epoch-2 snapshot is written at level {supported}"
     )]
     UnsupportedFeatureLevel { level: u32, supported: u32 },
+    #[error("{}", snapshot_format_epoch_message(.found))]
+    FormatEpoch { found: u32 },
+}
+
+fn snapshot_format_epoch_message(found: &u32) -> String {
+    crate::format_epoch_refusal("snapshot", &format!("is format epoch {found}"))
 }

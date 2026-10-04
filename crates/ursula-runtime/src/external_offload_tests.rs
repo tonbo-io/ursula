@@ -12,7 +12,6 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 use ursula_stream::ExternalPayloadRef;
 use ursula_stream::FEATURE_LEVEL_EXTERNAL_LOCATORS;
-use ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
 use ursula_stream::MAX_STAGED_EXTERNAL_REFS;
 use ursula_stream::ObjectPayloadRef;
 
@@ -176,111 +175,48 @@ fn offload_now(max_streams: usize) -> OffloadColdRefsRequest {
     }
 }
 
-/// Below level 3 the engine writes the page entry before proposing, so a
-/// rejected external append leaves one behind (D3). At level 3 neither a
-/// rejected nor a committed append writes a page entry; the committed one
-/// is served from state until the offload pass indexes it.
+/// Neither a rejected nor a committed external append writes a page entry
+/// before its proposal (F5); the committed one is served from state until
+/// the offload pass indexes it.
 #[tokio::test]
 async fn no_page_entry_is_written_before_a_proposal_at_level_three() {
-    for level in [FEATURE_LEVEL_KEYED_STREAMS, FEATURE_LEVEL_EXTERNAL_LOCATORS] {
-        let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-        let runtime = spawn(cold_store.clone());
-        raise(&runtime, level).await;
-        let s = stream("no-pre-proposal");
-        create(&runtime, &s).await;
-        append_with_seq(&runtime, &s, b"ab", "5").await;
-
-        let (_, rejected) =
-            append_external(&runtime, &cold_store, &s, &[b'#'; 30], Some("1")).await;
-        rejected.expect_err("a regressed stream seq rejects the external append");
-        let after_rejection = page_external_entries(&cold_store, &s).await;
-        if level < FEATURE_LEVEL_EXTERNAL_LOCATORS {
-            assert_eq!(
-                after_rejection.len(),
-                1,
-                "level 1 pins the pre-proposal write"
-            );
-            continue;
-        }
-        assert!(after_rejection.is_empty(), "{after_rejection:?}");
-
-        let (committed, result) = append_external(&runtime, &cold_store, &s, b"WXYZ", None).await;
-        result.expect("committed external append");
-        assert!(page_external_entries(&cold_store, &s).await.is_empty());
-        let gauges = runtime.state_gauges(GROUP).await.expect("gauges");
-        assert_eq!(gauges.staged_external_refs, 1);
-        assert_eq!(read_all(&runtime, &s).await, b"abWXYZ".to_vec());
-
-        let report = runtime
-            .offload_cold_refs(GROUP, offload_now(16))
-            .await
-            .expect("offload pass");
-        assert_eq!((report.streams, report.refs_offloaded), (1, 1));
-        let entries = page_external_entries(&cold_store, &s).await;
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].s3_path, committed);
-        assert_eq!((entries[0].start_offset, entries[0].end_offset), (2, 6));
-        let gauges = runtime.state_gauges(GROUP).await.expect("gauges");
-        assert_eq!(gauges.staged_external_refs, 0);
-        assert_eq!(read_all(&runtime, &s).await, b"abWXYZ".to_vec());
-
-        // A second pass finds nothing to do.
-        let again = runtime
-            .offload_cold_refs(GROUP, offload_now(16))
-            .await
-            .expect("second offload pass");
-        assert_eq!(again.streams, 0);
-    }
-}
-
-/// Invariant 11 across the raise: a rejected external append before level 3
-/// left a stale entry spanning offsets a later committed append reuses. The
-/// offload of the committed ref clips it, and reads and pages agree with the
-/// acknowledged bytes.
-#[tokio::test]
-async fn offload_clips_stale_entries_left_before_the_raise() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = spawn(cold_store.clone());
-    raise(&runtime, FEATURE_LEVEL_KEYED_STREAMS).await;
-    let s = stream("stale-before-raise");
+    let s = stream("no-pre-proposal");
     create(&runtime, &s).await;
     append_with_seq(&runtime, &s, b"ab", "5").await;
-    let (stale, rejected) =
-        append_external(&runtime, &cold_store, &s, &[b'#'; 30], Some("1")).await;
-    rejected.expect_err("rejected external append");
-    assert_eq!(page_external_entries(&cold_store, &s).await.len(), 1);
 
-    raise(&runtime, FEATURE_LEVEL_EXTERNAL_LOCATORS).await;
-    let (_, result) = append_external(&runtime, &cold_store, &s, b"WXYZ", None).await;
+    let (_, rejected) = append_external(&runtime, &cold_store, &s, &[b'#'; 30], Some("1")).await;
+    rejected.expect_err("a regressed stream seq rejects the external append");
+    let after_rejection = page_external_entries(&cold_store, &s).await;
+    assert!(after_rejection.is_empty(), "{after_rejection:?}");
+
+    let (committed, result) = append_external(&runtime, &cold_store, &s, b"WXYZ", None).await;
     result.expect("committed external append");
-    let mut acknowledged = b"abWXYZ".to_vec();
-    assert_eq!(read_all(&runtime, &s).await, acknowledged);
+    assert!(page_external_entries(&cold_store, &s).await.is_empty());
+    let gauges = runtime.state_gauges(GROUP).await.expect("gauges");
+    assert_eq!(gauges.staged_external_refs, 1);
+    assert_eq!(read_all(&runtime, &s).await, b"abWXYZ".to_vec());
 
     let report = runtime
         .offload_cold_refs(GROUP, offload_now(16))
         .await
         .expect("offload pass");
-    assert_eq!(report.refs_offloaded, 1);
-    assert_eq!(report.page_entries_clipped, 1, "the stale entry is clipped");
-    assert!(
-        page_external_entries(&cold_store, &s)
-            .await
-            .iter()
-            .all(|entry| entry.s3_path != stale)
-    );
-    assert_no_page_entry_overlaps_differing_bytes(&cold_store, &s, &acknowledged).await;
-    assert_eq!(read_all(&runtime, &s).await, acknowledged);
+    assert_eq!((report.streams, report.refs_offloaded), (1, 1));
+    let entries = page_external_entries(&cold_store, &s).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].s3_path, committed);
+    assert_eq!((entries[0].start_offset, entries[0].end_offset), (2, 6));
+    let gauges = runtime.state_gauges(GROUP).await.expect("gauges");
+    assert_eq!(gauges.staged_external_refs, 0);
+    assert_eq!(read_all(&runtime, &s).await, b"abWXYZ".to_vec());
 
-    // Later bytes at the stale entry's old offsets read correctly too.
-    let (_, result) = append_external(&runtime, &cold_store, &s, &[b'n'; 40], None).await;
-    result.expect("second committed external append");
-    acknowledged.extend_from_slice(&[b'n'; 40]);
-    runtime
+    // A second pass finds nothing to do.
+    let again = runtime
         .offload_cold_refs(GROUP, offload_now(16))
         .await
         .expect("second offload pass");
-    assert_no_page_entry_overlaps_differing_bytes(&cold_store, &s, &acknowledged).await;
-    assert_eq!(read_all(&runtime, &s).await, acknowledged);
+    assert_eq!(again.streams, 0);
 }
 
 /// W3 on the runtime: an external-only stream keeps at most T_ext staged

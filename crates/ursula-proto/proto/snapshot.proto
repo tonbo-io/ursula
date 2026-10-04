@@ -11,7 +11,14 @@ message SnapshotFrameV1 {
     StreamAppendCountV1 append_count = 3;
     ColdGcEntryV1 cold_gc = 4;
     SnapshotFooterV1 footer = 5;
+    // Always the first frame, checked before any other frame is decoded.
+    // Snapshots from Ursula 0.5.x and earlier (format epoch 1) have none.
+    FormatEpochV1 format_epoch = 6;
   }
+}
+
+message FormatEpochV1 {
+  uint32 epoch = 1;
 }
 
 message SnapshotHeaderV1 {
@@ -35,9 +42,8 @@ message SnapshotHeaderV1 {
   // Permanent bucket-erasure fences. Absent in snapshots written before
   // tenant physical-erasure proof became part of the contract.
   repeated string erased_buckets = 9;
-  // Replicated group feature level (C0). Absent in snapshots
-  // written before feature levels, which decode as level 0. Never lowered;
-  // a binary refuses snapshots above its supported level.
+  // Replicated group feature level (C0). Every format-epoch-2 snapshot is
+  // written at the top level, and a binary refuses any other level.
   uint32 feature_level = 10;
   // Largest stream created_at_ms the group assigned at feature level 1 or
   // later (C7). Absent in older snapshots, which decode as 0;

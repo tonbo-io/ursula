@@ -169,7 +169,7 @@ new_key_type! {
     struct StreamKey;
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct StreamStateMachine {
     buckets: HashSet<String>,
     /// Permanent tenant-erasure fences. A purged bucket name can never be
@@ -227,6 +227,29 @@ struct StreamSlot {
     /// engine, not in [`StreamSnapshot`]; living in the slot makes it die with
     /// the stream on every removal path (delete, TTL expiry, bucket purge).
     append_count: u64,
+}
+
+/// Every group starts at the top level. No engine calls
+/// [`StreamStateMachine::new`]; they all build the state machine through
+/// `Default` (in-memory engines derive it, Raft groups construct it), so the
+/// level is set here rather than in `new`.
+impl Default for StreamStateMachine {
+    fn default() -> Self {
+        Self {
+            buckets: HashSet::new(),
+            erased_buckets: HashSet::new(),
+            registry: StreamRegistry::default(),
+            hot_payload_bytes: 0,
+            hot_records: 0,
+            cold_gc: ColdGcQueue::default(),
+            shared_cold_object_refs: HashMap::new(),
+            shared_cold_object_owners: HashMap::new(),
+            bucket_usage: HashMap::new(),
+            flush_planner: flush_planner::FlushPlannerState::default(),
+            feature_level: crate::feature::MAX_SUPPORTED_FEATURE_LEVEL,
+            last_created_at_ms: 0,
+        }
+    }
 }
 
 impl StreamStateMachine {

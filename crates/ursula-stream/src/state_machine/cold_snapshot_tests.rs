@@ -4,7 +4,6 @@
 
 use super::*;
 use crate::feature::FEATURE_LEVEL_COLD_SNAPSHOTS;
-use crate::feature::FEATURE_LEVEL_HOT_REPRESENTATION;
 
 const BUCKET: &str = "f16snapshots";
 const OCTET: &str = "application/octet-stream";
@@ -69,20 +68,6 @@ fn gc_paths(machine: &StreamStateMachine) -> Vec<(String, u64)> {
             ColdGcTarget::Stream(_) => Vec::new(),
         })
         .collect()
-}
-
-#[test]
-fn cold_snapshot_publish_requires_level_five() {
-    let mut machine = machine_at(FEATURE_LEVEL_HOT_REPRESENTATION);
-    let response = publish_cold(&mut machine, 2, "s/external/a.bin", "da");
-    assert!(
-        matches!(response, StreamResponse::Error {
-            code: StreamErrorCode::FeatureNotEnabled,
-            ..
-        }),
-        "{response:?}"
-    );
-    assert_eq!(machine.latest_snapshot(&stream()), Ok(None));
 }
 
 #[test]

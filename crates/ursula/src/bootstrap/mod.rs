@@ -12,6 +12,7 @@
 mod cold_health;
 mod commit_stall;
 mod egress;
+mod format_epoch;
 mod leadership;
 mod runtime;
 mod snapshot;
@@ -19,6 +20,7 @@ mod topology;
 mod util;
 mod wal_disk;
 
+pub(crate) use format_epoch::check_and_stamp_format_epoch;
 pub use runtime::SpawnedRuntime;
 pub use runtime::spawn_runtime;
 pub(crate) use runtime::spawn_runtime_with_maintenance_drain;

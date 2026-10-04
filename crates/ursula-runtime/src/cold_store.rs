@@ -1526,6 +1526,13 @@ fn cold_store_io_error(path: &str, err: opendal::Error) -> io::Error {
     io::Error::new(kind, format!("cold object '{path}': {err}"))
 }
 
+/// The S3 operator a [`ColdStore`] built from `config` would use, rooted at
+/// `config.root`. The format-epoch marker check reads and writes through it
+/// before the runtime builds its own stores.
+pub(crate) fn s3_operator_for_config(config: &ColdConfig) -> io::Result<Operator> {
+    Ok(ColdStore::s3_from_config(config)?.operator)
+}
+
 #[cfg(not(madsim))]
 fn cold_object_unix_nanos() -> u128 {
     SystemTime::now()

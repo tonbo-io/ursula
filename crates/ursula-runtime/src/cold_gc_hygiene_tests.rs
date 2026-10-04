@@ -173,18 +173,6 @@ async fn gc_with_failing_head(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn f14b_failing_gc_head_blocks_the_queue_below_level_one() {
-    let (_cold_store, runtime, group, streams) = gc_with_failing_head(0).await;
-    let before = pending_gc(&runtime, group).await;
-    assert_eq!(before.len(), 2);
-    assert!(runtime.run_cold_gc_group_once(group, 16).await.is_err());
-    // Nothing behind the failing head was reclaimed.
-    let after = pending_gc(&runtime, group).await;
-    assert_eq!(after, before);
-    assert_eq!(after[1].target, ColdGcTarget::Stream(streams[1].clone()));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn f14b_failing_gc_head_is_deferred_and_the_rest_drains_at_level_one() {
     let (cold_store, runtime, group, streams) =
         gc_with_failing_head(FEATURE_LEVEL_KEYED_STREAMS).await;
@@ -361,12 +349,6 @@ async fn retain_past_last_pack_reference(level: u32) -> (Arc<ColdStore>, String)
     (cold_store, pack_path)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn f14i_retention_deletes_dropped_pack_slices_at_once_below_level_one() {
-    let (cold_store, pack_path) = retain_past_last_pack_reference(0).await;
-    assert!(!object_exists(&cold_store, &pack_path).await);
-}
-
 /// RC-19 / D6: a read planned before a concurrent retention still finds the
 /// pack bytes, because GC waits for the grace.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -404,6 +386,9 @@ async fn applying_flush_cold_drops_cached_pages_of_the_flushed_range() {
     engine
         .apply_committed_write(GroupWriteCommand::Stream(create), placement)
         .expect("create stream");
+    // C7/F14g: the group's first incarnation is `created_at_ms` 1, which is
+    // the generation its pages live under.
+    let generation = 1;
     // A stale entry for `[0, 2)` sits in the stream's page and in the cache.
     let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
     let stale = ColdChunkRef {
@@ -413,13 +398,13 @@ async fn applying_flush_cold_drops_cached_pages_of_the_flushed_range() {
         object_size: 2,
         ..Default::default()
     };
-    write_cold_chunk_index_pages_with_rollback_in_generation(&store, &stream, 0, &stale)
+    write_cold_chunk_index_pages_with_rollback_in_generation(&store, &stream, generation, &stale)
         .await
         .expect("write stale entry");
     let cache = engine.cold_index_cache().expect("page cache");
     cache
         .object_segments_for_read(&stream, &StreamReadColdIndexSegment {
-            generation: 0,
+            generation,
             page_id: 0,
             read_start_offset: 0,
             len: 2,

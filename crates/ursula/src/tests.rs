@@ -4281,9 +4281,10 @@ async fn flush_cold_endpoint_uploads_and_reads_back_segments() {
 async fn cold_backpressure_returns_service_unavailable_and_metrics() {
     let cold_store = std::sync::Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        // F6c: the cap counts payload plus per-record overhead.
-        RuntimeConfig::new(1, 1)
-            .with_cold_max_hot_bytes_per_group(Some(4 + ursula_runtime::HOT_RECORD_OVERHEAD_BYTES)),
+        // F6c/F4b: the cap counts payload plus 8 B per-record overhead.
+        RuntimeConfig::new(1, 1).with_cold_max_hot_bytes_per_group(Some(
+            4 + ursula_runtime::HOT_RECORD_OVERHEAD_BYTES_LB4,
+        )),
         InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
         Some(cold_store),
     )
@@ -4329,7 +4330,7 @@ async fn cold_backpressure_returns_service_unavailable_and_metrics() {
     let body = std::str::from_utf8(&body).expect("utf8 body");
     assert!(body.contains(&format!(
         "\"cold_hot_bytes\":{}",
-        4 + ursula_runtime::HOT_RECORD_OVERHEAD_BYTES
+        4 + ursula_runtime::HOT_RECORD_OVERHEAD_BYTES_LB4
     )));
     assert!(body.contains("\"cold_backpressure_events\":1"));
     assert!(body.contains("\"cold_backpressure_bytes\":1"));
@@ -4660,8 +4661,9 @@ async fn json_bootstrap_never_merges_cold_messages_into_one_part() {
     .await;
     let response = http_head(&app, stream_uri).await;
     let tail = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
-    // The first message after the flush could be a fragment as far as the
-    // state machine knows, so a snapshot at the flush point is partial...
+    // F4b: JSON streams keep dense record offsets, so the first message after
+    // the flush is exact and a snapshot at the flush point bootstraps
+    // complete, one JSON message per update part...
     let response = http_put(
         &app,
         &format!("{stream_uri}/snapshot/{flushed_tail}"),
@@ -4671,15 +4673,14 @@ async fn json_bootstrap_never_merges_cold_messages_into_one_part() {
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
-    assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
-        flushed_tail
-    );
-    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
-    assert_eq!(parts, vec![r#"{"n":2}"#.to_owned()]);
+    assert_eq!(header_str(&response, HEADER_STREAM_NEXT_OFFSET), tail);
+    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert_eq!(parts.len(), 3, "{parts:?}");
+    assert_eq!(parts[0], r#"{"n":2}"#);
+    assert!(parts[1].contains(r#"{"c":3}"#) && !parts[1].contains(r#"{"d":4}"#));
+    assert!(parts[2].contains(r#"{"d":4}"#));
 
-    // ...and a snapshot one message later is complete, one JSON message per
-    // update part.
+    // ...and so is a snapshot one message later.
     let response = http_get(&app, &format!("{stream_uri}?record=2&max_records=1")).await;
     let after_c = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
     let response = http_put(
@@ -5307,6 +5308,38 @@ async fn wal_disk_pressure_rejects_writes_and_marks_readiness_unavailable() {
         http_get(&app, READINESS_PATH).await.status(),
         StatusCode::OK
     );
+}
+
+/// Format epoch 2 (E8): once a Raft protocol mismatch is recorded, readiness
+/// answers 503 `format_epoch_mismatch` and stays there.
+#[tokio::test]
+async fn a_recorded_format_epoch_mismatch_makes_readiness_unavailable() {
+    let mismatch = ursula_raft::FormatEpochMismatch::default();
+    let state = HttpState::new(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    )
+    .with_format_epoch_mismatch(mismatch.clone());
+    let app = client_router_with_admission(state, IngressAdmission::default());
+    assert_eq!(
+        http_get(&app, READINESS_PATH).await.status(),
+        StatusCode::OK
+    );
+
+    mismatch.record();
+    let ready = http_get(&app, READINESS_PATH).await;
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value =
+        serde_json::from_slice(&body_bytes(ready).await).expect("readiness json");
+    assert_eq!(body["reason"], json!("format_epoch_mismatch"));
+    assert_eq!(body["ready"], json!(false));
 }
 
 /// Over its hard Raft-log limit a node answers body-carrying writes with 503 +
@@ -6520,6 +6553,36 @@ async fn usage_endpoint_reports_per_bucket_committed_counters() {
     assert_eq!(tenant_a_truncated["retained_bytes"], 0);
 }
 
+/// E10: an import is refused with 400 before decoding when its group has no
+/// format epoch (Ursula 0.5.x) or another epoch.
+#[tokio::test]
+async fn backup_import_refuses_groups_without_this_format_epoch() {
+    let app = test_router();
+    let without_epoch =
+        rmp_serde::to_vec_named(&json!({"buckets": ["tenant-a"], "streams": []})).unwrap();
+    let other_epoch = rmp_serde::to_vec_named(&ursula_runtime::StreamSnapshot {
+        format_epoch: ursula_runtime::FORMAT_EPOCH - 1,
+        ..ursula_runtime::StreamSnapshot::default()
+    })
+    .unwrap();
+    for (body, expected) in [
+        (without_epoch, "has no format_epoch"),
+        (other_epoch, "unsupported format_epoch"),
+    ] {
+        let response = http_post(
+            &app,
+            "/__ursula/backup/group/0/import",
+            &[(CONTENT_TYPE.as_str(), "application/x-msgpack")],
+            Body::from(body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_bytes(response).await;
+        let body = std::str::from_utf8(&body).expect("utf8");
+        assert!(body.contains(expected), "{body}");
+    }
+}
+
 // #136: the full recovery drill against the HTTP surface. Build a cluster,
 // write two tenants' streams (records, close state, app snapshot, retention
 // floor), export every group, destroy the cluster, restore into a fresh one,
@@ -6586,7 +6649,7 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
     assert_eq!(info.status(), StatusCode::OK);
     let info: serde_json::Value =
         serde_json::from_slice(&body_bytes(info).await).expect("backup info json");
-    assert_eq!(info["format_version"], 1);
+    assert_eq!(info["format_version"], ursula_runtime::FORMAT_EPOCH);
     let group_count = info["raft_group_count"].as_u64().expect("group count");
     let mut exports = Vec::new();
     for group in 0..group_count {
@@ -7040,10 +7103,12 @@ async fn metrics_expose_per_group_state_gauges() {
         .as_array()
         .expect("group_state_gauges array");
     assert_eq!(groups.len(), 8, "{metrics}");
+    // Format epoch 2: every router-built group is born at the top level.
+    let max = u64::from(ursula_runtime::MAX_SUPPORTED_FEATURE_LEVEL);
     assert!(
         groups
             .iter()
-            .all(|group| group["hosted"] == true && group["feature_level"] == 0)
+            .all(|group| group["hosted"] == true && group["feature_level"] == max)
     );
     let streams: u64 = groups.iter().filter_map(|g| g["streams"].as_u64()).sum();
     assert_eq!(streams, 1);
@@ -7076,9 +7141,11 @@ async fn metrics_expose_per_group_state_gauges() {
     }
 }
 
-// Replicated group feature level admin surface (C0).
+// Replicated group feature level admin surface (C0). Since format epoch 2
+// every group is born at the top level and the POST proposes nothing.
 #[tokio::test]
 async fn feature_level_endpoint_reports_and_raises_every_group() {
+    let max = u64::from(ursula_runtime::MAX_SUPPORTED_FEATURE_LEVEL);
     let app = test_router();
 
     let response = http_get(&app, "/__ursula/feature-level").await;
@@ -7092,7 +7159,7 @@ async fn feature_level_endpoint_reports_and_raises_every_group() {
     );
     let groups = report["groups"].as_array().expect("groups");
     assert_eq!(groups.len(), 8);
-    assert!(groups.iter().all(|group| group["level"] == 0));
+    assert!(groups.iter().all(|group| group["level"] == max));
 
     let response = http_post(
         &app,
@@ -7109,7 +7176,7 @@ async fn feature_level_endpoint_reports_and_raises_every_group() {
     assert!(
         groups
             .iter()
-            .all(|group| group["status"] == "set" && group["level"] == 1),
+            .all(|group| group["status"] == "set" && group["level"] == max),
         "{outcome}"
     );
 
@@ -7127,7 +7194,7 @@ async fn feature_level_endpoint_reports_and_raises_every_group() {
     let report: serde_json::Value =
         serde_json::from_slice(&body_bytes(response).await).expect("report json");
     let groups = report["groups"].as_array().expect("groups");
-    assert!(groups.iter().all(|group| group["level"] == 1), "{report}");
+    assert!(groups.iter().all(|group| group["level"] == max), "{report}");
 }
 
 #[tokio::test]
@@ -7149,7 +7216,8 @@ async fn feature_level_endpoint_refuses_levels_this_node_cannot_apply() {
     let report: serde_json::Value =
         serde_json::from_slice(&body_bytes(response).await).expect("report json");
     let groups = report["groups"].as_array().expect("groups");
-    assert!(groups.iter().all(|group| group["level"] == 0), "{report}");
+    let max = u64::from(ursula_runtime::MAX_SUPPORTED_FEATURE_LEVEL);
+    assert!(groups.iter().all(|group| group["level"] == max), "{report}");
 }
 
 #[test]
