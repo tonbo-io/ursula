@@ -2744,6 +2744,9 @@ pub(crate) async fn read_stream_by_id(
         Ok(query) => query,
         Err(response) => return *response,
     };
+    if let Err(response) = removed_surface::reject_removed_read_parameters(&query) {
+        return *response;
+    }
     let live_mode = query.get("live").map(String::as_str);
     let leader_only = match query.get("consistency").map(String::as_str) {
         None | Some("local") => false,
@@ -2756,9 +2759,6 @@ pub(crate) async fn read_stream_by_id(
             "leader consistency is available only for catch-up reads",
         )
             .into_response();
-    }
-    if let Err(response) = removed_surface::reject_removed_read_parameters(&query) {
-        return *response;
     }
     let offset_is_now = query.get("offset").is_some_and(|offset| offset == "now");
     if live_mode.is_some() && !query.contains_key("offset") {
@@ -2899,13 +2899,15 @@ fn json_boundary_unverified(err: &RuntimeError) -> Option<u64> {
 /// offset it refuses with the stream's incarnation, and this reads that
 /// byte on the leader (`consistency=leader`). LF passes, so the caller
 /// proposes again pinned to the incarnation; any other byte answers 400; a
-/// failed read answers 503 (fail closed). A delete and recreate between
-/// this read and the second apply changes the incarnation, so apply refuses
-/// it. Non-JSON streams and hot boundaries never reach this.
+/// failed read answers 503 (fail closed), except that a read refused for
+/// leadership gets the usual leader redirect or retry response. A delete and
+/// recreate between this read and the second apply changes the incarnation,
+/// so apply refuses it. Non-JSON streams and hot boundaries never reach this.
 async fn verify_json_boundary(
     state: &HttpState,
     stream_id: &BucketStreamId,
     offset: u64,
+    request_target: &str,
 ) -> Result<(), Response> {
     let read = state
         .runtime
@@ -2920,6 +2922,9 @@ async fn verify_json_boundary(
         .await;
     let byte = match read {
         Ok(read) => read.payload.first().copied(),
+        Err(err) if is_forward_to_leader(&err) => {
+            return Err(runtime_error_or_leader_redirect_async(state, err, request_target).await);
+        }
         Err(err) => {
             tracing::warn!(
                 bucket = %stream_id.bucket_id,
@@ -2975,7 +2980,9 @@ async fn publish_snapshot_by_offset(
     };
     let mut result = state.runtime.publish_snapshot(request.clone()).await;
     if let Some(incarnation) = result.as_ref().err().and_then(json_boundary_unverified) {
-        if let Err(response) = verify_json_boundary(&state, &stream_id, snapshot_offset).await {
+        if let Err(response) =
+            verify_json_boundary(&state, &stream_id, snapshot_offset, &request_target).await
+        {
             // Nothing references the staged body: apply refused it.
             if let Some(staged_path) = staged_path.as_deref() {
                 delete_unreferenced_staged_payload(&state, staged_path).await;
@@ -3022,7 +3029,9 @@ pub(crate) async fn advance_retention(
     };
     let mut result = state.runtime.advance_retention(request.clone()).await;
     if let Some(incarnation) = result.as_ref().err().and_then(json_boundary_unverified) {
-        if let Err(response) = verify_json_boundary(&state, &stream_id, retained_offset).await {
+        if let Err(response) =
+            verify_json_boundary(&state, &stream_id, retained_offset, &request_target).await
+        {
             return response;
         }
         request.expected_incarnation = Some(incarnation);

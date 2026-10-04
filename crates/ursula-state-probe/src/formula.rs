@@ -78,7 +78,7 @@ pub fn capacity_check(outcome: &mut Outcome, m: &Measured) {
     );
 }
 
-/// Residual `state - H - 8 U - 16 B K - Prod` for one stream, with state
+/// Residual `state - H - Prod` for one stream, with state
 /// measured as the stream's snapshot frame bytes.
 pub fn residual(m: &Measured) -> i64 {
     m.snap
@@ -86,8 +86,7 @@ pub fn residual(m: &Measured) -> i64 {
         .iter()
         .map(|s| {
             let frame = i64::try_from(s.frame_bytes).unwrap_or(i64::MAX);
-            let allowance =
-                s.hot_bytes + 8 * s.unflushed_records + 16 * s.cold_mib_ceil() + s.producer_bytes;
+            let allowance = s.hot_bytes + s.producer_bytes;
             frame.saturating_sub(i64::try_from(allowance).unwrap_or(i64::MAX))
         })
         .sum()

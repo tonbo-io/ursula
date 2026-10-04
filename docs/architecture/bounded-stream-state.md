@@ -226,7 +226,7 @@ Earlier main builds gated the replicated changes below behind replicated per-gro
 
 **F4a.** Earlier main builds collapsed every record ending at or below the seal point into a single `[retained, p)` entry at every cold transition. 0.6.0 ships F4b instead, which removes the field.
 
-**F4b (with F6b).** The field is gone. In the hot window, message boundaries are the record index's dense offsets for JSON; other content types have no message boundaries at all. Bootstrap uses the dense offsets for one part per JSON record. `snapshot_offset_aligned` uses them for JSON and accepts any offset in `[retained, tail]` for other types, and snapshot field 10 is reserved.
+**F4b (with F6b).** The field is gone. In the hot window, message boundaries are the record index's dense offsets for JSON; other content types have no message boundaries at all. Bootstrap uses the dense offsets for one part per JSON record. `snapshot_offset_aligned` uses them for JSON and accepts any offset in `[retained, tail]` for other types, and snapshot field 10 is reserved. (Superseded in 0.6.0: the record index is gone; bootstrap splits a JSON hot range on LF, and a JSON snapshot offset must follow an LF.)
 
 *Implementation notes (as built in 0.6.0).* No stream keeps anything per message; snapshot stream entry field 20 (`hot_append_starts`, which held per-message starts in earlier 0.6.0 development builds) is reserved. Bootstrap follows the honest-partial rule: there is no cold part. It answers from the hot range `[S, tail)` when `S` is at or above `max(seal point, retained)` and every byte of the range is hot (an external append above hot bytes leaves a cold gap), and the snapshot alone otherwise. A non-JSON stream gets the range as one part when it is at most 8 MiB; a JSON stream gets one part per message, split on LF, up to the last LF within 8 MiB. F6c charges hot payload only.
 
@@ -409,7 +409,7 @@ Every returned entry is at its stream's true expiry, and every smaller key has a
 **Design.**
 
 1. **B1, ungated, node-local.** Coverage is the complement of the hot buffer. In `read_plan_at` and `payload_sources_cover_retained_suffix`, every byte of `[retained, tail)` that no hot segment holds is cold, served by state refs where they exist and by cold-index pages otherwise. Reads of affected streams work again, and nodes restore and install snapshots that already carry a regressed frontier. Snapshots keep writing the frontier as before, so replicated state does not change.
-2. **Representation.** Apply drops the scalar frontier. `snapshot_offset_aligned` accepts the retained offset, any offset at or below `p(s)`, or a message boundary above it (F4b). The 0.5.1 frontier clause also accepted intra-message offsets in hot bytes that lie below an external append, and a frontier raised with `max` would widen that, which is why the clause is replaced rather than repaired. Snapshot field 6 is reserved. The per-call sort of external segments in the frontier computation (`cold_state.rs:83-108`) goes away with it.
+2. **Representation.** Apply drops the scalar frontier. `snapshot_offset_aligned` accepts the retained offset, any offset at or below `p(s)`, or a message boundary above it (F4b). (Superseded in 0.6.0: see the §5.2 note; the function is gone, and a JSON offset must follow an LF.) The 0.5.1 frontier clause also accepted intra-message offsets in hot bytes that lie below an external append, and a frontier raised with `max` would widen that, which is why the clause is replaced rather than repaired. Snapshot field 6 is reserved. The per-call sort of external segments in the frontier computation (`cold_state.rs:83-108`) goes away with it.
 3. **Consequences elsewhere.** F5's `OffloadColdRefs` can always drop a ref, because its range is never hot. F6b's blocks keep their own start offsets, because the hot buffer has gaps.
 
 **Cost.** +80 production LoC, +150 test LoC (the D1 sequence on both engines, plus restore and install of snapshots with a regressed frontier). Low risk.
@@ -421,8 +421,8 @@ Every returned entry is at its stream's true expiry, and every smaller key has a
 **Design.**
 
 1. **Clip on proven writes (B1, ungated).** A page write for a range whose bytes state proves removes or clips, in the same read-modify-write, every other entry overlapping the range. State proves three kinds of range: a flush of hot bytes (the hot buffer holds only committed appends), an F2 replacement of state-held refs, and an F5 offload of a committed external ref. Rollback restores the previous page, as today. Page writes are leader-side, so mixed versions need no gate.
-2. **Repair (B1, ungated).** A slow leader-side cursor over each group's stream ids repairs pages: per page, it keeps only the last-written external entry at each start offset, and drops external entries that overlap a chunk entry or another object's state ref, that start at or beyond the stream's tail, or whose objects predate the stream's creation by more than a minute (D4). Within a leader's term, a group's writes run one at a time through its group actor, so a later entry at the same start offset follows a proposal that did not commit there. F2 repairs a stream's pages right before compacting it. Two overlapping page-only external entries with different starts, both written before F5, cannot be told apart; they remain a documented hazard, which step 3 turns into an error on JSON streams.
-3. **Anchor verification (with F1).** A scan that crosses an anchor checks that the byte before it is LF, and when it spans two consecutive anchors, that their LF count equals their record difference. A mismatch fails the read with a corruption error and a metric.
+2. **Repair (B1, ungated).** A slow leader-side cursor over each group's stream ids repairs pages: per page, it keeps only the last-written external entry at each start offset, and drops external entries that overlap a chunk entry or another object's state ref, that start at or beyond the stream's tail, or whose objects predate the stream's creation by more than a minute (D4). Within a leader's term, a group's writes run one at a time through its group actor, so a later entry at the same start offset follows a proposal that did not commit there. F2 repairs a stream's pages right before compacting it. Two overlapping page-only external entries with different starts, both written before F5, cannot be told apart; they remain a documented hazard.
+3. **Anchor verification (with F1). Removed in 0.6.0** along with the marks: there are no anchors to verify, and the corruption error and its metric are gone.
 
 No new stale entries arise, because F5 removed the pre-proposal write.
 
@@ -502,7 +502,7 @@ A `state-growth` job runs reduced-scale versions of W1 and W3 to W5, plus the re
 | read plans per bootstrap | 1 | F11 |
 | D1 to D4 reproductions | pass on both engines | F11, F14g, F18, F19 |
 | per-structure formulas | every structure within its own I1 or I2 term, evaluated with the live U, K and P and length-based bytes, at every checkpoint | all |
-| residual growth | state − H − 8·U − 16 B·K − Prod − cache caps grows by ≤ 1 KiB between N and 4N records, with W1 checkpoints taken after a forced flush | all |
+| residual growth | state − H − Prod − cache caps grows by ≤ 1 KiB between N and 4N records, with W1 checkpoints taken after a forced flush (0.6.0: the 8·U and 16 B·K terms are gone with the marks) | all |
 
 Slopes on raw state would be confounded: W1's hot bytes swing between 1.3 and 7.1 MB across checkpoints, against an allowance of a few KB. Snapshot sizes and structure counts are deterministic for workloads with distinct stream names. Heap figures are deterministic for a fixed toolchain and are compared with a 5% tolerance.
 
@@ -563,7 +563,7 @@ Alerts:
 - mark bytes per node above the thinning threshold (Q10)
 - snapshot bytes growing by more than 1% per day beyond 16 B × the day's added cold MiB, at constant live streams
 
-**Soak gate (B7).** A 72-hour EKS soak on a commit candidate with W2-shaped trickle streams, one W1-shaped heavy stream, producer and TTL streams, mixed inline and external appends, delete-and-recreate churn, and leader churn. Passing means every structure stays within its own formula at every scrape, and after a 6-hour warm-up, the residual (state − H − 8·U − 16 B·K − Prod − cache caps) and RSS minus the same terms grow by no more than 1% per day.
+**Soak gate (B7).** A 72-hour EKS soak on a commit candidate with W2-shaped trickle streams, one W1-shaped heavy stream, producer and TTL streams, mixed inline and external appends, delete-and-recreate churn, and leader churn. Passing means every structure stays within its own formula at every scrape, and after a 6-hour warm-up, the residual (state − H − Prod − cache caps; before 0.6.0 also − 8·U − 16 B·K) and RSS minus the same terms grow by no more than 1% per day.
 
 ## 8. Rejected alternatives
 

@@ -34,7 +34,6 @@ pub use format::FORMAT_EPOCH;
 pub use format::format_epoch_refusal;
 pub use json_records::NonCanonicalJsonPayload;
 pub use json_records::canonical_json_record_ends;
-pub use json_records::is_json_record_content_type;
 pub use model::AppendStreamInput;
 pub use model::BOOTSTRAP_MAX_UPDATE_BYTES;
 pub use model::BucketUsage;

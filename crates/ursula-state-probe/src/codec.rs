@@ -18,8 +18,6 @@ use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::StreamSnapshot;
 
-pub const MIB: u64 = 1 << 20;
-
 pub fn placement0() -> ShardPlacement {
     ShardPlacement {
         core_id: CoreId(0),
@@ -69,22 +67,11 @@ pub struct StreamFrameStats {
     pub frame_bytes: u64,
     /// Unflushed payload bytes, `H(s)`.
     pub hot_bytes: u64,
-    /// JSON records that end in the hot bytes (LFs there), `U(s)`.
-    pub unflushed_records: u64,
-    /// Retained log below the seal point, in bytes (`K(s)` is this / MiB).
-    pub cold_bytes: u64,
     pub shared_refs: u64,
     pub external_segments: u64,
     pub producers: u64,
     pub receipts: u64,
     pub producer_bytes: u64,
-}
-
-impl StreamFrameStats {
-    /// `K(s)` in MiB, rounded up.
-    pub fn cold_mib_ceil(&self) -> u64 {
-        self.cold_bytes.div_ceil(MIB)
-    }
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -184,23 +171,11 @@ fn add_stream(st: &mut SnapStats, entry: proto::StreamSnapshotEntryV1, frame_byt
     st.visible_snapshot_bytes += vs;
     st.stream_fixed_bytes += frame_bytes.saturating_sub(cc + es + hp + hs + pr + vs);
 
-    let tail = entry
-        .metadata
-        .as_ref()
-        .map_or(0, |metadata| metadata.tail_offset);
     let hot_bytes = n(entry.payload.len());
-    let seal_point = if hot_bytes == 0 {
-        tail
-    } else {
-        entry.hot_start_offset
-    };
-    let retained = entry.retained_offset.unwrap_or(0);
     st.streams.push(StreamFrameStats {
         name: stream_name(&entry),
         frame_bytes,
         hot_bytes,
-        unflushed_records: n(entry.payload.iter().filter(|byte| **byte == b'\n').count()),
-        cold_bytes: seal_point.saturating_sub(retained),
         shared_refs: n(entry.cold_chunks.iter().filter(|c| c.shared_object).count()),
         external_segments: n(entry.external_segments.len()),
         producers: n(entry.producer_states.len()),

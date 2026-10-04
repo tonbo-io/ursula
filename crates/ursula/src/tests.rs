@@ -4346,15 +4346,6 @@ async fn json_snapshot_and_retention_offsets_must_follow_an_lf_hot_and_cold() {
             StatusCode::BAD_REQUEST,
             "offset {offset}"
         );
-        let response = put(format!("{stream_uri}/retention/{offset:020}")).await;
-        assert!(
-            matches!(
-                response.status(),
-                StatusCode::BAD_REQUEST | StatusCode::CONFLICT
-            ),
-            "offset {offset}: {}",
-            response.status()
-        );
     }
     let head = http_head(&app, stream_uri).await;
     assert!(head.headers().get(HEADER_STREAM_SNAPSHOT_OFFSET).is_none());
@@ -4364,8 +4355,15 @@ async fn json_snapshot_and_retention_offsets_must_follow_an_lf_hot_and_cold() {
         let response = put(format!("{stream_uri}/snapshot/{offset:020}")).await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT, "offset {offset}");
     }
-    let response = put(format!("{stream_uri}/retention/{:020}", 3)).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // Intra-message retention offsets: hot (20) and cold (3) both answer 400.
+    for offset in [20u64, 3] {
+        let response = put(format!("{stream_uri}/retention/{offset:020}")).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "offset {offset}"
+        );
+    }
     let response = put(format!("{stream_uri}/retention/{:020}", 8)).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(
