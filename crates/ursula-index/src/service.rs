@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,17 +37,31 @@ use ursula_observability::serve::shutdown_signal;
 use crate::EventIndex;
 use crate::EventIndexCache;
 use crate::EventIndexConfig;
+use crate::Extractor;
+use crate::ExtractorConfig;
 use crate::FsObjectStore;
 use crate::IndexCatalog;
 use crate::IndexError;
 use crate::IndexRegistration;
 use crate::IndexStatus;
 use crate::ObjectStore;
-use crate::QueryCursor;
 use crate::S3ObjectStore;
 use crate::S3ObjectStoreConfig;
-use crate::SourceBatch;
 use crate::SourceClient;
+use crate::catalog::StartPosition;
+use crate::source::MAX_MESSAGE_BYTES;
+use crate::source::ReadLimits;
+use crate::source::SegmentRead;
+use crate::source::SourceHead;
+use crate::store::Coverage;
+use crate::store::IndexBase;
+use crate::store::MatchMode;
+use crate::store::QueryCursor;
+use crate::store::QueryRequest;
+use crate::store::SkipCounts;
+use crate::store::SourceBinding;
+use crate::store::offset_token;
+use crate::store::parse_offset_token;
 
 #[derive(Debug, Args)]
 pub struct IndexerArgs {
@@ -68,14 +83,17 @@ pub struct IndexerArgs {
     maintenance_cache_max_bytes: u64,
     #[arg(long, default_value = "127.0.0.1:4493")]
     listen: SocketAddr,
+    /// Maximum messages (entries plus skips) in one committed segment, and
+    /// so entries in one uncompacted part.
     #[arg(long, default_value_t = 4_096)]
     flush_entries: usize,
     #[arg(long, default_value_t = 16_384)]
     row_group_entries: usize,
-    #[arg(long, default_value_t = 4_096)]
-    read_batch_records: usize,
-    #[arg(long, default_value_t = 65_536)]
-    segment_records: u64,
+    /// Source bytes read before a segment is committed. A shorter segment
+    /// waits for `--tail-flush-interval-ms`, unless it follows one that
+    /// stopped at `--flush-entries`.
+    #[arg(long, default_value_t = 32 * 1024 * 1024_u64)]
+    segment_bytes: u64,
     #[arg(long, default_value_t = 4)]
     worker_concurrency: usize,
     #[arg(long, default_value_t = 60_000)]
@@ -102,8 +120,17 @@ pub struct IndexerArgs {
     gc_retain_generations: u64,
     #[arg(long, default_value_t = 1_000)]
     maintenance_interval_ms: u64,
-    #[arg(long, default_value = "captured_at")]
-    timestamp_field: String,
+    /// Single-source mode: the top-level member holding the event time.
+    #[arg(long, conflicts_with = "extract")]
+    timestamp_field: Option<String>,
+    /// Single-source mode: an extractor as JSON,
+    /// `{"each":…,"time":[…],"end":[…],"unit":…}`.
+    #[arg(long)]
+    extract: Option<String>,
+    /// Single-source mode: start a new index at the `retained` offset or at
+    /// the `tail`. A recreated source is reindexed from its first byte.
+    #[arg(long, value_enum, default_value_t = StartPosition::Retained)]
+    start: StartPosition,
 }
 
 #[derive(Debug, Args)]
@@ -212,6 +239,28 @@ impl MaintenanceConfig {
     }
 }
 
+/// How one worker reads and claims source segments.
+#[derive(Clone, Debug)]
+struct WorkerParams {
+    worker_id: String,
+    lease_ms: u64,
+    limits: ReadLimits,
+}
+
+impl WorkerParams {
+    fn from_args(args: &IndexerArgs) -> Self {
+        Self {
+            worker_id: args.worker_id.clone(),
+            lease_ms: args.segment_lease_ms,
+            limits: ReadLimits {
+                segment_bytes: args.segment_bytes,
+                max_entries: args.flush_entries,
+                max_message_bytes: MAX_MESSAGE_BYTES,
+            },
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SingleAppState {
     index: Arc<Mutex<EventIndex>>,
@@ -221,11 +270,11 @@ struct SingleAppState {
 struct PoolIndexSettings {
     serving_cache: EventIndexCache,
     maintenance_cache: EventIndexCache,
-    flush_entries: usize,
     row_group_entries: usize,
 }
 
 struct PoolIndex {
+    namespace: String,
     serving: Arc<Mutex<EventIndex>>,
     maintenance: Mutex<EventIndex>,
 }
@@ -236,26 +285,31 @@ struct PoolState {
     backend: StoreTarget,
     settings: PoolIndexSettings,
     indexes: Arc<RwLock<HashMap<String, Arc<PoolIndex>>>>,
+    http: reqwest::Client,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RegisterIndexRequest {
     stream_url: String,
-    #[serde(default = "default_timestamp_field")]
-    timestamp_field: String,
-}
-
-fn default_timestamp_field() -> String {
-    "captured_at".to_owned()
+    #[serde(default)]
+    extract: Option<ExtractorConfig>,
+    /// Legacy form of `extract`: one top-level member.
+    #[serde(default)]
+    timestamp_field: Option<String>,
+    #[serde(default)]
+    start: StartPosition,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EventQuery {
     from: String,
     until: String,
-    after_captured_at_ms: Option<i64>,
-    after_record: Option<u64>,
-    through_record: Option<u64>,
+    #[serde(default, rename = "match")]
+    match_mode: Option<String>,
+    after: Option<String>,
+    through: Option<String>,
     #[serde(default = "default_limit")]
     limit: usize,
 }
@@ -267,20 +321,23 @@ fn default_limit() -> usize {
 #[derive(Debug, Serialize)]
 struct StatusBody {
     status: IndexStatus,
-    indexed_from_record: u64,
-    indexed_through_record: u64,
-    durable_through_record: u64,
+    source: SourceBinding,
+    coverage: Coverage,
+    skipped: SkipCounts,
     parts: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restarted_from_incarnation: Option<String>,
 }
 
 impl StatusBody {
-    fn read(index: &EventIndex) -> Self {
+    fn read(index: &EventIndex, restarted_from_incarnation: Option<String>) -> Self {
         Self {
             status: index.status().clone(),
-            indexed_from_record: index.indexed_from_record(),
-            indexed_through_record: index.indexed_through_record(),
-            durable_through_record: index.durable_through_record(),
+            source: index.source().clone(),
+            coverage: index.coverage(),
+            skipped: index.skipped(),
             parts: index.part_count(),
+            restarted_from_incarnation,
         }
     }
 }
@@ -292,16 +349,14 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match self.0 {
             IndexError::InvalidQuery
-            | IndexError::InvalidTimestamp { .. }
+            | IndexError::InvalidExtractor(_)
             | IndexError::InvalidConfig(_) => StatusCode::BAD_REQUEST,
-            IndexError::InvalidSourceResponse(_) | IndexError::MissingRecordCoordinates => {
-                StatusCode::UNPROCESSABLE_ENTITY
-            }
-            IndexError::RetentionGap { .. }
-            | IndexError::Blocked { .. }
+            IndexError::InvalidSourceResponse(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            IndexError::Blocked { .. }
+            | IndexError::SourceGone
             | IndexError::CannotResume(_)
             | IndexError::RegistrationConflict(_)
-            | IndexError::IndexBaseMismatch { .. } => StatusCode::CONFLICT,
+            | IndexError::NamespaceRetired(_) => StatusCode::CONFLICT,
             IndexError::UnknownIndex(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -316,10 +371,19 @@ impl IntoResponse for ApiError {
 pub async fn run(args: IndexerArgs) -> anyhow::Result<()> {
     let _observability =
         ursula_observability::init(ursula_observability::InitOptions::new("ursula-indexer"));
+    run_until(args, shutdown_signal()).await
+}
+
+/// Run the indexer until `shutdown` resolves. Used by `run` with the process
+/// signal handler and by in-process tests.
+pub async fn run_until(
+    args: IndexerArgs,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     validate_args(&args)?;
     match args.stream_url.clone() {
-        Some(stream_url) => run_single(args, stream_url).await,
-        None => run_pool(args).await,
+        Some(stream_url) => run_single(args, stream_url, shutdown).await,
+        None => run_pool(args, shutdown).await,
     }
 }
 
@@ -346,24 +410,63 @@ fn validate_args(args: &IndexerArgs) -> anyhow::Result<()> {
             "maintenance interval, GC interval, and retained generations must be positive"
         );
     }
-    if args.segment_records == 0
+    if args.segment_bytes == 0
+        || args.flush_entries == 0
         || args.worker_concurrency == 0
         || args.segment_lease_ms == 0
-        || usize::try_from(args.segment_records).is_err()
         || args.worker_id.is_empty()
     {
-        anyhow::bail!("segment records, lease duration, and worker id must be valid");
+        anyhow::bail!(
+            "segment bytes, flush entries, worker concurrency, lease duration, and worker id must be valid"
+        );
     }
     Ok(())
 }
 
-async fn run_single(args: IndexerArgs, stream_url: Url) -> anyhow::Result<()> {
-    let config = EventIndexConfig {
-        source_id: stream_url.to_string(),
-        flush_entries: args.flush_entries,
-        row_group_entries: args.row_group_entries,
-        timestamp_field: args.timestamp_field.clone(),
+fn single_extractor(args: &IndexerArgs) -> anyhow::Result<Extractor> {
+    if let Some(extract) = &args.extract {
+        let config: ExtractorConfig =
+            serde_json::from_str(extract).context("--extract is not a valid extractor")?;
+        return Ok(Extractor::new(config)?);
+    }
+    Ok(Extractor::timestamp_field(
+        args.timestamp_field.as_deref().unwrap_or("captured_at"),
+    )?)
+}
+
+fn start_offset(start: StartPosition, head: &SourceHead) -> u64 {
+    match start {
+        StartPosition::Retained => head.retained_offset,
+        StartPosition::Tail => head.next_offset,
+    }
+}
+
+/// Compare incarnations for equality only. An unknown incarnation on either
+/// side never triggers a restart.
+fn incarnation_changed(known: Option<&str>, observed: Option<&str>) -> bool {
+    matches!((known, observed), (Some(known), Some(observed)) if known != observed)
+}
+
+async fn run_single(
+    args: IndexerArgs,
+    stream_url: Url,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    let extractor = single_extractor(&args)?;
+    let start = args.start;
+    let source = SourceClient::new(reqwest::Client::new(), stream_url.clone());
+    let head = source
+        .head()
+        .await
+        .context("HEAD the source stream")?
+        .context("the source stream does not exist")?;
+    head.ensure_readable().context("HEAD the source stream")?;
+    let base = IndexBase {
+        offset: start_offset(start, &head),
+        incarnation: head.incarnation.clone(),
     };
+    let mut config = EventIndexConfig::new(stream_url.to_string(), extractor);
+    config.row_group_entries = args.row_group_entries;
     let store = StoreTarget::from_args(&args)?
         .open("")
         .context("open object store")?;
@@ -371,6 +474,7 @@ async fn run_single(args: IndexerArgs, stream_url: Url) -> anyhow::Result<()> {
         store.clone(),
         EventIndexCache::serving(&args.cache_dir, args.cache_max_bytes)?,
         config.clone(),
+        base.clone(),
     )
     .await
     .context("open event index")?;
@@ -381,21 +485,18 @@ async fn run_single(args: IndexerArgs, stream_url: Url) -> anyhow::Result<()> {
             args.maintenance_cache_max_bytes,
         )?,
         config,
+        base,
     )
     .await
     .context("open event index")?;
     let index = Arc::new(Mutex::new(index));
-    let source = SourceClient::new(stream_url.clone(), args.read_batch_records)
-        .context("configure source client")?;
-    source
-        .probe()
-        .await
-        .context("source stream must be application/json with json-record-coordinates-v1")?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let sync_task = tokio::spawn(sync_loop(
         source,
         Arc::clone(&index),
+        WorkerParams::from_args(&args),
         Duration::from_millis(args.poll_interval_ms),
+        Duration::from_millis(args.tail_flush_interval_ms),
         shutdown_rx.clone(),
     ));
     let maintenance_task = tokio::spawn(maintenance_loop(
@@ -415,71 +516,64 @@ async fn run_single(args: IndexerArgs, stream_url: Url) -> anyhow::Result<()> {
             .unwrap_or("filesystem-dev-backend"),
         "event indexer starting"
     );
-    serve(build_router(Arc::clone(&index)), args.listen, shutdown_tx).await?;
+    serve(build_router(index), args.listen, shutdown_tx, shutdown).await?;
     sync_task.await.context("join source sync loop")??;
     maintenance_task
         .await
         .context("join event index maintenance loop")??;
-    index
-        .lock()
-        .await
-        .flush()
-        .await
-        .context("flush event index on shutdown")?;
     Ok(())
 }
 
 impl PoolState {
-    fn namespace(registration: &IndexRegistration) -> String {
-        format!(
-            "{}-{}",
-            registration.id,
-            blake3::hash(registration.stream_url.as_bytes()).to_hex()
-        )
-    }
-
     async fn ensure_index(
         &self,
         registration: &IndexRegistration,
     ) -> Result<Arc<PoolIndex>, IndexError> {
-        if let Some(index) = self.indexes.read().await.get(&registration.id).cloned() {
-            return Ok(index);
+        let namespace = registration.namespace()?;
+        if let Some(index) = self.indexes.read().await.get(&registration.id)
+            && index.namespace == namespace
+        {
+            return Ok(Arc::clone(index));
         }
-        let namespace = Self::namespace(registration);
-        let config = EventIndexConfig {
-            source_id: registration.stream_url.clone(),
-            flush_entries: self.settings.flush_entries,
-            row_group_entries: self.settings.row_group_entries,
-            timestamp_field: registration.timestamp_field.clone(),
+        let mut config = EventIndexConfig::new(
+            registration.stream_url.clone(),
+            Extractor::new(registration.extract.clone())?,
+        );
+        config.row_group_entries = self.settings.row_group_entries;
+        let base = IndexBase {
+            offset: registration.indexed_from_offset,
+            incarnation: registration.incarnation.clone(),
         };
         let store = self.backend.open(&format!("indexes/{namespace}"))?;
-        let serving = EventIndex::open_from_record(
+        let serving = EventIndex::open(
             store.clone(),
             self.settings.serving_cache.clone(),
             config.clone(),
-            registration.indexed_from_record,
+            base.clone(),
         )
         .await?;
-        let maintenance = EventIndex::open_from_record(
-            store,
-            self.settings.maintenance_cache.clone(),
-            config,
-            registration.indexed_from_record,
-        )
-        .await?;
+        let maintenance =
+            EventIndex::open(store, self.settings.maintenance_cache.clone(), config, base).await?;
         let index = Arc::new(PoolIndex {
+            namespace: namespace.clone(),
             serving: Arc::new(Mutex::new(serving)),
             maintenance: Mutex::new(maintenance),
         });
         let mut indexes = self.indexes.write().await;
-        Ok(indexes
+        let entry = indexes
             .entry(registration.id.clone())
-            .or_insert_with(|| Arc::clone(&index))
-            .clone())
+            .or_insert_with(|| Arc::clone(&index));
+        if entry.namespace != namespace {
+            *entry = Arc::clone(&index);
+        }
+        Ok(Arc::clone(entry))
     }
 }
 
-async fn run_pool(args: IndexerArgs) -> anyhow::Result<()> {
+async fn run_pool(
+    args: IndexerArgs,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let backend = StoreTarget::from_args(&args)?;
     let catalog = IndexCatalog::new(backend.open("").context("open object store")?);
     let state = PoolState {
@@ -494,19 +588,16 @@ async fn run_pool(args: IndexerArgs) -> anyhow::Result<()> {
                 args.cache_dir.join("maintenance"),
                 args.maintenance_cache_max_bytes,
             )?,
-            flush_entries: args.flush_entries,
             row_group_entries: args.row_group_entries,
         },
         indexes: Arc::new(RwLock::new(HashMap::new())),
+        http: reqwest::Client::new(),
     };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let worker = tokio::spawn(pool_worker_loop(
         state.clone(),
-        args.worker_id.clone(),
-        args.segment_records,
+        WorkerParams::from_args(&args),
         args.worker_concurrency,
-        args.segment_lease_ms,
-        args.read_batch_records,
         Duration::from_millis(args.poll_interval_ms),
         Duration::from_millis(args.tail_flush_interval_ms),
         shutdown_rx.clone(),
@@ -520,11 +611,11 @@ async fn run_pool(args: IndexerArgs) -> anyhow::Result<()> {
     tracing::info!(
         listen = %args.listen,
         worker_id = %args.worker_id,
-        segment_records = args.segment_records,
+        segment_bytes = args.segment_bytes,
         cache_dir = %args.cache_dir.display(),
         "dynamic event-index worker pool starting"
     );
-    serve(pool_router(state), args.listen, shutdown_tx).await?;
+    serve(pool_router(state), args.listen, shutdown_tx, shutdown).await?;
     worker.await.context("join event-index worker pool")??;
     maintenance
         .await
@@ -532,17 +623,18 @@ async fn run_pool(args: IndexerArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Serve the HTTP app until a shutdown signal, then broadcast shutdown to the
+/// Serve the HTTP app until `shutdown`, then broadcast shutdown to the
 /// background loops.
 async fn serve(
     app: Router,
     listen: SocketAddr,
     shutdown_tx: watch::Sender<bool>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            shutdown_signal().await;
+            shutdown.await;
             if shutdown_tx.send(true).is_err() {
                 tracing::debug!("background loops already stopped");
             }
@@ -553,11 +645,8 @@ async fn serve(
 
 async fn pool_worker_loop(
     state: PoolState,
-    worker_id: String,
-    segment_records: u64,
+    params: WorkerParams,
     worker_concurrency: usize,
-    lease_ms: u64,
-    read_batch_records: usize,
     poll_interval: Duration,
     tail_flush_interval: Duration,
     mut shutdown: watch::Receiver<bool>,
@@ -580,6 +669,7 @@ async fn pool_worker_loop(
                     let mut tasks = JoinSet::new();
                     let mut attempts = 0_usize;
                     let mut partial_attempted = HashSet::new();
+                    let mut entry_capped = HashSet::new();
                     while (!pending.is_empty() || !tasks.is_empty()) && attempts < max_attempts {
                         while tasks.len() < worker_concurrency && attempts < max_attempts {
                             let Some(registration) = pending.pop_front() else {
@@ -587,17 +677,15 @@ async fn pool_worker_loop(
                             };
                             attempts = attempts.saturating_add(1);
                             let task_state = state.clone();
-                            let task_worker_id = worker_id.clone();
-                            let task_allow_partial =
-                                allow_partial && partial_attempted.insert(registration.id.clone());
+                            let task_params = params.clone();
+                            let task_allow_partial = entry_capped.remove(&registration.id)
+                                || (allow_partial
+                                    && partial_attempted.insert(registration.id.clone()));
                             tasks.spawn(async move {
                                 let result = process_pool_source(
                                     &task_state,
                                     &registration,
-                                    &task_worker_id,
-                                    segment_records,
-                                    lease_ms,
-                                    read_batch_records,
+                                    &task_params,
                                     task_allow_partial,
                                 )
                                 .await;
@@ -605,8 +693,14 @@ async fn pool_worker_loop(
                             });
                         }
                         match tasks.join_next().await {
-                            Some(Ok((registration, Ok(true)))) => pending.push_back(registration),
-                            Some(Ok((_registration, Ok(false)))) => {}
+                            Some(Ok((registration, Ok(Backlog::More)))) => {
+                                pending.push_back(registration)
+                            }
+                            Some(Ok((registration, Ok(Backlog::EntryCapped)))) => {
+                                entry_capped.insert(registration.id.clone());
+                                pending.push_back(registration);
+                            }
+                            Some(Ok((_registration, Ok(Backlog::Idle)))) => {}
                             Some(Ok((registration, Err(error)))) => tracing::warn!(
                                 index_id = %registration.id,
                                 stream_url = %registration.stream_url,
@@ -634,80 +728,199 @@ async fn pool_worker_loop(
     }
 }
 
+/// What an indexing pass leaves to do right away.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Backlog {
+    /// Nothing until the next poll.
+    Idle,
+    /// More source bytes are ready.
+    More,
+    /// The segment stopped at `--flush-entries` before the tail; claim the
+    /// rest even if it is shorter than `--segment-bytes`, so a stream of
+    /// small messages is not held to one segment per tail flush.
+    EntryCapped,
+}
+
+/// One scheduling attempt for one registration.
 async fn process_pool_source(
     state: &PoolState,
     registration: &IndexRegistration,
-    worker_id: &str,
-    segment_records: u64,
-    lease_ms: u64,
-    read_batch_records: usize,
+    params: &WorkerParams,
     allow_partial: bool,
-) -> Result<bool, IndexError> {
+) -> Result<Backlog, IndexError> {
     let stream_url = Url::parse(&registration.stream_url)
         .map_err(|_error| IndexError::InvalidConfig("registered stream URL is invalid"))?;
-    let source = SourceClient::new(stream_url, read_batch_records)?;
-    let source_range = source.record_range().await?;
+    let source = SourceClient::new(state.http.clone(), stream_url);
     let handles = state.ensure_index(registration).await?;
-    let index = &handles.serving;
-    let now_ms = wall_clock_millis()?;
-    let read_batch_records = u64::try_from(read_batch_records)
-        .map_err(|_error| IndexError::InvalidConfig("read batch record count is too large"))?;
-    let task_records = segment_records.min(read_batch_records);
-    let claim = {
-        let mut index = index.lock().await;
-        if source_range.first_record > index.durable_through_record() {
-            index.mark_retention_gap(source_range.first_record).await?;
-            return Ok(false);
+    let Some(head) = source.head().await? else {
+        mark_source_gone(&handles.serving).await?;
+        return Ok(Backlog::Idle);
+    };
+    if incarnation_changed(
+        registration.incarnation.as_deref(),
+        head.incarnation.as_deref(),
+    ) {
+        let restarted = state
+            .catalog
+            .restart(
+                &registration.id,
+                registration.incarnation.as_deref(),
+                head.incarnation.clone(),
+                wall_clock_millis()?,
+            )
+            .await?;
+        if restarted.incarnation == registration.incarnation {
+            // Equality-only comparison cannot order incarnations, so this
+            // is either a stale HEAD or a recreate into an incarnation this
+            // registration already retired; both wait for cleanup.
+            tracing::warn!(
+                index_id = %registration.id,
+                incarnation = ?registration.incarnation,
+                reported_incarnation = ?head.incarnation,
+                "source HEAD reports an incarnation whose index namespace is retired; not restarting"
+            );
+        } else {
+            tracing::info!(
+                index_id = %registration.id,
+                previous_incarnation = ?registration.incarnation,
+                incarnation = ?restarted.incarnation,
+                "source stream was recreated; restarted its event index"
+            );
         }
-        index
-            .claim_next_segment(
-                source_range.next_record,
-                task_records,
+        // The next pass picks up the restarted registration.
+        return Ok(Backlog::Idle);
+    }
+    index_source(&handles.serving, &source, &head, params, allow_partial).await
+}
+
+/// Record a 404 from the source. Only a ready index changes status: one this
+/// handle already saw gone or blocked needs no S3 request (a blocked index
+/// stays blocked until an operator resumes it).
+async fn mark_source_gone(index: &Mutex<EventIndex>) -> Result<(), IndexError> {
+    let mut index = index.lock().await;
+    if !matches!(index.status(), IndexStatus::Ready) {
+        return Ok(());
+    }
+    index.set_source_gone(true).await
+}
+
+/// Claim, read and commit one segment of `source` into `index`.
+async fn index_source(
+    index: &Mutex<EventIndex>,
+    source: &SourceClient,
+    head: &SourceHead,
+    params: &WorkerParams,
+    allow_partial: bool,
+) -> Result<Backlog, IndexError> {
+    // Refuse a content type the indexer cannot frame before claiming.
+    head.ensure_readable()?;
+    let now_ms = wall_clock_millis()?;
+    let (claim, resync, resume, extractor) = {
+        let mut index = index.lock().await;
+        // Idle skips, without any S3 request. The cached durable offset
+        // never exceeds the published one, so whenever the pending bytes
+        // it implies are below what a claim needs, the claim would be
+        // refused anyway. A blocked index (resumed perhaps on another pod),
+        // or one whose last read found only an unterminated line, is
+        // retried on tail-flush passes only.
+        let floor_current = head.retained_offset <= index.floor_offset();
+        let pending = head.next_offset.saturating_sub(index.durable_offset());
+        let idle = match index.status() {
+            IndexStatus::Ready => {
+                (floor_current
+                    && (pending == 0 || (!allow_partial && pending < params.limits.segment_bytes)))
+                    || (!allow_partial && index.is_stalled())
+            }
+            IndexStatus::Blocked { .. } => !allow_partial,
+            IndexStatus::SourceGone => false,
+        };
+        if idle {
+            return Ok(Backlog::Idle);
+        }
+        index.refresh().await?;
+        if matches!(index.status(), IndexStatus::SourceGone) {
+            index.set_source_gone(false).await?;
+        }
+        // Follow retention even while blocked.
+        if head.retained_offset > index.floor_offset() {
+            index.advance_floor(head.retained_offset).await?;
+        }
+        if matches!(index.status(), IndexStatus::Blocked { .. }) {
+            return Ok(Backlog::Idle);
+        }
+        let Some(claim) = index
+            .claim_segment(
+                head.next_offset,
+                params.limits.segment_bytes,
                 allow_partial,
-                worker_id,
+                &params.worker_id,
                 now_ms,
-                lease_ms,
+                params.lease_ms,
             )
             .await?
+        else {
+            return Ok(Backlog::Idle);
+        };
+        // A restart point may be mid-message: a first line that is not one
+        // complete JSON value is discarded as trimmed (a complete non-JSON
+        // NDJSON line included).
+        let resync = index.resync_offset() == Some(claim.start_offset);
+        (
+            claim,
+            resync,
+            index.oversize_scan(),
+            index.config().extractor.clone(),
+        )
     };
-    let Some(claim) = claim else {
-        return Ok(false);
-    };
-    let maximum = usize::try_from(claim.end_record.saturating_sub(claim.start_record))
-        .map_err(|_error| IndexError::InvalidConfig("claimed record range is too large"))?;
-    match source.read_range(claim.start_record, maximum).await? {
-        SourceBatch::Records(records) if records.is_empty() => {
-            Err(IndexError::InvalidSourceResponse(
-                "source returned no records for a non-empty claimed range",
-            ))
+    let read = source
+        .read_segment(
+            claim.start_offset,
+            resync,
+            resume,
+            &extractor,
+            params.limits,
+        )
+        .await;
+    let mut index = index.lock().await;
+    let segment = match read {
+        Ok(SegmentRead::Segment {
+            segment,
+            oversize_scan,
+        }) => {
+            index.note_oversize_scan(oversize_scan);
+            segment
         }
-        SourceBatch::Records(records) => {
-            let mut index = index.lock().await;
-            match index.finish_segment(&claim, records).await {
-                Err(error) if is_deterministic_data_error(&error) => {
-                    let reason = error.to_string();
-                    index
-                        .mark_segment_blocked(claim.start_record, reason.clone())
-                        .await?;
-                    Err(IndexError::Blocked {
-                        record: claim.start_record,
-                        reason,
-                    })
-                }
-                Ok(()) => Ok(true),
-                Err(error) => Err(error),
+        Ok(SegmentRead::Retained { retained_offset }) => {
+            index.advance_floor(retained_offset).await?;
+            index.release_claim(&claim).await?;
+            return Ok(Backlog::More);
+        }
+        Err(error) => {
+            if let Err(release) = index.release_claim(&claim).await {
+                tracing::warn!(%release, "failed to release an event-index claim");
             }
+            return Err(error);
         }
-        SourceBatch::RetentionGap {
-            first_available_record,
-        } => {
-            index
-                .lock()
-                .await
-                .mark_retention_gap(first_available_record)
-                .await?;
-            Ok(false)
+    };
+    let end = segment.end;
+    if end == segment.start {
+        index.note_stalled(end);
+        index.release_claim(&claim).await?;
+        return Ok(Backlog::Idle);
+    }
+    let entry_capped =
+        segment.entries.len().saturating_add(segment.skips.len()) >= params.limits.max_entries;
+    match index.finish_segment(&claim, segment).await {
+        Ok(()) if end >= head.next_offset => Ok(Backlog::Idle),
+        Ok(()) if entry_capped => Ok(Backlog::EntryCapped),
+        Ok(()) => Ok(Backlog::More),
+        Err(IndexError::EntryConflict { offset }) => {
+            let reason = IndexError::EntryConflict { offset }.to_string();
+            index.mark_blocked(offset, reason.clone()).await?;
+            index.release_claim(&claim).await?;
+            Err(IndexError::Blocked { offset, reason })
         }
+        Err(error) => Err(error),
     }
 }
 
@@ -723,9 +936,7 @@ async fn maintenance_pass(
         tracing::warn!(index_id, %error, "event index maintenance refresh failed; retrying");
         return;
     }
-    if matches!(index.status(), IndexStatus::Ready)
-        && index.needs_partition_compaction(config.compaction_fan_in, config.compaction_max_entries)
-    {
+    if index.needs_partition_compaction(config.compaction_fan_in, config.compaction_max_entries) {
         match index
             .compact_partition_once(config.compaction_fan_in, config.compaction_max_entries)
             .await
@@ -864,41 +1075,62 @@ async fn cleanup_retired_indexes(state: &PoolState, grace: Duration) {
             return;
         }
     };
-    for registration in retired {
-        let namespace = PoolState::namespace(&registration);
-        let store = match state.backend.open(&format!("indexes/{namespace}")) {
+    let live = match state.catalog.list().await {
+        Ok(registrations) => registrations
+            .iter()
+            .filter_map(|registration| registration.namespace().ok())
+            .collect::<HashSet<_>>(),
+        Err(error) => {
+            tracing::warn!(%error, "failed to load live event indexes");
+            return;
+        }
+    };
+    for retired in retired {
+        // Never delete a namespace a live registration uses; only drop its
+        // tombstone.
+        if live.contains(&retired.namespace) {
+            if let Err(error) = state.catalog.forget_retired(&retired.namespace).await {
+                tracing::warn!(index_id = %retired.id, %error, "failed to drop the tombstone of a live event index");
+            }
+            continue;
+        }
+        let store = match state
+            .backend
+            .open(&format!("indexes/{}", retired.namespace))
+        {
             Ok(store) => store,
             Err(error) => {
-                tracing::warn!(index_id = %registration.id, %error, "failed to open retired event index namespace");
+                tracing::warn!(index_id = %retired.id, %error, "failed to open retired event index namespace");
                 continue;
             }
         };
         match store.delete_all().await {
             Ok(deleted_objects) => {
-                if let Err(error) = state.catalog.forget_retired(&registration.id).await {
-                    tracing::warn!(index_id = %registration.id, %error, "retired event index was deleted but its tombstone remains");
+                if let Err(error) = state.catalog.forget_retired(&retired.namespace).await {
+                    tracing::warn!(index_id = %retired.id, %error, "retired event index was deleted but its tombstone remains");
                 } else {
-                    tracing::info!(index_id = %registration.id, deleted_objects, "deleted retired event index namespace");
+                    tracing::info!(index_id = %retired.id, namespace = %retired.namespace, deleted_objects, "deleted retired event index namespace");
                 }
             }
             Err(error) => {
-                tracing::warn!(index_id = %registration.id, %error, "failed to delete retired event index namespace")
+                tracing::warn!(index_id = %retired.id, %error, "failed to delete retired event index namespace")
             }
         }
     }
 }
 
+/// Drop in-memory indexes whose registration is gone or now names another
+/// namespace.
 async fn reconcile_pool_indexes(state: &PoolState) -> Result<(), IndexError> {
-    let registrations = state.catalog.list().await?;
-    let registered_ids = registrations
-        .into_iter()
-        .map(|registration| registration.id)
-        .collect::<HashSet<_>>();
-    state
-        .indexes
-        .write()
-        .await
-        .retain(|id, _index| registered_ids.contains(id));
+    let mut namespaces = HashMap::new();
+    for registration in state.catalog.list().await? {
+        namespaces.insert(registration.id.clone(), registration.namespace()?);
+    }
+    state.indexes.write().await.retain(|id, index| {
+        namespaces
+            .get(id)
+            .is_some_and(|namespace| *namespace == index.namespace)
+    });
     Ok(())
 }
 
@@ -912,77 +1144,72 @@ fn wall_clock_millis() -> Result<u64, IndexError> {
         ))
 }
 
+/// Single-source mode: one pass, restarting in place if the source was
+/// recreated.
+async fn single_pass(
+    source: &SourceClient,
+    index: &Mutex<EventIndex>,
+    params: &WorkerParams,
+    allow_partial: bool,
+) -> Result<Backlog, IndexError> {
+    let Some(head) = source.head().await? else {
+        mark_source_gone(index).await?;
+        return Ok(Backlog::Idle);
+    };
+    {
+        // The cached incarnation decides; `restart` refreshes and is a no-op
+        // if another instance already restarted.
+        let mut index = index.lock().await;
+        let known = index.source().incarnation.clone();
+        if incarnation_changed(known.as_deref(), head.incarnation.as_deref()) {
+            // As in pool mode, a recreated stream is covered from its first
+            // byte whatever `--start` says.
+            index.restart(head.incarnation.clone()).await?;
+            tracing::info!(
+                previous_incarnation = ?known,
+                incarnation = ?head.incarnation,
+                "source stream was recreated; restarted the event index"
+            );
+        }
+    }
+    index_source(index, source, &head, params, allow_partial).await
+}
+
 async fn sync_loop(
     source: SourceClient,
     index: Arc<Mutex<EventIndex>>,
+    params: WorkerParams,
     poll_interval: Duration,
+    tail_flush_interval: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    let mut next_tail_flush = Instant::now();
+    let mut entry_capped = false;
     loop {
         if *shutdown.borrow() {
             return Ok(());
         }
-        let (from_record, ready) = {
-            let mut index = index.lock().await;
-            index.refresh().await.context("refresh event index")?;
-            (
-                index.indexed_through_record(),
-                matches!(index.status(), IndexStatus::Ready),
-            )
-        };
-        if !ready {
-            if wait_or_shutdown(poll_interval, &mut shutdown).await {
-                return Ok(());
-            }
-            continue;
+        let tail_flush = Instant::now() >= next_tail_flush;
+        let follows_entry_cap = std::mem::take(&mut entry_capped);
+        let allow_partial = tail_flush || follows_entry_cap;
+        let result = single_pass(&source, &index, &params, allow_partial).await;
+        if tail_flush {
+            next_tail_flush = Instant::now()
+                .checked_add(tail_flush_interval)
+                .unwrap_or_else(Instant::now);
         }
-        match source.read_from(from_record).await {
-            Ok(SourceBatch::Records(records)) if records.is_empty() => {}
-            Ok(SourceBatch::Records(records)) => {
-                let update = async {
-                    let mut index = index.lock().await;
-                    for envelope in records {
-                        let record = envelope.record;
-                        if let Err(error) = index.ingest_envelope(envelope).await {
-                            if !is_deterministic_data_error(&error) {
-                                return Err(error);
-                            }
-                            let reason = error.to_string();
-                            let blocked_record = index.indexed_through_record();
-                            index.mark_blocked(blocked_record, reason.clone()).await?;
-                            return Err(IndexError::Blocked {
-                                record: blocked_record,
-                                reason: format!("source record {record}: {reason}"),
-                            });
-                        }
-                    }
-                    Ok(())
-                }
-                .await;
-                match update {
-                    Ok(()) => continue,
-                    Err(error) if matches!(error, IndexError::Blocked { .. }) => {
-                        tracing::error!(%error, "event index source processing blocked");
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "event index update failed transiently; retrying");
-                    }
-                }
+        match result {
+            Ok(Backlog::More) => continue,
+            Ok(Backlog::EntryCapped) => {
+                entry_capped = true;
+                continue;
             }
-            Ok(SourceBatch::RetentionGap {
-                first_available_record,
-            }) => {
-                let result = index
-                    .lock()
-                    .await
-                    .mark_retention_gap(first_available_record)
-                    .await;
-                if let Err(error) = result {
-                    tracing::error!(%error, "event index cannot cover retained source history");
-                }
+            Ok(Backlog::Idle) => {}
+            Err(error @ IndexError::Blocked { .. }) => {
+                tracing::error!(%error, "event index source processing blocked");
             }
             Err(error) => {
-                tracing::warn!(%error, from_record, "source read failed; retrying");
+                tracing::warn!(%error, "event index update failed transiently; retrying");
             }
         }
         if wait_or_shutdown(poll_interval, &mut shutdown).await {
@@ -1042,23 +1269,41 @@ async fn pool_readyz(State(state): State<PoolState>) -> StatusCode {
     }
 }
 
+fn request_extractor(request: &RegisterIndexRequest) -> Result<ExtractorConfig, IndexError> {
+    match (&request.extract, &request.timestamp_field) {
+        (Some(_), Some(_)) => Err(IndexError::InvalidConfig(
+            "pass either `extract` or the legacy `timestamp_field`, not both",
+        )),
+        (Some(extract), None) => Ok(extract.clone()),
+        (None, Some(field)) => Ok(Extractor::timestamp_field(field)?.config().clone()),
+        (None, None) => Ok(Extractor::timestamp_field("captured_at")?.config().clone()),
+    }
+}
+
 async fn register_pool_index(
     State(state): State<PoolState>,
     Path(id): Path<String>,
     Json(request): Json<RegisterIndexRequest>,
 ) -> Result<Response, ApiError> {
     let stream_url = crate::validate_stream_url(&request.stream_url).map_err(ApiError)?;
+    let extract = request_extractor(&request).map_err(ApiError)?;
     let canonical_stream_url = stream_url.to_string();
-    let source_range = SourceClient::new(stream_url, 1)
-        .map_err(ApiError)?
-        .record_range()
+    let head = SourceClient::new(state.http.clone(), stream_url)
+        .head()
         .await
-        .map_err(ApiError)?;
+        .map_err(ApiError)?
+        .ok_or(ApiError(IndexError::InvalidSourceResponse(
+            "the source stream does not exist",
+        )))?;
+    head.ensure_readable().map_err(ApiError)?;
     let registration = IndexRegistration {
         id,
         stream_url: canonical_stream_url,
-        timestamp_field: request.timestamp_field,
-        indexed_from_record: source_range.first_record,
+        extract,
+        start: request.start,
+        indexed_from_offset: start_offset(request.start, &head),
+        incarnation: head.incarnation.clone(),
+        restarted_from_incarnation: None,
     };
     state
         .catalog
@@ -1093,10 +1338,13 @@ async fn list_pool_indexes(
     Ok(Json(state.catalog.list().await.map_err(ApiError)?))
 }
 
-async fn pool_index(state: &PoolState, id: &str) -> Result<Arc<Mutex<EventIndex>>, ApiError> {
+async fn pool_index(
+    state: &PoolState,
+    id: &str,
+) -> Result<(Arc<Mutex<EventIndex>>, IndexRegistration), ApiError> {
     let registration = state.catalog.get(id).await.map_err(ApiError)?;
     let index = state.ensure_index(&registration).await.map_err(ApiError)?;
-    Ok(Arc::clone(&index.serving))
+    Ok((Arc::clone(&index.serving), registration))
 }
 
 /// Refresh (or, for a resume request, clear the blocked status of) an index
@@ -1104,6 +1352,7 @@ async fn pool_index(state: &PoolState, id: &str) -> Result<Arc<Mutex<EventIndex>
 async fn status_response(
     index: &Mutex<EventIndex>,
     resume: bool,
+    restarted_from_incarnation: Option<String>,
 ) -> Result<Json<StatusBody>, ApiError> {
     let mut index = index.lock().await;
     if resume {
@@ -1111,23 +1360,23 @@ async fn status_response(
     } else {
         index.refresh().await.map_err(ApiError)?;
     }
-    Ok(Json(StatusBody::read(&index)))
+    Ok(Json(StatusBody::read(&index, restarted_from_incarnation)))
 }
 
 async fn pool_index_status(
     State(state): State<PoolState>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusBody>, ApiError> {
-    let index = pool_index(&state, &id).await?;
-    status_response(&index, false).await
+    let (index, registration) = pool_index(&state, &id).await?;
+    status_response(&index, false, registration.restarted_from_incarnation).await
 }
 
 async fn resume_pool_index(
     State(state): State<PoolState>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusBody>, ApiError> {
-    let index = pool_index(&state, &id).await?;
-    status_response(&index, true).await
+    let (index, registration) = pool_index(&state, &id).await?;
+    status_response(&index, true, registration.restarted_from_incarnation).await
 }
 
 async fn query_pool_events(
@@ -1135,7 +1384,7 @@ async fn query_pool_events(
     Path(id): Path<String>,
     Query(query): Query<EventQuery>,
 ) -> Result<Response, ApiError> {
-    let index = pool_index(&state, &id).await?;
+    let (index, _registration) = pool_index(&state, &id).await?;
     query_index(index, query).await
 }
 
@@ -1143,36 +1392,22 @@ async fn livez() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+/// Query readiness is independent of source health: a blocked or gone source
+/// still serves its committed index.
 async fn readyz(State(state): State<SingleAppState>) -> StatusCode {
     let mut index = state.index.lock().await;
     match index.refresh().await {
-        Ok(())
-            if matches!(
-                index.status(),
-                IndexStatus::Ready | IndexStatus::Blocked { .. }
-            ) =>
-        {
-            StatusCode::NO_CONTENT
-        }
-        Ok(()) | Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
-fn is_deterministic_data_error(error: &IndexError) -> bool {
-    matches!(
-        error,
-        IndexError::InvalidTimestamp { .. }
-            | IndexError::UnexpectedRecord { .. }
-            | IndexError::RecordConflict { .. }
-    )
-}
-
 async fn resume_index(State(state): State<SingleAppState>) -> Result<Json<StatusBody>, ApiError> {
-    status_response(&state.index, true).await
+    status_response(&state.index, true, None).await
 }
 
 async fn index_status(State(state): State<SingleAppState>) -> Result<Json<StatusBody>, ApiError> {
-    status_response(&state.index, false).await
+    status_response(&state.index, false, None).await
 }
 
 async fn query_events(
@@ -1182,36 +1417,51 @@ async fn query_events(
     query_index(state.index, query).await
 }
 
+fn query_request(query: &EventQuery) -> Result<QueryRequest, IndexError> {
+    let from_ms = parse_query_timestamp(&query.from).ok_or(IndexError::InvalidQuery)?;
+    let until_ms = parse_query_timestamp(&query.until).ok_or(IndexError::InvalidQuery)?;
+    let match_mode = match query.match_mode.as_deref() {
+        None | Some("start") => MatchMode::Start,
+        Some("overlap") => MatchMode::Overlap,
+        Some(_) => return Err(IndexError::InvalidQuery),
+    };
+    let after = query
+        .after
+        .as_deref()
+        .map(|after| QueryCursor::decode(after).ok_or(IndexError::InvalidQuery))
+        .transpose()?;
+    let through = query
+        .through
+        .as_deref()
+        .map(|through| parse_offset_token(through).ok_or(IndexError::InvalidQuery))
+        .transpose()?;
+    if query.limit > 10_000 {
+        return Err(IndexError::InvalidQuery);
+    }
+    Ok(QueryRequest {
+        from_ms,
+        until_ms,
+        match_mode,
+        after,
+        through,
+        limit: query.limit,
+    })
+}
+
 async fn query_index(
     index: Arc<Mutex<EventIndex>>,
     query: EventQuery,
 ) -> Result<Response, ApiError> {
-    let from_ms = parse_query_timestamp(&query.from).ok_or(ApiError(IndexError::InvalidQuery))?;
-    let until_ms = parse_query_timestamp(&query.until).ok_or(ApiError(IndexError::InvalidQuery))?;
-    let after = match (query.after_captured_at_ms, query.after_record) {
-        (None, None) => None,
-        (Some(captured_at_ms), Some(record)) => Some(QueryCursor {
-            captured_at_ms,
-            record,
-        }),
-        _ => return Err(ApiError(IndexError::InvalidQuery)),
-    };
-    if query.limit > 10_000 {
-        return Err(ApiError(IndexError::InvalidQuery));
-    }
-    let result = index
-        .lock()
-        .await
-        .query(from_ms, until_ms, after, query.through_record, query.limit)
-        .await
-        .map_err(ApiError)?;
+    let request = query_request(&query).map_err(ApiError)?;
+    let result = index.lock().await.query(request).await.map_err(ApiError)?;
     let mut headers = HeaderMap::new();
     for (name, value) in [
-        ("indexed-from-record", result.indexed_from_record),
-        ("indexed-through-record", result.indexed_through_record),
-        ("durable-through-record", result.durable_through_record),
+        ("indexed-from-offset", result.coverage.from),
+        ("floor-offset", result.coverage.floor),
+        ("durable-offset", result.coverage.durable),
+        ("through-offset", result.coverage.through),
     ] {
-        let value = HeaderValue::from_str(&value.to_string())
+        let value = HeaderValue::from_str(&offset_token(value))
             .map_err(|_error| ApiError(IndexError::InvalidQuery))?;
         headers.insert(name, value);
     }
@@ -1234,52 +1484,45 @@ mod tests {
     )]
 
     use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
 
     use axum::body::Body;
     use axum::body::to_bytes;
     use axum::http::Request;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
-    use axum::routing::get;
+    use reqwest::Url;
     use tempfile::TempDir;
     use tokio::sync::Mutex;
     use tower::ServiceExt;
 
+    use super::Backlog;
     use super::PoolIndexSettings;
     use super::PoolState;
     use super::StoreTarget;
+    use super::WorkerParams;
     use super::build_router;
     use super::cleanup_retired_indexes;
-    use super::is_deterministic_data_error;
     use super::pool_router;
     use super::process_pool_source;
     use super::reconcile_pool_indexes;
+    use super::single_pass;
     use crate::EventEntry;
     use crate::EventIndex;
     use crate::EventIndexCache;
     use crate::EventIndexConfig;
+    use crate::Extractor;
     use crate::FsObjectStore;
+    use crate::IndexBase;
     use crate::IndexCatalog;
     use crate::IndexError;
     use crate::IndexRegistration;
-
-    async fn fs_index(
-        objects: &TempDir,
-        cache: &TempDir,
-        source_id: &str,
-    ) -> anyhow::Result<EventIndex> {
-        Ok(EventIndex::open(
-            FsObjectStore::new(objects.path())?,
-            EventIndexCache::serving(cache.path(), 16 * 1024 * 1024)?,
-            EventIndexConfig {
-                source_id: source_id.to_owned(),
-                flush_entries: 2,
-                row_group_entries: 2,
-                timestamp_field: "captured_at".to_owned(),
-            },
-        )
-        .await?)
-    }
+    use crate::IndexStatus;
+    use crate::QueryRequest;
+    use crate::Segment;
+    use crate::SourceClient;
+    use crate::catalog::StartPosition;
+    use crate::source::ReadLimits;
 
     fn pool_state(objects: &TempDir, cache: &TempDir) -> anyhow::Result<PoolState> {
         Ok(PoolState {
@@ -1296,161 +1539,123 @@ mod tests {
                     cache.path().join("maintenance"),
                     16 * 1024 * 1024,
                 )?,
-                flush_entries: 2,
                 row_group_entries: 2,
             },
             indexes: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            http: reqwest::Client::new(),
         })
     }
 
-    #[test]
-    fn only_deterministic_source_data_errors_block_the_index() {
-        assert!(is_deterministic_data_error(&IndexError::InvalidTimestamp {
-            record: 7,
-            field: "captured_at".to_owned(),
-        }));
-        assert!(is_deterministic_data_error(&IndexError::UnexpectedRecord {
-            expected: 7,
-            actual: 8,
-        }));
-        assert!(is_deterministic_data_error(&IndexError::RecordConflict {
-            record: 7,
-        }));
-        assert!(!is_deterministic_data_error(&IndexError::PublishConflict));
-        assert!(!is_deterministic_data_error(&IndexError::ObjectStore(
-            "temporary outage".to_owned(),
-        )));
+    fn params(worker_id: &str, segment_bytes: u64) -> WorkerParams {
+        WorkerParams {
+            worker_id: worker_id.to_owned(),
+            lease_ms: 60_000,
+            limits: ReadLimits {
+                segment_bytes,
+                max_entries: 1_000,
+                max_message_bytes: 1_024,
+            },
+        }
     }
 
-    #[tokio::test]
-    async fn http_query_exposes_sorted_records_and_watermarks() -> anyhow::Result<()> {
-        let objects = TempDir::new()?;
-        let cache = TempDir::new()?;
-        let mut index = fs_index(&objects, &cache, "http-test").await?;
-        index
-            .ingest(EventEntry {
-                captured_at_ms: 200,
-                record: 0,
-            })
-            .await?;
-        index
-            .ingest(EventEntry {
-                captured_at_ms: 100,
-                record: 1,
-            })
-            .await?;
-        let index = Arc::new(Mutex::new(index));
-        let app = build_router(Arc::clone(&index));
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/events?from=0&until=1000&limit=10")
-                    .body(Body::empty())?,
-            )
-            .await?;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()["indexed-through-record"], "2");
-        assert_eq!(response.headers()["durable-through-record"], "2");
-        let body = to_bytes(response.into_body(), 64 * 1024).await?;
-        let body: serde_json::Value = serde_json::from_slice(&body)?;
-        assert_eq!(body["records"][0]["record"], 1);
-        assert_eq!(body["records"][1]["record"], 0);
-        Ok(())
+    /// A mock source whose body, incarnation and retained offset tests
+    /// change between passes.
+    #[derive(Clone, Default)]
+    struct MockSource {
+        body: Arc<StdMutex<Vec<u8>>>,
+        incarnation: Arc<StdMutex<String>>,
+        retained: Arc<StdMutex<u64>>,
+        content_type: Arc<StdMutex<&'static str>>,
     }
 
-    #[tokio::test]
-    async fn health_endpoints_keep_query_readiness_independent_from_source_health()
-    -> anyhow::Result<()> {
-        let objects = TempDir::new()?;
-        let cache = TempDir::new()?;
-        let index = fs_index(&objects, &cache, "health-test").await?;
-        let index = Arc::new(Mutex::new(index));
-        let app = build_router(Arc::clone(&index));
+    impl MockSource {
+        fn set(&self, body: &str, incarnation: &str, retained: u64) {
+            *self.body.lock().expect("lock") = body.as_bytes().to_vec();
+            *self.incarnation.lock().expect("lock") = incarnation.to_owned();
+            *self.retained.lock().expect("lock") = retained;
+        }
 
-        let response = app
-            .clone()
-            .oneshot(Request::builder().uri("/livez").body(Body::empty())?)
-            .await?;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let response = app
-            .clone()
-            .oneshot(Request::builder().uri("/readyz").body(Body::empty())?)
-            .await?;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        fn set_content_type(&self, content_type: &'static str) {
+            *self.content_type.lock().expect("lock") = content_type;
+        }
 
-        index
-            .lock()
-            .await
-            .mark_blocked(0, "operator repair required".to_owned())
-            .await?;
-        let response = app
-            .clone()
-            .oneshot(Request::builder().uri("/readyz").body(Body::empty())?)
-            .await?;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/status/resume")
-                    .body(Body::empty())?,
-            )
-            .await?;
-        assert_eq!(response.status(), StatusCode::OK);
-        let response = app
-            .oneshot(Request::builder().uri("/readyz").body(Body::empty())?)
-            .await?;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dynamic_pool_registers_and_processes_record_ranges_without_reconfiguration()
-    -> anyhow::Result<()> {
-        let source_app = axum::Router::new()
-            .route(
+        async fn serve(self) -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
+            let app = axum::Router::new().route(
                 "/stream",
-                get(|request: axum::extract::Request| async move {
-                    let query = request.uri().query().unwrap_or_default();
-                    let start = if query.contains("record=7") { 7 } else { 5 };
-                    let body = if start == 5 {
-                        concat!(
-                            "{\"record\":5,\"value\":{\"captured_at\":\"2026-07-18T10:00:00Z\"}}\n",
-                            "{\"record\":6,\"value\":{\"captured_at\":\"2026-07-18T09:00:00Z\"}}\n"
-                        )
-                    } else {
-                        concat!(
-                            "{\"record\":7,\"value\":{\"captured_at\":\"2026-07-18T11:00:00Z\"}}\n",
-                            "{\"record\":8,\"value\":{\"captured_at\":\"2026-07-18T08:00:00Z\"}}\n"
-                        )
-                    };
-                    (
-                        StatusCode::OK,
-                        [("stream-extensions", "json-record-coordinates-v1")],
-                        body,
-                    )
-                        .into_response()
+                axum::routing::any(move |request: axum::extract::Request| {
+                    let source = self.clone();
+                    async move { source.respond(&request) }
                 }),
-            )
-            .route_layer(axum::middleware::from_fn(
-                |request: axum::extract::Request, next: axum::middleware::Next| async move {
-                    if request.method() == axum::http::Method::HEAD {
-                        return (StatusCode::OK, [
-                            ("content-type", "application/json"),
-                            ("stream-extensions", "json-record-coordinates-v1"),
-                            ("stream-record-first", "5"),
-                            ("stream-record-next", "9"),
-                        ])
-                            .into_response();
-                    }
-                    next.run(request).await
-                },
-            ));
-        let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let source_address = source_listener.local_addr()?;
-        let source_server = tokio::spawn(axum::serve(source_listener, source_app).into_future());
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let server = tokio::spawn(async move {
+                if let Err(error) = axum::serve(listener, app).await {
+                    tracing::warn!(%error, "mock source stopped");
+                }
+            });
+            Ok((format!("http://{address}/stream"), server))
+        }
 
+        fn respond(&self, request: &axum::extract::Request) -> axum::response::Response {
+            let body = self.body.lock().expect("lock").clone();
+            let incarnation = self.incarnation.lock().expect("lock").clone();
+            let retained = *self.retained.lock().expect("lock");
+            let tail = u64::try_from(body.len()).expect("small body");
+            let pad = |offset: u64| format!("{offset:020}");
+            if request.method() == axum::http::Method::HEAD {
+                let content_type = match *self.content_type.lock().expect("lock") {
+                    "" => "application/json",
+                    content_type => content_type,
+                };
+                return (StatusCode::OK, [
+                    ("content-type", content_type.to_owned()),
+                    ("stream-next-offset", pad(tail)),
+                    ("stream-retained-offset", pad(retained)),
+                    ("stream-incarnation", incarnation),
+                ])
+                    .into_response();
+            }
+            let offset = request
+                .uri()
+                .query()
+                .and_then(|query| {
+                    query
+                        .split('&')
+                        .find_map(|pair| pair.strip_prefix("offset="))
+                })
+                .and_then(|offset| offset.parse::<u64>().ok())
+                .unwrap_or(0);
+            if offset < retained {
+                return (StatusCode::GONE, [("stream-next-offset", pad(retained))]).into_response();
+            }
+            let start = usize::try_from(offset).expect("small offset");
+            let chunk = body.get(start..).unwrap_or_default().to_vec();
+            (
+                StatusCode::OK,
+                [
+                    ("stream-next-offset", pad(tail)),
+                    ("stream-up-to-date", "true".to_owned()),
+                ],
+                chunk,
+            )
+                .into_response()
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_registers_and_queries_an_index() -> anyhow::Result<()> {
+        let source = MockSource::default();
+        source.set(
+            concat!(
+                "{\"captured_at\":\"2026-07-18T10:00:00Z\"}\n",
+                "{\"other\":1}\n",
+                "{\"captured_at\":\"2026-07-18T09:00:00Z\"}\n"
+            ),
+            "100",
+            0,
+        );
+        let (stream_url, server) = source.clone().serve().await?;
         let objects = TempDir::new()?;
         let cache = TempDir::new()?;
         let state = pool_state(&objects, &cache)?;
@@ -1463,19 +1668,21 @@ mod tests {
                     .uri("/v1/indexes/session-42")
                     .header("content-type", "application/json")
                     .body(Body::from(format!(
-                        "{{\"stream_url\":\"http://{source_address}/stream\",\"timestamp_field\":\"captured_at\"}}"
+                        "{{\"stream_url\":\"{stream_url}\",\"timestamp_field\":\"captured_at\"}}"
                     )))?,
             )
             .await?;
         assert_eq!(response.status(), StatusCode::CREATED);
         let body = to_bytes(response.into_body(), 64 * 1024).await?;
         let body: serde_json::Value = serde_json::from_slice(&body)?;
-        assert_eq!(body["indexed_from_record"], 5);
+        assert_eq!(body["indexed_from_offset"], "00000000000000000000");
+        assert_eq!(body["incarnation"], "100");
         let registration = state.catalog.get("session-42").await?;
-        assert_eq!(registration.indexed_from_record, 5);
 
-        process_pool_source(&state, &registration, "worker-a", 2, 60_000, 2, true).await?;
-        process_pool_source(&state, &registration, "worker-b", 2, 60_000, 2, true).await?;
+        // A 2-byte segment limit commits one message per pass.
+        while process_pool_source(&state, &registration, &params("worker-a", 2), true).await?
+            != Backlog::Idle
+        {}
         let response = app
             .oneshot(
                 Request::builder()
@@ -1484,13 +1691,250 @@ mod tests {
             )
             .await?;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()["indexed-from-record"], "5");
-        assert_eq!(response.headers()["durable-through-record"], "9");
+        assert_eq!(response.headers()["durable-offset"], "00000000000000000090");
         let body = to_bytes(response.into_body(), 64 * 1024).await?;
         let body: serde_json::Value = serde_json::from_slice(&body)?;
-        assert_eq!(body["records"].as_array().map(Vec::len), Some(4));
+        assert_eq!(body["entries"][0]["offset"], "00000000000000000051");
+        assert_eq!(body["entries"][0]["len"], 39);
+        assert_eq!(body["entries"][1]["offset"], "00000000000000000000");
+        assert_eq!(body["skipped"]["missing"], 1);
+        assert_eq!(body["coverage"]["complete"], true);
+        assert_eq!(body["source"]["incarnation"], "100");
+        server.abort();
+        Ok(())
+    }
 
-        source_server.abort();
+    #[tokio::test]
+    async fn retention_past_unindexed_bytes_advances_the_floor_and_reports_incomplete()
+    -> anyhow::Result<()> {
+        // 18-byte messages. On JSON, retention lands on a message boundary;
+        // on NDJSON it lands mid-line in the second message, whose 9-byte
+        // tail is discarded and counted as trimmed too.
+        for (ndjson, retained, trimmed, offsets) in
+            [(false, 54, 36, vec![54]), (true, 27, 18, vec![36, 54])]
+        {
+            let source = MockSource::default();
+            if ndjson {
+                source.set_content_type("application/x-ndjson");
+            }
+            let message = "{\"captured_at\":7}\n";
+            source.set(&message.repeat(4), "1", 0);
+            let (stream_url, server) = source.clone().serve().await?;
+            let objects = TempDir::new()?;
+            let cache = TempDir::new()?;
+            let state = pool_state(&objects, &cache)?;
+            let registration = IndexRegistration {
+                id: "floor".to_owned(),
+                stream_url,
+                extract: Extractor::timestamp_field("captured_at")?.config().clone(),
+                start: StartPosition::Retained,
+                indexed_from_offset: 0,
+                incarnation: Some("1".to_owned()),
+                restarted_from_incarnation: None,
+            };
+            state.catalog.register(&registration).await?;
+            let registration = state.catalog.get("floor").await?;
+            // Index the first message only.
+            assert_eq!(
+                process_pool_source(&state, &registration, &params("worker-a", 1), true).await?,
+                Backlog::More
+            );
+            source.set(&message.repeat(4), "1", retained);
+            while process_pool_source(&state, &registration, &params("worker-a", 64), true).await?
+                != Backlog::Idle
+            {}
+            let handles = state.ensure_index(&registration).await?;
+            let mut index = handles.serving.lock().await;
+            assert_eq!(index.floor_offset(), retained);
+            assert_eq!(index.durable_offset(), 72);
+            assert_eq!(index.trimmed_bytes(), trimmed);
+            assert!(!index.coverage().complete);
+            let result = index.query(QueryRequest::window(0, 1_000, 10)).await?;
+            let located = result
+                .entries
+                .iter()
+                .map(|entry| entry.offset)
+                .collect::<Vec<_>>();
+            assert_eq!(located, offsets);
+            drop(index);
+            server.abort();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_source_router_serves_queries_and_stays_ready_while_blocked()
+    -> anyhow::Result<()> {
+        let objects = TempDir::new()?;
+        let cache = TempDir::new()?;
+        let mut config = EventIndexConfig::new(
+            "https://example.test/single",
+            Extractor::timestamp_field("captured_at")?,
+        );
+        config.row_group_entries = 2;
+        let mut index = EventIndex::open(
+            FsObjectStore::new(objects.path())?,
+            EventIndexCache::serving(cache.path(), 16 * 1024 * 1024)?,
+            config,
+            IndexBase::default(),
+        )
+        .await?;
+        let entry = |t_ms: i64, offset: u64| EventEntry {
+            t_ms,
+            t_end_ms: t_ms,
+            offset,
+            len: 10,
+        };
+        index
+            .commit_segment(Segment {
+                start: 0,
+                end: 20,
+                entries: vec![entry(200, 0), entry(100, 10)],
+                skips: Vec::new(),
+            })
+            .await?;
+        index
+            .mark_blocked(20, "operator repair required".to_owned())
+            .await?;
+        let index = Arc::new(Mutex::new(index));
+        let app = build_router(Arc::clone(&index));
+
+        // A blocked index still answers readiness and queries.
+        for uri in ["/livez", "/readyz"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty())?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events?from=0&until=1000&limit=10")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["durable-offset"], "00000000000000000020");
+        assert_eq!(response.headers()["through-offset"], "00000000000000000020");
+        let body = to_bytes(response.into_body(), 64 * 1024).await?;
+        let body: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(body["entries"][0]["offset"], "00000000000000000010");
+        assert_eq!(body["entries"][1]["offset"], "00000000000000000000");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/status/resume")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(index.lock().await.status(), &IndexStatus::Ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_source_mode_restarts_in_place_on_a_recreated_source() -> anyhow::Result<()> {
+        let source = MockSource::default();
+        let message = "{\"captured_at\":7}\n";
+        source.set(&message.repeat(2), "1", 0);
+        let (stream_url, server) = source.clone().serve().await?;
+        let objects = TempDir::new()?;
+        let cache = TempDir::new()?;
+        let index = EventIndex::open(
+            FsObjectStore::new(objects.path())?,
+            EventIndexCache::serving(cache.path(), 16 * 1024 * 1024)?,
+            EventIndexConfig::new(
+                stream_url.clone(),
+                Extractor::timestamp_field("captured_at")?,
+            ),
+            IndexBase {
+                offset: 0,
+                incarnation: Some("1".to_owned()),
+            },
+        )
+        .await?;
+        let index = Mutex::new(index);
+        let client = SourceClient::new(reqwest::Client::new(), Url::parse(&stream_url)?);
+        let worker = params("worker-a", 64);
+        while single_pass(&client, &index, &worker, true).await? != Backlog::Idle {}
+        assert_eq!(index.lock().await.durable_offset(), 36);
+
+        source.set(message, "2", 0);
+        while single_pass(&client, &index, &worker, true).await? != Backlog::Idle {}
+        let mut guard = index.lock().await;
+        assert_eq!(guard.source().incarnation.as_deref(), Some("2"));
+        assert_eq!(guard.durable_offset(), 18);
+        let result = guard.query(QueryRequest::window(0, 1_000, 10)).await?;
+        assert_eq!(result.entries.len(), 1);
+        drop(guard);
+
+        // Recreated with a type the indexer cannot read: the restart still
+        // happens, then indexing fails instead of serving stale locators.
+        source.set_content_type("application/octet-stream");
+        source.set(message, "3", 0);
+        assert!(matches!(
+            single_pass(&client, &index, &worker, true).await,
+            Err(IndexError::InvalidSourceResponse(_))
+        ));
+        let guard = index.lock().await;
+        assert_eq!(guard.source().incarnation.as_deref(), Some("3"));
+        assert_eq!(guard.durable_offset(), 0);
+        drop(guard);
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_tail_registration_covers_a_recreated_stream_from_its_first_byte()
+    -> anyhow::Result<()> {
+        let source = MockSource::default();
+        let message = "{\"captured_at\":7}\n";
+        source.set(&message.repeat(2), "1", 0);
+        let (stream_url, server) = source.clone().serve().await?;
+        let objects = TempDir::new()?;
+        let cache = TempDir::new()?;
+        let state = pool_state(&objects, &cache)?;
+        state
+            .catalog
+            .register(&IndexRegistration {
+                id: "tail".to_owned(),
+                stream_url,
+                extract: Extractor::timestamp_field("captured_at")?.config().clone(),
+                start: StartPosition::Tail,
+                indexed_from_offset: 36,
+                incarnation: Some("1".to_owned()),
+                restarted_from_incarnation: None,
+            })
+            .await?;
+
+        // Recreated with two messages before the indexer notices the new
+        // incarnation, and retention has already trimmed the first: those
+        // bytes were never indexed, so the index is not complete.
+        source.set(&message.repeat(2), "2", 18);
+        let registration = state.catalog.get("tail").await?;
+        assert_eq!(
+            process_pool_source(&state, &registration, &params("worker-a", 64), true).await?,
+            Backlog::Idle
+        );
+        let registration = state.catalog.get("tail").await?;
+        assert_eq!(registration.incarnation.as_deref(), Some("2"));
+        assert_eq!(registration.indexed_from_offset, 0);
+        while process_pool_source(&state, &registration, &params("worker-a", 64), true).await?
+            != Backlog::Idle
+        {}
+        let handles = state.ensure_index(&registration).await?;
+        let mut index = handles.serving.lock().await;
+        assert_eq!(index.durable_offset(), 36);
+        assert_eq!(index.trimmed_bytes(), 18);
+        assert!(!index.coverage().complete);
+        let result = index.query(QueryRequest::window(0, 1_000, 10)).await?;
+        assert_eq!(result.entries.len(), 1);
+        drop(index);
+        server.abort();
         Ok(())
     }
 
@@ -1502,8 +1946,11 @@ mod tests {
         let registration = IndexRegistration {
             id: "removed-stream".to_owned(),
             stream_url: "https://example.test/removed".to_owned(),
-            timestamp_field: "captured_at".to_owned(),
-            indexed_from_record: 0,
+            extract: Extractor::timestamp_field("captured_at")?.config().clone(),
+            start: StartPosition::Retained,
+            indexed_from_offset: 0,
+            incarnation: None,
+            restarted_from_incarnation: None,
         };
         state.catalog.register(&registration).await?;
         state.ensure_index(&registration).await?;
@@ -1511,7 +1958,7 @@ mod tests {
         let current = objects
             .path()
             .join("indexes")
-            .join(PoolState::namespace(&registration))
+            .join(registration.namespace()?)
             .join("CURRENT");
         assert!(current.exists());
 

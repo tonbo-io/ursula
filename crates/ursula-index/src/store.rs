@@ -1,51 +1,258 @@
-use chrono::DateTime;
+use std::cmp::Ordering;
+
 use serde::Deserialize;
-use serde::Deserializer;
 use serde::Serialize;
-use serde::de::IgnoredAny;
-use serde::de::MapAccess;
-use serde::de::Visitor;
-use serde_json::Value;
-use serde_json::value::RawValue;
+use serde::Serializer;
 use thiserror::Error;
+
+use crate::extract::Extractor;
+
+/// Render an offset as the 20-digit token Ursula itself sends. Clients treat
+/// it as opaque and only echo or compare it.
+pub(crate) fn offset_token(offset: u64) -> String {
+    format!("{offset:020}")
+}
+
+/// Parse an offset token that this indexer (or Ursula) minted.
+pub(crate) fn parse_offset_token(value: &str) -> Option<u64> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+/// Serde adapter that stores and returns offsets as 20-digit tokens.
+pub(crate) mod offset_string {
+    use serde::Deserialize;
+    use serde::Deserializer;
+    use serde::Serializer;
+    use serde::de::Error;
+
+    pub(crate) fn serialize<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        serializer.serialize_str(&super::offset_token(*value))
+    }
+
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where D: Deserializer<'de> {
+        let value = String::deserialize(deserializer)?;
+        super::parse_offset_token(&value).ok_or_else(|| D::Error::custom("invalid offset token"))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct EventIndexConfig {
-    pub source_id: String,
-    pub flush_entries: usize,
+    /// The source stream URL this index is bound to.
+    pub source_url: String,
+    /// How each source message yields its event time.
+    pub extractor: Extractor,
     pub row_group_entries: usize,
-    pub timestamp_field: String,
 }
 
-impl Default for EventIndexConfig {
-    fn default() -> Self {
+impl EventIndexConfig {
+    pub fn new(source_url: impl Into<String>, extractor: Extractor) -> Self {
         Self {
-            source_id: "default".to_owned(),
-            flush_entries: 65_536,
+            source_url: source_url.into(),
+            extractor,
             row_group_entries: 16_384,
-            timestamp_field: "captured_at".to_owned(),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-pub struct EventEntry {
-    pub captured_at_ms: i64,
-    pub record: u64,
+/// Where a new index starts reading and which incarnation of the source
+/// stream it describes. Used when the index namespace is empty and by
+/// `EventIndex::restart`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IndexBase {
+    pub offset: u64,
+    pub incarnation: Option<String>,
 }
 
+/// The source stream an index describes. The incarnation is Ursula's opaque
+/// `Stream-Incarnation` token, compared only for equality.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SourceBinding {
+    pub stream_url: String,
+    pub incarnation: Option<String>,
+}
+
+/// One indexed message: its event time span and its locator. `offset` is the
+/// message's first byte and `len` its stored length including the LF, so
+/// `GET {stream}?offset=<offset>&max_bytes=<len>` (continued from
+/// `Stream-Next-Offset` until `len` bytes arrive) returns exactly the message.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EventEntry {
+    pub t_ms: i64,
+    pub t_end_ms: i64,
+    #[serde(with = "offset_string")]
+    pub offset: u64,
+    pub len: u64,
+}
+
+impl Ord for EventEntry {
+    /// Event time first; ties sort by offset.
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.t_ms, self.offset, self.t_end_ms, self.len).cmp(&(
+            other.t_ms,
+            other.offset,
+            other.t_end_ms,
+            other.len,
+        ))
+    }
+}
+
+impl PartialOrd for EventEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Opaque pagination cursor: the last returned `(t_ms, offset)`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryCursor {
-    pub captured_at_ms: i64,
-    pub record: u64,
+    pub t_ms: i64,
+    pub offset: u64,
+}
+
+const SIGN_BIT: u64 = 1 << 63;
+
+impl QueryCursor {
+    /// 32 hex digits; the token sorts like the cursor it encodes.
+    pub fn encode(&self) -> String {
+        let time = u64::from_be_bytes(self.t_ms.to_be_bytes()) ^ SIGN_BIT;
+        format!("{time:016x}{:016x}", self.offset)
+    }
+
+    pub fn decode(value: &str) -> Option<Self> {
+        if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let time = u64::from_str_radix(value.get(..16)?, 16).ok()?;
+        let offset = u64::from_str_radix(value.get(16..)?, 16).ok()?;
+        Some(Self {
+            t_ms: i64::from_be_bytes((time ^ SIGN_BIT).to_be_bytes()),
+            offset,
+        })
+    }
+}
+
+impl Serialize for QueryCursor {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        serializer.serialize_str(&self.encode())
+    }
 }
 
 impl From<EventEntry> for QueryCursor {
     fn from(value: EventEntry) -> Self {
         Self {
-            captured_at_ms: value.captured_at_ms,
-            record: value.record,
+            t_ms: value.t_ms,
+            offset: value.offset,
         }
+    }
+}
+
+/// How an entry matches a `[from, until)` window.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MatchMode {
+    /// The event starts inside the window.
+    #[default]
+    Start,
+    /// The event's `[t_ms, t_end_ms]` span intersects the window.
+    Overlap,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueryRequest {
+    pub from_ms: i64,
+    pub until_ms: i64,
+    pub match_mode: MatchMode,
+    pub after: Option<QueryCursor>,
+    /// Pin pagination to entries before this offset (a previous
+    /// `coverage.through`). Defaults to the durable offset.
+    pub through: Option<u64>,
+    pub limit: usize,
+}
+
+impl QueryRequest {
+    pub fn window(from_ms: i64, until_ms: i64, limit: usize) -> Self {
+        Self {
+            from_ms,
+            until_ms,
+            match_mode: MatchMode::Start,
+            after: None,
+            through: None,
+            limit,
+        }
+    }
+}
+
+/// Messages that produced no entry, by reason. Counted once per message: a
+/// retried or overlapping commit adds only the counts for bytes it newly
+/// covers.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SkipCounts {
+    pub missing: u64,
+    pub invalid: u64,
+    pub unparseable: u64,
+    pub oversize: u64,
+}
+
+impl SkipCounts {
+    pub(crate) fn add(&mut self, kind: SkipKind) {
+        let counter = match kind {
+            SkipKind::Missing => &mut self.missing,
+            SkipKind::Invalid => &mut self.invalid,
+            SkipKind::Unparseable => &mut self.unparseable,
+            SkipKind::Oversize => &mut self.oversize,
+            SkipKind::Trimmed | SkipKind::Blank => return,
+        };
+        *counter = counter.saturating_add(1);
+    }
+}
+
+/// Why a message produced no entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SkipKind {
+    /// No time value, `null`, or 0.
+    Missing,
+    /// A time value of the wrong type or format for the declared unit.
+    Invalid,
+    /// The message is not JSON.
+    Unparseable,
+    /// The message is longer than the indexer assembles.
+    Oversize,
+    /// Bytes discarded to resynchronize on a message boundary after a
+    /// restart at an offset that was not one; counted as trimmed bytes.
+    Trimmed,
+    /// An empty or whitespace-only line; not an event and not counted.
+    Blank,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Skip {
+    pub offset: u64,
+    pub len: u64,
+    pub kind: SkipKind,
+}
+
+/// The result of reading `[start, end)` from the source: one entry or one
+/// skip per complete message. `end` is always a message boundary.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Segment {
+    pub start: u64,
+    pub end: u64,
+    pub entries: Vec<EventEntry>,
+    pub skips: Vec<Skip>,
+}
+
+impl Segment {
+    /// Whether `offset` is a message boundary inside this segment.
+    pub(crate) fn is_boundary(&self, offset: u64) -> bool {
+        offset == self.start
+            || offset == self.end
+            || self.entries.iter().any(|entry| entry.offset == offset)
+            || self.skips.iter().any(|skip| skip.offset == offset)
     }
 }
 
@@ -53,32 +260,45 @@ impl From<EventEntry> for QueryCursor {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum IndexStatus {
     Ready,
+    /// Two workers produced different entries for the same source bytes.
     Blocked {
-        record: u64,
+        #[serde(with = "offset_string")]
+        offset: u64,
         reason: String,
     },
-    RetentionGap {
-        expected_record: u64,
-        first_available_record: u64,
-    },
+    /// The source stream answered 404. Cleared when it answers again with
+    /// the same incarnation; a new incarnation restarts the index.
+    SourceGone,
 }
 
-/// One record of the source's envelope view. `value` is the stored JSON
-/// message text, kept raw: under JSON Message Text (P1) it may contain escapes
-/// of unpaired surrogates, which `serde_json::Value` cannot represent.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SourceEnvelope {
-    pub record: u64,
-    pub value: Box<RawValue>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct Coverage {
+    /// Where the index started reading.
+    #[serde(with = "offset_string")]
+    pub from: u64,
+    /// The source's retained offset as last observed; entries before it are
+    /// no longer fetchable and are not returned.
+    #[serde(with = "offset_string")]
+    pub floor: u64,
+    /// Entries returned are before this offset; pass it back as `through` to
+    /// pin later pages.
+    #[serde(with = "offset_string")]
+    pub through: u64,
+    /// Every complete message before this offset is indexed or counted.
+    #[serde(with = "offset_string")]
+    pub durable: u64,
+    /// False once source bytes were trimmed by retention before they were
+    /// indexed.
+    pub complete: bool,
+    pub trimmed_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct QueryResult {
-    pub indexed_from_record: u64,
-    pub indexed_through_record: u64,
-    pub durable_through_record: u64,
-    pub through_record: u64,
-    pub records: Vec<EventEntry>,
+    pub source: SourceBinding,
+    pub coverage: Coverage,
+    pub skipped: SkipCounts,
+    pub entries: Vec<EventEntry>,
     pub next: Option<QueryCursor>,
 }
 
@@ -94,14 +314,14 @@ pub enum IndexError {
     SourceStatus(u16),
     #[error("invalid source response: {0}")]
     InvalidSourceResponse(&'static str),
-    #[error("source response did not advertise json-record-coordinates-v1")]
-    MissingRecordCoordinates,
+    #[error("the source stream does not exist")]
+    SourceGone,
     #[error("event index lock poisoned")]
     LockPoisoned,
     #[error("blocking event-index worker failed")]
     WorkerFailed,
-    #[error("event index is blocked at source record {record}: {reason}")]
-    Blocked { record: u64, reason: String },
+    #[error("event index is blocked at source offset {offset:020}: {reason}")]
+    Blocked { offset: u64, reason: String },
     #[error("index status cannot be resumed: {0}")]
     CannotResume(&'static str),
     #[error("Parquet error: {0}")]
@@ -114,17 +334,8 @@ pub enum IndexError {
     SourceMismatch { stored: String, configured: String },
     #[error("invalid configuration: {0}")]
     InvalidConfig(&'static str),
-    #[error("expected source record {expected}, received {actual}")]
-    UnexpectedRecord { expected: u64, actual: u64 },
-    #[error("record {record} has no valid `{field}` timestamp")]
-    InvalidTimestamp { record: u64, field: String },
-    #[error(
-        "source retention gap: expected record {expected_record}, first available is {first_available_record}"
-    )]
-    RetentionGap {
-        expected_record: u64,
-        first_available_record: u64,
-    },
+    #[error("invalid extractor: {0}")]
+    InvalidExtractor(String),
     #[error("invalid query range or watermark")]
     InvalidQuery,
     #[error("index part size changed for {file}: manifest={expected}, actual={actual}")]
@@ -153,124 +364,60 @@ pub enum IndexError {
         "compaction candidate has {entries} entries, exceeding configured maximum {max_entries}"
     )]
     CompactionTooLarge { entries: u64, max_entries: u64 },
-    #[error("record {record} differs from the value already committed by another indexer")]
-    RecordConflict { record: u64 },
+    #[error(
+        "source bytes at offset {offset:020} index differently from the entries another indexer committed"
+    )]
+    EntryConflict { offset: u64 },
     #[error("cache capacity {capacity} bytes cannot hold a {object_size}-byte part")]
     CacheCapacity { capacity: u64, object_size: u64 },
     #[error("index registration `{0}` already exists with different settings")]
     RegistrationConflict(String),
+    #[error(
+        "index `{0}` was deleted; its namespace is retired until cleanup after the GC grace period"
+    )]
+    NamespaceRetired(String),
     #[error("index registration `{0}` does not exist")]
     UnknownIndex(String),
-    #[error("index starts at source record {stored}, not configured record {configured}")]
-    IndexBaseMismatch { stored: u64, configured: u64 },
-}
-
-pub(crate) fn parse_timestamp(value: &Value) -> Option<i64> {
-    match value {
-        Value::String(value) => DateTime::parse_from_rfc3339(value)
-            .ok()
-            .map(|value| value.timestamp_millis()),
-        Value::Number(value) => value.as_i64(),
-        _ => None,
-    }
-}
-
-/// Event time of a record: the `field` member of a top-level JSON object,
-/// parsed by [`parse_timestamp`]. Only that member's value is decoded; other
-/// members (and keys) are skipped lexically, so a lone-surrogate escape
-/// elsewhere in the record does not fail the ingest. With duplicate members
-/// the last one wins, as in `JSON.parse`.
-pub(crate) fn record_timestamp(value: &RawValue, field: &str) -> Option<i64> {
-    let mut deserializer = serde_json::Deserializer::from_str(value.get());
-    let member = (&mut deserializer)
-        .deserialize_map(MemberVisitor { field })
-        .ok()
-        .flatten()?;
-    let member: Value = serde_json::from_str(member.get()).ok()?;
-    parse_timestamp(&member)
-}
-
-struct MemberVisitor<'f> {
-    field: &'f str,
-}
-
-impl<'de> Visitor<'de> for MemberVisitor<'_> {
-    type Value = Option<&'de RawValue>;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a JSON object")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where A: MapAccess<'de> {
-        let mut found = None;
-        while let Some(key) = map.next_key::<&'de RawValue>()? {
-            if key_matches(key.get(), self.field) {
-                found = Some(map.next_value::<&'de RawValue>()?);
-            } else {
-                map.next_value::<IgnoredAny>()?;
-            }
-        }
-        Ok(found)
-    }
-}
-
-/// Compare a raw JSON string literal (quotes included) with `field`.
-fn key_matches(raw: &str, field: &str) -> bool {
-    let inner = raw
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-        .unwrap_or(raw);
-    if !inner.contains('\\') {
-        return inner == field;
-    }
-    // Escaped keys are decoded; one that encodes a lone surrogate cannot
-    // equal a Rust string and fails to decode, which is a non-match.
-    serde_json::from_str::<String>(raw).is_ok_and(|key| key == field)
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::value::RawValue;
-
-    use super::record_timestamp;
-
-    fn raw(text: &str) -> Box<RawValue> {
-        RawValue::from_string(text.to_owned()).unwrap()
-    }
+    use super::QueryCursor;
+    use super::offset_token;
+    use super::parse_offset_token;
 
     #[test]
-    fn extracts_the_timestamp_member_lexically() {
-        let value =
-            raw(r#"{"note":"\ud800 lone","\udc00":1,"captured_at":"2026-01-02T03:04:05Z"}"#);
-        assert_eq!(
-            record_timestamp(&value, "captured_at"),
-            Some(1_767_323_045_000)
-        );
-        let value = raw(r#"{"captured_at":1,"nested":{"captured_at":2},"captured_at":3}"#);
-        assert_eq!(record_timestamp(&value, "captured_at"), Some(3));
-        let value = raw(r#"{"captured\u005fat":42}"#);
-        assert_eq!(record_timestamp(&value, "captured_at"), Some(42));
-        // A deep sibling does not hit serde_json's recursion limit.
-        let deep = format!(
-            r#"{{"d":{}{},"captured_at":7}}"#,
-            "[".repeat(200),
-            "]".repeat(200)
-        );
-        assert_eq!(record_timestamp(&raw(&deep), "captured_at"), Some(7));
-    }
-
-    #[test]
-    fn missing_or_invalid_timestamps_are_none() {
-        for text in [
-            r#"{"other":1}"#,
-            r#"{"captured_at":"\ud800"}"#,
-            r#"{"captured_at":"not-a-time"}"#,
-            r#"{"captured_at":1.5}"#,
-            r#"[{"captured_at":1}]"#,
-            "12",
-        ] {
-            assert_eq!(record_timestamp(&raw(text), "captured_at"), None, "{text}");
+    fn cursor_tokens_round_trip_and_sort_like_their_cursor() {
+        let cursors = [
+            QueryCursor {
+                t_ms: -5,
+                offset: 9,
+            },
+            QueryCursor { t_ms: 0, offset: 0 },
+            QueryCursor {
+                t_ms: 1_759_482_001_000,
+                offset: 3,
+            },
+            QueryCursor {
+                t_ms: 1_759_482_001_000,
+                offset: 4,
+            },
+        ];
+        let tokens = cursors.iter().map(QueryCursor::encode).collect::<Vec<_>>();
+        let mut sorted = tokens.clone();
+        sorted.sort();
+        assert_eq!(sorted, tokens);
+        for (cursor, token) in cursors.iter().zip(&tokens) {
+            assert_eq!(QueryCursor::decode(token), Some(*cursor));
         }
+        assert_eq!(QueryCursor::decode("not-a-cursor"), None);
+    }
+
+    #[test]
+    fn offset_tokens_are_twenty_digits() {
+        assert_eq!(offset_token(42), "00000000000000000042");
+        assert_eq!(parse_offset_token("00000000000000000042"), Some(42));
+        assert_eq!(parse_offset_token("-1"), None);
+        assert_eq!(parse_offset_token(""), None);
     }
 }
