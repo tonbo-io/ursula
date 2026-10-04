@@ -93,8 +93,6 @@ use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
 use crate::request::ImportGroupStateRequest;
 use crate::request::ImportGroupStateResponse;
-use crate::request::ListBucketStreamsRequest;
-use crate::request::ListBucketStreamsResponse;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
@@ -104,8 +102,6 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
-use crate::request::SetBucketQuotaRequest;
-use crate::request::SetBucketQuotaResponse;
 use crate::request::SetFeatureLevelRequest;
 use crate::request::SetFeatureLevelResponse;
 use crate::request::TidyStreamsRequest;
@@ -574,7 +570,7 @@ impl ShardRuntime {
     ) -> Result<Vec<FlushColdResponse>, RuntimeError> {
         // A bucket is the physical erasure domain. Keep encounter order while
         // partitioning one Raft group's flush plan so no pack can retain bytes
-        // for a deleted bucket merely because another bucket is still live.
+        // for a purged bucket merely because another bucket is still live.
         let mut bucket_batches: Vec<Vec<ColdFlushCandidate>> = Vec::new();
         for candidate in candidates {
             if let Some(batch) = bucket_batches.iter_mut().find(|batch| {
@@ -810,58 +806,6 @@ impl ShardRuntime {
             .collect::<Vec<_>>();
         report.sort_by(|left, right| left.bucket_id.cmp(&right.bucket_id));
         Ok(report)
-    }
-
-    /// Lists a bucket's streams (`extensions.md` §1.4) by asking every Raft
-    /// group for its first `limit + 1` eligible streams and merging them by
-    /// bucket-local stream path. Each group answers from local replica state,
-    /// so a just-created stream may lag on a follower. Returns `None` when no
-    /// group knows the bucket.
-    pub async fn list_bucket_streams_all_groups(
-        &self,
-        bucket_id: &str,
-        prefix: &str,
-        after: Option<&str>,
-        limit: usize,
-        now_ms: u64,
-    ) -> Result<Option<ListBucketStreamsResponse>, RuntimeError> {
-        let request = ListBucketStreamsRequest {
-            bucket_id: bucket_id.to_owned(),
-            prefix: prefix.to_owned(),
-            after: after.map(str::to_owned),
-            limit: limit.saturating_add(1),
-            now_ms,
-        };
-        let group_count = self.shard_map.raft_group_count();
-        let mut shares = Vec::new();
-        for group_id in 0..group_count {
-            shares.push(
-                self.list_bucket_streams(RaftGroupId(group_id), request.clone())
-                    .await?,
-            );
-        }
-        Ok(merge_bucket_stream_listings(shares, limit))
-    }
-
-    /// Replicates one bucket's quota record to every Raft group so each
-    /// enforces the same local backstop. Serial like the other all-group
-    /// admin sweeps; quota changes are rare control-plane writes.
-    pub async fn set_bucket_quota_all_groups(
-        &self,
-        bucket_id: &str,
-        max_streams: Option<u64>,
-        max_retained_bytes: Option<u64>,
-    ) -> Result<(), RuntimeError> {
-        let group_count = self.shard_map.raft_group_count();
-        for group_id in 0..group_count {
-            self.set_bucket_quota(RaftGroupId(group_id), SetBucketQuotaRequest {
-                bucket_id: bucket_id.to_owned(),
-                max_streams,
-                max_retained_bytes,
-            })
-            .await?;
-        }
-        Ok(())
     }
 
     /// Replicated feature level (C0) of every Raft group as held by this
@@ -2199,27 +2143,4 @@ async fn erase_prefix_and_prove(cold_store: &ColdStore, prefix: &str) -> Result<
         });
     }
     Ok(())
-}
-
-/// Merges per-group bucket listing shares (`extensions.md` §1.4): each share
-/// is one group's first `limit + 1` eligible streams, or `None` when that
-/// group does not know the bucket. Returns `None` when no group knows it.
-pub fn merge_bucket_stream_listings(
-    shares: impl IntoIterator<Item = Option<Vec<ursula_stream::BucketStreamListing>>>,
-    limit: usize,
-) -> Option<ListBucketStreamsResponse> {
-    let mut bucket_known = false;
-    let mut streams = Vec::new();
-    for share in shares.into_iter().flatten() {
-        bucket_known = true;
-        streams.extend(share);
-    }
-    if !bucket_known {
-        return None;
-    }
-    streams.sort_by(|left, right| left.stream_id.cmp(&right.stream_id));
-    streams.dedup_by(|right, left| right.stream_id == left.stream_id);
-    let has_more = streams.len() > limit;
-    streams.truncate(limit);
-    Some(ListBucketStreamsResponse { streams, has_more })
 }

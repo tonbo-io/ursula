@@ -51,7 +51,6 @@ use super::GroupFlushColdFuture;
 use super::GroupGetStreamAttrsFuture;
 use super::GroupHeadStreamFuture;
 use super::GroupInstallSnapshotFuture;
-use super::GroupListBucketStreamsFuture;
 use super::GroupPlanColdFlushFuture;
 use super::GroupPlanColdGcFuture;
 use super::GroupPlanColdOrphanSweepFuture;
@@ -63,7 +62,6 @@ use super::GroupReadSnapshotFuture;
 use super::GroupReadStreamFuture;
 use super::GroupReadStreamPartsFuture;
 use super::GroupRepairColdIndexFuture;
-use super::GroupSetBucketQuotaFuture;
 use super::GroupSetFeatureLevelFuture;
 use super::GroupSnapshotFuture;
 use super::GroupStateGaugesFuture;
@@ -128,7 +126,6 @@ use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
 use crate::request::ImportGroupStateRequest;
 use crate::request::ImportGroupStateResponse;
-use crate::request::ListBucketStreamsRequest;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
@@ -137,8 +134,6 @@ use crate::request::PurgeBucketResponse;
 use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
-use crate::request::SetBucketQuotaRequest;
-use crate::request::SetBucketQuotaResponse;
 use crate::request::SetFeatureLevelRequest;
 use crate::request::SetFeatureLevelResponse;
 use crate::request::StreamAppendCount;
@@ -602,13 +597,6 @@ impl InMemoryGroupEngine {
                     },
                 ))
             }
-            StreamResponse::BucketQuotaSet { .. } => {
-                self.commit_index += 1;
-                Ok(GroupWriteResponse::SetBucketQuota(SetBucketQuotaResponse {
-                    placement,
-                    group_commit_index: self.commit_index,
-                }))
-            }
             StreamResponse::StreamTidied { debt_remaining } => {
                 require_response_stream_id(stream_id, "tidied")?;
                 self.commit_index += 1;
@@ -794,8 +782,7 @@ impl InMemoryGroupEngine {
                 context,
             )),
             other @ (StreamResponse::BucketCreated { .. }
-            | StreamResponse::BucketAlreadyExists { .. }
-            | StreamResponse::BucketDeleted { .. }) => Err(GroupEngineError::new(format!(
+            | StreamResponse::BucketAlreadyExists { .. }) => Err(GroupEngineError::new(format!(
                 "unexpected group write response: {other:?}"
             ))),
         }
@@ -1151,22 +1138,6 @@ impl InMemoryGroupEngine {
     /// Raft engine can serve usage reads from its applied state machine.
     pub fn bucket_usage_report(&self) -> Vec<ursula_stream::BucketUsageSnapshot> {
         self.state_machine.bucket_usage_report()
-    }
-
-    /// This group's share of a bucket listing; see
-    /// [`ursula_stream::StreamStateMachine::list_bucket_streams`]. Public so
-    /// the Raft engine can serve it from its applied state machine.
-    pub fn list_bucket_streams_report(
-        &self,
-        request: &ListBucketStreamsRequest,
-    ) -> Option<Vec<ursula_stream::BucketStreamListing>> {
-        self.state_machine.list_bucket_streams(
-            &request.bucket_id,
-            &request.prefix,
-            request.after.as_deref(),
-            request.limit,
-            request.now_ms,
-        )
     }
 
     /// Replicated group feature level (C0) of the applied state.
@@ -1907,14 +1878,6 @@ impl GroupEngine for InMemoryGroupEngine {
         Box::pin(async move { Ok(self.state_machine.feature_level()) })
     }
 
-    fn list_bucket_streams<'a>(
-        &'a mut self,
-        request: ListBucketStreamsRequest,
-        _placement: ShardPlacement,
-    ) -> GroupListBucketStreamsFuture<'a> {
-        Box::pin(async move { Ok(self.list_bucket_streams_report(&request)) })
-    }
-
     fn state_gauges<'a>(&'a mut self, _placement: ShardPlacement) -> GroupStateGaugesFuture<'a> {
         Box::pin(async move { Ok(self.state_machine.state_gauges()) })
     }
@@ -2021,22 +1984,6 @@ impl GroupEngine for InMemoryGroupEngine {
                 GroupWriteResponse::SetFeatureLevel(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
                     "unexpected set feature level write response: {other:?}"
-                ))),
-            }
-        })
-    }
-
-    fn set_bucket_quota<'a>(
-        &'a mut self,
-        request: SetBucketQuotaRequest,
-        placement: ShardPlacement,
-    ) -> GroupSetBucketQuotaFuture<'a> {
-        Box::pin(async move {
-            let command = GroupWriteCommand::from(request);
-            match self.apply_committed_write(command, placement)? {
-                GroupWriteResponse::SetBucketQuota(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected set bucket quota write response: {other:?}"
                 ))),
             }
         })
@@ -2770,12 +2717,10 @@ pub(crate) fn ensure_bucket_exists(
 fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
     match command {
         StreamCommand::CreateBucket { .. }
-        | StreamCommand::DeleteBucket { .. }
         | StreamCommand::PurgeBucket { .. }
         | StreamCommand::AckColdGc { .. }
         | StreamCommand::DeferColdGc { .. }
         | StreamCommand::ImportSnapshot { .. }
-        | StreamCommand::SetBucketQuota { .. }
         | StreamCommand::SetFeatureLevel { .. } => None,
         StreamCommand::CreateStream { stream_id, .. }
         | StreamCommand::CreateExternal { stream_id, .. }

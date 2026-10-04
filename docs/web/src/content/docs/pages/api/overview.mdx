@@ -11,10 +11,9 @@ This API is Ursula's implementation of the [Durable Streams Protocol](/docs/spec
 
 | Method | Path | Description |
 | -------- | ----------------------------- | ------------------------------------------------------------ |
-| `PUT` | `/{bucket}` | [Create a bucket](/docs/api/create-bucket) |
-| `GET` | `/{bucket}/streams` | [List streams](/docs/api/list-streams) |
+| `PUT` | `/{bucket}` | [Create a bucket](/docs/api/create-bucket) (validates the ID; buckets are implicit) |
 
-Bucket-level `GET` (metadata) and `DELETE` are part of the extensions specification but are not yet implemented in Ursula.
+There is no bucket metadata read, stream listing, or bucket delete. Removing a bucket is an operator action ([bucket purge](/docs/operations#tenant-offboarding-bucket-purge)), which permanently fences the bucket ID: later stream creates in it answer `404`.
 
 ## Stream operations
 

@@ -82,7 +82,6 @@ use ursula_runtime::GroupReadSnapshotFuture;
 use ursula_runtime::GroupReadStreamFuture;
 use ursula_runtime::GroupReadStreamPartsFuture;
 use ursula_runtime::GroupRequireLiveReadOwnerFuture;
-use ursula_runtime::GroupSetBucketQuotaFuture;
 use ursula_runtime::GroupSetFeatureLevelFuture;
 use ursula_runtime::GroupShutdownFuture;
 use ursula_runtime::GroupSnapshot;
@@ -103,7 +102,6 @@ use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::RuntimeThreading;
-use ursula_runtime::SetBucketQuotaRequest;
 use ursula_runtime::SetFeatureLevelRequest;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::UpdateStreamAttrsRequest;
@@ -1153,16 +1151,6 @@ impl GroupEngine for MadsimScopedGroupEngine {
     ) -> GroupPurgeBucketFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
             self.inner.purge_bucket(bucket_id, placement).await
-        }))
-    }
-
-    fn set_bucket_quota<'a>(
-        &'a mut self,
-        request: SetBucketQuotaRequest,
-        placement: ShardPlacement,
-    ) -> GroupSetBucketQuotaFuture<'a> {
-        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
-            self.inner.set_bucket_quota(request, placement).await
         }))
     }
 

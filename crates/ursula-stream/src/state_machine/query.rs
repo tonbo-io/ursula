@@ -2,7 +2,6 @@
 
 use super::BOOTSTRAP_MAX_UPDATE_BYTES;
 use super::BucketStreamId;
-use super::BucketStreamListing;
 use super::COLD_INDEX_PAGE_SPAN_BYTES;
 use super::ColdChunkRef;
 use super::HotPayloadSegment;
@@ -27,7 +26,6 @@ use super::stream_ttl_renewal_due;
 use crate::RecordIndexError;
 use crate::StreamRecordIndex;
 use crate::StreamRecordRange;
-use crate::bucket_local_stream_path;
 
 impl StreamStateMachine {
     pub fn head(&self, stream_id: &BucketStreamId) -> Option<&StreamMetadata> {
@@ -289,47 +287,6 @@ impl StreamStateMachine {
 
     pub fn bucket_exists(&self, bucket_id: &str) -> bool {
         self.buckets.contains(bucket_id)
-    }
-
-    /// Lists this group's live streams of `bucket_id` for the bucket listing
-    /// (`extensions.md` §1.4): bucket-local paths that start with `prefix`
-    /// and sort strictly after `after`, ascending, at most `limit` of them.
-    /// Streams whose TTL has passed at `now_ms` are omitted, as a read would
-    /// treat them. Returns `None` when this group does not know the bucket.
-    pub fn list_bucket_streams(
-        &self,
-        bucket_id: &str,
-        prefix: &str,
-        after: Option<&str>,
-        limit: usize,
-        now_ms: u64,
-    ) -> Option<Vec<BucketStreamListing>> {
-        if !self.buckets.contains(bucket_id) {
-            return None;
-        }
-        let mut streams = self
-            .registry
-            .slots()
-            .map(|slot| &slot.metadata)
-            .filter(|metadata| {
-                metadata.stream_id.bucket_id == bucket_id && !stream_is_expired(metadata, now_ms)
-            })
-            .filter_map(|metadata| {
-                let path = bucket_local_stream_path(&metadata.stream_id);
-                let eligible =
-                    path.starts_with(prefix) && after.is_none_or(|after| path.as_str() > after);
-                eligible.then(|| BucketStreamListing {
-                    stream_id: path,
-                    status: metadata.status,
-                    content_type: metadata.content_type.clone(),
-                    tail_offset: metadata.tail_offset,
-                    created_at_ms: metadata.created_at_ms,
-                })
-            })
-            .collect::<Vec<_>>();
-        streams.sort_unstable_by(|left, right| left.stream_id.cmp(&right.stream_id));
-        streams.truncate(limit);
-        Some(streams)
     }
 
     pub fn read(

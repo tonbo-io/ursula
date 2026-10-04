@@ -69,7 +69,6 @@ use ursula_runtime::GroupFlushColdFuture;
 use ursula_runtime::GroupGetStreamAttrsFuture;
 use ursula_runtime::GroupHeadStreamFuture;
 use ursula_runtime::GroupInstallSnapshotFuture;
-use ursula_runtime::GroupListBucketStreamsFuture;
 use ursula_runtime::GroupPlanColdFlushFuture;
 use ursula_runtime::GroupPlanColdGcFuture;
 use ursula_runtime::GroupPlanColdOrphanSweepFuture;
@@ -82,7 +81,6 @@ use ursula_runtime::GroupReadStreamFuture;
 use ursula_runtime::GroupReadStreamParts;
 use ursula_runtime::GroupReadStreamPartsFuture;
 use ursula_runtime::GroupRepairColdIndexFuture;
-use ursula_runtime::GroupSetBucketQuotaFuture;
 use ursula_runtime::GroupSetFeatureLevelFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
@@ -95,7 +93,6 @@ use ursula_runtime::GroupWriteBatchFuture;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
-use ursula_runtime::ListBucketStreamsRequest;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::PlanGroupColdFlushRequest;
 use ursula_runtime::PublishSnapshotRequest;
@@ -103,7 +100,6 @@ use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RepairColdIndexRequest;
 use ursula_runtime::RepairColdIndexResponse;
-use ursula_runtime::SetBucketQuotaRequest;
 use ursula_runtime::SetFeatureLevelRequest;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::StreamErrorCode;
@@ -813,23 +809,6 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
-    fn list_bucket_streams<'a>(
-        &'a mut self,
-        request: ListBucketStreamsRequest,
-        _placement: ShardPlacement,
-    ) -> GroupListBucketStreamsFuture<'a> {
-        Box::pin(async move {
-            // Local applied state, follower or leader, like `bucket_usage`:
-            // the bucket listing is a catalog that tolerates replication lag.
-            self.with_state_machine(move |state_machine| {
-                Box::pin(
-                    async move { Ok(state_machine.engine.list_bucket_streams_report(&request)) },
-                )
-            })
-            .await?
-        })
-    }
-
     fn feature_level<'a>(&'a mut self, _placement: ShardPlacement) -> GroupFeatureLevelFuture<'a> {
         Box::pin(async move {
             // Local applied state, follower or leader: `ursulactl cluster
@@ -1068,30 +1047,6 @@ impl GroupEngine for RaftGroupEngine {
                 GroupWriteResponse::ImportGroupState(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
                     "unexpected group state import response: {other:?}"
-                ))),
-            }
-        })
-    }
-
-    fn set_bucket_quota<'a>(
-        &'a mut self,
-        request: SetBucketQuotaRequest,
-        _placement: ShardPlacement,
-    ) -> GroupSetBucketQuotaFuture<'a> {
-        Box::pin(async move {
-            let command = GroupWriteCommand::from(request.clone());
-            if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
-                return match response {
-                    GroupWriteResponse::SetBucketQuota(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected set bucket quota write response: {other:?}"
-                    ))),
-                };
-            }
-            match self.write(GroupWriteCommand::from(request)).await? {
-                GroupWriteResponse::SetBucketQuota(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected set bucket quota write response: {other:?}"
                 ))),
             }
         })

@@ -1,4 +1,4 @@
-//! Per-tenant admission control (the gateway half of quota enforcement).
+//! Per-tenant admission control.
 //!
 //! A [`QuotaProvider`] supplies [`TenantLimits`] for a bucket; the
 //! [`Admission`] engine enforces them before a request is forwarded:
@@ -9,9 +9,9 @@
 //! - per-tenant request body size (`413`), tightening the gateway-wide cap.
 //!
 //! Every limit is optional; an absent limit means unlimited, and a gateway
-//! without an installed provider behaves exactly as before. Data-plane
-//! quotas (stream count, retained bytes) are enforced inside Ursula, not
-//! here — see the tracking issue for the split.
+//! without an installed provider behaves exactly as before. Ursula enforces
+//! no stream-count or retained-bytes quota (removed in 0.6.0); such limits
+//! belong to the operator's control plane, which can read `/__ursula/usage`.
 
 use std::collections::HashMap;
 use std::future::Future;

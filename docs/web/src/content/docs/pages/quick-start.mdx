@@ -7,9 +7,9 @@ This page assumes a single node is already running on `127.0.0.1:4437`. Starting
 
 Drive the HTTP API with `curl` from another terminal.
 
-## Acknowledge the bucket
+## Validate the bucket ID (optional)
 
-Bucket creation in the current build is an idempotent acknowledgement - Ursula returns `201` whether or not the name has been seen before. It's still worth issuing because clients and docs assume the call:
+Buckets are implicit: a bucket exists once a stream is created in it, so this call is optional. It only validates the bucket ID (`201`, or `400` for an invalid one):
 
 ```bash
 curl -X PUT http://127.0.0.1:4437/demo
