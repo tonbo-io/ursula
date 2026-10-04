@@ -7,6 +7,9 @@
 //!   process lifetime), catches the file up from the stream, claims the stream for this owner (a
 //!   new producer epoch, which fences every earlier owner), catches up to the claim and attaches the
 //!   file. It requires that no connection to the file is open. Returns the stream offset applied.
+//!   Offsets are the server's strings (`Stream-Next-Offset`), opaque: kept as they came, compared
+//!   only lexicographically (the protocol orders them that way), never computed; `-1` is the
+//!   protocol's "beginning of the stream", and stands for "none" where an offset may be absent.
 //!   A db file with a sidecar (`<db>-ursula`: it is the cache of a stream) opens only while an
 //!   attach of it has succeeded in this process: before that, after a failed attach, or in a
 //!   process that never attached it, opening it fails (SQLITE_CANTOPEN), so it is never written
@@ -15,8 +18,9 @@
 //!   a commit carries the db size after it and the transaction's final page images; a claim carries
 //!   the owner's producer epoch. Appends use the idempotent producer (`Producer-Id`
 //!   `sqlite-ursula-vfs/<Stream-Incarnation>` per stream incarnation, `Producer-Epoch` per owner,
-//!   `Producer-Seq` per append): an append whose outcome is unknown is retried with the same
-//!   sequence until the server answers (a duplicate is acknowledged without being applied twice);
+//!   `Producer-Seq` per append; commits also carry `Stream-Seq`, see `stream_seq`): an append
+//!   whose outcome is unknown is retried with the same sequence until the server answers (a
+//!   duplicate is acknowledged without being applied twice);
 //!   403 means another owner claimed the stream. An owner of a deleted stream is an unknown
 //!   producer in the stream recreated at its path (unless an attach racing the recreate claimed
 //!   there under the old id; see the design doc, §6): its next append is answered as an expired
@@ -44,7 +48,8 @@
 //!   verifiably complete or rejected: before the WAL starts a new generation or is truncated to
 //!   nothing, and at attach before a sidecar that relies on it. Attach never opens local files
 //!   through SQLite before replaying onto them: it folds the WAL into the db file itself.
-//! * Snapshots and retention (see [`snapshot`]): once the log since the latest snapshot exceeds the
+//! * Snapshots and retention (see [`snapshot`]): once the log since the latest snapshot (frame
+//!   bytes counted locally: replayed at attach, appended since, carried in the sidecar) exceeds the
 //!   database size (and `URSULA_VFS_SNAPSHOT_MIN_BYTES`, default 8 MiB), a background thread per
 //!   attached database checkpoints the local WAL through a private connection, pins the result with
 //!   a read transaction (no commit may land in between; otherwise it tries again later), copies the
@@ -53,8 +58,9 @@
 //!   the latest snapshot when the local file is missing or behind it, then replays the tail.
 //! * `SELECT ursula_status(path)` returns
 //!   `{"offset","epoch","poisoned","fenced","reason","snapshot","retained","local","installed"}`
-//!   (`local`: the stream offset of the local state attach started from, 0 when it rebuilt the
-//!   file; `installed`: the offset of the snapshot attach installed, 0 for none);
+//!   (offsets as strings; `local`: the stream offset of the local state attach started from, `-1`
+//!   when it rebuilt the file; `installed`: the offset of the snapshot attach installed, `-1` for
+//!   none; `snapshot`, `retained`: `-1` for none);
 //!   `SELECT ursula_stats(path)` drains per-commit, per-checkpoint and per-snapshot numbers (bench).
 //!
 //! Test hook: `URSULA_VFS_ABORT_AFTER_ACK=<n>` aborts the process right after the n-th acknowledged
@@ -109,6 +115,11 @@ const WINDOW_WAIT: Duration = Duration::from_secs(1);
 /// `Producer-Id` prefix; the stream incarnation follows (`producer_id`).
 const PRODUCER: &str = "sqlite-ursula-vfs";
 const CONTENT_TYPE: &str = "application/octet-stream";
+/// The protocol's offset for the beginning of a stream, and "none" for an offset that may be absent
+/// (a snapshot, retention, the local state): it sorts before every offset the server mints.
+const START: &str = "-1";
+/// The sidecar format (`sidecar_line`): 2 records offsets as the server's strings.
+const SIDECAR_VERSION: u32 = 2;
 
 static API: AtomicPtr<ffi::sqlite3_api_routines> = AtomicPtr::new(null_mut());
 static UNIX: AtomicPtr<ffi::sqlite3_vfs> = AtomicPtr::new(null_mut());
@@ -149,14 +160,17 @@ struct Db {
     /// `producer_id(incarnation)`.
     producer: String,
     sidecar: String,
-    /// What the sidecar records besides offset, epoch and the WAL claim (see `stamp`).
+    /// What the sidecar records besides offset, epoch, format, log count and the WAL claim (see
+    /// `stamp`).
     stamp: String,
     path: String,
     epoch: u64,
     /// Producer sequence of the last acknowledged append (the claim is 0).
     seq: u64,
     /// Stream offset after the last acknowledged frame.
-    offset: u64,
+    offset: String,
+    /// Frame bytes since the latest snapshot, counted locally (see `snapshot_due`).
+    log: u64,
     poisoned: Option<String>,
     fenced: bool,
     /// WAL writes of that transaction not yet on the local WAL, by offset (WAL writes never
@@ -185,10 +199,10 @@ struct Db {
     /// Database size in pages at `offset`.
     pages: u32,
     /// Offset of the latest snapshot known readable (published and read back by this owner, or
-    /// found at attach); 0 for none.
-    snapshot: u64,
-    /// Retention this owner advanced the stream to.
-    retained: u64,
+    /// found at attach); `START` for none.
+    snapshot: String,
+    /// Retention this owner advanced the stream to (`START`: none).
+    retained: String,
     snapper: Arc<Snapper>,
     /// A snapshot is pinning the state at `offset`: no commit is acknowledged until it closes.
     window: bool,
@@ -196,14 +210,14 @@ struct Db {
     /// (up to `WINDOW_WAIT`) until it has, so a writer committing back to back cannot starve it.
     window_wanted: bool,
     snapshot_stats: Vec<SnapshotStat>,
-    /// Stream offset of the local state attach started from (0: rebuilt from nothing), and of the
-    /// snapshot it installed (0: none).
-    attached_from: u64,
-    installed: u64,
+    /// Stream offset of the local state attach started from (`START`: rebuilt from nothing), and of
+    /// the snapshot it installed (`START`: none).
+    attached_from: String,
+    installed: String,
 }
 
 struct SnapshotStat {
-    offset: u64,
+    offset: String,
     bytes: usize,
     raw: usize,
     copy: Duration,
@@ -211,10 +225,12 @@ struct SnapshotStat {
 }
 
 impl Db {
-    /// The log since the latest snapshot outgrew the database (and the configured minimum).
+    /// The log since the latest snapshot outgrew the database (and the configured minimum). The log
+    /// is counted in frame bytes, not taken from offsets (opaque): what attach replayed after the
+    /// snapshot it started from (plus, from trusted local files, the sidecar's count), and every
+    /// frame acknowledged since; a snapshot taken subtracts what it covers.
     fn snapshot_due(&self) -> bool {
-        let log = self.offset.saturating_sub(self.snapshot);
-        log > (self.pages as u64 * PAGE as u64).max(snapshot_min_bytes())
+        self.log > (self.pages as u64 * PAGE as u64).max(snapshot_min_bytes())
     }
 
     fn overlay_end(&self) -> i64 {
@@ -329,7 +345,8 @@ impl Db {
             salts: u64::from_be_bytes(salts),
             frame: self.commit_frame_no,
         };
-        if let Err(e) = write_sidecar(&self.sidecar, self.offset, self.epoch, &self.stamp, wal) {
+        let line = sidecar_line(&self.offset, self.epoch, self.log, &self.stamp, wal);
+        if let Err(e) = write_sidecar(&self.sidecar, &line) {
             self.poison(e);
             return;
         }
@@ -499,9 +516,9 @@ fn file_id(path: &str) -> Option<String> {
     fs::metadata(path).ok().map(|m| m.ino().to_string())
 }
 
-/// What a sidecar records besides offset, epoch and the WAL claim: the boot it was written in
-/// (`boot`, from `boot_id`), the stream and its incarnation (`Head::incarnation`), and the db file
-/// it describes (see `trusted`).
+/// What a sidecar records besides offset, epoch, format (`v=`), log count (`log=`) and the WAL
+/// claim: the boot it was written in (`boot`, from `boot_id`), the stream and its incarnation
+/// (`Head::incarnation`), and the db file it describes (see `trusted`).
 fn stamp(path: &str, url: &str, boot: Option<&str>, incarnation: &str) -> String {
     let mut s = format!(
         " boot={} stream={}",
@@ -643,20 +660,19 @@ fn fold_wal(path: &str, f: &fs::File) -> Result<(), String> {
     f.set_len(scan.size as u64 * PAGE as u64).map_err(err)
 }
 
-/// Replaces the sidecar atomically against a process crash: temp file, rename. No fsync:
-/// `Sidecar::trusted` checks it against the files (a sidecar ahead of its WAL is rebuilt; one
-/// behind it replays from its offset).
-fn write_sidecar(
-    path: &str,
-    offset: u64,
-    epoch: u64,
-    stamp: &str,
-    wal: WalClaim,
-) -> Result<(), String> {
-    let line = format!(
-        "{offset} {epoch}{stamp} wal={:016x}:{}\n",
+/// A sidecar's content: the offset the local files reflect (the server's string), the epoch, the
+/// format version, the log since the latest snapshot (`Db::log`), the `stamp`, and the WAL claim.
+fn sidecar_line(offset: &str, epoch: u64, log: u64, stamp: &str, wal: WalClaim) -> String {
+    format!(
+        "{offset} {epoch} v={SIDECAR_VERSION} log={log}{stamp} wal={:016x}:{}\n",
         wal.salts, wal.frame
-    );
+    )
+}
+
+/// Replaces the sidecar (`sidecar_line`) atomically against a process crash: temp file, rename. No
+/// fsync: `Sidecar::trusted` checks it against the files (a sidecar ahead of its WAL is rebuilt;
+/// one behind it replays from its offset).
+fn write_sidecar(path: &str, line: &str) -> Result<(), String> {
     let err = |e: std::io::Error| format!("sidecar {path}: {e}");
     let tmp = format!("{path}.tmp");
     fs::write(&tmp, line).map_err(err)?;
@@ -664,9 +680,14 @@ fn write_sidecar(
 }
 
 struct Sidecar {
-    /// The offset the local file reflects.
-    offset: u64,
+    /// The offset the local file reflects (as the server wrote it; a version 1 sidecar's is a
+    /// decimal number, which the server still reads).
+    offset: String,
     epoch: u64,
+    /// The format (`SIDECAR_VERSION`; 1 without a `v=` token).
+    version: u32,
+    /// `Db::log` (0 when absent).
+    log: u64,
     boot: Option<String>,
     stream: Option<String>,
     incarnation: Option<String>,
@@ -680,10 +701,12 @@ impl Sidecar {
     /// another one, whatever its length), into this db file (one replaced behind our back would get
     /// the old one's WAL applied to it), and the local WAL still holds what the sidecar claims of
     /// it (a disk image restored without a reboot keeps boot and inode but may have lost any
-    /// unsynced write). A sidecar of an older version (no boot, no incarnation, or no WAL claim)
-    /// is not trusted, and nothing is when the current boot (`boot`, from `boot_id`) is unknown.
+    /// unsynced write). A sidecar of an older version (an older format, no boot, no incarnation,
+    /// or no WAL claim) is not trusted, and nothing is when the current boot (`boot`, from
+    /// `boot_id`) is unknown.
     fn trusted(&self, path: &str, boot: Option<&str>, incarnation: &str) -> bool {
-        boot.is_some_and(|b| self.boot.as_deref() == Some(b))
+        self.version == SIDECAR_VERSION
+            && boot.is_some_and(|b| self.boot.as_deref() == Some(b))
             && self.incarnation.as_deref() == Some(incarnation)
             && self.file.is_some()
             && self.file == file_id(path)
@@ -700,13 +723,16 @@ fn read_sidecar(path: &str) -> Result<Option<Sidecar>, String> {
         Err(e) => return Err(format!("sidecar {path}: {e}")),
     };
     let mut it = text.split_whitespace();
-    let mut num = || it.next().and_then(|v| v.parse::<u64>().ok());
-    let (Some(offset), Some(epoch)) = (num(), num()) else {
+    let offset = it.next().and_then(offset_token);
+    let epoch = it.next().and_then(|v| v.parse::<u64>().ok());
+    let (Some(offset), Some(epoch)) = (offset, epoch) else {
         return Ok(None);
     };
     let mut s = Sidecar {
         offset,
         epoch,
+        version: 1,
+        log: 0,
         boot: None,
         stream: None,
         incarnation: None,
@@ -715,6 +741,14 @@ fn read_sidecar(path: &str) -> Result<Option<Sidecar>, String> {
     };
     for token in it {
         match token.split_once('=') {
+            Some(("v", v)) => match v.parse() {
+                Ok(v) => s.version = v,
+                Err(_) => return Ok(None),
+            },
+            Some(("log", v)) => match v.parse() {
+                Ok(v) => s.log = v,
+                Err(_) => return Ok(None),
+            },
             Some(("boot", v)) => s.boot = Some(v.to_owned()),
             Some(("stream", v)) => s.stream = Some(v.to_owned()),
             Some(("incarnation", v)) => s.incarnation = Some(v.to_owned()),
@@ -840,6 +874,18 @@ fn header_u64(r: &ureq::http::Response<ureq::Body>, name: &str) -> Option<u64> {
     r.headers().get(name)?.to_str().ok()?.trim().parse().ok()
 }
 
+/// An offset as the server wrote it: opaque, kept verbatim and compared only lexicographically
+/// (never parsed or computed with). `None` unless it is usable in a URL path or query and a
+/// sidecar as it is: 1 to 64 unreserved URL characters.
+fn offset_token(v: &str) -> Option<String> {
+    let ok = |b: u8| b.is_ascii_alphanumeric() || b"-._~".contains(&b);
+    (!v.is_empty() && v.len() <= 64 && v.bytes().all(ok)).then(|| v.to_owned())
+}
+
+fn header_offset(r: &ureq::http::Response<ureq::Body>, name: &str) -> Option<String> {
+    offset_token(r.headers().get(name)?.to_str().ok()?.trim())
+}
+
 /// Waits before the next retry: no sooner than `retry_after`, and at least `backoff`, which then
 /// doubles (up to 1 s). Returns false, without waiting, when the wait would end past `deadline`
 /// (or overflow, for an absurd Retry-After).
@@ -881,12 +927,15 @@ fn read_retrying(
 
 enum Append {
     /// Applied (or a duplicate of an applied append); the stream offset after it when known.
-    Acked { next: Option<u64>, attempts: u32 },
+    Acked { next: Option<String>, attempts: u32 },
     /// 403: a newer epoch owns the stream.
     Fenced { current: Option<u64> },
     /// 409 expecting sequence 0: the server does not know this producer (expired after 7 idle days,
     /// or the stream was deleted and recreated: `producer_id`); `reclaim` tells them apart.
     ProducerExpired,
+    /// 409 refusing the commit's `Stream-Seq` (not above the stream's last one): another writer
+    /// appended with a higher one (see `stream_seq`).
+    SeqConflict(String),
     /// A definite rejection, or no answer within the retry budget.
     Failed(String),
 }
@@ -905,20 +954,23 @@ fn producer_id(incarnation: &str) -> String {
 /// only with its receipt (`Stream-Next-Offset`, checked by `commit`): they are sent after a
 /// verified claim (see `claim_once`), which makes this owner the only writer of its incarnation's
 /// producer at its epoch, so whatever holds (epoch, seq) there is ours. A claim's answer is
-/// verified separately.
+/// verified separately. Commits also carry their `Stream-Seq` (see `stream_seq`).
 fn append(url: &str, producer: &str, body: &[u8], epoch: u64, seq: u64) -> Append {
     let deadline = Instant::now() + retry_budget();
     let mut backoff = Duration::from_millis(20);
     let mut attempts = 0;
     loop {
         attempts += 1;
-        let sent = agent()
+        let mut req = agent()
             .post(url)
             .header("content-type", CONTENT_TYPE)
             .header("producer-id", producer)
             .header("producer-epoch", epoch.to_string())
-            .header("producer-seq", seq.to_string())
-            .send(body);
+            .header("producer-seq", seq.to_string());
+        if seq > 0 {
+            req = req.header("stream-seq", stream_seq((epoch, seq)));
+        }
+        let sent = req.send(body);
         let mut retry_after = None;
         let unknown = match sent {
             Ok(mut r) => {
@@ -929,7 +981,7 @@ fn append(url: &str, producer: &str, body: &[u8], epoch: u64, seq: u64) -> Appen
                 match status {
                     200..=299 => {
                         return Append::Acked {
-                            next: header_u64(&r, "stream-next-offset"),
+                            next: header_offset(&r, "stream-next-offset"),
                             attempts,
                         };
                     }
@@ -940,6 +992,14 @@ fn append(url: &str, producer: &str, body: &[u8], epoch: u64, seq: u64) -> Appen
                     }
                     409 if seq > 0 && header_u64(&r, "producer-expected-seq") == Some(0) => {
                         return Append::ProducerExpired;
+                    }
+                    // Neither a producer sequence conflict nor a closed stream: the `Stream-Seq`.
+                    409 if seq > 0
+                        && !r.headers().contains_key("producer-expected-seq")
+                        && !r.headers().contains_key("stream-closed") =>
+                    {
+                        let text = r.body_mut().read_to_string().unwrap_or_default();
+                        return Append::SeqConflict(text);
                     }
                     429 => format!(
                         "append: 429 {}",
@@ -1002,9 +1062,10 @@ impl From<Fail> for String {
     }
 }
 
-/// One read from `offset`: the bytes and the offset after them (empty at the tail). Reads the
-/// leader's applied state: a follower may lag behind an acknowledged append (a claim, a commit).
-fn read_from(url: &str, offset: u64) -> Result<(Vec<u8>, u64), Fail> {
+/// One read from `offset`: the bytes and the server's offset after them (empty at the tail). Reads
+/// the leader's applied state: a follower may lag behind an acknowledged append (a claim, a
+/// commit). A 200 without a usable `Stream-Next-Offset` is an error: offsets are never computed.
+fn read_from(url: &str, offset: &str) -> Result<(Vec<u8>, String), Fail> {
     let mut r = read_retrying(
         || {
             agent()
@@ -1015,10 +1076,10 @@ fn read_from(url: &str, offset: u64) -> Result<(Vec<u8>, u64), Fail> {
     )
     .map_err(|e| format!("read {url} at {offset}: {e}"))?;
     let status = r.status().as_u16();
+    let next = header_offset(&r, "stream-next-offset");
     if status == 204 {
-        return Ok((Vec::new(), offset));
+        return Ok((Vec::new(), next.unwrap_or_else(|| offset.to_owned())));
     }
-    let next = header_u64(&r, "stream-next-offset");
     let body = r
         .body_mut()
         .with_config()
@@ -1042,14 +1103,24 @@ fn read_from(url: &str, offset: u64) -> Result<(Vec<u8>, u64), Fail> {
             String::from_utf8_lossy(&body)
         )));
     }
-    let next = next.unwrap_or(offset + body.len() as u64);
-    if next != offset + body.len() as u64 {
+    let Some(next) = next else {
         return Err(Fail::Other(format!(
-            "read {url} at {offset}: {} bytes but next offset {next}",
-            body.len()
+            "read {url} at {offset}: no Stream-Next-Offset"
         )));
-    }
+    };
     Ok((body, next))
+}
+
+/// A read loop's step: `next`, answered by a read at `at` that returned bytes, must sort past `at`.
+/// Checked in the loops only, where both are server offsets (or `START`): an older sidecar's
+/// unpadded offset, read once to probe for a 416, compares meaninglessly.
+fn advanced(url: &str, at: &str, len: usize, next: &str) -> Result<(), String> {
+    if next <= at {
+        return Err(format!(
+            "read {url} at {at}: {len} bytes but next offset {next}"
+        ));
+    }
+    Ok(())
 }
 
 /// Snapshot transfers move whole databases: a longer timeout than appends.
@@ -1065,8 +1136,10 @@ fn bulk_agent() -> &'static ureq::Agent {
 }
 
 struct Head {
-    retained: u64,
-    snapshot: Option<u64>,
+    /// `START` when absent.
+    retained: String,
+    /// `None` when absent or `-1` (no snapshot).
+    snapshot: Option<String>,
     /// `Stream-Incarnation`: opaque, changes when the stream is deleted and recreated; compared
     /// for equality only. `None` when absent (or unusable in a sidecar or `Producer-Id`): attach
     /// refuses.
@@ -1082,8 +1155,8 @@ fn head(url: &str, stopped: &dyn Fn() -> bool) -> Result<Head, String> {
         return Err(format!("head {url}: {status}"));
     }
     Ok(Head {
-        retained: header_u64(&r, "stream-retained-offset").unwrap_or(0),
-        snapshot: header_u64(&r, "stream-snapshot-offset"),
+        retained: header_offset(&r, "stream-retained-offset").unwrap_or_else(|| START.into()),
+        snapshot: header_offset(&r, "stream-snapshot-offset").filter(|s| s != START),
         incarnation: r
             .headers()
             .get("stream-incarnation")
@@ -1098,7 +1171,7 @@ fn head(url: &str, stopped: &dyn Fn() -> bool) -> Result<Head, String> {
 /// `stopped` ends the retries of a 429/503 early (see `read_retrying`).
 fn get_snapshot(
     url: &str,
-    offset: u64,
+    offset: &str,
     stopped: &dyn Fn() -> bool,
 ) -> Result<Option<Vec<u8>>, String> {
     let mut r = read_retrying(
@@ -1323,13 +1396,16 @@ impl Drop for Private {
 /// handles (the private connections of `Private`).
 struct Applier {
     path: String,
-    /// The sidecar, its stamp, and the offset and epoch the replay starts from: rewritten once the
-    /// WAL is folded (`file`).
+    /// The sidecar, its stamp, and the offset, epoch and log the replay starts from: rewritten once
+    /// the WAL is folded (`file`).
     sidecar: String,
     stamp: String,
-    from: (u64, u64),
-    /// Offset of the snapshot installed (0: none).
-    installed: u64,
+    from: (String, u64, u64),
+    /// Offset of the snapshot installed (`START`: none).
+    installed: String,
+    /// Frame bytes since the latest snapshot (`Db::log`): `from`'s, plus every frame replayed;
+    /// reset by an install.
+    log: u64,
     /// Page images written (for the `URSULA_VFS_ABORT_IN_REPLAY` test hook).
     written: u64,
     file: Option<fs::File>,
@@ -1384,8 +1460,9 @@ impl Applier {
                 fold_wal(&self.path, &f)?;
                 f.sync_all()
                     .map_err(|e| format!("fsync {}: {e}", self.path))?;
-                let (offset, epoch) = self.from;
-                write_sidecar(&self.sidecar, offset, epoch, &self.stamp, WalClaim::NONE)?;
+                let (offset, epoch, log) = &self.from;
+                let line = sidecar_line(offset, *epoch, *log, &self.stamp, WalClaim::NONE);
+                write_sidecar(&self.sidecar, &line)?;
                 remove_if_exists(&format!("{}-wal", self.path))?;
                 remove_if_exists(&format!("{}-shm", self.path))?;
             }
@@ -1454,44 +1531,51 @@ impl Applier {
         self.size = Some((snap.image.len() / PAGE) as u32);
         self.epoch = self.epoch.max(snap.epoch);
         self.installed = snap.offset;
+        self.log = 0;
         Ok(())
     }
 }
 
-/// Reads and applies frames from `pos` until the tail (`until == None`) or `until`, advancing `pos`
-/// past every applied frame.
+/// Reads and applies frames from `pos` (a frame boundary) until the tail (`until == None`) or
+/// until `pos` reaches `until`. Offsets are opaque, so `pos` only ever takes a read's
+/// `Stream-Next-Offset`, once no partial frame is buffered: a frame boundary at or before
+/// everything applied (replay from there is idempotent).
 unsafe fn catch_up(
     url: &str,
-    pos: &mut u64,
-    until: Option<u64>,
+    pos: &mut String,
+    until: Option<&str>,
     applier: &mut Applier,
 ) -> Result<(), Fail> {
-    let mut buf: Vec<u8> = Vec::new();
+    let (mut buf, mut at) = (Vec::new(), pos.clone());
     loop {
-        if until.is_some_and(|u| *pos >= u) {
+        if buf.is_empty() && until.is_some_and(|u| pos.as_str() >= u) {
             break;
         }
-        let (bytes, _) = read_from(url, *pos + buf.len() as u64)?;
+        let (bytes, next) = read_from(url, &at)?;
         if bytes.is_empty() {
             if !buf.is_empty() || until.is_some() {
                 return Err(Fail::Other(format!(
-                    "stream {url} ends at {} inside a frame or before {until:?}",
-                    *pos + buf.len() as u64
+                    "stream {url} ends at {at} inside a frame or before {until:?}"
                 )));
             }
             break;
         }
+        advanced(url, &at, bytes.len(), &next)?;
         buf.extend_from_slice(&bytes);
+        at = next;
         let mut used = 0;
-        while let Decoded::Frame { record, len } = frame::decode(&buf[used..])
-            .map_err(|e| format!("{url} at {}: {e}", *pos + used as u64))?
+        while let Decoded::Frame { record, len } =
+            frame::decode(&buf[used..]).map_err(|e| format!("{url}: a frame after {pos}: {e}"))?
         {
             applier.apply(record);
             used += len;
         }
         buf.drain(..used);
-        *pos += used as u64;
+        applier.log += used as u64;
         unsafe { applier.flush()? };
+        if buf.is_empty() {
+            pos.clone_from(&at);
+        }
     }
     Ok(())
 }
@@ -1514,10 +1598,11 @@ fn first_claim_epoch() -> Option<u64> {
 }
 
 enum Claimed {
-    /// Our claim spans `start..next`: this owner alone writes at `epoch` from here on.
+    /// Our claim ends at `next`: this owner alone writes at `epoch` from here on. `first`: it is
+    /// the first frame after the position the claim was checked from.
     Won {
-        start: u64,
-        next: u64,
+        first: bool,
+        next: String,
     },
     /// Another owner's claim (or anything else) holds the answered position: a concurrent
     /// claim at the same epoch was answered as a duplicate of theirs.
@@ -1525,34 +1610,83 @@ enum Claimed {
     Fenced(Option<u64>),
 }
 
-/// Appends a claim at (`epoch`, seq 0) and verifies that the frame ending at the answered offset
-/// is ours. A 2xx alone proves nothing: two owners claiming the same epoch both get one, the
+/// Appends a claim at (`epoch`, seq 0) and verifies our claim among the frames read back (see
+/// `find_claim`). A 2xx alone proves nothing: two owners claiming the same epoch both get one, the
 /// second as a duplicate of the first's receipt. The nonce makes our claim's bytes unique.
-fn claim_once(url: &str, producer: &str, epoch: u64) -> Result<Claimed, String> {
-    let frame = frame::encode_claim(epoch, &nonce()?);
-    match append(url, producer, &frame, epoch, 0) {
+///
+/// Offsets are opaque, so the claim's start is not computed from its end: `from` is a frame
+/// boundary at or before the stream's tail before the claim (the tail catch-up recorded, or the
+/// owner's own offset), and the frames from there to the answered offset are read and decoded.
+fn claim_once(url: &str, producer: &str, epoch: u64, from: &str) -> Result<Claimed, String> {
+    let nonce = nonce()?;
+    let frame = frame::encode_claim(epoch, &nonce);
+    let next = match append(url, producer, &frame, epoch, 0) {
         Append::Acked {
             next: Some(next), ..
-        } => {
-            let start = next.checked_sub(frame.len() as u64);
-            let ours = match start {
-                Some(start) => read_from(url, start)?.0.get(..frame.len()) == Some(&frame[..]),
-                None => false,
-            };
-            Ok(match start {
-                Some(start) if ours => Claimed::Won { start, next },
-                _ => Claimed::Lost,
-            })
+        } => next,
+        Append::Acked { next: None, .. } => {
+            return Err(format!("claim {url}: no Stream-Next-Offset"));
         }
-        Append::Acked { next: None, .. } => Err(format!("claim {url}: no Stream-Next-Offset")),
-        Append::Fenced { current } => Ok(Claimed::Fenced(current)),
-        Append::ProducerExpired => unreachable!("a claim has sequence 0"),
-        Append::Failed(e) => Err(format!("claim {url}: {e}")),
+        Append::Fenced { current } => return Ok(Claimed::Fenced(current)),
+        Append::ProducerExpired | Append::SeqConflict(_) => {
+            unreachable!("a claim has sequence 0 and no Stream-Seq")
+        }
+        Append::Failed(e) => return Err(format!("claim {url}: {e}")),
+    };
+    let (mut buf, mut at) = (Vec::new(), from.to_owned());
+    while at.as_str() < next.as_str() {
+        let (bytes, n) = read_from(url, &at).map_err(String::from)?;
+        if bytes.is_empty() {
+            return Err(format!(
+                "claim {url}: the stream ends at {at}, before the claim's end {next}"
+            ));
+        }
+        advanced(url, &at, bytes.len(), &n)?;
+        buf.extend_from_slice(&bytes);
+        at = n;
     }
+    let exact = at == next;
+    let found = find_claim(&buf, exact, epoch, &nonce).map_err(|e| format!("claim {url}: {e}"))?;
+    Ok(match found {
+        Some(first) => Claimed::Won { first, next },
+        None => Claimed::Lost,
+    })
+}
+
+/// Our claim (`epoch`, `nonce`) among the frames in `buf`, read from a frame boundary before it up
+/// to the answered offset (`exact`) or past it (another owner appended meanwhile, and the answered
+/// offset's place in the bytes is unknown): `Some(first)` when it is the frame ending at the
+/// answered offset (`first`: no frame precedes it in `buf`), `None` (lost) otherwise. Past the
+/// answered offset, our claim being there at all is enough: the server applies one append per
+/// (producer, epoch, seq 0) and answers every other with that append's receipt, so our claim is in
+/// the stream only if the answer was its own end.
+fn find_claim(
+    buf: &[u8],
+    exact: bool,
+    epoch: u64,
+    nonce: &[u8; 16],
+) -> Result<Option<bool>, String> {
+    let (mut used, mut found, mut last_ours) = (0, None, false);
+    while let Decoded::Frame { record, len } = frame::decode(&buf[used..])? {
+        last_ours = record
+            == Record::Claim {
+                epoch,
+                nonce: *nonce,
+            };
+        if last_ours {
+            found = Some(used == 0);
+        }
+        used += len;
+    }
+    if exact && used != buf.len() {
+        return Err("the answered offset is not a frame boundary".into());
+    }
+    Ok(found.filter(|_| !exact || last_ours))
 }
 
 /// Claims the stream with an epoch above every earlier owner's; returns it and the claim's end.
-fn claim(url: &str, producer: &str, epoch: u64) -> Result<(u64, u64), String> {
+/// `from`: a frame boundary at or before the tail (see `claim_once`).
+fn claim(url: &str, producer: &str, epoch: u64, from: &str) -> Result<(u64, String), String> {
     // Test hook URSULA_VFS_FIRST_CLAIM_EPOCH: the process's first claim uses this epoch.
     static HOOKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let mut epoch = match first_claim_epoch() {
@@ -1560,7 +1694,7 @@ fn claim(url: &str, producer: &str, epoch: u64) -> Result<(u64, u64), String> {
         _ => epoch,
     };
     for _ in 0..16 {
-        match claim_once(url, producer, epoch)? {
+        match claim_once(url, producer, epoch, from)? {
             Claimed::Won { next, .. } => return Ok((epoch, next)),
             Claimed::Lost => epoch += 1,
             Claimed::Fenced(current) => epoch = current.unwrap_or(epoch).max(epoch) + 1,
@@ -1574,8 +1708,8 @@ fn claim(url: &str, producer: &str, epoch: u64) -> Result<(u64, u64), String> {
 /// deleted one (`producer_id`). Taking the stream back is safe only if it is still the incarnation
 /// this owner attached to and nobody wrote since this owner's last frame: the stream must end at
 /// our offset, and our new claim (one epoch up, fencing any later owner's older epochs) must be
-/// ours (verified) and land exactly there, the incarnation unchanged after it. Otherwise another
-/// owner wrote or claimed, or the stream is another one, and this one is fenced.
+/// ours (verified) and be the first frame after it, the incarnation unchanged after it. Otherwise
+/// another owner wrote or claimed, or the stream is another one, and this one is fenced.
 fn reclaim(db: &mut Db) -> Result<(), String> {
     fn same(db: &mut Db) -> Result<(), String> {
         match recreated(&db.url, &db.incarnation, &|| false)? {
@@ -1587,7 +1721,7 @@ fn reclaim(db: &mut Db) -> Result<(), String> {
         }
     }
     same(db)?;
-    let (bytes, _) = read_from(&db.url, db.offset)?;
+    let (bytes, _) = read_from(&db.url, &db.offset)?;
     if !bytes.is_empty() {
         db.fenced = true;
         return Err(format!(
@@ -1596,8 +1730,8 @@ fn reclaim(db: &mut Db) -> Result<(), String> {
         ));
     }
     let epoch = db.epoch + 1;
-    match claim_once(&db.url, &db.producer, epoch)? {
-        Claimed::Won { start, next } if start == db.offset => {
+    match claim_once(&db.url, &db.producer, epoch, &db.offset)? {
+        Claimed::Won { first: true, next } => {
             same(db)?;
             db.epoch = epoch;
             db.seq = 0;
@@ -1659,22 +1793,23 @@ fn recreated(
 /// snapshot when the file is behind it (or below the stream's retention), replays the frames after
 /// it, claims, and replays up to the claim, all from the stream's `incarnation` (checked by the
 /// `HEAD` before and after: a stream deleted and recreated meanwhile fails the attach, and the
-/// sidecar, still stamped with the old incarnation, makes the next one rebuild). Returns the epoch
-/// claimed and the latest snapshot's offset (0 for none).
+/// sidecar, still stamped with the old incarnation, makes the next one rebuild; a newer owner's
+/// claim replayed after ours fails it too). Returns the epoch claimed and the latest snapshot's
+/// offset (`START` for none).
 unsafe fn sync(
     url: &str,
     incarnation: &str,
-    pos: &mut u64,
+    pos: &mut String,
     applier: &mut Applier,
-) -> Result<(u64, u64), Fail> {
+) -> Result<(u64, String), Fail> {
     let head = head(url, &|| false)?;
     if head.incarnation.as_deref() != Some(incarnation) {
         return Err(Fail::Other(format!(
             "{url} was deleted and recreated during attach; attach again"
         )));
     }
-    if let Some(s) = head.snapshot
-        && *pos < s
+    if let Some(s) = head.snapshot.as_deref()
+        && pos.as_str() < s
     {
         let Some(body) = get_snapshot(url, s, &|| false)? else {
             return Err(Fail::Gone(format!("snapshot {s} superseded")));
@@ -1687,23 +1822,37 @@ unsafe fn sync(
             )));
         }
         unsafe { applier.install(snap)? };
-        *pos = s;
-    } else if *pos < head.retained {
+        s.clone_into(pos);
+    } else if *pos != START && *pos < head.retained {
         return Err(Fail::Gone(format!(
             "{pos} is below the retention {} and no newer snapshot is visible",
             head.retained
         )));
     }
+    // From the beginning (`START`), a stream trimmed with no snapshot visible answers 410: `Gone`.
     unsafe { catch_up(url, pos, None, applier)? };
-    let (epoch, claimed) = claim(url, &producer_id(incarnation), applier.epoch + 1)?;
-    unsafe { catch_up(url, pos, Some(claimed), applier)? };
+    // `pos` is now the tail as catch-up found it: the claim is checked from there.
+    let producer = producer_id(incarnation);
+    let (epoch, claimed) = claim(url, &producer, applier.epoch + 1, pos)?;
+    unsafe { catch_up(url, pos, Some(claimed.as_str()), applier)? };
+    // The replay may run past our claim into a higher one: another owner claimed meanwhile
+    // (normally after ours, as the server refuses a lower epoch from this producer; a stray claim
+    // under a deleted incarnation's producer is not epoch-fenced and may precede it). Either way
+    // this owner is fenced, and a snapshot it took would record an epoch below the highest
+    // claimed before it.
+    if applier.epoch > epoch {
+        return Err(Fail::Other(format!(
+            "fenced: another owner claimed epoch {} during attach; attach again",
+            applier.epoch
+        )));
+    }
     if let Some(e) = recreated(url, incarnation, &|| false)? {
         return Err(Fail::Other(format!("{e} during attach; attach again")));
     }
-    Ok((epoch, head.snapshot.unwrap_or(0)))
+    Ok((epoch, head.snapshot.unwrap_or_else(|| START.into())))
 }
 
-unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
+unsafe fn attach(path: &str, url: &str) -> Result<String, String> {
     let path = unsafe { full_pathname(path)? };
     let url = url.trim_end_matches('/').to_owned();
     let previous = {
@@ -1765,7 +1914,7 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
 unsafe fn attach_files(
     path: &str,
     url: &str,
-) -> Result<(u64, Arc<Mutex<Db>>, SnapshotThread), String> {
+) -> Result<(String, Arc<Mutex<Db>>, SnapshotThread), String> {
     create_stream(url)?;
     let sidecar = format!("{path}-ursula");
     let boot = boot_id();
@@ -1794,10 +1943,13 @@ unsafe fn attach_files(
             // or a disk image whose WAL lost frames the sidecar counts on: the stream has
             // everything committed.
             s => {
-                let why: String = match s.as_ref().map(|s| (s.incarnation.as_deref(), s.offset)) {
+                let why: String = match s
+                    .as_ref()
+                    .map(|s| (s.incarnation.as_deref(), s.version, s.offset.as_str()))
+                {
                     // The stream at the path is another one: nothing of the old one is wanted,
                     // whatever the new one's length.
-                    Some((Some(old), _)) if old != incarnation => format!(
+                    Some((Some(old), _, _)) if old != incarnation => format!(
                         "a cache of stream incarnation {old}, but {url} is now incarnation \
                          {incarnation}: deleted and recreated"
                     ),
@@ -1807,14 +1959,16 @@ unsafe fn attach_files(
                     // 416 (beyond the end) refuses, as for trusted files, instead of rebuilding an
                     // older database. `Gone` (below retention) is fine: the rebuild starts from a
                     // snapshot.
-                    Some((old, offset)) => {
-                        if offset > 0
+                    Some((old, version, offset)) => {
+                        if offset != START
                             && let Err(Fail::Other(e)) = read_from(url, offset)
                         {
                             return Err(e);
                         }
                         if old.is_none() {
                             "an older version's sidecar, without the stream incarnation".into()
+                        } else if version != SIDECAR_VERSION {
+                            format!("a sidecar of format {version}, not {SIDECAR_VERSION}")
                         } else {
                             "another boot, a replaced db file, or a WAL behind the sidecar".into()
                         }
@@ -1834,8 +1988,8 @@ unsafe fn attach_files(
     // roll it back, truncating whatever attach writes after it.
     remove_if_exists(&format!("{path}-journal"))?;
     let initial = stamp(path, url, boot, &incarnation);
-    let (from, epoch) = match &local {
-        Some(s) => (s.offset, s.epoch),
+    let (from, epoch, log) = match &local {
+        Some(s) => (s.offset.clone(), s.epoch, s.log),
         None => {
             // Nothing local: a WAL next to an empty db file holds nothing committed. The sidecar
             // is written before anything lands in the file, so a file an attach leaves
@@ -1843,16 +1997,20 @@ unsafe fn attach_files(
             // otherwise discarded and rebuilt) instead of being refused as never attached.
             remove_if_exists(&format!("{path}-wal"))?;
             remove_if_exists(&format!("{path}-shm"))?;
-            write_sidecar(&sidecar, 0, 0, &initial, WalClaim::NONE)?;
-            (0, 0)
+            write_sidecar(
+                &sidecar,
+                &sidecar_line(START, 0, 0, &initial, WalClaim::NONE),
+            )?;
+            (START.to_owned(), 0, 0)
         }
     };
     let mut applier = Applier {
         path: path.to_owned(),
         sidecar: sidecar.clone(),
         stamp: initial,
-        from: (from, epoch),
-        installed: 0,
+        from: (from.clone(), epoch, log),
+        installed: START.into(),
+        log,
         written: 0,
         file: emptied,
         pages: BTreeMap::new(),
@@ -1860,7 +2018,7 @@ unsafe fn attach_files(
         size: None,
         epoch,
     };
-    let mut pos = from;
+    let mut pos = from.clone();
     let mut tries = 0;
     // `Gone`: retention moved past the file (or the snapshot read was superseded) under a HEAD
     // that did not show it yet; the next round installs the newer snapshot.
@@ -1875,7 +2033,7 @@ unsafe fn attach_files(
             Err(e) => return Err(e.into()),
         }
     };
-    let installed = applier.installed;
+    let (installed, log) = (std::mem::take(&mut applier.installed), applier.log);
     // Untouched trusted files keep their claim; otherwise the WAL is gone (`Applier::file`,
     // `install`, or never there) and the db file alone holds the state.
     let wal = local.and_then(|s| s.wal.filter(|_| applier.file.is_none()));
@@ -1896,7 +2054,7 @@ unsafe fn attach_files(
     };
     // Stamped again: the db file may not have existed before (`file_id`).
     let stamp = stamp(path, url, boot, &incarnation);
-    write_sidecar(&sidecar, pos, epoch, &stamp, wal)?;
+    write_sidecar(&sidecar, &sidecar_line(&pos, epoch, log, &stamp, wal))?;
     let pages = (fs::metadata(path).map(|m| m.len()).unwrap_or(0) / PAGE as u64) as u32;
     let snapper = Arc::new(Snapper::default());
     let db = Arc::new(Mutex::new(Db {
@@ -1908,7 +2066,8 @@ unsafe fn attach_files(
         path: path.to_owned(),
         epoch,
         seq: 0,
-        offset: pos,
+        offset: pos.clone(),
+        log,
         poisoned: None,
         fenced: false,
         overlay: BTreeMap::new(),
@@ -1924,7 +2083,7 @@ unsafe fn attach_files(
         checkpoints: Vec::new(),
         pages,
         snapshot,
-        retained: 0,
+        retained: START.into(),
         snapper: snapper.clone(),
         window: false,
         window_wanted: false,
@@ -2058,7 +2217,7 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
     // Backfill outside the window, so the checkpoint inside it (which commits wait for) only
     // covers the frames committed in between.
     unsafe { conn.checkpoint(c"PRAGMA wal_checkpoint(PASSIVE)")? };
-    let (url, incarnation, offset, epoch, pages) = {
+    let (url, incarnation, offset, epoch, pages, log) = {
         let mut d = lock(db);
         loop {
             if !d.snapshot_due() || d.poisoned.is_some() || stopped() {
@@ -2085,9 +2244,10 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
         (
             d.url.clone(),
             d.incarnation.clone(),
-            d.offset,
+            d.offset.clone(),
             d.epoch,
             d.pages,
+            d.log,
         )
     };
     let window = Window(db);
@@ -2113,7 +2273,7 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
     let image = unsafe { conn.read_pages(pages)? };
     drop(conn); // ends the read transaction
     let copy = copy_started.elapsed();
-    let body = snapshot::encode(offset, epoch, &image);
+    let body = snapshot::encode(&offset, epoch, &image);
     // This state is a prefix of the incarnation it was attached to, not of a stream recreated at
     // the same path since: never publish it there (the snapshot endpoint knows no producer), and
     // stop this owner's commits now rather than at its next append (which the recreated stream
@@ -2137,10 +2297,14 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
     match put_idempotent(&format!("{url}/snapshot/{offset}"), &body, &stopped)? {
         (200..=299, _) => {}
         (409 | 410, _) => {
-            // A newer snapshot exists (another owner's, or this file's before a re-attach).
-            let newer = head(&url, &stopped)?.snapshot.unwrap_or(0);
+            // A snapshot at or past `offset` exists (another owner's, or this file's before a
+            // re-attach): it covers the log counted up to the window.
+            let newer = head(&url, &stopped)?.snapshot;
             let mut d = lock(db);
-            d.snapshot = d.snapshot.max(newer);
+            if let Some(newer) = newer.filter(|n| *n > d.snapshot) {
+                d.snapshot = newer;
+            }
+            d.log = d.log.saturating_sub(log);
             return Ok(true);
         }
         (status, mut r) => {
@@ -2156,7 +2320,7 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
         if stopped() {
             return Ok(true);
         }
-        if get_snapshot(&url, offset, &stopped)?.as_deref() == Some(&body[..]) {
+        if get_snapshot(&url, &offset, &stopped)?.as_deref() == Some(&body[..]) {
             verified = true;
             break;
         }
@@ -2167,18 +2331,21 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
     }
     let (previous, retained) = {
         let mut d = lock(db);
-        let previous = d.snapshot;
-        d.snapshot = d.snapshot.max(offset);
+        let previous = d.snapshot.clone();
+        if offset > d.snapshot {
+            d.snapshot.clone_from(&offset);
+        }
+        d.log = d.log.saturating_sub(log);
         if d.snapshot_stats.len() < 100_000 {
             d.snapshot_stats.push(SnapshotStat {
-                offset,
+                offset: offset.clone(),
                 bytes: body.len(),
                 raw: image.len(),
                 copy,
                 total: started.elapsed(),
             });
         }
-        (previous, d.retained)
+        (previous, d.retained.clone())
     };
     // Retention trails one snapshot behind: a host that read the previous snapshot (or whose file
     // is past it) still finds the frames after it, and the newer snapshot has read back.
@@ -2190,9 +2357,11 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
         }
         match put_idempotent(&format!("{url}/retention/{previous}"), &[], &stopped)? {
             (200..=299, r) => {
-                let effective = header_u64(&r, "stream-retained-offset").unwrap_or(previous);
+                let effective = header_offset(&r, "stream-retained-offset").unwrap_or(previous);
                 let mut d = lock(db);
-                d.retained = d.retained.max(effective);
+                if effective > d.retained {
+                    d.retained = effective;
+                }
             }
             // Already past it (another owner, or this file before a re-attach).
             (409 | 410, _) => {}
@@ -2229,15 +2398,15 @@ unsafe fn status(path: &str) -> Result<String, String> {
     let db = lock(&db);
     Ok(format!(
         "{{\"offset\":{},\"epoch\":{},\"poisoned\":{},\"fenced\":{},\"reason\":{},\"snapshot\":{},\"retained\":{},\"local\":{},\"installed\":{}}}",
-        db.offset,
+        json_str(&db.offset),
         db.epoch,
         db.poisoned.is_some(),
         db.fenced,
         db.poisoned.as_deref().map_or("null".to_owned(), json_str),
-        db.snapshot,
-        db.retained,
-        db.attached_from,
-        db.installed
+        json_str(&db.snapshot),
+        json_str(&db.retained),
+        json_str(&db.attached_from),
+        json_str(&db.installed)
     ))
 }
 
@@ -2276,7 +2445,7 @@ unsafe fn stats(path: &str) -> Result<String, String> {
         let _ = write!(
             out,
             "{{\"offset\":{},\"bytes\":{},\"raw\":{},\"copy_us\":{},\"total_us\":{}}}",
-            s.offset,
+            json_str(&s.offset),
             s.bytes,
             s.raw,
             s.copy.as_micros(),
@@ -2320,7 +2489,7 @@ unsafe extern "C" fn fn_attach(
 ) {
     unsafe {
         match attach(&arg(argv, 0), &arg(argv, 1)) {
-            Ok(n) => (api().result_int64.unwrap())(ctx, n as i64),
+            Ok(offset) => result_text(ctx, offset),
             Err(e) => result_error(ctx, &format!("ursula_attach: {e}")),
         }
     }
@@ -2693,6 +2862,17 @@ unsafe fn final_pages(
     Ok(pages)
 }
 
+/// A commit's `Stream-Seq`: the owner's (epoch, producer sequence), each zero-padded to 20 digits,
+/// so it sorts like the pair. Owners of one incarnation claim ever higher epochs and number commits
+/// upwards within one, so every commit's is above every earlier commit's: the server's check
+/// (refused unless above the stream's last `Stream-Seq`) then fences a writer outside this protocol
+/// that appended with a higher one since this owner's last commit (one with a lower or equal
+/// `Stream-Seq` is itself refused). Writers without `Stream-Seq` go unnoticed: offsets are opaque,
+/// so the VFS does not check where its frame landed.
+fn stream_seq((epoch, seq): (u64, u64)) -> String {
+    format!("{epoch:020}{seq:020}")
+}
+
 unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_frame: i64) -> c_int {
     let started = Instant::now();
     // The transaction starts a new WAL generation (its header is in the overlay): every page
@@ -2729,15 +2909,14 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
     }
     let seq = db.seq + 1;
     let append_time = t.elapsed();
-    let expected = db.offset + body.len() as u64;
-    let attempts = match outcome {
+    let (next, attempts) = match outcome {
         Append::Acked {
             next: Some(n),
             attempts,
-        } if n == expected => attempts,
+        } if n > db.offset => (n, attempts),
         Append::Acked { next: Some(n), .. } => {
             return db.poison(format!(
-                "append at {} acknowledged with next offset {n}, expected {expected}",
+                "append after {} acknowledged with next offset {n}, not past it",
                 db.offset
             ));
         }
@@ -2761,13 +2940,26 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
                 db.epoch
             ));
         }
+        // Not this owner's own retry (that is a duplicate, answered before `Stream-Seq` is
+        // checked), nor an older owner's (fenced by epoch): a writer outside this protocol.
+        Append::SeqConflict(e) => {
+            db.fenced = true;
+            return db.poison(format!(
+                "fenced: append after {} refused its Stream-Seq {}: another writer appended with \
+                 a higher one ({})",
+                db.offset,
+                stream_seq((db.epoch, seq)),
+                e.trim()
+            ));
+        }
         Append::ProducerExpired => {
             return db.poison("producer expired again right after a re-claim".into());
         }
         Append::Failed(e) => return db.poison(e),
     };
     db.seq = seq;
-    db.offset = expected;
+    db.offset = next;
+    db.log += body.len() as u64;
     db.pages = size;
     db.acked += 1;
     if abort_after_ack() == Some(db.acked) {
@@ -2836,9 +3028,9 @@ unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3
             if rc != OK {
                 return rc;
             }
+            let line = sidecar_line(&db.offset, db.epoch, db.log, &db.stamp, WalClaim::NONE);
             if db.poisoned.is_none()
-                && let Err(e) =
-                    write_sidecar(&db.sidecar, db.offset, db.epoch, &db.stamp, WalClaim::NONE)
+                && let Err(e) = write_sidecar(&db.sidecar, &line)
             {
                 return db.poison(e);
             }
@@ -3170,10 +3362,10 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         });
-        let (bytes, next) = read_from(&url, 4).map_err(String::from).unwrap();
-        assert_eq!((&bytes[..], next), (&b"abc"[..], 7));
-        assert_eq!(head(&url, &|| false).unwrap().retained, 2);
-        let refused = get_snapshot(&url, 9, &|| false).unwrap_err();
+        let (bytes, next) = read_from(&url, "4").map_err(String::from).unwrap();
+        assert_eq!((&bytes[..], next.as_str()), (&b"abc"[..], "7"));
+        assert_eq!(head(&url, &|| false).unwrap().retained, "2");
+        let refused = get_snapshot(&url, "9", &|| false).unwrap_err();
         assert!(refused.contains("503"), "{refused}");
         let refused = head(&url, &|| true).err().unwrap();
         assert!(refused.contains("503"), "{refused}");
@@ -3187,6 +3379,31 @@ mod tests {
             "GET /b/s/snapshot/9",
             "HEAD /b/s"
         ]);
+    }
+
+    // A claim is ours only if it is the frame ending at the answered offset (the bytes read from a
+    // frame boundary before it end there), or, when the read ran past that offset (another owner
+    // appended meanwhile), if it is among the frames at all. A same-epoch claim with another nonce
+    // (the answer was a duplicate of theirs) is lost; offsets are never computed.
+    #[test]
+    fn claims_are_found_by_their_nonce() {
+        let (ours, theirs) = ([1u8; 16], [2u8; 16]);
+        let commit = frame::encode_commit(1, &BTreeMap::from([(1, vec![0u8; PAGE])])).0;
+        let (mine, other) = (
+            frame::encode_claim(7, &ours),
+            frame::encode_claim(7, &theirs),
+        );
+        let find = |frames: &[&[u8]], exact: bool| find_claim(&frames.concat(), exact, 7, &ours);
+        assert_eq!(find(&[&mine[..]], true), Ok(Some(true)));
+        assert_eq!(find(&[&commit[..], &mine[..]], true), Ok(Some(false)));
+        assert_eq!(find(&[&commit[..], &other[..]], true), Ok(None));
+        assert_eq!(find(&[&frame::encode_claim(6, &ours)[..]], true), Ok(None));
+        // Read past the answered offset: ours, then another owner's claim and a partial frame.
+        let past: [&[u8]; 3] = [&mine[..], &other[..], &commit[..9]];
+        assert_eq!(find(&past, false), Ok(Some(true)));
+        assert_eq!(find(&[&other[..], &commit[..]], false), Ok(None));
+        // Read exactly to it, but not on a frame boundary.
+        assert!(find(&past, true).is_err());
     }
 
     // Attach trusts local files only when the sidecar was written in this boot, from this stream
@@ -3208,34 +3425,68 @@ mod tests {
         };
         let b1 = Some("b1");
         let none = " wal=0000000000000000:0\n";
-        let mine = format!("7 2{}", stamp(&db, "http://h:1/b/s", b1, "i1"));
+        let offset = "00000000000000000007";
+        let mine = sidecar_line(
+            offset,
+            2,
+            5,
+            &stamp(&db, "http://h:1/b/s", b1, "i1"),
+            WalClaim::NONE,
+        )
+        .replace(none, "");
         let here = format!("{mine}{none}");
-        assert!(here.starts_with("7 2 boot=b1 stream=/b/s file="));
+        assert!(here.starts_with("00000000000000000007 2 v=2 log=5 boot=b1 stream=/b/s file="));
         assert!(here.contains(" incarnation=i1 wal="));
         assert_eq!(trust(here.as_bytes(), b1), Some(true));
-        // The stream deleted and recreated (another incarnation), or a sidecar from before
-        // incarnations were recorded.
         let s = read_sidecar(&sidecar).unwrap().unwrap();
+        assert_eq!((s.offset.as_str(), s.epoch, s.log), (offset, 2, 5));
+        // The stream deleted and recreated (another incarnation), a sidecar from before
+        // incarnations were recorded, or one of format 1 (a numeric offset; still parsed, for the
+        // incarnation and the offset's read check before discarding).
         assert!(!s.trusted(&db, b1, "i2"));
         let legacy = here.replace(" incarnation=i1", "");
         assert_eq!(trust(legacy.as_bytes(), b1), Some(false));
+        let v1 = here.replace(" v=2 log=5", "").replace(offset, "7");
+        assert_eq!(trust(v1.as_bytes(), b1), Some(false));
+        let s = read_sidecar(&sidecar).unwrap().unwrap();
+        assert_eq!((s.version, s.offset.as_str()), (1, "7"));
+        assert_eq!(s.incarnation.as_deref(), Some("i1"));
         assert_eq!(trust(here.as_bytes(), Some("b2")), Some(false));
         assert_eq!(trust(here.as_bytes(), None), Some(false));
-        let unknown = format!("7 2{}{none}", stamp(&db, "http://h:1/b/s", None, "i1"));
-        assert!(unknown.starts_with("7 2 boot=unknown "));
+        let unknown = here.replace(" boot=b1", " boot=unknown");
+        assert_eq!(
+            unknown,
+            sidecar_line(
+                offset,
+                2,
+                5,
+                &stamp(&db, "http://h:1/b/s", None, "i1"),
+                WalClaim::NONE
+            )
+        );
         assert_eq!(trust(unknown.as_bytes(), None), Some(false));
         // A claim on WAL frames that are not there (no WAL here), or no claim at all.
         let behind = format!("{mine} wal=00000000000000ff:3\n");
         assert_eq!(trust(behind.as_bytes(), b1), Some(false));
         assert_eq!(trust(format!("{mine}\n").as_bytes(), b1), Some(false));
         // Another db file (replaced by a rename) is not trusted.
-        let other_file = "7 2 boot=b1 stream=/b/s file=0 incarnation=i1";
+        let other_file = format!("{offset} 2 v=2 boot=b1 stream=/b/s file=0 incarnation=i1");
         assert_eq!(
             trust(format!("{other_file}{none}").as_bytes(), b1),
             Some(false)
         );
         assert_eq!(trust(b"7 2\n", b1), Some(false));
-        for torn in ["", "7", "7 2 boot", "7 2 x=1", "7 2 wal=12", "7 2 wal=zz:1"] {
+        for torn in [
+            "",
+            "7",
+            "7 2 boot",
+            "7 2 x=1",
+            "7 2 wal=12",
+            "7 2 wal=zz:1",
+            "7 2 v=x",
+            "7 2 log=-1",
+            "7/ 2",
+        ] {
             assert_eq!(trust(torn.as_bytes(), b1), None);
         }
         assert_eq!(trust(b"\xff\xfe 7 2", b1), None);

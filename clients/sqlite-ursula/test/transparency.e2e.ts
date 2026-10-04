@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { expect, it } from "vitest";
 import { attach, drainStats, status } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
-import { dump, integrity, openPlain, streamPath, ursulaUrl } from "./kit.ts";
+import { dump, expectPast, integrity, openPlain, streamPath, ursulaUrl } from "./kit.ts";
 
 it("replicates any schema transparently and rebuilds a byte-identical file", () => {
 	const url = ursulaUrl() + streamPath();
@@ -44,7 +44,7 @@ it("replicates any schema transparently and rebuilds a byte-identical file", () 
 	db.close(); // last connection: checkpoint + WAL removed
 
 	const rebuilt = freshFile();
-	expect(attach(rebuilt, url)).toBeGreaterThan(offset); // plus the rebuild's own claim
+	expectPast(attach(rebuilt, url), offset); // plus the rebuild's own claim
 	const identical = Buffer.compare(readFileSync(file), readFileSync(rebuilt)) === 0;
 	console.log(`db file ${readFileSync(file).length} bytes; rebuilt ${readFileSync(rebuilt).length} bytes; byte-identical: ${identical}`);
 	const r = openPlain(rebuilt);

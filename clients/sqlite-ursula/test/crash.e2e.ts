@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { attach, status } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
-import { integrity, openPlain, runChild, StallProxy, streamPath, ursulaUrl, walContains } from "./kit.ts";
+import { expectPast, integrity, openPlain, runChild, StallProxy, sidecarOffset, streamPath, ursulaUrl, walContains } from "./kit.ts";
 
 const SQL = ["CREATE TABLE t(x TEXT)", "INSERT INTO t VALUES ('M-one')", "INSERT INTO t VALUES ('M-two')"];
 const rows = (file: string, where = ""): string[] => {
@@ -50,10 +50,10 @@ it("(b) killed after the ack, before the local WAL write: present after re-attac
 	expect(child.lines.some((l) => l.step === 2 && l.phase === "start")).toBe(true);
 	expect(walContains(file, "M-one")).toBe(true);
 	expect(walContains(file, "M-two")).toBe(false);
-	const behind = Number(readFileSync(`${file}-ursula`, "utf8").split(" ")[0]);
+	const behind = sidecarOffset(readFileSync(`${file}-ursula`, "utf8"));
 	attach(file, ursulaUrl() + path);
 	// Same boot: the local files are trusted and only the missing commit is replayed.
-	expect(status(file)).toMatchObject({ local: behind, installed: 0 });
+	expect(status(file)).toMatchObject({ local: behind, installed: "-1" });
 	expect(rows(file)).toEqual(["M-one", "M-two"]);
 });
 
@@ -122,8 +122,7 @@ it("(f) a local failure after the ack poisons the file, keeps the sidecar behind
 	await child.exited;
 	expect(child.lines.find((l) => l.step === 2 && l.ok !== undefined)?.ok).toBe(false);
 	expect(done.poisoned).toBe(true);
-	const sidecar = Number(readFileSync(`${file}-ursula`, "utf8").split(" ")[0]);
-	expect(sidecar).toBeLessThan(done.offset as number);
+	expectPast(done.offset as string, sidecarOffset(readFileSync(`${file}-ursula`, "utf8")));
 	attach(file, ursulaUrl() + path);
 	expect(rows(file)).toEqual(["M-one", "M-two"]);
 });
@@ -166,13 +165,13 @@ it("(h) killed in the middle of a recovery's page writes: the next attach resume
 	o.exec("CREATE INDEX t_y ON t(y)");
 	o.exec("INSERT INTO t VALUES ('late', 'z')");
 	o.close();
-	const before = Number(readFileSync(`${file}-ursula`, "utf8").split(" ")[0]);
-	expect(before).toBeGreaterThan(0);
+	const before = sidecarOffset(readFileSync(`${file}-ursula`, "utf8"));
+	expectPast(before, "-1");
 	// Re-attaching the first file replays that; the child dies after the first page write (page 1).
 	const child = runChild(file, url, [], { URSULA_VFS_ABORT_IN_REPLAY: "1" });
 	expect((await child.exited).signal).toBe("SIGABRT");
 	attach(file, url);
-	expect(status(file)).toMatchObject({ local: before, installed: 0 });
+	expect(status(file)).toMatchObject({ local: before, installed: "-1" });
 	const fresh = freshFile();
 	attach(fresh, url);
 	expect(Buffer.compare(readFileSync(file), readFileSync(fresh))).toBe(0);

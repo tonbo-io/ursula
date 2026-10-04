@@ -8,17 +8,23 @@ import { readFileSync } from "node:fs";
 import { expect, it } from "vitest";
 import { attach, status } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
-import { dump, integrity, openPlain, runChild, streamPath, ursulaUrl } from "./kit.ts";
+import { dump, expectPast, integrity, openPlain, runChild, streamPath, ursulaUrl } from "./kit.ts";
 
 const MiB = 1 << 20;
 const ROUNDS = 600;
 
-async function head(url: string): Promise<{ tail: number; retained: number; snapshot: number }> {
+async function head(url: string): Promise<{ tail: string; retained: string; snapshot: string }> {
 	const r = await fetch(url, { method: "HEAD" });
 	expect(r.status).toBe(200);
-	const n = (h: string): number => Number(r.headers.get(h) ?? "0");
-	return { tail: n("stream-next-offset"), retained: n("stream-retained-offset"), snapshot: n("stream-snapshot-offset") };
+	const h = (name: string): string => r.headers.get(name) ?? "-1";
+	return { tail: h("stream-next-offset"), retained: h("stream-retained-offset"), snapshot: h("stream-snapshot-offset") };
 }
+
+/**
+ * Bytes between two offsets. Offsets are opaque to clients (the extension never computes with them);
+ * this test measures the retained log with the server's internal byte positions.
+ */
+const bytes = (from: string, to: string): number => Number(to) - Number(from);
 
 /** Checkpoints `file` into its db file (plain connection) and returns its bytes and dump. */
 function settle(file: string): { bytes: Buffer; dump: Record<string, string[]> } {
@@ -69,17 +75,16 @@ it("snapshots + retention bound the stream; fresh and lagging hosts rebuild from
 		h = next;
 	}
 	console.log(`settled: tail ${h.tail}, snapshot ${h.snapshot}, retained ${h.retained}`);
-	expect(h.tail).toBeGreaterThan(150 * MiB);
-	expect(h.retained).toBeGreaterThan(laggingOffset);
-	expect(h.snapshot).toBeGreaterThanOrEqual(h.retained);
-	expect(h.tail - h.snapshot).toBeLessThan(9 * MiB);
-	expect(h.tail - h.retained).toBeLessThan(40 * MiB);
+	expect(bytes("0", h.tail)).toBeGreaterThan(150 * MiB);
+	expectPast(h.retained, laggingOffset);
+	expect(h.snapshot >= h.retained).toBe(true);
+	expect(bytes(h.snapshot, h.tail)).toBeLessThan(9 * MiB);
+	expect(bytes(h.retained, h.tail)).toBeLessThan(40 * MiB);
 	expect((await fetch(`${url}?offset=0`)).status).toBe(410);
 
 	// A fresh host takes over: snapshot + tail, then its claim fences the owner.
 	const fresh = freshFile();
-	const offset = attach(fresh, url);
-	expect(offset).toBeGreaterThan(h.snapshot);
+	expectPast(attach(fresh, url), h.snapshot);
 	const zombie = await owner.waitFor((x) => x.step === ROUNDS + 1 && x.ok !== undefined, 60_000);
 	expect(zombie.ok).toBe(false);
 	const done = await owner.waitFor((x) => x.done === true);
@@ -92,8 +97,8 @@ it("snapshots + retention bound the stream; fresh and lagging hosts rebuild from
 	// opens only once attached in this process: re-attaching it here reuses it (same boot) and adds
 	// only a claim.
 	attach(file, url);
-	expect(status(file).local).toBeGreaterThan(0);
-	expect(status(file).installed).toBe(0);
+	expectPast(status(file).local, "-1");
+	expect(status(file).installed).toBe("-1");
 	const ownerFile = settle(file);
 	expect(ownerFile.dump["t"]?.length).toBe(48);
 	const rebuilt = readFileSync(fresh);

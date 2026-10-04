@@ -22,34 +22,41 @@ export function loadUrsulaVfs(path = process.env.SQLITE_URSULA_VFS): DatabaseSyn
  * Catches `file` up from the stream (installing the stream's latest snapshot first when the file is
  * missing or behind it), claims the stream for this process (fencing every earlier owner)
  * and attaches the file. No connection to `file` may be open; the process keeps a host lock on the file
- * for its lifetime. Returns the stream offset the file reflects. A file that has a sidecar (`<file>-ursula`,
+ * for its lifetime. Returns the stream offset the file reflects (a {@link StreamOffset}). A file that has a sidecar (`<file>-ursula`,
  * written by its first attach) opens in this process only while attached here: not before an attach
  * of it succeeds, nor after one fails (unless refused up front for open connections, another thread
  * attaching it, or another process holding it, which leaves the file as it was).
  */
-export function attach(file: string, streamUrl: string): number {
-	const row = loadUrsulaVfs().prepare("SELECT ursula_attach(?, ?) AS n").get(file, streamUrl) as { n: number | bigint };
-	return Number(row.n);
+export function attach(file: string, streamUrl: string): StreamOffset {
+	const row = loadUrsulaVfs().prepare("SELECT ursula_attach(?, ?) AS n").get(file, streamUrl) as { n: string };
+	return row.n;
 }
+
+/**
+ * A stream offset as the server wrote it (`Stream-Next-Offset`): opaque. Compare two offsets of one
+ * stream only as strings (lexicographically, e.g. `a < b`); never parse or do arithmetic on them.
+ * `"-1"` is the beginning of the stream, and stands for "none" where an offset may be absent.
+ */
+export type StreamOffset = string;
 
 export interface AttachStatus {
 	/** Stream offset after the last acknowledged commit. */
-	readonly offset: number;
+	readonly offset: StreamOffset;
 	/** This owner's producer epoch. */
 	readonly epoch: number;
 	/** Every later commit fails until the file is re-attached. */
 	readonly poisoned: boolean;
-	/** Poisoned because a newer owner claimed the stream, or the stream was deleted and recreated. */
+	/** Poisoned because a newer owner claimed the stream, the stream was deleted and recreated, or another writer appended with a higher `Stream-Seq`. */
 	readonly fenced: boolean;
 	readonly reason: string | null;
-	/** Offset of the latest snapshot known readable (published and read back, or found at attach); 0 for none. */
-	readonly snapshot: number;
-	/** Retention this owner advanced the stream to (0: none yet). */
-	readonly retained: number;
-	/** Stream offset of the local state attach started from; 0 when it rebuilt the file from nothing (a fresh host, or local files it could not trust and discarded: another boot, a replaced file, a sidecar ahead of its WAL, another incarnation of the stream: deleted and recreated). */
-	readonly local: number;
-	/** Offset of the snapshot attach installed (0: none). */
-	readonly installed: number;
+	/** Offset of the latest snapshot known readable (published and read back, or found at attach); `"-1"` for none. */
+	readonly snapshot: StreamOffset;
+	/** Retention this owner advanced the stream to (`"-1"`: none yet). */
+	readonly retained: StreamOffset;
+	/** Stream offset of the local state attach started from; `"-1"` when it rebuilt the file from nothing (a fresh host, or local files it could not trust and discarded: another boot, a replaced file, a sidecar ahead of its WAL, another incarnation of the stream: deleted and recreated). */
+	readonly local: StreamOffset;
+	/** Offset of the snapshot attach installed (`"-1"`: none). */
+	readonly installed: StreamOffset;
 }
 
 export function status(file: string): AttachStatus {
@@ -76,7 +83,7 @@ export interface VfsCommitStat {
 /** One published (and read back) snapshot. */
 export interface VfsSnapshotStat {
 	/** Stream offset it reflects. */
-	readonly offset: number;
+	readonly offset: StreamOffset;
 	/** Body bytes (compressed). */
 	readonly bytes: number;
 	/** Database bytes. */
@@ -101,8 +108,9 @@ export function drainStats(file: string): VfsStats {
 }
 
 /**
- * A commit the VFS could not replicate: fenced (by a newer owner, or because the stream was deleted and
- * recreated), rejected, or with no answer in time.
+ * A commit the VFS could not replicate: fenced (by a newer owner, because the stream was deleted and
+ * recreated, or by another writer's append with a higher `Stream-Seq`), rejected, or with no answer in
+ * time.
  */
 export class UrsulaReplicationError extends Error {
 	readonly fenced: boolean;
