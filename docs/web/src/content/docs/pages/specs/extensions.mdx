@@ -81,7 +81,7 @@ Every stream belongs to a bucket. The stream URL takes the form `{base_url}/{buc
 
 ### 1.2. Bucket Lifecycle
 
-In Ursula, buckets are implicit namespaces. A bucket exists once a stream has been created in it; `PUT /{bucket_id}/{stream_id}` needs no earlier bucket create. `PUT /{bucket_id}` is kept for clients that create the bucket first: it validates `bucket_id`, changes no state, and answers `201 Created` for a valid ID or `400 Bad Request` for an invalid one. The client surface has no bucket metadata read, stream listing or bucket delete. Removing a bucket with everything in it is an operator action, the admin-plane [bucket purge](/docs/operations#tenant-offboarding-bucket-purge), not a protocol operation.
+In Ursula, buckets are implicit namespaces. A bucket exists once a stream has been created in it; `PUT /{bucket_id}/{stream_id}` needs no earlier bucket create. `PUT /{bucket_id}` is kept for clients that create the bucket first: it validates `bucket_id`, changes no state, and answers `201 Created` for a valid ID or `400 Bad Request` for an invalid one. The client surface has no bucket metadata read, stream listing or bucket delete. Removing a bucket with everything in it is an operator action, the admin-plane [bucket purge](/docs/operations#tenant-offboarding-bucket-purge), which permanently fences the bucket ID: later stream creates in it answer `404`. It is not a protocol operation.
 
 This section describes Ursula's server profile. Earlier drafts of this document required explicit bucket creation and defined bucket metadata, stream listing and bucket deletion in Sections 1.3 to 1.5. Those section numbers stay unused so that later section numbers do not change.
 

@@ -23,7 +23,7 @@ Buckets are implicit. A bucket exists once a stream is created in it; there is n
 
 - **`PUT /{bucket}`** validates the bucket ID and changes nothing: `201` for a valid ID, `400` for an invalid one. Clients that create the bucket first can keep doing so.
 - There is no bucket metadata read, stream listing, or bucket delete. Track your streams in your own application.
-- Removing a bucket and every stream in it is an operator action: the admin-plane [bucket purge](/docs/operations#tenant-offboarding-bucket-purge).
+- Removing a bucket and every stream in it is an operator action: the admin-plane [bucket purge](/docs/operations#tenant-offboarding-bucket-purge), which permanently fences the bucket ID: later stream creates in it answer `404`.
 
 ## Related
 

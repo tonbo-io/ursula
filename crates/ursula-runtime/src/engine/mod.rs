@@ -1052,7 +1052,7 @@ pub trait GroupEngine: Send + 'static {
                     .await
                     .map(GroupWriteResponse::TidyStream),
                 StreamCommand::CreateBucket { .. } => Err(GroupEngineError::new(
-                    "bucket commands are not valid group writes",
+                    "CreateBucket is not a valid group write",
                 )),
                 StreamCommand::OffloadColdRefs { .. } => Err(GroupEngineError::new(
                     "OffloadColdRefs is proposed only by the leader's offload pass",

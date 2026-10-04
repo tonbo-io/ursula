@@ -1214,7 +1214,7 @@ mod tenant_boundary {
     }
 }
 
-// Gateway-half quota enforcement and usage accounting (#134/#135).
+// Gateway quota enforcement and usage accounting (#134/#135).
 mod admission_and_usage {
     use super::*;
     use crate::admission::StaticQuotaProvider;
