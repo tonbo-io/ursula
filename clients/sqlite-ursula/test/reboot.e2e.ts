@@ -1,8 +1,8 @@
 // The local files are a cache of the stream: attach trusts them only when the sidecar says they were
-// written in this boot into this db file and the local WAL still holds the frames the sidecar counts
-// on, and otherwise discards them and rebuilds from snapshot + tail. A reboot is simulated by
-// rewriting the sidecar's boot id to one this kernel never had; the damage a power loss or a restored
-// disk image could do is applied by hand.
+// written in this boot, from this incarnation of the stream, into this db file and the local WAL
+// still holds the frames the sidecar counts on, and otherwise discards them and rebuilds from
+// snapshot + tail. A reboot is simulated by rewriting the sidecar's boot id to one this kernel never
+// had; the damage a power loss or a restored disk image could do is applied by hand.
 import { spawn } from "node:child_process";
 import { readFileSync, renameSync, statSync, truncateSync, writeFileSync } from "node:fs";
 import { expect, it } from "vitest";
@@ -118,18 +118,25 @@ it("(d) a file with content but no sidecar is refused, not discarded", () => {
 });
 
 // A cache of one stream must never replay another stream's frames on top of it, nor append page
-// images built on it to a stream that does not hold its history.
-it("(e) attaching the cache of one stream to another, or to its stream deleted and recreated, is refused", async () => {
+// images built on it to a stream that does not hold its history. Nor is it discarded for an older
+// database when its own stream ends before the offset it acknowledged (the server lost data).
+it("(e) attaching the cache of one stream to another, or to its stream that lost acknowledged data, is refused", async () => {
 	const url = ursulaUrl() + streamPath();
 	const file = freshFile();
 	const child = runChild(file, url, FIRST, { CHILD_EXIT: "1" });
 	expect((await child.exited).code).toBe(0);
 	expect(() => attach(file, ursulaUrl() + streamPath())).toThrow(/is a cache of stream/);
-	expect((await fetch(url, { method: "DELETE" })).ok).toBe(true);
-	expect(() => attach(file, url)).toThrow(/beyond the stream's end/);
-	// After a reboot too: the files are kept, not discarded for an empty database.
+	// A sidecar offset beyond the stream's end. Trusted files (same boot and incarnation): the
+	// catch-up from the sidecar's offset answers 416.
+	const sidecar = `${file}-ursula`;
+	writeFileSync(sidecar, readFileSync(sidecar, "utf8").replace(/^\d+/, (n) => `${Number(n) + 1_000_000}`));
+	expect(() => attach(file, url)).toThrow(/lost acknowledged data/);
+	// After a reboot (untrusted, same incarnation): the check before discarding refuses too.
 	rebooted(file);
-	expect(() => attach(file, url)).toThrow(/beyond the stream's end/);
+	expect(() => attach(file, url)).toThrow(/lost acknowledged data/);
+	// An older version's sidecar (no incarnation recorded) may be of the same stream: also refused.
+	writeFileSync(sidecar, readFileSync(sidecar, "utf8").replace(/ incarnation=\S+/, ""));
+	expect(() => attach(file, url)).toThrow(/lost acknowledged data/);
 	expect(statSync(file).size).toBeGreaterThan(0);
 });
 
@@ -179,4 +186,37 @@ it("(g) a same-boot image whose WAL is ahead of its sidecar is trusted", async (
 	attach(file, url);
 	expect(status(file)).toMatchObject({ local: Number(sidecar.split(" ")[0]), installed: 0 });
 	expect(rows(file)).toEqual(["1:fir", "2:sec", "3:thi"]);
+});
+
+// Regression (#345): a stream deleted and recreated at the same path is another incarnation,
+// whatever its length: resuming the old database from its offset would carry its state into the new
+// stream, and refusing while the new stream is shorter would keep a dead cache.
+it("(h) the cache of a deleted stream is rebuilt from the stream recreated at its path, shorter or longer", async () => {
+	const url = ursulaUrl() + streamPath();
+	const file = freshFile();
+	attach(file, url);
+	const db = openPlain(file);
+	db.exec("CREATE TABLE t(k INTEGER PRIMARY KEY, x TEXT)");
+	db.exec("INSERT INTO t VALUES (1, 'old'), (2, 'old-' || hex(randomblob(4000)))");
+	db.close();
+	/** Deletes the stream and recreates it through another file, with rows until it ends past `past`. */
+	const recreate = async (past: number): Promise<{ offset: number; rows: string[] }> => {
+		expect((await fetch(url, { method: "DELETE" })).ok).toBe(true);
+		const other = freshFile();
+		attach(other, url);
+		const o = openPlain(other);
+		o.exec("CREATE TABLE t(k INTEGER PRIMARY KEY, x TEXT)");
+		for (let k = 1; k === 1 || status(other).offset <= past; k++) o.exec(`INSERT INTO t VALUES (${k}, 'new')`);
+		o.close();
+		return { offset: status(other).offset, rows: rows(other) };
+	};
+	const shorter = await recreate(0);
+	expect(shorter.offset).toBeLessThan(status(file).offset);
+	attach(file, url);
+	expect(status(file).local).toBe(0);
+	expect(rows(file)).toEqual(shorter.rows);
+	const longer = await recreate(status(file).offset);
+	attach(file, url);
+	expect(status(file).local).toBe(0);
+	expect(rows(file)).toEqual(longer.rows);
 });

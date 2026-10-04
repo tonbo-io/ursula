@@ -50,6 +50,31 @@ it("a fenced writer's commit fails, stays out of its file, and the new owner is 
 	a2.close();
 });
 
+// Regression (#345): owners appended under one Producer-Id whatever the stream's incarnation, so an
+// owner of a deleted stream could keep committing into the stream recreated at its path.
+it("an owner of a deleted stream is fenced at its next commit; nothing of it reaches the recreated stream", async () => {
+	const url = ursulaUrl() + streamPath();
+	const fileA = freshFile();
+	attach(fileA, url);
+	const a = openPlain(fileA);
+	a.exec("CREATE TABLE t(x TEXT)");
+	a.exec("INSERT INTO t VALUES ('a1')");
+	expect((await fetch(url, { method: "DELETE" })).ok).toBe(true);
+	const fileB = freshFile();
+	attach(fileB, url);
+	const b = openPlain(fileB);
+	b.exec("CREATE TABLE t(x TEXT)");
+	b.exec("INSERT INTO t VALUES ('b1')");
+	b.close();
+	const tail = async () => (await fetch(url, { method: "HEAD" })).headers.get("stream-next-offset");
+	const before = await tail();
+	expect(attempt(() => a.exec("INSERT INTO t VALUES ('a2')"))).toMatch(/disk I\/O error/);
+	expect(status(fileA)).toMatchObject({ poisoned: true, fenced: true });
+	expect(status(fileA).reason).toMatch(/deleted and recreated/);
+	a.close();
+	expect(await tail()).toBe(before);
+});
+
 it("Pi: a fenced commit rejects with UrsulaReplicationError", async () => {
 	const url = ursulaUrl() + streamPath();
 	const stale = await openUrsulaPiStorage(freshFile(), url);
