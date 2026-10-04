@@ -387,7 +387,10 @@ pub(crate) fn group_engine_linearizable_read_error(
             )
         }
         Some(openraft::error::LinearizableReadError::QuorumNotEnough(_)) => {
-            group_engine_leader_read_unavailable(operation, self_id)
+            group_engine_leader_read_unavailable(
+                format!("OpenRaft {operation} could not confirm leadership with a quorum"),
+                self_id,
+            )
         }
         None => GroupEngineError::new(format!(
             "OpenRaft {operation} could not confirm leadership: {err}"
@@ -397,18 +400,13 @@ pub(crate) fn group_engine_linearizable_read_error(
 
 /// The leader-unknown answer (503 with Retry-After) for a leader read that
 /// could not be linearized in time: no quorum confirmed leadership, or the
-/// local state machine did not reach the read index.
+/// local state machine did not reach the read index. `message` (the 503
+/// body) names which, without internal addresses.
 pub(crate) fn group_engine_leader_read_unavailable(
-    operation: &str,
+    message: String,
     self_id: u64,
 ) -> GroupEngineError {
-    group_engine_forward_to_leader_error(
-        format!("OpenRaft {operation} could not confirm leadership with a quorum"),
-        None,
-        None,
-        self_id,
-        true,
-    )
+    group_engine_forward_to_leader_error(message, None, None, self_id, true)
 }
 
 /// `before_proposal` is true only for a local leadership check that runs

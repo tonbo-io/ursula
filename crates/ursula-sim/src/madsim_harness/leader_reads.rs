@@ -4,7 +4,9 @@
 //!
 //! Invariant `leader_read_linearizable`: a leader read that answers 200
 //! reflects every append acknowledged before it started. While the group is
-//! healthy every probe answers 200. A leader cut
+//! healthy every probe answers 200, and so it does across a partition shorter
+//! than an election timeout: the leader retries the confirmation until the
+//! heal instead of answering 503. A leader cut
 //! off from the quorum still believes it leads; its probes must answer 503
 //! (leader unknown, retry) instead of a view that misses the writes the new
 //! leader acknowledged. Once the new leader serves, the probes see both
@@ -19,6 +21,7 @@ use super::Arc;
 use super::AtomicU64;
 use super::Body;
 use super::ColdWriteAdmission;
+use super::Duration;
 use super::HttpState;
 use super::MadsimRuntimeRaftNetworkFactory;
 use super::RuntimeConfig;
@@ -180,12 +183,18 @@ impl Probes<'_> {
                     ),
                 );
             }
-            assert_eq!(
-                seen.status,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "{} on the deposed leader should be a retryable leader-unknown answer",
-                probe.name()
-            );
+            if seen.status != StatusCode::SERVICE_UNAVAILABLE {
+                fail(
+                    trace,
+                    phase,
+                    format!(
+                        "{} on the deposed leader answered {}, not a retryable leader-unknown \
+                         503",
+                        probe.name(),
+                        seen.status
+                    ),
+                );
+            }
             trace.push(observed(phase, probe, &seen));
         }
     }
@@ -302,6 +311,30 @@ pub(super) async fn run_leader_read_linearizability_inner(
         append_over_http(&app, &path, payload, &mut acked).await;
         probes.serve_acked("healthy", &acked, &mut trace).await;
     }
+
+    // A partition shorter than an election timeout (50 ms; heartbeats every
+    // 10 ms): no election happens, so the leader's first confirmation round
+    // fails but a retry after the heal confirms it, and every probe answers
+    // 200 instead of 503.
+    for node_id in (1..=3).filter(|node_id| *node_id != old_leader) {
+        policy.partition_bidirectional(old_leader, node_id);
+    }
+    trace.push(SimEvent::FaultApplied {
+        phase: "brief_partition".to_owned(),
+    });
+    let heal = {
+        let policy = policy.clone();
+        madsim::task::spawn(async move {
+            madsim::time::sleep(Duration::from_millis(15)).await;
+            for node_id in (1..=3).filter(|node_id| *node_id != old_leader) {
+                policy.heal_bidirectional(old_leader, node_id);
+            }
+        })
+    };
+    probes
+        .serve_acked("brief_partition", &acked, &mut trace)
+        .await;
+    heal.await.expect("heal the brief partition");
 
     // Cut the leader off from both followers. It keeps believing it leads
     // while the majority elects a new leader and acknowledges more appends.

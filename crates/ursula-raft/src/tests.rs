@@ -1313,10 +1313,18 @@ async fn deposed_leader_refuses_linearizable_reads() {
 fn assert_refused<T>(what: &str, result: Result<T, GroupEngineError>) {
     match result {
         Ok(_) => panic!("{what}: the deposed leader served its stale view"),
-        Err(err) => assert!(
-            err.leader_hint().is_some(),
-            "{what}: expected a forward or leader-unknown error, got {err:?}"
-        ),
+        Err(err) => {
+            assert!(
+                err.leader_hint().is_some(),
+                "{what}: expected a forward or leader-unknown error, got {err:?}"
+            );
+            // openraft's quorum error lists every member's address; the client
+            // sees a fixed message instead.
+            assert!(
+                !err.to_string().contains("node-"),
+                "{what}: refusal leaks member addresses: {err}"
+            );
+        }
     }
 }
 

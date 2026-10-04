@@ -715,7 +715,10 @@ impl RaftGroupEngine {
                 tracing::debug!(
                     "OpenRaft {operation} timed out waiting to apply the read index: {state:?}"
                 );
-                Err(group_engine_leader_read_unavailable(operation, self_id()))
+                Err(group_engine_leader_read_unavailable(
+                    format!("OpenRaft {operation} did not apply the read index in time"),
+                    self_id(),
+                ))
             }
             Err(fatal) => Err(GroupEngineError::new(format!(
                 "OpenRaft {operation} could not apply the read index: {fatal}"

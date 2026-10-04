@@ -49,9 +49,10 @@
 //!   `SELECT ursula_stats(path)` drains per-commit, per-checkpoint and per-snapshot numbers (bench).
 //!
 //! Test hook: `URSULA_VFS_ABORT_AFTER_ACK=<n>` aborts the process right after the n-th acknowledged
-//! commit of an attachment, before the local WAL write. `URSULA_VFS_RETRY_MS` bounds the retries of
-//! an append with an unknown outcome (default 30000). `URSULA_VFS_SNAPSHOT_MIN_BYTES` sets the
-//! smallest log (bytes since the latest snapshot) that triggers a snapshot.
+//! commit of an attachment, before the local WAL write. `URSULA_VFS_RETRY_MS` bounds every retry
+//! loop: appends with an unknown outcome, idempotent PUTs, and reads answered 429/503 (default
+//! 30000). `URSULA_VFS_SNAPSHOT_MIN_BYTES` sets the smallest log (bytes since the latest snapshot)
+//! that triggers a snapshot.
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 pub mod frame;
@@ -779,12 +780,30 @@ fn header_u64(r: &ureq::http::Response<ureq::Body>, name: &str) -> Option<u64> {
     r.headers().get(name)?.to_str().ok()?.trim().parse().ok()
 }
 
+/// Waits before the next retry: no sooner than `retry_after`, and at least `backoff`, which then
+/// doubles (up to 1 s). Returns false, without waiting, when the wait would end past `deadline`
+/// (or overflow, for an absurd Retry-After).
+fn pause(retry_after: Option<Duration>, backoff: &mut Duration, deadline: Instant) -> bool {
+    let wait = retry_after.map_or(*backoff, |after| after.max(*backoff));
+    if Instant::now()
+        .checked_add(wait)
+        .is_none_or(|end| end > deadline)
+    {
+        return false;
+    }
+    std::thread::sleep(wait);
+    *backoff = (*backoff * 2).min(Duration::from_secs(1));
+    true
+}
+
 /// Sends a read, retrying 429 (rate limiting) and 503 (overload, or a `consistency=leader` read,
 /// HEAD or snapshot read the leader could not confirm with a quorum in time) the way `append`
 /// does: no sooner than Retry-After (seconds), with backoff, within `retry_budget()`. Returns the
-/// first other answer, or the last 429/503 once the budget is spent.
+/// first other answer, or the last 429/503 once the budget is spent or `stopped` (a re-attach is
+/// waiting for the snapshot thread).
 fn read_retrying(
     send: impl Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    stopped: &dyn Fn() -> bool,
 ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
     let deadline = Instant::now() + retry_budget();
     let mut backoff = Duration::from_millis(20);
@@ -794,12 +813,9 @@ fn read_retrying(
             return Ok(r);
         }
         let retry_after = header_u64(&r, "retry-after").map(Duration::from_secs);
-        let wait = retry_after.map_or(backoff, |after| after.max(backoff));
-        if Instant::now() + wait > deadline {
+        if stopped() || !pause(retry_after, &mut backoff, deadline) {
             return Ok(r);
         }
-        std::thread::sleep(wait);
-        backoff = (backoff * 2).min(Duration::from_secs(1));
     }
 }
 
@@ -870,14 +886,11 @@ fn append(url: &str, body: &[u8], epoch: u64, seq: u64) -> Append {
             }
             Err(e) => format!("append: {e}"),
         };
-        let wait = retry_after.map_or(backoff, |r| r.max(backoff));
-        if Instant::now() + wait > deadline {
+        if !pause(retry_after, &mut backoff, deadline) {
             return Append::Failed(format!(
                 "{unknown} (outcome unknown after {attempts} attempts)"
             ));
         }
-        std::thread::sleep(wait);
-        backoff = (backoff * 2).min(Duration::from_secs(1));
     }
 }
 
@@ -921,11 +934,14 @@ impl From<Fail> for String {
 /// One read from `offset`: the bytes and the offset after them (empty at the tail). Reads the
 /// leader's applied state: a follower may lag behind an acknowledged append (a claim, a commit).
 fn read_from(url: &str, offset: u64) -> Result<(Vec<u8>, u64), Fail> {
-    let mut r = read_retrying(|| {
-        agent()
-            .get(format!("{url}?offset={offset}&consistency=leader"))
-            .call()
-    })
+    let mut r = read_retrying(
+        || {
+            agent()
+                .get(format!("{url}?offset={offset}&consistency=leader"))
+                .call()
+        },
+        &|| false,
+    )
     .map_err(|e| format!("read {url} at {offset}: {e}"))?;
     let status = r.status().as_u16();
     if status == 204 {
@@ -982,8 +998,10 @@ struct Head {
     snapshot: Option<u64>,
 }
 
-fn head(url: &str) -> Result<Head, String> {
-    let r = read_retrying(|| agent().head(url).call()).map_err(|e| format!("head {url}: {e}"))?;
+/// `stopped` ends the retries of a 429/503 early (see `read_retrying`).
+fn head(url: &str, stopped: &dyn Fn() -> bool) -> Result<Head, String> {
+    let r = read_retrying(|| agent().head(url).call(), stopped)
+        .map_err(|e| format!("head {url}: {e}"))?;
     let status = r.status().as_u16();
     if status != 200 {
         return Err(format!("head {url}: {status}"));
@@ -995,9 +1013,17 @@ fn head(url: &str) -> Result<Head, String> {
 }
 
 /// The snapshot at `offset`; `None` when it does not exist (superseded, or not yet visible here).
-fn get_snapshot(url: &str, offset: u64) -> Result<Option<Vec<u8>>, String> {
-    let mut r = read_retrying(|| bulk_agent().get(format!("{url}/snapshot/{offset}")).call())
-        .map_err(|e| format!("get snapshot {offset}: {e}"))?;
+/// `stopped` ends the retries of a 429/503 early (see `read_retrying`).
+fn get_snapshot(
+    url: &str,
+    offset: u64,
+    stopped: &dyn Fn() -> bool,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut r = read_retrying(
+        || bulk_agent().get(format!("{url}/snapshot/{offset}")).call(),
+        stopped,
+    )
+    .map_err(|e| format!("get snapshot {offset}: {e}"))?;
     let status = r.status().as_u16();
     // A body cut short: the snapshot was superseded and its cold object deleted (after its grace)
     // while it was streaming, or the connection dropped. Either way, start again from `HEAD`.
@@ -1521,11 +1547,11 @@ unsafe fn init_wal_format(path: &str) -> Result<(), String> {
 /// it, claims, and replays up to the claim. Returns the epoch claimed and the latest snapshot's
 /// offset (0 for none).
 unsafe fn sync(url: &str, pos: &mut u64, applier: &mut Applier) -> Result<(u64, u64), Fail> {
-    let head = head(url)?;
+    let head = head(url, &|| false)?;
     if let Some(s) = head.snapshot
         && *pos < s
     {
-        let Some(body) = get_snapshot(url, s)? else {
+        let Some(body) = get_snapshot(url, s, &|| false)? else {
             return Err(Fail::Gone(format!("snapshot {s} superseded")));
         };
         let snap = snapshot::decode(&body)?;
@@ -1918,7 +1944,7 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
         (200..=299, _) => {}
         (409 | 410, _) => {
             // A newer snapshot exists (another owner's, or this file's before a re-attach).
-            let newer = head(&url)?.snapshot.unwrap_or(0);
+            let newer = head(&url, &stopped)?.snapshot.unwrap_or(0);
             let mut d = lock(db);
             d.snapshot = d.snapshot.max(newer);
             return Ok(true);
@@ -1936,7 +1962,7 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
         if stopped() {
             return Ok(true);
         }
-        if get_snapshot(&url, offset)?.as_deref() == Some(&body[..]) {
+        if get_snapshot(&url, offset, &stopped)?.as_deref() == Some(&body[..]) {
             verified = true;
             break;
         }
@@ -2888,8 +2914,15 @@ mod tests {
             unavailable.clone(),
             answer("429 Too Many Requests", ""),
             answer("200 OK\r\nstream-next-offset: 7", "abc"),
-            unavailable,
+            unavailable.clone(),
             answer("200 OK\r\nstream-retained-offset: 2", ""),
+            // A Retry-After too large to wait for (or even add to now) ends the retries at once.
+            answer(
+                "503 Service Unavailable\r\nretry-after: 18446744073709551615",
+                "leader unknown",
+            ),
+            // So does the stop flag (a re-attach waiting for the snapshot thread).
+            unavailable,
         ];
         let server = std::thread::spawn(move || {
             answers
@@ -2910,13 +2943,19 @@ mod tests {
         });
         let (bytes, next) = read_from(&url, 4).map_err(String::from).unwrap();
         assert_eq!((&bytes[..], next), (&b"abc"[..], 7));
-        assert_eq!(head(&url).unwrap().retained, 2);
+        assert_eq!(head(&url, &|| false).unwrap().retained, 2);
+        let refused = get_snapshot(&url, 9, &|| false).unwrap_err();
+        assert!(refused.contains("503"), "{refused}");
+        let refused = head(&url, &|| true).err().unwrap();
+        assert!(refused.contains("503"), "{refused}");
         let read = "GET /b/s?offset=4&consistency=leader";
         assert_eq!(server.join().unwrap(), [
             read,
             read,
             read,
             "HEAD /b/s",
+            "HEAD /b/s",
+            "GET /b/s/snapshot/9",
             "HEAD /b/s"
         ]);
     }
