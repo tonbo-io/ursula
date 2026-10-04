@@ -48,7 +48,7 @@ pub struct CadenceArgs {
     /// Node log-byte budget in MiB (1 GiB by default).
     #[arg(long, default_value_t = 1024)]
     pub budget_mib: u64,
-    /// Group hot size (real bytes) at which the group flushes, in KiB.
+    /// Group hot size (payload bytes) at which the group flushes, in KiB.
     #[arg(long, default_value_t = 8192)]
     pub flush_kib: usize,
     /// Appends between driver ticks.
