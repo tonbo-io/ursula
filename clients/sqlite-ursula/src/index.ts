@@ -43,7 +43,7 @@ export interface AttachStatus {
 	readonly snapshot: number;
 	/** Retention this owner advanced the stream to (0: none yet). */
 	readonly retained: number;
-	/** Stream offset of the local state attach started from; 0 when it rebuilt the file from nothing (a fresh host, or local files from before a reboot, which are discarded). */
+	/** Stream offset of the local state attach started from; 0 when it rebuilt the file from nothing (a fresh host, or local files it could not trust and discarded: another boot, a replaced file, a sidecar ahead of its WAL). */
 	readonly local: number;
 	/** Offset of the snapshot attach installed (0: none). */
 	readonly installed: number;

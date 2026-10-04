@@ -71,16 +71,21 @@ appended with the idempotent producer (`Producer-Id` per database, `Producer-Epo
    replay rewrites). It locks other processes out of the file: a POSIX write lock on the db file's
    lock bytes, where every SQLite connection on a WAL file holds a read lock from its first read
    until it closes, so attach fails while one is open rather than rewriting pages under its cache.
-   The lock is held, not just probed, until the WAL is deleted: a connection that read in between
-   would recover the stale WAL and checkpoint it over the replayed pages at its close. Then attach
+   The lock is held, not just probed, from before attach first writes the file until it is done
+   writing it (a connection that read before the WAL is deleted would recover the stale WAL and
+   checkpoint it over the replayed pages at its close), and the file keeps its inode throughout
+   (a discard truncates it, §6; a snapshot is written over it, §4.3), so a connection that opened
+   the path meanwhile waits on the lock and then reads the rewritten file. Within the process,
+   opens of the main db through the VFS fail with `SQLITE_BUSY` while attach runs. Then attach
    folds the local WAL into the db file itself (the frames SQLite's recovery would read, up to the
    last commit, a later frame winning, the file cut to that commit's size), fsyncs it, rewrites the
    sidecar at the same offset with a `:0` claim, deletes `-wal`/`-shm`, and only then replays onto
-   it. No stale WAL sits next to pages replay has moved past it (a plain SQLite connection opening
-   the file meanwhile would checkpoint it over them when it closes), and an attach in the same boot
-   after a crash midway trusts the files again and replays from the same offset (folded pages hold
-   the state at the WAL's last commit, replayed ones later commits; replay is idempotent). A crash
-   between that sidecar and the delete leaves commits in a WAL the `:0` claim rejects: a rebuild.
+   it. No stale WAL sits next to pages replay has moved past it (once a crash midway has dropped
+   the lock, a plain SQLite connection opening the file would checkpoint it over them when it
+   closes), and an attach in the same boot after a crash midway trusts the files again and replays
+   from the same offset (folded pages hold the state at the WAL's last commit, replayed ones later
+   commits; replay is idempotent). A crash between that sidecar and the delete leaves commits in a
+   WAL the `:0` claim rejects: a rebuild.
 4. `HEAD` the stream. If its latest snapshot is ahead of the file (a fresh host, or a file left
    below the retention), installs it (§4.3). Then replays frames to the tail.
 5. Claims: appends a claim at (epoch = highest seen + 1, seq 0) and reads the frame back. A 2xx
@@ -165,14 +170,14 @@ threshold of retained log. The newer snapshot has read back before any history i
 retained stream always holds a readable snapshot at or above its start.
 
 Attach installs a snapshot when the file is behind the latest one: it verifies the body (offset,
-size, checksum), locks other processes out of the old file until it is replaced (§3) and deletes its
-WAL (a crash before the rename then leaves a sidecar the next attach trusts only if that WAL held no
-commit), writes the image to a temp file and renames it over the db file, then replays the tail. A
-crash after the rename leaves the sidecar at the old offset naming the replaced file, so the next
-attach discards the files and installs the snapshot again. A tail read that hits `410` (retention
-moved under a stale `HEAD`), or a snapshot superseded between `HEAD` and `GET` (a 404, or a body cut
-short when its cold object is deleted after the grace), restarts attach from `HEAD`, up to ten
-times.
+size, checksum), locks other processes out of the file (§3), deletes its WAL, writes the image over
+the db file in place (same inode, cut to the image's size), then replays the tail. A crash midway
+leaves a mix of old pages and the image's, every one holding the state at the sidecar's offset or a
+later one: the next attach trusts the files if the sidecar claims no WAL frame and installs the
+snapshot again, and rebuilds otherwise (the claimed frames went with the WAL). A tail read that hits
+`410` (retention moved under a stale `HEAD`), or a snapshot superseded between `HEAD` and `GET` (a
+404, or a body cut short when its cold object is deleted after the grace), restarts attach from
+`HEAD`, up to ten times.
 
 Any owner may publish a snapshot of its own offset, a fenced one included: its state at its offset
 is a true prefix of the stream. Retention never passes the latest snapshot (the server refuses).
@@ -229,9 +234,8 @@ be written into the stream. Trust is therefore verified against the files, not i
   sidecar switching to `:0` first (a truncate to a non-zero size, `journal_size_limit` in the
   commit that starts a generation, cuts only the previous generation's tail, already synced by
   (1)); (3) at attach, after folding the WAL and before the sidecar that drops its claim (`:0`; the
-  WAL is deleted after it), and again before the final sidecar whenever attach wrote the db
-  file. A failed fsync poisons the database (or fails
-  the attach).
+  WAL is deleted after it), and again before the final sidecar whenever attach wrote the db file.
+  A failed fsync poisons the database (or fails the attach).
 - The attached connections keep the WAL past the last close (`SQLITE_FCNTL_PERSIST_WAL`:
   checkpointed, not deleted), and so does the snapshot thread's, so a clean shutdown keeps the
   claim checkable.
@@ -277,12 +281,12 @@ What attach does in each case:
   files and rebuilds from the latest snapshot and the tail. A new random boot id cannot be on disk
   from before it was generated, so no torn sidecar passes the check. Discarding runs before
   anything opens the file through SQLite (a torn file could fail any checkpoint), refuses while
-  another process has the file open (and locks it out until the file is gone, §3), and removes the
-  db file and a leftover snapshot temp file (never the held lock file); every attach then removes
-  `-journal`, and the fresh path `-wal` and `-shm`, and rewrites the sidecar last, so a crash
-  midway discards again. The first attach after
-  upgrading from a version without the WAL claim rebuilds once; older versions refuse this one's
-  sidecar, so after a downgrade delete `<db>` (it is rebuilt from the stream).
+  another process has the file open, and truncates the db file under the lock, keeping it locked
+  for the rebuild (§3), and removes a snapshot temp file an older version may have left (never the
+  held lock file); every attach then removes `-journal`, and the fresh path `-wal` and `-shm`, and
+  rewrites the sidecar last, so a crash midway discards again. The first attach after upgrading
+  from a version without the WAL claim rebuilds once; older versions refuse this one's sidecar, so
+  after a downgrade delete `<db>` (it is rebuilt from the stream).
 - **Container runtimes with their own boot id**: LXC/LXD/Incus and systemd-nspawn bind-mount a new
   random boot id at every container start, and gVisor generates one per procfs instance, so a
   container restart there rebuilds; sandboxes with their own kernel (Kata, Firecracker, WSL2,

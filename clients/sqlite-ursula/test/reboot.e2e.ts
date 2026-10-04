@@ -80,7 +80,7 @@ it("(a) after a reboot, files a power loss damaged are discarded and rebuilt fro
 	attach(fresh, url);
 	expect(Buffer.compare(readFileSync(file), readFileSync(fresh))).toBe(0);
 	expect(rows(file)).toEqual(ACKED);
-	// The rebuilt file (a snapshot renamed over the old one) is trusted again in this boot.
+	// The rebuilt file (a snapshot written over the emptied one) is trusted again in this boot.
 	attach(file, url);
 	expect(status(file)).toMatchObject({ local: s.offset, installed: 0 });
 });

@@ -59,6 +59,7 @@ pub mod snapshot;
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::ffi::c_char;
@@ -132,7 +133,7 @@ struct CommitStat {
 struct Db {
     url: String,
     sidecar: String,
-    /// What the sidecar records besides offset and epoch (see `stamp`).
+    /// What the sidecar records besides offset, epoch and the WAL claim (see `stamp`).
     stamp: String,
     path: String,
     epoch: u64,
@@ -152,8 +153,9 @@ struct Db {
     /// WAL frame number (1-based) of the acknowledged commit frame: the transaction is published
     /// locally once the wal-index header's mxFrame reaches it.
     commit_frame_no: u32,
-    /// Open WAL handles, and the main db handle holding an EXCLUSIVE file lock (0: none): together
-    /// the closing connection's checkpoint, the one main-db write that takes no checkpoint shm lock.
+    /// Open WAL handles, and the main db handle holding an EXCLUSIVE file lock (0: none):
+    /// together the closing connection's checkpoint, the one main-db write that takes no
+    /// checkpoint shm lock.
     wal_open: usize,
     exclusive: usize,
     /// The main db handle holding the WAL write lock (0: none): the write transaction in progress
@@ -267,7 +269,8 @@ impl Db {
     }
 
     /// The write transaction ended (WAL write lock released): drop what never committed; after an
-    /// acknowledged commit that SQLite published, advance the sidecar (no fsync: see the crate docs).
+    /// acknowledged commit that SQLite published, advance the sidecar (no fsync: see the crate
+    /// docs).
     ///
     /// Runs before the real lock is released (see `x_shm_lock`), on the main db handle `file`,
     /// whose wal-index header tells whether SQLite published the commit.
@@ -321,6 +324,8 @@ struct Registry {
     dbs: HashMap<String, Arc<Mutex<Db>>>,
     /// Open main-db handles per path (attached or not): attach requires none.
     open: HashMap<String, usize>,
+    /// Paths being attached: `x_open` refuses their main db meanwhile (`Attaching`).
+    attaching: HashSet<String>,
     /// Host locks held for the process lifetime.
     locks: HashMap<String, fs::File>,
     /// Snapshot thread per attached database.
@@ -440,8 +445,8 @@ fn file_id(path: &str) -> Option<String> {
     fs::metadata(path).ok().map(|m| m.ino().to_string())
 }
 
-/// What a sidecar records besides offset and epoch: the boot it was written in (`boot`, from
-/// `boot_id`), the stream, and the db file it describes (see `trusted`).
+/// What a sidecar records besides offset, epoch and the WAL claim: the boot it was written in
+/// (`boot`, from `boot_id`), the stream, and the db file it describes (see `trusted`).
 fn stamp(path: &str, url: &str, boot: Option<&str>) -> String {
     let mut s = format!(
         " boot={} stream={}",
@@ -582,8 +587,9 @@ fn fold_wal(path: &str, f: &fs::File) -> Result<(), String> {
     f.set_len(scan.size as u64 * PAGE as u64).map_err(err)
 }
 
-/// Replaces the sidecar atomically against a process crash: temp file, rename. No fsync: an image
-/// with an older or newer sidecar than the files is caught by `Sidecar::trusted`.
+/// Replaces the sidecar atomically against a process crash: temp file, rename. No fsync:
+/// `Sidecar::trusted` checks it against the files (a sidecar ahead of its WAL is rebuilt; one
+/// behind it replays from its offset).
 fn write_sidecar(
     path: &str,
     offset: u64,
@@ -670,16 +676,18 @@ fn read_sidecar(path: &str) -> Result<Option<Sidecar>, String> {
     Ok(Some(s))
 }
 
-/// Deletes a database's local files (a cache of the stream) so attach rebuilds them: never while
-/// another process has the file open, and never the host lock (held). Every attach then removes
-/// `-journal`, and the fresh path `-wal` and `-shm`, and rewrites the sidecar: until then the
-/// sidecar marks whatever is left untrusted, so a crash midway discards again.
-fn discard_local(path: &str) -> Result<(), String> {
-    let _lock = open_locked(path)?; // held until the db file is removed (`lock_unused`)
-    for suffix in ["-ursula.snap", ""] {
-        remove_if_exists(&format!("{path}{suffix}"))?;
-    }
-    Ok(())
+/// Empties a database's local files (a cache of the stream) so attach rebuilds them: never while
+/// another process has the file open, and never the host lock (held). The db file is truncated, not
+/// unlinked, and returned still locked (`lock_unused`) for the rebuild to write: a connection that
+/// opened the path meanwhile waits on the lock and then reads the rebuilt file, never a deleted
+/// inode. Every attach then removes `-journal`, and the fresh path `-wal` and `-shm`, and rewrites
+/// the sidecar: until then the sidecar marks whatever is left untrusted, so a crash midway discards
+/// again. A snapshot temp file an older version may have left is removed too.
+fn discard_local(path: &str) -> Result<fs::File, String> {
+    let f = open_locked(path)?;
+    remove_if_exists(&format!("{path}-ursula.snap"))?;
+    f.set_len(0).map_err(|e| format!("truncate {path}: {e}"))?;
+    Ok(f)
 }
 
 /// Fails loudly: a stale WAL or journal left next to a rebuilt db file would be applied to it.
@@ -699,20 +707,23 @@ fn abort_in_replay() -> Option<u64> {
     })
 }
 
-/// Keeps other processes off the db file `f` while attach rewrites, replaces or removes it. Attach
-/// never opens local files through SQLite before that (a trusted file may hold a torn page 1, see
-/// `fold_wal`), so it does this without parsing pages: every SQLite connection on a WAL-format file
-/// (any process, any unix-based VFS) takes a POSIX read lock in the db file's lock-byte range at
-/// its first read and keeps it until it closes. Attach takes a write lock on that range (failing
-/// while any connection holds it) and must keep holding it until `-wal`/`-shm` are deleted and the
-/// old file is replaced or removed: a connection reading after a mere probe would recover the
-/// stale WAL, keep it open, and checkpoint it over the replayed pages at its close, silently
-/// rolling the file back. Meanwhile a connection's first read fails with SQLITE_BUSY.
+/// Keeps other processes off the db file `f` while attach rewrites it. Attach never opens local
+/// files through SQLite before that (a trusted file may hold a torn page 1, see `fold_wal`), so it
+/// does this without parsing pages: every SQLite connection on a WAL-format file (any process, any
+/// unix-based VFS) takes a POSIX read lock in the db file's lock-byte range at its first read and
+/// keeps it until it closes. Attach takes a write lock on that range (failing while any connection
+/// holds it) and holds it until it is done writing the file: a connection reading after a mere
+/// probe would recover the stale WAL, keep it open, and checkpoint it over the replayed pages at
+/// its close, silently rolling the file back. Meanwhile a connection's first read fails with
+/// SQLITE_BUSY. The file keeps its inode throughout (`discard_local` truncates, `install` writes
+/// in place), so a connection that opened the path meanwhile reads the rewritten file once the
+/// lock drops, not a deleted one whose checkpoint would land in the shared `-wal`/`-shm`.
 ///
 /// The lock lives as long as `f` and any other descriptor of this process on the file: closing any
 /// of them drops it, so the caller keeps `f` open and opens no other one meanwhile. No connection
-/// of this process is open (attach refuses otherwise), so closing `f` drops only this lock. Another
-/// *attached* process is excluded by the host lock already held.
+/// of this process is open or can open (attach refuses otherwise, and `x_open` refuses the main db
+/// while it attaches), so closing `f` drops only this lock. Another *attached* process is excluded
+/// by the host lock already held.
 fn lock_unused(path: &str, f: &fs::File) -> Result<(), String> {
     use std::os::fd::AsRawFd;
     let mut l: libc::flock = unsafe { std::mem::zeroed() };
@@ -1174,9 +1185,9 @@ impl Drop for Private {
 /// Applies records to the db file, deduplicating page writes per batch.
 ///
 /// Runs only inside `ursula_attach`, which refuses while any connection of this process has the
-/// file open and has stopped the previous attachment's snapshot thread, and `lock_unused` keeps
-/// other processes off the file while it is rewritten. So its own descriptors on the db file (and
-/// the temp file and rename of `install`) cannot drop anyone else's POSIX locks when they close.
+/// file open (or opens one) and has stopped the previous attachment's snapshot thread, and
+/// `lock_unused` keeps other processes off the file from its first write until the Applier drops.
+/// So its own descriptor on the db file cannot drop anyone else's POSIX locks when it closes.
 /// Outside `ursula_attach`, the extension touches the db file, -wal or -shm only through SQLite's
 /// handles (the private connections of `Private`).
 struct Applier {
@@ -1217,15 +1228,16 @@ impl Applier {
         }
     }
 
-    /// The db file, opened once. Before its first write, a file with content (trusted, never opened
-    /// through SQLite here) is locked (`lock_unused`, held on `self.file` until the Applier drops)
-    /// and gets its WAL folded in (`fold_wal`); then the db file is fsynced, the sidecar keeps its
-    /// offset but claims no WAL frame, and the WAL is deleted, all before replay writes a page. So
-    /// no stale WAL sits next to pages replay moves past it (a plain SQLite connection opening the
-    /// file meanwhile would checkpoint it over them when it closes), and a recovery that dies
-    /// midway leaves files the next attach trusts and replays again from the same offset (folded
-    /// pages hold the state at the WAL's last commit, replayed ones later commits). A crash between
-    /// that sidecar and the delete leaves a WAL with commits next to a claim of none: a rebuild.
+    /// The db file, opened once and locked (`lock_unused`, held on `self.file` until the Applier
+    /// drops; `discard_local` hands over its locked file). Before its first write, a file with
+    /// content (trusted, never opened through SQLite here) gets its WAL folded in (`fold_wal`);
+    /// then the db file is fsynced, the sidecar keeps its offset but claims no WAL frame, and the
+    /// WAL is deleted, all before replay writes a page. So no stale WAL sits next to pages replay
+    /// moves past it (once a crash midway has dropped the lock, a plain SQLite connection opening
+    /// the file would checkpoint it over them when it closes), and a recovery that dies midway
+    /// leaves files the next attach trusts and replays again from the same offset (folded pages
+    /// hold the state at the WAL's last commit, replayed ones later commits). A crash between that
+    /// sidecar and the delete leaves a WAL with commits next to a claim of none: a rebuild.
     unsafe fn file(&mut self) -> Result<&fs::File, String> {
         if self.file.is_none() {
             let existing = fs::metadata(&self.path).is_ok_and(|m| m.len() > 0);
@@ -1236,8 +1248,8 @@ impl Applier {
                 .truncate(false)
                 .open(&self.path);
             let f = f.map_err(|e| format!("open {}: {e}", self.path))?;
+            lock_unused(&self.path, &f)?;
             if existing {
-                lock_unused(&self.path, &f)?;
                 fold_wal(&self.path, &f)?;
                 f.sync_all()
                     .map_err(|e| format!("fsync {}: {e}", self.path))?;
@@ -1279,28 +1291,33 @@ impl Applier {
         Ok(())
     }
 
-    /// Replaces the db file with a snapshot's image (temp file, rename) and continues the batch
-    /// from it. The old file is not folded, only locked (`lock_unused`, held until the rename), and
-    /// its WAL is deleted first so none sits next to the new image: a crash before the rename
-    /// leaves a sidecar the next attach trusts only if that WAL held no commit (a claim of none),
-    /// so nothing is lost. A crash after the rename, before the final sidecar, leaves the old
-    /// sidecar naming the replaced file: the next attach discards the files and rebuilds.
+    /// Writes a snapshot's image over the db file in place (same inode, under the lock: see
+    /// `lock_unused`) and continues the batch from it. The old file is not folded, and its WAL is
+    /// deleted first so none sits next to the new image. A crash midway leaves a mix of the old
+    /// file's pages and the image's (a state past the sidecar's offset): if the sidecar claims no
+    /// WAL frame the next attach trusts it and installs the snapshot again (every page holds the
+    /// state at its offset or a later one), otherwise the deleted WAL is behind it: a rebuild.
     unsafe fn install(&mut self, snap: snapshot::Snapshot) -> Result<(), String> {
-        let old = match self.file.take() {
-            None if fs::metadata(&self.path).is_ok_and(|m| m.len() > 0) => {
-                Some(open_locked(&self.path)?)
+        let err = |e: std::io::Error| format!("install snapshot into {}: {e}", self.path);
+        let f = match self.file.take() {
+            Some(f) => f,
+            None => {
+                let f = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&self.path)
+                    .map_err(err)?;
+                lock_unused(&self.path, &f)?;
+                f
             }
-            f => f,
         };
         remove_if_exists(&format!("{}-wal", self.path))?;
         remove_if_exists(&format!("{}-shm", self.path))?;
-        let err = |e: std::io::Error| format!("install snapshot into {}: {e}", self.path);
-        let tmp = format!("{}-ursula.snap", self.path);
-        fs::write(&tmp, &snap.image).map_err(err)?;
-        fs::rename(&tmp, &self.path).map_err(err)?;
-        drop(old);
-        let f = OpenOptions::new().read(true).write(true).open(&self.path);
-        self.file = Some(f.map_err(err)?);
+        f.write_all_at(&snap.image, 0).map_err(err)?;
+        f.set_len(snap.image.len() as u64).map_err(err)?;
+        self.file = Some(f);
         self.pages.clear();
         self.min_size = None;
         self.size = Some((snap.image.len() / PAGE) as u32);
@@ -1509,15 +1526,29 @@ unsafe fn sync(url: &str, pos: &mut u64, applier: &mut Applier) -> Result<(u64, 
     Ok((epoch, head.snapshot.unwrap_or(0)))
 }
 
+/// Marks a path as being attached until dropped (on every exit from `attach`): a connection of
+/// this process opening it meanwhile would read under attach's writes, and its close would drop the
+/// lock attach holds against other processes (`lock_unused`).
+struct Attaching(String);
+
+impl Drop for Attaching {
+    fn drop(&mut self) {
+        registry().attaching.remove(&self.0);
+    }
+}
+
 unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
     let path = unsafe { full_pathname(path)? };
     let url = url.trim_end_matches('/').to_owned();
-    let previous = {
+    let (_attaching, previous) = {
         let mut reg = registry();
         if reg.open.get(&path).copied().unwrap_or(0) > 0 {
             return Err(format!(
                 "{path} has open connections; close them before attaching"
             ));
+        }
+        if reg.attaching.contains(&path) {
+            return Err(format!("{path} is being attached by another thread"));
         }
         if !reg.locks.contains_key(&path) {
             let lock_path = format!("{path}-ursula.lock");
@@ -1533,7 +1564,8 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
             reg.locks.insert(path.clone(), f);
         }
         reg.dbs.remove(&path);
-        reg.snappers.remove(&path)
+        reg.attaching.insert(path.clone());
+        (Attaching(path.clone()), reg.snappers.remove(&path))
     };
     // The previous attachment's snapshot thread may hold a private connection on the file.
     if let Some((snapper, thread)) = previous {
@@ -1543,7 +1575,7 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
     create_stream(&url)?;
     let sidecar = format!("{path}-ursula");
     let boot = boot_id();
-    let mut local = None;
+    let (mut local, mut emptied) = (None, None);
     if fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
         // A file with content but no sidecar was never attached: its pages are not in the stream.
         let s = read_sidecar(&sidecar).map_err(|e| {
@@ -1572,7 +1604,7 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
                 {
                     return Err(e);
                 }
-                discard_local(&path)?;
+                emptied = Some(discard_local(&path)?);
                 eprintln!(
                     "sqlite-ursula-vfs: {path}: local files untrusted (another boot, torn, \
                      replaced, or behind their sidecar); discarded them, rebuilding from the stream"
@@ -1605,7 +1637,7 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
         from: (from, epoch),
         installed: 0,
         written: 0,
-        file: None,
+        file: emptied,
         pages: BTreeMap::new(),
         min_size: None,
         size: None,
@@ -1634,8 +1666,8 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
         unsafe { init_wal_format(&path)? };
     }
     // Untouched trusted files keep their claim; otherwise the WAL is gone (`Applier::file`,
-    // `install`, or never there) and the db file alone holds the state, which must be on disk before the sidecar says so (no connection is open,
-    // so this descriptor's close drops no lock).
+    // `install`, or never there) and the db file alone holds the state, which must be on disk
+    // before the sidecar says so (no connection is open, so this descriptor's close drops no lock).
     let wal = match local.and_then(|s| s.wal.filter(|_| !rewritten)) {
         Some(wal) => wal,
         None => {
@@ -2146,17 +2178,29 @@ unsafe extern "C" fn x_open(
             );
             return ffi::SQLITE_CANTOPEN;
         }
+        // Counted before the open, so attach (which refuses while any is counted) and an open
+        // cannot pass each other; refused while attach rewrites the file (`Attaching`).
+        let main = match name {
+            Some(name) if flags & ffi::SQLITE_OPEN_MAIN_DB != 0 => {
+                let mut reg = registry();
+                if reg.attaching.contains(name) {
+                    return ffi::SQLITE_BUSY;
+                }
+                *reg.open.entry(name.to_owned()).or_default() += 1;
+                Some(reg.dbs.get(name).cloned())
+            }
+            _ => None,
+        };
         let u = unix();
         let rc = ((*u).xOpen.unwrap())(u, zname, inner(file), flags, out);
         if rc != OK {
+            if main.is_some() {
+                uncount_open(name.unwrap());
+            }
             return rc;
         }
         if let Some(name) = name {
-            if flags & ffi::SQLITE_OPEN_MAIN_DB != 0 {
-                let mut reg = registry();
-                *reg.open.entry(name.to_owned()).or_default() += 1;
-                let db = reg.dbs.get(name).cloned();
-                drop(reg);
+            if let Some(db) = main {
                 (*f).ext = Box::into_raw(Box::new(Ext {
                     path: Some(name.to_owned()),
                     db,
@@ -2198,15 +2242,19 @@ unsafe extern "C" fn x_close(file: *mut ffi::sqlite3_file) -> c_int {
         }
         let rc = fwd!(file, xClose);
         if let Some(path) = ext.and_then(|e| e.path) {
-            let mut reg = registry();
-            if let Some(n) = reg.open.get_mut(&path) {
-                *n -= 1;
-                if *n == 0 {
-                    reg.open.remove(&path);
-                }
-            }
+            uncount_open(&path);
         }
         rc
+    }
+}
+
+fn uncount_open(path: &str) {
+    let mut reg = registry();
+    if let Some(n) = reg.open.get_mut(path) {
+        *n -= 1;
+        if *n == 0 {
+            reg.open.remove(path);
+        }
     }
 }
 
