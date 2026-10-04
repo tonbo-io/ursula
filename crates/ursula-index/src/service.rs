@@ -1860,12 +1860,12 @@ mod tests {
         while single_pass(&client, &index, &worker, StartPosition::Retained, true).await?
             != Backlog::Idle
         {}
-        let mut index = index.lock().await;
-        assert_eq!(index.source().incarnation.as_deref(), Some("2"));
-        assert_eq!(index.durable_offset(), 18);
-        let result = index.query(QueryRequest::window(0, 1_000, 10)).await?;
+        let mut guard = index.lock().await;
+        assert_eq!(guard.source().incarnation.as_deref(), Some("2"));
+        assert_eq!(guard.durable_offset(), 18);
+        let result = guard.query(QueryRequest::window(0, 1_000, 10)).await?;
         assert_eq!(result.entries.len(), 1);
-        drop(index);
+        drop(guard);
 
         // Recreated with a type the indexer cannot read: the restart still
         // happens, then indexing fails instead of serving stale locators.
@@ -1875,10 +1875,10 @@ mod tests {
             single_pass(&client, &index, &worker, StartPosition::Retained, true).await,
             Err(IndexError::InvalidSourceResponse(_))
         ));
-        let index = index.lock().await;
-        assert_eq!(index.source().incarnation.as_deref(), Some("3"));
-        assert_eq!(index.durable_offset(), 0);
-        drop(index);
+        let guard = index.lock().await;
+        assert_eq!(guard.source().incarnation.as_deref(), Some("3"));
+        assert_eq!(guard.durable_offset(), 0);
+        drop(guard);
         server.abort();
         Ok(())
     }
