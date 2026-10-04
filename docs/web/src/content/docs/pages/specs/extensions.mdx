@@ -143,7 +143,7 @@ The response body is:
 - `prefix` echoes the request's prefix, and is the empty string when the request has none.
 - `stream_count` is the number of entries in `streams` on this page, not the number of streams in the bucket.
 - `has_more` is `true` when more matching streams sort after the last entry. `next_cursor` is then that entry's `stream_id`, to be passed as `after`; otherwise it is `null`.
-- `status` is `Open` or `Closed`. `tail_offset` is the stream's tail as an integer byte offset. Streams whose TTL or expiry time has passed are not listed.
+- `status` is `Open` or `Closed`. `tail_offset` is the stream's tail offset, as an integer. Streams whose TTL or expiry time has passed are not listed.
 
 Each entry MUST include `stream_id`, `status`, `content_type`, `tail_offset` and `created_at_ms`. `last_write_at_ms` is OPTIONAL: a server that does not track the time of the last write MUST omit it rather than report a substitute value, and clients MUST tolerate its absence.
 
@@ -286,7 +286,7 @@ PUT {stream_url}/snapshot?record={record}
 PUT {stream_url}/retention?record={record}
 ```
 
-The server resolves the stable record ordinal to the canonical byte boundary before applying the operation.
+The server resolves the stable record ordinal to its offset before applying the operation.
 
 Publishing a new snapshot replaces the previously visible snapshot immediately. The superseded snapshot MAY be garbage-collected asynchronously after the new snapshot becomes visible. Clients MUST NOT depend on older snapshots remaining readable after overwrite.
 
@@ -319,11 +319,13 @@ Servers SHOULD include `Stream-Snapshot-Offset` when a latest visible snapshot e
 
 - `Stream-Snapshot-Offset`: The latest visible snapshot offset.
 - `Stream-Snapshot-Digest`: A digest of the latest visible snapshot's content type and body.
+- `Stream-Incarnation`: An opaque token that identifies this incarnation of the stream.
 
 **Semantics:**
 
 - Absence of `Stream-Snapshot-Offset` means the stream has no visible snapshot.
 - When present, the value MUST refer to the same latest visible snapshot that `GET {stream_url}/snapshot` would resolve to.
+- A server implementing this extension MUST send `Stream-Incarnation` on every successful `HEAD`. It MUST change when the stream is deleted and recreated at the same URL, and MUST NOT change otherwise. Clients MUST compare it only for equality. Offsets do not identify an incarnation, so a client that stores offsets and snapshot offsets across a possible recreate SHOULD store the incarnation with them and check it on `HEAD` before resuming. An operator restore from backup keeps each stream's incarnation although it can rewind the stream to the backup's tail; offsets read after the backup was taken are not valid on the restored stream.
 
 ### 2.5. Read Snapshot
 
@@ -651,7 +653,7 @@ For one stream:
 - `F` is the first retained record ordinal.
 - `N` is the next record ordinal and record tail.
 - Retained records occupy `[F, N)`.
-- `O(r)` is the canonical Durable Streams offset at the first byte of record `r`.
+- `O(r)` is the canonical Durable Streams offset at the start of record `r`.
 
 A new empty stream has `F = N = 0`. An ordinal MUST NOT be reused or changed after it becomes externally visible. Retention MAY advance `F`, but MUST NOT renumber surviving records.
 
@@ -869,7 +871,7 @@ Implementations MUST preserve these invariants:
 2. Ordinals are contiguous in committed stream order and are never reused.
 3. One atomic append receives one contiguous ordinal range or no range.
 4. A deduplicated append returns its original ordinal range, or no range once its receipt left the receipt window.
-5. `O(r)` always identifies the first canonical byte of record `r`.
+5. `O(r)` always identifies the start of record `r`.
 6. Offset reads and record reads expose the same canonical JSON sequence.
 7. Record-aware reads never return partial records.
 8. Flush, compaction, snapshot, restart, and retention never change a surviving record's ordinal.

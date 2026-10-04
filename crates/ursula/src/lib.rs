@@ -142,6 +142,7 @@ use crate::render::insert_header_str;
 use crate::render::insert_lifetime_headers;
 use crate::render::insert_location;
 use crate::render::insert_offset;
+use crate::render::insert_padded_offset;
 use crate::render::insert_producer_ack;
 use crate::render::insert_producer_error_headers;
 use crate::render::insert_public_location;
@@ -173,6 +174,7 @@ const HEADER_STREAM_CLOSED: &str = "stream-closed";
 const HEADER_STREAM_CURSOR: &str = "stream-cursor";
 const HEADER_STREAM_EXPIRES_AT: &str = "stream-expires-at";
 const HEADER_STREAM_EXTENSIONS: &str = "stream-extensions";
+const HEADER_STREAM_INCARNATION: &str = "stream-incarnation";
 const HEADER_STREAM_INTEGRITY_EVICTED_RECORDS: &str = "stream-integrity-evicted-records";
 const HEADER_STREAM_INTEGRITY_EVICTED_SETSUM: &str = "stream-integrity-evicted-setsum";
 const HEADER_STREAM_INTEGRITY_LIVE_RECORDS: &str = "stream-integrity-live-records";
@@ -3361,7 +3363,7 @@ pub(crate) async fn head_stream_by_id(
             insert_default_response_headers(&mut headers);
             insert_content_type(&mut headers, &response.content_type);
             insert_offset(&mut headers, response.tail_offset);
-            insert_u64_header(
+            insert_padded_offset(
                 &mut headers,
                 HEADER_STREAM_COLD_HOT_START_OFFSET,
                 response.cold_hot_start_offset,
@@ -3414,11 +3416,14 @@ pub(crate) async fn head_stream_by_id(
             if let Some(snapshot_digest) = response.snapshot_digest {
                 insert_snapshot_digest(&mut headers, &snapshot_digest);
             }
-            insert_u64_header(
+            insert_padded_offset(
                 &mut headers,
                 HEADER_STREAM_RETAINED_OFFSET,
                 response.retained_offset,
             );
+            if let Some(incarnation) = response.created_at_ms {
+                insert_u64_header(&mut headers, HEADER_STREAM_INCARNATION, incarnation);
+            }
             if let Some(record_range) = response.record_range {
                 insert_record_head_headers(&mut headers, record_range);
             }
@@ -4029,7 +4034,7 @@ async fn advance_retention_by_offset(
         Ok(response) => {
             let mut headers = HeaderMap::new();
             insert_default_response_headers(&mut headers);
-            insert_u64_header(
+            insert_padded_offset(
                 &mut headers,
                 HEADER_STREAM_RETAINED_OFFSET,
                 response.retained_offset,

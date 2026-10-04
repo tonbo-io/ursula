@@ -12,7 +12,7 @@ curl -X PUT http://127.0.0.1:4437/chat/room-7 \
   -H 'Content-Type: application/json'
 ```
 
-`application/json` streams advertise `json-record-coordinates-v1`: each appended JSON object becomes one complete record with a stable zero-based ordinal, so clients paginate and resume by message, not by byte offset.
+`application/json` streams advertise `json-record-coordinates-v1`: each appended JSON object becomes one complete record with a stable zero-based ordinal, so clients paginate and resume by message, not by offset.
 
 ## Send a message
 
