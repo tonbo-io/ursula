@@ -2,7 +2,6 @@ name: Durable Streams conformance
 
 # Official Durable Streams server conformance suite against a single local
 # Ursula node, gated on scripts/ds-conformance/expected-failures.txt.
-# Runs on the keyed-streams integration branch and its agent task branches.
 
 on:
   pull_request:
@@ -24,7 +23,7 @@ env:
 jobs:
   conformance:
     name: DS conformance (single node, memory)
-    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    runs-on: depot-ubuntu-24.04-8
     steps:
       - name: Checkout
         uses: actions/checkout@v6

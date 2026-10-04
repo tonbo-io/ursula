@@ -48,8 +48,7 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   "examples/resumable-ai-stream": { group: "Examples", order: 1 },
   "examples/chat-room": { group: "Examples", order: 2 },
   "examples/browser-telemetry": { group: "Examples", order: 3 },
-  "examples/pi-durable": { group: "Examples", order: 4 },
-  "examples/sqlite-vfs": { group: "Examples", order: 5 },
+  "examples/sqlite-vfs": { group: "Examples", order: 4 },
 
   // Concepts - encounter order: primitive, organization, reading, writing, long-stream, transport.
   "concepts/streams": { group: "Concepts", order: 1 },
