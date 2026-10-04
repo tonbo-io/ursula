@@ -135,21 +135,21 @@ async fn restart_rebinds_the_incarnation_once_and_retires_the_old_namespace() ->
     catalog.register(&original).await?;
 
     let restarted = catalog
-        .restart(&original.id, Some("1"), Some("2".to_owned()), 5, 100)
+        .restart(&original.id, Some("1"), Some("2".to_owned()), 100)
         .await?;
     assert_eq!(restarted.incarnation.as_deref(), Some("2"));
     assert_eq!(restarted.restarted_from_incarnation.as_deref(), Some("1"));
-    assert_eq!(restarted.indexed_from_offset, 5);
+    assert_eq!(restarted.indexed_from_offset, 0);
     assert_ne!(restarted.namespace()?, original.namespace()?);
     // A second pod that saw the same change is a no-op.
     let again = catalog
-        .restart(&original.id, Some("1"), Some("2".to_owned()), 9, 100)
+        .restart(&original.id, Some("1"), Some("2".to_owned()), 100)
         .await?;
     assert_eq!(again, restarted);
     // A stale HEAD that reports the retired incarnation again is ignored, so
     // the live namespace is never retired.
     let stale = catalog
-        .restart(&original.id, Some("2"), Some("1".to_owned()), 0, 200)
+        .restart(&original.id, Some("2"), Some("1".to_owned()), 200)
         .await?;
     assert_eq!(stale, restarted);
     let retired = catalog.retired_before(u64::MAX).await?;

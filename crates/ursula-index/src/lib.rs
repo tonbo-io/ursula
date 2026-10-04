@@ -49,7 +49,6 @@ pub use source::OversizeScan;
 pub use source::ReadLimits;
 pub use source::SegmentRead;
 pub use source::SourceClient;
-pub use source::SourceFormat;
 pub use source::SourceHead;
 pub use source::SourceRead;
 pub use store::Coverage;

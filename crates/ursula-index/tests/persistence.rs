@@ -4,7 +4,6 @@
 )]
 
 use ursula_index::EventIndexConfig;
-use ursula_index::IndexBase;
 use ursula_index::IndexError;
 use ursula_index::IndexStatus;
 use ursula_index::QueryRequest;
@@ -66,23 +65,18 @@ async fn restart_in_place_starts_over_for_a_recreated_source() -> anyhow::Result
     let (_objects, store) = common::fs_store()?;
     let (_cache, mut index) = open(&store, config(), 0).await?;
     index.commit_segment(timed(0, &[100, 200])).await?;
-    index
-        .restart(IndexBase {
-            offset: 5,
-            incarnation: Some("2".to_owned()),
-        })
-        .await?;
+    index.restart(Some("2".to_owned())).await?;
     assert_eq!(index.source().incarnation.as_deref(), Some("2"));
-    assert_eq!(index.indexed_from_offset(), 5);
-    assert_eq!(index.durable_offset(), 5);
-    assert_eq!(index.resync_offset(), Some(5));
+    assert_eq!(index.indexed_from_offset(), 0);
+    assert_eq!(index.durable_offset(), 0);
+    assert_eq!(index.resync_offset(), None);
     assert_eq!(index.part_count(), 0);
     assert!(index.query(window(0, 400)).await?.entries.is_empty());
     drop(index);
 
     let (_fresh_cache, reopened) = open(&store, config(), 0).await?;
     assert_eq!(reopened.source().incarnation.as_deref(), Some("2"));
-    assert_eq!(reopened.durable_offset(), 5);
+    assert_eq!(reopened.durable_offset(), 0);
     Ok(())
 }
 

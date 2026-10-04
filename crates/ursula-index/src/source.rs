@@ -37,31 +37,28 @@ const HEADER_UP_TO_DATE: &str = "stream-up-to-date";
 /// an NDJSON line spanning appends can be longer; it is counted as oversize.
 pub const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SourceFormat {
-    /// `application/json`: one stored message per LF-terminated line.
-    Json,
-    /// `application/x-ndjson`: the writer's own lines.
-    Ndjson,
-}
-
-/// What a HEAD of the source reports. `format` is `None` for a content type
+/// What a HEAD of the source reports. `readable` is false for a content type
 /// the indexer cannot read; the incarnation is reported regardless, so a
 /// recreated stream is detected whatever its new type.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceHead {
-    pub format: Option<SourceFormat>,
+    pub readable: bool,
     pub next_offset: u64,
     pub retained_offset: u64,
     pub incarnation: Option<String>,
 }
 
 impl SourceHead {
-    /// The format, or an error for a content type the indexer cannot read.
-    pub fn readable_format(&self) -> Result<SourceFormat, IndexError> {
-        self.format.ok_or(IndexError::InvalidSourceResponse(
-            "source stream is neither application/json nor application/x-ndjson",
-        ))
+    /// An error for a content type the indexer cannot read. JSON and NDJSON
+    /// are framed alike, so the indexer needs no more than this.
+    pub fn ensure_readable(&self) -> Result<(), IndexError> {
+        if self.readable {
+            Ok(())
+        } else {
+            Err(IndexError::InvalidSourceResponse(
+                "source stream is neither application/json nor application/x-ndjson",
+            ))
+        }
     }
 }
 
@@ -128,7 +125,7 @@ impl SourceClient {
             return Err(IndexError::SourceStatus(response.status().as_u16()));
         }
         let headers = response.headers();
-        let format = source_format(headers);
+        let readable = readable_content_type(headers);
         let next_offset = offset_header(headers, HEADER_NEXT_OFFSET)?.ok_or(
             IndexError::InvalidSourceResponse("source HEAD omitted Stream-Next-Offset"),
         )?;
@@ -139,7 +136,7 @@ impl SourceClient {
             ));
         }
         Ok(Some(SourceHead {
-            format,
+            readable,
             next_offset,
             retained_offset,
             incarnation: headers
@@ -153,7 +150,10 @@ impl SourceClient {
     pub async fn read_at(&self, offset: u64) -> Result<SourceRead, IndexError> {
         let mut url = self.stream_url.clone();
         url.query_pairs_mut()
-            .append_pair("offset", &offset_token(offset));
+            .append_pair("offset", &offset_token(offset))
+            // A follower may not yet have applied a delete and recreate that
+            // HEAD (always the leader) already reported.
+            .append_pair("consistency", "leader");
         let response = self.client.get(url).send().await?;
         if response.status() == StatusCode::GONE {
             let retained_offset = offset_header(response.headers(), HEADER_NEXT_OFFSET)?.ok_or(
@@ -387,22 +387,18 @@ enum ReadOutcome {
     },
 }
 
-fn source_format(headers: &HeaderMap) -> Option<SourceFormat> {
-    let media_type = headers
-        .get(reqwest::header::CONTENT_TYPE)?
-        .to_str()
-        .ok()?
-        .split(';')
-        .next()?
-        .trim()
-        .to_ascii_lowercase();
-    match media_type.as_str() {
-        "application/json" => Some(SourceFormat::Json),
-        "application/x-ndjson" | "application/ndjson" | "application/jsonl" => {
-            Some(SourceFormat::Ndjson)
-        }
-        _ => None,
-    }
+fn readable_content_type(headers: &HeaderMap) -> bool {
+    let Some(media_type) = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+    else {
+        return false;
+    };
+    matches!(
+        media_type.trim().to_ascii_lowercase().as_str(),
+        "application/json" | "application/x-ndjson" | "application/ndjson" | "application/jsonl"
+    )
 }
 
 fn offset_header(headers: &HeaderMap, name: &'static str) -> Result<Option<u64>, IndexError> {

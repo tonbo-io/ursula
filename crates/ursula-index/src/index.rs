@@ -465,10 +465,15 @@ impl EventIndex {
     }
 
     /// Start over in place for a recreated source stream: publish an empty
-    /// manifest at `base`. The old parts become unreferenced and GC removes
-    /// them after the grace period. A no-op if another instance already
-    /// restarted onto `base.incarnation`.
-    pub async fn restart(&mut self, base: IndexBase) -> Result<(), IndexError> {
+    /// manifest for `incarnation` at offset 0, since every byte of the new
+    /// stream was appended after this index was created. The old parts
+    /// become unreferenced and GC removes them after the grace period. A
+    /// no-op if another instance already restarted onto `incarnation`.
+    pub async fn restart(&mut self, incarnation: Option<String>) -> Result<(), IndexError> {
+        let base = IndexBase {
+            offset: 0,
+            incarnation,
+        };
         self.stalled_at = None;
         self.oversize_scan = None;
         for _attempt in 0..MAX_PUBLISH_ATTEMPTS {

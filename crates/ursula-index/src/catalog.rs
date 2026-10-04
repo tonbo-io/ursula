@@ -185,8 +185,11 @@ impl IndexCatalog {
     }
 
     /// Restart a registration whose source was deleted and recreated:
-    /// retire its namespace and rebind it to `incarnation` from
-    /// `indexed_from_offset`. A no-op returning the current registration if
+    /// retire its namespace and rebind it to `incarnation` from offset 0.
+    /// Every byte of a recreated stream was appended after the registration,
+    /// so the restart covers it all from its first byte, whatever `start`
+    /// said; bytes retention already trimmed are counted as trimmed when
+    /// indexing resumes. A no-op returning the current registration if
     /// it no longer has `expected_incarnation` (another pod restarted it) or
     /// if `incarnation` names a namespace this catalog already retired: a
     /// stale HEAD can report an earlier incarnation again, and restarting
@@ -196,7 +199,6 @@ impl IndexCatalog {
         id: &str,
         expected_incarnation: Option<&str>,
         incarnation: Option<String>,
-        indexed_from_offset: u64,
         retired_at_ms: u64,
     ) -> Result<IndexRegistration, IndexError> {
         validate_id(id)?;
@@ -218,7 +220,7 @@ impl IndexCatalog {
             let mut restarted = registration.clone();
             restarted.restarted_from_incarnation = restarted.incarnation.take();
             restarted.incarnation = incarnation.clone();
-            restarted.indexed_from_offset = indexed_from_offset;
+            restarted.indexed_from_offset = 0;
             let namespace = restarted.namespace()?;
             if catalog
                 .retired

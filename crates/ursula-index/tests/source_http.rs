@@ -20,7 +20,6 @@ use ursula_index::ReadLimits;
 use ursula_index::SegmentRead;
 use ursula_index::SkipKind;
 use ursula_index::SourceClient;
-use ursula_index::SourceFormat;
 
 /// A source that serves `body` in reads of at most `chunk` bytes, like an
 /// Ursula offset read that the server cut.
@@ -60,10 +59,14 @@ impl ChunkedSource {
             ])
                 .into_response();
         }
-        let offset = request
-            .uri()
-            .query()
-            .and_then(|query| query.strip_prefix("offset="))
+        let query = request.uri().query().unwrap_or_default();
+        assert!(
+            query.split('&').any(|pair| pair == "consistency=leader"),
+            "offset reads go to the leader"
+        );
+        let offset = query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("offset="))
             .and_then(|offset| offset.parse::<u64>().ok())
             .expect("an offset read");
         self.reads.lock().expect("lock").push(offset);
@@ -147,12 +150,12 @@ async fn read(
 }
 
 #[tokio::test]
-async fn head_reports_format_offsets_incarnation_and_absence() -> anyhow::Result<()> {
+async fn head_reports_readability_offsets_incarnation_and_absence() -> anyhow::Result<()> {
     let (client, server) = ChunkedSource::new("{}\n", 8, "application/json; charset=utf-8")
         .client()
         .await?;
     let head = client.head().await?.expect("the stream exists");
-    assert_eq!(head.format, Some(SourceFormat::Json));
+    assert!(head.readable);
     assert_eq!(head.next_offset, 3);
     assert_eq!(head.retained_offset, 0);
     assert_eq!(head.incarnation.as_deref(), Some("1759482000123"));
@@ -162,10 +165,10 @@ async fn head_reports_format_offsets_incarnation_and_absence() -> anyhow::Result
         .client()
         .await?;
     let head = client.head().await?.expect("the stream exists");
-    assert_eq!(head.format, None);
+    assert!(!head.readable);
     assert_eq!(head.incarnation.as_deref(), Some("1759482000123"));
     assert!(matches!(
-        head.readable_format(),
+        head.ensure_readable(),
         Err(IndexError::InvalidSourceResponse(_))
     ));
     server.abort();
@@ -240,10 +243,7 @@ async fn an_unterminated_ndjson_tail_is_not_covered_and_oversize_lines_are_read_
     let (client, server) = ChunkedSource::new(&body, 16, "application/x-ndjson")
         .client()
         .await?;
-    assert_eq!(
-        client.head().await?.expect("exists").format,
-        Some(SourceFormat::Ndjson)
-    );
+    assert!(client.head().await?.expect("exists").readable);
     let segment = read(&client, 0, false, limits()).await?;
     let complete = u64::try_from(body.len().saturating_sub("{\"t\":3".len()))?;
     assert_eq!(segment.end, complete);

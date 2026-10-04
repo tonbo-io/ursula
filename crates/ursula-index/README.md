@@ -1,6 +1,6 @@
 # Ursula event-time index (experimental)
 
-The `ursula indexer` role is a rebuildable index of the event time carried inside the messages of Ursula `application/json` and `application/x-ndjson` streams. Ursula remains the source of truth. The indexer reads streams with ordinary offset reads, writes immutable sorted Parquet parts to S3, and conditionally publishes how far each stream is indexed. A query returns `(offset, len)` locators that a client resolves with base-protocol reads.
+The `ursula indexer` role is a rebuildable index of the event time carried inside the messages of Ursula `application/json` and `application/x-ndjson` streams. Ursula remains the source of truth. The indexer reads streams with ordinary offset reads (`consistency=leader`, so a read never trails the HEAD that detected a recreate), writes immutable sorted Parquet parts to S3, and conditionally publishes how far each stream is indexed. A query returns `(offset, len)` locators that a client resolves with base-protocol reads.
 
 **Experimental.** The HTTP API and the S3 format may change in a minor release. A format change needs a new or emptied S3 prefix and re-registration; the index is rebuilt from the retained source history.
 

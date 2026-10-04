@@ -3,7 +3,7 @@ title: Browser Telemetry
 description: Collect replayable browser events in a JSON stream and query them by client event time.
 ---
 
-Browser telemetry is a natural fit for an `application/json` stream: the browser appends ordinary JSON over HTTP, Ursula stores each event as one message in commit order, and consumers replay or tail complete events from an offset.
+Browser telemetry is a natural fit for an `application/json` stream: the browser appends ordinary JSON over HTTP, Ursula stores each event as one message in commit order, and consumers replay or tail events from an offset.
 
 The runnable example is in [`examples/browser-telemetry`](https://github.com/tonbo-io/ursula/tree/main/examples/browser-telemetry).
 
@@ -46,13 +46,13 @@ One array append stores one message per element. A successful response returns t
 
 ## Replay and live tail
 
-Read complete events from the start of the stream:
+Read events from the start of the stream:
 
 ```bash
 curl -i 'http://127.0.0.1:4437/telemetry/events?offset=-1'
 ```
 
-The body is NDJSON, one event per line. Continue from the response's `Stream-Next-Offset`; `Stream-Up-To-Date: true` means the read reached the tail. Offsets are opaque: store and pass back the values Ursula returns, and compare them only with each other. For a live native `EventSource`, add `live=sse`.
+The body is NDJSON, one event per line. A response returns at most 8 MiB and can end mid-line: buffer any incomplete trailing line and continue from the response's `Stream-Next-Offset`; `Stream-Up-To-Date: true` means the read reached the tail. Offsets are opaque: store and pass back the values Ursula returns, and compare them only with each other. For a live native `EventSource`, add `live=sse`.
 
 ## Event-time queries (experimental)
 

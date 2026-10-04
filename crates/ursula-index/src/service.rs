@@ -460,7 +460,7 @@ async fn run_single(
         .await
         .context("HEAD the source stream")?
         .context("the source stream does not exist")?;
-    head.readable_format().context("HEAD the source stream")?;
+    head.ensure_readable().context("HEAD the source stream")?;
     let base = IndexBase {
         offset: start_offset(start, &head),
         incarnation: head.incarnation.clone(),
@@ -766,11 +766,6 @@ async fn process_pool_source(
                 &registration.id,
                 registration.incarnation.as_deref(),
                 head.incarnation.clone(),
-                // Every byte of a recreated stream was appended after the
-                // registration, so the restart covers it all from its first
-                // byte, whatever `start` says. Bytes already trimmed by
-                // retention are then counted as trimmed by `index_source`.
-                0,
                 wall_clock_millis()?,
             )
             .await?;
@@ -798,11 +793,12 @@ async fn process_pool_source(
     index_source(&handles.serving, &source, &head, params, allow_partial).await
 }
 
-/// Record a 404 from the source. An index this handle already saw gone needs
-/// no S3 request.
+/// Record a 404 from the source. Only a ready index changes status: one this
+/// handle already saw gone or blocked needs no S3 request (a blocked index
+/// stays blocked until an operator resumes it).
 async fn mark_source_gone(index: &Mutex<EventIndex>) -> Result<(), IndexError> {
     let mut index = index.lock().await;
-    if matches!(index.status(), IndexStatus::SourceGone) {
+    if !matches!(index.status(), IndexStatus::Ready) {
         return Ok(());
     }
     index.set_source_gone(true).await
@@ -817,7 +813,7 @@ async fn index_source(
     allow_partial: bool,
 ) -> Result<Backlog, IndexError> {
     // Refuse a content type the indexer cannot frame before claiming.
-    head.readable_format()?;
+    head.ensure_readable()?;
     let now_ms = wall_clock_millis()?;
     let (claim, resync, resume, extractor) = {
         let mut index = index.lock().await;
@@ -865,8 +861,9 @@ async fn index_source(
         else {
             return Ok(Backlog::Idle);
         };
-        // Either content type: a stored message always parses as a whole,
-        // so only a trimmed message's tail is discarded.
+        // A restart point may be mid-message: a first line that is not one
+        // complete JSON value is discarded as trimmed (a complete non-JSON
+        // NDJSON line included).
         let resync = index.resync_offset() == Some(claim.start_offset);
         (
             claim,
@@ -1166,14 +1163,8 @@ async fn single_pass(
         let known = index.source().incarnation.clone();
         if incarnation_changed(known.as_deref(), head.incarnation.as_deref()) {
             // As in pool mode, a recreated stream is covered from its first
-            // byte whatever `--start` says; bytes already trimmed by
-            // retention are counted as trimmed.
-            index
-                .restart(IndexBase {
-                    offset: 0,
-                    incarnation: head.incarnation.clone(),
-                })
-                .await?;
+            // byte whatever `--start` says.
+            index.restart(head.incarnation.clone()).await?;
             tracing::info!(
                 previous_incarnation = ?known,
                 incarnation = ?head.incarnation,
@@ -1304,7 +1295,7 @@ async fn register_pool_index(
         .ok_or(ApiError(IndexError::InvalidSourceResponse(
             "the source stream does not exist",
         )))?;
-    head.readable_format().map_err(ApiError)?;
+    head.ensure_readable().map_err(ApiError)?;
     let registration = IndexRegistration {
         id,
         stream_url: canonical_stream_url,
@@ -1628,7 +1619,11 @@ mod tests {
             let offset = request
                 .uri()
                 .query()
-                .and_then(|query| query.strip_prefix("offset="))
+                .and_then(|query| {
+                    query
+                        .split('&')
+                        .find_map(|pair| pair.strip_prefix("offset="))
+                })
                 .and_then(|offset| offset.parse::<u64>().ok())
                 .unwrap_or(0);
             if offset < retained {
