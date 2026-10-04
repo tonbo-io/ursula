@@ -143,7 +143,8 @@ enum PassMode {
     AgedOnly,
 }
 
-/// Equal-size tie order: streams after the cursor first, then planner order.
+/// Equal-size tie order: streams after the cursor first, then
+/// `compare_stream_ids` order.
 fn rotated_order(
     left: &BucketStreamId,
     right: &BucketStreamId,

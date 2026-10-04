@@ -8,7 +8,7 @@ api: "PUT /{bucket}/{stream}"
 </ParamField>
 
 <ParamField path="stream" type="string" required>
- Stream ID within the bucket: 1 to 122 bytes, without `/`, `\0` or `..`, and `{bucket}/{stream}` together at most 122 bytes. `streams` is reserved. An invalid ID answers `400`.
+ Stream ID within the bucket: 1 to 122 bytes, without `/`, `\0` or `..`, not starting with `$`, and `{bucket}/{stream}` together at most 122 bytes. `streams` is reserved. An invalid ID answers `400`.
 </ParamField>
 
 <ParamField header="Content-Type" type="string">

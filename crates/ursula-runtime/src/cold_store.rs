@@ -1227,19 +1227,16 @@ impl ColdStore {
 
 fn parse_cold_index_page_path(path: &str) -> Option<ColdIndexPageKey> {
     let parts = path.split('/').collect::<Vec<_>>();
-    let (stream_id, generation, page_id) = match parts.as_slice() {
-        [bucket, stream, "cold-index", generation, page] => {
-            (BucketStreamId::new(*bucket, *stream), *generation, *page)
-        }
-        _ => return None,
+    let [bucket, stream, "cold-index", generation, page] = parts.as_slice() else {
+        return None;
     };
-    if stream_id.bucket_id.is_empty() || stream_id.stream_id.is_empty() {
+    if bucket.is_empty() || stream.is_empty() {
         return None;
     }
     Some(ColdIndexPageKey {
-        stream_id,
+        stream_id: BucketStreamId::new(*bucket, *stream),
         generation: generation.parse().ok()?,
-        page_id: page_id.strip_suffix(".idx")?.parse().ok()?,
+        page_id: page.strip_suffix(".idx")?.parse().ok()?,
     })
 }
 

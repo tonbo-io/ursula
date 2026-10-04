@@ -74,4 +74,18 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn identity_is_capped_at_122_bytes_including_the_bucket() {
+        // "test/" is 5 bytes.
+        assert_eq!(
+            validate_stream_id(&BucketStreamId::new("test", "a".repeat(117))),
+            Ok(())
+        );
+        assert!(
+            validate_stream_id(&BucketStreamId::new("test", "a".repeat(118)))
+                .expect_err("123-byte identity")
+                .contains("must not exceed 122 bytes")
+        );
+    }
 }

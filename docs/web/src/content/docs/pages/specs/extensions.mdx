@@ -83,7 +83,7 @@ This section describes Ursula's server profile. Earlier drafts of this document 
 
 ### 1.6. Stream Operations
 
-All stream operations defined in the base protocol apply under `{base_url}/{bucket_id}/{stream_id}`. A path segment after `{stream_id}` names a stream subresource (Sections 2 and 3), never another stream. Ursula answers `404 Not Found` for any other path with three or more segments.
+All stream operations defined in the base protocol apply under `{base_url}/{bucket_id}/{stream_id}`. A path segment after `{stream_id}` names a stream subresource (Sections 2 and 3), never another stream. Ursula answers `404 Not Found` for any other path with three or more segments under a bucket (paths under `/__ursula/` are operational endpoints, not buckets).
 
 The names `$transaction`, `append-batch`, `attrs`, `bootstrap`, `retention` and `snapshot` are reserved for any future co-location form and stream subresource; apart from the `$` rule in Section 1.1 they remain valid stream IDs. Earlier drafts defined a three-segment path-affinity form and a group-local `$transaction` endpoint in Sections 1.7 and 1.8; those features are removed and the section numbers stay unused.
 

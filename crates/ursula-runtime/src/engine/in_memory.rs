@@ -586,25 +586,14 @@ impl InMemoryGroupEngine {
         })
     }
 
-    /// Admission for one payload of `incoming_bytes`.
+    /// Cold admission (F6c): the group's real hot size (payload plus
+    /// per-record overhead) plus the incoming payload, charged as one record,
+    /// must stay within the group cap.
     pub fn check_cold_write_admission_bytes(
         &self,
         stream_id: &BucketStreamId,
         admission: ColdWriteAdmission,
         incoming_bytes: u64,
-    ) -> Result<(), GroupEngineError> {
-        self.check_cold_write_admission(stream_id, admission, incoming_bytes, 1)
-    }
-
-    /// Cold admission (F6c): the group's real hot size (payload plus
-    /// per-record overhead) plus the incoming payload, charged as at least
-    /// `incoming_records` records, must stay within the group cap.
-    pub fn check_cold_write_admission(
-        &self,
-        stream_id: &BucketStreamId,
-        admission: ColdWriteAdmission,
-        incoming_bytes: u64,
-        incoming_records: u64,
     ) -> Result<(), GroupEngineError> {
         let Some(limit) = admission.max_hot_bytes_per_group else {
             return Ok(());
@@ -613,10 +602,7 @@ impl InMemoryGroupEngine {
             return Ok(());
         }
         let before = self.state_machine.total_hot_real_bytes();
-        let after = before.saturating_add(
-            self.state_machine
-                .hot_real_bytes(incoming_bytes, incoming_records.max(1)),
-        );
+        let after = before.saturating_add(self.state_machine.hot_real_bytes(incoming_bytes, 1));
         if after <= limit {
             return Ok(());
         }

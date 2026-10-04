@@ -1,8 +1,8 @@
 //! Content-type normalization used by the node.
 //!
-//! A stream's content type is stored normalized (`extensions.md` §1.8): split
-//! at `;`, trim each part, drop empty parts, ASCII-lowercase each part and
-//! join with `; `.
+//! A stream's content type is stored normalized (see `api/append.mdx`,
+//! Content-Type): split at `;`, trim each part, drop empty parts,
+//! ASCII-lowercase each part and join with `; `.
 
 /// Normalizes a content type: split at `;`, trim, drop empty parts,
 /// ASCII-lowercase each part and join with `; `.

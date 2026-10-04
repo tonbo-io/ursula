@@ -601,7 +601,12 @@ async fn access_control_fails_closed_for_unclassified_routes() {
     let authorizer = Arc::new(RecordingAuthorizer::new(AuthorizationDecision::Allow));
     let gateway = gateway_with_access_control(upstream.url.clone(), resolver, authorizer);
 
-    for uri in ["/__ursula/metrics", "/future-unclassified-route"] {
+    for uri in [
+        "/__ursula/metrics",
+        "/future-unclassified-route",
+        // Three-segment paths that are not subresources (0.6.0 removed affinity).
+        "/owner-a/run-42/queue",
+    ] {
         let request = Request::builder()
             .method("GET")
             .uri(uri)
@@ -609,39 +614,6 @@ async fn access_control_fails_closed_for_unclassified_routes() {
             .expect("request");
         let response = gateway.handle(request).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
-    }
-    assert_eq!(hits.load(Ordering::Relaxed), 0);
-}
-
-#[tokio::test]
-async fn access_control_answers_404_for_three_segment_paths() {
-    let hits = Arc::new(AtomicUsize::new(0));
-    let upstream_hits = Arc::clone(&hits);
-    let upstream = spawn_upstream(Router::new().fallback(any(move || {
-        let upstream_hits = Arc::clone(&upstream_hits);
-        async move {
-            upstream_hits.fetch_add(1, Ordering::Relaxed);
-            StatusCode::OK
-        }
-    })))
-    .await;
-    let resolver = Arc::new(FixedPrincipalResolver::valid());
-    let authorizer = Arc::new(RecordingAuthorizer::new(AuthorizationDecision::Allow));
-    let gateway = gateway_with_access_control(upstream.url.clone(), resolver, authorizer);
-
-    for (method, uri) in [
-        ("PUT", "/owner-a/run-42/queue"),
-        ("POST", "/owner-a/run-42/queue"),
-        ("GET", "/owner-a/run-42/queue"),
-    ] {
-        let request = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header(AUTHORIZATION, "Bearer valid-token")
-            .body(Body::empty())
-            .expect("request");
-        let response = gateway.handle(request).await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
     }
     assert_eq!(hits.load(Ordering::Relaxed), 0);
 }

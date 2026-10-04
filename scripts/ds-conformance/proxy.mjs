@@ -23,7 +23,7 @@ function toUpstream(path) {
   if (path.startsWith(SUITE_STREAM_PREFIX)) {
     return `/${bucket}/${path.slice(SUITE_STREAM_PREFIX.length)}`;
   }
-  return path.startsWith("/v1/") ? `/${bucket}/${path.slice(4)}` : path;
+  return path;
 }
 
 function fromUpstream(location) {

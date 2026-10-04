@@ -135,16 +135,13 @@ impl StreamStateMachine {
         after: Option<&BucketStreamId>,
         max: usize,
     ) -> Vec<BucketStreamId> {
-        fn key(id: &BucketStreamId) -> (&str, &str) {
-            (id.bucket_id.as_str(), id.stream_id.as_str())
-        }
         let mut ids = self
             .registry
             .slots()
             .map(|slot| &slot.metadata.stream_id)
-            .filter(|id| after.is_none_or(|after| key(id) > key(after)))
+            .filter(|id| after.is_none_or(|after| super::compare_stream_ids(id, after).is_gt()))
             .collect::<Vec<_>>();
-        ids.sort_unstable_by(|left, right| key(left).cmp(&key(right)));
+        ids.sort_unstable_by(|left, right| super::compare_stream_ids(left, right));
         ids.truncate(max);
         ids.into_iter().cloned().collect()
     }
