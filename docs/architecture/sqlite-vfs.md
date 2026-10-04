@@ -141,6 +141,10 @@ unless an attach racing the recreate claimed under the old id (§6, wrong stream
    sidecar is still stamped with the old incarnation, so the next attach discards whatever this one
    wrote and rebuilds from the recreated stream (step 2). A recreate that breaks catch-up first (a
    read beyond the new stream's end, a frame that does not decode) fails the attach the same way.
+   If the replay up to the claim reaches a newer owner's claim (a higher epoch, which the server
+   accepts from this producer only after ours), the attach fails as fenced and the application
+   retries it: this owner is already fenced, and a snapshot it took would record an epoch below
+   the highest one claimed before it (§4.2).
    `HEAD` is a leader read and incarnations never repeat (unique per group from feature level 1),
    so a match means every read and the claim in between hit that incarnation. Then, if attach
    wrote the db file, fsyncs it; writes the sidecar (with the incarnation), and swaps the path's

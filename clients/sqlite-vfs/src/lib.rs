@@ -1610,8 +1610,8 @@ enum Claimed {
     Fenced(Option<u64>),
 }
 
-/// Appends a claim at (`epoch`, seq 0) and verifies that the frame ending at the answered offset
-/// is ours. A 2xx alone proves nothing: two owners claiming the same epoch both get one, the
+/// Appends a claim at (`epoch`, seq 0) and verifies our claim among the frames read back (see
+/// `find_claim`). A 2xx alone proves nothing: two owners claiming the same epoch both get one, the
 /// second as a duplicate of the first's receipt. The nonce makes our claim's bytes unique.
 ///
 /// Offsets are opaque, so the claim's start is not computed from its end: `from` is a frame
@@ -1835,9 +1835,11 @@ unsafe fn sync(
     let producer = producer_id(incarnation);
     let (epoch, claimed) = claim(url, &producer, applier.epoch + 1, pos)?;
     unsafe { catch_up(url, pos, Some(claimed.as_str()), applier)? };
-    // The replay may run past our claim into a newer owner's (a lower epoch than ours is refused
-    // by the server, so a higher one landed after it): this owner is already fenced, and a
-    // snapshot it took would record an epoch below the highest claimed before it.
+    // The replay may run past our claim into a higher one: another owner claimed meanwhile
+    // (normally after ours, as the server refuses a lower epoch from this producer; a stray claim
+    // under a deleted incarnation's producer is not epoch-fenced and may precede it). Either way
+    // this owner is fenced, and a snapshot it took would record an epoch below the highest
+    // claimed before it.
     if applier.epoch > epoch {
         return Err(Fail::Other(format!(
             "fenced: another owner claimed epoch {} during attach; attach again",
