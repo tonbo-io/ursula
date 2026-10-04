@@ -886,9 +886,12 @@ fn stream_ttl_renewal_due(stream: &StreamMetadata, now_ms: u64) -> bool {
     now_ms.saturating_sub(stream.last_ttl_touch_at_ms) >= renewal_interval_ms
 }
 
+/// Renewal never moves expiry earlier: `now_ms` comes from whichever node
+/// proposed the command, and a forwarding node with a slow clock must not
+/// shorten a stream's life.
 fn renew_stream_ttl(stream: &mut StreamMetadata, now_ms: u64) {
     if stream.stream_ttl_seconds.is_some() && stream.stream_expires_at_ms.is_none() {
-        stream.last_ttl_touch_at_ms = now_ms;
+        stream.last_ttl_touch_at_ms = stream.last_ttl_touch_at_ms.max(now_ms);
     }
 }
 

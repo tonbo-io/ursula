@@ -27,7 +27,7 @@ Response headers include:
 | `Stream-Closed` | Present and `true` if the stream is closed. |
 | `Stream-Snapshot-Offset` | Present if a snapshot exists, showing its offset. |
 | `Stream-Incarnation` | An opaque token for this incarnation of the stream. It changes when the stream is deleted and recreated at the same URL; compare it only for equality. |
-| `Stream-TTL` | Remaining TTL in seconds (if a TTL was set). |
+| `Stream-TTL` | The configured TTL in seconds (if a TTL was set). This is the sliding window length, not the time remaining. `HEAD` does not renew it. |
 | `Stream-Expires-At` | Expiration timestamp (if set). |
 | `Cache-Control` | `no-store`. |
 
