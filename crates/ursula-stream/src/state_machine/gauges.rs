@@ -220,7 +220,6 @@ mod tests {
             producer: None,
             stream_ttl_seconds: ttl,
             stream_expires_at_ms: None,
-            attrs: None,
             now_ms: T0,
         });
         assert!(

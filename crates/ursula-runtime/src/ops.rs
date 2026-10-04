@@ -90,13 +90,6 @@ macro_rules! runtime_operations {
                 handle { call head_stream(engine, metrics, request, placement) }
                 client { pub stream fn head_stream }
             }
-            op GetStreamAttrs {
-                fields { request: GetStreamAttrsRequest }
-                reply { response_tx: GetStreamAttrsResponse }
-                guard { none }
-                handle { call get_stream_attrs(engine, metrics, request, placement) }
-                client { pub stream fn get_stream_attrs }
-            }
             op ReadStream {
                 fields { request: ReadStreamRequest }
                 reply { response_tx: ReadStreamResponse }
@@ -152,13 +145,6 @@ macro_rules! runtime_operations {
                 handle { call read_snapshot(engine, metrics, request, placement) }
                 client { pub stream fn read_snapshot }
             }
-            op DeleteSnapshot {
-                fields { request: DeleteSnapshotRequest }
-                reply { response_tx: () }
-                guard { none }
-                handle { call delete_snapshot(engine, metrics, request, placement) }
-                client { pub stream fn delete_snapshot }
-            }
             op BootstrapStream {
                 fields { request: BootstrapStreamRequest }
                 reply { response_tx: BootstrapStreamResponse }
@@ -204,13 +190,6 @@ macro_rules! runtime_operations {
                     )
                 }
                 client { pub stream fn close_stream }
-            }
-            op UpdateStreamAttrs {
-                fields { request: UpdateStreamAttrsRequest }
-                reply { response_tx: UpdateStreamAttrsResponse }
-                guard { none }
-                handle { call update_stream_attrs(engine, metrics, request, placement) }
-                client { pub stream fn update_stream_attrs }
             }
             op DeleteStream {
                 fields { request: DeleteStreamRequest }

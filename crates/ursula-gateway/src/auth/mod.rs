@@ -95,7 +95,6 @@ pub enum Action {
     Delete,
     PublishSnapshot,
     ReadSnapshot,
-    DeleteSnapshot,
     AdministerBucket,
 }
 

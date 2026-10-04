@@ -21,7 +21,6 @@ use super::StreamSnapshotEntry;
 use super::StreamSnapshotError;
 use super::StreamStateMachine;
 use super::compare_stream_ids;
-use super::normalize_stream_attrs;
 
 impl StreamStateMachine {
     pub fn integrity_snapshot(
@@ -57,7 +56,6 @@ impl StreamStateMachine {
                 let producer_states = producer_snapshot(&slot.producers);
                 StreamSnapshotEntry {
                     metadata,
-                    attrs: slot.attrs.clone(),
                     hot_start_offset: self.hot_start_offset(&stream_id),
                     payload,
                     hot_segments: slot.hot_buffer.hot_segments(),
@@ -325,7 +323,6 @@ impl StreamStateMachine {
             hot_buffer.restore_append_starts(entry.hot_append_starts);
             let slot = StreamSlot {
                 metadata: entry.metadata,
-                attrs: normalize_stream_attrs(entry.attrs),
                 hot_buffer,
                 cold: StreamColdState::restore(
                     // F18 step 2: Lb1 derives coverage from the hot buffer and

@@ -40,7 +40,6 @@ fn create(machine: &mut StreamStateMachine, id: &str, now_ms: u64) {
         producer: None,
         stream_ttl_seconds: None,
         stream_expires_at_ms: None,
-        attrs: None,
         now_ms,
     });
     assert!(
@@ -116,7 +115,6 @@ fn publish_snapshot(machine: &mut StreamStateMachine, id: &str, offset: u64) -> 
         snapshot_offset: offset,
         content_type: OCTET.to_owned(),
         payload: bytes::Bytes::from_static(b"state"),
-        expected_digest: None,
         now_ms: 0,
     })
 }

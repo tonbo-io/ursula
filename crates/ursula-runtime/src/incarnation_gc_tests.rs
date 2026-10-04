@@ -307,7 +307,6 @@ async fn incarnation_scoped_stream_gc_reclaims_external_payloads() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            attrs: None,
             now_ms: 0,
         })
         .await

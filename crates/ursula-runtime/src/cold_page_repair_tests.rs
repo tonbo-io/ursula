@@ -705,7 +705,6 @@ fn create_external_req(
         producer: None,
         stream_ttl_seconds: None,
         stream_expires_at_ms: None,
-        attrs: None,
         now_ms: 0,
     }
 }
@@ -823,7 +822,6 @@ async fn retention_gc_never_touches_the_boundary_page() {
                 snapshot_offset: 4,
                 content_type: DEFAULT_CONTENT_TYPE.to_owned(),
                 payload: bytes::Bytes::from_static(b"state"),
-                expected_digest: None,
                 cold_body: None,
                 now_ms: 0,
             },

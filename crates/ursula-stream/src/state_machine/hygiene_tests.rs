@@ -30,7 +30,6 @@ fn machine_with_json_stream(name: &str) -> (StreamStateMachine, BucketStreamId) 
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            attrs: None,
             now_ms: 0,
         }),
         StreamResponse::Created { .. }
@@ -54,7 +53,6 @@ fn retention_shrinks_record_index_and_message_records() {
             snapshot_offset: retained,
             content_type: JSON.to_owned(),
             payload: bytes::Bytes::from_static(b"{}"),
-            expected_digest: None,
             now_ms: 1,
         }),
         StreamResponse::SnapshotPublished { .. }
@@ -93,7 +91,6 @@ fn rejected_retention_leaves_record_index_untouched() {
             snapshot_offset: 20,
             content_type: JSON.to_owned(),
             payload: bytes::Bytes::from_static(b"{}"),
-            expected_digest: None,
             now_ms: 1,
         }),
         StreamResponse::SnapshotPublished { .. }
@@ -166,7 +163,6 @@ fn compaction_shrinks_cold_ref_vectors() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            attrs: None,
             now_ms: 0,
         }),
         StreamResponse::Created { .. }

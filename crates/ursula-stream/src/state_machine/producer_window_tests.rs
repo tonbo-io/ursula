@@ -40,7 +40,6 @@ fn create(machine: &mut StreamStateMachine, name: &str, content_type: &str) -> B
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            attrs: None,
             now_ms: 0,
         }),
         StreamResponse::Created { .. }
@@ -293,7 +292,6 @@ fn failed_transaction_evicts_nothing_from_any_producer() {
                 producer: None,
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
-                attrs: None,
                 now_ms: 0,
             }),
             StreamResponse::Created { .. }
@@ -757,7 +755,6 @@ fn bootstrap_stays_honest_after_external_collapse() {
             snapshot_offset: 10,
             content_type: OCTET.to_owned(),
             payload: Bytes::from_static(b"s"),
-            expected_digest: None,
             now_ms: 1,
         }),
         StreamResponse::SnapshotPublished { .. }
@@ -773,7 +770,6 @@ fn bootstrap_stays_honest_after_external_collapse() {
             snapshot_offset: 30,
             content_type: OCTET.to_owned(),
             payload: Bytes::from_static(b"s"),
-            expected_digest: None,
             now_ms: 1,
         }),
         StreamResponse::SnapshotPublished { .. }
@@ -842,7 +838,6 @@ fn bootstrap_is_partial_when_the_cold_frontier_regressed_below_the_seal_point() 
             snapshot_offset: 10,
             content_type: OCTET.to_owned(),
             payload: Bytes::from_static(b"s"),
-            expected_digest: None,
             now_ms: 1,
         }),
         StreamResponse::SnapshotPublished { .. }

@@ -9,7 +9,6 @@ use ursula_stream::ColdChunkRef;
 use ursula_stream::ColdFlushPressure;
 use ursula_stream::ExternalPayloadRef;
 use ursula_stream::ProducerRequest;
-use ursula_stream::StreamAttrs;
 use ursula_stream::StreamErrorCode;
 use ursula_stream::StreamIntegritySnapshot;
 use ursula_stream::StreamReadPlan;
@@ -35,7 +34,6 @@ pub struct CreateStreamRequest {
     pub producer: Option<ProducerRequest>,
     pub stream_ttl_seconds: Option<u64>,
     pub stream_expires_at_ms: Option<u64>,
-    pub attrs: Option<StreamAttrs>,
     pub now_ms: u64,
 }
 
@@ -51,7 +49,6 @@ pub struct CreateStreamExternalRequest {
     pub producer: Option<ProducerRequest>,
     pub stream_ttl_seconds: Option<u64>,
     pub stream_expires_at_ms: Option<u64>,
-    pub attrs: Option<StreamAttrs>,
     pub now_ms: u64,
 }
 
@@ -71,7 +68,6 @@ impl CreateStreamExternalRequest {
             producer: request.producer,
             stream_ttl_seconds: request.stream_ttl_seconds,
             stream_expires_at_ms: request.stream_expires_at_ms,
-            attrs: request.attrs,
             now_ms: request.now_ms,
         }
     }
@@ -94,7 +90,6 @@ impl CreateStreamRequest {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            attrs: None,
             now_ms: 0,
         }
     }
@@ -149,32 +144,6 @@ pub struct HeadStreamResponse {
     /// forwarded by older followers decodable.
     #[serde(default)]
     pub created_at_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GetStreamAttrsRequest {
-    pub stream_id: BucketStreamId,
-    pub now_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GetStreamAttrsResponse {
-    pub placement: ShardPlacement,
-    pub attrs: Option<StreamAttrs>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UpdateStreamAttrsRequest {
-    pub stream_id: BucketStreamId,
-    pub attrs: Option<StreamAttrs>,
-    pub now_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UpdateStreamAttrsResponse {
-    pub placement: ShardPlacement,
-    pub changed: bool,
-    pub group_commit_index: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -405,7 +374,6 @@ pub struct PublishSnapshotRequest {
     pub content_type: String,
     /// Inline body; empty when `cold_body` is set.
     pub payload: Bytes,
-    pub expected_digest: Option<String>,
     /// A body staged as a cold-tier object (feature level 5, bounded-state
     /// F16). Proposed as `PublishSnapshotExternal`.
     pub cold_body: Option<ColdSnapshotBody>,
@@ -531,13 +499,6 @@ pub struct ReadSnapshotResponse {
     pub object: Option<ExternalPayloadRef>,
     pub up_to_date: bool,
     pub record_range: Option<StreamRecordRange>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeleteSnapshotRequest {
-    pub stream_id: BucketStreamId,
-    pub snapshot_offset: u64,
-    pub now_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

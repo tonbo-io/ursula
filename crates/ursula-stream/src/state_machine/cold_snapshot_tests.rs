@@ -28,7 +28,6 @@ fn machine_at(level: u32) -> StreamStateMachine {
         producer: None,
         stream_ttl_seconds: None,
         stream_expires_at_ms: None,
-        attrs: None,
         now_ms: 1,
     });
     assert!(
@@ -54,7 +53,6 @@ fn publish_cold(
             object_size: 64 << 20,
         },
         digest: digest.to_owned(),
-        expected_digest: None,
         now_ms: 10,
     })
 }

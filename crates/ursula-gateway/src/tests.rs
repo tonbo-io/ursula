@@ -367,12 +367,6 @@ fn request_classifier_maps_durable_stream_routes_to_bucket_resources() {
         ("HEAD", "/owner-a/orders", Action::Head, Some("orders")),
         ("DELETE", "/owner-a/orders", Action::Delete, Some("orders")),
         (
-            "PUT",
-            "/owner-a/orders/attrs",
-            Action::Update,
-            Some("orders"),
-        ),
-        (
             "GET",
             "/owner-a/orders/snapshot",
             Action::ReadSnapshot,

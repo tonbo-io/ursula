@@ -342,7 +342,6 @@ async fn retain_past_last_pack_reference(level: u32) -> (Arc<ColdStore>, String)
             snapshot_offset: 4,
             content_type: DEFAULT_CONTENT_TYPE.to_owned(),
             payload: Bytes::from_static(b"state"),
-            expected_digest: None,
             cold_body: None,
             now_ms: crate::runtime::unix_time_ms(),
         })
@@ -399,7 +398,6 @@ async fn applying_flush_cold_drops_cached_pages_of_the_flushed_range() {
         producer: None,
         stream_ttl_seconds: None,
         stream_expires_at_ms: None,
-        attrs: None,
         now_ms: 0,
     };
     engine

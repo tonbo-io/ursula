@@ -1,4 +1,4 @@
-//! Bucket/stream lifecycle: create, close, delete, attrs, and TTL expiry.
+//! Bucket/stream lifecycle: create, close, delete, and TTL expiry.
 
 use super::AppendStreamInput;
 use super::BucketStreamId;
@@ -7,13 +7,11 @@ use super::CreateExternalStreamInput;
 use super::CreateStreamInput;
 use super::HashMap;
 use super::HotBuffer;
-use super::MAX_STREAM_ATTRS_BYTES;
 use super::ObjectPayloadRef;
 use super::ProducerAppendRecord;
 use super::ProducerReceipt;
 use super::ProducerRequest;
 use super::ProducerState;
-use super::StreamAttrs;
 use super::StreamErrorCode;
 use super::StreamErrorContext;
 use super::StreamIntegrity;
@@ -23,7 +21,6 @@ use super::StreamSlot;
 use super::StreamStateMachine;
 use super::StreamStatus;
 use super::build_record_index;
-use super::normalize_stream_attrs;
 use super::renew_stream_ttl;
 use super::stream_is_expired;
 use super::validate_bucket_id;
@@ -82,11 +79,7 @@ impl StreamStateMachine {
     }
 
     pub(super) fn create_stream(&mut self, input: CreateStreamInput) -> StreamResponse {
-        let attrs = normalize_stream_attrs(input.attrs.clone());
         if let Err(response) = self.validate_stream_scope(&input.stream_id) {
-            return response;
-        }
-        if let Err(response) = validate_stream_attrs(attrs.as_ref()) {
             return response;
         }
         if let Err(response) =
@@ -132,7 +125,6 @@ impl StreamStateMachine {
                 && existing.status == status_from_closed(input.close_after)
                 && existing.stream_ttl_seconds == input.stream_ttl_seconds
                 && existing.stream_expires_at_ms == input.stream_expires_at_ms
-                && existing_slot.attrs.as_ref() == attrs.as_ref()
             {
                 return StreamResponse::AlreadyExists {
                     next_offset: existing.tail_offset,
@@ -204,7 +196,6 @@ impl StreamStateMachine {
         let stream_id = input.stream_id.clone();
         let mut slot = StreamSlot {
             metadata,
-            attrs,
             hot_buffer,
             cold: self.new_incarnation_cold_state(created_at_ms),
             message_records: Vec::new(),
@@ -245,14 +236,10 @@ impl StreamStateMachine {
         &mut self,
         input: CreateExternalStreamInput,
     ) -> StreamResponse {
-        let attrs = normalize_stream_attrs(input.attrs.clone());
         if let Err(response) = validate_external_payload_ref(&input.initial_payload) {
             return response;
         }
         if let Err(response) = self.validate_stream_scope(&input.stream_id) {
-            return response;
-        }
-        if let Err(response) = validate_stream_attrs(attrs.as_ref()) {
             return response;
         }
         if let Err(response) =
@@ -300,7 +287,6 @@ impl StreamStateMachine {
                 && existing.status == status_from_closed(input.close_after)
                 && existing.stream_ttl_seconds == input.stream_ttl_seconds
                 && existing.stream_expires_at_ms == input.stream_expires_at_ms
-                && existing_slot.attrs.as_ref() == attrs.as_ref()
             {
                 return StreamResponse::AlreadyExists {
                     next_offset: existing.tail_offset,
@@ -392,7 +378,6 @@ impl StreamStateMachine {
         let stream_id = input.stream_id.clone();
         let mut slot = StreamSlot {
             metadata,
-            attrs,
             hot_buffer: HotBuffer::default(),
             cold,
             message_records: Vec::new(),
@@ -464,40 +449,6 @@ impl StreamStateMachine {
         };
         self.remove_stream_state(stream_id);
         StreamResponse::Deleted
-    }
-
-    pub(super) fn update_stream_attrs(
-        &mut self,
-        stream_id: &BucketStreamId,
-        attrs: Option<StreamAttrs>,
-        now_ms: u64,
-    ) -> StreamResponse {
-        if let Err(response) = self.validate_stream_scope(stream_id) {
-            return response;
-        }
-        if self.expire_stream_if_due(stream_id, now_ms) {
-            return StreamResponse::error(
-                StreamErrorCode::StreamNotFound,
-                format!("stream '{stream_id}' does not exist"),
-            );
-        }
-        let Some(slot) = self.stream_slot(stream_id) else {
-            return StreamResponse::error(
-                StreamErrorCode::StreamNotFound,
-                format!("stream '{stream_id}' does not exist"),
-            );
-        };
-        let attrs = normalize_stream_attrs(attrs);
-        if let Err(response) = validate_stream_attrs(attrs.as_ref()) {
-            return response;
-        }
-        if slot.attrs.as_ref() == attrs.as_ref() {
-            return StreamResponse::AttrsUpdated { changed: false };
-        }
-        self.stream_slot_mut(stream_id)
-            .expect("stream existence checked before attrs mutation")
-            .attrs = attrs;
-        StreamResponse::AttrsUpdated { changed: true }
     }
 
     pub(super) fn touch_stream_access(
@@ -682,29 +633,6 @@ fn status_from_closed(closed: bool) -> StreamStatus {
     } else {
         StreamStatus::Open
     }
-}
-
-fn validate_stream_attrs(attrs: Option<&StreamAttrs>) -> Result<(), StreamResponse> {
-    let Some(attrs) = attrs else {
-        return Ok(());
-    };
-    let encoded_len = serde_json::to_vec(attrs)
-        .map_err(|err| {
-            StreamResponse::error(
-                StreamErrorCode::InvalidStreamAttrs,
-                format!("encode stream attrs JSON: {err}"),
-            )
-        })?
-        .len();
-    if encoded_len > MAX_STREAM_ATTRS_BYTES {
-        return Err(StreamResponse::error(
-            StreamErrorCode::InvalidStreamAttrs,
-            format!(
-                "stream attrs JSON is {encoded_len} bytes; limit is {MAX_STREAM_ATTRS_BYTES} bytes"
-            ),
-        ));
-    }
-    Ok(())
 }
 
 fn validate_retention(

@@ -62,6 +62,9 @@ Every `application/json` stream now follows [JSON message text](/docs/specs/exte
 - **Data-plane bucket quotas.** `PUT /__ursula/quota/{bucket}` is gone from both listeners, and creates and appends no longer answer `429` for a bucket's stream count or retained bytes. The per-group limits were a backstop worth `limit x group_count` cluster-wide. Nothing in Ursula replaces them: the gateway's `--quota-policy` limits request rate, live reads and body size only ([Security](/docs/security)). Cap a tenant's streams or bytes in your own control plane, using `/__ursula/usage`. The `429` with a `producer_limit` body is unchanged.
 - **Bucket lifecycle rules in the extensions specification.** Explicit bucket creation, bucket metadata, stream listing and bucket delete (Sections 1.2 to 1.5) were never implemented and are withdrawn; see [Buckets](/docs/specs/extensions#1-buckets). Removing a bucket stays an operator action ([bucket purge](/docs/operations#tenant-offboarding-bucket-purge)), which permanently fences the bucket ID: later stream creates in it answer `404`.
 
+- **Stream attributes.** `GET` and `PUT /{bucket}/{stream}/attrs` are gone, a `Stream-Attrs` header on create is ignored, and create idempotency no longer compares attributes. Keep application metadata about a stream in your own store.
+- **Snapshot delete, the latest-snapshot redirect and `Stream-Snapshot-Match`.** `DELETE /{bucket}/{stream}/snapshot/{offset}`, which never succeeded, and `GET /{bucket}/{stream}/snapshot`, which redirected (`307`) to the latest snapshot, now answer `405`. To read the latest snapshot, take `Stream-Snapshot-Offset` from `HEAD` and `GET /{bucket}/{stream}/snapshot/{offset}`. A snapshot publish carrying `Stream-Snapshot-Match` answers `400` rather than publishing unconditionally.
+
 ### Fixed
 
 - `/bootstrap` silently dropped bytes after a checkpoint that retention had not followed.
