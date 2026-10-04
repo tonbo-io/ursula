@@ -2102,7 +2102,7 @@ async fn legacy_cross_bucket_pack_is_rewritten_before_bucket_erasure_proof() {
         };
         runtime
             .flush_cold(FlushColdRequest {
-                cold_generation: live_cold_generation(&runtime, &stream).await,
+                cold_generation: live_cold_generation(&runtime, stream).await,
                 stream_id: stream.clone(),
                 chunk,
             })

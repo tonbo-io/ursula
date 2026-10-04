@@ -3779,7 +3779,7 @@ fn flush_and_delete(machine: &mut StreamStateMachine, id: &str) {
         StreamResponse::Appended { .. }
     ));
     assert!(matches!(
-        machine.apply(flush_cold_cmd(&machine, stream(id), 0, 4, "chunk", 4)),
+        machine.apply(flush_cold_cmd(machine, stream(id), 0, 4, "chunk", 4)),
         StreamResponse::ColdFlushed { .. }
     ));
     assert_eq!(
