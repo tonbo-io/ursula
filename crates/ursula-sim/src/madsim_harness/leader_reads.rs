@@ -19,7 +19,6 @@ use super::Arc;
 use super::AtomicU64;
 use super::Body;
 use super::ColdWriteAdmission;
-use super::GroupEngine;
 use super::HttpState;
 use super::MadsimRuntimeRaftNetworkFactory;
 use super::RuntimeConfig;
