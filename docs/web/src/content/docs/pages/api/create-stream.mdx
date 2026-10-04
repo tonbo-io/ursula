@@ -55,7 +55,7 @@ api: "PUT /{bucket}/{stream}"
 | `200` | Stream already exists (idempotent). |
 | `400` | Invalid bucket ID, invalid stream ID (including a reserved name such as `snapshot` under an affinity path), invalid headers, or bad JSON payload. |
 | `404` | The bucket was purged; its ID is permanently fenced. |
-| `409` | Stream already exists with a different content type, closed state or lifetime. |
+| `409` | Stream already exists with a different content type, closed state or lifetime, or `Producer-Seq` is not `0`. |
 
 Response headers include `Location`, `Content-Type`, `Stream-Next-Offset`, and lifetime headers (`Stream-TTL` / `Stream-Expires-At`) when set. `Stream-Closed: true` is set if the create request also closed the stream. `ETag` is set on reads only.
 

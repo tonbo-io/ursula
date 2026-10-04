@@ -50,13 +50,14 @@ api: "POST /{bucket}/{stream}"
 | `204` | Append successful (default success response, no body). |
 | `200` | Append successful with body - returned when a `Producer-Id` was supplied and the append was not deduplicated, so the response carries producer ack headers. |
 | `400` | Empty body without `Stream-Closed: true`, missing content type, invalid JSON or UTF-8, a JSON message nested deeper than 127 levels, or a `Producer-Id` or `Stream-Seq` longer than 256 bytes. |
+| `403` | `Producer-Epoch` is older than the last epoch accepted for this `Producer-Id`. The response's `Producer-Epoch` is the current epoch. |
 | `404` | Stream not found. |
 | `409` | Content type does not match the stream, stream is already closed, `Stream-Seq` not greater than the stored value, or `Producer-Seq` out of order. |
 | `412` | `Stream-Record-Match` did not match the current JSON record tail. |
 | `413` | Body larger than 32 MiB. |
 | `503` | Cold-write backpressure. Retry after the duration in `Retry-After`. |
 
-Response headers include `Stream-Next-Offset` (always). When a `Producer-Id` was supplied, the server echoes the accepted `Producer-Epoch` and `Producer-Seq` so the producer can confirm what was durably recorded. `Stream-Closed: true` is set if this request closed the stream. `ETag` is set on reads only, not on appends.
+Response headers include `Stream-Next-Offset`, except on a duplicate whose receipt has left the stream's receipt window ([exactly-once writes](/docs/concepts/exactly-once-writes#how-dedup-works)). When a `Producer-Id` was supplied, the server echoes the accepted `Producer-Epoch` and `Producer-Seq` so the producer can confirm what was durably recorded. `Stream-Closed: true` is set if this request closed the stream. `ETag` is set on reads only, not on appends.
 
 For an `application/json` stream advertising `json-record-coordinates-v1`, the response also includes `Stream-Record-Start` and `Stream-Record-Next`. A JSON object creates one record, and a top-level array creates one record per element. The returned half-open range identifies exactly the records created by this request.
 
@@ -91,15 +92,7 @@ Ursula validates every JSON body and stores each message as you wrote it, minus 
 
 ## Stream-Seq
 
-`Stream-Seq` is the base protocol's writer sequence, and Ursula enforces it per stream as a compare-and-set:
-
-- The comparison is bytewise, so `"10"` sorts before `"9"`. Use fixed-width values, such as counters zero-padded to 20 digits.
-- The scope is the stream, not a writer: every append that carries the header is compared with the last value accepted on that stream, whoever sent it.
-- A rejected append commits nothing. Its `409` carries `Stream-Next-Offset` at the current tail, so the writer can read only what it missed.
-- Producer deduplication runs first: a retry of an accepted `(Producer-Id, Producer-Epoch, Producer-Seq)` is answered as a duplicate with its original `Stream-Next-Offset`, not `409`. A `409` from `Stream-Seq` uses up no `Producer-Seq`.
-- A creating [`PUT`](/docs/api/create-stream) stores its `Stream-Seq` as the starting value.
-
-To let several writers extend one log, each validating against all of it, read to `Stream-Up-To-Date: true` and send the number of events read as `Stream-Seq`. See [Conditional writes](/docs/concepts/conditional-writes) for that pattern and for publishing committed facts.
+`Stream-Seq` is the base protocol's writer sequence, and Ursula enforces it per stream as a compare-and-set. [Conditional writes](/docs/concepts/conditional-writes#how-stream-seq-is-checked) states how it is checked, including how it interacts with producer deduplication and `PUT`, and gives two patterns: a prefix count, which lets several writers extend one log while each validates against all of it, and publishing committed facts.
 
 <Info>
 See [Record Coordinates](/docs/concepts/record-coordinates) for record ranges, complete-record reads, and the difference between committed record order and client event time.

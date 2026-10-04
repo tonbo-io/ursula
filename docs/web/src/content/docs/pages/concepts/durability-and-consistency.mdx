@@ -35,7 +35,7 @@ or SSE reader, and requests that resolve the tail through `HEAD`
 (`offset=now`, SSE start, and a long-poll's timeout answer) take the same leadership
 confirmation on the leader.
 
-`Stream-Up-To-Date` on each read tells the client whether more committed data exists past `next_offset`. `false` means keep paging.
+`Stream-Up-To-Date: true` on a read means it reached the committed tail. A response without it is partial; keep reading from `Stream-Next-Offset`.
 
 ## Availability and durability (standard layout)
 

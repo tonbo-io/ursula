@@ -605,9 +605,8 @@ Conformance tests SHOULD cover JSON array flattening, concurrent append ordering
 
 ## 7. Ordinary SSE Compatibility
 
-Ordinary SSE behavior, including binary stream handling, is defined by `docs/specs/durable-stream.md`.
+Ordinary SSE behavior is defined by the base protocol. Binary SSE: see Section 9.5.
 
-- For binary streams, ordinary `event: data` payloads are raw base64 text and the response MUST include `stream-sse-data-encoding: base64`.
 - Extension endpoints MUST NOT redefine the payload shape of ordinary binary SSE `event: data` frames unless they document an explicit endpoint-local contract.
 
 ---
@@ -642,7 +641,7 @@ A server that cannot prove the read is linearizable MUST NOT serve it. It answer
 
 A server MAY cap how many stream bytes one response returns. Ursula caps every read response, and every SSE data event, at 8 MiB (8,388,608 bytes).
 
-`max_bytes={n}` on an offset read asks for at most `n` bytes. A value above the server's cap is clamped to it. Ursula ignores a value that is not a decimal integer and applies the cap alone; clients SHOULD send a positive integer. On a live read, `max_bytes` bounds each response or SSE data event. On a record-aware read, Section 6.6 defines `max_bytes` instead.
+`max_bytes={n}` on an offset read asks for at most `n` bytes. A value above the server's cap is clamped to it. Ursula ignores a value that is not a decimal integer and applies the cap alone; clients SHOULD send a positive integer. On a live read, `max_bytes` bounds each response or SSE data event; Ursula raises a smaller value to 1 byte, and to 4 bytes on a text SSE read so an event can hold a whole UTF-8 character. On a record-aware read, Section 6.6 defines `max_bytes` instead.
 
 A response that `max_bytes` or the cap shortened is partial: it MUST NOT carry `Stream-Up-To-Date: true`, and its `Stream-Next-Offset` is the offset just past the returned bytes. Clients continue from `Stream-Next-Offset` until a response carries `Stream-Up-To-Date: true`.
 
@@ -660,4 +659,4 @@ A `live=sse` read of a stream whose content type is neither `text/*` nor `applic
 - Each `event: data` payload MUST be the standard base64 encoding [RFC4648] of a contiguous byte range of the stream, with no JSON envelope. The server MAY split the text across several `data:` lines; the client joins them, removes the line breaks and decodes.
 - Each data event is followed by an `event: control` event whose `streamNextOffset` is the offset just past the decoded bytes.
 
-There is no client opt-in or opt-out: the stream's content type decides the encoding. Section 7 states the same rule for compatibility with the base protocol's SSE.
+There is no client opt-in or opt-out: the stream's content type decides the encoding.

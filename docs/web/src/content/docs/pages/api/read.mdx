@@ -80,12 +80,13 @@ api: "GET /{bucket}/{stream}"
 | Status | Meaning |
 | ------ | ------------------------------------------------------------- |
 | `200` | Data returned. A catch-up read at the tail answers `200` with an empty body and `Stream-Up-To-Date: true`. |
-| `204` | Long-poll only: `timeout_ms` passed without new data. |
+| `204` | Long-poll only: `timeout_ms` passed without new data, or the stream is closed and the read is at its tail (answered at once with `Stream-Closed: true`, which signals end of stream). |
 | `304` | `If-None-Match` matched the response's `ETag`. |
 | `307` | In a cluster, this node could not serve the read as the stream's group leader (a long-poll or SSE read on a follower, or a `consistency=leader` read on a node that lost leadership). `Location` is the same request on the leader. |
 | `400` | Invalid offset, live mode or `consistency`, or `consistency=leader` with `live`. |
 | `404` | Stream not found or expired. |
 | `410` | Requested offset has been trimmed. `Stream-Next-Offset` is the earliest offset still readable. |
+| `416` | Requested offset is beyond the stream's tail. `Stream-Next-Offset` is the tail. |
 | `503` | The group has no known leader, the leader could not confirm its leadership in time (`consistency=leader` and live reads), or this node holds too many live readers. Retry after `Retry-After`. |
 
 Response headers include `Stream-Next-Offset`, `ETag`, `Stream-Up-To-Date`, `Stream-Closed`, and `Content-Type`. Long-poll responses for an open stream also carry `Stream-Cursor`.
@@ -102,8 +103,6 @@ In SSE mode, the server sends:
 
 - **Data events** (`event: data`): stream payload in the `data` field. The response `Stream-Data-Content-Type` header identifies the data payload type (`application/x-ndjson` for JSON streams, the original content type for other streams). SSE `data:` lines are transport lines, not guaranteed message boundaries. JSON clients should buffer until newline before parsing records. For binary streams, data is base64-encoded (controlled by the `Stream-Sse-Data-Encoding` header).
 - **Control events** (`event: control`): JSON metadata including the current offset and stream state.
-
-Ursula sends no heartbeat comments and does not end idle SSE connections.
 
 <RequestExample>
 ```bash Catch-up

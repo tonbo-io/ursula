@@ -122,9 +122,9 @@ JSON streams are validated on the server. Malformed JSON, invalid UTF-8, message
 
 ## Read path
 
-### `Stream-Up-To-Date: false`
+### No `Stream-Up-To-Date` on a read
 
-More committed data exists past this response. Page forward with `Stream-Next-Offset`. Not an error.
+The response is partial (cut by `max_bytes` or the 8 MiB cap). Read on from `Stream-Next-Offset`. Not an error.
 
 ### SSE drops after 30-60 s idle
 

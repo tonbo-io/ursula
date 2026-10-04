@@ -13,17 +13,19 @@ Writers that share a stream sometimes need to say "append this only if the strea
 - The scope is the stream. A value is checked only against earlier values on the same stream, whoever sent them.
 - An append without `Stream-Seq` is not checked and leaves the stored value unchanged.
 - A `PUT` that creates the stream stores its `Stream-Seq` as the starting value without checking it. A `PUT` that finds the stream already there ignores the header.
-- Producer deduplication runs first. A retry of an append that was already accepted from the same `Producer-Id`, `Producer-Epoch` and `Producer-Seq` is answered as a duplicate, with its original `Stream-Next-Offset`, even though its `Stream-Seq` is no longer greater than the stored value. An append rejected with `409` uses up no `Producer-Seq`.
+- Producer deduplication runs first. A retry of an append that was already accepted from the same `Producer-Id`, `Producer-Epoch` and `Producer-Seq` is answered as a duplicate, not `409`, even though its `Stream-Seq` is no longer greater than the stored value. While its receipt is in the stream's receipt window the answer carries its original `Stream-Next-Offset`; a duplicate whose receipt was evicted carries none (see [Exactly-once writes](/docs/concepts/exactly-once-writes#how-dedup-works)). An append rejected with `409` uses up no `Producer-Seq`.
+- A `Stream-Seq` `409` carries neither `Stream-Closed` nor `Producer-Expected-Seq`. A closed stream answers `409` with `Stream-Closed: true`, and an out-of-order `Producer-Seq` answers `409` with `Producer-Expected-Seq`; the recipes below treat those, and any `409` they don't expect, as errors.
 - A value is at most 256 bytes.
 
 ## Prefix-count compare-and-set
 
 This pattern lets several writers extend one log while each commit is validated against the whole log before it.
 
-1. **Commits.** Each append is one commit of one or more events. On an `application/json` stream, `POST` the commit as a JSON array: the elements are committed together, one message per event. Never append an empty commit.
-2. **Read to the tail.** Read with `consistency=leader`, continuing from `Stream-Next-Offset`, until a response carries `Stream-Up-To-Date: true`. Count the events you read; call it `n`.
-3. **Append.** Validate the commit against what you read, then append it with `Stream-Seq` set to `n`, zero-padded to a fixed width. On a new stream, the first commit sends `0`.
-4. **On `409`.** Another writer committed first. Read on from where you stopped until `Stream-Up-To-Date: true`, count the `k` new events, validate again, and retry with `n + k`.
+1. **Every writer, every append.** Every append to the stream, by every writer, carries a prefix-count `Stream-Seq`: an append without it is not checked and leaves the stored value unchanged, so a writer that read only the events before it could still win. Create the stream with a `PUT` without `Stream-Seq`, so no value is stored and the first commit's `0` is accepted; a `PUT` that seeds a value can make the first commit answer `409` on every retry.
+2. **Commits.** Each append is one commit of one or more events. On an `application/json` stream, `POST` the commit as a JSON array: the elements are committed together, one message per event. Never append an empty commit.
+3. **Read to the tail.** Read with `consistency=leader`, continuing from `Stream-Next-Offset`, until a response carries `Stream-Up-To-Date: true`. Count the events you read; call it `n`.
+4. **Append.** Validate the commit against what you read, then append it with `Stream-Seq` set to `n`, zero-padded to a fixed width. On a new stream, the first commit sends `0`.
+5. **On a `Stream-Seq` `409`.** Another writer committed first. Read on from where you stopped until `Stream-Up-To-Date: true`, count the `k` new events, validate again, and retry with `n + k`.
 
 ```bash
 # The writer read 3 events, ending with Stream-Up-To-Date: true.
@@ -47,7 +49,7 @@ When the facts are decided somewhere else, such as a database transaction or a [
 
 1. **Number the commits** in the source of truth, and publish only facts that have committed, in commit order.
 2. **Send both guards** on each append: `Producer-Id`, `Producer-Epoch` and `Producer-Seq` for retries, and `Stream-Seq` set to the commit's number, zero-padded.
-3. **On takeover**, the new owner uses a higher `Producer-Epoch` and starts `Producer-Seq` again at `0`. If it republishes a fact the old owner already published, the `Stream-Seq` check answers `409`, which here means "already published": go on to the next fact with the same `Producer-Seq`.
+3. **On takeover**, the new owner uses a higher `Producer-Epoch` and starts `Producer-Seq` again at `0`. If it republishes a fact the old owner already published, the `Stream-Seq` check answers `409`, which here means "already published": go on to the next fact with the same `Producer-Seq`. Only a `Stream-Seq` `409` means that; a `409` with `Stream-Closed` or `Producer-Expected-Seq` is an error, and skipping on it would lose facts.
 4. **Old owners.** Once the new owner's first append is accepted, appends with the old epoch answer `403`. Before that, an old owner can still publish only facts that committed, and `Stream-Seq` accepts each of those at most once and in commit order.
 5. **Gaps.** If a fact can no longer be published, for example because the source pruned it, append a snapshot or reset marker that tells readers to resynchronize. A fact skipped once can never be appended later, because its number is no longer greater than the stored value.
 
