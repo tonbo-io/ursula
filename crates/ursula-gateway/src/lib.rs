@@ -705,11 +705,9 @@ fn usage_class(action: Action) -> UsageClass {
         }
         Action::Read | Action::Head | Action::ReadSnapshot => UsageClass::Read,
         Action::Tail => UsageClass::LiveRead,
-        Action::Update
-        | Action::Delete
-        | Action::PublishSnapshot
-        | Action::DeleteSnapshot
-        | Action::AdministerBucket => UsageClass::Admin,
+        Action::Update | Action::Delete | Action::PublishSnapshot | Action::AdministerBucket => {
+            UsageClass::Admin
+        }
     }
 }
 
@@ -913,8 +911,6 @@ fn classify_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<C
         }
         [] if *method == Method::HEAD => Action::Head,
         [] if *method == Method::DELETE => Action::Delete,
-        [suffix] if suffix == "attrs" && *method == Method::PUT => Action::Update,
-        [suffix] if suffix == "attrs" && *method == Method::GET => Action::Head,
         [suffix] if suffix == "bootstrap" && *method == Method::GET => Action::Read,
         [suffix] if suffix == "append-batch" && *method == Method::POST => Action::Append,
         [suffix] if suffix == "snapshot" && *method == Method::GET => Action::ReadSnapshot,
@@ -924,9 +920,6 @@ fn classify_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<C
             Action::PublishSnapshot
         }
         [suffix, _offset] if suffix == "snapshot" && *method == Method::GET => Action::ReadSnapshot,
-        [suffix, _offset] if suffix == "snapshot" && *method == Method::DELETE => {
-            Action::DeleteSnapshot
-        }
         [suffix, _offset] if suffix == "retention" && *method == Method::PUT => Action::Update,
         _ => return None,
     };

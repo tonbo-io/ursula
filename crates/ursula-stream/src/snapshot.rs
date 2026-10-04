@@ -9,7 +9,6 @@ use crate::model::ColdGcEntry;
 use crate::model::HotPayloadSegment;
 use crate::model::ObjectPayloadRef;
 use crate::model::ProducerSnapshot;
-use crate::model::StreamAttrs;
 use crate::model::StreamMessageRecord;
 use crate::model::StreamMetadata;
 use crate::model::StreamVisibleSnapshot;
@@ -53,8 +52,6 @@ pub struct SharedColdObjectOwnersSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamSnapshotEntry {
     pub metadata: StreamMetadata,
-    #[serde(default)]
-    pub attrs: Option<StreamAttrs>,
     pub hot_start_offset: u64,
     pub payload: Vec<u8>,
     pub hot_segments: Vec<HotPayloadSegment>,

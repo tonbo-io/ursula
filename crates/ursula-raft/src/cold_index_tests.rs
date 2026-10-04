@@ -185,7 +185,6 @@ async fn openraft_snapshot_with_regressed_frontier_builds_and_installs() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            attrs: None,
             now_ms: 0,
         },
         StreamCommand::Append {

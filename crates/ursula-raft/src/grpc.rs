@@ -42,7 +42,6 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use ursula_runtime::ColdIndexPageCache;
 use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::ColdStoreHandle;
-use ursula_runtime::GetStreamAttrsRequest;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::ReadStreamRequest;
@@ -804,19 +803,6 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 raft_internal_proto::group_read_request_v1::Read::Head(_) => engine
                     .head_stream(
                         HeadStreamRequest {
-                            stream_id,
-                            now_ms: request.now_ms,
-                        },
-                        placement,
-                    )
-                    .await
-                    .map(|response| raft_internal_proto::GroupReadResponseV1 {
-                        ok: true,
-                        payload: encode_wire(&response),
-                    }),
-                raft_internal_proto::group_read_request_v1::Read::GetStreamAttrs(_) => engine
-                    .get_stream_attrs(
-                        GetStreamAttrsRequest {
                             stream_id,
                             now_ms: request.now_ms,
                         },

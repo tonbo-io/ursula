@@ -118,7 +118,6 @@ fn new_group(index: usize, streams_per_group: usize) -> Result<Group> {
                 producer: None,
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
-                attrs: None,
                 now_ms: smx::T0,
             },
             "create stream",

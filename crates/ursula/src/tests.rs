@@ -618,140 +618,6 @@ async fn group_append_transaction_is_atomic_over_http() {
 }
 
 #[tokio::test]
-async fn stream_attrs_can_be_updated_and_read_over_http() {
-    let app = test_router();
-
-    let response = http_put(
-        &app,
-        "/benchcmp/attrs-http",
-        &[(CONTENT_TYPE.as_str(), "text/plain")],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let attrs = json!({
-        "title": "Support session",
-        "metadata": {
-            "agent": { "id": "agent-1", "version": 2 },
-            "purpose": "customer-support"
-        }
-    });
-    let response = http_put(
-        &app,
-        "/benchcmp/attrs-http/attrs",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(attrs.to_string()),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-    let response = http_get(&app, "/benchcmp/attrs-http/attrs").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_str(&response, CONTENT_TYPE), "application/json");
-    let body = body_bytes(response).await;
-    let actual: serde_json::Value = serde_json::from_slice(&body).expect("attrs json");
-    assert_eq!(actual, attrs);
-
-    let response = http_put(
-        &app,
-        "/benchcmp/attrs-http/attrs",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from("{}"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-    let response = http_get(&app, "/benchcmp/attrs-http/attrs").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_bytes(response).await;
-    let actual: serde_json::Value = serde_json::from_slice(&body).expect("attrs json");
-    assert_eq!(actual, json!({}));
-
-    let response = http_put(
-        &app,
-        "/benchcmp/attrs-http",
-        &[(CONTENT_TYPE.as_str(), "text/plain")],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn stream_attrs_can_be_set_when_creating_stream_over_http() {
-    let app = test_router();
-    let attrs = json!({
-        "title": "Created session",
-        "metadata": {
-            "agent": { "id": "agent-create", "version": 2 },
-            "purpose": "create-time"
-        }
-    });
-
-    let response = http_put(
-        &app,
-        "/benchcmp/attrs-create-http",
-        &[
-            (CONTENT_TYPE.as_str(), "text/plain"),
-            ("stream-attrs", &attrs.to_string()),
-        ],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let response = http_get(&app, "/benchcmp/attrs-create-http/attrs").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_bytes(response).await;
-    let actual: serde_json::Value = serde_json::from_slice(&body).expect("attrs json");
-    assert_eq!(actual, attrs);
-}
-
-#[tokio::test]
-async fn stream_attrs_endpoints_return_not_found_for_missing_stream() {
-    let app = test_router();
-
-    let response = http_get(&app, "/benchcmp/attrs-missing/attrs").await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-
-    let response = http_put(
-        &app,
-        "/benchcmp/attrs-missing/attrs",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(r#"{"title":"missing"}"#),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn create_stream_rejects_invalid_stream_attrs_header() {
-    let app = test_router();
-
-    let response = http_put(
-        &app,
-        "/benchcmp/attrs-bad-header",
-        &[
-            (CONTENT_TYPE.as_str(), "text/plain"),
-            ("stream-attrs", "{not json"),
-        ],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-    let response = http_put(
-        &app,
-        "/benchcmp/attrs-bad-header/attrs",
-        &[(CONTENT_TYPE.as_str(), "application/json5")],
-        Body::from(r#"{"title":"json5"}"#),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
 async fn close_only_post_sets_closed_state_and_rejects_later_append() {
     let app = test_router();
 
@@ -4869,13 +4735,6 @@ async fn snapshot_and_bootstrap_routes_follow_extension_semantics() {
         "00000000000000000003"
     );
 
-    let response = http_get(&app, "/benchcmp/snapshot-http/snapshot").await;
-    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-    assert_eq!(
-        header_str(&response, LOCATION),
-        "/benchcmp/snapshot-http/snapshot/00000000000000000003"
-    );
-
     let response = http_get(
         &app,
         "/benchcmp/snapshot-http/snapshot/00000000000000000003",
@@ -4923,13 +4782,6 @@ async fn snapshot_and_bootstrap_routes_follow_extension_semantics() {
     let body = std::str::from_utf8(&body).expect("multipart utf8");
     assert!(body.contains(r#"{"state":"abc"}"#));
     assert!(body.contains("de"));
-
-    let response = http_delete(
-        &app,
-        "/benchcmp/snapshot-http/snapshot/00000000000000000003",
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]
@@ -4954,9 +4806,6 @@ async fn bootstrap_without_snapshot_emits_empty_snapshot_part_and_rejects_live()
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-    let response = http_get(&app, "/benchcmp/bootstrap-nosnapshot/snapshot").await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     let response = http_head(&app, stream_uri).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -5269,7 +5118,7 @@ async fn snapshot_publish_errors_and_overwrite_follow_extension_statuses() {
     let response = http_put(
         &app,
         "/benchcmp/snapshot-errors/snapshot/00000000000000000003",
-        &[(HEADER_STREAM_SNAPSHOT_MATCH, snapshot_digest.as_str())],
+        &[],
         Body::from("abc-state"),
     )
     .await;
@@ -5278,15 +5127,6 @@ async fn snapshot_publish_errors_and_overwrite_follow_extension_statuses() {
         header_str(&response, HEADER_STREAM_SNAPSHOT_DIGEST),
         snapshot_digest
     );
-
-    let response = http_put(
-        &app,
-        "/benchcmp/snapshot-errors/snapshot/00000000000000000003",
-        &[(HEADER_STREAM_SNAPSHOT_MATCH, &"0".repeat(64))],
-        Body::from("abc-state"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
 
     let response = http_put(
         &app,
@@ -5316,13 +5156,6 @@ async fn snapshot_publish_errors_and_overwrite_follow_extension_statuses() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     let response = http_get(
-        &app,
-        "/benchcmp/snapshot-errors/snapshot/00000000000000000003",
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-
-    let response = http_delete(
         &app,
         "/benchcmp/snapshot-errors/snapshot/00000000000000000003",
     )
@@ -6915,8 +6748,14 @@ async fn tenant_buckets_isolate_identical_stream_names() {
     assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "0");
 
     // The snapshot namespace is tenant-scoped as well: tenant-b has none.
-    let response = http_get(&app, "/tenant-b/orders/snapshot").await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = http_head(&app, "/tenant-b/orders").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(HEADER_STREAM_SNAPSHOT_OFFSET)
+            .is_none()
+    );
 }
 
 // #135 data-plane half: committed usage counters aggregated across groups.
@@ -7151,11 +6990,15 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
             .expect("utf8")
             .contains("\"id\":3")
     );
-    // The latest-snapshot URL canonicalizes via 307; follow it like a client.
-    let response = http_get(&restored, "/tenant-a/orders/snapshot").await;
-    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-    let location = header_str(&response, "location").to_owned();
-    let response = http_get(&restored, &location).await;
+    // Read the latest snapshot like a client: its offset comes from HEAD.
+    let response = http_head(&restored, "/tenant-a/orders").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let snapshot_offset = header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET).to_owned();
+    let response = http_get(
+        &restored,
+        &format!("/tenant-a/orders/snapshot/{snapshot_offset}"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_bytes(response).await;
     assert_eq!(&body[..], br#"{"count":2}"#);
@@ -7363,6 +7206,7 @@ async fn purge_endpoint_erases_one_tenant_and_leaves_the_other_intact() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let snapshot_offset = header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET).to_owned();
 
     let response = send(
         &app,
@@ -7389,7 +7233,11 @@ async fn purge_endpoint_erases_one_tenant_and_leaves_the_other_intact() {
     // Tenant A conceals as not-found across streams and snapshots.
     let response = http_get(&app, "/tenant-a/orders?record=0&max_records=1").await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    let response = http_get(&app, "/tenant-a/orders/snapshot").await;
+    let response = http_get(
+        &app,
+        &format!("/tenant-a/orders/snapshot/{snapshot_offset}"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     // Tenant B's identically named stream is untouched.

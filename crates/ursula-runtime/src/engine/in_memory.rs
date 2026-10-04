@@ -39,7 +39,6 @@ use super::GroupColdHotBacklogFuture;
 use super::GroupCompactColdFuture;
 use super::GroupCreateStreamFuture;
 use super::GroupDeferColdGcFuture;
-use super::GroupDeleteSnapshotFuture;
 use super::GroupDeleteStreamFuture;
 use super::GroupEngine;
 use super::GroupEngineCreateFuture;
@@ -48,7 +47,6 @@ use super::GroupEngineFactory;
 use super::GroupEngineMetrics;
 use super::GroupFeatureLevelFuture;
 use super::GroupFlushColdFuture;
-use super::GroupGetStreamAttrsFuture;
 use super::GroupHeadStreamFuture;
 use super::GroupInstallSnapshotFuture;
 use super::GroupPlanColdFlushFuture;
@@ -68,7 +66,6 @@ use super::GroupStateGaugesFuture;
 use super::GroupTidyStreamFuture;
 use super::GroupTidyStreamsFuture;
 use super::GroupTouchStreamAccessFuture;
-use super::GroupUpdateStreamAttrsFuture;
 use super::GroupWriteResponse;
 use crate::cold_index::ColdIndexPageCache;
 use crate::cold_index::ColdIndexPageKey;
@@ -114,13 +111,10 @@ use crate::request::CreateStreamExternalRequest;
 use crate::request::CreateStreamRequest;
 use crate::request::CreateStreamResponse;
 use crate::request::DeferColdGcResponse;
-use crate::request::DeleteSnapshotRequest;
 use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;
 use crate::request::FlushColdRequest;
 use crate::request::FlushColdResponse;
-use crate::request::GetStreamAttrsRequest;
-use crate::request::GetStreamAttrsResponse;
 use crate::request::GroupReadStreamParts;
 use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
@@ -140,8 +134,6 @@ use crate::request::StreamAppendCount;
 use crate::request::TidyStreamsRequest;
 use crate::request::TidyStreamsResponse;
 use crate::request::TouchStreamAccessResponse;
-use crate::request::UpdateStreamAttrsRequest;
-use crate::request::UpdateStreamAttrsResponse;
 use crate::request::WriteHotBacklog;
 use crate::retention_gc::RetentionGcTarget;
 use crate::retention_gc::RetentionGcTracker;
@@ -646,18 +638,6 @@ impl InMemoryGroupEngine {
                         placement,
                         changed,
                         expired,
-                        group_commit_index: self.commit_index,
-                    },
-                ))
-            }
-            StreamResponse::AttrsUpdated { changed } => {
-                if changed {
-                    self.commit_index += 1;
-                }
-                Ok(GroupWriteResponse::UpdateStreamAttrs(
-                    UpdateStreamAttrsResponse {
-                        placement,
-                        changed,
                         group_commit_index: self.commit_index,
                     },
                 ))
@@ -1202,27 +1182,6 @@ impl InMemoryGroupEngine {
                 .record_range(&request.stream_id)
                 .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?,
             created_at_ms: Some(created_at_ms),
-        })
-    }
-
-    pub fn get_stream_attrs_after_access(
-        &mut self,
-        request: &GetStreamAttrsRequest,
-        placement: ShardPlacement,
-    ) -> Result<GetStreamAttrsResponse, GroupEngineError> {
-        if self
-            .state_machine
-            .head_at(&request.stream_id, request.now_ms)
-            .is_none()
-        {
-            return Err(GroupEngineError::stream(
-                StreamErrorCode::StreamNotFound,
-                format!("stream '{}' does not exist", request.stream_id),
-            ));
-        }
-        Ok(GetStreamAttrsResponse {
-            placement,
-            attrs: self.state_machine.stream_attrs(&request.stream_id).cloned(),
         })
     }
 
@@ -2034,35 +1993,6 @@ impl GroupEngine for InMemoryGroupEngine {
         })
     }
 
-    fn delete_snapshot<'a>(
-        &'a mut self,
-        request: DeleteSnapshotRequest,
-        placement: ShardPlacement,
-    ) -> GroupDeleteSnapshotFuture<'a> {
-        Box::pin(async move {
-            self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
-            match self
-                .state_machine
-                .delete_snapshot(&request.stream_id, request.snapshot_offset)
-            {
-                StreamResponse::Error {
-                    code,
-                    message,
-                    next_offset,
-                    context,
-                } => Err(GroupEngineError::stream_with_context(
-                    code,
-                    message,
-                    next_offset,
-                    context,
-                )),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected delete snapshot response: {other:?}"
-                ))),
-            }
-        })
-    }
-
     fn bootstrap_stream<'a>(
         &'a mut self,
         request: BootstrapStreamRequest,
@@ -2138,32 +2068,6 @@ impl GroupEngine for InMemoryGroupEngine {
 
     fn bucket_usage<'a>(&'a mut self, _placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
         Box::pin(async move { Ok(self.state_machine.bucket_usage_report()) })
-    }
-
-    fn get_stream_attrs<'a>(
-        &'a mut self,
-        request: GetStreamAttrsRequest,
-        placement: ShardPlacement,
-    ) -> GroupGetStreamAttrsFuture<'a> {
-        Box::pin(async move {
-            self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
-            self.get_stream_attrs_after_access(&request, placement)
-        })
-    }
-
-    fn update_stream_attrs<'a>(
-        &'a mut self,
-        request: UpdateStreamAttrsRequest,
-        placement: ShardPlacement,
-    ) -> GroupUpdateStreamAttrsFuture<'a> {
-        Box::pin(async move {
-            match self.apply_committed_write(GroupWriteCommand::from(request), placement)? {
-                GroupWriteResponse::UpdateStreamAttrs(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected update stream attrs write response: {other:?}"
-                ))),
-            }
-        })
     }
 
     fn close_stream<'a>(
@@ -2731,7 +2635,6 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::PublishSnapshotExternal { stream_id, .. }
         | StreamCommand::AdvanceRetention { stream_id, .. }
         | StreamCommand::TouchStreamAccess { stream_id, .. }
-        | StreamCommand::UpdateStreamAttrs { stream_id, .. }
         | StreamCommand::FlushCold { stream_id, .. }
         | StreamCommand::CompactCold { stream_id, .. }
         | StreamCommand::Close { stream_id, .. }

@@ -55,13 +55,10 @@ use crate::request::CreateStreamExternalRequest;
 use crate::request::CreateStreamRequest;
 use crate::request::CreateStreamResponse;
 use crate::request::DeferColdGcResponse;
-use crate::request::DeleteSnapshotRequest;
 use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;
 use crate::request::FlushColdRequest;
 use crate::request::FlushColdResponse;
-use crate::request::GetStreamAttrsRequest;
-use crate::request::GetStreamAttrsResponse;
 use crate::request::GroupReadStreamParts;
 use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
@@ -80,8 +77,6 @@ use crate::request::SetFeatureLevelRequest;
 use crate::request::SetFeatureLevelResponse;
 use crate::request::TidyStreamsRequest;
 use crate::request::TidyStreamsResponse;
-use crate::request::UpdateStreamAttrsRequest;
-use crate::request::UpdateStreamAttrsResponse;
 use crate::rt::sync::Semaphore;
 use crate::rt::sync::mpsc;
 use crate::rt::sync::oneshot;
@@ -705,25 +700,6 @@ impl CoreWorker {
         response
     }
 
-    pub(crate) async fn delete_snapshot(
-        group: &mut Box<dyn GroupEngine>,
-        metrics: Arc<RuntimeMetricsInner>,
-        request: DeleteSnapshotRequest,
-        placement: ShardPlacement,
-    ) -> Result<(), RuntimeError> {
-        let exec_started_at = Instant::now();
-        let response = group
-            .delete_snapshot(request, placement)
-            .await
-            .map_err(|err| RuntimeError::group_engine(placement, err));
-        metrics.record_group_engine_exec(
-            placement.core_id,
-            placement.raft_group_id,
-            elapsed_ns(exec_started_at),
-        );
-        response
-    }
-
     pub(crate) async fn bootstrap_stream(
         group: &mut Box<dyn GroupEngine>,
         metrics: Arc<RuntimeMetricsInner>,
@@ -1322,51 +1298,6 @@ impl CoreWorker {
             elapsed_ns(exec_started_at),
         );
         response
-    }
-
-    pub(crate) async fn get_stream_attrs(
-        group: &mut Box<dyn GroupEngine>,
-        metrics: Arc<RuntimeMetricsInner>,
-        request: GetStreamAttrsRequest,
-        placement: ShardPlacement,
-    ) -> Result<GetStreamAttrsResponse, RuntimeError> {
-        let exec_started_at = Instant::now();
-        let response = group
-            .get_stream_attrs(request, placement)
-            .await
-            .map_err(|err| RuntimeError::group_engine(placement, err));
-        metrics.record_group_engine_exec(
-            placement.core_id,
-            placement.raft_group_id,
-            elapsed_ns(exec_started_at),
-        );
-        response
-    }
-
-    pub(crate) async fn update_stream_attrs(
-        group: &mut Box<dyn GroupEngine>,
-        metrics: Arc<RuntimeMetricsInner>,
-        request: UpdateStreamAttrsRequest,
-        placement: ShardPlacement,
-    ) -> Result<UpdateStreamAttrsResponse, RuntimeError> {
-        let started_at = Instant::now();
-        let response = group
-            .update_stream_attrs(request, placement)
-            .await
-            .map_err(|err| RuntimeError::group_engine(placement, err))?;
-        metrics.record_group_engine_exec(
-            placement.core_id,
-            placement.raft_group_id,
-            elapsed_ns(started_at),
-        );
-        if response.changed {
-            metrics.record_applied_mutation(
-                placement.core_id,
-                placement.raft_group_id,
-                elapsed_ns(started_at),
-            );
-        }
-        Ok(response)
     }
 
     pub(crate) async fn snapshot_group(

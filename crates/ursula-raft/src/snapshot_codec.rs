@@ -21,7 +21,6 @@ use ursula_stream::ProducerAppendRecord;
 use ursula_stream::ProducerReceipt;
 use ursula_stream::ProducerSnapshot;
 use ursula_stream::SharedColdObjectOwnersSnapshot;
-use ursula_stream::StreamAttrs;
 use ursula_stream::StreamIntegritySnapshot;
 use ursula_stream::StreamMessageRecord;
 use ursula_stream::StreamMetadata;
@@ -307,11 +306,6 @@ fn stream_to_proto(
         .unwrap_or_default();
     Ok(proto::StreamSnapshotEntryV1 {
         metadata: Some(metadata_to_proto(entry.metadata)),
-        attrs_json: entry
-            .attrs
-            .map(|attrs| serde_json::to_vec(&attrs).map(Bytes::from))
-            .transpose()
-            .map_err(|err| SnapshotStoreError::Serialize(format!("stream attrs: {err}")))?,
         hot_start_offset: entry.hot_start_offset,
         payload: entry.payload.into(),
         hot_segments: entry
@@ -393,11 +387,6 @@ fn stream_from_proto(
         .map_err(|err| SnapshotStoreError::Deserialize(format!("record index: {err:?}")))?;
     Ok(StreamSnapshotEntry {
         metadata: metadata_from_proto(required(entry.metadata, "snapshot stream metadata")?)?,
-        attrs: entry
-            .attrs_json
-            .map(|bytes| serde_json::from_slice::<StreamAttrs>(&bytes))
-            .transpose()
-            .map_err(|err| SnapshotStoreError::Deserialize(format!("stream attrs: {err}")))?,
         hot_start_offset: entry.hot_start_offset,
         payload: entry.payload.to_vec(),
         hot_segments: entry
@@ -840,7 +829,6 @@ mod tests {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            attrs: None,
             now_ms: 1,
         });
         for seq in 0..1_100u64 {
@@ -924,7 +912,6 @@ mod tests {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            attrs: None,
             now_ms: 1,
         });
         let record = format!("\"{}\"\n", "x".repeat(997));
@@ -1021,7 +1008,6 @@ mod tests {
                 producer: None,
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
-                attrs: None,
                 now_ms: 1,
             });
             for index in 0..4u64 {
@@ -1297,7 +1283,6 @@ mod tests {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            attrs: None,
             now_ms: 1,
         });
         let object = ursula_stream::ExternalPayloadRef {
@@ -1311,7 +1296,6 @@ mod tests {
             content_type: "application/octet-stream".to_owned(),
             object: object.clone(),
             digest: "d".to_owned(),
-            expected_digest: None,
             now_ms: 2,
         });
         let entry = machine.snapshot().streams.remove(0);

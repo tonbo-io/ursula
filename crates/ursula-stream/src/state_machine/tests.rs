@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use proptest::collection::vec;
 use proptest::prelude::*;
-use serde_json::json;
 
 use super::persist::message_records_cover_retained_suffix;
 use super::*;
@@ -208,7 +207,7 @@ fn create_bucket(machine: &mut StreamStateMachine) {
 }
 
 /// Overridable arguments for [`create_cmd`]; defaults mirror the most common
-/// inline literal (octet-stream, empty payload, no TTL/attrs, `now_ms: 0`).
+/// inline literal (octet-stream, empty payload, no TTL, `now_ms: 0`).
 #[derive(Clone)]
 struct Create {
     content_type: &'static str,
@@ -217,7 +216,6 @@ struct Create {
     stream_seq: Option<String>,
     ttl_seconds: Option<u64>,
     expires_at_ms: Option<u64>,
-    attrs: Option<StreamAttrs>,
     now_ms: u64,
 }
 
@@ -230,7 +228,6 @@ impl Default for Create {
             stream_seq: None,
             ttl_seconds: None,
             expires_at_ms: None,
-            attrs: None,
             now_ms: 0,
         }
     }
@@ -246,7 +243,6 @@ fn create_cmd(stream_id: BucketStreamId, args: Create) -> StreamCommand {
         producer: None,
         stream_ttl_seconds: args.ttl_seconds,
         stream_expires_at_ms: args.expires_at_ms,
-        attrs: args.attrs,
         now_ms: args.now_ms,
     }
 }
@@ -300,14 +296,6 @@ fn delete_cmd(stream_id: BucketStreamId) -> StreamCommand {
     StreamCommand::DeleteStream { stream_id }
 }
 
-fn update_attrs_cmd(stream_id: BucketStreamId, attrs: Option<StreamAttrs>) -> StreamCommand {
-    StreamCommand::UpdateStreamAttrs {
-        stream_id,
-        attrs,
-        now_ms: 0,
-    }
-}
-
 fn touch_cmd(stream_id: BucketStreamId, now_ms: u64) -> StreamCommand {
     StreamCommand::TouchStreamAccess {
         stream_id,
@@ -328,7 +316,6 @@ fn publish_snapshot_cmd(
         snapshot_offset,
         content_type: content_type.to_owned(),
         payload: bytes::Bytes::copy_from_slice(payload),
-        expected_digest: None,
         now_ms,
     }
 }
@@ -472,20 +459,6 @@ fn create_stream(machine: &mut StreamStateMachine, id: &str) {
         machine.apply(create_cmd(stream(id), Create::default())),
         created(stream(id), 0)
     );
-}
-
-fn attrs(title: &str, purpose: &str) -> StreamAttrs {
-    let metadata = json!({
-        "agent": { "id": "agent-1", "version": 2 },
-        "purpose": purpose
-    })
-    .as_object()
-    .expect("metadata object")
-    .clone();
-    StreamAttrs {
-        title: Some(title.to_owned()),
-        metadata,
-    }
 }
 
 #[test]
@@ -760,127 +733,6 @@ fn empty_integrity() -> StreamIntegritySnapshot {
 }
 
 #[test]
-fn create_stream_stores_stream_attrs_separately() {
-    let mut machine = machine();
-    let attrs = attrs("Support session", "customer-support");
-
-    assert_eq!(
-        machine.apply(create_cmd(stream("attrs"), Create {
-            attrs: Some(attrs.clone()),
-            ..Create::default()
-        })),
-        created(stream("attrs"), 0)
-    );
-
-    assert_eq!(machine.stream_attrs(&stream("attrs")), Some(&attrs));
-    assert!(machine.head(&stream("attrs")).is_some());
-}
-
-#[test]
-fn update_stream_attrs_replaces_existing_attrs() {
-    let mut machine = machine();
-    create_stream(&mut machine, "attrs");
-    let first = attrs("Support session", "customer-support");
-    let second = attrs("Escalated session", "incident-review");
-
-    assert_eq!(
-        machine.apply(update_attrs_cmd(stream("attrs"), Some(first.clone()))),
-        StreamResponse::AttrsUpdated { changed: true }
-    );
-    assert_eq!(machine.stream_attrs(&stream("attrs")), Some(&first));
-
-    assert_eq!(
-        machine.apply(update_attrs_cmd(stream("attrs"), Some(second.clone()))),
-        StreamResponse::AttrsUpdated { changed: true }
-    );
-
-    assert_eq!(machine.stream_attrs(&stream("attrs")), Some(&second));
-}
-
-#[test]
-fn update_stream_attrs_is_allowed_after_stream_is_closed() {
-    let mut machine = machine();
-    create_stream(&mut machine, "attrs-closed");
-    let attrs = attrs("Closed session", "post-close-metadata");
-
-    assert_eq!(
-        machine.apply(close_cmd(stream("attrs-closed"))),
-        StreamResponse::Closed {
-            next_offset: 0,
-            deduplicated: false,
-            producer: None,
-        }
-    );
-    assert_eq!(
-        machine.apply(update_attrs_cmd(
-            stream("attrs-closed"),
-            Some(attrs.clone())
-        )),
-        StreamResponse::AttrsUpdated { changed: true }
-    );
-
-    assert_eq!(machine.stream_attrs(&stream("attrs-closed")), Some(&attrs));
-}
-
-fn oversized_attrs() -> StreamAttrs {
-    let mut attrs = attrs("Oversized", "size-cap");
-    attrs.metadata.insert(
-        "blob".to_owned(),
-        serde_json::Value::String("x".repeat(MAX_STREAM_ATTRS_BYTES + 1)),
-    );
-    attrs
-}
-
-#[test]
-fn create_stream_rejects_oversized_attrs() {
-    let mut machine = machine();
-
-    assert_error_code(
-        machine.apply(create_cmd(stream("attrs-too-big"), Create {
-            attrs: Some(oversized_attrs()),
-            ..Create::default()
-        })),
-        StreamErrorCode::InvalidStreamAttrs,
-    );
-    assert!(machine.head(&stream("attrs-too-big")).is_none());
-}
-
-#[test]
-fn update_stream_attrs_rejects_oversized_attrs() {
-    let mut machine = machine();
-    create_stream(&mut machine, "attrs-cap");
-
-    assert_error_code(
-        machine.apply(update_attrs_cmd(
-            stream("attrs-cap"),
-            Some(oversized_attrs()),
-        )),
-        StreamErrorCode::InvalidStreamAttrs,
-    );
-    assert_eq!(machine.stream_attrs(&stream("attrs-cap")), None);
-}
-
-#[test]
-fn stream_command_decodes_pre_attrs_wal_records() {
-    let command = create_cmd(stream("legacy-wal"), Create {
-        payload: b"abc".to_vec(),
-        now_ms: 7,
-        ..Create::default()
-    });
-    let mut value = serde_json::to_value(&command).expect("encode command");
-    let fields = value
-        .get_mut("CreateStream")
-        .expect("create stream variant")
-        .as_object_mut()
-        .expect("variant object");
-    assert!(fields.remove("attrs").is_some());
-
-    let decoded: StreamCommand =
-        serde_json::from_value(value).expect("decode pre-attrs WAL record");
-    assert_eq!(decoded, command);
-}
-
-#[test]
 fn cold_flush_command_decodes_pre_pack_wal_records() {
     let command = flush_cold_cmd(stream("legacy-cold-wal"), 0, 4, "legacy.bin", 4);
     let mut value = serde_json::to_value(&command).expect("encode cold flush command");
@@ -988,43 +840,6 @@ fn create_stream_is_idempotent_only_when_metadata_matches() {
     assert_error_code(
         machine.apply(create_cmd(stream("s-1"), Create {
             content_type: "text/plain",
-            ..Create::default()
-        })),
-        StreamErrorCode::StreamAlreadyExistsConflict,
-    );
-}
-
-#[test]
-fn create_stream_is_idempotent_only_when_attrs_match() {
-    let mut machine = machine();
-    let first = attrs("Support session", "customer-support");
-    let second = attrs("Escalated session", "incident-review");
-
-    assert_eq!(
-        machine.apply(create_cmd(stream("attrs-idempotent"), Create {
-            attrs: Some(first.clone()),
-            ..Create::default()
-        })),
-        created(stream("attrs-idempotent"), 0)
-    );
-
-    assert_eq!(
-        machine.apply(create_cmd(stream("attrs-idempotent"), Create {
-            attrs: Some(first),
-            ..Create::default()
-        })),
-        StreamResponse::AlreadyExists {
-            next_offset: 0,
-            closed: false,
-            content_type: OCTET.to_owned(),
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
-        }
-    );
-
-    assert_error_code(
-        machine.apply(create_cmd(stream("attrs-idempotent"), Create {
-            attrs: Some(second),
             ..Create::default()
         })),
         StreamErrorCode::StreamAlreadyExistsConflict,
@@ -2409,13 +2224,11 @@ fn hot_start_offset_advances_to_tail_after_full_cold_flush() {
 #[test]
 fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
     let mut machine = machine();
-    let attrs = attrs("Snapshot session", "snapshot-restore");
     assert_eq!(
         machine.apply(create_cmd(stream("snap-open"), Create {
             payload: b"hi".to_vec(),
             stream_seq: Some("0001".to_owned()),
             ttl_seconds: Some(60),
-            attrs: Some(attrs.clone()),
             ..Create::default()
         })),
         created(stream("snap-open"), 2)
@@ -2463,7 +2276,6 @@ fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
     assert_eq!(metadata.last_stream_seq.as_deref(), Some("0002"));
     assert_eq!(metadata.stream_ttl_seconds, Some(60));
     assert_eq!(metadata.stream_expires_at_ms, None);
-    assert_eq!(restored.stream_attrs(&stream("snap-open")), Some(&attrs));
 
     assert_error_at(
         restored.apply(append_cmd(stream("snap-open"), b"bad", Append {
@@ -2544,7 +2356,6 @@ fn snapshot_entry(
             created_at_ms: 0,
             last_ttl_touch_at_ms: 0,
         },
-        attrs: None,
         retained_offset: None,
         hot_start_offset: 0,
         payload,
@@ -4593,7 +4404,6 @@ fn f14g_external_create_at_level_one_keeps_its_payload_in_state_for_gc() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            attrs: None,
             now_ms: 0,
         }),
         StreamResponse::Created { .. }

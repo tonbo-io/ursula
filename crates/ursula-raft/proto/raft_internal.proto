@@ -113,14 +113,14 @@ message GroupReadRequestV1 {
   oneof read {
     HeadStreamReadV1 head = 7;
     ReadStreamReadV1 read_stream = 8;
-    GetStreamAttrsReadV1 get_stream_attrs = 9;
   }
+  // Field 9 was the removed attribute read in the `read` oneof.
+  reserved 9;
+  reserved "get_stream_attrs";
   optional string affinity_key = 10;
 }
 
 message HeadStreamReadV1 {}
-
-message GetStreamAttrsReadV1 {}
 
 message ReadStreamReadV1 {
   uint64 offset = 1;

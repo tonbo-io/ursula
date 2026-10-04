@@ -1,4 +1,4 @@
-//! Read and query paths: heads, attrs, hot/cold accessors, read plans, snapshots, bootstrap.
+//! Read and query paths: heads, hot/cold accessors, read plans, snapshots, bootstrap.
 
 use super::BOOTSTRAP_MAX_UPDATE_BYTES;
 use super::BucketStreamId;
@@ -7,7 +7,6 @@ use super::ColdChunkRef;
 use super::HotPayloadSegment;
 use super::ObjectPayloadRef;
 use super::ProducerRequest;
-use super::StreamAttrs;
 use super::StreamBootstrapPlan;
 use super::StreamErrorCode;
 use super::StreamMessageRecord;
@@ -103,11 +102,6 @@ impl StreamStateMachine {
             }));
         }
         Ok(None)
-    }
-
-    pub fn stream_attrs(&self, stream_id: &BucketStreamId) -> Option<&StreamAttrs> {
-        self.stream_slot(stream_id)
-            .and_then(|slot| slot.attrs.as_ref())
     }
 
     pub fn head_at(&mut self, stream_id: &BucketStreamId, now_ms: u64) -> Option<&StreamMetadata> {

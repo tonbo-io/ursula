@@ -5,7 +5,7 @@
 //!
 //! - [`query`]: read paths — heads, accessors, read plans, snapshots, bootstrap.
 //! - [`append`]: append paths and idempotent producer bookkeeping.
-//! - [`lifecycle`]: bucket/stream create, close, delete, attrs, and TTL expiry.
+//! - [`lifecycle`]: bucket/stream create, close, delete, and TTL expiry.
 //! - [`cold`]: cold-tier flush candidates, GC, retention compaction, snapshot publishing.
 //! - [`flush_planner`]: leader-side flush passes over a derived hot-stream index.
 //! - [`persist`]: snapshot / restore / integrity serialization.
@@ -60,14 +60,12 @@ use crate::model::ColdGcPlanEntry;
 use crate::model::ColdGcTarget;
 use crate::model::ExternalPayloadRef;
 use crate::model::HotPayloadSegment;
-use crate::model::MAX_STREAM_ATTRS_BYTES;
 use crate::model::ObjectPayloadRef;
 use crate::model::ProducerAppendRecord;
 use crate::model::ProducerReceipt;
 use crate::model::ProducerRequest;
 use crate::model::ProducerSnapshot;
 use crate::model::ProducerState;
-use crate::model::StreamAttrs;
 use crate::model::StreamBatchAppend;
 use crate::model::StreamBatchAppendItem;
 use crate::model::StreamBootstrapPlan;
@@ -220,7 +218,6 @@ pub struct StreamStateMachine {
 #[derive(Debug, Clone)]
 struct StreamSlot {
     metadata: StreamMetadata,
-    attrs: Option<StreamAttrs>,
     hot_buffer: HotBuffer,
     cold: StreamColdState,
     message_records: Vec<StreamMessageRecord>,
@@ -556,7 +553,6 @@ impl StreamStateMachine {
                 producer,
                 stream_ttl_seconds,
                 stream_expires_at_ms,
-                attrs,
                 now_ms,
             } => {
                 let response = match canonical_json_record_ends(&content_type, &initial_payload) {
@@ -570,7 +566,6 @@ impl StreamStateMachine {
                         producer,
                         stream_ttl_seconds,
                         stream_expires_at_ms,
-                        attrs,
                         now_ms,
                     }),
                     Err(_) => StreamResponse::error(
@@ -591,7 +586,6 @@ impl StreamStateMachine {
                 producer,
                 stream_ttl_seconds,
                 stream_expires_at_ms,
-                attrs,
                 now_ms,
             } => {
                 let response = self.create_external_stream(CreateExternalStreamInput {
@@ -604,7 +598,6 @@ impl StreamStateMachine {
                     producer,
                     stream_ttl_seconds,
                     stream_expires_at_ms,
-                    attrs,
                     now_ms,
                 });
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
@@ -715,7 +708,6 @@ impl StreamStateMachine {
                 snapshot_offset,
                 content_type,
                 payload,
-                expected_digest,
                 now_ms,
             } => {
                 let response = self.publish_snapshot(
@@ -723,7 +715,6 @@ impl StreamStateMachine {
                     snapshot_offset,
                     content_type,
                     cold::SnapshotBody::Inline(payload.into()),
-                    expected_digest,
                     now_ms,
                 );
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
@@ -735,7 +726,6 @@ impl StreamStateMachine {
                 content_type,
                 object,
                 digest,
-                expected_digest,
                 now_ms,
             } => {
                 if let Err(response) = self.require_feature_level(
@@ -749,7 +739,6 @@ impl StreamStateMachine {
                     snapshot_offset,
                     content_type,
                     cold::SnapshotBody::Object { object, digest },
-                    expected_digest,
                     now_ms,
                 );
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
@@ -770,15 +759,6 @@ impl StreamStateMachine {
                 renew_ttl,
             } => {
                 let response = self.touch_stream_access(&stream_id, now_ms, renew_ttl);
-                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
-                response
-            }
-            StreamCommand::UpdateStreamAttrs {
-                stream_id,
-                attrs,
-                now_ms,
-            } => {
-                let response = self.update_stream_attrs(&stream_id, attrs, now_ms);
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
             }
@@ -830,7 +810,6 @@ struct CreateStreamInput {
     producer: Option<ProducerRequest>,
     stream_ttl_seconds: Option<u64>,
     stream_expires_at_ms: Option<u64>,
-    attrs: Option<StreamAttrs>,
     now_ms: u64,
 }
 
@@ -845,7 +824,6 @@ struct CreateExternalStreamInput {
     producer: Option<ProducerRequest>,
     stream_ttl_seconds: Option<u64>,
     stream_expires_at_ms: Option<u64>,
-    attrs: Option<StreamAttrs>,
     now_ms: u64,
 }
 
@@ -853,10 +831,6 @@ impl CreateStreamInput {
     fn initial_len(&self) -> u64 {
         u64::try_from(self.initial_payload.len()).expect("payload len fits u64")
     }
-}
-
-fn normalize_stream_attrs(attrs: Option<StreamAttrs>) -> Option<StreamAttrs> {
-    attrs.filter(|attrs| !attrs.is_empty())
 }
 
 fn stream_expiry_at_ms(stream: &StreamMetadata) -> Option<u64> {

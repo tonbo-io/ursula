@@ -6,8 +6,8 @@
 //! serde-capable RPC/log types travel as self-describing MessagePack produced
 //! directly by their serde derives — there are no hand-written per-field proto
 //! mirrors. MessagePack (with named struct fields) is used instead of a
-//! positional format because stream attrs embed `serde_json::Value`, which
-//! requires a self-describing wire.
+//! positional format because the wire types rely on `serde(default)` and
+//! `skip_serializing_if`, which require a self-describing wire.
 
 use bytes::Bytes;
 use serde::Serialize;
@@ -22,7 +22,7 @@ use ursula_shard::ShardPlacement;
 /// Encodes a canonical value into its MessagePack wire form.
 ///
 /// Infallible in practice: every wire type is a plain serde derive over owned
-/// data (JSON attrs keep string keys), so serialization cannot fail.
+/// data, so serialization cannot fail.
 pub(crate) fn encode_wire<T: Serialize>(value: &T) -> Bytes {
     rmp_serde::to_vec_named(value)
         .expect("wire value serializes to MessagePack")

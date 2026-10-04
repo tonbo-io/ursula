@@ -252,7 +252,6 @@ mod tests {
                 created_at_ms: now,
                 last_ttl_touch_at_ms: now,
             },
-            attrs: None,
             hot_buffer: HotBuffer::default(),
             cold: StreamColdState::default(),
             message_records: Vec::new(),

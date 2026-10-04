@@ -66,7 +66,9 @@ message SnapshotFooterV1 {}
 
 message StreamSnapshotEntryV1 {
   StreamMetadataV1 metadata = 1;
-  optional bytes attrs_json = 2;
+  // Field 2 held the removed per-stream attribute JSON.
+  reserved 2;
+  reserved "attrs_json";
   uint64 hot_start_offset = 3;
   bytes payload = 4;
   repeated HotPayloadSegmentV1 hot_segments = 5;

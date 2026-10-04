@@ -10,9 +10,9 @@ title: "Durable Streams Extensions"
 
 ## Abstract
 
-This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, optional path affinity, snapshot and bootstrap semantics, multipart bootstrap delivery, mutable stream attributes, Ursula-specific append batching for high-throughput small-event writes, stable record coordinates for JSON streams, a JSON message text rule, and read path parameters.
+This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, optional path affinity, snapshot and bootstrap semantics, multipart bootstrap delivery, Ursula-specific append batching for high-throughput small-event writes, stable record coordinates for JSON streams, a JSON message text rule, and read path parameters.
 
-The snapshot and bootstrap design in sections 2 and 3 was proposed by [Loro](https://loro.dev/); Ursula adopts that design.
+The snapshot and bootstrap design in sections 2 and 3 is based on a proposal by [Loro](https://loro.dev/). Ursula implements part of it: there is no latest-snapshot redirect, no snapshot deletion and no conditional publish.
 
 All base protocol semantics remain in effect. Where this document is silent, the base protocol governs.
 
@@ -24,15 +24,14 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 - [Extension Capability Advertisement](#extension-capability-advertisement)
 - [JSON Message Text](#json-message-text)
-1. [Buckets](#1-buckets)
-2. [Snapshots](#2-snapshots)
-3. [Bootstrap](#3-bootstrap)
-4. [Append Batch](#4-append-batch)
-5. [Stream Attributes](#5-stream-attributes)
-6. [JSON Record Coordinates](#6-json-record-coordinates)
-7. [Ordinary SSE Compatibility](#7-ordinary-sse-compatibility)
-8. [URL Encoding](#8-url-encoding)
-9. [Read Path](#9-read-path)
+- [1. Buckets](#1-buckets)
+- [2. Snapshots](#2-snapshots)
+- [3. Bootstrap](#3-bootstrap)
+- [4. Append Batch](#4-append-batch)
+- [6. JSON Record Coordinates](#6-json-record-coordinates)
+- [7. Ordinary SSE Compatibility](#7-ordinary-sse-compatibility)
+- [8. URL Encoding](#8-url-encoding)
+- [9. Read Path](#9-read-path)
 
 ---
 
@@ -167,7 +166,6 @@ Creates a snapshot at the specified offset. The snapshot represents the material
 **Request Headers:**
 
 - `Content-Type`: The content type of the snapshot blob. Servers MUST store this value and return it on subsequent reads. Defaults to `application/octet-stream`.
-- `Stream-Snapshot-Match`: Optional digest of the currently visible snapshot. If supplied and it does not match, the server MUST reject the publish with `409 Conflict`.
 
 **Response Codes:**
 
@@ -209,19 +207,6 @@ Publishing a new snapshot replaces the previously visible snapshot immediately. 
 
 Snapshot creation MUST NOT block concurrent appends. The snapshot's consistency boundary is `snapshot_offset`. Updates at or beyond that offset MUST NOT be folded into the snapshot.
 
-### 2.3. Read Latest Snapshot
-
-```
-GET {stream_url}/snapshot
-```
-
-Returns a redirect to the latest visible snapshot resource, if one exists.
-
-**Response:**
-
-- `307 Temporary Redirect` when a latest snapshot exists. The `Location` header points to `{stream_url}/snapshot/{snapshot_offset}`.
-- `404 Not Found` when no snapshot exists.
-
 ### 2.4. Snapshot Metadata on HEAD
 
 ```
@@ -239,7 +224,7 @@ Servers SHOULD include `Stream-Snapshot-Offset` when a latest visible snapshot e
 **Semantics:**
 
 - Absence of `Stream-Snapshot-Offset` means the stream has no visible snapshot.
-- When present, the value MUST refer to the same latest visible snapshot that `GET {stream_url}/snapshot` would resolve to.
+- To read the latest snapshot, a client takes `Stream-Snapshot-Offset` from `HEAD` and fetches it with Read Snapshot (Section 2.5).
 - A server implementing this extension MUST send `Stream-Incarnation` on every successful `HEAD`. It MUST change when the stream is deleted and recreated at the same URL, and MUST NOT change otherwise. Clients MUST compare it only for equality. Offsets do not identify an incarnation, so a client that stores offsets and snapshot offsets across a possible recreate SHOULD store the incarnation with them and check it on `HEAD` before resuming. An operator restore from backup keeps each stream's incarnation although it can rewind the stream to the backup's tail; offsets read after the backup was taken are not valid on the restored stream.
 
 ### 2.5. Read Snapshot
@@ -262,21 +247,6 @@ Returns the snapshot blob at the specified offset.
 
 - `200 OK`: Snapshot exists.
 - `404 Not Found`: Snapshot does not exist or has been garbage-collected.
-
-### 2.6. Delete Snapshot
-
-```
-DELETE {stream_url}/snapshot/{snapshot_offset}
-```
-
-Deletes the snapshot identified by `snapshot_offset`, subject to bootstrap safety rules.
-
-**Response Codes:**
-
-- `404 Not Found`: Snapshot does not exist or has been superseded.
-- `409 Conflict`: `snapshot_offset` refers to the latest visible snapshot and cannot be deleted because `/bootstrap` would become incomplete.
-
-Implementations that expose only one visible snapshot MAY make superseded snapshots unreachable immediately after overwrite. In that case, deleting an older offset will return `404 Not Found`.
 
 ---
 
@@ -464,90 +434,6 @@ Frame-level failures are reported inside the JSON array. A successful outer `200
 Frames are submitted in request order and response acknowledgements preserve that order. For a single stream, successful frames advance the same stream offsets that standard `POST {stream_url}` would have produced.
 
 All standard stream read APIs remain unchanged. Data appended through Append Batch is read through ordinary `GET`, long-poll, SSE, snapshot, and bootstrap paths using the same offsets and content type rules as standard appends.
-
----
-
-## 5. Stream Attributes
-
-Stream Attributes are an Ursula-specific metadata extension for mutable, application-owned stream attributes. They are separate from the base protocol's stream metadata returned by `HEAD {stream_url}`.
-
-Attributes are not part of the append-only byte stream. Updating attributes MUST NOT change stream offsets, `ETag`, content type, closed state, snapshots, bootstrap payloads, or ordinary read results.
-
-### 5.1. Attribute Object
-
-The attribute document is a JSON object with the following optional fields:
-
-```json
-{
-  "title": "Support session",
-  "metadata": {
-    "purpose": "customer-support",
-    "environment_id": "env_019e2590d33f711fabf42f2857cecd8a",
-    "agent": {
-      "id": "agent_019e390add9f7bac9b6cc806db46fcbd",
-      "version": 2
-    }
-  }
-}
-```
-
-Fields:
-
-- `title`: Optional string. Interpreted by the application.
-- `metadata`: Optional JSON object for arbitrary application metadata.
-
-Ursula does not define first-class semantics for application concepts such as agents or environments. If an application wants to associate such information with a stream, it SHOULD store that information inside `metadata`.
-
-Unknown top-level fields are ignored: servers MUST accept attribute objects containing unrecognized top-level fields and MUST NOT store them. Clients that need additional fields MUST place them inside `metadata`.
-
-The encoded attribute object MUST NOT exceed 16 KiB. Servers MUST reject larger attribute documents with `400 Bad Request`. Attributes are replicated with stream state, so the limit keeps log entries and snapshots small.
-
-An empty attribute object (`{}`) is equivalent to no attributes.
-
-### 5.2. Create Stream With Attributes
-
-Attributes MAY be supplied when creating a stream:
-
-```http
-PUT {stream_url}
-Stream-Attrs: {"title":"Support session","metadata":{"purpose":"customer-support"}}
-```
-
-`Stream-Attrs` is an optional request header whose value is the JSON attribute object.
-
-When a stream already exists, the create request is idempotent only if the existing stream attributes match the supplied attributes after empty-object normalization. A mismatch MUST return `409 Conflict`, the same as other create-configuration mismatches.
-
-### 5.3. Read Attributes
-
-```http
-GET {stream_url}/attrs
-```
-
-**Response:**
-
-- `200 OK`: Returns the current attribute object as `application/json`.
-- `404 Not Found`: The stream does not exist or has expired.
-
-When no attributes are set, the response body is `{}`.
-
-### 5.4. Replace Attributes
-
-```http
-PUT {stream_url}/attrs
-Content-Type: application/json
-
-{"title":"Renamed session","metadata":{"purpose":"debugging"}}
-```
-
-The request body replaces the complete attribute object. Partial merge semantics are not defined by this extension.
-
-**Response Codes:**
-
-- `204 No Content`: Attributes were replaced, or the submitted object already matched the stored attributes.
-- `400 Bad Request`: The request is missing `Content-Type`, the content type is not `application/json`, the body is not a valid attribute JSON object, or the attribute object exceeds the size limit.
-- `404 Not Found`: The stream does not exist or has expired.
-
-Submitting `{}` clears the stream attributes. Attributes MAY be updated after a stream is closed because stream closure only forbids further appends.
 
 ---
 
