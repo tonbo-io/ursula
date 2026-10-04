@@ -4,12 +4,20 @@ import { createServer, request, type Server } from "node:http";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
-import { inject } from "vitest";
+import { expect, inject } from "vitest";
 
 let counter = 0;
 /** A fresh stream URL on the spawned node (bucket created by the global setup). */
 export const streamPath = (): string => `/sqlite-e2e/vfs-${process.pid}-${Date.now().toString(36)}-${counter++}`;
 export const ursulaUrl = (): string => inject("ursulaUrl");
+
+/** The offset a sidecar's text records: its first token. */
+export const sidecarOffset = (sidecar: string): string => sidecar.split(" ")[0] ?? "";
+
+/** Offsets are the server's opaque strings, ordered as strings: asserts that `a` is past `b`. */
+export function expectPast(a: string, b: string): void {
+	expect(a > b, `${a} > ${b}`).toBe(true);
+}
 
 export function vfsPath(): string {
 	const p = process.env.SQLITE_URSULA_VFS;
@@ -43,7 +51,7 @@ export function dump(db: DatabaseSync): Record<string, string[]> {
 export const walContains = (file: string, marker: string): boolean => existsSync(`${file}-wal`) && readFileSync(`${file}-wal`).includes(Buffer.from(marker));
 
 export type ChildLine = {
-	attached?: number;
+	attached?: string;
 	step?: number;
 	phase?: string;
 	ok?: boolean;
@@ -53,12 +61,12 @@ export type ChildLine = {
 	/** On `done`: append attempts per commit, whether the file is poisoned, its stream offset. */
 	attempts?: number[];
 	poisoned?: boolean;
-	offset?: number;
+	offset?: string;
 	epoch?: number;
 	/** On `done`: snapshots published, the latest known snapshot and the retention this owner set. */
 	snapshots?: number;
-	snapshot?: number;
-	retained?: number;
+	snapshot?: string;
+	retained?: string;
 };
 
 export interface Child {

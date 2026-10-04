@@ -75,6 +75,24 @@ it("an owner of a deleted stream is fenced at its next commit; nothing of it rea
 	expect(await tail()).toBe(before);
 });
 
+// Offsets are opaque, so the VFS does not check where its frame landed. Instead every commit carries
+// a Stream-Seq above every earlier commit's: a writer outside the protocol that appends with a higher
+// one fences the owner at its next commit (one without Stream-Seq goes unnoticed).
+it("a foreign append with a higher Stream-Seq fences the owner at its next commit", async () => {
+	const url = ursulaUrl() + streamPath();
+	const file = freshFile();
+	attach(file, url);
+	const a = openPlain(file);
+	a.exec("CREATE TABLE t(x TEXT)");
+	const foreign = await fetch(url, { method: "POST", headers: { "content-type": "application/octet-stream", "stream-seq": "~" }, body: "foreign" });
+	expect(foreign.ok).toBe(true);
+	expect(attempt(() => a.exec("INSERT INTO t VALUES ('a1')"))).toMatch(/disk I\/O error/);
+	expect(status(file)).toMatchObject({ poisoned: true, fenced: true });
+	expect(status(file).reason).toMatch(/Stream-Seq/);
+	expect(xs(a)).toEqual([]);
+	a.close();
+});
+
 it("Pi: a fenced commit rejects with UrsulaReplicationError", async () => {
 	const url = ursulaUrl() + streamPath();
 	const stale = await openUrsulaPiStorage(freshFile(), url);

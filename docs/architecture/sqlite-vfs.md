@@ -21,11 +21,17 @@ WAL commit is appended to the stream *before* any of the transaction's frames re
   `"USQ1" | u32 len | u32 crc32c | zstd(record)`. A record is a **commit** (the database size after
   it and the transaction's final page images) or a **claim** (a producer epoch and a 128-bit
   random nonce).
-- The local file's position in the stream is the sidecar `<db>-ursula`: the byte offset after the
-  last frame the file reflects, the owner's epoch, the kernel boot id it was written in, the
-  stream's path and its `Stream-Incarnation`, the db file's inode and its claim on the local WAL
-  (generation and last commit frame, §6), replaced atomically against a process crash (temp file,
-  rename; no fsync).
+- The local file's position in the stream is the sidecar `<db>-ursula`: the stream offset after the
+  last frame the file reflects, the owner's epoch, the sidecar's format (`v=2`), the log since the
+  latest snapshot in bytes (§4.1), the kernel boot id it was written in, the stream's path and its
+  `Stream-Incarnation`, the db file's inode and its claim on the local WAL (generation and last
+  commit frame, §6), replaced atomically against a process crash (temp file, rename; no fsync).
+- Offsets are opaque: the VFS keeps every offset as the string the server wrote
+  (`Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Retained-Offset`), compares offsets only
+  as strings (the protocol orders them lexicographically), and never computes one. `-1`, the
+  protocol's "beginning of the stream", also stands for "none" (no snapshot, no local state). A
+  read without `Stream-Next-Offset` is an error. `ursula_attach`, `ursula_status`, `ursula_stats`
+  and the TypeScript API return offsets as these strings.
 - One owner per file per host: attach takes `flock` on `<db>-ursula.lock` for the process
   lifetime, and refuses while any connection to the file is open.
 - A db file with a sidecar is the cache of a stream: it opens through the VFS only while an attach
@@ -54,12 +60,22 @@ unless an attach racing the recreate claimed under the old id (§6, wrong stream
 - **403** (a newer epoch claimed the stream), a definite rejection, or an exhausted budget: the
   write fails with `SQLITE_IOERR_WRITE`, SQLite rolls the transaction back, nothing of it reaches
   the local WAL, and the database is poisoned until it is re-attached.
-- **A 2xx is accepted only with the expected `Stream-Next-Offset`** (the offset after this frame).
-  Another offset poisons. A duplicate answered without one (its receipt is beyond the server's
+- **A 2xx is accepted only with a `Stream-Next-Offset` past the owner's offset**, which becomes the
+  owner's offset; another poisons. The VFS does not check where its frame landed (that would need
+  offset arithmetic). A duplicate answered without one (its receipt is beyond the server's
   receipt window) fences and poisons: it is never this owner's own retry, because the owner is the
   only writer of its producer at its epoch, retries only its one newest append, and the server
   never evicts a producer's newest receipt. So another writer holds the producer at this epoch
   past this sequence.
+- **Foreign writers.** Every commit carries `Stream-Seq` = the owner's epoch and producer sequence,
+  each zero-padded to 20 digits. Owners claim ever higher epochs and number commits upwards within
+  one, so each commit's is above every earlier commit's, retries included (a retry is answered as a
+  duplicate before `Stream-Seq` is checked). The server refuses an append whose `Stream-Seq` is not
+  above the stream's last one (409), so a writer outside this protocol that appended with a higher
+  one since the owner's last commit fences and poisons the owner at its next commit; one with a
+  lower or equal `Stream-Seq` is refused itself and never lands. One that appends without
+  `Stream-Seq` goes unnoticed: its bytes then fail every replay that crosses them (the frames no
+  longer decode; attach refuses) until the owner publishes a snapshot past them.
 - The overlay belongs to the write transaction: it is cleared whenever the WAL write lock is taken
   or released, so a rolled-back transaction's spilled frames never shadow a later one's.
 - Any write to the main db file outside a checkpoint (a rollback journal, `journal_mode=MEMORY`) is
@@ -111,14 +127,24 @@ unless an attach racing the recreate claimed under the old id (§6, wrong stream
    attach, as in step 6). If its latest snapshot is ahead of the file (a fresh host, or a file left
    below the retention), installs it (§4.3). Then replays frames to the tail.
 5. Claims with the incarnation's `Producer-Id` (§2): appends a claim at (epoch = highest seen + 1,
-   seq 0) and reads the frame back. A 2xx alone proves nothing (two owners claiming the same epoch
-   both get one, the second as a duplicate), so the claim counts only if the bytes at the answered
-   offset are ours (the nonce makes them unique). Lost: epoch + 1. 403: the server's epoch + 1.
+   seq 0) and reads it back. A 2xx alone proves nothing (two owners claiming the same epoch both
+   get one, the second as a duplicate), so the claim counts only if the frame ending at the
+   answered offset is ours (the nonce makes it unique). Offsets are opaque, so its start is not
+   computed from that offset: the reads run from the tail step 4 reached (a frame boundary at or
+   before the claim) to the answered offset, and the frames read are decoded. When the reads run
+   past the answered offset (another owner appended meanwhile, and the offset's place in the bytes
+   is unknown), our claim being among the frames at all suffices: the server applies one append
+   per (producer, epoch, seq 0) and answers every other with its receipt, so our claim is in the
+   stream only if the answer was its own end. Lost: epoch + 1. 403: the server's epoch + 1.
 6. Replays up to the claim and `HEAD`s the stream again: if its incarnation is no longer step 2's
    (deleted and recreated meanwhile), the attach fails and the application retries it. The
    sidecar is still stamped with the old incarnation, so the next attach discards whatever this one
    wrote and rebuilds from the recreated stream (step 2). A recreate that breaks catch-up first (a
    read beyond the new stream's end, a frame that does not decode) fails the attach the same way.
+   If the replay up to the claim reaches a newer owner's claim (a higher epoch, which the server
+   accepts from this producer only after ours), the attach fails as fenced and the application
+   retries it: this owner is already fenced, and a snapshot it took would record an epoch below
+   the highest one claimed before it (§4.2).
    `HEAD` is a leader read and incarnations never repeat (unique per group from feature level 1),
    so a match means every read and the claim in between hit that incarnation. Then, if attach
    wrote the db file, fsyncs it; writes the sidecar (with the incarnation), and swaps the path's
@@ -138,7 +164,8 @@ replaying from an older offset than the file reflects is idempotent.
 Producer expiry: the server forgets a producer idle for 7 days (and a recreated stream never knew
 it, §6 wrong stream). The owner's next append gets 409 expecting seq 0; it takes the stream back
 only if the stream is still the incarnation it attached to (checked before and after), still ends
-at its own offset, and its new claim (epoch + 1) lands exactly there, else it is fenced. Reads in
+at its own offset, and its new claim (epoch + 1) is the first frame after it (read and decoded
+from that offset, as in step 5), else it is fenced. Reads in
 recovery use `consistency=leader` (a follower may lag an acknowledged append). Catch-up reads,
 `HEAD` and snapshot `GET`s retry `429` and `503` (a leader that could not confirm its leadership in
 time) like appends: no sooner than `Retry-After`, with backoff, within `URSULA_VFS_RETRY_MS`; the
@@ -153,14 +180,18 @@ the default per-group hot limit (64 MiB) trips after about 68 MB of frames.
 
 After a commit is published, if the log since the latest known snapshot exceeds
 `max(database size, URSULA_VFS_SNAPSHOT_MIN_BYTES)` (8 MiB by default), the database's snapshot
-thread is woken. Snapshotting never runs on the commit path. Stored log is therefore bounded by
-about twice the threshold plus what accumulates while a snapshot is in flight (§4.4).
+thread is woken. Offsets are opaque, so the log is counted in frame bytes, not taken from offsets:
+attach counts what it replays after the snapshot it installed (or, from trusted local files, adds
+it to the count the sidecar carries), every acknowledged commit adds its frame, and a snapshot
+taken (or found newer at publish) subtracts what was counted when its window opened.
+Snapshotting never runs on the commit path. Stored log is therefore bounded by about twice the
+threshold plus what accumulates while a snapshot is in flight (§4.4).
 
 ### 4.2 Taking one
 
-The body must be the stream's state at a frame boundary `W`, page-identical to a replay of
-`[0, W)`, so later page-image frames apply on top of it (`VACUUM INTO` and the backup API both
-rewrite pages, and are not). The thread:
+The body must be the stream's state at a frame boundary `W`, page-identical to a replay from the
+stream's start to `W`, so later page-image frames apply on top of it (`VACUUM INTO` and the backup
+API both rewrite pages, and are not). The thread:
 
 1. Opens a private `unix` connection on the file and runs `wal_checkpoint(PASSIVE)` once, so
    the checkpoint inside the window only covers the frames committed since.
@@ -190,7 +221,8 @@ Commits wait only for steps 3 and 4 (a passive checkpoint of the few frames comm
 (step 2, at most one commit, bounded). A re-attach stops the thread: it checks the stop flag
 between steps and retries, and each snapshot request is bounded to 120 s.
 
-The body is `"USS1" | u64 W | u64 epoch | u32 pages | u32 crc32c(image) | zstd(image)`. The epoch
+The body is `"USS2" | u8 n | W (n bytes, the offset string) | u64 epoch | u32 pages |
+u32 crc32c(image) | zstd(image)` (`"USS1"` held `W` as a u64 and is no longer read). The epoch
 is the highest one claimed before `W`: retention may trim every claim frame, and the next owner
 must still claim above it (after a producer expiry the server would accept a lower epoch, and a
 zombie with a higher one could then fence the new owner).
@@ -337,14 +369,19 @@ What attach does in each case:
   for the rebuild (§3), and removes a snapshot temp file an older version may have left (never the
   held lock file); every attach then removes `-journal`, and the fresh path `-wal` and `-shm`, and
   rewrites the sidecar last, so a crash midway discards again. The first attach after upgrading
-  from a version without the WAL claim or the incarnation rebuilds once (a sidecar without
-  `incarnation=` is not trusted); versions with the WAL claim but no incarnation take this one's
-  sidecar for a torn one and rebuild, and older ones refuse it, so after such a downgrade delete
-  `<db>` (it is rebuilt from the stream). Versions before the incarnation-scoped `Producer-Id`
-  (§2) append as `sqlite-ursula-vfs`, a producer this version's claims do not fence: stop every
-  owner of a stream that runs an older version before attaching it with this one (and the reverse
-  on a downgrade), or two owners can both commit and corrupt the database (replay then mixes page
-  images of two diverged states).
+  from a version with numeric offsets (sidecar format 1, no `v=`), or without the WAL claim or the
+  incarnation, rebuilds once (such a sidecar is not trusted; it is still parsed, for the stream
+  path, the incarnation and the read check at its offset). Older versions take this one's sidecar
+  for a torn one and rebuild, or refuse it, and none of them reads a `"USS2"` snapshot body: after a
+  downgrade, a stream this version has snapshotted cannot be attached (attach under a new stream
+  URL, as for `"USS1"` below); one it has not snapshotted is rebuilt from the stream after deleting
+  `<db>`. Snapshot bodies of the numeric-offset versions (`"USS1"`) are not read: a stream
+  whose latest snapshot is one cannot be attached (attach fails on its snapshot; deleting the local
+  files does not help): attach under a new stream URL. Versions before the incarnation-scoped
+  `Producer-Id` (§2) append as `sqlite-ursula-vfs`, a producer this version's claims do not fence:
+  stop every owner of a stream that runs an older version before attaching it with this one (and the
+  reverse on a downgrade), or two owners can both commit and corrupt the database (replay then mixes
+  page images of two diverged states).
 - **Container runtimes with their own boot id**: LXC/LXD/Incus and systemd-nspawn bind-mount a new
   random boot id at every container start, and gVisor generates one per procfs instance, so a
   container restart there rebuilds; sandboxes with their own kernel (Kata, Firecracker, WSL2,
@@ -373,14 +410,14 @@ What attach does in each case:
   expired producer, and the re-claim finds the incarnation changed and fences and poisons the
   owner, before anything of it lands. Three things can still land. The stray claim of an attach or
   re-claim racing the recreate (a new producer's seq 0 is accepted; the `HEAD` after it then fails
-  the attach or fences the owner) changes no page but raises the epoch later claims start from,
-  and, when the recreated stream already has an owner, makes that owner's next commit see an
-  unexpected next offset, which poisons it (re-attach to recover). The stray claim also registers
-  the deleted incarnation's `Producer-Id` in the recreated stream at its epoch: an owner of the
-  deleted stream still attached at that epoch, with no commit since its claim, then has its
-  commits accepted there (undetected while its offsets happen to match, as when both claims were
-  their streams' first frames, until its snapshot thread's `HEAD`), and owners of the recreated
-  stream, under another `Producer-Id`, do not fence it. And the snapshot thread can publish a
+  the attach or fences the owner) changes no page but raises the epoch later claims start from.
+  It also registers the deleted incarnation's `Producer-Id` in the recreated stream at its epoch:
+  an owner of the deleted stream still attached at that epoch, with no commit since its claim,
+  then has its commits accepted there until either owner (the recreated stream's is under another
+  `Producer-Id`, so not fenced by epoch) commits with the higher `Stream-Seq` (§2), which refuses
+  the other's next commit (possibly the new owner's, when the stray claim's epoch is above its
+  own), or until the old owner's snapshot thread's `HEAD`. Offsets are opaque, so neither owner
+  notices the other's frames by where its own landed. And the snapshot thread can publish a
   snapshot, or move retention (§4.3, a window of one `HEAD` round trip each). Stop every owner
   before deleting a stream you will recreate; closing these windows needs an incarnation
   precondition on appends and on the snapshot and retention endpoints at the server.
@@ -434,7 +471,9 @@ rebuild, delete `<db>`.
 
 ## 8. Tests
 
-- Units (`cargo test`): frame and snapshot encodings (whole frames only, damage refused).
+- Units (`cargo test`): frame and snapshot encodings (whole frames only, damage refused), and the
+  claim lookup (a claim wins only as the frame ending at the answered offset, or anywhere in a
+  read-back that ran past it; a re-claim also only as the first frame after the owner's offset).
 - Units also cover the sidecar: trusted only in this boot, for this stream incarnation and db file,
   and with its WAL claim met (a claim on frames the WAL does not hold or on another WAL generation,
   or no claim, is not); legacy, other-boot, other-incarnation and torn sidecars are not, nothing is
@@ -444,21 +483,22 @@ rebuild, delete `<db>`.
 - e2e against a real node (`clients/sqlite-ursula`): transparency (any schema, byte-identical
   rebuild), the crash matrix (same-boot re-attaches resume from the sidecar, a recovery killed
   mid-rewrite included, without a snapshot), fencing (an owner of a deleted stream included: its
-  next commit fails and nothing of it reaches the recreated stream), recovery exclusion, the local
-  cache (a simulated reboot with a rolled-back db file and sidecar, below retention, a torn first
-  sector and a cut WAL rebuilds byte-identical from snapshot + tail; the same boot reuses the files
-  with no snapshot and no replay from scratch, also for a file rebuilt from a snapshot; a same-boot
-  disk image whose WAL is behind its sidecar is rebuilt and the stream stays intact, one whose WAL
-  is ahead is trusted; discarding is refused while another process has the file open; a replaced db
-  file is rebuilt; a file without a sidecar, the cache of another stream, and files whose sidecar
-  offset lies beyond their stream's end are refused (also with an older version's sidecar); the
-  cache of a deleted stream is rebuilt from the stream recreated at its path, both shorter than the
-  file's offset and grown past it), a file with a sidecar opening only while attached in the process
-  (refused before an attach, and after a failed re-attach of an attached file, until an attach
-  succeeds; then commits replicate again), snapshots and retention (a ~160 MB run; CI also runs it
-  without a cold tier under the default hot limit; fresh and lagging hosts rebuild byte-identical
-  from snapshot + tail; the takeover after the trim fences the old owner), Pi conformance in three
-  modes, and a benchmark (sanity numbers only).
+  next commit fails and nothing of it reaches the recreated stream; a foreign append with a higher
+  `Stream-Seq` fences the owner), recovery exclusion, the local cache (a simulated reboot with a
+  rolled-back db file and sidecar, below retention, a torn first sector and a cut WAL rebuilds
+  byte-identical from snapshot + tail; the same boot reuses the files with no snapshot and no replay
+  from scratch, also for a file rebuilt from a snapshot; a same-boot disk image whose WAL is behind
+  its sidecar is rebuilt and the stream stays intact, one whose WAL is ahead is trusted; discarding
+  is refused while another process has the file open; a replaced db file is rebuilt; a file without
+  a sidecar, the cache of another stream, and files whose sidecar offset lies beyond their stream's
+  end are refused (also with an older version's sidecar); a format-1 sidecar (numeric offset) behind
+  a stream another owner extended is rebuilt; the cache of a deleted stream is rebuilt from the
+  stream recreated at its path, both shorter than the file's offset and grown past it), a file with
+  a sidecar opening only while attached in the process (refused before an attach, and after a failed
+  re-attach of an attached file, until an attach succeeds; then commits replicate again), snapshots
+  and retention (a ~160 MB run; CI also runs it without a cold tier under the default hot limit;
+  fresh and lagging hosts rebuild byte-identical from snapshot + tail; the takeover after the trim
+  fences the old owner), Pi conformance in three modes, and a benchmark (sanity numbers only).
 - The same Pi conformance, snapshot and benchmark suites on 3 nodes + gateway + MinIO at feature
   level 5 (the snapshot run's ~3.5 MB bodies go to the cold tier), with a 64 KiB snapshot minimum
   so the benchmark's Pi workload snapshots and trims at its database size.
