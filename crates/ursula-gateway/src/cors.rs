@@ -19,9 +19,9 @@
 //! keeps `Expose-Headers: *` effective — which is what lets a browser read the
 //! `stream-*` protocol headers (`stream-next-offset`, `stream-cursor`,
 //! `stream-retained-offset`) without enumerating a list here that would
-//! silently drift as the protocol grows. A browser that
-//! cannot read those headers cannot paginate, so the wildcard is load-bearing
-//! rather than a shortcut.
+//! silently drift as the protocol grows. A browser that cannot read those
+//! headers cannot paginate, so the wildcard is load-bearing rather than a
+//! shortcut.
 
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;

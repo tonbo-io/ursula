@@ -192,7 +192,7 @@ type ChaosStatus = {
     checked_at: string | null;
     /** Samples read back and matched byte for byte. */
     verified_offsets: number;
-    /** 200 reads whose bytes disagreed with the acknowledged append. */
+    /** Corruptions: a 200 read whose bytes disagreed with the acknowledged append, or a leader tail below an acknowledged end. */
     mismatch_count: number;
     /** Reads that could not be served (node down, lagging, short). */
     read_availability_error_count?: number;

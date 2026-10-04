@@ -47,7 +47,8 @@ CONTENT_TYPE = "application/octet-stream"
 #   502 — forwarding/proxy hop failed
 #   503 — backpressure / cold store unavailable
 # Real integrity divergence is a 200-OK response whose bytes disagree with a
-# recorded append; `verify_sample` counts that as a mismatch.
+# recorded append, or, when no node can serve a sample, a leader tail below its
+# acknowledged end; `verify_sample` counts both as mismatches.
 READ_AVAILABILITY_STATUSES = {0, 204, 404, 410, 416, 502, 503}
 # Largest forced cold flush; matches the server's flush-cold `max_bytes` default.
 COLD_FLUSH_MAX_BYTES = 8 * 1024 * 1024
@@ -1465,7 +1466,6 @@ class ChaosAgent:
     def verify_sample(self, sample: PayloadSample) -> str | None:
         last_error: str | None = None
         mismatch_error: str | None = None
-        matched_node: str | None = None
         node_results: list[dict[str, Any]] = []
         # Rotate the first node so steady-state reads cover every replica.
         first = self.verify_attempts % len(self.nodes) if self.nodes else 0
@@ -1491,7 +1491,6 @@ class ChaosAgent:
                 # An earlier node served different bytes for a committed
                 # range; no replica may legitimately differ, so this match
                 # does not excuse it.
-                matched_node = node.name
                 break
             node_result: dict[str, Any] = {"node": node.name, "status": status, "matched": False}
             if body:
@@ -1506,7 +1505,7 @@ class ChaosAgent:
                 last_error = f"{node.name} read status={status} short={len(body)}/{len(sample.payload)}"
                 continue
             mismatch_error = f"{node.name} read status={status} body_prefix={body[:32]!r}"
-        if mismatch_error is None and matched_node is None:
+        if mismatch_error is None:
             mismatch_error = self.acknowledged_bytes_lost(sample)
         self.last_read_check = {
             "stream": sample.stream,

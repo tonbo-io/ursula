@@ -61,6 +61,7 @@ jobs:
           helm lint charts/ursula-chaos
           helm template ursula-chaos charts/ursula-chaos --namespace ursula >/dev/null
           python3 scripts/chaos_helm_template_test.py
+          (cd scripts && python3 -m unittest ursula_chaos_agent_test)
 
   rust-lint:
     name: Rust lint
