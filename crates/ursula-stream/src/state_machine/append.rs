@@ -425,13 +425,6 @@ impl StreamStateMachine {
                     record_start: record_range.map(|range| range.first_record),
                     record_next: record_range.map(|range| range.next_record),
                 },
-                vec![ProducerAppendRecord {
-                    start_offset: offset,
-                    next_offset,
-                    closed,
-                    record_start: record_range.map(|range| range.first_record),
-                    record_next: record_range.map(|range| range.next_record),
-                }],
             );
         }
 
@@ -642,13 +635,6 @@ impl StreamStateMachine {
                     record_start: record_range.map(|range| range.first_record),
                     record_next: record_range.map(|range| range.next_record),
                 },
-                vec![ProducerAppendRecord {
-                    start_offset: offset,
-                    next_offset,
-                    closed,
-                    record_start: record_range.map(|range| range.first_record),
-                    record_next: record_range.map(|range| range.next_record),
-                }],
             );
         }
         let external_locators_in_state = self.external_locators_in_state();
@@ -903,7 +889,6 @@ impl StreamStateMachine {
         producer: ProducerRequest,
         now_ms: u64,
         last: ProducerAppendRecord,
-        last_items: Vec<ProducerAppendRecord>,
     ) {
         let bounded = self.producer_bounds_enabled();
         let receipt = ProducerReceipt {
@@ -911,11 +896,15 @@ impl StreamStateMachine {
             start_offset: last.start_offset,
             next_offset: last.next_offset,
             closed: last.closed,
-            items: last_items.clone(),
+            items: vec![last.clone()],
         };
         // Level 1 answers from the newest receipt and keeps no copy (F3);
         // level 0 keeps `last_items` exactly as earlier releases do.
-        let last_items = if bounded { Vec::new() } else { last_items };
+        let last_items = if bounded {
+            Vec::new()
+        } else {
+            vec![last.clone()]
+        };
         let last_seen_ms = bounded.then_some(now_ms);
         let Some(slot) = self.stream_slot_mut(&stream_id) else {
             return;

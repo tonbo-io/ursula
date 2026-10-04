@@ -82,6 +82,7 @@ use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
 use ursula_runtime::GroupStateGaugesFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
+#[cfg(test)]
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::InMemoryGroupEngineFactory;
