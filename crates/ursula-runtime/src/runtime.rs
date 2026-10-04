@@ -570,7 +570,7 @@ impl ShardRuntime {
     ) -> Result<Vec<FlushColdResponse>, RuntimeError> {
         // A bucket is the physical erasure domain. Keep encounter order while
         // partitioning one Raft group's flush plan so no pack can retain bytes
-        // for a deleted bucket merely because another bucket is still live.
+        // for a purged bucket merely because another bucket is still live.
         let mut bucket_batches: Vec<Vec<ColdFlushCandidate>> = Vec::new();
         for candidate in candidates {
             if let Some(batch) = bucket_batches.iter_mut().find(|batch| {
