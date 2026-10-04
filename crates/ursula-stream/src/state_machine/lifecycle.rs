@@ -12,6 +12,7 @@ use super::ProducerAppendRecord;
 use super::ProducerReceipt;
 use super::ProducerRequest;
 use super::ProducerState;
+use super::StreamColdState;
 use super::StreamErrorCode;
 use super::StreamErrorContext;
 use super::StreamMetadata;

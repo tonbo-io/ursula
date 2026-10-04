@@ -14,7 +14,7 @@ fn stream(id: &str) -> BucketStreamId {
     BucketStreamId::new(BUCKET, id)
 }
 
-fn machine() -> StreamStateMachine {
+fn fresh_machine() -> StreamStateMachine {
     let mut machine = StreamStateMachine::new();
     assert!(matches!(
         machine.apply(StreamCommand::CreateBucket {
@@ -248,7 +248,7 @@ fn assert_restore_matches_live(machine: &StreamStateMachine, id: &str) -> Stream
 
 #[test]
 fn binary_stream_keeps_append_starts() {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     create(&mut machine, "bin", OCTET, b"ab");
     append(&mut machine, "bin", OCTET, b"cde");
     append(&mut machine, "bin", OCTET, b"f");
@@ -270,7 +270,7 @@ fn binary_stream_keeps_append_starts() {
 
 #[test]
 fn json_stream_uses_dense_offsets_and_keeps_no_starts() {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     let first = json_records(2, 1);
     create(&mut machine, "json", JSON, &first);
     let second = json_records(3, 2);
@@ -288,7 +288,7 @@ fn json_stream_uses_dense_offsets_and_keeps_no_starts() {
 #[test]
 fn flush_that_splits_a_message_moves_the_exact_frontier_past_it() {
     for content_type in [OCTET, JSON] {
-        let mut machine = machine();
+        let mut machine = fresh_machine();
         let mut oracle = Oracle::default();
         create(&mut machine, "s", content_type, b"");
         let payloads = if content_type == JSON {
@@ -332,7 +332,7 @@ fn flush_that_splits_a_message_moves_the_exact_frontier_past_it() {
 
 #[test]
 fn flush_at_a_message_boundary_keeps_the_next_message_exact() {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     create(&mut machine, "bin", OCTET, b"");
     append(&mut machine, "bin", OCTET, b"aaaa");
     append(&mut machine, "bin", OCTET, b"bbbb");
@@ -352,7 +352,7 @@ fn flush_at_a_message_boundary_keeps_the_next_message_exact() {
 
 #[test]
 fn external_append_above_hot_bytes_is_a_message_until_the_hot_prefix_flushes() {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     let mut oracle = Oracle::default();
     create(&mut machine, "bin", OCTET, b"");
     append(&mut machine, "bin", OCTET, b"hot!");
@@ -378,7 +378,7 @@ fn external_append_above_hot_bytes_is_a_message_until_the_hot_prefix_flushes() {
 
 #[test]
 fn retention_prunes_append_starts_below_the_new_seal_point() {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     let mut oracle = Oracle::default();
     create(&mut machine, "bin", OCTET, b"");
     for payload in [b"aa".as_slice(), b"bbb", b"c", b"dddd"] {
@@ -402,7 +402,7 @@ fn retention_prunes_append_starts_below_the_new_seal_point() {
 
 #[test]
 fn restore_rejects_inconsistent_append_starts() {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     create(&mut machine, "bin", OCTET, b"");
     append(&mut machine, "bin", OCTET, b"aaaa");
     append(&mut machine, "bin", OCTET, b"bbbb");
@@ -477,7 +477,7 @@ fn restore_matches_live_and_bootstrap_matches_oracle_under_random_workload() {
         };
         let json = seed % 2 == 0;
         let content_type = if json { JSON } else { OCTET };
-        let mut machine = machine();
+        let mut machine = fresh_machine();
         let mut oracle = Oracle::default();
         create(&mut machine, "s", content_type, b"");
         let mut objects = 0u64;

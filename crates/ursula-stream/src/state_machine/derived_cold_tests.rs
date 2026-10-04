@@ -11,7 +11,7 @@ fn stream(id: &str) -> BucketStreamId {
     BucketStreamId::new(BUCKET, id)
 }
 
-fn machine() -> StreamStateMachine {
+fn fresh_machine() -> StreamStateMachine {
     let mut machine = StreamStateMachine::new();
     assert!(matches!(
         machine.apply(StreamCommand::CreateBucket {
@@ -131,7 +131,7 @@ fn assert_code(response: &StreamResponse, code: StreamErrorCode) {
 
 /// Hot message `[0, 4)` with an external append `[4, 7)` above it.
 fn hot_message_below_external(id: &str) -> StreamStateMachine {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     create(&mut machine, id, 1);
     append(&mut machine, id, b"abcd");
     append_external(&mut machine, id, "derived/external/x.bin", 3);
@@ -175,7 +175,7 @@ fn f18_offsets_at_or_below_the_seal_point_are_aligned() {
 
 #[test]
 fn f18_retention_keeps_hot_messages_above_the_seal_point() {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     create(&mut machine, "collapse", 1);
     append(&mut machine, "collapse", b"ab");
     append(&mut machine, "collapse", b"cd");
@@ -200,7 +200,7 @@ fn f18_retention_keeps_hot_messages_above_the_seal_point() {
 #[test]
 fn f18_bootstrap_after_a_d1_flush_uses_the_seal_point() {
     // D1: hot `ab`, external `[2, 5)`, flush of the hot prefix.
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     create(&mut machine, "boot", 1);
     append(&mut machine, "boot", b"ab");
     append_external(&mut machine, "boot", "derived/external/z.bin", 3);
@@ -224,7 +224,7 @@ fn f18_bootstrap_after_a_d1_flush_uses_the_seal_point() {
 
 #[test]
 fn f18_delete_enqueues_stream_gc_only_when_bytes_left_the_hot_buffer() {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     create(&mut machine, "hot-only", 1);
     append(&mut machine, "hot-only", b"abcd");
     assert!(matches!(
@@ -252,7 +252,7 @@ fn f18_delete_enqueues_stream_gc_only_when_bytes_left_the_hot_buffer() {
 
 /// Appends `abcd` and publishes `[0, 4)` as a slice of a shared pack.
 fn shared_pack_stream(id: &str) -> StreamStateMachine {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     create(&mut machine, id, 1);
     append(&mut machine, id, b"abcd");
     let response = machine.apply(StreamCommand::FlushCold {
@@ -306,7 +306,7 @@ fn f14i_retention_keeps_dropped_pack_slices_for_the_grace() {
 }
 
 fn gc_queue_with_two_entries() -> StreamStateMachine {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     for (index, id) in ["gc-a", "gc-b"].into_iter().enumerate() {
         create(&mut machine, id, 10 + index as u64);
         append(&mut machine, id, b"abcd");
@@ -377,7 +377,7 @@ fn f14b_defer_cold_gc_moves_the_failing_head_behind_the_queue() {
 /// of the old incarnation deletes).
 #[test]
 fn flush_cold_from_a_removed_incarnation_is_stale() {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     create(&mut machine, "reborn", 100);
     append(&mut machine, "reborn", b"abcd");
     let candidate = machine
@@ -449,7 +449,7 @@ fn flush_cold_from_a_removed_incarnation_is_stale() {
 /// A whole hot message at the seal point stays a complete bootstrap.
 #[test]
 fn bootstrap_keeps_whole_hot_messages_at_the_seal_point() {
-    let mut fresh = machine();
+    let mut fresh = fresh_machine();
     create(&mut fresh, "fresh", 1);
     append(&mut fresh, "fresh", b"ab");
     append(&mut fresh, "fresh", b"cd");
@@ -517,7 +517,7 @@ fn bootstrap_never_merges_or_skips_messages_for_any_history() {
 
     for seed in 1..=3_000_u64 {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-        let mut machine = machine();
+        let mut machine = fresh_machine();
         create(&mut machine, "sweep", 1);
         let mut messages: Vec<(u64, u64)> = Vec::new();
         let mut tail = 0_u64;

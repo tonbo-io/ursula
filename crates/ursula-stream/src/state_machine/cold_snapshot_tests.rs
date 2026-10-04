@@ -11,7 +11,7 @@ fn stream() -> BucketStreamId {
     BucketStreamId::new(BUCKET, "s")
 }
 
-fn machine() -> StreamStateMachine {
+fn fresh_machine() -> StreamStateMachine {
     let mut machine = StreamStateMachine::new();
     machine.apply(StreamCommand::CreateBucket {
         bucket_id: BUCKET.to_owned(),
@@ -70,7 +70,7 @@ fn gc_paths(machine: &StreamStateMachine) -> Vec<(String, u64)> {
 
 #[test]
 fn cold_snapshot_keeps_a_reference_and_queues_unreferenced_bodies() {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     let response = publish_cold(&mut machine, 2, "s/external/a.bin", "da");
     assert!(
         matches!(response, StreamResponse::SnapshotPublished { ref snapshot_digest, .. } if snapshot_digest == "da"),

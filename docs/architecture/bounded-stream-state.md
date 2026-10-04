@@ -1,6 +1,6 @@
 # Bounded Per-Stream State for Long-Lived Streams
 
-Status: Accepted 2026-10-02.
+Status: Accepted 2026-10-02. As built in Ursula 0.6.0: every fix below that this document once gated behind a replicated per-group upgrade gate (C0) is unconditional, and 0.6.0 removed the gates (format epoch 2, `docs/web/src/content/docs/pages/operations.mdx` "Upgrading to 0.6"). The "Today" paragraphs describe 0.5.1; the "Design" paragraphs describe what 0.6.0 runs.
 
 Scope: make the memory and snapshot footprint of every Ursula stream at most a small constant, plus its unflushed hot window, plus 16 bytes per MiB of cold history, without requiring retention. The footprint then no longer grows with record count, but it is not independent of history: it still grows by about 16 MiB per TiB of cold history, per stream and per replica. A history-independent bound is a follow-up (§3, I1). This covers replicated state on every replica, the group snapshots built from it, node-local state outside the state machine, per-request memory, and the S3 objects that state points to. It also fixes the cold-path correctness defects that the audit and its adversarial review found, because several fixes build on them.
 
@@ -18,9 +18,8 @@ Conventions: paths are relative to the repository root, and line numbers refer t
 6. Pack references compact through the existing `CompactCold`. The Raft engine lacks the all-shared branch that the in-memory engine has; adding it also fixes the legacy-pack migration that bucket purge runs. Every page write for a range whose bytes state proves clears the other entries overlapping it, so compaction never exposes a stale entry.
 7. Producer receipts become a per-stream window of 1,024 items plus each producer's newest acknowledgement, and idle producers expire; duplicates beyond the window answer `204` without ranges, as the base protocol says. Message records collapse at every cold transition. External payload locators are committed first and moved into cold-index pages afterwards, so state holds only the in-flight ones.
 8. Two other defects get their own fixes: the flush planner's head-of-line starvation with its O(S²) planning, and the per-append TTL heap. Node-local leaks (page-cache LRU deque, cold-read `readers` map, engine append counts), unbounded per-request materialization, quadratic bootstrap planning and byte-blind snapshot cadence are fixed alongside.
-9. Replicated changes are gated by a group feature level. Four levels keep the risky changes apart, so sparse marks ship alone, and their behavior-preserving parts ship ungated first.
-10. Milestones: B0 harness; B1 correctness defects and ungated fixes; B2 pack-reference driver, orphan sweep and decode support; B3 level Lb1 (state hygiene); B4 level Lb2 (sparse marks); B5 level Lb3 (external locators); B6 hot window and snapshot cadence; B7 hardening with a 72-hour soak gate. About +5,800 / −400 production LoC and +6,500 test LoC, twice the first estimate; #91, which built the dense index, took about 1,600 production lines alone.
-11. This is general Ursula work and can start now.
+9. Ursula 0.6.0 runs every replicated change below unconditionally. Earlier main builds gated them behind replicated per-group upgrade gates for rolling upgrades; 0.6.0 is a fresh install (format epoch 2), so the gates and the code that ran without them are gone.
+10. Delivered in milestones B0 (harness) to B6 (hot window and snapshot cadence); the 72-hour soak gate of B7 has not run (§7.5). About +5,800 / −400 production LoC and +6,500 test LoC, twice the first estimate; #91, which built the dense index, took about 1,600 production lines alone.
 
 ## 2. Problem
 
@@ -106,12 +105,12 @@ Every growth source the audits found, replicated or not, with the fix that bound
 |---|---|---|---|---|---|---|
 | 1 | Dense record index `record_offsets` (`record_index.rs:6-10`) | yes | O(records), hot and cold | 8 B/record tight, 8.4-11.2 B heap, 2.9-4.6 B in snapshots; 3M records: 33.5 MB buffer, 13.6 of 18.9 MB snapshot | retention only; capacity kept; retention clones it | F1, F7 |
 | 2 | Shared pack refs `cold_chunks` and group `shared_cold_object_refs/owners` (`cold_state.rs:26-31`; `state_machine.rs:115-122`) | yes | O(packed flushes) | 227 B tight, 421 B with slack, 166 B snapshot per ref; 260 B heap and 84 B snapshot per live pack | retention or delete; Raft engine rejects shared `CompactCold` | F2, F10 |
-| 3 | Producer receipts (`append.rs:1005`) and `last_items` (`model.rs:120`) | yes | O(appends per epoch) | 115-131 B heap, 24-36 B snapshot per append; a batch receipt up to about 28 KB, duplicated in `last_items` | epoch bump | F3 |
+| 3 | Producer receipts (`append.rs:1005`) and a copy of the newest receipt's items (`model.rs:120`) | yes | O(appends per epoch) | 115-131 B heap, 24-36 B snapshot per append | epoch bump | F3 |
 | 4 | Producer map (`state_machine.rs:143`) | yes | O(distinct ids) | about 380 B per id; id length unbounded | stream delete | F3 |
 | 5 | `message_records` (`state_machine.rs:138`) | yes | O(records since `FlushCold`); forever on external-only streams | 16 B/record heap, 12-15 B snapshot; 5,000-record external body: 120 KB heap, 91 KB snapshot per append | `FlushCold` or retention; collapse keeps capacity | F4, F7 |
 | 6 | Hot window chunk overhead (`hot_buffer.rs:7-17, 88-97`) | yes | O(unflushed appends) | about 64 B tight per record beyond payload; 2.6 MB deque kept after one flush window | flush thresholds and group cap, both payload-only | F6, F7 |
 | 7 | External locators in state (planned by an earlier design) `external_segments` (`cold_state.rs:9`) | yes | O(external appends) if shipped as written | est. 120 B snapshot, 170 B heap per append of 1 MiB or more | retention only | F5 |
-| 8 | Visible snapshot payload (`model.rs:264-273`) | yes | O(1), up to the 32 MiB body cap; at Lb5 a reference above the staging threshold | inline on every replica and every group snapshot | replacement | F16 |
+| 8 | Visible snapshot payload (`model.rs:264-273`) | yes | O(1), up to the 32 MiB body cap; in 0.6.0 a reference above the staging threshold | inline on every replica and every group snapshot | replacement | F16 |
 | 9 | `last_stream_seq` and producer id length (`append.rs:347-349`; `state_machine.rs:752-761`) | yes | O(1), length unbounded through the multi-stream JSON append body (removed in 0.6.0) | up to 32 MiB | replacement | F3 |
 | 10 | Engine `stream_append_counts` (`ursula-runtime/src/engine/in_memory.rs:128`) | frames | one leaked entry per TTL-expired or purged stream | est. 150 B per removed stream | restart or snapshot install | F9 |
 | 11 | TTL heap (`registry.rs:24-29, 126-138`; `ttl.rs:11-21`) | no | O(appends) on TTL streams | 104 B and 3 allocations per append; 1M appends: 104 MB that survives delete | each entry's own expiry | F8 |
@@ -159,37 +158,13 @@ Found on the way, independent of growth, and present at `e6d8d70` with default c
 
 ## 5. Fix designs
 
-Each subsection gives the data-structure change, read and write path changes, snapshot codec changes, migration of existing state, gating, cost and tests. Section 5.20 summarizes gating, cost and milestones.
+Each subsection gives the data-structure change, read and write path changes, snapshot codec changes, migration of existing state, gating, cost and tests. Section 5.20 summarizes cost.
 
-### 5.1 F0: group feature levels and `TidyStream`
+### 5.1 `TidyStream`
 
-**Why a level.** Old binaries would apply receipt eviction, message-record collapse, external staging and sealing differently, and cannot restore a sealed record index: `StreamRecordIndex::validate` requires the dense vector to start at the retained offset (`record_index.rs:231-256`). Commands travel as MessagePack maps with named fields (`crates/ursula-raft/src/codec.rs:26-38`): an old binary silently ignores a new optional field, which diverges quietly, and fails to decode a new variant, which fails loudly. `RAFT_GRPC_PROTOCOL_VERSION` is compared for strict equality (`crates/ursula-raft/src/grpc.rs:291, 757`), so bumping it breaks the graceful rollouts that #178 and #200 established. A per-group level makes the cut explicit: a new binary behaves exactly like its predecessor until every member supports the new level and an operator raises it.
+Earlier main builds gated the replicated changes below behind replicated per-group upgrade gates (C0); Ursula 0.6.0 removed the gates and runs them unconditionally (format epoch 2).
 
-**State, command and snapshot frame.**
-
-- `StreamStateMachine` gains `feature_level: u32` (0 is today's behavior) and `feature_level_raised_at_ms: u64`.
-- At any level above 0, group snapshots carry a new frame variant, `FeatureLevelV1 feature_level = 6` in `SnapshotFrameV1`, holding both. A binary without F0 decodes the unknown variant as an empty frame and refuses the snapshot (`required(frame.frame, …)`, `crates/ursula-raft/src/snapshot_codec.rs:55`). A header field would not do: prost skips unknown header fields, so a rolled-back binary would install the group and apply later commands with level-0 semantics. A binary with F0 refuses a level above its `MAX_SUPPORTED`. Backup exports carry the level, and `ImportSnapshot` refuses a level above the target group's.
-- New command `SetFeatureLevel { level, now_ms }`. If `level` is at or below the current level, apply is a no-op success. If it is at or below `MAX_SUPPORTED`, apply sets it. Above `MAX_SUPPORTED`, apply is fatal and the node stops applying, which is also what an old binary does when it cannot decode the variant.
-- Each gated call site checks one predicate, such as `self.feature_level >= LB1`. The check and the old path are deleted once the oldest supported release always runs at that level.
-- A gated command never depends on an optional field that a proposer below the level would omit. At a raised level apply decides from state alone, so a command proposed before the raise and applied after it is decided identically on every replica.
-
-**Raising.** `ursulactl cluster raise-feature-level --to N` reads each node's maximum supported level from the node admin info endpoint (a new field), requires every voter and learner of every group to support `N`, then proposes `SetFeatureLevel` to each group. The raise to Lb2 also requires every group to report a completed page-repair cycle (F19). Levels are never lowered. Membership changes refuse to add a node whose maximum is below the group's level. Once raised, binaries below the level cannot restore the group's snapshots, so downgrades are unsupported.
-
-**Levels.** Levels follow release order, and each costs one predicate per call site. This document defines five:
-
-- **Lb1, state hygiene:** F18's derived cold coverage, F3, F4a, `TidyStream`, F14a with F14g, F14b's `DeferColdGc`, F14i, and F12a emission.
-- **Lb2, sparse marks:** F1.
-- **Lb3, external locators:** F5.
-- **Lb4, hot representation:** F4b.
-- **Lb5, cold snapshots:** F16 (§5.16), feature level 5 (`FEATURE_LEVEL_COLD_SNAPSHOTS`).
-
-Numbers are assigned at release, and a level may carry several items when they release together.
-
-**`TidyStream { stream_id, now_ms }`** (Lb1) applies the normalizations that `FlushCold` and `AppendExternal` run inline: collapse message records (F4a), trim receipts and expire idle producers (F3), shrink capacities (F7), and from Lb2 seal the record index (F1). It is idempotent. Each command does bounded work, at most 1M records sealed and 64k receipts trimmed, so a legacy stream converges over several commands without stalling the group's apply. A leader-side maintenance driver issues it for streams whose derived debt exceeds a threshold (dense records below the seal point, receipts beyond the window, idle producers, capacity slack), at most 64 streams per group per minute, and repeats until no debt remains. This is how idle legacy streams converge after a raise without any O(group) apply.
-
-**Cost and risk.** +600 production LoC including `ursulactl`, the frame, the join and import checks and the debt driver; +400 test LoC. Medium risk, mostly operational.
-
-**Tests.** Raise refused when a member reports a lower maximum; raise applied and a fresh node installs a level-Lb1 snapshot; a decoder built from `e6d8d70`'s proto refuses a snapshot that carries the frame; restore above `MAX_SUPPORTED` fails closed; `SetFeatureLevel` replay is idempotent; a command proposed before a raise and applied after it decides identically on every replica; a madsim seed family with a test-only cap on a node's maximum level (§7.4).
+**`TidyStream { stream_id, now_ms }`** applies the normalizations that `FlushCold` and `AppendExternal` run inline to a stream that is idle: it seals the record index (F1), expires idle producers, evicts producers over the cap and trims receipts (F3), and shrinks capacities (F7). It is idempotent. Each command does bounded work, at most 1M records sealed and 64k receipts trimmed, so a stream with a large backlog converges over several commands without stalling the group's apply. A leader-side maintenance driver issues it for streams whose derived debt exceeds a threshold (dense records below the seal point, receipts beyond the window, idle producers, producers over the cap), at most 64 streams per group per minute, and repeats until no debt remains.
 
 ### 5.2 F1: sparse cold record marks
 
@@ -205,7 +180,7 @@ pub struct StreamRecordIndex {
     dense_offsets: VecDeque<u64>,  // start offsets of [dense_first_record, next_record); prefix drains cost O(drained)
 }
 pub struct RecordMark { pub record: u64, pub offset: u64 }
-const MARK_BLOCK_SHIFT: u32 = 20; // fixed by level Lb2
+const MARK_BLOCK_SHIFT: u32 = 20; // fixed by the format
 ```
 
 Invariants, maintained by apply and checked at restore where bytes are not needed:
@@ -216,7 +191,7 @@ Invariants, maintained by apply and checked at restore where bytes are not neede
 - **M4 (locality).** Every sealed record `r` starts in the same 1 MiB block as `mark_le(r)`. Equivalently, sealing emits a mark for each sealed record that starts in a later block than the previous mark.
 - **M5.** Dense offsets strictly increase and are below the tail. With marks present, `dense_offsets[0]` exceeds the last mark's offset; without marks, `dense_offsets[0] = retained_offset`, as today.
 
-**Sealing.** One function, `seal_below(p, budget)` with `p` the seal point (`hot_buffer.first_start_offset()` or the tail). It moves dense records whose end is at or below `p` into the sealed set, oldest first and at most `budget` = 1M records per call, emitting marks per M4, then drains the moved prefix and shrinks (F7). A record that straddles `p` stays dense; flushes can split an append mid-record (`hot_buffer.rs:131-136`). Records of an external append that sits above hot bytes also stay dense until the hot bytes below them flush. Apply calls it at the end of `FlushCold` (`cold.rs:402-518`), `AppendExternal` (`append.rs:419-597`), create with an external body, `AdvanceRetention` (retention can drop the hot bytes below an external append's dense records, so sealing there leaves no debt for the tidy driver), and `TidyStream`. The cost is amortized O(1) per record, and no apply spends more than about 5 ms sealing: a legacy stream's first seals after the raise proceed in 1M-record steps.
+**Sealing.** One function, `seal_below(p, budget)` with `p` the seal point (`hot_buffer.first_start_offset()` or the tail). It moves dense records whose end is at or below `p` into the sealed set, oldest first and at most `budget` = 1M records per call, emitting marks per M4, then drains the moved prefix and shrinks (F7). A record that straddles `p` stays dense; flushes can split an append mid-record (`hot_buffer.rs:131-136`). Records of an external append that sits above hot bytes also stay dense until the hot bytes below them flush. Apply calls it at the end of `FlushCold` (`cold.rs:402-518`), `AppendExternal` (`append.rs:419-597`), create with an external body, `AdvanceRetention` (retention can drop the hot bytes below an external append's dense records, so sealing there leaves no debt for the tidy driver), and `TidyStream`. The cost is amortized O(1) per record, and no apply spends more than about 5 ms sealing: a stream with a large dense backlog seals in 1M-record steps.
 
 **Lookups.**
 
@@ -232,11 +207,11 @@ For a sealed record `r`, let `m = mark_le(r)`. The result is `Exact(m.offset)` w
 
 Scans verify the anchors they cross (F19): the byte before each must be LF, and the LF count between two consecutive anchors must equal their record difference. A mismatch fails the read with a corruption error and a metric instead of returning shifted records.
 
-Server-side continuations carry an anchor taken from their own previous response, in a new `ReadStreamRequest` field `record_anchor: Option<RecordAnchor { incarnation, record, offset }>` with `#[serde(default)]`. The `offset` field cannot carry it, because record reads send `offset = 0` (`lib.rs:3141-3142`). That covers the SSE loop (`lib.rs:3800-3850`), including the envelope view, which reads one record per iteration. The engine uses an anchor only if its incarnation matches (unique from Lb1, F14g) and it validates: a dense anchor must equal the dense offset, and a sealed anchor must lie in its mark's bracket with an LF in the byte before it, which the plan reads. Otherwise it resolves from the mark. The anchor is never parsed from client input, and nodes that do not know the field ignore it. Client loops of `?record=r&max_records=k` pay at most one front scan per request; a node-local anchor cache could remove that later (Q11).
+Server-side continuations carry an anchor taken from their own previous response, in a new `ReadStreamRequest` field `record_anchor: Option<RecordAnchor { incarnation, record, offset }>` with `#[serde(default)]`. The `offset` field cannot carry it, because record reads send `offset = 0` (`lib.rs:3141-3142`). That covers the SSE loop (`lib.rs:3800-3850`), including the envelope view, which reads one record per iteration. The engine uses an anchor only if its incarnation matches (unique, F14g) and it validates: a dense anchor must equal the dense offset, and a sealed anchor must lie in its mark's bracket with an LF in the byte before it, which the plan reads. Otherwise it resolves from the mark. The anchor is never parsed from client input, and nodes that do not know the field ignore it. Client loops of `?record=r&max_records=k` pay at most one front scan per request; a node-local anchor cache could remove that later (Q11).
 
 Offset reads never consult the index and do not change. Record headers appear only on record reads (`render.rs:539-545`).
 
-**Writes and acknowledgements.** `StreamResponse::Appended` gains `record_range: Option<StreamRecordRange>`, which apply fills from the prepared range it already computes (`append.rs:270-286, 476-492`). `StreamResponse` is not serialized, so this is a local change. Deduplicated responses carry the stored receipt's range (`ProducerDecision::Duplicate` already holds the items, `append.rs:1019-1025`), or the producer's newest acknowledgement when the duplicate is of the newest sequence and its receipt was evicted (F3). `record_range_for_append` (`query.rs:57-91`) stops consulting the index. Today it searches the dense vector for appends without a producer and as a fallback when a batch duplicate is not the latest receipt. After F1 that search would fail for sealed records, including an external append that sealed its own records in the same apply. After retention the fallback already fails today with a 500. Close acknowledgements keep using `next_record`. `record_match`, HEAD, `tail_records` resolution and every first/next record header need only `(first_record, next_record)`, which stays O(1).
+**Writes and acknowledgements.** `StreamResponse::Appended` gains `record_range: Option<StreamRecordRange>`, which apply fills from the prepared range it already computes (`append.rs:270-286, 476-492`). `StreamResponse` is not serialized, so this is a local change. Deduplicated responses carry the stored receipt's range (`ProducerDecision::Duplicate` already holds the items, `append.rs:1019-1025`), or the producer's newest acknowledgement when the duplicate is of the newest sequence and its receipt was evicted (F3). `record_range_for_append` (`query.rs:57-91`) stops consulting the index. Today it searches the dense vector for appends without a producer and as a fallback when a duplicate is not the latest receipt. After F1 that search would fail for sealed records, including an external append that sealed its own records in the same apply. After retention the fallback already fails today with a 500. Close acknowledgements keep using `next_record`. `record_match`, HEAD, `tail_records` resolution and every first/next record header need only `(first_record, next_record)`, which stays O(1).
 
 **Retention and snapshot publish.** Apply never stores a record number it cannot recompute.
 
@@ -247,11 +222,11 @@ Offset reads never consult the index and do not change. Record headers appear on
 
 Neither command gains a field. A wrong scan, from wrong cold bytes or from a delete and recreate between resolution and commit, can make the leader accept or reject the wrong request, as a stale offset can today, but apply still lands on a real boundary, so record coordinates stay exact on every replica. Retention landing below its target needs a one-sentence amendment to `extensions.mdx` §2.2 (Q4).
 
-**Snapshot codec.** `StreamSnapshotEntryV1` gains `repeated uint64 record_mark_records = 17`, `repeated uint64 record_mark_offsets = 18` and `optional uint64 dense_first_record = 19`, and field 15 holds dense offsets only. Absent fields mean all-dense, so old snapshots restore unchanged. They are written only at level Lb2 or above; below it the index is all-dense anyway. The serde `StreamSnapshot` used by backup export (#154) gets the same fields with `#[serde(default)]`. A binary below Lb2 refuses such a snapshot through the level frame (F0) before it reaches `validate()`.
+**Snapshot codec.** `StreamSnapshotEntryV1` gains `repeated uint64 record_mark_records = 17`, `repeated uint64 record_mark_offsets = 18` and `optional uint64 dense_first_record = 19`, and field 15 holds dense offsets only. Absent fields mean all-dense. They are written only when the index has sealed records. The serde `StreamSnapshot` used by backup export (#154) gets the same fields with `#[serde(default)]`.
 
-**Migration.** Nothing is rewritten. After the raise each stream seals at its next `FlushCold` or `AppendExternal`, at most 1M records per command, and `TidyStream` seals idle legacy streams.
+**Migration.** None: format epoch 2 starts from empty state. Each stream seals at its next `FlushCold` or `AppendExternal`, at most 1M records per command, and `TidyStream` seals idle streams.
 
-**Gating.** Lb2, for the snapshot format and the apply representation. The behavior-preserving parts ship ungated in B1: acknowledgements carry the range apply computed; the record cursor and trim, which with exact locates only reproduce today's reads; and the RC-2 differential suite against the dense index. The level then only switches on sealing and the codec. Prerequisites: F18's coverage (Lb1) and a completed F19 repair cycle in every group.
+**Gating.** None in 0.6.0. Prerequisites that ship with it: F18's coverage and F19's clip rule and repair.
 
 **Cost.** +1,300 production LoC and +1,800 test LoC; #91 took about 1,600 and 2,000 for the dense form. Medium-high risk, because it touches every record-coordinate path; §6 is the mitigation.
 
@@ -286,38 +261,38 @@ Neither command gains a field. A wrong scan, from wrong cold bytes or from a del
 
 ### 5.4 F3: producer state bounds
 
-**Today.** `ProducerState.receipts` grows by one receipt per append within an epoch (`append.rs:1005`), and a batch receipt carries up to 512 items, which `last_items` duplicates (`model.rs:120`, set at `append.rs:1004`). The duplicate lookup scans linearly from the oldest receipt (`append.rs:931-948`). The producers map is never pruned, ids have no length limit (`state_machine.rs:752-761`), and transaction undo clones whole `ProducerState`s (`append.rs:108-111`). `model.rs:86-88` calls the history "Bounded exact response history", but nothing bounds it.
+**Today.** `ProducerState.receipts` grows by one receipt per append within an epoch (`append.rs:1005`), and a copy of the newest receipt's items duplicates it (`model.rs:120`, set at `append.rs:1004`). The duplicate lookup scans linearly from the oldest receipt (`append.rs:931-948`). The producers map is never pruned, ids have no length limit (`state_machine.rs:752-761`), and transaction undo clones whole `ProducerState`s (`append.rs:108-111`). `model.rs:86-88` calls the history "Bounded exact response history", but nothing bounds it.
 
 **Design.**
 
 - **Receipt window.** Each stream keeps at most R = 1,024 receipt items, one item per frame, where a single append is one item. Receipts stay in per-producer `VecDeque`s with contiguous sequences, so a duplicate's receipt sits at index `seq − front.seq`, which is O(1). Receipts are created in commit order, so a derived per-stream FIFO of receipt handles gives the eviction order; restore rebuilds it by sorting receipts by start offset, which is unique. When the stream exceeds R, apply drops the oldest receipt. Eviction never touches epoch, sequence or a producer's newest acknowledgement.
-- **Newest acknowledgement.** `ProducerState` keeps the newest append's byte range, closed flag and record range as scalars. A duplicate of the newest sequence whose receipt was evicted is answered from them, with its ranges. This is the most common retry, a client's last request after a timeout, so it keeps exact answers whatever other producers do. `last_items` is dropped; it duplicated the newest receipt, and its only reader (`query.rs:67-72`) goes away with F1's acknowledgements.
+- **Newest acknowledgement.** `ProducerState` keeps the newest append's byte range, closed flag and record range as scalars. A duplicate of the newest sequence whose receipt was evicted is answered from them, with its ranges. This is the most common retry, a client's last request after a timeout, so it keeps exact answers whatever other producers do. The copy of the newest receipt's items is dropped; its only reader (`query.rs:67-72`) goes away with F1's acknowledgements. *As built:* the window never evicts a producer's newest receipt, so the newest acknowledgement is answered from that receipt and needs no scalars.
 - **Beyond the window.** A duplicate whose receipt was evicted, other than of the newest sequence, is answered `204` deduplicated, with `Producer-Seq` and without byte or record range headers. Today it gets `409` "older than the retained receipt window" (`append.rs:931-948`). A `409` tells a client its sequence was wrong, which can provoke a re-append under a new sequence, which is a duplicate. The `204` follows the base protocol (upstream `PROTOCOL.md:417-418`) and #210's rule that eviction must never let a sequence be accepted twice.
 - **One enforcement point.** The window, idle expiry and the producer cap are enforced once per command, after the whole command has applied. (0.6.0 removed group transactions, the only multi-append command.)
-- **Idle expiry.** `ProducerState.last_seen_ms` is the command's `now_ms`. A producer idle for 7 days is treated as absent at its own next append and removed then; `TidyStream` removes idle producers in bulk. Every trigger depends only on persisted fields and the command's `now_ms`, so a replica that installed a snapshot expires exactly what a replica that replayed the log expires. Producers that existed before the raise count from the level's raise time. The base protocol suggests 7 days for in-memory stores and recommends that persistent stores keep producer state while data exists, so this is a deliberate trade that Q2 asks the maintainers to confirm. Expiry can duplicate only a producer's first append (sequence 0) retried after the idle period; any later sequence from an expired producer gets the existing `409` (expected 0) and cannot double-write.
+- **Idle expiry.** `ProducerState.last_seen_ms` is the command's `now_ms`. A producer idle for 7 days is treated as absent at its own next append and removed then; `TidyStream` removes idle producers in bulk. Every trigger depends only on persisted fields and the command's `now_ms`, so a replica that installed a snapshot expires exactly what a replica that replayed the log expires. The base protocol suggests 7 days for in-memory stores and recommends that persistent stores keep producer state while data exists, so this is a deliberate trade that Q2 asks the maintainers to confirm. Expiry can duplicate only a producer's first append (sequence 0) retried after the idle period; any later sequence from an expired producer gets the existing `409` (expected 0) and cannot double-write.
 - **Producer cap.** At most 4,096 producers per stream. A new producer beyond the cap evicts the least recently seen producer, found through a derived index on `(last_seen_ms, producer_id)`, if that one has been idle for at least an hour; otherwise the append fails with `429 producer_limit` (Q2).
-- **Length caps.** `Producer-Id` and `Stream-Seq` are capped at 256 B on every HTTP write path, immediately and ungated, and at apply under Lb1.
-- **Bounded catch-up.** A legacy producer can hold a million receipts. Enforcement trims at most 64k receipts per command, so the backlog drains over the producer's next appends and `TidyStream` commands.
+- **Length caps.** `Producer-Id` and `Stream-Seq` are capped at 256 B on every HTTP write path and at apply.
+- **Bounded catch-up.** Enforcement trims at most 64k receipts per command, so any backlog drains over the producer's next appends and `TidyStream` commands.
 
-**Codec.** `ProducerSnapshotV1` gains `optional uint64 last_seen_ms = 9`, `optional uint64 last_record_start = 10` and `optional uint64 last_record_next = 11`; `last_items` (field 7) is no longer written. At Lb1 an empty receipt list restores as empty. Only level-0 snapshots keep today's synthesis of a receipt from `last_*` (`persist.rs:359-365`); applied to a Lb1 snapshot, it would give a restored replica one receipt more than a live one, and their windows would diverge. Restore knows the level from the snapshot's level frame (F0).
+**Codec.** `ProducerSnapshotV1` carries `optional uint64 last_seen_ms = 9`, always written; decoding an absent value is an error. Field 7, the copy of the newest receipt's items, is reserved. An empty receipt list restores as empty, as a live replica holds it.
 
-**Gating.** Lb1, since apply behavior and response semantics change. Documentation changes ship in the same release: `exactly-once-writes.mdx:16, 31`, `durable-stream.mdx:329` and `extensions.mdx:786` change from "every accepted seq" to "within the stream's receipt window, and always for the newest sequence".
+**Gating.** None in 0.6.0. The documentation states the window: `exactly-once-writes.mdx`, `durable-stream.mdx` and `extensions.mdx` say "within the stream's receipt window, and always for the newest sequence" instead of "every accepted seq".
 
 **Bound.** At most 0.4 KiB per producer plus R items, about 56 KiB at today's 56 B per item: about 1.7 MiB at the 4,096-producer cap, and under 60 KiB for a stream with a few producers. Streams without producers pay nothing.
 
 **Cost.** +350 production LoC, +450 test LoC. Medium risk, because responses beyond the window are client-visible.
 
-**Tests.** Window edges at R − 1, R and R + 1; interleaved producers; a producer retrying its newest sequence after others have filled R (answered with its ranges); batch receipts; expiry with a deterministic clock; cap behavior; snapshot round trip; a restore-versus-live differential with fully evicted producers; a madsim seed that installs a snapshot mid-stream and compares producer maps across replicas; a duplicate after eviction returns `204` and never appends; duplicate lookup is O(1) at 1M appends; a legacy producer with 1M receipts converges in bounded commands.
+**Tests.** Window edges at R − 1, R and R + 1; interleaved producers; a producer retrying its newest sequence after others have filled R (answered with its ranges); expiry with a deterministic clock; cap behavior; snapshot round trip; a restore-versus-live differential with fully evicted producers; a madsim seed that installs a snapshot mid-stream and compares producer maps across replicas; a duplicate after eviction returns `204` and never appends; duplicate lookup is O(1) at 1M appends.
 
 ### 5.5 F4: message records
 
 **Today.** `message_records` holds one 16-byte entry per JSON record or per binary append. It collapses to one `[retained, frontier)` entry only at `FlushCold` (`cold.rs:510-514`) and retention (`cold.rs:699`). `AppendExternal` extends it (`append.rs:589-594`) and never collapses it, so external-only streams grow 16 B per record forever. The collapse allocates with the old length (`cold.rs:728`) and returns no memory. Consumers are bootstrap (`query.rs:386-416`), `snapshot_offset_aligned` (`cold.rs:670-686`), restore coverage (`persist.rs:223-229, 484-497`) and transaction rollback.
 
-**F4a (Lb1).** One rule at every cold transition. After `FlushCold`, `AppendExternal`, create with an external body, and `TidyStream`, every record ending at or below the seal point collapses into a single `[retained, p)` entry, built with exact capacity. F11 already reads bootstrap from the snapshot offset and splits JSON at LF, so JSON responses do not change. For binary streams that only receive external appends, cold history becomes one bootstrap part instead of one per append, as flushed history already is (I6). Alignment checks are unaffected: F18 accepts every offset at or below `p(s)`, which this collapse covers. +40 production LoC and +80 test LoC, low risk.
+**F4a.** Earlier main builds collapsed every record ending at or below the seal point into a single `[retained, p)` entry at every cold transition. 0.6.0 ships F4b instead, which removes the field.
 
-**F4b (Lb4, with F6b).** Delete the field. In the hot window, message boundaries are the record index's dense offsets for JSON or the hot buffer's append starts for other types, so one vector per stream serves both. Bootstrap uses those for binary hot messages plus one cold part from the snapshot offset; JSON keeps F11's LF split. Binary streams keep one part for cold history, which the spec should state. `snapshot_offset_aligned` and restore coverage use the derived boundaries, and the codec stops writing field 10. +100 / −140 production LoC and +150 test LoC, medium risk.
+**F4b (with F6b).** The field is gone. In the hot window, message boundaries are the record index's dense offsets for JSON or the hot buffer's append starts for other types, so one vector per stream serves both. Bootstrap uses those for binary hot messages; JSON keeps F11's LF split. `snapshot_offset_aligned` and restore coverage use the derived boundaries, and snapshot field 10 is reserved.
 
-*Implementation notes (level 4).* Streams without a record index, including legacy JSON streams created before the index existed, keep their append starts in the hot buffer; snapshots carry them in stream entry field 20 (`hot_append_starts`), which a level-3 binary never sees because the level frame refuses the snapshot first. Bootstrap follows the honest-partial rule: there is no cold part, and a snapshot offset below the first derived start at or above the seal point answers the snapshot alone. Because a recorded start at the seal point is a real message start, a snapshot published exactly at a flushed message boundary now gets update parts where levels 1 to 3 conservatively answered a partial. Legacy message records left after the raise are converted per stream, on its next append, external append, flush, retention or `TidyStream` (whose debt includes them), never in the raise itself; a legacy record that starts at the seal point is treated as a fragment, as before. F6c charges 8 B per hot record at level 4 (`HOT_RECORD_OVERHEAD_BYTES_LB4`).
+*Implementation notes.* Streams without a record index keep their append starts in the hot buffer; snapshots carry them in stream entry field 20 (`hot_append_starts`). Bootstrap follows the honest-partial rule: there is no cold part, and a snapshot offset below the first derived start at or above the seal point answers the snapshot alone. F6c charges 8 B per hot record (`HOT_RECORD_OVERHEAD_BYTES`).
 
 ### 5.6 F5: external payload locators, commit first and index after
 
@@ -331,16 +306,16 @@ An earlier design fixed the locator by keeping the `ObjectPayloadRef` in state a
 
 **Design.**
 
-1. **Apply (Lb3)** pushes the `ObjectPayloadRef` with its apply-assigned offsets into `StreamColdState.external_segments`. `read_plan_at` already serves state refs as direct object segments and excludes them from cold-index lookups (`query.rs:264-334`), so reads need no change.
-2. **No pre-proposal write.** At Lb3 the engine stops writing pages before proposing, on both the append and the create path. Below Lb3 the old path stays, and F19's clip rule and repair contain what it leaves behind.
-3. **Offload.** A leader-side offload step joins F2's driver loop, which becomes one "drain state-held cold refs" loop. It writes page entries for staged refs with an idempotent read-modify-write that clears every other entry overlapping them (F19); the refs are committed, so the entries are correct whatever happens next. It then proposes `OffloadColdRefs { stream_id, refs }`, a new Lb3 command. Apply removes exactly those refs if they are still present and queues no GC, because pages now reference the objects. A ref's range is never hot, so the coverage rule of F18 still covers it after removal. The trigger is any staged ref older than 10 s, or more than T_ext = 16 refs.
+1. **Apply** pushes the `ObjectPayloadRef` with its apply-assigned offsets into `StreamColdState.external_segments`. `read_plan_at` already serves state refs as direct object segments and excludes them from cold-index lookups (`query.rs:264-334`), so reads need no change.
+2. **No pre-proposal write.** The engine writes no page before proposing, on both the append and the create path.
+3. **Offload.** A leader-side offload step joins F2's driver loop, which becomes one "drain state-held cold refs" loop. It writes page entries for staged refs with an idempotent read-modify-write that clears every other entry overlapping them (F19); the refs are committed, so the entries are correct whatever happens next. It then proposes `OffloadColdRefs { stream_id, refs }`. Apply removes exactly those refs if they are still present and queues no GC, because pages now reference the objects. A ref's range is never hot, so the coverage rule of F18 still covers it after removal. The trigger is any staged ref older than 10 s, or more than T_ext = 16 refs.
 4. **Cleanup (B1, ungated).** The staged object is deleted only on a definite rejection (a typed stream error from apply, or a redirect before proposal) or a deduplicated response. Ambiguous outcomes keep the object; F14h reclaims it if nothing references it, and stream GC reclaims it at delete (F14a).
 
 **Bound.** At most T_ext plus in-flight refs per stream.
 
-**Implementation note.** Lb3 is feature level 3 (`FEATURE_LEVEL_EXTERNAL_LOCATORS`). The offload runs as its own leader-side worker every 2 s whenever a cold store is configured, rather than inside F2's driver loop, because that loop only runs when `compaction_enabled` is set and the offload bounds replicated state. A ref's age comes from the write time in its object name; a name without one counts as due. The cleanup rule also deletes the staged object of a create that answers already-exists. The orphan sweep (F14h) reads state refs before pages, and the offload writes pages before it removes refs, so a ref moving from state to pages is always seen in one of them.
+**Implementation note.** The offload runs as its own leader-side worker every 2 s whenever a cold store is configured, rather than inside F2's driver loop, because that loop only runs when `compaction_enabled` is set and the offload bounds replicated state. A ref's age comes from the write time in its object name; a name without one counts as due. The cleanup rule also deletes the staged object of a create that answers already-exists. The orphan sweep (F14h) reads state refs before pages, and the offload writes pages before it removes refs, so a ref moving from state to pages is always seen in one of them.
 
-**Codec and gating.** No new codec field; `external_segments` is field 9 already. The apply change and the new `OffloadColdRefs` command are gated at Lb3. Lb3 may trail the other levels: until it ships, deployments that cannot afford the staging path keep `external_payload_min_size` above the 32 MiB body cap.
+**Codec and gating.** No new codec field; `external_segments` is field 9 already. Ungated in 0.6.0.
 
 **Cost.** +500 production LoC, +600 test LoC. Medium-high risk, since this is the data path for large appends; madsim ambiguous-commit seeds mitigate it (§7.4).
 
@@ -352,9 +327,9 @@ An earlier design fixed the locator by keeping the `ObjectPayloadRef` in state a
 
 **F6b (B6, ungated).** Coalesce appends into 64 KiB blocks: a `VecDeque` of blocks, each with its own start offset. A block ends at a gap, and an external append above hot bytes leaves one (F18). Keep append starts for binary streams and rely on the dense record offsets for JSON as the only per-message vector. Reads binary-search blocks; flush drops whole blocks and splits at most one. Snapshots keep emitting `hot_segments`, now one per block, which every binary restores (`persist.rs:196-217`). +350 / −120 LoC, medium risk.
 
-**F6c (B6, ungated).** Admission and flush thresholds count payload plus the per-record overhead of the live representation: about 64 B today, about 24 B with F6b, 8 to 12 B with F4b. These are leader-side checks made before proposal (`ursula-raft/src/state_machine.rs:420-507`), so apply does not change. +40 LoC.
+**F6c (B6, ungated).** Admission and flush thresholds count payload plus the per-record overhead of the live representation: about 64 B in 0.5.1, 8 to 12 B with F6b and F4b. These are leader-side checks made before proposal (`ursula-raft/src/state_machine.rs:420-507`), so apply does not change. +40 LoC.
 
-**Bound.** Payload plus about 24 B per unflushed record with F6b (a dense offset and a message record), and 8 to 12 B once F4b removes message records at Lb4, against about 64 B today. Tests: hot read and flush equivalence against the current buffer under random workloads, including gaps from external appends; the harness asserts the overhead.
+**Bound.** Payload plus 8 to 12 B per unflushed record with F6b and F4b (a dense offset or an append start, and a share of the block headers), against about 64 B in 0.5.1. Tests: hot read and flush equivalence against the current buffer under random workloads, including gaps from external appends; the harness asserts the overhead.
 
 ### 5.8 F7: capacity hygiene
 
@@ -431,7 +406,7 @@ Every returned entry is at its stream's true expiry, and every smaller key has a
 
 **Design.**
 
-- **F12a, binary envelope.** `SnapshotPointer` and `PersistedSnapshot` move to MessagePack with `serde_bytes`. Decoders accept the old JSON forever. Decode support ships ungated in B2; emission starts at Lb1, because every follower must be able to decode it.
+- **F12a, binary envelope.** `SnapshotPointer` and `PersistedSnapshot` move to MessagePack with `serde_bytes`, the only envelope written. Decoders refuse the JSON envelope of 0.5.x (format epoch 2).
 - **F12b, S3 by default.** Use S3 snapshots by default whenever a cold store is configured; inline stays the fallback. This also starts the manual snapshot driver on every such cluster, and with it leadership shedding on S3 probe or flush failures (`ursula/src/bootstrap/snapshot.rs:139-179`): an operational change that is rated and rolled out as one.
 - **F12c, no extra copies.** The frame iterator borrows the `GroupSnapshot`, cloning only on fallback, and install decodes once.
 - **F12d, non-blocking permit.** `try_create_snapshot_builder` try-acquires the permit and returns `None` when it is busy, so no apply worker waits on another group's build.
@@ -452,17 +427,17 @@ Every returned entry is at its stream's true expiry, and every smaller key has a
 
 ### 5.15 F14: cold-object hygiene
 
-- **(a) External prefix in stream GC (Lb1, with g).** Stream delete reclaims `{stream}/chunks/` and `{stream}/cold-index/` only (`runtime.rs:1016-1021`), so payloads under `{stream}/external/` (`cold_store.rs:1347-1351`) survive until bucket purge. Add that prefix. It ships with (g): while GC is not scoped to an incarnation, the wider sweep would also delete a recreated stream's staged initial payload, which a create body of 1 MiB or more stages at once (`lib.rs:2436-2465`).
-- **(b) GC worker.** `run_cold_gc_all_groups_once` aborts all later groups on one group's error (`runtime.rs:1065-1069`); it should log and continue, ungated. The FIFO stops at the first entry that is not yet due or that fails (`runtime.rs:1011-1014`; `cold_gc.rs:54-64`). `DeferColdGc { seq }` (Lb1) moves a failing head entry to the tail with backoff.
+- **(a) External prefix in stream GC (with g).** Stream delete reclaims `{stream}/chunks/` and `{stream}/cold-index/` only (`runtime.rs:1016-1021`), so payloads under `{stream}/external/` (`cold_store.rs:1347-1351`) survive until bucket purge. Add that prefix. It ships with (g): while GC is not scoped to an incarnation, the wider sweep would also delete a recreated stream's staged initial payload, which a create body of 1 MiB or more stages at once (`lib.rs:2436-2465`).
+- **(b) GC worker.** `run_cold_gc_all_groups_once` aborts all later groups on one group's error (`runtime.rs:1065-1069`); it should log and continue, ungated. The FIFO stops at the first entry that is not yet due or that fails (`runtime.rs:1011-1014`; `cold_gc.rs:54-64`). `DeferColdGc { seq }` moves a failing head entry to the tail with backoff.
 - **(c) No tiny exclusive objects.** A lone candidate below 1 MiB goes down the pack path as a pack of one. Per-flush page rewrites (`cold_index.rs:360-399`) then happen only for large flushes and compaction outputs, and F2 bounds the resulting refs. Ungated.
 - **(d) Compaction discovery.** The flush path records `(stream, page)` debt when it publishes an exclusive chunk below `compaction_target_size`, and the compactor drains that debt instead of recursively listing the whole cold root every 30 s (`runtime.rs:770-900`). After failover the debt set restarts empty and refills on the next small flush; the slow cursor over the group's own stream ids that F19 introduces catches idle streams. Compaction then turns on by default (`config.rs:370`). Ungated.
 - **(e) Stale flushes.** On a definite rejection, roll back the page entry and delete the chunk, porting `write_cold_chunk_index_pages_with_rollback` to the Raft flush path (`ursula-raft/src/engine/mod.rs:1454-1475`). Ungated.
-- **(f) Retention GC.** Only deployments that trim need this: a leader-side pass deletes pages wholly below the retained offset together with their exclusive chunks and externals, through a gated `EnqueueColdGc` command. It is not needed for boundedness. *Status (2026-10-03):* shipped without a replicated command, after an AWS run showed nothing below the retained offset was ever deleted. The F19 repair cursor runs it on the leader: once a retained offset has been observed for the F14i grace (leader-local clock, restarted on failover), it deletes the pages that lie wholly below it and hold only entries below it, then the objects only those pages name (`crates/ursula-runtime/src/retention_gc.rs`). It never writes the boundary page and never deletes an object a kept page names: page writes are unconditional PUTs and leadership is checked only when a step starts, so a deposed leader rewriting the boundary page could drop an entry a new leader just flushed, which at Lb1 is the chunk's only reference. This leaves at most about one page span of objects below the retained offset per stream. Follow-up: conditional PUTs on page writes for repair, flush and compaction, which would remove that hazard everywhere. Direct external refs that retention drops from state are still left to the orphan sweep.
+- **(f) Retention GC.** Only deployments that trim need this: a leader-side pass deletes pages wholly below the retained offset together with their exclusive chunks and externals, through a gated `EnqueueColdGc` command. It is not needed for boundedness. *Status (2026-10-03):* shipped without a replicated command, after an AWS run showed nothing below the retained offset was ever deleted. The F19 repair cursor runs it on the leader: once a retained offset has been observed for the F14i grace (leader-local clock, restarted on failover), it deletes the pages that lie wholly below it and hold only entries below it, then the objects only those pages name (`crates/ursula-runtime/src/retention_gc.rs`). It never writes the boundary page and never deletes an object a kept page names: page writes are unconditional PUTs and leadership is checked only when a step starts, so a deposed leader rewriting the boundary page could drop an entry a new leader just flushed, which is the chunk's only reference. This leaves at most about one page span of objects below the retained offset per stream. Follow-up: conditional PUTs on page writes for repair, flush and compaction, which would remove that hazard everywhere. Direct external refs that retention drops from state are still left to the orphan sweep.
 - **(g) Incarnation-scoped objects (D4).**
   1. *B1, ungated.* The GC worker acknowledges a stream entry without deleting anything when a stream with that name exists again, and checks again before deleting pages; (h) reclaims the old incarnation's unreferenced objects later. Deleting a live stream's data becomes a bounded leak, and the window left is a recreate during an in-progress sweep. F19's repair drops page entries whose objects predate the stream's creation.
-  2. *Lb1.* A create assigns a unique incarnation, `created_at_ms := max(now_ms, group.last_created_at_ms + 1)`. `last_created_at_ms` (header field 10) starts at the raise as the maximum of its `now_ms` and every live stream's `created_at_ms`. A stream created at Lb1 or later keeps its cold-index pages under generation = incarnation; the page key's generation component and snapshot field 7 already exist and are always 0 today (`cold_index.rs:37`; `cold_state.rs:22-24`). Its chunk and external names gain an `{incarnation:016x}/` component. Stream GC entries carry the incarnation (`ColdGcEntryV1` field 6) and delete only that incarnation's names and generation. Legacy entries delete only legacy-format names directly under `chunks/` and `external/`, and generation-0 pages, which also stops today's recursive sweep from reaching an affinity stream under the same name.
+  2. *Unique incarnations.* A create assigns a unique incarnation, `created_at_ms := max(now_ms, group.last_created_at_ms + 1)`, kept in snapshot header field 11. Every stream keeps its cold-index pages under generation = incarnation (snapshot field 7), and its chunk names carry an `{incarnation:016x}/` component. Stream GC entries carry the incarnation (`ColdGcEntryV1` field 6) and delete only that incarnation's names and generation; the worker refuses a stream entry without one as corrupt and deletes nothing.
 - **(h) Orphan sweep (D5, B2, ungated).** Publishes with ambiguous outcomes keep their objects on purpose (`runtime.rs:404-414, 537-546`), and nothing reclaims them; packs live under `{bucket}/_packs/{group}/` (`cold_store.rs:1328-1331`), outside every stream prefix. A per-group leader job lists the group's pack prefix and walks stream prefixes with F19's cursor, deleting objects older than a day that no state ref, cold-index page or GC entry references; packs need only the group's ref maps. It wires up the existing `cold_orphan_cleanup_*` counters (`metrics.rs:413-415`).
-- **(i) Retention grace (D6, Lb1).** Retention releases dropped pack slices with no grace (`cold.rs:706`). It uses `compaction_gc_grace` instead, so a read planned before the retention still finds its bytes. The not-before time is replicated, hence the gate.
+- **(i) Retention grace (D6).** Retention releases dropped pack slices with no grace (`cold.rs:706`). It uses `compaction_gc_grace` instead, so a read planned before the retention still finds its bytes. The not-before time is replicated.
 
 **Cost.** +600 production LoC, +500 test LoC, medium risk: (g) changes object naming.
 
@@ -470,12 +445,12 @@ Every returned entry is at its stream's true expiry, and every smaller key has a
 
 **F15, tenant tombstones.** `bucket_usage` keeps a row of about 200 B per bucket ever written in every group. `erased_buckets` keeps about 95 B per purged bucket in every group, and `PurgeBucket` runs on all groups (`runtime.rs:579-600`). Both are deliberate (#258, #280), and both grow with tenant churn rather than records. Options: a gated `PruneBucketUsage { bucket_id, observed }` sent after the meter durably records the counters; fences held in the meta group, with only a 16-byte fingerprint set in data groups. Q9 asks the maintainers to decide.
 
-**F16, visible snapshot.** O(1) per stream, but inline up to the 32 MiB body cap on every replica and in every group snapshot. Accepted for the SQLite VFS, which publishes the database file itself as the snapshot, and implemented at Lb5 as follows.
+**F16, visible snapshot.** O(1) per stream, but inline up to the 32 MiB body cap on every replica and in every group snapshot. Accepted for the SQLite VFS, which publishes the database file itself as the snapshot, and implemented as follows.
 
-*Design (Lb5, feature level 5).* The smallest change that reuses F5:
+*Design.* The smallest change that reuses F5:
 
-1. **Staging.** `PUT {stream}/snapshot/{offset}` (and `?record=`) reads the body as a stream. Below the staging threshold, the smaller of `runtime.external_payload_min_size` (1 MiB by default) and the 32 MiB inline cap, the body stays inline and is proposed as today's `PublishSnapshot`. Above it, when a cold store is configured and the stream's group is at level 5 as the local replica sees it, the HTTP layer streams the body into a new object under `{stream}/external/` (F5's `new_external_payload_path`, uploaded in 8 MiB multipart parts) while hashing it with the same BLAKE3 digest apply uses for inline bodies. Memory per request stays at most one inline cap; admission charges at most 32 MiB of the in-flight budget for a snapshot PUT and admits bodies up to `MAX_COLD_SNAPSHOT_BYTES` = 1 GiB, enforced again while streaming (413).
-2. **Command.** A new command, `PublishSnapshotExternal { stream_id, snapshot_offset, content_type, object: ExternalPayloadRef, digest, now_ms }`, gated at Lb5 (`FeatureNotEnabled` below it). It is a new variant rather than an optional field on `PublishSnapshot`, so a binary without it fails loudly instead of applying an empty inline body (§5.1). Apply runs the existing publish rules unchanged (scope, tail, retained offset, alignment, idempotency by digest) and stores `StreamVisibleSnapshot { offset, content_type, digest, object, payload: [] }`. Group snapshots carry the reference as `StreamVisibleSnapshotV1.object` (field 5); the level frame keeps older binaries from installing them.
+1. **Staging.** `PUT {stream}/snapshot/{offset}` (and `?record=`) reads the body as a stream. Below the staging threshold, the smaller of `runtime.external_payload_min_size` (1 MiB by default) and the 32 MiB inline cap, the body stays inline and is proposed as today's `PublishSnapshot`. Above it, when a cold store is configured, the HTTP layer streams the body into a new object under `{stream}/external/` (F5's `new_external_payload_path`, uploaded in 8 MiB multipart parts) while hashing it with the same BLAKE3 digest apply uses for inline bodies. Memory per request stays at most one inline cap; admission charges at most 32 MiB of the in-flight budget for a snapshot PUT and admits bodies up to `MAX_COLD_SNAPSHOT_BYTES` = 1 GiB, enforced again while streaming (413).
+2. **Command.** A new command, `PublishSnapshotExternal { stream_id, snapshot_offset, content_type, object: ExternalPayloadRef, digest, now_ms }`. It is a new variant rather than an optional field on `PublishSnapshot`, so a binary without it fails loudly instead of applying an empty inline body. Apply runs the existing publish rules unchanged (scope, tail, retained offset, alignment, idempotency by digest) and stores `StreamVisibleSnapshot { offset, content_type, digest, object, payload: [] }`. Group snapshots carry the reference as `StreamVisibleSnapshotV1.object` (field 5).
 3. **Reads.** `GET {stream}/snapshot/{offset}` and `/bootstrap` plan as before; the plan carries the reference instead of bytes, and the HTTP layer streams the object from the cold store in 8 MiB pieces outside the state machine (no S3 inside `with_state_machine`, as F11 requires). The first piece is read before the status line, so a missing object answers 502 rather than a truncated 200. Both set `Content-Length`. Snapshot reads already require the local leader, so no body crosses the Raft gRPC path.
 4. **Object lifecycle, all through existing machinery.** The F5 cleanup rule deletes a staged body after a definite rejection and keeps it after an ambiguous failure. Apply queues a `ColdGcTarget::Paths` entry for a superseded cold body with the F14i grace (300 s), so a read planned before the publish still finds it; for the staged copy of an idempotent repeat (same digest, nothing references it), with the same grace; and for the visible body when the stream is removed (stream GC only reaches externals that pages reference). The orphan sweep (F14h) treats the visible body as a state ref (`stream_referenced_cold_paths`), so it reclaims only staged bodies whose publish never committed, after a day. Bucket purge erases the prefix as before.
 
@@ -498,7 +473,7 @@ Every returned entry is at its stream's true expiry, and every smaller key has a
 **Design.**
 
 1. **B1, ungated, node-local.** Coverage is the complement of the hot buffer. In `read_plan_at` and `payload_sources_cover_retained_suffix`, every byte of `[retained, tail)` that no hot segment holds is cold, served by state refs where they exist and by cold-index pages otherwise. Reads of affected streams work again, and nodes restore and install snapshots that already carry a regressed frontier. Snapshots keep writing the frontier as before, so replicated state does not change.
-2. **Lb1.** Apply drops the scalar frontier. `snapshot_offset_aligned` accepts the retained offset, any offset at or below `p(s)`, or a message-record end. Today's frontier clause also accepts intra-message offsets in hot bytes that lie below an external append, and a frontier raised with `max` would widen that, which is why the clause is replaced rather than repaired. Retention's message-record collapse uses `p(s)` too. Field 6 is written as `p(s)` for tooling and ignored at restore. The per-call sort of external segments in `cold_frontier_offset` (`cold_state.rs:83-108`) goes away with it.
+2. **Representation.** Apply drops the scalar frontier. `snapshot_offset_aligned` accepts the retained offset, any offset at or below `p(s)`, or a message boundary above it (F4b). The 0.5.1 frontier clause also accepted intra-message offsets in hot bytes that lie below an external append, and a frontier raised with `max` would widen that, which is why the clause is replaced rather than repaired. Snapshot field 6 is reserved. The per-call sort of external segments in `cold_frontier_offset` (`cold_state.rs:83-108`) goes away with it.
 3. **Consequences elsewhere.** F5's `OffloadColdRefs` can always drop a ref, because its range is never hot. F6b's blocks keep their own start offsets, because the hot buffer has gaps.
 
 **Cost.** +80 production LoC, +150 test LoC (the D1 sequence on both engines, plus restore and install of snapshots with a regressed frontier). Low risk.
@@ -510,37 +485,37 @@ Every returned entry is at its stream's true expiry, and every smaller key has a
 **Design.**
 
 1. **Clip on proven writes (B1, ungated).** A page write for a range whose bytes state proves removes or clips, in the same read-modify-write, every other entry overlapping the range. State proves three kinds of range: a flush of hot bytes (the hot buffer holds only committed appends), an F2 replacement of state-held refs, and an F5 offload of a committed external ref. Rollback restores the previous page, as today. Page writes are leader-side, so mixed versions need no gate.
-2. **Repair (B1, ungated).** A slow leader-side cursor over each group's stream ids repairs pages: per page, it keeps only the last-written external entry at each start offset, and drops external entries that overlap a chunk entry or another object's state ref, that start at or beyond the stream's tail, or whose objects predate the stream's creation by more than a minute (D4). Within a leader's term, a group's writes run one at a time through its group actor, so a later entry at the same start offset follows a proposal that did not commit there. F2 repairs a stream's pages right before compacting it. Each leader reports when it last completed a full cycle; the Lb2 raise requires one in every group. Two overlapping page-only external entries with different starts, both written before F5, cannot be told apart; they remain a documented hazard, which step 3 turns into an error on JSON streams.
+2. **Repair (B1, ungated).** A slow leader-side cursor over each group's stream ids repairs pages: per page, it keeps only the last-written external entry at each start offset, and drops external entries that overlap a chunk entry or another object's state ref, that start at or beyond the stream's tail, or whose objects predate the stream's creation by more than a minute (D4). Within a leader's term, a group's writes run one at a time through its group actor, so a later entry at the same start offset follows a proposal that did not commit there. F2 repairs a stream's pages right before compacting it. Two overlapping page-only external entries with different starts, both written before F5, cannot be told apart; they remain a documented hazard, which step 3 turns into an error on JSON streams.
 3. **Anchor verification (with F1).** A scan that crosses an anchor checks that the byte before it is LF, and when it spans two consecutive anchors, that their LF count equals their record difference. A mismatch fails the read with a corruption error and a metric.
 
-New stale entries stop at Lb3, when F5 removes the pre-proposal write.
+No new stale entries arise, because F5 removed the pre-proposal write.
 
 **Cost.** +200 production LoC, +250 test LoC (the three D3 reproductions as regression tests). Medium risk: the repair rewrites pages.
 
-### 5.20 Gating, cost and milestone summary
+### 5.20 Cost summary
 
-| Fix | Gate | Prod LoC | Test LoC | Risk | Milestone |
-|---|---|---|---|---|---|
-| F0 levels, frame, `TidyStream` | defines levels | +600 | +400 | medium | B1 plumbing, B3 `TidyStream` |
-| F1 sparse marks | Lb2 | +1,300 | +1,800 | medium-high | B1 preparation, B4 |
-| F2 pack refs: Raft branch / driver | none | +40 / +300 | +350 | low | B1 / B2 |
-| F3 producer bounds (HTTP caps ungated) | Lb1 | +350 | +450 | medium | B1 caps, B3 |
-| F4a collapse / F4b removal | Lb1 / Lb4 | +40 / +100 −140 | +80 / +150 | low / medium | B3 / B6 |
-| F5 external locators (cleanup rule ungated) | Lb3 | +500 | +600 | medium-high | B1 cleanup, B5 |
-| F6a counter / F6b blocks / F6c accounting | none | +20 / +350 −120 / +40 | +300 | low / medium / low | B1 / B6 / B6 |
-| F7 capacity | none | +80 | +100 | low | B1 |
-| F8 TTL index | none | +60 | +150 | low | B1 |
-| F9 engine bookkeeping | none | +80 −170 | +80 | low | B1 |
-| F10 planner | none | +250 | +300 | low-medium | B1 |
-| F11 read and bootstrap | none | +250 | +300 | low-medium | B1 |
-| F12 snapshot pipeline | F12a emission at Lb1 | +350 | +300 | medium | B1 (c, d), B2 (a decode), B3 (a emit), B6 (b, e) |
-| F13 node caches | none | +100 | +120 | low | B1 |
-| F14 cold-object hygiene | (a), (b) defer, (g) 2, (i) at Lb1; (f) gated | +600 | +500 | medium | B1 (b, e, g 1), B2 (h), B3 (a, b defer, g 2, i), B6 (c, d) |
-| F15 | next level, if accepted | +100 | +100 | low | decision in B7 |
-| F16 cold snapshots | Lb5 | +450 | +200 | medium | after B7 (SQLite VFS) |
-| F17 hardening | none | +150 | +100 | low | B7 |
-| F18 cold coverage | B1 rule none; representation Lb1 | +80 | +150 | low | B1, B3 |
-| F19 page-entry hygiene | none | +200 | +250 | medium | B1 |
+| Fix | Prod LoC | Test LoC | Risk |
+|---|---|---|---|
+| `TidyStream` (and, until 0.6.0, the upgrade gates) | +600 | +400 | medium |
+| F1 sparse marks | +1,300 | +1,800 | medium-high |
+| F2 pack refs: Raft branch / driver | +40 / +300 | +350 | low |
+| F3 producer bounds | +350 | +450 | medium |
+| F4a collapse / F4b removal | +40 / +100 −140 | +80 / +150 | low / medium |
+| F5 external locators | +500 | +600 | medium-high |
+| F6a counter / F6b blocks / F6c accounting | +20 / +350 −120 / +40 | +300 | low / medium / low |
+| F7 capacity | +80 | +100 | low |
+| F8 TTL index | +60 | +150 | low |
+| F9 engine bookkeeping | +80 −170 | +80 | low |
+| F10 planner | +250 | +300 | low-medium |
+| F11 read and bootstrap | +250 | +300 | low-medium |
+| F12 snapshot pipeline | +350 | +300 | medium |
+| F13 node caches | +100 | +120 | low |
+| F14 cold-object hygiene | +600 | +500 | medium |
+| F15 | +100 | +100 | low |
+| F16 cold snapshots | +450 | +200 | medium |
+| F17 hardening | +150 | +100 | low |
+| F18 cold coverage | +80 | +150 | low |
+| F19 page-entry hygiene | +200 | +250 | medium |
 
 Totals, excluding F15 and F16: about +5,800 / −400 production LoC and +6,500 test LoC, plus the harness (§7.1). The first estimate was half of this; the history of #91, `PurgeBucket` (#157, #282) and bucket quotas (#158) supports the larger figures.
 
@@ -568,7 +543,7 @@ F1 changes how every record coordinate is resolved, so it carries its own invari
 
 **RC-10, fresh acknowledgements.** Append, close and create responses carry the range computed in apply and never derive it from the index afterwards. *Test*: append immediately followed by a seal in the same apply batch; external appends that seal their own records; an inline append followed by an external append.
 
-**RC-11, duplicate acknowledgements.** A duplicate returns its stored receipt's original byte and record ranges, independent of sealing and retention. A duplicate of a producer's newest sequence always returns its ranges, from the newest acknowledgement if its receipt was evicted. Any other evicted duplicate returns no range, never a recomputed one. *Test*: batch duplicates for non-latest receipts (a 500 today after retention); duplicates after sealing; duplicates after eviction, newest and older.
+**RC-11, duplicate acknowledgements.** A duplicate returns its stored receipt's original byte and record ranges, independent of sealing and retention. A duplicate of a producer's newest sequence always returns its ranges, from the newest acknowledgement if its receipt was evicted. Any other evicted duplicate returns no range, never a recomputed one. *Test*: duplicates of non-latest receipts (a 500 in 0.5.1 after retention); duplicates after sealing; duplicates after eviction, newest and older.
 
 **RC-12, retention by offset.** On a JSON stream, retention to offset `o` succeeds exactly when `o` is a record boundary at or above the current retained offset and at or below the latest snapshot. The effective retained offset is `o` when `o` is dense or a mark, and otherwise the mark at or below `o`. Afterwards `first_record` equals the oracle's ordinal at the effective offset, and no record is renumbered. *Test*: RC-2 suite plus HTTP, with targets in dense, sealed, mark, block-edge and intra-record positions.
 
@@ -578,7 +553,7 @@ F1 changes how every record coordinate is resolved, so it carries its own invari
 
 **RC-15, bootstrap.** The parts after the snapshot offset concatenate to the oracle's bytes from that offset, and JSON parts are exactly one record each. This holds after a checkpoint that retention did not follow, after a flush past it, and after an external append that collapses message records. *Test*: HTTP bootstrap tests over hot, cold and mixed suffixes, including those three sequences on both engines.
 
-**RC-16, persistence.** Marks survive snapshot build, restore, WAL replay, snapshot install, backup export and import byte-for-byte. Old snapshots restore as all-dense, including those that carry a regressed frontier (D1). A snapshot at a raised level is refused by a binary below that level, and by a binary without F0. *Test*: codec round-trip property test; restore fixtures from `e6d8d70`, among them a D1 snapshot; a madsim snapshot-install family.
+**RC-16, persistence.** Marks survive snapshot build, restore, WAL replay, snapshot install, backup export and import byte-for-byte. Snapshots from 0.5.x and earlier main builds are refused (format epoch 2). *Test*: codec round-trip property test; a madsim snapshot-install family.
 
 **RC-17, determinism.** All replicas hold identical marks after the same log prefix. *Test*: madsim compares per-group introspection digests across replicas at quiescent points.
 
@@ -659,8 +634,6 @@ Seed families:
 - **Snapshot install** with marks, and mid-stream with producers.
 - **Mixed hot and external appends** (D1) with leader churn and snapshot installs.
 - **Delete and recreate** under the same name with GC pending (D4).
-- **Level raise** under live traffic.
-- **Old-binary emulation.** Nodes with a test-only cap on their maximum level emulate old binaries, so raises are refused and joins rejected. madsim runs one binary (`rolling_restart.rs`), so true N-1/N interop stays on the EKS commit-candidate rollout gate.
 - **Producer churn** against the receipt and producer bounds.
 - **TTL churn** against the heap bound.
 - **Ambiguous outcomes** for `CompactCold`, `OffloadColdRefs` and `AppendExternal` under network faults.
@@ -679,7 +652,6 @@ Per-group gauges:
 - pending cold-GC entries and the age of the head entry
 - unpurged log bytes, snapshot raw bytes and build time
 - page-repair cycle age, entries clipped and dropped, corruption errors
-- feature level
 
 Per-node gauges:
 
@@ -702,49 +674,9 @@ Alerts:
 
 **Soak gate (B7).** A 72-hour EKS soak on a commit candidate with W2-shaped trickle streams, one W1-shaped heavy stream, producer and TTL streams, mixed inline and external appends, delete-and-recreate churn, and leader churn. Passing means every structure stays within its own formula at every scrape, and after a 6-hour warm-up, the residual (state − H − 8·U − 16 B·K − Prod − cache caps) and RSS minus the same terms grow by no more than 1% per day.
 
-## 8. Milestones
+## 8. Rejected alternatives
 
-The workstream starts now. It touches no protocol surface except the receipt window (F3), retention granularity in cold history (F1), bootstrap parts and response caps (F11), and binary bootstrap parts (F4a, F4b).
-
-**B0, harness (about 1.5 weeks).** Port the probe and the adversarial reproductions (§7.1), add the per-group gauges, and land the CI ratchet job and the nightly job. *Exit*: CI reproduces the audit's figures within 10% at reduced scale and runs D1 to D4 as expected failures; the nightly job publishes W1 to W6; dashboards exist.
-
-**B1, correctness and ungated fixes (about 4 weeks, parallel work).** Correctness first: F18 step 1 (D1), F11 (D2 and the quadratic bootstrap), F19 steps 1 and 2 (D3), F14g step 1 (D4), and F2's Raft branch. Then F0's plumbing with no behavior assigned to any level, F1's behavior-preserving parts, F3's HTTP length caps, F5's cleanup rule, F6a, F7, F8, F9, F10, F12c and F12d, F13, and F14b's continue-on-error and F14e. Old and new binaries mix freely. *Exit*:
-
-- The D1 to D4 reproductions pass on both engines, including restore and install of snapshots that carry a regressed frontier.
-- A bootstrap issues one read plan.
-- A page-repair cycle completes on a staging cluster, with clip and drop counts reported.
-- The TTL heap stays at most twice the TTL streams; the starvation reproduction shows no starvation; planner counters stay within bounds; capacity is at most 2 × len + 64 after flush and retention; the page-cache deque is bounded; in-memory admission is O(1).
-- Shared-input `CompactCold`, legacy-pack migration and bucket purge pass on the Raft engine.
-- No staged object is deleted after an ambiguous error.
-- On a 3-node cluster a raise to a test level is refused when one node reports a lower maximum and applied otherwise; its snapshots carry the level frame, and a decoder from `e6d8d70` refuses them.
-
-**B2, pack-reference driver, orphan sweep and decode support (about 2 weeks).** F2's driver, F14h, and F12a decode support. *Exit*: W2 with F10 keeps at most 64 refs per stream, and packs are GC'd after compaction; a rejected external append under a packed trickle reads correctly after compaction; the orphan sweep reclaims objects from injected ambiguous publishes after the grace and nothing that is referenced.
-
-**B3, level Lb1, state hygiene (about 3 weeks).** F18 step 2, F3, F4a, `TidyStream`, F14a with F14g step 2, F14b's `DeferColdGc`, F14i and F12a emission, in one release that defines Lb1, together with the documentation they need. *Exit*:
-
-- W4 keeps at most 1,024 receipt items per stream and producer bytes within Prod(s); a restore-versus-live differential and a madsim install mid-stream show identical producer state on every replica.
-- W3 keeps at most 2 message records per stream.
-- A delete and recreate with GC pending keeps every object of the new incarnation, and stream GC removes every object of the old one, external payloads included.
-- A legacy producer with 1M receipts converges through bounded commands of under 10 ms of apply each.
-- An EKS rolling upgrade at level 0, followed by a raise to Lb1 under live traffic, completes with zero acknowledged-data divergence.
-
-**B4, level Lb2, sparse marks (about 4 weeks).** F1. Development starts in B2, in parallel with B3, and the release follows B3's, about 11 weeks after the start. *Exit*:
-
-- W1 at 3M records holds marks ≤ ⌈cold MiB⌉ + 2 (about 9.2 KB) and dense entries equal to its unflushed records (about 22k); its snapshot spends at most 32 B per cold MiB on marks.
-- RC-1 to RC-21 and DST invariants 9 to 12 pass.
-- A legacy stream of 10M records seals in commands of at most 1M records, each under 10 ms of apply.
-- The Lb2 raise is refused until every group reports a completed page-repair cycle.
-- An EKS rolling upgrade followed by a raise to Lb2 under live traffic completes with zero acknowledged-data divergence.
-
-**B5, level Lb3, external locators (about 3 weeks; may trail, in parallel with B6).** F5. *Exit*: W3 keeps at most 16 staged refs per stream; the ambiguous-commit seeds and Invariant 11 pass; no page entry is written before a proposal.
-
-**B6, hot window and snapshot cadence (about 3 weeks).** F6b, F6c, F4b (defines Lb4), F12b, F12e, F14c and F14d, and compaction on by default. *Exit*: hot overhead in W1 is at most payload plus 24 B per record with F6b and 12 B with F4b; snapshot bytes written per appended log byte average at most 0.6 on W1 and on a uniform 128-group workload, with unpurged log within the node budget; compaction issues no LIST.
-
-**B7, hardening (about 2 weeks, then ongoing).** The 72-hour soak gate (§7.5), F17, decisions on F15 and F16, and removal of the legacy paths (pre-level code, legacy pack migration) after the deprecation window. *Exit*: the soak gate passes and `operations.mdx` no longer names retention as the way to bound memory. *Status (2026-10-02):* the soak is deferred to a run on AWS (ECS or EKS) against real S3; it has not run, so the gate is open. (Its script drove the Pi Durable adapter and was removed with it.)
-
-## 9. Rejected alternatives
-
-**Require retention.** Applications publish snapshots and trim to stay bounded. This contradicts the principle and discards the history these streams exist for (#41). It makes Raft memory depend on applications or indexers staying alive; Pi's review measured unbounded growth during an indexer outage. It still leaves receipts, producer ids, the TTL heap and `Vec` capacity unbounded.
+**Require retention.** Applications publish snapshots and trim to stay bounded. This contradicts the principle and discards the history these streams exist for (#41). It makes Raft memory depend on applications or indexers staying alive; a review measured unbounded growth during an indexer outage. It still leaves receipts, producer ids, the TTL heap and `Vec` capacity unbounded.
 
 **Page the dense index into cold-index pages.** Record lookups would need asynchronous, two-phase resolution, extra S3 GETs per seek, and page writes that are never rolled back (the D3 defect class). Marks cost 16 B per MiB already. Moving marks into a page format v3 (about 128 B per GB of state) remains possible later if 16 B per MiB ever matters.
 
@@ -758,9 +690,8 @@ The workstream starts now. It touches no protocol surface except the receipt win
 
 **Reject recreating a name while its stream GC is pending.** Smaller than incarnation-scoped names, but it couples create availability to GC health, and the new incarnation would still share the old one's page keys while a sweep runs.
 
-**Per-producer receipt rings without a stream budget.** They bound each producer's retries but not the stream: 4,096 producers with 64 receipts each hold 262k receipts, and far more bytes when those are batch receipts. Each producer's newest acknowledgement already covers the common retry.
+**Per-producer receipt rings without a stream budget.** They bound each producer's retries but not the stream: 4,096 producers with 64 receipts each hold 262k receipts. Each producer's newest acknowledgement already covers the common retry.
 
-**Gate everything through maintenance commands instead of levels.** Every new behavior would leave its natural command. `FlushCold` would need a second "seal" entry per flush, receipt trimming a separate command, and so on, which adds permanent machinery and Raft entries. A level costs one predicate per call site, and those predicates can be deleted later. `TidyStream` exists, but only for idle streams and catch-up.
 
 **Bump `RAFT_GRPC_PROTOCOL_VERSION` with a full restart.** This breaks the graceful mixed-version rollouts shipped since 0.4 (#178, #200, #233).
 
@@ -774,23 +705,24 @@ The workstream starts now. It touches no protocol surface except the receipt win
 
 **Sweep stale TTL entries on every append.** This is O(stale) work and still allocates per append; arming one entry per stream removes the growth instead.
 
-## 10. Open questions for maintainers
+## 9. Open questions for maintainers
 
-1. **Receipt window.** Is R = 1,024 receipt items per stream, plus each producer's newest acknowledgement, enough for the retry horizon of workflow consumers (#146)? Beyond the window, do you accept `204` without ranges (recommended, base-protocol conformant) over today's `409`? Should the response carry an explicit marker header?
-2. **Producers.** Is 7-day idle expiry acceptable for Ursula's exactly-once promise? For the 4,096-producer cap, should a new producer that cannot evict an idle one get `429` (recommended) or evict the least recently seen producer anyway?
-3. **Levels and upgrades.** Which versions must interoperate (N-1 to N only?), and is no-downgrade after a raise acceptable? Are four levels, each raised by an operator, acceptable? `AGENTS.md` and `loc-reduction-plan.md:10-12` still describe atomic upgrades, while practice since 0.4 is graceful mixed-version rollout.
-4. **Spec and docs.** Will you amend these? Recommended: yes, each with the level that needs it.
-   - `extensions.mdx` §2.2 (`:235`) and §6.10: a retention boundary in cold history of a JSON stream may take effect at the nearest preceding indexed record boundary, at most 1 MiB earlier, reported in `Stream-Retained-Offset` and `Stream-Record-First` (Lb2).
-   - `extensions.mdx:753`: allow a sparse representation, with §6.1 (`:591`) keeping exact resolvability (Lb2).
-   - `extensions.mdx:751`: state bootstrap parts for cold binary history (Lb1).
-   - `extensions.mdx:786`, `durable-stream.mdx:329` and `exactly-once-writes.mdx:16, 31`: limit exact ranges to the receipt window and the newest sequence (Lb1).
-   - `operations.mdx:135`: retention is not needed for memory.
-5. **Response caps.** Can reads and `/bootstrap` cap responses at 8 MiB by default? Do the ursula-index source or the SDKs assume that a record read without `max_records`, or a bootstrap, returns everything up to the tail?
-6. **Maximum hot age.** Is keeping slow streams' small tails hot for up to 5 minutes acceptable? It bounds how long records stay hot in quiet groups; in the healthy regime it changes slices little (288 against 308 per day), and the large slice reductions come from F10's batching and F2.
-7. **Defaults.** Should compaction become on by default once discovery is debt-driven (F14d), S3 snapshots the default whenever a cold store exists (F12b, which also turns on S3-health leadership shedding), and snapshot cadence byte-based with a 1 GiB node log budget (F12e)? Is the inline backend meant for production clusters at all?
-8. **Visible snapshots.** Decided 2026-10-03: externalize above the staging threshold at Lb5 (F16, §5.16), up to 1 GiB.
-9. **Tenant tombstones.** Who acknowledges metered usage so rows can be pruned, and should erasure fences move to the meta group (F15)? Until then, O(buckets ever) rows per group are the documented exception to I2.
-10. **Mark granularity.** Is a 1 MiB block right, or should cold reads by record trade 16 times more marks (256 B per MiB) for a 64 KiB scan bound? Per node, marks cost 16 MiB per TiB of cold history, about 65 MiB per day at a sustained 50 MB/s of ingest. Recommended: commit now to thinning history older than 30 days to 8 MiB marks, at a later level, once mark bytes on any node exceed 1 GiB.
-11. **Anchor cache.** Should a node-local anchor cache keyed by stream incarnation, exact once F14g makes incarnations unique, remove the front scan for client loops that read by record?
-12. **Scope of #17.** Does the target apply to disk-WAL clusters and to the default single-node in-memory mode as well? This document assumes yes.
-13. **Binary streams.** Should #170 framed binary records reuse marks over a length-prefixed framing, rather than add a second dense index later?
+**Q1. Receipt window.** Is R = 1,024 receipt items per stream, plus each producer's newest acknowledgement, enough for the retry horizon of workflow consumers (#146)? Beyond the window, do you accept `204` without ranges (recommended, base-protocol conformant) over today's `409`? Should the response carry an explicit marker header?
+
+**Q2. Producers.** Is 7-day idle expiry acceptable for Ursula's exactly-once promise? For the 4,096-producer cap, should a new producer that cannot evict an idle one get `429` (recommended) or evict the least recently seen producer anyway?
+
+**Q5. Response caps.** Can reads and `/bootstrap` cap responses at 8 MiB by default? Do the ursula-index source or the SDKs assume that a record read without `max_records`, or a bootstrap, returns everything up to the tail?
+
+**Q6. Maximum hot age.** Is keeping slow streams' small tails hot for up to 5 minutes acceptable? It bounds how long records stay hot in quiet groups; in the healthy regime it changes slices little (288 against 308 per day), and the large slice reductions come from F10's batching and F2.
+
+**Q7. Defaults.** Should compaction become on by default once discovery is debt-driven (F14d), S3 snapshots the default whenever a cold store exists (F12b, which also turns on S3-health leadership shedding), and snapshot cadence byte-based with a 1 GiB node log budget (F12e)? Is the inline backend meant for production clusters at all?
+
+**Q9. Tenant tombstones.** Who acknowledges metered usage so rows can be pruned, and should erasure fences move to the meta group (F15)? Until then, O(buckets ever) rows per group are the documented exception to I2.
+
+**Q10. Mark granularity.** Is a 1 MiB block right, or should cold reads by record trade 16 times more marks (256 B per MiB) for a 64 KiB scan bound? Per node, marks cost 16 MiB per TiB of cold history, about 65 MiB per day at a sustained 50 MB/s of ingest. Recommended: commit now to thinning history older than 30 days to 8 MiB marks, in a later format epoch, once mark bytes on any node exceed 1 GiB.
+
+**Q11. Anchor cache.** Should a node-local anchor cache keyed by stream incarnation, exact once F14g makes incarnations unique, remove the front scan for client loops that read by record?
+
+**Q12. Scope of #17.** Does the target apply to disk-WAL clusters and to the default single-node in-memory mode as well? This document assumes yes.
+
+**Q13. Binary streams.** Should #170 framed binary records reuse marks over a length-prefixed framing, rather than add a second dense index later?

@@ -39,8 +39,6 @@ The naive procedure of "restart followers, then leader" does **not** wait for `a
 | `status` | Per-node group counts and leadership distribution |
 | `wait-ready` | Block until every node reports the expected group count and every group has a leader |
 | `verify-cluster` | Require every configured voter to be present and caught up in two consecutive samples before the next rollout step |
-| `cluster enable-feature --level N` | Raise every Raft group's replicated feature level to `N`. Refuses unless every voter, learner, and manifest node reports support for `N` (and, from level 2, unless every group reports a completed cold-index page-repair cycle); then proposes through each group's leader and verifies every replica. Levels are never lowered |
-| `cluster feature-level` | Print each node's supported feature level and each group's current level |
 
 Mutating verbs exit `0` on success and `2` on an abort (drain timeout, no safe transfer target, catch-up stall). Anything else is a configuration or transport error with a single-line, machine-greppable message.
 
@@ -157,23 +155,5 @@ For custom tooling, every verb maps onto a small set of HTTP endpoints on each n
 | `drain` / `undrain` (maintenance guard) | `POST /__ursula/leadership-shed/maintenance`, `DELETE` to clear |
 | `drain` (transfer step) | `POST /__ursula/raft/{raft_group_id}/leader/transfer/{node_id}` |
 | `repair-restarted-voter` | `POST /__ursula/raft/{raft_group_id}/membership`, then `POST /__ursula/raft/{raft_group_id}/learners/{node_id}`, then membership promotion |
-| `cluster feature-level`, `cluster enable-feature` | `GET /__ursula/feature-level`, `POST /__ursula/feature-level` with `{"level": N}` |
 
 The transfer endpoint refuses with `409 Conflict` if the receiving node isn't the current leader of the group, and `400` if the target node isn't a voter. ursulactl uses this to refuse to attempt a transfer it cannot reason about.
-
-## Feature levels
-
-Every Raft group carries a replicated **feature level**, `0` until raised. A release that changes how commands apply (new replicated state, new commands, new apply rules) activates that behavior only once the group's level reaches the release's level, so a rolling upgrade never mixes binaries that apply the same command differently. Level `1` enables unique stream incarnations and the first bounded-state step (producer receipt window and idle-producer expiry, message-record collapse, incarnation-scoped cold GC). Level `2` enables sparse cold record marks, level `3` external payload locators committed first and indexed after, and level `4` the compact hot window (message records removed). [Operations](/docs/operations#feature-levels) lists every level and the full upgrade procedure. Commands that need a higher level than the group holds fail with `409 Conflict` and a plain-text body naming the required level.
-
-Raise the level only after every node runs a binary that supports it:
-
-```bash
-ursulactl cluster feature-level --config cluster.json
-ursulactl cluster enable-feature --config cluster.json --level 1
-```
-
-`GET /__ursula/feature-level` reports `supported_level` (the highest level this binary can apply) and each group's `level` from the node's local replica. `POST /__ursula/feature-level` proposes the level for the groups the node leads (others come back as `not_leader`) and refuses with `409` a level above the node's own support; `enable-feature` therefore calls it on every node and re-checks until every replica agrees. Level 2 (sparse cold record marks) trusts cold bytes, so each group's report also carries `page_repair_completed`, true once the node completed a cold-index page-repair cycle as the group's leader (always true without a cold store); a node proposes level 2 or higher only for such groups and answers `repair_pending` for the others.
-
-<Warning>
-Feature levels never go down. Once a group is raised, a binary that does not support that level must not run it: such a binary refuses to load a snapshot recorded at a higher level. Downgrade below the release that introduced a raised level is not supported.
-</Warning>

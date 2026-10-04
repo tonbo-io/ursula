@@ -10,7 +10,7 @@ fn stream(id: &str) -> BucketStreamId {
     BucketStreamId::new(BUCKET, id)
 }
 
-fn machine() -> StreamStateMachine {
+fn fresh_machine() -> StreamStateMachine {
     let mut machine = StreamStateMachine::new();
     assert!(matches!(
         machine.apply(StreamCommand::CreateBucket {
@@ -103,7 +103,7 @@ fn offload(machine: &mut StreamStateMachine, refs: Vec<ObjectPayloadRef>) -> Str
 
 #[test]
 fn external_append_keeps_its_locator_in_state() {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     append_external(&mut machine, "s/external/a.bin", 10);
     assert_eq!(machine.external_segments(&stream("s")), &[object(
         0,
@@ -121,7 +121,7 @@ fn external_append_keeps_its_locator_in_state() {
 
 #[test]
 fn rejected_external_append_leaves_no_locator() {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     // A record match that does not hold rejects the append on every replica.
     let response = append_external_with_match(&mut machine, "s/external/lost.bin", 10, Some(7));
     assert!(
@@ -134,7 +134,7 @@ fn rejected_external_append_leaves_no_locator() {
 
 #[test]
 fn offload_removes_exactly_the_listed_refs_and_is_idempotent() {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     append_external(&mut machine, "s/external/a.bin", 10);
     append_inline(&mut machine, b"hot");
     append_external(&mut machine, "s/external/b.bin", 5);
@@ -194,7 +194,7 @@ fn offload_removes_exactly_the_listed_refs_and_is_idempotent() {
 
 #[test]
 fn offload_is_refused_for_missing_streams() {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     let response = machine.apply(StreamCommand::OffloadColdRefs {
         stream_id: stream("missing"),
         refs: Vec::new(),
@@ -211,7 +211,7 @@ fn offload_is_refused_for_missing_streams() {
 #[test]
 fn candidates_follow_the_count_bound_and_the_due_predicate() {
     let never_due = |_: &ObjectPayloadRef| false;
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     for index in 0..MAX_STAGED_EXTERNAL_REFS {
         append_external(&mut machine, &format!("s/external/{index:02}.bin"), 4);
     }
@@ -257,7 +257,7 @@ fn candidates_follow_the_count_bound_and_the_due_predicate() {
 
 #[test]
 fn delete_queues_state_held_external_refs_for_gc() {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     append_external(&mut machine, "s/external/a.bin", 10);
     let response = machine.apply(StreamCommand::DeleteStream {
         stream_id: stream("s"),
@@ -279,7 +279,7 @@ fn delete_queues_state_held_external_refs_for_gc() {
 /// restored machine still offloads them.
 #[test]
 fn snapshot_with_staged_locators_round_trips() {
-    let mut machine = machine();
+    let mut machine = fresh_machine();
     append_inline(&mut machine, b"abcd");
     append_external(&mut machine, "s/external/a.bin", 10);
     append_external(&mut machine, "s/external/b.bin", 6);

@@ -5,7 +5,7 @@ description: Changes that affect clients and operators, newest first.
 
 ## Unreleased: bounded stream state
 
-This release stores JSON messages exactly as written and starts the work that stops per-stream replicated memory from growing with record count, without retention (it still grows by about 16 MiB per TiB of cold history per stream per replica; see [Memory without retention](/docs/operations#memory-without-retention)). Read the upgrade notes before rolling it out.
+This release changes the storage format to epoch 2, stores JSON messages exactly as written, and stops per-stream replicated memory from growing with record count, without retention (it still grows by about 16 MiB per TiB of cold history per stream per replica; see [Memory without retention](/docs/operations#memory-without-retention)). Read the upgrade notes before rolling it out.
 
 ### Upgrade notes
 
@@ -15,6 +15,10 @@ This release changes the storage format to epoch 2. There is no in-place upgrade
 2. **Move data over HTTP.** Re-create streams on the new cluster; to keep data, read each stream from the old cluster and write it to the new one.
 3. **Never reuse a prefix** that an earlier release, or a failed upgrade attempt, wrote to.
 4. **`helm upgrade` stalls at the first pod.** The new pod exits at startup or reports not ready (`/__ursula/ready` answers `503` with `format_epoch_mismatch`), so no second voter is replaced. Recover with `helm rollback`, then install fresh.
+
+### Always on
+
+Every group runs one behaviour from its first command; there are no feature levels to raise. Always on: bounded producer receipts (1,024 receipt items per stream plus each producer's newest; older duplicates are answered `204` without ranges), 7-day idle-producer expiry, the 4,096-producer cap, unique incarnations, external locators committed before indexing, the compact hot window (no per-message bookkeeping), and cold-tier snapshot bodies up to 1 GiB.
 
 ### Observable changes for JSON streams
 
@@ -37,26 +41,24 @@ Every `application/json` stream now follows [JSON message text](/docs/specs/exte
 ### New
 
 - **Byte-bounded record reads.** `max_bytes` now works with `record=` and `tail_records=`: it bounds complete records and may be combined with `max_records`. It used to be rejected with `400`.
-- **Feature levels.** `GET` and `POST /__ursula/feature-level` on the admin plane, and `ursulactl cluster feature-level` and `cluster enable-feature`.
 - **Metrics.** `/__ursula/metrics` adds `group_state_gauges` (per-group state sizes) and `record_coordinate_corruptions`.
-- **Sparse cold record marks (level 2).** The JSON record index keeps exact offsets only for unflushed records plus one mark per MiB of cold log. Record reads into sealed history are unchanged for clients. Retention by offset or record into sealed history may land at or below its target (the response's `Stream-Retained-Offset` and `Stream-Record-First` report where), and raw-offset snapshot and retention requests whose offset falls inside a JSON record answer `400`.
-- **External payload locators (level 3).** External appends commit their locator in replicated state first and the leader indexes it afterwards, so `runtime.external_payload_min_size` may be lowered on clusters at level 3.
-- **Compact hot window (level 4).** Message records are removed from replicated state: JSON streams take message boundaries from the record index, other streams keep one 8-byte start per unflushed message. Cold admission and flush thresholds then charge 8 bytes per hot record instead of 24. Bootstrap answers are unchanged, except that a snapshot published exactly at a flushed message boundary is now followed by update parts instead of an honest partial.
-- **Snapshot bodies in the cold tier (level 5).** With a cold backend, snapshot bodies of at least `runtime.external_payload_min_size` are streamed into the cold tier instead of replicated state, and bodies of up to 1 GiB are accepted (32 MiB inline). Snapshot reads and `/bootstrap` stream them back and send `Content-Length`. Superseded bodies are deleted five minutes after the publish that replaced them.
+- **Sparse cold record marks.** The JSON record index keeps exact offsets only for unflushed records plus one mark per MiB of cold log. Record reads into sealed history are unchanged for clients. Retention by offset or record into sealed history may land at or below its target (the response's `Stream-Retained-Offset` and `Stream-Record-First` report where), and raw-offset snapshot and retention requests whose offset falls inside a JSON record answer `400`.
+- **External payload locators.** External appends commit their locator in replicated state first and the leader indexes it afterwards, so `runtime.external_payload_min_size` may be lowered.
+- **Compact hot window.** Replicated state keeps no per-message records: JSON streams take message boundaries from the record index, other streams keep one 8-byte start per unflushed message. Cold admission and flush thresholds charge 8 bytes per hot record.
+- **Snapshot bodies in the cold tier.** With a cold backend, snapshot bodies of at least `runtime.external_payload_min_size` are streamed into the cold tier instead of replicated state, and bodies of up to 1 GiB are accepted (32 MiB inline). Snapshot reads and `/bootstrap` stream them back and send `Content-Length`. Superseded bodies are deleted five minutes after the publish that replaced them.
 
 ### Changed
 
 - **Bootstrap is an honest partial.** `/bootstrap` never reads cold storage and never skips a message. When updates after the snapshot are already cold, it returns the snapshot part alone with `Stream-Next-Offset` at the snapshot point and no `Stream-Up-To-Date`; when updates exceed 8 MiB, it stops at the last message boundary within the cap. Clients continue from `Stream-Next-Offset` with ordinary reads, as the specification already required. Each update part holds exactly one message, so a JSON array append now appears as one part per record.
-- **Producer receipts are bounded (level 1).** Each stream keeps exact receipts for 1,024 items plus each producer's newest one. An older duplicate is still deduplicated, but answered `204` without range headers. A producer idle on a stream for 7 days is forgotten and must restart at sequence `0` or bump its epoch. See [Exactly-once writes](/docs/concepts/exactly-once-writes).
+- **Producer receipts are bounded.** Each stream keeps exact receipts for 1,024 items plus each producer's newest one. An older duplicate is still deduplicated, but answered `204` without range headers. A producer idle on a stream for 7 days is forgotten and must restart at sequence `0` or bump its epoch. See [Exactly-once writes](/docs/concepts/exactly-once-writes).
 - **`Producer-Id` and `Stream-Seq` are capped at 256 bytes** on every write path, with `400` above it.
-- **Unique incarnations (level 1).** A stream's `created_at_ms` strictly increases within a Raft group, so a stream deleted and recreated at the same path is always a distinguishable incarnation, and stream GC only removes the deleted incarnation's objects.
-- **Snapshots (level 1)** are written in a compact MessagePack envelope that earlier releases cannot read, which is one reason downgrade is unsupported.
-- **Producer cap (level 1).** A stream holds at most 4,096 producers; a new producer evicts producers idle for at least an hour, and when none is, the write answers `429` with a body starting `producer_limit`.
+- **Unique incarnations.** A stream's `created_at_ms` strictly increases within a Raft group, so a stream deleted and recreated at the same path is always a distinguishable incarnation, and stream GC only removes the deleted incarnation's objects.
+- **Snapshots** are written in a compact MessagePack envelope that earlier releases cannot read.
+- **Producer cap.** A stream holds at most 4,096 producers; a new producer evicts producers idle for at least an hour, and when none is, the write answers `429` with a body starting `producer_limit`.
 - **Reads are capped at 8 MiB.** A larger `max_bytes` is clamped. Without `max_bytes`, a capped JSON offset read ends at a record boundary.
 - **Hot tails are flushed after `storage.cold.flush_max_hot_age`** (default 5 minutes, `0` disables), even when the group is below its flush threshold.
-- **Defaults.** `storage.cold.compaction_enabled` now defaults to `true`, and `storage.snapshot.backend` defaults to `auto` (S3 when the cold backend is S3, inline otherwise). Raft snapshots are taken by log bytes against a node-wide `raft.snapshot_log_budget` (default 1 GiB) with a `raft.snapshot_backstop_logs` entry backstop. Cold admission and the hot backlog count 24 bytes per hot record on top of the payload (8 bytes at level 4).
+- **Defaults.** `storage.cold.compaction_enabled` now defaults to `true`, and `storage.snapshot.backend` defaults to `auto` (S3 when the cold backend is S3, inline otherwise). Raft snapshots are taken by log bytes against a node-wide `raft.snapshot_log_budget` (default 1 GiB) with a `raft.snapshot_backstop_logs` entry backstop. Cold admission and the hot backlog count 8 bytes per hot record on top of the payload.
 - **Format epoch 2.** The Raft WAL directory and the object-storage prefix carry a format-epoch marker, every snapshot starts with a format-epoch frame, snapshot pointers are MessagePack only, the WAL journal header, the Raft gRPC protocol (now also on forwarded reads and writes), S3 snapshot references and backups are version 2, and `ursulactl` checks the target cluster's backup format before the first import. A node checks its WAL directory, its object-storage prefix and its peers before it writes anything, and `/__ursula/ready` answers `503` with `format_epoch_mismatch` after any later Raft protocol mismatch.
-- **Every group starts at the top feature level.** New groups run every bounded-state behaviour from their first command; `POST /__ursula/feature-level` proposes nothing and reports each group's level, and `ursulactl cluster enable-feature` has nothing left to raise.
 - **Reserved bucket IDs.** `snapshots` (the default raft-snapshot namespace in the object store) and IDs starting with `__` answer `400`.
 - **`PUT /{bucket}` validates the bucket ID.** It answers `400` for an ID that does not match `[a-z0-9_-]{4,64}` and `201` otherwise, and still changes no state: buckets are implicit namespaces. See [Buckets](/docs/concepts/buckets).
 - **Helm chart defaults.** The chart now renders `coldStorage.compaction.enabled: true` and `snapshotStore.backend: auto` (previously `false` and `inline`), so releases with cold storage get compaction and S3 snapshots on upgrade. Set the old values to keep the old behaviour.
@@ -66,6 +68,8 @@ Every `application/json` stream now follows [JSON message text](/docs/specs/exte
 
 ### Removed
 
+- **Feature levels.** `/__ursula/feature-level` has no route any more (`GET` answers `404`), the `409` with `feature_not_enabled` is gone, the per-group `feature_level` gauge is gone from `/__ursula/metrics`, and `ursulactl cluster feature-level` and `cluster enable-feature` are gone.
+- **Keyed streams and `clients/pi-durable-ursula`.** `profile=keyed-batch-v1` is an inert media-type parameter, `{stream}/keyed-state` answers `404`, and `[keyed_state]`, `server.keyed_state_upstream` and the indexer's keyed mode are gone. Pi Durable runs on `clients/sqlite-vfs` and `clients/sqlite-ursula`.
 - **Data-plane bucket quotas.** `PUT /__ursula/quota/{bucket}` is gone from both listeners, and creates and appends no longer answer `429` for a bucket's stream count or retained bytes. The per-group limits were a backstop worth `limit x group_count` cluster-wide. Nothing in Ursula replaces them: the gateway's `--quota-policy` limits request rate, live reads and body size only ([Security](/docs/security)). Cap a tenant's streams or bytes in your own control plane, using `/__ursula/usage`. The `429` with a `producer_limit` body is unchanged.
 - **Bucket lifecycle rules in the extensions specification.** Explicit bucket creation, bucket metadata, stream listing and bucket delete (Sections 1.2 to 1.5) were never implemented and are withdrawn; see [Buckets](/docs/specs/extensions#1-buckets). Removing a bucket stays an operator action ([bucket purge](/docs/operations#tenant-offboarding-bucket-purge)), which permanently fences the bucket ID: later stream creates in it answer `404`.
 - **Stream attributes.** `GET` and `PUT /{bucket}/{stream}/attrs` are gone, a `Stream-Attrs` header on create is ignored, and create idempotency no longer compares attributes. Keep application metadata about a stream in your own store.

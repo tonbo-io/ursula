@@ -191,22 +191,6 @@ impl HotBuffer {
         self.blocks.front().map(|block| block.start_offset)
     }
 
-    /// End of the first contiguous run of hot bytes (blocks up to the first
-    /// gap), if any. Blocks keep no per-append boundaries (F6b), so this is
-    /// the furthest a single hot message starting at the hot start can
-    /// reach.
-    pub(super) fn first_end_offset(&self) -> Option<u64> {
-        let mut blocks = self.blocks.iter();
-        let mut end = blocks.next()?.end_offset();
-        for block in blocks {
-            if block.start_offset != end {
-                break;
-            }
-            end = block.end_offset();
-        }
-        Some(end)
-    }
-
     pub(super) fn payload(&self) -> Vec<u8> {
         let mut payload = Vec::with_capacity(self.len());
         for block in &self.blocks {
