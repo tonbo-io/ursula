@@ -1465,8 +1465,11 @@ class ChaosAgent:
     def verify_sample(self, sample: PayloadSample) -> str | None:
         last_error: str | None = None
         mismatch_error: str | None = None
+        matched_node: str | None = None
         node_results: list[dict[str, Any]] = []
-        for node in self.nodes:
+        # Rotate the first node so steady-state reads cover every replica.
+        first = self.verify_attempts % len(self.nodes) if self.nodes else 0
+        for node in self.nodes[first:] + self.nodes[:first]:
             try:
                 status, body = self.read_back(node, sample)
             except Exception as exc:  # noqa: BLE001
@@ -1474,15 +1477,22 @@ class ChaosAgent:
                 last_error = f"{node.name} read failed: {exc}"
                 continue
             if body == sample.payload:
-                self.last_read_check = {
-                    "stream": sample.stream,
-                    "offset": sample.start_offset,
-                    "bytes": len(sample.payload),
-                    "payload_kind": sample.payload_kind,
-                    "matched_node": node.name,
-                    "nodes": node_results + [{"node": node.name, "status": status, "matched": True}],
-                }
-                return None
+                node_results.append({"node": node.name, "status": status, "matched": True})
+                if mismatch_error is None:
+                    self.last_read_check = {
+                        "stream": sample.stream,
+                        "offset": sample.start_offset,
+                        "bytes": len(sample.payload),
+                        "payload_kind": sample.payload_kind,
+                        "matched_node": node.name,
+                        "nodes": node_results,
+                    }
+                    return None
+                # An earlier node served different bytes for a committed
+                # range; no replica may legitimately differ, so this match
+                # does not excuse it.
+                matched_node = node.name
+                break
             node_result: dict[str, Any] = {"node": node.name, "status": status, "matched": False}
             if body:
                 node_result["body_prefix_hex"] = body[:32].hex()
@@ -1491,10 +1501,13 @@ class ChaosAgent:
                 # `read_back` only gathers bytes from 200 responses, and every
                 # byte served so far matched; the range just could not be
                 # served in full (any status, including a 500). That is
-                # availability, not corruption.
+                # availability unless the leader's tail shows the bytes were
+                # lost (`acknowledged_bytes_lost`).
                 last_error = f"{node.name} read status={status} short={len(body)}/{len(sample.payload)}"
                 continue
             mismatch_error = f"{node.name} read status={status} body_prefix={body[:32]!r}"
+        if mismatch_error is None and matched_node is None:
+            mismatch_error = self.acknowledged_bytes_lost(sample)
         self.last_read_check = {
             "stream": sample.stream,
             "offset": sample.start_offset,
@@ -1512,6 +1525,34 @@ class ChaosAgent:
         # unavailability: they are the corruption signal.
         error = mismatch_error or last_error or "readback mismatch"
         return f"{error} ({summary})" if summary else error
+
+    def acknowledged_bytes_lost(self, sample: PayloadSample) -> str | None:
+        """Tells lost acknowledged bytes apart from an unavailable read.
+
+        No node served the sample in full. `HEAD` is answered by the leader
+        after it confirms leadership and applies everything committed, so a
+        tail it reports below the acknowledged end means the stream lost
+        bytes it acknowledged: corruption, not availability. Any other
+        answer (an error, a missing stream, a tail at or past the end) leaves
+        the failure as availability.
+        """
+        for node in self.nodes:
+            try:
+                status, _, headers = self.request("HEAD", f"{node.base_url}/{BUCKET}/{sample.stream}")
+            except Exception:  # noqa: BLE001
+                continue
+            if status != 200:
+                continue
+            tail = parse_int(headers.get("stream-next-offset"))
+            if tail is None:
+                continue
+            if tail < sample.end_offset:
+                return (
+                    f"{node.name} leader tail {tail} < acknowledged {sample.end_offset} "
+                    f"body_prefix=lost"
+                )
+            return None
+        return None
 
     def ensure_cold_sample(self, sample: PayloadSample) -> bool:
         if sample.cold_confirmed:
@@ -3444,8 +3485,9 @@ class ChaosAgent:
             },
             # Byte read-back verifier schema, read by the docs HomePage and
             # StatusPage: `verified_offsets` counts samples read back
-            # byte-for-byte, `mismatch_count` counts 200 reads whose bytes
-            # disagreed (data corruption), `read_availability_error_count`
+            # byte-for-byte, `mismatch_count` counts data corruption (a 200
+            # read whose bytes disagreed, or a leader tail below an
+            # acknowledged end), `read_availability_error_count`
             # counts reads that could not be served, and `verify_counts` /
             # `verify_errors` break these down per mode (`<mode>_unavailable`
             # for availability).
@@ -3457,7 +3499,6 @@ class ChaosAgent:
                 "read_availability_error_count": self.read_availability_errors,
                 "verify_counts": self.verify_counts,
                 "verify_errors": self.verify_errors,
-                "last_read": self.last_read_check,
                 "last_cold_flush": self.last_cold_flush,
                 "last_error": self.last_integrity_error,
                 "last_read_availability_error": self.last_read_availability_error,

@@ -478,6 +478,52 @@ class ChaosAgentStateTest(unittest.TestCase):
         self.assertEqual(agent.verify_errors, {"latest_unavailable": 1, "latest": 1})
         self.assertIn("body_prefix=", agent.last_integrity_error)
 
+    def test_verifier_counts_lost_acknowledged_bytes_and_replica_disagreement(self) -> None:
+        agent = self.verifier_agent([Node(f"n{i}", f"i-{i}", f"http://n{i}:4491") for i in (1, 2, 3)])
+        agent.verify_modes = ["latest"]
+        stream = WorkloadStream("run-test-0001")
+        agent.streams = [stream]
+        agent.record_payload_sample(stream, 30, b"0123456789", "ascii")
+        served = {"tail": 26, "n1": b"0123456789"}
+
+        def request(method, url, **kwargs):
+            if method == "HEAD":
+                return 200, b"", {"stream-next-offset": f"{served['tail']:020d}"}
+            node = url.split("//", 1)[1].split(":", 1)[0]
+            query = dict(part.split("=") for part in url.split("?", 1)[1].split("&"))
+            offset, max_bytes = int(query["offset"]), int(query["max_bytes"])
+            if offset > served["tail"]:
+                return 416, b"", {"stream-next-offset": str(served["tail"])}
+            stored = served.get(node, b"0123456789")[: served["tail"] - 20]
+            return 200, stored[offset - 20 : offset - 20 + max_bytes], {}
+
+        agent.request = request
+        # Every replica ends at 26 and the leader's tail agrees: the stream
+        # lost bytes [26, 30) it acknowledged.
+        agent.verify_integrity()
+        self.assertEqual(agent.mismatch_count, 1)
+        self.assertEqual(agent.read_availability_errors, 0)
+        self.assertIn("leader tail 26 < acknowledged 30", agent.last_integrity_error)
+
+        # Replicas served short, but the leader's tail covers the sample:
+        # the range was unavailable, not lost.
+        served["tail"] = 30
+        agent.request = lambda method, url, **kwargs: (
+            request(method, url) if method == "HEAD" else (503, b"", {})
+        )
+        agent.verify_integrity()
+        self.assertEqual(agent.mismatch_count, 1)
+        self.assertEqual(agent.read_availability_errors, 1)
+
+        # One replica served different bytes and a later one matched: still
+        # corruption.
+        agent.request = request
+        agent.verify_attempts = 0  # incremented to 1 before the read: start at n2
+        served["n2"] = b"0123456X89"
+        agent.verify_integrity()
+        self.assertEqual(agent.mismatch_count, 2)
+        self.assertIn("n2 read status=200 body_prefix=", agent.last_integrity_error)
+
     def test_cold_mode_confirms_samples_below_cold_hot_start_offset(self) -> None:
         agent = self.verifier_agent([Node("n1", "i-1", "http://n1:4491")])
         agent.verify_modes = ["cold"]

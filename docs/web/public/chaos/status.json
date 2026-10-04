@@ -38,7 +38,6 @@
     "read_availability_error_count": 0,
     "verify_counts": {},
     "verify_errors": {},
-    "last_read": null,
     "last_cold_flush": null,
     "last_error": null,
     "last_read_availability_error": null
