@@ -4,7 +4,9 @@
 //! is one message per line) and `application/x-ndjson`. A read may end
 //! mid-message, so a message is assembled across reads, up to
 //! [`ReadLimits::max_message_bytes`]; a longer one is read through and
-//! counted as oversize. An unterminated last line is not covered yet.
+//! counted as oversize. An unterminated last line is not covered yet; a read
+//! that ends inside an oversize line reports how far it scanned, so the next
+//! read resumes there instead of fetching the line again.
 //!
 //! Internally an offset is a byte position: a message's offset is the read's
 //! start plus the bytes consumed before it, and every read is checked against
@@ -76,8 +78,22 @@ pub enum SourceRead {
 
 #[derive(Debug)]
 pub enum SegmentRead {
-    Segment(Segment),
-    Retained { retained_offset: u64 },
+    /// `oversize_scan` is set when the read ended inside an oversize line.
+    Segment {
+        segment: Segment,
+        oversize_scan: Option<OversizeScan>,
+    },
+    Retained {
+        retained_offset: u64,
+    },
+}
+
+/// An unterminated oversize line starting at `line_start` (the segment's
+/// end) that holds no LF before `scanned_to`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OversizeScan {
+    pub line_start: u64,
+    pub scanned_to: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,14 +195,20 @@ impl SourceClient {
     /// Read and extract complete messages from `start`, which must be a
     /// message boundary unless `resync` is set: then a first line that is
     /// not a complete JSON value is a tail of a trimmed message and is
-    /// discarded as trimmed bytes.
+    /// discarded as trimmed bytes. A `resume` from an earlier read that
+    /// ended inside an oversize line at `start` continues that line's scan
+    /// at its `scanned_to`.
     pub async fn read_segment(
         &self,
         start: u64,
         resync: bool,
+        resume: Option<OversizeScan>,
         extractor: &Extractor,
         limits: ReadLimits,
     ) -> Result<SegmentRead, IndexError> {
+        let resume_at = resume
+            .filter(|scan| scan.line_start == start && scan.scanned_to > start)
+            .map(|scan| scan.scanned_to);
         let mut segment = Segment {
             start,
             end: start,
@@ -195,7 +217,7 @@ impl SourceClient {
         };
         let mut first = true;
         let outcome = self
-            .read_messages(start, limits, |message| {
+            .read_messages(start, resume_at, limits, |message| {
                 let resync_line = std::mem::take(&mut first) && resync;
                 match message {
                     Framed::Oversize { offset, len } => segment.skips.push(Skip {
@@ -232,9 +254,15 @@ impl SourceClient {
             })
             .await?;
         match outcome {
-            ReadOutcome::Ended { end } => {
+            ReadOutcome::Ended { end, oversize_to } => {
                 segment.end = end;
-                Ok(SegmentRead::Segment(segment))
+                Ok(SegmentRead::Segment {
+                    segment,
+                    oversize_scan: oversize_to.map(|scanned_to| OversizeScan {
+                        line_start: end,
+                        scanned_to,
+                    }),
+                })
             }
             ReadOutcome::Retained { retained_offset } => {
                 Ok(SegmentRead::Retained { retained_offset })
@@ -243,20 +271,23 @@ impl SourceClient {
     }
 
     /// Frame messages from `start` until a limit, the tail, or a 410.
-    /// `on_message` returns whether to continue after that message.
+    /// `on_message` returns whether to continue after that message. With
+    /// `resume_at`, the line at `start` is oversize and holds no LF before
+    /// `resume_at`, so reading starts there.
     async fn read_messages<F>(
         &self,
         start: u64,
+        resume_at: Option<u64>,
         limits: ReadLimits,
         mut on_message: F,
     ) -> Result<ReadOutcome, IndexError>
     where
         F: FnMut(Framed<'_>) -> bool,
     {
-        let mut read_offset = start;
+        let mut read_offset = resume_at.unwrap_or(start);
         let mut line_start = start;
         let mut pending = Vec::<u8>::new();
-        let mut oversize = false;
+        let mut oversize = resume_at.is_some();
         'reads: loop {
             let (body, next_offset, up_to_date) = match self.read_at(read_offset).await? {
                 SourceRead::Retained { retained_offset } => {
@@ -330,7 +361,10 @@ impl SourceClient {
                 break;
             }
         }
-        Ok(ReadOutcome::Ended { end: line_start })
+        Ok(ReadOutcome::Ended {
+            end: line_start,
+            oversize_to: oversize.then_some(read_offset),
+        })
     }
 }
 
@@ -342,8 +376,15 @@ enum Framed<'a> {
 }
 
 enum ReadOutcome {
-    Ended { end: u64 },
-    Retained { retained_offset: u64 },
+    /// `oversize_to` is how far an unterminated oversize line at `end` was
+    /// read.
+    Ended {
+        end: u64,
+        oversize_to: Option<u64>,
+    },
+    Retained {
+        retained_offset: u64,
+    },
 }
 
 fn source_format(headers: &HeaderMap) -> Option<SourceFormat> {

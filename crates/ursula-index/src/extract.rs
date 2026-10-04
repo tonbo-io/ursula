@@ -313,16 +313,16 @@ fn rfc3339(text: &str) -> Value {
     })
 }
 
-/// A decimal integer (digits with an optional leading '-') in `unit`.
+/// A decimal integer (digits with an optional leading '-') in `unit`, which
+/// is `Ms`, `Us` or `Ns` (seconds go through `parse_seconds`).
 fn scale_integer(text: &str, unit: TimeUnit) -> Value {
     let Some(value) = parse_decimal_integer(text) else {
         return Value::Invalid;
     };
     let millis = match unit {
-        TimeUnit::Ms | TimeUnit::Auto | TimeUnit::Rfc3339 => Some(value),
-        TimeUnit::S => value.checked_mul(1_000),
         TimeUnit::Us => value.checked_div_euclid(1_000),
         TimeUnit::Ns => value.checked_div_euclid(1_000_000),
+        _ => Some(value),
     };
     millis.map_or(Value::Invalid, nonzero)
 }
@@ -502,11 +502,12 @@ mod tests {
             legacy.extract(br#"{"captured_at":1,"nested":{"captured_at":2},"captured_at":3}"#),
             event(3, 3)
         );
-        assert_eq!(legacy.extract(br#"{"captured_at":42}"#), event(42, 42));
+        assert_eq!(legacy.extract(br#"{"captured\u005fat":42}"#), event(42, 42));
+        // A deep sibling does not hit serde_json's recursion limit.
         let deep = format!(
             r#"{{"d":{}{},"captured_at":7}}"#,
-            "[".repeat(120),
-            "]".repeat(120)
+            "[".repeat(200),
+            "]".repeat(200)
         );
         assert_eq!(legacy.extract(deep.as_bytes()), event(7, 7));
         assert_eq!(legacy.extract(b"{\"captured_at\":9}\n"), event(9, 9));

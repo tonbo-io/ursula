@@ -37,11 +37,11 @@ Common extractors:
 | Claude Code transcripts | `{"time":["/timestamp"]}` |
 | A capture envelope | `{"time":["/entry/timestamp"]}` |
 
-`start` is `retained` (the default: index all history still readable) or `tail` (only what is appended from now on). Registration records the source's `Stream-Incarnation`.
+`start` is `retained` (the default: index all history still readable) or `tail` (only what is appended from now on). Registration records the source's `Stream-Incarnation`. `start` applies to the first registration only: a restart after a recreate indexes the new stream from its retained offset, since all of it was appended after the registration.
 
 ## What is indexed
 
-Messages are framed by LF in both content types. A message longer than one read is assembled across reads up to 32 MiB; a longer one is read through and counted as `oversize`. An unterminated last line is not indexed until its LF arrives.
+Messages are framed by LF in both content types. A message longer than one read is assembled across reads up to 32 MiB; a longer one is read through and counted as `oversize`; a pass that ends inside such a line remembers how far it read and the next pass continues from there. An unterminated last line is not indexed until its LF arrives. Empty or whitespace-only lines are not messages; they are skipped without being counted.
 
 Bad data never blocks a stream. A message without a time is counted as `missing`, one whose time has the wrong type or format as `invalid`, and one that is not JSON as `unparseable`. A stream is blocked only when two workers produced different entries for the same source bytes; the committed prefix stays queryable and `POST /v1/indexes/{id}/status/resume` clears the block after repair.
 

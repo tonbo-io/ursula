@@ -2,6 +2,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
+use arrow_array::ArrayRef;
 use arrow_array::BooleanArray;
 use arrow_array::Int64Array;
 use arrow_array::RecordBatch;
@@ -134,12 +135,9 @@ where
         .collect::<Vec<_>>();
     let projection = ProjectionMask::leaves(&descriptor, leaves);
     let predicate = ArrowPredicateFn::new(projection, move |batch| {
-        let t_ms = int64_column(&batch, T_MS)?
-            .ok_or_else(|| ArrowError::SchemaError("t_ms column is missing".to_owned()))?;
-        let offsets = uint64_column(&batch, OFFSET)?
-            .ok_or_else(|| ArrowError::SchemaError("offset column is missing".to_owned()))?;
-        let ends = int64_column(&batch, T_END_MS)?
-            .ok_or_else(|| ArrowError::SchemaError("t_end_ms column is missing".to_owned()))?;
+        let t_ms = int64_column(&batch, T_MS)?;
+        let offsets = uint64_column(&batch, OFFSET)?;
+        let ends = int64_column(&batch, T_END_MS)?;
         Ok(BooleanArray::from_iter(
             t_ms.values()
                 .iter()
@@ -287,45 +285,34 @@ pub(crate) fn validate(path: &Path) -> Result<(), IndexError> {
     Ok(())
 }
 
-fn int64_column<'a>(
-    batch: &'a RecordBatch,
-    name: &str,
-) -> Result<Option<&'a Int64Array>, ArrowError> {
-    batch
-        .column_by_name(name)
-        .map(|column| {
-            column
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| ArrowError::CastError(format!("{name} is not int64")))
-        })
-        .transpose()
+fn int64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array, ArrowError> {
+    column(batch, name)?
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| ArrowError::CastError(format!("{name} is not int64")))
 }
 
-fn uint64_column<'a>(
-    batch: &'a RecordBatch,
-    name: &str,
-) -> Result<Option<&'a UInt64Array>, ArrowError> {
+fn uint64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt64Array, ArrowError> {
+    column(batch, name)?
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| ArrowError::CastError(format!("{name} is not uint64")))
+}
+
+fn column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a ArrayRef, ArrowError> {
     batch
         .column_by_name(name)
-        .map(|column| {
-            column
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| ArrowError::CastError(format!("{name} is not uint64")))
-        })
-        .transpose()
+        .ok_or_else(|| ArrowError::SchemaError(format!("{name} column is missing")))
 }
 
 fn append_record_batch(
     entries: &mut Vec<EventEntry>,
     batch: &RecordBatch,
 ) -> Result<(), IndexError> {
-    let missing = |name: &str| ArrowError::SchemaError(format!("{name} column is missing"));
-    let t_ms = int64_column(batch, T_MS)?.ok_or_else(|| missing(T_MS))?;
-    let offsets = uint64_column(batch, OFFSET)?.ok_or_else(|| missing(OFFSET))?;
-    let lens = uint64_column(batch, LEN)?.ok_or_else(|| missing(LEN))?;
-    let ends = int64_column(batch, T_END_MS)?.ok_or_else(|| missing(T_END_MS))?;
+    let t_ms = int64_column(batch, T_MS)?;
+    let offsets = uint64_column(batch, OFFSET)?;
+    let lens = uint64_column(batch, LEN)?;
+    let ends = int64_column(batch, T_END_MS)?;
     entries.extend(
         t_ms.values()
             .iter()

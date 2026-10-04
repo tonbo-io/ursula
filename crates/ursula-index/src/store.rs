@@ -209,13 +209,6 @@ impl SkipCounts {
         };
         *counter = counter.saturating_add(1);
     }
-
-    pub(crate) fn merge(&mut self, other: Self) {
-        self.missing = self.missing.saturating_add(other.missing);
-        self.invalid = self.invalid.saturating_add(other.invalid);
-        self.unparseable = self.unparseable.saturating_add(other.unparseable);
-        self.oversize = self.oversize.saturating_add(other.oversize);
-    }
 }
 
 /// Why a message produced no entry.
@@ -379,6 +372,10 @@ pub enum IndexError {
     CacheCapacity { capacity: u64, object_size: u64 },
     #[error("index registration `{0}` already exists with different settings")]
     RegistrationConflict(String),
+    #[error(
+        "index `{0}` was deleted; its namespace is retired until cleanup after the GC grace period"
+    )]
+    NamespaceRetired(String),
     #[error("index registration `{0}` does not exist")]
     UnknownIndex(String),
 }

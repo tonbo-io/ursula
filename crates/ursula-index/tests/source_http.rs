@@ -4,6 +4,7 @@
 )]
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use axum::Router;
 use axum::extract::Request;
@@ -14,6 +15,7 @@ use axum::response::Response;
 use reqwest::Url;
 use ursula_index::Extractor;
 use ursula_index::IndexError;
+use ursula_index::OversizeScan;
 use ursula_index::ReadLimits;
 use ursula_index::SegmentRead;
 use ursula_index::SkipKind;
@@ -30,6 +32,8 @@ struct ChunkedSource {
     retained: u64,
     /// Report a `Stream-Next-Offset` one byte past the body it sends.
     lie: bool,
+    /// The offset of every read served.
+    reads: Arc<Mutex<Vec<u64>>>,
 }
 
 impl ChunkedSource {
@@ -40,6 +44,7 @@ impl ChunkedSource {
             content_type,
             retained: 0,
             lie: false,
+            reads: Arc::default(),
         }
     }
 
@@ -61,6 +66,7 @@ impl ChunkedSource {
             .and_then(|query| query.strip_prefix("offset="))
             .and_then(|offset| offset.parse::<u64>().ok())
             .expect("an offset read");
+        self.reads.lock().expect("lock").push(offset);
         if offset < self.retained {
             return (StatusCode::GONE, [(
                 "stream-next-offset",
@@ -130,10 +136,10 @@ async fn read(
     limits: ReadLimits,
 ) -> anyhow::Result<ursula_index::Segment> {
     match client
-        .read_segment(start, resync, &extractor(), limits)
+        .read_segment(start, resync, None, &extractor(), limits)
         .await?
     {
-        SegmentRead::Segment(segment) => Ok(segment),
+        SegmentRead::Segment { segment, .. } => Ok(segment),
         SegmentRead::Retained { retained_offset } => {
             anyhow::bail!("unexpected 410 to {retained_offset}")
         }
@@ -258,6 +264,72 @@ async fn an_unterminated_ndjson_tail_is_not_covered_and_oversize_lines_are_read_
 }
 
 #[tokio::test]
+async fn a_read_ending_inside_an_oversize_line_is_resumed_where_it_stopped() -> anyhow::Result<()> {
+    let long = format!("{{\"t\":5,\"pad\":\"{}\"}}\n", "x".repeat(100));
+    let unterminated = format!("{{\"t\":1}}\n{}", long.trim_end());
+    let source = ChunkedSource::new(&unterminated, 16, "application/x-ndjson");
+    let (client, server) = source.clone().client().await?;
+    let scanned_to = u64::try_from(unterminated.len())?;
+    match client
+        .read_segment(0, false, None, &extractor(), limits())
+        .await?
+    {
+        SegmentRead::Segment {
+            segment,
+            oversize_scan,
+        } => {
+            assert_eq!(segment.end, 8);
+            assert_eq!(
+                oversize_scan,
+                Some(OversizeScan {
+                    line_start: 8,
+                    scanned_to,
+                })
+            );
+        }
+        SegmentRead::Retained { .. } => anyhow::bail!("unexpected 410"),
+    }
+    server.abort();
+
+    // Once the LF arrives, the next read starts where the scan stopped and
+    // still counts the whole line as one oversize message.
+    let source = ChunkedSource::new(
+        &format!("{{\"t\":1}}\n{long}{{\"t\":2}}\n"),
+        16,
+        "application/x-ndjson",
+    );
+    let (client, server) = source.clone().client().await?;
+    let resume = OversizeScan {
+        line_start: 8,
+        scanned_to,
+    };
+    let SegmentRead::Segment { segment, .. } = client
+        .read_segment(8, false, Some(resume), &extractor(), limits())
+        .await?
+    else {
+        anyhow::bail!("unexpected 410");
+    };
+    assert_eq!(
+        source.reads.lock().expect("lock").first(),
+        Some(&scanned_to)
+    );
+    assert_eq!(segment.skips.len(), 1);
+    assert_eq!(segment.skips[0].kind, SkipKind::Oversize);
+    assert_eq!(segment.skips[0].offset, 8);
+    assert_eq!(segment.skips[0].len, u64::try_from(long.len())?);
+    assert_eq!(
+        segment
+            .entries
+            .iter()
+            .map(|entry| entry.t_ms)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_restart_inside_an_ndjson_line_discards_its_tail_as_trimmed() -> anyhow::Result<()> {
     let body = "{\"t\":1,\"a\":\"bc\"}\n{\"t\":2}\n";
     let (client, server) = ChunkedSource::new(body, 64, "application/x-ndjson")
@@ -283,11 +355,11 @@ async fn retention_gaps_and_inconsistent_reads_are_reported() -> anyhow::Result<
     source.retained = 8;
     let (client, server) = source.clone().client().await?;
     match client
-        .read_segment(0, false, &extractor(), limits())
+        .read_segment(0, false, None, &extractor(), limits())
         .await?
     {
         SegmentRead::Retained { retained_offset } => assert_eq!(retained_offset, 8),
-        SegmentRead::Segment(_) => anyhow::bail!("expected a 410"),
+        SegmentRead::Segment { .. } => anyhow::bail!("expected a 410"),
     }
     server.abort();
 

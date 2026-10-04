@@ -129,7 +129,7 @@ pub struct IndexerArgs {
     #[arg(long)]
     extract: Option<String>,
     /// Single-source mode: start a new index at the `retained` offset or at
-    /// the `tail`.
+    /// the `tail`. A recreated source is reindexed from its retained offset.
     #[arg(long, default_value = "retained")]
     start: String,
 }
@@ -356,7 +356,8 @@ impl IntoResponse for ApiError {
             IndexError::Blocked { .. }
             | IndexError::SourceGone
             | IndexError::CannotResume(_)
-            | IndexError::RegistrationConflict(_) => StatusCode::CONFLICT,
+            | IndexError::RegistrationConflict(_)
+            | IndexError::NamespaceRetired(_) => StatusCode::CONFLICT,
             IndexError::UnknownIndex(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -504,7 +505,6 @@ async fn run_single(
         source,
         Arc::clone(&index),
         WorkerParams::from_args(&args),
-        start,
         Duration::from_millis(args.poll_interval_ms),
         Duration::from_millis(args.tail_flush_interval_ms),
         shutdown_rx.clone(),
@@ -776,7 +776,10 @@ async fn process_pool_source(
                 &registration.id,
                 registration.incarnation.as_deref(),
                 head.incarnation.clone(),
-                start_offset(registration.start, &head),
+                // Every byte of a recreated stream was appended after the
+                // registration, so the restart indexes it all, whatever
+                // `start` says.
+                head.retained_offset,
                 wall_clock_millis()?,
             )
             .await?;
@@ -824,7 +827,7 @@ async fn index_source(
 ) -> Result<Backlog, IndexError> {
     let format = head.readable_format()?;
     let now_ms = wall_clock_millis()?;
-    let (claim, resync, extractor) = {
+    let (claim, resync, resume, extractor) = {
         let mut index = index.lock().await;
         // Idle skips, without any S3 request. The cached durable offset
         // never exceeds the published one, so whenever the pending bytes
@@ -872,14 +875,31 @@ async fn index_source(
         };
         let resync =
             format == SourceFormat::Ndjson && index.resync_offset() == Some(claim.start_offset);
-        (claim, resync, index.config().extractor.clone())
+        (
+            claim,
+            resync,
+            index.oversize_scan(),
+            index.config().extractor.clone(),
+        )
     };
     let read = source
-        .read_segment(claim.start_offset, resync, &extractor, params.limits)
+        .read_segment(
+            claim.start_offset,
+            resync,
+            resume,
+            &extractor,
+            params.limits,
+        )
         .await;
     let mut index = index.lock().await;
     let segment = match read {
-        Ok(SegmentRead::Segment(segment)) => segment,
+        Ok(SegmentRead::Segment {
+            segment,
+            oversize_scan,
+        }) => {
+            index.note_oversize_scan(oversize_scan);
+            segment
+        }
         Ok(SegmentRead::Retained { retained_offset }) => {
             index.advance_floor(retained_offset).await?;
             index.release_claim(&claim).await?;
@@ -1140,7 +1160,6 @@ async fn single_pass(
     source: &SourceClient,
     index: &Mutex<EventIndex>,
     params: &WorkerParams,
-    start: StartPosition,
     allow_partial: bool,
 ) -> Result<Backlog, IndexError> {
     let Some(head) = source.head().await? else {
@@ -1153,9 +1172,11 @@ async fn single_pass(
         let mut index = index.lock().await;
         let known = index.source().incarnation.clone();
         if incarnation_changed(known.as_deref(), head.incarnation.as_deref()) {
+            // As in pool mode, a recreated stream is indexed from its
+            // retained offset whatever `--start` says.
             index
                 .restart(IndexBase {
-                    offset: start_offset(start, &head),
+                    offset: head.retained_offset,
                     incarnation: head.incarnation.clone(),
                 })
                 .await?;
@@ -1173,7 +1194,6 @@ async fn sync_loop(
     source: SourceClient,
     index: Arc<Mutex<EventIndex>>,
     params: WorkerParams,
-    start: StartPosition,
     poll_interval: Duration,
     tail_flush_interval: Duration,
     mut shutdown: watch::Receiver<bool>,
@@ -1187,7 +1207,7 @@ async fn sync_loop(
         let tail_flush = Instant::now() >= next_tail_flush;
         let follows_entry_cap = std::mem::take(&mut entry_capped);
         let allow_partial = tail_flush || follows_entry_cap;
-        let result = single_pass(&source, &index, &params, start, allow_partial).await;
+        let result = single_pass(&source, &index, &params, allow_partial).await;
         if tail_flush {
             next_tail_flush = Instant::now()
                 .checked_add(tail_flush_interval)
@@ -1851,15 +1871,11 @@ mod tests {
         let index = Mutex::new(index);
         let client = SourceClient::new(reqwest::Client::new(), Url::parse(&stream_url)?);
         let worker = params("worker-a", 64);
-        while single_pass(&client, &index, &worker, StartPosition::Retained, true).await?
-            != Backlog::Idle
-        {}
+        while single_pass(&client, &index, &worker, true).await? != Backlog::Idle {}
         assert_eq!(index.lock().await.durable_offset(), 36);
 
         source.set(message, "2", 0);
-        while single_pass(&client, &index, &worker, StartPosition::Retained, true).await?
-            != Backlog::Idle
-        {}
+        while single_pass(&client, &index, &worker, true).await? != Backlog::Idle {}
         let mut guard = index.lock().await;
         assert_eq!(guard.source().incarnation.as_deref(), Some("2"));
         assert_eq!(guard.durable_offset(), 18);
@@ -1872,13 +1888,60 @@ mod tests {
         source.set_content_type("application/octet-stream");
         source.set(message, "3", 0);
         assert!(matches!(
-            single_pass(&client, &index, &worker, StartPosition::Retained, true).await,
+            single_pass(&client, &index, &worker, true).await,
             Err(IndexError::InvalidSourceResponse(_))
         ));
         let guard = index.lock().await;
         assert_eq!(guard.source().incarnation.as_deref(), Some("3"));
         assert_eq!(guard.durable_offset(), 0);
         drop(guard);
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_tail_registration_indexes_a_recreated_stream_from_its_first_message()
+    -> anyhow::Result<()> {
+        let source = MockSource::default();
+        let message = "{\"captured_at\":7}\n";
+        source.set(&message.repeat(2), "1", 0);
+        let (stream_url, server) = source.clone().serve().await?;
+        let objects = TempDir::new()?;
+        let cache = TempDir::new()?;
+        let state = pool_state(&objects, &cache)?;
+        state
+            .catalog
+            .register(&IndexRegistration {
+                id: "tail".to_owned(),
+                stream_url,
+                extract: Extractor::timestamp_field("captured_at")?.config().clone(),
+                start: StartPosition::Tail,
+                indexed_from_offset: 36,
+                incarnation: Some("1".to_owned()),
+                restarted_from_incarnation: None,
+            })
+            .await?;
+
+        // Recreated with an initial message, written before the indexer
+        // notices the new incarnation.
+        source.set(message, "2", 0);
+        let registration = state.catalog.get("tail").await?;
+        assert_eq!(
+            process_pool_source(&state, &registration, &params("worker-a", 64), true).await?,
+            Backlog::Idle
+        );
+        let registration = state.catalog.get("tail").await?;
+        assert_eq!(registration.incarnation.as_deref(), Some("2"));
+        assert_eq!(registration.indexed_from_offset, 0);
+        while process_pool_source(&state, &registration, &params("worker-a", 64), true).await?
+            != Backlog::Idle
+        {}
+        let handles = state.ensure_index(&registration).await?;
+        let mut index = handles.serving.lock().await;
+        assert_eq!(index.durable_offset(), 18);
+        let result = index.query(QueryRequest::window(0, 1_000, 10)).await?;
+        assert_eq!(result.entries.len(), 1);
+        drop(index);
         server.abort();
         Ok(())
     }

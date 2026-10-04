@@ -45,6 +45,7 @@ pub use object_store::ObjectStore;
 pub use object_store::S3ObjectStore;
 pub use object_store::S3ObjectStoreConfig;
 pub use source::MAX_MESSAGE_BYTES;
+pub use source::OversizeScan;
 pub use source::ReadLimits;
 pub use source::SegmentRead;
 pub use source::SourceClient;

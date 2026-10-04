@@ -13,7 +13,8 @@ const MAINTENANCE_LEASE_KEY: &str = "maintenance/lease.json";
 const CATALOG_VERSION: u32 = 2;
 const MAX_CATALOG_ATTEMPTS: usize = 32;
 
-/// Where a new registration starts reading the source.
+/// Where a new registration starts reading the source. A restart after the
+/// source is recreated always starts at the new stream's retained offset.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartPosition {
@@ -75,8 +76,9 @@ impl IndexRegistration {
 }
 
 /// A namespace that stopped receiving writes and is deleted after the GC
-/// grace period. Tombstones are keyed by namespace, so a registration may be
-/// re-created under a new incarnation or extractor immediately.
+/// grace period. Tombstones are keyed by namespace, which leaves out `start`:
+/// a registration may be re-created under a new incarnation or extractor
+/// immediately, but not with only a different `start`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RetiredNamespace {
     pub id: String,
@@ -155,7 +157,7 @@ impl IndexCatalog {
                 .iter()
                 .find(|existing| existing.namespace == namespace)
             {
-                return Err(IndexError::RegistrationConflict(existing.id.clone()));
+                return Err(IndexError::NamespaceRetired(existing.id.clone()));
             }
             catalog.registrations.push(registration.clone());
             catalog

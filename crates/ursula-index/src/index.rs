@@ -29,6 +29,7 @@ use crate::object_store::ObjectStore;
 use crate::object_store::digest;
 use crate::part;
 use crate::part::PartFilter;
+use crate::source::OversizeScan;
 use crate::store::Coverage;
 use crate::store::IndexBase;
 use crate::store::MatchMode;
@@ -56,6 +57,9 @@ pub struct EventIndex {
     /// In-memory scheduling hint, never persisted: the offset at which this
     /// handle last read source bytes and found no complete message.
     stalled_at: Option<u64>,
+    /// In-memory, never persisted: how far this handle's last read scanned
+    /// an unterminated oversize line, so the next read resumes there.
+    oversize_scan: Option<OversizeScan>,
 }
 
 impl EventIndex {
@@ -82,6 +86,7 @@ impl EventIndex {
             binding,
             published,
             stalled_at: None,
+            oversize_scan: None,
         })
     }
 
@@ -122,6 +127,14 @@ impl EventIndex {
 
     pub(crate) fn note_stalled(&mut self, offset: u64) {
         self.stalled_at = Some(offset);
+    }
+
+    pub(crate) fn oversize_scan(&self) -> Option<OversizeScan> {
+        self.oversize_scan
+    }
+
+    pub(crate) fn note_oversize_scan(&mut self, scan: Option<OversizeScan>) {
+        self.oversize_scan = scan;
     }
 
     pub fn trimmed_bytes(&self) -> u64 {
@@ -276,8 +289,9 @@ impl EventIndex {
                 .copied()
                 .filter(|entry| entry.offset >= covered_end)
                 .collect::<Vec<_>>();
-            let mut skipped = SkipCounts::default();
-            let mut trimmed = 0_u64;
+            let parts = self.upload_day_partitions(&entries).await?;
+            let mut next = self.draft_manifest();
+            next.durable_offset = segment.end;
             for skip in segment
                 .skips
                 .iter()
@@ -285,17 +299,12 @@ impl EventIndex {
             {
                 if skip.kind == SkipKind::Trimmed {
                     if skip.offset != base {
-                        trimmed = trimmed.saturating_add(skip.len);
+                        next.trimmed_bytes = next.trimmed_bytes.saturating_add(skip.len);
                     }
                 } else {
-                    skipped.add(skip.kind);
+                    next.skipped.add(skip.kind);
                 }
             }
-            let parts = self.upload_day_partitions(&entries).await?;
-            let mut next = self.draft_manifest();
-            next.durable_offset = segment.end;
-            next.skipped.merge(skipped);
-            next.trimmed_bytes = next.trimmed_bytes.saturating_add(trimmed);
             if next
                 .resync_offset
                 .is_some_and(|offset| offset < next.durable_offset)
@@ -461,6 +470,7 @@ impl EventIndex {
     /// restarted onto `base.incarnation`.
     pub async fn restart(&mut self, base: IndexBase) -> Result<(), IndexError> {
         self.stalled_at = None;
+        self.oversize_scan = None;
         for _attempt in 0..MAX_PUBLISH_ATTEMPTS {
             self.refresh().await?;
             if self.published.manifest.source.incarnation == base.incarnation {

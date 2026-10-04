@@ -111,7 +111,7 @@ async fn catalog_registration_is_dynamic_durable_and_idempotent() -> anyhow::Res
         .register(&original)
         .await
         .expect_err("a retired namespace cannot be reused before cleanup");
-    assert!(matches!(error, IndexError::RegistrationConflict(_)));
+    assert!(matches!(error, IndexError::NamespaceRetired(_)));
     // Tombstones are keyed by namespace: the recreated stream registers at
     // once under its new incarnation.
     catalog

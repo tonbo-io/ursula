@@ -7,7 +7,7 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
-description = "Ursula deployment binary: Durable Streams server, gateway, and event-time indexer."
+description = "Ursula deployment binary: Durable Streams server, gateway, and event-time indexer (experimental)."
 
 [features]
 default = ["jemalloc", "release-max-info"]

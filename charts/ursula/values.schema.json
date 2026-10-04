@@ -1113,7 +1113,7 @@
     "indexer": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Optional S3-authoritative dynamic event-time indexer worker pool.",
+      "description": "Optional S3-authoritative dynamic event-time indexer worker pool (experimental).",
       "properties": {
         "enabled": {
           "type": "boolean"
