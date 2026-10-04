@@ -32,11 +32,11 @@
 //!   incarnation, the db file's inode and what it needs of the local WAL (`WalClaim`); attach
 //!   trusts the local files only when all four check out (written since this boot, from this
 //!   incarnation of the stream, into this file, and the WAL still holds the claimed frames) and
-//!   otherwise discards them and rebuilds from the latest snapshot and the tail. The db file alone is fsynced, rarely, so a crash-consistent image of the files (a disk
-//!   snapshot) is either verifiably complete or rejected: before the WAL starts a new generation
-//!   or is truncated to nothing, and at attach before a sidecar that relies on it. Attach never
-//!   opens local files through SQLite before replaying onto them: it folds the WAL into the db
-//!   file itself.
+//!   otherwise discards them and rebuilds from the latest snapshot and the tail. The db file alone
+//!   is fsynced, rarely, so a crash-consistent image of the files (a disk snapshot) is either
+//!   verifiably complete or rejected: before the WAL starts a new generation or is truncated to
+//!   nothing, and at attach before a sidecar that relies on it. Attach never opens local files
+//!   through SQLite before replaying onto them: it folds the WAL into the db file itself.
 //! * Snapshots and retention (see [`snapshot`]): once the log since the latest snapshot exceeds the
 //!   database size (and `URSULA_VFS_SNAPSHOT_MIN_BYTES`, default 8 MiB), a background thread per
 //!   attached database checkpoints the local WAL through a private connection, pins the result with
@@ -330,11 +330,13 @@ struct Registry {
     dbs: HashMap<String, Arc<Mutex<Db>>>,
     /// Open main-db handles per path (attached or not): attach requires none.
     open: HashMap<String, usize>,
-    /// Paths being attached: `x_open` refuses their main db meanwhile. Each keeps its binding
-    /// in `dbs` (if any) until the attach ends.
+    /// Paths being attached: `x_open` refuses their main db meanwhile (an open would read under
+    /// attach's writes, and its close would drop the lock attach holds against other processes:
+    /// `lock_unused`). Each keeps its binding in `dbs` (if any) until the attach ends.
     attaching: HashSet<String>,
     /// Paths whose attach failed after they had been attached in this process, with the reason:
-    /// `x_open` refuses their main db and WAL until an attach succeeds (see `attach`).
+    /// `x_open` refuses their main db until an attach succeeds (see `attach`). No WAL open can
+    /// follow: SQLite opens `<db>-wal` only through a connection whose main db it opened.
     failed: HashMap<String, String>,
     /// Host locks held for the process lifetime.
     locks: HashMap<String, fs::File>,
@@ -1817,7 +1819,8 @@ unsafe fn attach_files(
 /// Decides whether the local files can be trusted (or discards them), then brings them to the
 /// stream's tail and claims it (`sync`). `Recreated`: the stream was deleted and recreated after
 /// the trust decision; attach starts over, and the sidecar (stamped with the old incarnation)
-/// makes the next round discard whatever this one wrote.
+/// makes the next round distrust whatever this one wrote (discarding it, or refusing if the
+/// recreated stream is shorter than the sidecar's offset).
 unsafe fn recover(
     path: &str,
     url: &str,
@@ -2095,10 +2098,17 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
     let copy = copy_started.elapsed();
     let body = snapshot::encode(offset, epoch, &image);
     // This state is a prefix of the incarnation it was attached to, not of a stream recreated at
-    // the same path since (whose next append from this owner fails: its producers are new).
+    // the same path since: never publish it there, and stop this owner's commits. Its appends
+    // alone would not always notice: another owner's claim on the recreated stream answers them
+    // 403 (a higher epoch) or 400 (a lower one), and none at all 409 (producer forgotten; `reclaim`
+    // checks the incarnation), but the same epoch with the next seq is accepted (every first
+    // claim on a new stream is epoch 1).
     match same_incarnation(&url, incarnation.as_deref(), &stopped) {
         Err(Fail::Recreated(e)) => {
             eprintln!("sqlite-ursula-vfs: snapshot at {offset} not published: {e}");
+            let mut d = lock(db);
+            d.fenced = true;
+            d.poison(format!("fenced: {e}"));
             return Ok(true);
         }
         r => r.map_err(String::from)?,
@@ -2390,12 +2400,6 @@ unsafe extern "C" fn x_open(
             );
             return ffi::SQLITE_CANTOPEN;
         }
-        if flags & ffi::SQLITE_OPEN_WAL != 0
-            && let Some(db) = name.and_then(|n| n.strip_suffix("-wal"))
-            && let Some(why) = registry().failed.get(db).cloned()
-        {
-            return refuse_failed(db, &why);
-        }
         // Counted before the open, so attach (which refuses while any is counted) and an open
         // cannot pass each other; refused while `attach` runs on the path, and after a failed one
         // (`Registry::failed`).
@@ -2406,7 +2410,11 @@ unsafe extern "C" fn x_open(
                     return ffi::SQLITE_BUSY;
                 }
                 if let Some(why) = reg.failed.get(name) {
-                    return refuse_failed(name, why);
+                    // Passed through to "unix", its commits would bypass replication.
+                    eprintln!(
+                        "sqlite-ursula-vfs: {name}: open refused: its last attach failed ({why}); attach it again"
+                    );
+                    return ffi::SQLITE_CANTOPEN;
                 }
                 *reg.open.entry(name.to_owned()).or_default() += 1;
                 Some(reg.dbs.get(name).cloned())
@@ -2468,16 +2476,6 @@ unsafe extern "C" fn x_close(file: *mut ffi::sqlite3_file) -> c_int {
         }
         rc
     }
-}
-
-/// An open of a path whose attach failed after it had been attached (`Registry::failed`): its
-/// writes would bypass replication if it were passed through to "unix", so it fails until an attach
-/// succeeds.
-fn refuse_failed(path: &str, why: &str) -> c_int {
-    eprintln!(
-        "sqlite-ursula-vfs: {path}: open refused: its last attach failed ({why}); attach it again"
-    );
-    ffi::SQLITE_CANTOPEN
 }
 
 fn uncount_open(path: &str) {

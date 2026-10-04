@@ -36,14 +36,14 @@ export interface AttachStatus {
 	readonly epoch: number;
 	/** Every later commit fails until the file is re-attached. */
 	readonly poisoned: boolean;
-	/** Poisoned because a newer owner claimed the stream. */
+	/** Poisoned because a newer owner claimed the stream, or the stream was deleted and recreated. */
 	readonly fenced: boolean;
 	readonly reason: string | null;
 	/** Offset of the latest snapshot known readable (published and read back, or found at attach); 0 for none. */
 	readonly snapshot: number;
 	/** Retention this owner advanced the stream to (0: none yet). */
 	readonly retained: number;
-	/** Stream offset of the local state attach started from; 0 when it rebuilt the file from nothing (a fresh host, or local files it could not trust and discarded: another boot, a replaced file, a sidecar ahead of its WAL). */
+	/** Stream offset of the local state attach started from; 0 when it rebuilt the file from nothing (a fresh host, or local files it could not trust and discarded: another boot, a replaced file, a sidecar ahead of its WAL, another incarnation of the stream: deleted and recreated). */
 	readonly local: number;
 	/** Offset of the snapshot attach installed (0: none). */
 	readonly installed: number;
