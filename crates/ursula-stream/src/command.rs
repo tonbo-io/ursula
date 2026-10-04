@@ -17,9 +17,6 @@ pub enum StreamCommand {
     CreateBucket {
         bucket_id: String,
     },
-    DeleteBucket {
-        bucket_id: String,
-    },
     CreateStream {
         stream_id: BucketStreamId,
         content_type: String,
@@ -147,7 +144,7 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
     },
     /// Administrator-triggered tenant offboarding: removes every stream in
-    /// the bucket, the bucket itself, and its quota in this group. Monotonic
+    /// the bucket and the bucket itself in this group. Monotonic
     /// aggregate usage is retained for asynchronous accounting. Idempotent —
     /// purging an absent bucket reports zero removals.
     PurgeBucket {
@@ -177,14 +174,6 @@ pub enum StreamCommand {
     /// reused.
     ImportSnapshot {
         snapshot: Box<StreamSnapshot>,
-    },
-    /// Sets or clears this group's data-plane quota record for a bucket.
-    /// Replicated to every group so each enforces the same local backstop;
-    /// both limits `None` removes the record. Idempotent under replay.
-    SetBucketQuota {
-        bucket_id: String,
-        max_streams: Option<u64>,
-        max_retained_bytes: Option<u64>,
     },
     /// Raises this group's replicated feature level to
     /// `max(current, level)`; never lowers it. Idempotent under replay.
@@ -265,7 +254,6 @@ impl fmt::Display for StreamCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CreateBucket { bucket_id } => write!(f, "create_bucket:{bucket_id}"),
-            Self::DeleteBucket { bucket_id } => write!(f, "delete_bucket:{bucket_id}"),
             Self::CreateStream { stream_id, .. } => write!(f, "create_stream:{stream_id}"),
             Self::CreateExternal {
                 stream_id,
@@ -354,9 +342,6 @@ impl fmt::Display for StreamCommand {
                 snapshot.buckets.len(),
                 snapshot.streams.len()
             ),
-            Self::SetBucketQuota { bucket_id, .. } => {
-                write!(f, "set_bucket_quota:{bucket_id}")
-            }
             Self::SetFeatureLevel { level } => write!(f, "set_feature_level:{level}"),
             Self::TidyStream { stream_id, .. } => write!(f, "tidy_stream:{stream_id}"),
             Self::OffloadColdRefs { stream_id, refs } => {

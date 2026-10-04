@@ -22,8 +22,9 @@ message SnapshotHeaderV1 {
   // Monotonic per-bucket usage counters; gauges are recomputed from the
   // restored streams. Absent in legacy snapshots.
   repeated BucketUsageV1 bucket_usage = 5;
-  // Per-bucket data-plane quota records. Absent in legacy snapshots.
-  repeated BucketQuotaV1 bucket_quotas = 6;
+  // Field 6 held the removed per-bucket data-plane quota records.
+  reserved 6;
+  reserved "bucket_quotas";
   // Unit used to derive every committed_write_units counter in this snapshot.
   // Absent means the original 10 KiB contract for backward compatibility.
   optional uint64 committed_write_unit_bytes = 7;
@@ -59,12 +60,6 @@ message BucketUsageV1 {
   // operation. Field number 6 is unchanged from the original 10 KiB-specific
   // name, so existing snapshots remain wire-compatible.
   uint64 committed_write_units = 6;
-}
-
-message BucketQuotaV1 {
-  string bucket_id = 1;
-  optional uint64 max_streams = 2;
-  optional uint64 max_retained_bytes = 3;
 }
 
 message SnapshotFooterV1 {}

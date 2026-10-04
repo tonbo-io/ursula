@@ -55,7 +55,6 @@ use crate::request::GroupReadStreamParts;
 use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
 use crate::request::ImportGroupStateRequest;
-use crate::request::ListBucketStreamsRequest;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
@@ -65,8 +64,6 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
-use crate::request::SetBucketQuotaRequest;
-use crate::request::SetBucketQuotaResponse;
 use crate::request::SetFeatureLevelRequest;
 use crate::request::SetFeatureLevelResponse;
 use crate::request::TouchStreamAccessResponse;
@@ -107,8 +104,6 @@ pub type GroupPublishSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = Result<PublishSnapshotResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupAdvanceRetentionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AdvanceRetentionResponse, GroupEngineError>> + Send + 'a>>;
-pub type GroupSetBucketQuotaFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<SetBucketQuotaResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupSetFeatureLevelFuture<'a> =
     Pin<Box<dyn Future<Output = Result<SetFeatureLevelResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupTidyStreamFuture<'a> = Pin<
@@ -129,14 +124,6 @@ pub type GroupTidyStreamsFuture<'a> = Pin<
     Box<
         dyn Future<Output = Result<crate::request::TidyStreamsResponse, GroupEngineError>>
             + Send
-            + 'a,
-    >,
->;
-pub type GroupListBucketStreamsFuture<'a> = Pin<
-    Box<
-        dyn Future<
-                Output = Result<Option<Vec<ursula_stream::BucketStreamListing>>, GroupEngineError>,
-            > + Send
             + 'a,
     >,
 >;
@@ -230,7 +217,6 @@ pub enum GroupWriteResponse {
     AppendBatch(GroupAppendBatchResponse),
     PublishSnapshot(PublishSnapshotResponse),
     AdvanceRetention(AdvanceRetentionResponse),
-    SetBucketQuota(SetBucketQuotaResponse),
     TouchStreamAccess(TouchStreamAccessResponse),
     UpdateStreamAttrs(UpdateStreamAttrsResponse),
     FlushCold(FlushColdResponse),
@@ -363,39 +349,6 @@ pub trait GroupEngine: Send + 'static {
             Err(GroupEngineError::new(format!(
                 "group state import is not supported for group {}",
                 placement.raft_group_id.0
-            )))
-        })
-    }
-
-    fn set_bucket_quota<'a>(
-        &'a mut self,
-        request: SetBucketQuotaRequest,
-        _placement: ShardPlacement,
-    ) -> GroupSetBucketQuotaFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "bucket quotas are not supported for bucket '{}'",
-                request.bucket_id
-            )))
-        })
-    }
-
-    /// This group's share of a bucket listing (`extensions.md` §1.4), or
-    /// `None` when the group does not know the bucket. Like
-    /// [`GroupEngine::bucket_usage`] it is served from local replica state,
-    /// leader or follower: the listing is a catalog that tolerates
-    /// replication lag, and requiring leadership would fail it whenever any
-    /// group is led elsewhere. Default unsupported, so an engine that cannot
-    /// list never reports a bucket as empty.
-    fn list_bucket_streams<'a>(
-        &'a mut self,
-        request: ListBucketStreamsRequest,
-        placement: ShardPlacement,
-    ) -> GroupListBucketStreamsFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "bucket listing is not supported for bucket '{}' in group {}",
-                request.bucket_id, placement.raft_group_id.0
             )))
         })
     }
@@ -576,8 +529,8 @@ pub trait GroupEngine: Send + 'static {
         Box::pin(async { Err(GroupEngineError::new("cold GC deferral is not supported")) })
     }
 
-    /// Replicated tenant offboarding: removes every stream in the bucket, the
-    /// bucket, and its quota in this group. Monotonic aggregate usage remains
+    /// Replicated tenant offboarding: removes every stream in the bucket and
+    /// the bucket in this group. Monotonic aggregate usage remains
     /// available to asynchronous accounting readers. Default unsupported.
     fn purge_bucket<'a>(
         &'a mut self,
@@ -1090,21 +1043,6 @@ pub trait GroupEngine: Send + 'static {
                     .import_group_state(ImportGroupStateRequest { snapshot }, placement)
                     .await
                     .map(GroupWriteResponse::ImportGroupState),
-                StreamCommand::SetBucketQuota {
-                    bucket_id,
-                    max_streams,
-                    max_retained_bytes,
-                } => self
-                    .set_bucket_quota(
-                        SetBucketQuotaRequest {
-                            bucket_id,
-                            max_streams,
-                            max_retained_bytes,
-                        },
-                        placement,
-                    )
-                    .await
-                    .map(GroupWriteResponse::SetBucketQuota),
                 StreamCommand::SetFeatureLevel { level } => self
                     .set_feature_level(SetFeatureLevelRequest { level }, placement)
                     .await
@@ -1113,9 +1051,9 @@ pub trait GroupEngine: Send + 'static {
                     .tidy_stream(stream_id, now_ms, placement)
                     .await
                     .map(GroupWriteResponse::TidyStream),
-                StreamCommand::CreateBucket { .. } | StreamCommand::DeleteBucket { .. } => Err(
-                    GroupEngineError::new("bucket commands are not valid group writes"),
-                ),
+                StreamCommand::CreateBucket { .. } => Err(GroupEngineError::new(
+                    "bucket commands are not valid group writes",
+                )),
                 StreamCommand::OffloadColdRefs { .. } => Err(GroupEngineError::new(
                     "OffloadColdRefs is proposed only by the leader's offload pass",
                 )),

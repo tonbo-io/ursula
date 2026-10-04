@@ -6,14 +6,10 @@
 //! - [`json_text`]: JSON Message Text (P1): validation, flattening and lexical
 //!   minification of `application/json` write bodies.
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
-//! - `bucket_listing`: `GET /{bucket}/streams` across Raft groups, fetching
-//!   the share of a group this node does not host from one of its voters
-//!   (RT3).
 //! - [`bootstrap`]: typed-config `spawn_*_runtime` constructors and cold-flush worker.
 //! - [`server`]: command arguments and the long-running server service entrypoint.
 
 mod bootstrap;
-mod bucket_listing;
 mod cold_snapshot;
 pub mod json_text;
 mod otel_metrics;
@@ -554,17 +550,11 @@ struct HttpMetricsSnapshot {
 /// `server.cluster_listen` address when it is set. Peer URLs are also used as
 /// HTTP leader-redirect targets, so clients and gateways must be able to reach
 /// them too.
-/// Timeout of one node-to-node fan-out request.
-const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-
 #[derive(Clone, Debug)]
 pub struct ClientWriteLeaderRouter {
     peers: Arc<BTreeMap<u64, String>>,
     node_id: Option<u64>,
     per_group_voters: Arc<BTreeMap<RaftGroupId, BTreeSet<u64>>>,
-    /// Node-to-node HTTP client for fan-out reads such as a bucket listing
-    /// share of a group this node does not host (RT3).
-    peer_client: reqwest::Client,
 }
 
 impl ClientWriteLeaderRouter {
@@ -586,28 +576,7 @@ impl ClientWriteLeaderRouter {
             ),
             node_id: node_id.into(),
             per_group_voters: Arc::new(per_group_voters),
-            peer_client: reqwest::Client::builder()
-                .timeout(PEER_REQUEST_TIMEOUT)
-                .build()
-                .unwrap_or_default(),
         }
-    }
-
-    pub(crate) fn peer_client(&self) -> &reqwest::Client {
-        &self.peer_client
-    }
-
-    /// Base URLs of `group`'s voters other than this node.
-    pub(crate) fn group_voter_bases(&self, group: RaftGroupId) -> Vec<String> {
-        self.per_group_voters
-            .get(&group)
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(|node_id| Some(*node_id) != self.node_id)
-            .filter_map(|node_id| self.peers.get(&node_id))
-            .map(|base| base.trim_end_matches('/').to_owned())
-            .collect()
     }
 
     fn leader_base(&self, err: &RuntimeError) -> Option<(u64, String)> {
@@ -934,7 +903,6 @@ pub fn admin_router(state: HttpState) -> Router {
                 "/__ursula/purge/{bucket}",
                 axum::routing::delete(purge_bucket),
             )
-            .route("/__ursula/quota/{bucket}", put(set_bucket_quota))
             .with_state(state),
     )
 }
@@ -1394,14 +1362,8 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
             "/__ursula/purge/{bucket}",
             axum::routing::delete(purge_bucket),
         )
-        .route("/__ursula/quota/{bucket}", put(set_bucket_quota))
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .route("/{bucket}", put(create_bucket))
-        .route("/{bucket}/streams", get(list_bucket_streams))
-        .route(
-            bucket_listing::GROUP_SHARE_PATH,
-            get(bucket_listing::group_share),
-        )
         .route(
             "/{bucket}/{stream}/snapshot",
             get(read_latest_snapshot).put(publish_snapshot_at_record),
@@ -1754,79 +1716,14 @@ pub(crate) async fn purge_bucket(
 const COLD_GC_PURGE_BATCH_MAX_ENTRIES: usize = 4096;
 const LEGACY_SHARED_MIGRATION_MAX_CHUNKS: usize = 32;
 
-pub(crate) async fn create_bucket(Path(_bucket): Path<String>) -> Response {
-    StatusCode::CREATED.into_response()
-}
-
-/// Default and maximum page size of the bucket listing (`extensions.md` §1.4).
-const BUCKET_LISTING_MAX_LIMIT: usize = 1000;
-
-/// `GET /{bucket}/streams?prefix=&after=&limit=` (`extensions.md` §1.4): the
-/// bucket's streams merged across every Raft group, sorted by bucket-local
-/// stream path. Groups answer from local replica state, so the listing may
-/// briefly lag a just-committed create or delete. `last_write_at_ms` is
-/// omitted because Ursula does not track it.
-pub(crate) async fn list_bucket_streams(
-    State(state): State<HttpState>,
-    Path(bucket): Path<String>,
-    RawQuery(raw_query): RawQuery,
-) -> Response {
-    if let Err(message) = ursula_runtime::validate_bucket_id(&bucket) {
-        return (StatusCode::BAD_REQUEST, message).into_response();
+/// `PUT /{bucket}`: buckets are implicit namespaces, created on a group by
+/// the first stream create there, so this only validates the bucket ID and
+/// answers 201. It stays for clients that create the bucket first.
+pub(crate) async fn create_bucket(Path(bucket): Path<String>) -> Response {
+    match ursula_runtime::validate_bucket_id(&bucket) {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
     }
-    let query = match parse_query(raw_query.as_deref()) {
-        Ok(query) => query,
-        Err(response) => return *response,
-    };
-    let limit = match query.get("limit") {
-        None => BUCKET_LISTING_MAX_LIMIT,
-        Some(raw) => match raw.parse::<usize>() {
-            Ok(limit) if (1..=BUCKET_LISTING_MAX_LIMIT).contains(&limit) => limit,
-            _ => {
-                return (StatusCode::BAD_REQUEST, "limit must be in 1..=1000").into_response();
-            }
-        },
-    };
-    let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
-    let after = query.get("after").map(String::as_str);
-    let listing =
-        match bucket_listing::list_across_groups(&state, &bucket, prefix, after, limit).await {
-            Ok(Some(listing)) => listing,
-            Ok(None) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    format!("bucket '{bucket}' does not exist"),
-                )
-                    .into_response();
-            }
-            Err(response) => return response,
-        };
-    let next_cursor = listing
-        .has_more
-        .then(|| listing.streams.last().map(|entry| entry.stream_id.clone()))
-        .flatten();
-    let streams = listing
-        .streams
-        .iter()
-        .map(|entry| {
-            serde_json::json!({
-                "stream_id": entry.stream_id,
-                "status": entry.status,
-                "content_type": entry.content_type,
-                "tail_offset": entry.tail_offset,
-                "created_at_ms": entry.created_at_ms,
-            })
-        })
-        .collect::<Vec<_>>();
-    axum::Json(serde_json::json!({
-        "bucket_id": bucket,
-        "prefix": prefix,
-        "stream_count": streams.len(),
-        "streams": streams,
-        "next_cursor": next_cursor,
-        "has_more": listing.has_more,
-    }))
-    .into_response()
 }
 
 /// Versioned, self-described per-bucket usage summed across this node's Raft
@@ -1862,38 +1759,6 @@ pub(crate) async fn bucket_usage(State(state): State<HttpState>) -> Response {
             format!("bucket usage read failed: {err}"),
         )
             .into_response(),
-    }
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct BucketQuotaBody {
-    #[serde(default)]
-    max_streams: Option<u64>,
-    #[serde(default)]
-    max_retained_bytes: Option<u64>,
-}
-
-/// Sets or clears one bucket's data-plane quota, replicated to every Raft
-/// group. An empty or omitted body clears the record. Limits are per-group
-/// backstops: the cluster-wide bound is `limit × group_count`; exact
-/// tenant-level enforcement lives at the gateway.
-pub(crate) async fn set_bucket_quota(
-    State(state): State<HttpState>,
-    Path(bucket): Path<String>,
-    body: Option<axum::Json<BucketQuotaBody>>,
-) -> Response {
-    let body = body.map(|axum::Json(body)| body).unwrap_or_default();
-    match state
-        .runtime
-        .set_bucket_quota_all_groups(&bucket, body.max_streams, body.max_retained_bytes)
-        .await
-    {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(err) => {
-            let status = crate::render::runtime_error_status(&err);
-            (status, format!("bucket quota update failed: {err}")).into_response()
-        }
     }
 }
 

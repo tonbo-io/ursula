@@ -113,7 +113,6 @@ impl StreamStateMachine {
             next_cold_gc_seq: self.cold_gc.next_seq(),
             shared_cold_object_owners,
             bucket_usage: self.bucket_usage_report(),
-            bucket_quotas: self.bucket_quota_report(),
             feature_level: self.feature_level,
             last_created_at_ms: self.last_created_at_ms,
         }
@@ -402,15 +401,6 @@ impl StreamStateMachine {
             }
         }
         machine.bucket_usage = recomputed;
-
-        for persisted in snapshot.bucket_quotas {
-            if persisted.quota.is_unlimited() {
-                continue;
-            }
-            machine
-                .bucket_quotas
-                .insert(persisted.bucket_id, persisted.quota);
-        }
 
         Ok(machine)
     }

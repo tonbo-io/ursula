@@ -67,7 +67,6 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   // API Reference - typical call order: setup, hot path, snapshots/bootstrap, lifecycle, compatibility.
   "api/overview": { group: "API Reference", order: 1 },
   "api/create-bucket": { group: "API Reference", order: 2 },
-  "api/list-streams": { group: "API Reference", order: 2.5 },
   "api/create-stream": { group: "API Reference", order: 3 },
   "api/append": { group: "API Reference", order: 4 },
   "api/read": { group: "API Reference", order: 5 },

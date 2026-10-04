@@ -2587,7 +2587,6 @@ fn snapshot_restore_rejects_invalid_entries() {
             erased_buckets: Vec::new(),
             streams: Vec::new(),
             bucket_usage: Vec::new(),
-            bucket_quotas: Vec::new(),
             feature_level: 0,
             last_created_at_ms: 0,
         })
@@ -2604,7 +2603,6 @@ fn snapshot_restore_rejects_invalid_entries() {
             erased_buckets: Vec::new(),
             streams: vec![entry],
             bucket_usage: Vec::new(),
-            bucket_quotas: Vec::new(),
             feature_level: 0,
             last_created_at_ms: 0,
         })
@@ -3167,36 +3165,6 @@ fn append_conflict_precedence_reports_closed_before_mismatch_or_seq() {
         StreamErrorCode::StreamClosed,
         5,
     );
-}
-
-#[test]
-fn bucket_delete_requires_empty_bucket() {
-    let mut machine = machine();
-    create_stream(&mut machine, "s-1");
-
-    assert_error_code(
-        machine.apply(StreamCommand::DeleteBucket {
-            bucket_id: "benchcmp".to_owned(),
-        }),
-        StreamErrorCode::BucketNotEmpty,
-    );
-    assert_eq!(
-        machine.apply(delete_cmd(stream("s-1"))),
-        StreamResponse::Deleted
-    );
-    let usage_before_delete = bucket_usage(&machine, "benchcmp");
-    assert_eq!(
-        machine.apply(StreamCommand::DeleteBucket {
-            bucket_id: "benchcmp".to_owned(),
-        }),
-        StreamResponse::BucketDeleted {
-            bucket_id: "benchcmp".to_owned(),
-        }
-    );
-    assert_eq!(bucket_usage(&machine, "benchcmp"), usage_before_delete);
-    assert_eq!(usage_before_delete.stream_count, 0);
-    assert_eq!(usage_before_delete.retained_bytes, 0);
-    assert!(usage_before_delete.committed_write_units > 0);
 }
 
 #[test]
@@ -4164,11 +4132,6 @@ fn purge_bucket_removes_streams_but_preserves_accounting_idempotently() {
         machine.apply(create_cmd(other.clone(), Create::default())),
         StreamResponse::Created { .. }
     ));
-    assert!(matches!(
-        machine.apply(set_quota_cmd(Some(10), Some(1024))),
-        StreamResponse::BucketQuotaSet { .. }
-    ));
-
     let response = machine.apply(StreamCommand::PurgeBucket {
         bucket_id: "benchcmp".to_owned(),
     });
@@ -4190,12 +4153,6 @@ fn purge_bucket_removes_streams_but_preserves_accounting_idempotently() {
     assert_eq!(purged_usage.stream_count, 0);
     assert_eq!(purged_usage.retained_bytes, 0);
     assert!(purged_usage.committed_write_units > 0);
-    assert!(
-        machine
-            .bucket_quota_report()
-            .into_iter()
-            .all(|entry| entry.bucket_id != "benchcmp")
-    );
     let snapshot = machine.snapshot();
     assert_eq!(snapshot.erased_buckets, vec!["benchcmp".to_owned()]);
     let mut restored = StreamStateMachine::restore(snapshot).expect("restore snapshot");
@@ -4241,112 +4198,6 @@ fn purge_bucket_removes_streams_but_preserves_accounting_idempotently() {
         removed_streams: 0,
         ..
     }));
-}
-
-fn set_quota_cmd(max_streams: Option<u64>, max_retained_bytes: Option<u64>) -> StreamCommand {
-    StreamCommand::SetBucketQuota {
-        bucket_id: "benchcmp".to_owned(),
-        max_streams,
-        max_retained_bytes,
-    }
-}
-
-#[test]
-fn quota_limits_stream_count_and_retained_bytes_locally() {
-    let mut machine = machine();
-    assert_eq!(
-        machine.apply(set_quota_cmd(Some(1), Some(4))),
-        StreamResponse::BucketQuotaSet {
-            bucket_id: "benchcmp".to_owned(),
-        }
-    );
-
-    create_stream(&mut machine, "first");
-    // Stream-count backstop: a second stream in this group is rejected.
-    assert!(matches!(
-        machine.apply(create_cmd(stream("second"), Create::default())),
-        StreamResponse::Error {
-            code: StreamErrorCode::QuotaExceeded,
-            ..
-        }
-    ));
-    // Idempotent re-create of the existing stream still succeeds.
-    assert!(matches!(
-        machine.apply(create_cmd(stream("first"), Create::default())),
-        StreamResponse::AlreadyExists { .. }
-    ));
-
-    // Retained-bytes backstop: the first append fits, the next does not.
-    assert!(matches!(
-        machine.apply(append_cmd(stream("first"), b"abcd", Append::default())),
-        StreamResponse::Appended { .. }
-    ));
-    assert!(matches!(
-        machine.apply(append_cmd(stream("first"), b"x", Append::default())),
-        StreamResponse::Error {
-            code: StreamErrorCode::QuotaExceeded,
-            ..
-        }
-    ));
-
-    // Retention reclaim frees quota headroom again. Destructive retention
-    // requires a published application snapshot at or beyond the floor.
-    assert!(matches!(
-        machine.apply(publish_snapshot_cmd(
-            stream("first"),
-            4,
-            OCTET,
-            b"snapshot",
-            0
-        )),
-        StreamResponse::SnapshotPublished { .. }
-    ));
-    assert!(matches!(
-        machine.apply(advance_retention_cmd(stream("first"), 4, 1)),
-        StreamResponse::RetentionAdvanced { .. }
-    ));
-    assert!(matches!(
-        machine.apply(append_cmd(stream("first"), b"yz", Append::default())),
-        StreamResponse::Appended { .. }
-    ));
-
-    // Clearing the quota removes every limit and leaves no snapshot residue.
-    assert_eq!(
-        machine.apply(set_quota_cmd(None, None)),
-        StreamResponse::BucketQuotaSet {
-            bucket_id: "benchcmp".to_owned(),
-        }
-    );
-    assert!(machine.bucket_quota_report().is_empty());
-    assert!(matches!(
-        machine.apply(create_cmd(stream("second"), Create::default())),
-        StreamResponse::Created { .. }
-    ));
-}
-
-#[test]
-fn quota_survives_snapshot_round_trip() {
-    let mut machine = machine();
-    assert!(matches!(
-        machine.apply(set_quota_cmd(Some(2), None)),
-        StreamResponse::BucketQuotaSet { .. }
-    ));
-    create_stream(&mut machine, "first");
-
-    let mut restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
-    assert_eq!(
-        restored.bucket_quota_report(),
-        machine.bucket_quota_report()
-    );
-
-    create_stream(&mut restored, "second");
-    assert!(matches!(
-        restored.apply(create_cmd(stream("third"), Create::default())),
-        StreamResponse::Error {
-            code: StreamErrorCode::QuotaExceeded,
-            ..
-        }
-    ));
 }
 
 fn set_feature_level_cmd(level: u32) -> StreamCommand {
@@ -4505,30 +4356,15 @@ fn import_snapshot_never_raises_the_feature_level() {
 
 #[test]
 fn import_snapshot_never_lowers_last_created_at_ms() {
-    // SM3: a group that created and deleted streams at level 1 keeps its
-    // C7 counter when it imports an older backup, so the next incarnation
-    // never reuses a `created_at_ms` its objects may still be scoped to.
-    let mut target = machine();
-    target.apply(set_feature_level_cmd(1));
-    assert_eq!(
-        target.apply(create_cmd(stream("gone"), Create {
-            now_ms: 5_000,
-            ..Create::default()
-        })),
-        created(stream("gone"), 0)
-    );
-    assert_eq!(
-        target.apply(delete_cmd(stream("gone"))),
-        StreamResponse::Deleted
-    );
-    assert_eq!(
-        target.apply(StreamCommand::DeleteBucket {
-            bucket_id: "benchcmp".to_owned(),
-        }),
-        StreamResponse::BucketDeleted {
-            bucket_id: "benchcmp".to_owned(),
-        }
-    );
+    // SM3: an empty group whose C7 counter is ahead of a backup keeps its
+    // counter when it imports that backup, so the next incarnation never
+    // reuses a `created_at_ms` its objects may still be scoped to.
+    let mut target = StreamStateMachine::restore(StreamSnapshot {
+        feature_level: 1,
+        last_created_at_ms: 5_000,
+        ..StreamStateMachine::new().snapshot()
+    })
+    .expect("restore empty group");
     assert_eq!(target.last_created_at_ms(), 5_000);
 
     let mut backup = machine();
@@ -4811,78 +4647,6 @@ proptest! {
             prop_assert!(hot_start > 0 && hot_start >= snapshot_offset);
         }
     }
-}
-
-#[test]
-fn list_bucket_streams_filters_sorts_pages_and_hides_expired() {
-    let mut machine = machine();
-    assert_eq!(machine.list_bucket_streams("absent", "", None, 10, 0), None);
-    assert_eq!(
-        machine.list_bucket_streams("benchcmp", "", None, 10, 0),
-        Some(Vec::new())
-    );
-    for id in ["user-2", "user-1", "admin"] {
-        create_stream(&mut machine, id);
-    }
-    assert!(matches!(
-        machine.apply(create_cmd(
-            BucketStreamId::with_affinity("benchcmp", "run-42", "journal"),
-            Create::default()
-        )),
-        StreamResponse::Created { .. }
-    ));
-    assert!(matches!(
-        machine.apply(create_cmd(stream("user-3"), Create {
-            content_type: "application/json",
-            close_after: true,
-            now_ms: 7,
-            ..Create::default()
-        })),
-        StreamResponse::Created { .. }
-    ));
-    assert!(matches!(
-        machine.apply(create_cmd(stream("user-expiring"), Create {
-            expires_at_ms: Some(100),
-            ..Create::default()
-        })),
-        StreamResponse::Created { .. }
-    ));
-    let ids = |listing: Option<Vec<BucketStreamListing>>| {
-        listing
-            .expect("bucket exists")
-            .into_iter()
-            .map(|entry| entry.stream_id)
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(
-        ids(machine.list_bucket_streams("benchcmp", "", None, 10, 0)),
-        vec![
-            "admin",
-            "run-42/journal",
-            "user-1",
-            "user-2",
-            "user-3",
-            "user-expiring"
-        ]
-    );
-    assert_eq!(
-        ids(machine.list_bucket_streams("benchcmp", "user-", None, 10, 100)),
-        vec!["user-1", "user-2", "user-3"]
-    );
-    assert_eq!(
-        ids(machine.list_bucket_streams("benchcmp", "user-", Some("user-1"), 1, 100)),
-        vec!["user-2"]
-    );
-    let listing = machine
-        .list_bucket_streams("benchcmp", "user-3", None, 10, 0)
-        .expect("bucket exists");
-    assert_eq!(listing, vec![BucketStreamListing {
-        stream_id: "user-3".to_owned(),
-        status: StreamStatus::Closed,
-        content_type: "application/json".to_owned(),
-        tail_offset: 0,
-        created_at_ms: 7,
-    }]);
 }
 
 fn append_external_cmd(stream_id: BucketStreamId, s3_path: &str, len: u64) -> StreamCommand {

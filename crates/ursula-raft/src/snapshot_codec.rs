@@ -143,34 +143,11 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
                 .into_iter()
                 .map(bucket_usage_from_proto)
                 .collect(),
-            bucket_quotas: header
-                .bucket_quotas
-                .into_iter()
-                .map(bucket_quota_from_proto)
-                .collect(),
             feature_level: header.feature_level,
             last_created_at_ms: header.last_created_at_ms,
         },
         stream_append_counts,
     })
-}
-
-fn bucket_quota_from_proto(value: proto::BucketQuotaV1) -> ursula_stream::BucketQuotaSnapshot {
-    ursula_stream::BucketQuotaSnapshot {
-        bucket_id: value.bucket_id,
-        quota: ursula_stream::BucketQuota {
-            max_streams: value.max_streams,
-            max_retained_bytes: value.max_retained_bytes,
-        },
-    }
-}
-
-fn bucket_quota_to_proto(value: ursula_stream::BucketQuotaSnapshot) -> proto::BucketQuotaV1 {
-    proto::BucketQuotaV1 {
-        bucket_id: value.bucket_id,
-        max_streams: value.quota.max_streams,
-        max_retained_bytes: value.quota.max_retained_bytes,
-    }
 }
 
 fn bucket_usage_from_proto(value: proto::BucketUsageV1) -> ursula_stream::BucketUsageSnapshot {
@@ -243,12 +220,6 @@ impl GroupSnapshotFrameIter {
                 .iter()
                 .cloned()
                 .map(bucket_usage_to_proto)
-                .collect(),
-            bucket_quotas: stream_snapshot
-                .bucket_quotas
-                .iter()
-                .cloned()
-                .map(bucket_quota_to_proto)
                 .collect(),
             committed_write_unit_bytes: Some(ursula_stream::COMMITTED_WRITE_UNIT_BYTES),
             feature_level: stream_snapshot.feature_level,
@@ -825,13 +796,6 @@ mod tests {
                         stream_count: 2,
                     },
                 }],
-                bucket_quotas: vec![ursula_stream::BucketQuotaSnapshot {
-                    bucket_id: "bucket".to_owned(),
-                    quota: ursula_stream::BucketQuota {
-                        max_streams: Some(4),
-                        max_retained_bytes: Some(1024),
-                    },
-                }],
                 feature_level: ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL,
                 last_created_at_ms: 1_234,
             },
@@ -1159,7 +1123,6 @@ mod tests {
                     next_cold_gc_seq: 0,
                     shared_cold_object_owners: Vec::new(),
                     bucket_usage: Vec::new(),
-                    bucket_quotas: Vec::new(),
                     committed_write_unit_bytes: None,
                     feature_level: 0,
                     last_created_at_ms: 0,
@@ -1188,7 +1151,6 @@ mod tests {
             next_cold_gc_seq: 0,
             shared_cold_object_owners: Vec::new(),
             bucket_usage: Vec::new(),
-            bucket_quotas: Vec::new(),
             committed_write_unit_bytes: Some(4096),
             feature_level: 0,
             last_created_at_ms: 0,
@@ -1224,7 +1186,6 @@ mod tests {
             next_cold_gc_seq: 0,
             shared_cold_object_owners: Vec::new(),
             bucket_usage: Vec::new(),
-            bucket_quotas: Vec::new(),
             committed_write_unit_bytes: None,
             feature_level,
             last_created_at_ms: 0,

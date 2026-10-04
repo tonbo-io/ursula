@@ -670,10 +670,6 @@ fn stream_affinity_key(uri: &Uri, shard_map: Option<&StaticShardMap>) -> Option<
     let third = segments
         .next()
         .and_then(|segment| percent_decode_str(segment).decode_utf8().ok());
-    if third.is_none() && second.as_ref() == "streams" {
-        // The bucket listing reads every group; it has no stream to pin to.
-        return None;
-    }
     let stream_id = match third {
         Some(stream) if stream.as_ref() == "$transaction" => {
             BucketStreamId::with_affinity(bucket.as_ref(), second.as_ref(), "$transaction")
@@ -859,22 +855,6 @@ fn classify_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<C
                 stream_id: None,
             },
             action: Action::AdministerBucket,
-        });
-    }
-
-    // `GET /{bucket}/streams` lists the bucket (extensions.md §1.4): a
-    // read-only, bucket-level resource. `streams` is a reserved stream ID, so
-    // no other method addresses it.
-    if segments.len() == 2 && segments.get(1).is_some_and(|segment| segment == "streams") {
-        if *method != Method::GET {
-            return None;
-        }
-        return Some(ClassifiedRequest {
-            resource: Resource {
-                bucket_id,
-                stream_id: None,
-            },
-            action: Action::Read,
         });
     }
 

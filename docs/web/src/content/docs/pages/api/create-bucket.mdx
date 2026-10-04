@@ -4,17 +4,18 @@ api: "PUT /{bucket}"
 ---
 
 <ParamField path="bucket" type="string" required>
- Bucket ID. The Durable Streams Protocol specifies `[a-z0-9_-]{4,64}`. Client-side conformance is recommended even though Ursula does not currently enforce the regex.
+ Bucket ID. Must match `[a-z0-9_-]{4,64}`.
 </ParamField>
 
 ## Response
 
 | Status | Meaning |
 | ------ | -------------------------------------- |
-| `201` | Bucket created (idempotent - Ursula returns `201` whether or not the bucket existed before). |
+| `201` | The bucket ID is valid. Returned on every call, whether or not streams already exist in the bucket. |
+| `400` | The bucket ID is invalid. |
 
 <Note>
-In the current Ursula implementation `PUT /{bucket}` is a no-op acknowledgement and always returns `201`. Bucket existence is implicit. Streams created under any bucket name will succeed. Validation of the bucket ID (`400`) and conflict detection (`409`) are part of the Durable Streams Protocol but are not yet wired up here.
+`PUT /{bucket}` validates the bucket ID and changes no state. Buckets are implicit: a bucket exists once a stream is created in it, so creating the bucket first is optional. It is kept for clients that do so.
 </Note>
 
 <RequestExample>
