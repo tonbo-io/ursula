@@ -27,7 +27,6 @@ Bucket-level `GET` (metadata) and `DELETE` are part of the extensions specificat
 | `HEAD` | `/{bucket}/{stream}` | [Get stream metadata](/docs/api/head-stream) |
 | `GET` / `PUT` | `/{bucket}/{stream}/attrs` | [Read or replace stream attributes](/docs/api/stream-attrs) |
 | `DELETE` | `/{bucket}/{stream}` | [Delete a stream](/docs/api/delete-stream) |
-| `GET` | `/{bucket}/{stream}/keyed-state` | [Read keyed state](/docs/api/keyed-state) of a [keyed stream](/docs/concepts/keyed-streams) |
 
 ## Bootstrap and snapshots
 
@@ -74,4 +73,3 @@ curl 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
 - [Snapshots](/docs/concepts/snapshots): snapshot lifecycle
 - [Exactly-once writes](/docs/concepts/exactly-once-writes): producer deduplication
 - [Conditional writes](/docs/concepts/conditional-writes): sequence and JSON record-tail guards
-- [Keyed streams](/docs/concepts/keyed-streams): key-value batches and the keyed-state resource

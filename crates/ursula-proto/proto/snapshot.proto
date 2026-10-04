@@ -34,12 +34,12 @@ message SnapshotHeaderV1 {
   // Permanent bucket-erasure fences. Absent in snapshots written before
   // tenant physical-erasure proof became part of the contract.
   repeated string erased_buckets = 9;
-  // Replicated group feature level (keyed-streams C0). Absent in snapshots
+  // Replicated group feature level (C0). Absent in snapshots
   // written before feature levels, which decode as level 0. Never lowered;
   // a binary refuses snapshots above its supported level.
   uint32 feature_level = 10;
   // Largest stream created_at_ms the group assigned at feature level 1 or
-  // later (keyed-streams C7). Absent in older snapshots, which decode as 0;
+  // later (C7). Absent in older snapshots, which decode as 0;
   // restore raises it to every live stream's created_at_ms at level 1.
   uint64 last_created_at_ms = 11;
 }

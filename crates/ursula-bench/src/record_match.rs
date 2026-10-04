@@ -1,12 +1,11 @@
-//! Serialized single-writer `Stream-Record-Match` appends (keyed-streams M0c).
+//! Serialized single-writer `Stream-Record-Match` appends.
 //!
 //! Each writer owns one `application/json` stream and keeps exactly one append
 //! in flight. Every append carries `Stream-Record-Match: <n>`, where `n` is the
 //! `Stream-Record-Next` returned by the previous append (0 for a fresh
-//! stream). This is the commit path a Pi Durable owner uses: one Session line
-//! per harness, one commit in flight, each commit conditional on the previous
-//! one. Bodies are single JSON objects shaped like `keyed-batch-v1` records so
-//! each append is exactly one record.
+//! stream): one commit in flight per writer, each commit conditional on the
+//! previous one. Bodies are single JSON objects so each append is exactly one
+//! record.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -100,7 +99,7 @@ pub struct RecordMatchArgs {
     pub request_timeout_secs: u64,
 
     /// Optional path for raw measured samples, one `<latency_us> <bytes>` line
-    /// per commit (input for the §9.2 line-model simulation).
+    /// per commit.
     #[arg(long)]
     pub samples_out: Option<std::path::PathBuf>,
 }
@@ -282,7 +281,7 @@ async fn run_writer(
             PayloadMix::Fixed => args.payload_bytes,
             PayloadMix::Pi => pi_mix_size(&mut rng),
         };
-        let body = keyed_batch_body(op, size);
+        let body = json_record_body(op, size);
         op += 1;
         let started = Instant::now();
         let resp = backend
@@ -388,9 +387,9 @@ pub fn pi_mix_size(rng: &mut SplitMix64) -> usize {
     }
 }
 
-/// Builds a single JSON object of exactly `size` bytes (minimum 40) shaped like
-/// a `keyed-batch-v1` record with one put op: `{"o":N,"ops":[["p","k",{"t":"..."}]]}`.
-pub fn keyed_batch_body(op: u64, size: usize) -> Bytes {
+/// Builds a single JSON object of exactly `size` bytes (minimum 40):
+/// `{"o":N,"ops":[["p","k",{"t":"..."}]]}`.
+pub fn json_record_body(op: u64, size: usize) -> Bytes {
     let prefix = format!("{{\"o\":{op},\"ops\":[[\"p\",\"AWJlbmNoAA\",{{\"t\":\"");
     let suffix = "\"}]]}";
     let fixed = prefix.len() + suffix.len();
@@ -428,13 +427,13 @@ impl SplitMix64 {
 #[cfg(test)]
 mod tests {
     use super::SplitMix64;
-    use super::keyed_batch_body;
+    use super::json_record_body;
     use super::pi_mix_size;
 
     #[test]
-    fn keyed_batch_body_is_one_json_object_of_requested_size() {
+    fn json_record_body_is_one_json_object_of_requested_size() {
         for size in [127usize, 300, 4096, 50 * 1024] {
-            let body = keyed_batch_body(42, size);
+            let body = json_record_body(42, size);
             assert_eq!(body.len(), size);
             let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert!(value.is_object());

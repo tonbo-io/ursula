@@ -6,7 +6,6 @@
 use std::future::Future;
 
 use super::HttpProtocolSurfacePlan;
-use super::KeyedIndexerPlan;
 use super::RuntimeInterleavingPlan;
 use super::RuntimeRaftNetworkOptions;
 use super::SimReport;
@@ -37,7 +36,6 @@ use super::has_stop_current_leader_in_fault_plan;
 use super::has_stop_seeded_follower_in_fault_plan;
 use super::has_verify_runtime_cold_live_reads_in_fault_plan;
 use super::http_protocol_surface_plan_from_fault_plan;
-use super::keyed_indexer_plan_from_fault_plan;
 use super::run_cold_delete_fault_inner;
 use super::run_cold_live_read_inner;
 use super::run_cold_read_delay_inner;
@@ -50,7 +48,6 @@ use super::run_http_live_protocol_surface_inner;
 use super::run_http_producer_protocol_surface_inner;
 use super::run_http_protocol_surface_inner;
 use super::run_http_protocol_surface_randomized_inner;
-use super::run_keyed_indexer_inner;
 use super::run_leader_failover_inner;
 use super::run_no_fault_inner;
 use super::run_partition_heal_inner;
@@ -92,11 +89,6 @@ impl ThreeNodeRaftSim {
                 let plan = http_protocol_surface_plan_from_fault_plan(&schedule.fault_plan)
                     .unwrap_or_else(|| HttpProtocolSurfacePlan::from_seed(schedule.seed));
                 Self::run_http_protocol_surface_randomized_with_plan_report(config, plan)
-            }
-            SimScenario::KeyedIndexer => {
-                let plan = keyed_indexer_plan_from_fault_plan(&schedule.fault_plan)
-                    .unwrap_or_else(|| KeyedIndexerPlan::from_seed(schedule.seed));
-                Self::run_keyed_indexer_with_plan_report(config, plan)
             }
             SimScenario::RuntimeRaftNetwork => Self::run_runtime_raft_network_with_options_report(
                 config,
@@ -254,24 +246,7 @@ impl ThreeNodeRaftSim {
             SimScenario::RuntimeRaftSnapshotInstall => {
                 Self::run_runtime_raft_snapshot_install_report(config)
             }
-            SimScenario::KeyedIndexer => Self::run_keyed_indexer_report(config),
         }
-    }
-
-    pub fn run_keyed_indexer_report(config: ThreeNodeRaftSimConfig) -> SimReport {
-        let plan = KeyedIndexerPlan::from_seed(config.seed);
-        Self::run_keyed_indexer_with_plan_report(config, plan)
-    }
-
-    pub fn run_keyed_indexer_with_plan_report(
-        config: ThreeNodeRaftSimConfig,
-        plan: KeyedIndexerPlan,
-    ) -> SimReport {
-        report_of(
-            SimScenario::KeyedIndexer,
-            config.seed,
-            run_keyed_indexer_inner(config, plan),
-        )
     }
 
     pub fn run_partition_heal_report(config: ThreeNodeRaftSimConfig) -> SimReport {

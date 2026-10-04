@@ -6,7 +6,7 @@
 //! - `multi_stream`: concurrent writers, one stream each (producer-header octet appends).
 //! - `fanout`: SSE fan-out latency.
 //! - `bootstrap`: `/bootstrap` stampede.
-//! - `record_match`: serialized single-writer `Stream-Record-Match` JSON appends (keyed-streams M0c).
+//! - `record_match`: serialized single-writer `Stream-Record-Match` JSON appends.
 
 mod backend;
 mod bootstrap;
@@ -38,7 +38,7 @@ enum Cmd {
     FanOut(fanout::FanOutArgs),
     /// Bootstrap stampede - N clients hit /bootstrap simultaneously after a snapshot.
     Bootstrap(bootstrap::BootstrapArgs),
-    /// Serialized single-writer `Stream-Record-Match` JSON appends (keyed-streams M0c commit latency).
+    /// Serialized single-writer `Stream-Record-Match` JSON appends (commit latency).
     RecordMatch(record_match::RecordMatchArgs),
 }
 

@@ -4,7 +4,6 @@
 //! `pub use madsim_harness::{SimFaultAction, ...}` continue to compile.
 
 use super::Deserialize;
-use super::KeyedIndexerPlan;
 use super::Serialize;
 use super::SimScenario;
 use super::SplitMix64;
@@ -124,12 +123,6 @@ impl SimFaultPlan {
             SimScenario::HttpLiveProtocolSurface => Vec::new(),
             SimScenario::HttpProducerProtocolSurface => Vec::new(),
             SimScenario::HttpProtocolSurface => Vec::new(),
-            SimScenario::KeyedIndexer => vec![SimFaultStep {
-                phase: "keyed_indexer_workload".to_owned(),
-                action: SimFaultAction::RunKeyedIndexerWorkload {
-                    plan: KeyedIndexerPlan::from_seed(0),
-                },
-            }],
             SimScenario::HttpProtocolSurfaceRandomized => vec![SimFaultStep {
                 phase: "http_protocol_surface_workload".to_owned(),
                 action: SimFaultAction::RunHttpProtocolSurfaceWorkload {
@@ -242,14 +235,6 @@ impl SimFaultPlan {
                     },
                 }],
             },
-            SimScenario::KeyedIndexer => Self {
-                steps: vec![SimFaultStep {
-                    phase: "keyed_indexer_workload".to_owned(),
-                    action: SimFaultAction::RunKeyedIndexerWorkload {
-                        plan: KeyedIndexerPlan::from_seed(seed),
-                    },
-                }],
-            },
             _ => Self::for_scenario(scenario),
         }
     }
@@ -329,9 +314,6 @@ pub enum SimFaultAction {
     },
     RunHttpProtocolSurfaceWorkload {
         plan: HttpProtocolSurfacePlan,
-    },
-    RunKeyedIndexerWorkload {
-        plan: KeyedIndexerPlan,
     },
 }
 

@@ -102,7 +102,7 @@ struct EnableFeatureArgs {
     /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
-    /// Feature level to enable (1 = keyed streams M1).
+    /// Feature level to enable.
     #[arg(long)]
     level: u32,
     /// Seconds to wait until every group replica reports the level.

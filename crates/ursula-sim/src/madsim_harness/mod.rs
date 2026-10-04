@@ -166,7 +166,6 @@ pub enum SimScenario {
     HttpLiveProtocolSurface,
     HttpProducerProtocolSurface,
     HttpProtocolSurface,
-    KeyedIndexer,
 }
 
 #[derive(Clone)]
@@ -207,7 +206,6 @@ impl SimScenario {
             Self::HttpLiveProtocolSurface => "http-live-protocol-surface",
             Self::HttpProducerProtocolSurface => "http-producer-protocol-surface",
             Self::HttpProtocolSurface => "http-protocol-surface",
-            Self::KeyedIndexer => "keyed-indexer",
         }
     }
 }
@@ -535,7 +533,6 @@ pub use self::trace::SimTrace;
 
 mod cold_path;
 mod generators;
-mod keyed_indexer;
 use cold_path::run_cold_delete_fault_inner;
 use cold_path::run_cold_live_read_inner;
 use cold_path::run_cold_read_delay_inner;
@@ -543,8 +540,6 @@ use cold_path::run_cold_read_fault_inner;
 use cold_path::run_cold_read_truncate_inner;
 use cold_path::run_cold_write_delay_inner;
 use cold_path::run_cold_write_fault_inner;
-pub use keyed_indexer::KeyedIndexerPlan;
-use keyed_indexer::run_keyed_indexer_inner;
 mod http;
 use http::run_http_live_limit_protocol_surface_inner;
 use http::run_http_live_protocol_surface_inner;
@@ -594,7 +589,6 @@ use introspect::has_stop_seeded_follower_in_fault_plan;
 use introspect::has_verify_runtime_cold_live_reads_in_fault_plan;
 use introspect::http_protocol_surface_plan_from_fault_plan;
 use introspect::invariant_failed;
-use introspect::keyed_indexer_plan_from_fault_plan;
 use introspect::panic_payload_to_string;
 use introspect::runtime_interleaving_plan_from_fault_plan;
 use introspect::runtime_raft_network_workload_plan_from_fault_plan;
