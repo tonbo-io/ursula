@@ -779,6 +779,30 @@ fn header_u64(r: &ureq::http::Response<ureq::Body>, name: &str) -> Option<u64> {
     r.headers().get(name)?.to_str().ok()?.trim().parse().ok()
 }
 
+/// Sends a read, retrying 429 (rate limiting) and 503 (overload, or a `consistency=leader` read,
+/// HEAD or snapshot read the leader could not confirm with a quorum in time) the way `append`
+/// does: no sooner than Retry-After (seconds), with backoff, within `retry_budget()`. Returns the
+/// first other answer, or the last 429/503 once the budget is spent.
+fn read_retrying(
+    send: impl Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    let deadline = Instant::now() + retry_budget();
+    let mut backoff = Duration::from_millis(20);
+    loop {
+        let r = send()?;
+        if !matches!(r.status().as_u16(), 429 | 503) {
+            return Ok(r);
+        }
+        let retry_after = header_u64(&r, "retry-after").map(Duration::from_secs);
+        let wait = retry_after.map_or(backoff, |r| r.max(backoff));
+        if Instant::now() + wait > deadline {
+            return Ok(r);
+        }
+        std::thread::sleep(wait);
+        backoff = (backoff * 2).min(Duration::from_secs(1));
+    }
+}
+
 enum Append {
     /// Applied (or a duplicate of an applied append); the stream offset after it when known.
     Acked { next: Option<u64>, attempts: u32 },
@@ -897,10 +921,12 @@ impl From<Fail> for String {
 /// One read from `offset`: the bytes and the offset after them (empty at the tail). Reads the
 /// leader's applied state: a follower may lag behind an acknowledged append (a claim, a commit).
 fn read_from(url: &str, offset: u64) -> Result<(Vec<u8>, u64), Fail> {
-    let mut r = agent()
-        .get(format!("{url}?offset={offset}&consistency=leader"))
-        .call()
-        .map_err(|e| format!("read {url} at {offset}: {e}"))?;
+    let mut r = read_retrying(|| {
+        agent()
+            .get(format!("{url}?offset={offset}&consistency=leader"))
+            .call()
+    })
+    .map_err(|e| format!("read {url} at {offset}: {e}"))?;
     let status = r.status().as_u16();
     if status == 204 {
         return Ok((Vec::new(), offset));
@@ -957,10 +983,7 @@ struct Head {
 }
 
 fn head(url: &str) -> Result<Head, String> {
-    let r = agent()
-        .head(url)
-        .call()
-        .map_err(|e| format!("head {url}: {e}"))?;
+    let r = read_retrying(|| agent().head(url).call()).map_err(|e| format!("head {url}: {e}"))?;
     let status = r.status().as_u16();
     if status != 200 {
         return Err(format!("head {url}: {status}"));
@@ -973,9 +996,7 @@ fn head(url: &str) -> Result<Head, String> {
 
 /// The snapshot at `offset`; `None` when it does not exist (superseded, or not yet visible here).
 fn get_snapshot(url: &str, offset: u64) -> Result<Option<Vec<u8>>, String> {
-    let mut r = bulk_agent()
-        .get(format!("{url}/snapshot/{offset}"))
-        .call()
+    let mut r = read_retrying(|| bulk_agent().get(format!("{url}/snapshot/{offset}")).call())
         .map_err(|e| format!("get snapshot {offset}: {e}"))?;
     let status = r.status().as_u16();
     // A body cut short: the snapshot was superseded and its cold object deleted (after its grace)
@@ -2840,7 +2861,65 @@ pub unsafe extern "C" fn sqlite3_extension_init(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read as _;
+    use std::io::Write as _;
+    use std::net::TcpListener;
+
     use super::*;
+
+    // A leader read the server could not confirm with a quorum in time answers 503 (Retry-After),
+    // and a gateway may rate-limit with 429: catch-up reads and HEAD retry both, as appends do,
+    // so attach, the claim check and reclaim never fail on them.
+    #[test]
+    fn reads_retry_transient_unavailability() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/b/s", listener.local_addr().unwrap());
+        let answer = |head: &str, body: &str| {
+            format!(
+                "HTTP/1.1 {head}\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let unavailable = answer(
+            "503 Service Unavailable\r\nretry-after: 0",
+            "leader unknown",
+        );
+        let answers = [
+            unavailable.clone(),
+            answer("429 Too Many Requests", ""),
+            answer("200 OK\r\nstream-next-offset: 7", "abc"),
+            unavailable,
+            answer("200 OK\r\nstream-retained-offset: 2", ""),
+        ];
+        let server = std::thread::spawn(move || {
+            answers
+                .into_iter()
+                .map(|answer| {
+                    let (mut conn, _) = listener.accept().unwrap();
+                    let mut request = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        conn.read_exact(&mut byte).unwrap();
+                        request.push(byte[0]);
+                    }
+                    conn.write_all(answer.as_bytes()).unwrap();
+                    let request = String::from_utf8_lossy(&request);
+                    request.split(" HTTP/").next().unwrap().to_owned()
+                })
+                .collect::<Vec<_>>()
+        });
+        let (bytes, next) = read_from(&url, 4).map_err(String::from).unwrap();
+        assert_eq!((&bytes[..], next), (&b"abc"[..], 7));
+        assert_eq!(head(&url).unwrap().retained, 2);
+        let read = "GET /b/s?offset=4&consistency=leader";
+        assert_eq!(server.join().unwrap(), [
+            read,
+            read,
+            read,
+            "HEAD /b/s",
+            "HEAD /b/s"
+        ]);
+    }
 
     // Attach trusts local files only when the sidecar was written in this boot, for this db file,
     // and the WAL holds what it claims; a legacy, torn or other-boot sidecar is discarded, and a

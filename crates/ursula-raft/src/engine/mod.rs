@@ -27,6 +27,7 @@ use openraft::RaftNetworkFactory;
 use openraft::ReadPolicy;
 use openraft::rt::WatchReceiver;
 use openraft::storage::RaftLogStorage;
+use openraft::type_config::TypeConfigExt;
 use ursula_runtime::AdvanceRetentionRequest;
 use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendExternalRequest;
@@ -122,6 +123,7 @@ use crate::forward::forward_purge_bucket_to_leader;
 use crate::forward::forward_read_stream_to_leader;
 use crate::forward::group_engine_client_write_error;
 use crate::forward::group_engine_forward_to_leader_error;
+use crate::forward::group_engine_leader_read_unavailable;
 use crate::forward::group_engine_linearizable_read_error;
 use crate::forward::write_commands_on_raft;
 use crate::forward::write_result_from_raft_response;
@@ -666,19 +668,59 @@ impl RaftGroupEngine {
     /// miss a write any leader acknowledged before it started. A deposed
     /// leader cut off from the quorum answers a forward (or 503) instead of
     /// a stale view. A follower gets the plain forward-to-leader error.
+    ///
+    /// One confirmation round waits one heartbeat interval for the quorum,
+    /// which a loaded leader can miss. While this node still believes it
+    /// leads, `QuorumNotEnough` is retried (at most one round per heartbeat
+    /// interval) until `election_timeout_min` has passed; only then is it a
+    /// 503. The wait for the local apply is bounded by the same timeout and
+    /// also ends in a 503, so a read never hangs on a stalled state machine.
     pub(crate) async fn require_linearizable_leader_read(
         &self,
         operation: &str,
     ) -> Result<(), GroupEngineError> {
         self.require_local_leader_for_read(operation).await?;
-        self.raft
-            .ensure_linearizable(ReadPolicy::ReadIndex)
-            .await
-            .map(|_| ())
-            .map_err(|err| {
-                let self_id = self.raft.metrics().borrow_watched().id;
-                group_engine_linearizable_read_error(err, operation, self_id)
-            })
+        let config = self.raft.config();
+        let budget = Duration::from_millis(config.election_timeout_min);
+        let round = Duration::from_millis(config.heartbeat_interval);
+        let deadline = UrsulaRaftTypeConfig::now() + budget;
+        let self_id = || self.raft.metrics().borrow_watched().id;
+        let linearizer = loop {
+            let started = UrsulaRaftTypeConfig::now();
+            match self.raft.get_read_linearizer(ReadPolicy::ReadIndex).await {
+                Ok(linearizer) => break linearizer,
+                Err(err)
+                    if matches!(
+                        err.api_error(),
+                        Some(openraft::error::LinearizableReadError::QuorumNotEnough(_))
+                    ) && self.raft.is_leader()
+                        && UrsulaRaftTypeConfig::now() < deadline =>
+                {
+                    tracing::debug!("OpenRaft {operation} retrying leadership confirmation: {err}");
+                    let next_round = (started + round).min(deadline);
+                    UrsulaRaftTypeConfig::sleep_until(next_round).await;
+                }
+                Err(err) => {
+                    return Err(group_engine_linearizable_read_error(
+                        err,
+                        operation,
+                        self_id(),
+                    ));
+                }
+            }
+        };
+        match linearizer.try_await_ready(&self.raft, Some(budget)).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(state)) => {
+                tracing::debug!(
+                    "OpenRaft {operation} timed out waiting to apply the read index: {state:?}"
+                );
+                Err(group_engine_leader_read_unavailable(operation, self_id()))
+            }
+            Err(fatal) => Err(GroupEngineError::new(format!(
+                "OpenRaft {operation} could not apply the read index: {fatal}"
+            ))),
+        }
     }
 
     pub(crate) async fn current_leader_node(&self) -> Option<BasicNode> {

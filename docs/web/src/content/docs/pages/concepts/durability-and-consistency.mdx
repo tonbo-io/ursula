@@ -24,7 +24,9 @@ point, so the read is **linearizable**: it reflects every append acknowledged
 before the read started, including appends acknowledged by a newer leader. A
 leader cut off from the majority redirects to the new leader or answers `503`
 with `Retry-After` instead of serving its stale state. The confirmation costs
-one round trip to the voters per read. It is not a live-read mode; long-poll
+one round trip to the voters per read. A leader that misses a confirmation under
+load retries it for up to one election timeout before it answers `503`, so a
+client should retry a `503` after `Retry-After`. It is not a live-read mode; long-poll
 and SSE already have leader-owned watcher semantics.
 
 `HEAD`, `GET …/bootstrap`, snapshot reads, the registration of a long-poll
