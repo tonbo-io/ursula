@@ -1266,9 +1266,13 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         )
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .route("/{bucket}", put(create_bucket))
-        // A bare GET (the removed latest-snapshot redirect) answers 405, not
-        // a 404 that Loro's client would read as "no snapshot".
-        .route("/{bucket}/{stream}/snapshot", get(removed_latest_snapshot))
+        // The bare path (the removed latest-snapshot redirect and the removed
+        // record-addressed publish) answers 405 to every method, not a 404
+        // that Loro's client would read as "no snapshot".
+        .route(
+            "/{bucket}/{stream}/snapshot",
+            axum::routing::any(removed_latest_snapshot),
+        )
         .route(
             "/{bucket}/{stream}/snapshot/{snapshot_offset}",
             put(publish_snapshot).get(read_snapshot),
@@ -2862,12 +2866,14 @@ pub(crate) async fn publish_snapshot(
     .await
 }
 
-/// A bare `GET {stream}/snapshot` (the removed latest-snapshot redirect)
-/// answers 405, not 404: Loro's streams client reads a 404 as "no
-/// snapshot" (see `removed_surface`).
+/// The bare `{stream}/snapshot` path (the removed latest-snapshot redirect
+/// and record-addressed publish) answers 405 with an empty `Allow`, not 404:
+/// Loro's streams client reads a 404 as "no snapshot" (see
+/// `removed_surface`).
 pub(crate) async fn removed_latest_snapshot() -> Response {
     (
         StatusCode::METHOD_NOT_ALLOWED,
+        [(axum::http::header::ALLOW, "")],
         "the latest-snapshot redirect was removed; read Stream-Snapshot-Offset from HEAD",
     )
         .into_response()

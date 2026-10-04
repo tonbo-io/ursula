@@ -12,7 +12,8 @@
 //!   routes are gone.
 //! - A bare `GET {stream}/snapshot` (the old latest-snapshot redirect) answers
 //!   405, not 404: Loro's streams client reads a 404 as "no snapshot". An
-//!   explicit handler answers it. Clients read the latest snapshot's offset
+//!   explicit handler answers every method on that path with 405 and an
+//!   empty `Allow`. Clients read the latest snapshot's offset
 //!   from HEAD and fetch `GET {stream}/snapshot/{offset}`.
 //! - Three-segment stream paths (path affinity) and
 //!   `POST /{bucket}/{group}/$transaction` answer 404: no route matches. A
