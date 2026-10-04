@@ -514,7 +514,7 @@ container receives only chart-managed container settings plus explicit
 | `indexer.cache.servingMaxBytes` | `1073741824` | Shared serving-cache budget across every registration in one worker pod. |
 | `indexer.cache.maintenanceMaxBytes` | `268435456` | Shared compaction/GC cache budget across every registration in one worker pod. |
 | `indexer.cache.emptyDir.sizeLimit` | `2Gi` | Disposable local cache volume limit; durable index state remains in S3. |
-| `indexer.ingest.flushEntries` | `65536` | Maximum entries in one committed segment, and so in one level-0 part. |
+| `indexer.ingest.flushEntries` | `65536` | Maximum messages (entries plus skips) in one committed segment, and so entries in one uncompacted part. |
 | `indexer.workers.concurrency` | `4` | Concurrent stream tasks per worker pod. |
 | `indexer.workers.segmentBytes` | `33554432` | Source bytes read before a segment is committed; a shorter tail segment waits for `indexer.ingest.tailFlushIntervalMs`. Replaces `readBatchRecords` and `segmentRecords`. |
 | `indexer.workers.leaseMs` | `60000` | Claim duration used to reduce duplicate processing; not a correctness boundary. |

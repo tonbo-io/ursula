@@ -442,7 +442,8 @@ indexer:
     emptyDir:
       sizeLimit: 2Gi
   ingest:
-    # Maximum entries in one committed segment, and so in one level-0 part.
+    # Maximum messages (entries plus skips) in one committed segment, and so
+    # entries in one uncompacted part.
     flushEntries: 65536
     rowGroupEntries: 16384
     pollIntervalMs: 250

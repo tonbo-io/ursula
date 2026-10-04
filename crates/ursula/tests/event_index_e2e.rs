@@ -367,10 +367,24 @@ async fn indexer_pool_indexes_otlp_json_and_ndjson_streams_from_an_in_process_ur
         .await?;
     assert!(response.status().is_success());
     let tail = http.tail(&sessions).await?;
-    http.wait_status(&indexer, "session-1", |status| {
-        status["coverage"]["durable"].as_str() == Some(tail.as_str())
-    })
-    .await?;
+    let status = http
+        .wait_status(&indexer, "session-1", |status| {
+            status["coverage"]["durable"].as_str() == Some(tail.as_str())
+        })
+        .await?;
+    assert_eq!(status["skipped"]["unparseable"], 1);
+    assert_eq!(status["skipped"]["oversize"], 0);
+    let events = http
+        .json(&format!(
+            "{indexer}/v1/indexes/session-1/events?from=2026-10-03T00:00:00Z&until=2026-10-04T00:00:00Z"
+        ))
+        .await?;
+    let entries = events["entries"].as_array().context("entries")?;
+    assert_eq!(entries.len(), 3);
+    assert_eq!(
+        http.fetch(&sessions, &entries[2]).await?,
+        format!("{SESSION_PARTIAL}\n")
+    );
 
     // Delete and recreate: the registration restarts on the new stream.
     let previous = http.incarnation(&sessions).await?;

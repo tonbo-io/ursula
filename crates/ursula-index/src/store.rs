@@ -79,7 +79,7 @@ pub struct SourceBinding {
 /// message's first byte and `len` its stored length including the LF, so
 /// `GET {stream}?offset=<offset>&max_bytes=<len>` (continued from
 /// `Stream-Next-Offset` until `len` bytes arrive) returns exactly the message.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EventEntry {
     pub t_ms: i64,
     pub t_end_ms: i64,

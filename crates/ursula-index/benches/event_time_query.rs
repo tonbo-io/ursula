@@ -30,15 +30,10 @@ fn config(source: &str) -> EventIndexConfig {
     config
 }
 
-/// Commit `times` as consecutive messages from `first`, `per_segment` at a
+/// Commit `times` as consecutive messages from offset 0, `per_segment` at a
 /// time, so each commit writes one part per event-time day.
-async fn commit(
-    index: &mut EventIndex,
-    first: u64,
-    times: &[i64],
-    per_segment: usize,
-) -> anyhow::Result<()> {
-    let mut offset = first.saturating_mul(MESSAGE_LEN);
+async fn commit(index: &mut EventIndex, times: &[i64], per_segment: usize) -> anyhow::Result<()> {
+    let mut offset = 0_u64;
     for chunk in times.chunks(per_segment) {
         let start = offset;
         let entries = chunk
@@ -82,7 +77,7 @@ fn event_time_query(criterion: &mut Criterion) {
             let times = (0..RECORDS)
                 .map(|record| i64::try_from(record.wrapping_mul(7_919) % RECORDS))
                 .collect::<Result<Vec<_>, _>>()?;
-            commit(&mut index, 0, &times, 10_000).await?;
+            commit(&mut index, &times, 10_000).await?;
             Ok::<_, anyhow::Error>(index)
         })
         .expect("build query benchmark index");
@@ -126,7 +121,7 @@ fn bounded_partition_compaction(criterion: &mut Criterion) {
                         let times = (0..record_count)
                             .map(i64::try_from)
                             .collect::<Result<Vec<_>, _>>()?;
-                        commit(&mut index, 0, &times, COMPACTION_PART_ENTRIES).await?;
+                        commit(&mut index, &times, COMPACTION_PART_ENTRIES).await?;
                         Ok::<_, anyhow::Error>(index)
                     })
                     .expect("build compaction benchmark index");

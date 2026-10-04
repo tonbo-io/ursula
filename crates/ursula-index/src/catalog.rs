@@ -185,7 +185,10 @@ impl IndexCatalog {
     /// Restart a registration whose source was deleted and recreated:
     /// retire its namespace and rebind it to `incarnation` from
     /// `indexed_from_offset`. A no-op returning the current registration if
-    /// it no longer has `expected_incarnation` (another pod restarted it).
+    /// it no longer has `expected_incarnation` (another pod restarted it) or
+    /// if `incarnation` names a namespace this catalog already retired: a
+    /// stale HEAD can report an earlier incarnation again, and restarting
+    /// into a retired namespace would let cleanup delete a live index.
     pub async fn restart(
         &self,
         id: &str,
@@ -210,15 +213,24 @@ impl IndexCatalog {
             if registration.incarnation.as_deref() != expected_incarnation {
                 return Ok(registration.clone());
             }
+            let mut restarted = registration.clone();
+            restarted.restarted_from_incarnation = restarted.incarnation.take();
+            restarted.incarnation = incarnation.clone();
+            restarted.indexed_from_offset = indexed_from_offset;
+            let namespace = restarted.namespace()?;
+            if catalog
+                .retired
+                .iter()
+                .any(|retired| retired.namespace == namespace)
+            {
+                return Ok(registration.clone());
+            }
             let retired = RetiredNamespace {
                 id: id.to_owned(),
                 namespace: registration.namespace()?,
                 retired_at_ms,
             };
-            registration.restarted_from_incarnation = registration.incarnation.take();
-            registration.incarnation = incarnation.clone();
-            registration.indexed_from_offset = indexed_from_offset;
-            let restarted = registration.clone();
+            *registration = restarted.clone();
             catalog.retired.push(retired);
             if self.write(Some(&current), &catalog).await? {
                 return Ok(restarted);

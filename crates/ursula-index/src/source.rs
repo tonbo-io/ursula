@@ -29,10 +29,10 @@ use crate::store::parse_offset_token;
 const HEADER_NEXT_OFFSET: &str = "stream-next-offset";
 const HEADER_RETAINED_OFFSET: &str = "stream-retained-offset";
 const HEADER_INCARNATION: &str = "stream-incarnation";
-const HEADER_CLOSED: &str = "stream-closed";
 const HEADER_UP_TO_DATE: &str = "stream-up-to-date";
 
-/// Ursula's request body cap: no message can be longer.
+/// Longest message assembled across reads (Ursula's request body cap). Only
+/// an NDJSON line spanning appends can be longer; it is counted as oversize.
 pub const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,7 +49,6 @@ pub struct SourceHead {
     pub format: SourceFormat,
     pub next_offset: u64,
     pub retained_offset: u64,
-    pub closed: bool,
     pub incarnation: Option<String>,
 }
 
@@ -74,7 +73,7 @@ pub enum SegmentRead {
 pub struct ReadLimits {
     /// Stop after the message that reaches this many bytes past the start.
     pub segment_bytes: u64,
-    /// Stop after this many entries.
+    /// Stop after this many messages (entries plus skips).
     pub max_entries: usize,
     /// Longest message assembled across reads.
     pub max_message_bytes: usize,
@@ -90,10 +89,6 @@ impl SourceClient {
     /// `client` is shared by every source of one process.
     pub fn new(client: reqwest::Client, stream_url: Url) -> Self {
         Self { client, stream_url }
-    }
-
-    pub fn stream_url(&self) -> &Url {
-        &self.stream_url
     }
 
     /// HEAD the source. `None` means the stream does not exist (404).
@@ -122,7 +117,6 @@ impl SourceClient {
             format,
             next_offset,
             retained_offset,
-            closed: header_is_true(headers, HEADER_CLOSED),
             incarnation: headers
                 .get(HEADER_INCARNATION)
                 .and_then(|value| value.to_str().ok())
@@ -225,7 +219,7 @@ impl SourceClient {
                         }
                     }
                 }
-                segment.entries.len() < limits.max_entries
+                segment.entries.len().saturating_add(segment.skips.len()) < limits.max_entries
             })
             .await?;
         match outcome {

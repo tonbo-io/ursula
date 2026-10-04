@@ -52,7 +52,6 @@ impl ChunkedSource {
                 ("stream-next-offset", pad(tail)),
                 ("stream-retained-offset", pad(self.retained)),
                 ("stream-incarnation", "1759482000123".to_owned()),
-                ("stream-closed", "true".to_owned()),
             ])
                 .into_response();
         }
@@ -151,7 +150,6 @@ async fn head_reports_format_offsets_incarnation_and_absence() -> anyhow::Result
     assert_eq!(head.next_offset, 3);
     assert_eq!(head.retained_offset, 0);
     assert_eq!(head.incarnation.as_deref(), Some("1759482000123"));
-    assert!(head.closed);
     server.abort();
 
     let (client, server) = ChunkedSource::new("{}\n", 8, "application/octet-stream")

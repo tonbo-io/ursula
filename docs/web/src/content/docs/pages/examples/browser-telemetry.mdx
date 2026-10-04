@@ -122,6 +122,7 @@ async function fetchEvent(streamUrl, { offset, len }) {
   let received = 0;
   while (received < len) {
     const response = await fetch(`${streamUrl}?offset=${offset}&max_bytes=${len - received}`);
+    if (!response.ok) throw new Error(`event is no longer readable: ${response.status}`);
     const chunk = new Uint8Array(await response.arrayBuffer());
     if (chunk.length === 0) throw new Error("event is no longer readable");
     chunks.push(chunk);

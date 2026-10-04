@@ -84,7 +84,8 @@ pub struct IndexerArgs {
     maintenance_cache_max_bytes: u64,
     #[arg(long, default_value = "127.0.0.1:4493")]
     listen: SocketAddr,
-    /// Maximum entries in one committed segment, and so in one level-0 part.
+    /// Maximum messages (entries plus skips) in one committed segment, and
+    /// so entries in one uncompacted part.
     #[arg(long, default_value_t = 4_096)]
     flush_entries: usize,
     #[arg(long, default_value_t = 16_384)]
@@ -288,6 +289,7 @@ struct PoolState {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RegisterIndexRequest {
     stream_url: String,
     #[serde(default)]
@@ -300,6 +302,7 @@ struct RegisterIndexRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EventQuery {
     from: String,
     until: String,
@@ -738,7 +741,7 @@ async fn process_pool_source(
     let source = SourceClient::new(state.http.clone(), stream_url);
     let handles = state.ensure_index(registration).await?;
     let Some(head) = source.head().await? else {
-        handles.serving.lock().await.set_source_gone(true).await?;
+        mark_source_gone(&handles.serving).await?;
         return Ok(false);
     };
     if incarnation_changed(
@@ -755,17 +758,35 @@ async fn process_pool_source(
                 wall_clock_millis()?,
             )
             .await?;
-        state.indexes.write().await.remove(&registration.id);
-        tracing::info!(
-            index_id = %registration.id,
-            previous_incarnation = ?registration.incarnation,
-            incarnation = ?restarted.incarnation,
-            "source stream was recreated; restarted its event index"
-        );
+        if restarted.incarnation == registration.incarnation {
+            tracing::debug!(
+                index_id = %registration.id,
+                stale_incarnation = ?head.incarnation,
+                "ignoring a stale source HEAD that reports a retired incarnation"
+            );
+        } else {
+            state.indexes.write().await.remove(&registration.id);
+            tracing::info!(
+                index_id = %registration.id,
+                previous_incarnation = ?registration.incarnation,
+                incarnation = ?restarted.incarnation,
+                "source stream was recreated; restarted its event index"
+            );
+        }
         // The next pass picks up the restarted registration.
         return Ok(false);
     }
     index_source(&handles.serving, &source, &head, params, allow_partial).await
+}
+
+/// Record a 404 from the source. An index this handle already saw gone needs
+/// no S3 request.
+async fn mark_source_gone(index: &Mutex<EventIndex>) -> Result<(), IndexError> {
+    let mut index = index.lock().await;
+    if matches!(index.status(), IndexStatus::SourceGone) {
+        return Ok(());
+    }
+    index.set_source_gone(true).await
 }
 
 /// Claim, read and commit one segment of `source` into `index`.
@@ -779,12 +800,19 @@ async fn index_source(
     let now_ms = wall_clock_millis()?;
     let (claim, resync, extractor) = {
         let mut index = index.lock().await;
-        // Idle skip: the durable offset only grows, so a tail this pod has
-        // already seen indexed needs no S3 request at all.
-        if matches!(index.status(), IndexStatus::Ready)
-            && head.next_offset <= index.durable_offset()
-            && head.retained_offset <= index.floor_offset()
-        {
+        // Idle skips, without any S3 request. The durable offset only grows,
+        // so a tail this pod has already seen indexed needs nothing. A
+        // blocked index (resumed perhaps on another pod), or one whose last
+        // read found only an unterminated line, is retried on tail-flush
+        // passes only.
+        let caught_up = head.next_offset <= index.durable_offset()
+            && head.retained_offset <= index.floor_offset();
+        let idle = match index.status() {
+            IndexStatus::Ready => caught_up || (!allow_partial && index.stalled_at().is_some()),
+            IndexStatus::Blocked { .. } => !allow_partial,
+            IndexStatus::SourceGone => false,
+        };
+        if idle {
             return Ok(false);
         }
         index.refresh().await?;
@@ -834,6 +862,7 @@ async fn index_source(
     };
     let end = segment.end;
     if end == segment.start {
+        index.note_stalled(end);
         index.release_claim(&claim).await?;
         return Ok(false);
     }
@@ -1000,7 +1029,25 @@ async fn cleanup_retired_indexes(state: &PoolState, grace: Duration) {
             return;
         }
     };
+    let live = match state.catalog.list().await {
+        Ok(registrations) => registrations
+            .iter()
+            .filter_map(|registration| registration.namespace().ok())
+            .collect::<HashSet<_>>(),
+        Err(error) => {
+            tracing::warn!(%error, "failed to load live event indexes");
+            return;
+        }
+    };
     for retired in retired {
+        // Never delete a namespace a live registration uses; only drop its
+        // tombstone.
+        if live.contains(&retired.namespace) {
+            if let Err(error) = state.catalog.forget_retired(&retired.namespace).await {
+                tracing::warn!(index_id = %retired.id, %error, "failed to drop the tombstone of a live event index");
+            }
+            continue;
+        }
         let store = match state
             .backend
             .open(&format!("indexes/{}", retired.namespace))
@@ -1061,12 +1108,13 @@ async fn single_pass(
     allow_partial: bool,
 ) -> Result<bool, IndexError> {
     let Some(head) = source.head().await? else {
-        index.lock().await.set_source_gone(true).await?;
+        mark_source_gone(index).await?;
         return Ok(false);
     };
     {
+        // The cached incarnation decides; `restart` refreshes and is a no-op
+        // if another instance already restarted.
         let mut index = index.lock().await;
-        index.refresh().await?;
         let known = index.source().incarnation.clone();
         if incarnation_changed(known.as_deref(), head.incarnation.as_deref()) {
             index
@@ -1394,22 +1442,34 @@ mod tests {
     use axum::http::Request;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
+    use reqwest::Url;
     use tempfile::TempDir;
+    use tokio::sync::Mutex;
     use tower::ServiceExt;
 
     use super::PoolIndexSettings;
     use super::PoolState;
     use super::StoreTarget;
     use super::WorkerParams;
+    use super::build_router;
     use super::cleanup_retired_indexes;
     use super::pool_router;
     use super::process_pool_source;
     use super::reconcile_pool_indexes;
+    use super::single_pass;
+    use crate::EventEntry;
+    use crate::EventIndex;
     use crate::EventIndexCache;
+    use crate::EventIndexConfig;
     use crate::Extractor;
     use crate::FsObjectStore;
+    use crate::IndexBase;
     use crate::IndexCatalog;
     use crate::IndexRegistration;
+    use crate::IndexStatus;
+    use crate::QueryRequest;
+    use crate::Segment;
+    use crate::SourceClient;
     use crate::catalog::StartPosition;
     use crate::source::ReadLimits;
 
@@ -1454,6 +1514,7 @@ mod tests {
         body: Arc<StdMutex<Vec<u8>>>,
         incarnation: Arc<StdMutex<String>>,
         retained: Arc<StdMutex<u64>>,
+        ndjson: bool,
     }
 
     impl MockSource {
@@ -1488,8 +1549,13 @@ mod tests {
             let tail = u64::try_from(body.len()).expect("small body");
             let pad = |offset: u64| format!("{offset:020}");
             if request.method() == axum::http::Method::HEAD {
+                let content_type = if self.ndjson {
+                    "application/x-ndjson"
+                } else {
+                    "application/json"
+                };
                 return (StatusCode::OK, [
-                    ("content-type", "application/json".to_owned()),
+                    ("content-type", content_type.to_owned()),
                     ("stream-next-offset", pad(tail)),
                     ("stream-retained-offset", pad(retained)),
                     ("stream-incarnation", incarnation),
@@ -1520,8 +1586,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pool_registers_indexes_queries_and_restarts_a_recreated_source() -> anyhow::Result<()>
-    {
+    async fn pool_registers_and_queries_an_index() -> anyhow::Result<()> {
         let source = MockSource::default();
         source.set(
             concat!(
@@ -1559,7 +1624,6 @@ mod tests {
         // A 2-byte segment limit commits one message per pass.
         while process_pool_source(&state, &registration, &params("worker-a", 2), true).await? {}
         let response = app
-            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/v1/indexes/session-42/events?from=0&until=2000000000000&limit=10")
@@ -1576,29 +1640,6 @@ mod tests {
         assert_eq!(body["skipped"]["missing"], 1);
         assert_eq!(body["coverage"]["complete"], true);
         assert_eq!(body["source"]["incarnation"], "100");
-
-        // Delete and recreate: the registration restarts under a new
-        // namespace and the old one is retired.
-        source.set("{\"captured_at\":5}\n", "200", 0);
-        assert!(!process_pool_source(&state, &registration, &params("worker-a", 64), true).await?);
-        let restarted = state.catalog.get("session-42").await?;
-        assert_eq!(restarted.incarnation.as_deref(), Some("200"));
-        assert_eq!(restarted.restarted_from_incarnation.as_deref(), Some("100"));
-        assert_ne!(restarted.namespace()?, registration.namespace()?);
-        assert_eq!(state.catalog.retired_before(u64::MAX).await?.len(), 1);
-        while process_pool_source(&state, &restarted, &params("worker-a", 64), true).await? {}
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/indexes/session-42/status")
-                    .body(Body::empty())?,
-            )
-            .await?;
-        let body = to_bytes(response.into_body(), 64 * 1024).await?;
-        let body: serde_json::Value = serde_json::from_slice(&body)?;
-        assert_eq!(body["source"]["incarnation"], "200");
-        assert_eq!(body["restarted_from_incarnation"], "100");
-        assert_eq!(body["coverage"]["durable"], "00000000000000000018");
         server.abort();
         Ok(())
     }
@@ -1606,35 +1647,172 @@ mod tests {
     #[tokio::test]
     async fn retention_past_unindexed_bytes_advances_the_floor_and_reports_incomplete()
     -> anyhow::Result<()> {
+        // 18-byte messages. On JSON, retention lands on a message boundary;
+        // on NDJSON it lands mid-line in the second message, whose 9-byte
+        // tail is discarded and counted as trimmed too.
+        for (ndjson, retained, trimmed, offsets) in
+            [(false, 54, 36, vec![54]), (true, 27, 18, vec![36, 54])]
+        {
+            let source = MockSource {
+                ndjson,
+                ..MockSource::default()
+            };
+            let message = "{\"captured_at\":7}\n";
+            source.set(&message.repeat(4), "1", 0);
+            let (stream_url, server) = source.clone().serve().await?;
+            let objects = TempDir::new()?;
+            let cache = TempDir::new()?;
+            let state = pool_state(&objects, &cache)?;
+            let registration = IndexRegistration {
+                id: "floor".to_owned(),
+                stream_url,
+                extract: Extractor::timestamp_field("captured_at")?.config().clone(),
+                start: StartPosition::Retained,
+                indexed_from_offset: 0,
+                incarnation: Some("1".to_owned()),
+                restarted_from_incarnation: None,
+            };
+            state.catalog.register(&registration).await?;
+            let registration = state.catalog.get("floor").await?;
+            // Index the first message only.
+            assert!(
+                process_pool_source(&state, &registration, &params("worker-a", 1), true).await?
+            );
+            source.set(&message.repeat(4), "1", retained);
+            while process_pool_source(&state, &registration, &params("worker-a", 64), true).await? {
+            }
+            let handles = state.ensure_index(&registration).await?;
+            let mut index = handles.serving.lock().await;
+            assert_eq!(index.floor_offset(), retained);
+            assert_eq!(index.durable_offset(), 72);
+            assert_eq!(index.trimmed_bytes(), trimmed);
+            assert!(!index.coverage().complete);
+            let result = index.query(QueryRequest::window(0, 1_000, 10)).await?;
+            let located = result
+                .entries
+                .iter()
+                .map(|entry| entry.offset)
+                .collect::<Vec<_>>();
+            assert_eq!(located, offsets);
+            drop(index);
+            server.abort();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_source_router_serves_queries_and_stays_ready_while_blocked()
+    -> anyhow::Result<()> {
+        let objects = TempDir::new()?;
+        let cache = TempDir::new()?;
+        let mut config = EventIndexConfig::new(
+            "https://example.test/single",
+            Extractor::timestamp_field("captured_at")?,
+        );
+        config.row_group_entries = 2;
+        let mut index = EventIndex::open(
+            FsObjectStore::new(objects.path())?,
+            EventIndexCache::serving(cache.path(), 16 * 1024 * 1024)?,
+            config,
+            IndexBase::default(),
+        )
+        .await?;
+        let entry = |t_ms: i64, offset: u64| EventEntry {
+            t_ms,
+            t_end_ms: t_ms,
+            offset,
+            len: 10,
+        };
+        index
+            .commit_segment(Segment {
+                start: 0,
+                end: 20,
+                entries: vec![entry(200, 0), entry(100, 10)],
+                skips: Vec::new(),
+            })
+            .await?;
+        index
+            .mark_blocked(20, "operator repair required".to_owned())
+            .await?;
+        let index = Arc::new(Mutex::new(index));
+        let app = build_router(Arc::clone(&index));
+
+        // A blocked index still answers readiness and queries.
+        for uri in ["/livez", "/readyz"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty())?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events?from=0&until=1000&limit=10")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["durable-offset"], "00000000000000000020");
+        assert_eq!(response.headers()["through-offset"], "00000000000000000020");
+        let body = to_bytes(response.into_body(), 64 * 1024).await?;
+        let body: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(body["entries"][0]["offset"], "00000000000000000010");
+        assert_eq!(body["entries"][1]["offset"], "00000000000000000000");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/status/resume")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(index.lock().await.status(), &IndexStatus::Ready);
+        let response = app
+            .oneshot(Request::builder().uri("/readyz").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_source_mode_restarts_in_place_on_a_recreated_source() -> anyhow::Result<()> {
         let source = MockSource::default();
         let message = "{\"captured_at\":7}\n";
-        source.set(&message.repeat(4), "1", 0);
+        source.set(&message.repeat(2), "1", 0);
         let (stream_url, server) = source.clone().serve().await?;
         let objects = TempDir::new()?;
         let cache = TempDir::new()?;
-        let state = pool_state(&objects, &cache)?;
-        let registration = IndexRegistration {
-            id: "floor".to_owned(),
-            stream_url,
-            extract: Extractor::timestamp_field("captured_at")?.config().clone(),
-            start: StartPosition::Retained,
-            indexed_from_offset: 0,
-            incarnation: Some("1".to_owned()),
-            restarted_from_incarnation: None,
-        };
-        state.catalog.register(&registration).await?;
-        let registration = state.catalog.get("floor").await?;
-        // Index the first message only.
-        assert!(process_pool_source(&state, &registration, &params("worker-a", 1), true).await?);
-        // Retention trims through the third message.
-        source.set(&message.repeat(4), "1", 54);
-        while process_pool_source(&state, &registration, &params("worker-a", 64), true).await? {}
-        let handles = state.ensure_index(&registration).await?;
-        let index = handles.serving.lock().await;
-        assert_eq!(index.floor_offset(), 54);
-        assert_eq!(index.durable_offset(), 72);
-        assert_eq!(index.trimmed_bytes(), 36);
-        assert!(!index.coverage().complete);
+        let index = EventIndex::open(
+            FsObjectStore::new(objects.path())?,
+            EventIndexCache::serving(cache.path(), 16 * 1024 * 1024)?,
+            EventIndexConfig::new(
+                stream_url.clone(),
+                Extractor::timestamp_field("captured_at")?,
+            ),
+            IndexBase {
+                offset: 0,
+                incarnation: Some("1".to_owned()),
+            },
+        )
+        .await?;
+        let index = Mutex::new(index);
+        let client = SourceClient::new(reqwest::Client::new(), Url::parse(&stream_url)?);
+        let worker = params("worker-a", 64);
+        while single_pass(&client, &index, &worker, StartPosition::Retained, true).await? {}
+        assert_eq!(index.lock().await.durable_offset(), 36);
+
+        source.set(message, "2", 0);
+        while single_pass(&client, &index, &worker, StartPosition::Retained, true).await? {}
+        let mut index = index.lock().await;
+        assert_eq!(index.source().incarnation.as_deref(), Some("2"));
+        assert_eq!(index.durable_offset(), 18);
+        let result = index.query(QueryRequest::window(0, 1_000, 10)).await?;
+        assert_eq!(result.entries.len(), 1);
         drop(index);
         server.abort();
         Ok(())

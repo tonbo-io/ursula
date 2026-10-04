@@ -146,6 +146,12 @@ async fn restart_rebinds_the_incarnation_once_and_retires_the_old_namespace() ->
         .restart(&original.id, Some("1"), Some("2".to_owned()), 9, 100)
         .await?;
     assert_eq!(again, restarted);
+    // A stale HEAD that reports the retired incarnation again is ignored, so
+    // the live namespace is never retired.
+    let stale = catalog
+        .restart(&original.id, Some("2"), Some("1".to_owned()), 0, 200)
+        .await?;
+    assert_eq!(stale, restarted);
     let retired = catalog.retired_before(u64::MAX).await?;
     assert_eq!(retired.len(), 1);
     assert_eq!(retired[0].namespace, original.namespace()?);

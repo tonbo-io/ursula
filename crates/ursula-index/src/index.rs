@@ -53,6 +53,9 @@ pub struct EventIndex {
     config: EventIndexConfig,
     binding: ManifestBinding,
     published: PublishedManifest,
+    /// In-memory scheduling hint, never persisted: the offset at which this
+    /// handle last read source bytes and found no complete message.
+    stalled_at: Option<u64>,
 }
 
 impl EventIndex {
@@ -78,6 +81,7 @@ impl EventIndex {
             config,
             binding,
             published,
+            stalled_at: None,
         })
     }
 
@@ -108,6 +112,17 @@ impl EventIndex {
     /// A restart point that may not be a message boundary.
     pub fn resync_offset(&self) -> Option<u64> {
         self.published.manifest.resync_offset
+    }
+
+    /// Where this handle last found only an unterminated message, if the
+    /// durable offset has not moved since.
+    pub fn stalled_at(&self) -> Option<u64> {
+        self.stalled_at
+            .filter(|offset| *offset == self.published.manifest.durable_offset)
+    }
+
+    pub fn note_stalled(&mut self, offset: u64) {
+        self.stalled_at = Some(offset);
     }
 
     pub fn trimmed_bytes(&self) -> u64 {
@@ -222,7 +237,9 @@ impl EventIndex {
     /// covered must have produced exactly the same entries; only the
     /// uncovered suffix adds entries, skip counts and trimmed bytes. A
     /// segment that starts below the floor is stale and dropped: the next
-    /// claim starts at the floor.
+    /// claim starts at the floor. A fragment discarded at the base belongs
+    /// to a message that began before the indexed range, so it is covered
+    /// without counting as trimmed history.
     pub async fn commit_segment(&mut self, segment: Segment) -> Result<(), IndexError> {
         validate_segment(&segment)?;
         if segment.end == segment.start {
@@ -231,6 +248,7 @@ impl EventIndex {
         for _attempt in 0..MAX_PUBLISH_ATTEMPTS {
             self.refresh().await?;
             ensure_ready(&self.published.manifest.status)?;
+            let base = self.published.manifest.indexed_from_offset;
             let floor = self.published.manifest.floor_offset;
             let durable = self.published.manifest.durable_offset;
             if segment.start < floor {
@@ -267,7 +285,9 @@ impl EventIndex {
                 .filter(|skip| skip.offset >= covered_end)
             {
                 if skip.kind == SkipKind::Trimmed {
-                    trimmed = trimmed.saturating_add(skip.len);
+                    if skip.offset != base {
+                        trimmed = trimmed.saturating_add(skip.len);
+                    }
                 } else {
                     skipped.add(skip.kind);
                 }
@@ -438,10 +458,15 @@ impl EventIndex {
 
     /// Start over in place for a recreated source stream: publish an empty
     /// manifest at `base`. The old parts become unreferenced and GC removes
-    /// them after the grace period.
+    /// them after the grace period. A no-op if another instance already
+    /// restarted onto `base.incarnation`.
     pub async fn restart(&mut self, base: IndexBase) -> Result<(), IndexError> {
+        self.stalled_at = None;
         for _attempt in 0..MAX_PUBLISH_ATTEMPTS {
             self.refresh().await?;
+            if self.published.manifest.source.incarnation == base.incarnation {
+                return Ok(());
+            }
             let generation = self.published.manifest.generation.saturating_add(1);
             if self
                 .publish(Manifest::new(&self.binding, &base, generation))
@@ -643,9 +668,13 @@ impl EventIndex {
             .ok()
             .and_then(|duration| u64::try_from(duration.as_millis()).ok());
         let mut stale_claims = Vec::new();
-        for (key, claim) in self.load_claims().await? {
-            if now_ms.is_some_and(|now_ms| claim.expires_at_ms <= now_ms) {
-                stale_claims.push(key);
+        if let Some(stored) = self.store.get(CLAIM_KEY).await? {
+            match serde_json::from_slice::<SegmentLease>(&stored.bytes) {
+                Ok(claim) if now_ms.is_some_and(|now_ms| claim.expires_at_ms <= now_ms) => {
+                    stale_claims.push(CLAIM_KEY.to_owned());
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "skipping an unreadable event-index claim"),
             }
         }
         for key in stale_manifests
@@ -663,27 +692,6 @@ impl EventIndex {
             deleted_manifests: stale_manifests.len(),
             deleted_claims: stale_claims.len(),
         })
-    }
-
-    async fn load_claims(&self) -> Result<Vec<(String, SegmentLease)>, IndexError> {
-        let mut claims = Vec::new();
-        for object in self.store.list("claims/").await? {
-            if !object.key.ends_with(".json") {
-                continue;
-            }
-            let Some(stored) = self.store.get(&object.key).await? else {
-                continue;
-            };
-            match serde_json::from_slice::<SegmentLease>(&stored.bytes) {
-                Ok(claim) => claims.push((object.key, claim)),
-                Err(error) => tracing::warn!(
-                    key = %object.key,
-                    %error,
-                    "skipping unreadable event-index claim"
-                ),
-            }
-        }
-        Ok(claims)
     }
 
     async fn publish_status(&mut self, status: IndexStatus) -> Result<(), IndexError> {

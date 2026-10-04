@@ -9,6 +9,8 @@ use ursula_index::IndexError;
 use ursula_index::IndexStatus;
 use ursula_index::MatchMode;
 use ursula_index::QueryRequest;
+use ursula_index::Skip;
+use ursula_index::SkipKind;
 
 mod common;
 
@@ -59,6 +61,27 @@ async fn retained_stream_starts_at_an_explicit_base() -> anyhow::Result<()> {
     let (_fresh_cache, reopened) = open(&store, config(), 70).await?;
     assert_eq!(reopened.indexed_from_offset(), 40);
     assert_eq!(reopened.durable_offset(), 60);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_fragment_at_the_base_is_covered_but_not_trimmed() -> anyhow::Result<()> {
+    // A registration may start inside a message (an NDJSON tail): the
+    // fragment before the first boundary predates the indexed range.
+    let (_object_dir, store) = common::fs_store()?;
+    let (_cache, mut index) = open(&store, config(), 40).await?;
+    assert_eq!(index.resync_offset(), Some(40));
+    let mut segment = timed(44, &[100]);
+    segment.start = 40;
+    segment.skips.push(Skip {
+        offset: 40,
+        len: 4,
+        kind: SkipKind::Trimmed,
+    });
+    index.commit_segment(segment).await?;
+    assert_eq!(index.durable_offset(), 54);
+    assert_eq!(index.trimmed_bytes(), 0);
+    assert!(index.coverage().complete);
     Ok(())
 }
 
@@ -446,6 +469,33 @@ async fn compaction_reduces_fan_in_to_stay_within_the_memory_bound() -> anyhow::
     assert!(index.compact_partition_once(3, 2).await?);
     assert_eq!(index.part_count(), 2);
     assert_eq!(index.query(window(-1, 10)).await?.entries.len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_old_partition_does_not_block_later_partition() -> anyhow::Result<()> {
+    let (_object_dir, store) = common::fs_store()?;
+    let (_cache, mut index) = open(&store, config(), 0).await?;
+    index.commit_segment(timed(0, &[0, 1, 2])).await?;
+    index.commit_segment(timed(30, &[3, 4, 5])).await?;
+    index
+        .commit_segment(timed(60, &[DAY_MS.saturating_add(6)]))
+        .await?;
+    index
+        .commit_segment(timed(70, &[DAY_MS.saturating_add(7)]))
+        .await?;
+
+    // Day 0's parts are each too large to merge; day 1 is still compacted.
+    assert!(index.compact_partition_once(2, 2).await?);
+    assert_eq!(index.part_count(), 3);
+    assert_eq!(
+        index
+            .query(window(DAY_MS, DAY_MS.saturating_mul(2)))
+            .await?
+            .entries
+            .len(),
+        2
+    );
     Ok(())
 }
 
