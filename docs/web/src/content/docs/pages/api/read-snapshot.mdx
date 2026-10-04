@@ -25,7 +25,7 @@ api: "GET /{bucket}/{stream}/snapshot/{offset}"
 | `502` | The snapshot body is in the cold tier and could not be read. |
 | `503` | The group has no known leader, or the leader could not confirm its leadership in time. Retry after `Retry-After`. |
 
-Response headers include `Content-Type`, `Content-Length`, `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, and `Stream-Up-To-Date`. A body stored in the cold tier is streamed from it.
+Response headers include `Content-Type`, `Content-Length`, `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, and `Stream-Up-To-Date: true` when the snapshot offset is the stream's tail. A body stored in the cold tier is streamed from it.
 
 <RequestExample>
 ```bash Read specific offset

@@ -242,7 +242,7 @@ Returns the snapshot blob at the specified offset.
 - `Stream-Snapshot-Offset`: The snapshot offset.
 - `Stream-Snapshot-Digest`: The snapshot digest returned at publish time.
 - `Stream-Next-Offset`: The next offset after the snapshot.
-- `Stream-Up-To-Date`: Boolean indicating whether the stream has updates beyond the snapshot.
+- `Stream-Up-To-Date: true`: Present when no update follows the snapshot (the snapshot offset is the stream's tail); absent otherwise. Clients then read on from `Stream-Next-Offset`.
 
 **Response Codes:**
 
@@ -481,7 +481,7 @@ Record-aware reads MAY also specify `max_bytes=<positive-integer>`. On a record-
 - `Stream-Record-Next` and `Stream-Next-Offset` give the continuation after the last returned record. All other response headers are unchanged.
 - A record-aware response never ends inside a record because of `max_bytes`.
 
-Offset reads keep the base protocol's `max_bytes` semantics, including responses that end inside a JSON record.
+Offset reads follow Section 9.3 and may end inside a JSON record (Section 9.4).
 
 A server that implements this extension MUST support `max_bytes` on record-aware reads.
 

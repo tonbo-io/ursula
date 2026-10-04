@@ -35,7 +35,7 @@ or SSE reader, and requests that resolve the tail through `HEAD`
 (`offset=now`, SSE start, and a long-poll's timeout answer) take the same leadership
 confirmation on the leader.
 
-`Stream-Up-To-Date: true` on a read means it reached the committed tail. A response without it is partial; keep reading from `Stream-Next-Offset`.
+With `consistency=leader`, `Stream-Up-To-Date: true` on a read means it reached the committed tail. On a local read it means the tail as the serving node knew it: a leader that has lost leadership without knowing it yet can mark a stale tail. A response without it is partial; keep reading from `Stream-Next-Offset`.
 
 ## Availability and durability (standard layout)
 

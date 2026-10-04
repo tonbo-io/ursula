@@ -28,7 +28,7 @@ api: "PUT /{bucket}/{stream}"
 </ParamField>
 
 <ParamField header="Stream-Seq" type="string">
- Seeds the stream's stored `Stream-Seq`: later appends that carry `Stream-Seq` must be bytewise greater than it. A create never checks it, and a `PUT` that finds the stream already there ignores it. See [Stream-Seq](/docs/api/append#stream-seq).
+ Seeds the stream's stored `Stream-Seq`: later appends that carry `Stream-Seq` must be bytewise greater than it. A create never checks it, and a `PUT` that finds the stream already there ignores it. See [how `Stream-Seq` is checked](/docs/concepts/conditional-writes#how-stream-seq-is-checked).
 </ParamField>
 
 <ParamField header="Producer-Id" type="string">

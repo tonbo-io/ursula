@@ -20,7 +20,7 @@ api: "POST /{bucket}/{stream}"
 </ParamField>
 
 <ParamField header="Stream-Seq" type="string">
- A compare-and-set token. The append is accepted only when the value is bytewise greater than the last `Stream-Seq` accepted on this stream; it is then stored. An equal or smaller value answers `409` with `Stream-Next-Offset` at the tail. Without the header the append is not checked and the stored value is unchanged. At most 256 bytes. See [Stream-Seq](#stream-seq).
+ A compare-and-set token. The append is accepted only when the value is bytewise greater than the last `Stream-Seq` accepted on this stream; it is then stored. An equal or smaller value answers `409` with `Stream-Next-Offset` at the tail. Without the header the append is not checked and the stored value is unchanged. Printable ASCII, at most 256 bytes. See [how `Stream-Seq` is checked](/docs/concepts/conditional-writes#how-stream-seq-is-checked).
 </ParamField>
 
 <ParamField header="Producer-Id" type="string">
@@ -89,10 +89,6 @@ curl -X POST http://127.0.0.1:4437/demo/hello \
 ## JSON message text
 
 Ursula validates every JSON body and stores each message as you wrote it, minus insignificant whitespace (spaces, tabs and line breaks outside strings), followed by one LF. Member order, duplicate members, number spelling such as `1.50e3` or `1e400`, and string escapes, including escapes of unpaired surrogates, are kept byte for byte, and every read returns that text. A top-level array is split into one message per element. A message may nest at most 127 levels. See [JSON message text](/docs/specs/extensions#json-message-text). Releases before this rule re-serialized messages; see the [release notes](/docs/release-notes).
-
-## Stream-Seq
-
-`Stream-Seq` is the base protocol's writer sequence, and Ursula enforces it per stream as a compare-and-set. [Conditional writes](/docs/concepts/conditional-writes#how-stream-seq-is-checked) states how it is checked, including how it interacts with producer deduplication and `PUT`, and gives two patterns: a prefix count, which lets several writers extend one log while each validates against all of it, and publishing committed facts.
 
 <Info>
 See [Record Coordinates](/docs/concepts/record-coordinates) for record ranges, complete-record reads, and the difference between committed record order and client event time.

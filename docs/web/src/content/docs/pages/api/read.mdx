@@ -121,8 +121,8 @@ curl 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
 curl -i 'http://127.0.0.1:4437/demo/hello?record=42&max_records=100'
 ```
 
-```bash Read complete JSON records, at most 16 MiB
-curl -i 'http://127.0.0.1:4437/demo/hello?record=42&max_bytes=16777216'
+```bash Read complete JSON records, at most 1 MiB
+curl -i 'http://127.0.0.1:4437/demo/hello?record=42&max_bytes=1048576'
 ```
 
 ```bash Read the latest JSON records with ordinals

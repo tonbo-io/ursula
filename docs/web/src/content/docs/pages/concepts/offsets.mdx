@@ -18,7 +18,7 @@ Two special values are accepted on read requests:
 
 After every read or append, the server returns two related headers:
 
-- **`Stream-Next-Offset`**: the offset to pass back on the next request. Every read and append response carries it, except an append answered as a duplicate whose receipt has left the receipt window ([exactly-once writes](/docs/concepts/exactly-once-writes#how-dedup-works)).
+- **`Stream-Next-Offset`**: the offset to pass back on the next request. Every successful read and append response carries it (on SSE, in each control event's `streamNextOffset` instead of a header), except an append answered as a duplicate whose receipt has left the receipt window ([exactly-once writes](/docs/concepts/exactly-once-writes#how-dedup-works)). Error responses carry it only where the [read](/docs/api/read) and [append](/docs/api/append) status tables say so.
 - **`Stream-Cursor`**: set on live (long-poll, SSE) responses. A counter for caches, not a position: echo it as `?cursor=` on the next live request. Each response's cursor is past the one the request sent, so successive long-poll URLs differ and a cache can't serve the same empty response in a loop.
 
 Resume from `Stream-Next-Offset` (in SSE, the latest control event's `streamNextOffset`) in every read mode. `Stream-Cursor` carries no stream identity, so it doesn't reveal that a stream was recreated; see [Recreated streams](#recreated-streams).
