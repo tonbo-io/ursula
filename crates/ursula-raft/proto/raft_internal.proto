@@ -117,7 +117,9 @@ message GroupReadRequestV1 {
   // Field 9 was the removed attribute read in the `read` oneof.
   reserved 9;
   reserved "get_stream_attrs";
-  optional string affinity_key = 10;
+  // Field 10 was the removed affinity key.
+  reserved 10;
+  reserved "affinity_key";
 }
 
 message HeadStreamReadV1 {

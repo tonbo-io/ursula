@@ -36,8 +36,8 @@ use super::wait_all_nodes_applied;
 /// The leader's read log id (`ReadIndex`): a Raft log index at or above
 /// every entry the leader has committed, already applied on the leader.
 /// A response's `group_commit_index` is not a log index: it counts mutating
-/// stream outcomes (a `$transaction` adds one per operation; blank, membership and no-op
-/// entries add nothing), so it can trail or lead the entry's log index. The
+/// stream outcomes (blank, membership and no-op entries add nothing), so it
+/// can differ from the entry's log index. The
 /// leader's metrics can lag its own apply, so they are not a reliable
 /// barrier either.
 async fn leader_read_log_index(engine: &RaftGroupEngine) -> u64 {

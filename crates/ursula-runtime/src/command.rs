@@ -28,18 +28,11 @@ pub struct GroupSnapshot {
 }
 
 /// Replicated group-level write envelope around the canonical
-/// [`StreamCommand`]: one command or an all-or-none append transaction. A
-/// transaction envelope occupies one Raft entry. This enum (serde-encoded) is the Raft
-/// log payload; there is no separate wire mirror.
+/// [`StreamCommand`]: one command per Raft entry. This enum (serde-encoded) is
+/// the Raft log payload; there is no separate wire mirror.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "commands are transient write-path values; boxing `Stream` would \
-              add a heap allocation to every replicated write"
-)]
 pub enum GroupWriteCommand {
     Stream(StreamCommand),
-    Transaction { commands: Vec<StreamCommand> },
 }
 
 impl GroupWriteCommand {
@@ -47,10 +40,6 @@ impl GroupWriteCommand {
     pub fn log_bytes_estimate(&self) -> u64 {
         match self {
             Self::Stream(command) => command.log_bytes_estimate(),
-            Self::Transaction { commands } => commands
-                .iter()
-                .map(StreamCommand::log_bytes_estimate)
-                .fold(0, u64::saturating_add),
         }
     }
 }
@@ -241,9 +230,6 @@ impl fmt::Display for GroupWriteCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Stream(command) => command.fmt(f),
-            Self::Transaction { commands } => {
-                write!(f, "transaction:{} commands", commands.len())
-            }
         }
     }
 }

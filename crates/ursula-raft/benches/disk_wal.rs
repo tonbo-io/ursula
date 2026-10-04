@@ -338,7 +338,7 @@ fn entry(index: u64, group_id: u32, payload_size: usize) -> EntryOf<UrsulaRaftTy
     EntryOf::<UrsulaRaftTypeConfig>::new(
         log_id(index),
         EntryPayload::Normal(GroupWriteCommand::Stream(StreamCommand::Append {
-            stream_id: BucketStreamId::with_affinity("wal-bench", group_id.to_string(), "stream"),
+            stream_id: BucketStreamId::new("wal-bench", format!("stream-{group_id}")),
             content_type: Some("application/octet-stream".to_owned()),
             payload: Bytes::from(vec![7_u8; payload_size]),
             close_after: false,

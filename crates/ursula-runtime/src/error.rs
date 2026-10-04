@@ -38,8 +38,6 @@ pub enum RuntimeError {
     },
     #[error("append payload must be non-empty")]
     EmptyAppend,
-    #[error("invalid append transaction: {message}")]
-    InvalidAppendTransaction { message: String },
     #[error("invalid cold store config: {message}")]
     ColdStoreConfig { message: String },
     #[error("invalid static Raft membership config: {message}")]

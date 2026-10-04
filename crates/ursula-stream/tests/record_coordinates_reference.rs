@@ -961,40 +961,6 @@ mod sparse_marks_differential {
             );
         }
 
-        /// RC-18: a failed transaction rolls back only dense records.
-        pub(super) fn failed_transaction(&mut self, sizes: &[u64]) {
-            let now_ms = self.tick();
-            let before = self.machine.record_range(&self.stream).unwrap();
-            let commands = vec![
-                StreamCommand::Append {
-                    stream_id: self.stream.clone(),
-                    content_type: Some(JSON.to_owned()),
-                    payload: {
-                        let mut scratch = ReferenceStream::default();
-                        scratch.append_json(&body(sizes, 0), false, None).unwrap();
-                        scratch.canonical.into()
-                    },
-                    close_after: false,
-                    stream_seq: None,
-                    producer: None,
-                    now_ms,
-                    record_match: None,
-                },
-                StreamCommand::Append {
-                    stream_id: self.stream.clone(),
-                    content_type: Some("text/plain".to_owned()),
-                    payload: Bytes::from_static(b"x"),
-                    close_after: false,
-                    stream_seq: None,
-                    producer: None,
-                    now_ms,
-                    record_match: None,
-                },
-            ];
-            assert!(self.machine.append_transaction(commands).is_err());
-            assert_eq!(self.machine.record_range(&self.stream).unwrap(), before);
-        }
-
         /// RC-16: restore from the group snapshot, and from its serde form
         /// (backup export and `ImportSnapshot`).
         pub(super) fn round_trip(&mut self, via_serde: bool) {
@@ -1217,7 +1183,6 @@ mod sparse_marks_differential {
         Flush(usize),
         Tidy,
         Retain(u64),
-        FailedTransaction(Vec<u64>),
         RoundTrip(bool),
         Race(u64, usize, u64),
     }
@@ -1246,7 +1211,6 @@ mod sparse_marks_differential {
             5 => prop_oneof![1_usize..64, 64_usize..4_096, 4_096_usize..(4 << 20)].prop_map(Op::Flush),
             1 => Just(Op::Tidy),
             2 => (0_u64..1_000).prop_map(Op::Retain),
-            1 => sizes().prop_map(Op::FailedTransaction),
             1 => any::<bool>().prop_map(Op::RoundTrip),
             1 => (0_u64..1_000, 1_usize..(2 << 20), 0_u64..1_000)
                 .prop_map(|(fraction, flush, retain)| Op::Race(fraction, flush, retain)),
@@ -1269,7 +1233,6 @@ mod sparse_marks_differential {
             Op::Flush(max) => harness.flush(*max),
             Op::Tidy => harness.tidy(),
             Op::Retain(fraction) => harness.retain(*fraction),
-            Op::FailedTransaction(sizes) => harness.failed_transaction(sizes),
             Op::RoundTrip(serde) => harness.round_trip(*serde),
             Op::Race(fraction, flush, retain) => harness.race(*fraction, *flush, *retain),
         }

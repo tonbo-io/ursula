@@ -8,9 +8,8 @@
 //! for JSON, the record index's dense offsets); from level 4 (F4b) the dense
 //! offsets for streams with a record index and, for every other stream, the
 //! append starts this buffer keeps for each message at or above the seal
-//! point. Reads binary-search blocks, a flush drops whole
-//! blocks and trims at most one, and transaction rollback truncates blocks
-//! back to a checkpoint. Snapshots emit one hot segment per block and restore
+//! point. Reads binary-search blocks and a flush drops whole
+//! blocks and trims at most one. Snapshots emit one hot segment per block and restore
 //! segments one-to-one, so every replica holds the same block layout after
 //! the same history.
 
@@ -50,15 +49,6 @@ impl HotBlock {
     fn end_offset(&self) -> u64 {
         self.start_offset.saturating_add(len_u64(self.bytes.len()))
     }
-}
-
-/// Where a transaction's appends start, so a failed transaction truncates
-/// the buffer back to exactly what it held before.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct HotCheckpoint {
-    blocks: usize,
-    last_block_len: usize,
-    append_starts: usize,
 }
 
 fn len_u64(len: usize) -> u64 {
@@ -286,32 +276,6 @@ impl HotBuffer {
         }
     }
 
-    pub(super) fn append_checkpoint(&self) -> HotCheckpoint {
-        HotCheckpoint {
-            blocks: self.blocks.len(),
-            last_block_len: self.blocks.back().map_or(0, |block| block.bytes.len()),
-            append_starts: self.append_starts.len(),
-        }
-    }
-
-    /// Truncates the buffer back to `checkpoint`. Only appends may run
-    /// between the checkpoint and the rollback.
-    pub(super) fn rollback_appends(&mut self, checkpoint: HotCheckpoint) {
-        while self.blocks.len() > checkpoint.blocks {
-            if let Some(block) = self.blocks.pop_back() {
-                self.payload_len = self.payload_len.saturating_sub(block.bytes.len());
-            }
-        }
-        if let Some(last) = self.blocks.back_mut()
-            && last.bytes.len() > checkpoint.last_block_len
-        {
-            let removed = last.bytes.len() - checkpoint.last_block_len;
-            last.bytes.truncate(checkpoint.last_block_len);
-            self.payload_len = self.payload_len.saturating_sub(removed);
-        }
-        self.append_starts.truncate(checkpoint.append_starts);
-    }
-
     /// Index of the first block that ends after `offset`.
     fn first_block_ending_after(&self, offset: u64) -> usize {
         self.blocks
@@ -468,14 +432,8 @@ mod tests {
     }
 
     #[test]
-    fn payload_len_counter_tracks_push_flush_discard_and_rollback() {
+    fn payload_len_counter_tracks_push_flush_and_discard() {
         let mut hot = filled(10, 3);
-        assert_eq!(hot.len(), 30);
-        let checkpoint = hot.append_checkpoint();
-        hot.push(30, 35, b"abcde");
-        hot.push(35, 36, b"f");
-        assert_eq!(hot.len(), 36);
-        hot.rollback_appends(checkpoint);
         assert_eq!(hot.len(), 30);
         assert_eq!(scanned_len(&hot), 30);
         // Flush ends inside a block: partial drain of the front block.
@@ -671,20 +629,6 @@ mod tests {
                         hot.flush_prefix(end);
                         model.flush_prefix(end);
                         flushed = end;
-                    }
-                    8 => {
-                        // A transaction that fails rolls every append back.
-                        let checkpoint = hot.append_checkpoint();
-                        let model_len = model.appends.len();
-                        let saved_tail = tail;
-                        for _ in 0..1 + rng.below(4) {
-                            let len = 1 + rng.below(70_000) as usize;
-                            hot.push(tail, tail + len as u64, &vec![0xEE; len]);
-                            tail += len as u64;
-                        }
-                        hot.rollback_appends(checkpoint);
-                        model.appends.truncate(model_len);
-                        tail = saved_tail;
                     }
                     _ => {
                         // Snapshot round trip.

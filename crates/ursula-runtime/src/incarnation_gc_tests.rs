@@ -175,50 +175,6 @@ async fn d4_recreate_with_gc_pending_keeps_new_incarnation_objects() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn d4_two_segment_stream_gc_does_not_reach_affinity_streams_under_its_name() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let runtime = spawn(cold_store.clone());
-    let victim = BucketStreamId::new("d4-bucket", "victim");
-    // Their cold objects live below `d4-bucket/victim/chunks/` and
-    // `d4-bucket/victim/cold-index/`, the two-segment stream's GC prefixes.
-    let neighbours = [
-        BucketStreamId::with_affinity("d4-bucket", "victim", "chunks"),
-        BucketStreamId::with_affinity("d4-bucket", "victim", "cold-index"),
-    ];
-
-    create(&runtime, &victim).await;
-    append(&runtime, &victim, b"gone").await;
-    flush(&runtime, &victim, 4).await;
-    let victim_chunks = page_chunks(&cold_store, &victim, 0).await;
-    let mut neighbour_chunks = Vec::new();
-    for neighbour in &neighbours {
-        create(&runtime, neighbour).await;
-        append(&runtime, neighbour, b"kept").await;
-        flush(&runtime, neighbour, 4).await;
-        neighbour_chunks.extend(page_chunks(&cold_store, neighbour, 0).await);
-    }
-    assert_eq!(neighbour_chunks.len(), 2);
-
-    delete(&runtime, &victim).await;
-    runtime
-        .run_cold_gc_all_groups_once(256)
-        .await
-        .expect("run stream gc");
-
-    assert!(!object_exists(&cold_store, &victim_chunks[0].s3_path).await);
-    for chunk in &neighbour_chunks {
-        assert!(
-            object_exists(&cold_store, &chunk.s3_path).await,
-            "affinity stream object {} must survive",
-            chunk.s3_path
-        );
-    }
-    for neighbour in &neighbours {
-        assert_eq!(read(&runtime, neighbour, 4).await, b"kept");
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incarnation_scoped_recreate_reads_its_own_pages_and_gc_reclaims_the_old_incarnation() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = spawn(cold_store.clone());

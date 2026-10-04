@@ -128,27 +128,20 @@ impl StreamStateMachine {
         Ok(renew_ttl && stream_ttl_renewal_due(stream, now_ms))
     }
 
-    /// Up to `max` stream ids strictly after `after`, in (bucket, affinity
-    /// key, stream) order. Leader-side cursors walk a group's streams with it.
+    /// Up to `max` stream ids strictly after `after`, in (bucket, stream)
+    /// order. Leader-side cursors walk a group's streams with it.
     pub fn stream_ids_after(
         &self,
         after: Option<&BucketStreamId>,
         max: usize,
     ) -> Vec<BucketStreamId> {
-        fn key(id: &BucketStreamId) -> (&str, Option<&str>, &str) {
-            (
-                id.bucket_id.as_str(),
-                id.affinity_key.as_deref(),
-                id.stream_id.as_str(),
-            )
-        }
         let mut ids = self
             .registry
             .slots()
             .map(|slot| &slot.metadata.stream_id)
-            .filter(|id| after.is_none_or(|after| key(id) > key(after)))
+            .filter(|id| after.is_none_or(|after| super::compare_stream_ids(id, after).is_gt()))
             .collect::<Vec<_>>();
-        ids.sort_unstable_by(|left, right| key(left).cmp(&key(right)));
+        ids.sort_unstable_by(|left, right| super::compare_stream_ids(left, right));
         ids.truncate(max);
         ids.into_iter().cloned().collect()
     }

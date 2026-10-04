@@ -7,7 +7,7 @@ A stream is an append-only byte sequence addressed by a URL: `/{bucket}/{stream}
 
 ## Naming
 
-Stream IDs may contain any byte that is not `/`, `\0`, or `..`. Maximum stream ID length is 122 bytes, and the combined bucket-plus-stream path is also capped at 122 bytes. The literal name `streams` is reserved and cannot be used as a stream ID.
+Stream IDs may contain any byte that is not `/`, `\0`, or `..`. Maximum stream ID length is 122 bytes, and the combined bucket-plus-stream path is also capped at 122 bytes. The literal name `streams` is reserved and cannot be used as a stream ID. A stream ID cannot start with `$` either; that prefix is reserved for bucket-level subresources (`400`).
 
 A workspace app might use `/workspace-a/doc-123`. An agent system might use `/agents/run-2026-05-13-abc`. Anything within the rules above is fair.
 

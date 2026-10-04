@@ -27,8 +27,6 @@ use crate::request::AdvanceRetentionResponse;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
 use crate::request::AppendResponse;
-use crate::request::AppendTransactionRequest;
-use crate::request::AppendTransactionResponse;
 use crate::request::BootstrapStreamRequest;
 use crate::request::BootstrapStreamResponse;
 use crate::request::CloseStreamRequest;
@@ -64,8 +62,6 @@ use crate::request::TouchStreamAccessResponse;
 
 pub type GroupAppendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AppendResponse, GroupEngineError>> + Send + 'a>>;
-pub type GroupAppendTransactionFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<AppendTransactionResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupFlushColdFuture<'a> =
     Pin<Box<dyn Future<Output = Result<FlushColdResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupCompactColdFuture<'a> =
@@ -189,9 +185,6 @@ pub enum GroupWriteResponse {
     AckColdGc(AckColdGcResponse),
     PurgeBucket(PurgeBucketResponse),
     ImportGroupState(crate::request::ImportGroupStateResponse),
-    Batch(Vec<Result<GroupWriteResponse, GroupEngineError>>),
-    // Appended last so serialized variant positions of older variants stay
-    // stable across mixed-version clusters.
     SetFeatureLevel(SetFeatureLevelResponse),
     TidyStream(crate::request::TidyStreamResponse),
     DeferColdGc(DeferColdGcResponse),
@@ -531,19 +524,6 @@ pub trait GroupEngine: Send + 'static {
                 "external append is not supported for stream '{}'",
                 request.stream_id
             )))
-        })
-    }
-
-    fn append_transaction<'a>(
-        &'a mut self,
-        _request: AppendTransactionRequest,
-        _placement: ShardPlacement,
-        _admission: ColdWriteAdmission,
-    ) -> GroupAppendTransactionFuture<'a> {
-        Box::pin(async {
-            Err(GroupEngineError::new(
-                "append transactions are not supported by this group engine",
-            ))
         })
     }
 
