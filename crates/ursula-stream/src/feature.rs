@@ -63,9 +63,6 @@
 //!   queued for cold GC. Bodies of up to [`crate::MAX_COLD_SNAPSHOT_BYTES`]
 //!   are accepted this way.
 //!
-//! Later core-track changes (C1, C3, C4) take the remaining levels in
-//! release order.
-//!
 //! No downgrade: once a group's level is raised, a binary whose
 //! [`MAX_SUPPORTED_FEATURE_LEVEL`] is lower must not run it. Snapshots record
 //! their level and restoring one above this binary's supported level fails

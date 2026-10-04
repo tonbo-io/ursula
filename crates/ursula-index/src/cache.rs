@@ -246,39 +246,22 @@ impl VerifiedRangeCache {
         let fetch_store = store.clone();
         let fetch_key = part_key.to_owned();
         let fetch_unit = unit.clone();
-        // The cache reports a failed fetch as its own error type; this flag
-        // carries a missing object through it, so callers can tell a lost
-        // part (and schedule a rebuild) from a transient store failure.
-        let missing = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let fetch_missing = Arc::clone(&missing);
         let entry = self
             .cache()
             .await?
             .get_or_fetch(&cache_key, move || async move {
-                let bytes = match fetch_store
+                let bytes = fetch_store
                     .get_range(&fetch_key, fetch_unit.start..fetch_unit.end)
                     .await
-                {
-                    Ok(Some(bytes)) => bytes,
-                    Ok(None) | Err(IndexError::MissingObject(_)) => {
-                        fetch_missing.store(true, std::sync::atomic::Ordering::SeqCst);
-                        return Err(RangeReadError(IndexError::MissingObject(fetch_key)));
-                    }
-                    Err(error) => return Err(RangeReadError(error)),
-                };
+                    .map_err(RangeReadError)?
+                    .ok_or_else(|| RangeReadError(IndexError::MissingObject(fetch_key.clone())))?;
                 if digest(&bytes) != fetch_unit.hash {
                     return Err(RangeReadError(IndexError::ObjectHashMismatch(fetch_key)));
                 }
                 Ok::<_, RangeReadError>(Bytes::from(bytes))
             })
             .await
-            .map_err(|error| {
-                if missing.load(std::sync::atomic::Ordering::SeqCst) {
-                    IndexError::MissingObject(part_key.to_owned())
-                } else {
-                    IndexError::ObjectStore(error.to_string())
-                }
-            })?;
+            .map_err(|error| IndexError::ObjectStore(error.to_string()))?;
         let bytes = Bytes::clone(entry.value());
         // A fetched block was verified before insertion, and a memory hit
         // holds bytes verified on their way in; a block read back from disk

@@ -110,7 +110,7 @@ Every growth source the audits found, replicated or not, with the fix that bound
 | 4 | Producer map (`state_machine.rs:143`) | yes | O(distinct ids) | about 380 B per id; id length unbounded | stream delete | F3 |
 | 5 | `message_records` (`state_machine.rs:138`) | yes | O(records since `FlushCold`); forever on external-only streams | 16 B/record heap, 12-15 B snapshot; 5,000-record external body: 120 KB heap, 91 KB snapshot per append | `FlushCold` or retention; collapse keeps capacity | F4, F7 |
 | 6 | Hot window chunk overhead (`hot_buffer.rs:7-17, 88-97`) | yes | O(unflushed appends) | about 64 B tight per record beyond payload; 2.6 MB deque kept after one flush window | flush thresholds and group cap, both payload-only | F6, F7 |
-| 7 | External locators in state (planned by Pi C6) `external_segments` (`cold_state.rs:9`) | yes | O(external appends) if shipped as written | est. 120 B snapshot, 170 B heap per append of 1 MiB or more | retention only | F5 |
+| 7 | External locators in state (planned by an earlier design) `external_segments` (`cold_state.rs:9`) | yes | O(external appends) if shipped as written | est. 120 B snapshot, 170 B heap per append of 1 MiB or more | retention only | F5 |
 | 8 | Visible snapshot payload (`model.rs:264-273`) | yes | O(1), up to the 32 MiB body cap; at Lb5 a reference above the staging threshold | inline on every replica and every group snapshot | replacement | F16 |
 | 9 | `last_stream_seq` and producer id length (`append.rs:347-349`; `state_machine.rs:752-761`) | yes | O(1), length unbounded through `$transaction` JSON | up to 32 MiB | replacement | F3 |
 | 10 | Engine `stream_append_counts` (`ursula-runtime/src/engine/in_memory.rs:128`) | frames | one leaked entry per TTL-expired or purged stream | est. 150 B per removed stream | restart or snapshot install | F9 |
@@ -327,7 +327,7 @@ Neither command gains a field. A wrong scan, from wrong cold bytes or from a del
 - **Duplicates.** A deduplicated retry writes an entry at the current tail for an object nobody references.
 - **Ambiguous errors.** The HTTP layer deletes the staged object on any runtime error, including ambiguous ones where the append may still commit (`lib.rs:2482-2485, 2596-2601`).
 
-Pi's C6 fixes the locator by keeping the `ObjectPayloadRef` in state at apply, at about 120 B of snapshot per append "until offloaded (a follow-up)". This design makes the offload part of the fix: state is the staging area, pages are the durable index.
+An earlier design fixed the locator by keeping the `ObjectPayloadRef` in state at apply, at about 120 B of snapshot per append "until offloaded (a follow-up)". This design makes the offload part of the fix: state is the staging area, pages are the durable index.
 
 **Design.**
 
@@ -340,7 +340,7 @@ Pi's C6 fixes the locator by keeping the `ObjectPayloadRef` in state at apply, a
 
 **Implementation note.** Lb3 is feature level 3 (`FEATURE_LEVEL_EXTERNAL_LOCATORS`). The offload runs as its own leader-side worker every 2 s whenever a cold store is configured, rather than inside F2's driver loop, because that loop only runs when `compaction_enabled` is set and the offload bounds replicated state. A ref's age comes from the write time in its object name; a name without one counts as due. The cleanup rule also deletes the staged object of a create that answers already-exists. The orphan sweep (F14h) reads state refs before pages, and the offload writes pages before it removes refs, so a ref moving from state to pages is always seen in one of them.
 
-**Codec and gating.** No new codec field; `external_segments` is field 9 already. The apply change and the new `OffloadColdRefs` command are gated at Lb3. Lb3 may trail the other levels: until it ships, deployments that cannot afford the staging path keep `external_payload_min_size` above the 32 MiB body cap, as Pi does.
+**Codec and gating.** No new codec field; `external_segments` is field 9 already. The apply change and the new `OffloadColdRefs` command are gated at Lb3. Lb3 may trail the other levels: until it ships, deployments that cannot afford the staging path keep `external_payload_min_size` above the 32 MiB body cap.
 
 **Cost.** +500 production LoC, +600 test LoC. Medium-high risk, since this is the data path for large appends; madsim ambiguous-commit seeds mitigate it (§7.4).
 
@@ -537,7 +537,7 @@ New stale entries stop at Lb3, when F5 removes the pre-proposal write.
 | F13 node caches | none | +100 | +120 | low | B1 |
 | F14 cold-object hygiene | (a), (b) defer, (g) 2, (i) at Lb1; (f) gated | +600 | +500 | medium | B1 (b, e, g 1), B2 (h), B3 (a, b defer, g 2, i), B6 (c, d) |
 | F15 | next level, if accepted | +100 | +100 | low | decision in B7 |
-| F16 cold snapshots | Lb5 | +450 | +200 | medium | after B7 (Pi Durable VFS, M2) |
+| F16 cold snapshots | Lb5 | +450 | +200 | medium | after B7 (SQLite VFS) |
 | F17 hardening | none | +150 | +100 | low | B7 |
 | F18 cold coverage | B1 rule none; representation Lb1 | +80 | +150 | low | B1, B3 |
 | F19 page-entry hygiene | none | +200 | +250 | medium | B1 |
@@ -548,7 +548,7 @@ Totals, excluding F15 and F16: about +5,800 / −400 production LoC and +6,500 t
 
 F1 changes how every record coordinate is resolved, so it carries its own invariants. The dense implementation at `e6d8d70` is the oracle; marks must be invisible, apart from retention landing on a mark. Each invariant names its test.
 
-**RC-1, boundaries are LFs.** On a JSON stream each record is one compact JSON value plus one LF and contains no other LF, on every write path: inline append, append batch, transaction ops, create with a body, and external create and append. *Test*: a fuzz test (arbitrary JSON, arrays, escapes, lone surrogates once Pi's P1 lands) asserting that the stored bytes' LF positions equal the committed record ends on each path.
+**RC-1, boundaries are LFs.** On a JSON stream each record is one compact JSON value plus one LF and contains no other LF, on every write path: inline append, append batch, transaction ops, create with a body, and external create and append. *Test*: a fuzz test (arbitrary JSON, arrays, escapes, lone surrogates) asserting that the stored bytes' LF positions equal the committed record ends on each path.
 
 **RC-2, oracle equivalence.** In every reachable state, `offset_for(r)` after scanning equals the dense oracle for every retained `r`, and `record_for(o)` agrees for every boundary `o` and rejects every non-boundary. *Test*: a proptest differential suite on `StreamStateMachine` with an in-memory byte store standing in for S3. Random JSON appends of 1 to 2,000 records with sizes from 2 B to 3 MiB, external appends, flushes at random points including mid-record splits, retention at random boundaries, transactions with rollback, and snapshot round trips at random points. Explicit cases: the D1 sequence (hot prefix, external append, flush, offload, snapshot round trip), and stale page entries from rejected external appends at the same and at overlapping starts.
 
@@ -764,7 +764,7 @@ The workstream starts now. It touches no protocol surface except the receipt win
 
 **Bump `RAFT_GRPC_PROTOCOL_VERSION` with a full restart.** This breaks the graceful mixed-version rollouts shipped since 0.4 (#178, #200, #233).
 
-**Keep external locators in state permanently** (Pi C6 as written). That is 120 B per external append, 7.5 times the marks' constant, for no benefit, since the offload needs no byte copy.
+**Keep external locators in state permanently** (as an earlier design proposed). That is 120 B per external append, 7.5 times the marks' constant, for no benefit, since the offload needs no byte copy.
 
 **Make the legacy migration the permanent pack compactor.** It snapshots every group per pass, compacts one chunk per command, deletes replacements on ambiguous errors, and #278 plans to remove it.
 
@@ -785,7 +785,7 @@ The workstream starts now. It touches no protocol surface except the receipt win
    - `extensions.mdx:751`: state bootstrap parts for cold binary history (Lb1).
    - `extensions.mdx:786`, `durable-stream.mdx:329` and `exactly-once-writes.mdx:16, 31`: limit exact ranges to the receipt window and the newest sequence (Lb1).
    - `operations.mdx:135`: retention is not needed for memory.
-5. **Response caps.** Can reads and `/bootstrap` cap responses at 8 MiB by default? Do the ursula-index source, the SDKs or Pi assume that a record read without `max_records`, or a bootstrap, returns everything up to the tail?
+5. **Response caps.** Can reads and `/bootstrap` cap responses at 8 MiB by default? Do the ursula-index source or the SDKs assume that a record read without `max_records`, or a bootstrap, returns everything up to the tail?
 6. **Maximum hot age.** Is keeping slow streams' small tails hot for up to 5 minutes acceptable? It bounds how long records stay hot in quiet groups; in the healthy regime it changes slices little (288 against 308 per day), and the large slice reductions come from F10's batching and F2.
 7. **Defaults.** Should compaction become on by default once discovery is debt-driven (F14d), S3 snapshots the default whenever a cold store exists (F12b, which also turns on S3-health leadership shedding), and snapshot cadence byte-based with a 1 GiB node log budget (F12e)? Is the inline backend meant for production clusters at all?
 8. **Visible snapshots.** Decided 2026-10-03: externalize above the staging threshold at Lb5 (F16, §5.16), up to 1 GiB.
