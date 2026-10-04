@@ -561,8 +561,8 @@ fn wal_recover(path: &str) -> Option<WalScan> {
 /// up to the last commit, a later frame winning, pages past that commit's db size dropped, the file
 /// cut to it), without opening the file through SQLite: trust (`WalClaim`) only says every page
 /// holds the state at the sidecar's offset or a later commit's, not that SQLite can read the file
-/// (a disk image may hold a torn page 1 that replay rewrites). The caller has checked that no
-/// other process uses the file (`check_unused`).
+/// (a disk image may hold a torn page 1 that replay rewrites). The caller holds `f` locked against
+/// other processes (`lock_unused`).
 fn fold_wal(path: &str, f: &fs::File) -> Result<(), String> {
     let wal = format!("{path}-wal");
     let Some(scan) = wal_recover(&wal).filter(|w| w.last > 0) else {
@@ -649,9 +649,6 @@ fn read_sidecar(path: &str) -> Result<Option<Sidecar>, String> {
     };
     for token in it {
         match token.split_once('=') {
-            // The recovery marker of an earlier version: parsed (not torn), but it makes no WAL
-            // claim, so the sidecar is not trusted.
-            None if token == "recovering" => {}
             Some(("boot", v)) => s.boot = Some(v.to_owned()),
             Some(("stream", v)) => s.stream = Some(v.to_owned()),
             Some(("file", v)) => s.file = Some(v.to_owned()),
@@ -678,7 +675,7 @@ fn read_sidecar(path: &str) -> Result<Option<Sidecar>, String> {
 /// `-journal`, and the fresh path `-wal` and `-shm`, and rewrites the sidecar: until then the
 /// sidecar marks whatever is left untrusted, so a crash midway discards again.
 fn discard_local(path: &str) -> Result<(), String> {
-    check_unused(path)?;
+    let _lock = open_locked(path)?; // held until the db file is removed (`lock_unused`)
     for suffix in ["-ursula.snap", ""] {
         remove_if_exists(&format!("{path}{suffix}"))?;
     }
@@ -702,34 +699,53 @@ fn abort_in_replay() -> Option<u64> {
     })
 }
 
-/// Attach never opens local files through SQLite before replaying onto or discarding them (a
-/// trusted file may hold a torn page 1, see `fold_wal`), so it proves "no other process uses the file" without parsing pages: every SQLite
-/// connection on a WAL-format file (any process, any unix-based VFS) holds a POSIX lock in the
-/// db file's lock-byte range (SHARED, from its first read until it closes); F_GETLK reports such
-/// a lock without taking one or reading the file. Another *attached* process is excluded by the
-/// host lock already held, and this process by the open-connection count. Our descriptor holds no
-/// POSIX lock, so closing it drops none of this process's (there are none on the file either).
-fn check_unused(path: &str) -> Result<(), String> {
+/// Keeps other processes off the db file `f` while attach rewrites, replaces or removes it. Attach
+/// never opens local files through SQLite before that (a trusted file may hold a torn page 1, see
+/// `fold_wal`), so it does this without parsing pages: every SQLite connection on a WAL-format file
+/// (any process, any unix-based VFS) takes a POSIX read lock in the db file's lock-byte range at
+/// its first read and keeps it until it closes. Attach takes a write lock on that range (failing
+/// while any connection holds it) and must keep holding it until `-wal`/`-shm` are deleted and the
+/// old file is replaced or removed: a connection reading after a mere probe would recover the
+/// stale WAL, keep it open, and checkpoint it over the replayed pages at its close, silently
+/// rolling the file back. Meanwhile a connection's first read fails with SQLITE_BUSY.
+///
+/// The lock lives as long as `f` and any other descriptor of this process on the file: closing any
+/// of them drops it, so the caller keeps `f` open and opens no other one meanwhile. No connection
+/// of this process is open (attach refuses otherwise), so closing `f` drops only this lock. Another
+/// *attached* process is excluded by the host lock already held.
+fn lock_unused(path: &str, f: &fs::File) -> Result<(), String> {
     use std::os::fd::AsRawFd;
-    let f = fs::File::open(path).map_err(|e| format!("open {path}: {e}"))?;
     let mut l: libc::flock = unsafe { std::mem::zeroed() };
     l.l_type = libc::F_WRLCK as _;
     l.l_whence = libc::SEEK_SET as _;
     l.l_start = 0x4000_0000; // PENDING_BYTE; RESERVED and the SHARED range follow (512 bytes)
     l.l_len = 512;
-    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETLK, &mut l) } != 0 {
-        return Err(format!(
-            "F_GETLK {path}: {}",
-            std::io::Error::last_os_error()
-        ));
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &l) } == 0 {
+        return Ok(());
     }
-    if l.l_type != libc::F_UNLCK as _ {
-        return Err(format!(
-            "{path} is open by another process (pid {}); close it before attaching",
-            l.l_pid
-        ));
+    let e = std::io::Error::last_os_error();
+    if !matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EACCES)) {
+        return Err(format!("lock {path}: {e}"));
     }
-    Ok(())
+    // Name the holder, if it still holds the range.
+    let held = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETLK, &mut l) } == 0
+        && l.l_type != libc::F_UNLCK as _;
+    let pid = if held {
+        l.l_pid.to_string()
+    } else {
+        "unknown".into()
+    };
+    Err(format!(
+        "{path} is open by another process (pid {pid}); close it before attaching"
+    ))
+}
+
+/// Opens the db file and locks it (`lock_unused`); the lock lasts while the descriptor is open.
+fn open_locked(path: &str) -> Result<fs::File, String> {
+    let f = OpenOptions::new().read(true).write(true).open(path);
+    let f = f.map_err(|e| format!("open {path}: {e}"))?;
+    lock_unused(path, &f)?;
+    Ok(f)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1158,11 +1174,11 @@ impl Drop for Private {
 /// Applies records to the db file, deduplicating page writes per batch.
 ///
 /// Runs only inside `ursula_attach`, which refuses while any connection of this process has the
-/// file open and has stopped the previous attachment's snapshot thread; `check_unused` proves no
-/// other process holds it either. So its own descriptors on the db file (and the temp file and
-/// rename of `install`) cannot drop anyone's POSIX locks when they close. Outside `ursula_attach`,
-/// the extension touches the db file, -wal or -shm only through SQLite's handles (the private
-/// connections of `Private`).
+/// file open and has stopped the previous attachment's snapshot thread, and `lock_unused` keeps
+/// other processes off the file while it is rewritten. So its own descriptors on the db file (and
+/// the temp file and rename of `install`) cannot drop anyone else's POSIX locks when they close.
+/// Outside `ursula_attach`, the extension touches the db file, -wal or -shm only through SQLite's
+/// handles (the private connections of `Private`).
 struct Applier {
     path: String,
     /// The sidecar, its stamp, and the offset and epoch the replay starts from: rewritten once the
@@ -1202,20 +1218,17 @@ impl Applier {
     }
 
     /// The db file, opened once. Before its first write, a file with content (trusted, never opened
-    /// through SQLite here) gets its WAL folded in (`fold_wal`, after `check_unused`); then the db
-    /// file is fsynced, the sidecar keeps its offset but claims no WAL frame, and the WAL is
-    /// deleted, all before replay writes a page. So no stale WAL sits next to pages replay moves
-    /// past it (a plain SQLite connection opening the file meanwhile would checkpoint it over them
-    /// when it closes), and a recovery that dies midway leaves files the next attach trusts and
-    /// replays again from the same offset (folded pages hold the state at the WAL's last commit,
-    /// replayed ones later commits). A crash between that sidecar and the delete leaves a WAL with
-    /// commits next to a claim of none: a rebuild.
+    /// through SQLite here) is locked (`lock_unused`, held on `self.file` until the Applier drops)
+    /// and gets its WAL folded in (`fold_wal`); then the db file is fsynced, the sidecar keeps its
+    /// offset but claims no WAL frame, and the WAL is deleted, all before replay writes a page. So
+    /// no stale WAL sits next to pages replay moves past it (a plain SQLite connection opening the
+    /// file meanwhile would checkpoint it over them when it closes), and a recovery that dies
+    /// midway leaves files the next attach trusts and replays again from the same offset (folded
+    /// pages hold the state at the WAL's last commit, replayed ones later commits). A crash between
+    /// that sidecar and the delete leaves a WAL with commits next to a claim of none: a rebuild.
     unsafe fn file(&mut self) -> Result<&fs::File, String> {
         if self.file.is_none() {
             let existing = fs::metadata(&self.path).is_ok_and(|m| m.len() > 0);
-            if existing {
-                check_unused(&self.path)?;
-            }
             let f = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -1224,6 +1237,7 @@ impl Applier {
                 .open(&self.path);
             let f = f.map_err(|e| format!("open {}: {e}", self.path))?;
             if existing {
+                lock_unused(&self.path, &f)?;
                 fold_wal(&self.path, &f)?;
                 f.sync_all()
                     .map_err(|e| format!("fsync {}: {e}", self.path))?;
@@ -1266,21 +1280,25 @@ impl Applier {
     }
 
     /// Replaces the db file with a snapshot's image (temp file, rename) and continues the batch
-    /// from it. The old file is not folded, only checked unused, and its WAL is deleted first so
-    /// none sits next to the new image: a crash before the rename leaves a sidecar the next attach
-    /// trusts only if that WAL held no commit (a claim of none), so nothing is lost. A crash after
-    /// the rename, before the final sidecar, leaves the old sidecar naming the replaced file: the
-    /// next attach discards the files and rebuilds.
+    /// from it. The old file is not folded, only locked (`lock_unused`, held until the rename), and
+    /// its WAL is deleted first so none sits next to the new image: a crash before the rename
+    /// leaves a sidecar the next attach trusts only if that WAL held no commit (a claim of none),
+    /// so nothing is lost. A crash after the rename, before the final sidecar, leaves the old
+    /// sidecar naming the replaced file: the next attach discards the files and rebuilds.
     unsafe fn install(&mut self, snap: snapshot::Snapshot) -> Result<(), String> {
-        if self.file.take().is_none() && fs::metadata(&self.path).is_ok_and(|m| m.len() > 0) {
-            check_unused(&self.path)?;
-        }
+        let old = match self.file.take() {
+            None if fs::metadata(&self.path).is_ok_and(|m| m.len() > 0) => {
+                Some(open_locked(&self.path)?)
+            }
+            f => f,
+        };
         remove_if_exists(&format!("{}-wal", self.path))?;
         remove_if_exists(&format!("{}-shm", self.path))?;
         let err = |e: std::io::Error| format!("install snapshot into {}: {e}", self.path);
         let tmp = format!("{}-ursula.snap", self.path);
         fs::write(&tmp, &snap.image).map_err(err)?;
         fs::rename(&tmp, &self.path).map_err(err)?;
+        drop(old);
         let f = OpenOptions::new().read(true).write(true).open(&self.path);
         self.file = Some(f.map_err(err)?);
         self.pages.clear();
@@ -2805,8 +2823,6 @@ mod tests {
         let behind = format!("{mine} wal=00000000000000ff:3\n");
         assert_eq!(trust(behind.as_bytes(), b1), Some(false));
         assert_eq!(trust(format!("{mine}\n").as_bytes(), b1), Some(false));
-        // #330's recovery marker parses (not torn), so a discard still gets the 416 check.
-        assert_eq!(trust(b"7 2 recovering\n", b1), Some(false));
         // Another db file (replaced by a rename) is not trusted.
         let other_file = "7 2 boot=b1 stream=/b/s file=0";
         assert_eq!(

@@ -68,16 +68,18 @@ appended with the idempotent producer (`Producer-Id` per database, `Producer-Epo
 3. Recovery (only when it rewrites pages) never opens the local files through SQLite before
    replaying onto them: trust (§6) says every page holds the state at the sidecar's offset or a
    later commit's, not that SQLite can read the file (a disk image may hold a torn page 1 that
-   replay rewrites). It checks that no other process holds the file (a POSIX lock probe of the
-   db file's lock bytes, which every SQLite connection on a WAL file holds; otherwise attach
-   fails rather than rewriting pages under another connection's cache), folds the local WAL into
-   the db file itself (the frames SQLite's recovery would read, up to the last commit, a later
-   frame winning, the file cut to that commit's size), fsyncs it, rewrites the sidecar at the
-   same offset with a `:0` claim, deletes `-wal`/`-shm`, and only then replays onto it. No stale
-   WAL sits next to pages replay has moved past it (a plain SQLite connection opening the file
-   meanwhile would checkpoint it over them when it closes), and an attach in the same boot after a
-   crash midway trusts the files again and replays from the same offset (folded pages hold the
-   state at the WAL's last commit, replayed ones later commits; replay is idempotent). A crash
+   replay rewrites). It locks other processes out of the file: a POSIX write lock on the db file's
+   lock bytes, where every SQLite connection on a WAL file holds a read lock from its first read
+   until it closes, so attach fails while one is open rather than rewriting pages under its cache.
+   The lock is held, not just probed, until the WAL is deleted: a connection that read in between
+   would recover the stale WAL and checkpoint it over the replayed pages at its close. Then attach
+   folds the local WAL into the db file itself (the frames SQLite's recovery would read, up to the
+   last commit, a later frame winning, the file cut to that commit's size), fsyncs it, rewrites the
+   sidecar at the same offset with a `:0` claim, deletes `-wal`/`-shm`, and only then replays onto
+   it. No stale WAL sits next to pages replay has moved past it (a plain SQLite connection opening
+   the file meanwhile would checkpoint it over them when it closes), and an attach in the same boot
+   after a crash midway trusts the files again and replays from the same offset (folded pages hold
+   the state at the WAL's last commit, replayed ones later commits; replay is idempotent). A crash
    between that sidecar and the delete leaves commits in a WAL the `:0` claim rejects: a rebuild.
 4. `HEAD` the stream. If its latest snapshot is ahead of the file (a fresh host, or a file left
    below the retention), installs it (§4.3). Then replays frames to the tail.
@@ -163,15 +165,14 @@ threshold of retained log. The newer snapshot has read back before any history i
 retained stream always holds a readable snapshot at or above its start.
 
 Attach installs a snapshot when the file is behind the latest one: it verifies the body (offset,
-size, checksum), checks that no other process holds the old file (§3) and deletes its WAL (a
-crash before the rename then leaves a sidecar the next attach trusts only if that WAL held no
-commit), writes the image to a temp file and renames it
-over the db file, then replays the tail. A crash after the rename leaves the sidecar at the old
-offset naming the replaced file, so the next attach discards the files and installs the snapshot
-again. A tail read that hits `410`
-(retention moved under a stale `HEAD`), or a snapshot superseded between `HEAD` and `GET` (a 404,
-or a body cut short when its cold object is deleted after the grace), restarts
-attach from `HEAD`, up to ten times.
+size, checksum), locks other processes out of the old file until it is replaced (§3) and deletes its
+WAL (a crash before the rename then leaves a sidecar the next attach trusts only if that WAL held no
+commit), writes the image to a temp file and renames it over the db file, then replays the tail. A
+crash after the rename leaves the sidecar at the old offset naming the replaced file, so the next
+attach discards the files and installs the snapshot again. A tail read that hits `410` (retention
+moved under a stale `HEAD`), or a snapshot superseded between `HEAD` and `GET` (a 404, or a body cut
+short when its cold object is deleted after the grace), restarts attach from `HEAD`, up to ten
+times.
 
 Any owner may publish a snapshot of its own offset, a fenced one included: its state at its offset
 is a true prefix of the stream. Retention never passes the latest snapshot (the server refuses).
@@ -276,9 +277,10 @@ What attach does in each case:
   files and rebuilds from the latest snapshot and the tail. A new random boot id cannot be on disk
   from before it was generated, so no torn sidecar passes the check. Discarding runs before
   anything opens the file through SQLite (a torn file could fail any checkpoint), refuses while
-  another process has the file open, and removes the db file and a leftover snapshot temp file
-  (never the held lock file); every attach then removes `-journal`, and the fresh path `-wal` and
-  `-shm`, and rewrites the sidecar last, so a crash midway discards again. The first attach after
+  another process has the file open (and locks it out until the file is gone, §3), and removes the
+  db file and a leftover snapshot temp file (never the held lock file); every attach then removes
+  `-journal`, and the fresh path `-wal` and `-shm`, and rewrites the sidecar last, so a crash
+  midway discards again. The first attach after
   upgrading from a version without the WAL claim rebuilds once; older versions refuse this one's
   sidecar, so after a downgrade delete `<db>` (it is rebuilt from the stream).
 - **Container runtimes with their own boot id**: LXC/LXD/Incus and systemd-nspawn bind-mount a new
@@ -345,10 +347,9 @@ rebuild, delete `<db>`.
 - Units (`cargo test`): frame and snapshot encodings (whole frames only, damage refused).
 - Units also cover the sidecar: trusted only in this boot for this db file and with its WAL claim
   met (a claim on frames the WAL does not hold or on another WAL generation, or no claim, is
-  not); legacy (an older version's recovery marker included), other-boot and torn sidecars are
-  not, nothing is when the current boot id is unknown, and a missing sidecar is an error; folding
-  a WAL into the db file keeps the last image and cuts the file to the commit's size. CI runs
-  them on macOS too (its boot id).
+  not); legacy, other-boot and torn sidecars are not, nothing is when the current boot id is
+  unknown, and a missing sidecar is an error; folding a WAL into the db file keeps the last image
+  and cuts the file to the commit's size. CI runs them on macOS too (its boot id).
 - e2e against a real node (`clients/sqlite-ursula`): transparency (any schema, byte-identical
   rebuild), the crash matrix (same-boot re-attaches resume from the sidecar, a recovery killed
   mid-rewrite included, without a snapshot), fencing, recovery exclusion, the local cache (a
@@ -373,7 +374,10 @@ One run, 2026-10-03. EKS 1.33 in us-east-1: three `m6i.xlarge` Ursula nodes, one
 for the cold tier and snapshots with Ursula's default S3 settings (`server_side_encryption =
 "aes256"`), feature level 5. Server image: main `05132e0`. Extension: `05132e0` for the memory-WAL
 cells, `6ba4e60` for the disk-WAL cells (the difference is 429/503 retry and recovery, not the
-commit path). Clients: `m6i.2xlarge` pods (node 22) in us-east-1a, one process per database,
+commit path). Both builds predate #332, which removed the local WAL fsync and the sidecar's fsyncs
+from the commit path (about 4.7 ms of the agent-pace p50s, per the breakdown below); every VFS
+number in this section, the Durable Object comparison included, was measured before it and not
+re-measured. Clients: `m6i.2xlarge` pods (node 22) in us-east-1a, one process per database,
 through the gateway Service. The chart deploys the gateway without a quota policy, so there was no
 rate limit and no client saw a 429. Gateway `maxRequestBodyBytes` was raised to 1 GiB for the 1 GB
 snapshot; everything else is the chart default.
@@ -429,8 +433,8 @@ Where one database's commit goes (agent pace, p50, ms):
 | measured Pi commit | 9.7 | 16.5 |
 | for reference: raw append, same frame sizes (B3, gateway, 1 writer) | 1.15 | 8.2 |
 
-Measured before #332, which removed the local WAL fsync and the sidecar's fsyncs from the commit
-path (about 4.7 ms of these p50s); not re-measured.
+Measured before #332 (see the run description): its WAL fsync and sidecar fsyncs, about 4.7 ms of
+these p50s, are gone.
 
 The VFS's append request was 1.4 to 2.8 ms above the raw floor: 4.0 and 10.9 ms at agent pace, and
 3.8 and 9.6 ms for one database flat out. It reuses its connection (one `TIME_WAIT` socket in 15 s of commits), so connection
