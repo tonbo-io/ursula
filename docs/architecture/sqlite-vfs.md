@@ -225,8 +225,8 @@ be written into the stream. Trust is therefore verified against the files, not i
   sidecar switching to `:0` first (a truncate to a non-zero size, `journal_size_limit` in the
   commit that starts a generation, cuts only the previous generation's tail, already synced by
   (1)); (3) at attach, after folding the WAL into the db file and before the recovery marker, and
-  before the final sidecar whenever attach wrote the db file (that sidecar claims `:0`). A failed fsync poisons the database (or fails the
-  attach).
+  before the final sidecar whenever attach wrote the db file (that sidecar claims `:0`). A failed
+  fsync poisons the database (or fails the attach).
 - The attached connections keep the WAL past the last close (`SQLITE_FCNTL_PERSIST_WAL`:
   checkpointed, not deleted), and so does the snapshot thread's, so a clean shutdown keeps the
   claim checkable.
@@ -249,15 +249,15 @@ What attach does in each case:
 - **Process crash, same boot** (SIGKILL, OOM kill, abort, a pod rescheduled to the same node with a
   local volume, a container restart with runtimes that show the host's boot id: Docker,
   containerd, CRI-O): every completed `write()` is in the page cache, so the files are exactly
-  what this host wrote and, outside the two windows below, the claim holds (the sidecar is written only after the WAL writes
-  return). A killed write leaves a prefix; SQLite's salted, cumulative WAL checksums stop recovery
-  at the last whole commit, `-shm` is rebuilt, checkpoints are redone from the WAL. Attach trusts
-  the files and replays from the sidecar's offset (fast). A crash in the middle of a WAL truncate
-  (between the `:0` sidecar and the truncate), or between the first WAL write of a new generation
-  (the commit after a wrap or a truncate) and the sidecar update, leaves a claim the files do not
-  meet; that only costs a rebuild. Covered: SIGKILL before and after the ack, the cache spill with
-  in-place checksum rewrites, a failed local write after the ack, a crash mid-recovery (the
-  recovery marker).
+  what this host wrote and, outside the two windows below, the claim holds (the sidecar is
+  written only after the WAL writes return). A killed write leaves a prefix; SQLite's salted,
+  cumulative WAL checksums stop recovery at the last whole commit, `-shm` is rebuilt, checkpoints
+  are redone from the WAL. Attach trusts the files and replays from the sidecar's offset (fast).
+  A crash in the middle of a WAL truncate (between the `:0` sidecar and the truncate), or between
+  the first WAL write of a new generation (the commit after a wrap or a truncate) and the sidecar
+  update, leaves a claim the files do not meet; that only costs a rebuild. Covered: SIGKILL
+  before and after the ack, the cache spill with in-place checksum rewrites, a failed local write
+  after the ack, a crash mid-recovery (the recovery marker).
 - **Same boot, files restored from a crash-consistent image**: a block-level snapshot of the volume
   (EBS, PD or Azure disk snapshots, a CSI VolumeSnapshot or PVC clone) restored or cloned onto a
   host that has not rebooted since, or a block volume force-detached and reattached. Boot id and
