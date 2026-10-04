@@ -2,7 +2,7 @@
 //! at feature level 1.
 //!
 //! - **Receipt window.** A stream keeps at most [`RECEIPT_WINDOW_ITEMS`]
-//!   receipt items (one per frame; a single append is one item) beyond each
+//!   receipt items (one per append; legacy receipts may hold more) beyond each
 //!   producer's newest receipt, which is never evicted. Eviction takes the
 //!   oldest evictable receipt in commit order: every producer's receipts are
 //!   in commit order, so the oldest evictable one is the front of some
@@ -60,7 +60,7 @@ pub const PRODUCER_CAP_EVICT_BUDGET: usize = 1_024;
 /// Producers one `TidyStream` may stamp, expire or strip of `last_items`.
 pub const TIDY_PRODUCER_BUDGET: usize = 4_096;
 
-/// Items a receipt counts against the window: one per frame, at least one.
+/// Items a receipt counts against the window: one per append, at least one.
 pub(super) fn receipt_items(receipt: &crate::model::ProducerReceipt) -> u64 {
     u64::try_from(receipt.items.len().max(1)).unwrap_or(u64::MAX)
 }

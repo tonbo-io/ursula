@@ -501,8 +501,8 @@ impl SimSchedule {
                     SimFaultAction::RunRuntimeRaftNetworkWorkload {
                         plan: RuntimeRaftNetworkWorkloadPlan {
                             stream_count: 1,
-                            append_batch_lens: vec![1],
-                            failover_batch_lens: vec![1],
+                            append_payload_counts: vec![1],
+                            failover_payload_counts: vec![1],
                             producer_sessions: false,
                             producer_epoch_bumps: false,
                             concurrent_producers: false,

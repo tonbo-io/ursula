@@ -7,7 +7,6 @@ use ursula_stream::StreamCommand;
 use ursula_stream::StreamSnapshot;
 
 use crate::request::AdvanceRetentionRequest;
-use crate::request::AppendBatchRequest;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
 use crate::request::CloseStreamRequest;
@@ -29,9 +28,8 @@ pub struct GroupSnapshot {
 }
 
 /// Replicated group-level write envelope around the canonical
-/// [`StreamCommand`]: one command, a throughput batch with independent item
-/// results, or an all-or-none append transaction. Batch and transaction
-/// envelopes each occupy one Raft entry. This enum (serde-encoded) is the Raft
+/// [`StreamCommand`]: one command or an all-or-none append transaction. A
+/// transaction envelope occupies one Raft entry. This enum (serde-encoded) is the Raft
 /// log payload; there is no separate wire mirror.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[expect(
@@ -41,7 +39,6 @@ pub struct GroupSnapshot {
 )]
 pub enum GroupWriteCommand {
     Stream(StreamCommand),
-    Batch { commands: Vec<StreamCommand> },
     Transaction { commands: Vec<StreamCommand> },
 }
 
@@ -50,7 +47,7 @@ impl GroupWriteCommand {
     pub fn log_bytes_estimate(&self) -> u64 {
         match self {
             Self::Stream(command) => command.log_bytes_estimate(),
-            Self::Batch { commands } | Self::Transaction { commands } => commands
+            Self::Transaction { commands } => commands
                 .iter()
                 .map(StreamCommand::log_bytes_estimate)
                 .fold(0, u64::saturating_add),
@@ -132,18 +129,6 @@ impl From<AppendExternalRequest> for StreamCommand {
             producer: request.producer,
             now_ms: request.now_ms,
             record_match: request.record_match,
-        }
-    }
-}
-
-impl From<AppendBatchRequest> for StreamCommand {
-    fn from(request: AppendBatchRequest) -> Self {
-        Self::AppendBatch {
-            stream_id: request.stream_id,
-            content_type: Some(request.content_type),
-            payloads: request.payloads,
-            producer: request.producer,
-            now_ms: request.now_ms,
         }
     }
 }
@@ -243,7 +228,6 @@ group_write_from_request!(
     CreateStreamExternalRequest,
     AppendRequest,
     AppendExternalRequest,
-    AppendBatchRequest,
     PublishSnapshotRequest,
     AdvanceRetentionRequest,
     SetFeatureLevelRequest,
@@ -257,7 +241,6 @@ impl fmt::Display for GroupWriteCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Stream(command) => command.fmt(f),
-            Self::Batch { commands } => write!(f, "batch:{} commands", commands.len()),
             Self::Transaction { commands } => {
                 write!(f, "transaction:{} commands", commands.len())
             }

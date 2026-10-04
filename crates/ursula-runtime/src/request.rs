@@ -21,7 +21,6 @@ use crate::cold_store::ColdStoreHandle;
 use crate::cold_store::DEFAULT_CONTENT_TYPE;
 use crate::engine::GroupEngineError;
 use crate::engine::in_memory::InMemoryGroupEngine;
-use crate::error::RuntimeError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateStreamRequest {
@@ -772,28 +771,6 @@ impl AppendRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppendBatchRequest {
-    pub stream_id: BucketStreamId,
-    pub content_type: String,
-    pub payloads: Vec<Bytes>,
-    pub producer: Option<ProducerRequest>,
-    pub now_ms: u64,
-}
-
-impl AppendBatchRequest {
-    pub fn new<P>(stream_id: BucketStreamId, payloads: Vec<P>) -> Self
-    where P: Into<Bytes> {
-        Self {
-            stream_id,
-            content_type: DEFAULT_CONTENT_TYPE.to_owned(),
-            payloads: payloads.into_iter().map(Into::into).collect(),
-            producer: None,
-            now_ms: 0,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendResponse {
     pub placement: ShardPlacement,
@@ -814,12 +791,6 @@ pub struct AppendResponse {
     /// `next_offset` then carry no information about the original append.
     #[serde(default)]
     pub receipt_evicted: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppendBatchResponse {
-    pub placement: ShardPlacement,
-    pub items: Vec<Result<AppendResponse, RuntimeError>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

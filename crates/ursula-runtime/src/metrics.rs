@@ -13,7 +13,6 @@ use crate::engine::GroupEngine;
 use crate::engine::GroupEngineError;
 use crate::engine::GroupEngineMetrics;
 use crate::error::RuntimeError;
-use crate::request::AppendBatchRequest;
 use crate::request::ColdWriteAdmission;
 use crate::rt::time::Instant;
 
@@ -31,7 +30,6 @@ pub fn record_coordinate_corruptions() -> u64 {
     RECORD_COORDINATE_CORRUPTIONS.load(Ordering::Relaxed)
 }
 
-pub(crate) const GROUP_ACTOR_MAX_WRITE_BATCH: usize = 64;
 pub(crate) const COLD_FLUSH_GROUP_BATCH_MAX_CHUNKS: usize = 4096;
 
 #[derive(Debug, Clone)]
@@ -369,19 +367,6 @@ runtime_metrics! {
     sum group_mailbox_depth: group per_group_group_mailbox_depth;
     max group_mailbox_max_depth: group per_group_group_mailbox_max_depth;
     sum group_mailbox_full_events: group per_group_group_mailbox_full_events;
-    sum raft_write_many_batches:
-        core per_core_raft_write_many_batches, group per_group_raft_write_many_batches;
-    sum raft_write_many_commands:
-        core per_core_raft_write_many_commands, group per_group_raft_write_many_commands;
-    sum raft_write_many_logical_commands:
-        core per_core_raft_write_many_logical_commands,
-        group per_group_raft_write_many_logical_commands;
-    sum raft_write_many_responses:
-        core per_core_raft_write_many_responses, group per_group_raft_write_many_responses;
-    sum raft_write_many_submit_ns:
-        core per_core_raft_write_many_submit_ns, group per_group_raft_write_many_submit_ns;
-    sum raft_write_many_response_ns:
-        core per_core_raft_write_many_response_ns, group per_group_raft_write_many_response_ns;
     sum raft_apply_entries: core per_core_raft_apply_entries, group per_group_raft_apply_entries;
     sum raft_apply_ns: core per_core_raft_apply_ns, group per_group_raft_apply_ns;
     sum raft_snapshot_builds: group per_group_raft_snapshot_builds;
@@ -454,15 +439,6 @@ pub struct RuntimeMailboxSnapshot {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RaftWriteManySample {
-    pub(crate) command_count: u64,
-    pub(crate) logical_command_count: u64,
-    pub(crate) response_count: u64,
-    pub(crate) submit_ns: u64,
-    pub(crate) response_ns: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
 pub(crate) struct RaftSnapshotBuildSample {
     pub(crate) streams: u64,
     pub(crate) body_bytes: u64,
@@ -497,13 +473,9 @@ impl RuntimeMetricsInner {
     }
 
     pub(crate) fn record_append(&self, core_id: CoreId, group_id: RaftGroupId) {
-        self.record_append_batch(core_id, group_id, 1);
-    }
-
-    pub(crate) fn record_append_batch(&self, core_id: CoreId, group_id: RaftGroupId, count: u64) {
-        self.per_core_appends[usize::from(core_id.0)].fetch_add_relaxed(count);
+        self.per_core_appends[usize::from(core_id.0)].fetch_add_relaxed(1);
         self.per_group_appends[usize::try_from(group_id.0).expect("u32 fits usize")]
-            .fetch_add_relaxed(count);
+            .fetch_add_relaxed(1);
     }
 
     pub(crate) fn record_applied_mutation(
@@ -512,20 +484,10 @@ impl RuntimeMetricsInner {
         group_id: RaftGroupId,
         apply_ns: u64,
     ) {
-        self.record_applied_mutation_batch(core_id, group_id, 1, apply_ns);
-    }
-
-    pub(crate) fn record_applied_mutation_batch(
-        &self,
-        core_id: CoreId,
-        group_id: RaftGroupId,
-        count: u64,
-        apply_ns: u64,
-    ) {
         let core_index = usize::from(core_id.0);
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
-        self.per_core_applied_mutations[core_index].fetch_add_relaxed(count);
-        self.per_group_applied_mutations[group_index].fetch_add_relaxed(count);
+        self.per_core_applied_mutations[core_index].fetch_add_relaxed(1);
+        self.per_group_applied_mutations[group_index].fetch_add_relaxed(1);
         self.per_core_mutation_apply_ns[core_index].fetch_add_relaxed(apply_ns);
         self.per_group_mutation_apply_ns[group_index].fetch_add_relaxed(apply_ns);
     }
@@ -588,34 +550,6 @@ impl RuntimeMetricsInner {
     pub(crate) fn record_group_mailbox_full(&self, group_id: RaftGroupId) {
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
         self.per_group_group_mailbox_full_events[group_index].fetch_add_relaxed(1);
-    }
-
-    pub(crate) fn record_raft_write_many(
-        &self,
-        core_id: CoreId,
-        group_id: RaftGroupId,
-        sample: RaftWriteManySample,
-    ) {
-        let core_index = usize::from(core_id.0);
-        let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
-        self.per_core_raft_write_many_batches[core_index].fetch_add_relaxed(1);
-        self.per_group_raft_write_many_batches[group_index].fetch_add_relaxed(1);
-        self.per_core_raft_write_many_commands[core_index].fetch_add_relaxed(sample.command_count);
-        self.per_group_raft_write_many_commands[group_index]
-            .fetch_add_relaxed(sample.command_count);
-        self.per_core_raft_write_many_logical_commands[core_index]
-            .fetch_add_relaxed(sample.logical_command_count);
-        self.per_group_raft_write_many_logical_commands[group_index]
-            .fetch_add_relaxed(sample.logical_command_count);
-        self.per_core_raft_write_many_responses[core_index]
-            .fetch_add_relaxed(sample.response_count);
-        self.per_group_raft_write_many_responses[group_index]
-            .fetch_add_relaxed(sample.response_count);
-        self.per_core_raft_write_many_submit_ns[core_index].fetch_add_relaxed(sample.submit_ns);
-        self.per_group_raft_write_many_submit_ns[group_index].fetch_add_relaxed(sample.submit_ns);
-        self.per_core_raft_write_many_response_ns[core_index].fetch_add_relaxed(sample.response_ns);
-        self.per_group_raft_write_many_response_ns[group_index]
-            .fetch_add_relaxed(sample.response_ns);
     }
 
     pub(crate) fn record_raft_apply_batch(
@@ -818,14 +752,6 @@ pub(crate) fn elapsed_ns(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-pub(crate) fn append_batch_payload_bytes(request: &AppendBatchRequest) -> u64 {
-    request
-        .payloads
-        .iter()
-        .map(|payload| u64::try_from(payload.len()).expect("payload len fits u64"))
-        .sum()
-}
-
 pub(crate) fn record_cold_backpressure_error(
     metrics: &RuntimeMetricsInner,
     placement: ShardPlacement,
@@ -949,7 +875,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 152] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 134] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -983,24 +909,6 @@ mod metric_manifest_tests {
         "per_group_group_mailbox_max_depth",
         "group_mailbox_full_events",
         "per_group_group_mailbox_full_events",
-        "raft_write_many_batches",
-        "per_core_raft_write_many_batches",
-        "per_group_raft_write_many_batches",
-        "raft_write_many_commands",
-        "per_core_raft_write_many_commands",
-        "per_group_raft_write_many_commands",
-        "raft_write_many_logical_commands",
-        "per_core_raft_write_many_logical_commands",
-        "per_group_raft_write_many_logical_commands",
-        "raft_write_many_responses",
-        "per_core_raft_write_many_responses",
-        "per_group_raft_write_many_responses",
-        "raft_write_many_submit_ns",
-        "per_core_raft_write_many_submit_ns",
-        "per_group_raft_write_many_submit_ns",
-        "raft_write_many_response_ns",
-        "per_core_raft_write_many_response_ns",
-        "per_group_raft_write_many_response_ns",
         "raft_apply_entries",
         "per_core_raft_apply_entries",
         "per_group_raft_apply_entries",

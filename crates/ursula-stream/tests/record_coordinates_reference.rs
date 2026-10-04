@@ -800,38 +800,6 @@ mod sparse_marks_differential {
             }
         }
 
-        /// RC-10 for append batches: one range per frame.
-        pub(super) fn append_batch(&mut self, frames: &[Vec<u64>]) {
-            let now_ms = self.tick();
-            let mut payloads = Vec::new();
-            let mut acks = Vec::new();
-            for frame in frames {
-                let before = self.oracle.next_offset();
-                acks.push(
-                    self.oracle
-                        .append_json(&body(frame, before), false, None)
-                        .unwrap(),
-                );
-                payloads.push(self.canonical_tail(before));
-            }
-            let refs = payloads.iter().map(Vec::as_slice).collect::<Vec<_>>();
-            let batch = self
-                .machine
-                .append_batch_borrowed(self.stream.clone(), Some(JSON), &refs, None, now_ms)
-                .expect("append batch");
-            assert_eq!(batch.items.len(), acks.len());
-            for (item, ack) in batch.items.iter().zip(acks) {
-                assert_eq!(item.next_offset, ack.next_offset);
-                assert_eq!(
-                    item.record_range,
-                    Some(StreamRecordRange {
-                        first_record: ack.record_start,
-                        next_record: ack.record_next,
-                    })
-                );
-            }
-        }
-
         /// RC-10 for external appends, which seal their own records when no
         /// hot bytes lie below them.
         pub(super) fn append_external(&mut self, sizes: &[u64]) {
@@ -1245,7 +1213,6 @@ mod sparse_marks_differential {
     enum Op {
         Inline { sizes: Vec<u64>, producer: bool },
         Retry,
-        Batch(Vec<Vec<u64>>),
         External(Vec<u64>),
         Flush(usize),
         Tidy,
@@ -1275,7 +1242,6 @@ mod sparse_marks_differential {
         prop_oneof![
             6 => (sizes(), any::<bool>()).prop_map(|(sizes, producer)| Op::Inline { sizes, producer }),
             1 => Just(Op::Retry),
-            2 => prop::collection::vec(sizes(), 1..4).prop_map(Op::Batch),
             2 => sizes().prop_map(Op::External),
             5 => prop_oneof![1_usize..64, 64_usize..4_096, 4_096_usize..(4 << 20)].prop_map(Op::Flush),
             1 => Just(Op::Tidy),
@@ -1299,7 +1265,6 @@ mod sparse_marks_differential {
         match op {
             Op::Inline { sizes, producer } => harness.append_inline(sizes, *producer, false),
             Op::Retry => harness.append_inline(&[], true, true),
-            Op::Batch(frames) => harness.append_batch(frames),
             Op::External(sizes) => harness.append_external(sizes),
             Op::Flush(max) => harness.flush(*max),
             Op::Tidy => harness.tidy(),

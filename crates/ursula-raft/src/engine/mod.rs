@@ -29,7 +29,6 @@ use openraft::rt::WatchReceiver;
 use openraft::storage::RaftLogStorage;
 use openraft::type_config::TypeConfigExt;
 use ursula_runtime::AdvanceRetentionRequest;
-use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::AppendTransactionRequest;
@@ -49,7 +48,6 @@ use ursula_runtime::DeleteStreamRequest;
 use ursula_runtime::FlushColdRequest;
 use ursula_runtime::GroupAckColdGcFuture;
 use ursula_runtime::GroupAdvanceRetentionFuture;
-use ursula_runtime::GroupAppendBatchFuture;
 use ursula_runtime::GroupAppendFuture;
 use ursula_runtime::GroupAppendTransactionFuture;
 use ursula_runtime::GroupBootstrapStreamFuture;
@@ -86,7 +84,6 @@ use ursula_runtime::GroupStateGaugesFuture;
 use ursula_runtime::GroupTidyStreamFuture;
 use ursula_runtime::GroupTidyStreamsFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
-use ursula_runtime::GroupWriteBatchFuture;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
@@ -125,7 +122,6 @@ use crate::forward::group_engine_client_write_error;
 use crate::forward::group_engine_forward_to_leader_error;
 use crate::forward::group_engine_leader_read_unavailable;
 use crate::forward::group_engine_linearizable_read_error;
-use crate::forward::write_commands_on_raft;
 use crate::forward::write_result_from_raft_response;
 use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RaftGroupLogStore;
@@ -138,7 +134,6 @@ use crate::types::UrsulaRaftTypeConfig;
 pub struct RaftGroupEngine {
     pub(crate) raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
     pub(crate) placement: ShardPlacement,
-    pub(crate) metrics: Option<GroupEngineMetrics>,
     pub(crate) cold_store: Option<ColdStoreHandle>,
     pub(crate) cold_index_cache: Option<Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>>,
 }
@@ -374,7 +369,7 @@ impl RaftGroupEngine {
         let snapshot_install = snapshot_install.unwrap_or_default();
         let mut state_machine = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
             placement,
-            metrics.clone(),
+            metrics,
             cold_store.clone(),
             snapshot_store,
             snapshot_build,
@@ -402,7 +397,6 @@ impl RaftGroupEngine {
         Ok(Self {
             raft,
             placement,
-            metrics,
             cold_store,
             cold_index_cache,
         })
@@ -521,19 +515,6 @@ impl RaftGroupEngine {
             }
         };
         write_result_from_raft_response(response.data)?
-    }
-
-    pub(crate) async fn write_commands(
-        &self,
-        commands: Vec<GroupWriteCommand>,
-    ) -> Result<Vec<Result<GroupWriteResponse, GroupEngineError>>, GroupEngineError> {
-        write_commands_on_raft(
-            self.raft.clone(),
-            self.placement,
-            self.metrics.clone(),
-            commands,
-        )
-        .await
     }
 
     pub(crate) async fn forward_write_to_leader_if_follower(
@@ -1729,107 +1710,6 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
-    fn append_batch<'a>(
-        &'a mut self,
-        request: AppendBatchRequest,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> GroupAppendBatchFuture<'a> {
-        Box::pin(async move {
-            let command = GroupWriteCommand::from(request.clone());
-            if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
-                return match response {
-                    GroupWriteResponse::AppendBatch(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected append batch write response: {other:?}"
-                    ))),
-                };
-            }
-            self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
-                .await?;
-            if admission.max_hot_bytes_per_group.is_some() {
-                self.with_state_machine({
-                    let request = request.clone();
-                    move |state_machine| {
-                        Box::pin(async move {
-                            state_machine
-                                .check_append_batch_cold_admission(request, placement, admission)
-                                .await
-                        })
-                    }
-                })
-                .await??;
-            }
-            let mut responses = self
-                .write_commands(vec![GroupWriteCommand::from(request)])
-                .await?;
-            let response = responses.pop().ok_or_else(|| {
-                GroupEngineError::new("OpenRaft append batch returned no response")
-            })?;
-            match response? {
-                GroupWriteResponse::AppendBatch(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected append batch write response: {other:?}"
-                ))),
-            }
-        })
-    }
-
-    fn append_batch_many<'a>(
-        &'a mut self,
-        requests: Vec<AppendBatchRequest>,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> GroupWriteBatchFuture<'a> {
-        if admission.max_hot_bytes_per_group.is_none() {
-            let commands = requests
-                .into_iter()
-                .map(GroupWriteCommand::from)
-                .collect::<Vec<_>>();
-            return self.write_batch(commands, placement);
-        }
-        Box::pin(async move {
-            if requests.is_empty() {
-                return Ok(Vec::new());
-            }
-            let command = GroupWriteCommand::Batch {
-                commands: requests.iter().cloned().map(StreamCommand::from).collect(),
-            };
-            if let Some(response) = self
-                .forward_write_to_leader_if_follower(command.clone())
-                .await?
-            {
-                return match response {
-                    GroupWriteResponse::Batch(responses) => Ok(responses),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected append batch many write response: {other:?}"
-                    ))),
-                };
-            }
-            self.with_state_machine({
-                let requests = requests.clone();
-                move |state_machine| {
-                    Box::pin(async move {
-                        state_machine
-                            .check_append_batch_many_cold_admission(requests, placement, admission)
-                            .await
-                    })
-                }
-            })
-            .await??;
-            let mut responses = self.write_commands(vec![command]).await?;
-            let response = responses.pop().ok_or_else(|| {
-                GroupEngineError::new("OpenRaft append batch many returned no response")
-            })?;
-            match response? {
-                GroupWriteResponse::Batch(responses) => Ok(responses),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected append batch many write response: {other:?}"
-                ))),
-            }
-        })
-    }
-
     fn flush_cold<'a>(
         &'a mut self,
         request: FlushColdRequest,
@@ -1977,14 +1857,6 @@ impl GroupEngine for RaftGroupEngine {
             }
             result
         })
-    }
-
-    fn write_batch<'a>(
-        &'a mut self,
-        commands: Vec<GroupWriteCommand>,
-        _placement: ShardPlacement,
-    ) -> GroupWriteBatchFuture<'a> {
-        Box::pin(async move { self.write_commands(commands).await })
     }
 
     fn snapshot<'a>(&'a mut self, _placement: ShardPlacement) -> GroupSnapshotFuture<'a> {

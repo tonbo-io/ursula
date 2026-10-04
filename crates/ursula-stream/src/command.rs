@@ -62,13 +62,6 @@ pub enum StreamCommand {
         now_ms: u64,
         record_match: Option<u64>,
     },
-    AppendBatch {
-        stream_id: BucketStreamId,
-        content_type: Option<String>,
-        payloads: Vec<Bytes>,
-        producer: Option<ProducerRequest>,
-        now_ms: u64,
-    },
     PublishSnapshot {
         stream_id: BucketStreamId,
         snapshot_offset: u64,
@@ -218,10 +211,6 @@ impl StreamCommand {
             Self::Append { payload, .. } | Self::PublishSnapshot { payload, .. } => {
                 len_u64(payload.len())
             }
-            Self::AppendBatch { payloads, .. } => payloads
-                .iter()
-                .map(|payload| len_u64(payload.len()).saturating_add(8))
-                .fold(0, u64::saturating_add),
             Self::FlushCold { .. } => CHUNK_REF_LOG_BYTES,
             Self::CompactCold { old_chunks, .. } => len_u64(old_chunks.len())
                 .saturating_add(1)
@@ -259,11 +248,6 @@ impl fmt::Display for StreamCommand {
                 "append_external:{stream_id}:{} bytes",
                 payload.payload_len
             ),
-            Self::AppendBatch {
-                stream_id,
-                payloads,
-                ..
-            } => write!(f, "append_batch:{stream_id}:{} items", payloads.len()),
             Self::PublishSnapshot {
                 stream_id,
                 snapshot_offset,

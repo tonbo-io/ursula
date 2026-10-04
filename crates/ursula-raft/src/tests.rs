@@ -33,7 +33,6 @@ use openraft::testing::log::Suite;
 use openraft::type_config::TypeConfigExt;
 use openraft::vote::RaftLeaderId;
 use ursula_control::ControlCommand;
-use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::AppendTransactionRequest;
 use ursula_runtime::BootstrapStreamRequest;
@@ -428,16 +427,19 @@ fn create_stream_command(name: &str) -> GroupWriteCommand {
 
 #[test]
 fn raft_group_command_round_trips_through_wire_codec() {
-    let command = GroupWriteCommand::Stream(ursula_stream::StreamCommand::AppendBatch {
+    let command = GroupWriteCommand::Stream(ursula_stream::StreamCommand::Append {
         stream_id: bsid("shared-wire-log"),
         content_type: Some("application/octet-stream".to_owned()),
-        payloads: vec![b"ab".to_vec().into(), b"cd".to_vec().into()],
+        payload: b"abcd".to_vec().into(),
+        close_after: false,
+        stream_seq: None,
         producer: Some(ProducerRequest {
             producer_id: "writer-1".to_owned(),
             producer_epoch: 7,
             producer_seq: 42,
         }),
         now_ms: 123,
+        record_match: None,
     });
 
     let encoded = encode_wire(&command);
@@ -2132,58 +2134,6 @@ async fn raft_group_engine_implements_runtime_group_engine_over_openraft() {
 }
 
 #[tokio::test]
-async fn raft_group_engine_applies_batched_runtime_writes() {
-    let mut engine = RaftGroupEngine::new_single_node(placement())
-        .await
-        .expect("create raft group engine");
-    let stream_id = bsid("raft-group-engine-batch");
-
-    let responses = engine
-        .write_batch(
-            vec![
-                create_command(stream_id.clone()),
-                GroupWriteCommand::from(AppendBatchRequest::new(stream_id.clone(), vec![
-                    b"ab".to_vec(),
-                    b"cd".to_vec(),
-                ])),
-            ],
-            placement(),
-        )
-        .await
-        .expect("write batch through group engine");
-
-    assert_eq!(responses.len(), 2);
-    assert!(matches!(
-        &responses[0],
-        Ok(GroupWriteResponse::CreateStream(response)) if response.group_commit_index == 1
-    ));
-    match &responses[1] {
-        Ok(GroupWriteResponse::AppendBatch(response)) => {
-            assert_eq!(response.items.len(), 2);
-            assert_eq!(
-                response.items[0].as_ref().expect("first item").start_offset,
-                0
-            );
-            assert_eq!(
-                response.items[1]
-                    .as_ref()
-                    .expect("second item")
-                    .start_offset,
-                2
-            );
-        }
-        other => panic!("unexpected append batch response: {other:?}"),
-    }
-
-    let read = engine
-        .read_stream(read_req(stream_id, 16), placement())
-        .await
-        .expect("read batched write");
-    assert_eq!(read.payload, b"abcd");
-    engine.shutdown().await.expect("shutdown raft group engine");
-}
-
-#[tokio::test]
 async fn raft_group_engine_commits_append_transaction_as_one_entry_and_rolls_back_failures() {
     let mut engine = RaftGroupEngine::new_single_node(placement())
         .await
@@ -2259,148 +2209,6 @@ async fn raft_group_engine_commits_append_transaction_as_one_entry_and_rolls_bac
     assert_eq!(journal_read.payload, b"journal");
     assert_eq!(queue_read.payload, b"queue");
     engine.shutdown().await.expect("shutdown raft group engine");
-}
-
-#[tokio::test]
-async fn raft_group_engine_cold_admission_coalesces_append_batch_many_into_one_raft_entry() {
-    let mut engine = RaftGroupEngine::new_single_node(placement())
-        .await
-        .expect("create raft group engine");
-    let stream_id = bsid("raft-group-engine-cold-batch-many");
-
-    engine
-        .create_stream(
-            CreateStreamRequest::new(stream_id.clone(), "application/octet-stream"),
-            placement(),
-            ColdWriteAdmission::default(),
-        )
-        .await
-        .expect("create stream");
-    let before_batch_log_index = engine
-        .raft_handle()
-        .metrics()
-        .borrow_watched()
-        .last_log_index
-        .expect("create stream should append a raft log entry");
-
-    let responses = engine
-        .append_batch_many(
-            vec![
-                AppendBatchRequest::new(stream_id.clone(), vec![b"ab".to_vec()]),
-                AppendBatchRequest::new(stream_id.clone(), vec![b"cd".to_vec()]),
-                AppendBatchRequest::new(stream_id.clone(), vec![b"ef".to_vec()]),
-            ],
-            placement(),
-            ColdWriteAdmission {
-                max_hot_bytes_per_group: Some(1024 * 1024),
-            },
-        )
-        .await
-        .expect("append batch many with cold admission");
-
-    assert_eq!(responses.len(), 3);
-    for (index, response) in responses.into_iter().enumerate() {
-        match response.expect("append batch response") {
-            GroupWriteResponse::AppendBatch(response) => {
-                assert_eq!(response.items.len(), 1);
-                let item = response.items[0].as_ref().expect("append batch item");
-                assert_eq!(item.start_offset, u64::try_from(index * 2).unwrap());
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
-    }
-
-    let after_batch_log_index = engine
-        .raft_handle()
-        .metrics()
-        .borrow_watched()
-        .last_log_index
-        .expect("append batch should append a raft log entry");
-    assert_eq!(after_batch_log_index, before_batch_log_index + 1);
-
-    let read = engine
-        .read_stream(read_req(stream_id, 16), placement())
-        .await
-        .expect("read coalesced append batches");
-    assert_eq!(read.payload, b"abcdef");
-    engine.shutdown().await.expect("shutdown raft group engine");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn raft_metrics_count_logical_commands_inside_coalesced_batches() {
-    let runtime = ShardRuntime::spawn_with_engine_factory(
-        RuntimeConfig::new(1, 1).with_cold_max_hot_bytes_per_group(Some(1024 * 1024)),
-        RaftGroupEngineFactory,
-    )
-    .expect("spawn raft runtime");
-    let stream_id = bsid("raft-logical-command-metrics");
-
-    runtime
-        .create_stream(create_req(stream_id.clone()))
-        .await
-        .expect("create stream");
-    let before = runtime.metrics().snapshot();
-
-    let first = {
-        let runtime = runtime.clone();
-        let stream_id = stream_id.clone();
-        tokio::spawn(async move {
-            runtime
-                .append_batch(AppendBatchRequest::new(stream_id, vec![b"ab".to_vec()]))
-                .await
-                .expect("first append batch")
-        })
-    };
-    let second = {
-        let runtime = runtime.clone();
-        let stream_id = stream_id.clone();
-        tokio::spawn(async move {
-            runtime
-                .append_batch(AppendBatchRequest::new(stream_id, vec![b"cd".to_vec()]))
-                .await
-                .expect("second append batch")
-        })
-    };
-    let third = {
-        let runtime = runtime.clone();
-        let stream_id = stream_id.clone();
-        tokio::spawn(async move {
-            runtime
-                .append_batch(AppendBatchRequest::new(stream_id, vec![b"ef".to_vec()]))
-                .await
-                .expect("third append batch")
-        })
-    };
-
-    first.await.expect("first task");
-    second.await.expect("second task");
-    third.await.expect("third task");
-
-    let after = runtime.metrics().snapshot();
-    assert_eq!(
-        after.raft_write_many_commands - before.raft_write_many_commands,
-        after.raft_write_many_batches - before.raft_write_many_batches
-    );
-    assert_eq!(
-        after.raft_write_many_logical_commands - before.raft_write_many_logical_commands,
-        3
-    );
-    assert!(
-        after.raft_write_many_logical_commands >= after.raft_write_many_commands,
-        "logical command count should include commands nested in Batch"
-    );
-
-    let read = runtime
-        .read_stream(read_req(stream_id, 16))
-        .await
-        .expect("read appended batches");
-    let mut chunks = read
-        .payload
-        .chunks_exact(2)
-        .map(Vec::from)
-        .collect::<Vec<_>>();
-    chunks.sort();
-    assert_eq!(chunks, vec![b"ab".to_vec(), b"cd".to_vec(), b"ef".to_vec()]);
 }
 
 #[tokio::test]

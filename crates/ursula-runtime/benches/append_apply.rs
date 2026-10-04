@@ -35,7 +35,6 @@ fn append_apply_benches(c: &mut Criterion) {
     for scenario in [
         AppendScenario::SingleStream,
         AppendScenario::ManyStreams,
-        AppendScenario::AppendBatch,
         AppendScenario::ProducerDedup,
         AppendScenario::SnapshotCompaction,
     ] {
@@ -245,7 +244,6 @@ fn setup_record_machine(record_count: usize) -> (StreamStateMachine, BucketStrea
 enum AppendScenario {
     SingleStream,
     ManyStreams,
-    AppendBatch,
     ProducerDedup,
     SnapshotCompaction,
 }
@@ -255,7 +253,6 @@ impl AppendScenario {
         match self {
             Self::SingleStream => "single_stream_append",
             Self::ManyStreams => "many_streams_append",
-            Self::AppendBatch => "single_stream_append_batch_16",
             Self::ProducerDedup => "producer_dedup_retry",
             Self::SnapshotCompaction => "snapshot_compaction_setsums",
         }
@@ -266,7 +263,6 @@ fn setup_machine(scenario: &AppendScenario) -> StreamStateMachine {
     let stream_count = match scenario {
         AppendScenario::ManyStreams => STREAM_COUNT,
         AppendScenario::SingleStream
-        | AppendScenario::AppendBatch
         | AppendScenario::ProducerDedup
         | AppendScenario::SnapshotCompaction => 1,
     };
@@ -301,7 +297,6 @@ fn run_appends(machine: &mut StreamStateMachine, scenario: &AppendScenario, payl
     match scenario {
         AppendScenario::SingleStream => append_single_stream(machine, payload),
         AppendScenario::ManyStreams => append_many_streams(machine, payload),
-        AppendScenario::AppendBatch => append_batch(machine, payload),
         AppendScenario::ProducerDedup => producer_dedup(machine, payload),
         AppendScenario::SnapshotCompaction => snapshot_compaction(machine, payload),
     }
@@ -330,25 +325,6 @@ fn append_many_streams(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 
             bytes::Bytes::copy_from_slice(payload),
             None,
         );
-    }
-    tail
-}
-
-fn append_batch(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 {
-    let stream_id = stream_id(0);
-    let payloads = vec![bytes::Bytes::copy_from_slice(payload); 16];
-    let mut tail = 0u64;
-    for _ in 0..(APPENDS_PER_ITER / payloads.len()) {
-        tail = match machine.apply(StreamCommand::AppendBatch {
-            stream_id: stream_id.clone(),
-            content_type: Some(CONTENT_TYPE.to_owned()),
-            payloads: payloads.clone(),
-            producer: None,
-            now_ms: 0,
-        }) {
-            StreamResponse::Appended { next_offset, .. } => next_offset,
-            response => panic!("append batch failed: {response:?}"),
-        };
     }
     tail
 }

@@ -22,7 +22,6 @@ use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
 use serde::Deserialize;
 use serde::Serialize;
-use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::AppendTransactionRequest;
 use ursula_runtime::BootstrapStreamRequest;
@@ -574,56 +573,6 @@ impl RaftGroupStateMachine {
             &request.stream_id,
             admission,
             u64::try_from(request.payload.len()).expect("payload len fits u64"),
-        )?;
-        Ok(())
-    }
-
-    pub async fn check_append_batch_cold_admission(
-        &mut self,
-        request: AppendBatchRequest,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> Result<(), GroupEngineError> {
-        let _ = placement;
-        let incoming_bytes = request
-            .payloads
-            .iter()
-            .map(|payload| u64::try_from(payload.len()).expect("payload len fits u64"))
-            .sum();
-        self.engine.check_cold_write_admission(
-            &request.stream_id,
-            admission,
-            incoming_bytes,
-            u64::try_from(request.payloads.len()).unwrap_or(u64::MAX),
-        )?;
-        Ok(())
-    }
-
-    pub async fn check_append_batch_many_cold_admission(
-        &mut self,
-        requests: Vec<AppendBatchRequest>,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> Result<(), GroupEngineError> {
-        let _ = placement;
-        if requests.is_empty() {
-            return Ok(());
-        }
-        let stream_id = requests[0].stream_id.clone();
-        let incoming_bytes = requests
-            .iter()
-            .flat_map(|request| request.payloads.iter())
-            .map(|payload| u64::try_from(payload.len()).expect("payload len fits u64"))
-            .sum();
-        let incoming_records = requests
-            .iter()
-            .map(|request| u64::try_from(request.payloads.len()).unwrap_or(u64::MAX))
-            .fold(0u64, u64::saturating_add);
-        self.engine.check_cold_write_admission(
-            &stream_id,
-            admission,
-            incoming_bytes,
-            incoming_records,
         )?;
         Ok(())
     }

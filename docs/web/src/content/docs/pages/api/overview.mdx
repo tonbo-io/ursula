@@ -21,7 +21,6 @@ There is no bucket metadata read, stream listing, or bucket delete. Removing a b
 | -------- | ----------------------------- | ------------------------------------------------------------ |
 | `PUT` | `/{bucket}/{stream}` | [Create a stream](/docs/api/create-stream) |
 | `POST` | `/{bucket}/{stream}` | [Append data or close](/docs/api/append) |
-| `POST` | `/{bucket}/{stream}/append-batch` | Batched append. See [extensions spec](/docs/specs/extensions#4-append-batch) |
 | `GET` | `/{bucket}/{stream}` | [Read (catch-up, long-poll, SSE)](/docs/api/read) |
 | `HEAD` | `/{bucket}/{stream}` | [Get stream metadata](/docs/api/head-stream) |
 | `DELETE` | `/{bucket}/{stream}` | [Delete a stream](/docs/api/delete-stream) |

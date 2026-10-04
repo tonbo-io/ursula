@@ -777,9 +777,10 @@ fn runtime_raft_network_delay_snapshot_purge_probe() {
                             madsim::time::sleep(Duration::from_millis((append_id % 8) * 3)).await;
                         }
                         runtime
-                            .append_batch(AppendBatchRequest::new(stream, vec![
+                            .append(AppendRequest::from_bytes(
+                                stream,
                                 format!("delay-{append_id};").into_bytes(),
-                            ]))
+                            ))
                             .await
                     }));
                 }
@@ -820,17 +821,7 @@ fn runtime_raft_network_delay_snapshot_purge_probe() {
                         .expect("diagnostic delayed append task timed out")
                         .expect("diagnostic delayed append task panicked");
                     match joined {
-                        Ok(batch) => match batch.items.into_iter().collect::<Result<Vec<_>, _>>() {
-                            Ok(items) => successful_items += items.len(),
-                            Err(err) => {
-                                let err = format!("{err:?}");
-                                assert!(
-                                    !err.contains("panicked"),
-                                    "OpenRaft panicked during delayed append item: {err}"
-                                );
-                                nonfatal_errors += 1;
-                            }
-                        },
+                        Ok(_) => successful_items += 1,
                         Err(err) => {
                             let err = format!("{err:?}");
                             assert!(
@@ -862,9 +853,9 @@ fn runtime_raft_network_delay_snapshot_purge_probe() {
                     .expect("diagnostic current leader raft handle");
                 let probe_payload = format!("after-delay-{sim_seed}-{delay_ms};").into_bytes();
                 let probe = leader_raft
-                    .client_write(GroupWriteCommand::from(AppendBatchRequest::new(
+                    .client_write(GroupWriteCommand::from(AppendRequest::from_bytes(
                         stream,
-                        vec![probe_payload],
+                        probe_payload,
                     )))
                     .await;
                 if let Err(err) = probe {
@@ -1583,8 +1574,8 @@ fn expect_runtime_raft_network_workload(
 
 fn assert_minimized_runtime_raft_workload_plan(plan: &RuntimeRaftNetworkWorkloadPlan) {
     assert_eq!(plan.stream_count, 1);
-    assert_eq!(plan.append_batch_lens, vec![1]);
-    assert_eq!(plan.failover_batch_lens, vec![1]);
+    assert_eq!(plan.append_payload_counts, vec![1]);
+    assert_eq!(plan.failover_payload_counts, vec![1]);
     assert!(!plan.producer_sessions);
     assert!(!plan.producer_epoch_bumps);
     assert!(!plan.concurrent_producers);

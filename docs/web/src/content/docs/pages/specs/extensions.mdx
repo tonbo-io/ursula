@@ -10,7 +10,7 @@ title: "Durable Streams Extensions"
 
 ## Abstract
 
-This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, optional path affinity, snapshot and bootstrap semantics, multipart bootstrap delivery, Ursula-specific append batching for high-throughput small-event writes, stable record coordinates for JSON streams, a JSON message text rule, and read path parameters.
+This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, optional path affinity, snapshot and bootstrap semantics, multipart bootstrap delivery, stable record coordinates for JSON streams, a JSON message text rule, and read path parameters.
 
 The snapshot and bootstrap design in sections 2 and 3 is based on a proposal by [Loro](https://loro.dev/). Ursula implements part of it: there is no latest-snapshot redirect, no snapshot deletion and no conditional publish.
 
@@ -27,7 +27,6 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 - [1. Buckets](#1-buckets)
 - [2. Snapshots](#2-snapshots)
 - [3. Bootstrap](#3-bootstrap)
-- [4. Append Batch](#4-append-batch)
 - [6. JSON Record Coordinates](#6-json-record-coordinates)
 - [7. Ordinary SSE Compatibility](#7-ordinary-sse-compatibility)
 - [8. URL Encoding](#8-url-encoding)
@@ -55,9 +54,9 @@ This document registers the following extension tokens:
 
 This section defines the "normalized message" that the base protocol's JSON mode refers to. It is a storage rule, not an optional extension, and has no extension token. A server MUST apply it to every stream whose content type is `application/json` (with or without parameters).
 
-It applies to every JSON write: the body of a creating `PUT`, the body of `POST`, each Append Batch frame (Section 4), and each `$transaction` operation whose content type is JSON (Section 1.8). It applies to every read representation: the default NDJSON view, the record envelope view (Section 6.8), SSE, and bootstrap parts (Section 3).
+It applies to every JSON write: the body of a creating `PUT`, the body of `POST`, and each `$transaction` operation whose content type is JSON (Section 1.8). It applies to every read representation: the default NDJSON view, the record envelope view (Section 6.8), SSE, and bootstrap parts (Section 3).
 
-1. The server MUST validate each request body (each frame or operation payload, for Append Batch and `$transaction`) as JSON text per [RFC8259]. `\uXXXX` escapes that encode unpaired surrogates are valid.
+1. The server MUST validate each request body (each operation payload, for `$transaction`) as JSON text per [RFC8259]. `\uXXXX` escapes that encode unpaired surrogates are valid.
 2. After top-level array flattening, the server MUST store each message as the original text with insignificant whitespace removed, followed by one LF (U+000A). Insignificant whitespace is U+0020, U+0009, U+000A and U+000D outside string literals. The server MUST NOT reorder object members, drop or merge duplicate member names, or rewrite number or string literal text.
 3. The nesting depth of a scalar is 0. The depth of an array or object is 1 plus the maximum depth of its elements or member values; an empty array or object has depth 1. A message whose depth exceeds 127 MUST be rejected with `400 Bad Request`. Depth is measured per message, after flattening, so a top-level array body may be one level deeper than its deepest message.
 4. A body with invalid JSON or invalid UTF-8 MUST be rejected with `400 Bad Request`, and no message from that request is committed.
@@ -365,78 +364,6 @@ Bootstrap is one-shot only:
 
 ---
 
-## 4. Append Batch
-
-Append Batch is an Ursula-specific implementation extension. It is not part of the base Durable Streams Protocol and clients MUST NOT assume it exists on other Durable Streams servers.
-
-The extension reduces HTTP request overhead for workloads that append many small independent records. It is a transport batching mechanism only: each frame in the request is committed as an independent logical append with its own acknowledgement. Servers MUST NOT concatenate the frames into one stream record.
-
-### 4.1. Request
-
-Bucketed Ursula route:
-
-```
-POST /{bucket_id}/{stream_id}/append-batch
-```
-
-The request `Content-Type` applies to every frame and MUST match the stream's configured content type.
-
-The request body is a sequence of binary frames:
-
-```
-uint32_be payload_len
-payload bytes
-uint32_be payload_len
-payload bytes
-...
-```
-
-`payload_len` is a 32-bit unsigned integer encoded in network byte order. It is the number of payload bytes that immediately follow. Zero-length frames are invalid.
-
-Ursula currently accepts at most 512 frames per public append-batch request and a 32 MiB total body. Servers MAY reject larger batches with `413 Payload Too Large`.
-
-### 4.2. Unsupported Per-Append Controls
-
-The current Ursula append-batch endpoint does not support controls that require per-frame headers:
-
-- `Stream-Closed`
-- `Producer-Id`, `Producer-Epoch`, `Producer-Seq`
-- `Stream-Record-Match`
-- `Stream-Seq`
-
-Clients that need producer fencing, idempotent producer sequence checks, stream preconditions, or atomic stream close MUST use the standard `POST {stream_url}` append operation.
-
-### 4.3. Response
-
-On a syntactically valid batch request, the response is `200 OK` with a JSON array. The array order matches the request frame order. Each element acknowledges one logical append:
-
-```json
-[
-  { "status": 204, "stream_next_offset": 3 },
-  { "status": 204, "stream_next_offset": 6 }
-]
-```
-
-Acknowledgement fields:
-
-- `status`: HTTP status code for the frame-level logical append.
-- `stream_next_offset`: Present when the frame append succeeds or when an error can report the stream tail.
-- `stream_closed`: Present and `true` if the append observes a closed stream.
-- `error_code`: Present for failed frame-level appends.
-- `error`: Human-readable failure detail for failed frame-level appends.
-
-Malformed framing, missing `Content-Type`, unsupported headers, or an oversized request MAY fail the entire HTTP request with `400 Bad Request` or `413 Payload Too Large`.
-
-Frame-level failures are reported inside the JSON array. A successful outer `200 OK` does not mean every frame committed. Clients MUST inspect every acknowledgement.
-
-### 4.4. Ordering and Compatibility
-
-Frames are submitted in request order and response acknowledgements preserve that order. For a single stream, successful frames advance the same stream offsets that standard `POST {stream_url}` would have produced.
-
-All standard stream read APIs remain unchanged. Data appended through Append Batch is read through ordinary `GET`, long-poll, SSE, snapshot, and bootstrap paths using the same offsets and content type rules as standard appends.
-
----
-
 ## 6. JSON Record Coordinates
 
 The JSON Record Coordinates extension adds a stable logical message coordinate to streams configured with `Content-Type: application/json`. It is a pure superset of the base protocol: offsets remain the canonical exact-resume cursor, ordinary offset reads remain byte-oriented, and clients that do not understand record coordinates continue to operate unchanged.
@@ -639,15 +566,6 @@ Retention MUST advance `F` only at a record boundary. A trimmed ordinal MUST ret
 When a snapshot advances the earliest retained offset, that offset MUST map to one record boundary. Snapshot publication at an intra-record offset MUST return `400 Bad Request`. Snapshot and bootstrap responses SHOULD include `Stream-Record-First` and `Stream-Record-Next` when the underlying stream implements this extension. Bootstrap update parts MUST preserve one logical JSON message per update part.
 
 Implementations MAY reclaim ordinal index entries only after the corresponding records fall before `F` and are no longer required by a visible snapshot or bootstrap response.
-
-### 6.11. Append Batch Integration
-
-For JSON streams implementing this extension, each successful Append Batch frame receives its own contiguous record range. Frame acknowledgements defined in Section 4.3 MUST additionally include:
-
-- `stream_record_start`;
-- `stream_record_next`.
-
-One outer Append Batch request remains transport batching, not an atomic multi-frame transaction. A failed frame assigns no visible record ordinal; successful later frames continue from the last committed record tail.
 
 ### 6.12. Compatibility and Non-Goals
 

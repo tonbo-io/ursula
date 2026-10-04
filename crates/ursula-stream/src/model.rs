@@ -116,27 +116,6 @@ pub(crate) struct ProducerState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamBatchAppend {
-    pub items: Vec<StreamBatchAppendItem>,
-    pub deduplicated: bool,
-    /// A duplicate whose receipt the stream's receipt window evicted (F3,
-    /// feature level 1): deduplicated without per-frame ranges, so `items`
-    /// is empty.
-    pub receipt_evicted: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamBatchAppendItem {
-    pub offset: u64,
-    pub next_offset: u64,
-    pub closed: bool,
-    pub deduplicated: bool,
-    /// Records of this frame, as apply computed them (stored receipt for a
-    /// duplicate). `None` on streams without record coordinates.
-    pub record_range: Option<crate::StreamRecordRange>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamRead {
     pub offset: u64,
     pub next_offset: u64,
