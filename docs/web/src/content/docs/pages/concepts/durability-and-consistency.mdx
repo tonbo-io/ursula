@@ -27,14 +27,15 @@ with `Retry-After` instead of serving its stale state. The confirmation costs
 one round trip to the voters per read. A leader that misses a confirmation under
 load retries it for up to one election timeout before it answers `503`, so a
 client should retry a `503` after `Retry-After`. It is not a live-read mode; long-poll
-and SSE already have leader-owned watcher semantics.
+and SSE already have leader-owned watcher semantics. The [Read path](/docs/specs/extensions#92-leader-consistency)
+section of the extensions specification states this contract normatively.
 
 `HEAD`, `GET …/bootstrap`, snapshot reads, the registration of a long-poll
 or SSE reader, and requests that resolve the tail through `HEAD`
 (`offset=now`, SSE start, and a long-poll's timeout answer) take the same leadership
 confirmation on the leader.
 
-`Stream-Up-To-Date` on each read tells the client whether more committed data exists past `next_offset`. `false` means keep paging.
+With `consistency=leader`, `Stream-Up-To-Date: true` on a read means it reached the committed tail. On a local read it means the tail as the serving node knew it: a leader that has lost leadership without knowing it yet can mark a stale tail. A response without it is partial; keep reading from `Stream-Next-Offset`.
 
 ## Availability and durability (standard layout)
 

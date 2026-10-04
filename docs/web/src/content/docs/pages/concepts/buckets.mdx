@@ -15,7 +15,7 @@ A collaborative editing app might use one bucket per workspace, with one stream 
 
 Bucket IDs match the regex `[a-z0-9_-]{4,64}`: 4–64 bytes, lowercase ASCII letters and digits plus `_` and `-`. Uppercase letters, `/`, `.`, and most punctuation are rejected with `400`.
 
-The combined bucket-plus-stream URL path also has a 122-byte ceiling. With a 64-byte bucket name, you have 58 bytes left for the stream ID.
+The combined bucket-plus-stream URL path also has a 122-byte ceiling. With a 64-byte bucket name, you have 57 bytes left for the stream ID.
 
 ## Lifecycle
 

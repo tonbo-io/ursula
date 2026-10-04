@@ -13,7 +13,7 @@ A workspace app might use `/workspace-a/doc-123`. An agent system might use `/ag
 
 ## Content type
 
-A stream's content type is set on creation (PUT) or on first append (POST) and defaults to `application/octet-stream` if no `Content-Type` header is supplied. Subsequent appends must declare the same content type, or the server rejects them with `409`. The content type rides along on reads so clients can dispatch on it without inspecting payloads.
+A stream's content type is set when it is created with `PUT` and defaults to `application/octet-stream` if no `Content-Type` header is supplied. `POST` never creates a stream: an append to a stream that does not exist answers `404`. Subsequent appends must declare the same content type, or the server rejects them with `409`. The content type rides along on reads so clients can dispatch on it without inspecting payloads.
 
 ## Lifecycle
 

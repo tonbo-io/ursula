@@ -16,7 +16,11 @@ api: "HEAD /{bucket}/{stream}"
 | Status | Meaning |
 | ------ | ------------------------------------------------------ |
 | `200` | Stream found. |
+| `307` | In a cluster, this node could not answer as the stream's group leader. `Location` is the same request on the leader. |
 | `404` | Stream not found or expired. |
+| `503` | The group has no known leader, or the leader could not confirm its leadership in time. Retry after `Retry-After`. |
+
+`HEAD` is linearizable: the leader confirms with a majority of voters that it still leads before it answers, so the response reflects every append acknowledged before the request started. See [Durability and consistency](/docs/concepts/durability-and-consistency#consistency).
 
 Response headers include:
 
@@ -25,11 +29,14 @@ Response headers include:
 | `Content-Type` | The stream's content type. |
 | `Stream-Next-Offset` | The stream's tail: the offset the next append starts at. |
 | `Stream-Closed` | Present and `true` if the stream is closed. |
-| `Stream-Snapshot-Offset` | Present if a snapshot exists, showing its offset. |
+| `Stream-Retained-Offset` | The earliest offset still readable. Reads below it answer `410 Gone`. Before any [retention](/docs/concepts/snapshots) advance, it is the start of the stream. |
+| `Stream-Snapshot-Offset` | The offset of the latest snapshot. Absent when the stream has no snapshot. Read the snapshot with [`GET …/snapshot/{offset}`](/docs/api/read-snapshot). |
+| `Stream-Snapshot-Digest` | The digest of the latest snapshot's content type and body, as its publish returned it. Present with `Stream-Snapshot-Offset`. |
 | `Stream-Incarnation` | An opaque token for this incarnation of the stream. It changes when the stream is deleted and recreated at the same URL; compare it only for equality. |
 | `Stream-TTL` | The configured TTL in seconds (if a TTL was set). This is the sliding window length, not the time remaining. `HEAD` does not renew it. |
 | `Stream-Expires-At` | Expiration timestamp (if set). |
 | `Cache-Control` | `no-store`. |
+| `Stream-Cold-Hot-Start-Offset` | Diagnostic and unstable: may change or disappear in any release. Data below this offset has been flushed to cold storage. |
 
 For an `application/json` stream implementing Record Coordinates, `HEAD` also includes:
 

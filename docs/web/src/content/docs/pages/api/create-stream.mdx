@@ -8,7 +8,7 @@ api: "PUT /{bucket}/{stream}"
 </ParamField>
 
 <ParamField path="stream" type="string" required>
- Stream ID within the bucket. Cannot contain `\0` and segments cannot equal `..`. Note: Ursula does not currently enforce the Durable Streams Protocol's 122-byte stream-ID ceiling - clients should still respect it for conformance.
+ Stream ID within the bucket: 1 to 122 bytes, without `/`, `\0` or `..`, and `{bucket}/{stream}` together at most 122 bytes. `streams` is reserved. An invalid ID answers `400`.
 </ParamField>
 
 <ParamField header="Content-Type" type="string">
@@ -28,7 +28,7 @@ api: "PUT /{bucket}/{stream}"
 </ParamField>
 
 <ParamField header="Stream-Seq" type="string">
- Client-supplied monotonic sequence token. Rejects creates whose `Stream-Seq` is not lexicographically greater than the previous value seen for this stream.
+ Seeds the stream's stored `Stream-Seq`: later appends that carry `Stream-Seq` must be bytewise greater than it. A create never checks it, and a `PUT` that finds the stream already there ignores it. See [how `Stream-Seq` is checked](/docs/concepts/conditional-writes#how-stream-seq-is-checked).
 </ParamField>
 
 <ParamField header="Producer-Id" type="string">
@@ -55,7 +55,7 @@ api: "PUT /{bucket}/{stream}"
 | `200` | Stream already exists (idempotent). |
 | `400` | Invalid bucket ID, invalid stream ID (including a reserved name such as `snapshot` under an affinity path), invalid headers, or bad JSON payload. |
 | `404` | The bucket was purged; its ID is permanently fenced. |
-| `409` | Stream already exists with different content type, or sequence conflict. |
+| `409` | Stream already exists with a different content type, closed state or lifetime, or `Producer-Seq` is not `0`. |
 
 Response headers include `Location`, `Content-Type`, `Stream-Next-Offset`, and lifetime headers (`Stream-TTL` / `Stream-Expires-At`) when set. `Stream-Closed: true` is set if the create request also closed the stream. `ETag` is set on reads only.
 
@@ -80,7 +80,7 @@ curl -X PUT http://127.0.0.1:4437/demo/ephemeral \
 </RequestExample>
 
 <Note>
-If a stream with the same ID already exists and has identical configuration, the response is `200 OK` (idempotent). If the existing stream differs in content type, closed state, or retention, the response is `409 Conflict`.
+If a stream with the same ID already exists and has identical configuration, the response is `200 OK` (idempotent). If the existing stream differs in content type, closed state, TTL or expiry, the response is `409 Conflict`. A `PUT` answered `200` ignores its body and its `Stream-Seq`.
 </Note>
 
 <Info>

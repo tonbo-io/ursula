@@ -3,33 +3,71 @@ title: Conditional Writes
 sidebarTitle: Conditional Writes
 ---
 
-Writers appending to the same stream sometimes need coordination. Ursula supports two complementary request-header guards without introducing locks or cross-stream transactions.
+Writers that share a stream sometimes need to say "append this only if the stream is still what I read." Ursula does this with the base protocol's `Stream-Seq` header, which is a compare-and-set on a value the writers choose. There are no locks and no cross-stream transactions.
 
-## Stream-Seq
+## How `Stream-Seq` is checked
 
-`Stream-Seq` is a client-supplied monotonic sequence token. The server tracks the last accepted value per stream and rejects any append whose `Stream-Seq` is not lexicographically greater than the previous one.
+- Each stream stores the last accepted `Stream-Seq`. An append that carries `Stream-Seq` is accepted only when its value is strictly greater than the stored one, and the value is then stored.
+- The comparison is bytewise, not numeric: `"10"` sorts before `"9"`. Use fixed-width values, such as a counter zero-padded to 20 digits.
+- Values must be printable ASCII. A header with any other byte is ignored: the append is not checked and nothing is stored.
+- An equal or smaller value answers `409 Conflict`, and nothing from the request is committed. The `409` carries `Stream-Next-Offset` set to the stream's current tail.
+- The scope is the stream. A value is checked only against earlier values on the same stream, whoever sent them.
+- An append without `Stream-Seq` is not checked and leaves the stored value unchanged.
+- A `PUT` that creates the stream stores its `Stream-Seq` as the starting value without checking it. A `PUT` that finds the stream already there ignores the header.
+- Producer deduplication runs first. A retry of an append that was already accepted from the same `Producer-Id`, `Producer-Epoch` and `Producer-Seq` is answered as a duplicate, not `409`, even though its `Stream-Seq` is no longer greater than the stored value. While its receipt is in the stream's receipt window the answer carries its original `Stream-Next-Offset`; a duplicate whose receipt was evicted carries none (see [Exactly-once writes](/docs/concepts/exactly-once-writes#how-dedup-works)). An append rejected with `409` uses up no `Producer-Seq`.
+- A `Stream-Seq` `409` carries neither `Stream-Closed` nor `Producer-Expected-Seq`. A closed stream answers `409` with `Stream-Closed: true`, and an out-of-order `Producer-Seq` answers `409` with `Producer-Expected-Seq`.
+- A `Content-Type` that differs from the stream's also answers `409`, with the same headers as a `Stream-Seq` `409`; only the plain-text body differs. Types are compared after normalization, which keeps parameters, so `application/json; charset=utf-8` is not `application/json`. The recipes below send exactly the content type `HEAD` reports. Then a `409` without `Stream-Closed` or `Producer-Expected-Seq` can only come from the `Stream-Seq` check, and they treat every other `409` as an error.
+- A value is at most 256 bytes.
 
-This is useful when a single logical writer wants to enforce ordering without relying on server-side ETags. For instance, an agent that numbers its steps and wants the server to reject out-of-order delivery.
+## Prefix-count compare-and-set
 
-## Stream-Record-Match
+This pattern lets several writers extend one log while each commit is validated against the whole log before it.
 
-`Stream-Record-Match` is an Ursula extension for JSON streams using [Record Coordinates](/docs/concepts/record-coordinates). The server accepts the append only when the current record tail equals the supplied ordinal.
+1. **Every writer, every append.** Every append to the stream, by every writer, carries a prefix-count `Stream-Seq`: an append without it is not checked and leaves the stored value unchanged, so a writer that read only the events before it could still win. Create the stream with a `PUT` without `Stream-Seq`, so no value is stored and the first commit's `0` is accepted; a `PUT` that seeds a value can make the first commit answer `409` on every retry.
+2. **Commits.** Each append is one commit of one or more events. On an `application/json` stream, `POST` the commit as a JSON array: the elements are committed together, one message per event. Never append an empty commit.
+3. **Read to the tail.** Read with `consistency=leader`, continuing from `Stream-Next-Offset`, until a response carries `Stream-Up-To-Date: true`. Count the events you read; call it `n`. `n` counts every event since the stream was created. Once retention has trimmed the start of the stream, those events can't be read (a read from `offset=-1` answers `410`), so keep the event count in every snapshot you publish and count on from it, or don't advance retention on a prefix-count stream.
+4. **Append.** Validate the commit against what you read, then append it with `Stream-Seq` set to `n`, zero-padded to a fixed width. On a new stream, the first commit sends `0`.
+5. **On a `Stream-Seq` `409`.** Another writer committed first. Read on from where you stopped until `Stream-Up-To-Date: true`, count the `k` new events, validate again, and retry with `n + k`.
 
-Use it when multiple writers may race after reading the same stream state:
-
-```http
-POST /demo/events
-Content-Type: application/json
-Stream-Record-Match: 44
-
-{"type":"checkout"}
+```bash
+# The writer read 3 events, ending with Stream-Up-To-Date: true.
+curl -i -X POST http://127.0.0.1:4437/demo/run-42 \
+  -H 'Content-Type: application/json' \
+  -H 'Stream-Seq: 00000000000000000003' \
+  --data-binary '[{"type":"step","n":4},{"type":"step","n":5}]'
 ```
 
-A mismatch returns `412 Precondition Failed` with the current `Stream-Record-Next`, allowing the client to re-read and retry.
+Why it works: every commit holds at least one event, so the stored value is always the event count before the latest commit, and it grows with every commit. A count beats it only when it includes the latest commit, so a writer whose append is accepted has seen the whole log. When two writers send the same count, one wins and the other gets `409`.
 
-## When to use
+The read must end at the tail. A read shortened by `max_bytes` can stop inside a commit, and a count taken there can beat the stored value without the writer having seen the rest of that commit.
 
-- **Stream-Seq**: single-writer ordering. "Reject this if my writes arrive out of order."
-- **Stream-Record-Match**: multi-writer optimistic concurrency on a JSON stream. "Append this only if nobody has committed another record since I read."
-- **Producer-Id / Producer-Epoch / Producer-Seq** ([exactly-once writes](/docs/concepts/exactly-once-writes)): deduplicate retries from a producer that may resend the same logical append after a network hiccup or restart.
-- **Neither**: append-only workloads where every write is independent (e.g. event logging). Just POST.
+A value above the true count, from a counting bug or a seeding `PUT`, is stored like any other. Every honest writer's count is then too small, and each of its retries answers `409`.
+
+Do not send the count after your own commit (the last position your events take). That is not a compare-and-set: with 3 events in the log, writer A appends 1 event with `4`, and writer B, which also saw only 3, appends 2 events with `5`. Both are accepted, and B's events were validated against a stale log.
+
+If the response to an append is lost, you can't tell whether it committed. Put an operation ID in each commit, and before retrying, read the new events and look for it.
+
+## Publishing committed facts (outbox)
+
+When the facts are decided somewhere else, such as a database transaction or a [SQLite VFS](/docs/examples/sqlite-vfs) database, publish them to a stream after they commit:
+
+1. **Number the commits** in the source of truth, and publish only facts that have committed, in commit order.
+2. **Send both guards** on each append: `Producer-Id`, `Producer-Epoch` and `Producer-Seq` for retries, and `Stream-Seq` set to the commit's number, zero-padded.
+3. **On takeover**, the new owner uses a higher `Producer-Epoch` and starts `Producer-Seq` again at `0`. If it republishes a fact the old owner already published, the `Stream-Seq` check answers `409`, which here means "already published": go on to the next fact with the same `Producer-Seq`. Only a `Stream-Seq` `409` means that. A `409` with `Stream-Closed` or `Producer-Expected-Seq`, or any `409` while your `Content-Type` differs from the one `HEAD` reports, is an error, and skipping on it would lose facts.
+4. **Old owners.** Once the new owner's first append is accepted, appends with the old epoch answer `403`. Before that, an old owner can still publish only facts that committed, and `Stream-Seq` accepts each of those at most once and in commit order.
+5. **Gaps.** If a fact can no longer be published, for example because the source pruned it, append a snapshot or reset marker that tells readers to resynchronize. A fact skipped once can never be appended later, because its number is no longer greater than the stored value.
+
+## When to use what
+
+- **Prefix-count `Stream-Seq`**: several writers extend one log, and each commit must be validated against everything before it.
+- **Commit-number `Stream-Seq`**: one logical publisher, possibly failing over between owners, must not publish a fact twice or out of order.
+- **Producer headers** ([exactly-once writes](/docs/concepts/exactly-once-writes)): retries of the same append must not be written twice.
+- **Neither**: append-only workloads where every write is independent, such as event logging. Just `POST`.
+
+Ursula has no precondition on the stream's tail offset (`If-Match`).
+
+## Related
+
+- [API: append](/docs/api/append)
+- [Exactly-once writes](/docs/concepts/exactly-once-writes)
+- [Durability and consistency](/docs/concepts/durability-and-consistency): what `consistency=leader` guarantees
