@@ -78,7 +78,7 @@ pub(crate) fn head_stream_read_v1(
     request: &HeadStreamRequest,
 ) -> raft_internal_proto::HeadStreamReadV1 {
     raft_internal_proto::HeadStreamReadV1 {
-        linearizable: request.linearizable,
+        applied_state_only: !request.linearizable,
     }
 }
 

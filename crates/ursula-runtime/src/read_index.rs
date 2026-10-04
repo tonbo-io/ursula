@@ -1,4 +1,4 @@
-//! Linearizable reads confirmed outside the group actor (D10, PR10b).
+//! Linearizable reads confirmed outside the group actor (D10).
 //!
 //! A group actor runs one command at a time. A ReadIndex confirmation waits
 //! one quorum round trip (longer on a degraded quorum), so running it inside

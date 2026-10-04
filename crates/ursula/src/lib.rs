@@ -3424,8 +3424,8 @@ pub(crate) async fn publish_snapshot(
 /// intra-record offset with 400 before proposing; apply still lands on a
 /// real boundary if a racing delete or recreate makes this check stale.
 /// Streams without record coordinates, offsets at the retained offset or
-/// tail, and failed lookups are left to apply. Apply validates the offset
-/// again, so the HEAD here takes no quorum round trip (PR10b).
+/// tail, and failed lookups are left to apply. The HEAD stays linearizable:
+/// apply does not re-check JSON boundaries at or below the seal point.
 async fn check_json_record_boundary(
     state: &HttpState,
     stream_id: &BucketStreamId,
@@ -3437,7 +3437,7 @@ async fn check_json_record_boundary(
         .head_stream(HeadStreamRequest {
             stream_id: stream_id.clone(),
             now_ms: state.unix_time_ms(),
-            linearizable: false,
+            linearizable: true,
             read_index: None,
         })
         .await

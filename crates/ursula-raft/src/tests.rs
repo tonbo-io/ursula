@@ -2651,7 +2651,9 @@ async fn openraft_snapshot_carries_feature_level() {
 /// leader over gRPC, so a follower's SSE or record read continues from it;
 /// a request from an older follower (no field) decodes with no anchor.
 /// `leader_only` (field 6) travels too, so the leader linearizes a forwarded
-/// `consistency=leader` read.
+/// `consistency=leader` read, and so does `HeadStreamReadV1.applied_state_only`
+/// (field 1), so the leader linearizes a forwarded client HEAD and not an
+/// internal one.
 #[test]
 fn forwarded_reads_carry_the_record_anchor_and_linearizability_over_grpc() {
     use prost::Message;
@@ -2696,7 +2698,7 @@ fn forwarded_reads_carry_the_record_anchor_and_linearizability_over_grpc() {
     assert_eq!(served.record_anchor, None);
 
     // A forwarded client HEAD stays linearizable on the leader; an internal
-    // one does not (PR10b).
+    // one does not.
     for linearizable in [true, false] {
         let head = HeadStreamRequest {
             stream_id: request.stream_id.clone(),
@@ -2710,4 +2712,11 @@ fn forwarded_reads_carry_the_record_anchor_and_linearizability_over_grpc() {
         let served = crate::grpc::head_stream_request_from_v1(head.stream_id.clone(), 77, decoded);
         assert_eq!(served, head);
     }
+    // A sender that omits the field gets the linearizable HEAD.
+    let served = crate::grpc::head_stream_request_from_v1(
+        request.stream_id.clone(),
+        77,
+        crate::raft_internal_proto::HeadStreamReadV1::default(),
+    );
+    assert!(served.linearizable);
 }

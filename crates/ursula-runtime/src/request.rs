@@ -122,11 +122,10 @@ pub struct HeadStreamRequest {
     /// A client HEAD, which promises linearizability (D10): the leader
     /// confirms a read index first. Internal callers that need only the
     /// leader's applied state (the `offset=now` and record resolutions of
-    /// `consistency=local` reads, live-read starts, the write-path boundary
-    /// check) set `false`.
+    /// `consistency=local` reads, live-read starts) set `false`.
     pub linearizable: bool,
     /// The read index this request was linearized at before it was queued
-    /// (PR10b): `ShardRuntime` confirms the group's leadership and waits
+    /// (D10): `ShardRuntime` confirms the group's leadership and waits
     /// for the local apply outside the group actor, then sets it. The
     /// engine serves the read without a quorum round trip only while this
     /// replica leads and has applied that index. Callers leave it `None`;

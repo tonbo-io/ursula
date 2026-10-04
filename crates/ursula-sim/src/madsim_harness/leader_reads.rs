@@ -7,7 +7,7 @@
 //! healthy every probe answers 200, and so it does across a partition shorter
 //! than an election timeout: the leader retries the confirmation until the
 //! heal instead of answering 503. That confirmation waits outside the group
-//! actor (PR10b): a `consistency=local` read on the same leader answers
+//! actor: a `consistency=local` `offset=now` read on the same leader answers
 //! before the heal. A leader cut
 //! off from the quorum still believes it leads; its probes must answer 503
 //! (leader unknown, retry) instead of a view that misses the writes the new
@@ -85,7 +85,8 @@ enum Probe {
     Head,
     Bootstrap,
     Snapshot,
-    /// A `consistency=local` read: no linearizability promise.
+    /// A `consistency=local` tail lookup (`offset=now`): no linearizability
+    /// promise, so its internal HEAD takes no confirmation either.
     LocalRead,
 }
 
@@ -150,7 +151,7 @@ impl Probes<'_> {
         let path = self.path;
         let uri = match probe {
             Probe::CatchUpRead => format!("{path}?offset=0&consistency=leader"),
-            Probe::LocalRead => format!("{path}?offset=0"),
+            Probe::LocalRead => format!("{path}?offset=now"),
             Probe::Head => path.to_owned(),
             Probe::Bootstrap => format!("{path}/bootstrap"),
             Probe::Snapshot => format!("{path}/snapshot/{}", http_offset(self.snapshot_offset)),
@@ -375,7 +376,7 @@ pub(super) async fn run_leader_read_linearizability_inner(
     heal.await.expect("heal the brief partition");
 
     // The same brief partition stalls a HEAD's confirmation. It waits outside
-    // the group actor, so a `consistency=local` read on this leader answers
+    // the group actor, so a `consistency=local` tail lookup on this leader answers
     // before the heal, while the HEAD is still waiting; the HEAD answers 200
     // after the heal.
     for node_id in (1..=3).filter(|node_id| *node_id != old_leader) {
@@ -420,7 +421,7 @@ pub(super) async fn run_leader_read_linearizability_inner(
     let acked_offset = u64::try_from(acked.len()).expect("offset fits u64");
     if local.status != StatusCode::OK
         || local.next_offset != Some(acked_offset)
-        || local.body[..] != acked[..]
+        || !local.body.is_empty()
         || healed_first
         || head_first
     {
@@ -428,10 +429,13 @@ pub(super) async fn run_leader_read_linearizability_inner(
             &mut trace,
             "stalled_confirmation",
             format!(
-                "the consistency=local read answered {} at next offset {:?} (healed first: \
-                 {healed_first}, HEAD answered first: {head_first}); it must answer 200 at \
-                 {acked_offset} while the HEAD's confirmation waits for the heal",
-                local.status, local.next_offset,
+                "the consistency=local offset=now read answered {} at next offset {:?} with \
+                 {} body bytes (healed first: {healed_first}, HEAD answered first: \
+                 {head_first}); it must answer 200 at {acked_offset} with no body while the \
+                 HEAD's confirmation waits for the heal",
+                local.status,
+                local.next_offset,
+                local.body.len(),
             ),
         );
     }

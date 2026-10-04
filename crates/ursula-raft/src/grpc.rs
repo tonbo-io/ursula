@@ -771,7 +771,8 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 .get(placement.raft_group_id)
                 .ok_or_else(|| tonic::Status::not_found("raft group is not registered"))?;
             // The group's barrier, so forwarded linearizable reads share
-            // confirmation rounds with its local reads (PR10b).
+            // confirmation rounds with its local reads. Harnesses that
+            // register a bare raft handle get a fresh one.
             let read_barrier = self
                 .registry
                 .read_barrier(placement.raft_group_id)
@@ -852,7 +853,7 @@ pub(crate) fn head_stream_request_from_v1(
     HeadStreamRequest {
         stream_id,
         now_ms,
-        linearizable: head.linearizable,
+        linearizable: !head.applied_state_only,
         read_index: None,
     }
 }

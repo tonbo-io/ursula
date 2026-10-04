@@ -655,7 +655,7 @@ impl RaftGroupEngine {
     /// instead of a stale view; a follower gets the plain forward error.
     ///
     /// `read_index` is the index the runtime confirmed for this request
-    /// before queueing it (PR10b). While this replica leads and has applied
+    /// before queueing it. While this replica leads and has applied
     /// it, the read needs no further round trip. Otherwise (forwarded gRPC
     /// reads, direct engine calls, an engine swapped since) the engine joins
     /// the group's coalescing barrier itself; see [`ReadIndexBarrier`].

@@ -438,7 +438,7 @@ impl ShardRuntime {
     }
 
     /// Confirms a read index for `placement`'s group before a linearizable
-    /// read is queued (D10, PR10b), so the group actor never waits on the
+    /// read is queued (D10), so the group actor never waits on the
     /// quorum round trip and commands behind the read are not held by it.
     /// `None` when the group has no barrier yet or this replica does not
     /// lead: the engine then forwards, refuses, or linearizes the read
@@ -468,17 +468,7 @@ impl ShardRuntime {
         } else {
             None
         };
-        let (response_tx, response_rx) = oneshot::channel();
-        self.group_rpc(
-            placement,
-            None,
-            GroupCommand::HeadStream {
-                request,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
+        self.queue_head_stream(request).await
     }
 
     /// A `leader_only` (`consistency=leader`) read is linearized before it
@@ -493,17 +483,7 @@ impl ShardRuntime {
         } else {
             None
         };
-        let (response_tx, response_rx) = oneshot::channel();
-        self.group_rpc(
-            placement,
-            None,
-            GroupCommand::ReadStream {
-                request,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
+        self.queue_read_stream(request).await
     }
 
     pub async fn read_snapshot(
@@ -512,17 +492,7 @@ impl ShardRuntime {
     ) -> Result<ReadSnapshotResponse, RuntimeError> {
         let placement = self.shard_map.locate(&request.stream_id);
         request.read_index = self.confirm_read_index(placement).await?;
-        let (response_tx, response_rx) = oneshot::channel();
-        self.group_rpc(
-            placement,
-            None,
-            GroupCommand::ReadSnapshot {
-                request,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
+        self.queue_read_snapshot(request).await
     }
 
     pub async fn bootstrap_stream(
@@ -531,17 +501,7 @@ impl ShardRuntime {
     ) -> Result<BootstrapStreamResponse, RuntimeError> {
         let placement = self.shard_map.locate(&request.stream_id);
         request.read_index = self.confirm_read_index(placement).await?;
-        let (response_tx, response_rx) = oneshot::channel();
-        self.group_rpc(
-            placement,
-            None,
-            GroupCommand::BootstrapStream {
-                request,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
+        self.queue_bootstrap_stream(request).await
     }
 
     /// Live-read registration (SSE, long-poll) requires this replica to be

@@ -841,7 +841,7 @@ pub struct RaftGroupHandleRegistry {
     /// invalidates on apply, so forwarded gRPC reads share it (F13).
     cold_index_caches: Arc<Mutex<BTreeMap<u32, GroupColdIndexCache>>>,
     /// Each group's coalescing ReadIndex barrier, so forwarded gRPC reads
-    /// share confirmation rounds with the group's local reads (PR10b).
+    /// share confirmation rounds with the group's local reads.
     read_barriers: Arc<Mutex<BTreeMap<u32, Arc<ReadIndexBarrier>>>>,
     dynamic_hosted_groups: Arc<Mutex<BTreeSet<RaftGroupId>>>,
     leadership_shed: LeadershipShedFlag,
@@ -972,7 +972,7 @@ impl RaftGroupHandleRegistry {
         }
     }
 
-    /// Records the group engine's ReadIndex barrier (PR10b).
+    /// Records the group engine's ReadIndex barrier.
     pub(crate) fn register_read_barrier(
         &self,
         raft_group_id: RaftGroupId,

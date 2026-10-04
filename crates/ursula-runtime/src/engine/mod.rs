@@ -204,7 +204,7 @@ pub trait GroupEngine: Send + 'static {
     }
 
     /// The group's ReadIndex barrier, which the runtime calls before it
-    /// queues a linearizable read (D10, PR10b). `None` (the default) keeps
+    /// queues a linearizable read (D10). `None` (the default) keeps
     /// such reads linearized inside the engine, if at all.
     fn linearizable_read_barrier(&self) -> Option<Arc<dyn LinearizableReadBarrier>> {
         None

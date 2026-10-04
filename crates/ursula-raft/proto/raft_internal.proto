@@ -121,9 +121,10 @@ message GroupReadRequestV1 {
 }
 
 message HeadStreamReadV1 {
-  // A client HEAD: the leader linearizes it (ReadIndex) before serving it.
-  // Internal HEADs read the leader's applied state.
-  bool linearizable = 1;
+  // Set by internal HEADs, which read the leader's applied state. Unset (a
+  // client HEAD, or a sender that omits the field) the leader linearizes the
+  // HEAD (ReadIndex) before serving it.
+  bool applied_state_only = 1;
 }
 
 message ReadStreamReadV1 {

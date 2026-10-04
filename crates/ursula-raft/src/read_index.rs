@@ -1,4 +1,4 @@
-//! Coalesced ReadIndex confirmation for one Raft group (D10, PR10b).
+//! Coalesced ReadIndex confirmation for one Raft group (D10).
 //!
 //! openraft 0.10.0-alpha.21 sends a heartbeat to every voter for each
 //! `get_read_linearizer` call; it does not batch concurrent callers. This
