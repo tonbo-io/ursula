@@ -252,10 +252,11 @@ mod tests {
 
     #[test]
     fn empty_group_reports_zero_gauges() {
-        assert_eq!(
-            StreamStateMachine::new().state_gauges(),
-            GroupStateGauges::default()
-        );
+        // Every group starts at the top level (format epoch 2).
+        assert_eq!(StreamStateMachine::new().state_gauges(), GroupStateGauges {
+            feature_level: crate::MAX_SUPPORTED_FEATURE_LEVEL,
+            ..GroupStateGauges::default()
+        });
     }
 
     #[test]

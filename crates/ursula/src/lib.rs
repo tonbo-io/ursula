@@ -278,6 +278,9 @@ pub struct HttpState {
     /// (e.g. ursulactl auto-enabling empty-log rejoin only for `memory`).
     wal_backend: &'static str,
     wal_disk: WalDiskMonitor,
+    /// A Raft protocol (format-epoch) mismatch seen since start: readiness
+    /// answers 503 `format_epoch_mismatch` until restart.
+    format_epoch_mismatch: ursula_raft::FormatEpochMismatch,
 }
 
 impl HttpState {
@@ -300,6 +303,7 @@ impl HttpState {
             external_payload_min_bytes: 1024 * 1024,
             wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
+            format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
         }
     }
 
@@ -319,6 +323,7 @@ impl HttpState {
             external_payload_min_bytes: 1024 * 1024,
             wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
+            format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
         }
     }
 
@@ -359,6 +364,7 @@ impl HttpState {
             external_payload_min_bytes: 1024 * 1024,
             wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
+            format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
         }
     }
 
@@ -398,6 +404,15 @@ impl HttpState {
 
     pub(crate) fn with_wal_disk_monitor(mut self, monitor: WalDiskMonitor) -> Self {
         self.wal_disk = monitor;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_format_epoch_mismatch(
+        mut self,
+        mismatch: ursula_raft::FormatEpochMismatch,
+    ) -> Self {
+        self.format_epoch_mismatch = mismatch;
         self
     }
 
@@ -1100,15 +1115,27 @@ async fn cluster_probe(_body: Bytes) -> StatusCode {
 
 async fn readiness(State(state): State<HttpState>) -> Response {
     let disk = state.wal_disk.snapshot();
-    let status = if disk.pressure {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else {
+    // A node that saw a peer on another format epoch never becomes Ready
+    // again, so a rolling update stops at it (format epoch 2, E8).
+    let format_epoch_mismatch = state.format_epoch_mismatch.recorded();
+    let ready = !disk.pressure && !format_epoch_mismatch;
+    let status = if ready {
         StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
     };
     json_response(
         status,
         serde_json::json!({
-            "ready": !disk.pressure,
+            "ready": ready,
+            "reason": if format_epoch_mismatch {
+                Some("format_epoch_mismatch")
+            } else if disk.pressure {
+                Some("wal_disk_pressure")
+            } else {
+                None
+            },
+            "format_epoch_mismatch": format_epoch_mismatch,
             "wal_disk_pressure": disk.pressure,
             "wal_available_bytes": disk.available_bytes,
             "wal_min_available_bytes": disk.min_available_bytes,
@@ -1661,14 +1688,12 @@ pub(crate) struct SetFeatureLevelBody {
     level: u32,
 }
 
-/// `POST /__ursula/feature-level` with `{"level": N}` (C0): proposes
-/// `SetFeatureLevel` to every group this node can write (on a Raft cluster,
-/// the groups it leads). Each group ends at `max(current, N)`. Groups led
-/// elsewhere are reported with `status: "not_leader"` and the leader id when
-/// known, so `ursulactl cluster enable-feature` asks every node in turn.
+/// `POST /__ursula/feature-level` with `{"level": N}` (C0). Since format
+/// epoch 2 every group is born at the top level, so this proposes nothing: it
+/// reports each group's current level as `status: "set"`, and epoch-2 logs
+/// never contain `SetFeatureLevel`.
 ///
-/// Refuses (409) a level above this node's supported level. Checking that
-/// every other voter and learner supports it is the operator tool's job.
+/// Refuses (409) a level above this node's supported level.
 pub(crate) async fn set_feature_level(
     State(state): State<HttpState>,
     axum::Json(body): axum::Json<SetFeatureLevelBody>,
@@ -1684,66 +1709,27 @@ pub(crate) async fn set_feature_level(
         )
             .into_response();
     }
-    let results = if body.level >= ursula_runtime::FEATURE_LEVEL_SPARSE_MARKS {
-        // F1 (bounded-state §5.1): sealing trusts cold bytes, so a group
-        // reaches level 2 only through a leader that completed a cold-index
-        // page-repair cycle (F19). Other groups report `repair_pending`.
-        let mut results = Vec::new();
-        for group_id in 0..state.runtime.raft_group_count() {
-            let group = RaftGroupId(group_id);
-            let result = if state.runtime.cold_index_repair_completed(group) {
-                Some(
-                    state
-                        .runtime
-                        .set_feature_level(group, ursula_runtime::SetFeatureLevelRequest {
-                            level: body.level,
-                        })
-                        .await,
-                )
-            } else {
-                None
-            };
-            results.push((group, result));
-        }
-        results
-    } else {
-        state
-            .runtime
-            .set_feature_level_all_groups(body.level)
-            .await
-            .into_iter()
-            .map(|(group, result)| (group, Some(result)))
-            .collect()
-    };
-    let groups = results
+    let groups = state
+        .runtime
+        .feature_levels_all_groups()
+        .await
         .into_iter()
         .map(|(group, result)| match result {
-            None => serde_json::json!({
+            Ok(level) => serde_json::json!({
                 "raft_group_id": group.0,
-                "status": "repair_pending",
+                "status": "set",
+                "level": level,
+                "previous_level": level,
             }),
-            Some(result) => match result {
-                Ok(response) => serde_json::json!({
-                    "raft_group_id": group.0,
-                    "status": "set",
-                    "level": response.level,
-                    "previous_level": response.previous_level,
-                }),
-                Err(err) if err.leader_hint().is_some() => serde_json::json!({
-                    "raft_group_id": group.0,
-                    "status": "not_leader",
-                    "leader_id": err.leader_hint().and_then(|hint| hint.node_id),
-                }),
-                Err(RuntimeError::GroupNotHosted { .. }) => serde_json::json!({
-                    "raft_group_id": group.0,
-                    "status": "not_hosted",
-                }),
-                Err(err) => serde_json::json!({
-                    "raft_group_id": group.0,
-                    "status": "error",
-                    "error": err.to_string(),
-                }),
-            },
+            Err(RuntimeError::GroupNotHosted { .. }) => serde_json::json!({
+                "raft_group_id": group.0,
+                "status": "not_hosted",
+            }),
+            Err(err) => serde_json::json!({
+                "raft_group_id": group.0,
+                "status": "error",
+                "error": err.to_string(),
+            }),
         })
         .collect::<Vec<_>>();
     json_response(
@@ -2065,7 +2051,9 @@ pub(crate) async fn flush_cold_stream(
     }
 }
 
-pub(crate) const BACKUP_FORMAT_VERSION: u32 = 1;
+/// The backup format is the format epoch: a 0.5.x ursulactl refuses this
+/// version with its own check, and this server refuses 0.5.x groups (E10).
+pub(crate) const BACKUP_FORMAT_VERSION: u32 = ursula_runtime::FORMAT_EPOCH;
 pub(crate) const HEADER_BACKUP_FORMAT: &str = "x-ursula-backup-format";
 pub(crate) const HEADER_BACKUP_BLAKE3: &str = "x-ursula-backup-blake3";
 pub(crate) const HEADER_BACKUP_COMMIT_INDEX: &str = "x-ursula-backup-commit-index";
@@ -2124,7 +2112,10 @@ pub(crate) async fn export_backup_group(
     let checksum = blake3::hash(&body).to_hex().to_string();
     let mut response = (StatusCode::OK, body).into_response();
     let headers = response.headers_mut();
-    headers.insert(HEADER_BACKUP_FORMAT, HeaderValue::from_static("1"));
+    headers.insert(
+        HEADER_BACKUP_FORMAT,
+        HeaderValue::from(BACKUP_FORMAT_VERSION),
+    );
     if let Ok(value) = HeaderValue::from_str(&checksum) {
         headers.insert(HEADER_BACKUP_BLAKE3, value);
     }
@@ -2136,6 +2127,13 @@ pub(crate) async fn export_backup_group(
         HeaderValue::from_static("application/x-msgpack"),
     );
     response
+}
+
+/// The only field an import reads before it trusts the payload (E10).
+#[derive(serde::Deserialize)]
+struct BackupEpochProbe {
+    #[serde(default)]
+    format_epoch: Option<u32>,
 }
 
 /// Imports one group's backup snapshot into an empty group as a replicated
@@ -2158,6 +2156,34 @@ pub(crate) async fn import_backup_group(
     let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
         return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
     };
+    // E10: read only the epoch first, so a 0.5.x group answers 400 instead
+    // of being decoded under this epoch's rules.
+    match rmp_serde::from_slice::<BackupEpochProbe>(&body) {
+        Ok(BackupEpochProbe {
+            format_epoch: Some(epoch),
+        }) if epoch == ursula_runtime::FORMAT_EPOCH => {}
+        Ok(BackupEpochProbe { format_epoch }) => {
+            let found = format_epoch.map_or_else(
+                || "no format_epoch".to_owned(),
+                |epoch| format!("an unsupported format_epoch ({epoch})"),
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "backup group has {found}; this server imports format epoch {} only",
+                    ursula_runtime::FORMAT_EPOCH
+                ),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("decode backup snapshot: {err}"),
+            )
+                .into_response();
+        }
+    }
     let snapshot: ursula_runtime::StreamSnapshot = match rmp_serde::from_slice(&body) {
         Ok(snapshot) => snapshot,
         Err(err) => {

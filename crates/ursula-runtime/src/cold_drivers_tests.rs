@@ -57,6 +57,22 @@ async fn create(runtime: &ShardRuntime, stream_id: &BucketStreamId) {
         .expect("create stream");
 }
 
+/// C7/F14g: the incarnation generation the stream's chunks and pages live
+/// under (its `created_at_ms`).
+async fn generation(runtime: &ShardRuntime, stream_id: &BucketStreamId) -> u64 {
+    runtime
+        .head_stream(crate::HeadStreamRequest {
+            stream_id: stream_id.clone(),
+            now_ms: 0,
+            linearizable: false,
+            read_index: None,
+        })
+        .await
+        .expect("head")
+        .created_at_ms
+        .expect("incarnation")
+}
+
 async fn append(runtime: &ShardRuntime, stream_id: &BucketStreamId, payload: &[u8]) {
     runtime
         .append(AppendRequest::from_bytes(
@@ -271,7 +287,7 @@ async fn f2_driver_deletes_the_replacement_of_a_rejected_compaction() {
                 .expect("advance retention");
         }
     });
-    let chunk_dir = crate::cold_store::cold_chunk_dir(&a, 0);
+    let chunk_dir = crate::cold_store::cold_chunk_dir(&a, generation(&runtime, &a).await);
     let watched_dir = chunk_dir.clone();
     cold_store.set_fault_policy(move |context| {
         (context.operation == ColdStoreOperation::WriteChunk
@@ -468,7 +484,7 @@ async fn f14h_orphan_sweep_reclaims_only_unreferenced_objects_after_the_grace() 
 
     // Orphans of ambiguous publishes.
     let orphan_pack = new_cold_pack_path(BUCKET, GROUP.0);
-    let orphan_chunk = new_cold_chunk_path_in_generation(&a, 0, 0, 2);
+    let orphan_chunk = new_cold_chunk_path_in_generation(&a, generation(&runtime, &a).await, 0, 2);
     let orphan_external = new_external_payload_path(&b);
     for (path, payload) in [
         (&orphan_pack, b"orphan-pack".as_slice()),
@@ -489,7 +505,7 @@ async fn f14h_orphan_sweep_reclaims_only_unreferenced_objects_after_the_grace() 
         .map(|name| format!("{pack_dir}{name}"))
         .collect::<Vec<_>>();
     assert_eq!(referenced_packs.len(), 2, "one live pack, one pending GC");
-    let chunk_dir = crate::cold_store::cold_chunk_dir(&a, 0);
+    let chunk_dir = crate::cold_store::cold_chunk_dir(&a, generation(&runtime, &a).await);
     let referenced_chunks = cold_store
         .list_file_names(&chunk_dir)
         .await
@@ -569,7 +585,7 @@ async fn rt6_orphan_sweep_keeps_an_unreferenced_chunk_whose_range_nothing_covers
         })
         .await
         .expect("compact into an exclusive chunk");
-    let chunk_dir = crate::cold_store::cold_chunk_dir(&a, 0);
+    let chunk_dir = crate::cold_store::cold_chunk_dir(&a, generation(&runtime, &a).await);
     let chunks = cold_store.list_file_names(&chunk_dir).await.unwrap();
     assert_eq!(chunks.len(), 1, "the compaction replacement");
     let chunk = format!("{chunk_dir}{}", chunks[0]);
@@ -578,7 +594,7 @@ async fn rt6_orphan_sweep_keeps_an_unreferenced_chunk_whose_range_nothing_covers
     let pages = ColdStoreColdIndexPageStore::new(cold_store.clone());
     let key = ColdIndexPageKey {
         stream_id: a.clone(),
-        generation: 0,
+        generation: generation(&runtime, &a).await,
         page_id: 0,
     };
     let mut page = pages.get_page(&key).await.unwrap().expect("page");

@@ -150,6 +150,9 @@ async fn init_state(
         )?
     };
 
+    // Format epoch 2: refuse 0.5.x data and peers before anything is written.
+    crate::bootstrap::check_and_stamp_format_epoch(config).await?;
+
     let spawned = spawn_runtime_with_maintenance_drain(
         config,
         persistence,

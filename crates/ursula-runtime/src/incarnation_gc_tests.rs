@@ -157,7 +157,19 @@ async fn d4_recreate_with_gc_pending_keeps_new_incarnation_objects() {
     create(&runtime, &stream).await;
     append(&runtime, &stream, b"new!").await;
     flush(&runtime, &stream, 4).await;
-    let new_chunks = page_chunks(&cold_store, &stream, 0).await;
+    // C7/F14g: the new incarnation's pages live under its own generation.
+    let generation = runtime
+        .head_stream(crate::HeadStreamRequest {
+            stream_id: stream.clone(),
+            now_ms: 0,
+            linearizable: false,
+            read_index: None,
+        })
+        .await
+        .expect("head")
+        .created_at_ms
+        .expect("incarnation");
+    let new_chunks = page_chunks(&cold_store, &stream, generation).await;
     assert_eq!(new_chunks.len(), 1);
 
     runtime

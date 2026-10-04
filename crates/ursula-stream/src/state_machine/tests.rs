@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use proptest::collection::vec;
 use proptest::prelude::*;
 
-use super::persist::message_records_cover_retained_suffix;
 use super::*;
 use crate::RecordIndexError;
 use crate::StreamRecordRange;
@@ -518,7 +517,12 @@ fn json_record_coordinates_survive_flush_restore_and_retention() {
         }
     );
     let mut restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
-    assert_eq!(restored.offset_for_record(&stream_id, 1), Ok(Some(8)));
+    // Lb2 sparse marks: a flushed record keeps only a bracket in state; its
+    // exact offset needs a bounded scan of the cold bytes.
+    assert_eq!(
+        restored.offset_for_record(&stream_id, 1),
+        Err(RecordIndexError::RecordSealed)
+    );
     assert!(matches!(
         restored.apply(publish_snapshot_cmd(
             stream_id.clone(),
@@ -539,12 +543,14 @@ fn json_record_coordinates_survive_flush_restore_and_retention() {
             next_record: 3,
         }))
     );
+    // Lb2 sparse marks: retention into sealed history lands on the mark at
+    // or below its target, here the stream's first record.
     assert_eq!(
         restored.apply(advance_retention_cmd(stream_id.clone(), 16, 3)),
         StreamResponse::RetentionAdvanced {
-            retained_offset: 16,
+            retained_offset: 0,
             record_range: Some(StreamRecordRange {
-                first_record: 2,
+                first_record: 0,
                 next_record: 3,
             }),
         }
@@ -552,16 +558,13 @@ fn json_record_coordinates_survive_flush_restore_and_retention() {
     assert_eq!(
         restored.record_range(&stream_id),
         Ok(Some(StreamRecordRange {
-            first_record: 2,
+            first_record: 0,
             next_record: 3,
         }))
     );
     assert_eq!(
         restored.offset_for_record(&stream_id, 1),
-        Err(RecordIndexError::RecordGone {
-            first_record: 2,
-            next_record: 3,
-        })
+        Err(RecordIndexError::RecordSealed)
     );
     assert_eq!(restored.offset_for_record(&stream_id, 3), Ok(Some(24)));
 }
@@ -930,10 +933,9 @@ fn flush_cold_compacts_message_records_to_cold_prefix() {
             hot_start_offset: 4,
         }
     );
-    assert_eq!(
-        stream_message_records(&machine, "cold-records"),
-        records(&[(0, 4), (4, 6)])
-    );
+    // F4: the top level keeps no per-message records; boundaries are
+    // derived.
+    assert!(stream_message_records(&machine, "cold-records").is_empty());
     // Bootstrap must not return the collapsed cold prefix as one part.
     let plan = machine
         .bootstrap_plan(&stream("cold-records"))
@@ -954,20 +956,7 @@ fn flush_cold_compacts_message_records_to_cold_prefix() {
             hot_start_offset: 6,
         }
     );
-    assert_eq!(
-        stream_message_records(&machine, "cold-records"),
-        records(&[(0, 6)])
-    );
-    let snapshot = machine.snapshot();
-    let entry = snapshot
-        .streams
-        .iter()
-        .find(|entry| entry.metadata.stream_id == stream("cold-records"))
-        .expect("stream snapshot");
-    assert_eq!(entry.message_records, vec![StreamMessageRecord {
-        start_offset: 0,
-        end_offset: 6,
-    }]);
+    assert!(stream_message_records(&machine, "cold-records").is_empty());
     assert!(matches!(
         machine.apply(publish_snapshot_cmd(
             stream("cold-records"),
@@ -1672,8 +1661,9 @@ fn plan_next_cold_flush_drains_distributed_group_hot_bytes() {
         ));
     }
 
-    // F6c: the group holds 2 x (2 B + one record's overhead) real bytes.
-    let group_real = 2 * (2 + crate::HOT_RECORD_OVERHEAD_BYTES as usize);
+    // F6c/F4b: the group holds 2 x (2 B + one record's 8 B overhead) real
+    // bytes.
+    let group_real = 2 * (2 + crate::HOT_RECORD_OVERHEAD_BYTES_LB4 as usize);
     assert_eq!(machine.total_hot_real_bytes(), group_real as u64);
     assert_eq!(
         machine
@@ -1891,10 +1881,10 @@ fn flush_planner_drains_largest_streams_first() {
         create_stream(&mut machine, name);
         append_all(&mut machine, name, &[&vec![b'x'; len]]);
     }
-    // F6c: real sizes are payload plus one record's overhead each, 196 in
-    // all. Group hot 196 >= 196: drain until below 98 (d-40 and d-30 hold
-    // 64 + 54 real bytes).
-    let group_real = 100 + 4 * crate::HOT_RECORD_OVERHEAD_BYTES as usize;
+    // F6c/F4b: real sizes are payload plus one record's 8 B overhead each,
+    // 132 in all. Group hot 132 >= 132: drain until below 66 (d-40 and d-30
+    // hold 48 + 38 real bytes).
+    let group_real = 100 + 4 * crate::HOT_RECORD_OVERHEAD_BYTES_LB4 as usize;
     assert_eq!(machine.total_hot_real_bytes(), group_real as u64);
     let (pass, _) = machine
         .plan_cold_flush_pass_from(
@@ -2303,8 +2293,9 @@ fn snapshot_restore_rejects_invalid_entries() {
             erased_buckets: Vec::new(),
             streams: Vec::new(),
             bucket_usage: Vec::new(),
-            feature_level: 0,
+            feature_level: crate::MAX_SUPPORTED_FEATURE_LEVEL,
             last_created_at_ms: 0,
+            format_epoch: crate::FORMAT_EPOCH,
         })
         .expect_err("duplicate bucket"),
         StreamSnapshotError::DuplicateBucket("benchcmp".to_owned())
@@ -2319,8 +2310,9 @@ fn snapshot_restore_rejects_invalid_entries() {
             erased_buckets: Vec::new(),
             streams: vec![entry],
             bucket_usage: Vec::new(),
-            feature_level: 0,
+            feature_level: crate::MAX_SUPPORTED_FEATURE_LEVEL,
             last_created_at_ms: 0,
+            format_epoch: crate::FORMAT_EPOCH,
         })
     };
 
@@ -2536,15 +2528,21 @@ fn producer_state_survives_snapshot_restore() {
 
     let snapshot = machine.snapshot();
     assert_eq!(snapshot.streams[0].producer_states.len(), 1);
-    assert_eq!(snapshot.streams[0].producer_states[0].last_items, vec![
-        ProducerAppendRecord {
-            start_offset: 0,
-            next_offset: 1,
-            closed: false,
-            record_start: None,
-            record_next: None,
-        }
-    ]);
+    // F3: the response lives in the producer's bounded receipt window.
+    let producer_state = &snapshot.streams[0].producer_states[0];
+    assert!(producer_state.last_items.is_empty());
+    assert_eq!(
+        producer_state
+            .receipts
+            .iter()
+            .map(|receipt| (
+                receipt.producer_seq,
+                receipt.start_offset,
+                receipt.next_offset
+            ))
+            .collect::<Vec<_>>(),
+        vec![(0, 0, 1)]
+    );
     let mut restored = StreamStateMachine::restore(snapshot).expect("restore snapshot");
 
     assert!(matches!(
@@ -3390,11 +3388,9 @@ proptest! {
         prop_assert!(bootstrap.updates.is_empty());
         prop_assert_eq!(bootstrap.next_offset, snapshot_offset);
         prop_assert!(!bootstrap.up_to_date);
-        prop_assert!(message_records_cover_retained_suffix(
-            &stream_message_records(&machine, "prop-snapshot-cold"),
-            snapshot_offset,
-            tail_offset
-        ));
+        // F4: the top level keeps no per-message records; boundaries are
+        // derived.
+        prop_assert!(stream_message_records(&machine, "prop-snapshot-cold").is_empty());
 
         let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
         prop_assert_eq!(
@@ -3711,153 +3707,37 @@ fn set_feature_level_cmd(level: u32) -> StreamCommand {
 }
 
 #[test]
-fn feature_level_defaults_to_zero_and_only_rises() {
-    let mut machine = StreamStateMachine::new();
-    assert_eq!(machine.feature_level(), 0);
-
-    assert_eq!(
-        machine.apply(set_feature_level_cmd(1)),
-        StreamResponse::FeatureLevelSet {
-            level: 1,
-            previous_level: 0,
-        }
-    );
-    // Idempotent under replay.
-    assert_eq!(
-        machine.apply(set_feature_level_cmd(1)),
-        StreamResponse::FeatureLevelSet {
-            level: 1,
-            previous_level: 1,
-        }
-    );
-    // Never lowered.
-    assert_eq!(
-        machine.apply(set_feature_level_cmd(0)),
-        StreamResponse::FeatureLevelSet {
-            level: 1,
-            previous_level: 1,
-        }
-    );
-    assert_eq!(machine.feature_level(), 1);
-    assert_eq!(
-        machine.apply(set_feature_level_cmd(3)),
-        StreamResponse::FeatureLevelSet {
-            level: 3,
-            previous_level: 1,
-        }
-    );
-    assert_eq!(machine.feature_level(), 3);
-}
-
-#[test]
-fn feature_gate_rejects_below_required_level_deterministically() {
-    let mut machine = machine();
-    let Err(StreamResponse::Error {
-        code,
-        message,
-        next_offset,
-        context,
-    }) = machine.require_feature_level(1, "stream tidy")
-    else {
-        panic!("level 0 must not satisfy level 1");
-    };
-    assert_eq!(code, StreamErrorCode::FeatureNotEnabled);
-    assert!(
-        message.contains("requires group feature level 1"),
-        "{message}"
-    );
-    assert_eq!(next_offset, None);
-    assert!(context.is_empty());
-
-    machine.apply(set_feature_level_cmd(1));
-    assert_eq!(machine.require_feature_level(1, "stream tidy"), Ok(()));
-    assert_eq!(machine.require_feature_level(0, "anything"), Ok(()));
-}
-
-#[test]
-fn feature_level_survives_snapshot_round_trip() {
-    let mut machine = machine();
-    machine.apply(set_feature_level_cmd(1));
-    let snapshot = machine.snapshot();
-    assert_eq!(snapshot.feature_level, 1);
-    let restored = StreamStateMachine::restore(snapshot).expect("restore snapshot");
-    assert_eq!(restored.feature_level(), 1);
-}
-
-#[test]
-fn legacy_snapshot_without_feature_level_restores_at_zero() {
-    let mut value = serde_json::to_value(machine().snapshot()).expect("encode snapshot");
-    value
-        .as_object_mut()
-        .expect("snapshot object")
-        .remove("feature_level");
-    let legacy: StreamSnapshot = serde_json::from_value(value).expect("decode legacy snapshot");
-    assert_eq!(legacy.feature_level, 0);
-    let restored = StreamStateMachine::restore(legacy).expect("restore legacy snapshot");
-    assert_eq!(restored.feature_level(), 0);
-}
-
-#[test]
-fn restore_refuses_a_snapshot_above_the_supported_level() {
-    let mut snapshot = machine().snapshot();
-    snapshot.feature_level = crate::MAX_SUPPORTED_FEATURE_LEVEL + 1;
-    assert_eq!(
-        StreamStateMachine::restore(snapshot).expect_err("future level"),
-        StreamSnapshotError::UnsupportedFeatureLevel {
-            level: crate::MAX_SUPPORTED_FEATURE_LEVEL + 1,
-            supported: crate::MAX_SUPPORTED_FEATURE_LEVEL,
-        }
-    );
-}
-
-#[test]
-fn import_snapshot_never_lowers_the_feature_level() {
-    let backup = machine().snapshot();
-    assert_eq!(backup.feature_level, 0);
-
-    let mut target = StreamStateMachine::new();
-    target.apply(set_feature_level_cmd(1));
-    assert!(matches!(
-        target.apply(StreamCommand::ImportSnapshot {
-            snapshot: Box::new(backup),
-        }),
-        StreamResponse::SnapshotImported { .. }
-    ));
-    assert_eq!(target.feature_level(), 1);
-
-    let mut raised = machine();
-    raised.apply(set_feature_level_cmd(1));
-    let mut fresh = StreamStateMachine::new();
-    fresh.apply(set_feature_level_cmd(1));
-    assert!(matches!(
-        fresh.apply(StreamCommand::ImportSnapshot {
-            snapshot: Box::new(raised.snapshot()),
-        }),
-        StreamResponse::SnapshotImported { .. }
-    ));
-    assert_eq!(fresh.feature_level(), 1);
-}
-
-#[test]
-fn import_snapshot_never_raises_the_feature_level() {
-    // SM2: an import must not bypass enable-feature's all-nodes support
-    // check. A backup above the group's level fails closed on every replica
-    // and leaves the group untouched.
-    let mut raised = machine();
-    raised.apply(set_feature_level_cmd(1));
-    create_stream(&mut raised, "a");
-    let mut fresh = StreamStateMachine::new();
-    match fresh.apply(StreamCommand::ImportSnapshot {
-        snapshot: Box::new(raised.snapshot()),
-    }) {
-        StreamResponse::Error { code, message, .. } => {
-            assert_eq!(code, StreamErrorCode::ImportConflict);
-            assert!(message.contains("feature level 1"), "{message}");
-        }
-        other => panic!("expected ImportConflict, got {other:?}"),
+fn restore_refuses_another_format_epoch_or_level() {
+    // Format epoch 2: every writer runs at the top level, so any other level
+    // is a fixture bug or a later build's snapshot.
+    for level in [0, crate::MAX_SUPPORTED_FEATURE_LEVEL + 1] {
+        let mut snapshot = machine().snapshot();
+        snapshot.feature_level = level;
+        assert_eq!(
+            StreamStateMachine::restore(snapshot).expect_err("other level"),
+            StreamSnapshotError::UnsupportedFeatureLevel {
+                level,
+                supported: crate::MAX_SUPPORTED_FEATURE_LEVEL,
+            }
+        );
     }
-    assert_eq!(fresh.feature_level(), 0);
-    assert_eq!(fresh.snapshot(), StreamStateMachine::new().snapshot());
+    let mut snapshot = machine().snapshot();
+    snapshot.format_epoch = crate::FORMAT_EPOCH - 1;
+    assert_eq!(
+        StreamStateMachine::restore(snapshot.clone()).expect_err("other epoch"),
+        StreamSnapshotError::FormatEpoch {
+            found: crate::FORMAT_EPOCH - 1,
+        }
+    );
+    assert!(matches!(
+        StreamStateMachine::new().apply(StreamCommand::ImportSnapshot {
+            snapshot: Box::new(snapshot),
+        }),
+        StreamResponse::Error {
+            code: StreamErrorCode::ImportInvalid,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -3866,7 +3746,6 @@ fn import_snapshot_never_lowers_last_created_at_ms() {
     // counter when it imports that backup, so the next incarnation never
     // reuses a `created_at_ms` its objects may still be scoped to.
     let mut target = StreamStateMachine::restore(StreamSnapshot {
-        feature_level: 1,
         last_created_at_ms: 5_000,
         ..StreamStateMachine::new().snapshot()
     })
@@ -3874,7 +3753,6 @@ fn import_snapshot_never_lowers_last_created_at_ms() {
     assert_eq!(target.last_created_at_ms(), 5_000);
 
     let mut backup = machine();
-    backup.apply(set_feature_level_cmd(1));
     create_stream(&mut backup, "a");
     assert_eq!(backup.last_created_at_ms(), 1);
     assert!(matches!(
@@ -3911,22 +3789,8 @@ fn flush_and_delete(machine: &mut StreamStateMachine, id: &str) {
 }
 
 #[test]
-fn c7_created_at_ms_is_unique_under_a_frozen_clock_only_from_level_one() {
-    // Level 0 keeps today's behavior: a delete and recreate at the same
-    // instant reuses the incarnation.
-    let mut legacy = machine();
-    create_stream(&mut legacy, "frozen");
-    assert_eq!(created_at_ms(&legacy, "frozen"), 0);
-    assert_eq!(
-        legacy.apply(delete_cmd(stream("frozen"))),
-        StreamResponse::Deleted
-    );
-    create_stream(&mut legacy, "frozen");
-    assert_eq!(created_at_ms(&legacy, "frozen"), 0);
-    assert_eq!(legacy.last_created_at_ms(), 0);
-
+fn c7_created_at_ms_is_unique_under_a_frozen_clock() {
     let mut machine = machine();
-    machine.apply(set_feature_level_cmd(1));
     let mut seen = Vec::new();
     for _ in 0..3 {
         create_stream(&mut machine, "frozen");
@@ -4001,17 +3865,8 @@ fn c7_last_created_at_ms_survives_snapshot_round_trip_and_legacy_decode() {
 }
 
 #[test]
-fn f14g_stream_gc_entries_name_the_incarnation_only_from_level_one() {
-    let mut legacy = machine();
-    create_stream(&mut legacy, "gc");
-    flush_and_delete(&mut legacy, "gc");
-    let entries = legacy.pending_cold_gc_batch(8);
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].target, ColdGcTarget::Stream(stream("gc")));
-    assert_eq!(entries[0].cold_generation, None);
-
+fn f14g_stream_gc_entries_name_the_incarnation() {
     let mut machine = machine();
-    machine.apply(set_feature_level_cmd(1));
     create_stream(&mut machine, "gc");
     let first = created_at_ms(&machine, "gc");
     assert_eq!(machine.cold_index_generation(&stream("gc")), Some(first));
@@ -4201,15 +4056,23 @@ fn d1_read_plan_serves_external_bytes_above_a_flushed_hot_prefix() {
         .read_plan(&stream("d1-read"), 0, 16)
         .expect("plan covers the external above the flushed prefix");
     assert_eq!(plan.next_offset, 5);
+    // F5: the external append keeps its locator in state until the offload
+    // pass, so the plan serves it as an object segment after the flushed
+    // prefix.
     let covered = plan
         .segments
         .iter()
         .map(|segment| match segment {
-            StreamReadSegment::ColdIndex(segment) => (segment.read_start_offset, segment.len),
-            other => panic!("expected cold-index segments only, got {other:?}"),
+            StreamReadSegment::ColdIndex(segment) => {
+                ("cold", segment.read_start_offset, segment.len)
+            }
+            StreamReadSegment::Object(segment) => {
+                ("object", segment.read_start_offset, segment.len)
+            }
+            other => panic!("expected no hot segment, got {other:?}"),
         })
         .collect::<Vec<_>>();
-    assert_eq!(covered, vec![(0, 5)]);
+    assert_eq!(covered, vec![("cold", 0, 2), ("object", 2, 3)]);
     let tail_plan = machine
         .read_plan(&stream("d1-read"), 2, 16)
         .expect("plan from inside the external");
@@ -4225,9 +4088,9 @@ fn d1_snapshot_with_regressed_frontier_restores() {
         .iter()
         .find(|entry| entry.metadata.stream_id == stream("d1-restore"))
         .expect("snapshot entry");
-    // Replicated state is unchanged: the snapshot still carries the
-    // regressed frontier (F18 step 1 is a read/restore rule only).
-    assert_eq!(entry.cold_frontier_offset, 2);
+    // F5: with the external's locator in state the flush of the hot prefix
+    // no longer regresses the frontier below the external.
+    assert_eq!(entry.cold_frontier_offset, 5);
     let restored = StreamStateMachine::restore(snapshot).expect("restore regressed frontier");
     let plan = restored
         .read_plan(&stream("d1-restore"), 0, 16)
@@ -4264,7 +4127,13 @@ fn d1_read_plan_keeps_hot_bytes_between_cold_ranges() {
             StreamReadSegment::Object(_) => ("object", 0),
         })
         .collect::<Vec<_>>();
-    assert_eq!(shape, vec![("cold", 0), ("hot", 0), ("cold", 7)]);
+    // F5: both externals are served from their in-state locators.
+    assert_eq!(shape, vec![
+        ("cold", 0),
+        ("object", 0),
+        ("hot", 0),
+        ("object", 0)
+    ]);
     StreamStateMachine::restore(machine.snapshot()).expect("restore with a hot gap");
 }
 
@@ -4521,7 +4390,8 @@ fn flush_planner_flushes_tails_older_than_the_max_hot_age() {
 /// deletes and snapshot restore, and agrees with a recount.
 #[test]
 fn hot_real_bytes_track_records_across_every_hot_transition() {
-    const OVERHEAD: u64 = crate::HOT_RECORD_OVERHEAD_BYTES;
+    // F4b: 8 B per hot record at the top level.
+    const OVERHEAD: u64 = crate::HOT_RECORD_OVERHEAD_BYTES_LB4;
     let mut machine = machine();
     let first = BucketStreamId::new("benchcmp", "run-7-a");
     let second = BucketStreamId::new("benchcmp", "run-7-b");

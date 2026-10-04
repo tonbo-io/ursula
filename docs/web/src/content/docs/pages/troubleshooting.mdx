@@ -24,7 +24,8 @@ Useful jq selectors:
 | WAL reclaim/restart | `{physical: .wal_physical_bytes, reclaims: .wal_reclaims, recovered_bytes: .wal_recovery_bytes, recovery_ns: .wal_recovery_ns}` |
 
 `GET /__ursula/ready` is the process readiness probe: it returns `503` while
-the disk-WAL guard is active. Ursula does **not** expose `/healthz`, `/readyz`,
+the disk-WAL guard is active, and after a Raft protocol mismatch with a peer
+(`"reason": "format_epoch_mismatch"`). Ursula does **not** expose `/healthz`, `/readyz`,
 Prometheus `/metrics`, or `/cluster/status`; use the JSON snapshot for detailed
 diagnosis and `ursulactl wait-ready` for cluster-wide Raft readiness.
 
@@ -56,6 +57,34 @@ Set `storage.cold.s3.bucket`, or set `storage.cold.backend = "none"` if you don'
 ### Port already in use
 
 `server.listen` is taken. Public HTTP and inter-node gRPC share the same port unless `server.cluster_listen` is configured separately.
+
+### `raft WAL directory … holds data without a format marker`
+
+The data directory was written by Ursula 0.5.x or earlier (format epoch 1). Ursula 0.6 reads format epoch 2 only and has no in-place upgrade. Start on an empty `raft.wal.path` and a new object-storage prefix, or run the release that wrote it. See [Upgrading to 0.6](/docs/operations#upgrading-to-06).
+
+### `raft WAL directory … is format epoch N`
+
+The directory's `FORMAT_EPOCH` marker names another epoch. Run the release that wrote it, or start on an empty directory.
+
+### `object storage s3://… is not empty and has no URSULA_FORMAT_EPOCH marker`
+
+The cold root (or, with cold storage off, the S3 snapshot namespace) holds objects from Ursula 0.5.x or from another application. Point `storage.cold.root` (Helm: `s3.prefix` or `coldStorage.prefix`), or `storage.snapshot.s3_prefix` when only snapshots use S3, at an empty prefix used only by this cluster.
+
+### `object storage s3://… is format epoch N`
+
+The prefix's `URSULA_FORMAT_EPOCH` marker names another epoch. Use a new prefix; never reuse one across epochs.
+
+### `journal … uses Ursula WAL version 1`
+
+A Raft WAL journal from Ursula 0.5.x. The directory marker normally refuses it first; the journal check is the backstop. Start on an empty `raft.wal.path`.
+
+### `peer N (…) refused Raft protocol 2`
+
+A configured peer runs Ursula 0.5.x. A 0.6 node cannot join a 0.5.x cluster; install 0.6 as a new cluster.
+
+### `/__ursula/ready` answers `503` with `format_epoch_mismatch`
+
+The node exchanged a Raft RPC with a peer on another format epoch after it started (the peer was unreachable during the startup probe). The node stays not ready until it restarts. Remove the mismatched node from the cluster; see [Upgrading to 0.6](/docs/operations#upgrading-to-06).
 
 ### I/O error on `raft.wal.path`
 

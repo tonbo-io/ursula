@@ -1,7 +1,6 @@
 //! F1 sparse cold record marks over HTTP (bounded-stream-state §5.2, §6):
-//! the level-2 raise waits for a cold-index page-repair cycle, and record
-//! reads, SSE, snapshot publish and retention keep exact record coordinates
-//! over sealed history (RC-6, RC-7, RC-8, RC-12, RC-13, RC-14).
+//! record reads, SSE, snapshot publish and retention keep exact record
+//! coordinates over sealed history (RC-6, RC-7, RC-8, RC-12, RC-13, RC-14).
 
 use std::sync::Arc;
 
@@ -54,24 +53,6 @@ fn header<'a>(response: &'a Response, name: &str) -> &'a str {
         .expect("header utf8")
 }
 
-async fn post_level(app: &Router, level: u32) -> serde_json::Value {
-    let response = send(
-        app,
-        "POST",
-        "/__ursula/feature-level",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(format!(r#"{{"level":{level}}}"#)),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    serde_json::from_slice(&body_of(response).await).expect("json")
-}
-
-async fn levels(app: &Router) -> serde_json::Value {
-    let response = send(app, "GET", "/__ursula/feature-level", &[], Body::empty()).await;
-    serde_json::from_slice(&body_of(response).await).expect("json")
-}
-
 fn spawn_with_cold_store() -> (ShardRuntime, Router) {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
@@ -94,44 +75,11 @@ async fn complete_repair_cycle(runtime: &ShardRuntime) {
     panic!("repair cycle did not complete");
 }
 
-/// §5.1: the raise to level 2 is refused for every group whose leader has
-/// not completed a cold-index page-repair cycle (F19), and applied once it
-/// has.
-#[tokio::test]
-async fn raise_to_level_two_waits_for_a_page_repair_cycle() {
-    let (runtime, app) = spawn_with_cold_store();
-    let report = levels(&app).await;
-    assert_eq!(
-        report["groups"][0]["page_repair_completed"], false,
-        "{report}"
-    );
-
-    let outcome = post_level(&app, 2).await;
-    assert_eq!(
-        outcome["groups"][0]["status"], "repair_pending",
-        "{outcome}"
-    );
-    assert_eq!(levels(&app).await["groups"][0]["level"], 0);
-    // Level 1 does not need the cycle.
-    let outcome = post_level(&app, 1).await;
-    assert_eq!(outcome["groups"][0]["status"], "set", "{outcome}");
-
-    complete_repair_cycle(&runtime).await;
-    assert_eq!(
-        levels(&app).await["groups"][0]["page_repair_completed"],
-        true
-    );
-    let outcome = post_level(&app, 2).await;
-    assert_eq!(outcome["groups"][0]["status"], "set", "{outcome}");
-    assert_eq!(levels(&app).await["groups"][0]["level"], 2);
-}
-
-/// A level-2 JSON stream of `count` records of [`RECORD`] bytes, flushed
+/// A JSON stream of `count` records of [`RECORD`] bytes, flushed
 /// cold and sealed except for a hot tail of `hot` records.
 async fn sealed_stream(count: u64, hot: u64) -> (ShardRuntime, Router, Vec<u8>) {
     let (runtime, app) = spawn_with_cold_store();
     complete_repair_cycle(&runtime).await;
-    post_level(&app, 2).await;
     let record = |index: u64| {
         let mut line = format!("{{\"i\":{index},\"pad\":\"");
         line.push_str(&"p".repeat(usize::try_from(RECORD).unwrap() - line.len() - 3));

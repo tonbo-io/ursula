@@ -879,10 +879,8 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             snapshot_id: snapshot_id.clone(),
             location,
         };
-        // F12a: the binary envelope starts at feature level 1, when every
-        // follower that receives this pointer can decode it.
-        let envelope =
-            SnapshotEnvelope::for_feature_level(self.snapshot.stream_snapshot.feature_level);
+        // F12a: format epoch 2 writes only the MessagePack envelope.
+        let envelope = SnapshotEnvelope::MessagePack;
         let mut pointer_bytes = envelope.encode(&pointer).map_err(|err| err.into_io())?;
         persist_snapshot_metadata(
             self.snapshot_metadata_path.as_deref(),
@@ -1112,14 +1110,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(directory);
     }
 
-    /// F12a decode support: a node restores its persisted snapshot record
-    /// when both the record and the pointer inside it use the MessagePack
-    /// envelope that level Lb1 will emit, and the JSON record still decodes.
+    /// F12a: the persisted snapshot record and the pointer inside it use the
+    /// MessagePack envelope (format epoch 2 writes nothing else), and a node
+    /// restores from it.
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn persisted_snapshot_restores_from_the_binary_envelope() {
-        use ursula_runtime::decode_snapshot_envelope;
-        use ursula_runtime::encode_binary_envelope;
         use ursula_runtime::is_json_snapshot_envelope;
         use ursula_shard::CoreId;
         use ursula_shard::RaftGroupId;
@@ -1151,22 +1147,12 @@ mod tests {
         };
         builder.build_snapshot().await.expect("persist snapshot");
 
-        let json = std::fs::read(&metadata_path).expect("persisted record");
-        assert!(
-            is_json_snapshot_envelope(&json),
-            "emission stays JSON below Lb1"
-        );
-        let persisted =
-            decode_snapshot_envelope::<PersistedSnapshot>(&json).expect("decode JSON record");
-        let pointer = SnapshotPointer::decode(&persisted.pointer_bytes).expect("JSON pointer");
-        let binary = encode_binary_envelope(&PersistedSnapshot {
-            meta: persisted.meta,
-            pointer_bytes: pointer.encode_binary().expect("binary pointer"),
-        })
-        .expect("binary record");
+        let binary = std::fs::read(&metadata_path).expect("persisted record");
         assert!(!is_json_snapshot_envelope(&binary));
-        assert!(binary.len() < json.len());
-        std::fs::write(&metadata_path, &binary).expect("rewrite record");
+        let persisted =
+            SnapshotEnvelope::decode::<PersistedSnapshot>(&binary).expect("decode binary record");
+        assert!(!is_json_snapshot_envelope(&persisted.pointer_bytes));
+        SnapshotPointer::decode(&persisted.pointer_bytes).expect("binary pointer");
 
         let mut restored = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
             placement,
@@ -1191,86 +1177,6 @@ mod tests {
             42
         );
         let _ = std::fs::remove_dir_all(directory);
-    }
-
-    /// F12a: a group below feature level 1 keeps emitting the JSON
-    /// envelope; at level 1 the pointer and the persisted record are
-    /// MessagePack. Both restore, and both install on a follower.
-    #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn snapshot_envelope_switches_to_binary_at_feature_level_one() {
-        use ursula_shard::CoreId;
-        use ursula_shard::RaftGroupId;
-        use ursula_shard::ShardId;
-
-        let placement = ShardPlacement {
-            core_id: CoreId(0),
-            shard_id: ShardId(0),
-            raft_group_id: RaftGroupId(7),
-        };
-        for (level, expected) in [
-            (0, SnapshotEnvelope::Json),
-            (1, SnapshotEnvelope::MessagePack),
-        ] {
-            let directory = std::env::temp_dir().join(format!(
-                "ursula-snapshot-envelope-{level}-{}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&directory);
-            std::fs::create_dir_all(&directory).expect("snapshot metadata directory");
-            let metadata_path = directory.join("group-7.snapshot.json");
-            let mut group = test_group_snapshot(placement, 42);
-            group.stream_snapshot.feature_level = level;
-            let mut builder = RaftGroupSnapshotBuilder {
-                placement,
-                snapshot: Arc::new(group),
-                meta: test_snapshot_meta(42),
-                current_snapshot: Arc::new(Mutex::new(None)),
-                snapshot_store: default_snapshot_store(),
-                metrics: None,
-                _build_permit: test_build_permit().await,
-                log_gauge: Arc::default(),
-                log_mark: GroupLogMark::default(),
-                snapshot_metadata_path: Some(metadata_path.clone()),
-            };
-            let built = builder.build_snapshot().await.expect("build snapshot");
-            let pointer_bytes = built.snapshot.into_inner();
-            assert_eq!(SnapshotEnvelope::detect(&pointer_bytes), expected);
-            let persisted = std::fs::read(&metadata_path).expect("persisted record");
-            assert_eq!(SnapshotEnvelope::detect(&persisted), expected);
-
-            let mut restored = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
-                placement,
-                None,
-                None,
-                default_snapshot_store(),
-                SnapshotBuildCoordinator::default(),
-                SnapshotInstallCoordinator::default(),
-                Some(metadata_path),
-            );
-            restored
-                .restore_persisted_snapshot()
-                .await
-                .expect("restore persisted snapshot");
-            assert_eq!(restored.last_applied_log_id, Some(test_log_id(42)));
-            assert_eq!(
-                restored
-                    .group_snapshot()
-                    .await
-                    .expect("restored state")
-                    .stream_snapshot
-                    .feature_level,
-                level
-            );
-
-            let mut follower = RaftGroupStateMachine::new(placement);
-            follower
-                .install_snapshot(&test_snapshot_meta(42), Cursor::new(pointer_bytes))
-                .await
-                .expect("follower installs the pointer");
-            assert_eq!(follower.last_applied_log_id, Some(test_log_id(42)));
-            let _ = std::fs::remove_dir_all(directory);
-        }
     }
 
     #[cfg(not(madsim))]
@@ -1612,7 +1518,10 @@ mod tests {
         };
         let before = decode_calls_on_this_thread();
         state_machine
-            .install_snapshot(&meta, Cursor::new(pointer.encode().expect("pointer")))
+            .install_snapshot(
+                &meta,
+                Cursor::new(pointer.encode_binary().expect("pointer")),
+            )
             .await
             .expect("install inline snapshot");
         assert_eq!(decode_calls_on_this_thread() - before, 1);

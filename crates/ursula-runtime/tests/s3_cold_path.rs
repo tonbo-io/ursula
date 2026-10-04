@@ -111,25 +111,24 @@ async fn s3_cold_path_flushes_reads_and_cleans_up_object() {
     assert_eq!(metrics.cold_flush_publishes, 1);
     assert_eq!(metrics.cold_flush_publish_bytes, 4);
 
-    let snapshot = runtime
-        .snapshot_group(runtime.locate(&stream).raft_group_id)
+    // C7/F14: the flushed chunk is indexed by the stream's cold-index pages
+    // (under its incarnation generation), not held in replicated state.
+    let keys = cold_store
+        .list_cold_index_pages()
         .await
-        .expect("snapshot group");
-    let chunk_paths = snapshot
-        .stream_snapshot
-        .streams
-        .iter()
-        .find(|entry| entry.metadata.stream_id == stream)
-        .expect("stream snapshot entry")
-        .cold_chunks
-        .iter()
-        .map(|chunk| chunk.s3_path.clone())
+        .expect("list cold index pages")
+        .into_iter()
+        .filter(|key| key.stream_id == stream)
         .collect::<Vec<_>>();
-    assert_eq!(chunk_paths.len(), 1);
-    for path in chunk_paths {
-        cold_store
-            .delete_chunk(&path)
-            .await
-            .expect("cleanup S3 chunk");
-    }
+    let chunks = ursula_runtime::load_cold_chunks_from_pages(
+        &ursula_runtime::ColdStoreColdIndexPageStore::new(cold_store.clone()),
+        &keys,
+    )
+    .await
+    .expect("load cold chunks");
+    assert_eq!(chunks.len(), 1);
+    cold_store
+        .remove_all("")
+        .await
+        .expect("cleanup the per-run S3 root");
 }

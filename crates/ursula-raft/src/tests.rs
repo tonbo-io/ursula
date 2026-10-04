@@ -22,7 +22,6 @@ use openraft::SnapshotPolicy;
 use openraft::StorageError;
 use openraft::alias::VoteOf;
 use openraft::entry::RaftEntry;
-use openraft::rt::WatchReceiver;
 use openraft::storage::IOFlushed;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
@@ -2447,125 +2446,6 @@ async fn openraft_snapshot_round_trips_group_state() {
         }
         other => panic!("unexpected append response: {other:?}"),
     }
-}
-
-/// C0 parity: the in-memory engine and the Raft engine apply the same
-/// `SetFeatureLevel` sequence identically, report the same levels, and carry
-/// the level through their group snapshots.
-#[tokio::test]
-async fn feature_level_matches_between_in_memory_and_raft_engines() {
-    let mut in_memory = ursula_runtime::InMemoryGroupEngine::default();
-    let mut raft = RaftGroupEngine::new_single_node(placement())
-        .await
-        .expect("create raft group engine");
-
-    for level in [1, 1, 0] {
-        let request = ursula_runtime::SetFeatureLevelRequest { level };
-        let expected = in_memory
-            .set_feature_level(request, placement())
-            .await
-            .expect("in-memory set feature level");
-        let actual = raft
-            .set_feature_level(request, placement())
-            .await
-            .expect("raft set feature level");
-        assert_eq!(
-            (actual.level, actual.previous_level),
-            (expected.level, expected.previous_level),
-            "level {level}"
-        );
-    }
-    assert_eq!(
-        GroupEngine::feature_level(&mut in_memory, placement())
-            .await
-            .expect("level"),
-        1
-    );
-    assert_eq!(raft.feature_level(placement()).await.expect("level"), 1);
-
-    let in_memory_snapshot = in_memory.snapshot(placement()).await.expect("snapshot");
-    let raft_snapshot = raft.snapshot(placement()).await.expect("snapshot");
-    assert_eq!(in_memory_snapshot.stream_snapshot.feature_level, 1);
-    assert_eq!(
-        raft_snapshot.stream_snapshot,
-        in_memory_snapshot.stream_snapshot
-    );
-    raft.shutdown().await.expect("shutdown raft group engine");
-}
-
-#[tokio::test]
-async fn feature_level_replicates_to_followers_and_rejects_follower_proposals() {
-    let (_registry, mut engines, leader_id) =
-        build_three_node_cluster("ursula-feature-level-test", None).await;
-    for engine in &engines {
-        engine
-            .raft
-            .wait(Some(Duration::from_secs(5)))
-            .current_leader(leader_id, "all nodes observe the same leader")
-            .await
-            .expect("wait for shared leader");
-    }
-    let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
-    let follower_index = (leader_index + 1) % engines.len();
-
-    let err = engines[follower_index]
-        .set_feature_level(
-            ursula_runtime::SetFeatureLevelRequest { level: 1 },
-            placement(),
-        )
-        .await
-        .expect_err("follower must not propose locally");
-    assert!(err.leader_hint().is_some(), "{err:?}");
-
-    let response = engines[leader_index]
-        .set_feature_level(
-            ursula_runtime::SetFeatureLevelRequest { level: 1 },
-            placement(),
-        )
-        .await
-        .expect("leader proposes feature level");
-    assert_eq!((response.level, response.previous_level), (1, 0));
-
-    let applied = engines[leader_index]
-        .raft
-        .metrics()
-        .borrow_watched()
-        .last_applied
-        .map(|log_id| log_id.index());
-    for engine in &mut engines {
-        engine
-            .raft
-            .wait(Some(Duration::from_secs(5)))
-            .applied_index_at_least(applied, "feature level replicated")
-            .await
-            .expect("wait for replication");
-        assert_eq!(engine.feature_level(placement()).await.expect("level"), 1);
-    }
-    shutdown_all(&engines).await;
-}
-
-#[tokio::test]
-async fn openraft_snapshot_carries_feature_level() {
-    let mut source = RaftGroupStateMachine::new(placement());
-    let entries = vec![normal_entry(
-        1,
-        GroupWriteCommand::from(ursula_stream::StreamCommand::SetFeatureLevel { level: 1 }),
-    )];
-    source
-        .apply(stream::iter(
-            entries.into_iter().map(|entry| Ok((entry, None))),
-        ))
-        .await
-        .expect("apply source");
-
-    let mut builder = source.get_snapshot_builder().await;
-    let snapshot = builder.build_snapshot().await.expect("build snapshot");
-    let mut target = RaftGroupStateMachine::new(placement());
-    target
-        .install_snapshot(&snapshot.meta, snapshot.snapshot)
-        .await
-        .expect("install snapshot");
-    assert_eq!(target.engine.feature_level(), 1);
 }
 
 /// F1 follow-up: a forwarded read carries the continuation anchor to the

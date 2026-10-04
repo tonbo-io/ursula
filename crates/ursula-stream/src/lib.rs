@@ -4,6 +4,8 @@
 //!
 //! - [`command`]: replicated command variants applied to the state machine.
 //! - [`feature`]: replicated group feature levels and the apply-time gate.
+//! - [`format`]: the format epoch every persisted format and the Raft RPC
+//!   protocol share, and its policy.
 //! - [`response`]: result variants and error codes returned per command.
 //! - [`model`]: persistent data types (metadata, segments, producer state, plans).
 //! - [`record_index`]: retained record-ordinal to offset boundaries: exact for
@@ -20,6 +22,7 @@
 
 mod command;
 mod feature;
+mod format;
 mod model;
 mod record_index;
 mod response;
@@ -37,6 +40,8 @@ pub use feature::FEATURE_LEVEL_KEYED_STREAMS;
 pub use feature::FEATURE_LEVEL_SPARSE_MARKS;
 pub use feature::MAX_SUPPORTED_FEATURE_LEVEL;
 pub use feature::check_feature_level;
+pub use format::FORMAT_EPOCH;
+pub use format::format_epoch_refusal;
 pub use model::AppendStreamInput;
 pub use model::BOOTSTRAP_MAX_UPDATE_BYTES;
 pub use model::BucketUsage;

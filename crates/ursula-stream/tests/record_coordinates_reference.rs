@@ -552,8 +552,8 @@ fn retention_advances_first_without_renumbering_survivors() {
 }
 
 /// F1 sparse cold record marks (bounded-stream-state §6) against this
-/// reference model: a real [`ursula_stream::StreamStateMachine`] at feature
-/// level 2, with an in-memory byte store standing in for S3, must agree with
+/// reference model: a real [`ursula_stream::StreamStateMachine`] (born at the
+/// top feature level), with an in-memory byte store standing in for S3, must agree with
 /// [`ReferenceStream`] on every acknowledgement, record range, record read
 /// (exact and bracketed), retention and persistence path.
 mod sparse_marks_differential {
@@ -564,7 +564,6 @@ mod sparse_marks_differential {
     use ursula_shard::BucketStreamId;
     use ursula_stream::ColdChunkRef;
     use ursula_stream::ExternalPayloadRef;
-    use ursula_stream::FEATURE_LEVEL_SPARSE_MARKS;
     use ursula_stream::MARK_BLOCK_BYTES;
     use ursula_stream::ProducerRequest;
     use ursula_stream::RecordOffset;
@@ -659,12 +658,6 @@ mod sparse_marks_differential {
     impl Harness {
         pub(super) fn new() -> Self {
             let mut machine = StreamStateMachine::new();
-            ok(
-                machine.apply(StreamCommand::SetFeatureLevel {
-                    level: FEATURE_LEVEL_SPARSE_MARKS,
-                }),
-                "raise",
-            );
             ok(
                 machine.apply(StreamCommand::CreateBucket {
                     bucket_id: "rcmarks".to_owned(),
@@ -939,7 +932,7 @@ mod sparse_marks_differential {
                 assert!(offset - retained_offset < MARK_BLOCK_BYTES * 4);
             }
             self.oracle.retain_from(range.first_record).unwrap();
-            // Retention seals (level 2): dropping the hot bytes below dense
+            // Retention seals (Lb2 sparse marks): dropping the hot bytes below dense
             // records leaves no seal debt for the tidy driver.
             self.assert_dense_bound(&self.machine);
         }

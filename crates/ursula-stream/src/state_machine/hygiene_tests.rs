@@ -108,39 +108,6 @@ fn rejected_retention_leaves_record_index_untouched() {
 }
 
 #[test]
-fn flush_collapse_allocates_post_collapse_message_records() {
-    // Measured before F7: collapse allocated with the old length, holding
-    // 16 MB for a single message record.
-    let (mut machine, stream_id) = machine_with_json_stream("collapse");
-    assert_eq!(slot(&machine, &stream_id).message_records.len(), RECORDS);
-    let end = 2 * u64::try_from(RECORDS).unwrap() - 20;
-    assert!(matches!(
-        machine.apply(StreamCommand::FlushCold {
-            cold_generation: None,
-            stream_id: stream_id.clone(),
-            chunk: ColdChunkRef {
-                start_offset: 0,
-                end_offset: end,
-                s3_path: "s3://hygiene/collapse".to_owned(),
-                object_size: end,
-                object_offset: 0,
-                shared_object: false,
-                payload_digest: String::new(),
-            },
-        }),
-        StreamResponse::ColdFlushed { .. }
-    ));
-    let slot = slot(&machine, &stream_id);
-    assert_eq!(slot.message_records.len(), 11);
-    assert!(
-        bounded(slot.message_records.len(), slot.message_records.capacity()),
-        "message records capacity {}",
-        slot.message_records.capacity()
-    );
-    assert_eq!(slot.hot_buffer.len(), 20);
-}
-
-#[test]
 fn compaction_shrinks_cold_ref_vectors() {
     // F7: CompactCold and retention remove whole runs of state refs; the
     // vectors return the freed capacity.

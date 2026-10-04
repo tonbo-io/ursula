@@ -66,11 +66,49 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
     let mut pending_cold_gc = Vec::new();
     let mut footer_seen = false;
 
+    // E5: the format-epoch frame comes first and is checked before any other
+    // frame is decoded, so a 0.5.x snapshot fails here rather than on a
+    // stream frame it would misread.
+    // A first frame that does not decode is corruption, not an old
+    // snapshot; only a frame that decodes but is not `FormatEpoch` gets E5.
+    let first = if cursor.has_remaining() {
+        proto::SnapshotFrameV1::decode_length_delimited(&mut cursor)
+            .map_err(|err| SnapshotStoreError::Deserialize(format!("snapshot frame: {err}")))?
+            .frame
+    } else {
+        None
+    };
+    match first {
+        Some(proto::snapshot_frame_v1::Frame::FormatEpoch(value)) => {
+            if value.epoch != ursula_stream::FORMAT_EPOCH {
+                return Err(SnapshotStoreError::Deserialize(
+                    ursula_stream::format_epoch_refusal(
+                        "snapshot",
+                        &format!("is format epoch {}", value.epoch),
+                    ),
+                ));
+            }
+        }
+        _ => {
+            return Err(SnapshotStoreError::Deserialize(
+                ursula_stream::format_epoch_refusal(
+                    "snapshot",
+                    "has no leading format-epoch frame (Ursula 0.5.x or earlier, format epoch 1)",
+                ),
+            ));
+        }
+    }
+
     while cursor.has_remaining() {
         let frame = proto::SnapshotFrameV1::decode_length_delimited(&mut cursor)
             .map_err(|err| SnapshotStoreError::Deserialize(format!("snapshot frame: {err}")))?;
         let frame = required(frame.frame, "snapshot frame")?;
         match frame {
+            proto::snapshot_frame_v1::Frame::FormatEpoch(_) => {
+                return Err(SnapshotStoreError::Deserialize(
+                    "snapshot format-epoch frame is not the first frame".to_owned(),
+                ));
+            }
             proto::snapshot_frame_v1::Frame::Header(value) => {
                 if header.replace(value).is_some() {
                     return Err(SnapshotStoreError::Deserialize(
@@ -104,11 +142,14 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
     let snapshot_write_unit = header
         .committed_write_unit_bytes
         .unwrap_or(ursula_stream::COMMITTED_WRITE_UNIT_BYTES);
-    if header.feature_level > ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL {
+    // Every epoch-2 writer runs at the top level; anything else is a fixture
+    // bug or a snapshot from a later build that dropped the field.
+    if header.feature_level != ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL {
         return Err(SnapshotStoreError::Deserialize(format!(
-            "snapshot feature level {} exceeds this binary's supported level {}; \
-             a binary that cannot apply that level must not run this group",
+            "snapshot feature level {} is not this binary's level {}; every \
+             format-epoch-2 snapshot is written at level {}",
             header.feature_level,
+            ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL,
             ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL
         )));
     }
@@ -123,6 +164,7 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
         placement: placement_from_proto(required(header.placement, "snapshot header placement")?),
         group_commit_index: header.group_commit_index,
         stream_snapshot: StreamSnapshot {
+            format_epoch: ursula_stream::FORMAT_EPOCH,
             buckets: header.buckets,
             erased_buckets: header.erased_buckets,
             streams,
@@ -178,6 +220,7 @@ fn bucket_usage_to_proto(value: ursula_stream::BucketUsageSnapshot) -> proto::Bu
 /// only the entry being encoded is copied, one frame at a time.
 struct GroupSnapshotFrameIter {
     snapshot: Arc<GroupSnapshot>,
+    format_epoch: bool,
     header: bool,
     next_stream: usize,
     next_append_count: usize,
@@ -189,6 +232,7 @@ impl GroupSnapshotFrameIter {
     fn new(snapshot: Arc<GroupSnapshot>) -> Self {
         Self {
             snapshot,
+            format_epoch: true,
             header: true,
             next_stream: 0,
             next_append_count: 0,
@@ -231,7 +275,12 @@ impl Iterator for GroupSnapshotFrameIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         let snapshot = &*self.snapshot;
-        let frame = if self.header {
+        let frame = if self.format_epoch {
+            self.format_epoch = false;
+            proto::snapshot_frame_v1::Frame::FormatEpoch(proto::FormatEpochV1 {
+                epoch: ursula_stream::FORMAT_EPOCH,
+            })
+        } else if self.header {
             self.header = false;
             proto::snapshot_frame_v1::Frame::Header(Self::header_frame(snapshot))
         } else if let Some(stream) = snapshot.stream_snapshot.streams.get(self.next_stream) {
@@ -720,6 +769,7 @@ mod tests {
             },
             group_commit_index: 42,
             stream_snapshot: StreamSnapshot {
+                format_epoch: ursula_stream::FORMAT_EPOCH,
                 buckets: vec!["bucket".to_owned()],
                 erased_buckets: vec!["erased-bucket".to_owned()],
                 streams: Vec::new(),
@@ -944,10 +994,6 @@ mod tests {
             .expect("restore decoded snapshot");
         assert_eq!(restored.snapshot(), machine.snapshot());
         assert_eq!(restored.state_gauges(), machine.state_gauges());
-
-        let mut below = decoded.stream_snapshot;
-        below.feature_level = ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
-        assert!(ursula_stream::StreamStateMachine::restore(below).is_err());
     }
 
     /// Bounded-state F4b (level 4): the codec writes no message records
@@ -1056,11 +1102,95 @@ mod tests {
                 machine.bootstrap_plan(stream_id)
             );
         }
+    }
 
-        // A level-3 binary refuses append starts.
-        let mut below = decoded.stream_snapshot;
-        below.feature_level = ursula_stream::FEATURE_LEVEL_EXTERNAL_LOCATORS;
-        assert!(ursula_stream::StreamStateMachine::restore(below).is_err());
+    fn epoch_frame(epoch: u32) -> Bytes {
+        encode_frame(proto::SnapshotFrameV1 {
+            frame: Some(proto::snapshot_frame_v1::Frame::FormatEpoch(
+                proto::FormatEpochV1 { epoch },
+            )),
+        })
+        .expect("encode epoch frame")
+    }
+
+    fn header_v1(feature_level: u32) -> proto::SnapshotHeaderV1 {
+        proto::SnapshotHeaderV1 {
+            placement: Some(placement_to_proto(ShardPlacement {
+                core_id: CoreId(0),
+                shard_id: ShardId(0),
+                raft_group_id: RaftGroupId(0),
+            })),
+            group_commit_index: 0,
+            buckets: Vec::new(),
+            erased_buckets: Vec::new(),
+            next_cold_gc_seq: 0,
+            shared_cold_object_owners: Vec::new(),
+            bucket_usage: Vec::new(),
+            committed_write_unit_bytes: None,
+            feature_level,
+            last_created_at_ms: 0,
+        }
+    }
+
+    fn header_frame(feature_level: u32) -> Bytes {
+        encode_frame(proto::SnapshotFrameV1 {
+            frame: Some(proto::snapshot_frame_v1::Frame::Header(header_v1(
+                feature_level,
+            ))),
+        })
+        .expect("encode header")
+    }
+
+    fn footer_frame() -> Bytes {
+        encode_frame(proto::SnapshotFrameV1 {
+            frame: Some(proto::snapshot_frame_v1::Frame::Footer(
+                proto::SnapshotFooterV1 {},
+            )),
+        })
+        .expect("encode footer")
+    }
+
+    /// Format epoch 2 (E5): the epoch frame comes first and is checked before
+    /// any other frame; a header below the top level is refused too.
+    #[test]
+    fn decode_requires_a_leading_epoch_frame_of_this_epoch_at_the_top_level() {
+        let max = ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL;
+        let epoch = ursula_stream::FORMAT_EPOCH;
+        let valid = [epoch_frame(epoch), header_frame(max), footer_frame()].concat();
+        decode_group_snapshot(&valid).expect("an epoch-2 snapshot decodes");
+
+        let cases = [
+            (
+                [header_frame(max), footer_frame()].concat(),
+                "no leading format-epoch frame",
+            ),
+            (
+                [epoch_frame(epoch - 1), header_frame(max), footer_frame()].concat(),
+                "is format epoch 1",
+            ),
+            (
+                [header_frame(max), epoch_frame(epoch), footer_frame()].concat(),
+                "no leading format-epoch frame",
+            ),
+            (
+                [
+                    epoch_frame(epoch),
+                    header_frame(max),
+                    epoch_frame(epoch),
+                    footer_frame(),
+                ]
+                .concat(),
+                "not the first frame",
+            ),
+            (
+                [epoch_frame(epoch), header_frame(max - 1), footer_frame()].concat(),
+                "feature level",
+            ),
+        ];
+        for (bytes, expected) in cases {
+            let error = decode_group_snapshot(&bytes).expect_err("refused");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]
@@ -1080,12 +1210,13 @@ mod tests {
                     shared_cold_object_owners: Vec::new(),
                     bucket_usage: Vec::new(),
                     committed_write_unit_bytes: None,
-                    feature_level: 0,
+                    feature_level: ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL,
                     last_created_at_ms: 0,
                 },
             )),
         })
         .expect("encode header");
+        let header = [epoch_frame(ursula_stream::FORMAT_EPOCH), header].concat();
 
         assert!(matches!(
             decode_group_snapshot(&header),
@@ -1108,10 +1239,11 @@ mod tests {
             shared_cold_object_owners: Vec::new(),
             bucket_usage: Vec::new(),
             committed_write_unit_bytes: Some(4096),
-            feature_level: 0,
+            feature_level: ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL,
             last_created_at_ms: 0,
         };
         let bytes = [
+            epoch_frame(ursula_stream::FORMAT_EPOCH),
             encode_frame(proto::SnapshotFrameV1 {
                 frame: Some(proto::snapshot_frame_v1::Frame::Header(header)),
             })
@@ -1127,109 +1259,6 @@ mod tests {
 
         let error = decode_group_snapshot(&bytes).expect_err("unit mismatch must fail restore");
         assert!(error.to_string().contains("4096"), "{error}");
-    }
-
-    fn header_only_snapshot(feature_level: u32) -> Vec<u8> {
-        let header = proto::SnapshotHeaderV1 {
-            placement: Some(placement_to_proto(ShardPlacement {
-                core_id: CoreId(0),
-                shard_id: ShardId(0),
-                raft_group_id: RaftGroupId(0),
-            })),
-            group_commit_index: 0,
-            buckets: Vec::new(),
-            erased_buckets: Vec::new(),
-            next_cold_gc_seq: 0,
-            shared_cold_object_owners: Vec::new(),
-            bucket_usage: Vec::new(),
-            committed_write_unit_bytes: None,
-            feature_level,
-            last_created_at_ms: 0,
-        };
-        [
-            encode_frame(proto::SnapshotFrameV1 {
-                frame: Some(proto::snapshot_frame_v1::Frame::Header(header)),
-            })
-            .expect("encode header"),
-            encode_frame(proto::SnapshotFrameV1 {
-                frame: Some(proto::snapshot_frame_v1::Frame::Footer(
-                    proto::SnapshotFooterV1 {},
-                )),
-            })
-            .expect("encode footer"),
-        ]
-        .concat()
-    }
-
-    /// The header as written before C0, without field 10.
-    #[derive(Clone, PartialEq, prost::Message)]
-    struct LegacySnapshotHeaderV1 {
-        #[prost(message, optional, tag = "1")]
-        placement: Option<proto::ShardPlacementV1>,
-        #[prost(uint64, tag = "2")]
-        group_commit_index: u64,
-        #[prost(string, repeated, tag = "3")]
-        buckets: Vec<String>,
-    }
-
-    #[test]
-    fn legacy_snapshot_without_feature_level_decodes_as_level_zero() {
-        let legacy_header = LegacySnapshotHeaderV1 {
-            placement: Some(placement_to_proto(ShardPlacement {
-                core_id: CoreId(0),
-                shard_id: ShardId(0),
-                raft_group_id: RaftGroupId(3),
-            })),
-            group_commit_index: 5,
-            buckets: vec!["bucket".to_owned()],
-        };
-        // Frame field 1 (header) carrying the legacy message, length-delimited
-        // exactly as `encode_frame` lays out a frame.
-        let mut frame = Vec::new();
-        prost::encoding::message::encode(1, &legacy_header, &mut frame);
-        let mut bytes = Vec::new();
-        prost::encoding::encode_varint(frame.len() as u64, &mut bytes);
-        bytes.extend_from_slice(&frame);
-        bytes.extend(
-            encode_frame(proto::SnapshotFrameV1 {
-                frame: Some(proto::snapshot_frame_v1::Frame::Footer(
-                    proto::SnapshotFooterV1 {},
-                )),
-            })
-            .expect("encode footer"),
-        );
-
-        let decoded = decode_group_snapshot(&bytes).expect("decode legacy snapshot");
-        assert_eq!(decoded.stream_snapshot.feature_level, 0);
-        assert_eq!(decoded.stream_snapshot.last_created_at_ms, 0);
-        assert_eq!(decoded.stream_snapshot.buckets, vec!["bucket".to_owned()]);
-        assert_eq!(decoded.group_commit_index, 5);
-    }
-
-    #[test]
-    fn feature_level_round_trips_through_the_header() {
-        let decoded = decode_group_snapshot(&header_only_snapshot(1)).expect("decode level 1");
-        assert_eq!(decoded.stream_snapshot.feature_level, 1);
-        let reencoded = group_snapshot_frames(Arc::new(decoded.clone()))
-            .collect::<Result<Vec<_>, _>>()
-            .expect("encode frames")
-            .concat();
-        assert_eq!(
-            decode_group_snapshot(&reencoded).expect("decode again"),
-            decoded
-        );
-    }
-
-    #[test]
-    fn rejects_a_snapshot_above_the_supported_feature_level() {
-        let err = decode_group_snapshot(&header_only_snapshot(
-            ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL + 1,
-        ))
-        .expect_err("future level rejected");
-        assert!(
-            matches!(&err, SnapshotStoreError::Deserialize(message) if message.contains("feature level")),
-            "{err:?}"
-        );
     }
 
     /// Bounded-state F16 (level 5): a cold snapshot body travels through

@@ -106,11 +106,10 @@ The writer holds an exclusive advisory lock in `journal.bin.lock`. A second
 process receives a diagnostic error naming the journal, lock path, and recorded
 owner PID instead of concurrently modifying the same WAL.
 
-An existing unversioned journal is migrated under that lock. Migration streams
-records into a checksummed temporary file, syncs it, preserves the original as
-`journal.bin.v0.bak`, atomically installs v1, and syncs the parent directory.
-The backup is intentionally retained for rollback and should be removed only
-after the staged upgrade has been validated.
+The journal header version is the format epoch, 2 since Ursula 0.6. There is
+no migration: a version-1 journal (Ursula 0.5.x) and a journal without the
+Ursula WAL magic are refused, and the data directory's `FORMAT_EPOCH` marker
+refuses an older directory before any journal is opened.
 
 ## Online reclaim and the single-file question
 

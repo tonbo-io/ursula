@@ -16,6 +16,8 @@
 //! - [`meta`]: meta-group OpenRaft type config and control-plane state machine.
 //! - [`engine`]: [`RaftGroupEngine`] + `GroupEngine` impl, with the engine
 //!   factories under `engine::factory`.
+//! - [`format_epoch`]: the Raft protocol (format-epoch) peer probe and the
+//!   mismatch record readiness reads.
 //! - [`forward`]: leader-forwarding helpers used by the engine when a node is a follower.
 //! - [`snapshot_cadence`]: the byte-based snapshot cadence policy (F12e) and
 //!   the per-group log gauges the snapshot driver reads.
@@ -28,6 +30,7 @@ pub mod raft_internal_proto {
 
 mod codec;
 mod engine;
+mod format_epoch;
 mod forward;
 mod grpc;
 mod log_store;
@@ -51,6 +54,9 @@ pub use engine::RaftGroupEngine;
 pub use engine::RaftGroupEngineFactory;
 pub use engine::RegisteredRaftGroupEngineFactory;
 pub use engine::StaticGrpcRaftGroupEngineFactory;
+pub use format_epoch::FormatEpochMismatch;
+pub use format_epoch::PeerFormatEpoch;
+pub use format_epoch::probe_peer_format_epoch;
 pub use grpc::GrpcRaftNetwork;
 pub use grpc::GrpcRaftNetworkFactory;
 pub use grpc::RAFT_GRPC_APPEND_PATH;
