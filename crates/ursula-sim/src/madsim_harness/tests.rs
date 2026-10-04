@@ -1949,15 +1949,14 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
         // newest sequence, a duplicate beyond the window and an idle
         // expiry; every replica applies it from its own state.
         for seq in 1_100..1_300 {
-            last_index = engines[leader_index]
+            engines[leader_index]
                 .append(
                     append(seq, "busy", 10 + seq),
                     placement(),
                     ColdWriteAdmission::default(),
                 )
                 .await
-                .expect("busy suffix append")
-                .group_commit_index;
+                .expect("busy suffix append");
         }
         let newest = engines[leader_index]
             .append(
@@ -1986,21 +1985,7 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
             )
             .await
             .expect("quiet after idle expiry");
-        // Wait on the leader's applied Raft log index, which covers every
-        // entry above (the engine's commit index counts mutations only).
-        let leader_applied = openraft::rt::WatchReceiver::borrow_watched(&leader.metrics())
-            .last_applied
-            .map(|log_id| log_id.index)
-            .expect("leader applied index");
-        last_index = leader_applied;
-        for engine in &engines {
-            engine
-                .raft_handle()
-                .wait(Some(Duration::from_secs(10)))
-                .applied_index_at_least(Some(last_index), "every replica applied suffix")
-                .await
-                .expect("wait for replica apply");
-        }
+        apply_barrier(&engines, leader_index, "every replica applied suffix").await;
         let mut producer_states = Vec::new();
         for engine in &engines {
             let snapshot = engine
@@ -2303,14 +2288,13 @@ fn sparse_marks_body(from: u64, to: u64) -> Vec<u8> {
 }
 
 /// Appends `count` records through the leader and checks the
-/// acknowledgement range comes from apply (Invariant 10). Returns the
-/// append's group commit index.
+/// acknowledgement range comes from apply (Invariant 10).
 async fn sparse_marks_append(
     leader: &mut RaftGroupEngine,
     stream: &BucketStreamId,
     next: &mut u64,
     count: u64,
-) -> u64 {
+) {
     let from = *next;
     *next += count;
     let mut request = AppendRequest::from_bytes(stream.clone(), sparse_marks_body(from, *next));
@@ -2326,7 +2310,6 @@ async fn sparse_marks_append(
             next_record: *next,
         })
     );
-    response.group_commit_index
 }
 
 /// Flushes the whole hot prefix in cuts of at most `max` bytes.
@@ -2668,8 +2651,7 @@ async fn external_locator_ambiguity(variant: LocatorAmbiguity) {
         }
     }
 
-    let applied = leader_applied_index(&engines[leader]);
-    wait_all_nodes_applied(&engines, applied, "every replica applied the offloads").await;
+    apply_barrier(&engines, leader, "every replica applied the offloads").await;
     let mut acknowledged = b"base;".to_vec();
     if ambiguous_committed {
         acknowledged.extend_from_slice(&ambiguous);
@@ -2743,10 +2725,11 @@ fn external_locators_survive_ambiguous_commits() {
 
 /// Waits until every replica applied everything the leader committed so
 /// far. The barrier is the leader's read log id (`ReadIndex`), a Raft log
-/// index. A response's `group_commit_index` is not one: it counts applied
-/// stream commands and skips the blank and membership entries the log also
-/// holds, so it trails the entry's log index. The leader's metrics can lag
-/// its own apply, so they are not a reliable barrier either.
+/// index. A response's `group_commit_index` is not one: it counts mutating
+/// stream outcomes (a batch adds one per item; blank, membership and no-op
+/// entries add nothing), so it can trail or lead the entry's log index. The
+/// leader's metrics can lag its own apply, so they are not a reliable
+/// barrier either.
 async fn apply_barrier(
     engines: &[RaftGroupEngine],
     leader_index: usize,
