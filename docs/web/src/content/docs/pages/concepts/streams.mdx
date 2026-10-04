@@ -30,6 +30,7 @@ Every stream is in one of these states:
 
 - Every accepted append or close renews it; a deduplicated retry or a repeat close does not.
 - Reads renew it at most once per quarter of the TTL, so a stream that is only read can expire after about 0.75×TTL of idleness following the last read. `HEAD` does not renew it.
+- An SSE connection renews it when it opens, not while it waits for new data. Ursula does not close idle SSE connections (the base protocol expects servers to end them about every 60 seconds so readers reconnect), so an open subscription alone does not keep a stream with no writes alive. Each long-poll request renews like any other read.
 - Renewal never moves expiry earlier, even when the node that handled the request has a slower clock than the one that last renewed it.
 
 ## Related

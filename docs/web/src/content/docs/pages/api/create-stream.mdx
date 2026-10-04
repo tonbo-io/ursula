@@ -20,7 +20,7 @@ api: "PUT /{bucket}/{stream}"
 </ParamField>
 
 <ParamField header="Stream-TTL" type="string">
- Sliding time-to-live in seconds. Writes restart the window; reads renew it at most once per quarter of the TTL. See [stream lifecycle](/docs/concepts/streams#lifecycle).
+ Sliding time-to-live in seconds. Appends and closes restart the window; reads renew it at most once per quarter of the TTL. See [stream lifecycle](/docs/concepts/streams#lifecycle).
 </ParamField>
 
 <ParamField header="Stream-Expires-At" type="string">
