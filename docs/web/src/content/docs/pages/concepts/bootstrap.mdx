@@ -6,7 +6,7 @@ sidebarTitle: Bootstrap
 Bootstrap is the new-client initialization endpoint. A single request returns:
 
 1. The latest snapshot (if any)
-2. The updates after the snapshot, one message per part, up to the stream's current tail or up to an honest stopping point
+2. The updates after the snapshot (one part per record on a JSON stream, one part in all on any other stream), up to the stream's current tail or up to an honest stopping point
 
 ```
 GET /{bucket}/{stream}/bootstrap
@@ -21,7 +21,7 @@ Each part has its own `Content-Type`: the snapshot part uses `snapshot_content_t
 
 ## Partial responses
 
-Bootstrap only serves updates that are still in the hot tier, and at most 8 MiB of them per response. When updates after the snapshot have already moved to cold storage, or there are more than 8 MiB of them, the response stops early at a message boundary: `Stream-Next-Offset` is where it stopped and `Stream-Up-To-Date` is absent. In the cold case the response holds only the snapshot part. It never skips a message.
+Bootstrap only serves updates that are still in the hot tier, and at most 8 MiB of them per response. When updates after the snapshot have already moved to cold storage, or there are more than 8 MiB of them, the response stops early: `Stream-Next-Offset` is where it stopped and `Stream-Up-To-Date` is absent. In the cold case, and for a non-JSON stream above 8 MiB, the response holds only the snapshot part; a JSON stream above 8 MiB stops at a record boundary. It never skips bytes.
 
 Clients therefore follow one rule: after applying the bootstrap response, read from `Stream-Next-Offset` with ordinary reads until `Stream-Up-To-Date: true`, then go live. A complete response simply makes that loop empty.
 

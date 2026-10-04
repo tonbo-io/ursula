@@ -9,6 +9,7 @@ use super::ObjectPayloadRef;
 use super::ProducerRequest;
 use super::StreamBootstrapPlan;
 use super::StreamErrorCode;
+use super::StreamMessageRecord;
 use super::StreamMetadata;
 use super::StreamRead;
 use super::StreamReadColdIndexSegment;
@@ -490,11 +491,18 @@ impl StreamStateMachine {
         self.bootstrap_plan_with_cap(stream_id, BOOTSTRAP_MAX_UPDATE_BYTES)
     }
 
-    /// Plans `/bootstrap` with at most `max_update_bytes` of update messages
-    /// (bounded-stream-state F11). The updates stop at a message boundary;
-    /// a single message larger than the cap is returned whole. A capped plan
-    /// is an honest partial: `next_offset` is the end of the last returned
-    /// message and `up_to_date` is false.
+    /// Plans `/bootstrap` with at most `max_update_bytes` of updates
+    /// (bounded-stream-state F11).
+    ///
+    /// A stream without a record index has no message boundaries: its hot
+    /// range `[S, tail)` is one part when `S` is at or above the seal point,
+    /// every byte of the range is hot and the range fits the cap; otherwise
+    /// the plan is snapshot-only.
+    ///
+    /// A JSON stream answers one part per record. The updates stop at a
+    /// record boundary; a single record larger than the cap is returned
+    /// whole. A capped plan is an honest partial: `next_offset` is the end
+    /// of the last returned record and `up_to_date` is false.
     pub fn bootstrap_plan_with_cap(
         &self,
         stream_id: &BucketStreamId,
@@ -513,11 +521,10 @@ impl StreamStateMachine {
             .map_or(slot.retained_offset, |snapshot| snapshot.offset);
         let exact_frontier = self.exact_message_frontier(stream_id);
         let closed = stream.status == StreamStatus::Closed;
-        // Honest partial: the messages right after the snapshot only survive
-        // as a collapsed cold record, so bootstrap cannot split them into one
-        // part per message without reading cold storage. The client
-        // continues with ordinary reads from the snapshot, which also report
-        // closure once they reach the tail.
+        // Honest partial: the bytes right after the snapshot are cold (or,
+        // without a record index, more than the cap), so bootstrap answers
+        // the snapshot alone. The client continues with ordinary reads from
+        // the snapshot, which also report closure once they reach the tail.
         let honest_partial = |snapshot: Option<StreamVisibleSnapshot>| StreamBootstrapPlan {
             snapshot,
             updates: Vec::new(),
@@ -529,12 +536,37 @@ impl StreamStateMachine {
         if snapshot_offset < exact_frontier {
             return Ok(honest_partial(snapshot));
         }
+        let Some(messages) = slot.derived_messages_from(snapshot_offset) else {
+            // No record index: the whole hot range `[S, tail)` is one part.
+            // An external append above hot bytes leaves a cold gap that
+            // bootstrap does not read.
+            let len = stream.tail_offset.saturating_sub(snapshot_offset);
+            if len > max_update_bytes
+                || !slot.hot_buffer.covers(snapshot_offset, stream.tail_offset)
+            {
+                return Ok(honest_partial(snapshot));
+            }
+            let updates = (len > 0)
+                .then_some(StreamMessageRecord {
+                    start_offset: snapshot_offset,
+                    end_offset: stream.tail_offset,
+                })
+                .into_iter()
+                .collect();
+            return Ok(StreamBootstrapPlan {
+                snapshot,
+                updates,
+                next_offset: stream.tail_offset,
+                content_type: stream.content_type.clone(),
+                up_to_date: true,
+                closed,
+            });
+        };
         let mut updates = Vec::new();
         let mut update_bytes = 0u64;
         let mut capped_at = None;
-        // F4b: the messages derive from the dense record offsets or the hot
-        // append starts.
-        for record in slot.derived_messages_from(snapshot_offset) {
+        // F4b: the records derive from the dense record offsets.
+        for record in messages {
             let len = record.end_offset.saturating_sub(record.start_offset);
             let next_bytes = update_bytes.saturating_add(len);
             if !updates.is_empty() && next_bytes > max_update_bytes {

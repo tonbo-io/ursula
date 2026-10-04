@@ -4277,9 +4277,8 @@ async fn flush_cold_endpoint_uploads_and_reads_back_segments() {
 async fn cold_backpressure_returns_service_unavailable_and_metrics() {
     let cold_store = std::sync::Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        // F6c/F4b: the cap counts payload plus 8 B per-record overhead.
-        RuntimeConfig::new(1, 1)
-            .with_cold_max_hot_bytes_per_group(Some(4 + ursula_runtime::HOT_RECORD_OVERHEAD_BYTES)),
+        // F6c: a text/plain stream is charged its payload only.
+        RuntimeConfig::new(1, 1).with_cold_max_hot_bytes_per_group(Some(4)),
         InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
         Some(cold_store),
     )
@@ -4323,10 +4322,7 @@ async fn cold_backpressure_returns_service_unavailable_and_metrics() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("utf8 body");
-    assert!(body.contains(&format!(
-        "\"cold_hot_bytes\":{}",
-        4 + ursula_runtime::HOT_RECORD_OVERHEAD_BYTES
-    )));
+    assert!(body.contains("\"cold_hot_bytes\":4"));
     assert!(body.contains("\"cold_backpressure_events\":1"));
     assert!(body.contains("\"cold_backpressure_bytes\":1"));
     assert!(body.contains("\"cold_store\":{\"backend\":\"memory\""));
@@ -4587,8 +4583,8 @@ async fn bootstrap_after_cold_flush_past_snapshot_is_honest_partial() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(&body_bytes(response).await[..], b"defg");
 
-    // Once the snapshot is past the exact-message frontier, bootstrap is
-    // complete again with one part per message.
+    // Once the snapshot is at or above the seal point, bootstrap is complete
+    // again, with the hot range `[S, tail)` as one part.
     post_messages(&app, stream_uri, "application/octet-stream", &["hi", "jkl"]).await;
     let response = http_put(
         &app,
@@ -4606,9 +4602,59 @@ async fn bootstrap_after_cold_flush_past_snapshot_is_honest_partial() {
     assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
     assert_eq!(parts, vec![
         r#"{"state":"abcdefg"}"#.to_owned(),
-        "hi".to_owned(),
-        "jkl".to_owned(),
+        "hijkl".to_owned(),
     ]);
+}
+
+/// A binary stream has no message boundaries: a snapshot at a mid-message
+/// offset answers 204 whether or not the bytes around it were flushed, and
+/// bootstrap answers the hot range after it as one part.
+#[tokio::test]
+async fn binary_snapshot_mid_message_is_accepted_and_bootstrap_is_one_part() {
+    let app = cold_test_router();
+    let stream_uri = "/benchcmp/bootstrap-binary-one-part";
+    let response = http_put(
+        &app,
+        stream_uri,
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    post_messages(&app, stream_uri, "application/octet-stream", &[
+        "abc", "de", "fg",
+    ])
+    .await;
+    // Mid-message and hot.
+    let response = http_put(
+        &app,
+        &format!("{stream_uri}/snapshot/00000000000000000001"),
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::from("a"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        "00000000000000000007"
+    );
+    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert_eq!(parts, vec!["a".to_owned(), "bcdefg".to_owned()]);
+
+    // Mid-message after a flush into the second message.
+    flush_cold(&app, stream_uri, 4).await;
+    let response = http_put(
+        &app,
+        &format!("{stream_uri}/snapshot/00000000000000000004"),
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::from("abcd"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
+    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert_eq!(parts, vec!["abcd".to_owned(), "efg".to_owned()]);
 }
 
 /// Regression: without a snapshot (or with one at the retained offset), the
@@ -4728,6 +4774,8 @@ async fn snapshot_publish_errors_and_overwrite_follow_extension_statuses() {
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
+    // A binary stream has no message boundaries: an offset inside the first
+    // message is a valid snapshot offset.
     let response = http_put(
         &app,
         "/benchcmp/snapshot-errors/snapshot/00000000000000000002",
@@ -4735,7 +4783,7 @@ async fn snapshot_publish_errors_and_overwrite_follow_extension_statuses() {
         Body::from("ab-state"),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     let response = http_put(
         &app,
@@ -7576,8 +7624,7 @@ async fn duplicate_beyond_receipt_window_answers_204_without_ranges() {
 }
 
 /// bounded-stream-state F11: ordinary reads are capped at 8 MiB, like
-/// bootstrap. An offset read of a byte stream ends at the cap; a JSON offset
-/// read without `max_bytes` ends at the last record boundary within it; a
+/// bootstrap. An offset read ends at the cap whatever the content type; a
 /// record read ends at a record; a capped response is partial and the
 /// continuation from `Stream-Next-Offset` returns the rest.
 #[tokio::test]
@@ -7647,8 +7694,9 @@ async fn reads_are_capped_at_the_server_response_limit() {
         let up_to_date = response.headers().get(HEADER_STREAM_UP_TO_DATE).is_some();
         offset = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
         let body = body_bytes(response).await;
-        assert!(body.len() <= CAP);
-        assert!(body.ends_with(b"\n"), "capped JSON reads end at a record");
+        if !up_to_date {
+            assert_eq!(body.len(), CAP, "a capped page fills the cap");
+        }
         seen.extend_from_slice(&body);
         if up_to_date {
             break;
@@ -7672,9 +7720,11 @@ async fn reads_are_capped_at_the_server_response_limit() {
     assert!(body.len() <= CAP && body.ends_with(b"\n"));
 }
 
-/// F11: a single JSON record larger than the read cap is returned whole.
+/// F11: a JSON offset read without `max_bytes`, or with `max_bytes` above
+/// 8 MiB, may end inside a message at the cap; the continuation from
+/// `Stream-Next-Offset` returns the rest.
 #[tokio::test]
-async fn a_json_record_larger_than_the_read_cap_is_returned_whole() {
+async fn a_capped_json_offset_read_may_end_mid_message() {
     const CAP: usize = 8 * 1024 * 1024;
     let app = test_router();
     let response = http_put(
@@ -7696,24 +7746,36 @@ async fn a_json_record_larger_than_the_read_cap_is_returned_whole() {
         .await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
-    let response = http_get(&app, "/benchcmp/capped-big-record?offset=-1").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
-    let next = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
-    let body = body_bytes(response).await;
-    assert_eq!(body, format!("{big}\n").as_bytes());
-    assert_eq!(next, format!("{:020}", big.len() + 1));
-    let response = http_get(&app, &format!("/benchcmp/capped-big-record?offset={next}")).await;
-    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
-    assert_eq!(body_bytes(response).await, "{\"v\":\"small\"}\n".as_bytes());
+    let expected = format!("{big}\n{{\"v\":\"small\"}}\n");
+    for query in ["", "&max_bytes=99999999"] {
+        let response = http_get(
+            &app,
+            &format!("/benchcmp/capped-big-record?offset=-1{query}"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
+        let next = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+        assert_eq!(next, format!("{CAP:020}"));
+        let first = body_bytes(response).await;
+        assert_eq!(&first[..], &expected.as_bytes()[..CAP], "query={query}");
+        let response = http_get(
+            &app,
+            &format!("/benchcmp/capped-big-record?offset={next}{query}"),
+        )
+        .await;
+        assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+        assert_eq!(&body_bytes(response).await[..], &expected.as_bytes()[CAP..]);
+    }
 }
 
-/// F11 regression: a capped JSON offset read (catch-up and long-poll, on a
-/// stream that is closed at its tail) returns whole records, record headers
-/// that match the returned body, `Stream-Closed` only at the tail, and a
-/// `Stream-Next-Offset` that continues exactly after the last returned byte.
+/// F11: catch-up and long-poll offset reads of a JSON stream that is closed
+/// at its tail, uncapped (server cap only) and capped by `max_bytes`: every
+/// page fits its cap, `Stream-Next-Offset` continues exactly after the last
+/// returned byte, `Stream-Closed` appears only at the tail, and the pages
+/// concatenate to the stream.
 #[tokio::test]
-async fn capped_json_offset_reads_keep_record_headers_and_continuation_consistent() {
+async fn capped_and_uncapped_offset_reads_continue_exactly() {
     const CAP: usize = 8 * 1024 * 1024;
     let app = test_router();
     let response = http_put(
@@ -7724,7 +7786,7 @@ async fn capped_json_offset_reads_keep_record_headers_and_continuation_consisten
     )
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);
-    // Records of varying size so the cap lands inside a record.
+    // Records of varying size so the caps land inside a record.
     let records = (0..9_000)
         .map(|index| format!(r#"{{"i":{index},"v":"{}"}}"#, "v".repeat(900 + index % 257)))
         .collect::<Vec<_>>();
@@ -7747,159 +7809,44 @@ async fn capped_json_offset_reads_keep_record_headers_and_continuation_consisten
         .iter()
         .map(|record| format!("{record}\n"))
         .collect::<String>();
-    let head = http_head(&app, "/benchcmp/capped-consistent").await;
-    let record_next = header_str(&head, HEADER_STREAM_RECORD_NEXT).to_owned();
-    assert_eq!(record_next, "9000");
 
-    for live in ["", "&live=long-poll"] {
-        let mut offset = 0_u64;
-        let mut seen = Vec::new();
-        let mut pages = 0;
-        loop {
-            let response = http_get(
-                &app,
-                &format!("/benchcmp/capped-consistent?offset={offset:020}{live}"),
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::OK, "live={live}");
-            pages += 1;
-            let up_to_date = response.headers().get(HEADER_STREAM_UP_TO_DATE).is_some();
-            let closed = response.headers().get(HEADER_STREAM_CLOSED).is_some();
-            let next = header_str(&response, HEADER_STREAM_NEXT_OFFSET)
-                .parse::<u64>()
-                .unwrap();
-            let start = response
-                .headers()
-                .get(HEADER_STREAM_RECORD_START)
-                .map(|value| value.to_str().unwrap().parse::<u64>().unwrap());
-            let record_next = response
-                .headers()
-                .get(HEADER_STREAM_RECORD_NEXT)
-                .map(|value| value.to_str().unwrap().parse::<u64>().unwrap());
-            let body = body_bytes(response).await;
-            assert!(body.len() <= CAP, "live={live}");
-            assert!(body.ends_with(b"\n"), "live={live}: whole records only");
-            assert_eq!(
-                next,
-                offset + u64::try_from(body.len()).unwrap(),
-                "live={live}: continuation follows the returned bytes"
-            );
-            let lines = u64::try_from(body.iter().filter(|byte| **byte == b'\n').count()).unwrap();
-            for line in body
-                .split(|byte| *byte == b'\n')
-                .filter(|line| !line.is_empty())
-            {
-                serde_json::from_slice::<serde_json::Value>(line).expect("whole JSON record");
-            }
-            match (start, record_next) {
-                (Some(start), Some(record_next)) => {
-                    assert_eq!(
-                        record_next - start,
-                        lines,
-                        "live={live}: record headers match body"
-                    );
+    for (cap, max_bytes) in [(CAP, ""), (1_000_003, "&max_bytes=1000003")] {
+        for live in ["", "&live=long-poll"] {
+            let mut offset = 0_u64;
+            let mut seen = Vec::new();
+            let mut pages = 0;
+            loop {
+                let response = http_get(
+                    &app,
+                    &format!("/benchcmp/capped-consistent?offset={offset:020}{max_bytes}{live}"),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK, "{max_bytes}{live}");
+                pages += 1;
+                let up_to_date = response.headers().get(HEADER_STREAM_UP_TO_DATE).is_some();
+                let closed = response.headers().get(HEADER_STREAM_CLOSED).is_some();
+                let next = header_str(&response, HEADER_STREAM_NEXT_OFFSET)
+                    .parse::<u64>()
+                    .unwrap();
+                let body = body_bytes(response).await;
+                assert!(body.len() <= cap, "{max_bytes}{live}");
+                assert_eq!(
+                    next,
+                    offset + u64::try_from(body.len()).unwrap(),
+                    "{max_bytes}{live}: continuation follows the returned bytes"
+                );
+                assert_eq!(
+                    closed, up_to_date,
+                    "{max_bytes}{live}: Stream-Closed only at the tail"
+                );
+                seen.extend_from_slice(&body);
+                offset = next;
+                if up_to_date {
+                    break;
                 }
-                (None, _) => {}
-                (Some(_), None) => panic!("live={live}: Stream-Record-Start without Next"),
             }
-            assert_eq!(
-                closed, up_to_date,
-                "live={live}: Stream-Closed only at the tail"
-            );
-            seen.extend_from_slice(&body);
-            offset = next;
-            if up_to_date {
-                break;
-            }
+            assert!(pages > 1, "{max_bytes}{live}: the read was capped");
+            assert_eq!(seen, expected.as_bytes(), "{max_bytes}{live}");
         }
-        assert!(pages > 1, "live={live}: the read was capped");
-        assert_eq!(seen, expected.as_bytes(), "live={live}");
     }
-}
-
-/// F11 regression: cutting a capped read at a record boundary rewrites every
-/// coordinate from the kept bytes, including a record range (a partial last
-/// record is not counted) and the continuation offset.
-#[test]
-fn cutting_a_capped_read_keeps_the_record_range_consistent() {
-    let mut response = ReadStreamResponse {
-        placement: ursula_shard::ShardPlacement {
-            core_id: ursula_shard::CoreId(0),
-            shard_id: ursula_shard::ShardId(0),
-            raft_group_id: RaftGroupId(0),
-        },
-        offset: 100,
-        next_offset: 100 + 20,
-        content_type: "application/json".to_owned(),
-        payload: b"{\"a\":1}\n{\"b\":2}\n{\"c\"".to_vec(),
-        up_to_date: true,
-        closed: true,
-        retained_record_range: Some(ursula_runtime::StreamRecordRange {
-            first_record: 0,
-            next_record: 10,
-        }),
-        record_range: Some(ursula_runtime::StreamRecordRange {
-            first_record: 7,
-            next_record: 10,
-        }),
-    };
-    cut_read_after(&mut response, 16);
-    assert_eq!(response.payload, b"{\"a\":1}\n{\"b\":2}\n");
-    assert_eq!(response.next_offset, 116);
-    assert!(!response.up_to_date);
-    assert_eq!(
-        response.record_range,
-        Some(ursula_runtime::StreamRecordRange {
-            first_record: 7,
-            next_record: 9,
-        })
-    );
-    // The retained range describes the stream, not the response.
-    assert_eq!(
-        response
-            .retained_record_range
-            .map(|range| range.next_record),
-        Some(10)
-    );
-}
-
-/// F11 regression: the first SSE event of a JSON offset read never splits a
-/// record larger than the read cap; the record arrives whole in one event.
-#[tokio::test]
-async fn sse_offset_reads_do_not_split_a_json_record_larger_than_the_cap() {
-    const CAP: usize = 8 * 1024 * 1024;
-    let app = test_router();
-    let response = http_put(
-        &app,
-        "/benchcmp/sse-capped-big-record",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let big = format!(r#"{{"v":"{}"}}"#, "b".repeat(CAP + 4096));
-    for (body, close) in [(big.clone(), false), (r#"{"v":"small"}"#.to_owned(), true)] {
-        let mut headers = vec![(CONTENT_TYPE.as_str(), "application/json")];
-        if close {
-            headers.push((HEADER_STREAM_CLOSED, "true"));
-        }
-        let response = http_post(
-            &app,
-            "/benchcmp/sse-capped-big-record",
-            &headers,
-            Body::from(body),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    }
-    let response = http_get(&app, "/benchcmp/sse-capped-big-record?offset=-1&live=sse").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_bytes(response).await;
-    let body = std::str::from_utf8(&body).expect("utf8 sse body");
-    assert!(
-        body.contains(&format!("data:{big}\n")),
-        "the big record arrives whole in one event"
-    );
-    assert!(body.contains("data:{\"v\":\"small\"}\n"));
-    assert!(body.contains("\"streamClosed\":true"));
 }

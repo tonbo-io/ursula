@@ -1105,8 +1105,11 @@ fn bootstrap_never_returns_collapsed_cold_prefix_as_one_part() {
     assert!(!plan.up_to_date);
 }
 
+/// A stream without a record index has no message boundaries: from a
+/// snapshot at or above the seal point, bootstrap answers `[S, tail)` as one
+/// part, even when `S` is inside a message.
 #[test]
-fn bootstrap_returns_one_part_per_message_when_snapshot_is_above_the_seal_point() {
+fn binary_bootstrap_from_the_seal_point_is_one_part() {
     let mut machine = machine();
     create_stream(&mut machine, "boot-hot");
     append_all(&mut machine, "boot-hot", &[b"ab", b"cd", b"ef", b"gh"]);
@@ -1122,8 +1125,19 @@ fn bootstrap_returns_one_part_per_message_when_snapshot_is_above_the_seal_point(
         )),
         StreamResponse::ColdFlushed { .. }
     ));
-    // A snapshot at the cold frontier itself may sit inside a message whose
-    // head is cold, so the possible fragment [3, 4) must never become a part.
+    // A snapshot below the seal point is an honest partial.
+    assert!(matches!(
+        machine.apply(publish_snapshot_cmd(stream("boot-hot"), 2, OCTET, b"s", 0)),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    let plan = machine
+        .bootstrap_plan(&stream("boot-hot"))
+        .expect("bootstrap");
+    assert!(plan.updates.is_empty());
+    assert_eq!(plan.next_offset, 2);
+    assert!(!plan.up_to_date);
+
+    // At the seal point, inside message "cd": the hot range is one part.
     assert!(matches!(
         machine.apply(publish_snapshot_cmd(stream("boot-hot"), 3, OCTET, b"s", 0)),
         StreamResponse::SnapshotPublished { .. }
@@ -1135,9 +1149,9 @@ fn bootstrap_returns_one_part_per_message_when_snapshot_is_above_the_seal_point(
         plan.snapshot.as_ref().map(|snapshot| snapshot.offset),
         Some(3)
     );
-    assert!(plan.updates.is_empty());
-    assert_eq!(plan.next_offset, 3);
-    assert!(!plan.up_to_date);
+    assert_eq!(plan.updates, records(&[(3, 8)]));
+    assert_eq!(plan.next_offset, 8);
+    assert!(plan.up_to_date);
 
     assert!(matches!(
         machine.apply(publish_snapshot_cmd(stream("boot-hot"), 4, OCTET, b"s", 0)),
@@ -1146,7 +1160,7 @@ fn bootstrap_returns_one_part_per_message_when_snapshot_is_above_the_seal_point(
     let plan = machine
         .bootstrap_plan(&stream("boot-hot"))
         .expect("bootstrap");
-    assert_eq!(plan.updates, records(&[(4, 6), (6, 8)]));
+    assert_eq!(plan.updates, records(&[(4, 8)]));
     assert_eq!(plan.next_offset, 8);
     assert!(plan.up_to_date);
 }
@@ -1159,50 +1173,55 @@ fn bootstrap_without_cold_flush_returns_every_message() {
     let plan = machine
         .bootstrap_plan(&stream("boot-all"))
         .expect("bootstrap");
-    assert_eq!(plan.updates, records(&[(0, 2), (2, 4)]));
+    assert_eq!(plan.updates, records(&[(0, 4)]));
     assert_eq!(plan.next_offset, 4);
     assert!(plan.up_to_date);
 }
 
-/// bounded-stream-state F11: bootstrap updates stop at the response cap on a
-/// message boundary, as an honest partial; a single message larger than the
-/// cap is still returned whole.
+/// bounded-stream-state F11: JSON bootstrap updates stop at the response cap
+/// on a record boundary, as an honest partial; a single record larger than
+/// the cap is still returned whole.
 #[test]
-fn bootstrap_caps_updates_at_a_message_boundary() {
+fn json_bootstrap_caps_updates_at_a_record_boundary() {
     let mut machine = machine();
-    create_stream(&mut machine, "boot-cap");
-    append_all(&mut machine, "boot-cap", &[b"ab", b"cd", b"ef"]);
+    let stream_id = stream("boot-cap");
     assert!(matches!(
-        machine.apply(close_cmd(stream("boot-cap"))),
+        machine.apply(create_cmd(stream_id.clone(), Create {
+            content_type: "application/json",
+            payload: b"{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n".to_vec(),
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+    assert!(matches!(
+        machine.apply(close_cmd(stream_id.clone())),
         StreamResponse::Closed { .. }
     ));
 
     let plan = machine
-        .bootstrap_plan_with_cap(&stream("boot-cap"), 5)
+        .bootstrap_plan_with_cap(&stream_id, 20)
         .expect("bootstrap");
-    assert_eq!(plan.updates, records(&[(0, 2), (2, 4)]));
-    assert_eq!(plan.next_offset, 4);
+    assert_eq!(plan.updates, records(&[(0, 8), (8, 16)]));
+    assert_eq!(plan.next_offset, 16);
     assert!(!plan.up_to_date);
     assert!(!plan.closed);
 
     let plan = machine
-        .bootstrap_plan_with_cap(&stream("boot-cap"), 1)
+        .bootstrap_plan_with_cap(&stream_id, 1)
         .expect("bootstrap");
-    assert_eq!(plan.updates, records(&[(0, 2)]));
-    assert_eq!(plan.next_offset, 2);
+    assert_eq!(plan.updates, records(&[(0, 8)]));
+    assert_eq!(plan.next_offset, 8);
     assert!(!plan.up_to_date);
 
     let plan = machine
-        .bootstrap_plan_with_cap(&stream("boot-cap"), 6)
+        .bootstrap_plan_with_cap(&stream_id, 24)
         .expect("bootstrap");
-    assert_eq!(plan.updates, records(&[(0, 2), (2, 4), (4, 6)]));
-    assert_eq!(plan.next_offset, 6);
+    assert_eq!(plan.updates, records(&[(0, 8), (8, 16), (16, 24)]));
+    assert_eq!(plan.next_offset, 24);
     assert!(plan.up_to_date);
     assert!(plan.closed);
     assert_eq!(
-        machine
-            .bootstrap_plan(&stream("boot-cap"))
-            .expect("default cap"),
+        machine.bootstrap_plan(&stream_id).expect("default cap"),
         plan
     );
 }
@@ -1685,9 +1704,8 @@ fn plan_next_cold_flush_drains_distributed_group_hot_bytes() {
         ));
     }
 
-    // F6c/F4b: the group holds 2 x (2 B + one record's 8 B overhead) real
-    // bytes.
-    let group_real = 2 * (2 + crate::HOT_RECORD_OVERHEAD_BYTES as usize);
+    // F6c: binary streams are charged payload only, 2 x 2 B.
+    let group_real = 4;
     assert_eq!(machine.total_hot_real_bytes(), group_real as u64);
     assert_eq!(
         machine
@@ -1905,10 +1923,9 @@ fn flush_planner_drains_largest_streams_first() {
         create_stream(&mut machine, name);
         append_all(&mut machine, name, &[&vec![b'x'; len]]);
     }
-    // F6c/F4b: real sizes are payload plus one record's 8 B overhead each,
-    // 132 in all. Group hot 132 >= 132: drain until below 66 (d-40 and d-30
-    // hold 48 + 38 real bytes).
-    let group_real = 100 + 4 * crate::HOT_RECORD_OVERHEAD_BYTES as usize;
+    // F6c: binary streams are charged payload only, 100 in all. Group hot
+    // 100 >= 100: drain until below 50 (d-40 and d-30).
+    let group_real = 100;
     assert_eq!(machine.total_hot_real_bytes(), group_real as u64);
     let (pass, _) = machine
         .plan_cold_flush_pass_from(
@@ -2285,7 +2302,6 @@ fn snapshot_entry(
         cold_index_generation: 0,
         cold_chunks: Vec::new(),
         external_segments: Vec::new(),
-        hot_append_starts: Vec::new(),
         record_index: None,
         visible_snapshot: None,
         producer_states,
@@ -2943,25 +2959,43 @@ fn checkpoint_publish_and_retention_advance_are_independent() {
     );
 }
 
+/// F4b: a JSON snapshot must sit on a record boundary at or above the seal
+/// point; a stream without a record index accepts any offset in range.
 #[test]
-fn publish_snapshot_rejects_unaligned_offset() {
+fn publish_snapshot_rejects_an_intra_record_json_offset_only() {
     let mut machine = machine();
-    create_stream(&mut machine, "unaligned");
     assert!(matches!(
-        machine.apply(append_cmd(stream("unaligned"), b"abc", Append::default())),
-        StreamResponse::Appended { .. }
+        machine.apply(create_cmd(stream("unaligned"), Create {
+            content_type: "application/json",
+            payload: b"{\"a\":1}\n".to_vec(),
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
     ));
     assert_error_at(
         machine.apply(publish_snapshot_cmd(
             stream("unaligned"),
             2,
-            OCTET,
-            b"ab",
+            "application/json",
+            b"{}",
             0,
         )),
         StreamErrorCode::InvalidSnapshot,
-        3,
+        8,
     );
+
+    create_stream(&mut machine, "binary");
+    assert!(matches!(
+        machine.apply(append_cmd(stream("binary"), b"abc", Append::default())),
+        StreamResponse::Appended { .. }
+    ));
+    assert!(matches!(
+        machine.apply(publish_snapshot_cmd(stream("binary"), 2, OCTET, b"ab", 0)),
+        StreamResponse::SnapshotPublished {
+            snapshot_offset: 2,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -3915,11 +3949,11 @@ fn f14g_external_create_keeps_its_payload_in_state_for_gc() {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// Bootstrap is either complete (one part per appended message from the
-    /// snapshot to the tail, every part hot) or an honest partial that hands
-    /// the client back to ordinary reads at the snapshot offset.
+    /// Bootstrap of a binary stream is either complete (`[S, tail)` as one
+    /// hot part) or an honest partial that hands the client back to ordinary
+    /// reads at the snapshot offset, exactly when `S` is below the seal point.
     #[test]
-    fn prop_bootstrap_is_complete_per_message_or_honest_partial(
+    fn prop_binary_bootstrap_is_one_hot_part_or_honest_partial(
         payloads in payloads_strategy(),
         flush_bytes in 0_usize..=96,
         snapshot_index_seed in 0_usize..=24,
@@ -3962,22 +3996,18 @@ proptest! {
 
         let plan = machine.bootstrap_plan(&stream_id).expect("bootstrap");
         let hot_start = machine.hot_start_offset(&stream_id);
+        // The seal point: the first hot byte, or the tail when nothing is hot.
+        prop_assert_eq!(plan.up_to_date, snapshot_offset >= hot_start);
         if plan.up_to_date {
             prop_assert_eq!(plan.next_offset, tail);
-            let expected = messages
-                .iter()
-                .filter(|record| record.start_offset >= snapshot_offset)
-                .cloned()
+            let expected = (snapshot_offset < tail)
+                .then_some(StreamMessageRecord { start_offset: snapshot_offset, end_offset: tail })
+                .into_iter()
                 .collect::<Vec<_>>();
             prop_assert_eq!(&plan.updates, &expected);
-            prop_assert!(plan.updates.iter().all(|record| record.start_offset >= hot_start));
         } else {
             prop_assert!(plan.updates.is_empty());
             prop_assert_eq!(plan.next_offset, snapshot_offset);
-            // Only a cold flush that reaches the snapshot makes bootstrap
-            // partial. A flush ending exactly at the snapshot counts: the
-            // state machine cannot tell whether that cut split a message.
-            prop_assert!(hot_start > 0 && hot_start >= snapshot_offset);
         }
     }
 }

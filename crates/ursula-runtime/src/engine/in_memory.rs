@@ -564,11 +564,14 @@ impl InMemoryGroupEngine {
     }
 
     /// Cold admission (F6c): the group's real hot size (payload plus
-    /// per-record overhead) plus the incoming payload, charged as one record,
-    /// must stay within the group cap.
+    /// per-record overhead) plus the incoming payload must stay within the
+    /// group cap. An incoming JSON write is charged as one record; any other
+    /// content type keeps no per-message bookkeeping and is charged its
+    /// payload only.
     pub fn check_cold_write_admission(
         &self,
         stream_id: &BucketStreamId,
+        content_type: &str,
         admission: ColdWriteAdmission,
         incoming_bytes: u64,
     ) -> Result<(), GroupEngineError> {
@@ -579,7 +582,9 @@ impl InMemoryGroupEngine {
             return Ok(());
         }
         let before = self.state_machine.total_hot_real_bytes();
-        let after = before.saturating_add(self.state_machine.hot_real_bytes(incoming_bytes, 1));
+        let records = u64::from(ursula_stream::is_json_record_content_type(content_type));
+        let after =
+            before.saturating_add(self.state_machine.hot_real_bytes(incoming_bytes, records));
         if after <= limit {
             return Ok(());
         }
@@ -607,6 +612,7 @@ impl InMemoryGroupEngine {
         {
             self.check_cold_write_admission(
                 &request.stream_id,
+                &request.content_type,
                 admission,
                 u64::try_from(request.initial_payload.len()).expect("payload len fits u64"),
             )?;
@@ -640,6 +646,7 @@ impl InMemoryGroupEngine {
         {
             self.check_cold_write_admission(
                 &request.stream_id,
+                &request.content_type,
                 admission,
                 u64::try_from(request.payload.len()).expect("payload len fits u64"),
             )?;
@@ -1034,7 +1041,8 @@ impl InMemoryGroupEngine {
     }
 
     /// Materializes bootstrap updates from ONE read plan covering every
-    /// update, then cuts the window into one part per message record.
+    /// update, then cuts the window into the planned parts (one per JSON
+    /// record, or one in all for any other stream).
     pub(crate) async fn bootstrap_updates(
         &mut self,
         stream_id: &BucketStreamId,
@@ -1064,8 +1072,8 @@ impl InMemoryGroupEngine {
             .state_machine
             .read_plan_at(stream_id, window_start, window_len, now_ms)
             .map_err(stream_response_error)?;
-        // Bootstrap never reads cold storage: the plan only covers messages
-        // at or above the exact-message frontier, which are hot.
+        // Bootstrap never reads cold storage: the plan only covers bytes at
+        // or above the exact frontier, which are hot.
         if plan
             .segments
             .iter()
