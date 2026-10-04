@@ -18,7 +18,7 @@ pub fn validate_bucket_id(bucket_id: &str) -> Result<(), String> {
 /// Validates a stream identity on apply.
 pub fn validate_stream_id(stream_id: &BucketStreamId) -> Result<(), String> {
     let local = stream_id.stream_id.as_str();
-    validate_path_segment("stream_id", local)?;
+    validate_path_segment(local)?;
     if local == "streams" {
         return Err("stream_id 'streams' is reserved".to_owned());
     }
@@ -36,18 +36,18 @@ pub fn validate_stream_id(stream_id: &BucketStreamId) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_path_segment(name: &str, value: &str) -> Result<(), String> {
+fn validate_path_segment(value: &str) -> Result<(), String> {
     if value.is_empty() {
-        return Err(format!("{name} must not be empty"));
+        return Err("stream_id must not be empty".to_owned());
     }
     if value.len() > 122 {
         return Err(format!(
-            "{name} must not exceed 122 bytes, got {} bytes",
+            "stream_id must not exceed 122 bytes, got {} bytes",
             value.len()
         ));
     }
     if value.contains('/') || value.contains('\0') || value.contains("..") {
-        return Err(format!("{name} must not contain '/', NUL, or '..'"));
+        return Err("stream_id must not contain '/', NUL, or '..'".to_owned());
     }
     Ok(())
 }

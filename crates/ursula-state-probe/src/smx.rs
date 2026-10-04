@@ -27,8 +27,7 @@ pub fn ok(response: StreamResponse, what: &str) -> Result<StreamResponse> {
     Ok(response)
 }
 
-/// A stream id named `{group}-{name}`, distinct per stream so multi-stream
-/// runs order the same in every process (§7.1).
+/// A two-segment stream id `{group}-{name}`.
 pub fn sid(bucket: &str, group: &str, name: &str) -> BucketStreamId {
     BucketStreamId::new(bucket, format!("{group}-{name}"))
 }
