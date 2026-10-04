@@ -48,7 +48,7 @@ pub struct CadenceArgs {
     /// Node log-byte budget in MiB (1 GiB by default).
     #[arg(long, default_value_t = 1024)]
     pub budget_mib: u64,
-    /// Group hot size (real bytes) at which the group flushes, in KiB.
+    /// Group hot size (payload bytes) at which the group flushes, in KiB.
     #[arg(long, default_value_t = 8192)]
     pub flush_kib: usize,
     /// Appends between driver ticks.
@@ -121,10 +121,10 @@ fn new_group(index: usize, streams_per_group: usize) -> Result<Group> {
     Ok(group)
 }
 
-/// Flushes the group once its real hot size reaches `flush_bytes`, the way
+/// Flushes the group once its hot size reaches `flush_bytes`, the way
 /// the cold worker's group drain would, counting each `FlushCold` as log.
 fn maybe_flush(group: &mut Group, flush_bytes: usize) -> Result<()> {
-    if group.machine.total_hot_real_bytes() < flush_bytes as u64 {
+    if group.machine.total_hot_payload_bytes() < flush_bytes as u64 {
         return Ok(());
     }
     let published = smx::flush_pass(
@@ -203,7 +203,6 @@ pub fn run(args: &CadenceArgs, sink: &mut Sink) -> Result<Outcome> {
                 stream_seq: None,
                 producer: None,
                 now_ms: smx::T0 + n,
-                record_match: None,
             },
             "append",
         )?;

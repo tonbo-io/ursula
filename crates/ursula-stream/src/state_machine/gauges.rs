@@ -7,7 +7,6 @@
 use serde::Deserialize;
 use serde::Serialize;
 
-use super::ProducerAppendRecord;
 use super::ProducerReceipt;
 use super::ProducerState;
 use super::StreamStateMachine;
@@ -22,13 +21,6 @@ use super::stream_expiry_at_ms;
 pub struct GroupStateGauges {
     /// Live streams in the group.
     pub streams: u64,
-    /// Sparse cold record marks (F1).
-    pub record_marks: u64,
-    /// Dense record-index entries across JSON streams (F1 target: unflushed
-    /// records only).
-    pub dense_record_entries: u64,
-    /// Largest dense record index held by one stream.
-    pub max_dense_record_entries_per_stream: u64,
     /// Shared pack-slice references held in stream state (F2).
     pub shared_refs: u64,
     /// Largest shared-reference list held by one stream.
@@ -43,10 +35,10 @@ pub struct GroupStateGauges {
     pub max_producers_per_stream: u64,
     /// Producer receipts across streams (F3).
     pub receipts: u64,
-    /// Receipt items (one per receipt, at least one; F3 window target: 1,024
-    /// per stream).
+    /// Receipts counted against the F3 window (one item per receipt; target:
+    /// 1,024 per stream beyond each producer's newest).
     pub receipt_items: u64,
-    /// Largest receipt-item count held by one stream.
+    /// Largest receipt count held by one stream.
     pub max_receipt_items_per_stream: u64,
     /// Length-based producer state bytes across streams (F3 `Prod(s)`).
     pub producer_bytes: u64,
@@ -63,12 +55,6 @@ pub struct GroupStateGauges {
     pub hot_chunks: u64,
     /// Hot-window block headers beyond payload (F6b).
     pub hot_overhead_bytes: u64,
-    /// Hot records: message records at or above each stream's first hot
-    /// byte (F6c).
-    pub hot_records: u64,
-    /// Hot payload plus per-record overhead, what admission and the flush
-    /// planner count (F6c).
-    pub hot_real_bytes: u64,
     /// Pending cold-GC queue entries (F14).
     pub pending_cold_gc: u64,
     /// Per-bucket usage rows (F15, by design O(buckets ever written)).
@@ -82,11 +68,6 @@ fn as_u64(value: usize) -> u64 {
 }
 
 fn producer_state_bytes(producer_id: &str, state: &ProducerState) -> u64 {
-    let receipt_items: usize = state
-        .receipts
-        .iter()
-        .map(|receipt| receipt.items.len())
-        .sum();
     let bytes = producer_id
         .len()
         .saturating_add(std::mem::size_of::<ProducerState>())
@@ -95,18 +76,8 @@ fn producer_state_bytes(producer_id: &str, state: &ProducerState) -> u64 {
                 .receipts
                 .len()
                 .saturating_mul(std::mem::size_of::<ProducerReceipt>()),
-        )
-        .saturating_add(receipt_items.saturating_mul(std::mem::size_of::<ProducerAppendRecord>()));
+        );
     as_u64(bytes)
-}
-
-fn producer_receipt_items(state: &ProducerState) -> u64 {
-    let items: usize = state
-        .receipts
-        .iter()
-        .map(|receipt| receipt.items.len().max(1))
-        .sum();
-    as_u64(items)
 }
 
 impl StreamStateMachine {
@@ -116,8 +87,6 @@ impl StreamStateMachine {
             live_packs: as_u64(self.shared_cold_object_refs.len()),
             ttl_heap_entries: as_u64(self.registry.ttl_heap_len()),
             hot_payload_bytes: self.hot_payload_bytes,
-            hot_records: self.hot_records,
-            hot_real_bytes: self.total_hot_real_bytes(),
             pending_cold_gc: as_u64(self.cold_gc.len()),
             bucket_usage_rows: as_u64(self.bucket_usage.len()),
             erased_buckets: as_u64(self.erased_buckets.len()),
@@ -128,18 +97,6 @@ impl StreamStateMachine {
             if stream_expiry_at_ms(&slot.metadata).is_some() {
                 gauges.ttl_streams = gauges.ttl_streams.saturating_add(1);
             }
-            let dense = slot
-                .record_index
-                .as_ref()
-                .map_or(0, |index| as_u64(index.dense_len()));
-            let marks = slot
-                .record_index
-                .as_ref()
-                .map_or(0, |index| as_u64(index.marks().len()));
-            gauges.record_marks = gauges.record_marks.saturating_add(marks);
-            gauges.dense_record_entries = gauges.dense_record_entries.saturating_add(dense);
-            gauges.max_dense_record_entries_per_stream =
-                gauges.max_dense_record_entries_per_stream.max(dense);
             let shared = as_u64(
                 slot.cold
                     .cold_chunks()
@@ -158,8 +115,9 @@ impl StreamStateMachine {
             let mut stream_items = 0u64;
             let mut stream_producer_bytes = 0u64;
             for (producer_id, state) in &slot.producers {
-                gauges.receipts = gauges.receipts.saturating_add(as_u64(state.receipts.len()));
-                stream_items = stream_items.saturating_add(producer_receipt_items(state));
+                let receipts = as_u64(state.receipts.len());
+                gauges.receipts = gauges.receipts.saturating_add(receipts);
+                stream_items = stream_items.saturating_add(receipts);
                 stream_producer_bytes =
                     stream_producer_bytes.saturating_add(producer_state_bytes(producer_id, state));
             }
@@ -227,7 +185,6 @@ mod tests {
             stream_seq: None,
             producer,
             now_ms: T0,
-            record_match: None,
         });
         assert!(
             !matches!(response, StreamResponse::Error { .. }),
@@ -244,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn gauges_count_records_producers_ttl_and_shared_refs() {
+    fn gauges_count_producers_ttl_and_shared_refs() {
         let mut m = StreamStateMachine::new();
         m.apply(StreamCommand::CreateBucket {
             bucket_id: "bkt1".to_owned(),
@@ -268,12 +225,9 @@ mod tests {
         }
         let gauges = m.state_gauges();
         assert_eq!(gauges.streams, 2);
-        assert_eq!(gauges.record_marks, 0);
-        assert_eq!(gauges.dense_record_entries, 5);
-        assert_eq!(gauges.max_dense_record_entries_per_stream, 3);
         assert_eq!(gauges.producers, 1);
         assert_eq!(gauges.receipts, 3);
-        assert!(gauges.receipt_items >= 3);
+        assert_eq!(gauges.receipt_items, 3);
         assert!(gauges.producer_bytes > 0);
         assert_eq!(gauges.ttl_streams, 1);
         // F8: the heap keeps one armed entry per TTL stream.

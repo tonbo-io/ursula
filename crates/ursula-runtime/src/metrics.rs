@@ -16,20 +16,6 @@ use crate::error::RuntimeError;
 use crate::request::ColdWriteAdmission;
 use crate::rt::time::Instant;
 
-/// Record reads that found bytes disagreeing with the record index (F1
-/// anchor verification, RC-21). Process-wide: a scan runs outside any group
-/// actor, after the read plan left it.
-static RECORD_COORDINATE_CORRUPTIONS: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn record_coordinate_corruption() {
-    RECORD_COORDINATE_CORRUPTIONS.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Record reads failed by F1 anchor verification since process start.
-pub fn record_coordinate_corruptions() -> u64 {
-    RECORD_COORDINATE_CORRUPTIONS.load(Ordering::Relaxed)
-}
-
 pub(crate) const COLD_FLUSH_GROUP_BATCH_MAX_CHUNKS: usize = 4096;
 
 #[derive(Debug, Clone)]

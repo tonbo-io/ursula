@@ -120,6 +120,18 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
     )?;
 
     let mut rng = payload::Rng::new(7);
+    // Allocated before the heap baseline, so they do not count as state.
+    let mut starts: Vec<smx::RecordStarts> = (0..args.streams)
+        .map(|_| {
+            smx::RecordStarts::new(if args.retain_every_sec > 0 {
+                usize::try_from(args.retain_keep)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(2)
+            } else {
+                0
+            })
+        })
+        .collect();
     let base = Baseline::now();
     let mut m = StreamStateMachine::new();
     smx::create_bucket(&mut m, "bkt1")?;
@@ -168,6 +180,9 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
             if rng.below(1_000_000) < threshold {
                 let seq = appends.get(i).copied().unwrap_or(0);
                 let record = payload::json_record(&mut rng, seq, args.rec_bytes);
+                if let Some(starts) = starts.get_mut(i) {
+                    starts.push(seq, smx::tail(&m, id));
+                }
                 smx::ok(smx::append(&mut m, id, record, None, now), "append")?;
                 if let Some(count) = appends.get_mut(i) {
                     *count += 1;
@@ -214,18 +229,14 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
         }
         if args.retain_every_sec > 0 && sec % args.retain_every_sec == 0 {
             for (i, id) in ids.iter().enumerate() {
-                let range = m
-                    .record_range(id)
-                    .map_err(|err| anyhow::anyhow!("record range: {err:?}"))?;
-                let next = range.map_or(0, |r| r.next_record);
-                if next > args.retain_keep {
-                    smx::checkpoint_and_retain(
-                        &mut m,
-                        id,
-                        next - args.retain_keep,
-                        checkpoint_payload,
-                        now,
-                    )?;
+                let next = appends.get(i).copied().unwrap_or(0);
+                if next > args.retain_keep
+                    && let Some((_, offset)) = starts
+                        .get(i)
+                        .and_then(|starts| starts.at_or_below(next - args.retain_keep))
+                    && offset > m.retained_offset(id)
+                {
+                    smx::checkpoint_and_retain(&mut m, id, offset, checkpoint_payload, now)?;
                     retentions += 1;
                 }
                 let live = m.cold_chunks(id).len();

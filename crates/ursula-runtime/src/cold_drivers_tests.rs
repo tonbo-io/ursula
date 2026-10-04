@@ -109,10 +109,7 @@ async fn read_all(runtime: &ShardRuntime, stream_id: &BucketStreamId) -> Vec<u8>
             offset: 0,
             max_len: 1 << 20,
             now_ms: 0,
-            record: None,
-            max_records: None,
             leader_only: false,
-            record_anchor: None,
             read_index: None,
         })
         .await
@@ -274,6 +271,7 @@ async fn f2_driver_deletes_the_replacement_of_a_rejected_compaction() {
                     payload: Bytes::from_static(b"checkpoint"),
                     cold_body: None,
                     now_ms: 0,
+                    expected_incarnation: None,
                 })
                 .await
                 .expect("publish checkpoint");
@@ -282,6 +280,7 @@ async fn f2_driver_deletes_the_replacement_of_a_rejected_compaction() {
                     stream_id,
                     retained_offset: 12,
                     now_ms: 0,
+                    expected_incarnation: None,
                 })
                 .await
                 .expect("advance retention");
@@ -321,10 +320,7 @@ async fn f2_driver_deletes_the_replacement_of_a_rejected_compaction() {
             offset: 12,
             max_len: 64,
             now_ms: 0,
-            record: None,
-            max_records: None,
             leader_only: false,
-            record_anchor: None,
             read_index: None,
         })
         .await
@@ -370,7 +366,6 @@ async fn f2_rejected_external_append_under_a_packed_trickle_reads_correctly_afte
             stream_seq: Some("1".to_owned()),
             producer: None,
             now_ms: 0,
-            record_match: None,
         })
         .await
         .expect_err("a regressed stream seq rejects the external append");
@@ -404,7 +399,6 @@ async fn f2_rejected_external_append_under_a_packed_trickle_reads_correctly_afte
             stream_seq: None,
             producer: None,
             now_ms: 0,
-            record_match: None,
         })
         .await
         .expect("committed external append");
@@ -477,7 +471,6 @@ async fn f14h_orphan_sweep_reclaims_only_unreferenced_objects_after_the_grace() 
             stream_seq: None,
             producer: None,
             now_ms: 0,
-            record_match: None,
         })
         .await
         .expect("committed external append");

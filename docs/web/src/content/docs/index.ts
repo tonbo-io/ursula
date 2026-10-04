@@ -54,7 +54,6 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   "concepts/streams": { group: "Concepts", order: 1 },
   "concepts/buckets": { group: "Concepts", order: 2 },
   "concepts/offsets": { group: "Concepts", order: 3 },
-  "concepts/record-coordinates": { group: "Concepts", order: 4 },
   "concepts/read-modes": { group: "Concepts", order: 5 },
   "concepts/exactly-once-writes": { group: "Concepts", order: 6 },
   "concepts/conditional-writes": { group: "Concepts", order: 7 },

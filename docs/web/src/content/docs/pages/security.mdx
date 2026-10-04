@@ -87,7 +87,7 @@ Pass `*` instead to allow any origin.
 Three properties are deliberate:
 
 - **Credentials are never allowed.** Ursula authenticates from an `Authorization` header the caller sets explicitly, which CORS does not treat as credentials, and no cookies are involved. So `*` grants no ambient access — a cross-origin page must still present its own bearer token.
-- **`Access-Control-Expose-Headers: *`.** A read carries its continuation in response headers (`stream-next-offset`, `stream-record-next`, `stream-cursor`), and a browser cannot see those without exposure — an unexposed client can read one page and never advance. The wildcard is only honoured while credentials stay disallowed, which is the second reason they are.
+- **`Access-Control-Expose-Headers: *`.** A read carries its continuation in response headers (`stream-next-offset`, `stream-cursor`), and a browser cannot see those without exposure — an unexposed client can read one page and never advance. The wildcard is only honoured while credentials stay disallowed, which is the second reason they are.
 - **Preflight never consults the resource.** `OPTIONS` arrives without `Authorization`, so a per-bucket answer would tell an unauthenticated caller whether a private bucket exists. The preflight reply is identical for every path and is produced before authorization runs, which keeps concealment intact.
 
 <Note>

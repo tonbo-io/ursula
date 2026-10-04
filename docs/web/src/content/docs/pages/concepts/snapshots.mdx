@@ -26,7 +26,7 @@ Snapshot bodies of up to **32 MiB** are kept inline in the stream's replicated s
 
 Publishing a snapshot is safe on its own: it creates a replay checkpoint but leaves all stream history readable. After the application has verified the checkpoint, it may explicitly advance retention to the same or an older checkpoint boundary with `PUT /{bucket}/{stream}/retention/{offset}`. Only that operation makes earlier reads return `410 Gone` and makes old cold-tier data eligible for GC.
 
-JSON streams also accept record coordinates: `PUT /{bucket}/{stream}/snapshot?record=N` and `PUT /{bucket}/{stream}/retention?record=N`.
+On a JSON stream, snapshot and retention offsets must be message boundaries: an offset just after a message's LF, such as a `Stream-Next-Offset` Ursula returned. An offset inside a message answers `400`; when Ursula cannot read the byte before the offset to check it, it publishes nothing and answers `503`. Retention is exact.
 
 ## Immutability
 

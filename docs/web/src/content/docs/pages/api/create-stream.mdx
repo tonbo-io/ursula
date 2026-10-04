@@ -59,7 +59,7 @@ api: "PUT /{bucket}/{stream}"
 
 Response headers include `Location`, `Content-Type`, `Stream-Next-Offset`, and lifetime headers (`Stream-TTL` / `Stream-Expires-At`) when set. `Stream-Closed: true` is set if the create request also closed the stream. `ETag` is set on reads only.
 
-When the initial payload creates records in an `application/json` stream advertising `json-record-coordinates-v1`, the response also includes `Stream-Record-Start` and `Stream-Record-Next`. A top-level JSON array creates one record per element.
+In an `application/json` stream, a top-level JSON array in the initial payload creates one message per element.
 
 <RequestExample>
 ```bash Create empty stream
@@ -82,7 +82,3 @@ curl -X PUT http://127.0.0.1:4437/demo/ephemeral \
 <Note>
 If a stream with the same ID already exists and has identical configuration, the response is `200 OK` (idempotent). If the existing stream differs in content type, closed state, TTL or expiry, the response is `409 Conflict`. A `PUT` answered `200` ignores its body and its `Stream-Seq`.
 </Note>
-
-<Info>
-See [Record Coordinates](/docs/concepts/record-coordinates) for JSON record ranges and complete-record replay.
-</Info>

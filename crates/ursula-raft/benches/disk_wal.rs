@@ -345,7 +345,6 @@ fn entry(index: u64, group_id: u32, payload_size: usize) -> EntryOf<UrsulaRaftTy
             stream_seq: None,
             producer: None,
             now_ms: 0,
-            record_match: None,
         })),
     )
 }

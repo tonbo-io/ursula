@@ -1,8 +1,8 @@
 //! Producer-state bounds (bounded-stream-state F3) and `TidyStream`.
 //!
 //! - **Receipt window.** A stream keeps at most [`RECEIPT_WINDOW_ITEMS`]
-//!   receipt items (one per append; legacy receipts may hold more) beyond each
-//!   producer's newest receipt, which is never evicted. Eviction takes the
+//!   receipts (one per append) beyond each producer's newest receipt, which
+//!   is never evicted. Eviction takes the
 //!   oldest evictable receipt in commit order: every producer's receipts are
 //!   in commit order, so the oldest evictable one is the front of some
 //!   producer that holds at least two. [`ReceiptWindow`] is derived state:
@@ -22,9 +22,8 @@
 //!   [`PRODUCER_CAP_EVICT_BUDGET`] per command (`TidyStream` drains a larger
 //!   excess); when none is idle that long the write fails with
 //!   `ProducerLimit` (`429`).
-//! - **`TidyStream`.** Converges one stream in bounded steps: F1 record
-//!   sealing, idle-producer expiry, producer-cap eviction and receipt
-//!   trimming.
+//! - **`TidyStream`.** Converges one stream in bounded steps: idle-producer
+//!   expiry, producer-cap eviction and receipt trimming.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -36,7 +35,7 @@ use super::StreamResponse;
 use super::StreamSlot;
 use super::StreamStateMachine;
 
-/// Receipt items a stream keeps beyond each producer's newest receipt (F3).
+/// Receipts a stream keeps beyond each producer's newest receipt (F3).
 pub const RECEIPT_WINDOW_ITEMS: u64 = 1_024;
 
 /// A producer idle this long is treated as absent at its next write (F3).
@@ -59,11 +58,6 @@ pub const PRODUCER_CAP_EVICT_BUDGET: usize = 1_024;
 /// Idle producers one `TidyStream` may expire.
 pub const TIDY_PRODUCER_BUDGET: usize = 4_096;
 
-/// Items a receipt counts against the window: one per append, at least one.
-pub(super) fn receipt_items(receipt: &crate::model::ProducerReceipt) -> u64 {
-    u64::try_from(receipt.items.len().max(1)).unwrap_or(u64::MAX)
-}
-
 /// Whether a producer last written at `last_seen_ms` is idle at `now_ms`.
 pub(super) fn producer_is_idle(state: &ProducerState, now_ms: u64) -> bool {
     now_ms.saturating_sub(state.last_seen_ms) >= PRODUCER_IDLE_EXPIRY_MS
@@ -75,7 +69,7 @@ fn producer_cap_evictable(state: &ProducerState, now_ms: u64) -> bool {
     now_ms.saturating_sub(state.last_seen_ms) >= PRODUCER_CAP_EVICT_IDLE_MS
 }
 
-/// Derived per-stream receipt window: the total receipt items held and, for
+/// Derived per-stream receipt window: the total receipts held and, for
 /// every producer with at least two receipts, its front receipt keyed by
 /// `(start_offset, producer_id)` in eviction order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -107,7 +101,7 @@ impl ReceiptWindow {
 
     /// Accounts for every receipt of `state`.
     pub(super) fn add_producer(&mut self, producer_id: &str, state: &ProducerState) {
-        let items = state.receipts.iter().map(receipt_items).sum::<u64>();
+        let items = u64::try_from(state.receipts.len()).unwrap_or(u64::MAX);
         self.items = self.items.saturating_add(items);
         if let Some(key) = Self::front_key(producer_id, state) {
             self.evictable.insert(key);
@@ -115,13 +109,8 @@ impl ReceiptWindow {
     }
 
     /// Accounts for `receipt` about to be pushed onto `state`'s receipts.
-    pub(super) fn push_receipt(
-        &mut self,
-        producer_id: &str,
-        state: &ProducerState,
-        receipt: &crate::model::ProducerReceipt,
-    ) {
-        self.items = self.items.saturating_add(receipt_items(receipt));
+    pub(super) fn push_receipt(&mut self, producer_id: &str, state: &ProducerState) {
+        self.items = self.items.saturating_add(1);
         if state.receipts.len() == 1
             && let Some(front) = state.receipts.front()
         {
@@ -132,7 +121,7 @@ impl ReceiptWindow {
 
     /// Removes every receipt of `state` from the window.
     pub(super) fn remove_producer(&mut self, producer_id: &str, state: &ProducerState) {
-        let items = state.receipts.iter().map(receipt_items).sum::<u64>();
+        let items = u64::try_from(state.receipts.len()).unwrap_or(u64::MAX);
         self.items = self.items.saturating_sub(items);
         if let Some(key) = Self::front_key(producer_id, state) {
             self.evictable.remove(&key);
@@ -142,7 +131,7 @@ impl ReceiptWindow {
 
 impl StreamSlot {
     /// Evicts the oldest evictable receipts until the stream holds at most
-    /// [`RECEIPT_WINDOW_ITEMS`] items or nothing more is evictable, at most
+    /// [`RECEIPT_WINDOW_ITEMS`] receipts or nothing more is evictable, at most
     /// `budget` receipts. Returns whether evictable excess remains.
     pub(super) fn trim_receipt_window(&mut self, budget: usize) -> bool {
         let mut evicted = 0usize;
@@ -159,11 +148,8 @@ impl StreamSlot {
             if state.receipts.len() < 2 {
                 continue;
             }
-            if let Some(receipt) = state.receipts.pop_front() {
-                self.receipt_window.items = self
-                    .receipt_window
-                    .items
-                    .saturating_sub(receipt_items(&receipt));
+            if state.receipts.pop_front().is_some() {
+                self.receipt_window.items = self.receipt_window.items.saturating_sub(1);
                 evicted = evicted.saturating_add(1);
             }
             if let Some(key) = ReceiptWindow::front_key(&producer_id, state) {
@@ -281,8 +267,7 @@ impl StreamStateMachine {
         let Some(slot) = self.stream_slot(stream_id) else {
             return false;
         };
-        self.stream_has_seal_debt(stream_id)
-            || slot.receipt_window_over()
+        slot.receipt_window_over()
             || slot.producer_cap_over(now_ms)
             || slot
                 .producers
@@ -323,9 +308,6 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             );
         }
-        // F1: idle streams seal here, at most `SEAL_BUDGET_RECORDS` per
-        // command.
-        self.seal_record_index(stream_id);
         let Some(slot) = self.stream_slot_mut(stream_id) else {
             return StreamResponse::error(
                 StreamErrorCode::StreamNotFound,

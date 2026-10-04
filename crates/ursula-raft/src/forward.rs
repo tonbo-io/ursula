@@ -83,8 +83,7 @@ pub(crate) fn head_stream_read_v1(
     }
 }
 
-/// The wire form of a forwarded read, including the F1 continuation anchor
-/// so a follower's SSE or record read continues from it on the leader.
+/// The wire form of a forwarded read.
 pub(crate) fn read_stream_read_v1(
     request: &ReadStreamRequest,
 ) -> Result<raft_internal_proto::ReadStreamReadV1, GroupEngineError> {
@@ -93,16 +92,7 @@ pub(crate) fn read_stream_read_v1(
     Ok(raft_internal_proto::ReadStreamReadV1 {
         offset: request.offset,
         max_len,
-        record: request.record,
-        max_records: request.max_records,
         leader_only: request.leader_only,
-        record_anchor: request
-            .record_anchor
-            .map(|anchor| raft_internal_proto::RecordAnchorV1 {
-                incarnation: anchor.incarnation,
-                record: anchor.record,
-                offset: anchor.offset,
-            }),
     })
 }
 

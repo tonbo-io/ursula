@@ -19,7 +19,7 @@ Keep one timestamp: the time captured by the browser. It remains application dat
 }
 ```
 
-Ursula does not reorder the stream by `captured_at` and does not invent a second protocol timestamp. Commit order and offsets are the stream's only coordinates.
+Ursula does not reorder the stream by `captured_at` and does not invent a second protocol timestamp. Commit order and offsets are the stream's only coordinates: an out-of-order `captured_at` never changes the committed order, the stored bytes or any offset. Event time is therefore not a stream read parameter (there is no `?captured_at=` read); the experimental indexer below answers time-range queries with offset locators.
 
 ## Browser collector
 

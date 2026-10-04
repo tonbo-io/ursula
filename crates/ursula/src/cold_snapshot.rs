@@ -42,8 +42,8 @@ pub(crate) enum SnapshotUpload {
     Cold(ColdSnapshotBody),
 }
 
-/// Whether a request publishes a snapshot (`PUT …/snapshot/{offset}` or
-/// `PUT …/snapshot?record=`). Admission lets these bodies exceed the inline
+/// Whether a request publishes a snapshot (`PUT …/snapshot/{offset}`).
+/// Admission lets these bodies exceed the inline
 /// cap, up to [`MAX_COLD_SNAPSHOT_BYTES`], and charges at most the inline cap
 /// against the in-flight budget, because a large body is streamed to the
 /// cold store in bounded parts. The handler enforces the real limit.
@@ -59,7 +59,6 @@ pub(crate) fn is_snapshot_publish(method: &Method, uri: &Uri) -> bool {
     match segments.as_slice() {
         [bucket, ..] if bucket.starts_with("__ursula") => false,
         [_, _, "snapshot", offset] => offset.parse::<u64>().is_ok(),
-        [_, _, "snapshot"] => uri.query().is_some_and(|query| query.contains("record=")),
         _ => false,
     }
 }

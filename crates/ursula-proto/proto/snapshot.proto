@@ -92,18 +92,11 @@ message StreamSnapshotEntryV1 {
   reserved "integrity";
   StreamVisibleSnapshotV1 visible_snapshot = 12;
   repeated ProducerSnapshotV1 producer_states = 13;
-  optional uint64 first_record = 14;
-  // Exact start offsets of the dense (unflushed) records, from
-  // dense_first_record (field 19) when present, else from first_record.
-  repeated uint64 record_offsets = 15;
+  // Fields 14, 15 and 17-19 held the removed JSON record index (record
+  // coordinates); JSON message boundaries are the LF bytes themselves.
+  reserved 14, 15, 17, 18, 19;
+  reserved "first_record", "record_offsets", "record_mark_records", "record_mark_offsets", "dense_first_record";
   optional uint64 retained_offset = 16;
-  // Sparse cold record marks (bounded-state F1): one
-  // (record, offset) pair per 1 MiB block of sealed log that holds a record
-  // start, as two parallel lists. Absent means all-dense.
-  repeated uint64 record_mark_records = 17;
-  repeated uint64 record_mark_offsets = 18;
-  // First record with a dense offset. Absent means first_record.
-  optional uint64 dense_first_record = 19;
   // Field 20 held the removed hot append starts; streams without a record
   // index keep no per-message boundaries.
   reserved 20;
@@ -180,15 +173,10 @@ message ProducerReceiptV1 {
   uint64 start_offset = 2;
   uint64 next_offset = 3;
   bool closed = 4;
-  repeated ProducerAppendRecordV1 items = 5;
-}
-
-message ProducerAppendRecordV1 {
-  uint64 start_offset = 1;
-  uint64 next_offset = 2;
-  bool closed = 3;
-  optional uint64 record_start = 4;
-  optional uint64 record_next = 5;
+  // Field 5 held the removed per-receipt items; every receipt is exactly
+  // its own byte range.
+  reserved 5;
+  reserved "items";
 }
 
 message StreamAppendCountV1 {

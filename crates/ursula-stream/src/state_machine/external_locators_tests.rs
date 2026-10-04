@@ -36,11 +36,11 @@ fn fresh_machine() -> StreamStateMachine {
     machine
 }
 
-fn append_external_with_match(
+fn append_external_with_ends(
     machine: &mut StreamStateMachine,
     path: &str,
     len: u64,
-    record_match: Option<u64>,
+    record_ends: Vec<u64>,
 ) -> StreamResponse {
     machine.apply(StreamCommand::AppendExternal {
         stream_id: stream("s"),
@@ -50,17 +50,16 @@ fn append_external_with_match(
             payload_len: len,
             object_size: len,
         },
-        record_ends: Vec::new(),
+        record_ends,
         close_after: false,
         stream_seq: None,
         producer: None,
         now_ms: 2,
-        record_match,
     })
 }
 
 fn append_external(machine: &mut StreamStateMachine, path: &str, len: u64) {
-    let response = append_external_with_match(machine, path, len, None);
+    let response = append_external_with_ends(machine, path, len, Vec::new());
     assert!(
         matches!(response, StreamResponse::Appended { .. }),
         "{response:?}"
@@ -76,7 +75,6 @@ fn append_inline(machine: &mut StreamStateMachine, payload: &[u8]) {
         stream_seq: None,
         producer: None,
         now_ms: 2,
-        record_match: None,
     });
     assert!(
         matches!(response, StreamResponse::Appended { .. }),
@@ -122,10 +120,13 @@ fn external_append_keeps_its_locator_in_state() {
 #[test]
 fn rejected_external_append_leaves_no_locator() {
     let mut machine = fresh_machine();
-    // A record match that does not hold rejects the append on every replica.
-    let response = append_external_with_match(&mut machine, "s/external/lost.bin", 10, Some(7));
+    // Message ends on a non-JSON stream reject the append on every replica.
+    let response = append_external_with_ends(&mut machine, "s/external/lost.bin", 10, vec![10]);
     assert!(
-        matches!(response, StreamResponse::Error { .. }),
+        matches!(response, StreamResponse::Error {
+            code: StreamErrorCode::InvalidRecordBoundaries,
+            ..
+        }),
         "{response:?}"
     );
     assert!(machine.external_segments(&stream("s")).is_empty());

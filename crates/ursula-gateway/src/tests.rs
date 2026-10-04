@@ -327,7 +327,7 @@ fn request_classifier_maps_durable_stream_routes_to_bucket_resources() {
         ("GET", "/owner-a/orders", Action::Read, Some("orders")),
         (
             "GET",
-            "/owner-a/orders?record=now&live=sse",
+            "/owner-a/orders?offset=now&live=sse",
             Action::Tail,
             Some("orders"),
         ),

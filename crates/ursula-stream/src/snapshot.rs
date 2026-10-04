@@ -10,7 +10,6 @@ use crate::model::ObjectPayloadRef;
 use crate::model::ProducerSnapshot;
 use crate::model::StreamMetadata;
 use crate::model::StreamVisibleSnapshot;
-use crate::record_index::StreamRecordIndex;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamSnapshot {
@@ -74,8 +73,6 @@ pub struct StreamSnapshotEntry {
     pub cold_index_generation: u64,
     pub cold_chunks: Vec<ColdChunkRef>,
     pub external_segments: Vec<ObjectPayloadRef>,
-    #[serde(default)]
-    pub record_index: Option<StreamRecordIndex>,
     /// Independent destructive-retention floor. `None` denotes a legacy
     /// snapshot where the visible snapshot offset also implied retention.
     #[serde(default)]
@@ -109,8 +106,6 @@ pub enum StreamSnapshotError {
         tail_offset: u64,
         payload_len: usize,
     },
-    #[error("snapshot stream '{stream_id}' has inconsistent record boundaries")]
-    RecordBoundaryMismatch { stream_id: BucketStreamId },
     #[error(
         "snapshot stream '{stream_id}' visible snapshot offset {snapshot_offset} is beyond tail offset {tail_offset}"
     )]

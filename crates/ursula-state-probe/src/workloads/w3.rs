@@ -3,8 +3,7 @@
 //! into K records. `--inline-every=N` adds one small inline append plus a flush
 //! pass every N external appends. `--retain-every=N` (W6): checkpoint and
 //! retention every N external appends, keeping the last `--retain-keep` records.
-//! External appends seal their records into sparse marks (F1), and each
-//! external append keeps its locator in state (F5). The workload models the
+//! Each external append keeps its locator in state (F5). The workload models the
 //! leader's offload pass after every append, offloading a stream's staged refs
 //! once it holds more than T_ext = 16 or one is 10 s old.
 
@@ -85,6 +84,12 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
     }
     let ends: Vec<u64> = (1..=recs).map(|k| k * payload_bytes / recs).collect();
     let mut rng = payload::Rng::new(5);
+    // Allocated before the heap baseline, so it does not count as state.
+    let mut starts = smx::RecordStarts::new(if args.retain_every > 0 {
+        usize::try_from(args.retain_keep)?.saturating_add(2)
+    } else {
+        0
+    });
     let base = Baseline::now();
     let mut m = StreamStateMachine::new();
     let mut staged_at: HashMap<String, u64> = HashMap::new();
@@ -104,6 +109,7 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
     for cp in points {
         while n < cp {
             let now = smx::T0 + n * 1000;
+            starts.push(records, smx::tail(&m, &id));
             smx::ok(
                 smx::append_external(&mut m, &id, payload_bytes, ends.clone(), now),
                 "append external",
@@ -117,6 +123,7 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
             records += recs;
             if args.inline_every > 0 && n.is_multiple_of(args.inline_every) {
                 let record = payload::json_record(&mut rng, records, 200);
+                starts.push(records, smx::tail(&m, &id));
                 smx::ok(smx::append(&mut m, &id, record, None, now), "inline append")?;
                 inline_appends += 1;
                 records += 1;
@@ -125,14 +132,10 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
             if args.retain_every > 0
                 && n.is_multiple_of(args.retain_every)
                 && records > args.retain_keep
+                && let Some((_, offset)) = starts.at_or_below(records - args.retain_keep)
+                && offset > m.retained_offset(&id)
             {
-                smx::checkpoint_and_retain(
-                    &mut m,
-                    &id,
-                    records - args.retain_keep,
-                    checkpoint_payload,
-                    now,
-                )?;
+                smx::checkpoint_and_retain(&mut m, &id, offset, checkpoint_payload, now)?;
                 retentions += 1;
             }
         }
@@ -168,7 +171,6 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
             outcome.metric_u64("records", records);
             outcome.metric_i64("heap_bytes", measured.heap.bytes);
             outcome.metric_u64("snapshot_bytes", measured.snap.total_bytes);
-            outcome.metric_u64("dense_entries", measured.gauges.dense_record_entries);
             outcome.metric_u64("staged_external_refs", measured.gauges.staged_external_refs);
         }
     }

@@ -94,10 +94,7 @@ async fn s3_cold_path_flushes_reads_and_cleans_up_object() {
             offset: 0,
             max_len: 6,
             now_ms: 0,
-            record: None,
-            max_records: None,
             leader_only: false,
-            record_anchor: None,
             read_index: None,
         })
         .await

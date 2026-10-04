@@ -253,7 +253,6 @@ mod tests {
             },
             hot_buffer: HotBuffer::default(),
             cold: StreamColdState::default(),
-            record_index: None,
             retained_offset: 0,
             visible_snapshot: None,
             producers: HashMap::new(),

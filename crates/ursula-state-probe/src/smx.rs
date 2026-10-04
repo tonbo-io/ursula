@@ -2,7 +2,6 @@
 //! the runtime issues (create, append, external append, flush and pack,
 //! compaction, checkpoint and retention).
 
-use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use bytes::Bytes;
@@ -81,7 +80,6 @@ pub fn append(
         stream_seq: None,
         producer,
         now_ms,
-        record_match: None,
     })
 }
 
@@ -107,7 +105,6 @@ pub fn append_external(
         stream_seq: None,
         producer: None,
         now_ms,
-        record_match: None,
     })
 }
 
@@ -241,26 +238,59 @@ pub fn flush_pass(
     Ok(published)
 }
 
-/// Publish a tiny checkpoint at `record` and advance retention to it.
+/// Record starts a workload remembers for its retention targets: the first
+/// record and start offset of each recent append, oldest first. Offsets carry
+/// no message numbers, so the probe keeps these client side, in a buffer
+/// sized once (create it before the heap baseline) and never grown.
+#[derive(Debug)]
+pub struct RecordStarts {
+    starts: std::collections::VecDeque<(u64, u64)>,
+    capacity: usize,
+}
+
+impl RecordStarts {
+    /// Remembers the latest `capacity` appends; 0 remembers nothing.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            starts: std::collections::VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Notes that the append starting with record `record` starts at `offset`
+    /// (the stream tail before it).
+    pub fn push(&mut self, record: u64, offset: u64) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.starts.len() == self.capacity {
+            self.starts.pop_front();
+        }
+        self.starts.push_back((record, offset));
+    }
+
+    /// The latest remembered `(record, offset)` at or below `record`.
+    pub fn at_or_below(&self, record: u64) -> Option<(u64, u64)> {
+        self.starts
+            .iter()
+            .rev()
+            .find(|(start, _)| *start <= record)
+            .copied()
+    }
+}
+
+/// Publish a tiny checkpoint at `offset`, a JSON message boundary, and
+/// advance retention to it. The probe stands in for the HTTP proposer that
+/// read the byte before `offset` and found LF, so it pins both commands to
+/// the stream's incarnation.
 pub fn checkpoint_and_retain(
     m: &mut StreamStateMachine,
     id: &BucketStreamId,
-    record: u64,
+    offset: u64,
     checkpoint: &[u8],
     now_ms: u64,
 ) -> Result<()> {
-    // F1: a sealed target resolves to
-    // the record mark at or below it, an exact record start. The server
-    // would scan one cold block for the exact offset; the model retains
-    // conservatively from the mark instead.
-    let offset = match m
-        .locate_record(id, record)
-        .map_err(|err| anyhow::anyhow!("record index: {err:?}"))?
-        .context("not a JSON stream")?
-    {
-        ursula_stream::RecordOffset::Exact(offset) => offset,
-        ursula_stream::RecordOffset::Bracket(bracket) => bracket.from_offset,
-    };
+    let incarnation = m.head(id).map(|head| head.created_at_ms);
     ok(
         m.apply(StreamCommand::PublishSnapshot {
             stream_id: id.clone(),
@@ -268,6 +298,7 @@ pub fn checkpoint_and_retain(
             content_type: JSON.to_owned(),
             payload: Bytes::copy_from_slice(checkpoint),
             now_ms,
+            expected_incarnation: incarnation,
         }),
         "publish snapshot",
     )?;
@@ -276,10 +307,16 @@ pub fn checkpoint_and_retain(
             stream_id: id.clone(),
             retained_offset: offset,
             now_ms,
+            expected_incarnation: incarnation,
         }),
         "advance retention",
     )?;
     Ok(())
+}
+
+/// The stream's tail offset (0 when it does not exist).
+pub fn tail(m: &StreamStateMachine, id: &BucketStreamId) -> u64 {
+    m.head(id).map_or(0, |head| head.tail_offset)
 }
 
 /// Drain the cold-GC queue the way the GC worker acknowledges it.

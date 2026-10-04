@@ -10,7 +10,7 @@ def render_chart(*values: str) -> str:
 
 
 class ChaosHelmTemplateTest(unittest.TestCase):
-    def test_renders_record_index_workload_and_scoped_rbac(self) -> None:
+    def test_renders_record_stream_workload_and_scoped_rbac(self) -> None:
         rendered = render_chart(
             "--set",
             "statusS3Uri=s3://status-bucket/chaos/status.json",

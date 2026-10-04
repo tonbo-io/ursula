@@ -78,7 +78,6 @@ mod tests {
             snapshot_offset: None,
             snapshot_digest: None,
             retained_offset: 0,
-            record_range: None,
             created_at_ms,
         }
     }

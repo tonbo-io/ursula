@@ -6,9 +6,6 @@ use ursula_stream::AppendStreamInput;
 use ursula_stream::ColdFlushPassRequest;
 use ursula_stream::ObjectPayloadRef;
 use ursula_stream::ProducerRequest;
-use ursula_stream::RecordPlanError;
-use ursula_stream::RecordReadAnchor;
-use ursula_stream::RecordReadRequest;
 use ursula_stream::SharedRefCandidate;
 use ursula_stream::SharedRefCompactionRequest;
 use ursula_stream::SharedRefIdleTracker;
@@ -131,7 +128,6 @@ pub(crate) struct AppendPayloadInput<'a> {
     stream_seq: Option<String>,
     producer: Option<ProducerRequest>,
     now_ms: u64,
-    record_match: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -209,7 +205,6 @@ impl InMemoryGroupEngine {
                 stream_seq,
                 producer,
                 now_ms,
-                record_match,
             } => self
                 .append_payload(
                     AppendPayloadInput {
@@ -220,14 +215,12 @@ impl InMemoryGroupEngine {
                         stream_seq,
                         producer,
                         now_ms,
-                        record_match,
                     },
                     placement,
                 )
                 .map(GroupWriteResponse::Append),
             command => {
                 let stream_id = command_stream_id(&command);
-                let command_producer = command_producer(&command);
                 // Commands whose pages the leader rewrote before proposing:
                 // compaction and F5 offloads (which may clip entries), plus
                 // external appends and creates (bounded-state F13). Every
@@ -257,12 +250,7 @@ impl InMemoryGroupEngine {
                     ensure_bucket_exists(&mut self.state_machine, stream_id)?;
                 }
                 let response = self.state_machine.apply(command);
-                let response = self.group_response_from_stream(
-                    response,
-                    stream_id,
-                    command_producer,
-                    placement,
-                );
+                let response = self.group_response_from_stream(response, stream_id, placement);
                 if response.is_ok()
                     && let (Some(cache), Some(stream_id)) =
                         (self.cold_index_cache.as_ref(), compacted_stream_id.as_ref())
@@ -286,9 +274,9 @@ impl InMemoryGroupEngine {
     fn write_hot_backlog(&self, stream_id: Option<&BucketStreamId>) -> WriteHotBacklog {
         WriteHotBacklog {
             stream_hot_bytes: stream_id
-                .and_then(|stream_id| self.state_machine.hot_real_len(stream_id))
+                .and_then(|stream_id| self.state_machine.hot_payload_len(stream_id).ok())
                 .unwrap_or(0),
-            group_hot_bytes: self.state_machine.total_hot_real_bytes(),
+            group_hot_bytes: self.state_machine.total_hot_payload_bytes(),
         }
     }
 
@@ -298,7 +286,6 @@ impl InMemoryGroupEngine {
         &mut self,
         response: StreamResponse,
         stream_id: Option<BucketStreamId>,
-        command_producer: Option<ProducerRequest>,
         placement: ShardPlacement,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
         match response {
@@ -315,10 +302,6 @@ impl InMemoryGroupEngine {
                     closed,
                     already_exists: false,
                     group_commit_index: self.commit_index,
-                    record_range: self
-                        .state_machine
-                        .record_range(&stream_id)
-                        .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?,
                     hot_backlog: Some(self.write_hot_backlog(Some(&stream_id))),
                 }))
             }
@@ -332,7 +315,6 @@ impl InMemoryGroupEngine {
                 closed,
                 already_exists: true,
                 group_commit_index: self.commit_index,
-                record_range: None,
                 hot_backlog: Some(self.write_hot_backlog(stream_id.as_ref())),
             })),
             StreamResponse::Appended {
@@ -342,13 +324,10 @@ impl InMemoryGroupEngine {
                 deduplicated,
                 producer,
                 receipt_evicted,
-                record_range,
             } => {
                 let stream_id = require_response_stream_id(stream_id, "appended")?;
-                // F1 (RC-10, RC-11): apply computed the range (or kept the
-                // receipt's); F3: an evicted duplicate carries none.
-                let stream_hot_bytes = self.state_machine.hot_real_len(&stream_id).unwrap_or(0);
-                let group_hot_bytes = self.state_machine.total_hot_real_bytes();
+                let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
+                let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
                 if !deduplicated {
                     self.commit_index += 1;
                     self.state_machine.add_stream_append_count(&stream_id, 1);
@@ -363,7 +342,6 @@ impl InMemoryGroupEngine {
                     closed,
                     deduplicated,
                     producer,
-                    record_range,
                     stream_hot_bytes,
                     group_hot_bytes,
                     receipt_evicted,
@@ -372,7 +350,6 @@ impl InMemoryGroupEngine {
             StreamResponse::SnapshotPublished {
                 snapshot_offset,
                 snapshot_digest,
-                record_range,
             } => {
                 self.commit_index += 1;
                 Ok(GroupWriteResponse::PublishSnapshot(
@@ -381,7 +358,6 @@ impl InMemoryGroupEngine {
                         snapshot_offset,
                         snapshot_digest,
                         group_commit_index: self.commit_index,
-                        record_range,
                         hot_backlog: Some(self.write_hot_backlog(stream_id.as_ref())),
                     },
                 ))
@@ -397,17 +373,13 @@ impl InMemoryGroupEngine {
                     },
                 ))
             }
-            StreamResponse::RetentionAdvanced {
-                retained_offset,
-                record_range,
-            } => {
+            StreamResponse::RetentionAdvanced { retained_offset } => {
                 self.commit_index += 1;
                 Ok(GroupWriteResponse::AdvanceRetention(
                     AdvanceRetentionResponse {
                         placement,
                         retained_offset,
                         group_commit_index: self.commit_index,
-                        record_range,
                         hot_backlog: Some(self.write_hot_backlog(stream_id.as_ref())),
                     },
                 ))
@@ -462,16 +434,7 @@ impl InMemoryGroupEngine {
                 deduplicated,
                 ..
             } => {
-                let stream_id = require_response_stream_id(stream_id, "closed")?;
-                let record_range = self
-                    .state_machine
-                    .record_range_for_append(
-                        &stream_id,
-                        next_offset,
-                        next_offset,
-                        command_producer.as_ref(),
-                    )
-                    .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?;
+                require_response_stream_id(stream_id, "closed")?;
                 if !deduplicated {
                     self.commit_index += 1;
                 }
@@ -480,7 +443,6 @@ impl InMemoryGroupEngine {
                     next_offset,
                     group_commit_index: self.commit_index,
                     deduplicated,
-                    record_range,
                 }))
             }
             StreamResponse::Deleted => {
@@ -555,23 +517,20 @@ impl InMemoryGroupEngine {
         &self,
         stream_id: BucketStreamId,
     ) -> Result<ColdHotBacklog, GroupEngineError> {
-        let stream_hot_bytes = self.state_machine.hot_real_len(&stream_id).unwrap_or(0);
+        let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
         Ok(ColdHotBacklog {
             stream_id,
             stream_hot_bytes,
-            group_hot_bytes: self.state_machine.total_hot_real_bytes(),
+            group_hot_bytes: self.state_machine.total_hot_payload_bytes(),
         })
     }
 
-    /// Cold admission (F6c): the group's real hot size (payload plus
-    /// per-record overhead) plus the incoming payload must stay within the
-    /// group cap. An incoming JSON write is charged as one record; any other
-    /// content type keeps no per-message bookkeeping and is charged its
-    /// payload only.
+    /// Cold admission (F6c): the group's hot payload plus the incoming
+    /// payload must stay within the group cap. The hot window keeps no
+    /// per-message bookkeeping, so a write is charged its payload only.
     pub fn check_cold_write_admission(
         &self,
         stream_id: &BucketStreamId,
-        content_type: &str,
         admission: ColdWriteAdmission,
         incoming_bytes: u64,
     ) -> Result<(), GroupEngineError> {
@@ -581,10 +540,8 @@ impl InMemoryGroupEngine {
         if incoming_bytes == 0 {
             return Ok(());
         }
-        let before = self.state_machine.total_hot_real_bytes();
-        let records = u64::from(ursula_stream::is_json_record_content_type(content_type));
-        let after =
-            before.saturating_add(self.state_machine.hot_real_bytes(incoming_bytes, records));
+        let before = self.state_machine.total_hot_payload_bytes();
+        let after = before.saturating_add(incoming_bytes);
         if after <= limit {
             return Ok(());
         }
@@ -612,7 +569,6 @@ impl InMemoryGroupEngine {
         {
             self.check_cold_write_admission(
                 &request.stream_id,
-                &request.content_type,
                 admission,
                 u64::try_from(request.initial_payload.len()).expect("payload len fits u64"),
             )?;
@@ -646,7 +602,6 @@ impl InMemoryGroupEngine {
         {
             self.check_cold_write_admission(
                 &request.stream_id,
-                &request.content_type,
                 admission,
                 u64::try_from(request.payload.len()).expect("payload len fits u64"),
             )?;
@@ -730,7 +685,6 @@ impl InMemoryGroupEngine {
             stream_seq,
             producer,
             now_ms,
-            record_match,
         } = input;
         let stream_count_key = stream_id.clone();
         let response = self.state_machine.append_borrowed(AppendStreamInput {
@@ -741,7 +695,6 @@ impl InMemoryGroupEngine {
             stream_seq,
             producer,
             now_ms,
-            record_match,
         });
         self.append_response_from_stream(stream_count_key, response, placement)
     }
@@ -760,12 +713,9 @@ impl InMemoryGroupEngine {
                 deduplicated,
                 producer,
                 receipt_evicted,
-                record_range,
             } => {
-                let stream_hot_bytes = self.state_machine.hot_real_len(&stream_id).unwrap_or(0);
-                let group_hot_bytes = self.state_machine.total_hot_real_bytes();
-                // F1 (RC-10, RC-11): apply computed the range (or kept the
-                // receipt's); F3: an evicted duplicate carries none.
+                let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
+                let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
                 if !deduplicated {
                     self.commit_index += 1;
                     self.state_machine.add_stream_append_count(&stream_id, 1);
@@ -780,7 +730,6 @@ impl InMemoryGroupEngine {
                     closed,
                     deduplicated,
                     producer,
-                    record_range,
                     stream_hot_bytes,
                     group_hot_bytes,
                     receipt_evicted,
@@ -816,39 +765,14 @@ impl InMemoryGroupEngine {
         &self,
         request: &ReadStreamRequest,
     ) -> Result<StreamReadPlan, GroupEngineError> {
-        let Some(record) = request.record else {
-            let mut plan = self
-                .state_machine
-                .read_plan_at(
-                    &request.stream_id,
-                    request.offset,
-                    request.max_len,
-                    request.now_ms,
-                )
-                .map_err(stream_response_error)?;
-            plan.retained_record_range = self
-                .state_machine
-                .record_range(&request.stream_id)
-                .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?;
-            return Ok(plan);
-        };
         self.state_machine
-            .record_read_plan(&RecordReadRequest {
-                stream_id: &request.stream_id,
-                record,
-                max_records: request.max_records,
-                max_bytes: request.max_len,
-                now_ms: request.now_ms,
-                anchor: request.record_anchor.map(|anchor| RecordReadAnchor {
-                    incarnation: anchor.incarnation,
-                    record: anchor.record,
-                    offset: anchor.offset,
-                }),
-            })
-            .map_err(|err| match err {
-                RecordPlanError::Response(response) => stream_response_error(response),
-                RecordPlanError::Index(message) => GroupEngineError::new(message),
-            })
+            .read_plan_at(
+                &request.stream_id,
+                request.offset,
+                request.max_len,
+                request.now_ms,
+            )
+            .map_err(stream_response_error)
     }
 
     /// Per-bucket usage held by this group's state machine. Public so the
@@ -905,10 +829,6 @@ impl InMemoryGroupEngine {
             snapshot_offset: snapshot.as_ref().map(|snapshot| snapshot.offset),
             snapshot_digest: snapshot.map(|snapshot| snapshot.digest),
             retained_offset: self.state_machine.retained_offset(&request.stream_id),
-            record_range: self
-                .state_machine
-                .record_range(&request.stream_id)
-                .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?,
             created_at_ms: Some(created_at_ms),
         })
     }
@@ -1656,10 +1576,6 @@ impl GroupEngine for InMemoryGroupEngine {
                 payload: snapshot.payload,
                 object: snapshot.object,
                 up_to_date: snapshot.offset == tail_offset,
-                record_range: self
-                    .state_machine
-                    .record_range(&request.stream_id)
-                    .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?,
             })
         })
     }
@@ -1708,10 +1624,6 @@ impl GroupEngine for InMemoryGroupEngine {
                 next_offset: plan.next_offset,
                 up_to_date: plan.up_to_date,
                 closed: plan.closed,
-                record_range: self
-                    .state_machine
-                    .record_range(&request.stream_id)
-                    .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?,
             })
         })
     }
@@ -2211,13 +2123,6 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::DeleteStream { stream_id }
         | StreamCommand::TidyStream { stream_id, .. }
         | StreamCommand::OffloadColdRefs { stream_id, .. } => Some(stream_id.clone()),
-    }
-}
-
-fn command_producer(command: &StreamCommand) -> Option<ProducerRequest> {
-    match command {
-        StreamCommand::Close { producer, .. } => producer.clone(),
-        _ => None,
     }
 }
 

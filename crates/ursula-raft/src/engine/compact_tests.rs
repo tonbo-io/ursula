@@ -154,10 +154,7 @@ async fn raft_compacts_shared_slice_into_exclusive_chunk() {
             offset: 0,
             max_len: 4,
             now_ms: 0,
-            record: None,
-            max_records: None,
             leader_only: false,
-            record_anchor: None,
             read_index: None,
         })
         .await

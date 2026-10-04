@@ -87,6 +87,12 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
     let producers = usize::try_from(args.producers.max(1))?;
     let ids: Vec<String> = (0..producers).map(|p| format!("writer-{p:08}")).collect();
     let mut rng = payload::Rng::new(11);
+    // Allocated before the heap baseline, so it does not count as state.
+    let mut starts = smx::RecordStarts::new(if args.retain_every > 0 {
+        usize::try_from(args.retain_keep)?.saturating_add(2)
+    } else {
+        0
+    });
     let base = Baseline::now();
     let mut m = StreamStateMachine::new();
     smx::create_bucket(&mut m, "bkt1")?;
@@ -121,6 +127,7 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
             };
             let now = smx::T0 + n * 10;
             let record = payload::json_record(&mut rng, n, args.rec_bytes);
+            starts.push(n, smx::tail(&m, &id));
             let response = smx::append(&mut m, &id, record, Some(producer), now);
             if let StreamResponse::Appended {
                 deduplicated: true, ..
@@ -143,15 +150,13 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
             if m.total_hot_payload_bytes() >= flush_bytes as u64 {
                 smx::flush_pass(&mut m, flush_bytes, flush_bytes, &mut packs, &mut stats)?;
             }
-            if args.retain_every > 0 && n.is_multiple_of(args.retain_every) && n > args.retain_keep
+            if args.retain_every > 0
+                && n.is_multiple_of(args.retain_every)
+                && n > args.retain_keep
+                && let Some((_, offset)) = starts.at_or_below(n - args.retain_keep)
+                && offset > m.retained_offset(&id)
             {
-                smx::checkpoint_and_retain(
-                    &mut m,
-                    &id,
-                    n - args.retain_keep,
-                    checkpoint_payload,
-                    now,
-                )?;
+                smx::checkpoint_and_retain(&mut m, &id, offset, checkpoint_payload, now)?;
                 retentions += 1;
             }
         }

@@ -42,7 +42,6 @@ impl StreamStateMachine {
                     cold_index_generation: slot.cold.cold_generation(),
                     cold_chunks: slot.cold.cold_chunks().to_vec(),
                     external_segments: slot.cold.external_segments().to_vec(),
-                    record_index: slot.record_index.clone(),
                     retained_offset: Some(slot.retained_offset),
                     visible_snapshot: slot.visible_snapshot.clone(),
                     producer_states,
@@ -189,13 +188,6 @@ impl StreamStateMachine {
                     tail_offset: entry.metadata.tail_offset,
                 });
             }
-            if let Some(record_index) = entry.record_index.as_ref()
-                && record_index
-                    .validate(retained_offset, entry.metadata.tail_offset)
-                    .is_err()
-            {
-                return Err(StreamSnapshotError::RecordBoundaryMismatch { stream_id });
-            }
             let hot_segments = if entry.hot_segments.is_empty() && !entry.payload.is_empty() {
                 vec![HotPayloadSegment {
                     start_offset: entry.hot_start_offset,
@@ -247,7 +239,6 @@ impl StreamStateMachine {
                     entry.cold_chunks,
                     entry.external_segments,
                 ),
-                record_index: entry.record_index,
                 retained_offset,
                 visible_snapshot,
                 receipt_window: super::producers::ReceiptWindow::rebuild(&producer_states),

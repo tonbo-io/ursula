@@ -349,7 +349,7 @@ impl ShardRuntime {
             return;
         }
         if let Ok(mut debt) = self.compaction_debt.lock() {
-            debt.record_range(stream_id, generation, start_offset, end_offset);
+            debt.record_pages_of_range(stream_id, generation, start_offset, end_offset);
         }
     }
 

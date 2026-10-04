@@ -227,7 +227,7 @@ jobs:
           RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- replay \
             --artifact target/ursula-sim-seed-155-leader-cold-live-minimize/seed-155-minimized-record.json
 
-      # Bounded-state DST PR subset (bounded-stream-state §7.4): sparse marks (F1), producer
+      # Bounded-state DST PR subset (bounded-stream-state §7.4): producer
       # state across a mid-stream snapshot install (F3, Invariant 12; fixed seed), external
       # locators (F5: ambiguous appends and offloads, a learner installing a snapshot with
       # staged refs, ambiguous CompactCold). A few seeds each, a few seconds of virtual time;
@@ -235,7 +235,7 @@ jobs:
       - name: Run bounded-state seed families (PR subset)
         run: |
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
-            sparse_marks_survive external_locators_survive producer_state_matches --nocapture
+            external_locators_survive producer_state_matches --nocapture
 
       - name: Verify expected-failure replay and minimization
         run: |

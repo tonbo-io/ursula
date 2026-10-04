@@ -44,10 +44,6 @@ fn tiny_workloads_produce_metrics_and_checks() {
         w1.metrics["heap_bytes"] > 0.0,
         "counting allocator installed"
     );
-    // F1: flushed records seal into sparse marks, so the dense index keeps
-    // only the unflushed ones.
-    assert!(w1.metrics["dense_entries"] < 4000.0);
-    assert!(check_met(&w1, "f1_dense_entries_eq_unflushed"));
     assert!(dir.join("w1_inline.jsonl").exists());
 
     let w3 = Workload::W3(parse::<W3Args>("--appends=20 --recs-per-append=10"))
@@ -67,7 +63,7 @@ fn tiny_workloads_produce_metrics_and_checks() {
     let w4 = Workload::W4(parse::<W4Args>("--appends=2000 --checkpoints=2000"))
         .run(&dir, false)
         .expect("w4");
-    // F3: the receipt window keeps 1,024 items.
+    // F3: the receipt window keeps 1,024 receipts.
     assert_eq!(w4.metrics["receipts"], 1024.0);
     assert!(check_met(&w4, "f3_receipt_items_per_stream"));
 

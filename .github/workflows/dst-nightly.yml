@@ -129,13 +129,12 @@ jobs:
       # ci.yml's DST job runs: same tests, larger seed ranges.
       - name: Run bounded-state seed families (nightly ranges)
         env:
-          SPARSE_MARKS_SEEDS: "2000..=2039"
           EXTERNAL_LOCATOR_AMBIGUITY_SEEDS: "1..=60"
           EXTERNAL_LOCATOR_SNAPSHOT_SEEDS: "1..=30"
           AMBIGUOUS_COMPACTION_SEEDS: "1..=30"
         run: |
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
-            sparse_marks_survive external_locators_survive --nocapture
+            external_locators_survive --nocapture
 
       - name: Write simulation result summary
         if: always()

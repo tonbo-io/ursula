@@ -6,14 +6,12 @@
 //! - `multi_stream`: concurrent writers, one stream each (producer-header octet appends).
 //! - `fanout`: SSE fan-out latency.
 //! - `bootstrap`: `/bootstrap` stampede.
-//! - `record_match`: serialized single-writer `Stream-Record-Match` JSON appends.
 
 mod backend;
 mod bootstrap;
 mod common;
 mod fanout;
 mod multi_stream;
-mod record_match;
 
 use anyhow::Result;
 use clap::Parser;
@@ -38,8 +36,6 @@ enum Cmd {
     FanOut(fanout::FanOutArgs),
     /// Bootstrap stampede - N clients hit /bootstrap simultaneously after a snapshot.
     Bootstrap(bootstrap::BootstrapArgs),
-    /// Serialized single-writer `Stream-Record-Match` JSON appends (commit latency).
-    RecordMatch(record_match::RecordMatchArgs),
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -52,7 +48,6 @@ async fn main() -> Result<()> {
         Cmd::MultiStream(args) => serde_json::to_string_pretty(&multi_stream::run(args).await?)?,
         Cmd::FanOut(args) => serde_json::to_string_pretty(&fanout::run(args).await?)?,
         Cmd::Bootstrap(args) => serde_json::to_string_pretty(&bootstrap::run(args).await?)?,
-        Cmd::RecordMatch(args) => serde_json::to_string_pretty(&record_match::run(args).await?)?,
     };
     println!("{json}");
     Ok(())
