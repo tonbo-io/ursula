@@ -141,6 +141,7 @@ async fn wait_raft_state_machine_payload(
                                     max_records: None,
                                     leader_only: false,
                                     record_anchor: None,
+                                    read_index: None,
                                 },
                                 placement,
                             )

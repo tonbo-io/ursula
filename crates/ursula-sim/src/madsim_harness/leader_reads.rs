@@ -6,15 +6,21 @@
 //! reflects every append acknowledged before it started. While the group is
 //! healthy every probe answers 200, and so it does across a partition shorter
 //! than an election timeout: the leader retries the confirmation until the
-//! heal instead of answering 503. A leader cut
-//! off from the quorum still believes it leads; its probes must answer 503
-//! (leader unknown, retry) instead of a view that misses the writes the new
-//! leader acknowledged. Once the new leader serves, the probes see both
-//! sides of the failover.
+//! heal instead of answering 503. That confirmation waits outside the group
+//! actor: a `consistency=local` `offset=now` read on the same leader answers
+//! before the heal. A leader cut off from the quorum still believes it leads;
+//! its probes must answer 503 (leader unknown, retry) instead of a view that
+//! misses the writes the new leader acknowledged. Once the new leader serves,
+//! the probes see both sides of the failover.
+
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use axum::Router;
 use axum::body::Bytes;
 use ursula_raft::RaftGroupHandleRegistry;
+use ursula_runtime::LinearizableReadBarrier;
+use ursula_runtime::ReadIndexFuture;
 
 use super::AppendRequest;
 use super::Arc;
@@ -23,6 +29,7 @@ use super::Body;
 use super::ColdWriteAdmission;
 use super::Duration;
 use super::HttpState;
+use super::MadsimOpenRaftRuntime;
 use super::MadsimRuntimeRaftNetworkFactory;
 use super::RuntimeConfig;
 use super::RuntimeThreading;
@@ -45,12 +52,41 @@ const INVARIANT: &str = "leader_read_linearizable";
 const SNAPSHOT_BODY: &[u8] = b"leader-read-snapshot";
 const CONTENT_TYPE: &str = "application/octet-stream";
 
+/// Runs a group's ReadIndex barrier in the engine's deterministic openraft
+/// scope, as `MadsimScopedGroupEngine` runs engine calls.
+pub(super) struct ScopedReadBarrier {
+    seed: u64,
+    inner: Arc<dyn LinearizableReadBarrier>,
+}
+
+impl ScopedReadBarrier {
+    pub(super) fn wrap(
+        seed: u64,
+        inner: Option<Arc<dyn LinearizableReadBarrier>>,
+    ) -> Option<Arc<dyn LinearizableReadBarrier>> {
+        let inner = inner?;
+        Some(Arc::new(Self { seed, inner }))
+    }
+}
+
+impl LinearizableReadBarrier for ScopedReadBarrier {
+    fn confirm(&self) -> ReadIndexFuture {
+        Box::pin(MadsimOpenRaftRuntime::scope(
+            self.seed,
+            self.inner.confirm(),
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Probe {
     CatchUpRead,
     Head,
     Bootstrap,
     Snapshot,
+    /// A `consistency=local` tail lookup (`offset=now`): no linearizability
+    /// promise, so its internal HEAD takes no confirmation either.
+    LocalRead,
 }
 
 impl Probe {
@@ -60,6 +96,7 @@ impl Probe {
             Self::Head => "head",
             Self::Bootstrap => "bootstrap",
             Self::Snapshot => "snapshot_read",
+            Self::LocalRead => "consistency_local_read",
         }
     }
 }
@@ -113,6 +150,7 @@ impl Probes<'_> {
         let path = self.path;
         let uri = match probe {
             Probe::CatchUpRead => format!("{path}?offset=0&consistency=leader"),
+            Probe::LocalRead => format!("{path}?offset=now"),
             Probe::Head => path.to_owned(),
             Probe::Bootstrap => format!("{path}/bootstrap"),
             Probe::Snapshot => format!("{path}/snapshot/{}", http_offset(self.snapshot_offset)),
@@ -142,6 +180,7 @@ impl Probes<'_> {
             let seen = self.observe(probe).await;
             let (want_offset, want_body) = match probe {
                 Probe::CatchUpRead => (acked_offset, Some(acked)),
+                Probe::LocalRead => unreachable!("observed only by the stalled_confirmation phase"),
                 Probe::Head | Probe::Bootstrap => (acked_offset, None),
                 Probe::Snapshot => (self.snapshot_offset, Some(SNAPSHOT_BODY)),
             };
@@ -335,6 +374,85 @@ pub(super) async fn run_leader_read_linearizability_inner(
         .serve_acked("brief_partition", &acked, &mut trace)
         .await;
     heal.await.expect("heal the brief partition");
+
+    // The same brief partition stalls a HEAD's confirmation. It waits outside
+    // the group actor, so a `consistency=local` tail lookup on this leader answers
+    // before the heal, while the HEAD is still waiting; the HEAD answers 200
+    // after the heal.
+    for node_id in (1..=3).filter(|node_id| *node_id != old_leader) {
+        policy.partition_bidirectional(old_leader, node_id);
+    }
+    trace.push(SimEvent::FaultApplied {
+        phase: "stalled_confirmation".to_owned(),
+    });
+    let healed = Arc::new(AtomicBool::new(false));
+    let heal = {
+        let policy = policy.clone();
+        let healed = healed.clone();
+        madsim::task::spawn(async move {
+            madsim::time::sleep(Duration::from_millis(15)).await;
+            for node_id in (1..=3).filter(|node_id| *node_id != old_leader) {
+                policy.heal_bidirectional(old_leader, node_id);
+            }
+            healed.store(true, Ordering::SeqCst);
+        })
+    };
+    let head_done = Arc::new(AtomicBool::new(false));
+    let stalled_head = {
+        let (app, path, head_done) = (app.clone(), path.clone(), head_done.clone());
+        madsim::task::spawn(async move {
+            let probes = Probes {
+                app: &app,
+                path: &path,
+                snapshot_offset,
+            };
+            let seen = probes.observe(Probe::Head).await;
+            head_done.store(true, Ordering::SeqCst);
+            seen
+        })
+    };
+    madsim::time::sleep(Duration::from_millis(1)).await;
+    let local = probes.observe(Probe::LocalRead).await;
+    let (healed_first, head_first) = (
+        healed.load(Ordering::SeqCst),
+        head_done.load(Ordering::SeqCst),
+    );
+    trace.push(observed("stalled_confirmation", Probe::LocalRead, &local));
+    let acked_offset = u64::try_from(acked.len()).expect("offset fits u64");
+    if local.status != StatusCode::OK
+        || local.next_offset != Some(acked_offset)
+        || !local.body.is_empty()
+        || healed_first
+        || head_first
+    {
+        fail(
+            &mut trace,
+            "stalled_confirmation",
+            format!(
+                "the consistency=local offset=now read answered {} at next offset {:?} with \
+                 {} body bytes (healed first: {healed_first}, HEAD answered first: \
+                 {head_first}); it must answer 200 at {acked_offset} with no body while the \
+                 HEAD's confirmation waits for the heal",
+                local.status,
+                local.next_offset,
+                local.body.len(),
+            ),
+        );
+    }
+    let head = stalled_head.await.expect("stalled HEAD task");
+    trace.push(observed("stalled_confirmation", Probe::Head, &head));
+    if head.status != StatusCode::OK || head.next_offset != Some(acked_offset) {
+        fail(
+            &mut trace,
+            "stalled_confirmation",
+            format!(
+                "the stalled HEAD answered {} at next offset {:?} after the heal; every append \
+                 through {acked_offset} was acknowledged first",
+                head.status, head.next_offset,
+            ),
+        );
+    }
+    heal.await.expect("heal the stalled confirmation");
 
     // Cut the leader off from both followers. It keeps believing it leads
     // while the majority elects a new leader and acknowledges more appends.

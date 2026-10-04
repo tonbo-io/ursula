@@ -94,6 +94,7 @@ async fn read(runtime: &ShardRuntime, stream: &BucketStreamId, len: usize) -> Ve
             max_records: None,
             leader_only: false,
             record_anchor: None,
+            read_index: None,
         })
         .await
         .expect("read stream")
@@ -244,6 +245,8 @@ async fn incarnation_scoped_recreate_reads_its_own_pages_and_gc_reclaims_the_old
         .head_stream(HeadStreamRequest {
             stream_id: stream.clone(),
             now_ms: 0,
+            linearizable: true,
+            read_index: None,
         })
         .await
         .expect("head stream");

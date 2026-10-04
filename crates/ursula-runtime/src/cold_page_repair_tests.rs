@@ -60,6 +60,7 @@ fn read_req(stream_id: BucketStreamId, offset: u64, max_len: usize) -> ReadStrea
         max_records: None,
         leader_only: false,
         record_anchor: None,
+        read_index: None,
     }
 }
 

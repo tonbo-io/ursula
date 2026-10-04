@@ -20,6 +20,7 @@ use ursula_stream::StreamErrorContext;
 use crate::command::GroupSnapshot;
 use crate::metrics::RaftSnapshotBuildSample;
 use crate::metrics::RuntimeMetricsInner;
+use crate::read_index::LinearizableReadBarrier;
 use crate::request::AckColdGcResponse;
 use crate::request::AdvanceRetentionRequest;
 use crate::request::AdvanceRetentionResponse;
@@ -200,6 +201,13 @@ pub enum GroupWriteResponse {
 pub trait GroupEngine: Send + 'static {
     fn accepts_local_writes(&self) -> bool {
         true
+    }
+
+    /// The group's ReadIndex barrier, which the runtime calls before it
+    /// queues a linearizable read (D10). `None` (the default) keeps
+    /// such reads linearized inside the engine, if at all.
+    fn linearizable_read_barrier(&self) -> Option<Arc<dyn LinearizableReadBarrier>> {
+        None
     }
 
     fn create_stream<'a>(

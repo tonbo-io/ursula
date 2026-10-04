@@ -635,7 +635,7 @@ This section collects read parameters and read representations that apply to eve
 
 A server that cannot prove the read is linearizable MUST NOT serve it. It answers `307 Temporary Redirect` to the current leader when it knows one, and otherwise `503 Service Unavailable` with `Retry-After`. Clients SHOULD follow the redirect and retry the `503` after the advertised delay.
 
-> **Note (informative).** Ursula forwards a `consistency=leader` read from a follower to the group's leader. The leader confirms with a majority of voters that it still leads (Raft ReadIndex) and waits until it has applied everything committed up to that point; each such read costs one round trip to the voters. A leader cut off from the majority, or one that cannot confirm within one election timeout, answers `307` or `503` rather than its own state. Ursula applies the same confirmation to `HEAD`, `/bootstrap`, snapshot reads and the registration of a long-poll or SSE reader.
+> **Note (informative).** Ursula forwards a `consistency=leader` read from a follower to the group's leader. The leader confirms with a majority of voters that it still leads (Raft ReadIndex) and waits until it has applied everything committed up to that point. Concurrent reads to the same Raft group share confirmation rounds. A leader cut off from the majority, or one that cannot confirm in time, answers `307` or `503` rather than its own state. Ursula applies the same confirmation to `HEAD`, `/bootstrap`, snapshot reads and the registration of a long-poll or SSE reader.
 
 ### 9.3. Response Size
 

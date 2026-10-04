@@ -47,6 +47,7 @@ use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 
 use crate::meta::MetaRaftTypeConfig;
+use crate::read_index::ReadIndexBarrier;
 use crate::snapshot_codec::decode_group_snapshot;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::state_machine::SnapshotBuildCoordinator;
@@ -839,6 +840,9 @@ pub struct RaftGroupHandleRegistry {
     /// Each group's cold-index page cache, the one its state machine
     /// invalidates on apply, so forwarded gRPC reads share it (F13).
     cold_index_caches: Arc<Mutex<BTreeMap<u32, GroupColdIndexCache>>>,
+    /// Each group's coalescing ReadIndex barrier, so forwarded gRPC reads
+    /// share confirmation rounds with the group's local reads.
+    read_barriers: Arc<Mutex<BTreeMap<u32, Arc<ReadIndexBarrier>>>>,
     dynamic_hosted_groups: Arc<Mutex<BTreeSet<RaftGroupId>>>,
     leadership_shed: LeadershipShedFlag,
     transport_shutdown: watch::Sender<bool>,
@@ -853,6 +857,7 @@ impl Default for RaftGroupHandleRegistry {
         Self {
             groups: Arc::new(Mutex::new(BTreeMap::new())),
             cold_index_caches: Arc::new(Mutex::new(BTreeMap::new())),
+            read_barriers: Arc::new(Mutex::new(BTreeMap::new())),
             dynamic_hosted_groups: Arc::new(Mutex::new(BTreeSet::new())),
             leadership_shed: Arc::new(AtomicU8::new(0)),
             transport_shutdown,
@@ -965,6 +970,27 @@ impl RaftGroupHandleRegistry {
                 caches.remove(&raft_group_id.0);
             }
         }
+    }
+
+    /// Records the group engine's ReadIndex barrier.
+    pub(crate) fn register_read_barrier(
+        &self,
+        raft_group_id: RaftGroupId,
+        barrier: Arc<ReadIndexBarrier>,
+    ) {
+        self.read_barriers
+            .lock()
+            .expect("raft group read barrier mutex")
+            .insert(raft_group_id.0, barrier);
+    }
+
+    /// The group's ReadIndex barrier, if its engine registered one.
+    pub(crate) fn read_barrier(&self, raft_group_id: RaftGroupId) -> Option<Arc<ReadIndexBarrier>> {
+        self.read_barriers
+            .lock()
+            .expect("raft group read barrier mutex")
+            .get(&raft_group_id.0)
+            .cloned()
     }
 
     /// The group's shared cold-index page cache, if one was registered.

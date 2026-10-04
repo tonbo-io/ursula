@@ -158,6 +158,7 @@ impl Fixture {
                 max_records,
                 leader_only: false,
                 record_anchor,
+                read_index: None,
             })
             .await
     }
@@ -262,6 +263,7 @@ async fn bracketed_record_reads_match_the_dense_layout() {
             max_records: None,
             leader_only: false,
             record_anchor: None,
+            read_index: None,
         })
         .await
         .expect("offset read");
@@ -281,6 +283,8 @@ async fn continuation_anchors_are_validated() {
         .head_stream(crate::HeadStreamRequest {
             stream_id: fixture.stream.clone(),
             now_ms: 0,
+            linearizable: true,
+            read_index: None,
         })
         .await
         .expect("head");
@@ -347,6 +351,8 @@ async fn corrupt_chunk_bytes_fail_bracketed_reads() {
             .head_stream(crate::HeadStreamRequest {
                 stream_id: fixture.stream.clone(),
                 now_ms: 0,
+                linearizable: true,
+                read_index: None,
             })
             .await
             .expect("head");

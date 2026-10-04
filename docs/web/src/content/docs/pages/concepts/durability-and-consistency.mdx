@@ -24,16 +24,24 @@ point, so the read is **linearizable**: it reflects every append acknowledged
 before the read started, including appends acknowledged by a newer leader. A
 leader cut off from the majority redirects to the new leader or answers `503`
 with `Retry-After` instead of serving its stale state. The confirmation costs
-one round trip to the voters per read. A leader that misses a confirmation under
-load retries it for up to one election timeout before it answers `503`, so a
-client should retry a `503` after `Retry-After`. It is not a live-read mode; long-poll
-and SSE already have leader-owned watcher semantics. The [Read path](/docs/specs/extensions#92-leader-consistency)
+one round trip to the voters; concurrent leader reads to the same Raft group
+share rounds, and a read that arrives while a round is in flight waits for the
+next one. On the leader, a read waits for its confirmation before it reaches
+the group, so appends and other reads to the group do not queue behind it. A
+leader that misses a confirmation under load retries it for up to one election
+timeout before it answers `503`; a read that arrived during a round can wait
+for that round and its own, so up to two. A client should retry a `503` after
+`Retry-After`. It is not a live-read mode; long-poll and SSE already have
+leader-owned watcher semantics. The [Read path](/docs/specs/extensions#92-leader-consistency)
 section of the extensions specification states this contract normatively.
 
-`HEAD`, `GET …/bootstrap`, snapshot reads, the registration of a long-poll
-or SSE reader, and requests that resolve the tail through `HEAD`
-(`offset=now`, SSE start, and a long-poll's timeout answer) take the same leadership
-confirmation on the leader.
+`HEAD`, `GET …/bootstrap`, snapshot reads and the registration of a long-poll
+or SSE reader take the same leadership confirmation on the leader, as do
+`offset=now`, `record=` and `tail_records=` on a `consistency=leader` read.
+Reads that promise no linearizability skip it and use the leader's applied
+state: `offset=now`, `record=` and `tail_records=` without
+`consistency=leader`, an SSE session's tail lookup after its registration,
+and a long-poll's timeout answer.
 
 With `consistency=leader`, `Stream-Up-To-Date: true` on a read means it reached the committed tail. On a local read it means the tail as the serving node knew it: a leader that has lost leadership without knowing it yet can mark a stale tail. A response without it is partial; keep reading from `Stream-Next-Offset`.
 

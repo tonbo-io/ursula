@@ -98,6 +98,7 @@ async fn s3_cold_path_flushes_reads_and_cleans_up_object() {
             max_records: None,
             leader_only: false,
             record_anchor: None,
+            read_index: None,
         })
         .await
         .expect("read cold and hot bytes");
