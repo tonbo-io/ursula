@@ -59,8 +59,9 @@
 //!     followed by the `fields` in declaration order.
 //!
 //! Operations that do not fit these shapes (wait-read registration and
-//! cancellation, group warm-up, snapshot install placement checks, and the
-//! madsim engine swap commands) keep hand-written client methods or
+//! cancellation, the linearizable reads that confirm a read index before
+//! they are queued, group warm-up, snapshot install placement checks, and
+//! the madsim engine swap commands) keep hand-written client methods or
 //! `CoreCommand` variants next to the generated code.
 macro_rules! runtime_operations {
     ($generate:ident) => {
@@ -88,7 +89,7 @@ macro_rules! runtime_operations {
                 reply { response_tx: HeadStreamResponse }
                 guard { none }
                 handle { call head_stream(engine, metrics, request, placement) }
-                client { pub stream fn head_stream }
+                client { none }
             }
             op ReadStream {
                 fields { request: ReadStreamRequest }
@@ -104,7 +105,7 @@ macro_rules! runtime_operations {
                         response_tx
                     )
                 }
-                client { pub stream fn read_stream }
+                client { none }
             }
             op PublishSnapshot {
                 fields { request: PublishSnapshotRequest }
@@ -143,14 +144,14 @@ macro_rules! runtime_operations {
                 reply { response_tx: ReadSnapshotResponse }
                 guard { none }
                 handle { call read_snapshot(engine, metrics, request, placement) }
-                client { pub stream fn read_snapshot }
+                client { none }
             }
             op BootstrapStream {
                 fields { request: BootstrapStreamRequest }
                 reply { response_tx: BootstrapStreamResponse }
                 guard { none }
                 handle { call bootstrap_stream(engine, metrics, request, placement) }
-                client { pub stream fn bootstrap_stream }
+                client { none }
             }
             op WaitRead {
                 fields { request: ReadStreamRequest, waiter_id: u64 }

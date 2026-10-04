@@ -120,7 +120,11 @@ message GroupReadRequestV1 {
   optional string affinity_key = 10;
 }
 
-message HeadStreamReadV1 {}
+message HeadStreamReadV1 {
+  // A client HEAD: the leader linearizes it (ReadIndex) before serving it.
+  // Internal HEADs read the leader's applied state.
+  bool linearizable = 1;
+}
 
 message ReadStreamReadV1 {
   uint64 offset = 1;

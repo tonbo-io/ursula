@@ -24,10 +24,8 @@ use openraft::Config;
 use openraft::OptionalSend;
 use openraft::Raft;
 use openraft::RaftNetworkFactory;
-use openraft::ReadPolicy;
 use openraft::rt::WatchReceiver;
 use openraft::storage::RaftLogStorage;
-use openraft::type_config::TypeConfigExt;
 use ursula_runtime::AdvanceRetentionRequest;
 use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
@@ -87,6 +85,7 @@ use ursula_runtime::GroupTouchStreamAccessFuture;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
+use ursula_runtime::LinearizableReadBarrier;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::PlanGroupColdFlushRequest;
 use ursula_runtime::PublishSnapshotRequest;
@@ -120,11 +119,10 @@ use crate::forward::forward_purge_bucket_to_leader;
 use crate::forward::forward_read_stream_to_leader;
 use crate::forward::group_engine_client_write_error;
 use crate::forward::group_engine_forward_to_leader_error;
-use crate::forward::group_engine_leader_read_unavailable;
-use crate::forward::group_engine_linearizable_read_error;
 use crate::forward::write_result_from_raft_response;
 use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RaftGroupLogStore;
+use crate::read_index::ReadIndexBarrier;
 use crate::registry::SingleNodeRaftNetworkFactory;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::state_machine::SnapshotBuildCoordinator;
@@ -136,6 +134,9 @@ pub struct RaftGroupEngine {
     pub(crate) placement: ShardPlacement,
     pub(crate) cold_store: Option<ColdStoreHandle>,
     pub(crate) cold_index_cache: Option<Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>>,
+    /// The group's coalescing ReadIndex barrier, shared with the runtime and
+    /// with forwarded gRPC reads (through the registry).
+    pub(crate) read_barrier: Arc<ReadIndexBarrier>,
 }
 
 pub(crate) fn should_forward_stale_follower_read_error(
@@ -395,6 +396,7 @@ impl RaftGroupEngine {
         .map_err(|err| GroupEngineError::new(format!("create OpenRaft group: {err}")))?;
 
         Ok(Self {
+            read_barrier: Arc::new(ReadIndexBarrier::new(raft.clone())),
             raft,
             placement,
             cold_store,
@@ -633,78 +635,52 @@ impl RaftGroupEngine {
         if self.raft.is_leader() {
             return Ok(());
         }
+        Err(self.not_leader_for_read(operation).await)
+    }
+
+    async fn not_leader_for_read(&self, operation: &str) -> GroupEngineError {
         let self_id = self.raft.metrics().borrow_watched().id;
-        Err(group_engine_forward_to_leader_error(
+        group_engine_forward_to_leader_error(
             format!("OpenRaft {operation} has to forward request to leader"),
             self.raft.current_leader().await,
             None,
             self_id,
             true,
-        ))
+        )
     }
 
-    /// Linearizable leader read (ReadIndex): on the leader, confirm
-    /// leadership with a quorum round trip and wait until the local state
-    /// machine has applied the read index, so the read that follows cannot
-    /// miss a write any leader acknowledged before it started. A deposed
-    /// leader cut off from the quorum answers a forward (or 503) instead of
-    /// a stale view. A follower gets the plain forward-to-leader error.
+    /// Linearizable leader read (ReadIndex, D10): the read that follows
+    /// cannot miss a write any leader acknowledged before it started. A
+    /// deposed leader cut off from the quorum answers a forward (or 503)
+    /// instead of a stale view; a follower gets the plain forward error.
     ///
-    /// One confirmation round waits one heartbeat interval for the quorum,
-    /// which a loaded leader can miss. While this node still believes it
-    /// leads, `QuorumNotEnough` is retried (at most one round per heartbeat
-    /// interval) until `election_timeout_min` has passed; only then is it a
-    /// 503. The wait for the local apply is bounded by the same timeout and
-    /// also ends in a 503, so a read never hangs on a stalled state machine.
+    /// `read_index` is the index the runtime confirmed for this request
+    /// before queueing it (PR10b). While this replica leads and has applied
+    /// it, the read needs no further round trip. Otherwise (forwarded gRPC
+    /// reads, direct engine calls, an engine swapped since) the engine joins
+    /// the group's coalescing barrier itself; see [`ReadIndexBarrier`].
     pub(crate) async fn require_linearizable_leader_read(
         &self,
         operation: &str,
+        read_index: Option<u64>,
     ) -> Result<(), GroupEngineError> {
         self.require_local_leader_for_read(operation).await?;
-        let config = self.raft.config();
-        let budget = Duration::from_millis(config.election_timeout_min);
-        let round = Duration::from_millis(config.heartbeat_interval);
-        let deadline = UrsulaRaftTypeConfig::now() + budget;
-        let self_id = || self.raft.metrics().borrow_watched().id;
-        let linearizer = loop {
-            let started = UrsulaRaftTypeConfig::now();
-            match self.raft.get_read_linearizer(ReadPolicy::ReadIndex).await {
-                Ok(linearizer) => break linearizer,
-                Err(err)
-                    if matches!(
-                        err.api_error(),
-                        Some(openraft::error::LinearizableReadError::QuorumNotEnough(_))
-                    ) && self.raft.is_leader()
-                        && UrsulaRaftTypeConfig::now() < deadline =>
-                {
-                    tracing::debug!("OpenRaft {operation} retrying leadership confirmation: {err}");
-                    let next_round = (started + round).min(deadline);
-                    UrsulaRaftTypeConfig::sleep_until(next_round).await;
-                }
-                Err(err) => {
-                    return Err(group_engine_linearizable_read_error(
-                        err,
-                        operation,
-                        self_id(),
-                    ));
-                }
-            }
-        };
-        match linearizer.try_await_ready(&self.raft, Some(budget)).await {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(state)) => {
-                tracing::debug!(
-                    "OpenRaft {operation} timed out waiting to apply the read index: {state:?}"
-                );
-                Err(group_engine_leader_read_unavailable(
-                    format!("OpenRaft {operation} did not apply the read index in time"),
-                    self_id(),
-                ))
-            }
-            Err(fatal) => Err(GroupEngineError::new(format!(
-                "OpenRaft {operation} could not apply the read index: {fatal}"
-            ))),
+        if read_index.is_some_and(|read_index| self.applied_index() >= read_index) {
+            return Ok(());
         }
+        match self.read_barrier.round().await? {
+            Some(_) => Ok(()),
+            None => Err(self.not_leader_for_read(operation).await),
+        }
+    }
+
+    fn applied_index(&self) -> u64 {
+        self.raft
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .as_ref()
+            .map_or(0, |log_id| log_id.index())
     }
 
     pub(crate) async fn current_leader_node(&self) -> Option<BasicNode> {
@@ -722,6 +698,10 @@ impl RaftGroupEngine {
 impl GroupEngine for RaftGroupEngine {
     fn accepts_local_writes(&self) -> bool {
         self.raft.is_leader()
+    }
+
+    fn linearizable_read_barrier(&self) -> Option<Arc<dyn LinearizableReadBarrier>> {
+        Some(self.read_barrier.clone())
     }
 
     fn create_stream<'a>(
@@ -824,7 +804,12 @@ impl GroupEngine for RaftGroupEngine {
             {
                 return forward_head_stream_to_leader(placement, &leader_node, request).await;
             }
-            self.require_linearizable_leader_read("head_stream").await?;
+            if request.linearizable {
+                self.require_linearizable_leader_read("head_stream", request.read_index)
+                    .await?;
+            } else {
+                self.require_local_leader_for_read("head_stream").await?;
+            }
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
                 .await?;
             self.with_state_machine(move |state_machine| {
@@ -902,8 +887,11 @@ impl GroupEngine for RaftGroupEngine {
                         forward_read_stream_to_leader(placement, &leader_node, request).await?;
                     return Ok(GroupReadStreamParts::from_response(response));
                 }
-                self.require_linearizable_leader_read("leader-only read_stream")
-                    .await?;
+                self.require_linearizable_leader_read(
+                    "leader-only read_stream",
+                    request.read_index,
+                )
+                .await?;
             }
             if !self.raft.is_leader() {
                 match self
@@ -990,7 +978,10 @@ impl GroupEngine for RaftGroupEngine {
         &'a mut self,
         _placement: ShardPlacement,
     ) -> ursula_runtime::GroupRequireLiveReadOwnerFuture<'a> {
-        Box::pin(async move { self.require_linearizable_leader_read("live_read").await })
+        Box::pin(async move {
+            self.require_linearizable_leader_read("live_read", None)
+                .await
+        })
     }
 
     fn publish_snapshot<'a>(
@@ -1236,7 +1227,7 @@ impl GroupEngine for RaftGroupEngine {
         placement: ShardPlacement,
     ) -> GroupReadSnapshotFuture<'a> {
         Box::pin(async move {
-            self.require_linearizable_leader_read("read_snapshot")
+            self.require_linearizable_leader_read("read_snapshot", request.read_index)
                 .await?;
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, true)
                 .await?;
@@ -1253,7 +1244,7 @@ impl GroupEngine for RaftGroupEngine {
         placement: ShardPlacement,
     ) -> GroupBootstrapStreamFuture<'a> {
         Box::pin(async move {
-            self.require_linearizable_leader_read("bootstrap_stream")
+            self.require_linearizable_leader_read("bootstrap_stream", request.read_index)
                 .await?;
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, true)
                 .await?;

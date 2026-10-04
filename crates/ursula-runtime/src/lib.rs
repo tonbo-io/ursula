@@ -24,6 +24,8 @@
 //! - [`ops`]: declarative manifest of the uniform runtime operations; expands
 //!   into the per-operation actor and client plumbing.
 //! - [`metrics`]: runtime metrics shared across cores; lock-free counters.
+//! - [`read_index`]: the per-group ReadIndex barrier that linearizes reads
+//!   before they are queued to the group actor (D10).
 //! - [`tidy_worker`]: leader-side `TidyStream` driver (bounded-state F0).
 
 mod admission;
@@ -40,6 +42,7 @@ mod group_actor;
 pub mod journal;
 mod metrics;
 mod ops;
+mod read_index;
 mod request;
 mod retention_gc;
 mod rt;
@@ -169,6 +172,8 @@ pub use metrics::RuntimeMailboxSnapshot;
 pub use metrics::RuntimeMetrics;
 pub use metrics::RuntimeMetricsSnapshot;
 pub use metrics::record_coordinate_corruptions;
+pub use read_index::LinearizableReadBarrier;
+pub use read_index::ReadIndexFuture;
 pub use request::AckColdGcResponse;
 pub use request::AdvanceRetentionRequest;
 pub use request::AdvanceRetentionResponse;

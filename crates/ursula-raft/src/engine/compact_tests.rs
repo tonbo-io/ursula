@@ -139,6 +139,7 @@ async fn raft_compacts_shared_slice_into_exclusive_chunk() {
             max_records: None,
             leader_only: false,
             record_anchor: None,
+            read_index: None,
         })
         .await
         .expect("read compacted stream");

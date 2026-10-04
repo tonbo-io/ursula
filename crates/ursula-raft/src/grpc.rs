@@ -55,6 +55,7 @@ use crate::codec::required;
 use crate::engine::RaftGroupEngine;
 use crate::forward::write_commands_on_raft;
 use crate::raft_internal_proto;
+use crate::read_index::ReadIndexBarrier;
 use crate::types::UrsulaAppendEntriesRequest;
 use crate::types::UrsulaAppendEntriesResponse;
 use crate::types::UrsulaRaftTypeConfig;
@@ -769,9 +770,16 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 .registry
                 .get(placement.raft_group_id)
                 .ok_or_else(|| tonic::Status::not_found("raft group is not registered"))?;
+            // The group's barrier, so forwarded linearizable reads share
+            // confirmation rounds with its local reads (PR10b).
+            let read_barrier = self
+                .registry
+                .read_barrier(placement.raft_group_id)
+                .unwrap_or_else(|| Arc::new(ReadIndexBarrier::new(raft.clone())));
             let mut engine = RaftGroupEngine {
                 raft,
                 placement,
+                read_barrier,
                 cold_store: self.cold_store.clone(),
                 // The group's shared page cache (bounded-state F13), which
                 // apply-time invalidation reaches; a request-scoped cache only
@@ -799,12 +807,9 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             let result = match required(request.read, "group_read.read")
                 .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?
             {
-                raft_internal_proto::group_read_request_v1::Read::Head(_) => engine
+                raft_internal_proto::group_read_request_v1::Read::Head(head) => engine
                     .head_stream(
-                        HeadStreamRequest {
-                            stream_id,
-                            now_ms: request.now_ms,
-                        },
+                        head_stream_request_from_v1(stream_id, request.now_ms, head),
                         placement,
                     )
                     .await
@@ -837,6 +842,21 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
     }
 }
 
+/// Server half of a forwarded HEAD: a client HEAD stays linearizable on the
+/// leader, an internal one reads the leader's applied state (D10).
+pub(crate) fn head_stream_request_from_v1(
+    stream_id: BucketStreamId,
+    now_ms: u64,
+    head: raft_internal_proto::HeadStreamReadV1,
+) -> HeadStreamRequest {
+    HeadStreamRequest {
+        stream_id,
+        now_ms,
+        linearizable: head.linearizable,
+        read_index: None,
+    }
+}
+
 /// Server half of a forwarded read: the engine request, with the F1
 /// continuation anchor the follower sent (absent from older followers) and
 /// its `leader_only` flag, so a forwarded `consistency=leader` read is
@@ -864,6 +884,7 @@ pub(crate) fn read_stream_request_from_v1(
                 record: anchor.record,
                 offset: anchor.offset,
             }),
+        read_index: None,
     })
 }
 

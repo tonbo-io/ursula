@@ -30,6 +30,7 @@ use crate::metrics::RuntimeMetricsInner;
 use crate::metrics::elapsed_ns;
 use crate::metrics::record_cold_backpressure_error;
 use crate::metrics::record_write_hot_backlog;
+use crate::read_index::ReadIndexBarriers;
 use crate::request::AckColdGcResponse;
 use crate::request::AdvanceRetentionRequest;
 use crate::request::AdvanceRetentionResponse;
@@ -142,6 +143,8 @@ pub(crate) struct CoreWorker {
     pub(crate) raft_uncommitted_bytes: SharedRaftUncommittedBytes,
     pub(crate) live_read_max_waiters_per_core: Option<u64>,
     pub(crate) read_materialization: Arc<Semaphore>,
+    /// Each started group's ReadIndex barrier, shared with `ShardRuntime`.
+    pub(crate) read_barriers: ReadIndexBarriers,
 }
 
 pub(crate) type ReadWatchers = HashMap<BucketStreamId, Vec<ReadWatcher>>;
@@ -349,6 +352,8 @@ impl CoreWorker {
                 .create(placement, metrics)
                 .await
                 .map_err(|err| RuntimeError::group_engine(placement, err))?;
+            self.read_barriers
+                .install(placement.raft_group_id, engine.linearizable_read_barrier());
             let (tx, rx) = mpsc::channel(self.group_mailbox_capacity);
             let actor = GroupActor {
                 placement,
@@ -383,6 +388,7 @@ impl CoreWorker {
             let _ = response_tx.send(Ok(()));
             return;
         };
+        self.read_barriers.remove(placement.raft_group_id);
         if let Err(command) = group
             .send(GroupCommand::ShutdownEngine { response_tx })
             .await
@@ -405,6 +411,8 @@ impl CoreWorker {
                 error: GroupEngineError::new("group engine already installed"),
             });
         }
+        self.read_barriers
+            .install(placement.raft_group_id, engine.linearizable_read_barrier());
         let (tx, rx) = mpsc::channel(self.group_mailbox_capacity);
         let actor = GroupActor {
             placement,

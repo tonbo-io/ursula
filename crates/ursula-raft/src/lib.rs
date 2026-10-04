@@ -32,6 +32,7 @@ mod forward;
 mod grpc;
 mod log_store;
 mod meta;
+mod read_index;
 mod registry;
 mod rt;
 #[cfg(madsim)]
