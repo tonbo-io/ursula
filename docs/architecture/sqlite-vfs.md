@@ -345,3 +345,265 @@ A freshly deployed cluster made 1,400 to 1,550 PUTs in its first 2 to 3 minutes.
   although retention had passed all but their last 15 and 11 MB.
 - A snapshot read-back `GET` through the gateway was answered `503` ("read_snapshot has to forward
   request to leader") instead of being forwarded; the VFS retried it.
+
+### Baseline: Pi Durable in a Durable Object (Cloudflare PiHarness)
+
+Cloudflare runs Pi Durable inside a Durable Object through the Agents SDK: `PiHarness` from
+`agents/harness/pi` (`agents` 0.26.0, cloudflare/agents#2423). Pi's own `SqliteStorage`
+(`@earendil-works/pi-durable` 1.0.0) runs over the object's SQLite, with Pi's tables prefixed `pi_`.
+We ran the VFS workload inside such objects: a real `Harness` with the faux model, turns of text,
+text, tool (5.0 commits per turn), a 30 s warm-up and 10.5 min cells. Each database is its own fresh
+object of a SQLite-backed class (122,880 bytes at the start of a cell). Every object was in IAD
+(Ashburn, Northern Virginia, the same metro as the VFS's us-east-1 cluster), created with
+`locationHint: "enam"` and its colo checked through `cdn-cgi/trace`. The objects of a cell ran at the
+same time. The account is on Workers Paid (standard usage model). The Worker uses compatibility date
+2026-06-11 with `nodejs_compat` and `limits.cpu_ms` 300,000. It was deployed and driven with
+`wrangler` 4.147.0 from a laptop, not from GitHub Actions. Runs: re-run 2 on 2026-10-03 (harness v2,
+`wrangler tail` attached) and re-run 3 on 2026-10-04 UTC (harness v3, no tail). Run 1 used a timer
+that turned out to include Pi's CPU and is withdrawn, except for the cold-start numbers below.
+
+**Paths and modes.** The *pi path* calls Pi's root conversation `submit` and `wait` inside the
+object, the same calls as the Node bench, through PiHarness's storage adapter. This is the baseline
+in the tables. The *shipped path* calls `PiHarness.submit` and `wait`, which add a Lifecycle wake
+job and an alarm to each turn. In *durable* mode every commit awaits `ctx.storage.sync()` before Pi
+continues, as every VFS commit waits for its append. *As shipped*, commits return at once and the
+output gate holds the object's outgoing messages until its writes are confirmed. There we await
+`sync()` before each faux model call, where a real model fetch would be held, and at the end of each
+turn.
+
+**What a confirmed write means.** A DO write is confirmed once at least 3 of the object's 5
+followers, each in a different physical data center, report that they received it; a follower keeps
+what it receives in a buffer on local disk. Changes then go to object storage in batches of up to
+10 s or 16 MB, whichever comes first (Cloudflare, "Zero-latency SQLite storage in every Durable
+Object", https://blog.cloudflare.com/sqlite-in-durable-objects/). A VFS append is acknowledged when 2
+of the group's 3 replicas, one per AZ, hold it: in memory with the memory WAL, or written and flushed
+to the Raft log on local disk with the disk WAL. Ursula documents the multi-peer memory WAL as
+volatile and requires the disk WAL for production clusters. The disk-WAL column is the like-for-like
+one. Spreading followers over data centers rather than AZs is likely the stronger geographic
+guarantee, which favours the DO.
+
+**Timing.** On deployed Workers an object's clock does not advance while JavaScript runs. It catches
+up at a later, unpredictable I/O (`results/clockprobe*.json`). A span read on the object's own clock
+therefore includes part of Pi's CPU: in the flat-out cells it reads 10 to 11 ms above the observer
+on average. So each owner sends a mark to a second object, the observer, right before
+`Storage.commit` and right after `await commit; await ctx.storage.sync()`, and yields
+(`setTimeout(0)`) after each send. The observer is in the same colo and was checked not to share an
+isolate with any owner: at the start of each re-run-2 cell, and at every 2 s drain in re-run 3, which
+moves the owner to a fresh observer when the check fails. It stamps arrivals with `Date.now()`, so DO
+samples have 1 ms resolution. The VFS numbers are `Storage.commit` wall time on Node's clock. A probe
+ran the exact measured sequence (`timedSpan`) 100 times per combination on two objects
+(`results/floorprobe3.json`). Around no work at all it read 0 ms p50 and at most 1 ms p90. Around a
+one-row insert plus `sync()` it read 26 ms p50 on one object and 8 ms on the other, the same with 0,
+11 or 22 ms of CPU before the sequence. The objects' own clocks read 27, 29, 33 ms and 9, 10, 12 ms.
+How long `commit` takes to return without `sync()` is not measured: it is CPU only, below the
+observer's resolution, and the object's clock does not move during it. On Node, B1 (0.11 ms p50) is
+the non-durable reference.
+
+**Durable commit latency**, ms, p50 / p99 (p99.9 / max), pi path, IAD. "Per object" gives the
+median and range across objects of each object's own p50 and p99. The interval is a 95% bootstrap
+over objects (2,000 resamples of the objects, all samples of a drawn object pooled). VFS columns are
+from the table above.
+
+| cell | DO durable commit | n | per object p50 | per object p99 | 95% interval, pooled p99 | VFS memory WAL | VFS disk WAL |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 db, agent pace, 64 objects, gaps 1.5 to 2.5 s (re-run 3) | 18 / 52 (190 / 6,494) | 95,058 | 18.5 (9 to 29) | 41 (17 to 122) | 37 to 67 | 9.7 / 12.8 | 16.5 / 20.0 |
+| 1 db, agent pace, 64 objects, fixed 2 s (re-run 3) [3] | 19 / 43 (213 / 5,506) | 78,871 | 19 (9 to 29) | 30 (21 to 257) | 34 to 64 | 9.7 / 12.8 | 16.5 / 20.0 |
+| 1 db, agent pace, 8 objects, fixed 2 s (re-run 2) | 20 / 68 (210 / 641) | 12,000 | 19 (11 to 28) | 33.5 (25 to 146) | 32 to 113 | 9.7 / 12.8 | 16.5 / 20.0 |
+| 1 db, flat out, 8 objects (re-run 2) | 20 / 41 (167 / 2,955) | 148,130 | 19.5 (18 to 28) | 41 (30 to 75) | 35 to 53 | 9.4 / 12.8 (42 / 147) | 15.2 / 18.7 (65 / 124) |
+| 16 dbs, flat out (re-run 2) [1] | 19 / 46 (180 / 723) | 315,291 | 20 (10 to 20) | 46 (28 to 56) | 41 to 49 | 13.0 / 31.8 (50 / 132) | 21.7 / 37.1 (110 / 363) |
+| 128 dbs, flat out (re-run 2) [2] | 19 / 63 (205 / 5,335) | 2,561,957 | 19 (10 to 29) | 51 (19 to 143) | 60 to 67 | not comparable | not comparable |
+
+[1] The VFS ran its 16 databases as 16 processes on one client pod (6 CPU requested). On that pod B1
+falls from 115 to 41 commits/s per database and its p99 rises from 8.9 to 13.1 ms, so the VFS row
+includes client scheduling delay, mostly in the memory-WAL column and in p99. The DO's 16 owners ran
+in 16 isolates.
+[2] The VFS's two client nodes were saturated in this cell. Run 1 of the DO's 128-owner cell read
+18 / 67 (216 / 3,035), but two of its owners lost 51% and 35% of their marks to a broken stub (below).
+[3] Recorded from 30 to 522 s. The driver's laptop went to sleep 522 s into the cell, and the owners
+stopped 60 s later, as designed when no drain arrives. The records up to then are complete: at least
+99.6% of each owner's commits are on the observer.
+
+The observer column is reported as measured. Three variants move p99 by at most 1 ms in every
+cell: dropping samples under 5 ms (a durable commit cannot take less; 0 ms readings are 0.03% to 1%
+of samples, and in the flat-out cells 74% to 94% of them come in runs of two or more consecutive
+commits, so they are bursts of marks delivered together rather than single late marks); replacing a
+high sample by the owner's own-clock span only when the next commit shows the paired artifact of a
+late end mark (next start within 2 ms, next sample under 5 ms); and excluding windows in which the
+observer shared an isolate with an owner. The paired correction lowers two maxima: 2,955 to 1,194 ms
+(1 db flat out) and 5,335 to 4,839 ms (128 dbs).
+
+Per object, the largest commit at the median object is 116 ms at agent pace with fixed gaps (range
+28 to 5,506 ms over the 64 objects), 191 ms with jittered gaps (84 to 6,494), 513 ms for 1 db flat
+out (217 to 2,955), 419 ms at 16 dbs (243 to 723) and 466 ms at 128 dbs (174 to 5,335). An object in
+the 1-db flat-out cell has about 18,500 samples. The VFS's single database had about 36,000 (memory
+WAL) and 28,000 (disk WAL), with maxima of 147 and 124 ms.
+
+**Where the DO's tail comes from.**
+
+- *The first commit of a turn.* By position in the turn, agent pace on 64 objects reads 21 / 113,
+  18 / 38, 18 / 33, 17 / 33 and 21 / 42 ms with jittered gaps, and 21 / 131, 18 / 34, 18 / 34,
+  18 / 32 and 21 / 38 ms with fixed gaps. That first commit follows 1.5 to 2.5 s of idle. Flat out,
+  the five positions read 19 to 22 ms p50 and 32 to 59 ms p99 (1 db).
+- *A 10 s cycle per object.* We picked, for each object, the 750 ms slot of a 10 s cycle that held
+  most of its commits of 80 ms or more in the first half of the cell, and counted the second half.
+  With fixed 2 s pacing, 42 of the 46 slow commits fell in the slot on 8 objects and 99 of 123 on 64
+  objects, while the slot holds 6.5% and 9.6% of all commits. With jittered gaps (64 objects) it was
+  64 of 251 against 6.9%. Flat out it was 40% against 6.9% (1 db) and 34% against 6.7% (128 dbs).
+  Fixed pacing hits the same phase every fifth turn, so an object either keeps landing in its slot or
+  never does: per-object p99 runs from 21 to 257 ms with fixed gaps on 64 objects, against 17 to 122
+  with jittered gaps. With 8 objects the pooled p99 depended on which objects landed there (per-object
+  p99 25 to 146 ms). The cycle matches the 10 s batch period Cloudflare describes, but we did not
+  verify the link.
+- *The object.* Per-object p50 ranges from 9 to 29 ms in the same colo, and the floor probe's two
+  objects read 8 and 26 ms for a one-row commit. Objects differ, not just samples.
+- *Shared isolates.* At 128 owners, 37 owners spent time in 19 isolates that held 2 owners each.
+  Their median per-object p99 was 70 ms against 42 ms for owners alone, at the same p50 (18 against
+  19). The yield after the start mark lies inside the measured span, so a co-resident owner's CPU can
+  land in it; part of that gap may be the instrument. At agent pace on 64 objects, 4 owners shared 2
+  isolates (jittered gaps) and 10 shared 5 (fixed gaps), with no p99 difference (40 against 41, and
+  31.5 against 29.5).
+
+**Throughput**, Pi commits/s from the owners' own counters over 30 to 630 s, pi path, durable.
+
+| cell | DO per owner, median (range) | DO total | VFS memory WAL | VFS disk WAL |
+| --- | --- | --- | --- | --- |
+| 1 db, flat out (8 objects) | 31.0 (26.9 to 33.8) | 247 | 60 | 46 |
+| 16 dbs, flat out | 32.2 (28.7 to 45.2) | 525 | 565 | 499 |
+| 128 dbs, flat out | 32.5 (24.2 to 48.4) | 4,267 | 1,900 [2] | 841 [2] |
+
+DO throughput falls within a cell. With 1 db flat out it goes from 42.1 commits/s in the first
+minute to 24.2 in the last half minute, while commit p50 stays at 20 ms. The owner's time between
+commits on the observer (Pi's CPU, two mark sends, two yields and any mark delay) grows from 2.3 to
+19.8 ms on average. Pi rereads its growing transcript from the object's SQLite (re-run 2 read 11.25
+billion rows). B1 sustains 115 commits/s on Node over 14.4k turns. So DO commits/s measures Pi's CPU
+on Workers more than storage, depends on cell length, and is not a storage comparison.
+
+**As shipped**, turn level, 8 objects flat out, re-run 3: each turn's writes are confirmed before its
+model calls and before its reply (output-gate semantics). Pi does not wait for each commit. The VFS
+has no equivalent mode: every VFS commit waits for its append. "Turn" is turn start to the end of the
+final `sync()`, on the observer.
+
+| path | commits/s per owner, median (range) | total | turn p50 / p99 (p99.9 / max), ms | turns |
+| --- | --- | --- | --- | --- |
+| Pi on PiHarness's DO SQLite adapter | 57.6 (38.4 to 64.8) | 428 | 87 / 210 (326 / 2,616) | 51,440 |
+| Shipped `PiHarness.submit` / `wait` | 22.4 (21.0 to 32.6) | 188 | 215 / 397 (1,003 / 3,582) | 22,540 |
+
+The shipped path, which adds a Lifecycle wake job and an alarm to each turn, runs at about 39% of
+the pi path's commit rate per owner. On the shipped path the owners' own clocks agree with the
+observer within 20 ms on 94% of turns (own clock 214 / 430 (1,125 / 3,697)). On the pi path they
+cannot check it: the observer reads more than 20 ms above the own clock on 56% of turns and more
+than 20 ms below it on 5% (own-clock p99 1,245 ms), so the pi path's p99.9 and max are unverified. A
+turn under 10 ms is impossible here (at least two confirmed syncs), so its start mark arrived late:
+48 turns on the pi path and 4 on the shipped path. Dropping them and the turn before each gives
+87 / 210 (323 / 826) on the pi path and leaves the shipped path unchanged. Re-run 2's pi-path cell,
+on other objects, read 81 / 234 (478 / 888) at 60.7 commits/s per owner.
+
+**Cold start** (run 1, not re-run). Time to the first answer of a call that opens Pi and reads the
+root transcript after `ctx.abort()`, from a client object in IAD, minus that client's warm no-op
+call (4 to 8 ms). Where the object came back was not recorded, and we could not make it restore on
+another host, so this is not comparable to the VFS cold start (a fresh host installing a snapshot
+and replaying the tail). Each abort was confirmed by its error. That the next call ran on a new
+instance is proven only for the first repetition.
+
+| database | first restart after the bulk load | next two restarts |
+| --- | --- | --- |
+| 10.5 MB | 348 ms | 81 / 81 ms |
+| 103 MB | 1,916 ms | 86 / 112 ms |
+| 1.03 GB | 2,084 ms | 74 / 73 ms |
+
+A full scan of the 1 GB table took 1,799 ms wall and 1,519 ms CPU in one invocation (from `wrangler
+tail`; the object's own clock read 0 ms).
+
+**Incidents.** No commit or `sync()` threw and no turn failed in any cell.
+
+- *Owner resets* (the object restarted and lost its loop): 0 in the 8- and 16-object re-run-2 cells;
+  2 and 4 in the two 128-owner runs; 1 in each re-run-2 native cell. In re-run 3: 6 at agent pace
+  with jittered gaps (50 to 442 s into the cell), 2 with fixed gaps, 0 in the pi-path native cell
+  and 1 in the shipped-path native cell. A stall is the first acknowledged commit (in the native
+  cells, turn) after a reset minus the last one before it. It includes our driver noticing (drains
+  every 2 s) and restarting the owner, so it bounds the platform's share from above: 0.9 to 2.5 s at
+  128 owners; 1.6 and 8.9 s (re-run 2) and 14.0 s (re-run 3) in the native cells; 2.6 to 24 s at
+  agent pace with jittered gaps and 2.8 and 5.1 s with fixed gaps. One more agent-pace stall of
+  397 s was a drain request that hung after its object reset; every request now has a 60 s timeout.
+  At most 2 owners reset at the same moment (128 owners, run 2, 608 s). In run 1 (withdrawn), all 16
+  objects of one 16-owner run reset together; that run started 4 minutes after a deploy, which may
+  have caused it.
+- *Long commits without a reset.* The longest single commits in re-run 3 were 6,494 ms (jittered
+  gaps) and 5,506 ms (fixed gaps). Neither object was reset, and their own clocks agree (6,504 and
+  5,508 ms).
+- *Commits that never finished on the observer:* 7 and 19 in the two 128-owner runs. 2 and 4 were
+  in flight at an owner reset, 1 and 8 were near an observer reset, and the rest are end marks that
+  never arrived while the owner carried on (harness v2 did not record failed sends). In re-run 3: 1
+  at agent pace with jittered gaps, at an observer move; 7 with fixed gaps, 6 of them in flight when
+  the driver stopped draining at 522 s and 1 at an observer reset.
+- *Observer resets* (an idle object with no storage): 1 (1 db flat out), 5 and 4 (128 owners), 1
+  (re-run-2 shipped path); in re-run 3, 5 at agent pace with jittered gaps and 3 with fixed gaps (all
+  three at the same moment). Harness v3 also moved 2 owners off an observer that shared an isolate
+  with an owner.
+- *Lost marks.* Harness v2 swallowed a failed mark and kept the broken stub. Owner 5 of the re-run-2
+  shipped-path cell lost 80% of its turns that way, and owners 30 and 73 of the first 128-owner run
+  lost 51% and 35%. Those cells are withdrawn or superseded. Harness v3 renews the stub and counts
+  failures: 1 failed send in re-run 3 (a turn-end mark 596 s into the pi-path native cell, "Network
+  connection lost"); the renewed stub delivered every later mark. Every re-run-2 and re-run-3 cell in
+  the tables has at least 99.5% of each owner's commits (or turns) on the observer.
+- *Platform errors* (GraphQL, bench namespace). Re-run 2: 384 `clientDisconnected` (270 during
+  probes and smoke tests at 20:50Z, 84 in the first 128-owner run, 9 between the native cells, 9
+  alarms in the shipped-path cell, 12 in the second 128-owner run) and 2 `scriptThrewException` (one
+  RPC during deploys at 20:40Z, one alarm at 21:55Z in the shipped-path cell, the same 5 minutes as
+  its owner reset). These were read by the teardown audit and are no longer queryable: analytics for
+  a deleted namespace disappear. Re-run 3, read before its teardown: 19 of 880,521 invocations,
+  none from the durable cells. 15 alarms ended `clientDisconnected`: 2 during the shipped-path smoke
+  test (00:16Z), 4 during the shipped-path cell and 9 around its end (00:50 to 00:51Z); pi-path
+  objects run no alarms. 3 RPCs ended `clientDisconnected` in the minute of the failed mark send
+  above (00:39Z), and 1 RPC ended `scriptThrewException` in the minute of the shipped-path owner
+  reset (00:45Z).
+
+**Cost.** Re-run 2: 16.2 million DO requests, 79.6 million rows written, 11.25 billion rows read and
+291,315 s of active time, read from GraphQL after the data settled. Run 1 had used 76.3 million rows
+written of the monthly 50 million included, so re-run 2's rows written cost about $80 and its
+requests about $2. Re-run 3: 0.88 million DO requests, 7.57 million rows written, 0.79 billion rows
+read, 97,031 s of active time and 159 MB of peak storage, so about $7.6 for rows written and $0.13
+for requests. Rows read over all runs (at least 21 billion) and duration stay within the included
+amounts. Run 1 and re-run 2 together cost about $108, and all three runs about $116. These are
+estimates from the published rates; the OAuth token cannot read billing.
+
+**Reproduce.** Code in `do-bench/` (to be moved into the repo).
+
+- Worker: `worker/src/index.ts` (harness v3; v2 in `worker-v2/`, v1 in `worker-v1/`) and
+  `worker/wrangler.jsonc`. Packages pinned in `worker/package.json`: `agents` 0.26.0,
+  `@earendil-works/pi-durable` 1.0.0, `@earendil-works/pi-ai` 1.0.0, `@earendil-works/chord` 1.0.0,
+  `typebox` 1.3.27, `wrangler` 4.147.0. Node 22.22.1 on the driver.
+- Deploy: `cd worker && npx wrangler deploy`, then `npx wrangler secret put BENCH_TOKEN` with the
+  value in `.token`. Re-run 3 ran on version 1b08d4cf-5d1a-4e5a-a7cd-081517f6dfff, re-run 2 on
+  b62c11f1-f26e-4089-9a47-27af16de08a7.
+- Cells: `node cell3.mjs <label> <owners> <turnMs> <durable|native> <pi|harness> 630 30 <gateModel>
+  <jitterMs> <staggerMs>`. Re-run 3 is `seq6.sh` and `seq7.sh`; re-run 2 is `seq4.sh` and `seq5.sh`
+  with `cell2.mjs`. Floor probe: `node probe6.mjs`. Keep the driver machine awake for the whole cell
+  (one re-run-3 cell lost its last 108 s to a laptop sleep).
+- Analysis: `python3 analyze3.py <cell...>` writes `results/<cell>/summary3.json` (all cells:
+  `run3/analyze3-final.txt`); `python3 zerobursts.py <cell...>`. Raw data:
+  `results/<cell>/owner-<i>.json.gz` (every mark with the observer's arrival time, every own-clock
+  commit and turn record, every drain) and `results/<cell>/config.json` (worker version, isolates,
+  observer moves). Usage and errors: `run3/gql3.py` (`results/gql3-final.json`, `gql3-minute.json`);
+  it must run before the teardown.
+- Teardown: `teardown/run3.sh` deploys a stub whose migration v2 deletes the class and its data,
+  deletes the Worker, and compares read-only account snapshots taken before and after
+  (`teardown/snapshot.py`). Everything created is listed in `INVENTORY.md`.
+
+**In short.**
+
+- Waiting for a confirmed write costs about 18 to 20 ms at p50 in a DO in IAD, against 9.7 ms
+  (memory WAL) and 16.5 ms (disk WAL) on the VFS at agent pace. At p50 the DO is about 1.1 to 1.2x the
+  production-equivalent disk WAL.
+- The DO's tail is wider. At agent pace on 64 objects its p99 is 52 ms with jittered gaps (95%
+  interval 37 to 67) and 43 ms with fixed 2 s gaps (34 to 64), against 20.0 ms on the disk WAL. The
+  slow commits are mostly the first commit of a turn and a 10 s cycle per object, and single commits
+  reached 5 to 6.5 s.
+- The DO's latency depends on the object: per-object p50 runs from 9 to 29 ms in one colo.
+- Flat out, a DO owner manages 31 durable commits/s against 46 (disk WAL) and 60 (memory WAL) on the
+  VFS, and its rate falls as Pi's transcript grows. That is Pi's CPU on Workers, not storage.
+- As shipped, Pi on a DO does not wait for each commit, so it runs at 58 commits/s per owner with
+  each turn confirmed before its model calls and its reply; through `PiHarness.submit` it runs at
+  22. The VFS has no such mode.
+- The DO confirms writes on 3 of 5 followers in different data centers. That is likely a stronger
+  geographic guarantee than the VFS's 2 of 3 AZs.
