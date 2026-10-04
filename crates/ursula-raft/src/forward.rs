@@ -359,10 +359,10 @@ pub(crate) fn group_engine_client_write_error(
 }
 
 /// Map a failed ReadIndex barrier (`Raft::ensure_linearizable`). Nothing was
-/// proposed, so every arm is a definite, retryable rejection: a lost
-/// leadership forwards to the known leader (503 while it is unknown), and a
-/// leader that cannot reach a quorum answers leader-unknown (503) rather than
-/// serving a view that may miss a newer leader's acknowledged writes.
+/// proposed. A lost leadership forwards to the known leader (503 while it is
+/// unknown), and a leader that cannot reach a quorum answers leader-unknown
+/// (503) rather than serving a view that may miss a newer leader's
+/// acknowledged writes. A fatal error stays internal.
 pub(crate) fn group_engine_linearizable_read_error(
     err: openraft::error::RaftError<
         UrsulaRaftTypeConfig,

@@ -27,8 +27,10 @@ with `Retry-After` instead of serving its stale state. The confirmation costs
 one round trip to the voters per read. It is not a live-read mode; long-poll
 and SSE already have leader-owned watcher semantics.
 
-`HEAD`, `GET …/bootstrap`, snapshot reads, and the registration of a long-poll
-or SSE reader take the same leadership confirmation on the leader.
+`HEAD`, `GET …/bootstrap`, snapshot reads, the registration of a long-poll
+or SSE reader, and requests that resolve the tail through `HEAD`
+(`offset=now`, record-aware reads, SSE start) take the same leadership
+confirmation on the leader.
 
 `Stream-Up-To-Date` on each read tells the client whether more committed data exists past `next_offset`. `false` means keep paging.
 

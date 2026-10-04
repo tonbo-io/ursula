@@ -419,6 +419,24 @@ impl ShardRuntime {
         response
     }
 
+    /// Whether the local replica of the stream's group currently leads, by
+    /// its own view. Unlike `require_local_live_read_owner` this takes no
+    /// quorum round trip; it gates background leader-side work only.
+    pub async fn accepts_local_writes(
+        &self,
+        stream_id: &BucketStreamId,
+    ) -> Result<bool, RuntimeError> {
+        let placement = self.shard_map.locate(stream_id);
+        let (response_tx, response_rx) = oneshot::channel();
+        self.group_rpc(
+            placement,
+            None,
+            GroupCommand::AcceptsLocalWrites { response_tx },
+            response_rx,
+        )
+        .await
+    }
+
     pub async fn require_local_live_read_owner(
         &self,
         stream_id: &BucketStreamId,
@@ -1067,12 +1085,10 @@ impl ShardRuntime {
             let Some(((stream_id, generation), stream_pages)) = pages_by_stream.next() else {
                 break;
             };
-            // Only the local Raft leader may publish a replacement.
-            if self
-                .require_local_live_read_owner(&stream_id)
-                .await
-                .is_err()
-            {
+            // Only the local Raft leader may publish a replacement. A plain
+            // leadership check: compaction gains no quorum round trip, and the
+            // replacement's own commit is what proves leadership.
+            if !self.accepts_local_writes(&stream_id).await.unwrap_or(false) {
                 continue;
             }
             let chunks = load_cold_chunks_from_pages(&store, &stream_pages)

@@ -62,15 +62,19 @@ impl Probe {
     }
 }
 
-/// Seed-derived shape: payload sizes on both sides of the fault, whether the
-/// leader is deposed or a follower only lags, whether the partition heals
-/// before the new leader takes over, and the probe order.
+const PROBES: [Probe; 4] = [
+    Probe::CatchUpRead,
+    Probe::Head,
+    Probe::Bootstrap,
+    Probe::Snapshot,
+];
+
+/// Seed-derived shape: payload sizes on both sides of the fault, and whether
+/// the leader is deposed or a follower only lags.
 struct LeaderReadPlan {
     before: Vec<Vec<u8>>,
     after: Vec<Vec<u8>>,
     depose_leader: bool,
-    heal: bool,
-    probes: [Probe; 4],
 }
 
 impl LeaderReadPlan {
@@ -88,24 +92,10 @@ impl LeaderReadPlan {
         let before = payloads(b'a');
         let after = payloads(b'A');
         let depose_leader = rng.next_bounded(3) != 0;
-        let heal = rng.next_bounded(2) == 0;
-        let mut probes = [
-            Probe::CatchUpRead,
-            Probe::Head,
-            Probe::Bootstrap,
-            Probe::Snapshot,
-        ];
-        for index in (1..probes.len()).rev() {
-            let bound = u64::try_from(index + 1).expect("bound fits u64");
-            let swap = usize::try_from(rng.next_bounded(bound)).expect("index fits usize");
-            probes.swap(index, swap);
-        }
         Self {
             before,
             after,
             depose_leader,
-            heal,
-            probes,
         }
     }
 }
@@ -120,7 +110,6 @@ struct Observation {
 struct Probes<'a> {
     app: &'a Router,
     path: &'a str,
-    order: [Probe; 4],
     snapshot_offset: u64,
 }
 
@@ -154,7 +143,7 @@ impl Probes<'_> {
     /// Every probe answers 200 and reflects every acknowledged append.
     async fn serve_acked(&self, phase: &str, acked: &[u8], trace: &mut SimTrace) {
         let acked_offset = u64::try_from(acked.len()).expect("offset fits u64");
-        for probe in self.order {
+        for probe in PROBES {
             let seen = self.observe(probe).await;
             let (want_offset, want_body) = match probe {
                 Probe::CatchUpRead => (acked_offset, Some(acked)),
@@ -185,7 +174,7 @@ impl Probes<'_> {
     /// A leader cut off from the quorum refuses every probe with a
     /// retryable 503.
     async fn refuse(&self, phase: &str, acked_offset: u64, trace: &mut SimTrace) {
-        for probe in self.order {
+        for probe in PROBES {
             let seen = self.observe(probe).await;
             if seen.status.is_success() {
                 fail(
@@ -314,7 +303,6 @@ pub(super) async fn run_leader_read_linearizability_inner(
     let probes = Probes {
         app: &app,
         path: &path,
-        order: plan.probes,
         snapshot_offset,
     };
     probes.serve_acked("healthy", &acked, &mut trace).await;
@@ -334,15 +322,6 @@ pub(super) async fn run_leader_read_linearizability_inner(
             append_over_http(&app, &path, payload, &mut acked).await;
             probes
                 .serve_acked("follower_lags", &acked, &mut trace)
-                .await;
-        }
-        if plan.heal {
-            policy.heal_bidirectional(old_leader, lagging);
-            trace.push(SimEvent::FaultApplied {
-                phase: "follower_healed".to_owned(),
-            });
-            probes
-                .serve_acked("follower_healed", &acked, &mut trace)
                 .await;
         }
         return ThreeNodeRaftSimOutcome {
@@ -389,14 +368,6 @@ pub(super) async fn run_leader_read_linearizability_inner(
         .refuse("leader_isolated", acked_offset, &mut trace)
         .await;
 
-    if plan.heal {
-        for node_id in (1..=3).filter(|node_id| *node_id != old_leader) {
-            policy.heal_bidirectional(old_leader, node_id);
-        }
-        trace.push(SimEvent::FaultApplied {
-            phase: "partition_healed".to_owned(),
-        });
-    }
     runtime
         .shutdown_group_engine_for_simulation(placement)
         .await

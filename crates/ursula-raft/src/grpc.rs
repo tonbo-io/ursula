@@ -838,8 +838,6 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
     }
 }
 
-/// Decode a MessagePack RPC payload carried inside a proto envelope, mapping
-/// failures to `InvalidArgument`.
 /// Server half of a forwarded read: the engine request, with the F1
 /// continuation anchor the follower sent (absent from older followers) and
 /// its `leader_only` flag, so a forwarded `consistency=leader` read is
@@ -870,6 +868,8 @@ pub(crate) fn read_stream_request_from_v1(
     })
 }
 
+/// Decode a MessagePack RPC payload carried inside a proto envelope, mapping
+/// failures to `InvalidArgument`.
 fn decode_rpc_payload<T: DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T, GrpcRpcError> {
     decode_wire(bytes, what).map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))
 }
