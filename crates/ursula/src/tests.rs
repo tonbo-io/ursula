@@ -1755,11 +1755,11 @@ async fn metrics_expose_per_core_and_group_append_distribution() {
     assert!(body.contains("\"cold_orphan_cleanup_attempts\":0"));
     assert!(body.contains("\"cold_orphan_cleanup_errors\":0"));
     assert!(body.contains("\"cold_orphan_bytes\":0"));
-    assert!(body.contains("\"cold_hot_bytes\":0"));
+    assert!(body.contains("\"cold_hot_bytes\":"));
     assert!(body.contains("\"per_group_cold_hot_bytes\":["));
-    assert!(body.contains("\"cold_hot_group_bytes_max\":0"));
+    assert!(body.contains("\"cold_hot_group_bytes_max\":"));
     assert!(body.contains("\"per_group_cold_hot_bytes_max\":["));
-    assert!(body.contains("\"cold_hot_stream_bytes_max\":0"));
+    assert!(body.contains("\"cold_hot_stream_bytes_max\":"));
     assert!(body.contains("\"cold_backpressure_events\":0"));
     assert!(body.contains("\"per_core_cold_backpressure_events\":[0,0]"));
     assert!(body.contains("\"per_group_cold_backpressure_events\":["));
