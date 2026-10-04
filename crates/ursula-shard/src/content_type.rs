@@ -1,4 +1,4 @@
-//! Content-type normalization shared by the node and the gateway.
+//! Content-type normalization used by the node.
 //!
 //! A stream's content type is stored normalized (`extensions.md` §1.8): split
 //! at `;`, trim each part, drop empty parts, ASCII-lowercase each part and

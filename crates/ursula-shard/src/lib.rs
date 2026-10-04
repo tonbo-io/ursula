@@ -2,7 +2,7 @@
 //!
 //! Module map:
 //!
-//! - [`content_type`]: content-type normalization, shared by node and gateway.
+//! - [`content_type`]: content-type normalization, used by the node.
 //! - crate root: shard and Raft group identifiers, [`BucketStreamId`],
 //!   reserved affinity stream IDs and the static shard map.
 
@@ -200,21 +200,6 @@ fn fnv1a64_routing_key(stream_id: &BucketStreamId) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn subresource_names_are_reserved_affinity_stream_ids() {
-        for name in [
-            "$transaction",
-            "append-batch",
-            "attrs",
-            "bootstrap",
-            "retention",
-            "snapshot",
-        ] {
-            assert!(is_reserved_affinity_stream_id(name));
-        }
-        assert!(!is_reserved_affinity_stream_id("journal"));
-    }
 
     #[test]
     fn rejects_empty_dimensions() {

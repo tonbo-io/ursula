@@ -59,17 +59,6 @@ def indexer_values() -> tuple[str, ...]:
     )
 
 
-def documents(rendered: str, kind: str, name: str) -> list[str]:
-    """Every rendered document of ``kind`` whose ``metadata.name`` is ``name``."""
-    found = []
-    for document in re.split(r"^---$", rendered, flags=re.M):
-        if re.search(rf"^kind: {re.escape(kind)}$", document, re.M) and re.search(
-            rf"^metadata:\n(?:[ \t].*\n)*?  name: {re.escape(name)}$", document, re.M
-        ):
-            found.append(document)
-    return found
-
-
 def hook_annotations(rendered: str) -> dict[tuple[str, str], dict[str, str]]:
     """Map every rendered Helm hook to its own ``helm.sh/*`` annotations.
 

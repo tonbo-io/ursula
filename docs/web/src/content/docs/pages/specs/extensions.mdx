@@ -901,4 +901,4 @@ This section collects read parameters that apply to every stream and are not def
 
 ### 9.1. Long-Poll Timeout
 
-`timeout_ms={t}` bounds how long a `live=long-poll` read waits for new data before the server answers `204 No Content`. The default is `1000`. An unparseable value means the default, and a parsed value is clamped to `1..60000`. It is ignored on reads that do not wait.
+`timeout_ms={t}` bounds how long a `live=long-poll` read waits for new data before the server answers `204 No Content`. The default is `1000`. An unparseable value means the default, and a parsed value is clamped to `1..60000`. It applies only to `live=long-poll` reads; every other read, including `live=sse`, ignores it.

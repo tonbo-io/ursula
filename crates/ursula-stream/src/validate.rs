@@ -82,6 +82,7 @@ mod tests {
     #[test]
     fn affinity_rejects_ambiguous_subresource_names() {
         for stream in [
+            "$transaction",
             "append-batch",
             "attrs",
             "bootstrap",

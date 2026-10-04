@@ -40,5 +40,4 @@ workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
 tower = { workspace = true, features = ["util"] }
