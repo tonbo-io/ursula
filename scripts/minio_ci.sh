@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Starts MinIO for the keyed-streams e2e and drill jobs (S3 at 127.0.0.1:9000, minioadmin /
-# minioadmin) and waits until it is live. The test stack creates its own S3 buckets.
+# Starts MinIO for the CI jobs that need S3 (the sqlite-vfs cluster e2e and the memory soak) at
+# 127.0.0.1:9000 (minioadmin / minioadmin) and waits until it is live. The test stack creates its
+# own S3 buckets.
 #
 # Tries, in order: a MinIO binary (MINIO_BIN or `minio` on PATH), a container (MINIO_IMAGE, else
 # quay.io/minio/minio then cgr.dev/chainguard/minio; Docker Hub's minio/minio is gone), and finally
@@ -22,12 +23,12 @@ if [ -n "$bin" ]; then
   started="binary $bin"
 elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   for image in ${MINIO_IMAGE:-quay.io/minio/minio:latest cgr.dev/chainguard/minio:latest}; do
-    if docker run -d --name ks-minio -p 127.0.0.1:9000:9000 \
+    if docker run -d --name ci-minio -p 127.0.0.1:9000:9000 \
       -e MINIO_ROOT_USER -e MINIO_ROOT_PASSWORD "$image" server /data >/dev/null; then
       started="container $image"
       break
     fi
-    docker rm -f ks-minio >/dev/null 2>&1 || true
+    docker rm -f ci-minio >/dev/null 2>&1 || true
   done
 fi
 if [ -z "$started" ]; then
@@ -50,5 +51,5 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 echo "MinIO ($started) did not become live" >&2
-cat "$data.log" >&2 2>/dev/null || docker logs ks-minio 2>&1 | tail -50 >&2 || true
+cat "$data.log" >&2 2>/dev/null || docker logs ci-minio 2>&1 | tail -50 >&2 || true
 exit 1

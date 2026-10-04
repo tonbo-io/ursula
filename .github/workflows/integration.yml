@@ -1,10 +1,9 @@
-name: Keyed streams CI
+name: Integration
 
-# Verification for keyed streams (docs/architecture/keyed-streams-pi-durable.md) that the main CI
-# workflow does not already run: every Rust integration test target, the bounded-state DST seed
-# families, and the TypeScript owner (units, then e2e against a release `ursula` built once per run).
-# Lint, unit tests and the keyed-indexer DST seeds run in ci.yml; the fault drills run nightly
-# (keyed-streams-drills.yml).
+# Verification that the main CI workflow (ci.yml) does not already run: every Rust integration test
+# target, and the sqlite-vfs extension (lint, units, build) with its TypeScript e2e suite against a
+# release `ursula` built once per run, on a single node and on 3 nodes + gateway + MinIO. Lint, unit
+# tests and the DST seeds run in ci.yml.
 
 on:
   pull_request:
@@ -25,7 +24,7 @@ env:
 jobs:
   integration:
     name: Rust integration tests
-    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    runs-on: depot-ubuntu-24.04-8
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -41,28 +40,9 @@ jobs:
       - name: Test all integration targets
         run: cargo test --workspace --exclude ursula-sim --test '*'
 
-  typescript:
-    name: TypeScript owner
-    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 22
-
-      - name: Test clients/pi-durable-ursula
-        run: |
-          cd clients/pi-durable-ursula
-          npm ci
-          npm run typecheck
-          npm test
-
   build-ursula:
     name: Build release ursula
-    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    runs-on: depot-ubuntu-24.04-8
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -83,89 +63,9 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  typescript-e2e:
-    name: TypeScript owner e2e (single-node ursula + keyed indexer)
-    needs: build-ursula
-    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 22
-
-      - name: Download ursula
-        uses: actions/download-artifact@v7
-        with:
-          name: ursula-release
-          path: ${{ runner.temp }}/ursula-bin
-
-      # The global setup starts `ursula server` with `server.keyed_state_upstream` pointing at a
-      # keyed-mode `ursula indexer` (filesystem object store, source = the node), raises the
-      # feature level to 1, and the suite runs the bounded owner (LocalStore over keyed-state):
-      # Pi conformance (direct, and close+reopen in both open modes), open/claim/fencing, takeover
-      # and indexer-restart scenarios.
-      - name: Pi conformance, takeover and indexer restart against the real keyed stack
-        timeout-minutes: 10
-        run: |
-          chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
-          cd clients/pi-durable-ursula
-          npm ci
-          URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" E2E_STATE_STORE=bounded npm run test:e2e
-
-  typescript-e2e-s3:
-    name: TypeScript owner e2e on S3 (single node, then 3 nodes + gateway)
-    needs: build-ursula
-    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
-    timeout-minutes: 25
-    env:
-      URSULA_S3_ENDPOINT: http://127.0.0.1:9000
-      URSULA_S3_ACCESS_KEY: minioadmin
-      URSULA_S3_SECRET_KEY: minioadmin
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      # MinIO as the S3 service: the node cold store and the keyed indexer's object store (one
-      # S3 bucket per stack, the indexer under the node cold root's `.keyed/`).
-      - name: Start MinIO
-        run: scripts/ks_minio_ci.sh
-
-      - name: Install Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 22
-
-      - name: Download ursula
-        uses: actions/download-artifact@v7
-        with:
-          name: ursula-release
-          path: ${{ runner.temp }}/ursula-bin
-
-      # The whole e2e suite plus the S3 lifecycle checks (stream-delete GC and bucket purge remove
-      # the indexer's namespaces) on one S3-backed node.
-      - name: e2e on S3, single node
-        timeout-minutes: 15
-        run: |
-          chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
-          cd clients/pi-durable-ursula
-          npm ci
-          E2E_S3=1 URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" npm run test:e2e
-
-      # The same suite through the gateway of a 3-node cluster, plus keyed-state on followers, an
-      # owner on a follower node (307 to the leader) and a takeover across nodes.
-      - name: e2e on S3, 3 nodes + gateway
-        timeout-minutes: 15
-        run: |
-          cd clients/pi-durable-ursula
-          E2E_NODES=3 E2E_S3=1 URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" npm run test:e2e
-
   sqlite-vfs:
     name: sqlite-vfs (extension lint + units + build)
-    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    runs-on: depot-ubuntu-24.04-8
     timeout-minutes: 20
     env:
       # Keeps libsqlite3-sys from probing (and linking) a system libsqlite3: the extension only calls
@@ -201,7 +101,7 @@ jobs:
   sqlite-vfs-e2e:
     name: sqlite-vfs e2e (single-node ursula)
     needs: [build-ursula, sqlite-vfs]
-    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    runs-on: depot-ubuntu-24.04-8
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -244,7 +144,7 @@ jobs:
   sqlite-vfs-e2e-cluster:
     name: sqlite-vfs e2e (3 nodes + gateway + MinIO, feature level 5)
     needs: [build-ursula, sqlite-vfs]
-    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    runs-on: depot-ubuntu-24.04-8
     timeout-minutes: 40
     env:
       URSULA_S3_ENDPOINT: http://127.0.0.1:9000
@@ -255,7 +155,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Start MinIO
-        run: scripts/ks_minio_ci.sh
+        run: scripts/minio_ci.sh
 
       - name: Install Node
         uses: actions/setup-node@v6

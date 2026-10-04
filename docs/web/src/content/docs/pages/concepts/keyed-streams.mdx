@@ -5,7 +5,7 @@ sidebarTitle: Keyed streams
 
 A keyed stream is a JSON stream whose records are batches of key-value mutations. Writers declare every mutation in the record; Ursula checks the grammar when the record is appended, never runs application code, and serves the resulting key-value state through the [keyed-state](/docs/api/keyed-state) resource. The log stays the source of truth: the state is a deterministic fold of the records and can be rebuilt from them at any time.
 
-Use a keyed stream when an application needs both a durable commit log and point or range reads over the state that log produces, for example an agent harness that commits its session, task and conversation tables as one record per step. [Pi Durable on Ursula](/docs/examples/pi-durable) is the reference user.
+Use a keyed stream when an application needs both a durable commit log and point or range reads over the state that log produces, for example an agent harness that commits its session, task and conversation tables as one record per step.
 
 ## Creating one
 
@@ -77,6 +77,5 @@ Keyed logs are meant to be kept forever. Retention removes the records the proje
 ## Related
 
 - [Read keyed state](/docs/api/keyed-state)
-- [Pi Durable on Ursula](/docs/examples/pi-durable)
 - [Record Coordinates](/docs/concepts/record-coordinates)
 - [Extensions spec, section 9](/docs/specs/extensions#9-keyed-streams)
