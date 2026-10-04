@@ -107,7 +107,7 @@ Every growth source the audits found, replicated or not, with the fix that bound
 | 2 | Shared pack refs `cold_chunks` and group `shared_cold_object_refs/owners` (`cold_state.rs:26-31`; `state_machine.rs:115-122`) | yes | O(packed flushes) | 227 B tight, 421 B with slack, 166 B snapshot per ref; 260 B heap and 84 B snapshot per live pack | retention or delete; Raft engine rejects shared `CompactCold` | F2, F10 |
 | 3 | Producer receipts (`append.rs:1005`) and a copy of the newest receipt's items (`model.rs:120`) | yes | O(appends per epoch) | 115-131 B heap, 24-36 B snapshot per append | epoch bump | F3 |
 | 4 | Producer map (`state_machine.rs:143`) | yes | O(distinct ids) | about 380 B per id; id length unbounded | stream delete | F3 |
-| 5 | `message_records` (`state_machine.rs:138`) | yes | O(records since `FlushCold`); forever on external-only streams | 16 B/record heap, 12-15 B snapshot; 5,000-record external body: 120 KB heap, 91 KB snapshot per append | `FlushCold` or retention; collapse keeps capacity | F4, F7 |
+| 5 | Message records (`state_machine.rs:138`) | yes | O(records since `FlushCold`); forever on external-only streams | 16 B/record heap, 12-15 B snapshot; 5,000-record external body: 120 KB heap, 91 KB snapshot per append | `FlushCold` or retention; collapse keeps capacity | F4, F7 |
 | 6 | Hot window chunk overhead (`hot_buffer.rs:7-17, 88-97`) | yes | O(unflushed appends) | about 64 B tight per record beyond payload; 2.6 MB deque kept after one flush window | flush thresholds and group cap, both payload-only | F6, F7 |
 | 7 | External locators in state (planned by an earlier design) `external_segments` (`cold_state.rs:9`) | yes | O(external appends) if shipped as written | est. 120 B snapshot, 170 B heap per append of 1 MiB or more | retention only | F5 |
 | 8 | Visible snapshot payload (`model.rs:264-273`) | yes | O(1), up to the 32 MiB body cap; in 0.6.0 a reference above the staging threshold | inline on every replica and every group snapshot | replacement | F16 |
@@ -286,7 +286,7 @@ Neither command gains a field. A wrong scan, from wrong cold bytes or from a del
 
 ### 5.5 F4: message records
 
-**Today.** `message_records` holds one 16-byte entry per JSON record or per binary append. It collapses to one `[retained, frontier)` entry only at `FlushCold` (`cold.rs:510-514`) and retention (`cold.rs:699`). `AppendExternal` extends it (`append.rs:589-594`) and never collapses it, so external-only streams grow 16 B per record forever. The collapse allocates with the old length (`cold.rs:728`) and returns no memory. Consumers are bootstrap (`query.rs:386-416`), `snapshot_offset_aligned` (`cold.rs:670-686`), restore coverage (`persist.rs:223-229, 484-497`) and transaction rollback.
+**Today.** The message records hold one 16-byte entry per JSON record or per binary append. It collapses to one `[retained, frontier)` entry only at `FlushCold` (`cold.rs:510-514`) and retention (`cold.rs:699`). `AppendExternal` extends it (`append.rs:589-594`) and never collapses it, so external-only streams grow 16 B per record forever. The collapse allocates with the old length (`cold.rs:728`) and returns no memory. Consumers are bootstrap (`query.rs:386-416`), `snapshot_offset_aligned` (`cold.rs:670-686`), restore coverage (`persist.rs:223-229, 484-497`) and transaction rollback.
 
 **F4a.** Earlier main builds collapsed every record ending at or below the seal point into a single `[retained, p)` entry at every cold transition. 0.6.0 ships F4b instead, which removes the field.
 
@@ -336,7 +336,7 @@ An earlier design fixed the locator by keeping the `ObjectPayloadRef` in state a
 **Today.**
 
 - `advance_retention` clones the whole record index to validate it (`cold.rs:368-385`), then drains without shrinking (`record_index.rs:227`).
-- `compact_message_records_before` allocates with the old length (`cold.rs:728`).
+- The message-record collapse allocates with the old length (`cold.rs:728`).
 - `flush_prefix` pops chunks without shrinking (`hot_buffer.rs:205-221`).
 - The registry keeps `SlotMap` slots of `sizeof(StreamSlot)` and `HashMap` capacity after deletes.
 
@@ -473,7 +473,7 @@ Every returned entry is at its stream's true expiry, and every smaller key has a
 **Design.**
 
 1. **B1, ungated, node-local.** Coverage is the complement of the hot buffer. In `read_plan_at` and `payload_sources_cover_retained_suffix`, every byte of `[retained, tail)` that no hot segment holds is cold, served by state refs where they exist and by cold-index pages otherwise. Reads of affected streams work again, and nodes restore and install snapshots that already carry a regressed frontier. Snapshots keep writing the frontier as before, so replicated state does not change.
-2. **Representation.** Apply drops the scalar frontier. `snapshot_offset_aligned` accepts the retained offset, any offset at or below `p(s)`, or a message boundary above it (F4b). The 0.5.1 frontier clause also accepted intra-message offsets in hot bytes that lie below an external append, and a frontier raised with `max` would widen that, which is why the clause is replaced rather than repaired. Snapshot field 6 is reserved. The per-call sort of external segments in `cold_frontier_offset` (`cold_state.rs:83-108`) goes away with it.
+2. **Representation.** Apply drops the scalar frontier. `snapshot_offset_aligned` accepts the retained offset, any offset at or below `p(s)`, or a message boundary above it (F4b). The 0.5.1 frontier clause also accepted intra-message offsets in hot bytes that lie below an external append, and a frontier raised with `max` would widen that, which is why the clause is replaced rather than repaired. Snapshot field 6 is reserved. The per-call sort of external segments in the frontier computation (`cold_state.rs:83-108`) goes away with it.
 3. **Consequences elsewhere.** F5's `OffloadColdRefs` can always drop a ref, because its range is never hot. F6b's blocks keep their own start offsets, because the hot buffer has gaps.
 
 **Cost.** +80 production LoC, +150 test LoC (the D1 sequence on both engines, plus restore and install of snapshots with a regressed frontier). Low risk.
