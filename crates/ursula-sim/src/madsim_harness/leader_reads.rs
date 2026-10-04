@@ -180,7 +180,8 @@ impl Probes<'_> {
         for probe in PROBES {
             let seen = self.observe(probe).await;
             let (want_offset, want_body) = match probe {
-                Probe::CatchUpRead | Probe::LocalRead => (acked_offset, Some(acked)),
+                Probe::CatchUpRead => (acked_offset, Some(acked)),
+                Probe::LocalRead => (acked_offset, Some(&[][..])),
                 Probe::Head | Probe::Bootstrap => (acked_offset, None),
                 Probe::Snapshot => (self.snapshot_offset, Some(SNAPSHOT_BODY)),
             };

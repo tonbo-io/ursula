@@ -55,7 +55,6 @@ use crate::codec::required;
 use crate::engine::RaftGroupEngine;
 use crate::forward::write_commands_on_raft;
 use crate::raft_internal_proto;
-use crate::read_index::ReadIndexBarrier;
 use crate::types::UrsulaAppendEntriesRequest;
 use crate::types::UrsulaAppendEntriesResponse;
 use crate::types::UrsulaRaftTypeConfig;
@@ -771,12 +770,12 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 .get(placement.raft_group_id)
                 .ok_or_else(|| tonic::Status::not_found("raft group is not registered"))?;
             // The group's barrier, so forwarded linearizable reads share
-            // confirmation rounds with its local reads. Harnesses that
-            // register a bare raft handle get a fresh one.
+            // confirmation rounds with its local reads. The factories register
+            // it before the raft handle.
             let read_barrier = self
                 .registry
                 .read_barrier(placement.raft_group_id)
-                .unwrap_or_else(|| Arc::new(ReadIndexBarrier::new(raft.clone())));
+                .ok_or_else(|| tonic::Status::not_found("raft group is not registered"))?;
             let mut engine = RaftGroupEngine {
                 raft,
                 placement,

@@ -78,8 +78,10 @@ impl ReadIndexBarrier {
         let state = Arc::downgrade(&self.rounds);
         let round = async move {
             if let Some(previous) = previous {
-                // Its outcome belongs to its own readers.
-                let _previous = previous.await;
+                // Its outcome belongs to its own readers. Should it ever
+                // panic, this round must still close, or every later reader
+                // would join the poisoned round.
+                let _previous = std::panic::AssertUnwindSafe(previous).catch_unwind().await;
             }
             // Close the round: readers arriving from now on open the next.
             if let Some(state) = state.upgrade() {

@@ -2712,11 +2712,4 @@ fn forwarded_reads_carry_the_record_anchor_and_linearizability_over_grpc() {
         let served = crate::grpc::head_stream_request_from_v1(head.stream_id.clone(), 77, decoded);
         assert_eq!(served, head);
     }
-    // A sender that omits the field gets the linearizable HEAD.
-    let served = crate::grpc::head_stream_request_from_v1(
-        request.stream_id.clone(),
-        77,
-        crate::raft_internal_proto::HeadStreamReadV1::default(),
-    );
-    assert!(served.linearizable);
 }

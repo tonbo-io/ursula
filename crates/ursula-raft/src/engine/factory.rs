@@ -250,13 +250,15 @@ impl GroupEngineFactory for RegisteredRaftGroupEngineFactory {
             let engine =
                 RaftGroupEngine::new_single_node_with_optional_metrics(placement, Some(metrics))
                     .await?;
+            // The barrier goes in before the raft handle, so a forwarded read
+            // that finds the group always finds its barrier.
+            self.registry
+                .register_read_barrier(placement.raft_group_id, engine.read_barrier.clone());
             self.registry.register(placement, engine.raft.clone());
             self.registry.register_cold_index_cache(
                 placement.raft_group_id,
                 engine.cold_index_cache.clone(),
             );
-            self.registry
-                .register_read_barrier(placement.raft_group_id, engine.read_barrier.clone());
             let engine: Box<dyn GroupEngine> = Box::new(engine);
             Ok(engine)
         })
@@ -739,13 +741,15 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 )
                 .await?
             };
+            // The barrier goes in before the raft handle, so a forwarded read
+            // that finds the group always finds its barrier.
+            self.registry
+                .register_read_barrier(placement.raft_group_id, engine.read_barrier.clone());
             self.registry.register(placement, engine.raft_handle());
             self.registry.register_cold_index_cache(
                 placement.raft_group_id,
                 engine.cold_index_cache.clone(),
             );
-            self.registry
-                .register_read_barrier(placement.raft_group_id, engine.read_barrier.clone());
             if self.should_initialize_membership(placement.raft_group_id) {
                 let rejoin_existing_cluster = self.snapshot_store.is_some()
                     && engine

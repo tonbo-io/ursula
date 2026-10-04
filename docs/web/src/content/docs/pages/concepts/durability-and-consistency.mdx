@@ -40,8 +40,8 @@ or SSE reader take the same leadership confirmation on the leader, as do
 `offset=now`, `record=` and `tail_records=` on a `consistency=leader` read.
 Reads that promise no linearizability skip it and use the leader's applied
 state: `offset=now`, `record=` and `tail_records=` without
-`consistency=leader`, the start of an SSE session, and a long-poll's timeout
-answer.
+`consistency=leader`, an SSE session's tail lookup after its registration,
+and a long-poll's timeout answer.
 
 With `consistency=leader`, `Stream-Up-To-Date: true` on a read means it reached the committed tail. On a local read it means the tail as the serving node knew it: a leader that has lost leadership without knowing it yet can mark a stale tail. A response without it is partial; keep reading from `Stream-Next-Offset`.
 

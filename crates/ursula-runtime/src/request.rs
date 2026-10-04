@@ -119,10 +119,13 @@ pub struct CreateStreamResponse {
 pub struct HeadStreamRequest {
     pub stream_id: BucketStreamId,
     pub now_ms: u64,
-    /// A client HEAD, which promises linearizability (D10): the leader
-    /// confirms a read index first. Internal callers that need only the
-    /// leader's applied state (the `offset=now` and record resolutions of
-    /// `consistency=local` reads, live-read starts) set `false`.
+    /// `true` when the HEAD promises linearizability (D10), so the leader
+    /// confirms a read index first: a client HEAD, the `offset=now` and
+    /// record resolutions of a `consistency=leader` read, the JSON
+    /// record-boundary pre-check. `false` for internal HEADs that need only
+    /// the leader's applied state: the `offset=now` and record resolutions
+    /// of `consistency=local` reads, the SSE tail lookup, the long-poll
+    /// timeout answer.
     pub linearizable: bool,
     /// The read index this request was linearized at before it was queued
     /// (D10): `ShardRuntime` confirms the group's leadership and waits
