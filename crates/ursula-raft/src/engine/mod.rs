@@ -24,6 +24,7 @@ use openraft::Config;
 use openraft::OptionalSend;
 use openraft::Raft;
 use openraft::RaftNetworkFactory;
+use openraft::ReadPolicy;
 use openraft::rt::WatchReceiver;
 use openraft::storage::RaftLogStorage;
 use ursula_runtime::AdvanceRetentionRequest;
@@ -121,6 +122,7 @@ use crate::forward::forward_purge_bucket_to_leader;
 use crate::forward::forward_read_stream_to_leader;
 use crate::forward::group_engine_client_write_error;
 use crate::forward::group_engine_forward_to_leader_error;
+use crate::forward::group_engine_linearizable_read_error;
 use crate::forward::write_commands_on_raft;
 use crate::forward::write_result_from_raft_response;
 use crate::log_store::RaftGroupFileLogStore;
@@ -658,6 +660,27 @@ impl RaftGroupEngine {
         ))
     }
 
+    /// Linearizable leader read (ReadIndex): on the leader, confirm
+    /// leadership with a quorum round trip and wait until the local state
+    /// machine has applied the read index, so the read that follows cannot
+    /// miss a write any leader acknowledged before it started. A deposed
+    /// leader cut off from the quorum answers a forward (or 503) instead of
+    /// a stale view. A follower gets the plain forward-to-leader error.
+    pub(crate) async fn require_linearizable_leader_read(
+        &self,
+        operation: &str,
+    ) -> Result<(), GroupEngineError> {
+        self.require_local_leader_for_read(operation).await?;
+        self.raft
+            .ensure_linearizable(ReadPolicy::ReadIndex)
+            .await
+            .map(|_| ())
+            .map_err(|err| {
+                let self_id = self.raft.metrics().borrow_watched().id;
+                group_engine_linearizable_read_error(err, operation, self_id)
+            })
+    }
+
     pub(crate) async fn current_leader_node(&self) -> Option<BasicNode> {
         let leader_id = self.raft.current_leader().await?;
         self.raft
@@ -775,7 +798,7 @@ impl GroupEngine for RaftGroupEngine {
             {
                 return forward_head_stream_to_leader(placement, &leader_node, request).await;
             }
-            self.require_local_leader_for_read("head_stream").await?;
+            self.require_linearizable_leader_read("head_stream").await?;
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
                 .await?;
             self.with_state_machine(move |state_machine| {
@@ -843,13 +866,17 @@ impl GroupEngine for RaftGroupEngine {
     ) -> GroupReadStreamPartsFuture<'a> {
         Box::pin(async move {
             let original_request = request.clone();
-            if request.leader_only && !self.raft.is_leader() {
-                if let Some(leader_node) = self.current_leader_node().await {
+            if request.leader_only {
+                // A follower forwards with `leader_only` set, so the leader
+                // linearizes the read too (field 6 of `ReadStreamReadV1`).
+                if !self.raft.is_leader()
+                    && let Some(leader_node) = self.current_leader_node().await
+                {
                     let response =
                         forward_read_stream_to_leader(placement, &leader_node, request).await?;
                     return Ok(GroupReadStreamParts::from_response(response));
                 }
-                self.require_local_leader_for_read("leader-only read_stream")
+                self.require_linearizable_leader_read("leader-only read_stream")
                     .await?;
             }
             if !self.raft.is_leader() {
@@ -937,7 +964,7 @@ impl GroupEngine for RaftGroupEngine {
         &'a mut self,
         _placement: ShardPlacement,
     ) -> ursula_runtime::GroupRequireLiveReadOwnerFuture<'a> {
-        Box::pin(async move { self.require_local_leader_for_read("live_read").await })
+        Box::pin(async move { self.require_linearizable_leader_read("live_read").await })
     }
 
     fn publish_snapshot<'a>(
@@ -1183,7 +1210,8 @@ impl GroupEngine for RaftGroupEngine {
         placement: ShardPlacement,
     ) -> GroupReadSnapshotFuture<'a> {
         Box::pin(async move {
-            self.require_local_leader_for_read("read_snapshot").await?;
+            self.require_linearizable_leader_read("read_snapshot")
+                .await?;
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, true)
                 .await?;
             self.with_state_machine(move |state_machine| {
@@ -1199,7 +1227,7 @@ impl GroupEngine for RaftGroupEngine {
         placement: ShardPlacement,
     ) -> GroupBootstrapStreamFuture<'a> {
         Box::pin(async move {
-            self.require_local_leader_for_read("bootstrap_stream")
+            self.require_linearizable_leader_read("bootstrap_stream")
                 .await?;
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, true)
                 .await?;

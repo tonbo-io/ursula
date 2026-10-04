@@ -130,6 +130,9 @@ message ReadStreamReadV1 {
   // F1 server-side continuation anchor from the reader's previous response.
   // Leaders that do not know the field ignore it and resolve from the mark.
   optional RecordAnchorV1 record_anchor = 5;
+  // `consistency=leader`: the leader linearizes the read (ReadIndex) before
+  // serving it. Leaders that do not know the field serve it unlinearized.
+  bool leader_only = 6;
 }
 
 message RecordAnchorV1 {

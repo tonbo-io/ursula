@@ -532,10 +532,12 @@ EXPECTED_PR_FAMILIES = {
     "pipeline-smoke-runtime-raft-network-snapshot-corruption",
     "pipeline-smoke-runtime-raft-network-tail-read-corruption",
     "runtime-raft-snapshot-install-failures",
+    "leader-read-linearizability",
 }
 EXPECTED_PR_RANGES = {"60..=64", "137..=140"}
 EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {
     "runtime-raft-network-randomized-extended",
+    "leader-read-linearizability-extended",
 }
 EXPECTED_NIGHTLY_RANGES = {"60..=199"}
 

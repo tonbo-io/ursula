@@ -207,3 +207,55 @@ jobs:
           cd clients/sqlite-ursula
           npm ci
           E2E_NODES=3 URSULA_VFS_SNAPSHOT_MIN_BYTES=65536 URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/conformance.e2e.ts test/snapshot.e2e.ts test/bench.e2e.ts
+
+  # TEMPORARY (PR10 A/B measurement, removed before merge): HEAD and consistency=leader read
+  # latency on the 3-node stack, this PR's ursula against main's (integration run 37182936997).
+  leader-read-perf:
+    name: leader read perf A/B (temporary)
+    needs: [build-ursula]
+    runs-on: depot-ubuntu-24.04-8
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read
+    env:
+      URSULA_S3_ENDPOINT: http://127.0.0.1:9000
+      URSULA_S3_ACCESS_KEY: minioadmin
+      URSULA_S3_SECRET_KEY: minioadmin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Start MinIO
+        run: scripts/minio_ci.sh
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Download ursula (this PR)
+        uses: actions/download-artifact@v7
+        with:
+          name: ursula-release
+          path: ${{ runner.temp }}/ursula-pr
+
+      - name: Download ursula (main baseline)
+        uses: actions/download-artifact@v7
+        with:
+          name: ursula-release
+          path: ${{ runner.temp }}/ursula-main
+          run-id: 37182936997
+          github-token: ${{ github.token }}
+
+      - name: A/B (main, PR, main, PR)
+        timeout-minutes: 30
+        run: |
+          chmod +x "$RUNNER_TEMP/ursula-pr/ursula" "$RUNNER_TEMP/ursula-main/ursula"
+          cd clients/sqlite-ursula
+          npm ci
+          for round in 1 2; do
+            for build in main pr; do
+              E2E_NODES=3 LEADER_READ_PERF=1 PERF_LABEL="$build#$round" URSULA_BIN="$RUNNER_TEMP/ursula-$build/ursula" npx vitest --run test/leader-read-perf.e2e.ts
+            done
+          done

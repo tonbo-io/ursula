@@ -89,6 +89,7 @@ pub(crate) fn read_stream_read_v1(
         max_len,
         record: request.record,
         max_records: request.max_records,
+        leader_only: request.leader_only,
         record_anchor: request
             .record_anchor
             .map(|anchor| raft_internal_proto::RecordAnchorV1 {
@@ -355,6 +356,37 @@ pub(crate) fn group_engine_client_write_error(
         );
     }
     GroupEngineError::new(format!("OpenRaft client_write: {err}"))
+}
+
+/// Map a failed ReadIndex barrier (`Raft::ensure_linearizable`). Nothing was
+/// proposed, so every arm is a definite, retryable rejection: a lost
+/// leadership forwards to the known leader (503 while it is unknown), and a
+/// leader that cannot reach a quorum answers leader-unknown (503) rather than
+/// serving a view that may miss a newer leader's acknowledged writes.
+pub(crate) fn group_engine_linearizable_read_error(
+    err: openraft::error::RaftError<
+        UrsulaRaftTypeConfig,
+        openraft::error::LinearizableReadError<UrsulaRaftTypeConfig>,
+    >,
+    operation: &str,
+    self_id: u64,
+) -> GroupEngineError {
+    let message = format!("OpenRaft {operation} could not confirm leadership: {err}");
+    match err.api_error() {
+        Some(openraft::error::LinearizableReadError::ForwardToLeader(forward)) => {
+            group_engine_forward_to_leader_error(
+                message,
+                forward.leader_id,
+                forward.leader_node.as_ref(),
+                self_id,
+                true,
+            )
+        }
+        Some(openraft::error::LinearizableReadError::QuorumNotEnough(_)) => {
+            group_engine_forward_to_leader_error(message, None, None, self_id, true)
+        }
+        None => GroupEngineError::new(message),
+    }
 }
 
 /// `before_proposal` is true only for a local leadership check that runs
