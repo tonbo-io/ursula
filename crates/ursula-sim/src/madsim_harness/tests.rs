@@ -2003,7 +2003,7 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
         .find(|producer| producer.producer_id == "quiet")
         .expect("quiet producer");
     assert_eq!(quiet.receipts.len(), 1, "quiet restarted after idle expiry");
-    assert_eq!(quiet.last_seen_ms, Some(5 + 7 * 24 * 60 * 60 * 1_000));
+    assert_eq!(quiet.last_seen_ms, 5 + 7 * 24 * 60 * 60 * 1_000);
 }
 
 /// Seeds for a `#[test]` seed family: the PR default set, or the inclusive

@@ -13,9 +13,9 @@
 //!   two-segment stream ID may not start with `$` (400), so a future
 //!   bucket-level `$` subresource cannot collide with an existing stream.
 //! - `/__ursula/feature-level` has no route: it falls through to stream
-//!   routing, where bucket `__ursula` holds no streams (`GET` answers 404)
-//!   and is a reserved bucket ID (`POST` answers 4xx). Every group runs one
-//!   behaviour, so there is no level to report or raise.
+//!   routing, where `__ursula` is a reserved bucket ID, so `GET` answers 400
+//!   and `POST` a 4xx. Every group runs one behaviour, so there is no level
+//!   to report or raise.
 //!
 //! The removed names live only in this file, which the release's "nothing
 //! left" check allowlists.
@@ -149,7 +149,7 @@ mod tests {
     async fn feature_level_endpoint_is_gone() {
         let app = app();
         let response = send(&app, "GET", "/__ursula/feature-level", &[], "").await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = [(CONTENT_TYPE.as_str(), "application/json")];
         let response = send(
             &app,
