@@ -905,10 +905,9 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                     .flat_map(|chunk| chunk.to_vec())
                     .collect(),
             };
-            pointer_bytes = envelope.encode(&pointer).map_err(|err| err.into_io())?;
+            pointer_bytes = pointer.encode_binary().map_err(|err| err.into_io())?;
             persist_snapshot_metadata(
                 self.snapshot_metadata_path.as_deref(),
-                envelope,
                 &self.meta,
                 &pointer_bytes,
             )?;
