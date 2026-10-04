@@ -1728,7 +1728,7 @@ async fn metrics_expose_per_core_and_group_append_distribution() {
     assert!(body.contains("\"sse_data_events\":0"));
     assert!(body.contains("\"sse_control_events\":0"));
     assert!(body.contains("\"sse_error_events\":0"));
-    assert!(body.contains("\"routed_requests\":2"));
+    assert!(body.contains("\"routed_requests\":3"));
     assert!(body.contains("\"per_core_routed_requests\":["));
     assert!(body.contains("\"mailbox_send_wait_ns\":"));
     assert!(body.contains("\"per_core_mailbox_send_wait_ns\":["));
