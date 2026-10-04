@@ -1347,9 +1347,11 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         )
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .route("/{bucket}", put(create_bucket))
+        // Only PUT: a bare GET (the removed latest-snapshot redirect) gets
+        // axum's 405, not a 404 that Loro's client would read as "no snapshot".
         .route(
             "/{bucket}/{stream}/snapshot",
-            get(removed_surface::latest_snapshot_removed).put(publish_snapshot_at_record),
+            put(publish_snapshot_at_record),
         )
         .route(
             "/{bucket}/{stream}/snapshot/{snapshot_offset}",
@@ -1379,7 +1381,7 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         )
         .route(
             "/{bucket}/{affinity}/{stream}/snapshot",
-            get(removed_surface::latest_snapshot_removed).put(publish_snapshot_at_record),
+            put(publish_snapshot_at_record),
         )
         .route(
             "/{bucket}/{affinity}/{stream}/snapshot/{snapshot_offset}",

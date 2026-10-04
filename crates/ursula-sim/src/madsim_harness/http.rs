@@ -215,6 +215,7 @@ pub(super) async fn run_http_protocol_surface_inner(
     // The latest-snapshot redirect was removed; the bare path answers 405.
     let latest_snapshot = send(&app, "GET", &format!("{path}/snapshot"), &[], Body::empty()).await;
     assert_eq!(latest_snapshot.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(header_str(&latest_snapshot, "allow"), "PUT");
 
     let read_snapshot = send(&app, "GET", &snapshot_path, &[], Body::empty()).await;
     assert_eq!(read_snapshot.status(), StatusCode::OK);

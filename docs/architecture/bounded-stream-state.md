@@ -70,7 +70,7 @@ Definitions for a stream `s`:
 ```text
 state(s) ≤ C0 + H(s) + 8 B · U(s) + 16 B · ⌈K(s)⌉ + Prod(s)
 
-C0      ≤ 32 KiB + attrs (≤ 16 KiB, existing cap) + inline visible snapshot
+C0      ≤ 32 KiB + inline visible snapshot
           metadata, integrity, counters, ≤ 64 shared pack refs,
           ≤ 16 staged external refs, plus one node-local TTL heap entry
 H(s)    = unflushed payload bytes (also capped per group by admission)
@@ -142,7 +142,7 @@ Every growth source the audits found, replicated or not, with the fix that bound
 | 36 | Meta-group migrations (`crates/ursula-control/src/state.rs:334`) | meta | O(migrations ever) | one record each | none | F17 |
 | 37 | Raft log held until purge (`config.rs:205-208`) | yes | O(entries since snapshot) | full payload per entry; triggers count entries, not bytes | snapshot cadence | F12 |
 
-Already constant per stream: metadata (apart from row 9), attrs (16 KiB cap, `model.rs:34`), integrity setsums, `retained_offset`, the group hot gauge and the commit index. Bounded per node: read watchers (65,536 per core), the cold read block cache (256 MiB LRU with deque compaction), gateway leader and rate caches, metrics arrays, gRPC channel maps.
+Already constant per stream: metadata (apart from row 9), integrity setsums, `retained_offset`, the group hot gauge and the commit index. Bounded per node: read watchers (65,536 per core), the cold read block cache (256 MiB LRU with deque compaction), gateway leader and rate caches, metrics arrays, gRPC channel maps.
 
 ### 4.2 Correctness defects
 
