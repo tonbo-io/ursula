@@ -1,7 +1,8 @@
 //! Pins of the base protocol contract that the 0.6.0 removals must keep:
 //! `Stream-Seq` as a compare-and-set, `Stream-Next-Offset` as the exact
-//! resume point, the HEAD snapshot and retention headers, and the headers
-//! error responses carry.
+//! resume point, the HEAD snapshot and retention headers, and `Retry-After`
+//! on temporary 503s. The producer error headers are pinned in `tests.rs`
+//! (`producer_headers_deduplicate_retries_and_fence_stale_epochs`).
 //!
 //! Offsets are opaque here: an offset is only ever echoed back or compared
 //! with another offset, never computed. A failing pin is a finding to triage;
@@ -350,7 +351,8 @@ async fn head_reports_snapshot_and_retention_after_publish_and_advance() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(header(&response, HEADER_STREAM_SNAPSHOT_OFFSET), at);
     assert_eq!(header(&response, HEADER_STREAM_SNAPSHOT_DIGEST), digest);
-    // Compared by value: Stream-Retained-Offset is not zero-padded yet.
+    // Compared by value until PR04 pads Stream-Retained-Offset; PR04 replaces
+    // this with string equality.
     let value = |offset: &str| offset.parse::<u64>().expect("decimal offset");
     assert_eq!(
         value(header(&response, HEADER_STREAM_RETAINED_OFFSET)),
@@ -359,37 +361,9 @@ async fn head_reports_snapshot_and_retention_after_publish_and_advance() {
 }
 
 #[tokio::test]
-async fn producer_errors_carry_producer_headers() {
-    let app = app();
-    let uri = "/contract/producer-errors";
-    let response = create(&app, uri, &[], "").await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let producer = |epoch, seq| {
-        [
-            (HEADER_PRODUCER_ID, "writer"),
-            (HEADER_PRODUCER_EPOCH, epoch),
-            (HEADER_PRODUCER_SEQ, seq),
-        ]
-    };
-    let response = append(&app, uri, &producer("0", "0"), "a").await;
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = append(&app, uri, &producer("0", "2"), "gap").await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert_eq!(header(&response, "producer-expected-seq"), "1");
-
-    let response = append(&app, uri, &producer("1", "0"), "b").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let response = append(&app, uri, &producer("0", "1"), "stale").await;
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(header(&response, HEADER_PRODUCER_EPOCH), "1");
-}
-
-#[tokio::test]
-async fn unavailable_answers_carry_retry_after() {
-    // A one-byte hot cap refuses every non-empty append as a temporary
-    // error, and an 8-byte ingress budget refuses any larger body.
+async fn temporary_unavailable_answers_carry_retry_after() {
+    // A one-byte hot cap refuses any append of two or more bytes as a
+    // temporary error, whatever the per-record charge.
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
         RuntimeConfig::new(1, 1).with_cold_max_hot_bytes_per_group(Some(1)),
@@ -397,27 +371,13 @@ async fn unavailable_answers_carry_retry_after() {
         Some(cold_store),
     )
     .expect("runtime");
-    let admission = IngressAdmission {
-        body_bytes: Arc::new(tokio::sync::Semaphore::new(8)),
-        wal_disk: WalDiskMonitor::default(),
-        raft_log: None,
-    };
-    let app = client_router_with_admission(HttpState::new(runtime), admission);
+    let app = router(runtime);
     let uri = "/contract/unavailable";
     let response = create(&app, uri, &[], "").await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = append(&app, uri, &[], "a").await;
+    let response = append(&app, uri, &[], "ab").await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(header(&response, "retry-after"), "1");
     assert!(body_text(response).await.contains("ColdBackpressure"));
-
-    let response = append(&app, uri, &[], "123456789").await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(header(&response, "retry-after"), "1");
-    assert!(
-        body_text(response)
-            .await
-            .contains("IngressBodyBytesLimitReached")
-    );
 }

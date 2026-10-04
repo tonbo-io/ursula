@@ -867,56 +867,6 @@ async fn append_conflict_precedence_reports_closed_header_before_mismatch_or_seq
 }
 
 #[tokio::test]
-async fn stream_seq_header_rejects_regressing_appends() {
-    let app = test_router();
-
-    let response = http_put(
-        &app,
-        "/benchcmp/seq-stream",
-        &[(CONTENT_TYPE.as_str(), "text/plain")],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let response = http_post(
-        &app,
-        "/benchcmp/seq-stream",
-        &[
-            (CONTENT_TYPE.as_str(), "text/plain"),
-            (HEADER_STREAM_SEQ, "0002"),
-        ],
-        Body::from("a"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-    let response = http_post(
-        &app,
-        "/benchcmp/seq-stream",
-        &[
-            (CONTENT_TYPE.as_str(), "text/plain"),
-            (HEADER_STREAM_SEQ, "0002"),
-        ],
-        Body::from("b"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-
-    let response = http_post(
-        &app,
-        "/benchcmp/seq-stream",
-        &[
-            (CONTENT_TYPE.as_str(), "text/plain"),
-            (HEADER_STREAM_SEQ, "0003"),
-        ],
-        Body::from("c"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-}
-
-#[tokio::test]
 async fn producer_headers_deduplicate_retries_and_fence_stale_epochs() {
     let app = test_router();
 
