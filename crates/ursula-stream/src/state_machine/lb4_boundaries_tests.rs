@@ -48,7 +48,6 @@ fn create(machine: &mut StreamStateMachine, id: &str, content_type: &str, initia
         producer: None,
         stream_ttl_seconds: None,
         stream_expires_at_ms: None,
-        attrs: None,
         now_ms: 0,
     });
     assert!(
@@ -126,7 +125,6 @@ fn publish_snapshot(machine: &mut StreamStateMachine, id: &str, offset: u64) -> 
         snapshot_offset: offset,
         content_type: OCTET.to_owned(),
         payload: bytes::Bytes::from_static(b"state"),
-        expected_digest: None,
         now_ms: 0,
     })
 }
@@ -442,7 +440,6 @@ fn failed_transaction_rolls_back_append_starts() {
         producer: None,
         stream_ttl_seconds: None,
         stream_expires_at_ms: None,
-        attrs: None,
         now_ms: 0,
     });
     assert!(matches!(response, StreamResponse::Created { .. }));

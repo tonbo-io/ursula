@@ -67,9 +67,6 @@ pub enum StreamResponse {
         changed: bool,
         expired: bool,
     },
-    AttrsUpdated {
-        changed: bool,
-    },
     ColdGcAcked {
         removed: u64,
     },
@@ -151,7 +148,6 @@ pub enum StreamErrorCode {
     InvalidSnapshot,
     SnapshotNotFound,
     SnapshotConflict,
-    InvalidStreamAttrs,
     InvalidRecordBoundaries,
     RecordPreconditionFailed,
     /// A state import targeted a group that already holds buckets or streams.

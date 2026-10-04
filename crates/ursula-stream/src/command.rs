@@ -9,7 +9,6 @@ use crate::model::ColdChunkRef;
 use crate::model::ExternalPayloadRef;
 use crate::model::ObjectPayloadRef;
 use crate::model::ProducerRequest;
-use crate::model::StreamAttrs;
 use crate::snapshot::StreamSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,9 +25,6 @@ pub enum StreamCommand {
         producer: Option<ProducerRequest>,
         stream_ttl_seconds: Option<u64>,
         stream_expires_at_ms: Option<u64>,
-        // `default` keeps pre-attrs replicated records decodable.
-        #[serde(default)]
-        attrs: Option<StreamAttrs>,
         now_ms: u64,
     },
     CreateExternal {
@@ -42,9 +38,6 @@ pub enum StreamCommand {
         producer: Option<ProducerRequest>,
         stream_ttl_seconds: Option<u64>,
         stream_expires_at_ms: Option<u64>,
-        // `default` keeps pre-attrs replicated records decodable.
-        #[serde(default)]
-        attrs: Option<StreamAttrs>,
         now_ms: u64,
     },
     Append {
@@ -81,8 +74,6 @@ pub enum StreamCommand {
         snapshot_offset: u64,
         content_type: String,
         payload: Bytes,
-        #[serde(default)]
-        expected_digest: Option<String>,
         now_ms: u64,
     },
     /// Publishes a snapshot whose body the proposer staged as a cold-tier
@@ -95,7 +86,6 @@ pub enum StreamCommand {
         content_type: String,
         object: ExternalPayloadRef,
         digest: String,
-        expected_digest: Option<String>,
         now_ms: u64,
     },
     AdvanceRetention {
@@ -107,11 +97,6 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
         now_ms: u64,
         renew_ttl: bool,
-    },
-    UpdateStreamAttrs {
-        stream_id: BucketStreamId,
-        attrs: Option<StreamAttrs>,
-        now_ms: u64,
     },
     FlushCold {
         stream_id: BucketStreamId,
@@ -309,9 +294,6 @@ impl fmt::Display for StreamCommand {
                 renew_ttl,
                 ..
             } => write!(f, "touch_stream_access:{stream_id}:renew_ttl={renew_ttl}"),
-            Self::UpdateStreamAttrs { stream_id, .. } => {
-                write!(f, "update_stream_attrs:{stream_id}")
-            }
             Self::FlushCold {
                 stream_id, chunk, ..
             } => write!(

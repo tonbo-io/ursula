@@ -35,7 +35,6 @@ fn machine_at(level: u32) -> StreamStateMachine {
         producer: None,
         stream_ttl_seconds: None,
         stream_expires_at_ms: None,
-        attrs: None,
         now_ms: 1,
     });
     assert!(

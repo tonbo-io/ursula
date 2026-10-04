@@ -23,10 +23,6 @@ For JSON streams, `PUT /{bucket}/{stream}/snapshot?record={record}` resolves a s
  Content type of the snapshot blob, stored separately from the stream's own content type. Defaults to `application/octet-stream`.
 </ParamField>
 
-<ParamField header="Stream-Snapshot-Match" type="string">
- Optional digest of the currently visible snapshot. The publish succeeds only if it still matches.
-</ParamField>
-
 <ParamField body="body" type="binary" required>
  The snapshot blob bytes. Bodies of up to **32 MiB** are stored inline in the stream's replicated state. On a node with a cold backend whose group is at [feature level 5](/docs/operations#feature-levels), a body of at least `runtime.external_payload_min_size` (1 MiB by default) is streamed into the cold tier instead, and bodies of up to **1 GiB** are accepted. Larger bodies return `413`.
 </ParamField>
@@ -58,19 +54,6 @@ curl -X PUT 'http://127.0.0.1:4437/demo/hello/snapshot/00000000000000000042' \
 `PUT /{bucket}/{stream}/retention/{offset}` explicitly discards history before a published checkpoint. For JSON streams, `PUT /{bucket}/{stream}/retention?record={record}` accepts a record ordinal. The boundary must be monotonic, aligned, and no newer than the visible checkpoint.
 
 After a successful `204`, reads before the retained offset return `410 Gone`. This separate step lets clients publish and verify a checkpoint before making history unreachable.
-
----
-
-## Delete snapshot
-
-`DELETE /{bucket}/{stream}/snapshot/{offset}`
-
-Attempting to delete the current visible snapshot is not allowed.
-
-| Status | Meaning |
-| ------ | ----------------------------------- |
-| `404` | No snapshot at the given offset. |
-| `409` | Cannot delete the current snapshot. |
 
 <Note>
 Snapshots are immutable at a given offset. A byte-identical retry is idempotent; a different body at the same offset conflicts. Publishing does not advance retention.

@@ -32,7 +32,6 @@ use openraft::testing::log::StoreBuilder;
 use openraft::testing::log::Suite;
 use openraft::type_config::TypeConfigExt;
 use openraft::vote::RaftLeaderId;
-use serde_json::json;
 use ursula_control::ControlCommand;
 use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendRequest;
@@ -40,7 +39,6 @@ use ursula_runtime::AppendTransactionRequest;
 use ursula_runtime::CloseStreamRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
-use ursula_runtime::GetStreamAttrsRequest;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineFactory;
@@ -54,10 +52,8 @@ use ursula_runtime::ReadStreamResponse;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::RuntimeThreading;
 use ursula_runtime::ShardRuntime;
-use ursula_runtime::StreamAttrs;
 use ursula_runtime::StreamErrorCode;
 use ursula_runtime::StreamErrorContext;
-use ursula_runtime::UpdateStreamAttrsRequest;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardId;
@@ -428,19 +424,6 @@ fn create_stream_command(name: &str) -> GroupWriteCommand {
     create_command(bsid(name))
 }
 
-fn stream_attrs(title: &str, purpose: &str) -> StreamAttrs {
-    StreamAttrs {
-        title: Some(title.to_owned()),
-        metadata: json!({
-            "agent": { "id": "agent-1", "version": 2 },
-            "purpose": purpose
-        })
-        .as_object()
-        .expect("metadata object")
-        .clone(),
-    }
-}
-
 #[test]
 fn raft_group_command_round_trips_through_wire_codec() {
     let command = GroupWriteCommand::Stream(ursula_stream::StreamCommand::AppendBatch {
@@ -461,21 +444,6 @@ fn raft_group_command_round_trips_through_wire_codec() {
     assert_eq!(decoded, command);
 
     // Determinism: re-encoding the decoded value is byte-identical.
-    assert_eq!(encode_wire(&decoded), encoded);
-}
-
-#[test]
-fn stream_attrs_update_command_round_trips_through_wire_codec() {
-    let command = GroupWriteCommand::from(UpdateStreamAttrsRequest {
-        stream_id: bsid("attrs-wire"),
-        attrs: Some(stream_attrs("Support session", "customer-support")),
-        now_ms: 123,
-    });
-
-    let encoded = encode_wire(&command);
-    let decoded: GroupWriteCommand =
-        decode_wire(&encoded, "group command").expect("decode attrs update command");
-    assert_eq!(decoded, command);
     assert_eq!(encode_wire(&decoded), encoded);
 }
 
@@ -2416,25 +2384,6 @@ async fn shard_runtime_uses_raft_group_engine_factory_for_owned_group() {
         ))
         .await
         .expect("append through runtime-owned raft group");
-    let attrs = stream_attrs("Runtime raft session", "customer-support");
-    runtime
-        .update_stream_attrs(UpdateStreamAttrsRequest {
-            stream_id: stream_id.clone(),
-            attrs: Some(attrs.clone()),
-            now_ms: 0,
-        })
-        .await
-        .expect("update attrs through runtime-owned raft group");
-
-    let current_attrs = runtime
-        .get_stream_attrs(GetStreamAttrsRequest {
-            stream_id: stream_id.clone(),
-            now_ms: 0,
-        })
-        .await
-        .expect("read attrs through runtime-owned raft group");
-    assert_eq!(current_attrs.attrs, Some(attrs));
-
     let read = runtime
         .read_stream(read_req(stream_id, 16))
         .await

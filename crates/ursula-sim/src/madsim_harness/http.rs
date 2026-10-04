@@ -212,12 +212,10 @@ pub(super) async fn run_http_protocol_surface_inner(
         "00000000000000000001"
     );
 
+    // The latest-snapshot redirect was removed; the bare path answers 405.
     let latest_snapshot = send(&app, "GET", &format!("{path}/snapshot"), &[], Body::empty()).await;
-    assert_eq!(latest_snapshot.status(), StatusCode::TEMPORARY_REDIRECT);
-    assert_eq!(
-        header_str(&latest_snapshot, "location"),
-        snapshot_path.as_str()
-    );
+    assert_eq!(latest_snapshot.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(header_str(&latest_snapshot, "allow"), "PUT");
 
     let read_snapshot = send(&app, "GET", &snapshot_path, &[], Body::empty()).await;
     assert_eq!(read_snapshot.status(), StatusCode::OK);
@@ -310,8 +308,8 @@ pub(super) async fn run_http_protocol_surface_inner(
     assert!(bootstrap_body.contains(r#"{"state":"a"}"#));
     assert!(bootstrap_body.contains("b"));
 
-    let delete_snapshot = send(&app, "DELETE", &snapshot_path, &[], Body::empty()).await;
-    assert_eq!(delete_snapshot.status(), StatusCode::CONFLICT);
+    let removed_delete = send(&app, "DELETE", &snapshot_path, &[], Body::empty()).await;
+    assert_eq!(removed_delete.status(), StatusCode::METHOD_NOT_ALLOWED);
 
     trace.push(SimEvent::HttpSnapshotProtocolSurfaceVerified {
         stream: config.stream.clone(),

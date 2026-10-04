@@ -7,7 +7,6 @@ use axum::http::StatusCode;
 use axum::http::header::CACHE_CONTROL;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::header::ETAG;
-use axum::http::header::HOST;
 use axum::http::header::HeaderMap;
 use axum::http::header::HeaderValue;
 use axum::http::header::IF_NONE_MATCH;
@@ -112,7 +111,6 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         | StreamErrorCode::InvalidRetention
         | StreamErrorCode::InvalidColdFlush
         | StreamErrorCode::InvalidSnapshot
-        | StreamErrorCode::InvalidStreamAttrs
         | StreamErrorCode::InvalidRecordBoundaries
         | StreamErrorCode::ImportInvalid => StatusCode::BAD_REQUEST,
         // F3 producer cap; the plain-text body starts with `producer_limit`.
@@ -268,22 +266,6 @@ pub(crate) fn insert_header_str(headers: &mut HeaderMap, name: &'static str, val
 
 pub(crate) fn insert_location(headers: &mut HeaderMap, stream_id: &BucketStreamId) {
     if let Ok(value) = HeaderValue::from_str(&format!("/{stream_id}")) {
-        headers.insert(LOCATION, value);
-    }
-}
-
-pub(crate) fn insert_public_location(
-    headers: &mut HeaderMap,
-    request_headers: &HeaderMap,
-    path: &str,
-) {
-    let location = request_headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .filter(|host| !host.trim().is_empty())
-        .map(|host| format!("http://{host}{path}"))
-        .unwrap_or_else(|| path.to_owned());
-    if let Ok(value) = HeaderValue::from_str(&location) {
         headers.insert(LOCATION, value);
     }
 }

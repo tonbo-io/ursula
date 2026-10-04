@@ -72,7 +72,6 @@ const PAGE_ORDER = new Map([
   ["api/append", ["API Reference", 4]],
   ["api/read", ["API Reference", 5]],
   ["api/head-stream", ["API Reference", 6]],
-  ["api/stream-attrs", ["API Reference", 7]],
   ["api/publish-snapshot", ["API Reference", 8]],
   ["api/read-snapshot", ["API Reference", 9]],
   ["api/bootstrap", ["API Reference", 10]],

@@ -1,11 +1,9 @@
 ---
 title: Read snapshot
-api: "GET /{bucket}/{stream}/snapshot"
+api: "GET /{bucket}/{stream}/snapshot/{offset}"
 ---
 
-## Latest snapshot
-
-`GET /{bucket}/{stream}/snapshot` redirects to the latest published snapshot's offset-specific URL.
+`GET /{bucket}/{stream}/snapshot/{offset}` returns the snapshot blob at a specific offset. To read the latest snapshot, take its offset from the `Stream-Snapshot-Offset` header of [`HEAD`](/docs/api/head-stream).
 
 <ParamField path="bucket" type="string" required>
  Bucket ID.
@@ -14,19 +12,6 @@ api: "GET /{bucket}/{stream}/snapshot"
 <ParamField path="stream" type="string" required>
  Stream ID.
 </ParamField>
-
-| Status | Meaning |
-| ------ | ------------------------------------------------------------- |
-| `307` | Redirect to `/{bucket}/{stream}/snapshot/{offset}`. |
-| `404` | Stream not found, expired, or no snapshot has been published. |
-
-Response headers include `Location`, `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, and `Stream-Up-To-Date`.
-
----
-
-## Snapshot at offset
-
-`GET /{bucket}/{stream}/snapshot/{offset}` returns the snapshot blob at a specific offset.
 
 <ParamField path="offset" type="string" required>
  Snapshot offset: the 20-character zero-padded decimal token returned by previous reads or `Stream-Snapshot-Offset` headers.
@@ -41,10 +26,6 @@ Response headers include `Location`, `Stream-Next-Offset`, `Stream-Snapshot-Offs
 Response headers include `Content-Type`, `Content-Length`, `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, `Stream-Up-To-Date`, and `Stream-Closed`. A body stored in the cold tier is streamed from it.
 
 <RequestExample>
-```bash Follow redirect to latest
-curl -L 'http://127.0.0.1:4437/demo/hello/snapshot'
-```
-
 ```bash Read specific offset
 curl 'http://127.0.0.1:4437/demo/hello/snapshot/00000000000000000042'
 ```

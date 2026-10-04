@@ -103,7 +103,6 @@ impl StreamStateMachine {
         snapshot_offset: u64,
         content_type: String,
         body: SnapshotBody,
-        expected_digest: Option<String>,
         now_ms: u64,
     ) -> StreamResponse {
         if let Err(response) = self.validate_stream_scope(&stream_id) {
@@ -160,15 +159,6 @@ impl StreamStateMachine {
         let current_snapshot = self
             .stream_slot(&stream_id)
             .and_then(|slot| slot.visible_snapshot.as_ref());
-        if let Some(expected_digest) = expected_digest.as_deref()
-            && current_snapshot.map(|snapshot| snapshot.digest.as_str()) != Some(expected_digest)
-        {
-            return StreamResponse::error_with_next_offset(
-                StreamErrorCode::SnapshotConflict,
-                "current snapshot digest does not match Stream-Snapshot-Match",
-                tail_offset,
-            );
-        }
         if let Some(current) = current_snapshot {
             if snapshot_offset < current.offset {
                 return StreamResponse::error_with_next_offset(
@@ -670,26 +660,6 @@ impl StreamStateMachine {
         StreamResponse::ColdCompacted {
             compacted_chunks,
             compacted_bytes,
-        }
-    }
-
-    pub fn delete_snapshot(
-        &self,
-        stream_id: &BucketStreamId,
-        snapshot_offset: u64,
-    ) -> StreamResponse {
-        match self.latest_snapshot(stream_id) {
-            Ok(Some(snapshot)) if snapshot.offset == snapshot_offset => StreamResponse::error(
-                StreamErrorCode::SnapshotConflict,
-                format!(
-                    "snapshot {snapshot_offset} for stream '{stream_id}' is the latest visible snapshot"
-                ),
-            ),
-            Ok(_) => StreamResponse::error(
-                StreamErrorCode::SnapshotNotFound,
-                format!("snapshot {snapshot_offset} for stream '{stream_id}' does not exist"),
-            ),
-            Err(err) => err,
         }
     }
 

@@ -111,7 +111,6 @@ fn build_machine(scenario: SnapshotScenario) -> StreamStateMachine {
                 producer: None,
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
-                attrs: None,
                 now_ms: 0,
             }),
             StreamResponse::Created { .. }
@@ -179,7 +178,6 @@ fn build_high_cardinality_machine() -> StreamStateMachine {
                 producer: None,
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
-                attrs: None,
                 now_ms: 0,
             }),
             StreamResponse::Created { .. }

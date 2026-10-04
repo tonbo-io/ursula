@@ -31,10 +31,6 @@ api: "PUT /{bucket}/{stream}"
  Client-supplied monotonic sequence token. Rejects creates whose `Stream-Seq` is not lexicographically greater than the previous value seen for this stream.
 </ParamField>
 
-<ParamField header="Stream-Attrs" type="string">
- JSON stream attributes. See [stream attributes](/docs/api/stream-attrs). If the stream already exists, the submitted attributes must match the stored attributes for the create request to be idempotent.
-</ParamField>
-
 <ParamField header="Producer-Id" type="string">
  Producer identity for [exactly-once writes](/docs/concepts/exactly-once-writes).
 </ParamField>
@@ -81,15 +77,10 @@ curl -X PUT http://127.0.0.1:4437/demo/ephemeral \
   -H 'Stream-TTL: 3600'
 ```
 
-```bash Create with attributes
-curl -X PUT http://127.0.0.1:4437/demo/session-1 \
-  -H 'Stream-Attrs: {"title":"Support session","metadata":{"purpose":"customer-support"}}'
-```
-
 </RequestExample>
 
 <Note>
-If a stream with the same ID already exists and has identical configuration, the response is `200 OK` (idempotent). If the existing stream differs in content type, closed state, retention, or stream attributes, the response is `409 Conflict`.
+If a stream with the same ID already exists and has identical configuration, the response is `200 OK` (idempotent). If the existing stream differs in content type, closed state, or retention, the response is `409 Conflict`.
 </Note>
 
 <Info>

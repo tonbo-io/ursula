@@ -8,8 +8,6 @@ use openraft::rt::WatchReceiver;
 use serde::de::DeserializeOwned;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
-use ursula_runtime::GetStreamAttrsRequest;
-use ursula_runtime::GetStreamAttrsResponse;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::GroupWriteCommand;
@@ -101,32 +99,9 @@ pub(crate) fn read_stream_read_v1(
     })
 }
 
-#[tracing::instrument(
-    name = "raft.forward_get_attrs",
-    skip_all,
-    fields(group = placement.raft_group_id.0, bucket = %request.stream_id.bucket_id, stream = %request.stream_id.stream_id),
-)]
-pub(crate) async fn forward_get_stream_attrs_to_leader(
-    placement: ShardPlacement,
-    leader_node: &BasicNode,
-    request: GetStreamAttrsRequest,
-) -> Result<GetStreamAttrsResponse, GroupEngineError> {
-    forward_typed_read_to_leader(
-        placement,
-        leader_node,
-        request.stream_id,
-        request.now_ms,
-        "get stream attrs",
-        raft_internal_proto::group_read_request_v1::Read::GetStreamAttrs(
-            raft_internal_proto::GetStreamAttrsReadV1 {},
-        ),
-    )
-    .await
-}
-
 /// Forward one leader-only read to the leader over gRPC and decode the
 /// serde-carried response payload into the engine-level response (`T`). The
-/// three public forwarders above differ only in the read variant they
+/// two public forwarders above differ only in the read variant they
 /// construct and the decode target, so they all funnel through here.
 async fn forward_typed_read_to_leader<T>(
     placement: ShardPlacement,

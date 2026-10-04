@@ -205,7 +205,6 @@ fn setup_group_engine(stream_count: usize, placement: ShardPlacement) -> InMemor
                     producer: None,
                     stream_ttl_seconds: None,
                     stream_expires_at_ms: None,
-                    attrs: None,
                     now_ms: 0,
                 }),
                 placement,
@@ -235,7 +234,6 @@ fn setup_record_machine(record_count: usize) -> (StreamStateMachine, BucketStrea
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            attrs: None,
             now_ms: 0,
         }),
         StreamResponse::Created { .. }
@@ -291,7 +289,6 @@ fn setup_machine(scenario: &AppendScenario) -> StreamStateMachine {
                 producer: None,
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
-                attrs: None,
                 now_ms: 0,
             }),
             StreamResponse::Created { .. }
@@ -398,7 +395,6 @@ fn snapshot_compaction(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 
         snapshot_offset,
         content_type: "application/json".to_owned(),
         payload: bytes::Bytes::from_static(b"{}"),
-        expected_digest: None,
         now_ms: 0,
     }) {
         StreamResponse::SnapshotPublished { .. } => {}

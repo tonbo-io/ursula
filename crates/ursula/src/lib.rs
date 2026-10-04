@@ -20,6 +20,7 @@ mod http_time {
     #[cfg(not(madsim))]
     pub use tokio::time::timeout;
 }
+mod removed_surface;
 mod render;
 mod wal_disk;
 
@@ -103,11 +104,9 @@ use ursula_runtime::CloseStreamRequest;
 use ursula_runtime::CreateStreamExternalRequest;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::CreateStreamResponse;
-use ursula_runtime::DeleteSnapshotRequest;
 use ursula_runtime::DeleteStreamRequest;
 use ursula_runtime::ErrorStatus;
 use ursula_runtime::ExternalPayloadRef;
-use ursula_runtime::GetStreamAttrsRequest;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::ImportGroupStateRequest;
 use ursula_runtime::PlanColdFlushRequest;
@@ -118,8 +117,6 @@ use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::ReadStreamResponse;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
-use ursula_runtime::StreamAttrs;
-use ursula_runtime::UpdateStreamAttrsRequest;
 use ursula_runtime::new_external_payload_path;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
@@ -141,7 +138,6 @@ use crate::render::insert_offset;
 use crate::render::insert_padded_offset;
 use crate::render::insert_producer_ack;
 use crate::render::insert_producer_error_headers;
-use crate::render::insert_public_location;
 use crate::render::insert_snapshot_digest;
 use crate::render::insert_snapshot_offset;
 use crate::render::insert_static;
@@ -187,10 +183,8 @@ const HEADER_STREAM_RECORD_NEXT: &str = "stream-record-next";
 const HEADER_STREAM_RECORD_START: &str = "stream-record-start";
 const HEADER_STREAM_SNAPSHOT_OFFSET: &str = "stream-snapshot-offset";
 const HEADER_STREAM_SNAPSHOT_DIGEST: &str = "stream-snapshot-digest";
-const HEADER_STREAM_SNAPSHOT_MATCH: &str = "stream-snapshot-match";
 const HEADER_STREAM_RETAINED_OFFSET: &str = "stream-retained-offset";
 const HEADER_STREAM_SSE_DATA_ENCODING: &str = "stream-sse-data-encoding";
-const HEADER_STREAM_ATTRS: &str = "stream-attrs";
 const HEADER_STREAM_SEQ: &str = "stream-seq";
 const HEADER_STREAM_TTL: &str = "stream-ttl";
 const HEADER_STREAM_UP_TO_DATE: &str = "stream-up-to-date";
@@ -267,17 +261,6 @@ impl StreamPath {
         match self.affinity {
             Some(affinity) => BucketStreamId::with_affinity(self.bucket, affinity, self.stream),
             None => BucketStreamId::new(self.bucket, self.stream),
-        }
-    }
-
-    fn stream_id(&self) -> BucketStreamId {
-        match &self.affinity {
-            Some(affinity) => BucketStreamId::with_affinity(
-                self.bucket.clone(),
-                affinity.clone(),
-                self.stream.clone(),
-            ),
-            None => BucketStreamId::new(self.bucket.clone(), self.stream.clone()),
         }
     }
 }
@@ -1364,15 +1347,15 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         )
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .route("/{bucket}", put(create_bucket))
+        // Only PUT: a bare GET (the removed latest-snapshot redirect) gets
+        // axum's 405, not a 404 that Loro's client would read as "no snapshot".
         .route(
             "/{bucket}/{stream}/snapshot",
-            get(read_latest_snapshot).put(publish_snapshot_at_record),
+            put(publish_snapshot_at_record),
         )
         .route(
             "/{bucket}/{stream}/snapshot/{snapshot_offset}",
-            put(publish_snapshot)
-                .get(read_snapshot)
-                .delete(delete_snapshot),
+            put(publish_snapshot).get(read_snapshot),
         )
         .route(
             "/{bucket}/{stream}/retention",
@@ -1383,10 +1366,6 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
             put(advance_retention),
         )
         .route("/{bucket}/{stream}/bootstrap", get(bootstrap_stream))
-        .route(
-            "/{bucket}/{stream}/attrs",
-            put(update_stream_attrs).get(get_stream_attrs),
-        )
         .route(
             "/{bucket}/{stream}",
             put(create_stream)
@@ -1402,13 +1381,11 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         )
         .route(
             "/{bucket}/{affinity}/{stream}/snapshot",
-            get(read_latest_snapshot).put(publish_snapshot_at_record),
+            put(publish_snapshot_at_record),
         )
         .route(
             "/{bucket}/{affinity}/{stream}/snapshot/{snapshot_offset}",
-            put(publish_snapshot)
-                .get(read_snapshot)
-                .delete(delete_snapshot),
+            put(publish_snapshot).get(read_snapshot),
         )
         .route(
             "/{bucket}/{affinity}/{stream}/retention",
@@ -1421,10 +1398,6 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         .route(
             "/{bucket}/{affinity}/{stream}/bootstrap",
             get(bootstrap_stream),
-        )
-        .route(
-            "/{bucket}/{affinity}/{stream}/attrs",
-            put(update_stream_attrs).get(get_stream_attrs),
         )
         .route(
             "/{bucket}/{affinity}/{stream}",
@@ -2694,10 +2667,6 @@ pub(crate) async fn create_stream_by_id(
         Ok(lifetime) => lifetime,
         Err(response) => return *response,
     };
-    let attrs = match stream_attrs(&request_headers) {
-        Ok(attrs) => attrs,
-        Err(response) => return *response,
-    };
     let mut request = CreateStreamRequest::new(stream_id.clone(), content_type.clone());
     request.content_type_explicit = content_type_explicit;
     request.now_ms = state.unix_time_ms();
@@ -2713,7 +2682,6 @@ pub(crate) async fn create_stream_by_id(
     };
     request.stream_ttl_seconds = stream_ttl_seconds;
     request.stream_expires_at_ms = stream_expires_at_ms;
-    request.attrs = attrs;
     let producer = match producer_request(&request_headers) {
         Ok(producer) => producer,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
@@ -3102,97 +3070,6 @@ pub(crate) async fn delete_stream_by_id(
             (StatusCode::NO_CONTENT, headers).into_response()
         }
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
-    }
-}
-
-pub(crate) async fn update_stream_attrs(
-    State(state): State<HttpState>,
-    OriginalUri(uri): OriginalUri,
-    Path(path): Path<StreamPath>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    if !has_content_type(&headers) {
-        return (
-            StatusCode::BAD_REQUEST,
-            "stream attrs update must include content type",
-        )
-            .into_response();
-    }
-    let content_type = request_content_type(&headers);
-    if !render::is_json_content_type(&content_type) {
-        return (
-            StatusCode::BAD_REQUEST,
-            "stream attrs update body must be application/json",
-        )
-            .into_response();
-    }
-    let attrs = match serde_json::from_slice::<StreamAttrs>(&body) {
-        Ok(attrs) => attrs,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("invalid stream attrs JSON: {err}"),
-            )
-                .into_response();
-        }
-    };
-    let stream_id = path.into_stream_id();
-    match state
-        .runtime
-        .update_stream_attrs(UpdateStreamAttrsRequest {
-            stream_id,
-            attrs: Some(attrs),
-            now_ms: state.unix_time_ms(),
-        })
-        .await
-    {
-        Ok(_) => {
-            let mut headers = HeaderMap::new();
-            insert_default_response_headers(&mut headers);
-            (StatusCode::NO_CONTENT, headers).into_response()
-        }
-        Err(err) => {
-            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
-        }
-    }
-}
-
-pub(crate) async fn get_stream_attrs(
-    State(state): State<HttpState>,
-    OriginalUri(uri): OriginalUri,
-    Path(path): Path<StreamPath>,
-) -> Response {
-    let stream_id = path.into_stream_id();
-    match state
-        .runtime
-        .get_stream_attrs(GetStreamAttrsRequest {
-            stream_id,
-            now_ms: state.unix_time_ms(),
-        })
-        .await
-    {
-        Ok(response) => {
-            let attrs = response.attrs.unwrap_or_default();
-            let body = match serde_json::to_vec(&attrs) {
-                Ok(body) => body,
-                Err(err) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("render stream attrs JSON: {err}"),
-                    )
-                        .into_response();
-                }
-            };
-            let mut headers = HeaderMap::new();
-            insert_default_response_headers(&mut headers);
-            insert_content_type(&mut headers, "application/json");
-            insert_cache_control(&mut headers, "no-store");
-            (StatusCode::OK, headers, body).into_response()
-        }
-        Err(err) => {
-            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
-        }
     }
 }
 
@@ -3626,6 +3503,9 @@ pub(crate) async fn publish_snapshot(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    if let Err(response) = removed_surface::reject_removed_snapshot_headers(&headers) {
+        return *response;
+    }
     let (stream_id, snapshot_offset) = path.into_parts();
     let snapshot_offset = match parse_snapshot_offset(&snapshot_offset) {
         Ok(offset) => offset,
@@ -3716,15 +3596,6 @@ async fn publish_snapshot_by_offset(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let expected_digest = match headers.get(HEADER_STREAM_SNAPSHOT_MATCH) {
-        Some(value) => match value.to_str() {
-            Ok(value) if !value.trim().is_empty() => Some(value.to_owned()),
-            _ => {
-                return (StatusCode::BAD_REQUEST, "invalid Stream-Snapshot-Match").into_response();
-            }
-        },
-        None => None,
-    };
     let content_type = request_content_type(&headers);
     let (payload, cold_body) =
         match cold_snapshot::receive_snapshot_body(&state, &stream_id, &content_type, body).await {
@@ -3740,7 +3611,6 @@ async fn publish_snapshot_by_offset(
         snapshot_offset,
         content_type,
         payload,
-        expected_digest,
         cold_body,
         now_ms: state.unix_time_ms(),
     };
@@ -3773,6 +3643,9 @@ pub(crate) async fn publish_snapshot_at_record(
     RawQuery(raw_query): RawQuery,
     body: Body,
 ) -> Response {
+    if let Err(response) = removed_surface::reject_removed_snapshot_headers(&headers) {
+        return *response;
+    }
     let query = match parse_query(raw_query.as_deref()) {
         Ok(query) => query,
         Err(response) => return *response,
@@ -3914,58 +3787,6 @@ async fn advance_retention_by_offset(
 }
 
 #[tracing::instrument(
-    name = "http.snapshot_read_latest",
-    skip_all,
-    fields(bucket = %path.bucket, affinity = ?path.affinity, stream = %path.stream),
-)]
-pub(crate) async fn read_latest_snapshot(
-    State(state): State<HttpState>,
-    OriginalUri(uri): OriginalUri,
-    Path(path): Path<StreamPath>,
-    headers: HeaderMap,
-) -> Response {
-    let stream_id = path.stream_id();
-    let head = match state
-        .runtime
-        .head_stream(HeadStreamRequest {
-            stream_id,
-            now_ms: state.unix_time_ms(),
-        })
-        .await
-    {
-        Ok(head) => head,
-        Err(err) => {
-            return runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri))
-                .await;
-        }
-    };
-    let Some(snapshot_offset) = head.snapshot_offset else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let mut response_headers = HeaderMap::new();
-    insert_default_response_headers(&mut response_headers);
-    insert_snapshot_offset(&mut response_headers, snapshot_offset);
-    if let Some(snapshot_digest) = head.snapshot_digest {
-        insert_snapshot_digest(&mut response_headers, &snapshot_digest);
-    }
-    if let Some(record_range) = head.record_range {
-        insert_record_head_headers(&mut response_headers, record_range);
-    }
-    let snapshot_path = match &path.affinity {
-        Some(affinity) => format!(
-            "/{}/{affinity}/{}/snapshot/{snapshot_offset:020}",
-            path.bucket, path.stream
-        ),
-        None => format!(
-            "/{}/{}/snapshot/{snapshot_offset:020}",
-            path.bucket, path.stream
-        ),
-    };
-    insert_public_location(&mut response_headers, &headers, &snapshot_path);
-    (StatusCode::TEMPORARY_REDIRECT, response_headers).into_response()
-}
-
-#[tracing::instrument(
     name = "http.snapshot_read",
     skip_all,
     fields(bucket = %path.bucket, affinity = ?path.affinity, stream = %path.stream, snapshot_offset = %path.snapshot_offset),
@@ -4005,41 +3826,6 @@ pub(crate) async fn read_snapshot(
                 }
             }
             rendered
-        }
-        Err(err) => {
-            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
-        }
-    }
-}
-
-#[tracing::instrument(
-    name = "http.snapshot_delete",
-    skip_all,
-    fields(bucket = %path.bucket, affinity = ?path.affinity, stream = %path.stream, snapshot_offset = %path.snapshot_offset),
-)]
-pub(crate) async fn delete_snapshot(
-    State(state): State<HttpState>,
-    OriginalUri(uri): OriginalUri,
-    Path(path): Path<SnapshotPath>,
-) -> Response {
-    let (stream_id, snapshot_offset) = path.into_parts();
-    let snapshot_offset = match parse_snapshot_offset(&snapshot_offset) {
-        Ok(offset) => offset,
-        Err(response) => return *response,
-    };
-    match state
-        .runtime
-        .delete_snapshot(DeleteSnapshotRequest {
-            stream_id,
-            snapshot_offset,
-            now_ms: state.unix_time_ms(),
-        })
-        .await
-    {
-        Ok(()) => {
-            let mut headers = HeaderMap::new();
-            insert_default_response_headers(&mut headers);
-            (StatusCode::NO_CONTENT, headers).into_response()
         }
         Err(err) => {
             runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
@@ -4522,23 +4308,6 @@ pub(crate) fn request_content_type(headers: &HeaderMap) -> String {
         .filter(|value| !value.trim().is_empty())
         .map(normalize_content_type)
         .unwrap_or_else(|| DEFAULT_CONTENT_TYPE.to_owned())
-}
-
-pub(crate) fn stream_attrs(headers: &HeaderMap) -> Result<Option<StreamAttrs>, BoxResponse> {
-    let Some(raw) = header_value(headers, HEADER_STREAM_ATTRS) else {
-        return Ok(None);
-    };
-    serde_json::from_str::<StreamAttrs>(raw)
-        .map(Some)
-        .map_err(|err| {
-            Box::new(
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid stream-attrs JSON: {err}"),
-                )
-                    .into_response(),
-            )
-        })
 }
 
 pub(crate) fn has_content_type(headers: &HeaderMap) -> bool {

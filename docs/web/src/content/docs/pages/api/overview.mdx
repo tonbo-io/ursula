@@ -24,7 +24,6 @@ There is no bucket metadata read, stream listing, or bucket delete. Removing a b
 | `POST` | `/{bucket}/{stream}/append-batch` | Batched append. See [extensions spec](/docs/specs/extensions#4-append-batch) |
 | `GET` | `/{bucket}/{stream}` | [Read (catch-up, long-poll, SSE)](/docs/api/read) |
 | `HEAD` | `/{bucket}/{stream}` | [Get stream metadata](/docs/api/head-stream) |
-| `GET` / `PUT` | `/{bucket}/{stream}/attrs` | [Read or replace stream attributes](/docs/api/stream-attrs) |
 | `DELETE` | `/{bucket}/{stream}` | [Delete a stream](/docs/api/delete-stream) |
 
 ## Bootstrap and snapshots
@@ -32,7 +31,6 @@ There is no bucket metadata read, stream listing, or bucket delete. Removing a b
 | Method | Path | Description |
 | -------- | --------------------------------------------- | ---------------------------------------------------- |
 | `GET` | `/{bucket}/{stream}/bootstrap` | [Snapshot + tail replay](/docs/api/bootstrap) |
-| `GET` | `/{bucket}/{stream}/snapshot` | [Read latest snapshot](/docs/api/read-snapshot) |
 | `GET` | `/{bucket}/{stream}/snapshot/{offset}` | [Read snapshot at offset](/docs/api/read-snapshot) |
 | `PUT` | `/{bucket}/{stream}/snapshot/{offset}` | [Publish a snapshot](/docs/api/publish-snapshot) |
 

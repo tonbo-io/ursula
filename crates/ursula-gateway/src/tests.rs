@@ -367,12 +367,6 @@ fn request_classifier_maps_durable_stream_routes_to_bucket_resources() {
         ("HEAD", "/owner-a/orders", Action::Head, Some("orders")),
         ("DELETE", "/owner-a/orders", Action::Delete, Some("orders")),
         (
-            "PUT",
-            "/owner-a/orders/attrs",
-            Action::Update,
-            Some("orders"),
-        ),
-        (
             "GET",
             "/owner-a/orders/snapshot",
             Action::ReadSnapshot,
@@ -1061,48 +1055,6 @@ fn gateway_caps_long_poll_timeout_headroom_at_server_limit() {
             "http://127.0.0.1:1/bucket/stream?live=sse&timeout_ms=999999"
         ),
         Duration::from_secs(30)
-    );
-}
-
-#[tokio::test]
-async fn gateway_preserves_public_snapshot_redirect_without_upstream_host() {
-    let app = Router::new()
-        .route(
-            "/bucket/stream/snapshot",
-            get(|| async {
-                (
-                    StatusCode::TEMPORARY_REDIRECT,
-                    [(
-                        LOCATION,
-                        "http://internal-node:4437/bucket/stream/snapshot/00000000000000000003",
-                    )],
-                    "redirecting",
-                )
-            }),
-        )
-        .route(
-            "/bucket/stream/snapshot/00000000000000000003",
-            get(|| async { (StatusCode::OK, "snapshot-body") }),
-        );
-    let upstream = spawn_upstream(app).await;
-    let gateway = gateway_for_url(upstream.url.clone());
-    let req = Request::builder()
-        .method("GET")
-        .uri("/bucket/stream/snapshot")
-        .body(Body::empty())
-        .unwrap();
-
-    let (parts, body) = req.into_parts();
-    let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-    let resp = gateway
-        .forward(&upstream.url, &parts, body_bytes, ResponseTail::default())
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
-    assert_eq!(
-        resp.headers().get(LOCATION).unwrap(),
-        "/bucket/stream/snapshot/00000000000000000003"
     );
 }
 

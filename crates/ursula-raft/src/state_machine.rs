@@ -33,7 +33,6 @@ use ursula_runtime::ColdHotBacklog;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
-use ursula_runtime::DeleteSnapshotRequest;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
@@ -494,14 +493,6 @@ impl RaftGroupStateMachine {
         placement: ShardPlacement,
     ) -> Result<ReadSnapshotResponse, GroupEngineError> {
         self.engine.read_snapshot(request, placement).await
-    }
-
-    pub async fn delete_snapshot(
-        &mut self,
-        request: DeleteSnapshotRequest,
-        placement: ShardPlacement,
-    ) -> Result<(), GroupEngineError> {
-        self.engine.delete_snapshot(request, placement).await
     }
 
     pub async fn bootstrap_stream(

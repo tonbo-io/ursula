@@ -44,13 +44,10 @@ use crate::request::CreateStreamExternalRequest;
 use crate::request::CreateStreamRequest;
 use crate::request::CreateStreamResponse;
 use crate::request::DeferColdGcResponse;
-use crate::request::DeleteSnapshotRequest;
 use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;
 use crate::request::FlushColdRequest;
 use crate::request::FlushColdResponse;
-use crate::request::GetStreamAttrsRequest;
-use crate::request::GetStreamAttrsResponse;
 use crate::request::GroupReadStreamParts;
 use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
@@ -67,8 +64,6 @@ use crate::request::ReadStreamResponse;
 use crate::request::SetFeatureLevelRequest;
 use crate::request::SetFeatureLevelResponse;
 use crate::request::TouchStreamAccessResponse;
-use crate::request::UpdateStreamAttrsRequest;
-use crate::request::UpdateStreamAttrsResponse;
 
 pub type GroupAppendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AppendResponse, GroupEngineError>> + Send + 'a>>;
@@ -92,8 +87,6 @@ pub type GroupCreateStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CreateStreamResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupHeadStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<HeadStreamResponse, GroupEngineError>> + Send + 'a>>;
-pub type GroupGetStreamAttrsFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<GetStreamAttrsResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupReadStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ReadStreamResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupReadStreamPartsFuture<'a> =
@@ -134,14 +127,10 @@ pub type GroupStateGaugesFuture<'a> = Pin<
 >;
 pub type GroupReadSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ReadSnapshotResponse, GroupEngineError>> + Send + 'a>>;
-pub type GroupDeleteSnapshotFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<(), GroupEngineError>> + Send + 'a>>;
 pub type GroupBootstrapStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<BootstrapStreamResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupTouchStreamAccessFuture<'a> =
     Pin<Box<dyn Future<Output = Result<TouchStreamAccessResponse, GroupEngineError>> + Send + 'a>>;
-pub type GroupUpdateStreamAttrsFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<UpdateStreamAttrsResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupCloseStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CloseStreamResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupDeleteStreamFuture<'a> =
@@ -218,7 +207,6 @@ pub enum GroupWriteResponse {
     PublishSnapshot(PublishSnapshotResponse),
     AdvanceRetention(AdvanceRetentionResponse),
     TouchStreamAccess(TouchStreamAccessResponse),
-    UpdateStreamAttrs(UpdateStreamAttrsResponse),
     FlushCold(FlushColdResponse),
     CompactCold(CompactColdResponse),
     CloseStream(CloseStreamResponse),
@@ -274,19 +262,6 @@ pub trait GroupEngine: Send + 'static {
     /// Deliberately a required method — an engine that silently reported
     /// nothing would underbill.
     fn bucket_usage<'a>(&'a mut self, placement: ShardPlacement) -> GroupBucketUsageFuture<'a>;
-
-    fn get_stream_attrs<'a>(
-        &'a mut self,
-        request: GetStreamAttrsRequest,
-        _placement: ShardPlacement,
-    ) -> GroupGetStreamAttrsFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "stream attrs read is not supported for stream '{}'",
-                request.stream_id
-            )))
-        })
-    }
 
     fn read_stream<'a>(
         &'a mut self,
@@ -448,19 +423,6 @@ pub trait GroupEngine: Send + 'static {
         })
     }
 
-    fn delete_snapshot<'a>(
-        &'a mut self,
-        request: DeleteSnapshotRequest,
-        _placement: ShardPlacement,
-    ) -> GroupDeleteSnapshotFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "snapshot delete is not supported for stream '{}'",
-                request.stream_id
-            )))
-        })
-    }
-
     fn bootstrap_stream<'a>(
         &'a mut self,
         request: BootstrapStreamRequest,
@@ -481,19 +443,6 @@ pub trait GroupEngine: Send + 'static {
         renew_ttl: bool,
         placement: ShardPlacement,
     ) -> GroupTouchStreamAccessFuture<'a>;
-
-    fn update_stream_attrs<'a>(
-        &'a mut self,
-        request: UpdateStreamAttrsRequest,
-        _placement: ShardPlacement,
-    ) -> GroupUpdateStreamAttrsFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "stream attrs update is not supported for stream '{}'",
-                request.stream_id
-            )))
-        })
-    }
 
     fn close_stream<'a>(
         &'a mut self,
@@ -765,7 +714,6 @@ pub trait GroupEngine: Send + 'static {
                     producer,
                     stream_ttl_seconds,
                     stream_expires_at_ms,
-                    attrs,
                     now_ms,
                 } => self
                     .create_stream(
@@ -779,7 +727,6 @@ pub trait GroupEngine: Send + 'static {
                             producer,
                             stream_ttl_seconds,
                             stream_expires_at_ms,
-                            attrs,
                             now_ms,
                         },
                         placement,
@@ -797,7 +744,6 @@ pub trait GroupEngine: Send + 'static {
                     producer,
                     stream_ttl_seconds,
                     stream_expires_at_ms,
-                    attrs,
                     now_ms,
                 } => self
                     .create_stream_external(
@@ -811,7 +757,6 @@ pub trait GroupEngine: Send + 'static {
                             producer,
                             stream_ttl_seconds,
                             stream_expires_at_ms,
-                            attrs,
                             now_ms,
                         },
                         placement,
@@ -896,7 +841,6 @@ pub trait GroupEngine: Send + 'static {
                     snapshot_offset,
                     content_type,
                     payload,
-                    expected_digest,
                     now_ms,
                 } => self
                     .publish_snapshot(
@@ -905,7 +849,6 @@ pub trait GroupEngine: Send + 'static {
                             snapshot_offset,
                             content_type,
                             payload,
-                            expected_digest,
                             cold_body: None,
                             now_ms,
                         },
@@ -919,7 +862,6 @@ pub trait GroupEngine: Send + 'static {
                     content_type,
                     object,
                     digest,
-                    expected_digest,
                     now_ms,
                 } => self
                     .publish_snapshot(
@@ -928,7 +870,6 @@ pub trait GroupEngine: Send + 'static {
                             snapshot_offset,
                             content_type,
                             payload: bytes::Bytes::new(),
-                            expected_digest,
                             cold_body: Some(crate::request::ColdSnapshotBody { object, digest }),
                             now_ms,
                         },
@@ -959,21 +900,6 @@ pub trait GroupEngine: Send + 'static {
                     .touch_stream_access(stream_id, now_ms, renew_ttl, placement)
                     .await
                     .map(GroupWriteResponse::TouchStreamAccess),
-                StreamCommand::UpdateStreamAttrs {
-                    stream_id,
-                    attrs,
-                    now_ms,
-                } => self
-                    .update_stream_attrs(
-                        UpdateStreamAttrsRequest {
-                            stream_id,
-                            attrs,
-                            now_ms,
-                        },
-                        placement,
-                    )
-                    .await
-                    .map(GroupWriteResponse::UpdateStreamAttrs),
                 StreamCommand::FlushCold {
                     stream_id,
                     chunk,

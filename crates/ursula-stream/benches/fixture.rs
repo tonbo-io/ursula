@@ -57,7 +57,6 @@ pub fn build_state(scenario: FlushScenario) -> StreamStateMachine {
                 producer: None,
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
-                attrs: None,
                 now_ms: 0,
             }),
             StreamResponse::Created { .. }

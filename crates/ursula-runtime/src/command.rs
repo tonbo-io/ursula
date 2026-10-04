@@ -19,7 +19,6 @@ use crate::request::FlushColdRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::SetFeatureLevelRequest;
 use crate::request::StreamAppendCount;
-use crate::request::UpdateStreamAttrsRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupSnapshot {
@@ -84,7 +83,6 @@ impl From<CreateStreamRequest> for StreamCommand {
             producer: request.producer,
             stream_ttl_seconds: request.stream_ttl_seconds,
             stream_expires_at_ms: request.stream_expires_at_ms,
-            attrs: request.attrs,
             now_ms: request.now_ms,
         }
     }
@@ -102,17 +100,6 @@ impl From<CreateStreamExternalRequest> for StreamCommand {
             producer: request.producer,
             stream_ttl_seconds: request.stream_ttl_seconds,
             stream_expires_at_ms: request.stream_expires_at_ms,
-            attrs: request.attrs,
-            now_ms: request.now_ms,
-        }
-    }
-}
-
-impl From<UpdateStreamAttrsRequest> for StreamCommand {
-    fn from(request: UpdateStreamAttrsRequest) -> Self {
-        Self::UpdateStreamAttrs {
-            stream_id: request.stream_id,
-            attrs: request.attrs,
             now_ms: request.now_ms,
         }
     }
@@ -170,7 +157,6 @@ impl From<PublishSnapshotRequest> for StreamCommand {
                 content_type: request.content_type,
                 object: body.object,
                 digest: body.digest,
-                expected_digest: request.expected_digest,
                 now_ms: request.now_ms,
             },
             None => Self::PublishSnapshot {
@@ -178,7 +164,6 @@ impl From<PublishSnapshotRequest> for StreamCommand {
                 snapshot_offset: request.snapshot_offset,
                 content_type: request.content_type,
                 payload: request.payload,
-                expected_digest: request.expected_digest,
                 now_ms: request.now_ms,
             },
         }
@@ -256,7 +241,6 @@ macro_rules! group_write_from_request {
 group_write_from_request!(
     CreateStreamRequest,
     CreateStreamExternalRequest,
-    UpdateStreamAttrsRequest,
     AppendRequest,
     AppendExternalRequest,
     AppendBatchRequest,
