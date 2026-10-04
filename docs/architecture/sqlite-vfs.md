@@ -72,19 +72,21 @@ appended with the idempotent producer (`Producer-Id` per database, `Producer-Epo
    db file's lock bytes, which every SQLite connection on a WAL file holds; otherwise attach
    fails rather than rewriting pages under another connection's cache), folds the local WAL into
    the db file itself (the frames SQLite's recovery would read, up to the last commit, a later
-   frame winning, the file cut to that commit's size) and replays onto it. The WAL and the
-   sidecar's claim on it stay until replay ends, so an attach in the same boot after a crash
-   midway trusts the files again, folds the WAL again and replays from the same offset (both
-   steps are idempotent: folded pages hold the state at the WAL's last commit, replayed ones
-   later commits).
+   frame winning, the file cut to that commit's size), fsyncs it, rewrites the sidecar at the
+   same offset with a `:0` claim, deletes `-wal`/`-shm`, and only then replays onto it. No stale
+   WAL sits next to pages replay has moved past it (a plain SQLite connection opening the file
+   meanwhile would checkpoint it over them when it closes), and an attach in the same boot after a
+   crash midway trusts the files again and replays from the same offset (folded pages hold the
+   state at the WAL's last commit, replayed ones later commits; replay is idempotent). A crash
+   between that sidecar and the delete leaves commits in a WAL the `:0` claim rejects: a rebuild.
 4. `HEAD` the stream. If its latest snapshot is ahead of the file (a fresh host, or a file left
    below the retention), installs it (§4.3). Then replays frames to the tail.
 5. Claims: appends a claim at (epoch = highest seen + 1, seq 0) and reads the frame back. A 2xx
    alone proves nothing (two owners claiming the same epoch both get one, the second as a
    duplicate), so the claim counts only if the bytes at the answered offset are ours (the nonce
    makes them unique). Lost: epoch + 1. 403: the server's epoch + 1.
-6. Replays up to the claim; if attach wrote the db file, deletes `-wal`/`-shm` (folded) and
-   fsyncs the db file; writes the sidecar, and attaches.
+6. Replays up to the claim; if attach wrote the db file, fsyncs it; writes the sidecar, and
+   attaches.
 
 The new epoch fences every earlier owner at the server: their next append gets 403. Replay applies
 page images per read batch (last image per page, truncate to the batch's smallest size first), so
@@ -161,7 +163,9 @@ threshold of retained log. The newer snapshot has read back before any history i
 retained stream always holds a readable snapshot at or above its start.
 
 Attach installs a snapshot when the file is behind the latest one: it verifies the body (offset,
-size, checksum), recovers the old file as in §3, writes the image to a temp file and renames it
+size, checksum), checks that no other process holds the old file (§3) and deletes its WAL (a
+crash before the rename then leaves a sidecar the next attach trusts only if that WAL held no
+commit), writes the image to a temp file and renames it
 over the db file, then replays the tail. A crash after the rename leaves the sidecar at the old
 offset naming the replaced file, so the next attach discards the files and installs the snapshot
 again. A tail read that hits `410`
@@ -223,8 +227,9 @@ be written into the stream. Trust is therefore verified against the files, not i
   complete checkpoint: `wal_checkpoint(TRUNCATE)`, a close with `journal_size_limit`), the
   sidecar switching to `:0` first (a truncate to a non-zero size, `journal_size_limit` in the
   commit that starts a generation, cuts only the previous generation's tail, already synced by
-  (1)); (3) at attach, before the final sidecar whenever attach wrote the db file (that sidecar
-  claims `:0`; the folded WAL is deleted first). A failed fsync poisons the database (or fails
+  (1)); (3) at attach, after folding the WAL and before the sidecar that drops its claim (`:0`; the
+  WAL is deleted after it), and again before the final sidecar whenever attach wrote the db
+  file. A failed fsync poisons the database (or fails
   the attach).
 - The attached connections keep the WAL past the last close (`SQLITE_FCNTL_PERSIST_WAL`:
   checkpointed, not deleted), and so does the snapshot thread's, so a clean shutdown keeps the
@@ -248,16 +253,16 @@ What attach does in each case:
 - **Process crash, same boot** (SIGKILL, OOM kill, abort, a pod rescheduled to the same node with a
   local volume, a container restart with runtimes that show the host's boot id: Docker,
   containerd, CRI-O): every completed `write()` is in the page cache, so the files are exactly
-  what this host wrote and, outside the three windows below, the claim holds (the sidecar is
+  what this host wrote and, outside the windows below, the claim holds (the sidecar is
   written only after the WAL writes return). A killed write leaves a prefix; SQLite's salted,
   cumulative WAL checksums stop recovery at the last whole commit, `-shm` is rebuilt, checkpoints
   are redone from the WAL. Attach trusts the files and replays from the sidecar's offset (fast).
   A crash in the middle of a WAL truncate (between the `:0` sidecar and the truncate), or between
   the first WAL write of a new generation (the commit after a wrap or a truncate) and the sidecar
-  update, or at the end of a recovery between deleting the folded WAL and the final sidecar,
-  leaves a claim the files do not meet; that only costs a rebuild. Covered: SIGKILL before and
-  after the ack, the cache spill with in-place checksum rewrites, a failed local write after the
-  ack, a crash mid-recovery (the sidecar keeps its claim until replay ends).
+  update, or in a recovery between the `:0` sidecar and deleting the folded WAL, leaves a claim
+  the files do not meet; that only costs a rebuild. Covered: SIGKILL before and after the ack,
+  the cache spill with in-place checksum rewrites, a failed local write after the ack, a crash
+  mid-recovery (the WAL is folded and gone, the sidecar claims `:0` at the old offset).
 - **Same boot, files restored from a crash-consistent image**: a block-level snapshot of the volume
   (EBS, PD or Azure disk snapshots, a CSI VolumeSnapshot or PVC clone) restored or cloned onto a
   host that has not rebooted since, or a block volume force-detached and reattached. Boot id and

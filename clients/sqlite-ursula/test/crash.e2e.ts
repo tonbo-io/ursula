@@ -145,9 +145,9 @@ it("(g) a rate-limited append (429 + Retry-After) is retried with the same produ
 
 // Regression (review of #324/#325): recovery rewrites pages in place; a crash after the new page 1
 // but before the rest left a file SQLite rejects as malformed, and the next attach checkpointed it
-// through SQLite first, so it could never recover. The sidecar keeps its claim until replay ends,
-// so the next attach folds and replays again from the same offset without reading the file through
-// SQLite.
+// through SQLite first, so it could never recover. Recovery folds the WAL, rewrites the sidecar at
+// the same offset claiming no WAL frame and deletes the WAL before replaying, so the next attach
+// trusts the files and replays again from that offset without reading the file through SQLite.
 it("(h) killed in the middle of a recovery's page writes: the next attach resumes it", async () => {
 	const url = ursulaUrl() + streamPath();
 	const file = freshFile();
