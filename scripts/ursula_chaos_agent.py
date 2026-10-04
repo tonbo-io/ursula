@@ -46,9 +46,8 @@ CONTENT_TYPE = "application/octet-stream"
 #   416 — OffsetOutOfRange (follower apply lag, or offset below live window after snapshot)
 #   502 — forwarding/proxy hop failed
 #   503 — backpressure / cold store unavailable
-# Real integrity divergence would be 200-OK responses with disagreeing bytes,
-# which `verify_server_integrity` already checks against published setsum
-# headers — that's the authoritative signal, not this read probe.
+# Real integrity divergence is a 200-OK response whose bytes disagree with a
+# recorded append; `verify_sample` counts that as a mismatch.
 READ_AVAILABILITY_STATUSES = {0, 204, 404, 410, 416, 502, 503}
 REVERT_DETECTION_SCENARIOS = {"no_allow_stop"}
 # Scenarios applied as faultd impairments (tc qdisc / iptables) rather than by
@@ -126,41 +125,11 @@ PRODUCER_SEQ_CONFLICT_RE = re.compile(
 # systemd unit running the ursula node process on each node, targeted by the
 # process kill/freeze faults (faultd runs `systemctl` against it).
 NODE_SERVICE_UNIT = "ursula-chaos.service"
-SETSUM_PRIMES = [
-    4294967291,
-    4294967279,
-    4294967231,
-    4294967197,
-    4294967189,
-    4294967161,
-    4294967143,
-    4294967111,
-]
-
-
-class Setsum:
-    def __init__(self) -> None:
-        self.state = [0] * len(SETSUM_PRIMES)
-
-    def insert_vectored(self, pieces: list[bytes]) -> None:
-        digest = hashlib.sha3_256(b"".join(pieces)).digest()
-        for idx, prime in enumerate(SETSUM_PRIMES):
-            value = int.from_bytes(digest[idx * 4 : idx * 4 + 4], "little")
-            if value >= prime:
-                value -= prime
-            self.state[idx] = (self.state[idx] + value) % prime
-
-    def hexdigest(self) -> str:
-        return b"".join(value.to_bytes(4, "little") for value in self.state).hex()
-
-    def load_hex(self, hex_str: str) -> None:
-        raw = bytes.fromhex(hex_str)
-        if len(raw) != len(SETSUM_PRIMES) * 4:
-            raise ValueError(f"unexpected setsum hex length {len(raw)}")
-        self.state = [
-            int.from_bytes(raw[idx * 4 : idx * 4 + 4], "little")
-            for idx in range(len(SETSUM_PRIMES))
-        ]
+# Byte read-back verifier: each workload stream keeps its most recent
+# acknowledged appends plus a sparse set of older ones, and `verify_integrity`
+# reads them back by offset and compares the bytes.
+RECENT_SAMPLES_PER_STREAM = 32
+OLD_SAMPLES_PER_STREAM = 32
 
 
 def utc_now() -> datetime:
@@ -407,19 +376,32 @@ def _lower_headers(headers: Any) -> dict[str, str]:
 
 
 @dataclass
+class PayloadSample:
+    stream: str
+    start_offset: int
+    end_offset: int
+    payload: bytes
+    payload_kind: str
+    cold_confirmed: bool = False
+
+
+@dataclass
 class WorkloadStream:
     name: str
     content_type: str = CONTENT_TYPE
     next_offset: int = 0
     verified_offsets: int = 0
-    needs_integrity_resync: bool = False
-    expected_live_setsum: Setsum | None = None
     producer_epochs: dict[str, int] | None = None
     producer_seqs: dict[str, int] | None = None
     pending_producer_appends: dict[str, bytes] | None = None
+    recent_payloads: deque[PayloadSample] | None = None
+    old_payloads: deque[PayloadSample] | None = None
+
     def __post_init__(self) -> None:
-        if self.expected_live_setsum is None:
-            self.expected_live_setsum = Setsum()
+        if self.recent_payloads is None:
+            self.recent_payloads = deque(maxlen=RECENT_SAMPLES_PER_STREAM)
+        if self.old_payloads is None:
+            self.old_payloads = deque(maxlen=OLD_SAMPLES_PER_STREAM)
         if self.producer_epochs is None:
             self.producer_epochs = {}
         if self.producer_seqs is None:
@@ -553,19 +535,14 @@ class ChaosAgent:
         self.verify_attempts = 0
         self.verified_offsets = 0
         self.mismatch_count = 0
-        self.setsum_mismatch_count = 0
-        self.setsum_availability_errors = 0
         self.verify_counts: dict[str, int] = {mode: 0 for mode in self.verify_modes}
         self.verify_errors: dict[str, int] = {mode: 0 for mode in self.verify_modes}
         self.last_integrity_error: str | None = None
-        self.last_setsum_availability_error: str | None = None
         self.last_read_availability_error: str | None = None
         self.last_integrity_check: datetime | None = None
         self.last_read_check: dict[str, Any] | None = None
         self.last_read_error_check: dict[str, Any] | None = None
         self.last_cold_flush: dict[str, Any] | None = None
-        self.last_checked_expected_live_setsum: str | None = None
-        self.last_server_integrity: dict[str, Any] | None = None
         self.events: deque[dict[str, Any]] = deque(maxlen=32)
         self.active_fault: dict[str, Any] | None = None
         self.active_injection_id: int | None = None
@@ -719,47 +696,33 @@ class ChaosAgent:
             print(f"{iso(utc_now())} WARN unable to restore previous status: {exc}", flush=True)
             return None
 
-    def record_expected_append(
+    def record_payload_sample(
         self,
         stream: WorkloadStream,
-        record_start_offset: int,
         end_offset: int,
         payload: bytes,
+        payload_kind: str,
     ) -> None:
-        stream.expected_live_setsum.insert_vectored(
-            [
-                b"ursula-stream-record-v1",
-                BUCKET.encode(),
-                b"\0",
-                stream.name.encode(),
-                b"\0",
-                record_start_offset.to_bytes(8, "little"),
-                end_offset.to_bytes(8, "little"),
-                b"inline",
-                payload,
-            ]
-        )
+        """Records an acknowledged append for byte read-back.
 
-    def record_expected_append_span(
-        self,
-        stream: WorkloadStream,
-        previous_next_offset: int,
-        end_offset: int,
-        payload: bytes,
-    ) -> bool:
-        if not payload or end_offset <= previous_next_offset:
-            return True
-        payload_len = len(payload)
-        span = end_offset - previous_next_offset
-        if span != payload_len:
-            return False
-        self.record_expected_append(
-            stream,
-            previous_next_offset,
-            end_offset,
-            payload,
+        Caller holds `state_lock`. A 200 append's `Stream-Next-Offset` is the
+        end of that append, so the payload occupies `[end - len, end)` even
+        when other lanes append to the same stream concurrently. JSON streams
+        are not sampled: their reads are not the raw appended bytes.
+        """
+        start_offset = end_offset - len(payload)
+        if not payload or start_offset < 0 or stream.content_type != CONTENT_TYPE:
+            return
+        sample = PayloadSample(
+            stream=stream.name,
+            start_offset=start_offset,
+            end_offset=end_offset,
+            payload=payload,
+            payload_kind=payload_kind,
         )
-        return True
+        stream.recent_payloads.append(sample)
+        if self.append_success % self.old_sample_every == 0:
+            stream.old_payloads.append(sample)
 
     @staticmethod
     def parse_producer_seq_conflict(body: bytes) -> tuple[str, int, int] | None:
@@ -770,7 +733,7 @@ class ChaosAgent:
         return match.group(1), int(match.group(2)), int(match.group(3))
 
     def resync_stream_from_server(self, stream: WorkloadStream) -> bool:
-        samples: list[tuple[int, int, str]] = []
+        next_offsets: list[int] = []
         last_error: str | None = None
         for node in self.nodes:
             try:
@@ -782,35 +745,20 @@ class ChaosAgent:
                 last_error = f"{node.name} head status={status}"
                 continue
             next_offset = parse_int(headers.get("stream-next-offset"))
-            total_records = parse_int(headers.get("stream-integrity-total-records")) or 0
-            total_setsum = headers.get("stream-integrity-total-setsum")
-            if next_offset is None or total_setsum is None:
-                last_error = f"{node.name} head missing stream-next-offset or total setsum"
+            if next_offset is None:
+                last_error = f"{node.name} head missing stream-next-offset"
                 continue
-            samples.append((total_records, next_offset, total_setsum))
-        if not samples:
+            next_offsets.append(next_offset)
+        if not next_offsets:
             self.event(
                 "warn",
                 f"producer conflict resync skipped for {stream.name}: "
-                f"{last_error or 'no server integrity sample'}",
-            )
-            return False
-        total_records, next_offset, total_setsum = max(samples, key=lambda sample: (sample[0], sample[1]))
-        try:
-            expected_setsum = Setsum()
-            expected_setsum.load_hex(total_setsum)
-        except ValueError as exc:
-            self.event(
-                "warn",
-                f"producer conflict resync skipped for {stream.name}: invalid server setsum {exc}",
+                f"{last_error or 'no server head sample'}",
             )
             return False
         with self.state_lock:
-            stream.next_offset = next_offset
-            stream.expected_live_setsum = expected_setsum
-            stream.needs_integrity_resync = False
+            stream.next_offset = max(next_offsets)
             stream.pending_producer_appends.clear()
-            stream.verified_offsets = min(stream.verified_offsets, next_offset)
         return True
 
     def recover_producer_seq_conflict(
@@ -1239,49 +1187,14 @@ class ChaosAgent:
                         f"{next_offset_header!r}: {exc}"
                     ) from exc
                 end_offset = next_offset_value
-                committed_new_record = status == 200
-                needs_resync = False
-                resync_reason = ""
                 with self.state_lock:
-                    pending_payload = stream.pending_producer_appends.pop(pending_key, None)
-                    if committed_new_record:
-                        previous_next_offset = stream.next_offset
-                        stream.next_offset = max(stream.next_offset, end_offset)
-                        needs_resync = not self.record_expected_append_span(
-                            stream,
-                            previous_next_offset,
-                            end_offset,
-                            payload,
-                        )
-                        resync_reason = "new append response"
-                    elif pending_payload is not None:
-                        # 204 is a producer dedup acknowledgement. If the original
-                        # append timed out but committed, account the original
-                        # payload once the dedup response proves it.
-                        previous_next_offset = stream.next_offset
-                        stream.next_offset = max(stream.next_offset, end_offset)
-                        needs_resync = not self.record_expected_append_span(
-                            stream,
-                            previous_next_offset,
-                            end_offset,
-                            pending_payload,
-                        )
-                        resync_reason = "dedup response with pending payload"
-                    else:
-                        previous_next_offset = stream.next_offset
-                        stream.next_offset = max(stream.next_offset, end_offset)
-                        if end_offset > previous_next_offset:
-                            # A dedup response can be the first durable proof the
-                            # agent sees for this producer seq. The payload is
-                            # deterministic for the seq, so account it when the
-                            # response advances our stream view.
-                            needs_resync = not self.record_expected_append_span(
-                                stream,
-                                previous_next_offset,
-                                end_offset,
-                                payload,
-                            )
-                            resync_reason = "dedup response without pending payload"
+                    # 204 is a producer dedup acknowledgement: it resolves the
+                    # pending append but does not say where the bytes landed,
+                    # so only a 200 records a read-back sample.
+                    stream.pending_producer_appends.pop(pending_key, None)
+                    stream.next_offset = max(stream.next_offset, end_offset)
+                    if status == 200:
+                        self.record_payload_sample(stream, end_offset, payload, payload_kind)
                     producer.last_seq = producer_seq
                     producer.last_stream = stream.name
                     producer.last_append_ordinal = producer_seq
@@ -1299,16 +1212,6 @@ class ChaosAgent:
                         self.lane_attempts[lane] += 1
                         self.lane_unresolved_appends[lane] = False
                     self.append_success += 1
-                if needs_resync:
-                    span = max(0, end_offset - previous_next_offset)
-                    self.event(
-                        "warn",
-                        f"resyncing expected setsum for {stream_name}: "
-                        f"ambiguous {resync_reason} span={span} payload_len={len(payload)}",
-                    )
-                    if not self.resync_stream_from_server(stream):
-                        with self.state_lock:
-                            stream.needs_integrity_resync = True
                 return True
             if (
                 not retryable_sweep
@@ -1477,25 +1380,233 @@ class ChaosAgent:
     def verify_integrity(self) -> None:
         if self.workload_probes_paused():
             return
-        self.retry_pending_integrity_resyncs()
-        with self.state_lock:
-            has_unknown_appends = self.has_unknown_appends_locked()
-        if has_unknown_appends:
-            return
-        mode = "setsum"
+        mode = self.verify_modes[self.verify_attempts % len(self.verify_modes)] if self.verify_modes else "latest"
         self.verify_attempts += 1
-        stream = self.streams[self.verify_attempts % len(self.streams)]
-        result = self.verify_server_integrity(stream)
+        unavailable_key = f"{mode}_unavailable"
+        if mode == "cold":
+            self.refresh_cold_confirmed_samples(max_streams=8)
+        sample = self.choose_verify_sample(mode)
+        if sample is None:
+            self.verify_errors[unavailable_key] = self.verify_errors.get(unavailable_key, 0) + 1
+            self.last_integrity_check = utc_now()
+            return
+        if mode == "cold" and not self.ensure_cold_sample(sample):
+            self.verify_errors[unavailable_key] = self.verify_errors.get(unavailable_key, 0) + 1
+            self.last_integrity_check = utc_now()
+            return
+        last_error = self.verify_sample(sample)
         self.last_integrity_check = utc_now()
-        if result == "ok":
+        if last_error is None:
             self.verified_offsets += 1
             self.verify_counts[mode] = self.verify_counts.get(mode, 0) + 1
-            stream.verified_offsets += 1
+            stream = next((stream for stream in self.streams if stream.name == sample.stream), None)
+            if stream is not None:
+                stream.verified_offsets += 1
             return
-        if result == "unavailable":
-            self.verify_errors["setsum_unavailable"] = self.verify_errors.get("setsum_unavailable", 0) + 1
+        if self.is_read_availability_error(last_error):
+            self.verify_errors[unavailable_key] = self.verify_errors.get(unavailable_key, 0) + 1
+            self.read_availability_errors += 1
+            self.last_read_availability_error = last_error
+            self.event("warn", f"{mode} read availability check failed: {last_error}")
             return
         self.verify_errors[mode] = self.verify_errors.get(mode, 0) + 1
+        self.mismatch_count += 1
+        self.last_integrity_error = last_error
+        self.event("error", f"{mode} integrity check failed: {last_error}")
+
+    def choose_verify_sample(self, mode: str) -> PayloadSample | None:
+        with self.state_lock:
+            populated = [stream for stream in self.streams if stream.recent_payloads]
+            if not populated:
+                return None
+            stream = populated[self.verify_attempts % len(populated)]
+            if mode == "latest":
+                return stream.recent_payloads[-1]
+            if mode == "recent":
+                return random.choice(list(stream.recent_payloads))
+            if mode == "cold":
+                cold_samples = [
+                    sample
+                    for candidate in self.streams
+                    for sample in list(candidate.old_payloads) + list(candidate.recent_payloads)
+                    if sample.cold_confirmed
+                ]
+                if cold_samples:
+                    return random.choice(cold_samples)
+            if mode in {"old", "cold"}:
+                old_streams = [stream for stream in self.streams if stream.old_payloads]
+                if old_streams:
+                    chosen = old_streams[self.verify_attempts % len(old_streams)]
+                    return random.choice(list(chosen.old_payloads))
+            return stream.recent_payloads[-1]
+
+    def read_back(self, node: Node, sample: PayloadSample) -> tuple[int, bytes]:
+        """Reads `sample`'s byte range from `node`, following short reads.
+
+        A read may return fewer bytes than `max_bytes`; the next read starts
+        where the previous one ended. Returns the last status and the bytes
+        gathered.
+        """
+        gathered = b""
+        status = 200
+        while len(gathered) < len(sample.payload):
+            query = urllib.parse.urlencode(
+                {
+                    "offset": sample.start_offset + len(gathered),
+                    "max_bytes": len(sample.payload) - len(gathered),
+                }
+            )
+            status, body, _ = self.request("GET", f"{node.base_url}/{BUCKET}/{sample.stream}?{query}")
+            if status != 200 or not body:
+                break
+            gathered += body
+        return status, gathered
+
+    def verify_sample(self, sample: PayloadSample) -> str | None:
+        last_error: str | None = None
+        mismatch_error: str | None = None
+        node_results: list[dict[str, Any]] = []
+        for node in self.nodes:
+            try:
+                status, body = self.read_back(node, sample)
+            except Exception as exc:  # noqa: BLE001
+                node_results.append({"node": node.name, "status": "error", "error": str(exc)})
+                last_error = f"{node.name} read failed: {exc}"
+                continue
+            if body == sample.payload:
+                self.last_read_check = {
+                    "stream": sample.stream,
+                    "offset": sample.start_offset,
+                    "bytes": len(sample.payload),
+                    "payload_kind": sample.payload_kind,
+                    "matched_node": node.name,
+                    "nodes": node_results + [{"node": node.name, "status": status, "matched": True}],
+                }
+                return None
+            node_result: dict[str, Any] = {"node": node.name, "status": status, "matched": False}
+            if body:
+                node_result["body_prefix_hex"] = body[:32].hex()
+            node_results.append(node_result)
+            if sample.payload.startswith(body) and (status == 200 or status in READ_AVAILABILITY_STATUSES):
+                # Every byte served so far matched; the range just could not
+                # be served in full. That is availability, not corruption.
+                last_error = f"{node.name} read status={status} short={len(body)}/{len(sample.payload)}"
+                continue
+            mismatch_error = f"{node.name} read status={status} body_prefix={body[:32]!r}"
+        self.last_read_check = {
+            "stream": sample.stream,
+            "offset": sample.start_offset,
+            "bytes": len(sample.payload),
+            "payload_kind": sample.payload_kind,
+            "nodes": node_results,
+        }
+        self.last_read_error_check = self.last_read_check
+        summary = "; ".join(
+            f"{result['node']}={result.get('status')}"
+            + (f":{result['error']}" if result.get("error") else "")
+            for result in node_results
+        )
+        # Disagreeing bytes from any node outrank another node's
+        # unavailability: they are the corruption signal.
+        error = mismatch_error or last_error or "readback mismatch"
+        return f"{error} ({summary})" if summary else error
+
+    def ensure_cold_sample(self, sample: PayloadSample) -> bool:
+        if sample.cold_confirmed:
+            return True
+        return self.flush_cold_for_sample(sample)
+
+    def flush_cold_for_sample(self, sample: PayloadSample) -> bool:
+        self.cold_flush_attempts += 1
+        query = urllib.parse.urlencode(
+            {
+                "min_hot_bytes": 1,
+                "max_bytes": max(1, sample.end_offset - sample.start_offset),
+            }
+        )
+        last_error = "no target nodes"
+        for node in self.nodes:
+            try:
+                status, body, _ = self.request(
+                    "POST",
+                    f"{node.admin_url}/__ursula/flush-cold/{BUCKET}/{sample.stream}?{query}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"{node.name}: {exc}"
+                continue
+            self.last_cold_flush = {
+                "node": node.name,
+                "stream": sample.stream,
+                "status": status,
+                "body_prefix": body[:80].decode("utf-8", errors="replace") if body else "",
+            }
+            if status == 200:
+                self.mark_cold_confirmed_from_flush(sample.stream, body)
+                self.cold_flush_success += 1
+                if sample.cold_confirmed:
+                    return True
+                last_error = f"{node.name}: flushed but sample is not below hot start"
+                continue
+            if status == 204:
+                self.cold_flush_noop += 1
+                if self.refresh_stream_cold_confirmed(sample.stream) and sample.cold_confirmed:
+                    return True
+                last_error = f"{node.name}: no cold flush candidate and sample is not below hot start"
+                continue
+            last_error = f"{node.name}: status={status} body={body[:80]!r}"
+        self.cold_flush_errors += 1
+        self.last_cold_flush = {
+            "stream": sample.stream,
+            "status": "error",
+            "error": last_error,
+        }
+        self.event("warn", f"cold flush before verify failed: {last_error}")
+        return False
+
+    def mark_cold_confirmed(self, stream_name: str, hot_start_offset: int) -> None:
+        with self.state_lock:
+            stream = next((stream for stream in self.streams if stream.name == stream_name), None)
+            if stream is None:
+                return
+            for sample in list(stream.old_payloads) + list(stream.recent_payloads):
+                if sample.end_offset <= hot_start_offset:
+                    sample.cold_confirmed = True
+
+    def mark_cold_confirmed_from_flush(self, stream_name: str, body: bytes) -> None:
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            return
+        hot_start_offset = parse_int(str(payload.get("hot_start_offset"))) if isinstance(payload, dict) else None
+        if hot_start_offset is not None:
+            self.mark_cold_confirmed(stream_name, hot_start_offset)
+
+    def refresh_cold_confirmed_samples(self, *, max_streams: int) -> None:
+        with self.state_lock:
+            names = [stream.name for stream in self.streams if stream.old_payloads or stream.recent_payloads]
+        if not names:
+            return
+        max_streams = max(1, min(max_streams, len(names)))
+        start = self.cold_refresh_cursor % len(names)
+        self.cold_refresh_cursor = (start + max_streams) % len(names)
+        for index in range(max_streams):
+            self.refresh_stream_cold_confirmed(names[(start + index) % len(names)])
+
+    def refresh_stream_cold_confirmed(self, stream_name: str) -> bool:
+        """Marks samples below `Stream-Cold-Hot-Start-Offset` as cold."""
+        for node in self.nodes:
+            try:
+                status, _, headers = self.request("HEAD", f"{node.base_url}/{BUCKET}/{stream_name}")
+            except Exception:  # noqa: BLE001
+                continue
+            if status != 200:
+                continue
+            cold_hot_start_offset = parse_int(headers.get("stream-cold-hot-start-offset"))
+            if cold_hot_start_offset is None:
+                continue
+            self.mark_cold_confirmed(stream_name, cold_hot_start_offset)
+            return True
+        return False
 
     def probe_read_availability(self, stream: WorkloadStream) -> str | None:
         if stream.next_offset <= 0:
@@ -1553,7 +1664,7 @@ class ChaosAgent:
             return False
         if "body_prefix=" in error or "body_prefix_hex" in error:
             return False
-        if " read failed:" in error:
+        if " read failed:" in error or " short=" in error:
             return True
         return any(f"read status={status}" in error for status in READ_AVAILABILITY_STATUSES)
 
@@ -1638,26 +1749,8 @@ class ChaosAgent:
                 f"producer append probe failed: status={status} next_offset={next_offset}",
             )
             return
-        needs_resync = False
         with self.state_lock:
-            previous_next_offset = stream.next_offset
             stream.next_offset = max(stream.next_offset, next_offset)
-            needs_resync = not self.record_expected_append_span(
-                stream,
-                previous_next_offset,
-                next_offset,
-                payload,
-            )
-        if needs_resync:
-            span = max(0, next_offset - previous_next_offset)
-            self.event(
-                "warn",
-                f"resyncing expected setsum for {stream.name}: "
-                f"ambiguous producer probe span={span} payload_len={len(payload)}",
-            )
-            if not self.resync_stream_from_server(stream):
-                with self.state_lock:
-                    stream.needs_integrity_resync = True
 
         status, _, headers = self.request(
             "POST",
@@ -1672,26 +1765,8 @@ class ChaosAgent:
         )
         duplicate_next = parse_int(response_header(headers, "Stream-Next-Offset"))
         if status == 200 and duplicate_next is not None and duplicate_next > next_offset:
-            needs_resync = False
             with self.state_lock:
-                previous_next_offset = stream.next_offset
                 stream.next_offset = max(stream.next_offset, duplicate_next)
-                needs_resync = not self.record_expected_append_span(
-                    stream,
-                    previous_next_offset,
-                    duplicate_next,
-                    payload,
-                )
-            if needs_resync:
-                span = max(0, duplicate_next - previous_next_offset)
-                self.event(
-                    "warn",
-                    f"resyncing expected setsum for {stream.name}: "
-                    f"ambiguous producer duplicate span={span} payload_len={len(payload)}",
-                )
-                if not self.resync_stream_from_server(stream):
-                    with self.state_lock:
-                        stream.needs_integrity_resync = True
             self.record_producer_probe_skipped(
                 f"producer duplicate_seq probe skipped (state lost): "
                 f"status={status} next_offset={duplicate_next} expected={next_offset}"
@@ -1742,125 +1817,7 @@ class ChaosAgent:
             self.global_unresolved_append
             or any(self.lane_unresolved_appends)
             or any(stream.pending_producer_appends for stream in self.streams)
-            or any(stream.needs_integrity_resync for stream in self.streams)
-            or self.producer_probe_stream.needs_integrity_resync
         )
-
-    def retry_pending_integrity_resyncs(self) -> None:
-        with self.state_lock:
-            streams = [
-                stream
-                for stream in [*self.streams, self.producer_probe_stream]
-                if stream.needs_integrity_resync
-            ]
-        for stream in streams:
-            self.resync_stream_from_server(stream)
-
-    def verify_server_integrity(self, stream: WorkloadStream) -> str:
-        with self.state_lock:
-            expected = stream.expected_live_setsum.hexdigest()
-            expected_next_offset = stream.next_offset
-        last_error: str | None = None
-        samples: list[dict[str, Any]] = []
-        self.last_checked_expected_live_setsum = expected
-        for node in self.nodes:
-            try:
-                status, _, headers = self.request("HEAD", f"{node.base_url}/{BUCKET}/{stream.name}")
-            except Exception as exc:  # noqa: BLE001
-                last_error = f"{node.name} head failed: {exc}"
-                continue
-            if status != 200:
-                last_error = f"{node.name} head status={status}"
-                continue
-            server_live = headers.get("stream-integrity-live-setsum")
-            server_total = headers.get("stream-integrity-total-setsum")
-            server_evicted_records = headers.get("stream-integrity-evicted-records")
-            sample = {
-                "node": node.name,
-                "stream": stream.name,
-                "expected_live_setsum": expected,
-                "live_setsum": server_live,
-                "total_setsum": server_total,
-                "evicted_records": parse_int(server_evicted_records),
-                "next_offset": parse_int(headers.get("stream-next-offset")),
-                "expected_next_offset": expected_next_offset,
-                "live_start_offset": parse_int(headers.get("stream-integrity-live-start-offset")),
-                "live_records": parse_int(headers.get("stream-integrity-live-records")),
-                "total_records": parse_int(headers.get("stream-integrity-total-records")),
-            }
-            samples.append(sample)
-            # Any replica matching the expected setsum is sufficient: Raft
-            # guarantees the other replicas converge to the same state. The
-            # remaining replicas may be one apply tick behind, which is not a
-            # consistency problem.
-            if server_total == expected:
-                if self.setsum_mismatch_count == 0:
-                    self.last_integrity_error = None
-                self.last_setsum_availability_error = None
-                self.last_server_integrity = {**sample, "check": "total-setsum-match"}
-                return "ok"
-            if server_evicted_records == "0" and server_live == expected:
-                if self.setsum_mismatch_count == 0:
-                    self.last_integrity_error = None
-                self.last_setsum_availability_error = None
-                self.last_server_integrity = {**sample, "check": "live-setsum-match"}
-                return "ok"
-
-        if not samples:
-            self.setsum_availability_errors += 1
-            self.last_setsum_availability_error = last_error or "server integrity headers unavailable"
-            self.event("warn", f"integrity setsum unavailable: {self.last_setsum_availability_error}")
-            return "unavailable"
-
-        # No replica matched. Distinguish two cases:
-        #   (a) Replicas disagree with each other → at least one is behind and
-        #       hasn't applied the most recent commit yet. Treat as transient
-        #       follower lag; the next verify cycle will catch up.
-        #   (b) All replicas agree with each other but differ from `expected` →
-        #       client and server have genuinely diverged. This is what we
-        #       want the verifier to surface.
-        live_set = {s["live_setsum"] for s in samples if s["live_setsum"] is not None}
-        total_set = {s["total_setsum"] for s in samples if s["total_setsum"] is not None}
-        # Pick the most up-to-date sample (highest total_records) for the
-        # diagnostic; falls back to first sample if counts unavailable.
-        ranked = sorted(samples, key=lambda s: s.get("total_records") or 0, reverse=True)
-        best = ranked[0]
-        server_next_offsets = [s["next_offset"] for s in samples if s["next_offset"] is not None]
-        if server_next_offsets and max(server_next_offsets) > expected_next_offset:
-            if self.setsum_mismatch_count == 0:
-                self.last_integrity_error = None
-            self.last_server_integrity = {**best, "check": "server-ahead-of-expected"}
-            return "ok"
-        if len(samples) < len(self.nodes) or len(live_set) > 1 or len(total_set) > 1:
-            # Either we couldn't reach all replicas, or replicas disagree
-            # among themselves. Either way, not a confirmed divergence.
-            if self.setsum_mismatch_count == 0:
-                self.last_integrity_error = None
-            self.last_server_integrity = {**best, "check": "replicas-not-converged"}
-            return "ok"
-
-        self.setsum_mismatch_count += 1
-        def sample_detail(sample: dict[str, Any]) -> str:
-            return (
-                f"{sample['node']}={sample['stream']}"
-                f"/live:{sample['live_setsum']}"
-                f"/total:{sample['total_setsum']}"
-                f"/evicted:{sample['evicted_records']}"
-                f"/next:{sample['next_offset']}"
-                f"/expected_next:{sample['expected_next_offset']}"
-                f"/live_records:{sample['live_records']}"
-                f"/total_records:{sample['total_records']}"
-            )
-
-        detail = ", ".join(
-            sample_detail(s) for s in samples
-        )
-        self.last_integrity_error = (
-            f"all {len(samples)} replicas agree but differ from expected={expected}; {detail}"
-        )
-        self.last_server_integrity = {**best, "check": "all-replicas-disagree-with-expected"}
-        self.event("error", f"integrity setsum failed: {self.last_integrity_error}")
-        return "mismatch"
 
     def sample_node(self, node: Node) -> dict[str, Any]:
         sample: dict[str, Any] = {
@@ -2878,14 +2835,15 @@ class ChaosAgent:
         cold_backpressure_bytes = storage.get("cold_backpressure_bytes")
         cold_flush_publishes = storage.get("cold_flush_publishes")
         cold_flush_uploads = storage.get("cold_flush_uploads")
-        cold_verify_checks = self.verify_counts.get("setsum", 0)
+        cold_verify_checks = self.verify_counts.get("cold", 0)
         verify_modes = {
-            "setsum": {
-                "checks": self.verify_counts.get("setsum", 0),
-                "errors": self.verify_errors.get("setsum", 0),
-                "availability_errors": self.verify_errors.get("setsum_unavailable", 0),
-                "covered": self.verify_counts.get("setsum", 0) > 0,
+            mode: {
+                "checks": self.verify_counts.get(mode, 0),
+                "errors": self.verify_errors.get(mode, 0),
+                "availability_errors": self.verify_errors.get(f"{mode}_unavailable", 0),
+                "covered": self.verify_counts.get(mode, 0) > 0,
             }
+            for mode in self.verify_modes
         }
         payload_sizes = {
             str(size): {
@@ -2969,6 +2927,11 @@ class ChaosAgent:
                 continue
             for key, restored_entry in restored_entries.items():
                 if not isinstance(restored_entry, dict) or not restored_entry.get("covered"):
+                    continue
+                # A verify mode that is no longer configured (for example a
+                # removed mode restored from an older status) is not carried
+                # forward.
+                if section == "verify_modes" and key not in current_entries:
                     continue
                 current_entry = current_entries.setdefault(key, {})
                 if not isinstance(current_entry, dict):
@@ -3461,17 +3424,25 @@ class ChaosAgent:
                 "last_read_error_check": self.last_read_error_check,
                 "coverage": self.workload_coverage(storage),
             },
+            # Byte read-back verifier schema, read by the docs HomePage and
+            # StatusPage: `verified_offsets` counts samples read back
+            # byte-for-byte, `mismatch_count` counts 200 reads whose bytes
+            # disagreed (data corruption), `read_availability_error_count`
+            # counts reads that could not be served, and `verify_counts` /
+            # `verify_errors` break these down per mode (`<mode>_unavailable`
+            # for availability).
             "integrity": {
                 "status": integrity_status,
                 "checked_at": iso(self.last_integrity_check),
                 "verified_offsets": self.verified_offsets,
                 "mismatch_count": self.mismatch_count,
-                "setsum_mismatch_count": self.setsum_mismatch_count,
-                "setsum_availability_error_count": self.setsum_availability_errors,
+                "read_availability_error_count": self.read_availability_errors,
                 "verify_counts": self.verify_counts,
                 "verify_errors": self.verify_errors,
+                "last_read": self.last_read_check,
+                "last_cold_flush": self.last_cold_flush,
                 "last_error": self.last_integrity_error,
-                "last_setsum_availability_error": self.last_setsum_availability_error,
+                "last_read_availability_error": self.last_read_availability_error,
             },
             "chaos": {
                 "enabled": not self.disable_faults,

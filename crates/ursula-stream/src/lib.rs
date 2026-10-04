@@ -20,7 +20,6 @@
 
 mod command;
 mod feature;
-mod integrity;
 mod model;
 mod record_index;
 mod response;
@@ -38,7 +37,6 @@ pub use feature::FEATURE_LEVEL_KEYED_STREAMS;
 pub use feature::FEATURE_LEVEL_SPARSE_MARKS;
 pub use feature::MAX_SUPPORTED_FEATURE_LEVEL;
 pub use feature::check_feature_level;
-pub use integrity::StreamIntegritySnapshot;
 pub use model::AppendStreamInput;
 pub use model::BOOTSTRAP_MAX_UPDATE_BYTES;
 pub use model::BucketUsage;

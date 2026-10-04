@@ -232,7 +232,6 @@ mod tests {
     use crate::model::StreamStatus;
     use crate::state_machine::HotBuffer;
     use crate::state_machine::StreamColdState;
-    use crate::state_machine::StreamIntegrity;
 
     fn slot(
         name: &str,
@@ -256,7 +255,6 @@ mod tests {
             cold: StreamColdState::default(),
             message_records: Vec::new(),
             record_index: None,
-            integrity: StreamIntegrity::default(),
             retained_offset: 0,
             visible_snapshot: None,
             producers: HashMap::new(),

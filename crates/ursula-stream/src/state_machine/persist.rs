@@ -1,4 +1,4 @@
-//! Snapshot / restore / integrity serialization for the Raft state machine.
+//! Snapshot / restore serialization for the Raft state machine.
 
 use super::BucketStreamId;
 use super::ColdChunkRef;
@@ -12,7 +12,6 @@ use super::ProducerSnapshot;
 use super::ProducerState;
 use super::StreamColdState;
 use super::StreamErrorCode;
-use super::StreamIntegrity;
 use super::StreamMessageRecord;
 use super::StreamResponse;
 use super::StreamSlot;
@@ -23,22 +22,6 @@ use super::StreamStateMachine;
 use super::compare_stream_ids;
 
 impl StreamStateMachine {
-    pub fn integrity_snapshot(
-        &self,
-        stream_id: &BucketStreamId,
-    ) -> Result<crate::integrity::StreamIntegritySnapshot, StreamResponse> {
-        let Some(slot) = self.stream_slot(stream_id) else {
-            return Err(StreamResponse::error(
-                StreamErrorCode::StreamNotFound,
-                format!("stream '{stream_id}' does not exist"),
-            ));
-        };
-        Ok(slot.integrity.snapshot(
-            self.earliest_retained_offset(stream_id),
-            slot.metadata.tail_offset,
-        ))
-    }
-
     pub fn snapshot(&self) -> StreamSnapshot {
         let mut buckets = self.buckets.iter().cloned().collect::<Vec<_>>();
         buckets.sort();
@@ -51,7 +34,6 @@ impl StreamStateMachine {
             .map(|slot| {
                 let metadata = slot.metadata.clone();
                 let stream_id = metadata.stream_id.clone();
-                let tail_offset = metadata.tail_offset;
                 let payload = slot.hot_buffer.payload();
                 let producer_states = producer_snapshot(&slot.producers);
                 StreamSnapshotEntry {
@@ -75,9 +57,6 @@ impl StreamStateMachine {
                     message_records: slot.message_records.clone(),
                     hot_append_starts: slot.hot_buffer.append_starts().iter().copied().collect(),
                     record_index: slot.record_index.clone(),
-                    integrity: slot
-                        .integrity
-                        .snapshot(self.earliest_retained_offset(&stream_id), tail_offset),
                     retained_offset: Some(slot.retained_offset),
                     visible_snapshot: slot.visible_snapshot.clone(),
                     producer_states,
@@ -296,11 +275,6 @@ impl StreamStateMachine {
             if !boundaries_valid {
                 return Err(StreamSnapshotError::MessageBoundaryMismatch { stream_id });
             }
-            let integrity = StreamIntegrity::restore(entry.integrity).ok_or_else(|| {
-                StreamSnapshotError::IntegrityMismatch {
-                    stream_id: stream_id.clone(),
-                }
-            })?;
             if machine.registry.contains_key(&stream_id) {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));
             }
@@ -338,7 +312,6 @@ impl StreamStateMachine {
                 ),
                 message_records: entry.message_records,
                 record_index: entry.record_index,
-                integrity,
                 retained_offset,
                 visible_snapshot,
                 receipt_window: super::producers::ReceiptWindow::rebuild(&producer_states),

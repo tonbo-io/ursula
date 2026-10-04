@@ -35,10 +35,13 @@
     "checked_at": null,
     "verified_offsets": 0,
     "mismatch_count": 0,
-    "setsum_mismatch_count": 0,
-    "expected_live_setsum": null,
-    "server": null,
-    "last_error": null
+    "read_availability_error_count": 0,
+    "verify_counts": {},
+    "verify_errors": {},
+    "last_read": null,
+    "last_cold_flush": null,
+    "last_error": null,
+    "last_read_availability_error": null
   },
   "chaos": {
     "enabled": false,

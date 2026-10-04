@@ -133,20 +133,6 @@ fn producer(id: &str, epoch: u64, seq: u64) -> ProducerRequest {
     }
 }
 
-fn empty_integrity() -> StreamIntegritySnapshot {
-    let empty = "00".repeat(32);
-    StreamIntegritySnapshot {
-        live_setsum: empty.clone(),
-        evicted_setsum: empty.clone(),
-        total_setsum: empty,
-        live_start_offset: 0,
-        tail_offset: 0,
-        live_records: 0,
-        evicted_records: 0,
-        total_records: 0,
-    }
-}
-
 #[test]
 fn stream_from_replicated_preserves_wire_message() {
     let err = GroupEngineError::stream_from_replicated(
@@ -3945,7 +3931,6 @@ impl GroupEngine for RecordingEngine {
                 snapshot_offset: None,
                 snapshot_digest: None,
                 retained_offset: 0,
-                integrity: empty_integrity(),
                 record_range: None,
                 created_at_ms: None,
             })

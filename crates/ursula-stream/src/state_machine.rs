@@ -8,7 +8,7 @@
 //! - [`lifecycle`]: bucket/stream create, close, delete, and TTL expiry.
 //! - [`cold`]: cold-tier flush candidates, GC, retention compaction, snapshot publishing.
 //! - [`flush_planner`]: leader-side flush passes over a derived hot-stream index.
-//! - [`persist`]: snapshot / restore / integrity serialization.
+//! - [`persist`]: snapshot / restore serialization.
 //! - [`producers`]: F3 receipt window, idle-producer expiry, F4a collapse and
 //!   `TidyStream` (feature level 1).
 //! - [`marks`]: F1 sparse cold record marks — sealing at cold transitions and
@@ -45,7 +45,6 @@ use self::registry::StreamRegistry;
 use self::ttl::TtlEntry;
 use self::ttl::TtlIndex;
 use crate::command::StreamCommand;
-use crate::integrity::StreamIntegrity;
 use crate::model::AppendExternalInput;
 use crate::model::AppendStreamInput;
 use crate::model::BOOTSTRAP_MAX_UPDATE_BYTES;
@@ -219,7 +218,6 @@ struct StreamSlot {
     cold: StreamColdState,
     message_records: Vec<StreamMessageRecord>,
     record_index: Option<StreamRecordIndex>,
-    integrity: StreamIntegrity,
     retained_offset: u64,
     visible_snapshot: Option<StreamVisibleSnapshot>,
     producers: HashMap<String, ProducerState>,

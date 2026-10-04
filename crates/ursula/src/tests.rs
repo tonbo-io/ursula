@@ -519,24 +519,6 @@ async fn create_append_read_and_head_match_perf_compare_subset() {
         "00000000000000000000"
     );
     assert_eq!(header_str(&response, CONTENT_TYPE), "text/plain");
-    assert_eq!(
-        header_str(&response, HEADER_STREAM_INTEGRITY_LIVE_RECORDS),
-        "1"
-    );
-    assert_eq!(
-        header_str(&response, HEADER_STREAM_INTEGRITY_TOTAL_RECORDS),
-        "1"
-    );
-    assert_eq!(
-        header_str(&response, HEADER_STREAM_INTEGRITY_EVICTED_RECORDS),
-        "0"
-    );
-    assert!(
-        response
-            .headers()
-            .get(HEADER_STREAM_INTEGRITY_LIVE_SETSUM)
-            .is_some()
-    );
 }
 
 #[tokio::test]

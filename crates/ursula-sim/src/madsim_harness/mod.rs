@@ -1173,7 +1173,7 @@ impl GroupEngine for MadsimScopedGroupEngine {
 
     fn head_stream<'a>(
         &'a mut self,
-        request: ursula_runtime::HeadStreamRequest,
+        request: HeadStreamRequest,
         placement: ShardPlacement,
     ) -> GroupHeadStreamFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {

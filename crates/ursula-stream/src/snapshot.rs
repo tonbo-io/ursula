@@ -2,7 +2,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::BucketStreamId;
 
-use crate::integrity::StreamIntegritySnapshot;
 use crate::model::BucketUsageSnapshot;
 use crate::model::ColdChunkRef;
 use crate::model::ColdGcEntry;
@@ -71,7 +70,6 @@ pub struct StreamSnapshotEntry {
     pub hot_append_starts: Vec<u64>,
     #[serde(default)]
     pub record_index: Option<StreamRecordIndex>,
-    pub integrity: StreamIntegritySnapshot,
     /// Independent destructive-retention floor. `None` denotes a legacy
     /// snapshot where the visible snapshot offset also implied retention.
     #[serde(default)]
@@ -109,8 +107,6 @@ pub enum StreamSnapshotError {
     MessageBoundaryMismatch { stream_id: BucketStreamId },
     #[error("snapshot stream '{stream_id}' has inconsistent record boundaries")]
     RecordBoundaryMismatch { stream_id: BucketStreamId },
-    #[error("snapshot stream '{stream_id}' has inconsistent integrity setsums")]
-    IntegrityMismatch { stream_id: BucketStreamId },
     #[error(
         "snapshot stream '{stream_id}' visible snapshot offset {snapshot_offset} is beyond tail offset {tail_offset}"
     )]

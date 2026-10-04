@@ -10,7 +10,6 @@ use ursula_stream::ColdFlushPressure;
 use ursula_stream::ExternalPayloadRef;
 use ursula_stream::ProducerRequest;
 use ursula_stream::StreamErrorCode;
-use ursula_stream::StreamIntegritySnapshot;
 use ursula_stream::StreamReadPlan;
 use ursula_stream::StreamReadSegment;
 use ursula_stream::StreamRecordRange;
@@ -134,7 +133,6 @@ pub struct HeadStreamResponse {
     pub snapshot_offset: Option<u64>,
     pub snapshot_digest: Option<String>,
     pub retained_offset: u64,
-    pub integrity: StreamIntegritySnapshot,
     pub record_range: Option<StreamRecordRange>,
     /// The stream incarnation's `created_at_ms`, unique per group from
     /// feature level 1 (C7). HEAD renders it as the public

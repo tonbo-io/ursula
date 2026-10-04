@@ -59,7 +59,6 @@ pub(crate) fn required<T>(value: Option<T>, field: &str) -> Result<T, GroupEngin
 #[cfg(test)]
 mod tests {
     use ursula_runtime::HeadStreamResponse;
-    use ursula_runtime::StreamIntegritySnapshot;
 
     use super::*;
 
@@ -79,16 +78,6 @@ mod tests {
             snapshot_offset: None,
             snapshot_digest: None,
             retained_offset: 0,
-            integrity: StreamIntegritySnapshot {
-                live_setsum: String::new(),
-                evicted_setsum: String::new(),
-                total_setsum: String::new(),
-                live_start_offset: 0,
-                tail_offset: 9,
-                live_records: 0,
-                evicted_records: 0,
-                total_records: 0,
-            },
             record_range: None,
             created_at_ms,
         }

@@ -13,7 +13,6 @@ use super::ProducerState;
 use super::StreamCommand;
 use super::StreamErrorCode;
 use super::StreamErrorContext;
-use super::StreamIntegrity;
 use super::StreamMetadata;
 use super::StreamResponse;
 use super::StreamStateMachine;
@@ -29,7 +28,6 @@ struct StreamAppendUndo {
     hot_checkpoint: super::hot_buffer::HotCheckpoint,
     message_records_len: usize,
     record_checkpoint: Option<u64>,
-    integrity: StreamIntegrity,
     producers: HashMap<String, Option<ProducerState>>,
 }
 
@@ -105,7 +103,6 @@ impl StreamStateMachine {
                         .record_index
                         .as_ref()
                         .map(crate::StreamRecordIndex::append_checkpoint),
-                    integrity: slot.integrity.clone(),
                     producers: HashMap::new(),
                 });
             if let Some(producer) = producer {
@@ -194,7 +191,6 @@ impl StreamStateMachine {
             {
                 index.rollback_appends(checkpoint);
             }
-            slot.integrity = undo.integrity;
             let producers_touched = !undo.producers.is_empty();
             for (producer_id, producer) in undo.producers {
                 match producer {
@@ -445,8 +441,6 @@ impl StreamStateMachine {
                 let _range = index.commit_append(prepared);
             }
             slot.hot_buffer.push(offset, next_offset, payload);
-            slot.integrity
-                .append_payload(&stream_id, offset, next_offset, payload);
             slot.record_message_boundaries(records_removed, offset, next_offset, &record_ends);
             self.add_hot_payload_bytes(payload_len);
             self.sync_hot_index(&stream_id);
@@ -660,13 +654,6 @@ impl StreamStateMachine {
         } else {
             slot.cold.push_external_segment(object.clone());
         }
-        slot.integrity.append_external(
-            &stream_id,
-            object.start_offset,
-            object.end_offset,
-            &object.s3_path,
-            object.object_size,
-        );
         slot.record_message_boundaries(records_removed, offset, next_offset, &record_ends);
         // F4a: an external append is a cold transition.
         self.collapse_sealed_message_records(&stream_id);
