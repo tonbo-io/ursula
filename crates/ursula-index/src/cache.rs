@@ -334,7 +334,7 @@ impl VerifiedParquetReader {
             }
             pieces.push(bytes.slice(slice_start..slice_end));
         }
-        let result = crate::keyed::part::join_pieces(pieces);
+        let result = join_pieces(pieces);
         if result.len() != capacity {
             return Err(IndexError::InvalidPartLayout(self.layout.part_key.clone()));
         }
@@ -561,6 +561,19 @@ async fn validate_cached_part(path: PathBuf, meta: PartMeta) -> Result<bool, Ind
     tokio::task::spawn_blocking(move || valid_cached_part(&path, &meta))
         .await
         .map_err(|_error| IndexError::WorkerFailed)?
+}
+
+/// Concatenates verified block slices; one slice (the common case of a
+/// page within one block) is returned without copying.
+fn join_pieces(mut pieces: Vec<Bytes>) -> Bytes {
+    if pieces.len() == 1 {
+        return pieces.pop().unwrap_or_default();
+    }
+    let mut out = Vec::with_capacity(pieces.iter().map(Bytes::len).sum());
+    for piece in &pieces {
+        out.extend_from_slice(piece);
+    }
+    Bytes::from(out)
 }
 
 fn valid_cached_part(path: &Path, meta: &PartMeta) -> Result<bool, IndexError> {

@@ -45,9 +45,7 @@ jobs:
             --seed-family http-protocol-surface-randomized \
             --seed-family runtime-raft-network-randomized-extended \
             --seed-family runtime-raft-network-cold-live-write-recovery \
-            --seed-family runtime-interleaving \
-            --seed-family keyed-indexer \
-            --seed-family keyed-indexer-extended
+            --seed-family runtime-interleaving
           RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-runtime-raft-network-randomized-read-corruption \
             --expect-failures \
