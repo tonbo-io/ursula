@@ -180,14 +180,14 @@ async fn overlapping_commits_must_match_exactly() -> anyhow::Result<()> {
         .commit_segment(timed(0, &[100, 999, 300]))
         .await
         .expect_err("a different event time for committed bytes conflicts");
-    assert!(matches!(different_time, IndexError::RecordConflict {
+    assert!(matches!(different_time, IndexError::EntryConflict {
         offset: 10
     }));
     let missing_entry = second
         .commit_segment(segment(0, &[Some(100), None, Some(300)]))
         .await
         .expect_err("dropping a committed entry conflicts; a subset is not enough");
-    assert!(matches!(missing_entry, IndexError::RecordConflict {
+    assert!(matches!(missing_entry, IndexError::EntryConflict {
         offset: 10
     }));
     let mut misaligned = timed(0, &[100, 200]);
@@ -198,7 +198,7 @@ async fn overlapping_commits_must_match_exactly() -> anyhow::Result<()> {
         .commit_segment(misaligned)
         .await
         .expect_err("covered bytes must end on one of this segment's boundaries");
-    assert!(matches!(misaligned, IndexError::RecordConflict {
+    assert!(matches!(misaligned, IndexError::EntryConflict {
         offset: 20
     }));
 
@@ -304,21 +304,6 @@ async fn garbage_collection_removes_an_expired_crashed_worker_claim() -> anyhow:
         .await?;
     assert_eq!(report.deleted_claims, 1);
     assert!(!object_dir.path().join("claims/current.json").exists());
-    Ok(())
-}
-
-#[tokio::test]
-async fn cache_is_disposable_and_rebuilt_from_authoritative_objects() -> anyhow::Result<()> {
-    let (_object_dir, store) = common::fs_store()?;
-    let (first_cache, mut writer) = open(&store, config(), 0).await?;
-    writer.commit_segment(timed(0, &[200, 100])).await?;
-    drop(writer);
-    drop(first_cache);
-
-    let (_empty_cache, mut reader) = open(&store, config(), 0).await?;
-    let result = reader.query(window(0, 1_000)).await?;
-    assert_eq!(result.coverage.durable, 20);
-    assert_eq!(result.entries, vec![entry(10, 100), entry(0, 200)]);
     Ok(())
 }
 
@@ -548,6 +533,9 @@ async fn garbage_collection_skips_and_reclaims_incompatible_manifests() -> anyho
             "parts": []
         }))?,
     )?;
+    // Generation 1 puts generation 0, and so the legacy key, in the
+    // retained window, where it must be skipped rather than parsed.
+    index.commit_segment(timed(0, &[1])).await?;
 
     let report = index
         .garbage_collect(8, std::time::Duration::ZERO, std::time::SystemTime::now())

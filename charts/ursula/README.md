@@ -258,7 +258,7 @@ curl -X PUT http://ursula-indexer:4493/v1/indexes/browser-session-42 \
 
 Registration performs a HEAD preflight, rejects sources of any other content type, and records the stream's `Stream-Incarnation`. Each stream has one claim at a time, which starts at the first unindexed byte; a worker reads up to `indexer.workers.segmentBytes` with ordinary offset reads and commits the messages it framed. Claims are expiring efficiency hints rather than locks, so worker death cannot strand correctness: overlapping commits must produce identical entries, and duplicate work converges through immutable content-addressed parts plus S3 manifest CAS. Messages without a usable event time are skipped and counted, retention is followed with a floor, and a deleted and recreated stream restarts its registration. See the [indexer README](https://github.com/tonbo-io/ursula/blob/main/crates/ursula-index/README.md) for the extractor, query, and status formats.
 
-Query one registration at `/v1/indexes/{id}/events`; inspect or resume it at `/v1/indexes/{id}/status` and `/v1/indexes/{id}/status/resume`. `GET /v1/indexes` lists registrations and `DELETE /v1/indexes/{id}` stops future scheduling without deleting authoritative index objects. Do not expose the Service directly to the internet: registration, deletion, and resume are administrative operations. Put authentication and path-aware authorization in a separate ingress or API gateway if applications need remote query access.
+Query one registration at `/v1/indexes/{id}/events`; inspect or resume it at `/v1/indexes/{id}/status` and `/v1/indexes/{id}/status/resume`. `GET /v1/indexes` lists registrations and `DELETE /v1/indexes/{id}` stops scheduling and retires its namespace; maintenance deletes the registration's index objects after `indexer.garbageCollection.graceSeconds`, and an identical re-registration is refused until then. Do not expose the Service directly to the internet: registration, deletion, and resume are administrative operations. Put authentication and path-aware authorization in a separate ingress or API gateway if applications need remote query access.
 
 ## Snapshot Store
 
@@ -516,7 +516,7 @@ container receives only chart-managed container settings plus explicit
 | `indexer.cache.emptyDir.sizeLimit` | `2Gi` | Disposable local cache volume limit; durable index state remains in S3. |
 | `indexer.ingest.flushEntries` | `65536` | Maximum messages (entries plus skips) in one committed segment, and so entries in one uncompacted part. |
 | `indexer.workers.concurrency` | `4` | Concurrent stream tasks per worker pod. |
-| `indexer.workers.segmentBytes` | `33554432` | Source bytes read before a segment is committed; a shorter tail segment waits for `indexer.ingest.tailFlushIntervalMs`. Replaces `readBatchRecords` and `segmentRecords`. |
+| `indexer.workers.segmentBytes` | `33554432` | Source bytes read before a segment is committed; a shorter segment waits for `indexer.ingest.tailFlushIntervalMs` unless it follows one that stopped at `indexer.ingest.flushEntries`. Replaces `readBatchRecords` and `segmentRecords`. |
 | `indexer.workers.leaseMs` | `60000` | Claim duration used to reduce duplicate processing; not a correctness boundary. |
 | `indexer.compaction.fanIn` | `8` | Number of same-partition parts selected for bounded compaction. |
 | `indexer.compaction.maxEntries` | `1000000` | Maximum entries loaded by one compaction; must cover one configured fan-in. |

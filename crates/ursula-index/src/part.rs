@@ -138,20 +138,14 @@ where
             .ok_or_else(|| ArrowError::SchemaError("t_ms column is missing".to_owned()))?;
         let offsets = uint64_column(&batch, OFFSET)?
             .ok_or_else(|| ArrowError::SchemaError("offset column is missing".to_owned()))?;
-        let t_end_ms = int64_column(&batch, T_END_MS)?;
-        let ends = t_end_ms.map(|column| column.values());
+        let ends = int64_column(&batch, T_END_MS)?
+            .ok_or_else(|| ArrowError::SchemaError("t_end_ms column is missing".to_owned()))?;
         Ok(BooleanArray::from_iter(
             t_ms.values()
                 .iter()
+                .zip(ends.values().iter())
                 .zip(offsets.values().iter())
-                .enumerate()
-                .map(|(row, (t_ms, offset))| {
-                    let t_end_ms = ends
-                        .and_then(|ends| ends.get(row))
-                        .copied()
-                        .unwrap_or(*t_ms);
-                    Some(filter.matches(*t_ms, t_end_ms, *offset))
-                }),
+                .map(|((t_ms, t_end_ms), offset)| Some(filter.matches(*t_ms, *t_end_ms, *offset))),
         ))
     });
     let row_filter = RowFilter::new(vec![Box::new(predicate)]);
@@ -271,9 +265,8 @@ pub(crate) fn read_all(path: &Path) -> Result<Vec<EventEntry>, IndexError> {
     Ok(entries)
 }
 
-/// Columns are found by name. `t_ms`, `offset` and `len` are required;
-/// `t_end_ms` defaults to `t_ms`, and unknown columns are ignored, so later
-/// columns are additive.
+/// Columns are found by name. `t_ms`, `t_end_ms`, `offset` and `len` are
+/// required; unknown columns are ignored, so later columns are additive.
 pub(crate) fn validate(path: &Path) -> Result<(), IndexError> {
     let file = File::open(path)?;
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
@@ -287,7 +280,7 @@ pub(crate) fn validate(path: &Path) -> Result<(), IndexError> {
     let valid = has(T_MS, &DataType::Int64)
         && has(OFFSET, &DataType::UInt64)
         && has(LEN, &DataType::UInt64)
-        && (schema.field_with_name(T_END_MS).is_err() || has(T_END_MS, &DataType::Int64));
+        && has(T_END_MS, &DataType::Int64);
     if !valid {
         return Err(IndexError::InvalidPartSchema);
     }
@@ -332,16 +325,16 @@ fn append_record_batch(
     let t_ms = int64_column(batch, T_MS)?.ok_or_else(|| missing(T_MS))?;
     let offsets = uint64_column(batch, OFFSET)?.ok_or_else(|| missing(OFFSET))?;
     let lens = uint64_column(batch, LEN)?.ok_or_else(|| missing(LEN))?;
-    let ends = int64_column(batch, T_END_MS)?.map(|column| column.values());
+    let ends = int64_column(batch, T_END_MS)?.ok_or_else(|| missing(T_END_MS))?;
     entries.extend(
         t_ms.values()
             .iter()
+            .zip(ends.values().iter())
             .zip(offsets.values().iter())
             .zip(lens.values().iter())
-            .enumerate()
-            .map(|(row, ((&t_ms, &offset), &len))| EventEntry {
+            .map(|(((&t_ms, &t_end_ms), &offset), &len)| EventEntry {
                 t_ms,
-                t_end_ms: ends.and_then(|ends| ends.get(row)).copied().unwrap_or(t_ms),
+                t_end_ms,
                 offset,
                 len,
             }),

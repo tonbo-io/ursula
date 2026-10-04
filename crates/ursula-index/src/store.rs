@@ -60,7 +60,8 @@ impl EventIndexConfig {
 }
 
 /// Where a new index starts reading and which incarnation of the source
-/// stream it describes. Only used when the index namespace is empty.
+/// stream it describes. Used when the index namespace is empty and by
+/// `EventIndex::restart`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IndexBase {
     pub offset: u64,
@@ -326,7 +327,7 @@ pub enum IndexError {
     LockPoisoned,
     #[error("blocking event-index worker failed")]
     WorkerFailed,
-    #[error("event index is blocked at source offset {offset}: {reason}")]
+    #[error("event index is blocked at source offset {offset:020}: {reason}")]
     Blocked { offset: u64, reason: String },
     #[error("index status cannot be resumed: {0}")]
     CannotResume(&'static str),
@@ -371,9 +372,9 @@ pub enum IndexError {
     )]
     CompactionTooLarge { entries: u64, max_entries: u64 },
     #[error(
-        "source bytes at offset {offset} index differently from the entries another indexer committed"
+        "source bytes at offset {offset:020} index differently from the entries another indexer committed"
     )]
-    RecordConflict { offset: u64 },
+    EntryConflict { offset: u64 },
     #[error("cache capacity {capacity} bytes cannot hold a {object_size}-byte part")]
     CacheCapacity { capacity: u64, object_size: u64 },
     #[error("index registration `{0}` already exists with different settings")]

@@ -40,6 +40,7 @@ async fn out_of_order_time_and_skip_counts_survive_restart() -> anyhow::Result<(
 
     let (_fresh_cache, mut reopened) = open(&store, config(), 0).await?;
     let result = reopened.query(window(0, 400)).await?;
+    assert_eq!(result.coverage.durable, 4_u64.saturating_mul(LEN));
     assert_eq!(result.entries, expected);
     assert_eq!(result.skipped.missing, 1);
     Ok(())

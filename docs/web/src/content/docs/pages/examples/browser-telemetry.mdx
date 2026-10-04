@@ -114,7 +114,7 @@ GET http://ursula-indexer:4493/v1/indexes/browser-session-42/events?from=2026-07
 }
 ```
 
-Fetch an event with its locator. A read returns at most 8 MiB, so keep reading from each response's `Stream-Next-Offset` until `len` bytes have arrived; never compute an offset yourself:
+Fetch an event with its locator. A read returns at most 8 MiB, so keep reading from each response's `Stream-Next-Offset` until `len` bytes have arrived; never compute an offset yourself. Locators are valid for `source.incarnation`; if the stream's `Stream-Incarnation` (HEAD) differs, the stream was recreated and the locators are stale:
 
 ```js
 async function fetchEvent(streamUrl, { offset, len }) {

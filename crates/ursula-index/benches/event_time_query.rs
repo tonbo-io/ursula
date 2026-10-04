@@ -16,7 +16,7 @@ use ursula_index::IndexBase;
 use ursula_index::QueryRequest;
 use ursula_index::Segment;
 
-const RECORDS: u64 = 100_000;
+const MESSAGES: u64 = 100_000;
 const COMPACTION_PARTS: usize = 8;
 const COMPACTION_PART_ENTRIES: usize = 10_000;
 const MESSAGE_LEN: u64 = 64;
@@ -74,8 +74,8 @@ fn event_time_query(criterion: &mut Criterion) {
                 IndexBase::default(),
             )
             .await?;
-            let times = (0..RECORDS)
-                .map(|record| i64::try_from(record.wrapping_mul(7_919) % RECORDS))
+            let times = (0..MESSAGES)
+                .map(|message| i64::try_from(message.wrapping_mul(7_919) % MESSAGES))
                 .collect::<Result<Vec<_>, _>>()?;
             commit(&mut index, &times, 10_000).await?;
             Ok::<_, anyhow::Error>(index)
@@ -84,7 +84,7 @@ fn event_time_query(criterion: &mut Criterion) {
 
     let mut group = criterion.benchmark_group("event_time_query");
     group.throughput(Throughput::Elements(100));
-    group.bench_function(BenchmarkId::new("100_record_window", RECORDS), |bencher| {
+    group.bench_function(BenchmarkId::new("100_entry_window", MESSAGES), |bencher| {
         bencher.iter(|| {
             black_box(
                 runtime
@@ -117,8 +117,8 @@ fn bounded_partition_compaction(criterion: &mut Criterion) {
                             IndexBase::default(),
                         )
                         .await?;
-                        let record_count = COMPACTION_PARTS * COMPACTION_PART_ENTRIES;
-                        let times = (0..record_count)
+                        let entry_count = COMPACTION_PARTS * COMPACTION_PART_ENTRIES;
+                        let times = (0..entry_count)
                             .map(i64::try_from)
                             .collect::<Result<Vec<_>, _>>()?;
                         commit(&mut index, &times, COMPACTION_PART_ENTRIES).await?;

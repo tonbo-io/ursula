@@ -114,14 +114,13 @@ impl EventIndex {
         self.published.manifest.resync_offset
     }
 
-    /// Where this handle last found only an unterminated message, if the
-    /// durable offset has not moved since.
-    pub fn stalled_at(&self) -> Option<u64> {
-        self.stalled_at
-            .filter(|offset| *offset == self.published.manifest.durable_offset)
+    /// Whether this handle's last read found only an unterminated message
+    /// and the durable offset has not moved since.
+    pub(crate) fn is_stalled(&self) -> bool {
+        self.stalled_at == Some(self.published.manifest.durable_offset)
     }
 
-    pub fn note_stalled(&mut self, offset: u64) {
+    pub(crate) fn note_stalled(&mut self, offset: u64) {
         self.stalled_at = Some(offset);
     }
 
@@ -262,7 +261,7 @@ impl EventIndex {
             let covered_end = durable.min(segment.end);
             if covered_end > segment.start {
                 if !segment.is_boundary(covered_end) {
-                    return Err(IndexError::RecordConflict {
+                    return Err(IndexError::EntryConflict {
                         offset: covered_end,
                     });
                 }
@@ -354,7 +353,7 @@ impl EventIndex {
                     .map(|entry| entry.offset)
             })
             .unwrap_or(segment.start);
-        Err(IndexError::RecordConflict { offset })
+        Err(IndexError::EntryConflict { offset })
     }
 
     /// Follow the source's retained offset. Entries before the floor are no

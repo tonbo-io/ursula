@@ -146,7 +146,7 @@ async fn head_reports_format_offsets_incarnation_and_absence() -> anyhow::Result
         .client()
         .await?;
     let head = client.head().await?.expect("the stream exists");
-    assert_eq!(head.format, SourceFormat::Json);
+    assert_eq!(head.format, Some(SourceFormat::Json));
     assert_eq!(head.next_offset, 3);
     assert_eq!(head.retained_offset, 0);
     assert_eq!(head.incarnation.as_deref(), Some("1759482000123"));
@@ -155,8 +155,11 @@ async fn head_reports_format_offsets_incarnation_and_absence() -> anyhow::Result
     let (client, server) = ChunkedSource::new("{}\n", 8, "application/octet-stream")
         .client()
         .await?;
+    let head = client.head().await?.expect("the stream exists");
+    assert_eq!(head.format, None);
+    assert_eq!(head.incarnation.as_deref(), Some("1759482000123"));
     assert!(matches!(
-        client.head().await,
+        head.readable_format(),
         Err(IndexError::InvalidSourceResponse(_))
     ));
     server.abort();
@@ -233,7 +236,7 @@ async fn an_unterminated_ndjson_tail_is_not_covered_and_oversize_lines_are_read_
         .await?;
     assert_eq!(
         client.head().await?.expect("exists").format,
-        SourceFormat::Ndjson
+        Some(SourceFormat::Ndjson)
     );
     let segment = read(&client, 0, false, limits()).await?;
     let complete = u64::try_from(body.len().saturating_sub("{\"t\":3".len()))?;

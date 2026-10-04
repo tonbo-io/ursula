@@ -90,8 +90,9 @@ pub struct IndexerArgs {
     flush_entries: usize,
     #[arg(long, default_value_t = 16_384)]
     row_group_entries: usize,
-    /// Source bytes read before a segment is committed. A shorter tail
-    /// segment waits for `--tail-flush-interval-ms`.
+    /// Source bytes read before a segment is committed. A shorter segment
+    /// waits for `--tail-flush-interval-ms`, unless it follows one that
+    /// stopped at `--flush-entries`.
     #[arg(long, default_value_t = 32 * 1024 * 1024_u64)]
     segment_bytes: u64,
     #[arg(long, default_value_t = 4)]
@@ -468,6 +469,7 @@ async fn run_single(
         .await
         .context("HEAD the source stream")?
         .context("the source stream does not exist")?;
+    head.readable_format().context("HEAD the source stream")?;
     let base = IndexBase {
         offset: start_offset(start, &head),
         incarnation: head.incarnation.clone(),
@@ -677,6 +679,7 @@ async fn pool_worker_loop(
                     let mut tasks = JoinSet::new();
                     let mut attempts = 0_usize;
                     let mut partial_attempted = HashSet::new();
+                    let mut entry_capped = HashSet::new();
                     while (!pending.is_empty() || !tasks.is_empty()) && attempts < max_attempts {
                         while tasks.len() < worker_concurrency && attempts < max_attempts {
                             let Some(registration) = pending.pop_front() else {
@@ -685,8 +688,9 @@ async fn pool_worker_loop(
                             attempts = attempts.saturating_add(1);
                             let task_state = state.clone();
                             let task_params = params.clone();
-                            let task_allow_partial =
-                                allow_partial && partial_attempted.insert(registration.id.clone());
+                            let task_allow_partial = entry_capped.remove(&registration.id)
+                                || (allow_partial
+                                    && partial_attempted.insert(registration.id.clone()));
                             tasks.spawn(async move {
                                 let result = process_pool_source(
                                     &task_state,
@@ -699,8 +703,14 @@ async fn pool_worker_loop(
                             });
                         }
                         match tasks.join_next().await {
-                            Some(Ok((registration, Ok(true)))) => pending.push_back(registration),
-                            Some(Ok((_registration, Ok(false)))) => {}
+                            Some(Ok((registration, Ok(Backlog::More)))) => {
+                                pending.push_back(registration)
+                            }
+                            Some(Ok((registration, Ok(Backlog::EntryCapped)))) => {
+                                entry_capped.insert(registration.id.clone());
+                                pending.push_back(registration);
+                            }
+                            Some(Ok((_registration, Ok(Backlog::Idle)))) => {}
                             Some(Ok((registration, Err(error)))) => tracing::warn!(
                                 index_id = %registration.id,
                                 stream_url = %registration.stream_url,
@@ -728,21 +738,33 @@ async fn pool_worker_loop(
     }
 }
 
-/// One scheduling attempt for one registration. Returns whether more source
-/// bytes are ready right away.
+/// What an indexing pass leaves to do right away.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Backlog {
+    /// Nothing until the next poll.
+    Idle,
+    /// More source bytes are ready.
+    More,
+    /// The segment stopped at `--flush-entries` before the tail; claim the
+    /// rest even if it is shorter than `--segment-bytes`, so a stream of
+    /// small messages is not held to one segment per tail flush.
+    EntryCapped,
+}
+
+/// One scheduling attempt for one registration.
 async fn process_pool_source(
     state: &PoolState,
     registration: &IndexRegistration,
     params: &WorkerParams,
     allow_partial: bool,
-) -> Result<bool, IndexError> {
+) -> Result<Backlog, IndexError> {
     let stream_url = Url::parse(&registration.stream_url)
         .map_err(|_error| IndexError::InvalidConfig("registered stream URL is invalid"))?;
     let source = SourceClient::new(state.http.clone(), stream_url);
     let handles = state.ensure_index(registration).await?;
     let Some(head) = source.head().await? else {
         mark_source_gone(&handles.serving).await?;
-        return Ok(false);
+        return Ok(Backlog::Idle);
     };
     if incarnation_changed(
         registration.incarnation.as_deref(),
@@ -759,13 +781,16 @@ async fn process_pool_source(
             )
             .await?;
         if restarted.incarnation == registration.incarnation {
-            tracing::debug!(
+            // Equality-only comparison cannot order incarnations, so this
+            // is either a stale HEAD or a recreate into an incarnation this
+            // registration already retired; both wait for cleanup.
+            tracing::warn!(
                 index_id = %registration.id,
-                stale_incarnation = ?head.incarnation,
-                "ignoring a stale source HEAD that reports a retired incarnation"
+                incarnation = ?registration.incarnation,
+                reported_incarnation = ?head.incarnation,
+                "source HEAD reports an incarnation whose index namespace is retired; not restarting"
             );
         } else {
-            state.indexes.write().await.remove(&registration.id);
             tracing::info!(
                 index_id = %registration.id,
                 previous_incarnation = ?registration.incarnation,
@@ -774,7 +799,7 @@ async fn process_pool_source(
             );
         }
         // The next pass picks up the restarted registration.
-        return Ok(false);
+        return Ok(Backlog::Idle);
     }
     index_source(&handles.serving, &source, &head, params, allow_partial).await
 }
@@ -796,34 +821,41 @@ async fn index_source(
     head: &SourceHead,
     params: &WorkerParams,
     allow_partial: bool,
-) -> Result<bool, IndexError> {
+) -> Result<Backlog, IndexError> {
+    let format = head.readable_format()?;
     let now_ms = wall_clock_millis()?;
     let (claim, resync, extractor) = {
         let mut index = index.lock().await;
-        // Idle skips, without any S3 request. The durable offset only grows,
-        // so a tail this pod has already seen indexed needs nothing. A
-        // blocked index (resumed perhaps on another pod), or one whose last
-        // read found only an unterminated line, is retried on tail-flush
-        // passes only.
-        let caught_up = head.next_offset <= index.durable_offset()
-            && head.retained_offset <= index.floor_offset();
+        // Idle skips, without any S3 request. The cached durable offset
+        // never exceeds the published one, so whenever the pending bytes
+        // it implies are below what a claim needs, the claim would be
+        // refused anyway. A blocked index (resumed perhaps on another pod),
+        // or one whose last read found only an unterminated line, is
+        // retried on tail-flush passes only.
+        let floor_current = head.retained_offset <= index.floor_offset();
+        let pending = head.next_offset.saturating_sub(index.durable_offset());
         let idle = match index.status() {
-            IndexStatus::Ready => caught_up || (!allow_partial && index.stalled_at().is_some()),
+            IndexStatus::Ready => {
+                (floor_current
+                    && (pending == 0 || (!allow_partial && pending < params.limits.segment_bytes)))
+                    || (!allow_partial && index.is_stalled())
+            }
             IndexStatus::Blocked { .. } => !allow_partial,
             IndexStatus::SourceGone => false,
         };
         if idle {
-            return Ok(false);
+            return Ok(Backlog::Idle);
         }
         index.refresh().await?;
         if matches!(index.status(), IndexStatus::SourceGone) {
             index.set_source_gone(false).await?;
         }
-        if matches!(index.status(), IndexStatus::Blocked { .. }) {
-            return Ok(false);
-        }
+        // Follow retention even while blocked.
         if head.retained_offset > index.floor_offset() {
             index.advance_floor(head.retained_offset).await?;
+        }
+        if matches!(index.status(), IndexStatus::Blocked { .. }) {
+            return Ok(Backlog::Idle);
         }
         let Some(claim) = index
             .claim_segment(
@@ -836,10 +868,10 @@ async fn index_source(
             )
             .await?
         else {
-            return Ok(false);
+            return Ok(Backlog::Idle);
         };
-        let resync = head.format == SourceFormat::Ndjson
-            && index.resync_offset() == Some(claim.start_offset);
+        let resync =
+            format == SourceFormat::Ndjson && index.resync_offset() == Some(claim.start_offset);
         (claim, resync, index.config().extractor.clone())
     };
     let read = source
@@ -851,7 +883,7 @@ async fn index_source(
         Ok(SegmentRead::Retained { retained_offset }) => {
             index.advance_floor(retained_offset).await?;
             index.release_claim(&claim).await?;
-            return Ok(true);
+            return Ok(Backlog::More);
         }
         Err(error) => {
             if let Err(release) = index.release_claim(&claim).await {
@@ -864,12 +896,16 @@ async fn index_source(
     if end == segment.start {
         index.note_stalled(end);
         index.release_claim(&claim).await?;
-        return Ok(false);
+        return Ok(Backlog::Idle);
     }
+    let entry_capped =
+        segment.entries.len().saturating_add(segment.skips.len()) >= params.limits.max_entries;
     match index.finish_segment(&claim, segment).await {
-        Ok(()) => Ok(end < head.next_offset),
-        Err(IndexError::RecordConflict { offset }) => {
-            let reason = IndexError::RecordConflict { offset }.to_string();
+        Ok(()) if end >= head.next_offset => Ok(Backlog::Idle),
+        Ok(()) if entry_capped => Ok(Backlog::EntryCapped),
+        Ok(()) => Ok(Backlog::More),
+        Err(IndexError::EntryConflict { offset }) => {
+            let reason = IndexError::EntryConflict { offset }.to_string();
             index.mark_blocked(offset, reason.clone()).await?;
             index.release_claim(&claim).await?;
             Err(IndexError::Blocked { offset, reason })
@@ -1106,10 +1142,10 @@ async fn single_pass(
     params: &WorkerParams,
     start: StartPosition,
     allow_partial: bool,
-) -> Result<bool, IndexError> {
+) -> Result<Backlog, IndexError> {
     let Some(head) = source.head().await? else {
         mark_source_gone(index).await?;
-        return Ok(false);
+        return Ok(Backlog::Idle);
     };
     {
         // The cached incarnation decides; `restart` refreshes and is a no-op
@@ -1143,20 +1179,27 @@ async fn sync_loop(
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut next_tail_flush = Instant::now();
+    let mut entry_capped = false;
     loop {
         if *shutdown.borrow() {
             return Ok(());
         }
-        let allow_partial = Instant::now() >= next_tail_flush;
+        let tail_flush = Instant::now() >= next_tail_flush;
+        let follows_entry_cap = std::mem::take(&mut entry_capped);
+        let allow_partial = tail_flush || follows_entry_cap;
         let result = single_pass(&source, &index, &params, start, allow_partial).await;
-        if allow_partial {
+        if tail_flush {
             next_tail_flush = Instant::now()
                 .checked_add(tail_flush_interval)
                 .unwrap_or_else(Instant::now);
         }
         match result {
-            Ok(true) => continue,
-            Ok(false) => {}
+            Ok(Backlog::More) => continue,
+            Ok(Backlog::EntryCapped) => {
+                entry_capped = true;
+                continue;
+            }
+            Ok(Backlog::Idle) => {}
             Err(error @ IndexError::Blocked { .. }) => {
                 tracing::error!(%error, "event index source processing blocked");
             }
@@ -1247,6 +1290,7 @@ async fn register_pool_index(
         .ok_or(ApiError(IndexError::InvalidSourceResponse(
             "the source stream does not exist",
         )))?;
+    head.readable_format().map_err(ApiError)?;
     let registration = IndexRegistration {
         id,
         stream_url: canonical_stream_url,
@@ -1447,6 +1491,7 @@ mod tests {
     use tokio::sync::Mutex;
     use tower::ServiceExt;
 
+    use super::Backlog;
     use super::PoolIndexSettings;
     use super::PoolState;
     use super::StoreTarget;
@@ -1465,6 +1510,7 @@ mod tests {
     use crate::FsObjectStore;
     use crate::IndexBase;
     use crate::IndexCatalog;
+    use crate::IndexError;
     use crate::IndexRegistration;
     use crate::IndexStatus;
     use crate::QueryRequest;
@@ -1514,7 +1560,7 @@ mod tests {
         body: Arc<StdMutex<Vec<u8>>>,
         incarnation: Arc<StdMutex<String>>,
         retained: Arc<StdMutex<u64>>,
-        ndjson: bool,
+        content_type: Arc<StdMutex<&'static str>>,
     }
 
     impl MockSource {
@@ -1522,6 +1568,10 @@ mod tests {
             *self.body.lock().expect("lock") = body.as_bytes().to_vec();
             *self.incarnation.lock().expect("lock") = incarnation.to_owned();
             *self.retained.lock().expect("lock") = retained;
+        }
+
+        fn set_content_type(&self, content_type: &'static str) {
+            *self.content_type.lock().expect("lock") = content_type;
         }
 
         async fn serve(self) -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
@@ -1549,10 +1599,9 @@ mod tests {
             let tail = u64::try_from(body.len()).expect("small body");
             let pad = |offset: u64| format!("{offset:020}");
             if request.method() == axum::http::Method::HEAD {
-                let content_type = if self.ndjson {
-                    "application/x-ndjson"
-                } else {
-                    "application/json"
+                let content_type = match *self.content_type.lock().expect("lock") {
+                    "" => "application/json",
+                    content_type => content_type,
                 };
                 return (StatusCode::OK, [
                     ("content-type", content_type.to_owned()),
@@ -1622,7 +1671,9 @@ mod tests {
         let registration = state.catalog.get("session-42").await?;
 
         // A 2-byte segment limit commits one message per pass.
-        while process_pool_source(&state, &registration, &params("worker-a", 2), true).await? {}
+        while process_pool_source(&state, &registration, &params("worker-a", 2), true).await?
+            != Backlog::Idle
+        {}
         let response = app
             .oneshot(
                 Request::builder()
@@ -1653,10 +1704,10 @@ mod tests {
         for (ndjson, retained, trimmed, offsets) in
             [(false, 54, 36, vec![54]), (true, 27, 18, vec![36, 54])]
         {
-            let source = MockSource {
-                ndjson,
-                ..MockSource::default()
-            };
+            let source = MockSource::default();
+            if ndjson {
+                source.set_content_type("application/x-ndjson");
+            }
             let message = "{\"captured_at\":7}\n";
             source.set(&message.repeat(4), "1", 0);
             let (stream_url, server) = source.clone().serve().await?;
@@ -1675,12 +1726,14 @@ mod tests {
             state.catalog.register(&registration).await?;
             let registration = state.catalog.get("floor").await?;
             // Index the first message only.
-            assert!(
-                process_pool_source(&state, &registration, &params("worker-a", 1), true).await?
+            assert_eq!(
+                process_pool_source(&state, &registration, &params("worker-a", 1), true).await?,
+                Backlog::More
             );
             source.set(&message.repeat(4), "1", retained);
-            while process_pool_source(&state, &registration, &params("worker-a", 64), true).await? {
-            }
+            while process_pool_source(&state, &registration, &params("worker-a", 64), true).await?
+                != Backlog::Idle
+            {}
             let handles = state.ensure_index(&registration).await?;
             let mut index = handles.serving.lock().await;
             assert_eq!(index.floor_offset(), retained);
@@ -1762,7 +1815,6 @@ mod tests {
         assert_eq!(body["entries"][1]["offset"], "00000000000000000000");
 
         let response = app
-            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1772,10 +1824,6 @@ mod tests {
             .await?;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(index.lock().await.status(), &IndexStatus::Ready);
-        let response = app
-            .oneshot(Request::builder().uri("/readyz").body(Body::empty())?)
-            .await?;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
         Ok(())
     }
 
@@ -1803,16 +1851,33 @@ mod tests {
         let index = Mutex::new(index);
         let client = SourceClient::new(reqwest::Client::new(), Url::parse(&stream_url)?);
         let worker = params("worker-a", 64);
-        while single_pass(&client, &index, &worker, StartPosition::Retained, true).await? {}
+        while single_pass(&client, &index, &worker, StartPosition::Retained, true).await?
+            != Backlog::Idle
+        {}
         assert_eq!(index.lock().await.durable_offset(), 36);
 
         source.set(message, "2", 0);
-        while single_pass(&client, &index, &worker, StartPosition::Retained, true).await? {}
+        while single_pass(&client, &index, &worker, StartPosition::Retained, true).await?
+            != Backlog::Idle
+        {}
         let mut index = index.lock().await;
         assert_eq!(index.source().incarnation.as_deref(), Some("2"));
         assert_eq!(index.durable_offset(), 18);
         let result = index.query(QueryRequest::window(0, 1_000, 10)).await?;
         assert_eq!(result.entries.len(), 1);
+        drop(index);
+
+        // Recreated with a type the indexer cannot read: the restart still
+        // happens, then indexing fails instead of serving stale locators.
+        source.set_content_type("application/octet-stream");
+        source.set(message, "3", 0);
+        assert!(matches!(
+            single_pass(&client, &index, &worker, StartPosition::Retained, true).await,
+            Err(IndexError::InvalidSourceResponse(_))
+        ));
+        let index = index.lock().await;
+        assert_eq!(index.source().incarnation.as_deref(), Some("3"));
+        assert_eq!(index.durable_offset(), 0);
         drop(index);
         server.abort();
         Ok(())

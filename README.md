@@ -35,7 +35,7 @@ cargo run --bin ursula -- server --preset default
 It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses an in-memory engine. Use `--config` to load a TOML config file, or `--preset` to choose a built-in resource preset.
 
 The `ursula` deployment binary also provides the independently scalable
-`gateway` and `indexer` roles. `ursulactl` remains a separate, lightweight
+`gateway` and (experimental) `indexer` roles. `ursulactl` remains a separate, lightweight
 operator CLI:
 
 ```bash

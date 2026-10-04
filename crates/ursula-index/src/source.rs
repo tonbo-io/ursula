@@ -43,13 +43,24 @@ pub enum SourceFormat {
     Ndjson,
 }
 
-/// What a HEAD of the source reports.
+/// What a HEAD of the source reports. `format` is `None` for a content type
+/// the indexer cannot read; the incarnation is reported regardless, so a
+/// recreated stream is detected whatever its new type.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceHead {
-    pub format: SourceFormat,
+    pub format: Option<SourceFormat>,
     pub next_offset: u64,
     pub retained_offset: u64,
     pub incarnation: Option<String>,
+}
+
+impl SourceHead {
+    /// The format, or an error for a content type the indexer cannot read.
+    pub fn readable_format(&self) -> Result<SourceFormat, IndexError> {
+        self.format.ok_or(IndexError::InvalidSourceResponse(
+            "source stream is neither application/json nor application/x-ndjson",
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -101,9 +112,7 @@ impl SourceClient {
             return Err(IndexError::SourceStatus(response.status().as_u16()));
         }
         let headers = response.headers();
-        let format = source_format(headers).ok_or(IndexError::InvalidSourceResponse(
-            "source stream is neither application/json nor application/x-ndjson",
-        ))?;
+        let format = source_format(headers);
         let next_offset = offset_header(headers, HEADER_NEXT_OFFSET)?.ok_or(
             IndexError::InvalidSourceResponse("source HEAD omitted Stream-Next-Offset"),
         )?;

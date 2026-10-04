@@ -204,7 +204,7 @@ impl Extractor {
         let mut end: Option<i64> = None;
         let mut saw_invalid = false;
         for element in self.each.select(root) {
-            let time = match first_value(&self.time, element, self.config.unit) {
+            let time = match first_value(&self.time, element, self.config.unit, false) {
                 Value::Time(time) => time,
                 Value::Missing => continue,
                 Value::Invalid => {
@@ -212,7 +212,7 @@ impl Extractor {
                     continue;
                 }
             };
-            let element_end = match first_value(&self.end, element, self.config.unit) {
+            let element_end = match first_value(&self.end, element, self.config.unit, true) {
                 Value::Time(value) => value.max(time),
                 Value::Missing | Value::Invalid => time,
             };
@@ -240,14 +240,22 @@ enum Value {
 
 /// Evaluate a fallback list on one element: the first pointer that selects a
 /// present value decides. A pointer with a wildcard contributes the minimum
-/// of its valid values.
-fn first_value(pointers: &[Pointer], element: &RawValue, unit: TimeUnit) -> Value {
+/// of its valid values, or the maximum when `latest` (for `end`).
+fn first_value(pointers: &[Pointer], element: &RawValue, unit: TimeUnit, latest: bool) -> Value {
     for pointer in pointers {
         let mut best: Option<i64> = None;
         let mut invalid = false;
         for value in pointer.select(element) {
             match parse_time(value, unit) {
-                Value::Time(time) => best = Some(best.map_or(time, |current| current.min(time))),
+                Value::Time(time) => {
+                    best = Some(best.map_or(time, |current| {
+                        if latest {
+                            current.max(time)
+                        } else {
+                            current.min(time)
+                        }
+                    }))
+                }
                 Value::Invalid => invalid = true,
                 Value::Missing => {}
             }
@@ -564,6 +572,12 @@ mod tests {
         assert_eq!(
             logs.extract(br#"{"resourceLogs":[]}"#),
             Extraction::Skip(SkipKind::Missing)
+        );
+        // Without `each`, a wildcard `end` keeps its latest value.
+        let flat = extractor(None, &["/spans/*/s"], &["/spans/*/e"], TimeUnit::Ms);
+        assert_eq!(
+            flat.extract(br#"{"spans":[{"s":1,"e":5},{"s":2,"e":9}]}"#),
+            event(1, 9)
         );
     }
 
