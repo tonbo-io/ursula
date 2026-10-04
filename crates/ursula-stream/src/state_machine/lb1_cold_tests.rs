@@ -1,8 +1,7 @@
 //! Bounded-state level Lb1 cold hygiene (feature level 1): F18 step 2
 //! derived cold coverage, F14b `DeferColdGc`, F14i retention grace, and the
-//! incarnation check on `FlushCold`. Each test pins the level-0 behavior next
-//! to the level-1 one, because level 0 must stay byte-for-byte what older
-//! binaries apply.
+//! incarnation check on `FlushCold`. Since format epoch 2 every group runs at
+//! the top level, so the level-0 halves these tests once pinned are gone.
 
 use super::*;
 
@@ -156,13 +155,6 @@ fn hot_message_below_external(level: u32, id: &str) -> StreamStateMachine {
 
 #[test]
 fn f18_snapshot_at_intra_message_hot_offset_below_external_is_rejected_at_lb1() {
-    // Level 0 keeps the old (wrong) acceptance: older binaries apply it.
-    let mut legacy = hot_message_below_external(0, "align");
-    assert!(matches!(
-        publish_snapshot(&mut legacy, "align", 2),
-        StreamResponse::SnapshotPublished { .. }
-    ));
-
     let mut machine = hot_message_below_external(1, "align");
     assert_code(
         &publish_snapshot(&mut machine, "align", 2),
@@ -198,39 +190,26 @@ fn f18_offsets_at_or_below_the_seal_point_are_aligned_at_lb1() {
 
 #[test]
 fn f18_retention_collapse_stops_at_the_seal_point_at_lb1() {
-    for (level, expected_updates) in [(0, None), (1, Some(2))] {
-        let mut machine = machine_at(level);
-        create(&mut machine, "collapse", 1);
-        append(&mut machine, "collapse", b"ab");
-        append(&mut machine, "collapse", b"cd");
-        append_external(&mut machine, "collapse", "lb1/external/y.bin", 3);
-        assert!(matches!(
-            publish_snapshot(&mut machine, "collapse", 2),
-            StreamResponse::SnapshotPublished { .. }
-        ));
-        assert!(matches!(
-            retain(&mut machine, "collapse", 2, 0),
-            StreamResponse::RetentionAdvanced { .. }
-        ));
-        let plan = machine
-            .bootstrap_plan(&stream("collapse"))
-            .expect("bootstrap plan");
-        match expected_updates {
-            // Level 0 collapses `[2, 7)` (a hot message and the external)
-            // into one record, so bootstrap can only answer a partial.
-            None => {
-                assert!(plan.updates.is_empty());
-                assert!(!plan.up_to_date);
-                assert_eq!(plan.next_offset, 2);
-            }
-            // Lb1 keeps both messages: `[2, 4)` is hot, above p(s) = 2.
-            Some(count) => {
-                assert_eq!(plan.updates.len(), count, "{plan:?}");
-                assert!(plan.up_to_date);
-                assert_eq!(plan.next_offset, 7);
-            }
-        }
-    }
+    let mut machine = machine_at(1);
+    create(&mut machine, "collapse", 1);
+    append(&mut machine, "collapse", b"ab");
+    append(&mut machine, "collapse", b"cd");
+    append_external(&mut machine, "collapse", "lb1/external/y.bin", 3);
+    assert!(matches!(
+        publish_snapshot(&mut machine, "collapse", 2),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    assert!(matches!(
+        retain(&mut machine, "collapse", 2, 0),
+        StreamResponse::RetentionAdvanced { .. }
+    ));
+    let plan = machine
+        .bootstrap_plan(&stream("collapse"))
+        .expect("bootstrap plan");
+    // Both messages are kept: `[2, 4)` is hot, above p(s) = 2.
+    assert_eq!(plan.updates.len(), 2, "{plan:?}");
+    assert!(plan.up_to_date);
+    assert_eq!(plan.next_offset, 7);
 }
 
 #[test]
@@ -284,18 +263,6 @@ fn f18_snapshot_field_six_is_the_seal_point_and_ignored_at_restore() {
         .read_plan(&stream("field"), 0, 64)
         .expect("restored read plan");
     assert_eq!(restored_plan.next_offset, 7);
-
-    // Level 0 still writes the legacy scalar (2, regressed below the
-    // external: bounded-state D1).
-    let mut legacy = machine_at(0);
-    create(&mut legacy, "field", 1);
-    append(&mut legacy, "field", b"ab");
-    append_external(&mut legacy, "field", "lb1/external/w.bin", 3);
-    assert!(matches!(
-        flush(&mut legacy, "field", 0, 2, "lb1/chunks/ab.bin"),
-        StreamResponse::ColdFlushed { .. }
-    ));
-    assert_eq!(entry(&legacy.snapshot(), "field").cold_frontier_offset, 2);
 }
 
 #[test]
@@ -359,29 +326,24 @@ fn shared_pack_stream(level: u32, id: &str) -> StreamStateMachine {
 #[test]
 fn f14i_retention_keeps_dropped_pack_slices_for_the_grace_at_lb1() {
     const NOW_MS: u64 = 1_000_000;
-    for (level, expected_not_before) in [
-        (0, 0),
-        (1, NOW_MS + super::cold::RETENTION_COLD_GC_GRACE_MS),
-    ] {
-        let mut machine = shared_pack_stream(level, "pack");
-        assert!(matches!(
-            retain(&mut machine, "pack", 4, NOW_MS),
-            StreamResponse::RetentionAdvanced { .. }
-        ));
-        let pending = machine.pending_cold_gc_batch(8);
-        assert_eq!(pending.len(), 1, "level {level}: {pending:?}");
-        assert_eq!(
-            pending[0].target,
-            ColdGcTarget::Paths(vec!["_packs/0/pack.bin".to_owned()])
-        );
-        assert_eq!(
-            pending[0].not_before_ms, expected_not_before,
-            "level {level}"
-        );
-        // The grace is replicated state: a restored replica keeps it.
-        let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore");
-        assert_eq!(restored.pending_cold_gc_batch(8), pending);
-    }
+    let mut machine = shared_pack_stream(1, "pack");
+    assert!(matches!(
+        retain(&mut machine, "pack", 4, NOW_MS),
+        StreamResponse::RetentionAdvanced { .. }
+    ));
+    let pending = machine.pending_cold_gc_batch(8);
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(
+        pending[0].target,
+        ColdGcTarget::Paths(vec!["_packs/0/pack.bin".to_owned()])
+    );
+    assert_eq!(
+        pending[0].not_before_ms,
+        NOW_MS + super::cold::RETENTION_COLD_GC_GRACE_MS
+    );
+    // The grace is replicated state: a restored replica keeps it.
+    let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore");
+    assert_eq!(restored.pending_cold_gc_batch(8), pending);
 }
 
 fn gc_queue_with_two_entries(level: u32) -> StreamStateMachine {
@@ -402,20 +364,6 @@ fn gc_queue_with_two_entries(level: u32) -> StreamStateMachine {
     }
     assert_eq!(machine.pending_cold_gc_len(), 2);
     machine
-}
-
-#[test]
-fn f14b_defer_cold_gc_requires_level_one() {
-    let mut machine = gc_queue_with_two_entries(0);
-    let head = machine.pending_cold_gc_batch(1)[0].seq;
-    assert_code(
-        &machine.apply(StreamCommand::DeferColdGc {
-            seq: head,
-            not_before_ms: 5,
-        }),
-        StreamErrorCode::FeatureNotEnabled,
-    );
-    assert_eq!(machine.pending_cold_gc_batch(1)[0].seq, head);
 }
 
 #[test]
@@ -540,75 +488,9 @@ fn flush_cold_from_a_removed_incarnation_is_stale_at_lb1() {
     ));
 }
 
+/// A whole hot message at the seal point stays a complete bootstrap.
 #[test]
-fn flush_cold_generation_is_not_checked_at_level_zero() {
-    let mut machine = machine_at(0);
-    create(&mut machine, "legacy", 1);
-    append(&mut machine, "legacy", b"abcd");
-    // Old binaries ignore the field, so level 0 must too.
-    assert!(matches!(
-        machine.apply(StreamCommand::FlushCold {
-            stream_id: stream("legacy"),
-            chunk: ColdChunkRef {
-                start_offset: 0,
-                end_offset: 4,
-                s3_path: "lb1/chunks/legacy.bin".to_owned(),
-                object_size: 4,
-                object_offset: 0,
-                shared_object: false,
-                payload_digest: String::new(),
-            },
-            cold_generation: Some(99),
-        }),
-        StreamResponse::ColdFlushed { .. }
-    ));
-}
-
-/// A group raised from level 0 can hold a legacy collapsed message record
-/// that starts at the retained offset, which is also the seal point, and
-/// folds a hot message and an external into one record. At Lb1 bootstrap
-/// must not return it as one part (never more than one message per part):
-/// it answers the honest partial instead.
-#[test]
-fn bootstrap_after_a_raise_does_not_return_a_legacy_collapsed_record_as_one_part() {
-    let mut machine = machine_at(0);
-    create(&mut machine, "raised", 1);
-    append(&mut machine, "raised", b"ab");
-    append(&mut machine, "raised", b"cd");
-    append_external(&mut machine, "raised", "lb1/external/r.bin", 3);
-    assert!(matches!(
-        publish_snapshot(&mut machine, "raised", 2),
-        StreamResponse::SnapshotPublished { .. }
-    ));
-    assert!(matches!(
-        retain(&mut machine, "raised", 2, 0),
-        StreamResponse::RetentionAdvanced { .. }
-    ));
-    // Level 0 collapsed `[2, 7)`: the hot `cd` and the external.
-    let records = &machine
-        .stream_slot(&stream("raised"))
-        .expect("slot")
-        .message_records;
-    assert_eq!(
-        records
-            .iter()
-            .map(|record| (record.start_offset, record.end_offset))
-            .collect::<Vec<_>>(),
-        vec![(2, 7)]
-    );
-    assert!(matches!(
-        machine.apply(StreamCommand::SetFeatureLevel { level: 1 }),
-        StreamResponse::FeatureLevelSet { .. }
-    ));
-    assert_eq!(machine.seal_point(&stream("raised")), 2);
-    let plan = machine
-        .bootstrap_plan(&stream("raised"))
-        .expect("bootstrap plan");
-    assert!(plan.updates.is_empty(), "{plan:?}");
-    assert!(!plan.up_to_date);
-    assert_eq!(plan.next_offset, 2);
-
-    // A whole hot message at the seal point stays a complete bootstrap.
+fn bootstrap_keeps_whole_hot_messages_at_the_seal_point() {
     let mut fresh = machine_at(1);
     create(&mut fresh, "fresh", 1);
     append(&mut fresh, "fresh", b"ab");
@@ -793,10 +675,9 @@ fn bootstrap_after_a_raise_never_merges_or_skips_messages_for_any_level_zero_his
         }
         folds += u32::from(check(&machine, &messages, seed, "final"));
     }
-    assert!(
-        folds > 0,
-        "the sweep builds legacy collapsed records at the seal point"
-    );
+    // F4: the top level keeps no per-message records, so no history builds a
+    // collapsed record at the seal point.
+    assert_eq!(folds, 0);
 }
 
 fn len_u64(len: usize) -> u64 {

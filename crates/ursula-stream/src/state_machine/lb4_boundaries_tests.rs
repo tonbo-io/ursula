@@ -137,13 +137,6 @@ fn retain(machine: &mut StreamStateMachine, id: &str, offset: u64) -> StreamResp
     })
 }
 
-fn tidy(machine: &mut StreamStateMachine, id: &str) -> StreamResponse {
-    machine.apply(StreamCommand::TidyStream {
-        stream_id: stream(id),
-        now_ms: 0,
-    })
-}
-
 fn entry(machine: &StreamStateMachine, id: &str) -> StreamSnapshotEntry {
     machine
         .snapshot()
@@ -262,13 +255,6 @@ fn assert_restore_matches_live(machine: &StreamStateMachine, id: &str) -> Stream
         machine.hot_real_len(&stream(id))
     );
     restored
-}
-
-#[test]
-fn level_four_can_be_raised() {
-    let mut machine = machine_at(0);
-    raise(&mut machine, LB4);
-    assert_eq!(machine.feature_level(), LB4);
 }
 
 #[test]
@@ -428,98 +414,6 @@ fn retention_prunes_append_starts_below_the_new_seal_point() {
 }
 
 #[test]
-fn legacy_records_convert_on_tidy_and_bootstrap_stays_exact() {
-    for content_type in [OCTET, JSON] {
-        let mut machine = machine_at(crate::feature::FEATURE_LEVEL_EXTERNAL_LOCATORS);
-        let mut oracle = Oracle::default();
-        create(&mut machine, "s", content_type, b"");
-        let mut offset = 0;
-        for seed in 0..4 {
-            let payload = if content_type == JSON {
-                json_records(2, seed)
-            } else {
-                vec![b'a' + seed as u8; 5]
-            };
-            append(&mut machine, "s", content_type, &payload);
-            if content_type == JSON {
-                oracle.push_json(offset, &payload);
-            } else {
-                oracle.push(offset, offset + payload.len() as u64);
-            }
-            offset += payload.len() as u64;
-        }
-        // Split the second message at level 3: the legacy representation
-        // keeps a fragment record at the seal point.
-        let split = oracle.messages[1].0 + 2;
-        flush(&mut machine, "s", 0, split, "chunk-1");
-        let legacy = entry(&machine, "s");
-        assert!(!legacy.message_records.is_empty());
-        let legacy_plan = machine.bootstrap_plan(&stream("s"));
-
-        raise(&mut machine, LB4);
-        // Untouched legacy streams keep answering from their records.
-        assert_eq!(machine.bootstrap_plan(&stream("s")), legacy_plan);
-        oracle.check_bootstrap(&machine, "s");
-        assert!(machine.stream_has_tidy_debt(&stream("s"), 0));
-        let restored = assert_restore_matches_live(&machine, "s");
-        assert_eq!(restored.snapshot(), machine.snapshot());
-
-        assert!(matches!(
-            tidy(&mut machine, "s"),
-            StreamResponse::StreamTidied { .. }
-        ));
-        let converted = entry(&machine, "s");
-        assert!(converted.message_records.is_empty());
-        if content_type == JSON {
-            assert!(converted.hot_append_starts.is_empty());
-        } else {
-            // The fragment at the seal point is not a message start.
-            let starts = oracle
-                .messages
-                .iter()
-                .map(|(start, _)| *start)
-                .filter(|start| *start > split)
-                .collect::<Vec<_>>();
-            assert_eq!(converted.hot_append_starts, starts);
-        }
-        assert!(!machine.stream_has_tidy_debt(&stream("s"), 0));
-        oracle.check_bootstrap(&machine, "s");
-        assert_restore_matches_live(&machine, "s");
-        // A later append extends the converted representation.
-        let payload = if content_type == JSON {
-            json_records(1, 9)
-        } else {
-            b"zz".to_vec()
-        };
-        append(&mut machine, "s", content_type, &payload);
-        if content_type == JSON {
-            oracle.push_json(offset, &payload);
-        } else {
-            oracle.push(offset, offset + payload.len() as u64);
-        }
-        oracle.check_bootstrap(&machine, "s");
-        assert_restore_matches_live(&machine, "s");
-    }
-}
-
-#[test]
-fn legacy_records_convert_on_the_next_append() {
-    let mut machine = machine_at(crate::feature::FEATURE_LEVEL_EXTERNAL_LOCATORS);
-    create(&mut machine, "bin", OCTET, b"abc");
-    append(&mut machine, "bin", OCTET, b"de");
-    raise(&mut machine, LB4);
-    append(&mut machine, "bin", OCTET, b"f");
-    let entry = entry(&machine, "bin");
-    assert!(entry.message_records.is_empty());
-    assert_eq!(entry.hot_append_starts, vec![0, 3, 5]);
-    let mut oracle = Oracle::default();
-    oracle.push(0, 3);
-    oracle.push(3, 5);
-    oracle.push(5, 6);
-    oracle.check_bootstrap(&machine, "bin");
-}
-
-#[test]
 fn restore_rejects_inconsistent_append_starts() {
     let mut machine = machine_at(LB4);
     create(&mut machine, "bin", OCTET, b"");
@@ -574,13 +468,6 @@ fn restore_rejects_inconsistent_append_starts() {
                 .position(|entry| entry.metadata.stream_id == stream("json"))
                 .expect("json");
             s.streams[i].hot_append_starts = vec![0];
-        }),
-        Err(StreamSnapshotError::MessageBoundaryMismatch { .. })
-    ));
-    // Starts below level 4.
-    assert!(matches!(
-        mutate(&|s| {
-            s.feature_level = crate::feature::FEATURE_LEVEL_EXTERNAL_LOCATORS;
         }),
         Err(StreamSnapshotError::MessageBoundaryMismatch { .. })
     ));
@@ -700,60 +587,6 @@ fn restore_matches_live_and_bootstrap_matches_oracle_under_random_workload() {
             }
             oracle.check_bootstrap(&machine, "s");
             assert_restore_matches_live(&machine, "s");
-        }
-    }
-}
-
-/// Regression: below level 4, a flush that clips a straddling message record
-/// to start at the seal point left the hot-record gauge (F6c) one short of
-/// what a restored replica counts, so admission and the flush planner saw
-/// different real bytes on the leader and on a replica that installed a
-/// snapshot.
-#[test]
-fn hot_record_gauge_matches_restore_after_a_clipping_flush_below_level_4() {
-    let mut machine = machine_at(crate::feature::FEATURE_LEVEL_EXTERNAL_LOCATORS);
-    create(&mut machine, "bin", OCTET, b"");
-    append(&mut machine, "bin", OCTET, b"aaaaa");
-    append(&mut machine, "bin", OCTET, b"bbbbb");
-    append(&mut machine, "bin", OCTET, b"ccccc");
-    flush(&mut machine, "bin", 0, 7, "chunk-1");
-    let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore");
-    assert_eq!(restored.total_hot_records(), machine.total_hot_records());
-    assert_eq!(
-        restored.total_hot_real_bytes(),
-        machine.total_hot_real_bytes()
-    );
-}
-
-/// SM4: a level-0 group accepts a snapshot inside an external append that
-/// lies above hot bytes (the scalar cold frontier covers it). Whatever level
-/// the group reaches later, bootstrap from that snapshot must never skip the
-/// rest of the straddled message: it answers the honest partial.
-#[test]
-fn bootstrap_from_a_level_zero_snapshot_inside_an_external_append_is_partial() {
-    for level in [0, 1, 2, 3, LB4] {
-        let mut machine = machine_at(0);
-        create(&mut machine, "mid-ext", OCTET, b"");
-        append(&mut machine, "mid-ext", OCTET, &[b'h'; 50]);
-        append_external(&mut machine, "mid-ext", "ext", 19);
-        let response = publish_snapshot(&mut machine, "mid-ext", 55);
-        assert!(
-            matches!(response, StreamResponse::SnapshotPublished { .. }),
-            "{response:?}"
-        );
-        if level > 0 {
-            raise(&mut machine, level);
-        }
-        append(&mut machine, "mid-ext", OCTET, b"tail!");
-        for machine in [
-            &machine,
-            &StreamStateMachine::restore(machine.snapshot()).expect("restore"),
-        ] {
-            let plan = machine.bootstrap_plan(&stream("mid-ext")).expect("plan");
-            assert_eq!(plan.snapshot.as_ref().map(|s| s.offset), Some(55));
-            assert!(plan.updates.is_empty(), "level {level}: {plan:?}");
-            assert_eq!(plan.next_offset, 55, "level {level}");
-            assert!(!plan.up_to_date, "level {level}");
         }
     }
 }

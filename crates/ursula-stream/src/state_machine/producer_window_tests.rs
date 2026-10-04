@@ -1,16 +1,14 @@
 //! F3 producer bounds, F4a message-record collapse and F0 `TidyStream` at
-//! feature level 1 (`docs/architecture/bounded-stream-state.md` §5.1, §5.4,
+//! the top feature level (`docs/architecture/bounded-stream-state.md` §5.1, §5.4,
 //! §5.5).
 
 use bytes::Bytes;
 
 use super::producers::PRODUCER_IDLE_EXPIRY_MS;
-use super::producers::RECEIPT_TRIM_BUDGET;
 use super::producers::RECEIPT_WINDOW_ITEMS;
 use super::*;
 
 const OCTET: &str = "application/octet-stream";
-const JSON: &str = "application/json";
 const BUCKET: &str = "window";
 const R: u64 = RECEIPT_WINDOW_ITEMS;
 
@@ -142,24 +140,6 @@ fn window_edges_at_r_minus_one_r_and_r_plus_one() {
         );
         assert!(window_items(&machine, &stream_id) <= R);
     }
-}
-
-#[test]
-fn level_zero_keeps_every_receipt_and_answers_409_shape_unchanged() {
-    let mut machine = machine_at(0);
-    let stream_id = create(&mut machine, "legacy", OCTET);
-    for seq in 0..(R + 10) {
-        appended(append(&mut machine, &stream_id, "p", seq, 1));
-    }
-    assert_eq!(receipts(&machine, &stream_id, "p").len() as u64, R + 10);
-    let state = machine
-        .stream_slot(&stream_id)
-        .unwrap()
-        .producers
-        .get("p")
-        .unwrap();
-    assert_eq!(state.last_items.len(), 1, "level 0 keeps last_items");
-    assert_eq!(state.last_seen_ms, None, "level 0 stamps nothing new");
 }
 
 #[test]
@@ -320,62 +300,18 @@ fn snapshot_round_trip_and_restore_versus_live_differential() {
 }
 
 #[test]
-fn legacy_snapshot_without_last_seen_restores_unstamped() {
-    let mut machine = machine_at(1);
-    let stream_id = create(&mut machine, "legacy-field", OCTET);
-    appended(append(&mut machine, &stream_id, "p", 0, 5));
-    let mut value = serde_json::to_value(machine.snapshot()).unwrap();
-    value["streams"][0]["producer_states"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("last_seen_ms");
-    let legacy: StreamSnapshot = serde_json::from_value(value).unwrap();
-    assert_eq!(legacy.streams[0].producer_states[0].last_seen_ms, None);
-    let restored = StreamStateMachine::restore(legacy).unwrap();
-    assert_eq!(
-        restored
-            .stream_slot(&stream_id)
-            .unwrap()
-            .producers
-            .get("p")
-            .unwrap()
-            .last_seen_ms,
-        None
-    );
-    // Its idle period starts at the first tidy.
-    assert!(restored.stream_has_tidy_debt(&stream_id, 6));
-}
-
-#[test]
 fn level_one_restore_does_not_synthesize_receipts() {
     let mut machine = machine_at(1);
     let stream_id = create(&mut machine, "synth", OCTET);
     appended(append(&mut machine, &stream_id, "p", 0, 5));
     let mut snapshot = machine.snapshot();
     snapshot.streams[0].producer_states[0].receipts.clear();
-    let restored = StreamStateMachine::restore(snapshot.clone()).unwrap();
-    assert!(receipts(&restored, &stream_id, "p").is_empty());
-    snapshot.feature_level = 0;
     let restored = StreamStateMachine::restore(snapshot).unwrap();
-    assert_eq!(receipts(&restored, &stream_id, "p"), vec![0]);
+    assert!(receipts(&restored, &stream_id, "p").is_empty());
 }
 
 #[test]
-fn tidy_stream_requires_level_one_and_is_idempotent() {
-    let mut machine = machine_at(0);
-    let stream_id = create(&mut machine, "tidy-gate", OCTET);
-    assert!(matches!(
-        machine.apply(StreamCommand::TidyStream {
-            stream_id: stream_id.clone(),
-            now_ms: 1,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::FeatureNotEnabled,
-            ..
-        }
-    ));
-    assert!(machine.tidy_candidates(1, 64).is_empty());
-
+fn tidy_stream_is_idempotent() {
     let mut machine = machine_at(1);
     let stream_id = create(&mut machine, "tidy", OCTET);
     assert_eq!(
@@ -411,116 +347,6 @@ fn tidy_stream_requires_level_one_and_is_idempotent() {
 }
 
 #[test]
-fn tidy_stream_stamps_and_expires_pre_raise_producers() {
-    let mut machine = machine_at(0);
-    let stream_id = create(&mut machine, "raise", OCTET);
-    appended(append(&mut machine, &stream_id, "p", 0, 1));
-    machine.apply(StreamCommand::SetFeatureLevel { level: 1 });
-    assert_eq!(machine.tidy_candidates(2, 64), vec![stream_id.clone()]);
-    assert_eq!(
-        machine.apply(StreamCommand::TidyStream {
-            stream_id: stream_id.clone(),
-            now_ms: 2,
-        }),
-        StreamResponse::StreamTidied {
-            debt_remaining: false
-        }
-    );
-    let state = machine
-        .stream_slot(&stream_id)
-        .unwrap()
-        .producers
-        .get("p")
-        .unwrap()
-        .clone();
-    assert_eq!(state.last_seen_ms, Some(2));
-    assert!(state.last_items.is_empty());
-    assert!(machine.tidy_candidates(3, 64).is_empty());
-    // Idle from the stamp on.
-    let idle_at = 2 + PRODUCER_IDLE_EXPIRY_MS;
-    assert_eq!(machine.tidy_candidates(idle_at, 64), vec![
-        stream_id.clone()
-    ]);
-    machine.apply(StreamCommand::TidyStream {
-        stream_id: stream_id.clone(),
-        now_ms: idle_at,
-    });
-    assert!(
-        machine
-            .stream_slot(&stream_id)
-            .unwrap()
-            .producers
-            .is_empty()
-    );
-    assert_eq!(window_items(&machine, &stream_id), 0);
-}
-
-/// A legacy producer with 1M receipts converges through bounded
-/// `TidyStream` commands (§8 B3 exit: under 10 ms of apply each).
-#[test]
-fn legacy_producer_with_a_million_receipts_converges_in_bounded_commands() {
-    const LEGACY: u64 = 1_000_000;
-    let mut machine = machine_at(0);
-    let stream_id = create(&mut machine, "million", OCTET);
-    appended(append(&mut machine, &stream_id, "p", 0, 1));
-    let mut snapshot = machine.snapshot();
-    let state = &mut snapshot.streams[0].producer_states[0];
-    let template = state.receipts[0].clone();
-    state.receipts = (0..LEGACY)
-        .map(|seq| ProducerReceipt {
-            producer_seq: seq,
-            ..template.clone()
-        })
-        .collect();
-    state.producer_seq = LEGACY - 1;
-    let mut machine = StreamStateMachine::restore(snapshot).unwrap();
-    assert_eq!(window_items(&machine, &stream_id), LEGACY);
-    machine.apply(StreamCommand::SetFeatureLevel { level: 1 });
-
-    let mut commands = 0;
-    let mut slowest = std::time::Duration::ZERO;
-    loop {
-        let before = receipts(&machine, &stream_id, "p").len();
-        let started = std::time::Instant::now();
-        let response = machine.apply(StreamCommand::TidyStream {
-            stream_id: stream_id.clone(),
-            now_ms: 2,
-        });
-        slowest = slowest.max(started.elapsed());
-        commands += 1;
-        let after = receipts(&machine, &stream_id, "p").len();
-        assert!(before - after <= RECEIPT_TRIM_BUDGET);
-        if response
-            == (StreamResponse::StreamTidied {
-                debt_remaining: false,
-            })
-        {
-            break;
-        }
-        assert!(commands < 32, "tidy did not converge");
-    }
-    assert_eq!(
-        commands,
-        (LEGACY - R).div_ceil(RECEIPT_TRIM_BUDGET as u64) as usize
-    );
-    assert_eq!(window_items(&machine, &stream_id), R);
-    assert_eq!(
-        receipts(&machine, &stream_id, "p").first().copied(),
-        Some(LEGACY - R)
-    );
-    // The newest sequence is still answered exactly; an evicted one without
-    // ranges, and the lookup does not scan.
-    assert!(!appended(append(&mut machine, &stream_id, "p", LEGACY - 1, 3)).3);
-    assert!(appended(append(&mut machine, &stream_id, "p", 5, 3)).3);
-    if !cfg!(debug_assertions) {
-        assert!(
-            slowest < std::time::Duration::from_millis(10),
-            "slowest tidy apply took {slowest:?}"
-        );
-    }
-}
-
-#[test]
 fn duplicate_lookup_is_direct_at_a_million_receipts() {
     let receipts = (0..1_000_000u64)
         .map(|seq| ProducerReceipt {
@@ -541,82 +367,6 @@ fn duplicate_lookup_is_direct_at_a_million_receipts() {
     assert!(super::append::find_receipt(&receipts, 6).is_none());
     assert!(super::append::find_receipt(&receipts, 1_000_007).is_none());
     assert!(started.elapsed() < std::time::Duration::from_millis(50));
-}
-
-fn external(
-    machine: &mut StreamStateMachine,
-    stream_id: &BucketStreamId,
-    path: &str,
-    len: u64,
-    record_ends: Vec<u64>,
-) {
-    let response = machine.apply(StreamCommand::AppendExternal {
-        stream_id: stream_id.clone(),
-        content_type: Some(JSON.to_owned()),
-        payload: ExternalPayloadRef {
-            s3_path: path.to_owned(),
-            payload_len: len,
-            object_size: len,
-        },
-        record_ends,
-        close_after: false,
-        stream_seq: None,
-        producer: None,
-        now_ms: 1,
-        record_match: None,
-    });
-    assert!(
-        matches!(response, StreamResponse::Appended { .. }),
-        "{response:?}"
-    );
-}
-
-#[test]
-fn external_appends_keep_at_most_two_message_records_at_level_one() {
-    for (level, expected) in [(0usize, 50usize), (1, 1)] {
-        let mut machine = machine_at(level as u32);
-        let stream_id = create(&mut machine, "w3", JSON);
-        for index in 0..10 {
-            external(&mut machine, &stream_id, &format!("ext/{index}"), 10, vec![
-                2, 4, 6, 8, 10,
-            ]);
-        }
-        let slot = machine.stream_slot(&stream_id).unwrap();
-        assert_eq!(slot.message_records.len(), expected, "level {level}");
-    }
-    // Interleaved hot bytes: records above the first hot byte stay exact.
-    let mut machine = machine_at(1);
-    let stream_id = create(&mut machine, "w3-inline", JSON);
-    external(&mut machine, &stream_id, "ext/a", 10, vec![5, 10]);
-    assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream_id.clone(),
-            content_type: Some(JSON.to_owned()),
-            payload: Bytes::from_static(b"1\n2\n"),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 1,
-            record_match: None,
-        }),
-        StreamResponse::Appended { .. }
-    ));
-    external(&mut machine, &stream_id, "ext/b", 10, vec![5, 10]);
-    let records = &machine.stream_slot(&stream_id).unwrap().message_records;
-    assert_eq!(
-        records
-            .iter()
-            .map(|record| (record.start_offset, record.end_offset))
-            .collect::<Vec<_>>(),
-        vec![(0, 10), (10, 12), (12, 14), (14, 19), (19, 24)]
-    );
-    let plan = machine.bootstrap_plan(&stream_id).unwrap();
-    assert!(
-        !plan.up_to_date,
-        "bootstrap from 0 below the seal point is partial"
-    );
-    assert!(plan.updates.is_empty());
-    assert_eq!(plan.next_offset, 0);
 }
 
 #[test]
@@ -746,42 +496,6 @@ fn bootstrap_is_partial_when_the_cold_frontier_regressed_below_the_seal_point() 
 }
 
 #[test]
-fn tidy_stream_collapses_legacy_external_message_records() {
-    let mut machine = machine_at(0);
-    let stream_id = create(&mut machine, "tidy-w3", JSON);
-    for index in 0..5 {
-        external(&mut machine, &stream_id, &format!("ext/{index}"), 10, vec![
-            5, 10,
-        ]);
-    }
-    assert_eq!(
-        machine
-            .stream_slot(&stream_id)
-            .unwrap()
-            .message_records
-            .len(),
-        10
-    );
-    machine.apply(StreamCommand::SetFeatureLevel { level: 1 });
-    assert_eq!(machine.tidy_candidates(1, 64), vec![stream_id.clone()]);
-    assert_eq!(
-        machine.apply(StreamCommand::TidyStream {
-            stream_id: stream_id.clone(),
-            now_ms: 1,
-        }),
-        StreamResponse::StreamTidied {
-            debt_remaining: false
-        }
-    );
-    let records = &machine.stream_slot(&stream_id).unwrap().message_records;
-    assert_eq!(records.len(), 1);
-    assert_eq!((records[0].start_offset, records[0].end_offset), (0, 50));
-    assert_eq!(records.capacity(), 1);
-    // Restore accepts the collapsed coverage.
-    StreamStateMachine::restore(machine.snapshot()).unwrap();
-}
-
-#[test]
 fn tidy_stream_command_round_trips_through_serde() {
     let command = StreamCommand::TidyStream {
         stream_id: sid("serde"),
@@ -856,88 +570,4 @@ fn producer_cap_evicts_hour_idle_producers_and_rejects_otherwise() {
     // A replica that restores the snapshot holds the same producers.
     let restored = StreamStateMachine::restore(machine.snapshot()).unwrap();
     assert_eq!(producer_snapshot(&restored), producer_snapshot(&machine));
-}
-
-#[test]
-fn producer_cap_does_not_apply_below_level_one() {
-    use super::producers::MAX_PRODUCERS_PER_STREAM;
-    let mut machine = machine_at(0);
-    let stream_id = create(&mut machine, "cap-l0", OCTET);
-    for index in 0..=MAX_PRODUCERS_PER_STREAM {
-        appended(append(
-            &mut machine,
-            &stream_id,
-            &format!("p{index:04}"),
-            0,
-            0,
-        ));
-    }
-    assert_eq!(
-        machine.stream_slot(&stream_id).unwrap().producers.len(),
-        MAX_PRODUCERS_PER_STREAM + 1
-    );
-}
-
-#[test]
-fn producer_cap_excess_after_the_raise_drains_in_bounded_commands() {
-    use super::producers::MAX_PRODUCERS_PER_STREAM;
-    use super::producers::PRODUCER_CAP_EVICT_BUDGET;
-    use super::producers::PRODUCER_CAP_EVICT_IDLE_MS;
-    // SM1: a level-0 stream far over the cap must not evict its whole
-    // excess in one apply after the raise; each command evicts at most the
-    // budget, oldest `(last_seen_ms, producer_id)` first, and `TidyStream`
-    // drains the rest.
-    let total = MAX_PRODUCERS_PER_STREAM + 3 * PRODUCER_CAP_EVICT_BUDGET + 7;
-    let mut machine = machine_at(0);
-    let stream_id = create(&mut machine, "cap-drain", OCTET);
-    for index in 0..total {
-        appended(append(
-            &mut machine,
-            &stream_id,
-            &format!("p{index:05}"),
-            0,
-            0,
-        ));
-    }
-    machine.apply(StreamCommand::SetFeatureLevel { level: 1 });
-    let tidy = |machine: &mut StreamStateMachine, now_ms: u64| match machine.apply(
-        StreamCommand::TidyStream {
-            stream_id: stream_id.clone(),
-            now_ms,
-        },
-    ) {
-        StreamResponse::StreamTidied { debt_remaining } => debt_remaining,
-        other => panic!("expected StreamTidied, got {other:?}"),
-    };
-    // Stamp every pre-raise producer at 0; nobody is evictable yet.
-    while tidy(&mut machine, 0) {}
-    let count =
-        |machine: &StreamStateMachine| machine.stream_slot(&stream_id).unwrap().producers.len();
-    assert_eq!(count(&machine), total);
-
-    let later = PRODUCER_CAP_EVICT_IDLE_MS;
-    appended(append(&mut machine, &stream_id, "new", 0, later));
-    assert_eq!(count(&machine), total + 1 - PRODUCER_CAP_EVICT_BUDGET);
-    assert!(machine.stream_has_tidy_debt(&stream_id, later));
-    let restored = StreamStateMachine::restore(machine.snapshot()).unwrap();
-    assert_eq!(producer_snapshot(&restored), producer_snapshot(&machine));
-
-    let mut tidies = 0;
-    while tidy(&mut machine, later) {
-        tidies += 1;
-        assert!(tidies <= 4, "tidy does not converge");
-    }
-    assert_eq!(count(&machine), MAX_PRODUCERS_PER_STREAM);
-    assert!(!machine.stream_has_tidy_debt(&stream_id, later));
-    let slot = machine.stream_slot(&stream_id).unwrap();
-    assert!(slot.producers.contains_key("new"));
-    // Every producer was stamped at 0, so the smallest ids went first.
-    let first_kept = total + 1 - MAX_PRODUCERS_PER_STREAM;
-    assert!(
-        !slot
-            .producers
-            .contains_key(&format!("p{:05}", first_kept - 1))
-    );
-    assert!(slot.producers.contains_key(&format!("p{first_kept:05}")));
-    window_items(&machine, &stream_id);
 }

@@ -1,8 +1,9 @@
 //! Pins of the base protocol contract that the 0.6.0 removals must keep:
 //! `Stream-Seq` as a compare-and-set, `Stream-Next-Offset` as the exact
 //! resume point, the HEAD snapshot and retention headers, `Stream-Incarnation`
-//! as a token that changes on delete and recreate, and `Retry-After` on an
-//! append's temporary 503. The other error headers are pinned in
+//! as a token that changes on delete and recreate, `Retry-After` on an
+//! append's temporary 503, a duplicate beyond the receipt window answered 204
+//! without `Stream-Next-Offset`, and the producer-cap 429. The other error headers are pinned in
 //! `tests.rs`: `producer_headers_deduplicate_retries_and_fence_stale_epochs`,
 //! `long_poll_returns_service_unavailable_when_live_waiters_are_full` (a
 //! read's temporary 503) and
@@ -372,8 +373,9 @@ async fn head_reports_snapshot_and_retention_after_publish_and_advance() {
     assert_eq!(header(&response, HEADER_STREAM_RETAINED_OFFSET), at);
 }
 
-/// The group is raised to feature level 1, where incarnations are unique
-/// per group even when both creates land in the same millisecond.
+/// Incarnations are unique per group even when both creates land in the
+/// same millisecond; every group runs at the top level, so no raise is
+/// needed (format epoch 2).
 #[tokio::test]
 async fn stream_incarnation_changes_on_delete_and_recreate() {
     async fn incarnation(app: &Router, uri: &str) -> String {
@@ -383,15 +385,6 @@ async fn stream_incarnation_changes_on_delete_and_recreate() {
     }
 
     let app = app();
-    let response = send(
-        &app,
-        "POST",
-        "/__ursula/feature-level",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        r#"{"level":1}"#,
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
     let uri = "/contract/incarnation";
 
     let response = create(&app, uri, &[], "").await;
@@ -426,4 +419,58 @@ async fn temporary_unavailable_answers_carry_retry_after() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(header(&response, "retry-after"), "1");
     assert!(body_text(response).await.contains("ColdBackpressure"));
+}
+
+fn producer_headers<'a>(id: &'a str, seq: &'a str) -> [(&'static str, &'a str); 3] {
+    [
+        (HEADER_PRODUCER_ID, id),
+        (HEADER_PRODUCER_EPOCH, "0"),
+        (HEADER_PRODUCER_SEQ, seq),
+    ]
+}
+
+/// A duplicate older than the producer's newest 1,024 receipts is still
+/// answered as a duplicate, 204 without `Stream-Next-Offset`, and appends
+/// nothing (bounded producer receipts, F3).
+#[tokio::test]
+async fn duplicate_beyond_the_receipt_window_answers_204_without_next_offset() {
+    let app = app();
+    let uri = "/contract/receipt-window";
+    let response = create(&app, uri, &[], "").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    for seq in 0..=1_025_u64 {
+        let seq = seq.to_string();
+        let response = append(&app, uri, &producer_headers("writer", &seq), "x").await;
+        assert_eq!(response.status(), StatusCode::OK, "seq {seq}");
+    }
+    let before = tail(&app, uri).await;
+
+    let response = append(&app, uri, &producer_headers("writer", "0"), "x").await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(
+        response.headers().get(HEADER_STREAM_NEXT_OFFSET).is_none(),
+        "{:?}",
+        response.headers()
+    );
+    assert_eq!(tail(&app, uri).await, before);
+}
+
+/// The 4,097th producer active within an hour is refused with 429 and a
+/// `producer_limit` body. The error is permanent for that request, so it
+/// carries no `Retry-After`.
+#[tokio::test]
+async fn producer_cap_answers_429_with_producer_limit_and_no_retry_after() {
+    let app = app();
+    let uri = "/contract/producer-cap";
+    let response = create(&app, uri, &[], "").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    for index in 0..4_096 {
+        let id = format!("p{index:04}");
+        let response = append(&app, uri, &producer_headers(&id, "0"), "x").await;
+        assert_eq!(response.status(), StatusCode::OK, "producer {id}");
+    }
+    let response = append(&app, uri, &producer_headers("one-too-many", "0"), "x").await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().get("retry-after").is_none());
+    assert!(body_text(response).await.contains("producer_limit"));
 }

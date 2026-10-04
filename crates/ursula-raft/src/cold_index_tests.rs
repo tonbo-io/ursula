@@ -18,9 +18,7 @@ use openraft::entry::RaftEntry;
 use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
 use openraft::vote::RaftLeaderId;
-use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
-use ursula_runtime::ColdIndexPageKey;
 use ursula_runtime::ColdIndexPageStore;
 use ursula_runtime::ColdStore;
 use ursula_runtime::ColdStoreColdIndexPageStore;
@@ -105,25 +103,6 @@ fn external_payload(s3_path: &str, len: u64) -> ExternalPayloadRef {
         s3_path: s3_path.to_owned(),
         payload_len: len,
         object_size: len,
-    }
-}
-
-fn append_external_req(
-    stream_id: &BucketStreamId,
-    s3_path: &str,
-    len: u64,
-    stream_seq: Option<&str>,
-) -> AppendExternalRequest {
-    AppendExternalRequest {
-        stream_id: stream_id.clone(),
-        content_type: OCTET.to_owned(),
-        payload: external_payload(s3_path, len),
-        record_ends: Vec::new(),
-        close_after: false,
-        stream_seq: stream_seq.map(str::to_owned),
-        producer: None,
-        now_ms: 0,
-        record_match: None,
     }
 }
 
@@ -297,12 +276,16 @@ async fn stale_flush_leaves_no_page_entry() {
         .expect_err("stale flush is rejected");
     assert_eq!(err.code(), Some(StreamErrorCode::InvalidColdFlush));
 
+    // C7/F14g: the page lives under the stream's incarnation generation.
+    let key = cold_store
+        .list_cold_index_pages()
+        .await
+        .expect("list pages")
+        .into_iter()
+        .find(|key| key.stream_id == stream_id)
+        .expect("page key");
     let page = ColdStoreColdIndexPageStore::new(cold_store)
-        .get_page(&ColdIndexPageKey {
-            stream_id,
-            generation: 0,
-            page_id: 0,
-        })
+        .get_page(&key)
         .await
         .expect("read page")
         .expect("page exists");
@@ -376,94 +359,5 @@ async fn raft_read_path_shares_the_page_cache_that_apply_invalidates() {
         .await
         .expect("read both chunks");
     assert_eq!(read.payload, b"abcdefgh");
-    engine.shutdown().await.expect("shutdown");
-}
-
-/// F13: the leader writes an external append's page entry before proposing,
-/// straight to the page store. A page that a replica cached earlier (here
-/// holding a rejected append's stale entry over the same offsets) must not
-/// keep serving the old entries once the append applies: apply drops the
-/// stream's cached pages on every replica. Cold-index repair through the
-/// Raft engine then drops the superseded entry (D3).
-#[tokio::test]
-async fn external_append_apply_invalidates_a_cached_page_holding_a_stale_entry() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let mut engine = cold_engine(cold_store.clone()).await;
-    let stream_id = bsid("raft-external-cache");
-    engine
-        .create_stream(
-            CreateStreamRequest::new(stream_id.clone(), OCTET),
-            placement(),
-            ColdWriteAdmission::default(),
-        )
-        .await
-        .expect("create stream");
-    engine
-        .append(
-            append_req(&stream_id, b"ab", Some("5")),
-            placement(),
-            ColdWriteAdmission::default(),
-        )
-        .await
-        .expect("append with stream seq");
-    let flushed = "benchcmp/raft-external-cache/chunks/ab.bin";
-    stage(&cold_store, flushed, b"ab").await;
-    engine
-        .flush_cold(
-            FlushColdRequest {
-                cold_generation: None,
-                stream_id: stream_id.clone(),
-                chunk: chunk(0, 2, flushed),
-            },
-            placement(),
-        )
-        .await
-        .expect("flush");
-    let rejected = "benchcmp/raft-external-cache/external/rejected.bin";
-    stage(&cold_store, rejected, b"0123456789").await;
-    engine
-        .append_external(
-            append_external_req(&stream_id, rejected, 10, Some("1")),
-            placement(),
-        )
-        .await
-        .expect_err("a regressed stream seq rejects the external append");
-    // Cache the page, stale entry included, through the read path.
-    let read = engine
-        .read_stream(read_req(stream_id.clone(), 0, 2), placement())
-        .await
-        .expect("cold read");
-    assert_eq!(read.payload, b"ab");
-    let live = "benchcmp/raft-external-cache/external/live.bin";
-    stage(&cold_store, live, b"WXYZ").await;
-    engine
-        .append_external(append_external_req(&stream_id, live, 4, None), placement())
-        .await
-        .expect("append external");
-    let read = engine
-        .read_stream(read_req(stream_id.clone(), 2, 64), placement())
-        .await
-        .expect("read external");
-    assert_eq!(read.payload, b"WXYZ");
-
-    let response = engine
-        .repair_cold_index(
-            ursula_runtime::RepairColdIndexRequest {
-                after: None,
-                max_streams: 16,
-                stream: None,
-                retention_gc_now_ms: None,
-            },
-            placement(),
-        )
-        .await
-        .expect("repair");
-    assert!(response.cycle_completed);
-    assert_eq!(response.report.superseded_entries_dropped, 1);
-    let read = engine
-        .read_stream(read_req(stream_id, 2, 64), placement())
-        .await
-        .expect("read external after repair");
-    assert_eq!(read.payload, b"WXYZ");
     engine.shutdown().await.expect("shutdown");
 }

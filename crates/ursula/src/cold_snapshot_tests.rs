@@ -1,6 +1,6 @@
 //! Bounded-state F16 over HTTP: a snapshot body above the 32 MiB inline cap
-//! is refused below feature level 5 and, at level 5, staged in the cold
-//! tier and streamed back by snapshot reads and `/bootstrap`.
+//! is staged in the cold tier and streamed back by snapshot reads and
+//! `/bootstrap`.
 
 use std::sync::Arc;
 
@@ -9,15 +9,12 @@ use axum::body::to_bytes;
 use axum::http::Request;
 use tower::ServiceExt;
 use ursula_runtime::ColdStore;
-use ursula_runtime::FEATURE_LEVEL_COLD_SNAPSHOTS;
 use ursula_runtime::InMemoryGroupEngineFactory;
 use ursula_runtime::RuntimeConfig;
-use ursula_runtime::SetFeatureLevelRequest;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::SnapshotDigest;
 use ursula_runtime::cold_external_dir;
 use ursula_shard::BucketStreamId;
-use ursula_shard::RaftGroupId;
 
 use super::*;
 
@@ -56,25 +53,6 @@ async fn snapshot_above_the_inline_cap_round_trips_through_the_cold_tier() {
     let snapshot = (0..MAX_HTTP_BODY_BYTES + (1 << 20))
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
-    let response = send(
-        &app,
-        "PUT",
-        "/cold-snapshots/s/snapshot/2",
-        Body::from(snapshot.clone()),
-    )
-    .await;
-    assert_eq!(
-        response.status(),
-        StatusCode::PAYLOAD_TOO_LARGE,
-        "below level 5 the inline cap applies"
-    );
-
-    runtime
-        .set_feature_level(RaftGroupId(0), SetFeatureLevelRequest {
-            level: FEATURE_LEVEL_COLD_SNAPSHOTS,
-        })
-        .await
-        .expect("raise level");
     let response = send(
         &app,
         "PUT",

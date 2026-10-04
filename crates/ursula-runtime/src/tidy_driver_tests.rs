@@ -1,10 +1,10 @@
 //! The bounded-state F0 tidy driver through the runtime on the in-memory
-//! engine: rate-limited passes over every group converge streams written
-//! before the feature-level raise. (The F3 receipt window is pinned by the
-//! state machine's producer-window tests and the HTTP 204 regression.)
+//! engine: rate-limited passes over every group converge streams with
+//! normalization debt. The debt here is idle-producer expiry (F3). (The F3
+//! receipt window is pinned by the state machine's producer-window tests and
+//! the HTTP 204 regression.)
 
 use ursula_shard::BucketStreamId;
-use ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
 use ursula_stream::ProducerRequest;
 
 use crate::AppendRequest;
@@ -13,17 +13,11 @@ use crate::RuntimeConfig;
 use crate::ShardRuntime;
 use crate::cold_store::DEFAULT_CONTENT_TYPE;
 
+/// F3: a producer idle this long expires at the next tidy.
+const PRODUCER_IDLE_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
 fn spawn() -> ShardRuntime {
     ShardRuntime::spawn(RuntimeConfig::new(1, 2)).expect("spawn runtime")
-}
-
-async fn raise(runtime: &ShardRuntime) {
-    for (group, result) in runtime
-        .set_feature_level_all_groups(FEATURE_LEVEL_KEYED_STREAMS)
-        .await
-    {
-        result.unwrap_or_else(|err| panic!("raise group {group:?}: {err}"));
-    }
 }
 
 fn producer_append(stream: &BucketStreamId, seq: u64) -> AppendRequest {
@@ -38,10 +32,10 @@ fn producer_append(stream: &BucketStreamId, seq: u64) -> AppendRequest {
 }
 
 #[tokio::test]
-async fn tidy_pass_converges_streams_written_before_the_raise() {
+async fn tidy_pass_converges_streams_with_idle_producers() {
     let runtime = spawn();
     let streams = (0..3)
-        .map(|index| BucketStreamId::new("window", format!("legacy-{index}")))
+        .map(|index| BucketStreamId::new("window", format!("idle-{index}")))
         .collect::<Vec<_>>();
     for stream in &streams {
         runtime
@@ -58,24 +52,24 @@ async fn tidy_pass_converges_streams_written_before_the_raise() {
                 .expect("append");
         }
     }
-    // Below level 1 nothing has debt and nothing is proposed.
+    // Before the expiry nothing has debt and nothing is proposed.
     let report = runtime
         .tidy_streams_all_groups_once(64, 10)
         .await
-        .expect("tidy pass at level 0");
+        .expect("tidy pass before the expiry");
     assert_eq!(report.tidied, 0);
 
-    raise(&runtime).await;
+    let expired = 1 + PRODUCER_IDLE_EXPIRY_MS;
     // At most one stream per group per pass, so the pass is rate-limited.
     let report = runtime
-        .tidy_streams_all_groups_once(1, 10)
+        .tidy_streams_all_groups_once(1, expired)
         .await
         .expect("bounded tidy pass");
     assert!(report.tidied >= 1 && report.tidied <= 2, "{report:?}");
     let mut passes = 1;
     loop {
         let report = runtime
-            .tidy_streams_all_groups_once(1, 10)
+            .tidy_streams_all_groups_once(1, expired)
             .await
             .expect("tidy pass");
         if report.tidied == 0 {
@@ -87,6 +81,6 @@ async fn tidy_pass_converges_streams_written_before_the_raise() {
     let gauges = runtime.state_gauges_all_groups().await;
     for (group, gauges) in gauges {
         let gauges = gauges.unwrap_or_else(|err| panic!("gauges {group:?}: {err}"));
-        assert_eq!(gauges.feature_level, FEATURE_LEVEL_KEYED_STREAMS);
+        assert_eq!(gauges.producers, 0, "group {group:?}");
     }
 }

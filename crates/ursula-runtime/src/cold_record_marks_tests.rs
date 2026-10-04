@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
-use ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
 use ursula_stream::FEATURE_LEVEL_SPARSE_MARKS;
 use ursula_stream::MARK_BLOCK_BYTES;
 use ursula_stream::StreamRecordRange;
@@ -24,7 +23,6 @@ use crate::RecordAnchor;
 use crate::RuntimeConfig;
 use crate::RuntimeError;
 use crate::ShardRuntime;
-use crate::TidyStreamsRequest;
 use crate::cold_store::cold_chunk_dir;
 
 const JSON: &str = "application/json";
@@ -391,30 +389,4 @@ async fn corrupt_chunk_bytes_fail_bracketed_reads() {
         "{err}"
     );
     assert!(crate::record_coordinate_corruptions() > before);
-}
-
-/// A legacy stream (records written below level 2) seals through
-/// `TidyStream` after the raise, in commands of at most
-/// `SEAL_BUDGET_RECORDS`, and reads stay exact throughout.
-#[tokio::test]
-async fn legacy_streams_seal_after_the_raise_through_tidy() {
-    let mut fixture = Fixture::new(FEATURE_LEVEL_KEYED_STREAMS).await;
-    fixture.append(&[300; 5_000]).await;
-    fixture.flush_all(8 << 20).await;
-    assert_eq!(fixture.marks_and_dense().await, (0, 5_000));
-    raise(&fixture.runtime, FEATURE_LEVEL_SPARSE_MARKS).await;
-    let report = fixture
-        .runtime
-        .tidy_streams(RaftGroupId(0), TidyStreamsRequest {
-            max_streams: 16,
-            now_ms: 1,
-        })
-        .await
-        .expect("tidy");
-    assert_eq!(report.tidied, 1);
-    let (marks, dense) = fixture.marks_and_dense().await;
-    assert_eq!(dense, 0);
-    assert_eq!(marks, (5_000_u64 * 300).div_ceil(MARK_BLOCK_BYTES));
-    fixture.assert_read(4_321, Some(7), usize::MAX).await;
-    fixture.assert_read(0, None, usize::MAX).await;
 }

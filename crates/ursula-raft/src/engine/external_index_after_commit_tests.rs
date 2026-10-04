@@ -15,7 +15,6 @@ use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::ExternalPayloadRef;
 use ursula_runtime::FEATURE_LEVEL_EXTERNAL_LOCATORS;
-use ursula_runtime::FEATURE_LEVEL_KEYED_STREAMS;
 use ursula_runtime::OffloadColdRefsRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeConfig;
@@ -142,12 +141,6 @@ fn offload_now() -> OffloadColdRefsRequest {
 
 #[tokio::test]
 async fn level_three_writes_no_page_entry_before_a_proposal() {
-    // Level 1 pins the pre-proposal write a rejected append leaves behind.
-    let (cold_store, runtime, s) = setup(FEATURE_LEVEL_KEYED_STREAMS, "legacy").await;
-    let (_, ok) = append_external(&runtime, &cold_store, &s, &[b'#'; 30], Some("1")).await;
-    assert!(!ok);
-    assert_eq!(page_external_entries(&cold_store, &s).await.len(), 1);
-
     let (cold_store, runtime, s) = setup(FEATURE_LEVEL_EXTERNAL_LOCATORS, "lb3").await;
     let (_, ok) = append_external(&runtime, &cold_store, &s, &[b'#'; 30], Some("1")).await;
     assert!(!ok, "a regressed stream seq rejects the external append");

@@ -34,7 +34,24 @@ use crate::core_worker::ReadWatchers;
 use crate::error::ErrorStatus;
 use crate::metrics::RuntimeMetricsInner;
 
-const R: u64 = ursula_stream::HOT_RECORD_OVERHEAD_BYTES;
+/// F4b: hot overhead per record at the top level.
+const R: u64 = ursula_stream::HOT_RECORD_OVERHEAD_BYTES_LB4;
+
+/// C7/F14g: the incarnation generation a stream's chunks and pages live
+/// under (its `created_at_ms`).
+async fn live_cold_generation(runtime: &ShardRuntime, stream_id: &BucketStreamId) -> u64 {
+    runtime
+        .head_stream(HeadStreamRequest {
+            stream_id: stream_id.clone(),
+            now_ms: 0,
+            linearizable: false,
+            read_index: None,
+        })
+        .await
+        .expect("head")
+        .created_at_ms
+        .expect("incarnation")
+}
 
 fn runtime(core_count: usize, group_count: usize) -> ShardRuntime {
     ShardRuntime::spawn(test_config(core_count, group_count, 128)).expect("spawn runtime")
@@ -383,12 +400,13 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             placement,
             hot_start_offset: 2,
             group_commit_index: 3,
-            // F6a: the write response carries the backlog it left. The
-            // clipped record [2, 3) still costs one record's overhead (F6c),
-            // as a replica restored from a snapshot counts it.
+            // F6a: the write response carries the backlog it left. F4b: the
+            // message's start was flushed, so the hot fragment [2, 3) keeps
+            // no append start and costs its payload only; a replica restored
+            // from a snapshot counts the same.
             hot_backlog: Some(crate::request::WriteHotBacklog {
-                stream_hot_bytes: 1 + R,
-                group_hot_bytes: 1 + R,
+                stream_hot_bytes: 1,
+                group_hot_bytes: 1,
             }),
         })
     );
@@ -833,19 +851,35 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
     assert_eq!(read.payload, b"abcdef");
     assert_eq!(read.next_offset, 6);
 
-    let snapshot = runtime
-        .snapshot_group(runtime.locate(&stream).raft_group_id)
+    // F5: both locators stay in state until the offload pass indexes them,
+    // and then leave it.
+    let group = runtime.locate(&stream).raft_group_id;
+    let entry_of = |snapshot: GroupSnapshot| {
+        snapshot
+            .stream_snapshot
+            .streams
+            .into_iter()
+            .find(|entry| entry.metadata.stream_id == stream)
+            .expect("snapshot entry")
+    };
+    let entry = entry_of(runtime.snapshot_group(group).await.expect("snapshot group"));
+    assert_eq!(entry.external_segments.len(), 2);
+    let report = runtime
+        .offload_cold_refs(group, crate::cold_refs::OffloadColdRefsRequest {
+            min_age_ms: 0,
+            ..crate::cold_refs::OffloadColdRefsRequest::new(0, 16)
+        })
         .await
-        .expect("snapshot group");
-    let entry = snapshot
-        .stream_snapshot
-        .streams
-        .iter()
-        .find(|entry| entry.metadata.stream_id == stream)
-        .expect("snapshot entry");
-    assert_eq!(entry.cold_frontier_offset, 6);
+        .expect("offload pass");
+    assert_eq!(report.refs_offloaded, 2);
+    let entry = entry_of(runtime.snapshot_group(group).await.expect("snapshot group"));
     assert!(entry.cold_chunks.is_empty());
     assert!(entry.external_segments.is_empty());
+    let read = runtime
+        .read_stream(read_req(stream.clone(), 0, 6))
+        .await
+        .expect("read after the offload");
+    assert_eq!(read.payload, b"abcdef");
 }
 
 /// bounded-stream-state F11: bootstrap plans one read window for all hot
@@ -1391,8 +1425,9 @@ async fn install_group_snapshot_rejects_mismatched_placement_before_routing() {
             next_cold_gc_seq: 0,
             shared_cold_object_owners: Vec::new(),
             bucket_usage: Vec::new(),
-            feature_level: 0,
+            feature_level: ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL,
             last_created_at_ms: 0,
+            format_epoch: ursula_stream::FORMAT_EPOCH,
         },
         stream_append_counts: Vec::new(),
     };
@@ -2112,11 +2147,13 @@ async fn legacy_cross_bucket_pack_is_rewritten_before_bucket_erasure_proof() {
     let page_store = ColdStoreColdIndexPageStore::new(cold_store.clone());
     async fn rewritten(
         page_store: &ColdStoreColdIndexPageStore,
+        runtime: &ShardRuntime,
         stream: &BucketStreamId,
     ) -> ColdChunkRef {
+        // C7/F14g: pages live under the stream's incarnation generation.
         load_cold_chunks_from_pages(page_store, &[ColdIndexPageKey {
             stream_id: stream.clone(),
-            generation: 0,
+            generation: live_cold_generation(runtime, stream).await,
             page_id: 0,
         }])
         .await
@@ -2125,8 +2162,8 @@ async fn legacy_cross_bucket_pack_is_rewritten_before_bucket_erasure_proof() {
         .next()
         .expect("rewritten exclusive chunk")
     }
-    let a_chunk = rewritten(&page_store, &stream_a).await;
-    let b_chunk = rewritten(&page_store, &stream_b).await;
+    let a_chunk = rewritten(&page_store, &runtime, &stream_a).await;
+    let b_chunk = rewritten(&page_store, &runtime, &stream_b).await;
     assert!(!a_chunk.shared_object);
     assert!(!b_chunk.shared_object);
     assert!(a_chunk.s3_path.starts_with("legacy-erasure-a/"));
@@ -2230,7 +2267,13 @@ async fn cold_gc_worker_physically_reclaims_deleted_stream_chunks() {
     let chunk = ColdChunkRef {
         start_offset: 0,
         end_offset: 4,
-        s3_path: new_cold_chunk_path(&stream, 0, 4),
+        // C7/F14g: stream GC deletes the names its incarnation owns.
+        s3_path: new_cold_chunk_path_in_generation(
+            &stream,
+            live_cold_generation(&runtime, &stream).await,
+            0,
+            4,
+        ),
         object_size: 4,
         ..Default::default()
     };
@@ -2297,7 +2340,13 @@ async fn purge_report_proves_cold_gc_queue_is_empty_only_after_reclamation() {
     let chunk = ColdChunkRef {
         start_offset: 0,
         end_offset: 4,
-        s3_path: new_cold_chunk_path(&stream, 0, 4),
+        // C7/F14g: stream GC deletes the names its incarnation owns.
+        s3_path: new_cold_chunk_path_in_generation(
+            &stream,
+            live_cold_generation(&runtime, &stream).await,
+            0,
+            4,
+        ),
         object_size: 4,
         ..Default::default()
     };
@@ -3882,8 +3931,9 @@ impl GroupEngine for BlockingReadEngine {
                     next_cold_gc_seq: 0,
                     shared_cold_object_owners: Vec::new(),
                     bucket_usage: Vec::new(),
-                    feature_level: 0,
+                    feature_level: ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL,
                     last_created_at_ms: 0,
+                    format_epoch: ursula_stream::FORMAT_EPOCH,
                 },
                 stream_append_counts: Vec::new(),
             })
@@ -4083,8 +4133,9 @@ impl GroupEngine for RecordingEngine {
                     next_cold_gc_seq: 0,
                     shared_cold_object_owners: Vec::new(),
                     bucket_usage: Vec::new(),
-                    feature_level: 0,
+                    feature_level: ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL,
                     last_created_at_ms: 0,
+                    format_epoch: ursula_stream::FORMAT_EPOCH,
                 },
                 stream_append_counts: Vec::new(),
             })

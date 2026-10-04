@@ -38,6 +38,7 @@ mod core_worker;
 mod engine;
 
 mod error;
+pub mod format_marker;
 mod group_actor;
 pub mod journal;
 mod metrics;
@@ -267,6 +268,7 @@ pub use ursula_stream::FEATURE_LEVEL_EXTERNAL_LOCATORS;
 pub use ursula_stream::FEATURE_LEVEL_HOT_REPRESENTATION;
 pub use ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
 pub use ursula_stream::FEATURE_LEVEL_SPARSE_MARKS;
+pub use ursula_stream::FORMAT_EPOCH;
 pub use ursula_stream::HOT_RECORD_OVERHEAD_BYTES;
 pub use ursula_stream::HOT_RECORD_OVERHEAD_BYTES_LB4;
 pub use ursula_stream::MARK_BLOCK_BYTES;
@@ -278,6 +280,7 @@ pub use ursula_stream::StreamErrorCode;
 pub use ursula_stream::StreamErrorContext;
 pub use ursula_stream::StreamRecordRange;
 pub use ursula_stream::StreamSnapshot;
+pub use ursula_stream::format_epoch_refusal;
 pub use ursula_stream::validate_bucket_id;
 
 #[cfg(test)]

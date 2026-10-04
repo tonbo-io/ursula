@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdChunkRef;
-use ursula_runtime::ColdIndexPageKey;
 use ursula_runtime::ColdStore;
 use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::CompactColdRequest;
@@ -69,14 +68,18 @@ fn shared_slice(path: &str, object_offset: u64, payload: &[u8]) -> ColdChunkRef 
 }
 
 async fn page_chunks(cold_store: &Arc<ColdStore>, stream: &BucketStreamId) -> Vec<ColdChunkRef> {
+    // C7/F14g: pages live under the stream's incarnation generation.
+    let keys = cold_store
+        .list_cold_index_pages()
+        .await
+        .expect("list pages")
+        .into_iter()
+        .filter(|key| &key.stream_id == stream)
+        .collect::<Vec<_>>();
     let page_store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-    load_cold_chunks_from_pages(&page_store, &[ColdIndexPageKey {
-        stream_id: stream.clone(),
-        generation: 0,
-        page_id: 0,
-    }])
-    .await
-    .expect("load cold index page")
+    load_cold_chunks_from_pages(&page_store, &keys)
+        .await
+        .expect("load cold index page")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

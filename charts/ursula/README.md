@@ -293,6 +293,13 @@ plus `snapshotStore.prefix`.
 
 ## Upgrade Limitations
 
+Ursula 0.6 (format epoch 2) cannot upgrade a 0.5.x release in place. Install it
+fresh: `helm uninstall`, delete the PVCs, and install with a new `s3.prefix`
+(and, with cold storage off and S3 snapshots, a new `snapshotStore.prefix`).
+`helm upgrade` from 0.5.x stalls at the first new pod, which exits at startup
+or reports not ready, so no second voter is replaced; recover with
+`helm rollback`. See the operations guide's "Upgrading to 0.6".
+
 Until the operator exists, Kubernetes StatefulSet rolling updates do not
 transfer leaders, coordinate applied-index catch-up, or mutate Raft membership.
 Use `ursulactl restart` manually for drain-aware rolling restarts when you need

@@ -188,11 +188,17 @@ impl SnapshotEnvelope {
         }
     }
 
-    /// Decodes `bytes` in whichever envelope they were written.
+    /// Decodes a MessagePack envelope. Format epoch 2 writes only
+    /// MessagePack, so the JSON envelope of Ursula 0.5.x is refused (E6)
+    /// instead of decoded.
     pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, SnapshotStoreError> {
         match Self::detect(bytes) {
-            Self::Json => serde_json::from_slice(bytes)
-                .map_err(|err| SnapshotStoreError::Deserialize(err.to_string())),
+            Self::Json => Err(SnapshotStoreError::Deserialize(
+                ursula_stream::format_epoch_refusal(
+                    "snapshot pointer",
+                    "uses the JSON envelope of Ursula 0.5.x and earlier (format epoch 1)",
+                ),
+            )),
             Self::MessagePack => rmp_serde::from_slice(bytes)
                 .map_err(|err| SnapshotStoreError::Deserialize(err.to_string())),
         }
@@ -213,7 +219,7 @@ impl SnapshotPointer {
         SnapshotEnvelope::for_feature_level(feature_level).encode(self)
     }
 
-    /// Decodes either envelope.
+    /// Decodes the MessagePack envelope; refuses JSON (E6).
     pub fn decode(bytes: &[u8]) -> Result<Self, SnapshotStoreError> {
         SnapshotEnvelope::decode(bytes)
     }
@@ -230,7 +236,7 @@ pub fn encode_binary_envelope<T: Serialize>(value: &T) -> Result<Vec<u8>, Snapsh
     SnapshotEnvelope::MessagePack.encode(value)
 }
 
-/// Decodes a snapshot envelope in either format.
+/// Decodes a MessagePack snapshot envelope; refuses JSON (E6).
 pub fn decode_snapshot_envelope<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, SnapshotStoreError> {
@@ -457,7 +463,7 @@ mod s3 {
 
     const S3_SNAPSHOT_ZSTD_LEVEL: i32 = 3;
     const S3_SNAPSHOT_GC_GRACE: Duration = Duration::from_secs(60 * 60);
-    const SNAPSHOT_REFERENCE_VERSION: u32 = 1;
+    const SNAPSHOT_REFERENCE_VERSION: u32 = ursula_stream::FORMAT_EPOCH;
 
     #[derive(serde::Deserialize, serde::Serialize)]
     struct SnapshotReference {
@@ -1202,22 +1208,16 @@ mod tests {
                 bytes: payload.clone(),
             },
         };
-        let json = pointer.encode_for_feature_level(0).unwrap();
-        let binary = pointer.encode_for_feature_level(1).unwrap();
-        assert_eq!(SnapshotEnvelope::detect(&json), SnapshotEnvelope::Json);
+        let binary = pointer.encode_binary().unwrap();
         assert_eq!(
             SnapshotEnvelope::detect(&binary),
             SnapshotEnvelope::MessagePack
         );
-        // The JSON envelope spells every byte as decimal text; the binary
-        // envelope stores it once.
-        assert!(json.len() > 3 * payload.len());
+        // The binary envelope stores every byte once.
         assert!(binary.len() < payload.len() + 128, "{}", binary.len());
-        for bytes in [json, binary] {
-            let back = SnapshotPointer::decode(&bytes).unwrap();
-            assert_eq!(back.snapshot_id, pointer.snapshot_id);
-            assert_eq!(back.location, pointer.location);
-        }
+        let back = SnapshotPointer::decode(&binary).unwrap();
+        assert_eq!(back.snapshot_id, pointer.snapshot_id);
+        assert_eq!(back.location, pointer.location);
     }
 
     #[test]
@@ -1239,7 +1239,7 @@ mod tests {
                 snapshot_id: "group-7-2-500".into(),
                 location,
             };
-            let bytes = pointer.encode_for_feature_level(1).unwrap();
+            let bytes = pointer.encode_binary().unwrap();
             assert_eq!(
                 SnapshotPointer::decode(&bytes).unwrap().location,
                 pointer.location
@@ -1255,7 +1255,7 @@ mod tests {
                 bytes: vec![1, 2, 3, 4],
             },
         };
-        let bytes = pointer.encode().unwrap();
+        let bytes = pointer.encode_binary().unwrap();
         let back = SnapshotPointer::decode(&bytes).unwrap();
         assert_eq!(back.snapshot_id, pointer.snapshot_id);
         match back.location {
@@ -1264,11 +1264,11 @@ mod tests {
         }
     }
 
-    /// F12a decode support: every location round-trips through the binary
-    /// envelope, inline bytes travel as one MessagePack `bin` instead of a
-    /// JSON number array, and the JSON form still decodes.
+    /// F12a: every location round-trips through the binary envelope, inline
+    /// bytes travel as one MessagePack `bin`, and the JSON envelope of Ursula
+    /// 0.5.x is refused (format epoch 2, E6).
     #[test]
-    fn pointer_decodes_the_binary_envelope_and_the_legacy_json() {
+    fn pointer_decodes_the_binary_envelope_and_refuses_the_legacy_json() {
         let pointers = [
             SnapshotPointer {
                 snapshot_id: "group-0-1-100".into(),
@@ -1297,13 +1297,16 @@ mod tests {
         for pointer in pointers {
             let binary = pointer.encode_binary().unwrap();
             assert!(!is_json_snapshot_envelope(&binary));
+            let back = SnapshotPointer::decode(&binary).unwrap();
+            assert_eq!(back.snapshot_id, pointer.snapshot_id);
+            assert_eq!(back.location, pointer.location);
             let json = pointer.encode().unwrap();
             assert!(is_json_snapshot_envelope(&json));
-            for encoded in [binary, json] {
-                let back = SnapshotPointer::decode(&encoded).unwrap();
-                assert_eq!(back.snapshot_id, pointer.snapshot_id);
-                assert_eq!(back.location, pointer.location);
-            }
+            let error = SnapshotPointer::decode(&json).expect_err("E6");
+            assert!(
+                error.to_string().contains("JSON envelope of Ursula 0.5.x"),
+                "{error}"
+            );
         }
         let inline = SnapshotPointer {
             snapshot_id: "g".into(),
@@ -1312,9 +1315,7 @@ mod tests {
             },
         };
         let binary = inline.encode_binary().unwrap().len();
-        let json = inline.encode().unwrap().len();
         assert!(binary < 4096 + 64, "binary inline bytes are not amplified");
-        assert!(json > 3 * 4096, "JSON writes one number per byte");
         assert!(SnapshotPointer::decode(b"\x00garbage").is_err());
         assert!(SnapshotPointer::decode(b" \n{\"snapshot_id\":1}").is_err());
     }
@@ -1328,7 +1329,7 @@ mod tests {
                 size_bytes: 12345,
             },
         };
-        let bytes = pointer.encode().unwrap();
+        let bytes = pointer.encode_binary().unwrap();
         let back = SnapshotPointer::decode(&bytes).unwrap();
         assert_eq!(back.snapshot_id, pointer.snapshot_id);
         assert_eq!(back.location.size_hint(), 12345);
@@ -1336,16 +1337,17 @@ mod tests {
 
     #[test]
     fn pointer_decode_defaults_legacy_s3_objects_to_unshared() {
-        let bytes = br#"{
-            "snapshot_id":"group-7-2-500",
-            "location":{
-                "kind":"s3",
-                "key":"snapshots/group-7/legacy.snap",
-                "size_bytes":123,
-                "compression":"none"
+        let bytes = rmp_serde::to_vec_named(&serde_json::json!({
+            "snapshot_id": "group-7-2-500",
+            "location": {
+                "kind": "s3",
+                "key": "snapshots/group-7/legacy.snap",
+                "size_bytes": 123,
+                "compression": "none"
             }
-        }"#;
-        let pointer = SnapshotPointer::decode(bytes).unwrap();
+        }))
+        .unwrap();
+        let pointer = SnapshotPointer::decode(&bytes).unwrap();
         assert!(matches!(pointer.location, SnapshotLocation::S3 {
             shared_object: false,
             ..
@@ -1531,7 +1533,8 @@ mod tests {
                 .write_raw_for_tests(
                     &format!("snapshots/group-7/references/node-{node_id}.json"),
                     serde_json::to_vec(&serde_json::json!({
-                        "version": 1,
+                        // References carry the format epoch (version 2).
+                        "version": ursula_stream::FORMAT_EPOCH,
                         "node_id": node_id,
                         "raft_group_id": 7,
                         "snapshot_key": key,

@@ -1425,7 +1425,7 @@ mod tests {
         };
         TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
             meta: snapshot_meta(snapshot_id),
-            snapshot: Cursor::new(pointer.encode().expect("encode test pointer")),
+            snapshot: Cursor::new(pointer.encode_binary().expect("encode test pointer")),
         }
     }
 
@@ -1543,7 +1543,7 @@ mod tests {
         };
         let snapshot = TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
             meta: snapshot_meta("inline"),
-            snapshot: Cursor::new(pointer.encode().expect("encode test pointer")),
+            snapshot: Cursor::new(pointer.encode_binary().expect("encode test pointer")),
         };
 
         let prefetched = registry

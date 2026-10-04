@@ -197,14 +197,6 @@ impl RaftGroupFileLogStore {
         } else {
             None
         };
-        if core_writer.is_none() && journal::migrate_legacy::<WireCodec<RaftGroupLogRecord>>(&path)?
-        {
-            tracing::warn!(
-                path = %path.display(),
-                backup = %format!("{}.v0.bak", path.display()),
-                "migrated legacy OpenRaft group WAL to checksummed format"
-            );
-        }
         let parent_needs_sync = !path.exists();
         let inner = match (&core_writer, &metrics) {
             (Some(writer), Some(metrics)) => {
@@ -330,13 +322,6 @@ impl CoreFileLogWriter {
         }
         let (tx, rx) = mpsc::channel();
         let lock = JournalLock::acquire(&journal_path)?;
-        if journal::migrate_legacy::<WireCodec<CoreJournalRecord>>(&journal_path)? {
-            tracing::warn!(
-                path = %journal_path.display(),
-                backup = %format!("{}.v0.bak", journal_path.display()),
-                "migrated legacy OpenRaft core WAL to checksummed format"
-            );
-        }
         let recovery_started_at = Instant::now();
         let recovery_bytes = fs::metadata(&journal_path)
             .map(|metadata| metadata.len())

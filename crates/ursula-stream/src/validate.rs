@@ -12,6 +12,16 @@ pub fn validate_bucket_id(bucket_id: &str) -> Result<(), String> {
     }) {
         return Err("bucket_id must match ^[a-z0-9_-]{4,64}$".to_owned());
     }
+    // `snapshots` is the default raft-snapshot namespace in the object store,
+    // which sits beside the bucket prefixes: a tenant bucket of that name
+    // would share it, and purging it would erase raft snapshots. `__` names
+    // stay free for Ursula's own namespaces (format epoch 2).
+    if bucket_id == "snapshots" {
+        return Err("bucket_id 'snapshots' is reserved".to_owned());
+    }
+    if bucket_id.starts_with("__") {
+        return Err("bucket_id must not start with '__'".to_owned());
+    }
     Ok(())
 }
 
@@ -55,6 +65,25 @@ fn validate_path_segment(value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_namespace_and_double_underscore_bucket_ids_are_reserved() {
+        assert!(
+            validate_bucket_id("snapshots")
+                .expect_err("reserved bucket")
+                .contains("reserved")
+        );
+        for bucket in ["__ursula", "__ab"] {
+            assert!(
+                validate_bucket_id(bucket)
+                    .expect_err("reserved bucket")
+                    .contains("'__'")
+            );
+        }
+        for bucket in ["snapshot", "my-snapshots", "a__b", "_abc"] {
+            assert_eq!(validate_bucket_id(bucket), Ok(()));
+        }
+    }
 
     #[test]
     fn stream_ids_starting_with_dollar_are_reserved() {
