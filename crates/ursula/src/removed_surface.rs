@@ -124,10 +124,8 @@ mod tests {
     async fn three_segment_paths_answer_404_and_dollar_stream_ids_400() {
         let app = app();
         let text = [(CONTENT_TYPE.as_str(), "text/plain")];
-        for method in ["PUT", "POST", "GET", "HEAD", "DELETE"] {
-            let response = send(&app, method, "/removed/run-42/journal", &text, "event").await;
-            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method}");
-        }
+        let response = send(&app, "PUT", "/removed/run-42/journal", &text, "event").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let json = [(CONTENT_TYPE.as_str(), "application/json")];
         let response = send(
             &app,

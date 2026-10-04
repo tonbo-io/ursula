@@ -59,13 +59,12 @@ pub(crate) fn is_snapshot_publish(method: &Method, uri: &Uri) -> bool {
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
-    if segments.len() < 3 || segments[0].starts_with("__ursula") {
-        return false;
+    match segments.as_slice() {
+        [bucket, ..] if bucket.starts_with("__ursula") => false,
+        [_, _, "snapshot", offset] => offset.parse::<u64>().is_ok(),
+        [_, _, "snapshot"] => uri.query().is_some_and(|query| query.contains("record=")),
+        _ => false,
     }
-    let last = segments[segments.len() - 1];
-    let before_last = segments[segments.len() - 2];
-    (before_last == "snapshot" && last.parse::<u64>().is_ok())
-        || (last == "snapshot" && uri.query().is_some_and(|query| query.contains("record=")))
 }
 
 /// Admission's body limit for a write request.

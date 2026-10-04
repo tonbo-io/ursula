@@ -185,8 +185,6 @@ pub enum GroupWriteResponse {
     AckColdGc(AckColdGcResponse),
     PurgeBucket(PurgeBucketResponse),
     ImportGroupState(crate::request::ImportGroupStateResponse),
-    // Appended last so serialized variant positions of older variants stay
-    // stable across mixed-version clusters.
     SetFeatureLevel(SetFeatureLevelResponse),
     TidyStream(crate::request::TidyStreamResponse),
     DeferColdGc(DeferColdGcResponse),

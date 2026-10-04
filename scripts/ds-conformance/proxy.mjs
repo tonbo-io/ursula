@@ -3,9 +3,9 @@
 // The suite addresses streams as `/v1/stream/<name>`. Ursula serves streams as
 // `/{bucket}/{stream}`, and bucket IDs must be 4-64 bytes, so `/v1/...` is not
 // a valid Ursula path. This proxy rewrites `/v1/stream/<name>` to
-// `/<bucket>/<name>` (any other `/v1/<rest>` to `/<bucket>/<rest>`) and
-// rewrites `Location` headers back to `/v1/stream/<name>`. Bodies stream
-// through unbuffered, so SSE and long-poll work.
+// `/<bucket>/<name>`, passes every other path through unchanged, and rewrites
+// `Location` headers back to `/v1/stream/<name>`. Bodies stream through
+// unbuffered, so SSE and long-poll work.
 //
 // Usage: node proxy.mjs <listen-port> <upstream-base-url> [bucket]
 import http from "node:http";

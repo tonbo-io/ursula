@@ -553,7 +553,7 @@ impl RaftGroupStateMachine {
         admission: ColdWriteAdmission,
     ) -> Result<(), GroupEngineError> {
         let _ = placement;
-        self.engine.check_cold_write_admission_bytes(
+        self.engine.check_cold_write_admission(
             &request.stream_id,
             admission,
             u64::try_from(request.initial_payload.len()).expect("payload len fits u64"),
@@ -568,7 +568,7 @@ impl RaftGroupStateMachine {
         admission: ColdWriteAdmission,
     ) -> Result<(), GroupEngineError> {
         let _ = placement;
-        self.engine.check_cold_write_admission_bytes(
+        self.engine.check_cold_write_admission(
             &request.stream_id,
             admission,
             u64::try_from(request.payload.len()).expect("payload len fits u64"),

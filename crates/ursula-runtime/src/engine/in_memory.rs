@@ -589,7 +589,7 @@ impl InMemoryGroupEngine {
     /// Cold admission (F6c): the group's real hot size (payload plus
     /// per-record overhead) plus the incoming payload, charged as one record,
     /// must stay within the group cap.
-    pub fn check_cold_write_admission_bytes(
+    pub fn check_cold_write_admission(
         &self,
         stream_id: &BucketStreamId,
         admission: ColdWriteAdmission,
@@ -628,7 +628,7 @@ impl InMemoryGroupEngine {
                 .state_machine
                 .stream_is_live(&request.stream_id, request.now_ms)
         {
-            self.check_cold_write_admission_bytes(
+            self.check_cold_write_admission(
                 &request.stream_id,
                 admission,
                 u64::try_from(request.initial_payload.len()).expect("payload len fits u64"),
@@ -661,7 +661,7 @@ impl InMemoryGroupEngine {
                 request.now_ms,
             )
         {
-            self.check_cold_write_admission_bytes(
+            self.check_cold_write_admission(
                 &request.stream_id,
                 admission,
                 u64::try_from(request.payload.len()).expect("payload len fits u64"),

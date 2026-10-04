@@ -112,7 +112,7 @@ Every growth source the audits found, replicated or not, with the fix that bound
 | 6 | Hot window chunk overhead (`hot_buffer.rs:7-17, 88-97`) | yes | O(unflushed appends) | about 64 B tight per record beyond payload; 2.6 MB deque kept after one flush window | flush thresholds and group cap, both payload-only | F6, F7 |
 | 7 | External locators in state (planned by an earlier design) `external_segments` (`cold_state.rs:9`) | yes | O(external appends) if shipped as written | est. 120 B snapshot, 170 B heap per append of 1 MiB or more | retention only | F5 |
 | 8 | Visible snapshot payload (`model.rs:264-273`) | yes | O(1), up to the 32 MiB body cap; at Lb5 a reference above the staging threshold | inline on every replica and every group snapshot | replacement | F16 |
-| 9 | `last_stream_seq` and producer id length (`append.rs:347-349`; `state_machine.rs:752-761`) | yes | O(1), length unbounded through `$transaction` JSON (removed in 0.6.0) | up to 32 MiB | replacement | F3 |
+| 9 | `last_stream_seq` and producer id length (`append.rs:347-349`; `state_machine.rs:752-761`) | yes | O(1), length unbounded through the multi-stream JSON append body (removed in 0.6.0) | up to 32 MiB | replacement | F3 |
 | 10 | Engine `stream_append_counts` (`ursula-runtime/src/engine/in_memory.rs:128`) | frames | one leaked entry per TTL-expired or purged stream | est. 150 B per removed stream | restart or snapshot install | F9 |
 | 11 | TTL heap (`registry.rs:24-29, 126-138`; `ttl.rs:11-21`) | no | O(appends) on TTL streams | 104 B and 3 allocations per append; 1M appends: 104 MB that survives delete | each entry's own expiry | F8 |
 | 12 | Registry capacity (`SlotMap`, keys map) (`registry.rs:24-29`) | no | O(peak streams) | 592-882 B per peak slot | restart or install | F7 |
@@ -348,13 +348,13 @@ An earlier design fixed the locator by keeping the `ObjectPayloadRef` in state a
 
 **Today.** Each append becomes its own `HotChunk` (a 40-byte header plus an allocation) and also adds a 16-byte message record and an 8-byte dense offset. Admission (64 MiB per group, `config.rs:376`) and flush thresholds count payload only. `hot_payload_len` sums every chunk on every append response (`hot_buffer.rs:47-49`; `query.rs:153-160`; `in_memory.rs:325, 454, 649, 902`) and in `record_cold_hot_backlog` after every mutation (`ursula-runtime/src/metrics.rs:825-838`).
 
-**F6a (B1, ungated).** A running byte counter in `HotBuffer`, updated in `push`, `flush_prefix`, `discard_before`, the same pattern #190 used for the group gauge. Write responses return the stream backlog, so the Raft engine drops its second state-machine round trip for metrics (`ursula-raft/src/engine/mod.rs:1101-1110`). +20 LoC.
+**F6a (B1, ungated).** A running byte counter in `HotBuffer`, updated in `push`, `flush_prefix` and `discard_before`, the same pattern #190 used for the group gauge. Write responses return the stream backlog, so the Raft engine drops its second state-machine round trip for metrics (`ursula-raft/src/engine/mod.rs:1101-1110`). +20 LoC.
 
 **F6b (B6, ungated).** Coalesce appends into 64 KiB blocks: a `VecDeque` of blocks, each with its own start offset. A block ends at a gap, and an external append above hot bytes leaves one (F18). Keep append starts for binary streams and rely on the dense record offsets for JSON as the only per-message vector. Reads binary-search blocks; flush drops whole blocks and splits at most one. Snapshots keep emitting `hot_segments`, now one per block, which every binary restores (`persist.rs:196-217`). +350 / −120 LoC, medium risk.
 
 **F6c (B6, ungated).** Admission and flush thresholds count payload plus the per-record overhead of the live representation: about 64 B today, about 24 B with F6b, 8 to 12 B with F4b. These are leader-side checks made before proposal (`ursula-raft/src/state_machine.rs:420-507`), so apply does not change. +40 LoC.
 
-**Bound.** Payload plus about 24 B per unflushed record with F6b (a dense offset and a message record), and 8 to 12 B once F4b removes message records at Lb4, against about 64 B today. Tests: hot read, flush and rollback equivalence against the current buffer under random workloads, including gaps from external appends; the harness asserts the overhead.
+**Bound.** Payload plus about 24 B per unflushed record with F6b (a dense offset and a message record), and 8 to 12 B once F4b removes message records at Lb4, against about 64 B today. Tests: hot read and flush equivalence against the current buffer under random workloads, including gaps from external appends; the harness asserts the overhead.
 
 ### 5.8 F7: capacity hygiene
 
@@ -390,7 +390,7 @@ Every returned entry is at its stream's true expiry, and every smaller key has a
 
 **Append counts.** `stream_append_counts` (`in_memory.rs:128`) loses entries only on `Deleted` (`in_memory.rs:594-599`). TTL expiry and `PurgeBucket` leave them. Snapshots filter them out (`in_memory.rs:1247-1273`), so after a recreate a replica that installed a snapshot and a long-lived one disagree. The fix moves the count into `StreamSlot`, so it dies with the slot. `StreamAppendCountV1` frames stay as they are, and the `restore_stream_append_counts` cross-check (`in_memory.rs:2123-2146`) goes away. The count is not exposed over HTTP. Ungated, +40 / −80 LoC.
 
-**Admission.** The default single-node mode clones the whole engine to preview admission on every create and append (`in_memory.rs:690, 729`): a transient full copy of the group's memory per write, and 17.7 s for 30k appends with the default admission against 0.44 s without. It should use the O(1) `check_cold_write_admission_bytes` that the Raft path uses, plus the read-only `evaluate_producer` when deduplicated retries must bypass backpressure. Ungated, +40 / −90 LoC.
+**Admission.** The default single-node mode clones the whole engine to preview admission on every create and append (`in_memory.rs:690, 729`): a transient full copy of the group's memory per write, and 17.7 s for 30k appends with the default admission against 0.44 s without. It should use the O(1) `check_cold_write_admission` that the Raft path uses, plus the read-only `evaluate_producer` when deduplicated retries must bypass backpressure. Ungated, +40 / −90 LoC.
 
 ### 5.11 F10: flush planner
 
