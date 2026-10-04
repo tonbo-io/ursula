@@ -80,10 +80,7 @@ async fn read(runtime: &ShardRuntime, stream: &BucketStreamId, len: usize) -> Ve
             offset: 0,
             max_len: len,
             now_ms: 0,
-            record: None,
-            max_records: None,
             leader_only: false,
-            record_anchor: None,
             read_index: None,
         })
         .await
@@ -281,7 +278,6 @@ async fn incarnation_scoped_stream_gc_reclaims_external_payloads() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
-            record_match: None,
         })
         .await
         .expect("append external payload");

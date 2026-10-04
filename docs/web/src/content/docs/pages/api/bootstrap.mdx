@@ -37,7 +37,6 @@ Response headers include:
 | `Stream-Snapshot-Offset` | The snapshot offset, or `-1` if no snapshot exists. |
 | `Stream-Up-To-Date` | `true` when the response reaches the stream's tail. Absent on a partial response. |
 | `Stream-Closed` | Present and `true` if the stream is closed and the response reaches its tail. |
-| `Stream-Record-First`, `Stream-Record-Next` | On a JSON stream with Record Coordinates: the stream's first retained record and record tail (not the end of this response). |
 | `Cache-Control` | `no-store`. |
 
 ## Complete and partial responses
@@ -45,7 +44,7 @@ Response headers include:
 Let `S` be the snapshot offset, or the first retained offset when there is no snapshot. Ursula returns one of two forms:
 
 - **Complete.** Every retained byte in `[S, tail)`, with `Stream-Next-Offset` at the tail and `Stream-Up-To-Date: true`.
-- **Partial.** The bytes in `[S, P)` for some `P` below the tail, with `Stream-Next-Offset: P` and no `Stream-Up-To-Date`. When bytes after `S` have already moved to cold storage, `P = S` and the response holds only the snapshot part. When the updates exceed 8 MiB, a JSON stream stops at the last record boundary within 8 MiB and always holds at least one record; any other stream answers the snapshot part alone.
+- **Partial.** The bytes in `[S, P)` for some `P` below the tail, with `Stream-Next-Offset: P` and no `Stream-Up-To-Date`. When bytes after `S` have already moved to cold storage, `P = S` and the response holds only the snapshot part. When the updates exceed 8 MiB, a JSON stream stops at the last message boundary within 8 MiB and always holds at least one message; any other stream answers the snapshot part alone.
 
 Neither form skips bytes. After a partial response, read from `Stream-Next-Offset` with ordinary catch-up reads until `Stream-Up-To-Date: true`, and apply those updates before treating the state as current. Bootstrap never reads cold storage itself.
 
@@ -58,7 +57,7 @@ The body is a `multipart/mixed` message:
  The first part is the snapshot blob (or an empty part if no snapshot exists).
  </Step>
  <Step title="Update parts">
- Subsequent parts hold the updates starting at the snapshot point, with the stream's content type. For JSON streams, each part is one JSON record. For any other stream, the updates come back as one part that may contain several messages; a part boundary is not a message boundary.
+ Subsequent parts hold the updates starting at the snapshot point, with the stream's content type. For JSON streams, each part is one JSON message. For any other stream, the updates come back as one part that may contain several messages; a part boundary is not a message boundary.
  </Step>
 </Steps>
 

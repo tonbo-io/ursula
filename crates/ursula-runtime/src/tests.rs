@@ -89,10 +89,7 @@ fn read_req(stream_id: BucketStreamId, offset: u64, max_len: usize) -> ReadStrea
         offset,
         max_len,
         now_ms: 0,
-        record: None,
-        max_records: None,
         leader_only: false,
-        record_anchor: None,
         read_index: None,
     }
 }
@@ -293,7 +290,6 @@ fn group_write_command_round_trips_as_log_payload() {
         stream_seq: None,
         producer: Some(producer("writer-1", 7, 42)),
         now_ms: 0,
-        record_match: None,
     });
 
     let encoded = serde_json::to_vec(&command).expect("encode command");
@@ -336,7 +332,6 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             closed: false,
             already_exists: false,
             group_commit_index: 1,
-            record_range: None,
             hot_backlog: Some(crate::request::WriteHotBacklog::default()),
         })
     );
@@ -351,7 +346,6 @@ fn committed_write_command_is_state_machine_apply_boundary() {
                 stream_seq: None,
                 producer: None,
                 now_ms: 0,
-                record_match: None,
             }),
             placement,
         )
@@ -367,7 +361,6 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             closed: false,
             deduplicated: false,
             producer: None,
-            record_range: None,
             // F6c: a binary stream's real hot bytes are its payload.
             stream_hot_bytes: 3,
             group_hot_bytes: 3,
@@ -462,7 +455,6 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
                 stream_seq: None,
                 producer: None,
                 now_ms: 0,
-                record_match: None,
             }),
             placement,
         )
@@ -556,9 +548,6 @@ async fn cold_index_read_materializes_overlapping_flush_objects_once() {
         })],
         up_to_date: true,
         closed: false,
-        retained_record_range: None,
-        record_trim: None,
-        record_range: None,
     };
 
     let payload = InMemoryGroupEngine::read_payload_from_plan(
@@ -623,9 +612,6 @@ async fn cold_read_refreshes_page_when_its_object_was_collected() {
         })],
         up_to_date: true,
         closed: false,
-        retained_record_range: None,
-        record_trim: None,
-        record_range: None,
     };
     let read = || {
         InMemoryGroupEngine::read_payload_from_plan(Some(&cold_store), Some(&cache), &stream, &plan)
@@ -848,7 +834,6 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
-            record_match: None,
         })
         .await
         .expect("append external payload");
@@ -1036,10 +1021,7 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
                 offset: 0,
                 max_len: 16,
                 now_ms: 1_500,
-                record: None,
-                max_records: None,
                 leader_only: false,
-                record_anchor: None,
                 read_index: None,
             },
             placement,
@@ -1084,10 +1066,7 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
                 offset: 0,
                 max_len: 16,
                 now_ms: 2_500,
-                record: None,
-                max_records: None,
                 leader_only: false,
-                record_anchor: None,
                 read_index: None,
             },
             placement,
@@ -3835,8 +3814,6 @@ impl GroupEngine for BlockingReadEngine {
                 payload: Vec::new(),
                 up_to_date: true,
                 closed: false,
-                retained_record_range: None,
-                record_range: None,
             })
         })
     }
@@ -3861,8 +3838,6 @@ impl GroupEngine for BlockingReadEngine {
                     content_type: DEFAULT_CONTENT_TYPE.to_owned(),
                     up_to_date: true,
                     closed: false,
-                    retained_record_range: None,
-                    record_range: None,
                     body: GroupReadStreamBody::Blocking {
                         entered: self.entered.clone(),
                         materialized: self.materialized.clone(),
@@ -3879,8 +3854,6 @@ impl GroupEngine for BlockingReadEngine {
                 payload: Vec::new(),
                 up_to_date: true,
                 closed: false,
-                retained_record_range: None,
-                record_range: None,
             };
             Ok(GroupReadStreamParts::from_response(response))
         })
@@ -3976,7 +3949,6 @@ impl GroupEngine for RecordingEngine {
                 closed: request.close_after,
                 already_exists: false,
                 group_commit_index: self.commit_index,
-                record_range: None,
                 hot_backlog: None,
             })
         })
@@ -4000,7 +3972,6 @@ impl GroupEngine for RecordingEngine {
                 snapshot_offset: None,
                 snapshot_digest: None,
                 retained_offset: 0,
-                record_range: None,
                 created_at_ms: None,
             })
         })
@@ -4021,8 +3992,6 @@ impl GroupEngine for RecordingEngine {
                 payload: Vec::new(),
                 up_to_date: true,
                 closed: false,
-                retained_record_range: None,
-                record_range: None,
             })
         })
     }
@@ -4058,7 +4027,6 @@ impl GroupEngine for RecordingEngine {
                 next_offset: self.commit_index,
                 group_commit_index: self.commit_index,
                 deduplicated: false,
-                record_range: None,
             })
         })
     }
@@ -4099,7 +4067,6 @@ impl GroupEngine for RecordingEngine {
                 closed: request.close_after,
                 deduplicated: false,
                 producer: request.producer,
-                record_range: None,
                 stream_hot_bytes: 0,
                 group_hot_bytes: 0,
                 receipt_evicted: false,

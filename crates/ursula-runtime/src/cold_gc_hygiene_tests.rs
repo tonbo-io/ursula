@@ -97,10 +97,7 @@ async fn read(runtime: &ShardRuntime, stream: &BucketStreamId, len: usize) -> Ve
             offset: 0,
             max_len: len,
             now_ms: 0,
-            record: None,
-            max_records: None,
             leader_only: false,
-            record_anchor: None,
             read_index: None,
         })
         .await
@@ -317,6 +314,7 @@ async fn retain_past_last_pack_reference() -> (Arc<ColdStore>, String) {
             payload: Bytes::from_static(b"state"),
             cold_body: None,
             now_ms: crate::runtime::unix_time_ms(),
+            expected_incarnation: None,
         })
         .await
         .expect("publish checkpoint");
@@ -325,6 +323,7 @@ async fn retain_past_last_pack_reference() -> (Arc<ColdStore>, String) {
             stream_id: streams[1].clone(),
             retained_offset: 4,
             now_ms: crate::runtime::unix_time_ms(),
+            expected_incarnation: None,
         })
         .await
         .expect("advance retention");

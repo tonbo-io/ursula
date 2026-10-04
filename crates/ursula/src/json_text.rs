@@ -438,9 +438,9 @@ mod tests {
                     "body: {:?}",
                     body
                 );
-                // RC-1 (bounded-state F1): record boundaries are exactly the
-                // LFs of the stored bytes, one per message, so sparse marks
-                // can recover them by counting LFs.
+                // RC-1: a JSON message boundary is exactly an offset after an
+                // LF of the stored bytes, and `committed_records` counts one
+                // per message.
                 let messages = match &value {
                     Json::Array(items) => items.len(),
                     _ => 1,

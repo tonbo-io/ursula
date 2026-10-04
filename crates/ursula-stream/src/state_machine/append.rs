@@ -4,7 +4,6 @@ use super::AppendExternalInput;
 use super::AppendStreamInput;
 use super::BucketStreamId;
 use super::ObjectPayloadRef;
-use super::ProducerAppendRecord;
 use super::ProducerReceipt;
 use super::ProducerRequest;
 use super::ProducerState;
@@ -15,10 +14,10 @@ use super::StreamResponse;
 use super::StreamStateMachine;
 use super::StreamStatus;
 use super::canonical_json_record_ends;
-use super::prepare_record_append;
 use super::renew_stream_ttl;
 use super::validate_external_payload_ref;
 use super::validate_producer_request;
+use super::validate_record_ends;
 
 impl StreamStateMachine {
     /// Applies one append, then enforces the F3 receipt window once.
@@ -34,7 +33,6 @@ impl StreamStateMachine {
                 stream_seq,
                 producer,
                 now_ms,
-                record_match,
             } = input;
             if let Err(response) = self.validate_stream_scope(&stream_id) {
                 break 'append response;
@@ -83,7 +81,6 @@ impl StreamStateMachine {
                     deduplicated: true,
                     producer: Some(producer),
                     receipt_evicted: true,
-                    record_range: None,
                 };
             }
             if let ProducerDecision::Duplicate {
@@ -91,7 +88,6 @@ impl StreamStateMachine {
                 next_offset,
                 closed,
                 producer,
-                items,
             } = producer_decision
             {
                 if payload.is_empty() {
@@ -108,12 +104,7 @@ impl StreamStateMachine {
                     deduplicated: true,
                     producer: Some(producer),
                     receipt_evicted: false,
-                    record_range: duplicate_record_range(&items, offset, next_offset),
                 };
-            }
-
-            if let Err(response) = self.validate_record_match(&stream_id, record_match) {
-                break 'append response;
             }
 
             let payload_len = u64::try_from(payload.len()).expect("payload len fits u64");
@@ -129,24 +120,6 @@ impl StreamStateMachine {
                 },
                 None => Vec::new(),
             };
-            let prepared_record_append = {
-                let slot = self
-                    .stream_slot(&stream_id)
-                    .expect("stream existence checked before record validation");
-                match prepare_record_append(
-                    slot.record_index.as_ref(),
-                    super::is_json_record_content_type(&slot.metadata.content_type),
-                    slot.metadata.tail_offset,
-                    payload_len,
-                    &record_ends,
-                ) {
-                    Ok(prepared) => prepared,
-                    Err(response) => break 'append response,
-                }
-            };
-            let record_range = prepared_record_append
-                .as_ref()
-                .map(crate::PreparedRecordAppend::range);
 
             let Some(stream) = self.stream_metadata_mut(&stream_id) else {
                 unreachable!("stream existence checked before producer evaluation");
@@ -216,12 +189,10 @@ impl StreamStateMachine {
                     stream_id.clone(),
                     producer,
                     now_ms,
-                    ProducerAppendRecord {
+                    ProducerReceiptRange {
                         start_offset: offset,
                         next_offset,
                         closed,
-                        record_start: record_range.map(|range| range.first_record),
-                        record_next: record_range.map(|range| range.next_record),
                     },
                 );
             }
@@ -236,11 +207,6 @@ impl StreamStateMachine {
                 let slot = self
                     .stream_slot_mut(&stream_id)
                     .expect("stream existence checked before append mutation");
-                if let (Some(index), Some(prepared)) =
-                    (slot.record_index.as_mut(), prepared_record_append)
-                {
-                    let _range = index.commit_append(prepared);
-                }
                 slot.hot_buffer.push(offset, next_offset, payload);
                 self.add_hot_payload_bytes(payload_len);
                 self.sync_hot_index(&stream_id);
@@ -256,7 +222,6 @@ impl StreamStateMachine {
                     deduplicated: false,
                     producer: producer_ack,
                     receipt_evicted: false,
-                    record_range,
                 }
             }
         };
@@ -286,7 +251,6 @@ impl StreamStateMachine {
             stream_seq,
             producer,
             now_ms,
-            record_match,
         } = input;
         if let Err(response) = validate_external_payload_ref(&payload) {
             return response;
@@ -330,7 +294,6 @@ impl StreamStateMachine {
                 deduplicated: true,
                 producer: Some(producer),
                 receipt_evicted: true,
-                record_range: None,
             };
         }
         if let ProducerDecision::Duplicate {
@@ -338,7 +301,6 @@ impl StreamStateMachine {
             next_offset,
             closed,
             producer,
-            items,
         } = producer_decision
         {
             return StreamResponse::Appended {
@@ -348,36 +310,17 @@ impl StreamStateMachine {
                 deduplicated: true,
                 producer: Some(producer),
                 receipt_evicted: false,
-                record_range: duplicate_record_range(&items, offset, next_offset),
             };
         }
-
-        if let Err(response) = self.validate_record_match(&stream_id, record_match) {
-            return response;
-        }
-
-        let prepared_record_append = {
-            let slot = self
-                .stream_slot(&stream_id)
-                .expect("stream existence checked before record validation");
-            match prepare_record_append(
-                slot.record_index.as_ref(),
-                super::is_json_record_content_type(&slot.metadata.content_type),
-                slot.metadata.tail_offset,
-                payload.payload_len,
-                &record_ends,
-            ) {
-                Ok(prepared) => prepared,
-                Err(response) => return response,
-            }
-        };
-        let record_range = prepared_record_append
-            .as_ref()
-            .map(crate::PreparedRecordAppend::range);
 
         let Some(stream) = self.stream_metadata(&stream_id) else {
             unreachable!("stream existence checked before producer evaluation");
         };
+        if let Err(response) =
+            validate_record_ends(&stream.content_type, payload.payload_len, &record_ends)
+        {
+            return response;
+        }
         if stream.status == StreamStatus::Closed {
             return StreamResponse::error_with_next_offset_and_context(
                 StreamErrorCode::StreamClosed,
@@ -426,12 +369,10 @@ impl StreamStateMachine {
                 stream_id.clone(),
                 producer,
                 now_ms,
-                ProducerAppendRecord {
+                ProducerReceiptRange {
                     start_offset: offset,
                     next_offset,
                     closed,
-                    record_start: record_range.map(|range| range.first_record),
-                    record_next: record_range.map(|range| range.next_record),
                 },
             );
         }
@@ -445,19 +386,10 @@ impl StreamStateMachine {
         let slot = self
             .stream_slot_mut(&stream_id)
             .expect("stream existence checked before external append mutation");
-        if let (Some(index), Some(prepared)) = (slot.record_index.as_mut(), prepared_record_append)
-        {
-            let _range = index.commit_append(prepared);
-        }
         // F5: commit first, index after. State holds the locator until the
         // leader's offload pass writes its page entry.
         slot.cold.push_direct_external_segment(object.clone());
         self.sync_hot_index(&stream_id);
-        // F1: an external append is a cold transition; it seals the records
-        // below the seal point, which may include its own. The
-        // acknowledgement uses the range computed above, never the index
-        // (RC-10).
-        self.seal_record_index(&stream_id);
         let appended_bytes = next_offset.saturating_sub(offset);
         self.usage_on_append(
             &stream_id.bucket_id,
@@ -471,47 +403,7 @@ impl StreamStateMachine {
             deduplicated: false,
             producer: producer_ack,
             receipt_evicted: false,
-            record_range,
         }
-    }
-
-    fn validate_record_match(
-        &self,
-        stream_id: &BucketStreamId,
-        expected: Option<u64>,
-    ) -> Result<(), StreamResponse> {
-        let Some(expected) = expected else {
-            return Ok(());
-        };
-        let Some(slot) = self.stream_slot(stream_id) else {
-            return Ok(());
-        };
-        let Some(index) = slot.record_index.as_ref() else {
-            return Err(StreamResponse::error(
-                StreamErrorCode::InvalidRecordBoundaries,
-                "Stream-Record-Match requires active JSON record coordinates",
-            ));
-        };
-        let current = index
-            .range()
-            .map_err(|_| {
-                StreamResponse::error(
-                    StreamErrorCode::InvalidRecordBoundaries,
-                    "stream record index is invalid",
-                )
-            })?
-            .next_record;
-        if current == expected {
-            return Ok(());
-        }
-        Err(StreamResponse::error_with_next_offset_and_context(
-            StreamErrorCode::RecordPreconditionFailed,
-            format!("record tail is {current}, expected {expected}"),
-            slot.metadata.tail_offset,
-            vec![StreamErrorContext::RecordTailMismatch {
-                current_record: current,
-            }],
-        ))
     }
 
     /// Read-only: whether an append from `producer` would be
@@ -629,7 +521,6 @@ impl StreamStateMachine {
                     producer_epoch: state.producer_epoch,
                     producer_seq: receipt.producer_seq,
                 },
-                items: receipt.items.clone(),
             });
         }
         if producer.producer_seq == state.producer_seq + 1 {
@@ -655,14 +546,13 @@ impl StreamStateMachine {
         stream_id: BucketStreamId,
         producer: ProducerRequest,
         now_ms: u64,
-        last: ProducerAppendRecord,
+        last: ProducerReceiptRange,
     ) {
         let receipt = ProducerReceipt {
             producer_seq: producer.producer_seq,
             start_offset: last.start_offset,
             next_offset: last.next_offset,
             closed: last.closed,
-            items: vec![last.clone()],
         };
         let Some(slot) = self.stream_slot_mut(&stream_id) else {
             return;
@@ -677,7 +567,7 @@ impl StreamStateMachine {
             // O(1) window update: the front is unchanged by a push and
             // becomes evictable once the producer holds two receipts.
             slot.receipt_window
-                .push_receipt(&producer.producer_id, state, &receipt);
+                .push_receipt(&producer.producer_id, state);
             state.receipts.push_back(receipt);
             state.last_seen_ms = now_ms;
             return;
@@ -700,28 +590,11 @@ impl StreamStateMachine {
     }
 }
 
-/// The record range a producer receipt item stored at apply time.
-fn item_record_range(item: &ProducerAppendRecord) -> Option<crate::StreamRecordRange> {
-    match (item.record_start, item.record_next) {
-        (Some(first_record), Some(next_record)) => Some(crate::StreamRecordRange {
-            first_record,
-            next_record,
-        }),
-        _ => None,
-    }
-}
-
-/// A duplicate's acknowledgement range: the stored receipt item for its
-/// byte range (RC-11), never one recomputed from the index.
-fn duplicate_record_range(
-    items: &[ProducerAppendRecord],
-    offset: u64,
+/// The byte range and closure an accepted producer write committed.
+struct ProducerReceiptRange {
+    start_offset: u64,
     next_offset: u64,
-) -> Option<crate::StreamRecordRange> {
-    items
-        .iter()
-        .find(|item| item.start_offset == offset && item.next_offset == next_offset)
-        .and_then(item_record_range)
+    closed: bool,
 }
 
 /// O(1) duplicate lookup (F3): receipts hold contiguous sequences, so the
@@ -754,7 +627,6 @@ enum ProducerDecision {
         next_offset: u64,
         closed: bool,
         producer: ProducerRequest,
-        items: Vec<ProducerAppendRecord>,
     },
     /// A duplicate whose receipt the window evicted (F3).
     DuplicateEvicted {

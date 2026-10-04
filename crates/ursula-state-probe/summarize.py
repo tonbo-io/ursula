@@ -24,7 +24,7 @@ def summarize(path):
                 g = m.get("gauges", {})
                 text += (
                     f" | heap={mb(m['heap_actual_bytes'])} tight={mb(m['heap_tight_bytes'])}"
-                    f" snap={mb(s['total_bytes'])} offsets={s['record_offsets_bytes']}"
+                    f" snap={mb(s['total_bytes'])}"
                     f" refs={s['cold_chunks_count']}"
                     f" receipts={s['receipt_count']} ttl_heap={g.get('ttl_heap_entries')}"
                 )

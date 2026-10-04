@@ -8,7 +8,6 @@ use super::CreateStreamInput;
 use super::HashMap;
 use super::HotBuffer;
 use super::ObjectPayloadRef;
-use super::ProducerAppendRecord;
 use super::ProducerReceipt;
 use super::ProducerRequest;
 use super::ProducerState;
@@ -20,12 +19,12 @@ use super::StreamResponse;
 use super::StreamSlot;
 use super::StreamStateMachine;
 use super::StreamStatus;
-use super::build_record_index;
 use super::renew_stream_ttl;
 use super::stream_is_expired;
 use super::validate_bucket_id;
 use super::validate_external_payload_ref;
 use super::validate_producer_request;
+use super::validate_record_ends;
 use super::validate_stream_id;
 
 impl StreamStateMachine {
@@ -91,12 +90,6 @@ impl StreamStateMachine {
             return response;
         }
         let initial_len = input.initial_len();
-        let record_index =
-            match build_record_index(&input.content_type, initial_len, &input.record_ends) {
-                Ok(index) => index,
-                Err(response) => return response,
-            };
-        let record_range = record_index.as_ref().and_then(|index| index.range().ok());
         if let Some(producer) = input.producer.as_ref()
             && producer.producer_seq != 0
         {
@@ -158,25 +151,17 @@ impl StreamStateMachine {
         let hot_buffer = HotBuffer::from_payload(0, input.initial_payload);
         let mut producer_states = HashMap::new();
         if let Some(producer) = input.producer {
-            let last_item = ProducerAppendRecord {
-                start_offset: 0,
-                next_offset: initial_len,
-                closed: input.close_after,
-                record_start: record_range.map(|range| range.first_record),
-                record_next: record_range.map(|range| range.next_record),
-            };
             producer_states.insert(producer.producer_id, ProducerState {
                 producer_epoch: producer.producer_epoch,
                 producer_seq: producer.producer_seq,
-                last_start_offset: last_item.start_offset,
-                last_next_offset: last_item.next_offset,
-                last_closed: last_item.closed,
+                last_start_offset: 0,
+                last_next_offset: initial_len,
+                last_closed: input.close_after,
                 receipts: std::collections::VecDeque::from([ProducerReceipt {
                     producer_seq: producer.producer_seq,
-                    start_offset: last_item.start_offset,
-                    next_offset: last_item.next_offset,
-                    closed: last_item.closed,
-                    items: vec![last_item],
+                    start_offset: 0,
+                    next_offset: initial_len,
+                    closed: input.close_after,
                 }]),
                 last_seen_ms: input.now_ms,
             });
@@ -186,7 +171,6 @@ impl StreamStateMachine {
             metadata,
             hot_buffer,
             cold: StreamColdState::with_generation(created_at_ms),
-            record_index,
             retained_offset: 0,
             visible_snapshot: None,
             receipt_window: super::producers::ReceiptWindow::rebuild(&producer_states),
@@ -233,15 +217,13 @@ impl StreamStateMachine {
         if let Err(response) = validate_producer_request(input.producer.as_ref()) {
             return response;
         }
-        let record_index = match build_record_index(
+        if let Err(response) = validate_record_ends(
             &input.content_type,
             input.initial_payload.payload_len,
             &input.record_ends,
         ) {
-            Ok(index) => index,
-            Err(response) => return response,
-        };
-        let record_range = record_index.as_ref().and_then(|index| index.range().ok());
+            return response;
+        }
         if let Some(producer) = input.producer.as_ref()
             && producer.producer_seq != 0
         {
@@ -314,25 +296,17 @@ impl StreamStateMachine {
         cold.push_direct_external_segment(object.clone());
         let mut producer_states = HashMap::new();
         if let Some(producer) = input.producer {
-            let last_item = ProducerAppendRecord {
-                start_offset: 0,
-                next_offset: initial_len,
-                closed: input.close_after,
-                record_start: record_range.map(|range| range.first_record),
-                record_next: record_range.map(|range| range.next_record),
-            };
             producer_states.insert(producer.producer_id, ProducerState {
                 producer_epoch: producer.producer_epoch,
                 producer_seq: producer.producer_seq,
-                last_start_offset: last_item.start_offset,
-                last_next_offset: last_item.next_offset,
-                last_closed: last_item.closed,
+                last_start_offset: 0,
+                last_next_offset: initial_len,
+                last_closed: input.close_after,
                 receipts: std::collections::VecDeque::from([ProducerReceipt {
                     producer_seq: producer.producer_seq,
-                    start_offset: last_item.start_offset,
-                    next_offset: last_item.next_offset,
-                    closed: last_item.closed,
-                    items: vec![last_item],
+                    start_offset: 0,
+                    next_offset: initial_len,
+                    closed: input.close_after,
                 }]),
                 last_seen_ms: input.now_ms,
             });
@@ -342,7 +316,6 @@ impl StreamStateMachine {
             metadata,
             hot_buffer: HotBuffer::default(),
             cold,
-            record_index,
             retained_offset: 0,
             visible_snapshot: None,
             receipt_window: super::producers::ReceiptWindow::rebuild(&producer_states),
@@ -359,8 +332,6 @@ impl StreamStateMachine {
             );
         }
         self.record_created_at_ms(created_at_ms);
-        // F1: the external body is cold at once; seal its records.
-        self.seal_record_index(&stream_id);
         self.usage_on_stream_created(
             &stream_id.bucket_id,
             initial_len,
@@ -388,7 +359,6 @@ impl StreamStateMachine {
             stream_seq,
             producer,
             now_ms,
-            record_match: None,
         })
     }
 
@@ -483,9 +453,6 @@ impl StreamStateMachine {
         self.remove_hot_payload_bytes(
             u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64"),
         );
-        self.hot_records = self
-            .hot_records
-            .saturating_sub(slot.hot_buffer.accounted_records());
         let shared_paths = slot
             .cold
             .shared_object_paths()

@@ -12,6 +12,7 @@ use super::StreamResponse;
 use super::StreamStateMachine;
 use super::StreamVisibleSnapshot;
 use super::stream_is_expired;
+use crate::json_records::is_json_record_content_type;
 
 /// Grace before the cold GC may delete pack slices that retention dropped
 /// (bounded-state F14i). It matches the default
@@ -103,6 +104,7 @@ impl StreamStateMachine {
         content_type: String,
         body: SnapshotBody,
         now_ms: u64,
+        expected_incarnation: Option<u64>,
     ) -> StreamResponse {
         if let Err(response) = self.validate_stream_scope(&stream_id) {
             return response;
@@ -187,7 +189,6 @@ impl StreamStateMachine {
                     return StreamResponse::SnapshotPublished {
                         snapshot_offset,
                         snapshot_digest: digest,
-                        record_range: self.record_range(&stream_id).ok().flatten(),
                     };
                 }
                 return StreamResponse::error_with_next_offset(
@@ -199,17 +200,14 @@ impl StreamStateMachine {
                 );
             }
         }
-        if !self.snapshot_offset_aligned(&stream_id, snapshot_offset, retained_offset) {
-            return StreamResponse::error_with_next_offset(
-                StreamErrorCode::InvalidSnapshot,
-                format!(
-                    "snapshot offset {snapshot_offset} is not aligned to a committed message boundary for stream '{stream_id}'"
-                ),
-                tail_offset,
-            );
+        if let Err(response) = self.check_json_boundary(
+            &stream_id,
+            snapshot_offset,
+            retained_offset,
+            expected_incarnation,
+        ) {
+            return response;
         }
-
-        let record_range = self.record_range(&stream_id).ok().flatten();
 
         let superseded = self
             .stream_slot_mut(&stream_id)
@@ -234,7 +232,6 @@ impl StreamStateMachine {
         StreamResponse::SnapshotPublished {
             snapshot_offset,
             snapshot_digest: digest,
-            record_range,
         }
     }
 
@@ -243,6 +240,7 @@ impl StreamStateMachine {
         stream_id: BucketStreamId,
         retained_offset: u64,
         now_ms: u64,
+        expected_incarnation: Option<u64>,
     ) -> StreamResponse {
         if let Err(response) = self.validate_stream_scope(&stream_id) {
             return response;
@@ -291,50 +289,12 @@ impl StreamStateMachine {
             );
         }
         if retained_offset == current {
-            return StreamResponse::RetentionAdvanced {
-                retained_offset,
-                record_range: self.record_range(&stream_id).ok().flatten(),
-            };
+            return StreamResponse::RetentionAdvanced { retained_offset };
         }
-        if !self.snapshot_offset_aligned(&stream_id, retained_offset, current) {
-            return StreamResponse::error_with_next_offset(
-                StreamErrorCode::InvalidSnapshot,
-                format!(
-                    "retention offset {retained_offset} is not aligned to a committed message boundary for stream '{stream_id}'"
-                ),
-                stream.tail_offset,
-            );
-        }
-        let prepared_record_retain = match self
-            .stream_slot(&stream_id)
-            .expect("stream existence checked before retention")
-            .record_index
-            .as_ref()
-            .map(|record_index| record_index.prepare_retain(retained_offset, stream.tail_offset))
-            .transpose()
+        if let Err(response) =
+            self.check_json_boundary(&stream_id, retained_offset, current, expected_incarnation)
         {
-            Ok(prepared) => prepared,
-            Err(_) => {
-                return StreamResponse::error_with_next_offset(
-                    StreamErrorCode::InvalidRecordBoundaries,
-                    format!(
-                        "retention offset {retained_offset} is not a retained record boundary for stream '{stream_id}'"
-                    ),
-                    stream.tail_offset,
-                );
-            }
-        };
-        // F1: a target inside sealed history lands on the mark at
-        // or below it; the response reports the effective boundary.
-        let retained_offset = prepared_record_retain.as_ref().map_or(
-            retained_offset,
-            crate::record_index::PreparedRetain::effective_offset,
-        );
-        if retained_offset == current {
-            return StreamResponse::RetentionAdvanced {
-                retained_offset,
-                record_range: self.record_range(&stream_id).ok().flatten(),
-            };
+            return response;
         }
         let slot = self
             .stream_slot_mut(&stream_id)
@@ -350,20 +310,8 @@ impl StreamStateMachine {
         // not-before time derives from the command's `now_ms`, so every
         // replica enqueues the same entry.
         let gc_not_before_ms = now_ms.saturating_add(RETENTION_COLD_GC_GRACE_MS);
-        self.compact_retained_prefix(
-            &stream_id,
-            retained_offset,
-            prepared_record_retain,
-            gc_not_before_ms,
-        );
-        // F1: retention can drop the hot bytes below dense records
-        // (an external append above them), which moves the seal point; seal
-        // here so retention leaves no seal debt for the tidy driver.
-        self.seal_record_index(&stream_id);
-        StreamResponse::RetentionAdvanced {
-            retained_offset,
-            record_range: self.record_range(&stream_id).ok().flatten(),
-        }
+        self.compact_retained_prefix(&stream_id, retained_offset, gc_not_before_ms);
+        StreamResponse::RetentionAdvanced { retained_offset }
     }
 
     pub(super) fn flush_cold(
@@ -394,11 +342,6 @@ impl StreamStateMachine {
         if let Some(path) = shared_path {
             self.retain_shared_cold_object(&path, &stream_id.bucket_id);
         }
-        // F1: seal the record offsets below the seal point.
-        self.seal_record_index(&stream_id);
-        // Sealing moves dense offsets below the seal point into marks;
-        // recount so the gauge matches a restored replica.
-        self.sync_hot_index(&stream_id);
         StreamResponse::ColdFlushed {
             hot_start_offset: self.hot_start_offset(&stream_id),
         }
@@ -701,45 +644,63 @@ impl StreamStateMachine {
             .unwrap_or(0)
     }
 
-    /// Seal point `p(s)`: the first hot byte, or the tail when nothing is
-    /// hot. Every byte of `[retained, tail)` the hot buffer does not hold is
-    /// cold: everything below `p(s)`, and external appends above hot bytes.
-    pub(super) fn seal_point(&self, stream_id: &BucketStreamId) -> u64 {
-        self.hot_start_offset(stream_id)
-    }
-
-    pub(super) fn snapshot_offset_aligned(
+    /// The JSON LF obligation, apply side, for a snapshot or retention
+    /// offset already inside `[floor, tail]` (`floor` is the retained
+    /// offset). A JSON message boundary is an offset whose preceding byte is
+    /// LF; the floor, the tail and offset 0 always are. When that byte is
+    /// hot, apply checks it. Otherwise only the proposer can read it, so
+    /// apply needs `expected_incarnation` naming the stream incarnation the
+    /// proposer read it from, and refuses a missing or stale one with
+    /// [`StreamErrorCode::JsonBoundaryUnverified`]. Other streams have no
+    /// message boundaries: any offset in range is accepted.
+    fn check_json_boundary(
         &self,
         stream_id: &BucketStreamId,
-        snapshot_offset: u64,
-        retained_offset: u64,
-    ) -> bool {
-        // F18 step 2: the retained offset, any offset at or below the seal
-        // point, or a record start at or above it (F4b), or the tail. A
-        // stream without a record index has no message boundaries, so any
-        // offset in `[retained, tail]` is aligned (callers check the range).
-        snapshot_offset == retained_offset
-            || snapshot_offset <= self.seal_point(stream_id)
-            || self
-                .stream_slot(stream_id)
-                .is_some_and(|slot| slot.derived_is_boundary(snapshot_offset))
+        offset: u64,
+        floor: u64,
+        expected_incarnation: Option<u64>,
+    ) -> Result<(), StreamResponse> {
+        let Some(slot) = self.stream_slot(stream_id) else {
+            return Ok(());
+        };
+        let stream = &slot.metadata;
+        if !is_json_record_content_type(&stream.content_type)
+            || offset == 0
+            || offset == floor
+            || offset == stream.tail_offset
+        {
+            return Ok(());
+        }
+        match slot.hot_buffer.byte_at(offset - 1) {
+            Some(b'\n') => Ok(()),
+            Some(_) => Err(StreamResponse::error_with_next_offset(
+                StreamErrorCode::InvalidSnapshot,
+                format!("offset {offset} is not a JSON message boundary for stream '{stream_id}'"),
+                stream.tail_offset,
+            )),
+            None if expected_incarnation == Some(stream.created_at_ms) => Ok(()),
+            None => Err(StreamResponse::error_with_next_offset_and_context(
+                StreamErrorCode::JsonBoundaryUnverified,
+                format!(
+                    "offset {offset} of stream '{stream_id}' needs a verified JSON message boundary"
+                ),
+                stream.tail_offset,
+                vec![StreamErrorContext::StreamIncarnation {
+                    incarnation: stream.created_at_ms,
+                }],
+            )),
+        }
     }
 
     pub(super) fn compact_retained_prefix(
         &mut self,
         stream_id: &BucketStreamId,
         retained_offset: u64,
-        prepared_record_retain: Option<crate::record_index::PreparedRetain>,
         gc_not_before_ms: u64,
     ) {
         let slot = self
             .stream_slot_mut(stream_id)
             .expect("stream existence checked before retained-prefix compaction");
-        if let (Some(record_index), Some(prepared)) =
-            (slot.record_index.as_mut(), prepared_record_retain)
-        {
-            record_index.commit_retain(prepared);
-        }
         let dropped_cold_paths = slot.cold.compact_before(retained_offset);
         self.release_shared_cold_objects(
             &stream_id.bucket_id,
@@ -755,15 +716,5 @@ impl StreamStateMachine {
         let hot_bytes_after = u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64");
         self.remove_hot_payload_bytes(hot_bytes_before.saturating_sub(hot_bytes_after));
         self.sync_hot_index(stream_id);
-    }
-
-    /// Lowest offset from which bootstrap answers exactly from hot bytes
-    /// (F4b). For a JSON stream: the first record start at or above the seal
-    /// point; a record that straddles the seal point has no start there, so
-    /// the frontier moves past it. For any other stream: `max(seal point,
-    /// retained)`.
-    pub(super) fn exact_message_frontier(&self, stream_id: &BucketStreamId) -> u64 {
-        self.stream_slot(stream_id)
-            .map_or(0, |slot| slot.derived_exact_frontier())
     }
 }

@@ -65,10 +65,7 @@ fn read_req(stream_id: BucketStreamId, offset: u64, max_len: usize) -> ReadStrea
         offset,
         max_len,
         now_ms: 0,
-        record: None,
-        max_records: None,
         leader_only: false,
-        record_anchor: None,
         read_index: None,
     }
 }
@@ -175,7 +172,6 @@ async fn openraft_snapshot_with_regressed_frontier_builds_and_installs() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
-            record_match: None,
         },
         StreamCommand::AppendExternal {
             stream_id: stream_id.clone(),
@@ -186,7 +182,6 @@ async fn openraft_snapshot_with_regressed_frontier_builds_and_installs() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
-            record_match: None,
         },
         StreamCommand::FlushCold {
             // C7: the group's first incarnation, created at 0, is 1.

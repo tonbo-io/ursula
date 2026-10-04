@@ -21,8 +21,6 @@ const CONTENT_TYPE: &str = "application/octet-stream";
 const APPENDS_PER_ITER: usize = 1024;
 const PAYLOAD_BYTES: usize = 256;
 const STREAM_COUNT: usize = 1024;
-const RECORD_COUNT: usize = 100_000;
-const JSON_RECORD: &[u8] = b"{\"value\":1}\n";
 const CARDINALITY_APPEND_COUNT: usize = 256;
 
 fn append_apply_benches(c: &mut Criterion) {
@@ -57,92 +55,6 @@ fn append_apply_benches(c: &mut Criterion) {
     group.finish();
 }
 
-fn record_coordinate_benches(c: &mut Criterion) {
-    let (machine, stream_id) = setup_record_machine(RECORD_COUNT);
-    let mut group = c.benchmark_group("record_coordinates");
-
-    group.bench_function("seek_100k_records", |b| {
-        b.iter(|| {
-            black_box(
-                machine
-                    .offset_for_record(&stream_id, black_box(75_000))
-                    .expect("record seek"),
-            )
-        });
-    });
-
-    group.bench_function("aligned_read_100_records", |b| {
-        b.iter(|| {
-            let start = machine
-                .offset_for_record(&stream_id, black_box(50_000))
-                .expect("record start")
-                .expect("record index active");
-            let end = machine
-                .offset_for_record(&stream_id, 50_100)
-                .expect("record end")
-                .expect("record index active");
-            black_box(
-                machine
-                    .read_plan(
-                        &stream_id,
-                        start,
-                        usize::try_from(end - start).expect("read length fits usize"),
-                    )
-                    .expect("record-aligned read"),
-            );
-        });
-    });
-
-    group.throughput(Throughput::Elements(
-        u64::try_from(APPENDS_PER_ITER).expect("append count fits u64"),
-    ));
-    group.bench_function("append_json_records", |b| {
-        b.iter_batched(
-            || setup_record_machine(0),
-            |(mut machine, stream_id)| {
-                for _ in 0..APPENDS_PER_ITER {
-                    let response = machine.apply(StreamCommand::Append {
-                        stream_id: stream_id.clone(),
-                        content_type: Some("application/json".to_owned()),
-                        payload: bytes::Bytes::from_static(JSON_RECORD),
-                        close_after: false,
-                        stream_seq: None,
-                        producer: None,
-                        now_ms: 0,
-                        record_match: None,
-                    });
-                    assert!(matches!(response, StreamResponse::Appended { .. }));
-                }
-                black_box(machine);
-            },
-            BatchSize::LargeInput,
-        );
-    });
-
-    group.throughput(Throughput::Elements(1));
-    group.bench_function("append_json_record_to_100k_index", |b| {
-        b.iter_batched(
-            || setup_record_machine(RECORD_COUNT),
-            |(mut machine, stream_id)| {
-                let response = machine.apply(StreamCommand::Append {
-                    stream_id,
-                    content_type: Some("application/json".to_owned()),
-                    payload: bytes::Bytes::from_static(JSON_RECORD),
-                    close_after: false,
-                    stream_seq: None,
-                    producer: None,
-                    now_ms: 0,
-                    record_match: None,
-                });
-                assert!(matches!(response, StreamResponse::Appended { .. }));
-                black_box(machine);
-            },
-            BatchSize::LargeInput,
-        );
-    });
-    group.finish();
-}
-
 fn unrelated_stream_cardinality_benches(c: &mut Criterion) {
     let placement = ShardPlacement {
         core_id: CoreId(0),
@@ -174,7 +86,6 @@ fn unrelated_stream_cardinality_benches(c: &mut Criterion) {
                                         stream_seq: None,
                                         producer: None,
                                         now_ms: 0,
-                                        record_match: None,
                                     }),
                                     placement,
                                 )
@@ -212,32 +123,6 @@ fn setup_group_engine(stream_count: usize, placement: ShardPlacement) -> InMemor
         black_box(response);
     }
     engine
-}
-
-fn setup_record_machine(record_count: usize) -> (StreamStateMachine, BucketStreamId) {
-    let stream_id = BucketStreamId::new("benchcmp", "record-coordinates");
-    let mut machine = StreamStateMachine::new();
-    assert!(matches!(
-        machine.apply(StreamCommand::CreateBucket {
-            bucket_id: "benchcmp".to_owned(),
-        }),
-        StreamResponse::BucketCreated { .. }
-    ));
-    assert!(matches!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream_id.clone(),
-            content_type: "application/json".to_owned(),
-            initial_payload: bytes::Bytes::from(JSON_RECORD.repeat(record_count)),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
-            now_ms: 0,
-        }),
-        StreamResponse::Created { .. }
-    ));
-    (machine, stream_id)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -372,6 +257,7 @@ fn snapshot_compaction(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 
         content_type: "application/json".to_owned(),
         payload: bytes::Bytes::from_static(b"{}"),
         now_ms: 0,
+        expected_incarnation: None,
     }) {
         StreamResponse::SnapshotPublished { .. } => {}
         response => panic!("publish snapshot failed: {response:?}"),
@@ -380,6 +266,7 @@ fn snapshot_compaction(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 
         stream_id,
         retained_offset: snapshot_offset,
         now_ms: 0,
+        expected_incarnation: None,
     }) {
         StreamResponse::RetentionAdvanced {
             retained_offset, ..
@@ -402,7 +289,6 @@ fn append(
         stream_seq: None,
         producer,
         now_ms: 0,
-        record_match: None,
     }) {
         StreamResponse::Appended { next_offset, .. } => next_offset,
         response => panic!("append failed: {response:?}"),
@@ -416,7 +302,6 @@ fn stream_id(index: usize) -> BucketStreamId {
 criterion_group!(
     benches,
     append_apply_benches,
-    record_coordinate_benches,
     unrelated_stream_cardinality_benches
 );
 criterion_main!(benches);

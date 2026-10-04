@@ -238,6 +238,8 @@ fn ttl_heap(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
     let mut finals = Vec::new();
     for variant in ["none", "sliding", "absolute"] {
         let mut rng = payload::Rng::new(23);
+        // Allocated before the heap baseline, so it does not count as state.
+        let mut starts = smx::RecordStarts::new(if args.retain_every > 0 { 1_002 } else { 0 });
         let base = Baseline::now();
         let mut m = StreamStateMachine::new();
         smx::create_bucket(&mut m, "bkt1")?;
@@ -255,13 +257,19 @@ fn ttl_heap(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
             while n < *cp {
                 let now = smx::T0 + n * 10;
                 let record = payload::json_record(&mut rng, n, 200);
+                starts.push(n, smx::tail(&m, &id));
                 smx::ok(smx::append(&mut m, &id, record, None, now), "append")?;
                 n += 1;
                 if m.total_hot_payload_bytes() >= 8 * smx::MIB as u64 {
                     smx::flush_pass(&mut m, 8 * smx::MIB, 8 * smx::MIB, &mut packs, &mut stats)?;
                 }
-                if args.retain_every > 0 && n.is_multiple_of(args.retain_every) && n > 1000 {
-                    smx::checkpoint_and_retain(&mut m, &id, n - 1000, br#"{"c":1}"#, now)?;
+                if args.retain_every > 0
+                    && n.is_multiple_of(args.retain_every)
+                    && n > 1000
+                    && let Some((_, offset)) = starts.at_or_below(n - 1000)
+                    && offset > m.retained_offset(&id)
+                {
+                    smx::checkpoint_and_retain(&mut m, &id, offset, br#"{"c":1}"#, now)?;
                 }
             }
             let heap = alloc::heap() - base.heap;

@@ -37,7 +37,6 @@ pub struct AppendStreamInput<'a> {
     pub stream_seq: Option<String>,
     pub producer: Option<ProducerRequest>,
     pub now_ms: u64,
-    pub record_match: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -50,7 +49,6 @@ pub(crate) struct AppendExternalInput<'a> {
     pub(crate) stream_seq: Option<String>,
     pub(crate) producer: Option<ProducerRequest>,
     pub(crate) now_ms: u64,
-    pub(crate) record_match: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,18 +73,6 @@ pub struct ProducerReceipt {
     pub start_offset: u64,
     pub next_offset: u64,
     pub closed: bool,
-    pub items: Vec<ProducerAppendRecord>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProducerAppendRecord {
-    pub start_offset: u64,
-    pub next_offset: u64,
-    pub closed: bool,
-    #[serde(default)]
-    pub record_start: Option<u64>,
-    #[serde(default)]
-    pub record_next: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,13 +236,6 @@ pub struct StreamReadPlan {
     pub segments: Vec<StreamReadSegment>,
     pub up_to_date: bool,
     pub closed: bool,
-    pub retained_record_range: Option<crate::StreamRecordRange>,
-    pub record_range: Option<crate::StreamRecordRange>,
-    /// Set on a bracketed record read (F1): the segments cover a byte
-    /// window around the requested records, and materialization trims it
-    /// by counting LFs, then rewrites `offset`, `next_offset`,
-    /// `record_range` and `up_to_date`. Until then `up_to_date` is false.
-    pub record_trim: Option<Box<crate::RecordTrim>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -3,7 +3,6 @@ use serde::Serialize;
 use ursula_shard::BucketStreamId;
 
 use crate::model::ProducerRequest;
-use crate::record_index::StreamRecordRange;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamResponse {
@@ -33,13 +32,9 @@ pub enum StreamResponse {
         producer: Option<ProducerRequest>,
         /// A duplicate whose receipt the stream's receipt window evicted
         /// (F3). It is answered as deduplicated without
-        /// byte or record ranges: `offset` and `next_offset` are the stream
-        /// tail and carry no information about the original append.
+        /// byte ranges: `offset` and `next_offset` are the stream tail and
+        /// carry no information about the original append.
         receipt_evicted: bool,
-        /// Records of this append as apply computed them, or the stored
-        /// receipt's range for a duplicate (F1, RC-10/RC-11). Never derived
-        /// from the record index afterwards, which may have sealed them.
-        record_range: Option<StreamRecordRange>,
     },
     Closed {
         next_offset: u64,
@@ -57,11 +52,9 @@ pub enum StreamResponse {
     SnapshotPublished {
         snapshot_offset: u64,
         snapshot_digest: String,
-        record_range: Option<StreamRecordRange>,
     },
     RetentionAdvanced {
         retained_offset: u64,
-        record_range: Option<StreamRecordRange>,
     },
     Accessed {
         changed: bool,
@@ -141,7 +134,12 @@ pub enum StreamErrorCode {
     SnapshotNotFound,
     SnapshotConflict,
     InvalidRecordBoundaries,
-    RecordPreconditionFailed,
+    /// A JSON snapshot or retention offset whose preceding byte is not in
+    /// the hot buffer, proposed without an `expected_incarnation` that
+    /// matches the stream. The proposer verifies the byte is LF by reading
+    /// it, then proposes again with the incarnation the error carries in
+    /// [`StreamErrorContext::StreamIncarnation`].
+    JsonBoundaryUnverified,
     /// A state import targeted a group that already holds buckets or streams.
     ImportConflict,
     /// A state import payload failed snapshot validation.
@@ -162,8 +160,10 @@ pub enum StreamErrorContext {
         expected_seq: u64,
         received_seq: u64,
     },
-    RecordTailMismatch {
-        current_record: u64,
+    /// The stream incarnation (`created_at_ms`) a
+    /// [`StreamErrorCode::JsonBoundaryUnverified`] refusal saw.
+    StreamIncarnation {
+        incarnation: u64,
     },
 }
 

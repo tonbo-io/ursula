@@ -858,9 +858,8 @@ pub(crate) fn head_stream_request_from_v1(
     }
 }
 
-/// Server half of a forwarded read: the engine request, with the F1
-/// continuation anchor the follower sent (absent from older followers) and
-/// its `leader_only` flag, so a forwarded `consistency=leader` read is
+/// Server half of a forwarded read: the engine request with the follower's
+/// `leader_only` flag, so a forwarded `consistency=leader` read is
 /// linearized on the leader.
 /// `Err` names the invalid field.
 pub(crate) fn read_stream_request_from_v1(
@@ -875,16 +874,7 @@ pub(crate) fn read_stream_request_from_v1(
         offset: read.offset,
         max_len,
         now_ms,
-        record: read.record,
-        max_records: read.max_records,
         leader_only: read.leader_only,
-        record_anchor: read
-            .record_anchor
-            .map(|anchor| ursula_runtime::RecordAnchor {
-                incarnation: anchor.incarnation,
-                record: anchor.record,
-                offset: anchor.offset,
-            }),
         read_index: None,
     })
 }

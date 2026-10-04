@@ -3,11 +3,18 @@
 //!
 //! - `Stream-Snapshot-Match` answers 400. Ignoring it would turn a
 //!   conditional snapshot publish into an unconditional one.
+//! - JSON record coordinates (F2): the read parameters `record`,
+//!   `tail_records`, `max_records` and `record_view` answer 400 on every
+//!   read (catch-up, long-poll and SSE), and so does `Stream-Record-Match`
+//!   on an append. Ignoring them would read from the wrong position or turn
+//!   a conditional append into an unconditional one. The record-addressed
+//!   `PUT {stream}/snapshot?record=` and `PUT {stream}/retention?record=`
+//!   routes are gone.
 //! - A bare `GET {stream}/snapshot` (the old latest-snapshot redirect) answers
-//!   405, not 404: Loro's streams client reads a 404 as "no snapshot". The
-//!   router registers only `PUT` on that path, so axum answers 405 with
-//!   `Allow: PUT`. Clients read the latest snapshot's offset from HEAD and
-//!   fetch `GET {stream}/snapshot/{offset}`.
+//!   405, not 404: Loro's streams client reads a 404 as "no snapshot". An
+//!   explicit handler answers every method on that path with 405 and an
+//!   empty `Allow`. Clients read the latest snapshot's offset
+//!   from HEAD and fetch `GET {stream}/snapshot/{offset}`.
 //! - Three-segment stream paths (path affinity) and
 //!   `POST /{bucket}/{group}/$transaction` answer 404: no route matches. A
 //!   two-segment stream ID may not start with `$` (400), so a future
@@ -21,6 +28,8 @@
 //! The removed names live only in this file, which the release's "nothing
 //! left" check allowlists.
 
+use std::collections::HashMap;
+
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -28,6 +37,45 @@ use axum::response::Response;
 
 /// The removed compare-and-set precondition on snapshot publish.
 const HEADER_STREAM_SNAPSHOT_MATCH: &str = "stream-snapshot-match";
+
+/// The removed compare-and-append precondition on JSON appends.
+const HEADER_STREAM_RECORD_MATCH: &str = "stream-record-match";
+
+/// The removed record-coordinate read parameters.
+const RECORD_READ_PARAMETERS: [&str; 4] = ["record", "tail_records", "max_records", "record_view"];
+
+/// Rejects a read that carries a removed record-coordinate parameter.
+pub(crate) fn reject_removed_read_parameters(
+    query: &HashMap<String, String>,
+) -> Result<(), Box<Response>> {
+    match RECORD_READ_PARAMETERS
+        .iter()
+        .find(|name| query.contains_key(**name))
+    {
+        Some(name) => Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                format!("the {name} parameter is not supported; record coordinates were removed"),
+            )
+                .into_response(),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Rejects an append that carries the removed `Stream-Record-Match`.
+pub(crate) fn reject_removed_append_headers(headers: &HeaderMap) -> Result<(), Box<Response>> {
+    if headers.contains_key(HEADER_STREAM_RECORD_MATCH) {
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                "Stream-Record-Match is not supported",
+            )
+                .into_response(),
+        ));
+    }
+    Ok(())
+}
 
 /// Rejects a snapshot publish that carries a removed precondition header.
 pub(crate) fn reject_removed_snapshot_headers(headers: &HeaderMap) -> Result<(), Box<Response>> {
@@ -108,21 +156,70 @@ mod tests {
         let digest = "0".repeat(64);
         let header = [(HEADER_STREAM_SNAPSHOT_MATCH, digest.as_str())];
 
-        for target in [
-            format!("{uri}/snapshot/{at}"),
-            format!("{uri}/snapshot?record=0"),
-        ] {
-            let response = send(&app, "PUT", &target, &header, "state").await;
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{target}");
-            assert!(
-                body_text(response).await.contains("Stream-Snapshot-Match"),
-                "{target}"
-            );
-        }
+        let target = format!("{uri}/snapshot/{at}");
+        let response = send(&app, "PUT", &target, &header, "state").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(response).await.contains("Stream-Snapshot-Match"));
 
         let head = send(&app, "HEAD", uri, &[], "").await;
         assert_eq!(head.status(), StatusCode::OK);
         assert!(!head.headers().contains_key(HEADER_STREAM_SNAPSHOT_OFFSET));
+    }
+
+    #[tokio::test]
+    async fn record_coordinate_surface_answers_400_and_writes_nothing() {
+        let app = app();
+        let uri = "/removed/records";
+        let json = [(CONTENT_TYPE.as_str(), "application/json")];
+        let response = send(&app, "PUT", uri, &json, "{\"a\":1}\n").await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        for query in [
+            "record=0",
+            "record=now",
+            "tail_records=1",
+            "offset=-1&max_records=1",
+            "offset=-1&record_view=envelope",
+        ] {
+            for live in ["", "&live=long-poll", "&live=sse"] {
+                let target = format!("{uri}?{query}{live}");
+                let response = send(&app, "GET", &target, &[], "").await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{target}");
+            }
+        }
+
+        let matched = [
+            (CONTENT_TYPE.as_str(), "application/json"),
+            (HEADER_STREAM_RECORD_MATCH, "1"),
+        ];
+        let response = send(&app, "POST", uri, &matched, "{\"b\":2}\n").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(response).await.contains("Stream-Record-Match"));
+        let head = send(&app, "HEAD", uri, &[], "").await;
+        assert_eq!(
+            head.headers()
+                .get(HEADER_STREAM_NEXT_OFFSET)
+                .expect("next offset"),
+            &format!("{:020}", 8)
+        );
+        assert!(!head.headers().contains_key("stream-extensions"));
+
+        for target in [
+            format!("{uri}/snapshot?record=0"),
+            format!("{uri}/retention?record=0"),
+        ] {
+            let response = send(&app, "PUT", &target, &[], "state").await;
+            assert!(
+                matches!(
+                    response.status(),
+                    StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+                ),
+                "{target}: {}",
+                response.status()
+            );
+        }
+        let response = send(&app, "GET", &format!("{uri}/snapshot"), &[], "").await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]

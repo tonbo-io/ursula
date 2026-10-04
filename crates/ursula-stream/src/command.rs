@@ -48,7 +48,6 @@ pub enum StreamCommand {
         stream_seq: Option<String>,
         producer: Option<ProducerRequest>,
         now_ms: u64,
-        record_match: Option<u64>,
     },
     AppendExternal {
         stream_id: BucketStreamId,
@@ -60,14 +59,18 @@ pub enum StreamCommand {
         stream_seq: Option<String>,
         producer: Option<ProducerRequest>,
         now_ms: u64,
-        record_match: Option<u64>,
     },
+    /// `expected_incarnation` (JSON streams only): the stream incarnation
+    /// whose byte before `snapshot_offset` the proposer read and found LF.
+    /// Apply needs it when that byte is not hot, and refuses a mismatch.
     PublishSnapshot {
         stream_id: BucketStreamId,
         snapshot_offset: u64,
         content_type: String,
         payload: Bytes,
         now_ms: u64,
+        #[serde(default)]
+        expected_incarnation: Option<u64>,
     },
     /// Publishes a snapshot whose body the proposer staged as a cold-tier
     /// object (bounded-state F16). The proposer computed
@@ -80,11 +83,16 @@ pub enum StreamCommand {
         object: ExternalPayloadRef,
         digest: String,
         now_ms: u64,
+        #[serde(default)]
+        expected_incarnation: Option<u64>,
     },
+    /// `expected_incarnation` as on [`Self::PublishSnapshot`].
     AdvanceRetention {
         stream_id: BucketStreamId,
         retained_offset: u64,
         now_ms: u64,
+        #[serde(default)]
+        expected_incarnation: Option<u64>,
     },
     TouchStreamAccess {
         stream_id: BucketStreamId,
@@ -184,7 +192,7 @@ fn len_u64(len: usize) -> u64 {
 
 impl StreamCommand {
     /// Approximate bytes this command occupies in the Raft log: its payload
-    /// bytes plus a fixed allowance per command, record boundary and chunk
+    /// bytes plus a fixed allowance per command, message end and chunk
     /// reference. Snapshot cadence (bounded-state F12e) counts log bytes
     /// with it, so it needs to track payload volume, not exact encodings.
     pub fn log_bytes_estimate(&self) -> u64 {

@@ -17,7 +17,7 @@ Publishes a new checkpoint blob at the given offset. The snapshot replaces any p
  Stream offset this snapshot represents: the 20-character zero-padded decimal token.
 </ParamField>
 
-For JSON streams, `PUT /{bucket}/{stream}/snapshot?record={record}` resolves a stable record ordinal to its offset and publishes at that boundary.
+For an `application/json` stream the offset must be a message boundary: a `Stream-Next-Offset` that Ursula returned, or any offset just after a message's LF.
 
 <ParamField header="Content-Type" type="string">
  Content type of the snapshot blob, stored separately from the stream's own content type. Defaults to `application/octet-stream`.
@@ -32,12 +32,13 @@ For JSON streams, `PUT /{bucket}/{stream}/snapshot?record={record}` resolves a s
 | Status | Meaning |
 | ------ | --------------------------------------------------------------- |
 | `204` | Snapshot published successfully. |
-| `400` | Invalid offset or content type. |
+| `400` | Invalid offset or content type, or, on a JSON stream, an offset inside a message. |
 | `404` | Stream not found or expired. |
 | `409` | Stale publish (a newer snapshot exists) or offset out of range. |
 | `410` | Snapshot offset is older than the retained stream history. |
 | `413` | Snapshot body exceeds the maximum allowed size (32 MiB inline, 1 GiB in the cold tier). |
 | `502` | The cold backend failed while storing the body. |
+| `503` | JSON stream only: Ursula could not read the byte before the offset to check the boundary. Nothing was published; retry. |
 
 Response headers include `Stream-Next-Offset`, `Stream-Snapshot-Offset`, and `Stream-Snapshot-Digest`. Repeating the same offset, content type, and body is idempotent and returns the same digest. Reusing an offset with different content returns `409`.
 
@@ -51,7 +52,7 @@ curl -X PUT 'http://127.0.0.1:4437/demo/hello/snapshot/00000000000000000042' \
 
 ## Advance retention
 
-`PUT /{bucket}/{stream}/retention/{offset}` explicitly discards history before a published checkpoint. For JSON streams, `PUT /{bucket}/{stream}/retention?record={record}` accepts a record ordinal. The boundary must be monotonic, aligned, and no newer than the visible checkpoint.
+`PUT /{bucket}/{stream}/retention/{offset}` explicitly discards history before a published checkpoint. The boundary must be monotonic, no newer than the visible checkpoint, and, on a JSON stream, a message boundary (`400` otherwise, `503` when it cannot be checked). Retention is exact: the response's `Stream-Retained-Offset` is the requested offset.
 
 After a successful `204`, reads before the retained offset return `410 Gone`. This separate step lets clients publish and verify a checkpoint before making history unreachable.
 

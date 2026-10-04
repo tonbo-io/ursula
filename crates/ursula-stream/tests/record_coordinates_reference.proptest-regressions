@@ -1,9 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 9149765745edad1a8087384d87646995a3dc6f4924a69ffc8fdadf15731e9fe8 # shrinks to ops = [Inline { sizes: [2], producer: false }], reads = [(0, None, 18446744073709551615)]
-cc c59994f53dfe542ab56dbb3b7dc1abd57f1683d96288a4461ae02db4643bff3f # shrinks to ops = [Retry], reads = [(0, None, 18446744073709551615)]
-cc 2ff0632a94c6c091bee4b1ec3d4197c0304f247f6aa69c74fd6475dfaf9e7dbc # shrinks to ops = [External([154, 174, 138]), Retain(939), Retain(572)], reads = [(674, None, 18446744073709551615), (781, Some(45), 18446744073709551615), (400, None, 1589), (402, Some(18), 878554)]

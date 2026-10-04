@@ -51,6 +51,7 @@ fn publish_cold(
         },
         digest: digest.to_owned(),
         now_ms: 10,
+        expected_incarnation: None,
     })
 }
 
@@ -115,7 +116,6 @@ fn cold_snapshot_keeps_a_reference_and_queues_unreferenced_bodies() {
         stream_seq: None,
         producer: None,
         now_ms: 11,
-        record_match: None,
     });
     publish_cold(&mut machine, 4, "s/external/c.bin", "dc");
     assert_eq!(gc_paths(&machine), vec![

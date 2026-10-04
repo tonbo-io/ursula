@@ -49,7 +49,6 @@ fn append(machine: &mut StreamStateMachine, id: &str, payload: &[u8]) {
         stream_seq: None,
         producer: None,
         now_ms: 0,
-        record_match: None,
     });
     assert!(
         matches!(response, StreamResponse::Appended { .. }),
@@ -71,7 +70,6 @@ fn append_external(machine: &mut StreamStateMachine, id: &str, path: &str, len: 
         stream_seq: None,
         producer: None,
         now_ms: 0,
-        record_match: None,
     });
     assert!(
         matches!(response, StreamResponse::Appended { .. }),
@@ -110,6 +108,7 @@ fn publish_snapshot(machine: &mut StreamStateMachine, id: &str, offset: u64) -> 
         content_type: OCTET.to_owned(),
         payload: bytes::Bytes::from_static(b"state"),
         now_ms: 0,
+        expected_incarnation: None,
     })
 }
 
@@ -118,6 +117,7 @@ fn retain(machine: &mut StreamStateMachine, id: &str, offset: u64, now_ms: u64) 
         stream_id: stream(id),
         retained_offset: offset,
         now_ms,
+        expected_incarnation: None,
     })
 }
 
@@ -138,9 +138,9 @@ fn f18_offsets_at_or_below_the_seal_point_are_aligned() {
         flush(&mut machine, "seal", 0, 4, "derived/chunks/a.bin"),
         StreamResponse::ColdFlushed { .. }
     ));
-    assert_eq!(machine.seal_point(&stream("seal")), 7);
-    // Intra-record cold offsets below p(s) stay accepted (F1 rejects them
-    // for JSON leader-side, later).
+    assert_eq!(machine.hot_start_offset(&stream("seal")), 7);
+    // A non-JSON stream has no message boundaries: an offset inside the
+    // cold external append is accepted.
     assert!(matches!(
         publish_snapshot(&mut machine, "seal", 5),
         StreamResponse::SnapshotPublished { .. }
@@ -163,7 +163,7 @@ fn f18_retention_keeps_hot_messages_above_the_seal_point() {
         StreamResponse::RetentionAdvanced { .. }
     ));
     // `[2, 4)` stays hot, at p(s) = 2.
-    assert_eq!(machine.seal_point(&stream("collapse")), 2);
+    assert_eq!(machine.hot_start_offset(&stream("collapse")), 2);
     // The external append `[4, 7)` above it is cold, so bootstrap from 2 is
     // an honest partial rather than a part that would need cold bytes.
     let plan = machine

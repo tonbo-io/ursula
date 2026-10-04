@@ -215,7 +215,7 @@ pub(super) async fn run_http_protocol_surface_inner(
     // The latest-snapshot redirect was removed; the bare path answers 405.
     let latest_snapshot = send(&app, "GET", &format!("{path}/snapshot"), &[], Body::empty()).await;
     assert_eq!(latest_snapshot.status(), StatusCode::METHOD_NOT_ALLOWED);
-    assert_eq!(header_str(&latest_snapshot, "allow"), "PUT");
+    assert_eq!(header_str(&latest_snapshot, "allow"), "");
 
     let read_snapshot = send(&app, "GET", &snapshot_path, &[], Body::empty()).await;
     assert_eq!(read_snapshot.status(), StatusCode::OK);
@@ -1174,10 +1174,6 @@ pub(super) async fn run_http_producer_protocol_surface_inner(
     )
     .await;
     assert_eq!(create_records.status(), StatusCode::CREATED);
-    assert_eq!(
-        header_str(&create_records, "stream-extensions"),
-        "json-record-coordinates-v1"
-    );
 
     let append_records = send(
         &app,
@@ -1193,8 +1189,7 @@ pub(super) async fn run_http_producer_protocol_surface_inner(
     )
     .await;
     assert_eq!(append_records.status(), StatusCode::OK);
-    assert_eq!(header_str(&append_records, "stream-record-start"), "0");
-    assert_eq!(header_str(&append_records, "stream-record-next"), "2");
+    let records_tail = header_str(&append_records, "stream-next-offset").to_owned();
 
     let duplicate_records = send(
         &app,
@@ -1210,23 +1205,24 @@ pub(super) async fn run_http_producer_protocol_surface_inner(
     )
     .await;
     assert_eq!(duplicate_records.status(), StatusCode::NO_CONTENT);
-    assert_eq!(header_str(&duplicate_records, "stream-record-next"), "2");
+    assert_eq!(
+        header_str(&duplicate_records, "stream-next-offset"),
+        records_tail
+    );
 
-    let record_read = send(
+    let records_read = send(
         &app,
         "GET",
-        &format!("{record_path}?record=1&max_records=1&record_view=envelope"),
+        &format!("{record_path}?offset=-1"),
         &[],
         Body::empty(),
     )
     .await;
-    assert_eq!(record_read.status(), StatusCode::OK);
-    assert_eq!(header_str(&record_read, "stream-record-next"), "2");
-    let record_body = body_bytes(record_read).await;
+    assert_eq!(records_read.status(), StatusCode::OK);
+    let records_body = body_bytes(records_read).await;
     assert_eq!(
-        &record_body[..],
-        br#"{"record":1,"value":{"captured_at_ms":100}}
-"#
+        &records_body[..],
+        b"{\"captured_at_ms\":120}\n{\"captured_at_ms\":100}\n"
     );
 
     trace.push(SimEvent::HttpProducerProtocolSurfaceVerified {

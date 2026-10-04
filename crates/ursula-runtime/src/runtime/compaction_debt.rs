@@ -40,7 +40,7 @@ impl CompactionDebt {
 
     /// Records every page that `[start_offset, end_offset)` of one stream
     /// incarnation touches.
-    pub(crate) fn record_range(
+    pub(crate) fn record_pages_of_range(
         &mut self,
         stream_id: &BucketStreamId,
         generation: u64,
@@ -90,9 +90,9 @@ mod tests {
         let stream = BucketStreamId::new("bkt", "s");
         let span = ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
         let mut debt = CompactionDebt::default();
-        debt.record_range(&stream, 3, 10, 20);
-        debt.record_range(&stream, 3, span - 5, span + 5);
-        debt.record_range(&stream, 3, 0, 0);
+        debt.record_pages_of_range(&stream, 3, 10, 20);
+        debt.record_pages_of_range(&stream, 3, span - 5, span + 5);
+        debt.record_pages_of_range(&stream, 3, 0, 0);
         assert_eq!(debt.len(), 2);
         let taken = debt.take(1);
         assert_eq!(taken[0].page_id, 0);
@@ -103,7 +103,7 @@ mod tests {
         );
         assert_eq!(debt.len(), 0);
         // Once drained, a page can be recorded again.
-        debt.record_range(&stream, 3, 10, 20);
+        debt.record_pages_of_range(&stream, 3, 10, 20);
         assert_eq!(debt.len(), 1);
     }
 

@@ -106,22 +106,9 @@ async fn raft_file_log_store_passes_openraft_conformance_suite() {
 
 #[test]
 fn follower_forwards_stale_read_visibility_errors() {
-    let invalid_boundary = GroupEngineError::stream(
-        StreamErrorCode::InvalidRecordBoundaries,
-        "record 4 is beyond record tail 2",
-    );
-    assert!(should_forward_stale_follower_read_error(
-        false,
-        &invalid_boundary
-    ));
-    assert!(!should_forward_stale_follower_read_error(
-        true,
-        &invalid_boundary
-    ));
-    assert!(should_forward_stale_follower_read_error(
-        false,
-        &GroupEngineError::stream(StreamErrorCode::StreamNotFound, "missing")
-    ));
+    let missing = GroupEngineError::stream(StreamErrorCode::StreamNotFound, "missing");
+    assert!(should_forward_stale_follower_read_error(false, &missing));
+    assert!(!should_forward_stale_follower_read_error(true, &missing));
 }
 
 #[test]
@@ -265,10 +252,7 @@ fn read_req(stream_id: ursula_shard::BucketStreamId, max_len: usize) -> ReadStre
         offset: 0,
         max_len,
         now_ms: 0,
-        record: None,
-        max_records: None,
         leader_only: false,
-        record_anchor: None,
         read_index: None,
     }
 }
@@ -438,7 +422,6 @@ fn raft_group_command_round_trips_through_wire_codec() {
             producer_seq: 42,
         }),
         now_ms: 123,
-        record_match: None,
     });
 
     let encoded = encode_wire(&command);
@@ -458,7 +441,6 @@ fn raft_group_write_response_round_trips_through_wire_codec() {
         closed: false,
         already_exists: false,
         group_commit_index: 11,
-        record_range: None,
         hot_backlog: None,
     });
 
@@ -2456,22 +2438,15 @@ async fn openraft_snapshot_round_trips_group_state() {
 /// (field 1), so the leader linearizes a forwarded client HEAD and not an
 /// internal one.
 #[test]
-fn forwarded_reads_carry_the_record_anchor_and_linearizability_over_grpc() {
+fn forwarded_reads_carry_linearizability_over_grpc() {
     use prost::Message;
 
     let request = ursula_runtime::ReadStreamRequest {
-        stream_id: bsid("anchor-forward"),
+        stream_id: bsid("leader-forward"),
         offset: 0,
         max_len: 4096,
         now_ms: 77,
-        record: Some(1_234),
-        max_records: Some(5),
         leader_only: true,
-        record_anchor: Some(ursula_runtime::RecordAnchor {
-            incarnation: 42,
-            record: 1_234,
-            offset: 987_654,
-        }),
         read_index: None,
     };
     let wire = crate::forward::read_stream_read_v1(&request)
@@ -2482,21 +2457,6 @@ fn forwarded_reads_carry_the_record_anchor_and_linearizability_over_grpc() {
     let served = crate::grpc::read_stream_request_from_v1(request.stream_id.clone(), 77, decoded)
         .expect("served request");
     assert_eq!(served, request);
-
-    let legacy = crate::raft_internal_proto::ReadStreamReadV1 {
-        offset: 0,
-        max_len: 4096,
-        record: Some(1_234),
-        max_records: Some(5),
-        record_anchor: None,
-        leader_only: false,
-    }
-    .encode_to_vec();
-    let decoded =
-        crate::raft_internal_proto::ReadStreamReadV1::decode(legacy.as_slice()).expect("decode");
-    let served = crate::grpc::read_stream_request_from_v1(request.stream_id.clone(), 77, decoded)
-        .expect("served request");
-    assert_eq!(served.record_anchor, None);
 
     // A forwarded client HEAD stays linearizable on the leader; an internal
     // one does not.

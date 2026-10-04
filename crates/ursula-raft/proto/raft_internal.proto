@@ -138,20 +138,12 @@ message HeadStreamReadV1 {
 message ReadStreamReadV1 {
   uint64 offset = 1;
   uint64 max_len = 2;
-  optional uint64 record = 3;
-  optional uint64 max_records = 4;
-  // F1 server-side continuation anchor from the reader's previous response.
-  // Leaders that do not know the field ignore it and resolve from the mark.
-  optional RecordAnchorV1 record_anchor = 5;
+  // Fields 3-5 held the removed record-coordinate read parameters.
+  reserved 3, 4, 5;
+  reserved "record", "max_records", "record_anchor";
   // `consistency=leader`: the leader linearizes the read (ReadIndex) before
   // serving it.
   bool leader_only = 6;
-}
-
-message RecordAnchorV1 {
-  uint64 incarnation = 1;
-  uint64 record = 2;
-  uint64 offset = 3;
 }
 
 message GroupReadResponseV1 {

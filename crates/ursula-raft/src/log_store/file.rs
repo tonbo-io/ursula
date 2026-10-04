@@ -769,7 +769,7 @@ pub(crate) fn load_log_store_inner(path: &Path) -> Result<RaftGroupLogStoreInner
     }
 
     let mut inner = RaftGroupLogStoreInner::default();
-    for (record_index, record) in read_wire_frames_from_file::<RaftGroupLogRecord>(path)?
+    for (record_number, record) in read_wire_frames_from_file::<RaftGroupLogRecord>(path)?
         .into_iter()
         .enumerate()
     {
@@ -779,7 +779,7 @@ pub(crate) fn load_log_store_inner(path: &Path) -> Result<RaftGroupLogStoreInner
                 format!(
                     "replay OpenRaft log record '{}' record {}: {err}",
                     path.display(),
-                    record_index + 1
+                    record_number + 1
                 ),
             )
         })?;
@@ -807,22 +807,22 @@ fn load_log_store_inners_from_core_journal_with_stats(
     journal_path: &Path,
 ) -> Result<(BTreeMap<u32, RaftGroupLogStoreInner>, usize), io::Error> {
     let mut inners = BTreeMap::<u32, RaftGroupLogStoreInner>::new();
-    let mut record_index = 0_usize;
+    let mut record_number = 0_usize;
     journal::replay_each::<WireCodec<CoreJournalRecord>>(journal_path, |record| {
-        record_index = record_index.saturating_add(1);
+        record_number = record_number.saturating_add(1);
         apply_log_store_record(inners.entry(record.group_id).or_default(), record.record).map_err(
             |err| {
                 io::Error::new(
                     err.kind(),
                     format!(
-                        "replay OpenRaft core journal record '{}' record {record_index}: {err}",
+                        "replay OpenRaft core journal record '{}' record {record_number}: {err}",
                         journal_path.display(),
                     ),
                 )
             },
         )
     })?;
-    Ok((inners, record_index))
+    Ok((inners, record_number))
 }
 
 #[cfg(not(madsim))]
@@ -1116,7 +1116,6 @@ mod tests {
                 stream_seq: None,
                 producer: None,
                 now_ms: 0,
-                record_match: None,
             })),
         )
     }

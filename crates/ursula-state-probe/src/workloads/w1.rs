@@ -93,6 +93,13 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
     )?;
 
     let mut rng = payload::Rng::new(1);
+    let per_append = args.recs_per_append.max(1);
+    // Allocated before the heap baseline, so it does not count as state.
+    let mut starts = smx::RecordStarts::new(if args.retain_every > 0 {
+        usize::try_from(args.retain_keep / per_append)? + 2
+    } else {
+        0
+    });
     let base = Baseline::now();
     let mut m = StreamStateMachine::new();
     smx::create_bucket(&mut m, "bkt1")?;
@@ -100,7 +107,6 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
     smx::create_stream(&mut m, &id, None, None, smx::T0)?;
 
     let flush_bytes = args.flush_mib * smx::MIB;
-    let per_append = args.recs_per_append.max(1);
     let mut packs = smx::PackPaths::default();
     let mut stats = smx::FlushStats::default();
     let mut outcome = Outcome::default();
@@ -108,6 +114,7 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
     let mut appends: u64 = 0;
     let mut apply_ns: u128 = 0;
     let mut retentions = 0u64;
+    let mut retained_from = 0u64;
     let mut next_retain = args.retain_every;
     let mut residuals = Vec::new();
     let checkpoint_payload = br#"{"checkpoint":1,"through":0}"#;
@@ -117,6 +124,7 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
             let now = smx::T0 + n * 10;
             let k = per_append.min(cp - n);
             let body = payload::json_records(&mut rng, n, usize::try_from(k)?, args.rec_bytes);
+            starts.push(n, smx::tail(&m, &id));
             let started = Instant::now();
             let response = smx::append(&mut m, &id, body, None, now);
             apply_ns += started.elapsed().as_nanos();
@@ -128,14 +136,12 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
             }
             if args.retain_every > 0 && n >= next_retain {
                 next_retain += args.retain_every;
-                if n > args.retain_keep {
-                    smx::checkpoint_and_retain(
-                        &mut m,
-                        &id,
-                        n - args.retain_keep,
-                        checkpoint_payload,
-                        now,
-                    )?;
+                if n > args.retain_keep
+                    && let Some((record, offset)) = starts.at_or_below(n - args.retain_keep)
+                    && record > retained_from
+                {
+                    smx::checkpoint_and_retain(&mut m, &id, offset, checkpoint_payload, now)?;
+                    retained_from = record;
                     retentions += 1;
                 }
             }
@@ -143,10 +149,6 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
         if args.forced_flush {
             while !smx::flush_pass(&mut m, 1, flush_bytes, &mut packs, &mut stats)?.is_empty() {}
         }
-        let range = m
-            .record_range(&id)
-            .map_err(|err| anyhow::anyhow!("record range: {err:?}"))?
-            .ok_or_else(|| anyhow::anyhow!("not a JSON stream"))?;
         let tail = m.head(&id).map_or(0, |h| h.tail_offset);
         let hot = m.hot_payload_len(&id).unwrap_or(0);
         let measured = measure_sm(
@@ -161,14 +163,14 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
         }
         let residual = formula::residual(&measured);
         residuals.push((n, residual));
-        let retained = range.next_record - range.first_record;
+        let retained = n - retained_from;
         sink.row(&json!({
             "workload": name,
             "records": n,
             "appends": appends,
             "logical_bytes": tail,
             "retained_records": retained,
-            "record_range": [range.first_record, range.next_record],
+            "retained_from_record": retained_from,
             "hot_bytes": hot,
             "cold_refs_in_state": m.cold_chunks(&id).len(),
             "flush": stats,
@@ -201,16 +203,6 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
         outcome.metric_i64("heap_bytes", measured.heap.bytes);
         outcome.metric_i64("heap_tight_bytes", measured.tight.bytes);
         outcome.metric_u64("snapshot_bytes", measured.snap.total_bytes);
-        outcome.metric_u64(
-            "snapshot_record_offsets_bytes",
-            measured.snap.record_offsets_bytes,
-        );
-        outcome.metric_u64("dense_entries", measured.gauges.dense_record_entries);
-        outcome.metric_u64("record_marks", measured.gauges.record_marks);
-        outcome.metric_u64(
-            "snapshot_record_marks_bytes",
-            measured.snap.record_marks_bytes,
-        );
         outcome.metric_u64("flush_passes", stats.passes);
         outcome.metric_u64("hot_chunks", measured.gauges.hot_chunks);
         if let Some(&(_, residual)) = residuals.last() {
@@ -235,7 +227,7 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
                 "snapshot_bytes": bytes.len(),
                 "restored_heap_bytes": (after - before).bytes,
                 "decode_and_restore_ms": round3(restore_ms),
-                "record_range": restored.record_range(&id).ok().flatten().map(|r| [r.first_record, r.next_record]),
+                "restored_tail": smx::tail(&restored, &id),
             }
         }))?;
     }

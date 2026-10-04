@@ -100,7 +100,6 @@ impl From<AppendRequest> for StreamCommand {
             stream_seq: request.stream_seq,
             producer: request.producer,
             now_ms: request.now_ms,
-            record_match: request.record_match,
         }
     }
 }
@@ -116,7 +115,6 @@ impl From<AppendExternalRequest> for StreamCommand {
             stream_seq: request.stream_seq,
             producer: request.producer,
             now_ms: request.now_ms,
-            record_match: request.record_match,
         }
     }
 }
@@ -131,6 +129,7 @@ impl From<PublishSnapshotRequest> for StreamCommand {
                 object: body.object,
                 digest: body.digest,
                 now_ms: request.now_ms,
+                expected_incarnation: request.expected_incarnation,
             },
             None => Self::PublishSnapshot {
                 stream_id: request.stream_id,
@@ -138,6 +137,7 @@ impl From<PublishSnapshotRequest> for StreamCommand {
                 content_type: request.content_type,
                 payload: request.payload,
                 now_ms: request.now_ms,
+                expected_incarnation: request.expected_incarnation,
             },
         }
     }
@@ -149,6 +149,7 @@ impl From<AdvanceRetentionRequest> for StreamCommand {
             stream_id: request.stream_id,
             retained_offset: request.retained_offset,
             now_ms: request.now_ms,
+            expected_incarnation: request.expected_incarnation,
         }
     }
 }

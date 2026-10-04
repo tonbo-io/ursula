@@ -18,8 +18,6 @@ use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::StreamSnapshot;
 
-pub const MIB: u64 = 1 << 20;
-
 pub fn placement0() -> ShardPlacement {
     ShardPlacement {
         core_id: CoreId(0),
@@ -69,28 +67,11 @@ pub struct StreamFrameStats {
     pub frame_bytes: u64,
     /// Unflushed payload bytes, `H(s)`.
     pub hot_bytes: u64,
-    /// Records starting at or above the seal point, `U(s)`.
-    pub unflushed_records: u64,
-    /// Retained log below the seal point, in bytes (`K(s)` is this / MiB).
-    pub cold_bytes: u64,
-    pub dense_entries: u64,
-    pub record_offsets_bytes: u64,
-    /// Sparse record marks (F1, stream entry fields 17-18).
-    pub record_marks: u64,
-    /// Snapshot bytes of the mark fields 17-19.
-    pub record_marks_bytes: u64,
     pub shared_refs: u64,
     pub external_segments: u64,
     pub producers: u64,
     pub receipts: u64,
     pub producer_bytes: u64,
-}
-
-impl StreamFrameStats {
-    /// `K(s)` in MiB, rounded up.
-    pub fn cold_mib_ceil(&self) -> u64 {
-        self.cold_bytes.div_ceil(MIB)
-    }
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -107,10 +88,6 @@ pub struct SnapStats {
     pub header_erased_bucket_count: u64,
     pub stream_frames: u64,
     pub stream_bytes: u64,
-    pub record_offsets_count: u64,
-    pub record_offsets_bytes: u64,
-    pub record_marks_count: u64,
-    pub record_marks_bytes: u64,
     pub cold_chunks_count: u64,
     pub cold_chunks_bytes: u64,
     pub external_segments_count: u64,
@@ -170,12 +147,6 @@ fn add_stream(st: &mut SnapStats, entry: proto::StreamSnapshotEntryV1, frame_byt
     st.stream_frames += 1;
     st.stream_bytes += frame_bytes;
     let full = entry.encoded_len();
-    let ro = delta(&entry, full, |x| x.record_offsets.clear());
-    let rm = delta(&entry, full, |x| {
-        x.record_mark_records.clear();
-        x.record_mark_offsets.clear();
-        x.dense_first_record = None;
-    });
     let cc = delta(&entry, full, |x| x.cold_chunks.clear());
     let es = delta(&entry, full, |x| x.external_segments.clear());
     let hp = delta(&entry, full, |x| x.payload = Bytes::new());
@@ -187,10 +158,6 @@ fn add_stream(st: &mut SnapStats, entry: proto::StreamSnapshotEntryV1, frame_byt
         .iter()
         .map(|p| n(p.receipts.len()))
         .sum();
-    st.record_offsets_bytes += ro;
-    st.record_offsets_count += n(entry.record_offsets.len());
-    st.record_marks_bytes += rm;
-    st.record_marks_count += n(entry.record_mark_records.len());
     st.cold_chunks_bytes += cc;
     st.cold_chunks_count += n(entry.cold_chunks.len());
     st.external_segments_bytes += es;
@@ -202,33 +169,13 @@ fn add_stream(st: &mut SnapStats, entry: proto::StreamSnapshotEntryV1, frame_byt
     st.producer_count += n(entry.producer_states.len());
     st.receipt_count += receipts;
     st.visible_snapshot_bytes += vs;
-    st.stream_fixed_bytes += frame_bytes.saturating_sub(ro + rm + cc + es + hp + hs + pr + vs);
+    st.stream_fixed_bytes += frame_bytes.saturating_sub(cc + es + hp + hs + pr + vs);
 
-    let tail = entry
-        .metadata
-        .as_ref()
-        .map_or(0, |metadata| metadata.tail_offset);
     let hot_bytes = n(entry.payload.len());
-    let seal_point = if hot_bytes == 0 {
-        tail
-    } else {
-        entry.hot_start_offset
-    };
-    let retained = entry.retained_offset.unwrap_or(0);
     st.streams.push(StreamFrameStats {
         name: stream_name(&entry),
         frame_bytes,
         hot_bytes,
-        unflushed_records: n(entry
-            .record_offsets
-            .iter()
-            .filter(|offset| **offset >= seal_point)
-            .count()),
-        cold_bytes: seal_point.saturating_sub(retained),
-        dense_entries: n(entry.record_offsets.len()),
-        record_offsets_bytes: ro,
-        record_marks: n(entry.record_mark_records.len()),
-        record_marks_bytes: rm,
         shared_refs: n(entry.cold_chunks.iter().filter(|c| c.shared_object).count()),
         external_segments: n(entry.external_segments.len()),
         producers: n(entry.producer_states.len()),

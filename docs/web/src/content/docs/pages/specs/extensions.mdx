@@ -10,7 +10,7 @@ title: "Durable Streams Extensions"
 
 ## Abstract
 
-This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, snapshot and bootstrap semantics, multipart bootstrap delivery, stable record coordinates for JSON streams, a JSON message text rule, and read path parameters.
+This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, snapshot and bootstrap semantics, multipart bootstrap delivery, a JSON message text rule, and read path parameters.
 
 The snapshot and bootstrap design in sections 2 and 3 is based on a proposal by [Loro](https://loro.dev/). Ursula implements part of it: there is no latest-snapshot redirect, no snapshot deletion and no conditional publish.
 
@@ -22,48 +22,40 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 ## Table of Contents
 
-- [Extension Capability Advertisement](#extension-capability-advertisement)
 - [JSON Message Text](#json-message-text)
 - [1. Buckets](#1-buckets)
 - [2. Snapshots](#2-snapshots)
 - [3. Bootstrap](#3-bootstrap)
-- [6. JSON Record Coordinates](#6-json-record-coordinates)
 - [7. Ordinary SSE Compatibility](#7-ordinary-sse-compatibility)
 - [8. URL Encoding](#8-url-encoding)
 - [9. Read Path](#9-read-path)
 
 ---
 
-## Extension Capability Advertisement
-
-`Stream-Extensions` is a response header for advertising protocol extensions that are active for the target stream. Its value is a comma-separated list of extension tokens registered by the specifications that define them. A server MUST advertise only tokens whose extension semantics apply to the target stream; server-wide support for an extension is not sufficient. An extension specification defines its token and the responses on which an active implementation MUST advertise it.
-
-Clients MUST ignore unrecognized extension tokens. A client that depends on an extension MUST verify its token before relying on extension-specific request parameters, response headers, or body semantics.
-
-This document registers the following extension tokens:
-
-| Token | Defined in | Active for |
-|---|---|---|
-| `json-record-coordinates-v1` | Section 6 | `application/json` streams |
-
-[JSON Message Text](#json-message-text) has no token: it applies to every `application/json` stream.
-
 ## JSON Message Text
 
 This section defines the "normalized message" that the base protocol's JSON mode refers to. It is a storage rule, not an optional extension, and has no extension token. A server MUST apply it to every stream whose content type is `application/json` (with or without parameters).
 
-It applies to every JSON write: the body of a creating `PUT` and the body of `POST`. It applies to every read representation: the default NDJSON view, the record envelope view (Section 6.8), SSE, and bootstrap parts (Section 3).
+It applies to every JSON write: the body of a creating `PUT` and the body of `POST`. It applies to every read representation: the default NDJSON view, SSE, and bootstrap parts (Section 3).
 
 1. The server MUST validate each request body as JSON text per [RFC8259]. `\uXXXX` escapes that encode unpaired surrogates are valid.
 2. After top-level array flattening, the server MUST store each message as the original text with insignificant whitespace removed, followed by one LF (U+000A). Insignificant whitespace is U+0020, U+0009, U+000A and U+000D outside string literals. The server MUST NOT reorder object members, drop or merge duplicate member names, or rewrite number or string literal text.
 3. The nesting depth of a scalar is 0. The depth of an array or object is 1 plus the maximum depth of its elements or member values; an empty array or object has depth 1. A message whose depth exceeds 127 MUST be rejected with `400 Bad Request`. Depth is measured per message, after flattening, so a top-level array body may be one level deeper than its deepest message.
 4. A body with invalid JSON or invalid UTF-8 MUST be rejected with `400 Bad Request`, and no message from that request is committed.
-5. Every read representation MUST carry the stored message text unchanged. Where a representation embeds the message in a larger JSON document, such as the envelope `value` member, the embedded text MUST be the stored text.
-6. Offsets, ETags and record coordinates (Section 6) refer to the stored text.
+5. Every read representation MUST carry the stored message text unchanged. Where a representation embeds the message in a larger JSON document, the embedded text MUST be the stored text.
+6. Offsets and ETags refer to the stored text.
 
 Messages stored before a server adopted this rule are not rewritten. Clients MUST NOT assume that numbers survive storage as any particular binary floating-point value: a literal such as `1.50e3` or `1e400` is stored and returned as written.
 
 > **Compatibility note (informative).** Earlier Ursula releases re-serialized JSON messages: they sorted object members, kept only one of several duplicate members, rewrote numbers through a binary double, and rejected lone-surrogate escapes and numbers outside the double range. This rule removes these behaviors for new writes. The depth limit is unchanged for a bare message; a message inside an array body gains one level.
+
+A JSON message boundary is an offset whose preceding stored byte is LF, plus the stream's first offset. Stored messages contain no other LF, so the boundaries are exactly the ends of the stored messages.
+
+### Client Event Time
+
+The server does not assign a timestamp to messages. Applications that need event time SHOULD include one client-supplied timestamp in each JSON value, for example a `captured_at` field in a telemetry event.
+
+Client event times MAY be out of order and MUST NOT change committed message order, stored bytes, or offsets. Their HTTP metadata representation and any secondary index over them are outside this document; Ursula's experimental event-time indexer is one such index.
 
 ## 1. Buckets
 
@@ -97,7 +89,7 @@ A snapshot is a materialized representation of a stream's content from offset `-
 
 - Offsets are opaque tokens as defined in the base protocol. Clients MUST use server-returned `Stream-Next-Offset` values.
 
-The messages of a JSON stream are its LF-terminated records ([JSON Message Text](#json-message-text)); servers MUST use the same record boundaries for ordinary reads, snapshot-offset validation and bootstrap parts. A non-JSON stream has no message boundaries that this extension exposes: any committed offset is a valid snapshot or retention offset, and a bootstrap part MAY contain several consecutive messages. This extension does not require any particular binary framing format.
+The messages of a JSON stream are its LF-terminated messages ([JSON Message Text](#json-message-text)); servers MUST use the same message boundaries for snapshot and retention offset validation and for bootstrap parts. A non-JSON stream has no message boundaries that this extension exposes: any committed offset is a valid snapshot or retention offset, and a bootstrap part MAY contain several consecutive messages. This extension does not require any particular binary framing format.
 
 ### 2.2. Publish Snapshot
 
@@ -114,11 +106,12 @@ Creates a snapshot at the specified offset. The snapshot represents the material
 **Response Codes:**
 
 - `204 No Content`: Snapshot published successfully.
-- `400 Bad Request`: `snapshot_offset` is invalid or, for a JSON stream, not aligned to a committed record boundary.
+- `400 Bad Request`: `snapshot_offset` is invalid or, for a JSON stream, not a message boundary.
 - `404 Not Found`: Stream does not exist.
 - `409 Conflict`: `snapshot_offset` exceeds the current tail, or the server cannot produce a consistent view at that offset.
 - `410 Gone`: `snapshot_offset` is older than the current earliest retained offset.
 - `413 Payload Too Large`: Snapshot exceeds the server's size limit.
+- `503 Service Unavailable`: For a JSON stream, the server could not verify that `snapshot_offset` is a message boundary. It MUST NOT publish an unverified offset; the client MAY retry.
 
 > **Note (informative).** Ursula keeps snapshot bodies of up to 32 MiB in replicated state. With a cold backend, it stores bodies of at least its external-payload threshold (1 MiB by default) as cold-tier objects instead and accepts up to 1 GiB; only the reference is replicated, and the digest is the same as for an inline body.
 
@@ -134,16 +127,9 @@ Publishing a snapshot MUST NOT change the earliest retained offset. Retention is
 PUT {stream_url}/retention/{retained_offset}
 ```
 
-The server MUST reject a retention boundary that is not aligned to committed data, moves backward, or is newer than the latest published snapshot. After success, offsets less than `retained_offset` MUST return `410 Gone`. A server MAY retain less than requested, at a committed boundary at or below `retained_offset` (Ursula keeps exact boundaries for older history only once per MiB of log); the success response's `Stream-Retained-Offset` (and, for record-aware streams, `Stream-Record-First`) then reports the effective boundary, and offsets below it MUST return `410 Gone`.
+The server MUST reject a retention boundary that is not aligned to committed data (for a JSON stream, not a message boundary: `400 Bad Request`), moves backward, or is newer than the latest published snapshot. As for a snapshot, a JSON retention boundary the server cannot verify MUST NOT be applied (`503 Service Unavailable`). After success, offsets less than `retained_offset` MUST return `410 Gone`. A server MAY retain less than requested, at a committed boundary at or below `retained_offset`; the success response's `Stream-Retained-Offset` then reports the effective boundary, and offsets below it MUST return `410 Gone`. Ursula retains exactly the requested offset.
 
-For record-aware JSON streams, servers also expose:
-
-```
-PUT {stream_url}/snapshot?record={record}
-PUT {stream_url}/retention?record={record}
-```
-
-The server resolves the stable record ordinal to its offset before applying the operation.
+> **Note (informative).** Ursula checks a JSON boundary at apply time when the byte before the offset is still in memory. Otherwise it reads that byte from the leader (as a `consistency=leader` read), and applies the operation only if the stream was not deleted and recreated in between; a failed read answers `503`.
 
 Publishing a new snapshot replaces the previously visible snapshot immediately. The superseded snapshot MAY be garbage-collected asynchronously after the new snapshot becomes visible. Clients MUST NOT depend on older snapshots remaining readable after overwrite.
 
@@ -229,18 +215,18 @@ A server MUST return one of the following:
 - **Complete:** update parts holding every retained byte in `[S, tail)`, with `Stream-Next-Offset` equal to the tail and `Stream-Up-To-Date: true`.
 - **Partial:** update parts holding the retained bytes in `[S, P)` for some offset `P` with `S ≤ P < tail`, with `Stream-Next-Offset: P` and no `Stream-Up-To-Date: true`. `P` MAY equal `S`, in which case the response contains the snapshot part and no update parts.
 
-In both cases the update parts MUST hold the retained bytes starting exactly at `S`, contiguous and in stream order: a server MUST NOT skip or duplicate any byte between `S` and `Stream-Next-Offset`. For a JSON stream each part MUST be exactly one record. For a non-JSON stream a part MAY contain several consecutive messages, and a part boundary carries no meaning. `Stream-Next-Offset` MUST be an offset that ordinary reads accept, and MUST NOT be below `S`.
+In both cases the update parts MUST hold the retained bytes starting exactly at `S`, contiguous and in stream order: a server MUST NOT skip or duplicate any byte between `S` and `Stream-Next-Offset`. For a JSON stream each part MUST be exactly one message. For a non-JSON stream a part MAY contain several consecutive messages, and a part boundary carries no meaning. `Stream-Next-Offset` MUST be an offset that ordinary reads accept, and MUST NOT be below `S`.
 
 A server MAY choose the partial form for any reason, for example because some messages after `S` are held only in a storage tier that does not keep per-message boundaries in memory. Serving `/bootstrap` never requires a server to read such a tier. A client MUST NOT treat a partial response as an error.
 
-> **Note (informative).** Ursula never reads cold storage for update parts while serving `/bootstrap` (a snapshot body stored in the cold tier is streamed from it as the first part), and it omits `Stream-Up-To-Date` from a partial response. For a non-JSON stream it returns `[S, tail)` as one part when `S` is at or above the stream's cold frontier, every byte of that range is still hot and the range is at most 8 MiB; otherwise it returns the partial form with `P = S` (the snapshot part only). For a JSON stream it returns one part per record when every record in `[S, tail)` is above the cold frontier, and otherwise the partial form with `P = S`; it caps the update parts of one response at 8 MiB, returning the partial form with `P` at the last record boundary that keeps the parts within the cap, and always includes at least one record, even when that record alone exceeds the cap. Each response uses a fresh 128-bit random multipart boundary.
+> **Note (informative).** Ursula never reads cold storage for update parts while serving `/bootstrap` (a snapshot body stored in the cold tier is streamed from it as the first part), and it omits `Stream-Up-To-Date` from a partial response. For a non-JSON stream it returns `[S, tail)` as one part when `S` is at or above the stream's cold frontier, every byte of that range is still hot and the range is at most 8 MiB; otherwise it returns the partial form with `P = S` (the snapshot part only). For a JSON stream, under the same hot-range conditions, it splits `[S, tail)` on LF into one part per message, and otherwise returns the partial form with `P = S`; it caps the update parts of one response at 8 MiB, returning the partial form with `P` at the last message boundary that keeps the parts within the cap, and always includes at least one message, even when that message alone exceeds the cap. Each response uses a fresh 128-bit random multipart boundary.
 
 **Response Body:**
 
 The body is an RFC 2046 `multipart/mixed` entity. The multipart boundary, not any outer binary framing, delimits the parts. Servers SHOULD choose an unpredictable boundary for every response, so that no stream content can contain it.
 
 1. **First part**: Snapshot message. If a snapshot exists, the part body MUST be the raw snapshot bytes and the part `Content-Type` MUST equal the snapshot blob's stored content type.
-2. **Subsequent parts**: Zero or more parts of retained updates starting at the snapshot point, as required by the completeness rules above: one record per part for a JSON stream; one or more consecutive messages per part for any other stream. The part `Content-Type` MUST be the content type of the update. For streams with a fixed stream-level content type, all update parts will normally share that value.
+2. **Subsequent parts**: Zero or more parts of retained updates starting at the snapshot point, as required by the completeness rules above: one message per part for a JSON stream; one or more consecutive messages per part for any other stream. The part `Content-Type` MUST be the content type of the update. For streams with a fixed stream-level content type, all update parts will normally share that value.
 
 If no snapshot exists, the server MUST still emit an empty first part, `Stream-Snapshot-Offset` MUST be `-1`, and that empty part's `Content-Type` MUST be `application/octet-stream`. Update parts, if any, then begin at the earliest retained offset.
 
@@ -307,244 +293,7 @@ Bootstrap is one-shot only:
 - Regular `GET {stream_url}?offset=...` MUST NOT return snapshot bytes. Snapshots are only delivered through `/bootstrap`.
 - When a server returns `410 Gone` for a read (because retention has advanced), clients SHOULD call `/bootstrap` to rebuild state, then continue tailing from the returned `Stream-Next-Offset` through the ordinary read APIs.
 - If a server has begun returning `410 Gone` for a stream (i.e., earliest retained offset > `-1`), the server MUST ensure `/bootstrap` is available and can provide a snapshot covering that earliest retained offset.
-- Clients MUST parse `/bootstrap` as an ordered sequence of parts. For a JSON stream each update part is one record; for any other stream, clients MUST NOT treat a part boundary as a message boundary.
-
----
-
-## 6. JSON Record Coordinates
-
-The JSON Record Coordinates extension adds a stable logical message coordinate to streams configured with `Content-Type: application/json`. It is a pure superset of the base protocol: offsets remain the canonical exact-resume cursor, ordinary offset reads remain byte-oriented, and clients that do not understand record coordinates continue to operate unchanged.
-
-This extension registers the token `json-record-coordinates-v1`. It is active only for an `application/json` stream for which the server maintains the record model defined below. Responses to `HEAD` and stream operations targeting such a stream MUST advertise this token in `Stream-Extensions`. A server MUST NOT advertise this token for a stream on which the extension is inactive, including a stream with a non-JSON content type.
-
-Record-aware clients MUST verify this token before relying on record query parameters or response headers and MUST reject a record-aware response that omits it.
-
-### 6.1. Record Model
-
-Each logical JSON message has a zero-based unsigned integer record ordinal. Ordinals are assigned consecutively in committed stream order and are scoped to one stream.
-
-For one stream:
-
-- `F` is the first retained record ordinal.
-- `N` is the next record ordinal and record tail.
-- Retained records occupy `[F, N)`.
-- `O(r)` is the canonical Durable Streams offset at the start of record `r`.
-
-A new empty stream has `F = N = 0`. An ordinal MUST NOT be reused or changed after it becomes externally visible. Retention MAY advance `F`, but MUST NOT renumber surviving records.
-
-Record ordinals are independent from offsets, `Stream-Seq`, idempotent-producer sequence numbers, and sequence fields inside application JSON values. Clients MAY perform arithmetic on ordinals, but MUST continue to treat offsets as opaque tokens.
-
-The JSON-mode normalization rules in the base protocol, made precise by [JSON Message Text](#json-message-text), define the records:
-
-- A non-array JSON value creates one record.
-- A top-level JSON array creates one record per array element after exactly one level of flattening.
-- An empty array creates no records on `PUT` and remains invalid on `POST`.
-
-An implementation MUST preserve each normalized message boundary and its ordinal across hot storage, WAL, cold flush, compaction, snapshot, restart, and retention. Coalescing physical storage objects MUST NOT coalesce the logical record coordinate space.
-
-### 6.2. Client Event Time
-
-This extension does not assign a server timestamp to records. Applications that need event time SHOULD include one client-supplied timestamp in each JSON value, for example a `captured_at` field in a telemetry event.
-
-Client event times MAY be out of order and MUST NOT change committed record order, ordinals, canonical bytes, or offsets. Their HTTP metadata representation and any secondary index over them are outside this extension.
-
-### 6.3. Create and Append Acknowledgements
-
-When `PUT` creates a JSON stream with initial messages, or `POST` appends one or more JSON messages, successful responses MUST include:
-
-- `Stream-Record-Start`: Inclusive ordinal of the first record created by this operation.
-- `Stream-Record-Next`: Exclusive ordinal after the last record created by this operation.
-
-For an operation that creates no records, `Stream-Record-Start` and `Stream-Record-Next` MUST both equal the current record tail.
-
-All messages from one JSON request body MUST commit atomically and receive one contiguous ordinal range, or the operation MUST fail without making any ordinal visible. Concurrent appenders MUST receive disjoint ranges in committed stream order.
-
-When an idempotent-producer retry is deduplicated, the server MUST return the original `Stream-Record-Start` and `Stream-Record-Next` values for a sequence whose receipt it retains: every sequence in the stream's receipt window, and always each producer's newest sequence. A server MAY bound the receipt window; Ursula keeps 1,024 receipt items per stream beyond each producer's newest receipt. A duplicate whose receipt the window evicted MUST still be deduplicated, never appended again, and is answered `204 No Content` with `Producer-Seq` and without `Stream-Next-Offset`, `Stream-Record-Start` or `Stream-Record-Next`. A server MUST NOT return a recomputed range.
-
-For example, if the current record tail is `42`:
-
-```http
-POST {stream_url}
-Content-Type: application/json
-
-[
-  {"type":"navigation_started"},
-  {"type":"network_response","status":500}
-]
-```
-
-The successful response includes:
-
-```http
-Stream-Extensions: json-record-coordinates-v1
-Stream-Record-Start: 42
-Stream-Record-Next: 44
-Stream-Next-Offset: <opaque-offset>
-```
-
-### 6.4. Conditional Append by Record Tail
-
-A writer MAY require the current record tail to match an expected value:
-
-```http
-Stream-Record-Match: 42
-```
-
-The server MUST accept the append only when the current `N` equals the supplied unsigned integer. A mismatch MUST return `412 Precondition Failed` with the current `Stream-Record-Next` and `Stream-Next-Offset`. This precondition composes with, but does not replace, `Stream-Seq` or idempotent-producer headers.
-
-### 6.5. Record Metadata on HEAD
-
-For a JSON stream implementing this extension, `HEAD {stream_url}` MUST include:
-
-- `Stream-Record-First`: First retained record ordinal `F`.
-- `Stream-Record-Next`: Next record ordinal `N`.
-
-### 6.6. Record-Aware Read Parameters
-
-A record-aware read selects its starting position with exactly one of:
-
-- `record=<ordinal>`: Start at the specified record boundary.
-- `record=now`: Start at the current record tail.
-- `tail_records=<count>`: Start at `max(F, N - count)`.
-
-These parameters are mutually exclusive with each other and with `offset`. `tail_records` MUST be a non-negative integer.
-
-The following rules apply:
-
-- `record < F` MUST return `410 Gone` with `Stream-Record-First` and `Stream-Record-Next`.
-- `record = N` is a valid up-to-date empty read.
-- `record > N` MUST return `400 Bad Request` with `Stream-Record-Next`.
-- `tail_records=0` is equivalent to `record=now`.
-
-Record-aware reads MAY also specify `max_records=<positive-integer>`. `max_records` limits the number of complete records returned. `max_records` without a record-aware start parameter MUST return `400 Bad Request`.
-
-Record-aware reads MAY also specify `max_bytes=<positive-integer>`. On a record-aware read, `max_bytes` bounds complete records rather than bytes of a partial range:
-
-- The response contains the longest run of complete records from the resolved start whose total size is at most `max_bytes`, and always at least one record when a record exists at the start, even if that record alone exceeds `max_bytes`.
-- Size counts the stored message bytes (see [JSON Message Text](#json-message-text)), including each record's terminating LF, whatever representation the response uses. Envelope framing (Section 6.8) does not count.
-- `max_bytes` MAY be combined with `max_records`; both limits apply, and the response stops at whichever is reached first.
-- `Stream-Record-Next` and `Stream-Next-Offset` give the continuation after the last returned record. All other response headers are unchanged.
-- A record-aware response never ends inside a record because of `max_bytes`.
-
-Offset reads follow Section 9.3 and may end inside a JSON record (Section 9.4).
-
-A server that implements this extension MUST support `max_bytes` on record-aware reads.
-
-### 6.7. Record-Aligned Read Responses
-
-A successful record-aware catch-up or long-poll response MUST:
-
-- begin at a complete record boundary;
-- contain only complete normalized JSON messages;
-- return `Content-Type: application/x-ndjson` by default;
-- return at most `max_records` messages when supplied;
-- include `Stream-Record-First`, `Stream-Record-Start`, `Stream-Record-Next`, and `Stream-Next-Offset`.
-
-`Stream-Record-Start` is the resolved starting ordinal. `Stream-Record-Next` is the continuation ordinal after the last complete returned record. `Stream-Next-Offset` MUST identify the same logical boundary as `Stream-Record-Next`.
-
-An empty successful response MUST set `Stream-Record-Start` and `Stream-Record-Next` to the resolved starting ordinal.
-
-Example:
-
-```http
-HTTP/1.1 200 OK
-Content-Type: application/x-ndjson
-Stream-Extensions: json-record-coordinates-v1
-Stream-Record-First: 0
-Stream-Record-Start: 42
-Stream-Record-Next: 44
-Stream-Next-Offset: <opaque-offset>
-
-{"type":"navigation_started"}
-{"type":"network_response","status":500}
-```
-
-Ordinary `GET {stream_url}?offset=...` behavior is unchanged and MAY still end in the middle of a JSON record as defined by the base protocol.
-
-### 6.8. Optional Record Envelope View
-
-A record-aware client MAY request `record_view=envelope`. This parameter MUST be combined with a record-aware start parameter.
-
-The response MUST use:
-
-```http
-Content-Type: application/vnd.durable-stream-records+ndjson
-```
-
-Each response line MUST be a JSON object containing:
-
-- `record`: Record ordinal.
-- `value`: The stored message text, embedded verbatim as defined by [JSON Message Text](#json-message-text). Servers MUST NOT re-serialize it, so member order, duplicate members, number and string literal text, and unpaired-surrogate escapes are preserved.
-
-Example:
-
-```json
-{"record":42,"value":{"captured_at":"2026-07-18T10:29:59.900Z","type":"navigation_started"}}
-{"record":43,"value":{"captured_at":"2026-07-18T10:30:00.100Z","type":"network_response","status":500}}
-```
-
-The envelope is an alternate read representation only. It MUST NOT change canonical stream bytes, offsets, record ordinals, ETags for the canonical representation, snapshots, bootstrap data, or ordinary reads.
-
-### 6.9. Live Reads and SSE
-
-Record start parameters compose with `live=long-poll` and `live=sse`.
-
-SSE control events for record-aware reads MUST add:
-
-```json
-{
-  "streamNextOffset": "<opaque-offset>",
-  "streamFirstRecord": 0,
-  "streamNextRecord": 44,
-  "upToDate": true
-}
-```
-
-For the default JSON view, SSE data events retain the base protocol's JSON-mode representation and MAY contain multiple newline-delimited messages. Control-event record coordinates MUST refer to the boundary after every complete message represented before that control event.
-
-With `record_view=envelope`, each SSE `event: data` MUST contain exactly one envelope object and the response MUST include `Stream-Data-Content-Type: application/vnd.durable-stream-record+json`.
-
-A reconnecting client MAY use either the last `streamNextRecord` or `streamNextOffset`. Offset-based reconnection remains the base-protocol path.
-
-### 6.10. Retention, Snapshots, and Bootstrap
-
-Retention MUST advance `F` only at a record boundary. A trimmed ordinal MUST return `410 Gone`; surviving records keep their original ordinals. When retention lands below its target (Section 2.2), `F` is the ordinal of the effective boundary; a retention or snapshot target at an intra-record offset MUST return `400 Bad Request`.
-
-When a snapshot advances the earliest retained offset, that offset MUST map to one record boundary. Snapshot publication at an intra-record offset MUST return `400 Bad Request`. Snapshot and bootstrap responses SHOULD include `Stream-Record-First` and `Stream-Record-Next` when the underlying stream implements this extension. Bootstrap update parts MUST preserve one logical JSON message per update part.
-
-Implementations MAY reclaim ordinal index entries only after the corresponding records fall before `F` and are no longer required by a visible snapshot or bootstrap response.
-
-### 6.12. Compatibility and Non-Goals
-
-A base Durable Streams client continues to append JSON values or arrays, read by offset, and receive canonical NDJSON. It MAY ignore all `Stream-Record-*` and `Stream-Extensions` headers.
-
-This extension does not define:
-
-- schema validation or schema evolution;
-- indexes over arbitrary JSON fields;
-- SQL, Arrow, Parquet, or DataFusion integration;
-- consumer groups;
-- per-record arbitrary byte headers;
-- authentication or authorization;
-- a bidirectional append-session transport;
-- record framing for arbitrary binary content types.
-
-### 6.13. Correctness Requirements
-
-Implementations MUST preserve these invariants:
-
-1. Every successfully appended normalized JSON message receives exactly one ordinal.
-2. Ordinals are contiguous in committed stream order and are never reused.
-3. One atomic append receives one contiguous ordinal range or no range.
-4. A deduplicated append returns its original ordinal range, or no range once its receipt left the receipt window.
-5. `O(r)` always identifies the start of record `r`.
-6. Offset reads and record reads expose the same canonical JSON sequence.
-7. Record-aware reads never return partial records.
-8. Flush, compaction, snapshot, restart, and retention never change a surviving record's ordinal.
-9. `N - F` equals the number of retained logical messages.
-10. Base-protocol clients observe no semantic change.
-
-Conformance tests SHOULD cover JSON array flattening, concurrent append ordering, idempotent retry, record-tail preconditions, partial offset reads, record-aligned reads, byte-bounded record reads, retention, snapshot/bootstrap boundaries, cold flush, restart, and live-read reconnection.
+- Clients MUST parse `/bootstrap` as an ordered sequence of parts. For a JSON stream each update part is one message; for any other stream, clients MUST NOT treat a part boundary as a message boundary.
 
 ---
 
@@ -564,7 +313,7 @@ Ordinary SSE behavior is defined by the base protocol. Binary SSE: see Section 9
 
 ## 9. Read Path
 
-This section collects read parameters and read representations that apply to every stream and that the base protocol leaves to the server. Record-aware reads of JSON streams are defined separately in Section 6.
+This section collects read parameters and read representations that apply to every stream and that the base protocol leaves to the server.
 
 ### 9.1. Long-Poll Timeout
 
@@ -586,7 +335,7 @@ A server that cannot prove the read is linearizable MUST NOT serve it. It answer
 
 A server MAY cap how many stream bytes one response returns. Ursula caps every read response, and every SSE data event, at 8 MiB (8,388,608 bytes).
 
-`max_bytes={n}` on an offset read asks for at most `n` bytes. A value above the server's cap is clamped to it. Ursula ignores a value that is not a decimal integer and applies the cap alone; clients SHOULD send a positive integer. On a live read, `max_bytes` bounds each response or SSE data event; Ursula raises a smaller value to 1 byte, and to 4 bytes on a text SSE read so an event can hold a whole UTF-8 character. On a record-aware read, Section 6.6 defines `max_bytes` instead.
+`max_bytes={n}` on an offset read asks for at most `n` bytes. A value above the server's cap is clamped to it. Ursula ignores a value that is not a decimal integer and applies the cap alone; clients SHOULD send a positive integer. On a live read, `max_bytes` bounds each response or SSE data event; Ursula raises a smaller value to 1 byte, and to 4 bytes on a text SSE read so an event can hold a whole UTF-8 character.
 
 A response that `max_bytes` or the cap shortened is partial: it MUST NOT carry `Stream-Up-To-Date: true`, and its `Stream-Next-Offset` is the offset just past the returned bytes. Clients continue from `Stream-Next-Offset` until a response carries `Stream-Up-To-Date: true`.
 
