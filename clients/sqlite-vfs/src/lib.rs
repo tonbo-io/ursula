@@ -946,8 +946,8 @@ fn create_stream(url: &str) -> Result<(), String> {
 
 /// A failed stream operation: `Gone` when the data lies below the stream's retention (or a
 /// snapshot was superseded), which a re-attach answers by installing the latest snapshot;
-/// `Recreated` when the stream was deleted and recreated under an attach, which starts over from
-/// the trust decision.
+/// `Recreated` when the stream is no longer the expected incarnation (deleted and recreated):
+/// attach starts over from the trust decision; a re-claim or the snapshot thread fences the owner.
 enum Fail {
     Gone(String),
     Recreated(String),
@@ -2105,10 +2105,16 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
     // claim on a new stream is epoch 1).
     match same_incarnation(&url, incarnation.as_deref(), &stopped) {
         Err(Fail::Recreated(e)) => {
-            eprintln!("sqlite-ursula-vfs: snapshot at {offset} not published: {e}");
+            // Not `poison()`: the overlay belongs to a write transaction that may be in flight; it
+            // clears it itself when it ends, and `x_write` refuses its commit (`poisoned`).
+            let why = format!("fenced: snapshot at {offset} not published: {e}");
             let mut d = lock(db);
+            eprintln!(
+                "sqlite-ursula-vfs: {}: {why}; database poisoned (re-attach to recover)",
+                d.url
+            );
             d.fenced = true;
-            d.poison(format!("fenced: {e}"));
+            d.poisoned = Some(why);
             return Ok(true);
         }
         r => r.map_err(String::from)?,
@@ -2619,6 +2625,10 @@ unsafe extern "C" fn x_write(
                         .wait_timeout(db, wait)
                         .unwrap_or_else(|e| e.into_inner())
                         .0;
+                }
+                // The snapshot thread may have fenced this owner while it waited.
+                if db.poisoned.is_some() {
+                    return ffi::SQLITE_IOERR_WRITE;
                 }
                 return commit(file, &mut db, size, off - FRAME_HDR);
             }

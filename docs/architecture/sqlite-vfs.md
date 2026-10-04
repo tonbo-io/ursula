@@ -23,8 +23,9 @@ WAL commit is appended to the stream *before* any of the transaction's frames re
   random nonce).
 - The local file's position in the stream is the sidecar `<db>-ursula`: the byte offset after the
   last frame the file reflects, the owner's epoch, the kernel boot id it was written in, the
-  stream's path, the db file's inode and its claim on the local WAL (generation and last commit
-  frame, §6), replaced atomically against a process crash (temp file, rename; no fsync).
+  stream's path and its `Stream-Incarnation`, the db file's inode and its claim on the local WAL
+  (generation and last commit frame, §6), replaced atomically against a process crash (temp file,
+  rename; no fsync).
 - One owner per file per host: attach takes `flock` on `<db>-ursula.lock` for the process
   lifetime, and refuses while any connection to the file is open.
 
@@ -107,10 +108,11 @@ appended with the idempotent producer (`Producer-Id` per database, `Producer-Epo
 
 An attach that fails after step 1 leaves a path that was attached in this process unbound and
 *failed*: its files may hold anything between the old attachment's state and the stream's, and the
-old binding no longer owns the stream. Opening its main db then fails with `SQLITE_CANTOPEN` (the
+stream may hold a newer claim. Opening its main db then fails with `SQLITE_CANTOPEN` (the
 reason is logged, and `ursula_status` names it) until an attach succeeds; passing it through to the
-plain `unix` VFS would let its commits bypass replication. A path never attached in this process
-keeps passing through after a failed attach (it is no replica yet).
+plain `unix` VFS would let its commits bypass replication. A path not attached earlier in this
+process keeps passing through after a failed attach, including a file a previous process attached
+(open question: mark any file with a sidecar as failed).
 
 The new epoch fences every earlier owner at the server: their next append gets 403. Replay applies
 page images per read batch (last image per page, truncate to the batch's smallest size first), so
@@ -177,8 +179,9 @@ zombie with a higher one could then fence the new owner).
 
 ### 4.3 Publishing, retention, and attach
 
-1. `PUT {stream}/snapshot/{W}` (retried while the outcome is unknown; publishing is idempotent).
-   409/410: a newer snapshot exists; nothing to do.
+1. `PUT {stream}/snapshot/{W}` (retried while the outcome is unknown; publishing is idempotent),
+   unless a `HEAD` just before shows the stream was recreated (below). 409/410: a newer snapshot
+   exists; nothing to do.
 2. `GET {stream}/snapshot/{W}` until it returns exactly the published bytes.
 3. Only then `PUT {stream}/retention/{P}`, where `P` is the *previous* snapshot's offset (the latest
    one known at attach, or the one before `W`).
@@ -201,7 +204,9 @@ WAL (the old pages may predate the offset) and the files are rebuilt. A tail rea
 `HEAD`, up to ten times.
 
 Any owner may publish a snapshot of its own offset, a fenced one included: its state at its offset
-is a true prefix of the stream. Retention never passes the latest snapshot (the server refuses).
+is a true prefix of the incarnation it attached to. The thread `HEAD`s the stream before the `PUT`
+and, if it was recreated, does not publish and fences the owner (§6, wrong stream). Retention
+never passes the latest snapshot (the server refuses).
 
 ### 4.4 Snapshot bodies on the server
 
@@ -243,10 +248,11 @@ be written into the stream. Trust is therefore verified against the files, not i
   generation (the salts of its header, which SQLite changes at every restart) and the frame number
   of the acknowledged commit frame. `:0` says the WAL holds no commit and the db file alone holds
   the state.
-- **The check.** Attach trusts the files only when the boot id and the db file's inode match and
-  the WAL, read the way SQLite's recovery reads it (header checksum, then frames in order while
-  their salts match and the cumulative checksum holds), is the claimed generation with valid
-  frames up to at least the claimed one; for `:0`, it must hold no commit frame.
+- **The check.** Attach trusts the files only when the boot id, the stream's incarnation and the
+  db file's inode match and the WAL, read the way SQLite's recovery reads it (header checksum,
+  then frames in order while their salts match and the cumulative checksum holds), is the claimed
+  generation with valid frames up to at least the claimed one; for `:0`, it must hold no commit
+  frame.
 - **Three fsyncs of the db file**, none per commit, all through SQLite's own handle except at
   attach (when no connection is open): (1) before a commit that starts a new WAL generation is
   appended (once per WAL wrap; SQLite starts one only when every frame of the previous one is in
@@ -332,11 +338,14 @@ What attach does in each case:
   the re-claim checks the incarnation before and after (fenced on a change); 403 (fenced) if
   another owner claimed a higher epoch; 400 (poisoned) if a lower one. All owners share one
   producer id and every first claim on a new stream is epoch 1, so an append at the same epoch
-  and the next seq is accepted: an owner attached at epoch 1 with nothing committed keeps writing
-  into a stream another owner recreated and claimed at epoch 1. The snapshot thread checks the
-  incarnation before publishing and, on a change, fences the owner, which bounds that window to
-  the next snapshot attempt; a recreate between that check and the `PUT` also remains a window.
-  Closing both needs an incarnation precondition at the server.
+  and the next seq is accepted: an owner at epoch 1 with as many appends as one that recreated
+  and claimed the stream at epoch 1 lands one commit in it. Its receipt's next offset then
+  differs from its own (unless neither had committed), which poisons it, and the other owner's
+  next append may be answered as a duplicate of that commit. The snapshot thread checks the
+  incarnation before publishing and, on a change, fences the owner; a recreate between that check
+  and the snapshot or retention `PUT` remains a window. Closing these needs a producer scoped to
+  the incarnation (e.g. the incarnation in the `Producer-Id`) or an incarnation precondition at
+  the server.
 - A rollback journal next to an attached file can only be left by a crash while attach switched
   an empty file to WAL; attach deletes it in every case (rolling it back would truncate the file
   under the pages attach writes next).
