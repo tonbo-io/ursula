@@ -3,7 +3,7 @@
 //! An `application/json` stream stores each message as one compact JSON
 //! value followed by one LF, with no other LF. Create and append validate
 //! that shape, and the message ends feed the usage counter
-//! `committed_records`. Offsets carry no record coordinates: a JSON message
+//! `committed_records`. Messages carry no ordinals: a JSON message
 //! boundary is an offset whose preceding byte is LF.
 
 /// Whether `content_type` is `application/json` (parameters ignored).
