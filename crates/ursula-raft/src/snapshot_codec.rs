@@ -21,7 +21,6 @@ use ursula_stream::ProducerAppendRecord;
 use ursula_stream::ProducerReceipt;
 use ursula_stream::ProducerSnapshot;
 use ursula_stream::SharedColdObjectOwnersSnapshot;
-use ursula_stream::StreamMessageRecord;
 use ursula_stream::StreamMetadata;
 use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamSnapshotEntry;
@@ -142,17 +141,6 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
     let snapshot_write_unit = header
         .committed_write_unit_bytes
         .unwrap_or(ursula_stream::COMMITTED_WRITE_UNIT_BYTES);
-    // Every epoch-2 writer runs at the top level; anything else is a fixture
-    // bug or a snapshot from a later build that dropped the field.
-    if header.feature_level != ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL {
-        return Err(SnapshotStoreError::Deserialize(format!(
-            "snapshot feature level {} is not this binary's level {}; every \
-             format-epoch-2 snapshot is written at level {}",
-            header.feature_level,
-            ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL,
-            ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL
-        )));
-    }
     if snapshot_write_unit != ursula_stream::COMMITTED_WRITE_UNIT_BYTES {
         return Err(SnapshotStoreError::Deserialize(format!(
             "snapshot committed write unit is {snapshot_write_unit} bytes; this build uses {}",
@@ -183,7 +171,6 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
                 .into_iter()
                 .map(bucket_usage_from_proto)
                 .collect(),
-            feature_level: header.feature_level,
             last_created_at_ms: header.last_created_at_ms,
         },
         stream_append_counts,
@@ -264,7 +251,6 @@ impl GroupSnapshotFrameIter {
                 .map(bucket_usage_to_proto)
                 .collect(),
             committed_write_unit_bytes: Some(ursula_stream::COMMITTED_WRITE_UNIT_BYTES),
-            feature_level: stream_snapshot.feature_level,
             last_created_at_ms: stream_snapshot.last_created_at_ms,
         }
     }
@@ -338,7 +324,7 @@ fn stream_to_proto(
         .transpose()
         .map_err(|err| SnapshotStoreError::Serialize(format!("record index: {err:?}")))?
         .unwrap_or((None, Vec::new()));
-    // F1 (level 2): marks are written only when the index has sealed records,
+    // F1: marks are written only when the index has sealed records,
     // so all-dense entries stay byte-identical to earlier releases.
     let (record_mark_records, record_mark_offsets, dense_first_record) = entry
         .record_index
@@ -361,18 +347,12 @@ fn stream_to_proto(
             .into_iter()
             .map(hot_segment_to_proto)
             .collect(),
-        cold_frontier_offset: entry.cold_frontier_offset,
         cold_index_generation: entry.cold_index_generation,
         cold_chunks: entry.cold_chunks,
         external_segments: entry
             .external_segments
             .into_iter()
             .map(object_ref_to_proto)
-            .collect(),
-        message_records: entry
-            .message_records
-            .into_iter()
-            .map(message_record_to_proto)
             .collect(),
         visible_snapshot: entry.visible_snapshot.map(visible_snapshot_to_proto),
         producer_states: entry
@@ -441,18 +421,12 @@ fn stream_from_proto(
             .into_iter()
             .map(hot_segment_from_proto)
             .collect::<Result<Vec<_>, _>>()?,
-        cold_frontier_offset: entry.cold_frontier_offset,
         cold_index_generation: entry.cold_index_generation,
         cold_chunks: entry.cold_chunks,
         external_segments: entry
             .external_segments
             .into_iter()
             .map(object_ref_from_proto)
-            .collect(),
-        message_records: entry
-            .message_records
-            .into_iter()
-            .map(message_record_from_proto)
             .collect(),
         hot_append_starts: entry.hot_append_starts,
         record_index,
@@ -462,7 +436,7 @@ fn stream_from_proto(
             .producer_states
             .into_iter()
             .map(producer_from_proto)
-            .collect(),
+            .collect::<Result<Vec<_>, _>>()?,
     })
 }
 
@@ -561,20 +535,6 @@ fn object_ref_from_proto(object: proto::ObjectPayloadRefV1) -> ObjectPayloadRef 
     }
 }
 
-fn message_record_to_proto(record: StreamMessageRecord) -> proto::StreamMessageRecordV1 {
-    proto::StreamMessageRecordV1 {
-        start_offset: record.start_offset,
-        end_offset: record.end_offset,
-    }
-}
-
-fn message_record_from_proto(record: proto::StreamMessageRecordV1) -> StreamMessageRecord {
-    StreamMessageRecord {
-        start_offset: record.start_offset,
-        end_offset: record.end_offset,
-    }
-}
-
 fn visible_snapshot_to_proto(snapshot: StreamVisibleSnapshot) -> proto::StreamVisibleSnapshotV1 {
     proto::StreamVisibleSnapshotV1 {
         offset: snapshot.offset,
@@ -603,40 +563,40 @@ fn producer_to_proto(producer: ProducerSnapshot) -> proto::ProducerSnapshotV1 {
         last_start_offset: producer.last_start_offset,
         last_next_offset: producer.last_next_offset,
         last_closed: producer.last_closed,
-        last_items: producer
-            .last_items
-            .into_iter()
-            .map(producer_append_record_to_proto)
-            .collect(),
         receipts: producer
             .receipts
             .into_iter()
             .map(producer_receipt_to_proto)
             .collect(),
-        last_seen_ms: producer.last_seen_ms,
+        last_seen_ms: Some(producer.last_seen_ms),
     }
 }
 
-fn producer_from_proto(producer: proto::ProducerSnapshotV1) -> ProducerSnapshot {
-    ProducerSnapshot {
+/// Field 9 `last_seen_ms` stays `optional` on the wire, but every writer sets
+/// it (bounded-state F3), so an absent value is corruption.
+fn producer_from_proto(
+    producer: proto::ProducerSnapshotV1,
+) -> Result<ProducerSnapshot, SnapshotStoreError> {
+    let last_seen_ms = producer.last_seen_ms.ok_or_else(|| {
+        SnapshotStoreError::Deserialize(format!(
+            "snapshot producer '{}' has no last_seen_ms",
+            producer.producer_id
+        ))
+    })?;
+    Ok(ProducerSnapshot {
         producer_id: producer.producer_id,
         producer_epoch: producer.producer_epoch,
         producer_seq: producer.producer_seq,
         last_start_offset: producer.last_start_offset,
         last_next_offset: producer.last_next_offset,
         last_closed: producer.last_closed,
-        last_items: producer
-            .last_items
-            .into_iter()
-            .map(producer_append_record_from_proto)
-            .collect(),
         receipts: producer
             .receipts
             .into_iter()
             .map(producer_receipt_from_proto)
             .collect(),
-        last_seen_ms: producer.last_seen_ms,
-    }
+        last_seen_ms,
+    })
 }
 
 fn producer_receipt_to_proto(receipt: ProducerReceipt) -> proto::ProducerReceiptV1 {
@@ -806,7 +766,6 @@ mod tests {
                         stream_count: 2,
                     },
                 }],
-                feature_level: ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL,
                 last_created_at_ms: 1_234,
             },
             stream_append_counts: vec![StreamAppendCount {
@@ -829,13 +788,12 @@ mod tests {
         assert_eq!(decoded, snapshot);
     }
 
-    /// Bounded-state F3: the producer idle clock and the level-1 receipt
-    /// window survive the group snapshot codec, so an installed replica
-    /// holds exactly the live replica's producer state.
+    /// Bounded-state F3: the producer idle clock and the receipt window
+    /// survive the group snapshot codec, so an installed replica holds
+    /// exactly the live replica's producer state.
     #[test]
     fn producer_last_seen_and_receipt_window_round_trip() {
         let mut machine = ursula_stream::StreamStateMachine::new();
-        machine.apply(ursula_stream::StreamCommand::SetFeatureLevel { level: 1 });
         machine.apply(ursula_stream::StreamCommand::CreateBucket {
             bucket_id: "bucket".to_owned(),
         });
@@ -878,13 +836,13 @@ mod tests {
         }
         let stream_snapshot = machine.snapshot();
         let producers = &stream_snapshot.streams[0].producer_states;
-        assert_eq!(producers[0].last_seen_ms, Some(10 + 1_099));
-        assert_eq!(producers[1].last_seen_ms, Some(23));
-        assert!(
-            producers
-                .iter()
-                .all(|producer| producer.last_items.is_empty())
-        );
+        assert_eq!(producers[0].last_seen_ms, 10 + 1_099);
+        assert_eq!(producers[1].last_seen_ms, 23);
+        // Field 9 stays optional on the wire; an absent value is refused.
+        let mut entry = stream_to_proto(stream_snapshot.streams[0].clone()).expect("encode entry");
+        entry.producer_states[0].last_seen_ms = None;
+        let error = stream_from_proto(entry).expect_err("absent last_seen_ms");
+        assert!(error.to_string().contains("last_seen_ms"), "{error}");
         let snapshot = GroupSnapshot {
             placement: ShardPlacement {
                 core_id: CoreId(0),
@@ -910,15 +868,11 @@ mod tests {
     }
 
     /// Bounded-state F1 (RC-16): sparse record marks survive the group
-    /// snapshot codec in stream entry fields 17-19, an all-dense entry
-    /// writes none of them, and a snapshot below level 2 that carries marks
-    /// is refused at restore.
+    /// snapshot codec in stream entry fields 17-19, and an all-dense entry
+    /// writes none of them.
     #[test]
     fn sparse_record_marks_round_trip() {
         let mut machine = ursula_stream::StreamStateMachine::new();
-        machine.apply(ursula_stream::StreamCommand::SetFeatureLevel {
-            level: ursula_stream::FEATURE_LEVEL_SPARSE_MARKS,
-        });
         machine.apply(ursula_stream::StreamCommand::CreateBucket {
             bucket_id: "bucket".to_owned(),
         });
@@ -964,7 +918,9 @@ mod tests {
                 object_size: 2_000_000,
                 ..Default::default()
             },
-            cold_generation: None,
+            cold_generation: machine
+                .cold_index_generation(&stream_id)
+                .unwrap_or_default(),
         });
         let entry = dense_entry(&machine);
         assert_eq!(entry.record_mark_records, vec![0, 1_049]);
@@ -996,16 +952,12 @@ mod tests {
         assert_eq!(restored.state_gauges(), machine.state_gauges());
     }
 
-    /// Bounded-state F4b (level 4): the codec writes no message records
-    /// (field 10), binary streams carry their hot append starts in field 20,
-    /// JSON streams carry neither, and the decoded snapshot restores to the
-    /// live state with the same bootstrap answers.
+    /// Bounded-state F4b: binary streams carry their hot append starts in
+    /// field 20, JSON streams carry none, and the decoded snapshot restores
+    /// to the live state with the same bootstrap answers.
     #[test]
-    fn level_4_append_starts_round_trip_without_message_records() {
+    fn append_starts_round_trip() {
         let mut machine = ursula_stream::StreamStateMachine::new();
-        machine.apply(ursula_stream::StreamCommand::SetFeatureLevel {
-            level: ursula_stream::FEATURE_LEVEL_HOT_REPRESENTATION,
-        });
         machine.apply(ursula_stream::StreamCommand::CreateBucket {
             bucket_id: "bucket".to_owned(),
         });
@@ -1059,7 +1011,7 @@ mod tests {
                 object_size: 12,
                 ..Default::default()
             },
-            cold_generation: None,
+            cold_generation: machine.cold_index_generation(&binary).unwrap_or_default(),
         });
         let entries = machine
             .snapshot()
@@ -1068,10 +1020,8 @@ mod tests {
             .map(|entry| stream_to_proto(entry).expect("encode entry"))
             .collect::<Vec<_>>();
         let binary_entry = &entries[0];
-        assert!(binary_entry.message_records.is_empty());
         assert_eq!(binary_entry.hot_append_starts, vec![16, 24]);
         let json_entry = &entries[1];
-        assert!(json_entry.message_records.is_empty());
         assert!(json_entry.hot_append_starts.is_empty());
 
         let snapshot = GroupSnapshot {
@@ -1113,7 +1063,7 @@ mod tests {
         .expect("encode epoch frame")
     }
 
-    fn header_v1(feature_level: u32) -> proto::SnapshotHeaderV1 {
+    fn header_v1() -> proto::SnapshotHeaderV1 {
         proto::SnapshotHeaderV1 {
             placement: Some(placement_to_proto(ShardPlacement {
                 core_id: CoreId(0),
@@ -1127,16 +1077,13 @@ mod tests {
             shared_cold_object_owners: Vec::new(),
             bucket_usage: Vec::new(),
             committed_write_unit_bytes: None,
-            feature_level,
             last_created_at_ms: 0,
         }
     }
 
-    fn header_frame(feature_level: u32) -> Bytes {
+    fn header_frame() -> Bytes {
         encode_frame(proto::SnapshotFrameV1 {
-            frame: Some(proto::snapshot_frame_v1::Frame::Header(header_v1(
-                feature_level,
-            ))),
+            frame: Some(proto::snapshot_frame_v1::Frame::Header(header_v1())),
         })
         .expect("encode header")
     }
@@ -1151,40 +1098,35 @@ mod tests {
     }
 
     /// Format epoch 2 (E5): the epoch frame comes first and is checked before
-    /// any other frame; a header below the top level is refused too.
+    /// any other frame.
     #[test]
-    fn decode_requires_a_leading_epoch_frame_of_this_epoch_at_the_top_level() {
-        let max = ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL;
+    fn decode_requires_a_leading_epoch_frame_of_this_epoch() {
         let epoch = ursula_stream::FORMAT_EPOCH;
-        let valid = [epoch_frame(epoch), header_frame(max), footer_frame()].concat();
+        let valid = [epoch_frame(epoch), header_frame(), footer_frame()].concat();
         decode_group_snapshot(&valid).expect("an epoch-2 snapshot decodes");
 
         let cases = [
             (
-                [header_frame(max), footer_frame()].concat(),
+                [header_frame(), footer_frame()].concat(),
                 "no leading format-epoch frame",
             ),
             (
-                [epoch_frame(epoch - 1), header_frame(max), footer_frame()].concat(),
+                [epoch_frame(epoch - 1), header_frame(), footer_frame()].concat(),
                 "is format epoch 1",
             ),
             (
-                [header_frame(max), epoch_frame(epoch), footer_frame()].concat(),
+                [header_frame(), epoch_frame(epoch), footer_frame()].concat(),
                 "no leading format-epoch frame",
             ),
             (
                 [
                     epoch_frame(epoch),
-                    header_frame(max),
+                    header_frame(),
                     epoch_frame(epoch),
                     footer_frame(),
                 ]
                 .concat(),
                 "not the first frame",
-            ),
-            (
-                [epoch_frame(epoch), header_frame(max - 1), footer_frame()].concat(),
-                "feature level",
             ),
         ];
         for (bytes, expected) in cases {
@@ -1210,7 +1152,6 @@ mod tests {
                     shared_cold_object_owners: Vec::new(),
                     bucket_usage: Vec::new(),
                     committed_write_unit_bytes: None,
-                    feature_level: ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL,
                     last_created_at_ms: 0,
                 },
             )),
@@ -1239,7 +1180,6 @@ mod tests {
             shared_cold_object_owners: Vec::new(),
             bucket_usage: Vec::new(),
             committed_write_unit_bytes: Some(4096),
-            feature_level: ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL,
             last_created_at_ms: 0,
         };
         let bytes = [
@@ -1261,14 +1201,11 @@ mod tests {
         assert!(error.to_string().contains("4096"), "{error}");
     }
 
-    /// Bounded-state F16 (level 5): a cold snapshot body travels through
-    /// the codec as its object reference, never as inline bytes.
+    /// Bounded-state F16: a cold snapshot body travels through the codec as
+    /// its object reference, never as inline bytes.
     #[test]
     fn cold_snapshot_reference_round_trips() {
         let mut machine = ursula_stream::StreamStateMachine::new();
-        machine.apply(ursula_stream::StreamCommand::SetFeatureLevel {
-            level: ursula_stream::FEATURE_LEVEL_COLD_SNAPSHOTS,
-        });
         machine.apply(ursula_stream::StreamCommand::CreateBucket {
             bucket_id: "bucket".to_owned(),
         });

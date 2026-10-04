@@ -79,7 +79,6 @@ pub struct StreamFrameStats {
     pub record_marks: u64,
     /// Snapshot bytes of the mark fields 17-19.
     pub record_marks_bytes: u64,
-    pub message_records: u64,
     pub shared_refs: u64,
     pub external_segments: u64,
     pub producers: u64,
@@ -112,8 +111,6 @@ pub struct SnapStats {
     pub record_offsets_bytes: u64,
     pub record_marks_count: u64,
     pub record_marks_bytes: u64,
-    pub message_records_count: u64,
-    pub message_records_bytes: u64,
     pub cold_chunks_count: u64,
     pub cold_chunks_bytes: u64,
     pub external_segments_count: u64,
@@ -179,7 +176,6 @@ fn add_stream(st: &mut SnapStats, entry: proto::StreamSnapshotEntryV1, frame_byt
         x.record_mark_offsets.clear();
         x.dense_first_record = None;
     });
-    let mr = delta(&entry, full, |x| x.message_records.clear());
     let cc = delta(&entry, full, |x| x.cold_chunks.clear());
     let es = delta(&entry, full, |x| x.external_segments.clear());
     let hp = delta(&entry, full, |x| x.payload = Bytes::new());
@@ -195,8 +191,6 @@ fn add_stream(st: &mut SnapStats, entry: proto::StreamSnapshotEntryV1, frame_byt
     st.record_offsets_count += n(entry.record_offsets.len());
     st.record_marks_bytes += rm;
     st.record_marks_count += n(entry.record_mark_records.len());
-    st.message_records_bytes += mr;
-    st.message_records_count += n(entry.message_records.len());
     st.cold_chunks_bytes += cc;
     st.cold_chunks_count += n(entry.cold_chunks.len());
     st.external_segments_bytes += es;
@@ -208,7 +202,7 @@ fn add_stream(st: &mut SnapStats, entry: proto::StreamSnapshotEntryV1, frame_byt
     st.producer_count += n(entry.producer_states.len());
     st.receipt_count += receipts;
     st.visible_snapshot_bytes += vs;
-    st.stream_fixed_bytes += frame_bytes.saturating_sub(ro + rm + mr + cc + es + hp + hs + pr + vs);
+    st.stream_fixed_bytes += frame_bytes.saturating_sub(ro + rm + cc + es + hp + hs + pr + vs);
 
     let tail = entry
         .metadata
@@ -235,7 +229,6 @@ fn add_stream(st: &mut SnapStats, entry: proto::StreamSnapshotEntryV1, frame_byt
         record_offsets_bytes: ro,
         record_marks: n(entry.record_mark_records.len()),
         record_marks_bytes: rm,
-        message_records: n(entry.message_records.len()),
         shared_refs: n(entry.cold_chunks.iter().filter(|c| c.shared_object).count()),
         external_segments: n(entry.external_segments.len()),
         producers: n(entry.producer_states.len()),
@@ -246,7 +239,7 @@ fn add_stream(st: &mut SnapStats, entry: proto::StreamSnapshotEntryV1, frame_byt
 
 /// Encode `snapshot` with the real codec, then decode each frame to attribute
 /// bytes to fields and streams. `with_zstd` mirrors the S3 snapshot store
-/// (level 3).
+/// (zstd-3).
 pub fn measure(snapshot: GroupSnapshot, with_zstd: bool) -> Result<SnapStats> {
     let started = Instant::now();
     let frames = encode_frames(snapshot)?;

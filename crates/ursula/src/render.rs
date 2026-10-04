@@ -94,10 +94,7 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         | StreamErrorCode::StreamSeqConflict
         | StreamErrorCode::SnapshotConflict
         | StreamErrorCode::ProducerSeqConflict
-        | StreamErrorCode::ImportConflict
-        // Below the required group feature level (C0); the plain-text body
-        // names the level the operation needs.
-        | StreamErrorCode::FeatureNotEnabled => StatusCode::CONFLICT,
+        | StreamErrorCode::ImportConflict => StatusCode::CONFLICT,
         StreamErrorCode::RecordPreconditionFailed => StatusCode::PRECONDITION_FAILED,
         StreamErrorCode::ProducerEpochStale => StatusCode::FORBIDDEN,
         StreamErrorCode::OffsetOutOfRange => StatusCode::RANGE_NOT_SATISFIABLE,

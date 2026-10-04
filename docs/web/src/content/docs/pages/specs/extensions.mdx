@@ -120,7 +120,7 @@ Creates a snapshot at the specified offset. The snapshot represents the material
 - `410 Gone`: `snapshot_offset` is older than the current earliest retained offset.
 - `413 Payload Too Large`: Snapshot exceeds the server's size limit.
 
-> **Note (informative).** Ursula keeps snapshot bodies of up to 32 MiB in replicated state. With a cold backend and feature level 5, it stores bodies of at least its external-payload threshold (1 MiB by default) as cold-tier objects instead and accepts up to 1 GiB; only the reference is replicated, and the digest is the same as for an inline body.
+> **Note (informative).** Ursula keeps snapshot bodies of up to 32 MiB in replicated state. With a cold backend, it stores bodies of at least its external-payload threshold (1 MiB by default) as cold-tier objects instead and accepts up to 1 GiB; only the reference is replicated, and the digest is the same as for an inline body.
 
 **Idempotency:**
 

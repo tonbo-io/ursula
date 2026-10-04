@@ -61,20 +61,12 @@ pub struct ProducerSnapshot {
     pub last_start_offset: u64,
     pub last_next_offset: u64,
     pub last_closed: bool,
-    pub last_items: Vec<ProducerAppendRecord>,
-    /// Exact response history for delayed retries, oldest first. At feature
-    /// level 1 it is bounded by the stream's receipt window (F3), and a
-    /// producer's newest receipt is never evicted. Missing in legacy
-    /// snapshots: a level-0 restore uses the last response as the sole
-    /// receipt.
-    #[serde(default)]
+    /// Exact response history for delayed retries, oldest first, bounded by
+    /// the stream's receipt window (F3). A producer's newest receipt is never
+    /// evicted, so it is never empty.
     pub receipts: Vec<ProducerReceipt>,
-    /// `now_ms` of the producer's newest accepted write (F3 idle expiry),
-    /// kept from feature level 1 on. `None` for producers last written
-    /// below level 1 and in legacy snapshots: their idle period starts at
-    /// the first `TidyStream` that stamps them.
-    #[serde(default)]
-    pub last_seen_ms: Option<u64>,
+    /// `now_ms` of the producer's newest accepted write (F3 idle expiry).
+    pub last_seen_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,15 +96,11 @@ pub(crate) struct ProducerState {
     pub(crate) last_start_offset: u64,
     pub(crate) last_next_offset: u64,
     pub(crate) last_closed: bool,
-    /// The newest receipt's items. Kept only below feature level 1, where
-    /// snapshots still carry it for older binaries; level 1 answers from the
-    /// newest receipt, which the window never evicts (F3).
-    pub(crate) last_items: Vec<ProducerAppendRecord>,
     /// Receipts of the current epoch in sequence order, with contiguous
     /// sequences, so a duplicate's receipt sits at `seq - front.seq`.
     pub(crate) receipts: std::collections::VecDeque<ProducerReceipt>,
     /// See [`ProducerSnapshot::last_seen_ms`].
-    pub(crate) last_seen_ms: Option<u64>,
+    pub(crate) last_seen_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,16 +154,15 @@ pub struct ColdGcEntry {
     pub not_before_ms: u64,
     pub target: ColdGcTarget,
     /// Cold generation of the removed incarnation for a
-    /// [`ColdGcTarget::Stream`] entry enqueued at feature level 1 or later
-    /// (F14g step 2): the worker deletes only that generation's cold-index
-    /// pages, the objects they reference, and chunk names scoped to it.
-    /// `None` marks a legacy entry, which deletes only legacy-format chunk
-    /// names and generation-0 pages and never runs while a stream of the
-    /// same name exists (F14g step 1).
+    /// [`ColdGcTarget::Stream`] entry (F14g step 2): the worker deletes only
+    /// that generation's cold-index pages, the objects they reference, and
+    /// chunk names scoped to it. Always set for `Stream` targets and always
+    /// `None` for `Paths` targets; the worker refuses a `Stream` entry
+    /// without a generation as corrupt and deletes nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cold_generation: Option<u64>,
     /// How many times the leader's GC worker deferred this entry after a
-    /// failure (`DeferColdGc`, F14b, feature level 1). The worker backs off
+    /// failure (`DeferColdGc`, F14b). The worker backs off
     /// exponentially in it.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub defer_attempts: u32,
@@ -288,14 +275,13 @@ pub struct StreamVisibleSnapshot {
     /// decoding legacy snapshots; restore recomputes it.
     #[serde(default)]
     pub digest: String,
-    /// Cold-tier object holding the whole body (feature level 5,
-    /// bounded-state F16). `payload_len` is the body length.
+    /// Cold-tier object holding the whole body (bounded-state F16). `payload_len` is the body length.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object: Option<ExternalPayloadRef>,
 }
 
-/// Largest snapshot body Ursula stores as a cold-tier object (feature
-/// level 5). Inline bodies stay bounded by the HTTP body cap.
+/// Largest snapshot body Ursula stores as a cold-tier object (F16). Inline
+/// bodies stay bounded by the HTTP body cap.
 pub const MAX_COLD_SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Incremental form of the snapshot digest: BLAKE3 over the content type's

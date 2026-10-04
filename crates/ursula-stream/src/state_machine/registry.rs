@@ -253,7 +253,6 @@ mod tests {
             },
             hot_buffer: HotBuffer::default(),
             cold: StreamColdState::default(),
-            message_records: Vec::new(),
             record_index: None,
             retained_offset: 0,
             visible_snapshot: None,

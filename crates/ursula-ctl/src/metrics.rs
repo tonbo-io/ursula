@@ -37,10 +37,6 @@ impl MetricsClient {
         self.timeout
     }
 
-    pub(crate) fn http(&self) -> &Client {
-        &self.client
-    }
-
     pub async fn fetch_node(&self, node: &NodeInfo) -> Result<NodeMetricsView> {
         let url = metrics_base_url(node)
             .join("/__ursula/metrics")

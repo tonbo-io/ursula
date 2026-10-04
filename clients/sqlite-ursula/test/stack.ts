@@ -3,8 +3,7 @@
 // - Default: one `ursula server` node with a memory Raft WAL and an in-memory cold store
 //   (URSULA_COLD=none for none).
 // - E2E_NODES=3: three nodes (memory Raft WAL) behind an `ursula gateway`, with S3 (MinIO at
-//   URSULA_S3_ENDPOINT) as the cold store, raised to feature level 5 (snapshot bodies in the cold
-//   tier).
+//   URSULA_S3_ENDPOINT) as the cold store (snapshot bodies in the cold tier).
 import { type ChildProcess, spawn } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import { createHash, createHmac } from "node:crypto";
@@ -264,19 +263,6 @@ async function startCluster(): Promise<Stack> {
 		procs.push(new Proc(ursulaBin(), args, dir, {}, "gateway"));
 		const url = `http://127.0.0.1:${gatewayPort}`;
 		await waitWritable(url, logs);
-		// Feature level 5 on every group: POST to every node until every hosted replica reports it.
-		const deadline = Date.now() + 60_000;
-		for (;;) {
-			let min = Number.POSITIVE_INFINITY;
-			for (const node of nodes) {
-				await fetch(`${node.admin}/__ursula/feature-level`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ level: 5 }), signal: AbortSignal.timeout(10_000) });
-				const report = (await (await fetch(`${node.admin}/__ursula/feature-level`, { signal: AbortSignal.timeout(10_000) })).json()) as { groups: { hosted: boolean; level?: number }[] };
-				for (const g of report.groups) if (g.hosted) min = Math.min(min, g.level ?? 0);
-			}
-			if (min >= 5 && Number.isFinite(min)) break;
-			if (Date.now() > deadline) throw new Error(`feature level 5 not reached (min ${min})\n${logs()}`);
-			await sleep(250);
-		}
 		return { url, nodes: nodes.map((node, i) => ({ url: `http://127.0.0.1:${node.port}`, pid: (procs[i] as Proc).pid })), stop };
 	} catch (error) {
 		await stop();

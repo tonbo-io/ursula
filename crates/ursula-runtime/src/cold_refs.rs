@@ -6,7 +6,7 @@
 //! - the orphan sweep (F14h, §5.15), which deletes cold objects that
 //!   ambiguous publishes left behind once they are older than a grace period
 //!   and nothing references them;
-//! - the external-locator offload (F5, §5.6, feature level 3), which writes
+//! - the external-locator offload (F5, §5.6), which writes
 //!   cold-index page entries for committed state-held external refs and then
 //!   removes them from state with `OffloadColdRefs`.
 //!

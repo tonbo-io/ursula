@@ -1,4 +1,4 @@
-//! Bounded-state level Lb1 cold hygiene on the in-memory engine: F14b
+//! Bounded-state cold hygiene on the in-memory engine: F14b
 //! `DeferColdGc` in the GC worker, F14i retention grace for dropped pack
 //! slices, the `FlushCold` incarnation check, and apply-time cold-index page
 //! invalidation.
@@ -10,7 +10,6 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 use ursula_stream::ColdChunkRef;
 use ursula_stream::ColdGcTarget;
-use ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
 use ursula_stream::StreamCommand;
 use ursula_stream::StreamReadColdIndexSegment;
 
@@ -46,18 +45,9 @@ fn spawn(cold_store: Arc<ColdStore>) -> ShardRuntime {
     .expect("spawn runtime")
 }
 
-async fn raise(runtime: &ShardRuntime, level: u32) {
-    if level == 0 {
-        return;
-    }
-    for (group, result) in runtime.set_feature_level_all_groups(level).await {
-        result.unwrap_or_else(|err| panic!("raise group {group:?}: {err}"));
-    }
-}
-
 fn stream_on_group(runtime: &ShardRuntime, group: RaftGroupId, prefix: &str) -> BucketStreamId {
     (0..10_000)
-        .map(|index| BucketStreamId::new("lb1cold", format!("{prefix}-{index}")))
+        .map(|index| BucketStreamId::new("coldhygiene", format!("{prefix}-{index}")))
         .find(|stream| runtime.locate(stream).raft_group_id == group)
         .expect("stream on group")
 }
@@ -139,9 +129,7 @@ async fn object_exists(cold_store: &ColdStore, path: &str) -> bool {
 
 /// Two deleted streams with flushed chunks in one group; the first one's
 /// objects cannot be deleted.
-async fn gc_with_failing_head(
-    level: u32,
-) -> (
+async fn gc_with_failing_head() -> (
     Arc<ColdStore>,
     ShardRuntime,
     RaftGroupId,
@@ -149,7 +137,6 @@ async fn gc_with_failing_head(
 ) {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = spawn(cold_store.clone());
-    raise(&runtime, level).await;
     let group = RaftGroupId(1);
     let streams = [
         stream_on_group(&runtime, group, "failing"),
@@ -173,9 +160,8 @@ async fn gc_with_failing_head(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn f14b_failing_gc_head_is_deferred_and_the_rest_drains_at_level_one() {
-    let (cold_store, runtime, group, streams) =
-        gc_with_failing_head(FEATURE_LEVEL_KEYED_STREAMS).await;
+async fn f14b_failing_gc_head_is_deferred_and_the_rest_drains() {
+    let (cold_store, runtime, group, streams) = gc_with_failing_head().await;
     let before = pending_gc(&runtime, group).await;
     assert_eq!(before.len(), 2);
     let started_ms = crate::runtime::unix_time_ms();
@@ -211,7 +197,6 @@ async fn f14b_failing_gc_head_is_deferred_and_the_rest_drains_at_level_one() {
 async fn flush_planned_before_delete_and_recreate_never_publishes_into_the_new_incarnation() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = spawn(cold_store.clone());
-    raise(&runtime, FEATURE_LEVEL_KEYED_STREAMS).await;
     let group = RaftGroupId(2);
     let stream = stream_on_group(&runtime, group, "reborn");
     create(&runtime, &stream).await;
@@ -286,10 +271,9 @@ async fn flush_planned_before_delete_and_recreate_never_publishes_into_the_new_i
 
 /// Two streams of one bucket share a pack; the first is deleted, then
 /// retention drops the last reference to the pack from the second.
-async fn retain_past_last_pack_reference(level: u32) -> (Arc<ColdStore>, String) {
+async fn retain_past_last_pack_reference() -> (Arc<ColdStore>, String) {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = spawn(cold_store.clone());
-    raise(&runtime, level).await;
     let group = RaftGroupId(3);
     let streams = [
         stream_on_group(&runtime, group, "pack-a"),
@@ -352,9 +336,8 @@ async fn retain_past_last_pack_reference(level: u32) -> (Arc<ColdStore>, String)
 /// RC-19 / D6: a read planned before a concurrent retention still finds the
 /// pack bytes, because GC waits for the grace.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn f14i_retention_keeps_dropped_pack_slices_for_the_grace_at_level_one() {
-    let (cold_store, pack_path) =
-        retain_past_last_pack_reference(FEATURE_LEVEL_KEYED_STREAMS).await;
+async fn f14i_retention_keeps_dropped_pack_slices_for_the_grace() {
+    let (cold_store, pack_path) = retain_past_last_pack_reference().await;
     assert!(object_exists(&cold_store, &pack_path).await);
 }
 
@@ -370,7 +353,7 @@ async fn applying_flush_cold_drops_cached_pages_of_the_flushed_range() {
         shard_id: ursula_shard::ShardId(0),
         raft_group_id: RaftGroupId(0),
     };
-    let stream = BucketStreamId::new("lb1cold", "cached");
+    let stream = BucketStreamId::new("coldhygiene", "cached");
     // Creating the stream creates its bucket.
     let create = StreamCommand::CreateStream {
         stream_id: stream.clone(),
@@ -394,7 +377,7 @@ async fn applying_flush_cold_drops_cached_pages_of_the_flushed_range() {
     let stale = ColdChunkRef {
         start_offset: 0,
         end_offset: 2,
-        s3_path: "lb1cold/cached/chunks/stale.bin".to_owned(),
+        s3_path: "coldhygiene/cached/chunks/stale.bin".to_owned(),
         object_size: 2,
         ..Default::default()
     };
@@ -421,11 +404,11 @@ async fn applying_flush_cold_drops_cached_pages_of_the_flushed_range() {
                 chunk: ColdChunkRef {
                     start_offset: 0,
                     end_offset: 4,
-                    s3_path: "lb1cold/cached/chunks/flushed.bin".to_owned(),
+                    s3_path: "coldhygiene/cached/chunks/flushed.bin".to_owned(),
                     object_size: 4,
                     ..Default::default()
                 },
-                cold_generation: None,
+                cold_generation: generation,
             }),
             placement,
         )

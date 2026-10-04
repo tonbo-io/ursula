@@ -16,11 +16,8 @@ pub const MAX_PRODUCERS: u64 = 4_096;
 pub const MAX_SHARED_REFS: u64 = 64;
 /// Staged external refs per stream (F5).
 pub const MAX_STAGED_EXTERNAL: u64 = 16;
-/// Hot overhead per unflushed record with F6b (bytes).
-pub const HOT_OVERHEAD_PER_RECORD: f64 = 24.0;
-/// Hot overhead per unflushed record with F6b and F4b, from feature level 4
-/// (bytes).
-pub const HOT_OVERHEAD_PER_RECORD_LB4: f64 = 12.0;
+/// Hot overhead per unflushed record with F6b and F4b (bytes).
+pub const HOT_OVERHEAD_PER_RECORD: f64 = 12.0;
 /// Payload bytes per hot block (F6b).
 pub const HOT_BLOCK_BYTES: u64 = 64 * 1024;
 /// Header bytes allowed per hot block (F6b).
@@ -75,12 +72,6 @@ pub fn per_stream_checks(outcome: &mut Outcome, m: &Measured, shared_refs_interv
             producer_bound(s.producers) as f64,
         );
         outcome.check(
-            "f4_message_records_per_stream",
-            "message records per stream <= unflushed records + 2 (F4a)",
-            s.message_records as f64,
-            (s.unflushed_records + 2) as f64,
-        );
-        outcome.check(
             "f5_staged_external_refs_per_stream",
             "staged external refs per stream <= 16 (F5)",
             s.external_segments as f64,
@@ -113,15 +104,12 @@ pub fn per_stream_checks(outcome: &mut Outcome, m: &Measured, shared_refs_interv
     let unflushed: u64 = m.snap.streams.iter().map(|s| s.unflushed_records).sum();
     if unflushed > 0 {
         // Hot overhead per unflushed record: hot-buffer headers and append
-        // starts (8 B each, F4b) + message records (16 B) + dense offsets
-        // (8 B) for records above the seal point. With F6b the hot buffer
-        // holds one header per block of up to 64 KiB, which is per payload
-        // byte rather than per record: the bound allows one header per
-        // started block of each stream's hot bytes, so per-append headers
-        // would still fail it. From feature level 4 message records are gone
-        // and the target drops from 24 B to 12 B per record.
-        let hot_message_records = m.snap.message_records_count.min(unflushed);
-        let overhead = g.hot_overhead_bytes + 16 * hot_message_records + 8 * unflushed;
+        // starts (8 B each, F4b) + dense offsets (8 B) for records above the
+        // seal point. With F6b the hot buffer holds one header per block of
+        // up to 64 KiB, which is per payload byte rather than per record: the
+        // bound allows one header per started block of each stream's hot
+        // bytes, so per-append headers would still fail it.
+        let overhead = g.hot_overhead_bytes + 8 * unflushed;
         let block_allowance: u64 = m
             .snap
             .streams
@@ -129,17 +117,12 @@ pub fn per_stream_checks(outcome: &mut Outcome, m: &Measured, shared_refs_interv
             .filter(|s| s.hot_bytes > 0)
             .map(|s| HOT_BLOCK_HEADER_ALLOWANCE * (s.hot_bytes.div_ceil(HOT_BLOCK_BYTES) + 1))
             .sum();
-        let per_record = if g.feature_level >= ursula_stream::FEATURE_LEVEL_HOT_REPRESENTATION {
-            HOT_OVERHEAD_PER_RECORD_LB4
-        } else {
-            HOT_OVERHEAD_PER_RECORD
-        };
         outcome.check(
             "f6_hot_overhead_per_unflushed_record",
-            "hot overhead per unflushed record <= 24 B (12 B from level 4, F4b) plus one header \
-             per 64 KiB hot block (F6b)",
+            "hot overhead per unflushed record <= 12 B (F4b) plus one header per 64 KiB hot \
+             block (F6b)",
             overhead as f64 / unflushed as f64,
-            per_record + block_allowance as f64 / unflushed as f64,
+            HOT_OVERHEAD_PER_RECORD + block_allowance as f64 / unflushed as f64,
         );
     }
 }

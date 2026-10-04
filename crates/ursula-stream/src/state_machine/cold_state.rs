@@ -1,8 +1,7 @@
-//! Cold-tier reference state: flushed chunks, external segments, and the cold frontier.
+//! Cold-tier reference state: flushed chunks and external segments.
 //!
-//! The scalar cold frontier is a level-0 representation. From bounded-state
-//! level Lb1 (feature level 1, F18 step 2) apply derives cold coverage from
-//! the hot buffer and never reads it.
+//! Cold coverage is derived from the hot buffer (F18 step 2): every retained
+//! byte the hot buffer does not hold is cold.
 
 use super::ColdChunkRef;
 use super::ObjectPayloadRef;
@@ -12,10 +11,8 @@ use super::hot_buffer::shrink_vec_if_slack;
 pub(super) struct StreamColdState {
     cold_chunks: Vec<ColdChunkRef>,
     external_segments: Vec<ObjectPayloadRef>,
-    cold_frontier: u64,
-    /// Cold-index page generation of this stream incarnation (F14g). Zero
-    /// for streams created below feature level 1, whose pages and chunk names
-    /// carry no incarnation; otherwise the stream's unique `created_at_ms`.
+    /// Cold-index page generation of this stream incarnation (F14g): the
+    /// stream's unique `created_at_ms`.
     cold_generation: u64,
 }
 
@@ -46,7 +43,6 @@ impl StreamColdState {
     /// apply assigns the incarnation, so no page generation exists for it
     /// yet (F14g step 2).
     pub(super) fn push_direct_external_segment(&mut self, object: ObjectPayloadRef) {
-        self.cold_frontier = self.cold_frontier.max(object.end_offset);
         self.external_segments.push(object);
     }
 
@@ -63,19 +59,12 @@ impl StreamColdState {
     }
 
     pub(super) fn push_cold_chunk(&mut self, chunk: ColdChunkRef) {
-        self.cold_frontier = chunk.end_offset;
         if chunk.shared_object {
             self.cold_chunks.push(chunk);
         }
     }
 
-    pub(super) fn push_external_segment(&mut self, object: ObjectPayloadRef) {
-        let frontier = self.cold_frontier.max(object.end_offset);
-        self.cold_frontier = frontier;
-    }
-
     pub(super) fn restore(
-        cold_frontier_offset: u64,
         cold_index_generation: u64,
         cold_chunks: Vec<ColdChunkRef>,
         external_segments: Vec<ObjectPayloadRef>,
@@ -83,15 +72,8 @@ impl StreamColdState {
         Self {
             cold_chunks,
             external_segments,
-            cold_frontier: cold_frontier_offset,
             cold_generation: cold_index_generation,
         }
-    }
-
-    /// Legacy (level 0) test: the scalar frontier ever moved, or state holds
-    /// a cold ref.
-    pub(super) fn has_cold_objects(&self) -> bool {
-        self.cold_frontier > 0 || self.has_state_refs()
     }
 
     pub(super) fn has_state_refs(&self) -> bool {
@@ -137,32 +119,5 @@ impl StreamColdState {
             self.cold_chunks.capacity(),
             self.external_segments.capacity(),
         )
-    }
-
-    pub(super) fn cold_frontier_offset(&self, retained_offset: u64) -> u64 {
-        let external_segments = self.external_segments();
-        let cold_frontier = self.cold_frontier.max(retained_offset);
-        let mut ranges = Vec::with_capacity(1 + external_segments.len());
-        if cold_frontier > retained_offset {
-            ranges.push((retained_offset, cold_frontier));
-        }
-        ranges.extend(
-            external_segments
-                .iter()
-                .map(|object| (object.start_offset, object.end_offset)),
-        );
-        ranges.sort_unstable();
-
-        let mut frontier = retained_offset;
-        for (start_offset, end_offset) in ranges {
-            if end_offset <= frontier {
-                continue;
-            }
-            if start_offset > frontier {
-                break;
-            }
-            frontier = end_offset;
-        }
-        frontier
     }
 }

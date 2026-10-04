@@ -1,4 +1,4 @@
-//! F1 sparse cold record marks (bounded-stream-state §5.2, feature level 2)
+//! F1 sparse cold record marks (bounded-stream-state §5.2)
 //! through the in-memory engine with a real cold store and cold-index pages:
 //! sealing at `FlushCold` and `TidyStream`, bracketed record reads (RC-6),
 //! offset reads unchanged (RC-5), continuation anchors (RC-20), corruption
@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
-use ursula_stream::FEATURE_LEVEL_SPARSE_MARKS;
 use ursula_stream::MARK_BLOCK_BYTES;
 use ursula_stream::StreamRecordRange;
 
@@ -34,12 +33,6 @@ fn spawn(cold_store: Arc<ColdStore>) -> ShardRuntime {
         Some(cold_store),
     )
     .expect("spawn runtime")
-}
-
-async fn raise(runtime: &ShardRuntime, level: u32) {
-    for (group, result) in runtime.set_feature_level_all_groups(level).await {
-        result.unwrap_or_else(|err| panic!("raise group {group:?}: {err}"));
-    }
 }
 
 /// The stream's canonical bytes and record starts, kept by the test.
@@ -88,10 +81,9 @@ struct Fixture {
 }
 
 impl Fixture {
-    async fn new(level: u32) -> Self {
+    async fn new() -> Self {
         let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
         let runtime = spawn(cold_store.clone());
-        raise(&runtime, level).await;
         let stream = BucketStreamId::new("marks", "log");
         runtime
             .create_stream(CreateStreamRequest::new(stream.clone(), JSON))
@@ -208,7 +200,7 @@ impl Fixture {
 /// same bytes and coordinates as the dense layout.
 #[tokio::test]
 async fn bracketed_record_reads_match_the_dense_layout() {
-    let mut fixture = Fixture::new(FEATURE_LEVEL_SPARSE_MARKS).await;
+    let mut fixture = Fixture::new().await;
     let mut sizes = Vec::new();
     for index in 0..3_000_u64 {
         sizes.push(40 + (index * 37) % 1_500);
@@ -273,7 +265,7 @@ async fn bracketed_record_reads_match_the_dense_layout() {
 /// and one whose preceding byte is not LF fails the read.
 #[tokio::test]
 async fn continuation_anchors_are_validated() {
-    let mut fixture = Fixture::new(FEATURE_LEVEL_SPARSE_MARKS).await;
+    let mut fixture = Fixture::new().await;
     fixture.append(&[1_000; 3_000]).await;
     fixture.flush_all(8 << 20).await;
     let head = fixture
@@ -340,7 +332,7 @@ async fn continuation_anchors_are_validated() {
 /// a corruption error and a metric, instead of returning shifted records.
 #[tokio::test]
 async fn corrupt_chunk_bytes_fail_bracketed_reads() {
-    let mut fixture = Fixture::new(FEATURE_LEVEL_SPARSE_MARKS).await;
+    let mut fixture = Fixture::new().await;
     fixture.append(&[1_000; 3_000]).await;
     fixture.flush_all(8 << 20).await;
     let dir = cold_chunk_dir(&fixture.stream, {

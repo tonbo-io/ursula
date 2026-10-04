@@ -9,7 +9,6 @@ use super::ObjectPayloadRef;
 use super::ProducerRequest;
 use super::StreamBootstrapPlan;
 use super::StreamErrorCode;
-use super::StreamMessageRecord;
 use super::StreamMetadata;
 use super::StreamRead;
 use super::StreamReadColdIndexSegment;
@@ -41,7 +40,7 @@ impl StreamStateMachine {
             .transpose()
     }
 
-    /// Exact start offset of `record`. A sealed record (feature level 2)
+    /// Exact start offset of `record`. A sealed record (F1)
     /// that no mark names fails with [`RecordIndexError::RecordSealed`]; use
     /// [`Self::locate_record`] to get its bracket.
     pub fn offset_for_record(
@@ -75,8 +74,7 @@ impl StreamStateMachine {
         };
         if let Some(producer) = producer
             && let Some(record) = slot.producers.get(&producer.producer_id).and_then(|state| {
-                // The newest receipt's items (F3 keeps it at every level;
-                // level 0 also mirrors it in `last_items`).
+                // The newest receipt's items (F3 never evicts it).
                 state.receipts.back().and_then(|receipt| {
                     receipt.items.iter().find(|item| {
                         item.start_offset == start_offset && item.next_offset == next_offset
@@ -255,21 +253,10 @@ impl StreamStateMachine {
         })
     }
 
-    /// Per-record hot overhead of this group's representation (F6c):
-    /// [`super::HOT_RECORD_OVERHEAD_BYTES`] below feature level 4 and
-    /// [`super::HOT_RECORD_OVERHEAD_BYTES_LB4`] from it (F4b).
-    pub fn hot_record_overhead_bytes(&self) -> u64 {
-        if self.message_records_removed() {
-            super::HOT_RECORD_OVERHEAD_BYTES_LB4
-        } else {
-            super::HOT_RECORD_OVERHEAD_BYTES
-        }
-    }
-
-    /// `payload_bytes` plus this group's per-record overhead for `records`
-    /// (F6c). Admission charges incoming writes with it.
+    /// `payload_bytes` plus [`super::HOT_RECORD_OVERHEAD_BYTES`] for each of
+    /// `records` (F6c). Admission charges incoming writes with it.
     pub fn hot_real_bytes(&self, payload_bytes: u64, records: u64) -> u64 {
-        super::hot_real_bytes_with(payload_bytes, records, self.hot_record_overhead_bytes())
+        payload_bytes.saturating_add(records.saturating_mul(super::HOT_RECORD_OVERHEAD_BYTES))
     }
 
     pub fn bucket_exists(&self, bucket_id: &str) -> bool {
@@ -545,20 +532,9 @@ impl StreamStateMachine {
         let mut updates = Vec::new();
         let mut update_bytes = 0u64;
         let mut capped_at = None;
-        // F4b (level 4): the messages derive from the dense record offsets or
-        // the hot append starts; below it from the message records.
-        let derived: Box<dyn Iterator<Item = StreamMessageRecord> + '_> =
-            if self.derived_boundaries(slot) {
-                Box::new(slot.derived_messages_from(snapshot_offset))
-            } else {
-                Box::new(
-                    slot.message_records
-                        .iter()
-                        .filter(move |record| record.start_offset >= snapshot_offset)
-                        .cloned(),
-                )
-            };
-        for record in derived {
+        // F4b: the messages derive from the dense record offsets or the hot
+        // append starts.
+        for record in slot.derived_messages_from(snapshot_offset) {
             let len = record.end_offset.saturating_sub(record.start_offset);
             let next_bytes = update_bytes.saturating_add(len);
             if !updates.is_empty() && next_bytes > max_update_bytes {
@@ -568,10 +544,9 @@ impl StreamStateMachine {
             update_bytes = next_bytes;
             updates.push(record);
         }
-        // The parts must start exactly at the snapshot offset. A snapshot
-        // published at level 0 inside an external append (accepted below the
-        // scalar cold frontier) is no message boundary, and the next exact
-        // start lies past it; answering from there would skip bytes.
+        // The parts must start exactly at the snapshot offset. When the
+        // snapshot offset is no message start, the next exact start lies
+        // past it; answering from there would skip bytes.
         let first_start = updates
             .first()
             .map_or(stream.tail_offset, |record| record.start_offset);

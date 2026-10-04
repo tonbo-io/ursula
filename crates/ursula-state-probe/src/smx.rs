@@ -32,16 +32,6 @@ pub fn sid(bucket: &str, group: &str, name: &str) -> BucketStreamId {
     BucketStreamId::new(bucket, format!("{group}-{name}"))
 }
 
-/// Raises the group to `level` (C0) so level-gated bounds apply, as on a
-/// cluster whose operator raised it (W3/W4 run at level 1: F3, F4a).
-pub fn raise_feature_level(m: &mut StreamStateMachine, level: u32) -> Result<()> {
-    ok(
-        m.apply(StreamCommand::SetFeatureLevel { level }),
-        "set feature level",
-    )?;
-    Ok(())
-}
-
 pub fn create_bucket(m: &mut StreamStateMachine, bucket: &str) -> Result<()> {
     ok(
         m.apply(StreamCommand::CreateBucket {
@@ -206,7 +196,7 @@ pub fn flush_pass(
                 };
                 ok(
                     m.apply(StreamCommand::FlushCold {
-                        cold_generation: None,
+                        cold_generation: candidate.cold_generation,
                         stream_id: candidate.stream_id.clone(),
                         chunk: chunk.clone(),
                     }),
@@ -223,8 +213,9 @@ pub fn flush_pass(
                 let chunk = ColdChunkRef {
                     start_offset: candidate.start_offset,
                     end_offset: candidate.end_offset,
-                    s3_path: ursula_runtime::new_cold_chunk_path(
+                    s3_path: ursula_runtime::new_cold_chunk_path_in_generation(
                         &candidate.stream_id,
+                        candidate.cold_generation,
                         candidate.start_offset,
                         candidate.end_offset,
                     ),
@@ -235,7 +226,7 @@ pub fn flush_pass(
                 };
                 ok(
                     m.apply(StreamCommand::FlushCold {
-                        cold_generation: None,
+                        cold_generation: candidate.cold_generation,
                         stream_id: candidate.stream_id.clone(),
                         chunk: chunk.clone(),
                     }),
@@ -258,7 +249,7 @@ pub fn checkpoint_and_retain(
     checkpoint: &[u8],
     now_ms: u64,
 ) -> Result<()> {
-    // F1 (every group runs at the top level): a sealed target resolves to
+    // F1: a sealed target resolves to
     // the record mark at or below it, an exact record start. The server
     // would scan one cold block for the exact offset; the model retains
     // conservatively from the mark instead.

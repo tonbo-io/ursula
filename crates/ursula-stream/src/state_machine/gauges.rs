@@ -20,21 +20,15 @@ use super::stream_expiry_at_ms;
 /// §7.2 formula checks compare against.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupStateGauges {
-    /// Replicated group feature level (C0 / F0).
-    pub feature_level: u32,
     /// Live streams in the group.
     pub streams: u64,
-    /// Sparse cold record marks (F1, level 2). Always 0 below level 2.
+    /// Sparse cold record marks (F1).
     pub record_marks: u64,
     /// Dense record-index entries across JSON streams (F1 target: unflushed
     /// records only).
     pub dense_record_entries: u64,
     /// Largest dense record index held by one stream.
     pub max_dense_record_entries_per_stream: u64,
-    /// Message records across streams (F4).
-    pub message_records: u64,
-    /// Largest message-record list held by one stream.
-    pub max_message_records_per_stream: u64,
     /// Shared pack-slice references held in stream state (F2).
     pub shared_refs: u64,
     /// Largest shared-reference list held by one stream.
@@ -49,8 +43,8 @@ pub struct GroupStateGauges {
     pub max_producers_per_stream: u64,
     /// Producer receipts across streams (F3).
     pub receipts: u64,
-    /// Receipt items (one per receipt; legacy receipts may hold more) plus each
-    /// producer's `last_items` (F3 window target: 1,024 per stream).
+    /// Receipt items (one per receipt, at least one; F3 window target: 1,024
+    /// per stream).
     pub receipt_items: u64,
     /// Largest receipt-item count held by one stream.
     pub max_receipt_items_per_stream: u64,
@@ -102,11 +96,7 @@ fn producer_state_bytes(producer_id: &str, state: &ProducerState) -> u64 {
                 .len()
                 .saturating_mul(std::mem::size_of::<ProducerReceipt>()),
         )
-        .saturating_add(
-            receipt_items
-                .saturating_add(state.last_items.len())
-                .saturating_mul(std::mem::size_of::<ProducerAppendRecord>()),
-        );
+        .saturating_add(receipt_items.saturating_mul(std::mem::size_of::<ProducerAppendRecord>()));
     as_u64(bytes)
 }
 
@@ -116,14 +106,13 @@ fn producer_receipt_items(state: &ProducerState) -> u64 {
         .iter()
         .map(|receipt| receipt.items.len().max(1))
         .sum();
-    as_u64(items.saturating_add(state.last_items.len()))
+    as_u64(items)
 }
 
 impl StreamStateMachine {
     /// Bounded-state gauges for this group (§7.5). Walks every stream once.
     pub fn state_gauges(&self) -> GroupStateGauges {
         let mut gauges = GroupStateGauges {
-            feature_level: self.feature_level,
             live_packs: as_u64(self.shared_cold_object_refs.len()),
             ttl_heap_entries: as_u64(self.registry.ttl_heap_len()),
             hot_payload_bytes: self.hot_payload_bytes,
@@ -151,10 +140,6 @@ impl StreamStateMachine {
             gauges.dense_record_entries = gauges.dense_record_entries.saturating_add(dense);
             gauges.max_dense_record_entries_per_stream =
                 gauges.max_dense_record_entries_per_stream.max(dense);
-            let message_records = as_u64(slot.message_records.len());
-            gauges.message_records = gauges.message_records.saturating_add(message_records);
-            gauges.max_message_records_per_stream =
-                gauges.max_message_records_per_stream.max(message_records);
             let shared = as_u64(
                 slot.cold
                     .cold_chunks()
@@ -252,11 +237,10 @@ mod tests {
 
     #[test]
     fn empty_group_reports_zero_gauges() {
-        // Every group starts at the top level (format epoch 2).
-        assert_eq!(StreamStateMachine::new().state_gauges(), GroupStateGauges {
-            feature_level: crate::MAX_SUPPORTED_FEATURE_LEVEL,
-            ..GroupStateGauges::default()
-        });
+        assert_eq!(
+            StreamStateMachine::new().state_gauges(),
+            GroupStateGauges::default()
+        );
     }
 
     #[test]
@@ -309,7 +293,9 @@ mod tests {
         for candidate in candidates {
             let len = candidate.payload.len() as u64;
             let response = m.apply(StreamCommand::FlushCold {
-                cold_generation: None,
+                cold_generation: m
+                    .cold_index_generation(&candidate.stream_id)
+                    .unwrap_or_default(),
                 stream_id: candidate.stream_id.clone(),
                 chunk: ColdChunkRef {
                     start_offset: candidate.start_offset,

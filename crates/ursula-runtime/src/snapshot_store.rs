@@ -145,86 +145,37 @@ pub struct SnapshotPointer {
     pub location: SnapshotLocation,
 }
 
-/// Wire envelope of a [`SnapshotPointer`] (bounded-state F12a).
-///
-/// MessagePack is the only envelope written; a leading `{` or whitespace
-/// marks the 0.5.x JSON envelope, which [`Self::decode`] refuses (E6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SnapshotEnvelope {
-    Json,
-    MessagePack,
-}
-
-impl SnapshotEnvelope {
-    /// The envelope `bytes` were written in.
-    pub fn detect(bytes: &[u8]) -> Self {
-        match bytes.first() {
-            Some(b'{' | b' ' | b'\t' | b'\n' | b'\r') | None => Self::Json,
-            Some(_) => Self::MessagePack,
-        }
-    }
-
-    /// Encodes `value` in this envelope.
-    pub fn encode<T: Serialize>(self, value: &T) -> Result<Vec<u8>, SnapshotStoreError> {
-        match self {
-            Self::Json => serde_json::to_vec(value)
-                .map_err(|err| SnapshotStoreError::Serialize(err.to_string())),
-            Self::MessagePack => rmp_serde::to_vec_named(value)
-                .map_err(|err| SnapshotStoreError::Serialize(err.to_string())),
-        }
-    }
-
-    /// Decodes a MessagePack envelope. Format epoch 2 writes only
-    /// MessagePack, so the JSON envelope of Ursula 0.5.x is refused (E6)
-    /// instead of decoded.
-    pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, SnapshotStoreError> {
-        match Self::detect(bytes) {
-            Self::Json => Err(SnapshotStoreError::Deserialize(
-                ursula_stream::format_epoch_refusal(
-                    "snapshot pointer",
-                    "uses the JSON envelope of Ursula 0.5.x and earlier (format epoch 1)",
-                ),
-            )),
-            Self::MessagePack => rmp_serde::from_slice(bytes)
-                .map_err(|err| SnapshotStoreError::Deserialize(err.to_string())),
-        }
-    }
-}
-
-impl SnapshotPointer {
-    /// 0.5.x JSON envelope, kept to build E6 test inputs until PR17.
-    pub fn encode(&self) -> Result<Vec<u8>, SnapshotStoreError> {
-        SnapshotEnvelope::Json.encode(self)
-    }
-
-    /// Decodes the MessagePack envelope; refuses JSON (E6).
-    pub fn decode(bytes: &[u8]) -> Result<Self, SnapshotStoreError> {
-        SnapshotEnvelope::decode(bytes)
-    }
-}
-
-/// Whether `bytes` hold the 0.5.x JSON envelope (refused by decode, E6).
-pub fn is_json_snapshot_envelope(bytes: &[u8]) -> bool {
-    SnapshotEnvelope::detect(bytes) == SnapshotEnvelope::Json
-}
-
 /// Encodes `value` as the F12a binary snapshot envelope (MessagePack map
-/// with named fields).
+/// with named fields), the only envelope Ursula writes.
 pub fn encode_binary_envelope<T: Serialize>(value: &T) -> Result<Vec<u8>, SnapshotStoreError> {
-    SnapshotEnvelope::MessagePack.encode(value)
+    rmp_serde::to_vec_named(value).map_err(|err| SnapshotStoreError::Serialize(err.to_string()))
 }
 
-/// Decodes a MessagePack snapshot envelope; refuses JSON (E6).
+/// Decodes the F12a binary snapshot envelope. A leading `{` marks the JSON
+/// envelope of Ursula 0.5.x, which is refused (format epoch 2, E6).
 pub fn decode_snapshot_envelope<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, SnapshotStoreError> {
-    SnapshotEnvelope::decode(bytes)
+    if bytes.first() == Some(&b'{') {
+        return Err(SnapshotStoreError::Deserialize(
+            ursula_stream::format_epoch_refusal(
+                "snapshot pointer",
+                "uses the JSON envelope of Ursula 0.5.x and earlier (format epoch 1)",
+            ),
+        ));
+    }
+    rmp_serde::from_slice(bytes).map_err(|err| SnapshotStoreError::Deserialize(err.to_string()))
 }
 
 impl SnapshotPointer {
-    /// The F12a MessagePack envelope regardless of feature level.
+    /// Encodes the F12a binary envelope.
     pub fn encode_binary(&self) -> Result<Vec<u8>, SnapshotStoreError> {
-        SnapshotEnvelope::MessagePack.encode(self)
+        encode_binary_envelope(self)
+    }
+
+    /// Decodes the F12a binary envelope; refuses JSON (E6).
+    pub fn decode(bytes: &[u8]) -> Result<Self, SnapshotStoreError> {
+        decode_snapshot_envelope(bytes)
     }
 }
 
@@ -1187,10 +1138,6 @@ mod tests {
             },
         };
         let binary = pointer.encode_binary().unwrap();
-        assert_eq!(
-            SnapshotEnvelope::detect(&binary),
-            SnapshotEnvelope::MessagePack
-        );
         // The binary envelope stores every byte once.
         assert!(binary.len() < payload.len() + 128, "{}", binary.len());
         let back = SnapshotPointer::decode(&binary).unwrap();
@@ -1274,12 +1221,10 @@ mod tests {
         ];
         for pointer in pointers {
             let binary = pointer.encode_binary().unwrap();
-            assert!(!is_json_snapshot_envelope(&binary));
             let back = SnapshotPointer::decode(&binary).unwrap();
             assert_eq!(back.snapshot_id, pointer.snapshot_id);
             assert_eq!(back.location, pointer.location);
-            let json = pointer.encode().unwrap();
-            assert!(is_json_snapshot_envelope(&json));
+            let json = serde_json::to_vec(&pointer).unwrap();
             let error = SnapshotPointer::decode(&json).expect_err("E6");
             assert!(
                 error.to_string().contains("JSON envelope of Ursula 0.5.x"),

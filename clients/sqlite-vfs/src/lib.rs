@@ -1773,7 +1773,7 @@ unsafe fn init_wal_format(path: &str) -> Result<(), String> {
 
 /// `Some(why)` unless the stream is still the incarnation `expected`: state built from one
 /// incarnation must never reach another. `HEAD` is a leader read and incarnations never repeat
-/// (unique per group from feature level 1), so a match also covers everything done on the stream
+/// (unique per group), so a match also covers everything done on the stream
 /// since the last check that matched.
 fn recreated(
     url: &str,

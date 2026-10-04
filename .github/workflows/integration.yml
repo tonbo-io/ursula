@@ -199,7 +199,7 @@ jobs:
           URSULA_COLD=none URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/snapshot.e2e.ts
 
   sqlite-vfs-e2e-cluster:
-    name: sqlite-vfs e2e (3 nodes + gateway + MinIO, feature level 5)
+    name: sqlite-vfs e2e (3 nodes + gateway + MinIO)
     needs: [build-ursula, sqlite-vfs]
     runs-on: depot-ubuntu-24.04-8
     timeout-minutes: 40

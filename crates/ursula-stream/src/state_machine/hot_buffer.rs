@@ -4,11 +4,9 @@
 //! its own start offset, so the buffer carries no per-append header. A block
 //! ends where the next append is not contiguous (an external append above hot
 //! bytes leaves a gap, F18) or where it is full. Per-message boundaries live
-//! in one place per stream: below feature level 4 the message records (and,
-//! for JSON, the record index's dense offsets); from level 4 (F4b) the dense
-//! offsets for streams with a record index and, for every other stream, the
-//! append starts this buffer keeps for each message at or above the seal
-//! point. Reads binary-search blocks and a flush drops whole
+//! in one place per stream (F4b): the dense offsets for streams with a record
+//! index and, for every other stream, the append starts this buffer keeps for
+//! each message at or above the seal point. Reads binary-search blocks and a flush drops whole
 //! blocks and trims at most one. Snapshots emit one hot segment per block and restore
 //! segments one-to-one, so every replica holds the same block layout after
 //! the same history.
@@ -31,11 +29,11 @@ pub(super) struct HotBuffer {
     /// Maintained by the state machine, which owns the record boundaries;
     /// the buffer only stores it next to the bytes it describes.
     accounted_records: u64,
-    /// F4b (level 4), streams without a record index: start offsets of the
-    /// messages that start at or above the seal point, strictly increasing.
-    /// Includes external appends that sit above hot bytes. A flush or
-    /// retention drops the starts below the new seal point; empty below
-    /// level 4 and for streams with a record index.
+    /// F4b, streams without a record index: start offsets of the messages
+    /// that start at or above the seal point, strictly increasing. Includes
+    /// external appends that sit above hot bytes. A flush or retention drops
+    /// the starts below the new seal point; empty for streams with a record
+    /// index.
     append_starts: VecDeque<u64>,
 }
 
@@ -191,22 +189,6 @@ impl HotBuffer {
 
     pub(super) fn first_start_offset(&self) -> Option<u64> {
         self.blocks.front().map(|block| block.start_offset)
-    }
-
-    /// End of the first contiguous run of hot bytes (blocks up to the first
-    /// gap), if any. Blocks keep no per-append boundaries (F6b), so this is
-    /// the furthest a single hot message starting at the hot start can
-    /// reach.
-    pub(super) fn first_end_offset(&self) -> Option<u64> {
-        let mut blocks = self.blocks.iter();
-        let mut end = blocks.next()?.end_offset();
-        for block in blocks {
-            if block.start_offset != end {
-                break;
-            }
-            end = block.end_offset();
-        }
-        Some(end)
     }
 
     pub(super) fn payload(&self) -> Vec<u8> {

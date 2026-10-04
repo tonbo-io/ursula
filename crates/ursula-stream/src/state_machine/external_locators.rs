@@ -1,10 +1,10 @@
 //! External payload locators, committed first and indexed after
-//! (bounded-stream-state F5, feature level 3).
+//! (bounded-stream-state F5).
 //!
-//! From level 3 an `AppendExternal` keeps its [`ObjectPayloadRef`] in the
+//! An `AppendExternal` keeps its [`ObjectPayloadRef`] in the
 //! stream's replicated cold state at apply, so the locator exists exactly
-//! when the append committed. The engine no longer writes a cold-index page
-//! entry before proposing. A leader-side offload pass later writes page
+//! when the append committed. The engine writes no cold-index page entry
+//! before proposing. A leader-side offload pass later writes page
 //! entries for the committed refs (clipping whatever overlapped them, F19)
 //! and proposes [`StreamCommand::OffloadColdRefs`], whose apply removes those
 //! refs from state. State is the staging area; pages are the durable index.
@@ -43,25 +43,16 @@ pub struct StagedExternalRefCandidate {
 }
 
 impl StreamStateMachine {
-    /// Whether `AppendExternal` keeps its locator in state (F5, level 3).
-    pub(super) fn external_locators_in_state(&self) -> bool {
-        self.feature_level >= crate::feature::FEATURE_LEVEL_EXTERNAL_LOCATORS
-    }
-
     /// Offload discovery (F5): streams holding more than `max_staged` state
     /// external refs, or at least one ref for which `is_due` holds (the
     /// caller decides age, typically from the object's write time), most refs
-    /// first, then by stream id, at most `limit`. Empty below level 3, where
-    /// `OffloadColdRefs` is refused. Read-only.
+    /// first, then by stream id, at most `limit`. Read-only.
     pub fn staged_external_ref_candidates(
         &self,
         max_staged: usize,
         is_due: &dyn Fn(&ObjectPayloadRef) -> bool,
         limit: usize,
     ) -> Vec<StagedExternalRefCandidate> {
-        if !self.external_locators_in_state() {
-            return Vec::new();
-        }
         let mut candidates = self
             .registry
             .slots()
@@ -101,12 +92,6 @@ impl StreamStateMachine {
         stream_id: &BucketStreamId,
         refs: &[ObjectPayloadRef],
     ) -> StreamResponse {
-        if let Err(response) = self.require_feature_level(
-            crate::feature::FEATURE_LEVEL_EXTERNAL_LOCATORS,
-            "external locator offload",
-        ) {
-            return response;
-        }
         let Some(slot) = self.stream_slot_mut(stream_id) else {
             return StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
