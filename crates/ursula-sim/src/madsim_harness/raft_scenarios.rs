@@ -21,19 +21,46 @@ use super::SimEvent;
 use super::SimTrace;
 use super::ThreeNodeRaftSimConfig;
 use super::ThreeNodeRaftSimOutcome;
-use super::apply_barrier;
 use super::build_lagging_learner_snapshot_cluster;
 use super::build_restartable_three_node_cluster;
 use super::build_three_node_cluster;
 #[cfg(test)]
 use super::build_three_node_snapshot_purge_cluster;
-use super::leader_read_log_index;
 use super::placement;
 use super::read_local_payload_eventually;
 use super::seeded_follower_id;
 use super::sim_network_policy;
 use super::verify_all_nodes_can_read;
 use super::wait_all_nodes_applied;
+
+/// The leader's read log id (`ReadIndex`): a Raft log index at or above
+/// every entry the leader has committed, already applied on the leader.
+/// A response's `group_commit_index` is not a log index: it counts mutating
+/// stream outcomes (a batch adds one per item; blank, membership and no-op
+/// entries add nothing), so it can trail or lead the entry's log index. The
+/// leader's metrics can lag its own apply, so they are not a reliable
+/// barrier either.
+async fn leader_read_log_index(engine: &RaftGroupEngine) -> u64 {
+    engine
+        .raft_handle()
+        .ensure_linearizable(openraft::ReadPolicy::ReadIndex)
+        .await
+        .expect("leader read index")
+        .expect("leader committed log id")
+        .index()
+}
+
+/// Waits until every replica applied everything the leader committed so
+/// far (see [`leader_read_log_index`]), and returns that log index.
+pub(super) async fn apply_barrier(
+    engines: &[RaftGroupEngine],
+    leader_index: usize,
+    description: &'static str,
+) -> u64 {
+    let log_index = leader_read_log_index(&engines[leader_index]).await;
+    wait_all_nodes_applied(engines, log_index, description).await;
+    log_index
+}
 
 pub(super) async fn run_no_fault_inner(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
     let mut trace = SimTrace::default();
@@ -450,13 +477,8 @@ pub(super) async fn run_isolated_leader_pending_write_snapshot_purge_inner(
         stream: config.stream.clone(),
         log_index: baseline_log_index,
     });
-    let baseline_applied_index = leader_read_log_index(&engines[old_leader_index]).await;
-    wait_all_nodes_applied(
-        &engines,
-        baseline_applied_index,
-        "baseline applied on all nodes",
-    )
-    .await;
+    let baseline_applied_index =
+        apply_barrier(&engines, old_leader_index, "baseline applied on all nodes").await;
     trace.push(SimEvent::AllNodesApplied {
         log_index: baseline_log_index,
     });

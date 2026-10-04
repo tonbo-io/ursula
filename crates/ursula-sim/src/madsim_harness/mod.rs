@@ -2053,34 +2053,6 @@ pub(super) fn runtime_interleaving_payload(client_id: usize, append_index: usize
     format!("c{client_id}{append_index}!").into_bytes()
 }
 
-/// The leader's read log id (`ReadIndex`): a Raft log index at or above
-/// every entry the leader has committed, already applied on the leader.
-/// A response's `group_commit_index` is not a log index: it counts mutating
-/// stream outcomes (a batch adds one per item; blank, membership and no-op
-/// entries add nothing), so it can trail or lead the entry's log index. The
-/// leader's metrics can lag its own apply, so they are not a reliable
-/// barrier either.
-pub(super) async fn leader_read_log_index(engine: &RaftGroupEngine) -> u64 {
-    engine
-        .raft_handle()
-        .ensure_linearizable(openraft::ReadPolicy::ReadIndex)
-        .await
-        .expect("leader read index")
-        .expect("leader committed log id")
-        .index()
-}
-
-/// Waits until every replica applied everything the leader committed so
-/// far (see [`leader_read_log_index`]).
-pub(super) async fn apply_barrier(
-    engines: &[RaftGroupEngine],
-    leader_index: usize,
-    description: &'static str,
-) {
-    let log_index = leader_read_log_index(&engines[leader_index]).await;
-    wait_all_nodes_applied(engines, log_index, description).await;
-}
-
 pub(super) async fn wait_all_nodes_applied(
     engines: &[RaftGroupEngine],
     log_index: u64,

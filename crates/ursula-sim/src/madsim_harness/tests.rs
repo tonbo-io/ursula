@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
+use super::raft_scenarios::apply_barrier;
 use super::*;
 
 static SIM_TEST_LOCK: Mutex<()> = Mutex::new(());
