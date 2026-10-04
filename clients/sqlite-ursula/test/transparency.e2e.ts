@@ -79,7 +79,8 @@ it("a rolled-back spill never shadows another connection's commit", () => {
 });
 
 // Regression (#324 review, P2-3): only WAL commits are replicated, so a connection that leaves WAL
-// (journal_mode=MEMORY writes the db file directly) must not write the file.
+// must not write the file: journal_mode=MEMORY either writes the db file directly or, with the WAL
+// kept, commits page 1 in rollback format through it; both are refused.
 it("a journal mode other than WAL cannot write the file", () => {
 	const url = ursulaUrl() + streamPath();
 	const file = freshFile();

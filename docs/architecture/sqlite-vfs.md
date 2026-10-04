@@ -48,7 +48,9 @@ appended with the idempotent producer (`Producer-Id` per database, `Producer-Epo
 - The overlay belongs to the write transaction: it is cleared whenever the WAL write lock is taken
   or released, so a rolled-back transaction's spilled frames never shadow a later one's.
 - Any write to the main db file outside a checkpoint (a rollback journal, `journal_mode=MEMORY`) is
-  refused: it would bypass replication.
+  refused: it would bypass replication. So is a commit whose page 1 leaves WAL format: with the
+  WAL kept (§6), SQLite reopens it and would commit `journal_mode=MEMORY`/`DELETE` through it,
+  leaving a stream whose rebuilt copies need a rollback journal to be written.
 
 ## 3. Attach and fencing
 
@@ -63,15 +65,18 @@ appended with the idempotent producer (`Producer-Id` per database, `Producer-Epo
    boot id, an older version's sidecar, a torn one, a replaced db file, a WAL behind its sidecar)
    means the local files are discarded (§6) and the attach proceeds as on a fresh host, unless a
    read at the sidecar's offset shows the stream lost acknowledged data (§6, wrong stream).
-3. Recovery (only when it rewrites pages): a private `unix` connection runs
-   `wal_checkpoint(TRUNCATE)` and must see every frame checkpointed and be the last connection
-   (the WAL is deleted on its close); otherwise attach fails rather than rewriting pages under
-   another connection's cache. Recovery then fsyncs the db file and, before its first page write,
-   replaces the sidecar with the recovery marker (`<restart offset> <epoch> boot=… file=…
-   recovering`). An attach in the same boot that finds it does not open the file through SQLite,
-   because the file may be inconsistent: it checks that no other process holds the file, deletes
-   `-wal`/`-shm` (empty, since recovery starts only after a complete checkpoint) and replays from
-   the recorded offset.
+3. Recovery (only when it rewrites pages) never opens the local files through SQLite before
+   replaying onto them: trust (§6) says every page holds the state at the sidecar's offset or a
+   later commit's, not that SQLite can read the file (a disk image may hold a torn page 1 that
+   replay rewrites). It checks that no other process holds the file (a POSIX lock probe of the
+   db file's lock bytes, which every SQLite connection on a WAL file holds; otherwise attach
+   fails rather than rewriting pages under another connection's cache), folds the local WAL into
+   the db file itself (the frames SQLite's recovery would read, up to the last commit, a later
+   frame winning, the file cut to that commit's size), fsyncs the db file and, before its first
+   page write, replaces the sidecar with the recovery marker (`<restart offset> <epoch> boot=…
+   stream=… file=… recovering`), then deletes `-wal`/`-shm`. An attach in the same boot that
+   finds the marker does the same lock probe, deletes `-wal`/`-shm` (already folded) and replays
+   from the recorded offset.
 4. `HEAD` the stream. If its latest snapshot is ahead of the file (a fresh host, or a file left
    below the retention), installs it (§4.3). Then replays frames to the tail.
 5. Claims: appends a claim at (epoch = highest seen + 1, seq 0) and reads the frame back. A 2xx
@@ -215,11 +220,12 @@ be written into the stream. Trust is therefore verified against the files, not i
 - **Three fsyncs of the db file**, none per commit, all through SQLite's own handle except at
   attach (when no connection is open): (1) before a commit that starts a new WAL generation is
   appended (once per WAL wrap; SQLite starts one only when every frame of the previous one is in
-  the db file); (2) before an attached connection truncates the WAL, and when it truncates it to
-  nothing (only after a complete checkpoint: `wal_checkpoint(TRUNCATE)`, a close with
-  `journal_size_limit`) the sidecar switches to `:0` before the truncate; (3) at attach, after the
-  local checkpoint and before the recovery marker, and before the final sidecar whenever attach
-  wrote the db file (that sidecar claims `:0`). A failed fsync poisons the database (or fails the
+  the db file); (2) before an attached connection truncates the WAL to nothing (only after a
+  complete checkpoint: `wal_checkpoint(TRUNCATE)`, a close with `journal_size_limit`), the
+  sidecar switching to `:0` first (a truncate to a non-zero size, `journal_size_limit` in the
+  commit that starts a generation, cuts only the previous generation's tail, already synced by
+  (1)); (3) at attach, after folding the WAL into the db file and before the recovery marker, and
+  before the final sidecar whenever attach wrote the db file (that sidecar claims `:0`). A failed fsync poisons the database (or fails the
   attach).
 - The attached connections keep the WAL past the last close (`SQLITE_FCNTL_PERSIST_WAL`:
   checkpointed, not deleted), and so does the snapshot thread's, so a clean shutdown keeps the
@@ -243,11 +249,12 @@ What attach does in each case:
 - **Process crash, same boot** (SIGKILL, OOM kill, abort, a pod rescheduled to the same node with a
   local volume, a container restart with runtimes that show the host's boot id: Docker,
   containerd, CRI-O): every completed `write()` is in the page cache, so the files are exactly
-  what this host wrote and the claim holds (the sidecar is written only after the WAL writes
+  what this host wrote and, outside the two windows below, the claim holds (the sidecar is written only after the WAL writes
   return). A killed write leaves a prefix; SQLite's salted, cumulative WAL checksums stop recovery
   at the last whole commit, `-shm` is rebuilt, checkpoints are redone from the WAL. Attach trusts
-  the files and replays from the sidecar's offset (fast). A crash in the middle of a WAL truncate,
-  or of attach's local checkpoint before the recovery marker, can leave a claim the files do not
+  the files and replays from the sidecar's offset (fast). A crash in the middle of a WAL truncate
+  (between the `:0` sidecar and the truncate), or between the first WAL write of a new generation
+  (the commit after a wrap or a truncate) and the sidecar update, leaves a claim the files do not
   meet; that only costs a rebuild. Covered: SIGKILL before and after the ack, the cache spill with
   in-place checksum rewrites, a failed local write after the ack, a crash mid-recovery (the
   recovery marker).
