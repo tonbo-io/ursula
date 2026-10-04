@@ -429,6 +429,7 @@ class ChaosAgentStateTest(unittest.TestCase):
         agent.cold_flush_success = 0
         agent.cold_flush_noop = 0
         agent.cold_flush_errors = 0
+        agent.fault_backend = "ec2"
         return agent
 
     def test_verifier_reads_back_bytes_and_separates_corruption_from_availability(self) -> None:
@@ -462,7 +463,8 @@ class ChaosAgentStateTest(unittest.TestCase):
             "http://n1:4491/chaos/run-test-0001?offset=26&max_bytes=4",
         ])
 
-        agent.request = lambda method, url, **kwargs: (416, b"offset out of range", {})
+        # A server error serves no bytes: availability, not corruption.
+        agent.request = lambda method, url, **kwargs: (500, b"boom", {})
         agent.verify_integrity()
         self.assertEqual(agent.mismatch_count, 0)
         self.assertEqual(agent.read_availability_errors, 1)
@@ -499,6 +501,32 @@ class ChaosAgentStateTest(unittest.TestCase):
         self.assertEqual(agent.verify_counts, {"cold": 1})
         self.assertEqual(agent.last_read_check["offset"], 0)
         self.assertEqual(agent.cold_flush_attempts, 0)
+
+    def test_cold_flush_that_leaves_sample_hot_is_unavailable_not_an_error(self) -> None:
+        agent = self.verifier_agent([Node(f"n{i}", f"i-{i}", f"http://n{i}:4491") for i in (1, 2, 3)])
+        stream = WorkloadStream("run-test-0001")
+        agent.streams = [stream]
+        agent.record_payload_sample(stream, 100, b"0123456789", "ascii")
+        sample = stream.recent_payloads[-1]
+        posts: list[str] = []
+
+        def request(method, url, **kwargs):
+            if method == "HEAD":
+                return 200, b"", {"stream-cold-hot-start-offset": "0"}
+            posts.append(url)
+            return 200, b'{"hot_start_offset": 50}', {}
+
+        agent.request = request
+        self.assertFalse(agent.ensure_cold_sample(sample))
+        self.assertEqual(posts, ["http://n1:4438/__ursula/flush-cold/chaos/run-test-0001?min_hot_bytes=1&max_bytes=100"])
+        self.assertEqual((agent.cold_flush_success, agent.cold_flush_errors), (1, 0))
+
+        # The chart's admin plane is loopback-only on Kubernetes: no POST.
+        agent.fault_backend = "kubernetes"
+        posts.clear()
+        self.assertFalse(agent.ensure_cold_sample(sample))
+        self.assertEqual(posts, [])
+        self.assertEqual(agent.cold_flush_attempts, 1)
 
     def test_workload_rollover_forces_progress_after_unknown_append_grace(self) -> None:
         agent = object.__new__(ChaosAgent)

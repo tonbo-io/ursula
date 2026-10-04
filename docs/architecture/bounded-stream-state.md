@@ -71,7 +71,7 @@ Definitions for a stream `s`:
 state(s) ≤ C0 + H(s) + 8 B · U(s) + 16 B · ⌈K(s)⌉ + Prod(s)
 
 C0      ≤ 32 KiB + inline visible snapshot
-          metadata, integrity, counters, ≤ 64 shared pack refs,
+          metadata, counters, ≤ 64 shared pack refs,
           ≤ 16 staged external refs, plus one node-local TTL heap entry
 H(s)    = unflushed payload bytes (also capped per group by admission)
 Prod(s) ≤ 0.4 KiB · P(s) + 56 KiB     (P(s) ≤ 4,096; window of 1,024 receipt items)
@@ -84,7 +84,7 @@ I1 does not grow with record count, but its last term grows with history: 16 B p
 
 **I2. Per group.** The sum of I1 over the group's streams, plus: hot-window real memory (payload plus boundaries) at most the 64 MiB admission cap once admission counts real memory (F6c); shared-pack maps at most one entry per live pack, which is at most 64 per stream; a cold-GC queue bounded while GC is healthy and alerted otherwise. The one documented exception is tenant tombstones, which are O(buckets ever written or purged) by design (F15).
 
-**I3. Snapshots.** A group snapshot encodes I2: about 300 B per stream, about 9 B per cold MiB, and the hot window. No representation amplifies it (F12). Cadence follows bytes (F12e): a group snapshots after max(F, 2 × its last snapshot) bytes of Raft log, so snapshot bytes written per appended log byte stay near one half, averaged over a flush cycle, and never grow with history. A node pressure pass may snapshot earlier to keep unpurged log within the node's log-byte budget; it spends that budget on the groups that free the most log per snapshot byte.
+**I3. Snapshots.** A group snapshot encodes I2: about 100 B per stream, about 9 B per cold MiB, and the hot window. No representation amplifies it (F12). Cadence follows bytes (F12e): a group snapshots after max(F, 2 × its last snapshot) bytes of Raft log, so snapshot bytes written per appended log byte stay near one half, averaged over a flush cycle, and never grow with history. A node pressure pass may snapshot earlier to keep unpurged log within the node's log-byte budget; it spends that budget on the groups that free the most log per snapshot byte.
 
 **I4. Per node.** No structure keyed by something "ever seen" (streams, pages, lookups) grows without a cap. Caches are bounded by bytes or entries. Per-request memory is at most the response cap (8 MiB) or one record (at most 32 MiB), and no write copies group state (F9). The TTL heap holds at most two entries per live TTL stream. Hot payload across the node stays near `flush_pressure_hot_size` (128 MiB) while S3 is healthy (F10); the per-group admission cap is the hard bound. Unpurged Raft log stays within the node log-byte budget (F12e). Marks cost 16 MiB per TiB of cold history across the node's groups; a gauge and an alert track them, and Q10 fixes the threshold at which older history is thinned.
 

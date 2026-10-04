@@ -49,6 +49,8 @@ CONTENT_TYPE = "application/octet-stream"
 # Real integrity divergence is a 200-OK response whose bytes disagree with a
 # recorded append; `verify_sample` counts that as a mismatch.
 READ_AVAILABILITY_STATUSES = {0, 204, 404, 410, 416, 502, 503}
+# Largest forced cold flush; matches the server's flush-cold `max_bytes` default.
+COLD_FLUSH_MAX_BYTES = 8 * 1024 * 1024
 REVERT_DETECTION_SCENARIOS = {"no_allow_stop"}
 # Scenarios applied as faultd impairments (tc qdisc / iptables) rather than by
 # stopping the instance. Their recovery MUST clear the impairment via faultd
@@ -199,9 +201,10 @@ class Node:
     @property
     def admin_url(self) -> str:
         # Mutating raft operations moved off the public client plane to the
-        # admin plane (server.admin_listen, :4438). The chaos nodes bind it to
-        # the private interface and the security group restricts it to the
-        # client, so the agent reaches it directly.
+        # admin plane (server.admin_listen, :4438). The EC2 chaos nodes bind it
+        # to the private interface and the security group restricts it to the
+        # client, so the agent reaches it directly. The ursula chart binds it to
+        # loopback, so the Kubernetes profile cannot reach it.
         parsed = urllib.parse.urlparse(self.base_url)
         host = parsed.hostname or self.base_url
         return f"http://{host}:4438"
@@ -390,7 +393,6 @@ class WorkloadStream:
     name: str
     content_type: str = CONTENT_TYPE
     next_offset: int = 0
-    verified_offsets: int = 0
     producer_epochs: dict[str, int] | None = None
     producer_seqs: dict[str, int] | None = None
     pending_producer_appends: dict[str, bytes] | None = None
@@ -1188,9 +1190,10 @@ class ChaosAgent:
                     ) from exc
                 end_offset = next_offset_value
                 with self.state_lock:
-                    # 204 is a producer dedup acknowledgement: it resolves the
-                    # pending append but does not say where the bytes landed,
-                    # so only a 200 records a read-back sample.
+                    # 204 is a producer dedup acknowledgement of an earlier
+                    # append. It resolves the pending append, but the agent
+                    # cannot prove `payload` is the committed bytes of that
+                    # earlier append, so only a 200 records a read-back sample.
                     stream.pending_producer_appends.pop(pending_key, None)
                     stream.next_offset = max(stream.next_offset, end_offset)
                     if status == 200:
@@ -1399,9 +1402,6 @@ class ChaosAgent:
         if last_error is None:
             self.verified_offsets += 1
             self.verify_counts[mode] = self.verify_counts.get(mode, 0) + 1
-            stream = next((stream for stream in self.streams if stream.name == sample.stream), None)
-            if stream is not None:
-                stream.verified_offsets += 1
             return
         if self.is_read_availability_error(last_error):
             self.verify_errors[unavailable_key] = self.verify_errors.get(unavailable_key, 0) + 1
@@ -1487,9 +1487,11 @@ class ChaosAgent:
             if body:
                 node_result["body_prefix_hex"] = body[:32].hex()
             node_results.append(node_result)
-            if sample.payload.startswith(body) and (status == 200 or status in READ_AVAILABILITY_STATUSES):
-                # Every byte served so far matched; the range just could not
-                # be served in full. That is availability, not corruption.
+            if sample.payload.startswith(body):
+                # `read_back` only gathers bytes from 200 responses, and every
+                # byte served so far matched; the range just could not be
+                # served in full (any status, including a 500). That is
+                # availability, not corruption.
                 last_error = f"{node.name} read status={status} short={len(body)}/{len(sample.payload)}"
                 continue
             mismatch_error = f"{node.name} read status={status} body_prefix={body[:32]!r}"
@@ -1514,14 +1516,32 @@ class ChaosAgent:
     def ensure_cold_sample(self, sample: PayloadSample) -> bool:
         if sample.cold_confirmed:
             return True
-        return self.flush_cold_for_sample(sample)
+        hot_start_offset = self.refresh_stream_cold_confirmed(sample.stream)
+        if sample.cold_confirmed:
+            return True
+        if self.fault_backend == "kubernetes":
+            # The ursula chart binds the admin plane to loopback, so the agent
+            # cannot force a flush; the background flush plus
+            # `Stream-Cold-Hot-Start-Offset` confirm cold samples instead.
+            return False
+        return self.flush_cold_for_sample(sample, hot_start_offset)
 
-    def flush_cold_for_sample(self, sample: PayloadSample) -> bool:
+    def flush_cold_for_sample(self, sample: PayloadSample, hot_start_offset: int | None) -> bool:
+        """Forces one flush that covers `sample`; False leaves it hot for now.
+
+        The server flushes at most `max_bytes` from the hot start, so the
+        request is sized from the last known hot start to the sample's end,
+        capped at the server's 8 MiB default; a sample further out stays hot
+        and a later attempt continues. Only a round in which no node answered
+        200 or 204 counts as an error.
+        """
         self.cold_flush_attempts += 1
+        flush_from = hot_start_offset if hot_start_offset is not None else sample.start_offset
+        flush_bytes = sample.end_offset - min(flush_from, sample.start_offset)
         query = urllib.parse.urlencode(
             {
                 "min_hot_bytes": 1,
-                "max_bytes": max(1, sample.end_offset - sample.start_offset),
+                "max_bytes": max(1, min(COLD_FLUSH_MAX_BYTES, flush_bytes)),
             }
         )
         last_error = "no target nodes"
@@ -1543,16 +1563,11 @@ class ChaosAgent:
             if status == 200:
                 self.mark_cold_confirmed_from_flush(sample.stream, body)
                 self.cold_flush_success += 1
-                if sample.cold_confirmed:
-                    return True
-                last_error = f"{node.name}: flushed but sample is not below hot start"
-                continue
+                return sample.cold_confirmed
             if status == 204:
                 self.cold_flush_noop += 1
-                if self.refresh_stream_cold_confirmed(sample.stream) and sample.cold_confirmed:
-                    return True
-                last_error = f"{node.name}: no cold flush candidate and sample is not below hot start"
-                continue
+                self.refresh_stream_cold_confirmed(sample.stream)
+                return sample.cold_confirmed
             last_error = f"{node.name}: status={status} body={body[:80]!r}"
         self.cold_flush_errors += 1
         self.last_cold_flush = {
@@ -1592,8 +1607,11 @@ class ChaosAgent:
         for index in range(max_streams):
             self.refresh_stream_cold_confirmed(names[(start + index) % len(names)])
 
-    def refresh_stream_cold_confirmed(self, stream_name: str) -> bool:
-        """Marks samples below `Stream-Cold-Hot-Start-Offset` as cold."""
+    def refresh_stream_cold_confirmed(self, stream_name: str) -> int | None:
+        """Marks samples below `Stream-Cold-Hot-Start-Offset` as cold.
+
+        Returns the hot start offset a node reported, or None.
+        """
         for node in self.nodes:
             try:
                 status, _, headers = self.request("HEAD", f"{node.base_url}/{BUCKET}/{stream_name}")
@@ -1605,8 +1623,8 @@ class ChaosAgent:
             if cold_hot_start_offset is None:
                 continue
             self.mark_cold_confirmed(stream_name, cold_hot_start_offset)
-            return True
-        return False
+            return cold_hot_start_offset
+        return None
 
     def probe_read_availability(self, stream: WorkloadStream) -> str | None:
         if stream.next_offset <= 0:
