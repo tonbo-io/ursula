@@ -8,11 +8,10 @@
 //! than an election timeout: the leader retries the confirmation until the
 //! heal instead of answering 503. That confirmation waits outside the group
 //! actor: a `consistency=local` `offset=now` read on the same leader answers
-//! before the heal. A leader cut
-//! off from the quorum still believes it leads; its probes must answer 503
-//! (leader unknown, retry) instead of a view that misses the writes the new
-//! leader acknowledged. Once the new leader serves, the probes see both
-//! sides of the failover.
+//! before the heal. A leader cut off from the quorum still believes it leads;
+//! its probes must answer 503 (leader unknown, retry) instead of a view that
+//! misses the writes the new leader acknowledged. Once the new leader serves,
+//! the probes see both sides of the failover.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -181,7 +180,7 @@ impl Probes<'_> {
             let seen = self.observe(probe).await;
             let (want_offset, want_body) = match probe {
                 Probe::CatchUpRead => (acked_offset, Some(acked)),
-                Probe::LocalRead => (acked_offset, Some(&[][..])),
+                Probe::LocalRead => unreachable!("observed only by the stalled_confirmation phase"),
                 Probe::Head | Probe::Bootstrap => (acked_offset, None),
                 Probe::Snapshot => (self.snapshot_offset, Some(SNAPSHOT_BODY)),
             };
