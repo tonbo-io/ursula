@@ -34,11 +34,11 @@ use super::assert_cold_live_read_consistency;
 use super::build_three_node_cluster_with_cold_store;
 use super::duration_ms;
 use super::placement;
+use super::raft_scenarios::apply_barrier;
 use super::read_local_payload_eventually;
 use super::sim_cold_store;
 use super::sim_network_policy;
 use super::verify_all_nodes_can_read_payload;
-use super::wait_all_nodes_applied;
 
 /// Everything the three-node cold-path scenarios share after bring-up: the
 /// fault-injectable cold store, the live cluster handles, and the first
@@ -179,12 +179,7 @@ async fn cold_path_publish(
         log_index: flushed.group_commit_index,
     });
 
-    wait_all_nodes_applied(
-        &setup.engines,
-        flushed.group_commit_index,
-        applied_description,
-    )
-    .await;
+    apply_barrier(&setup.engines, setup.leader_index, applied_description).await;
     flushed
 }
 
@@ -415,9 +410,9 @@ pub(super) async fn run_cold_write_fault_inner(
         );
     }
 
-    wait_all_nodes_applied(
+    apply_barrier(
         &setup.engines,
-        appended_log_index,
+        setup.leader_index,
         "append remains applied after failed cold write",
     )
     .await;
@@ -520,9 +515,9 @@ pub(super) async fn run_cold_write_delay_inner(
         log_index: flushed.group_commit_index,
     });
 
-    wait_all_nodes_applied(
+    apply_barrier(
         &setup.engines,
-        flushed.group_commit_index,
+        setup.leader_index,
         "cold flush applied on all nodes after write delay",
     )
     .await;
