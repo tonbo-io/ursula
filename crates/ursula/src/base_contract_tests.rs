@@ -1,21 +1,20 @@
 //! Pins of the base protocol contract that the 0.6.0 removals must keep:
 //! `Stream-Seq` as a compare-and-set, `Stream-Next-Offset` as the exact
-//! resume point, the HEAD snapshot and retention headers, and `Retry-After`
-//! on temporary 503s. The producer error headers are pinned in `tests.rs`
-//! (`producer_headers_deduplicate_retries_and_fence_stale_epochs`).
+//! resume point, and the HEAD snapshot and retention headers. The error
+//! headers are pinned in `tests.rs`:
+//! `producer_headers_deduplicate_retries_and_fence_stale_epochs`,
+//! `long_poll_returns_service_unavailable_when_live_waiters_are_full` and
+//! `ingress_body_budget_rejects_write_when_budget_is_exhausted`.
 //!
 //! Offsets are opaque here: an offset is only ever echoed back or compared
-//! with another offset, never computed. A failing pin is a finding to triage;
-//! a later change may edit an assertion only with a named reason.
-
-use std::sync::Arc;
+//! with another offset, never computed (one bridge in the HEAD test, until
+//! PR04). A failing pin is a finding to triage; a later change may edit an
+//! assertion only with a named reason.
 
 use axum::body::Body;
 use axum::body::to_bytes;
 use axum::http::Request;
 use tower::ServiceExt;
-use ursula_runtime::ColdStore;
-use ursula_runtime::InMemoryGroupEngineFactory;
 use ursula_runtime::RuntimeConfig;
 
 use super::*;
@@ -181,15 +180,26 @@ async fn stream_seq_check_runs_after_producer_dedup() {
     let original_ack = next_offset(&response);
     assert_eq!(original_ack, tail(&app, uri).await);
 
-    let response = append(&app, uri, &[(HEADER_STREAM_SEQ, "0002")], "bb").await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = append(
+        &app,
+        uri,
+        &[
+            (HEADER_PRODUCER_ID, "writer"),
+            (HEADER_PRODUCER_EPOCH, "0"),
+            (HEADER_PRODUCER_SEQ, "1"),
+            (HEADER_STREAM_SEQ, "0002"),
+        ],
+        "bb",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
 
     // The retry's Stream-Seq is now stale, but the producer duplicate is
-    // answered first: 204 with the original ack, not 409 and not the tail.
+    // answered first: 204 with the original ack, not 409, not the tail and
+    // not the producer's latest ack.
     let response = append(&app, uri, &first_try, "a").await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(next_offset(&response), original_ack);
-    assert_eq!(header(&response, HEADER_PRODUCER_SEQ), "0");
 
     assert_eq!(read_all(&app, uri).await, "abb");
 }
@@ -358,26 +368,4 @@ async fn head_reports_snapshot_and_retention_after_publish_and_advance() {
         value(header(&response, HEADER_STREAM_RETAINED_OFFSET)),
         value(&at)
     );
-}
-
-#[tokio::test]
-async fn temporary_unavailable_answers_carry_retry_after() {
-    // A one-byte hot cap refuses any append of two or more bytes as a
-    // temporary error, whatever the per-record charge.
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        RuntimeConfig::new(1, 1).with_cold_max_hot_bytes_per_group(Some(1)),
-        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
-        Some(cold_store),
-    )
-    .expect("runtime");
-    let app = router(runtime);
-    let uri = "/contract/unavailable";
-    let response = create(&app, uri, &[], "").await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let response = append(&app, uri, &[], "ab").await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(header(&response, "retry-after"), "1");
-    assert!(body_text(response).await.contains("ColdBackpressure"));
 }

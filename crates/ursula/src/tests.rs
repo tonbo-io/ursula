@@ -866,6 +866,7 @@ async fn append_conflict_precedence_reports_closed_header_before_mismatch_or_seq
     );
 }
 
+// Base-contract pin; see base_contract_tests.rs.
 #[tokio::test]
 async fn producer_headers_deduplicate_retries_and_fence_stale_epochs() {
     let app = test_router();
@@ -2198,6 +2199,7 @@ async fn long_poll_times_out_with_no_content_and_cleans_waiter() {
     assert!(body.contains("\"live_read_waiters\":0"));
 }
 
+// Base-contract pin; see base_contract_tests.rs.
 #[tokio::test]
 async fn long_poll_returns_service_unavailable_when_live_waiters_are_full() {
     let runtime =
@@ -5845,6 +5847,7 @@ fn batch_body(payloads: &[&[u8]]) -> Vec<u8> {
     body
 }
 
+// Base-contract pin; see base_contract_tests.rs.
 #[tokio::test]
 async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {
     let app = Router::new()
