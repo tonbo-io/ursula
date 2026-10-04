@@ -1861,38 +1861,30 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
         };
         // Prefix: "quiet" writes twice, "busy" fills and overflows the
         // window, so the snapshot carries evicted state.
-        let mut last_index = 0;
         for seq in 0..2 {
-            last_index = engines[leader_index]
+            engines[leader_index]
                 .append(
                     append(seq, "quiet", 5),
                     placement(),
                     ColdWriteAdmission::default(),
                 )
                 .await
-                .expect("quiet append")
-                .group_commit_index;
+                .expect("quiet append");
         }
         for seq in 0..1_100 {
-            last_index = engines[leader_index]
+            engines[leader_index]
                 .append(
                     append(seq, "busy", 10 + seq),
                     placement(),
                     ColdWriteAdmission::default(),
                 )
                 .await
-                .expect("busy append")
-                .group_commit_index;
+                .expect("busy append");
         }
-        // Raft log index of the prefix (the engine's commit index counts
-        // mutations only).
+        // A lower bound on the prefix's Raft log index; it only sizes the
+        // snapshot and the purge.
+        let last_index = leader_applied_index(&engines[leader_index]);
         let leader = engines[leader_index].raft_handle();
-        last_index = last_index.max(
-            openraft::rt::WatchReceiver::borrow_watched(&leader.metrics())
-                .last_applied
-                .map(|log_id| log_id.index)
-                .expect("leader applied index"),
-        );
         for engine in &engines[..2] {
             engine
                 .raft_handle()
