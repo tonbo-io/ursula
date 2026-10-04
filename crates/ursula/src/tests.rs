@@ -1648,7 +1648,13 @@ async fn metrics_expose_per_core_and_group_append_distribution() {
     assert_eq!(response.status(), StatusCode::CREATED);
 
     for payload in ["abc", "de"] {
-        let response = http_post(&app, "/benchcmp/metrics-stream", &[], Body::from(payload)).await;
+        let response = http_post(
+            &app,
+            "/benchcmp/metrics-stream",
+            &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+            Body::from(payload),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 

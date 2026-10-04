@@ -210,8 +210,7 @@
               "stream_id": "ursula-sim-schedule-146-runtime-raft-network-randomized"
             },
             "next_offset": 45,
-            "raft_write_many_batches": 7,
-            "raft_apply_entries": 19,
+            "raft_apply_entries": 41,
             "delivered_rpc_count": 1
           },
           {
@@ -221,8 +220,7 @@
               "stream_id": "ursula-sim-schedule-146-runtime-raft-network-randomized-s1"
             },
             "next_offset": 36,
-            "raft_write_many_batches": 7,
-            "raft_apply_entries": 19,
+            "raft_apply_entries": 41,
             "delivered_rpc_count": 1
           },
           {
@@ -2360,7 +2358,7 @@
           {
             "event": "isolated_follower_lagged",
             "node_id": 2,
-            "log_index": 3
+            "log_index": 4
           },
           {
             "event": "fault_applied",
@@ -2369,7 +2367,7 @@
           {
             "event": "follower_caught_up",
             "node_id": 2,
-            "log_index": 3
+            "log_index": 4
           },
           {
             "event": "runtime_raft_network_read_verified",
@@ -2378,8 +2376,7 @@
               "stream_id": "ursula-sim-schedule-317-runtime-raft-network-cold-live-write-recovery"
             },
             "next_offset": 18,
-            "raft_write_many_batches": 1,
-            "raft_apply_entries": 6,
+            "raft_apply_entries": 9,
             "delivered_rpc_count": 1
           },
           {
@@ -2590,7 +2587,7 @@
           {
             "event": "isolated_follower_lagged",
             "node_id": 2,
-            "log_index": 11
+            "log_index": 13
           },
           {
             "event": "fault_applied",
@@ -2599,7 +2596,7 @@
           {
             "event": "follower_caught_up",
             "node_id": 2,
-            "log_index": 11
+            "log_index": 13
           },
           {
             "event": "runtime_raft_network_read_verified",
@@ -2608,8 +2605,7 @@
               "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized"
             },
             "next_offset": 36,
-            "raft_write_many_batches": 7,
-            "raft_apply_entries": 30,
+            "raft_apply_entries": 36,
             "delivered_rpc_count": 1
           },
           {
@@ -2630,8 +2626,7 @@
               "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized-s1"
             },
             "next_offset": 27,
-            "raft_write_many_batches": 7,
-            "raft_apply_entries": 30,
+            "raft_apply_entries": 36,
             "delivered_rpc_count": 1
           },
           {
@@ -3008,8 +3003,7 @@
               "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized"
             },
             "next_offset": 36,
-            "raft_write_many_batches": 15,
-            "raft_apply_entries": 63,
+            "raft_apply_entries": 69,
             "delivered_rpc_count": 1
           },
           {
@@ -3019,8 +3013,7 @@
               "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s1"
             },
             "next_offset": 36,
-            "raft_write_many_batches": 15,
-            "raft_apply_entries": 63,
+            "raft_apply_entries": 69,
             "delivered_rpc_count": 1
           },
           {
@@ -3030,8 +3023,7 @@
               "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s2"
             },
             "next_offset": 45,
-            "raft_write_many_batches": 15,
-            "raft_apply_entries": 63,
+            "raft_apply_entries": 69,
             "delivered_rpc_count": 1
           },
           {
@@ -3136,19 +3128,19 @@
             "stage": "failover_appends_applied",
             "old_leader_id": 1,
             "current_leader_id": 3,
-            "log_index": 29
+            "log_index": 37
           },
           {
             "event": "follower_caught_up",
             "node_id": 1,
-            "log_index": 29
+            "log_index": 37
           },
           {
             "event": "runtime_raft_network_leader_failover_stage_reached",
             "stage": "old_leader_caught_up",
             "old_leader_id": 1,
             "current_leader_id": 3,
-            "log_index": 29
+            "log_index": 37
           },
           {
             "event": "runtime_raft_network_leader_failover_read_verified",
@@ -3196,7 +3188,7 @@
             "stage": "cold_flush_applied_after_failover",
             "old_leader_id": 1,
             "current_leader_id": 3,
-            "log_index": 41
+            "log_index": 49
           },
           {
             "event": "fault_applied",
@@ -3470,7 +3462,6 @@
               "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized"
             },
             "next_offset": 18,
-            "raft_write_many_batches": 12,
             "raft_apply_entries": 43,
             "delivered_rpc_count": 1
           },
@@ -3502,7 +3493,6 @@
               "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s1"
             },
             "next_offset": 18,
-            "raft_write_many_batches": 12,
             "raft_apply_entries": 43,
             "delivered_rpc_count": 1
           },
@@ -3534,7 +3524,6 @@
               "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s2"
             },
             "next_offset": 18,
-            "raft_write_many_batches": 12,
             "raft_apply_entries": 43,
             "delivered_rpc_count": 1
           },
