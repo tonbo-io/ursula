@@ -794,7 +794,7 @@ fn read_retrying(
             return Ok(r);
         }
         let retry_after = header_u64(&r, "retry-after").map(Duration::from_secs);
-        let wait = retry_after.map_or(backoff, |r| r.max(backoff));
+        let wait = retry_after.map_or(backoff, |after| after.max(backoff));
         if Instant::now() + wait > deadline {
             return Ok(r);
         }
