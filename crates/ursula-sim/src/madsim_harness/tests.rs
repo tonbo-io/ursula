@@ -2715,27 +2715,6 @@ fn external_locators_survive_ambiguous_commits() {
     }
 }
 
-/// Waits until every replica applied everything the leader committed so
-/// far. The barrier is the leader's read log id (`ReadIndex`), a Raft log
-/// index. A response's `group_commit_index` is not one: it counts mutating
-/// stream outcomes (a batch adds one per item; blank, membership and no-op
-/// entries add nothing), so it can trail or lead the entry's log index. The
-/// leader's metrics can lag its own apply, so they are not a reliable
-/// barrier either.
-async fn apply_barrier(
-    engines: &[RaftGroupEngine],
-    leader_index: usize,
-    description: &'static str,
-) {
-    let read_log_id = engines[leader_index]
-        .raft_handle()
-        .ensure_linearizable(openraft::ReadPolicy::ReadIndex)
-        .await
-        .expect("leader read index")
-        .expect("leader committed log id");
-    wait_all_nodes_applied(engines, read_log_id.index(), description).await;
-}
-
 /// Seeds of the level-3 snapshot-install family: a learner installs a
 /// group snapshot that holds staged external refs (not yet offloaded).
 const EXTERNAL_LOCATOR_SNAPSHOT_SEEDS: [u64; 2] = [5, 23];

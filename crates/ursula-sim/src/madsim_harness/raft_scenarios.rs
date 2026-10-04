@@ -21,11 +21,13 @@ use super::SimEvent;
 use super::SimTrace;
 use super::ThreeNodeRaftSimConfig;
 use super::ThreeNodeRaftSimOutcome;
+use super::apply_barrier;
 use super::build_lagging_learner_snapshot_cluster;
 use super::build_restartable_three_node_cluster;
 use super::build_three_node_cluster;
 #[cfg(test)]
 use super::build_three_node_snapshot_purge_cluster;
+use super::leader_read_log_index;
 use super::placement;
 use super::read_local_payload_eventually;
 use super::seeded_follower_id;
@@ -68,7 +70,7 @@ pub(super) async fn run_no_fault_inner(config: ThreeNodeRaftSimConfig) -> ThreeN
         log_index: appended_log_index,
     });
 
-    wait_all_nodes_applied(&engines, appended_log_index, "append applied on all nodes").await;
+    apply_barrier(&engines, leader_index, "append applied on all nodes").await;
     trace.push(SimEvent::AllNodesApplied {
         log_index: appended_log_index,
     });
@@ -154,12 +156,13 @@ pub(super) async fn run_partition_heal_inner(
         stream: config.stream.clone(),
         log_index: appended_log_index,
     });
+    let applied_log_index = leader_read_log_index(&engines[leader_index]).await;
 
     for index in [leader_index, connected_index] {
         engines[index]
             .raft_handle()
             .wait(Some(Duration::from_secs(5)))
-            .applied_index_at_least(Some(appended_log_index), "append applied on majority")
+            .applied_index_at_least(Some(applied_log_index), "append applied on majority")
             .await
             .expect("wait for majority apply");
     }
@@ -171,7 +174,7 @@ pub(super) async fn run_partition_heal_inner(
         let isolated_wait = engines[isolated_index]
             .raft_handle()
             .wait(Some(Duration::from_millis(50)))
-            .applied_index_at_least(Some(appended_log_index), "isolated follower should lag")
+            .applied_index_at_least(Some(applied_log_index), "isolated follower should lag")
             .await;
         assert!(
             isolated_wait.is_err(),
@@ -205,7 +208,7 @@ pub(super) async fn run_partition_heal_inner(
     engines[isolated_index]
         .raft_handle()
         .wait(Some(Duration::from_secs(5)))
-        .applied_index_at_least(Some(appended_log_index), "healed follower catches up")
+        .applied_index_at_least(Some(applied_log_index), "healed follower catches up")
         .await
         .expect("wait for healed follower apply");
     trace.push(SimEvent::FollowerCaughtUp {
@@ -275,12 +278,13 @@ pub(super) async fn run_snapshot_catch_up_inner(
         stream: config.stream.clone(),
         log_index: appended_log_index,
     });
+    let applied_log_index = leader_read_log_index(&engines[leader_index]).await;
 
     for engine in &engines[..2] {
         engine
             .raft_handle()
             .wait(Some(Duration::from_secs(5)))
-            .applied_index_at_least(Some(appended_log_index), "initial voters applied append")
+            .applied_index_at_least(Some(applied_log_index), "initial voters applied append")
             .await
             .expect("wait for initial voter apply");
     }
@@ -301,7 +305,7 @@ pub(super) async fn run_snapshot_catch_up_inner(
                 metrics
                     .snapshot
                     .as_ref()
-                    .is_some_and(|log_id| log_id.index() >= appended_log_index)
+                    .is_some_and(|log_id| log_id.index() >= applied_log_index)
             },
             "leader snapshot includes append",
         )
@@ -313,7 +317,7 @@ pub(super) async fn run_snapshot_catch_up_inner(
 
     leader
         .trigger()
-        .purge_log(appended_log_index)
+        .purge_log(applied_log_index)
         .await
         .expect("trigger leader log purge");
     leader
@@ -323,7 +327,7 @@ pub(super) async fn run_snapshot_catch_up_inner(
                 metrics
                     .purged
                     .as_ref()
-                    .is_some_and(|log_id| log_id.index() >= appended_log_index)
+                    .is_some_and(|log_id| log_id.index() >= applied_log_index)
             },
             "leader purged snapshotted logs",
         )
@@ -446,9 +450,10 @@ pub(super) async fn run_isolated_leader_pending_write_snapshot_purge_inner(
         stream: config.stream.clone(),
         log_index: baseline_log_index,
     });
+    let baseline_applied_index = leader_read_log_index(&engines[old_leader_index]).await;
     wait_all_nodes_applied(
         &engines,
-        baseline_log_index,
+        baseline_applied_index,
         "baseline applied on all nodes",
     )
     .await;
@@ -492,7 +497,7 @@ pub(super) async fn run_isolated_leader_pending_write_snapshot_purge_inner(
             .await
             .expect("read old leader log state");
         if let Some(index) = log_state.last_log_id.map(|log_id| log_id.index)
-            && index >= baseline_log_index + pending_write_count
+            && index >= baseline_applied_index + pending_write_count
         {
             pending_log_index = Some(index);
             break;
@@ -548,13 +553,14 @@ pub(super) async fn run_isolated_leader_pending_write_snapshot_purge_inner(
             log_index: latest_log_index,
         });
     }
+    let latest_applied_index = leader_read_log_index(&engines[new_leader_index]).await;
     for node_id in &connected_ids {
         let index = usize::try_from(*node_id - 1).expect("node id fits usize");
         engines[index]
             .raft_handle()
             .wait(Some(Duration::from_secs(5)))
             .applied_index_at_least(
-                Some(latest_log_index),
+                Some(latest_applied_index),
                 "replacement majority applied new leader appends",
             )
             .await
@@ -577,7 +583,7 @@ pub(super) async fn run_isolated_leader_pending_write_snapshot_purge_inner(
                 metrics
                     .snapshot
                     .as_ref()
-                    .is_some_and(|log_id| log_id.index() >= latest_log_index)
+                    .is_some_and(|log_id| log_id.index() >= latest_applied_index)
             },
             "replacement leader snapshot includes new appends",
         )
@@ -589,7 +595,7 @@ pub(super) async fn run_isolated_leader_pending_write_snapshot_purge_inner(
 
     new_leader_raft
         .trigger()
-        .purge_log(latest_log_index)
+        .purge_log(latest_applied_index)
         .await
         .expect("trigger replacement leader log purge");
     new_leader_raft
@@ -599,7 +605,7 @@ pub(super) async fn run_isolated_leader_pending_write_snapshot_purge_inner(
                 metrics
                     .purged
                     .as_ref()
-                    .is_some_and(|log_id| log_id.index() >= latest_log_index)
+                    .is_some_and(|log_id| log_id.index() >= latest_applied_index)
             },
             "replacement leader purged snapshotted logs",
         )
@@ -623,7 +629,10 @@ pub(super) async fn run_isolated_leader_pending_write_snapshot_purge_inner(
     for attempt in 0..50 {
         if old_leader_raft
             .wait(Some(Duration::from_millis(100)))
-            .applied_index_at_least(Some(latest_log_index), "old leader catches up after purge")
+            .applied_index_at_least(
+                Some(latest_applied_index),
+                "old leader catches up after purge",
+            )
             .await
             .is_ok()
         {
@@ -643,7 +652,10 @@ pub(super) async fn run_isolated_leader_pending_write_snapshot_purge_inner(
     }
     old_leader_raft
         .wait(Some(Duration::from_secs(5)))
-        .applied_index_at_least(Some(latest_log_index), "old leader catches up after purge")
+        .applied_index_at_least(
+            Some(latest_applied_index),
+            "old leader catches up after purge",
+        )
         .await
         .expect("wait for old leader catch-up after purge");
     trace.push(SimEvent::FullSnapshotTransferred {
@@ -737,13 +749,14 @@ pub(super) async fn run_restart_follower_inner(
         stream: config.stream.clone(),
         log_index: appended_log_index,
     });
+    let applied_log_index = leader_read_log_index(&engines[leader_index]).await;
 
     for index in [leader_index, connected_index] {
         engines[index]
             .raft_handle()
             .wait(Some(Duration::from_secs(5)))
             .applied_index_at_least(
-                Some(appended_log_index),
+                Some(applied_log_index),
                 "majority applied append while follower stopped",
             )
             .await
@@ -777,7 +790,7 @@ pub(super) async fn run_restart_follower_inner(
         if engines[restarted_index]
             .raft_handle()
             .wait(Some(Duration::from_millis(100)))
-            .applied_index_at_least(Some(appended_log_index), "restarted follower catches up")
+            .applied_index_at_least(Some(applied_log_index), "restarted follower catches up")
             .await
             .is_ok()
         {
@@ -798,7 +811,7 @@ pub(super) async fn run_restart_follower_inner(
     engines[restarted_index]
         .raft_handle()
         .wait(Some(Duration::from_secs(5)))
-        .applied_index_at_least(Some(appended_log_index), "restarted follower caught up")
+        .applied_index_at_least(Some(applied_log_index), "restarted follower caught up")
         .await
         .expect("wait for restarted follower catch-up");
     trace.push(SimEvent::FollowerCaughtUp {
@@ -868,18 +881,12 @@ pub(super) async fn run_leader_failover_inner(
         stream: config.stream.clone(),
         log_index: before.group_commit_index,
     });
-    for node_id in 1..=3 {
-        let index = usize::try_from(node_id - 1).expect("node id fits usize");
-        engines[index]
-            .raft_handle()
-            .wait(Some(Duration::from_secs(5)))
-            .applied_index_at_least(
-                Some(before.group_commit_index),
-                "all nodes apply initial append before leader failover",
-            )
-            .await
-            .expect("wait for initial append on all nodes before leader failover");
-    }
+    apply_barrier(
+        &engines,
+        old_leader_index,
+        "all nodes apply initial append before leader failover",
+    )
+    .await;
     trace.push(SimEvent::AllNodesApplied {
         log_index: before.group_commit_index,
     });
@@ -941,6 +948,7 @@ pub(super) async fn run_leader_failover_inner(
         second_next_offset: after.next_offset,
         log_index: after.group_commit_index,
     });
+    let after_applied_index = leader_read_log_index(&engines[new_leader_index]).await;
 
     for node_id in 1..=3 {
         if node_id == old_leader_id {
@@ -951,7 +959,7 @@ pub(super) async fn run_leader_failover_inner(
             .raft_handle()
             .wait(Some(Duration::from_secs(5)))
             .applied_index_at_least(
-                Some(after.group_commit_index),
+                Some(after_applied_index),
                 "remaining majority applies post-failover append",
             )
             .await
@@ -989,7 +997,7 @@ pub(super) async fn run_leader_failover_inner(
             .raft_handle()
             .wait(Some(Duration::from_millis(100)))
             .applied_index_at_least(
-                Some(after.group_commit_index),
+                Some(after_applied_index),
                 "old leader catches up after restart",
             )
             .await
@@ -1013,7 +1021,7 @@ pub(super) async fn run_leader_failover_inner(
         .raft_handle()
         .wait(Some(Duration::from_secs(5)))
         .applied_index_at_least(
-            Some(after.group_commit_index),
+            Some(after_applied_index),
             "old leader caught up after restart",
         )
         .await

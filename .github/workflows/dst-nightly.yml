@@ -206,3 +206,23 @@ jobs:
           name: dst-nondeterminism-report
           path: target/dst-nondeterminism-report.md
           if-no-files-found: warn
+
+      - name: TEMP harness-waits verification (ignored raft/cold scenario tests)
+        if: always()
+        run: |
+          fail=0
+          for t in no_fault_workload_replays_with_same_seed_and_trace \
+                   partition_heal_workload_replays_with_same_seed_and_trace \
+                   snapshot_catch_up_workload_replays_with_same_seed_and_trace \
+                   isolated_leader_pending_write_snapshot_purge_probe \
+                   restart_follower_workload_replays_with_same_seed_and_trace \
+                   leader_failover_workload_replays_with_same_seed_and_trace \
+                   cold_live_read_workload_replays_with_same_seed_and_trace \
+                   cold_read_fault_workload_replays_with_same_seed_and_trace \
+                   cold_write_fault_workload_replays_with_same_seed_and_trace \
+                   cold_write_delay_workload_replays_with_same_seed_and_trace; do
+            echo "::group::$t"
+            RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- --ignored --exact "madsim_harness::tests::$t" --nocapture || { echo "FAILED: $t"; fail=1; }
+            echo "::endgroup::"
+          done
+          exit $fail
