@@ -5165,6 +5165,8 @@ fn request_target(uri: &Uri) -> String {
 mod tests;
 
 #[cfg(test)]
+mod base_contract_tests;
+#[cfg(test)]
 mod cold_snapshot_tests;
 #[cfg(test)]
 mod keyed_indexer_tests;
