@@ -158,7 +158,7 @@ Found on the way, independent of growth, and present at `e6d8d70` with default c
 
 ## 5. Fix designs
 
-Each subsection gives the data-structure change, read and write path changes, snapshot codec changes, migration of existing state, gating, cost and tests. Section 5.20 summarizes cost.
+Each subsection gives the data-structure change, read and write path changes, snapshot codec changes, cost and tests. Section 5.20 summarizes cost.
 
 ### 5.1 `TidyStream`
 
@@ -220,7 +220,7 @@ Offset reads never consult the index and do not change. Record headers appear on
 - **Leader-side checks.** The `?record=` routes resolve `O(r)` with a one-record read, as today (`resolve_record_offset`, `lib.rs:3388-3410`). On JSON streams the raw-offset routes check a sealed target with a bounded scan and return 400 for an intra-record offset before proposing.
 - **Publish.** Apply checks dense targets exactly and accepts sealed targets at or below `p(s)`, as today's frontier rule does. The leader-side scan rejects intra-record cold offsets with 400, which closes today's gap in practice: `snapshot_offset_aligned` accepts any offset at or below the cold frontier (`cold.rs:670-686`), so a JSON snapshot at an intra-record cold offset is accepted, contrary to `extensions.mdx:751`.
 
-Neither command gains a field. A wrong scan, from wrong cold bytes or from a delete and recreate between resolution and commit, can make the leader accept or reject the wrong request, as a stale offset can today, but apply still lands on a real boundary, so record coordinates stay exact on every replica. Retention landing below its target needs a one-sentence amendment to `extensions.mdx` §2.2 (Q4).
+Neither command gains a field. A wrong scan, from wrong cold bytes or from a delete and recreate between resolution and commit, can make the leader accept or reject the wrong request, as a stale offset can today, but apply still lands on a real boundary, so record coordinates stay exact on every replica. Retention landing below its target needs a one-sentence amendment to `extensions.mdx` §2.2.
 
 **Snapshot codec.** `StreamSnapshotEntryV1` gains `repeated uint64 record_mark_records = 17`, `repeated uint64 record_mark_offsets = 18` and `optional uint64 dense_first_record = 19`, and field 15 holds dense offsets only. Absent fields mean all-dense. They are written only when the index has sealed records. The serde `StreamSnapshot` used by backup export (#154) gets the same fields with `#[serde(default)]`.
 
@@ -244,7 +244,7 @@ Neither command gains a field. A wrong scan, from wrong cold bytes or from a del
 2. **Driver (B2).** `compact_shared_refs_once` runs in the leader's cold worker for each led group every `compaction_interval`. It compacts a stream only right after repairing that stream's pages (F19), because turning refs into page entries uncovers whatever the refs hid.
    - **Discovery** is a state query, `shared_ref_candidates(limit)`. It returns streams with at least T = 64 shared refs, or with at least one shared ref and a tail that has not moved for an hour (tracked leader-locally), ordered by the occupancy of the packs they pin, fewest live slices first, so nearly empty packs are released first. One slice is enough: `compact_cold` accepts a single shared input (`cold.rs:536-543`). No `snapshot_group` and no S3 LIST.
    - **Plan.** Take the oldest contiguous run of shared refs, where each start equals the previous end, up to `compaction_max_size` (16 MiB).
-   - **Execute.** Range-read each slice from its pack, bypassing the read cache so compaction does not evict hot read blocks. Write one exclusive chunk at `new_cold_chunk_path` and call `compact_cold` with `gc_not_before = now + compaction_gc_grace` (300 s).
+   - **Execute.** Range-read each slice from its pack, bypassing the read cache so compaction does not evict hot read blocks. Write one exclusive chunk at `new_cold_chunk_path_in_generation` (under `{stream}/chunks/{generation:016x}/`) and call `compact_cold` with `gc_not_before = now + compaction_gc_grace` (300 s).
    - **Failures.** On a definite rejection (a typed stream error, or a redirect before proposal), the engine rolls back the page entries and the driver deletes the replacement. On an ambiguous outcome it keeps both; F14h reclaims the replacement if it was never referenced. A page entry for a range still covered by state refs is shadowed, because reads exclude state-ref ranges from cold-index lookups (`query.rs:264-275`). A retried compaction's page write clips the earlier attempt's entry.
    - **Packs.** Pack GC is unchanged: releasing a pack's last ref queues it with the grace delay (`state_machine.rs:175-211`).
 3. `migrate_legacy_shared_cold_once` becomes a call into the same function with a different candidate filter, so #278 can delete it on its own schedule. It stops cloning every group's state on each purge retry (`runtime.rs:913-924`).

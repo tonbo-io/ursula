@@ -12,10 +12,11 @@
 //!   `POST /{bucket}/{group}/$transaction` answer 404: no route matches. A
 //!   two-segment stream ID may not start with `$` (400), so a future
 //!   bucket-level `$` subresource cannot collide with an existing stream.
-//! - `/__ursula/feature-level` has no route: it falls through to stream
-//!   routing, where `__ursula` is a reserved bucket ID, so `GET` answers 400
-//!   and `POST` a 4xx. Every group runs one behaviour, so there is no level
-//!   to report or raise.
+//! - `/__ursula/feature-level` has no route. It only ever lived on the admin
+//!   listener, which has no fallback, so it answers 404 there. (On the
+//!   merged single-router build used in tests it falls through to stream
+//!   routing, where `__ursula` is a reserved bucket ID, so it answers 400.)
+//!   Every group runs one behaviour, so there is no level to report or raise.
 //!
 //! The removed names live only in this file, which the release's "nothing
 //! left" check allowlists.
@@ -147,18 +148,25 @@ mod tests {
 
     #[tokio::test]
     async fn feature_level_endpoint_is_gone() {
-        let app = app();
-        let response = send(&app, "GET", "/__ursula/feature-level", &[], "").await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // Production served this path only on the admin listener.
+        let admin = crate::admin_router(crate::HttpState::new(
+            ShardRuntime::spawn(RuntimeConfig::new(1, 1)).expect("runtime"),
+        ));
         let json = [(CONTENT_TYPE.as_str(), "application/json")];
+        let response = send(&admin, "GET", "/__ursula/feature-level", &[], "").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let response = send(
-            &app,
+            &admin,
             "POST",
             "/__ursula/feature-level",
             &json,
             r#"{"level":1}"#,
         )
         .await;
-        assert!(response.status().is_client_error(), "{}", response.status());
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // The merged router routes it as a stream in the reserved `__ursula` bucket.
+        let response = send(&app(), "GET", "/__ursula/feature-level", &[], "").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

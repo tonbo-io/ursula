@@ -34,7 +34,7 @@ use crate::core_worker::ReadWatchers;
 use crate::error::ErrorStatus;
 use crate::metrics::RuntimeMetricsInner;
 
-/// F4b: hot overhead per record at the top level.
+/// F4b: hot overhead per record.
 const R: u64 = ursula_stream::HOT_RECORD_OVERHEAD_BYTES;
 
 /// C7/F14g: the incarnation generation a stream's chunks and pages live
@@ -774,7 +774,7 @@ async fn failed_cold_compaction_publish_rolls_back_index_replacement() {
         ..Default::default()
     };
     for chunk in [&first, &second] {
-        write_cold_chunk_index_pages(&page_store, &stream, chunk)
+        write_cold_chunk_index_pages_in_generation(&page_store, &stream, 0, chunk)
             .await
             .expect("index input chunk");
     }

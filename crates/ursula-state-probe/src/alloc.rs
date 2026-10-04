@@ -2,7 +2,7 @@
 //!
 //! Tracks requested live bytes and live block counts, plus a census of every
 //! live allocation of at least [`BIG`] bytes, so the probe sees individual
-//! large `Vec`/`VecDeque` buffers (record index, message records, hot-chunk
+//! large `Vec`/`VecDeque` buffers (record index, hot-chunk
 //! deque) and their capacity, not just their length. The binary installs it
 //! with `#[global_allocator]`; library users (tests) may install it too.
 //!
