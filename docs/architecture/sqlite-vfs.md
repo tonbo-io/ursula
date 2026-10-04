@@ -60,11 +60,11 @@ appended with the idempotent producer (`Producer-Id` per database, `Producer-Epo
 2. Reads the sidecar, before anything opens the file through SQLite. A file with content and no
    sidecar was never attached and is refused (it may be a database whose pages were never in the
    stream). A sidecar for another stream path is refused. The local files are trusted when the
-   sidecar was written in this boot for this db file (with or without the recovery marker, step 3)
-   and the local WAL holds what the sidecar claims of it (§6); anything else (another or unknown
-   boot id, an older version's sidecar, a torn one, a replaced db file, a WAL behind its sidecar)
-   means the local files are discarded (§6) and the attach proceeds as on a fresh host, unless a
-   read at the sidecar's offset shows the stream lost acknowledged data (§6, wrong stream).
+   sidecar was written in this boot for this db file and the local WAL holds what the sidecar
+   claims of it (§6); anything else (another or unknown boot id, an older version's sidecar, a
+   torn one, a replaced db file, a WAL behind its sidecar) means the local files are discarded
+   (§6) and the attach proceeds as on a fresh host, unless a read at the sidecar's offset shows
+   the stream lost acknowledged data (§6, wrong stream).
 3. Recovery (only when it rewrites pages) never opens the local files through SQLite before
    replaying onto them: trust (§6) says every page holds the state at the sidecar's offset or a
    later commit's, not that SQLite can read the file (a disk image may hold a torn page 1 that
@@ -72,19 +72,19 @@ appended with the idempotent producer (`Producer-Id` per database, `Producer-Epo
    db file's lock bytes, which every SQLite connection on a WAL file holds; otherwise attach
    fails rather than rewriting pages under another connection's cache), folds the local WAL into
    the db file itself (the frames SQLite's recovery would read, up to the last commit, a later
-   frame winning, the file cut to that commit's size), fsyncs the db file and, before its first
-   page write, replaces the sidecar with the recovery marker (`<restart offset> <epoch> boot=…
-   stream=… file=… recovering`), then deletes `-wal`/`-shm`. An attach in the same boot that
-   finds the marker does the same lock probe, deletes `-wal`/`-shm` (already folded) and replays
-   from the recorded offset.
+   frame winning, the file cut to that commit's size) and replays onto it. The WAL and the
+   sidecar's claim on it stay until replay ends, so an attach in the same boot after a crash
+   midway trusts the files again, folds the WAL again and replays from the same offset (both
+   steps are idempotent: folded pages hold the state at the WAL's last commit, replayed ones
+   later commits).
 4. `HEAD` the stream. If its latest snapshot is ahead of the file (a fresh host, or a file left
    below the retention), installs it (§4.3). Then replays frames to the tail.
 5. Claims: appends a claim at (epoch = highest seen + 1, seq 0) and reads the frame back. A 2xx
    alone proves nothing (two owners claiming the same epoch both get one, the second as a
    duplicate), so the claim counts only if the bytes at the answered offset are ours (the nonce
    makes them unique). Lost: epoch + 1. 403: the server's epoch + 1.
-6. Replays up to the claim, fsyncs the db file if attach wrote it, writes the sidecar, and
-   attaches.
+6. Replays up to the claim; if attach wrote the db file, deletes `-wal`/`-shm` (folded) and
+   fsyncs the db file; writes the sidecar, and attaches.
 
 The new epoch fences every earlier owner at the server: their next append gets 403. Replay applies
 page images per read batch (last image per page, truncate to the batch's smallest size first), so
@@ -161,10 +161,10 @@ threshold of retained log. The newer snapshot has read back before any history i
 retained stream always holds a readable snapshot at or above its start.
 
 Attach installs a snapshot when the file is behind the latest one: it verifies the body (offset,
-size, checksum), recovers the old file as in §3 (writing the recovery marker into the sidecar
-first), writes the image to a temp file and renames it over the db file, then replays the tail. A
-crash after the rename leaves the marked sidecar at the old offset naming the replaced file, so
-the next attach discards the files and installs the snapshot again. A tail read that hits `410`
+size, checksum), recovers the old file as in §3, writes the image to a temp file and renames it
+over the db file, then replays the tail. A crash after the rename leaves the sidecar at the old
+offset naming the replaced file, so the next attach discards the files and installs the snapshot
+again. A tail read that hits `410`
 (retention moved under a stale `HEAD`), or a snapshot superseded between `HEAD` and `GET` (a 404,
 or a body cut short when its cold object is deleted after the grace), restarts
 attach from `HEAD`, up to ten times.
@@ -215,8 +215,7 @@ be written into the stream. Trust is therefore verified against the files, not i
 - **The check.** Attach trusts the files only when the boot id and the db file's inode match and
   the WAL, read the way SQLite's recovery reads it (header checksum, then frames in order while
   their salts match and the cumulative checksum holds), is the claimed generation with valid
-  frames up to at least the claimed one; for `:0`, it must hold no commit frame. The recovery
-  marker makes no claim on the WAL (that attach deletes it).
+  frames up to at least the claimed one; for `:0`, it must hold no commit frame.
 - **Three fsyncs of the db file**, none per commit, all through SQLite's own handle except at
   attach (when no connection is open): (1) before a commit that starts a new WAL generation is
   appended (once per WAL wrap; SQLite starts one only when every frame of the previous one is in
@@ -224,9 +223,9 @@ be written into the stream. Trust is therefore verified against the files, not i
   complete checkpoint: `wal_checkpoint(TRUNCATE)`, a close with `journal_size_limit`), the
   sidecar switching to `:0` first (a truncate to a non-zero size, `journal_size_limit` in the
   commit that starts a generation, cuts only the previous generation's tail, already synced by
-  (1)); (3) at attach, after folding the WAL into the db file and before the recovery marker, and
-  before the final sidecar whenever attach wrote the db file (that sidecar claims `:0`). A failed
-  fsync poisons the database (or fails the attach).
+  (1)); (3) at attach, before the final sidecar whenever attach wrote the db file (that sidecar
+  claims `:0`; the folded WAL is deleted first). A failed fsync poisons the database (or fails
+  the attach).
 - The attached connections keep the WAL past the last close (`SQLITE_FCNTL_PERSIST_WAL`:
   checkpointed, not deleted), and so does the snapshot thread's, so a clean shutdown keeps the
   claim checkable.
@@ -249,15 +248,16 @@ What attach does in each case:
 - **Process crash, same boot** (SIGKILL, OOM kill, abort, a pod rescheduled to the same node with a
   local volume, a container restart with runtimes that show the host's boot id: Docker,
   containerd, CRI-O): every completed `write()` is in the page cache, so the files are exactly
-  what this host wrote and, outside the two windows below, the claim holds (the sidecar is
+  what this host wrote and, outside the three windows below, the claim holds (the sidecar is
   written only after the WAL writes return). A killed write leaves a prefix; SQLite's salted,
   cumulative WAL checksums stop recovery at the last whole commit, `-shm` is rebuilt, checkpoints
   are redone from the WAL. Attach trusts the files and replays from the sidecar's offset (fast).
   A crash in the middle of a WAL truncate (between the `:0` sidecar and the truncate), or between
   the first WAL write of a new generation (the commit after a wrap or a truncate) and the sidecar
-  update, leaves a claim the files do not meet; that only costs a rebuild. Covered: SIGKILL
-  before and after the ack, the cache spill with in-place checksum rewrites, a failed local write
-  after the ack, a crash mid-recovery (the recovery marker).
+  update, or at the end of a recovery between deleting the folded WAL and the final sidecar,
+  leaves a claim the files do not meet; that only costs a rebuild. Covered: SIGKILL before and
+  after the ack, the cache spill with in-place checksum rewrites, a failed local write after the
+  ack, a crash mid-recovery (the sidecar keeps its claim until replay ends).
 - **Same boot, files restored from a crash-consistent image**: a block-level snapshot of the volume
   (EBS, PD or Azure disk snapshots, a CSI VolumeSnapshot or PVC clone) restored or cloned onto a
   host that has not rebooted since, or a block volume force-detached and reattached. Boot id and
@@ -338,20 +338,22 @@ rebuild, delete `<db>`.
 ## 8. Tests
 
 - Units (`cargo test`): frame and snapshot encodings (whole frames only, damage refused).
-- Units also cover the sidecar: trusted only in this boot for this db file (the recovery marker
-  included) and with its WAL claim met (a claim on frames the WAL does not hold, or no claim, is
-  not); legacy, other-boot and torn sidecars are not, nothing is when the current boot id is
-  unknown, and a missing sidecar is an error. CI runs them on macOS too (its boot id).
+- Units also cover the sidecar: trusted only in this boot for this db file and with its WAL claim
+  met (a claim on frames the WAL does not hold or on another WAL generation, or no claim, is
+  not); legacy (an older version's recovery marker included), other-boot and torn sidecars are
+  not, nothing is when the current boot id is unknown, and a missing sidecar is an error; folding
+  a WAL into the db file keeps the last image and cuts the file to the commit's size. CI runs
+  them on macOS too (its boot id).
 - e2e against a real node (`clients/sqlite-ursula`): transparency (any schema, byte-identical
-  rebuild), the crash matrix (same-boot re-attaches resume from the sidecar or the recovery
-  marker, without a snapshot), fencing, recovery exclusion, the local cache (a simulated reboot
-  with a rolled-back db file and sidecar, below retention, a torn first sector and a cut WAL
-  rebuilds byte-identical from snapshot + tail; the same boot reuses the files with no snapshot
-  and no replay from scratch, also for a file rebuilt from a snapshot; a same-boot disk image
-  whose WAL is behind its sidecar is rebuilt and the stream stays intact, one whose WAL is ahead is
-  trusted; discarding is refused while another process has the file open; a replaced db file is
-  rebuilt; a file without a sidecar, another stream and a recreated stream are refused, the last
-  also after a reboot), snapshots and retention (a ~160 MB run; CI also runs it without a cold
+  rebuild), the crash matrix (same-boot re-attaches resume from the sidecar, a recovery killed
+  mid-rewrite included, without a snapshot), fencing, recovery exclusion, the local cache (a
+  simulated reboot with a rolled-back db file and sidecar, below retention, a torn first sector and
+  a cut WAL rebuilds byte-identical from snapshot + tail; the same boot reuses the files with no
+  snapshot and no replay from scratch, also for a file rebuilt from a snapshot; a same-boot disk
+  image whose WAL is behind its sidecar is rebuilt and the stream stays intact, one whose WAL is
+  ahead is trusted; discarding is refused while another process has the file open; a replaced db
+  file is rebuilt; a file without a sidecar, another stream and a recreated stream are refused, the
+  last also after a reboot), snapshots and retention (a ~160 MB run; CI also runs it without a cold
   tier under the default hot limit; fresh and lagging hosts rebuild byte-identical from snapshot +
   tail; the takeover after the trim fences the old owner), Pi conformance in three modes, and a
   benchmark (sanity numbers only).

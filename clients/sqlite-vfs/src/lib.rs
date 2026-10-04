@@ -249,8 +249,9 @@ impl Db {
 
     /// Fsyncs the db file through the main db handle of the connection asking (the one holding the
     /// WAL write lock, or a closing one's EXCLUSIVE lock): before the local WAL starts a new
-    /// generation or is truncated, so a disk image that shows the new WAL holds every page
-    /// checkpointed from the old one (see `WalClaim`). Rare: once per WAL wrap. A failure poisons.
+    /// generation or is truncated to nothing, so a disk image that shows the new WAL holds every
+    /// page checkpointed from the old one (see `WalClaim`). Rare: once per WAL wrap. A failure
+    /// poisons.
     unsafe fn sync_db(&mut self, before: &str) -> c_int {
         let h = [self.writer, self.exclusive].into_iter().find(|&h| h != 0);
         let rc = match h {
@@ -478,7 +479,8 @@ impl WalClaim {
     /// generation with frames reaching the claimed one, or for `NONE` no commit at all (frames left
     /// over from before the db file was synced would roll pages back).
     fn covered(self, path: &str) -> bool {
-        let (salts, last, _) = wal_recover(&format!("{path}-wal")).unwrap_or((0, 0, 0));
+        let (salts, last) =
+            wal_recover(&format!("{path}-wal")).map_or((0, 0), |w| (w.salts, w.last));
         match self.frame {
             0 => last == 0,
             frame => salts == self.salts && last >= frame,
@@ -486,11 +488,21 @@ impl WalClaim {
     }
 }
 
-/// What SQLite's recovery (`walIndexRecover`) finds in a WAL file: its generation (the header's
-/// salts), the number of the last commit frame among the valid ones (read in order while their
-/// salts match the header's and the cumulative checksum holds) and the db size (pages) after it.
+/// What SQLite's recovery (`walIndexRecover`) finds in a WAL file. The valid frames are read in
+/// order while their salts match the header's and the cumulative checksum holds.
+struct WalScan {
+    /// The generation: the header's salts.
+    salts: u64,
+    /// The number of the last commit frame among the valid ones (0: none).
+    last: u32,
+    /// The db size (pages) after that commit.
+    size: u32,
+    /// The page number of each frame up to `last`, in order.
+    pages: Vec<u32>,
+}
+
 /// `None` without a valid header (missing, short, torn, or not 4 KiB pages).
-fn wal_recover(path: &str) -> Option<(u64, u32, u32)> {
+fn wal_recover(path: &str) -> Option<WalScan> {
     use std::io::Read;
     let mut r = std::io::BufReader::new(fs::File::open(path).ok()?);
     let mut hdr = [0u8; WAL_HDR as usize];
@@ -520,7 +532,7 @@ fn wal_recover(path: &str) -> Option<(u64, u32, u32)> {
     if s != (be32(&hdr[24..]), be32(&hdr[28..])) {
         return None;
     }
-    let (mut n, mut last, mut size) = (0, 0, 0);
+    let (mut last, mut size, mut pages) = (0, 0, Vec::new());
     let mut f = vec![0u8; FRAME as usize];
     while r.read_exact(&mut f).is_ok() {
         if be32(&f) == 0 || f[8..16] != hdr[16..24] {
@@ -530,13 +542,19 @@ fn wal_recover(path: &str) -> Option<(u64, u32, u32)> {
         if s != (be32(&f[16..]), be32(&f[20..])) {
             break;
         }
-        n += 1;
+        pages.push(be32(&f));
         if be32(&f[4..]) != 0 {
-            (last, size) = (n, be32(&f[4..]));
+            (last, size) = (pages.len() as u32, be32(&f[4..]));
         }
     }
+    pages.truncate(last as usize);
     let salts: [u8; 8] = hdr[16..24].try_into().unwrap();
-    Some((u64::from_be_bytes(salts), last, size))
+    Some(WalScan {
+        salts: u64::from_be_bytes(salts),
+        last,
+        size,
+        pages,
+    })
 }
 
 /// Folds the local WAL into the db file `f` the way a complete checkpoint would (the valid frames
@@ -547,26 +565,21 @@ fn wal_recover(path: &str) -> Option<(u64, u32, u32)> {
 /// other process uses the file (`check_unused`).
 fn fold_wal(path: &str, f: &fs::File) -> Result<(), String> {
     let wal = format!("{path}-wal");
-    let Some((_, last, size)) = wal_recover(&wal).filter(|w| w.1 > 0) else {
+    let Some(scan) = wal_recover(&wal).filter(|w| w.last > 0) else {
         return Ok(());
     };
     let err = |e: std::io::Error| format!("fold {wal} into {path}: {e}");
     let w = fs::File::open(&wal).map_err(err)?;
-    let at = |n: u32| (WAL_HDR + (n as i64 - 1) * FRAME) as u64;
-    let mut latest = BTreeMap::new();
-    let mut h = [0u8; FRAME_HDR as usize];
-    for n in 1..=last {
-        w.read_exact_at(&mut h, at(n)).map_err(err)?;
-        latest.insert(be32(&h), n);
-    }
+    // Frame index per page, a later frame winning.
+    let latest: BTreeMap<u32, i64> = scan.pages.iter().copied().zip(0..).collect();
     let mut page = vec![0u8; PAGE];
-    for (pgno, n) in latest.range(1..=size) {
-        w.read_exact_at(&mut page, at(*n) + FRAME_HDR as u64)
-            .map_err(err)?;
+    for (pgno, i) in latest.range(1..=scan.size) {
+        let at = (WAL_HDR + i * FRAME + FRAME_HDR) as u64;
+        w.read_exact_at(&mut page, at).map_err(err)?;
         f.write_all_at(&page, (*pgno as u64 - 1) * PAGE as u64)
             .map_err(err)?;
     }
-    f.set_len(size as u64 * PAGE as u64).map_err(err)
+    f.set_len(scan.size as u64 * PAGE as u64).map_err(err)
 }
 
 /// Replaces the sidecar atomically against a process crash: temp file, rename. No fsync: an image
@@ -582,17 +595,6 @@ fn write_sidecar(
         "{offset} {epoch}{stamp} wal={:016x}:{}\n",
         wal.salts, wal.frame
     );
-    write_sidecar_line(path, &line)
-}
-
-/// The recovery marker: attach is rewriting the db file from the stream, restarting from `offset`.
-/// Until the sidecar is written again the file may be inconsistent (some pages of a later state),
-/// so the next attach must not let SQLite read it before replaying (see `attach`).
-fn write_recovery_marker(path: &str, offset: u64, epoch: u64, stamp: &str) -> Result<(), String> {
-    write_sidecar_line(path, &format!("{offset} {epoch}{stamp} recovering\n"))
-}
-
-fn write_sidecar_line(path: &str, line: &str) -> Result<(), String> {
     let err = |e: std::io::Error| format!("sidecar {path}: {e}");
     let tmp = format!("{path}.tmp");
     fs::write(&tmp, line).map_err(err)?;
@@ -600,11 +602,9 @@ fn write_sidecar_line(path: &str, line: &str) -> Result<(), String> {
 }
 
 struct Sidecar {
-    /// The offset the local file reflects (or, with the recovery marker, the offset an interrupted
-    /// recovery restarts from).
+    /// The offset the local file reflects.
     offset: u64,
     epoch: u64,
-    recovering: bool,
     boot: Option<String>,
     stream: Option<String>,
     file: Option<String>,
@@ -615,15 +615,14 @@ impl Sidecar {
     /// The local files hold at least the state at the sidecar's offset: written since this boot,
     /// into this db file (one replaced behind our back would get the old one's WAL applied to it),
     /// and the local WAL still holds what the sidecar claims of it (a disk image restored without a
-    /// reboot keeps boot and inode but may have lost any unsynced write). The recovery marker
-    /// makes no claim on the WAL: that attach deletes it and replays from the marker's offset. A
-    /// sidecar of an older version (no boot) is not trusted, and nothing is when the current boot
+    /// reboot keeps boot and inode but may have lost any unsynced write). A sidecar of an older
+    /// version (no boot, or no WAL claim) is not trusted, and nothing is when the current boot
     /// (`boot`, from `boot_id`) is unknown.
     fn trusted(&self, path: &str, boot: Option<&str>) -> bool {
         boot.is_some_and(|b| self.boot.as_deref() == Some(b))
             && self.file.is_some()
             && self.file == file_id(path)
-            && (self.recovering || self.wal.is_some_and(|w| w.covered(path)))
+            && self.wal.is_some_and(|w| w.covered(path))
     }
 }
 
@@ -643,7 +642,6 @@ fn read_sidecar(path: &str) -> Result<Option<Sidecar>, String> {
     let mut s = Sidecar {
         offset,
         epoch,
-        recovering: false,
         boot: None,
         stream: None,
         file: None,
@@ -651,7 +649,9 @@ fn read_sidecar(path: &str) -> Result<Option<Sidecar>, String> {
     };
     for token in it {
         match token.split_once('=') {
-            None if token == "recovering" => s.recovering = true,
+            // The recovery marker of an earlier version: parsed (not torn), but it makes no WAL
+            // claim, so the sidecar is not trusted.
+            None if token == "recovering" => {}
             Some(("boot", v)) => s.boot = Some(v.to_owned()),
             Some(("stream", v)) => s.stream = Some(v.to_owned()),
             Some(("file", v)) => s.file = Some(v.to_owned()),
@@ -1029,9 +1029,9 @@ enum Checkpoint {
     Busy,
 }
 
-/// A private connection on the "unix" VFS, outside this VFS's bookkeeping: recovery's checkpoint,
-/// and the snapshot thread's checkpoint, read transaction and page copy. `synchronous=OFF`: the
-/// local files are a cache (see the crate docs), so its checkpoints never fsync.
+/// A private connection on the "unix" VFS, outside this VFS's bookkeeping: the snapshot thread's
+/// checkpoint, read transaction and page copy. `synchronous=OFF`: the local files are a cache (see
+/// the crate docs), so its checkpoints never fsync.
 struct Private {
     db: *mut ffi::sqlite3,
 }
@@ -1160,18 +1160,11 @@ impl Drop for Private {
 /// Runs only inside `ursula_attach`, which refuses while any connection of this process has the
 /// file open and has stopped the previous attachment's snapshot thread; `check_unused` proves no
 /// other process holds it either. So its own descriptors on the db file (and the temp file and
-/// rename of `install`) cannot drop anyone's POSIX locks when they close. Everywhere else the
-/// extension touches the db file, -wal or -shm only through SQLite's handles (the private
+/// rename of `install`) cannot drop anyone's POSIX locks when they close. Outside `ursula_attach`,
+/// the extension touches the db file, -wal or -shm only through SQLite's handles (the private
 /// connections of `Private`).
 struct Applier {
     path: String,
-    sidecar: String,
-    /// Attach's stamp, recorded in the recovery marker.
-    stamp: String,
-    /// Offset and epoch a recovery restarts from, recorded in the recovery marker.
-    restart: (u64, u64),
-    /// The recovery marker is written: the file may be rewritten.
-    recovering: bool,
     /// Offset of the snapshot installed (0: none).
     installed: u64,
     /// Page images written (for the `URSULA_VFS_ABORT_IN_REPLAY` test hook).
@@ -1203,16 +1196,16 @@ impl Applier {
         }
     }
 
-    /// The db file, opened once. Before its first write, unless an interrupted recovery is being
-    /// resumed (marker already set): a file with content (trusted, never opened through SQLite
-    /// here) gets its WAL folded in (`fold_wal`, after `check_unused`) and is fsynced, then the
-    /// recovery marker is written (it makes no claim on the WAL, so the folded pages must be on
-    /// disk first) and `-wal`/`-shm` are deleted.
+    /// The db file, opened once. Before its first write, a file with content (trusted, never opened
+    /// through SQLite here) gets its WAL folded in (`fold_wal`, after `check_unused`). The WAL and
+    /// the sidecar's claim on it stay until replay ends, so a recovery that dies midway leaves
+    /// files the next attach trusts, folds and replays again from the same offset (both steps are
+    /// idempotent: folded pages hold the state at the WAL's last commit, replayed ones later
+    /// commits).
     unsafe fn file(&mut self) -> Result<&fs::File, String> {
         if self.file.is_none() {
-            let resume = self.recovering;
             let existing = fs::metadata(&self.path).is_ok_and(|m| m.len() > 0);
-            if !resume && existing {
+            if existing {
                 check_unused(&self.path)?;
             }
             let f = OpenOptions::new()
@@ -1222,16 +1215,8 @@ impl Applier {
                 .truncate(false)
                 .open(&self.path);
             let f = f.map_err(|e| format!("open {}: {e}", self.path))?;
-            if !resume {
-                if existing {
-                    fold_wal(&self.path, &f)?;
-                }
-                f.sync_all()
-                    .map_err(|e| format!("fsync {}: {e}", self.path))?;
-                write_recovery_marker(&self.sidecar, self.restart.0, self.restart.1, &self.stamp)?;
-                self.recovering = true;
-                remove_if_exists(&format!("{}-wal", self.path))?;
-                remove_if_exists(&format!("{}-shm", self.path))?;
+            if existing {
+                fold_wal(&self.path, &f)?;
             }
             self.file = Some(f);
         }
@@ -1267,8 +1252,8 @@ impl Applier {
     }
 
     /// Replaces the db file with a snapshot's image (temp file, rename) and continues the batch
-    /// from it. A crash before the sidecar records the new offset leaves the old one (with the
-    /// recovery marker), from which a re-attach installs the snapshot again.
+    /// from it. A crash before the sidecar records the new offset leaves the old one, which names
+    /// the replaced file: the next attach discards the files and rebuilds.
     unsafe fn install(&mut self, snap: snapshot::Snapshot) -> Result<(), String> {
         unsafe { self.file()? };
         self.file = None;
@@ -1561,9 +1546,8 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
     // mid-switch: the file is an empty database with or without it, but SQLite's first open would
     // roll it back, truncating whatever attach writes after it.
     remove_if_exists(&format!("{path}-journal"))?;
-    let mark = stamp(&path, &url, boot.as_deref());
-    let (from, epoch, recovering) = match &local {
-        Some(s) => (s.offset, s.epoch, s.recovering),
+    let (from, epoch) = match &local {
+        Some(s) => (s.offset, s.epoch),
         None => {
             // Nothing local: a WAL next to an empty db file holds nothing committed. The sidecar
             // is written before anything lands in the file, so a file an attach leaves
@@ -1571,25 +1555,13 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
             // otherwise discarded and rebuilt) instead of being refused as never attached.
             remove_if_exists(&format!("{path}-wal"))?;
             remove_if_exists(&format!("{path}-shm"))?;
+            let mark = stamp(&path, &url, boot.as_deref());
             write_sidecar(&sidecar, 0, 0, &mark, WalClaim::NONE)?;
-            (0, 0, false)
+            (0, 0)
         }
     };
-    if recovering {
-        // An earlier recovery died mid-rewrite: the file may be inconsistent, so SQLite must not
-        // read it. Its WAL was folded into the db file and fsynced before the marker (or the file
-        // was empty), so stale -wal/-shm files carry nothing.
-        check_unused(&path)?;
-        remove_if_exists(&format!("{path}-wal"))?;
-        remove_if_exists(&format!("{path}-shm"))?;
-        eprintln!("sqlite-ursula-vfs: {path}: resuming an interrupted recovery from {from}");
-    }
     let mut applier = Applier {
         path: path.clone(),
-        sidecar: sidecar.clone(),
-        stamp: mark,
-        restart: (from, epoch),
-        recovering,
         installed: 0,
         written: 0,
         file: None,
@@ -1617,13 +1589,19 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
     let installed = applier.installed;
     let rewritten = applier.file.is_some();
     drop(applier);
+    if rewritten {
+        // The WAL is folded in: until the sidecar below drops its claim, a crash here costs a
+        // rebuild instead of a resume.
+        remove_if_exists(&format!("{path}-wal"))?;
+        remove_if_exists(&format!("{path}-shm"))?;
+    }
     if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0 {
         unsafe { init_wal_format(&path)? };
     }
     // Untouched trusted files keep their claim; otherwise the WAL is gone and the db file alone
     // holds the state, which must be on disk before the sidecar says so (no connection is open,
     // so this descriptor's close drops no lock).
-    let wal = match local.and_then(|s| s.wal.filter(|_| !s.recovering && !rewritten)) {
+    let wal = match local.and_then(|s| s.wal.filter(|_| !rewritten)) {
         Some(wal) => wal,
         None => {
             fs::File::open(&path)
@@ -2779,10 +2757,9 @@ pub unsafe extern "C" fn sqlite3_extension_init(
 mod tests {
     use super::*;
 
-    // Attach trusts local files only when the sidecar was written in this boot, for this db file
-    // (with or without the recovery marker), and the WAL holds what it claims; a legacy, torn or
-    // other-boot sidecar is discarded, and a missing one is an error (the file may be a database
-    // that was never attached).
+    // Attach trusts local files only when the sidecar was written in this boot, for this db file,
+    // and the WAL holds what it claims; a legacy, torn or other-boot sidecar is discarded, and a
+    // missing one is an error (the file may be a database that was never attached).
     #[test]
     fn sidecar_trust() {
         let dir = std::env::temp_dir().join(format!("ursula-sidecar-{}", std::process::id()));
@@ -2811,22 +2788,16 @@ mod tests {
         let behind = format!("{mine} wal=00000000000000ff:3\n");
         assert_eq!(trust(behind.as_bytes(), b1), Some(false));
         assert_eq!(trust(format!("{mine}\n").as_bytes(), b1), Some(false));
-        // The recovery marker makes no claim on the WAL, but still names this db file.
+        // An earlier version's recovery marker parses (not torn) but makes no claim on the WAL.
         let marker = format!("{mine} recovering\n");
-        assert_eq!(trust(marker.as_bytes(), b1), Some(true));
-        assert_eq!(trust(marker.as_bytes(), Some("b2")), Some(false));
-        // Another db file (replaced by a rename) is not trusted, with or without the marker.
+        assert_eq!(trust(marker.as_bytes(), b1), Some(false));
+        // Another db file (replaced by a rename) is not trusted.
         let other_file = "7 2 boot=b1 stream=/b/s file=0";
         assert_eq!(
             trust(format!("{other_file}{none}").as_bytes(), b1),
             Some(false)
         );
-        assert_eq!(
-            trust(format!("{other_file} recovering\n").as_bytes(), b1),
-            Some(false)
-        );
         assert_eq!(trust(b"7 2\n", b1), Some(false));
-        assert_eq!(trust(b"7 2 recovering\n", b1), Some(false));
         for torn in ["", "7", "7 2 boot", "7 2 x=1", "7 2 wal=12", "7 2 wal=zz:1"] {
             assert_eq!(trust(torn.as_bytes(), b1), None);
         }

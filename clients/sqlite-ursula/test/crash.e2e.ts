@@ -145,8 +145,9 @@ it("(g) a rate-limited append (429 + Retry-After) is retried with the same produ
 
 // Regression (review of #324/#325): recovery rewrites pages in place; a crash after the new page 1
 // but before the rest left a file SQLite rejects as malformed, and the next attach checkpointed it
-// through SQLite first, so it could never recover. The recovery marker makes the next attach
-// resume the replay without reading the file through SQLite.
+// through SQLite first, so it could never recover. The sidecar keeps its claim until replay ends,
+// so the next attach folds and replays again from the same offset without reading the file through
+// SQLite.
 it("(h) killed in the middle of a recovery's page writes: the next attach resumes it", async () => {
 	const url = ursulaUrl() + streamPath();
 	const file = freshFile();
@@ -165,15 +166,13 @@ it("(h) killed in the middle of a recovery's page writes: the next attach resume
 	o.exec("CREATE INDEX t_y ON t(y)");
 	o.exec("INSERT INTO t VALUES ('late', 'z')");
 	o.close();
+	const before = Number(readFileSync(`${file}-ursula`, "utf8").split(" ")[0]);
+	expect(before).toBeGreaterThan(0);
 	// Re-attaching the first file replays that; the child dies after the first page write (page 1).
 	const child = runChild(file, url, [], { URSULA_VFS_ABORT_IN_REPLAY: "1" });
 	expect((await child.exited).signal).toBe("SIGABRT");
-	const sidecar = readFileSync(`${file}-ursula`, "utf8");
-	expect(sidecar).toMatch(/recovering/);
-	const marker = Number(sidecar.split(" ")[0]);
-	expect(marker).toBeGreaterThan(0);
 	attach(file, url);
-	expect(status(file)).toMatchObject({ local: marker, installed: 0 });
+	expect(status(file)).toMatchObject({ local: before, installed: 0 });
 	const fresh = freshFile();
 	attach(fresh, url);
 	expect(Buffer.compare(readFileSync(file), readFileSync(fresh))).toBe(0);
