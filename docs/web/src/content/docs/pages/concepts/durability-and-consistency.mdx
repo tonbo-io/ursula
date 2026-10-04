@@ -27,7 +27,8 @@ with `Retry-After` instead of serving its stale state. The confirmation costs
 one round trip to the voters per read. A leader that misses a confirmation under
 load retries it for up to one election timeout before it answers `503`, so a
 client should retry a `503` after `Retry-After`. It is not a live-read mode; long-poll
-and SSE already have leader-owned watcher semantics.
+and SSE already have leader-owned watcher semantics. The [Read path](/docs/specs/extensions#92-leader-consistency)
+section of the extensions specification states this contract normatively.
 
 `HEAD`, `GET …/bootstrap`, snapshot reads, the registration of a long-poll
 or SSE reader, and requests that resolve the tail through `HEAD`

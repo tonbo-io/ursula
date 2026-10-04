@@ -20,9 +20,13 @@ Bootstrap does not accept `?live=sse`. Combining the multipart body with an SSE 
 | Status | Meaning |
 | ------ | --------------------------------------------- |
 | `200` | Bootstrap response with snapshot and updates. |
+| `307` | In a cluster, this node is not the stream's group leader. `Location` is the same request on the leader. |
 | `400` | Invalid query parameters (including `live=sse`). |
 | `404` | Stream not found or expired. |
 | `410` | Requested offset has been trimmed. |
+| `503` | The group has no known leader, or the leader could not confirm its leadership in time. Retry after `Retry-After`. |
+
+Bootstrap is served by the group's leader after it confirms with a majority of voters that it still leads, so the response reflects every append and snapshot acknowledged before the request. See [Durability and consistency](/docs/concepts/durability-and-consistency#consistency).
 
 Response headers include:
 

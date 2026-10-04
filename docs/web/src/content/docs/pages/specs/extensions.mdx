@@ -212,18 +212,20 @@ Snapshot creation MUST NOT block concurrent appends. The snapshot's consistency 
 HEAD {stream_url}
 ```
 
-Servers SHOULD include `Stream-Snapshot-Offset` when a latest visible snapshot exists for the stream.
+Servers MUST include `Stream-Snapshot-Offset` and `Stream-Snapshot-Digest` when a latest visible snapshot exists for the stream. Apart from bootstrap (Section 3), `HEAD` is the only way to learn which snapshot is the latest.
 
 **Response Headers:**
 
 - `Stream-Snapshot-Offset`: The latest visible snapshot offset.
-- `Stream-Snapshot-Digest`: A digest of the latest visible snapshot's content type and body.
+- `Stream-Snapshot-Digest`: A digest of the latest visible snapshot's content type and body, equal to the digest its publish returned.
+- `Stream-Retained-Offset`: The earliest retained offset (Section 2.2, Retention Effect).
 - `Stream-Incarnation`: An opaque token that identifies this incarnation of the stream.
 
 **Semantics:**
 
 - Absence of `Stream-Snapshot-Offset` means the stream has no visible snapshot.
 - To read the latest snapshot, a client takes `Stream-Snapshot-Offset` from `HEAD` and fetches it with Read Snapshot (Section 2.5).
+- A server implementing this extension MUST send `Stream-Retained-Offset` on every successful `HEAD`. Reads at offsets below it MUST return `410 Gone`. Before any retention advance it is the offset of the stream's first byte. Like every offset, it is opaque: clients pass it back as `offset` or compare it lexicographically with other offsets of the same stream.
 - A server implementing this extension MUST send `Stream-Incarnation` on every successful `HEAD`. It MUST change when the stream is deleted and recreated at the same URL, and MUST NOT change otherwise. Clients MUST compare it only for equality. Offsets do not identify an incarnation, so a client that stores offsets and snapshot offsets across a possible recreate SHOULD store the incarnation with them and check it on `HEAD` before resuming. An operator restore from backup keeps each stream's incarnation although it can rewind the stream to the backup's tail; offsets read after the backup was taken are not valid on the restored stream.
 
 ### 2.5. Read Snapshot
@@ -618,8 +620,44 @@ Ordinary SSE behavior, including binary stream handling, is defined by `docs/spe
 
 ## 9. Read Path
 
-This section collects read parameters that apply to every stream and are not defined by the base protocol.
+This section collects read parameters and read representations that apply to every stream and that the base protocol leaves to the server. Record-aware reads of JSON streams are defined separately in Section 6.
 
 ### 9.1. Long-Poll Timeout
 
 `timeout_ms={t}` bounds how long a `live=long-poll` read waits for new data before the server answers `204 No Content`. The default is `1000`. An unparseable value means the default, and a parsed value is clamped to `1..60000`. It applies only to `live=long-poll` reads; every other read, including `live=sse`, ignores it.
+
+### 9.2. Leader Consistency
+
+`consistency={c}` selects how fresh a catch-up read must be.
+
+- `local`, the default: any replica MAY serve bytes it has applied. Offsets are immutable, so those bytes are correct, but a replica that lags MAY omit appends that were already acknowledged.
+- `leader`: the read MUST be linearizable. It MUST reflect every append acknowledged before the request was received, including appends acknowledged by a newer leader.
+- Any other value MUST be rejected with `400 Bad Request`. `consistency=leader` combined with `live` MUST be rejected with `400 Bad Request`; live reads follow the leader's watchers already.
+
+A server that cannot prove the read is linearizable MUST NOT serve it. It answers `307 Temporary Redirect` to the current leader when it knows one, and otherwise `503 Service Unavailable` with `Retry-After`. Clients SHOULD follow the redirect and retry the `503` after the advertised delay.
+
+> **Note (informative).** Ursula forwards a `consistency=leader` read from a follower to the group's leader. The leader confirms with a majority of voters that it still leads (Raft ReadIndex) and waits until it has applied everything committed up to that point; each such read costs one round trip to the voters. A leader cut off from the majority, or one that cannot confirm within one election timeout, answers `307` or `503` rather than its own state. Ursula applies the same confirmation to `HEAD`, `/bootstrap`, snapshot reads and the registration of a long-poll or SSE reader.
+
+### 9.3. Response Size
+
+A server MAY cap how many stream bytes one response returns. Ursula caps every read response, and every SSE data event, at 8 MiB (8,388,608 bytes).
+
+`max_bytes={n}` on an offset read asks for at most `n` bytes. A value above the server's cap is clamped to it. Ursula ignores a value that is not a decimal integer and applies the cap alone; clients SHOULD send a positive integer. On a live read, `max_bytes` bounds each response or SSE data event. On a record-aware read, Section 6.6 defines `max_bytes` instead.
+
+A response that `max_bytes` or the cap shortened is partial: it MUST NOT carry `Stream-Up-To-Date: true`, and its `Stream-Next-Offset` is the offset just past the returned bytes. Clients continue from `Stream-Next-Offset` until a response carries `Stream-Up-To-Date: true`.
+
+### 9.4. JSON Stream Reads
+
+Reads of an `application/json` stream return the stored messages (see JSON Message Text) in their stored order, each followed by one LF, as `Content-Type: application/x-ndjson`. `HEAD` reports the configured content type, `application/json`. SSE responses for such a stream carry `Stream-Data-Content-Type: application/x-ndjson`.
+
+`max_bytes` and the server's cap (Section 9.3) count bytes of this representation, so a response or SSE data event MAY end inside a message. Clients MUST resume from `Stream-Next-Offset` and buffer an incomplete trailing line until the rest arrives. SSE `data:` lines are transport framing, not message boundaries.
+
+### 9.5. Binary SSE
+
+A `live=sse` read of a stream whose content type is neither `text/*` nor `application/json` carries binary data:
+
+- The response MUST include `Stream-Sse-Data-Encoding: base64`, and `Stream-Data-Content-Type` MUST be the stream's content type.
+- Each `event: data` payload MUST be the standard base64 encoding [RFC4648] of a contiguous byte range of the stream, with no JSON envelope. The server MAY split the text across several `data:` lines; the client joins them, removes the line breaks and decodes.
+- Each data event is followed by an `event: control` event whose `streamNextOffset` is the offset just past the decoded bytes.
+
+There is no client opt-in or opt-out: the stream's content type decides the encoding. Section 7 states the same rule for compatibility with the base protocol's SSE.

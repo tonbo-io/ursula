@@ -110,7 +110,7 @@ Common causes:
 
 ### `409 Conflict` from `Stream-Seq`
 
-The supplied `Stream-Seq` is not lexicographically greater than the last accepted value. Re-read and re-derive, or use producer dedup instead.
+The supplied `Stream-Seq` is not bytewise greater than the last value accepted on this stream: another writer committed first, or the values are not fixed-width (`"10"` sorts before `"9"`). The response's `Stream-Next-Offset` is the tail. Read what you missed, re-derive the value and retry. See [Conditional writes](/docs/concepts/conditional-writes).
 
 ### `404 Not Found` on `POST /{bucket}/{stream}`
 

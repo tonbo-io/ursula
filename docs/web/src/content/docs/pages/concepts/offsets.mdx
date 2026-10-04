@@ -11,7 +11,7 @@ Offsets are opaque tokens. Ursula returns them as 20-character strings, for exam
 
 Two special values are accepted on read requests:
 
-- `offset=-1`: start from the very beginning of retained data (the earliest still-available offset).
+- `offset=-1`: start from the beginning of the stream. After a retention advance has trimmed the beginning, it answers `410 Gone` like any trimmed offset; continue from that response's `Stream-Next-Offset`, which is the earliest offset still readable.
 - `offset=now`: start from the stream's current tail. Useful for "only new data" subscriptions.
 
 ## Response headers

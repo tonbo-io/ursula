@@ -17,8 +17,8 @@ The server records an exact receipt for every accepted sequence in the current e
 
 - **Delayed duplicate** (same epoch and any seq already accepted): silently deduplicated. The response carries that sequence's original byte and record ranges, even when newer sequences have committed, as long as its receipt is in the window. The newest sequence always gets its ranges. An older duplicate whose receipt left the window is still deduplicated (never written twice) and answered `204` with `Producer-Seq` but without range headers.
 - **Next in sequence** (`seq = last_seq + 1`): accepted.
-- **Out of order** (seq skips ahead or goes backward): rejected with `409 producer_seq_conflict`. The response body includes the `expected_seq` the server wanted.
-- **Epoch regression** (new epoch less than last accepted): rejected with `409`.
+- **Out of order** (seq skips ahead or goes backward): rejected with `409`. The response carries `Producer-Expected-Seq`, the sequence the server wanted, and `Producer-Received-Seq`.
+- **Epoch regression** (epoch less than the last accepted one): rejected with `403 Forbidden`. The response's `Producer-Epoch` is the current epoch. A producer that gets `403` has been replaced by a newer instance and should stop writing.
 
 ## Restart and epoch hygiene
 
@@ -36,5 +36,5 @@ For append-only workloads where each write is independent (event logging, audit 
 
 ## Related
 
-- [Conditional writes](/docs/concepts/conditional-writes): coordinate multiple writers, different problem
+- [Conditional writes](/docs/concepts/conditional-writes): coordinate multiple writers with `Stream-Seq`, and combine it with producer headers to publish committed facts
 - [API: append](/docs/api/append)
