@@ -252,16 +252,12 @@ fn sealing_respects_the_per_call_budget() {
 }
 
 #[test]
-fn appends_after_sealing_keep_exact_offsets_and_rollback_only_dense() {
+fn appends_after_sealing_keep_exact_offsets() {
     let (mut index, _) = build(&[10, 10]);
     index.seal_below(20, 20, u64::MAX);
-    let checkpoint = index.append_checkpoint();
-    assert_eq!(checkpoint, 2);
     index.append_relative_ends(20, 10, &[5, 10]).unwrap();
     assert_eq!(index.offset_for(3, 30), Ok(RecordOffset::Exact(25)));
-    index.rollback_appends(checkpoint);
-    assert_eq!(index.range().unwrap().next_record, 2);
-    assert_eq!(index.marks().len(), 1);
+    assert_eq!(index.range().unwrap().next_record, 4);
     // An append must start beyond the last anchor.
     assert_eq!(
         index.prepare_append(0, 10, &[10]).map(|p| p.range()),

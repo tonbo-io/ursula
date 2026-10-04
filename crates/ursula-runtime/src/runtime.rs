@@ -67,8 +67,6 @@ use crate::request::AdvanceRetentionResponse;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
 use crate::request::AppendResponse;
-use crate::request::AppendTransactionRequest;
-use crate::request::AppendTransactionResponse;
 use crate::request::BootstrapStreamRequest;
 use crate::request::BootstrapStreamResponse;
 use crate::request::CloseStreamRequest;
@@ -1397,8 +1395,7 @@ impl ShardRuntime {
     /// Reclaims the cold objects of one removed stream incarnation (F14a,
     /// F14g). The sweep deletes only object names Ursula writes for that
     /// stream, one directory level at a time, so it never reaches another
-    /// stream's namespace, such as an affinity stream under a two-segment
-    /// stream's name. It never deletes objects of the generation a live
+    /// stream's namespace. It never deletes objects of the generation a live
     /// stream of the same name uses, and checks that again before deleting
     /// pages, which are the last objects removed.
     ///
@@ -1840,65 +1837,6 @@ impl ShardRuntime {
         self.metrics
             .record_routed_request(mailbox.core_id, elapsed_ns(started_at));
         Ok(())
-    }
-
-    /// Atomically appends to affinity-grouped streams in one Raft group.
-    ///
-    /// This operation deliberately rejects ungrouped or differently grouped
-    /// streams: the runtime has no cross-group transaction coordinator.
-    pub async fn append_transaction(
-        &self,
-        request: AppendTransactionRequest,
-    ) -> Result<AppendTransactionResponse, RuntimeError> {
-        const MAX_OPERATIONS: usize = 64;
-        let Some(first) = request.operations.first() else {
-            return Err(RuntimeError::InvalidAppendTransaction {
-                message: "at least one append operation is required".to_owned(),
-            });
-        };
-        if request.operations.len() > MAX_OPERATIONS {
-            return Err(RuntimeError::InvalidAppendTransaction {
-                message: format!("at most {MAX_OPERATIONS} append operations are allowed"),
-            });
-        }
-        if request
-            .operations
-            .iter()
-            .any(|operation| operation.payload.is_empty())
-        {
-            return Err(RuntimeError::InvalidAppendTransaction {
-                message: "every append operation must have a non-empty payload".to_owned(),
-            });
-        }
-        let Some(affinity_key) = first.stream_id.affinity_key.as_deref() else {
-            return Err(RuntimeError::InvalidAppendTransaction {
-                message: "all streams must use an affinity path".to_owned(),
-            });
-        };
-        let placement = self.shard_map.locate(&first.stream_id);
-        for operation in &request.operations {
-            if operation.stream_id.bucket_id != first.stream_id.bucket_id
-                || operation.stream_id.affinity_key.as_deref() != Some(affinity_key)
-                || self.shard_map.locate(&operation.stream_id) != placement
-            {
-                return Err(RuntimeError::InvalidAppendTransaction {
-                    message: "all streams must share one bucket and affinity key".to_owned(),
-                });
-            }
-        }
-        let incoming_bytes = request.payload_bytes();
-        let (response_tx, response_rx) = oneshot::channel();
-        self.group_rpc(
-            placement,
-            Some(incoming_bytes),
-            GroupCommand::AppendTransaction {
-                request,
-                response_tx,
-                raft_uncommitted: None,
-            },
-            response_rx,
-        )
-        .await
     }
 
     pub fn metrics(&self) -> RuntimeMetrics {

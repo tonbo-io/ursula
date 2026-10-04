@@ -428,40 +428,6 @@ fn retention_prunes_append_starts_below_the_new_seal_point() {
 }
 
 #[test]
-fn failed_transaction_rolls_back_append_starts() {
-    let mut machine = machine_at(LB4);
-    let id = BucketStreamId::with_affinity(BUCKET, "aff", "tx");
-    let response = machine.apply(StreamCommand::CreateStream {
-        stream_id: id.clone(),
-        content_type: OCTET.to_owned(),
-        initial_payload: bytes::Bytes::from_static(b"x"),
-        close_after: false,
-        stream_seq: None,
-        producer: None,
-        stream_ttl_seconds: None,
-        stream_expires_at_ms: None,
-        now_ms: 0,
-    });
-    assert!(matches!(response, StreamResponse::Created { .. }));
-    let before = machine.snapshot();
-    let command = |stream_id: &BucketStreamId, payload: &'static [u8]| StreamCommand::Append {
-        stream_id: stream_id.clone(),
-        content_type: Some(OCTET.to_owned()),
-        payload: bytes::Bytes::from_static(payload),
-        close_after: false,
-        stream_seq: Some("1".to_owned()),
-        producer: None,
-        now_ms: 0,
-        record_match: None,
-    };
-    // The second append fails on its stream sequence, after the first one
-    // already pushed its start.
-    let result = machine.append_transaction(vec![command(&id, b"yy"), command(&id, b"zz")]);
-    assert!(result.is_err(), "{result:?}");
-    assert_eq!(machine.snapshot(), before);
-}
-
-#[test]
 fn legacy_records_convert_on_tidy_and_bootstrap_stays_exact() {
     for content_type in [OCTET, JSON] {
         let mut machine = machine_at(crate::feature::FEATURE_LEVEL_EXTERNAL_LOCATORS);

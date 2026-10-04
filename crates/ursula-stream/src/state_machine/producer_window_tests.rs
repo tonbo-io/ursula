@@ -229,61 +229,6 @@ fn duplicate_beyond_window_is_deduplicated_without_ranges_and_never_appends() {
 }
 
 #[test]
-fn failed_transaction_evicts_nothing_from_any_producer() {
-    let mut machine = machine_at(1);
-    let a = BucketStreamId::with_affinity(BUCKET, "h", "a");
-    let b = BucketStreamId::with_affinity(BUCKET, "h", "b");
-    for stream_id in [&a, &b] {
-        assert!(matches!(
-            machine.apply(StreamCommand::CreateStream {
-                stream_id: stream_id.clone(),
-                content_type: OCTET.to_owned(),
-                initial_payload: Bytes::new(),
-                close_after: false,
-                stream_seq: None,
-                producer: None,
-                stream_ttl_seconds: None,
-                stream_expires_at_ms: None,
-                now_ms: 0,
-            }),
-            StreamResponse::Created { .. }
-        ));
-    }
-    for seq in 0..R {
-        appended(append(&mut machine, &a, "p", seq, 1));
-    }
-    let before = producer_snapshot(&machine);
-    let ok = StreamCommand::Append {
-        stream_id: a.clone(),
-        content_type: Some(OCTET.to_owned()),
-        payload: Bytes::from_static(b"x"),
-        close_after: false,
-        stream_seq: None,
-        producer: Some(producer("p", R)),
-        now_ms: 2,
-        record_match: None,
-    };
-    let bad = StreamCommand::Append {
-        stream_id: b.clone(),
-        content_type: Some("text/plain".to_owned()),
-        payload: Bytes::from_static(b"x"),
-        close_after: false,
-        stream_seq: None,
-        producer: None,
-        now_ms: 2,
-        record_match: None,
-    };
-    assert!(machine.append_transaction(vec![ok.clone(), bad]).is_err());
-    assert_eq!(producer_snapshot(&machine), before);
-    assert_eq!(window_items(&machine, &a), R);
-
-    // The same append committed alone evicts exactly one receipt.
-    assert!(machine.append_transaction(vec![ok]).is_ok());
-    assert_eq!(receipts(&machine, &a, "p").first().copied(), Some(1));
-    assert_eq!(window_items(&machine, &a), R);
-}
-
-#[test]
 fn idle_producer_expires_at_its_own_next_write() {
     let mut machine = machine_at(1);
     let stream_id = create(&mut machine, "idle", OCTET);

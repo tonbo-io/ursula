@@ -523,115 +523,6 @@ async fn create_append_read_and_head_match_perf_compare_subset() {
 }
 
 #[tokio::test]
-async fn path_affinity_keeps_sibling_streams_independent_and_advertises_extension() {
-    let app = test_router();
-
-    for (stream, payload) in [("journal", "event"), ("queue", "message")] {
-        let response = http_put(
-            &app,
-            &format!("/benchcmp/run-42/{stream}"),
-            &[(CONTENT_TYPE.as_str(), "text/plain")],
-            Body::from(payload),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::CREATED);
-        assert_eq!(
-            header_str(&response, HEADER_STREAM_EXTENSIONS),
-            PATH_AFFINITY_EXTENSION
-        );
-    }
-
-    let response = http_get(&app, "/benchcmp/run-42/journal").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        header_str(&response, HEADER_STREAM_EXTENSIONS),
-        PATH_AFFINITY_EXTENSION
-    );
-    assert_eq!(&body_bytes(response).await[..], b"event");
-
-    let response = http_get(&app, "/benchcmp/run-42/queue").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(&body_bytes(response).await[..], b"message");
-
-    let response = http_head(&app, "/benchcmp/ungrouped").await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    assert!(response.headers().get(HEADER_STREAM_EXTENSIONS).is_none());
-}
-
-#[tokio::test]
-async fn group_append_transaction_is_atomic_over_http() {
-    let app = test_router();
-    for stream in ["journal", "queue"] {
-        let response = http_put(
-            &app,
-            &format!("/benchcmp/run-42/{stream}"),
-            &[(CONTENT_TYPE.as_str(), "application/json")],
-            Body::empty(),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::CREATED);
-    }
-
-    let committed = json!({
-        "operations": [
-            {
-                "stream": "journal",
-                "content_type": "application/json",
-                "payload_base64": "eyJldmVudCI6MX0K",
-                "record_match": 0
-            },
-            {
-                "stream": "queue",
-                "content_type": "application/json",
-                "payload_base64": "eyJldmVudCI6Mn0K",
-                "record_match": 0
-            }
-        ]
-    });
-    let response = http_post(
-        &app,
-        "/benchcmp/run-42/$transaction",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(serde_json::to_vec(&committed).expect("serialize transaction")),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let extensions = header_str(&response, HEADER_STREAM_EXTENSIONS);
-    assert!(extensions.contains(PATH_AFFINITY_EXTENSION));
-    assert!(extensions.contains(GROUP_APPEND_TRANSACTION_EXTENSION));
-
-    let rejected = json!({
-        "operations": [
-            {
-                "stream": "journal",
-                "content_type": "application/json",
-                "payload_base64": "eyJldmVudCI6M30K",
-                "record_match": 1
-            },
-            {
-                "stream": "queue",
-                "content_type": "application/json",
-                "payload_base64": "eyJldmVudCI6NH0K",
-                "record_match": 99
-            }
-        ]
-    });
-    let response = http_post(
-        &app,
-        "/benchcmp/run-42/$transaction",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(serde_json::to_vec(&rejected).expect("serialize transaction")),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
-
-    let journal = body_bytes(http_get(&app, "/benchcmp/run-42/journal").await).await;
-    let queue = body_bytes(http_get(&app, "/benchcmp/run-42/queue").await).await;
-    assert_eq!(&journal[..], b"{\"event\":1}\n");
-    assert_eq!(&queue[..], b"{\"event\":2}\n");
-}
-
-#[tokio::test]
 async fn close_only_post_sets_closed_state_and_rejects_later_append() {
     let app = test_router();
 
@@ -2779,11 +2670,11 @@ async fn static_grpc_follower_serves_replicated_catch_up_read_without_leader_pro
         .timeout(Duration::from_secs(5))
         .build()
         .expect("build reqwest client");
-    let stream = BucketStreamId::with_affinity("benchcmp", "run-42", "follower-local-read");
+    let stream = BucketStreamId::new("benchcmp", "follower-local-read");
     let leader_base = peers[0].1.as_str();
     let follower_base = peers[1].1.as_str();
     let create = http_client
-        .put(format!("{leader_base}/benchcmp/run-42/follower-local-read"))
+        .put(format!("{leader_base}/benchcmp/follower-local-read"))
         .header(CONTENT_TYPE, "text/plain")
         .body("read-without-leader")
         .send()
@@ -2803,7 +2694,7 @@ async fn static_grpc_follower_serves_replicated_catch_up_read_without_leader_pro
 
     let leader_read = http_client
         .get(format!(
-            "{follower_base}/benchcmp/run-42/follower-local-read?consistency=leader"
+            "{follower_base}/benchcmp/follower-local-read?consistency=leader"
         ))
         .send()
         .await
@@ -2829,9 +2720,7 @@ async fn static_grpc_follower_serves_replicated_catch_up_read_without_leader_pro
     leader.shutdown().await;
 
     let read = http_client
-        .get(format!(
-            "{follower_base}/benchcmp/run-42/follower-local-read"
-        ))
+        .get(format!("{follower_base}/benchcmp/follower-local-read"))
         .send()
         .await
         .expect("send follower local read after leader proxy is unavailable");
@@ -7271,47 +7160,6 @@ fn feature_not_enabled_maps_to_conflict() {
     );
 }
 
-fn transaction_op(stream: &str, content_type: &str, payload: &str) -> serde_json::Value {
-    json!({
-        "stream": stream,
-        "content_type": content_type,
-        "payload_base64": BASE64_STANDARD.encode(payload),
-    })
-}
-
-async fn post_transaction(app: &Router, uri: &str, operations: Vec<serde_json::Value>) -> Response {
-    http_post(
-        app,
-        uri,
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(json!({ "operations": operations }).to_string()),
-    )
-    .await
-}
-
-#[tokio::test]
-async fn transaction_op_content_types_are_normalized() {
-    // U10 regression: `$transaction` compared op content types verbatim, so
-    // a differently-cased type that the Content-Type header would accept was
-    // a 409.
-    let app = test_router();
-    let response = http_put(
-        &app,
-        "/benchcmp/txn-norm/journal",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let response = post_transaction(&app, "/benchcmp/txn-norm/$transaction", vec![
-        transaction_op("journal", " Application/JSON ", r#"{"a":1}"#),
-    ])
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_bytes(http_get(&app, "/benchcmp/txn-norm/journal").await).await;
-    assert_eq!(&body[..], b"{\"a\":1}\n");
-}
-
 // --- P7: byte-bounded record-aware reads (extensions.md §6.6) ---
 
 /// Record sizes in stored bytes, LF included: 8, 8, 49, 8.
@@ -7693,44 +7541,6 @@ async fn producer_id_and_stream_seq_length_caps_reject_with_400() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-    // `$transaction` JSON.
-    let response = http_put(
-        &app,
-        "/benchcmp/run-caps/journal",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-    for operation in [
-        json!({
-            "stream": "journal",
-            "content_type": "application/json",
-            "payload_base64": "eyJldmVudCI6MX0K",
-            "stream_seq": over_cap,
-        }),
-        json!({
-            "stream": "journal",
-            "content_type": "application/json",
-            "payload_base64": "eyJldmVudCI6MX0K",
-            "producer": {"producer_id": over_cap, "producer_epoch": 0, "producer_seq": 0},
-        }),
-    ] {
-        let response = http_post(
-            &app,
-            "/benchcmp/run-caps/$transaction",
-            &[(CONTENT_TYPE.as_str(), "application/json")],
-            Body::from(
-                serde_json::to_vec(&json!({"operations": [operation]}))
-                    .expect("serialize transaction"),
-            ),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-    let journal = body_bytes(http_get(&app, "/benchcmp/run-caps/journal").await).await;
-    assert!(journal.is_empty());
 }
 
 /// bounded-stream-state F3 at feature level 1: a duplicate whose receipt

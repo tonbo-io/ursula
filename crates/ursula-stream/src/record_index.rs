@@ -379,20 +379,6 @@ impl StreamRecordIndex {
         prepared.range
     }
 
-    /// Transaction checkpoint: the record tail before the transaction.
-    pub(crate) fn append_checkpoint(&self) -> u64 {
-        self.dense_first_record
-            .saturating_add(u64::try_from(self.dense_offsets.len()).unwrap_or(u64::MAX))
-    }
-
-    /// Drops dense records appended since `checkpoint`. Sealing never runs
-    /// inside a transaction (RC-18), so only the dense part changes.
-    pub(crate) fn rollback_appends(&mut self, checkpoint: u64) {
-        let keep = checkpoint.saturating_sub(self.dense_first_record);
-        let keep = usize::try_from(keep).unwrap_or(usize::MAX);
-        self.dense_offsets.truncate(keep);
-    }
-
     /// Index of the last mark whose record is at or below `record`.
     fn mark_index_le_record(&self, record: u64) -> Option<usize> {
         self.marks

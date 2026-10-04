@@ -15,8 +15,6 @@
 //!
 //! [`StreamCommand::OffloadColdRefs`]: crate::StreamCommand::OffloadColdRefs
 
-use std::cmp::Ordering;
-
 use ursula_shard::BucketStreamId;
 
 use super::ObjectPayloadRef;
@@ -42,19 +40,6 @@ pub struct StagedExternalRefCandidate {
     pub cold_generation: u64,
     /// The stream's state-held external refs, in offset order.
     pub refs: Vec<ObjectPayloadRef>,
-}
-
-fn stream_order(left: &BucketStreamId, right: &BucketStreamId) -> Ordering {
-    (
-        left.bucket_id.as_str(),
-        left.affinity_key.as_deref(),
-        left.stream_id.as_str(),
-    )
-        .cmp(&(
-            right.bucket_id.as_str(),
-            right.affinity_key.as_deref(),
-            right.stream_id.as_str(),
-        ))
 }
 
 impl StreamStateMachine {
@@ -99,7 +84,7 @@ impl StreamStateMachine {
                 .refs
                 .len()
                 .cmp(&left.refs.len())
-                .then_with(|| stream_order(&left.stream_id, &right.stream_id))
+                .then_with(|| super::compare_stream_ids(&left.stream_id, &right.stream_id))
         });
         candidates.truncate(limit);
         candidates

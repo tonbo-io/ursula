@@ -3,8 +3,8 @@
 //! Module map:
 //!
 //! - [`content_type`]: content-type normalization, used by the node.
-//! - crate root: shard and Raft group identifiers, [`BucketStreamId`],
-//!   reserved affinity stream IDs and the static shard map.
+//! - crate root: shard and Raft group identifiers, [`BucketStreamId`], the
+//!   reserved subresource names and the static shard map.
 
 use std::fmt;
 
@@ -24,30 +24,31 @@ pub struct ShardId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct RaftGroupId(pub u32);
 
-/// Returns whether a local stream ID collides with a two-segment stream
-/// subresource when used in the three-segment path-affinity form. Node and
-/// gateway routing and replicated apply share this list; changing it changes
-/// replicated apply.
-pub fn is_reserved_affinity_stream_id(stream_id: &str) -> bool {
-    matches!(
-        stream_id,
-        "$transaction" | "append-batch" | "attrs" | "bootstrap" | "retention" | "snapshot"
-    )
-}
+/// Path segments reserved for any future co-location form and stream
+/// subresource. Ursula serves `/{bucket}/{stream}` and the two-segment
+/// subresources below it; it accepts no three-segment stream paths. A future
+/// grouping form or subresource takes its name from this list, so no stream
+/// created today can collide with it. Stream IDs also never contain `/` and
+/// never start with `$`.
+pub const RESERVED_SUBRESOURCE_NAMES: [&str; 6] = [
+    "$transaction",
+    "append-batch",
+    "attrs",
+    "bootstrap",
+    "retention",
+    "snapshot",
+];
 
-/// Stable resource identity with optional path affinity.
+/// Stable resource identity.
 ///
 /// `bucket_id` is the top-level namespace and logical tenant boundary;
-/// `stream_id` identifies one Durable Stream inside that namespace. When
-/// `affinity_key` is present, every stream with the same bucket and affinity
-/// hashes to the same Raft group. Hosted deployments keep tenant membership and
-/// bucket visibility policy outside the replicated stream state.
+/// `stream_id` identifies one Durable Stream inside that namespace. Hosted
+/// deployments keep tenant membership and bucket visibility policy outside
+/// the replicated stream state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BucketStreamId {
     pub bucket_id: String,
     pub stream_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub affinity_key: Option<String>,
 }
 
 impl BucketStreamId {
@@ -55,19 +56,6 @@ impl BucketStreamId {
         Self {
             bucket_id: bucket_id.into(),
             stream_id: stream_id.into(),
-            affinity_key: None,
-        }
-    }
-
-    pub fn with_affinity(
-        bucket_id: impl Into<String>,
-        affinity_key: impl Into<String>,
-        stream_id: impl Into<String>,
-    ) -> Self {
-        Self {
-            bucket_id: bucket_id.into(),
-            stream_id: stream_id.into(),
-            affinity_key: Some(affinity_key.into()),
         }
     }
 }
@@ -77,7 +65,6 @@ impl From<BucketStreamId> for ursula_proto::BucketStreamIdV1 {
         Self {
             bucket_id: stream_id.bucket_id,
             stream_id: stream_id.stream_id,
-            affinity_key: stream_id.affinity_key,
         }
     }
 }
@@ -87,7 +74,6 @@ impl From<&BucketStreamId> for ursula_proto::BucketStreamIdV1 {
         Self {
             bucket_id: stream_id.bucket_id.clone(),
             stream_id: stream_id.stream_id.clone(),
-            affinity_key: stream_id.affinity_key.clone(),
         }
     }
 }
@@ -97,18 +83,13 @@ impl From<ursula_proto::BucketStreamIdV1> for BucketStreamId {
         Self {
             bucket_id: stream_id.bucket_id,
             stream_id: stream_id.stream_id,
-            affinity_key: stream_id.affinity_key,
         }
     }
 }
 
 impl fmt::Display for BucketStreamId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(affinity_key) = &self.affinity_key {
-            write!(f, "{}/{affinity_key}/{}", self.bucket_id, self.stream_id)
-        } else {
-            write!(f, "{}/{}", self.bucket_id, self.stream_id)
-        }
+        write!(f, "{}/{}", self.bucket_id, self.stream_id)
     }
 }
 
@@ -186,11 +167,7 @@ fn fnv1a64_routing_key(stream_id: &BucketStreamId) -> u64 {
     }
     hash ^= u64::from(b'/');
     hash = hash.wrapping_mul(PRIME);
-    let local_routing_key = stream_id
-        .affinity_key
-        .as_deref()
-        .unwrap_or(&stream_id.stream_id);
-    for byte in local_routing_key.as_bytes() {
+    for byte in stream_id.stream_id.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(PRIME);
     }
@@ -222,36 +199,12 @@ mod tests {
 
     #[test]
     fn bucket_stream_id_round_trips_through_shared_proto() {
-        let stream = BucketStreamId::with_affinity("agents", "run-42", "queue");
+        let stream = BucketStreamId::new("agents", "queue");
         let proto = ursula_proto::BucketStreamIdV1::from(&stream);
 
         assert_eq!(proto.bucket_id, "agents");
-        assert_eq!(proto.affinity_key.as_deref(), Some("run-42"));
         assert_eq!(proto.stream_id, "queue");
         assert_eq!(BucketStreamId::from(proto), stream);
-    }
-
-    #[test]
-    fn affinity_routes_sibling_streams_to_the_same_group() {
-        let map = StaticShardMap::new(4, 64).expect("valid shard map");
-        let journal = BucketStreamId::with_affinity("agents", "run-42", "journal");
-        let queue = BucketStreamId::with_affinity("agents", "run-42", "queue");
-
-        assert_ne!(journal, queue);
-        assert_eq!(map.locate(&journal), map.locate(&queue));
-    }
-
-    #[test]
-    fn streams_without_affinity_remain_independently_distributed() {
-        let map = StaticShardMap::new(4, 64).expect("valid shard map");
-        let first = BucketStreamId::new("agents", "run-42-journal");
-        let first_placement = map.locate(&first);
-        let second = (0..10_000)
-            .map(|index| BucketStreamId::new("agents", format!("stream-{index}")))
-            .find(|stream| map.locate(stream) != first_placement)
-            .expect("independent streams reach another placement");
-
-        assert_ne!(map.locate(&first), map.locate(&second));
     }
 
     #[test]

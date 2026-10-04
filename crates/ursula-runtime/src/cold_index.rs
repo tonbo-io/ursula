@@ -141,13 +141,8 @@ fn clip_page_for_proven_chunk(page: &mut ColdIndexPage, chunk: &ColdChunkRef) ->
 fn encode_page(key: &ColdIndexPageKey, page: &ColdIndexPage) -> Vec<u8> {
     let mut body = Vec::new();
     put_string(&mut body, &key.stream_id.bucket_id);
-    match &key.stream_id.affinity_key {
-        Some(affinity_key) => {
-            put_u8(&mut body, 1);
-            put_string(&mut body, affinity_key);
-        }
-        None => put_u8(&mut body, 0),
-    }
+    // Version-2 affinity marker: always 0, since grouped streams are gone.
+    put_u8(&mut body, 0);
     put_string(&mut body, &key.stream_id.stream_id);
     put_u64(&mut body, key.generation);
     put_u64(&mut body, key.page_id);
@@ -224,25 +219,18 @@ fn decode_page(key: &ColdIndexPageKey, bytes: &[u8]) -> io::Result<ColdIndexPage
 
     let mut body = Cursor::new(body);
     let bucket_id = body.read_string()?;
-    let affinity_key = if version >= 2 {
-        match body.read_u8()? {
-            0 => None,
-            1 => Some(body.read_string()?),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "cold index page has invalid affinity marker",
-                ));
-            }
-        }
-    } else {
-        None
-    };
+    // Version 2 carries an affinity marker; marker 1 (a grouped stream) is
+    // no longer valid.
+    if version >= 2 && body.read_u8()? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cold index page has invalid affinity marker",
+        ));
+    }
     let stream_id = body.read_string()?;
     let generation = body.read_u64()?;
     let page_id = body.read_u64()?;
     if bucket_id != key.stream_id.bucket_id
-        || affinity_key != key.stream_id.affinity_key
         || stream_id != key.stream_id.stream_id
         || generation != key.generation
         || page_id != key.page_id
@@ -816,7 +804,6 @@ fn approximate_page_bytes(key: &ColdIndexPageKey, page: &ColdIndexPage) -> usize
         .saturating_add(std::mem::size_of::<ColdIndexPageKey>())
         .saturating_add(key.stream_id.bucket_id.len())
         .saturating_add(key.stream_id.stream_id.len())
-        .saturating_add(key.stream_id.affinity_key.as_ref().map_or(0, String::len))
         .saturating_add(chunks)
         .saturating_add(externals)
 }
@@ -2064,31 +2051,28 @@ mod tests {
     }
 
     #[test]
-    fn affinity_is_part_of_the_page_path_and_binary_identity() {
-        let key = ColdIndexPageKey {
-            stream_id: BucketStreamId::with_affinity("benchcmp", "run-42", "journal"),
-            generation: 7,
-            page_id: 42,
-        };
-        assert_eq!(
-            key.path(),
-            "benchcmp/run-42/journal/cold-index/00000000000000000007/00000000000000000042.idx"
-        );
+    fn page_carrying_affinity_marker_one_is_refused() {
+        let key = key(42);
+        let mut body = Vec::new();
+        put_string(&mut body, &key.stream_id.bucket_id);
+        put_u8(&mut body, 1);
+        put_string(&mut body, "run-42");
+        put_string(&mut body, &key.stream_id.stream_id);
+        put_u64(&mut body, key.generation);
+        put_u64(&mut body, key.page_id);
+        put_u64(&mut body, 0);
+        put_u64(&mut body, 10);
+        put_u32(&mut body, 0);
+        put_u32(&mut body, 0);
+        let mut bytes = COLD_INDEX_PAGE_MAGIC.to_vec();
+        put_u16(&mut bytes, COLD_INDEX_PAGE_VERSION);
+        put_u32(&mut bytes, u32::try_from(body.len()).expect("body len"));
+        bytes.extend_from_slice(&body);
+        put_u64(&mut bytes, checksum64(&body));
 
-        let page = page(0, 10);
-        let bytes = encode_page(&key, &page);
-        assert_eq!(decode_page(&key, &bytes).expect("decode page"), page);
-
-        let wrong_key = ColdIndexPageKey {
-            stream_id: BucketStreamId::with_affinity("benchcmp", "run-43", "journal"),
-            ..key
-        };
-        assert_eq!(
-            decode_page(&wrong_key, &bytes)
-                .expect_err("affinity mismatch")
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
+        let err = decode_page(&key, &bytes).expect_err("marker 1 is refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("affinity marker"), "{err}");
     }
 
     #[tokio::test]

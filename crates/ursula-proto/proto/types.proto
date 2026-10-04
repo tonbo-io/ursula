@@ -5,7 +5,9 @@ package ursula.durable.v1;
 message BucketStreamIdV1 {
   string bucket_id = 1;
   string stream_id = 2;
-  optional string affinity_key = 3;
+  // Field 3 was the removed affinity key.
+  reserved 3;
+  reserved "affinity_key";
 }
 
 message ProducerRequestV1 {

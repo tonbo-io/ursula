@@ -132,15 +132,6 @@ pub struct ColdFlushPass {
     pub stats: ColdFlushPlanStats,
 }
 
-/// Planner-local total order: bucket, affinity, stream. `compare_stream_ids`
-/// stays as it is because it also orders TTL expiry and snapshots.
-fn planner_order(left: &BucketStreamId, right: &BucketStreamId) -> Ordering {
-    left.bucket_id
-        .cmp(&right.bucket_id)
-        .then_with(|| left.affinity_key.cmp(&right.affinity_key))
-        .then_with(|| left.stream_id.cmp(&right.stream_id))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PassMode {
     /// Stop once the group's unplanned hot bytes fall below half of
@@ -152,18 +143,20 @@ enum PassMode {
     AgedOnly,
 }
 
-/// Equal-size tie order: streams after the cursor first, then planner order.
+/// Equal-size tie order: streams after the cursor first, then
+/// `compare_stream_ids` order.
 fn rotated_order(
     left: &BucketStreamId,
     right: &BucketStreamId,
     cursor: Option<&BucketStreamId>,
 ) -> Ordering {
     let wrapped = |stream_id: &BucketStreamId| {
-        cursor.is_some_and(|cursor| planner_order(stream_id, cursor) != Ordering::Greater)
+        cursor
+            .is_some_and(|cursor| super::compare_stream_ids(stream_id, cursor) != Ordering::Greater)
     };
     wrapped(left)
         .cmp(&wrapped(right))
-        .then_with(|| planner_order(left, right))
+        .then_with(|| super::compare_stream_ids(left, right))
 }
 
 impl StreamStateMachine {
