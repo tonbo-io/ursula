@@ -57,12 +57,14 @@ appended with the idempotent producer (`Producer-Id` per database, `Producer-Epo
 `ursula_attach`:
 
 1. Takes the host lock; refuses if a connection to the file is open in this process.
-2. Reads the sidecar, before anything opens the file through SQLite. A file with content and no
-   sidecar was never attached and is refused (it may be a database whose pages were never in the
-   stream). A sidecar for another stream path is refused. The local files are trusted when the
-   sidecar was written in this boot for this db file and the local WAL holds what the sidecar
-   claims of it (§6); anything else (another or unknown boot id, an older version's sidecar, a
-   torn one, a replaced db file, a WAL behind its sidecar) means the local files are discarded
+2. `HEAD`s the stream for its `Stream-Incarnation` (an opaque token that changes when the stream
+   is deleted and recreated at the same path), then reads the sidecar, before anything opens the
+   file through SQLite. A file with content and no sidecar was never attached and is refused (it
+   may be a database whose pages were never in the stream). A sidecar for another stream path is
+   refused. The local files are trusted when the sidecar was written in this boot, from this
+   incarnation of the stream, for this db file, and the local WAL holds what the sidecar claims of
+   it (§6); anything else (another or unknown boot id or incarnation, an older version's sidecar,
+   a torn one, a replaced db file, a WAL behind its sidecar) means the local files are discarded
    (§6) and the attach proceeds as on a fresh host, unless a read at the sidecar's offset shows
    the stream lost acknowledged data (§6, wrong stream).
 3. Recovery (only when it rewrites pages) never opens the local files through SQLite before
@@ -77,7 +79,9 @@ appended with the idempotent producer (`Producer-Id` per database, `Producer-Epo
    (a discard truncates it, §6; a snapshot is written over it, §4.3), so a connection that opened
    the path meanwhile gets SQLITE_BUSY until the lock drops (a busy timeout retries) and then reads
    the rewritten file. Within the process,
-   opens of the main db through the VFS fail with `SQLITE_BUSY` while attach runs. Then attach
+   opens of the main db through the VFS fail with `SQLITE_BUSY` while attach runs, and the path
+   keeps its previous attachment until attach succeeds (see the end of this section for a
+   failure). Then attach
    folds the local WAL into the db file itself (the frames SQLite's recovery would read, up to the
    last commit, a later frame winning, the file cut to that commit's size), fsyncs it, rewrites the
    sidecar at the same offset with a `:0` claim, deletes `-wal`/`-shm`, and only then replays onto
@@ -93,8 +97,19 @@ appended with the idempotent producer (`Producer-Id` per database, `Producer-Epo
    alone proves nothing (two owners claiming the same epoch both get one, the second as a
    duplicate), so the claim counts only if the bytes at the answered offset are ours (the nonce
    makes them unique). Lost: epoch + 1. 403: the server's epoch + 1.
-6. Replays up to the claim; if attach wrote the db file, fsyncs it; writes the sidecar, and
-   attaches.
+6. Replays up to the claim and `HEAD`s the stream again: if its incarnation is no longer the one
+   step 2 trusted the files for (deleted and recreated meanwhile), attach starts over from step 2,
+   where the sidecar, still stamped with the old incarnation, discards whatever this round wrote.
+   Incarnations never repeat and `HEAD` is a leader read, so a match means every read and the claim
+   in between hit that incarnation. Then, if attach wrote the db file, fsyncs it; writes the
+   sidecar (with the incarnation), and swaps the path's binding to the new attachment.
+
+An attach that fails after step 1 leaves a path that was attached in this process unbound and
+*failed*: its files may hold anything between the old attachment's state and the stream's, and the
+old binding no longer owns the stream. `x_open` of its main db or WAL then fails with
+`SQLITE_CANTOPEN` (the reason is logged, and `ursula_status` names it) until an attach succeeds;
+passing it through to the plain `unix` VFS would let its commits bypass replication. A path never
+attached in this process keeps passing through after a failed attach (it is no replica yet).
 
 The new epoch fences every earlier owner at the server: their next append gets 403. Replay applies
 page images per read batch (last image per page, truncate to the batch's smallest size first), so
@@ -303,16 +318,22 @@ What attach does in each case:
   published (a body over the gateway's 32 MiB, a reader pinning WAL frames), a rebuild replays
   everything since the last published snapshot (the whole log if none was ever published):
   snapshot health is an availability dependency (watch the log since the latest snapshot).
-- **Wrong stream**: the sidecar names the stream's path; attaching the file to another stream is
-  refused, and so is attaching it to its stream after that was deleted and recreated shorter: a
-  read at the sidecar's offset (the replay start for trusted files, a check before discarding
-  otherwise) is beyond the stream's end. Both hold after a reboot too, and the local files are
-  kept. A stream recreated at the same path and already grown past the file's offset is not
-  detected.
+- **Wrong stream**: the sidecar names the stream's path and its incarnation; attaching the file
+  to another stream is refused. A stream deleted and recreated at the same path is another
+  incarnation, so the files are never trusted for it: if it is already longer than the
+  sidecar's offset they are discarded and rebuilt from it; if it is shorter, a read at the
+  sidecar's offset (a check before discarding) is beyond its end and attach refuses, keeping the
+  files (the stream lost acknowledged data; delete `<db>` to rebuild). Both hold after a reboot
+  too. A recreate during attach starts it over (§3). While attached, the owner never takes the
+  recreated stream: its next append finds its producer forgotten, and the re-claim checks the
+  incarnation before and after (fenced on a change); the snapshot thread checks it before
+  publishing (a recreate between that check and the `PUT` remains a window).
 - A rollback journal next to an attached file can only be left by a crash while attach switched
   an empty file to WAL; attach deletes it in every case (rolling it back would truncate the file
   under the pages attach writes next).
-- Network partition or slow server: commits block up to the retry budget, then poison.
+- Network partition or slow server: commits block up to the retry budget, then poison. An attach
+  that fails (server unreachable, refused, recreated twice over) leaves a previously attached path
+  refusing opens until an attach succeeds (§3), never open unreplicated.
 - Two owners: the later claim wins; the earlier one's next commit fails cleanly
   (`UrsulaReplicationError` with `fenced: true` through the Pi helper).
 - A snapshot that cannot be taken (a long reader pins WAL frames) or published (body too large):
@@ -354,9 +375,10 @@ rebuild, delete `<db>`.
 ## 8. Tests
 
 - Units (`cargo test`): frame and snapshot encodings (whole frames only, damage refused).
-- Units also cover the sidecar: trusted only in this boot for this db file and with its WAL claim
-  met (a claim on frames the WAL does not hold or on another WAL generation, or no claim, is
-  not); legacy, other-boot and torn sidecars are not, nothing is when the current boot id is
+- Units also cover the sidecar: trusted only in this boot, for this stream incarnation and db
+  file, and with its WAL claim met (a claim on frames the WAL does not hold or on another WAL
+  generation, or no claim, is not); legacy, other-boot, other-incarnation and torn sidecars are
+  not, nothing is when the current boot id is
   unknown, and a missing sidecar is an error; folding a WAL into the db file keeps the last image
   and cuts the file to the commit's size. CI runs them on macOS too (its boot id).
 - e2e against a real node (`clients/sqlite-ursula`): transparency (any schema, byte-identical
@@ -367,8 +389,10 @@ rebuild, delete `<db>`.
   snapshot and no replay from scratch, also for a file rebuilt from a snapshot; a same-boot disk
   image whose WAL is behind its sidecar is rebuilt and the stream stays intact, one whose WAL is
   ahead is trusted; discarding is refused while another process has the file open; a replaced db
-  file is rebuilt; a file without a sidecar, another stream and a recreated stream are refused, the
-  last also after a reboot), snapshots and retention (a ~160 MB run; CI also runs it without a cold
+  file is rebuilt; a file without a sidecar, another stream and a recreated shorter stream are
+  refused, the last also after a reboot; the cache of a deleted stream is rebuilt from the stream
+  recreated at its path and grown past it), a failed re-attach (the file refuses to open until
+  an attach succeeds, then commits replicate again), snapshots and retention (a ~160 MB run; CI also runs it without a cold
   tier under the default hot limit; fresh and lagging hosts rebuild byte-identical from snapshot +
   tail; the takeover after the trim fences the old owner), Pi conformance in three modes, and a
   benchmark (sanity numbers only).

@@ -7,6 +7,8 @@
 //!   process lifetime), catches the file up from the stream, claims the stream for this owner (a
 //!   new producer epoch, which fences every earlier owner), catches up to the claim and attaches the
 //!   file. It requires that no connection to the file is open. Returns the stream offset applied.
+//!   A failed attach leaves a file that was attached in this process refusing opens
+//!   (SQLITE_CANTOPEN) until an attach succeeds, so it is never written unreplicated.
 //! * Stream: `application/octet-stream`, one self-delimiting frame per append (see [`frame`]):
 //!   a commit carries the db size after it and the transaction's final page images; a claim carries
 //!   the owner's producer epoch. Appends use the idempotent producer (`Producer-Id` per db,
@@ -26,11 +28,11 @@
 //!   spilled frames never shadow a later one's.
 //! * Durability is the stream's acknowledgement alone: the local files (db, -wal, -shm, sidecar)
 //!   are a cache, not fsynced on the commit path (`xSync` of an attached database is a no-op,
-//!   whatever `PRAGMA synchronous` says). The sidecar records the kernel's boot id, the db file's
-//!   inode and what it needs of the local WAL (`WalClaim`); attach trusts the local files only when
-//!   all three check out (written since this boot, into this file, and the WAL still holds the
-//!   claimed frames) and otherwise discards them and rebuilds from the latest snapshot and the
-//!   tail. The db file alone is fsynced, rarely, so a crash-consistent image of the files (a disk
+//!   whatever `PRAGMA synchronous` says). The sidecar records the kernel's boot id, the stream's
+//!   incarnation, the db file's inode and what it needs of the local WAL (`WalClaim`); attach
+//!   trusts the local files only when all four check out (written since this boot, from this
+//!   incarnation of the stream, into this file, and the WAL still holds the claimed frames) and
+//!   otherwise discards them and rebuilds from the latest snapshot and the tail. The db file alone is fsynced, rarely, so a crash-consistent image of the files (a disk
 //!   snapshot) is either verifiably complete or rejected: before the WAL starts a new generation
 //!   or is truncated to nothing, and at attach before a sidecar that relies on it. Attach never
 //!   opens local files through SQLite before replaying onto them: it folds the WAL into the db
@@ -133,6 +135,9 @@ struct CommitStat {
 
 struct Db {
     url: String,
+    /// The stream's incarnation at attach (`Head::incarnation`): a re-claim or a snapshot checks
+    /// the stream is still it.
+    incarnation: Option<String>,
     sidecar: String,
     /// What the sidecar records besides offset, epoch and the WAL claim (see `stamp`).
     stamp: String,
@@ -325,13 +330,19 @@ struct Registry {
     dbs: HashMap<String, Arc<Mutex<Db>>>,
     /// Open main-db handles per path (attached or not): attach requires none.
     open: HashMap<String, usize>,
-    /// Paths being attached: `x_open` refuses their main db meanwhile (`Attaching`).
+    /// Paths being attached: `x_open` refuses their main db meanwhile. Each keeps its binding
+    /// in `dbs` (if any) until the attach ends.
     attaching: HashSet<String>,
+    /// Paths whose attach failed after they had been attached in this process, with the reason:
+    /// `x_open` refuses their main db and WAL until an attach succeeds (see `attach`).
+    failed: HashMap<String, String>,
     /// Host locks held for the process lifetime.
     locks: HashMap<String, fs::File>,
     /// Snapshot thread per attached database.
-    snappers: HashMap<String, (Arc<Snapper>, std::thread::JoinHandle<()>)>,
+    snappers: HashMap<String, SnapshotThread>,
 }
+
+type SnapshotThread = (Arc<Snapper>, std::thread::JoinHandle<()>);
 
 fn registry() -> MutexGuard<'static, Registry> {
     static R: OnceLock<Mutex<Registry>> = OnceLock::new();
@@ -342,6 +353,18 @@ fn registry() -> MutexGuard<'static, Registry> {
 
 fn lookup(path: &str) -> Option<Arc<Mutex<Db>>> {
     registry().dbs.get(path).cloned()
+}
+
+/// The attachment of `path`, for `ursula_status` and `ursula_stats`.
+fn attached(path: &str) -> Result<Arc<Mutex<Db>>, String> {
+    let reg = registry();
+    if let Some(db) = reg.dbs.get(path) {
+        return Ok(db.clone());
+    }
+    Err(match reg.failed.get(path) {
+        Some(why) => format!("{path} is not attached: its last attach failed ({why})"),
+        None => format!("{path} is not attached"),
+    })
 }
 
 fn lock(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
@@ -447,8 +470,9 @@ fn file_id(path: &str) -> Option<String> {
 }
 
 /// What a sidecar records besides offset, epoch and the WAL claim: the boot it was written in
-/// (`boot`, from `boot_id`), the stream, and the db file it describes (see `trusted`).
-fn stamp(path: &str, url: &str, boot: Option<&str>) -> String {
+/// (`boot`, from `boot_id`), the stream and its incarnation (`Head::incarnation`), and the db file
+/// it describes (see `trusted`).
+fn stamp(path: &str, url: &str, boot: Option<&str>, incarnation: Option<&str>) -> String {
     let mut s = format!(
         " boot={} stream={}",
         boot.unwrap_or("unknown"),
@@ -456,6 +480,9 @@ fn stamp(path: &str, url: &str, boot: Option<&str>) -> String {
     );
     if let Some(id) = file_id(path) {
         let _ = write!(s, " file={id}");
+    }
+    if let Some(i) = incarnation {
+        let _ = write!(s, " incarnation={i}");
     }
     s
 }
@@ -614,19 +641,23 @@ struct Sidecar {
     epoch: u64,
     boot: Option<String>,
     stream: Option<String>,
+    incarnation: Option<String>,
     file: Option<String>,
     wal: Option<WalClaim>,
 }
 
 impl Sidecar {
     /// The local files hold at least the state at the sidecar's offset: written since this boot,
-    /// into this db file (one replaced behind our back would get the old one's WAL applied to it),
-    /// and the local WAL still holds what the sidecar claims of it (a disk image restored without a
-    /// reboot keeps boot and inode but may have lost any unsynced write). A sidecar of an older
-    /// version (no boot, or no WAL claim) is not trusted, and nothing is when the current boot
-    /// (`boot`, from `boot_id`) is unknown.
-    fn trusted(&self, path: &str, boot: Option<&str>) -> bool {
+    /// from this incarnation of the stream (a stream deleted and recreated at the same path is
+    /// another one, whatever its length), into this db file (one replaced behind our back would get
+    /// the old one's WAL applied to it), and the local WAL still holds what the sidecar claims of
+    /// it (a disk image restored without a reboot keeps boot and inode but may have lost any
+    /// unsynced write). A sidecar of an older version (no boot, no incarnation, or no WAL claim)
+    /// is not trusted, and nothing is when the current boot (`boot`, from `boot_id`) or
+    /// incarnation is unknown.
+    fn trusted(&self, path: &str, boot: Option<&str>, incarnation: Option<&str>) -> bool {
         boot.is_some_and(|b| self.boot.as_deref() == Some(b))
+            && incarnation.is_some_and(|i| self.incarnation.as_deref() == Some(i))
             && self.file.is_some()
             && self.file == file_id(path)
             && self.wal.is_some_and(|w| w.covered(path))
@@ -651,6 +682,7 @@ fn read_sidecar(path: &str) -> Result<Option<Sidecar>, String> {
         epoch,
         boot: None,
         stream: None,
+        incarnation: None,
         file: None,
         wal: None,
     };
@@ -658,6 +690,7 @@ fn read_sidecar(path: &str) -> Result<Option<Sidecar>, String> {
         match token.split_once('=') {
             Some(("boot", v)) => s.boot = Some(v.to_owned()),
             Some(("stream", v)) => s.stream = Some(v.to_owned()),
+            Some(("incarnation", v)) => s.incarnation = Some(v.to_owned()),
             Some(("file", v)) => s.file = Some(v.to_owned()),
             Some(("wal", v)) => {
                 let claim = v.split_once(':').and_then(|(salts, frame)| {
@@ -910,9 +943,12 @@ fn create_stream(url: &str) -> Result<(), String> {
 }
 
 /// A failed stream operation: `Gone` when the data lies below the stream's retention (or a
-/// snapshot was superseded), which a re-attach answers by installing the latest snapshot.
+/// snapshot was superseded), which a re-attach answers by installing the latest snapshot;
+/// `Recreated` when the stream was deleted and recreated under an attach, which starts over from
+/// the trust decision.
 enum Fail {
     Gone(String),
+    Recreated(String),
     Other(String),
 }
 
@@ -926,7 +962,7 @@ impl From<Fail> for String {
     fn from(f: Fail) -> Self {
         match f {
             Fail::Gone(e) => format!("gone: {e}"),
-            Fail::Other(e) => e,
+            Fail::Recreated(e) | Fail::Other(e) => e,
         }
     }
 }
@@ -996,6 +1032,9 @@ fn bulk_agent() -> &'static ureq::Agent {
 struct Head {
     retained: u64,
     snapshot: Option<u64>,
+    /// `Stream-Incarnation`: opaque, changes when the stream is deleted and recreated; compared
+    /// for equality only. `None` when absent (or unusable in a sidecar): nothing local is trusted.
+    incarnation: Option<String>,
 }
 
 /// `stopped` ends the retries of a 429/503 early (see `read_retrying`).
@@ -1009,6 +1048,13 @@ fn head(url: &str, stopped: &dyn Fn() -> bool) -> Result<Head, String> {
     Ok(Head {
         retained: header_u64(&r, "stream-retained-offset").unwrap_or(0),
         snapshot: header_u64(&r, "stream-snapshot-offset"),
+        incarnation: r
+            .headers()
+            .get("stream-incarnation")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && !v.contains(char::is_whitespace))
+            .map(str::to_owned),
     })
 }
 
@@ -1490,9 +1536,20 @@ fn claim(url: &str, epoch: u64) -> Result<(u64, u64), String> {
 /// The server expired this owner's idle producer (7 days without a write) and forgot its epoch.
 /// Taking the stream back is safe only if nobody wrote since this owner's last frame: the stream
 /// must end at our offset, and our new claim (one epoch up, fencing any later owner's older
-/// epochs) must be ours (verified) and land exactly there. Otherwise another owner wrote or
-/// claimed, and this one is fenced.
+/// epochs) must be ours (verified) and land exactly there, in the incarnation this owner attached
+/// to (a stream deleted and recreated forgets its producers too). Otherwise another owner wrote or
+/// claimed, or the stream is another one, and this one is fenced.
 fn reclaim(db: &mut Db) -> Result<(), String> {
+    fn same(db: &mut Db) -> Result<(), String> {
+        match same_incarnation(&db.url, db.incarnation.as_deref(), &|| false) {
+            Err(Fail::Recreated(e)) => {
+                db.fenced = true;
+                Err(format!("fenced: {e}"))
+            }
+            r => r.map_err(String::from),
+        }
+    }
+    same(db)?;
     let (bytes, _) = read_from(&db.url, db.offset)?;
     if !bytes.is_empty() {
         db.fenced = true;
@@ -1504,6 +1561,7 @@ fn reclaim(db: &mut Db) -> Result<(), String> {
     let epoch = db.epoch + 1;
     match claim_once(&db.url, epoch)? {
         Claimed::Won { start, next } if start == db.offset => {
+            same(db)?;
             db.epoch = epoch;
             db.seq = 0;
             db.offset = next;
@@ -1542,12 +1600,40 @@ unsafe fn init_wal_format(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `Recreated` unless the stream is still the incarnation `expected`: state built from one
+/// incarnation must never reach another. `HEAD` is a leader read and incarnations never repeat, so
+/// a match also covers everything done on the stream since the last check that matched.
+fn same_incarnation(
+    url: &str,
+    expected: Option<&str>,
+    stopped: &dyn Fn() -> bool,
+) -> Result<(), Fail> {
+    let now = head(url, stopped)?.incarnation;
+    if now.as_deref() == expected {
+        return Ok(());
+    }
+    Err(Fail::Recreated(format!(
+        "{url} was deleted and recreated (incarnation {} is now {})",
+        expected.unwrap_or("unknown"),
+        now.as_deref().unwrap_or("unknown")
+    )))
+}
+
 /// Brings the db file from `pos` to the stream's tail and claims the stream: installs the latest
 /// snapshot when the file is behind it (or below the stream's retention), replays the frames after
-/// it, claims, and replays up to the claim. Returns the epoch claimed and the latest snapshot's
-/// offset (0 for none).
-unsafe fn sync(url: &str, pos: &mut u64, applier: &mut Applier) -> Result<(u64, u64), Fail> {
+/// it, claims, and replays up to the claim, all from the stream's `incarnation` (checked by the
+/// `HEAD` before and after). Returns the epoch claimed and the latest snapshot's offset (0 for
+/// none).
+unsafe fn sync(
+    url: &str,
+    incarnation: Option<&str>,
+    pos: &mut u64,
+    applier: &mut Applier,
+) -> Result<(u64, u64), Fail> {
     let head = head(url, &|| false)?;
+    if head.incarnation.as_deref() != incarnation {
+        return Err(Fail::Recreated(format!("{url} was deleted and recreated")));
+    }
     if let Some(s) = head.snapshot
         && *pos < s
     {
@@ -1572,24 +1658,14 @@ unsafe fn sync(url: &str, pos: &mut u64, applier: &mut Applier) -> Result<(u64, 
     unsafe { catch_up(url, pos, None, applier)? };
     let (epoch, claimed) = claim(url, applier.epoch + 1)?;
     unsafe { catch_up(url, pos, Some(claimed), applier)? };
+    same_incarnation(url, incarnation, &|| false)?;
     Ok((epoch, head.snapshot.unwrap_or(0)))
-}
-
-/// Marks a path as being attached until dropped (on every exit from `attach`): a connection of
-/// this process opening it meanwhile would read under attach's writes, and its close would drop the
-/// lock attach holds against other processes (`lock_unused`).
-struct Attaching(String);
-
-impl Drop for Attaching {
-    fn drop(&mut self) {
-        registry().attaching.remove(&self.0);
-    }
 }
 
 unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
     let path = unsafe { full_pathname(path)? };
     let url = url.trim_end_matches('/').to_owned();
-    let (_attaching, previous) = {
+    let previous = {
         let mut reg = registry();
         if reg.open.get(&path).copied().unwrap_or(0) > 0 {
             return Err(format!(
@@ -1612,132 +1688,99 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
                 .map_err(|e| format!("{path} is attached by another process ({lock_path}: {e})"))?;
             reg.locks.insert(path.clone(), f);
         }
-        reg.dbs.remove(&path);
+        // The path keeps its binding (refused to `x_open` meanwhile) until the outcome replaces
+        // it below. No panic gets past `fn_attach` (extern "C" aborts), so this always ends there.
         reg.attaching.insert(path.clone());
-        (Attaching(path.clone()), reg.snappers.remove(&path))
+        reg.snappers.remove(&path)
     };
     // The previous attachment's snapshot thread may hold a private connection on the file.
     if let Some((snapper, thread)) = previous {
         snapper.stop();
         let _ = thread.join();
     }
-    create_stream(&url)?;
-    let sidecar = format!("{path}-ursula");
-    let boot = boot_id();
-    let (mut local, mut emptied) = (None, None);
-    if fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
-        // A file with content but no sidecar was never attached: its pages are not in the stream.
-        let s = read_sidecar(&sidecar).map_err(|e| {
-            format!("{path} has content but no readable sidecar ({e}); refusing to attach")
-        })?;
-        if let Some(k) = s.as_ref().and_then(|s| s.stream.as_deref())
-            && k != stream_key(&url)
-        {
-            return Err(format!(
-                "{path} is a cache of stream {k}, not {}; delete it to attach it there",
-                stream_key(&url)
-            ));
+    let outcome = unsafe { attach_files(&path, &url) };
+    let mut reg = registry();
+    reg.attaching.remove(&path);
+    match outcome {
+        Ok((offset, db, snapper)) => {
+            reg.failed.remove(&path);
+            reg.dbs.insert(path.clone(), db);
+            reg.snappers.insert(path, snapper);
+            Ok(offset)
         }
-        match s {
-            Some(s) if s.trusted(&path, boot.as_deref()) => local = Some(s),
-            // Written before a reboot (a power loss may have left any prefix of any write), by an
-            // older version, torn, for another db file, or a disk image whose WAL lost frames the
-            // sidecar counts on: the stream has everything committed.
-            s => {
-                // Unless it lost acknowledged data (deleted and recreated): a sidecar offset never
-                // exceeds an acknowledged one, so a read there answering 416 (beyond the end)
-                // refuses, as for trusted files, instead of rebuilding an empty database. `Gone`
-                // (below retention) is fine: the rebuild starts from a snapshot.
-                if let Some(s) = s.filter(|s| s.offset > 0)
-                    && let Err(Fail::Other(e)) = read_from(&url, s.offset)
-                {
-                    return Err(e);
-                }
-                emptied = Some(discard_local(&path)?);
-                eprintln!(
-                    "sqlite-ursula-vfs: {path}: local files untrusted (another boot, torn, \
-                     replaced, or behind their sidecar); discarded them, rebuilding from the stream"
-                );
+        Err(e) => {
+            // A path attached before is no longer described by its binding (its files may hold
+            // anything between that state and the stream's, its stream a newer claim): it stays
+            // refused until an attach succeeds, never passed through to "unix" unreplicated. A path
+            // never attached in this process keeps passing through.
+            if reg.dbs.remove(&path).is_some() || reg.failed.contains_key(&path) {
+                reg.failed.insert(path, e.clone());
             }
+            Err(e)
         }
     }
-    // The only rollback journal an attached file can have is `init_wal_format`'s, left by a crash
-    // mid-switch: the file is an empty database with or without it, but SQLite's first open would
-    // roll it back, truncating whatever attach writes after it.
-    remove_if_exists(&format!("{path}-journal"))?;
-    let (from, epoch) = match &local {
-        Some(s) => (s.offset, s.epoch),
-        None => {
-            // Nothing local: a WAL next to an empty db file holds nothing committed. The sidecar
-            // is written before anything lands in the file, so a file an attach leaves
-            // half-written is known as this stream's cache (resumed when the sidecar names it,
-            // otherwise discarded and rebuilt) instead of being refused as never attached.
-            remove_if_exists(&format!("{path}-wal"))?;
-            remove_if_exists(&format!("{path}-shm"))?;
-            let mark = stamp(&path, &url, boot.as_deref());
-            write_sidecar(&sidecar, 0, 0, &mark, WalClaim::NONE)?;
-            (0, 0)
-        }
-    };
-    let mut applier = Applier {
-        path: path.clone(),
-        sidecar: sidecar.clone(),
-        stamp: stamp(&path, &url, boot.as_deref()),
-        from: (from, epoch),
-        installed: 0,
-        written: 0,
-        file: emptied,
-        pages: BTreeMap::new(),
-        min_size: None,
-        size: None,
-        epoch,
-    };
-    let mut pos = from;
-    let mut tries = 0;
-    // `Gone`: retention moved past the file (or the snapshot read was superseded) under a HEAD
-    // that did not show it yet; the next round installs the newer snapshot.
-    let (epoch, snapshot) = loop {
-        match unsafe { sync(&url, &mut pos, &mut applier) } {
-            Ok(r) => break r,
-            Err(Fail::Gone(e)) if tries < 10 => {
-                tries += 1;
-                eprintln!("sqlite-ursula-vfs: {url}: attach: {e}; retrying");
-                std::thread::sleep(Duration::from_millis(50 * tries));
+}
+
+/// What `recover` leaves for attach to bind.
+struct Recovered {
+    offset: u64,
+    epoch: u64,
+    snapshot: u64,
+    /// Stream offset of the local state recovery started from (0: rebuilt from nothing), and of
+    /// the snapshot it installed (0: none).
+    from: u64,
+    installed: u64,
+    /// The trusted files' WAL claim, when recovery did not write the db file.
+    wal: Option<WalClaim>,
+    incarnation: Option<String>,
+}
+
+/// Recovers the files and claims the stream (see `recover`), then binds a new attachment to them.
+unsafe fn attach_files(
+    path: &str,
+    url: &str,
+) -> Result<(u64, Arc<Mutex<Db>>, SnapshotThread), String> {
+    create_stream(url)?;
+    let sidecar = format!("{path}-ursula");
+    let boot = boot_id();
+    let mut rounds = 0;
+    let r = loop {
+        match unsafe { recover(path, url, &sidecar, boot.as_deref()) } {
+            Err(Fail::Recreated(e)) if rounds < 3 => {
+                rounds += 1;
+                eprintln!("sqlite-ursula-vfs: {path}: attach: {e}; starting over");
             }
-            Err(e) => return Err(e.into()),
+            r => break r?,
         }
     };
-    let offset = pos;
-    let installed = applier.installed;
-    let rewritten = applier.file.is_some();
-    drop(applier);
-    if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0 {
-        unsafe { init_wal_format(&path)? };
+    if fs::metadata(path).map(|m| m.len()).unwrap_or(0) == 0 {
+        unsafe { init_wal_format(path)? };
     }
     // Untouched trusted files keep their claim; otherwise the WAL is gone (`Applier::file`,
     // `install`, or never there) and the db file alone holds the state, which must be on disk
     // before the sidecar says so (no connection is open, so this descriptor's close drops no lock).
-    let wal = match local.and_then(|s| s.wal.filter(|_| !rewritten)) {
+    let wal = match r.wal {
         Some(wal) => wal,
         None => {
-            fs::File::open(&path)
+            fs::File::open(path)
                 .and_then(|f| f.sync_all())
                 .map_err(|e| format!("fsync {path}: {e}"))?;
             WalClaim::NONE
         }
     };
-    let stamp = stamp(&path, &url, boot.as_deref());
-    write_sidecar(&sidecar, offset, epoch, &stamp, wal)?;
-    let pages = (fs::metadata(&path).map(|m| m.len()).unwrap_or(0) / PAGE as u64) as u32;
+    let stamp = stamp(path, url, boot.as_deref(), r.incarnation.as_deref());
+    write_sidecar(&sidecar, r.offset, r.epoch, &stamp, wal)?;
+    let pages = (fs::metadata(path).map(|m| m.len()).unwrap_or(0) / PAGE as u64) as u32;
     let snapper = Arc::new(Snapper::default());
     let db = Arc::new(Mutex::new(Db {
-        url,
+        url: url.to_owned(),
+        incarnation: r.incarnation,
         sidecar,
         stamp,
-        path: path.clone(),
-        epoch,
+        path: path.to_owned(),
+        epoch: r.epoch,
         seq: 0,
-        offset,
+        offset: r.offset,
         poisoned: None,
         fenced: false,
         overlay: BTreeMap::new(),
@@ -1752,14 +1795,14 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
         checkpoint_started: None,
         checkpoints: Vec::new(),
         pages,
-        snapshot,
+        snapshot: r.snapshot,
         retained: 0,
         snapper: snapper.clone(),
         window: false,
         window_wanted: false,
         snapshot_stats: Vec::new(),
-        attached_from: from,
-        installed,
+        attached_from: r.from,
+        installed: r.installed,
     }));
     let thread = {
         let (db, snapper) = (db.clone(), snapper.clone());
@@ -1768,10 +1811,115 @@ unsafe fn attach(path: &str, url: &str) -> Result<u64, String> {
             .spawn(move || snapshot_loop(&db, &snapper))
             .map_err(|e| format!("spawn the snapshot thread: {e}"))?
     };
-    let mut reg = registry();
-    reg.dbs.insert(path.clone(), db);
-    reg.snappers.insert(path, (snapper, thread));
-    Ok(offset)
+    Ok((r.offset, db, (snapper, thread)))
+}
+
+/// Decides whether the local files can be trusted (or discards them), then brings them to the
+/// stream's tail and claims it (`sync`). `Recreated`: the stream was deleted and recreated after
+/// the trust decision; attach starts over, and the sidecar (stamped with the old incarnation)
+/// makes the next round discard whatever this one wrote.
+unsafe fn recover(
+    path: &str,
+    url: &str,
+    sidecar: &str,
+    boot: Option<&str>,
+) -> Result<Recovered, Fail> {
+    let incarnation = head(url, &|| false)?.incarnation;
+    let (mut local, mut emptied) = (None, None);
+    if fs::metadata(path).is_ok_and(|m| m.len() > 0) {
+        // A file with content but no sidecar was never attached: its pages are not in the stream.
+        let s = read_sidecar(sidecar).map_err(|e| {
+            format!("{path} has content but no readable sidecar ({e}); refusing to attach")
+        })?;
+        if let Some(k) = s.as_ref().and_then(|s| s.stream.as_deref())
+            && k != stream_key(url)
+        {
+            return Err(Fail::Other(format!(
+                "{path} is a cache of stream {k}, not {}; delete it to attach it there",
+                stream_key(url)
+            )));
+        }
+        match s {
+            Some(s) if s.trusted(path, boot, incarnation.as_deref()) => local = Some(s),
+            // Written before a reboot (a power loss may have left any prefix of any write), by an
+            // older version, torn, from another incarnation of the stream, for another db file,
+            // or a disk image whose WAL lost frames the sidecar counts on: the stream has
+            // everything committed.
+            s => {
+                // Unless it lost acknowledged data (deleted and recreated shorter): a sidecar
+                // offset never exceeds an acknowledged one, so a read there answering 416 (beyond
+                // the end) refuses, as for trusted files, instead of rebuilding an empty database.
+                // `Gone` (below retention) is fine: the rebuild starts from a snapshot.
+                if let Some(s) = s.filter(|s| s.offset > 0)
+                    && let Err(Fail::Other(e)) = read_from(url, s.offset)
+                {
+                    return Err(Fail::Other(e));
+                }
+                emptied = Some(discard_local(path)?);
+                eprintln!(
+                    "sqlite-ursula-vfs: {path}: local files untrusted (another boot or stream \
+                     incarnation, torn, replaced, or behind their sidecar); discarded them, \
+                     rebuilding from the stream"
+                );
+            }
+        }
+    }
+    // The only rollback journal an attached file can have is `init_wal_format`'s, left by a crash
+    // mid-switch: the file is an empty database with or without it, but SQLite's first open would
+    // roll it back, truncating whatever attach writes after it.
+    remove_if_exists(&format!("{path}-journal"))?;
+    let stamp = stamp(path, url, boot, incarnation.as_deref());
+    let (from, epoch) = match &local {
+        Some(s) => (s.offset, s.epoch),
+        None => {
+            // Nothing local: a WAL next to an empty db file holds nothing committed. The sidecar
+            // is written before anything lands in the file, so a file an attach leaves
+            // half-written is known as this stream's cache (resumed when the sidecar names it,
+            // otherwise discarded and rebuilt) instead of being refused as never attached.
+            remove_if_exists(&format!("{path}-wal"))?;
+            remove_if_exists(&format!("{path}-shm"))?;
+            write_sidecar(sidecar, 0, 0, &stamp, WalClaim::NONE)?;
+            (0, 0)
+        }
+    };
+    let mut applier = Applier {
+        path: path.to_owned(),
+        sidecar: sidecar.to_owned(),
+        stamp,
+        from: (from, epoch),
+        installed: 0,
+        written: 0,
+        file: emptied,
+        pages: BTreeMap::new(),
+        min_size: None,
+        size: None,
+        epoch,
+    };
+    let mut pos = from;
+    let mut tries = 0;
+    // `Gone`: retention moved past the file (or the snapshot read was superseded) under a HEAD
+    // that did not show it yet; the next round installs the newer snapshot.
+    let (epoch, snapshot) = loop {
+        match unsafe { sync(url, incarnation.as_deref(), &mut pos, &mut applier) } {
+            Ok(r) => break r,
+            Err(Fail::Gone(e)) if tries < 10 => {
+                tries += 1;
+                eprintln!("sqlite-ursula-vfs: {url}: attach: {e}; retrying");
+                std::thread::sleep(Duration::from_millis(50 * tries));
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    let rewritten = applier.file.is_some();
+    Ok(Recovered {
+        offset: pos,
+        epoch,
+        snapshot,
+        from,
+        installed: applier.installed,
+        wal: local.and_then(|s| s.wal.filter(|_| !rewritten)),
+        incarnation,
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1890,7 +2038,7 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
     // Backfill outside the window, so the checkpoint inside it (which commits wait for) only
     // covers the frames committed in between.
     unsafe { conn.checkpoint(c"PRAGMA wal_checkpoint(PASSIVE)")? };
-    let (url, offset, epoch, pages) = {
+    let (url, incarnation, offset, epoch, pages) = {
         let mut d = lock(db);
         loop {
             if !d.snapshot_due() || d.poisoned.is_some() || stopped() {
@@ -1914,7 +2062,13 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
         }
         d.window_wanted = false;
         d.window = true;
-        (d.url.clone(), d.offset, d.epoch, d.pages)
+        (
+            d.url.clone(),
+            d.incarnation.clone(),
+            d.offset,
+            d.epoch,
+            d.pages,
+        )
     };
     let window = Window(db);
     // A checkpoint started by another connection after the window opened makes this one busy
@@ -1940,6 +2094,15 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
     drop(conn); // ends the read transaction
     let copy = copy_started.elapsed();
     let body = snapshot::encode(offset, epoch, &image);
+    // This state is a prefix of the incarnation it was attached to, not of a stream recreated at
+    // the same path since (whose next append from this owner fails: its producers are new).
+    match same_incarnation(&url, incarnation.as_deref(), &stopped) {
+        Err(Fail::Recreated(e)) => {
+            eprintln!("sqlite-ursula-vfs: snapshot at {offset} not published: {e}");
+            return Ok(true);
+        }
+        r => r.map_err(String::from)?,
+    }
     match put_idempotent(&format!("{url}/snapshot/{offset}"), &body, &stopped)? {
         (200..=299, _) => {}
         (409 | 410, _) => {
@@ -2026,7 +2189,7 @@ fn json_str(s: &str) -> String {
 
 unsafe fn status(path: &str) -> Result<String, String> {
     let path = unsafe { full_pathname(path)? };
-    let db = lookup(&path).ok_or_else(|| format!("{path} is not attached"))?;
+    let db = attached(&path)?;
     let db = lock(&db);
     Ok(format!(
         "{{\"offset\":{},\"epoch\":{},\"poisoned\":{},\"fenced\":{},\"reason\":{},\"snapshot\":{},\"retained\":{},\"local\":{},\"installed\":{}}}",
@@ -2044,7 +2207,7 @@ unsafe fn status(path: &str) -> Result<String, String> {
 
 unsafe fn stats(path: &str) -> Result<String, String> {
     let path = unsafe { full_pathname(path)? };
-    let db = lookup(&path).ok_or_else(|| format!("{path} is not attached"))?;
+    let db = attached(&path)?;
     let mut db = lock(&db);
     let mut out = String::from("{\"commits\":[");
     for (i, s) in db.stats.drain(..).enumerate() {
@@ -2227,13 +2390,23 @@ unsafe extern "C" fn x_open(
             );
             return ffi::SQLITE_CANTOPEN;
         }
+        if flags & ffi::SQLITE_OPEN_WAL != 0
+            && let Some(db) = name.and_then(|n| n.strip_suffix("-wal"))
+            && let Some(why) = registry().failed.get(db).cloned()
+        {
+            return refuse_failed(db, &why);
+        }
         // Counted before the open, so attach (which refuses while any is counted) and an open
-        // cannot pass each other; refused while `attach` runs on the path (`Attaching`).
+        // cannot pass each other; refused while `attach` runs on the path, and after a failed one
+        // (`Registry::failed`).
         let main = match name {
             Some(name) if flags & ffi::SQLITE_OPEN_MAIN_DB != 0 => {
                 let mut reg = registry();
                 if reg.attaching.contains(name) {
                     return ffi::SQLITE_BUSY;
+                }
+                if let Some(why) = reg.failed.get(name) {
+                    return refuse_failed(name, why);
                 }
                 *reg.open.entry(name.to_owned()).or_default() += 1;
                 Some(reg.dbs.get(name).cloned())
@@ -2295,6 +2468,16 @@ unsafe extern "C" fn x_close(file: *mut ffi::sqlite3_file) -> c_int {
         }
         rc
     }
+}
+
+/// An open of a path whose attach failed after it had been attached (`Registry::failed`): its
+/// writes would bypass replication if it were passed through to "unix", so it fails until an attach
+/// succeeds.
+fn refuse_failed(path: &str, why: &str) -> c_int {
+    eprintln!(
+        "sqlite-ursula-vfs: {path}: open refused: its last attach failed ({why}); attach it again"
+    );
+    ffi::SQLITE_CANTOPEN
 }
 
 fn uncount_open(path: &str) {
@@ -2960,9 +3143,10 @@ mod tests {
         ]);
     }
 
-    // Attach trusts local files only when the sidecar was written in this boot, for this db file,
-    // and the WAL holds what it claims; a legacy, torn or other-boot sidecar is discarded, and a
-    // missing one is an error (the file may be a database that was never attached).
+    // Attach trusts local files only when the sidecar was written in this boot, from this stream
+    // incarnation, for this db file, and the WAL holds what it claims; a legacy, torn, other-boot
+    // or other-incarnation sidecar is discarded, and a missing one is an error (the file may be a
+    // database that was never attached).
     #[test]
     fn sidecar_trust() {
         let dir = std::env::temp_dir().join(format!("ursula-sidecar-{}", std::process::id()));
@@ -2974,17 +3158,28 @@ mod tests {
             fs::write(&sidecar, line).unwrap();
             read_sidecar(&sidecar)
                 .unwrap()
-                .map(|s| s.trusted(&db, boot))
+                .map(|s| s.trusted(&db, boot, Some("i1")))
         };
         let b1 = Some("b1");
         let none = " wal=0000000000000000:0\n";
-        let mine = format!("7 2{}", stamp(&db, "http://h:1/b/s", b1));
+        let mine = format!("7 2{}", stamp(&db, "http://h:1/b/s", b1, Some("i1")));
         let here = format!("{mine}{none}");
         assert!(here.starts_with("7 2 boot=b1 stream=/b/s file="));
+        assert!(here.contains(" incarnation=i1 wal="));
         assert_eq!(trust(here.as_bytes(), b1), Some(true));
+        // The stream deleted and recreated (another incarnation), an unknown current one, or a
+        // sidecar from before incarnations were recorded.
+        let s = read_sidecar(&sidecar).unwrap().unwrap();
+        assert!(!s.trusted(&db, b1, Some("i2")));
+        assert!(!s.trusted(&db, b1, None));
+        let legacy = here.replace(" incarnation=i1", "");
+        assert_eq!(trust(legacy.as_bytes(), b1), Some(false));
         assert_eq!(trust(here.as_bytes(), Some("b2")), Some(false));
         assert_eq!(trust(here.as_bytes(), None), Some(false));
-        let unknown = format!("7 2{}{none}", stamp(&db, "http://h:1/b/s", None));
+        let unknown = format!(
+            "7 2{}{none}",
+            stamp(&db, "http://h:1/b/s", None, Some("i1"))
+        );
         assert!(unknown.starts_with("7 2 boot=unknown "));
         assert_eq!(trust(unknown.as_bytes(), None), Some(false));
         // A claim on WAL frames that are not there (no WAL here), or no claim at all.
@@ -2992,7 +3187,7 @@ mod tests {
         assert_eq!(trust(behind.as_bytes(), b1), Some(false));
         assert_eq!(trust(format!("{mine}\n").as_bytes(), b1), Some(false));
         // Another db file (replaced by a rename) is not trusted.
-        let other_file = "7 2 boot=b1 stream=/b/s file=0";
+        let other_file = "7 2 boot=b1 stream=/b/s file=0 incarnation=i1";
         assert_eq!(
             trust(format!("{other_file}{none}").as_bytes(), b1),
             Some(false)

@@ -133,6 +133,32 @@ it("(e) attaching the cache of one stream to another, or to its stream deleted a
 	expect(statSync(file).size).toBeGreaterThan(0);
 });
 
+// Regression (VFS-P1): a stream deleted and recreated at the same path is another incarnation, even
+// once it has grown past the file's offset; resuming the old database from that offset would carry
+// its state into the new stream.
+it("(h) the cache of a deleted stream is rebuilt from the stream recreated at its path", async () => {
+	const url = ursulaUrl() + streamPath();
+	const file = freshFile();
+	attach(file, url);
+	const db = openPlain(file);
+	db.exec("CREATE TABLE t(k INTEGER PRIMARY KEY, x TEXT)");
+	db.exec("INSERT INTO t VALUES (1, 'old')");
+	db.close();
+	const old = status(file).offset;
+	expect((await fetch(url, { method: "DELETE" })).ok).toBe(true);
+	const other = freshFile();
+	attach(other, url);
+	const o = openPlain(other);
+	o.exec("CREATE TABLE t(k INTEGER PRIMARY KEY, x TEXT)");
+	for (let k = 1; status(other).offset <= old; k++) o.exec(`INSERT INTO t VALUES (${k}, 'new')`);
+	o.close();
+	const recreated = rows(other);
+	expect(recreated[0]).toBe("1:new");
+	attach(file, url);
+	expect(status(file).local).toBe(0);
+	expect(rows(file)).toEqual(recreated);
+});
+
 /** Runs `sqls` in an owner that is SIGKILLed afterwards: its WAL stays as it is, never checkpointed. */
 async function killedOwner(file: string, url: string, sqls: string[]): Promise<void> {
 	const child = runChild(file, url, sqls);

@@ -1,8 +1,9 @@
 // Attach is the only writer of a file it recovers: one owner per file on a host (lock file), and no
 // other connection open while pages are rewritten.
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { expect, it } from "vitest";
-import { attach } from "../src/index.ts";
+import { attach, status } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
 import { integrity, openPlain, runChild, streamPath, ursulaUrl } from "./kit.ts";
 
@@ -54,4 +55,30 @@ it("attach refuses to recover while another connection has the file open", async
 	await new Promise((r) => reader.once("exit", r));
 	attach(file, url);
 	expect(xs(file)).toEqual(["f1", "o1"]);
+});
+
+// Regression (VFS-P1): a re-attach that failed had already dropped the file's binding, so the next
+// open passed through to the plain "unix" VFS and its commits never reached the stream.
+it("after a failed re-attach the file refuses to open until an attach succeeds", () => {
+	const path = streamPath();
+	const url = ursulaUrl() + path;
+	const file = freshFile();
+	attach(file, url);
+	const db = openPlain(file);
+	db.exec("CREATE TABLE t(x TEXT)");
+	db.exec("INSERT INTO t VALUES ('r1')");
+	db.close();
+	const before = readFileSync(file);
+	// Nothing listens on port 1: creating the stream fails.
+	expect(() => attach(file, `http://127.0.0.1:1${path}`)).toThrow(/create/);
+	expect(() => openPlain(file)).toThrow(/unable to open/);
+	expect(() => status(file)).toThrow(/last attach failed/);
+	expect(Buffer.compare(readFileSync(file), before)).toBe(0);
+	attach(file, url);
+	const again = openPlain(file);
+	again.exec("INSERT INTO t VALUES ('r2')");
+	again.close();
+	const fresh = freshFile();
+	attach(fresh, url);
+	expect(xs(fresh)).toEqual(["r1", "r2"]);
 });
