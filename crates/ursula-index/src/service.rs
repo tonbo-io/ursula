@@ -52,7 +52,6 @@ use crate::catalog::StartPosition;
 use crate::source::MAX_MESSAGE_BYTES;
 use crate::source::ReadLimits;
 use crate::source::SegmentRead;
-use crate::source::SourceFormat;
 use crate::source::SourceHead;
 use crate::store::Coverage;
 use crate::store::IndexBase;
@@ -129,9 +128,9 @@ pub struct IndexerArgs {
     #[arg(long)]
     extract: Option<String>,
     /// Single-source mode: start a new index at the `retained` offset or at
-    /// the `tail`. A recreated source is reindexed from its retained offset.
-    #[arg(long, default_value = "retained")]
-    start: String,
+    /// the `tail`. A recreated source is reindexed from its first byte.
+    #[arg(long, value_enum, default_value_t = StartPosition::Retained)]
+    start: StartPosition,
 }
 
 #[derive(Debug, Args)]
@@ -421,16 +420,7 @@ fn validate_args(args: &IndexerArgs) -> anyhow::Result<()> {
             "segment bytes, flush entries, worker concurrency, lease duration, and worker id must be valid"
         );
     }
-    let _start = parse_start(&args.start)?;
     Ok(())
-}
-
-fn parse_start(value: &str) -> anyhow::Result<StartPosition> {
-    match value {
-        "retained" => Ok(StartPosition::Retained),
-        "tail" => Ok(StartPosition::Tail),
-        _ => anyhow::bail!("--start must be `retained` or `tail`"),
-    }
 }
 
 fn single_extractor(args: &IndexerArgs) -> anyhow::Result<Extractor> {
@@ -463,7 +453,7 @@ async fn run_single(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let extractor = single_extractor(&args)?;
-    let start = parse_start(&args.start)?;
+    let start = args.start;
     let source = SourceClient::new(reqwest::Client::new(), stream_url.clone());
     let head = source
         .head()
@@ -777,9 +767,10 @@ async fn process_pool_source(
                 registration.incarnation.as_deref(),
                 head.incarnation.clone(),
                 // Every byte of a recreated stream was appended after the
-                // registration, so the restart indexes it all, whatever
-                // `start` says.
-                head.retained_offset,
+                // registration, so the restart covers it all from its first
+                // byte, whatever `start` says. Bytes already trimmed by
+                // retention are then counted as trimmed by `index_source`.
+                0,
                 wall_clock_millis()?,
             )
             .await?;
@@ -825,7 +816,8 @@ async fn index_source(
     params: &WorkerParams,
     allow_partial: bool,
 ) -> Result<Backlog, IndexError> {
-    let format = head.readable_format()?;
+    // Refuse a content type the indexer cannot frame before claiming.
+    head.readable_format()?;
     let now_ms = wall_clock_millis()?;
     let (claim, resync, resume, extractor) = {
         let mut index = index.lock().await;
@@ -873,8 +865,9 @@ async fn index_source(
         else {
             return Ok(Backlog::Idle);
         };
-        let resync =
-            format == SourceFormat::Ndjson && index.resync_offset() == Some(claim.start_offset);
+        // Either content type: a stored message always parses as a whole,
+        // so only a trimmed message's tail is discarded.
+        let resync = index.resync_offset() == Some(claim.start_offset);
         (
             claim,
             resync,
@@ -1172,11 +1165,12 @@ async fn single_pass(
         let mut index = index.lock().await;
         let known = index.source().incarnation.clone();
         if incarnation_changed(known.as_deref(), head.incarnation.as_deref()) {
-            // As in pool mode, a recreated stream is indexed from its
-            // retained offset whatever `--start` says.
+            // As in pool mode, a recreated stream is covered from its first
+            // byte whatever `--start` says; bytes already trimmed by
+            // retention are counted as trimmed.
             index
                 .restart(IndexBase {
-                    offset: head.retained_offset,
+                    offset: 0,
                     incarnation: head.incarnation.clone(),
                 })
                 .await?;
@@ -1900,7 +1894,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tail_registration_indexes_a_recreated_stream_from_its_first_message()
+    async fn a_tail_registration_covers_a_recreated_stream_from_its_first_byte()
     -> anyhow::Result<()> {
         let source = MockSource::default();
         let message = "{\"captured_at\":7}\n";
@@ -1922,9 +1916,10 @@ mod tests {
             })
             .await?;
 
-        // Recreated with an initial message, written before the indexer
-        // notices the new incarnation.
-        source.set(message, "2", 0);
+        // Recreated with two messages before the indexer notices the new
+        // incarnation, and retention has already trimmed the first: those
+        // bytes were never indexed, so the index is not complete.
+        source.set(&message.repeat(2), "2", 18);
         let registration = state.catalog.get("tail").await?;
         assert_eq!(
             process_pool_source(&state, &registration, &params("worker-a", 64), true).await?,
@@ -1938,7 +1933,9 @@ mod tests {
         {}
         let handles = state.ensure_index(&registration).await?;
         let mut index = handles.serving.lock().await;
-        assert_eq!(index.durable_offset(), 18);
+        assert_eq!(index.durable_offset(), 36);
+        assert_eq!(index.trimmed_bytes(), 18);
+        assert!(!index.coverage().complete);
         let result = index.query(QueryRequest::window(0, 1_000, 10)).await?;
         assert_eq!(result.entries.len(), 1);
         drop(index);

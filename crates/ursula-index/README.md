@@ -37,7 +37,7 @@ Common extractors:
 | Claude Code transcripts | `{"time":["/timestamp"]}` |
 | A capture envelope | `{"time":["/entry/timestamp"]}` |
 
-`start` is `retained` (the default: index all history still readable) or `tail` (only what is appended from now on). Registration records the source's `Stream-Incarnation`. `start` applies to the first registration only: a restart after a recreate indexes the new stream from its retained offset, since all of it was appended after the registration.
+`start` is `retained` (the default: index all history still readable) or `tail` (only what is appended from now on). Registration records the source's `Stream-Incarnation`. `start` applies to the first registration only: a restart after a recreate covers the new stream from its first byte, since all of it was appended after the registration; bytes retention trimmed before the restart are counted as trimmed.
 
 ## What is indexed
 
@@ -45,9 +45,9 @@ Messages are framed by LF in both content types. A message longer than one read 
 
 Bad data never blocks a stream. A message without a time is counted as `missing`, one whose time has the wrong type or format as `invalid`, and one that is not JSON as `unparseable`. A stream is blocked only when two workers produced different entries for the same source bytes; the committed prefix stays queryable and `POST /v1/indexes/{id}/status/resume` clears the block after repair.
 
-Retention is followed, not fatal. The index keeps a floor at the source's retained offset and does not return entries below it. Bytes trimmed before they were indexed are counted, and queries then report `complete: false`. When an NDJSON stream is trimmed in the middle of a line, the indexer discards the rest of that line and counts it as trimmed.
+Retention is followed, not fatal. The index keeps a floor at the source's retained offset and does not return entries below it. Bytes trimmed before they were indexed are counted, and queries then report `complete: false`. When a stream is trimmed in the middle of a message, the indexer discards the rest of that line and counts it as trimmed; a first line that parses as a complete JSON value is kept.
 
-A deleted and recreated stream has a new `Stream-Incarnation`. The pool then retires the registration's namespace and restarts the registration under a new one, `{id}-{url hash}-{incarnation}-{extractor digest}`; `/status` reports `restarted_from_incarnation`. A stream that answers 404 is reported as `source_gone` until it answers again.
+A deleted and recreated stream has a new `Stream-Incarnation`. The pool then retires the registration's namespace and restarts the registration under a new one, `{id}-{url hash}-{incarnation}-{extractor digest}`; `/status` reports `restarted_from_incarnation`. Single-source mode restarts its index in place and does not report `restarted_from_incarnation`. A stream that answers 404 is reported as `source_gone` until it answers again.
 
 ## Querying
 
@@ -80,7 +80,7 @@ The shared S3 root stores the registration catalog and one namespace per registr
 
 The manifest is format version 6 and the catalog version 2. Older indexes are not adopted: use a new or emptied prefix and register again.
 
-Passing `--stream-url` selects single-source mode for local development and focused recovery work. It takes `--extract '<json>'` or `--timestamp-field <name>`, and `--start retained|tail`; on a recreated source it restarts the index in place.
+Passing `--stream-url` selects single-source mode for local development and focused recovery work. It takes `--extract '<json>'` or `--timestamp-field <name>`, and `--start retained|tail`; on a recreated source it restarts the index in place. Run one single-source process per index prefix: unlike the pool, it does not guard a segment read from the old stream against a restart by another process.
 
 ```bash
 cargo run -p ursula --bin ursula -- indexer \

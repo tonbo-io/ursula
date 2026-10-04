@@ -392,6 +392,8 @@ async fn indexer_pool_indexes_otlp_json_and_ndjson_streams_from_an_in_process_ur
         .send(reqwest::Method::DELETE, &sessions, None, "")
         .await?;
     assert!(response.status().is_success());
+    // At feature level 0 the incarnation is the creation millisecond, so a
+    // recreate in the same millisecond would reuse it.
     tokio::time::sleep(Duration::from_millis(20)).await;
     let response = http
         .send(

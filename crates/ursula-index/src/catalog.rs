@@ -14,8 +14,8 @@ const CATALOG_VERSION: u32 = 2;
 const MAX_CATALOG_ATTEMPTS: usize = 32;
 
 /// Where a new registration starts reading the source. A restart after the
-/// source is recreated always starts at the new stream's retained offset.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+/// source is recreated always covers the new stream from its first byte.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum StartPosition {
     /// The source's retained offset: index all history still readable.

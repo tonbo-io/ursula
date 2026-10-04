@@ -515,8 +515,11 @@ container receives only chart-managed container settings plus explicit
 | `indexer.cache.maintenanceMaxBytes` | `268435456` | Shared compaction/GC cache budget across every registration in one worker pod. |
 | `indexer.cache.emptyDir.sizeLimit` | `2Gi` | Disposable local cache volume limit; durable index state remains in S3. |
 | `indexer.ingest.flushEntries` | `65536` | Maximum messages (entries plus skips) in one committed segment, and so entries in one uncompacted part. |
+| `indexer.ingest.rowGroupEntries` | `16384` | Entries per Parquet row group in a written part. |
+| `indexer.ingest.pollIntervalMs` | `250` | Interval between source polls in each worker. |
+| `indexer.ingest.tailFlushIntervalMs` | `5000` | Maximum delay before a tail segment shorter than `indexer.workers.segmentBytes` is committed. |
 | `indexer.workers.concurrency` | `4` | Concurrent stream tasks per worker pod. |
-| `indexer.workers.segmentBytes` | `33554432` | Source bytes read before a segment is committed; a shorter segment waits for `indexer.ingest.tailFlushIntervalMs` unless it follows one that stopped at `indexer.ingest.flushEntries`. Replaces `readBatchRecords` and `segmentRecords`. |
+| `indexer.workers.segmentBytes` | `33554432` | Source bytes read before a segment is committed; a shorter segment waits for `indexer.ingest.tailFlushIntervalMs` unless it follows one that stopped at `indexer.ingest.flushEntries`. |
 | `indexer.workers.leaseMs` | `60000` | Claim duration used to reduce duplicate processing; not a correctness boundary. |
 | `indexer.compaction.fanIn` | `8` | Number of same-partition parts selected for bounded compaction. |
 | `indexer.compaction.maxEntries` | `1000000` | Maximum entries loaded by one compaction; must cover one configured fan-in. |
