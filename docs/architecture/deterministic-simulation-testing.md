@@ -240,17 +240,17 @@ trait Invariant {
 }
 ```
 
-The workload owns client-side expectations: acknowledged appends, producer sequence state, expected readable bytes, expected setsum, open SSE/long-poll sessions, and cold-confirmed samples. The invariant checker compares those expectations with observable cluster state.
+The workload owns client-side expectations: acknowledged appends, producer sequence state, expected readable bytes, open SSE/long-poll sessions, and cold-confirmed samples. The invariant checker compares those expectations with observable cluster state.
 
 ## Invariants
 
 The minimum viable simulator should check these on every quiescent point or after every delivered event:
 
 1. **Committed data remains readable.** Any append that returned success to the client remains readable from the stream after failover, restart, snapshot install, and cold eviction.
-2. **Per-stream integrity.** Client-tracked expected setsum equals the server-observed live/total setsum under the current hot/cold state; no record is lost or duplicated.
+2. **Per-stream integrity.** The bytes read back from the stream equal the client-tracked acknowledged bytes under the current hot/cold state; no record is lost or duplicated.
 3. **Producer idempotence.** A `(Producer-Id, Producer-Epoch, Producer-Seq)` triple commits at most once, and stale epochs or sequence gaps are rejected consistently.
 4. **Read-your-write.** Within one client session, reads after an acknowledged write observe that write.
-5. **Cold/live equivalence.** Moving bytes from hot buffers to cold chunks does not change the readable byte sequence or total integrity.
+5. **Cold/live equivalence.** Moving bytes from hot buffers to cold chunks does not change the readable byte sequence.
 6. **Quorum loss behavior.** A minority partition must not acknowledge writes that later disappear.
 7. **Snapshot install correctness.** A node restored from snapshot reaches the leader's committed state at the snapshot index and can serve the same committed data.
 8. **Raft integration safety.** For entries visible through Ursula's log/state-machine surfaces, a committed log index is never applied as two different commands.

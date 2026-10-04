@@ -17,7 +17,6 @@ from ursula_chaos_agent import (
     ChaosAgent,
     Node,
     ProducerState,
-    Setsum,
     WorkloadStream,
     _downsample_history,
     _prune_history,
@@ -368,24 +367,13 @@ class ChaosAgentStateTest(unittest.TestCase):
             workload_stream.pending_producer_appends[
                 f"{producer.producer_id}\0{producer.epoch}\0{42}"
             ] = b"pending"
-        server_setsum = Setsum()
-        server_setsum.insert_vectored([b"server"])
-        zero_setsum = Setsum().hexdigest()
         calls: list[str] = []
 
         def request(method, url, **kwargs):
             calls.append(url)
             if url.startswith("http://n1"):
-                return 200, b"", {
-                    "stream-next-offset": "80",
-                    "stream-integrity-total-records": "8",
-                    "stream-integrity-total-setsum": zero_setsum,
-                }
-            return 200, b"", {
-                "stream-next-offset": "120",
-                "stream-integrity-total-records": "12",
-                "stream-integrity-total-setsum": server_setsum.hexdigest(),
-            }
+                return 200, b"", {"stream-next-offset": "80"}
+            return 200, b"", {"stream-next-offset": "120"}
 
         agent.request = request
 
@@ -405,9 +393,7 @@ class ChaosAgentStateTest(unittest.TestCase):
             "http://n2:4491/chaos/run-test-0002",
         ])
         self.assertEqual(stream.next_offset, 120)
-        self.assertEqual(stream.expected_live_setsum.hexdigest(), server_setsum.hexdigest())
         self.assertEqual(other_stream.next_offset, 120)
-        self.assertEqual(other_stream.expected_live_setsum.hexdigest(), server_setsum.hexdigest())
         self.assertEqual(producer.epoch, 4)
         for workload_stream in agent.streams:
             self.assertEqual(workload_stream.producer_seqs[producer.producer_id], 0)
@@ -415,51 +401,178 @@ class ChaosAgentStateTest(unittest.TestCase):
             self.assertEqual(workload_stream.pending_producer_appends, {})
         self.assertEqual(agent.events[-1][0], "warn")
 
-    def test_pending_integrity_resync_blocks_verifier_until_resynced(self) -> None:
+    def verifier_agent(self, nodes: list[Node]) -> ChaosAgent:
         agent = object.__new__(ChaosAgent)
-        agent.nodes = [Node("n1", "i-1", "http://n1:4491")]
+        agent.nodes = nodes
         agent.state_lock = threading.Lock()
         agent.events = deque()
         agent.event = lambda level, message: agent.events.append((level, message))
-        agent.global_unresolved_append = False
-        agent.lane_unresolved_appends = []
-        stream = WorkloadStream("run-test-0001", next_offset=40)
-        stream.needs_integrity_resync = True
+        agent.active_fault = None
+        agent.active_injection_id = None
+        agent.injections = deque()
+        agent.append_success = 0
+        agent.old_sample_every = 1
+        agent.verify_attempts = 0
+        agent.verified_offsets = 0
+        agent.mismatch_count = 0
+        agent.read_availability_errors = 0
+        agent.verify_counts = {}
+        agent.verify_errors = {}
+        agent.last_integrity_error = None
+        agent.last_read_availability_error = None
+        agent.last_integrity_check = None
+        agent.last_read_check = None
+        agent.last_read_error_check = None
+        agent.last_cold_flush = None
+        agent.cold_refresh_cursor = 0
+        agent.cold_flush_attempts = 0
+        agent.cold_flush_success = 0
+        agent.cold_flush_noop = 0
+        agent.cold_flush_errors = 0
+        agent.fault_backend = "ec2"
+        return agent
+
+    def test_verifier_reads_back_bytes_and_separates_corruption_from_availability(self) -> None:
+        agent = self.verifier_agent([Node("n1", "i-1", "http://n1:4491")])
+        agent.verify_modes = ["latest"]
+        stream = WorkloadStream("run-test-0001")
         agent.streams = [stream]
-        agent.producer_probe_stream = WorkloadStream("run-test-producer-probe")
-        server_setsum = Setsum()
-        server_setsum.insert_vectored([b"server"])
-        responses = [
-            (0, b"timeout", {}),
-            (
-                200,
-                b"",
-                {
-                    "stream-next-offset": "80",
-                    "stream-integrity-total-records": "8",
-                    "stream-integrity-total-setsum": server_setsum.hexdigest(),
-                },
-            ),
-        ]
+        # A 200 append acknowledged at Stream-Next-Offset 30 holds [20, 30).
+        agent.record_payload_sample(stream, 30, b"0123456789", "ascii")
+        self.assertEqual(stream.recent_payloads[-1].start_offset, 20)
+        json_stream = WorkloadStream("run-test-record-0000", content_type="application/json")
+        agent.record_payload_sample(json_stream, 4, b"{}\n\n", "ascii")
+        self.assertEqual(len(json_stream.recent_payloads), 0)
+
+        stored = {"bytes": b"0123456789"}
+        urls: list[str] = []
 
         def request(method, url, **kwargs):
-            return responses.pop(0)
+            urls.append(url)
+            query = dict(part.split("=") for part in url.split("?", 1)[1].split("&"))
+            start = int(query["offset"]) - 20
+            # Serve at most 6 bytes per read, so the verifier follows a short read.
+            return 200, stored["bytes"][start : start + min(6, int(query["max_bytes"]))], {}
 
         agent.request = request
+        agent.verify_integrity()
+        self.assertEqual(agent.verified_offsets, 1)
+        self.assertEqual(agent.verify_counts, {"latest": 1})
+        self.assertEqual(urls, [
+            "http://n1:4491/chaos/run-test-0001?offset=20&max_bytes=10",
+            "http://n1:4491/chaos/run-test-0001?offset=26&max_bytes=4",
+        ])
 
-        self.assertTrue(agent.has_unknown_appends_locked())
+        # A server error serves no bytes: availability, not corruption.
+        agent.request = lambda method, url, **kwargs: (500, b"boom", {})
+        agent.verify_integrity()
+        self.assertEqual(agent.mismatch_count, 0)
+        self.assertEqual(agent.read_availability_errors, 1)
+        self.assertEqual(agent.verify_errors, {"latest_unavailable": 1})
+        self.assertIsNone(agent.last_integrity_error)
 
-        agent.retry_pending_integrity_resyncs()
+        stored["bytes"] = b"0123456X89"
+        agent.request = request
+        agent.verify_integrity()
+        self.assertEqual(agent.mismatch_count, 1)
+        self.assertEqual(agent.verify_errors, {"latest_unavailable": 1, "latest": 1})
+        self.assertIn("body_prefix=", agent.last_integrity_error)
 
-        self.assertTrue(stream.needs_integrity_resync)
-        self.assertTrue(agent.has_unknown_appends_locked())
+    def test_verifier_counts_lost_acknowledged_bytes_and_replica_disagreement(self) -> None:
+        agent = self.verifier_agent([Node(f"n{i}", f"i-{i}", f"http://n{i}:4491") for i in (1, 2, 3)])
+        agent.verify_modes = ["latest"]
+        stream = WorkloadStream("run-test-0001")
+        agent.streams = [stream]
+        agent.record_payload_sample(stream, 30, b"0123456789", "ascii")
+        served = {"tail": 26, "n1": b"0123456789"}
 
-        agent.retry_pending_integrity_resyncs()
+        def request(method, url, **kwargs):
+            if method == "HEAD":
+                return 200, b"", {"stream-next-offset": f"{served['tail']:020d}"}
+            node = url.split("//", 1)[1].split(":", 1)[0]
+            query = dict(part.split("=") for part in url.split("?", 1)[1].split("&"))
+            offset, max_bytes = int(query["offset"]), int(query["max_bytes"])
+            if offset > served["tail"]:
+                return 416, b"", {"stream-next-offset": str(served["tail"])}
+            stored = served.get(node, b"0123456789")[: served["tail"] - 20]
+            return 200, stored[offset - 20 : offset - 20 + max_bytes], {}
 
-        self.assertFalse(stream.needs_integrity_resync)
-        self.assertFalse(agent.has_unknown_appends_locked())
-        self.assertEqual(stream.next_offset, 80)
-        self.assertEqual(stream.expected_live_setsum.hexdigest(), server_setsum.hexdigest())
+        agent.request = request
+        # Every replica ends at 26 and the leader's tail agrees: the stream
+        # lost bytes [26, 30) it acknowledged.
+        agent.verify_integrity()
+        self.assertEqual(agent.mismatch_count, 1)
+        self.assertEqual(agent.read_availability_errors, 0)
+        self.assertIn("leader tail 26 < acknowledged 30", agent.last_integrity_error)
+
+        # Replicas served short, but the leader's tail covers the sample:
+        # the range was unavailable, not lost.
+        served["tail"] = 30
+        agent.request = lambda method, url, **kwargs: (
+            request(method, url) if method == "HEAD" else (503, b"", {})
+        )
+        agent.verify_integrity()
+        self.assertEqual(agent.mismatch_count, 1)
+        self.assertEqual(agent.read_availability_errors, 1)
+
+        # One replica served different bytes and a later one matched: still
+        # corruption.
+        agent.request = request
+        agent.verify_attempts = 0  # incremented to 1 before the read: start at n2
+        served["n2"] = b"0123456X89"
+        agent.verify_integrity()
+        self.assertEqual(agent.mismatch_count, 2)
+        self.assertIn("n2 read status=200 body_prefix=", agent.last_integrity_error)
+
+    def test_cold_mode_confirms_samples_below_cold_hot_start_offset(self) -> None:
+        agent = self.verifier_agent([Node("n1", "i-1", "http://n1:4491")])
+        agent.verify_modes = ["cold"]
+        stream = WorkloadStream("run-test-0001")
+        agent.streams = [stream]
+        agent.record_payload_sample(stream, 4, b"cold", "ascii")
+        agent.record_payload_sample(stream, 8, b"warm", "ascii")
+        stored = b"coldwarm"
+
+        def request(method, url, **kwargs):
+            if method == "HEAD":
+                return 200, b"", {"stream-cold-hot-start-offset": "00000000000000000004"}
+            query = dict(part.split("=") for part in url.split("?", 1)[1].split("&"))
+            start = int(query["offset"])
+            return 200, stored[start : start + int(query["max_bytes"])], {}
+
+        agent.request = request
+        agent.verify_integrity()
+
+        self.assertEqual([sample.cold_confirmed for sample in stream.recent_payloads], [True, False])
+        self.assertEqual(agent.verify_counts, {"cold": 1})
+        self.assertEqual(agent.last_read_check["offset"], 0)
+        self.assertEqual(agent.cold_flush_attempts, 0)
+
+    def test_cold_flush_that_leaves_sample_hot_is_unavailable_not_an_error(self) -> None:
+        agent = self.verifier_agent([Node(f"n{i}", f"i-{i}", f"http://n{i}:4491") for i in (1, 2, 3)])
+        stream = WorkloadStream("run-test-0001")
+        agent.streams = [stream]
+        agent.record_payload_sample(stream, 100, b"0123456789", "ascii")
+        sample = stream.recent_payloads[-1]
+        posts: list[str] = []
+
+        def request(method, url, **kwargs):
+            if method == "HEAD":
+                return 200, b"", {"stream-cold-hot-start-offset": "0"}
+            posts.append(url)
+            return 200, b'{"hot_start_offset": 50}', {}
+
+        agent.request = request
+        self.assertFalse(agent.ensure_cold_sample(sample))
+        self.assertEqual(posts, ["http://n1:4438/__ursula/flush-cold/chaos/run-test-0001?min_hot_bytes=1&max_bytes=100"])
+        self.assertEqual((agent.cold_flush_success, agent.cold_flush_errors), (1, 0))
+
+        # The chart's admin plane is loopback-only on Kubernetes: no POST.
+        agent.fault_backend = "kubernetes"
+        posts.clear()
+        self.assertFalse(agent.ensure_cold_sample(sample))
+        self.assertEqual(posts, [])
+        self.assertEqual(agent.cold_flush_attempts, 1)
 
     def test_workload_rollover_forces_progress_after_unknown_append_grace(self) -> None:
         agent = object.__new__(ChaosAgent)

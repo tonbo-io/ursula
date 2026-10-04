@@ -16,7 +16,6 @@ memchr = { workspace = true }
 bytes = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
-setsum = { workspace = true }
 slotmap = { workspace = true }
 ursula-shard = { workspace = true }
 ursula-proto = { workspace = true }

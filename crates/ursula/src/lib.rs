@@ -164,13 +164,6 @@ const HEADER_STREAM_CURSOR: &str = "stream-cursor";
 const HEADER_STREAM_EXPIRES_AT: &str = "stream-expires-at";
 const HEADER_STREAM_EXTENSIONS: &str = "stream-extensions";
 const HEADER_STREAM_INCARNATION: &str = "stream-incarnation";
-const HEADER_STREAM_INTEGRITY_EVICTED_RECORDS: &str = "stream-integrity-evicted-records";
-const HEADER_STREAM_INTEGRITY_EVICTED_SETSUM: &str = "stream-integrity-evicted-setsum";
-const HEADER_STREAM_INTEGRITY_LIVE_RECORDS: &str = "stream-integrity-live-records";
-const HEADER_STREAM_INTEGRITY_LIVE_SETSUM: &str = "stream-integrity-live-setsum";
-const HEADER_STREAM_INTEGRITY_LIVE_START_OFFSET: &str = "stream-integrity-live-start-offset";
-const HEADER_STREAM_INTEGRITY_TOTAL_RECORDS: &str = "stream-integrity-total-records";
-const HEADER_STREAM_INTEGRITY_TOTAL_SETSUM: &str = "stream-integrity-total-setsum";
 const HEADER_STREAM_COLD_HOT_START_OFFSET: &str = "stream-cold-hot-start-offset";
 const HEADER_STREAM_DATA_CONTENT_TYPE: &str = "stream-data-content-type";
 const HEADER_STREAM_NEXT_OFFSET: &str = "stream-next-offset";
@@ -3037,41 +3030,6 @@ pub(crate) async fn head_stream_by_id(
                 &mut headers,
                 response.stream_ttl_seconds,
                 response.stream_expires_at_ms,
-            );
-            insert_header_str(
-                &mut headers,
-                HEADER_STREAM_INTEGRITY_LIVE_SETSUM,
-                &response.integrity.live_setsum,
-            );
-            insert_header_str(
-                &mut headers,
-                HEADER_STREAM_INTEGRITY_EVICTED_SETSUM,
-                &response.integrity.evicted_setsum,
-            );
-            insert_header_str(
-                &mut headers,
-                HEADER_STREAM_INTEGRITY_TOTAL_SETSUM,
-                &response.integrity.total_setsum,
-            );
-            insert_u64_header(
-                &mut headers,
-                HEADER_STREAM_INTEGRITY_LIVE_START_OFFSET,
-                response.integrity.live_start_offset,
-            );
-            insert_u64_header(
-                &mut headers,
-                HEADER_STREAM_INTEGRITY_LIVE_RECORDS,
-                response.integrity.live_records,
-            );
-            insert_u64_header(
-                &mut headers,
-                HEADER_STREAM_INTEGRITY_EVICTED_RECORDS,
-                response.integrity.evicted_records,
-            );
-            insert_u64_header(
-                &mut headers,
-                HEADER_STREAM_INTEGRITY_TOTAL_RECORDS,
-                response.integrity.total_records,
             );
             if let Some(snapshot_offset) = response.snapshot_offset {
                 insert_snapshot_offset(&mut headers, snapshot_offset);

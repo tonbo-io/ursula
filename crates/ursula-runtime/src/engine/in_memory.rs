@@ -987,10 +987,6 @@ impl InMemoryGroupEngine {
             snapshot_offset: snapshot.as_ref().map(|snapshot| snapshot.offset),
             snapshot_digest: snapshot.map(|snapshot| snapshot.digest),
             retained_offset: self.state_machine.retained_offset(&request.stream_id),
-            integrity: self
-                .state_machine
-                .integrity_snapshot(&request.stream_id)
-                .map_err(stream_response_error)?,
             record_range: self
                 .state_machine
                 .record_range(&request.stream_id)

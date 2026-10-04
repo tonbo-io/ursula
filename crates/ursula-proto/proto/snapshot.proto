@@ -77,7 +77,9 @@ message StreamSnapshotEntryV1 {
   repeated ColdChunkRefV1 cold_chunks = 8;
   repeated ObjectPayloadRefV1 external_segments = 9;
   repeated StreamMessageRecordV1 message_records = 10;
-  StreamIntegritySnapshotV1 integrity = 11;
+  // Field 11 held the removed per-stream integrity tally.
+  reserved 11;
+  reserved "integrity";
   StreamVisibleSnapshotV1 visible_snapshot = 12;
   repeated ProducerSnapshotV1 producer_states = 13;
   optional uint64 first_record = 14;
@@ -136,17 +138,6 @@ message ObjectPayloadRefV1 {
 message StreamMessageRecordV1 {
   uint64 start_offset = 1;
   uint64 end_offset = 2;
-}
-
-message StreamIntegritySnapshotV1 {
-  string live_setsum = 1;
-  string evicted_setsum = 2;
-  string total_setsum = 3;
-  uint64 live_start_offset = 4;
-  uint64 tail_offset = 5;
-  uint64 live_records = 6;
-  uint64 evicted_records = 7;
-  uint64 total_records = 8;
 }
 
 message StreamVisibleSnapshotV1 {

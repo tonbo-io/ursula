@@ -190,24 +190,18 @@ type ChaosStatus = {
   integrity: {
     status: StatusLevel;
     checked_at: string | null;
+    /** Samples read back and matched byte for byte. */
     verified_offsets: number;
+    /** Corruptions: a 200 read whose bytes disagreed with the acknowledged append, or a leader tail below an acknowledged end. */
     mismatch_count: number;
-    setsum_mismatch_count?: number;
-    setsum_availability_error_count?: number;
+    /** Reads that could not be served (node down, lagging, short). */
+    read_availability_error_count?: number;
+    /** Per read-back mode (`latest`, `recent`, `old`, `cold`). */
     verify_counts?: Record<string, number>;
+    /** Per mode; `<mode>_unavailable` counts availability errors. */
     verify_errors?: Record<string, number>;
-    expected_live_setsum?: string;
-    server?: {
-      node?: string;
-      live_setsum?: string | null;
-      total_setsum?: string | null;
-      evicted_records?: number | null;
-      live_start_offset?: number | null;
-      live_records?: number | null;
-      total_records?: number | null;
-    } | null;
     last_error: string | null;
-    last_setsum_availability_error?: string | null;
+    last_read_availability_error?: string | null;
   };
   chaos: {
     enabled: boolean;
@@ -1057,10 +1051,9 @@ function StatusPage() {
   const verifyModes = useMemo(() => {
     const ok = status?.integrity.verify_counts ?? {};
     const errors = status?.integrity.verify_errors ?? {};
-    // Filter out suffixed bookkeeping keys (`_unavailable`, `_skipped`) — they
-    // belong to the parent mode's badge, not their own row.
-    const isAuxKey = (name: string) =>
-      name.endsWith("_unavailable") || name.endsWith("_skipped");
+    // Filter out the suffixed `_unavailable` bookkeeping keys — they belong
+    // to the parent mode's badge, not their own row.
+    const isAuxKey = (name: string) => name.endsWith("_unavailable");
     const names = Array.from(
       new Set([
         ...Object.keys(ok).filter((name) => !isAuxKey(name)),
@@ -1073,12 +1066,8 @@ function StatusPage() {
         ok: ok[name] ?? 0,
         errors: errors[name] ?? 0,
         unavailable: errors[`${name}_unavailable`] ?? 0,
-        skipped: ok[`${name}_skipped`] ?? 0,
       }))
-      .filter(
-        (mode) =>
-          mode.ok > 0 || mode.errors > 0 || mode.unavailable > 0 || mode.skipped > 0,
-      );
+      .filter((mode) => mode.ok > 0 || mode.errors > 0 || mode.unavailable > 0);
   }, [status]);
   const workloadProbes = useMemo(() => {
     return Object.entries(status?.workload.coverage?.probes ?? {}).sort(([left], [right]) =>
@@ -1183,16 +1172,16 @@ function StatusPage() {
             </div>
             <div className="status-verdict-cell">
               <dd>{numberValue(status?.integrity.verified_offsets)}</dd>
-              <dt>offsets verified against checksums</dt>
+              <dt>appends read back byte for byte</dt>
             </div>
             <div
               className={`status-verdict-cell ${
-                (status?.integrity.setsum_mismatch_count ?? 0) > 0
+                (status?.integrity.mismatch_count ?? 0) > 0
                   ? "status-verdict-bad"
                   : "status-verdict-ok"
               }`}
             >
-              <dd>{numberValue(status?.integrity.setsum_mismatch_count)}</dd>
+              <dd>{numberValue(status?.integrity.mismatch_count)}</dd>
               <dt>data corruptions detected</dt>
             </div>
           </dl>
@@ -1205,8 +1194,8 @@ function StatusPage() {
             {status?.chaos.recovery_slo_secs ? <> · recovery SLO {status.chaos.recovery_slo_secs}s</> : null}
           </p>
           <p className="status-hero-blurb">
-            A scheduler injects faults while the cluster takes continuous reads and writes; every
-            read is verified against a running checksum, and recovery is measured against the SLO.
+            A scheduler injects faults while the cluster takes continuous reads and writes; sampled
+            appends are read back and compared byte for byte, and recovery is measured against the SLO.
           </p>
         </section>
 
@@ -1459,14 +1448,14 @@ function StatusPage() {
                 {numberValue(status?.integrity.verified_offsets)}
               </span>
               <span className={
-                (status?.integrity.setsum_mismatch_count ?? 0) > 0 ? "status-section-stat-bad" : undefined
+                (status?.integrity.mismatch_count ?? 0) > 0 ? "status-section-stat-bad" : undefined
               }>
                 <em>mismatches</em>
-                {numberValue(status?.integrity.setsum_mismatch_count)}
+                {numberValue(status?.integrity.mismatch_count)}
               </span>
               <span>
                 <em>unavailable</em>
-                {numberValue(status?.integrity.setsum_availability_error_count)}
+                {numberValue(status?.integrity.read_availability_error_count)}
               </span>
               <span>
                 <em>checked</em>
@@ -1477,9 +1466,9 @@ function StatusPage() {
           {status?.integrity.last_error ? (
             <div className="status-callout">{status.integrity.last_error}</div>
           ) : null}
-          {status?.integrity.last_setsum_availability_error ? (
+          {status?.integrity.last_read_availability_error ? (
             <div className="status-callout status-callout-muted">
-              {status.integrity.last_setsum_availability_error}
+              {status.integrity.last_read_availability_error}
             </div>
           ) : null}
           {verifyModes.length > 0 ? (
@@ -1487,11 +1476,9 @@ function StatusPage() {
               {verifyModes.map((mode) => {
                 const bad = mode.errors > 0;
                 const unavailable = mode.unavailable > 0;
-                const skipped = mode.skipped > 0;
                 const titleParts = [`${mode.ok.toLocaleString()} ok`];
                 if (bad) titleParts.push(`${mode.errors.toLocaleString()} errors`);
                 if (unavailable) titleParts.push(`${mode.unavailable.toLocaleString()} unavailable`);
-                if (skipped) titleParts.push(`${mode.skipped.toLocaleString()} skipped (stream setsum-dirty)`);
                 return (
                   <span
                     className={`integrity-mode${bad ? " integrity-mode-bad" : ""}${
@@ -1515,7 +1502,6 @@ function StatusPage() {
                     <em>{mode.ok.toLocaleString()}</em>
                     {bad ? <strong>{mode.errors.toLocaleString()} err</strong> : null}
                     {!bad && unavailable ? <strong>{mode.unavailable.toLocaleString()} unavailable</strong> : null}
-                    {!bad && skipped ? <em className="integrity-mode-aux">{mode.skipped.toLocaleString()} skipped</em> : null}
                   </span>
                 );
               })}

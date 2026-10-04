@@ -7,7 +7,6 @@ use super::persist::message_records_cover_retained_suffix;
 use super::*;
 use crate::RecordIndexError;
 use crate::StreamRecordRange;
-use crate::integrity::StreamIntegritySnapshot;
 
 const OCTET: &str = "application/octet-stream";
 
@@ -721,20 +720,6 @@ fn append_transaction_commits_all_streams_together() {
     assert_eq!(machine.head(&second).expect("second stream").tail_offset, 5);
 }
 
-fn empty_integrity() -> StreamIntegritySnapshot {
-    let empty = setsum::Setsum::default().hexdigest();
-    StreamIntegritySnapshot {
-        live_setsum: empty.clone(),
-        evicted_setsum: empty.clone(),
-        total_setsum: empty,
-        live_start_offset: 0,
-        tail_offset: 0,
-        live_records: 0,
-        evicted_records: 0,
-        total_records: 0,
-    }
-}
-
 #[test]
 fn cold_flush_command_decodes_pre_pack_wal_records() {
     let command = flush_cold_cmd(stream("legacy-cold-wal"), 0, 4, "legacy.bin", 4);
@@ -867,15 +852,6 @@ fn append_advances_offsets_and_checks_content_type() {
         7,
     );
     assert_eq!(machine.head(&stream("s-1")).expect("stream").tail_offset, 7);
-    let integrity = machine
-        .integrity_snapshot(&stream("s-1"))
-        .expect("integrity");
-    assert_eq!(integrity.live_start_offset, 0);
-    assert_eq!(integrity.tail_offset, 7);
-    assert_eq!(integrity.live_records, 1);
-    assert_eq!(integrity.evicted_records, 0);
-    assert_eq!(integrity.total_records, 1);
-    assert_eq!(integrity.live_setsum, integrity.total_setsum);
 }
 
 #[test]
@@ -2370,7 +2346,6 @@ fn snapshot_entry(
         message_records: Vec::new(),
         hot_append_starts: Vec::new(),
         record_index: None,
-        integrity: empty_integrity(),
         visible_snapshot: None,
         producer_states,
     }
@@ -2998,15 +2973,6 @@ fn checkpoint_publish_and_retention_advance_are_independent() {
     );
     let read = machine.read(&stream("snap"), 3, 2).expect("retained read");
     assert_eq!(read.payload, b"de");
-    let integrity = machine
-        .integrity_snapshot(&stream("snap"))
-        .expect("integrity");
-    assert_eq!(integrity.live_start_offset, 3);
-    assert_eq!(integrity.tail_offset, 5);
-    assert_eq!(integrity.live_records, 2);
-    assert_eq!(integrity.evicted_records, 0);
-    assert_eq!(integrity.total_records, 2);
-    assert_eq!(integrity.live_setsum, integrity.total_setsum);
     let snapshot = machine
         .read_snapshot(&stream("snap"), 3)
         .expect("visible snapshot");
@@ -3022,11 +2988,13 @@ fn checkpoint_publish_and_retention_advance_are_independent() {
         end_offset: 5,
     }]);
     let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
+    assert_eq!(restored.retained_offset(&stream("snap")), 3);
     assert_eq!(
         restored
-            .integrity_snapshot(&stream("snap"))
-            .expect("restored integrity"),
-        integrity
+            .head(&stream("snap"))
+            .expect("restored head")
+            .tail_offset,
+        5
     );
 }
 
@@ -3158,10 +3126,7 @@ proptest! {
         prop_assert_eq!(restored_read.next_offset, expected_tail);
         prop_assert_eq!(restored_read.payload, expected);
         prop_assert_eq!(
-            restored
-                .integrity_snapshot(&stream_id)
-                .expect("restored integrity")
-                .tail_offset,
+            restored.head(&stream_id).expect("restored head").tail_offset,
             expected_tail
         );
     }
@@ -3513,10 +3478,7 @@ proptest! {
         prop_assert_eq!(restored.hot_start_offset(&stream_id), candidate.end_offset);
         prop_assert_eq!(restored.bootstrap_plan(&stream_id).expect("restored bootstrap"), bootstrap);
         prop_assert_eq!(
-            restored
-                .integrity_snapshot(&stream_id)
-                .expect("restored integrity")
-                .tail_offset,
+            restored.head(&stream_id).expect("restored head").tail_offset,
             tail_offset
         );
     }

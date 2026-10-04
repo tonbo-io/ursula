@@ -21,7 +21,6 @@ use ursula_stream::ProducerAppendRecord;
 use ursula_stream::ProducerReceipt;
 use ursula_stream::ProducerSnapshot;
 use ursula_stream::SharedColdObjectOwnersSnapshot;
-use ursula_stream::StreamIntegritySnapshot;
 use ursula_stream::StreamMessageRecord;
 use ursula_stream::StreamMetadata;
 use ursula_stream::StreamSnapshot;
@@ -326,7 +325,6 @@ fn stream_to_proto(
             .into_iter()
             .map(message_record_to_proto)
             .collect(),
-        integrity: Some(integrity_to_proto(entry.integrity)),
         visible_snapshot: entry.visible_snapshot.map(visible_snapshot_to_proto),
         producer_states: entry
             .producer_states
@@ -409,7 +407,6 @@ fn stream_from_proto(
             .collect(),
         hot_append_starts: entry.hot_append_starts,
         record_index,
-        integrity: integrity_from_proto(required(entry.integrity, "snapshot stream integrity")?),
         retained_offset: entry.retained_offset,
         visible_snapshot: entry.visible_snapshot.map(visible_snapshot_from_proto),
         producer_states: entry
@@ -526,32 +523,6 @@ fn message_record_from_proto(record: proto::StreamMessageRecordV1) -> StreamMess
     StreamMessageRecord {
         start_offset: record.start_offset,
         end_offset: record.end_offset,
-    }
-}
-
-fn integrity_to_proto(integrity: StreamIntegritySnapshot) -> proto::StreamIntegritySnapshotV1 {
-    proto::StreamIntegritySnapshotV1 {
-        live_setsum: integrity.live_setsum,
-        evicted_setsum: integrity.evicted_setsum,
-        total_setsum: integrity.total_setsum,
-        live_start_offset: integrity.live_start_offset,
-        tail_offset: integrity.tail_offset,
-        live_records: integrity.live_records,
-        evicted_records: integrity.evicted_records,
-        total_records: integrity.total_records,
-    }
-}
-
-fn integrity_from_proto(integrity: proto::StreamIntegritySnapshotV1) -> StreamIntegritySnapshot {
-    StreamIntegritySnapshot {
-        live_setsum: integrity.live_setsum,
-        evicted_setsum: integrity.evicted_setsum,
-        total_setsum: integrity.total_setsum,
-        live_start_offset: integrity.live_start_offset,
-        tail_offset: integrity.tail_offset,
-        live_records: integrity.live_records,
-        evicted_records: integrity.evicted_records,
-        total_records: integrity.total_records,
     }
 }
 
