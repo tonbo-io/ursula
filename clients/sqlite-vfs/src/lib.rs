@@ -1822,7 +1822,7 @@ unsafe fn attach_files(
     // mid-switch: the file is an empty database with or without it, but SQLite's first open would
     // roll it back, truncating whatever attach writes after it.
     remove_if_exists(&format!("{path}-journal"))?;
-    let stamp = stamp(path, url, boot, &incarnation);
+    let initial = stamp(path, url, boot, &incarnation);
     let (from, epoch) = match &local {
         Some(s) => (s.offset, s.epoch),
         None => {
@@ -1832,14 +1832,14 @@ unsafe fn attach_files(
             // otherwise discarded and rebuilt) instead of being refused as never attached.
             remove_if_exists(&format!("{path}-wal"))?;
             remove_if_exists(&format!("{path}-shm"))?;
-            write_sidecar(&sidecar, 0, 0, &stamp, WalClaim::NONE)?;
+            write_sidecar(&sidecar, 0, 0, &initial, WalClaim::NONE)?;
             (0, 0)
         }
     };
     let mut applier = Applier {
         path: path.to_owned(),
         sidecar: sidecar.clone(),
-        stamp: stamp.clone(),
+        stamp: initial,
         from: (from, epoch),
         installed: 0,
         written: 0,
@@ -1883,6 +1883,8 @@ unsafe fn attach_files(
             WalClaim::NONE
         }
     };
+    // Stamped again: the db file may not have existed before (`file_id`).
+    let stamp = stamp(path, url, boot, &incarnation);
     write_sidecar(&sidecar, pos, epoch, &stamp, wal)?;
     let pages = (fs::metadata(path).map(|m| m.len()).unwrap_or(0) / PAGE as u64) as u32;
     let snapper = Arc::new(Snapper::default());
