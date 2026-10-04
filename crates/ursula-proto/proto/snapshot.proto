@@ -104,9 +104,10 @@ message StreamSnapshotEntryV1 {
   repeated uint64 record_mark_offsets = 18;
   // First record with a dense offset. Absent means first_record.
   optional uint64 dense_first_record = 19;
-  // Start offsets of the messages at or above the seal point, for streams
-  // without a record index (bounded-state F4b).
-  repeated uint64 hot_append_starts = 20;
+  // Field 20 held the removed hot append starts; streams without a record
+  // index keep no per-message boundaries.
+  reserved 20;
+  reserved "hot_append_starts";
 }
 
 message StreamMetadataV1 {

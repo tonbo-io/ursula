@@ -38,6 +38,7 @@ fs4 = { workspace = true }
 memchr = { workspace = true }
 openraft = { workspace = true }
 opentelemetry = { workspace = true }
+rand = { workspace = true, features = ["thread_rng"] }
 reqwest = { workspace = true, features = ["rustls-tls"] }
 serde = { workspace = true }
 rmp-serde = { workspace = true }
