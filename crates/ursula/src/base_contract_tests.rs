@@ -1,9 +1,10 @@
 //! Pins of the base protocol contract that the 0.6.0 removals must keep:
 //! `Stream-Seq` as a compare-and-set, `Stream-Next-Offset` as the exact
-//! resume point, and the HEAD snapshot and retention headers. The error
-//! headers are pinned in `tests.rs`:
-//! `producer_headers_deduplicate_retries_and_fence_stale_epochs`,
-//! `long_poll_returns_service_unavailable_when_live_waiters_are_full` and
+//! resume point, the HEAD snapshot and retention headers, and `Retry-After`
+//! on an append's temporary 503. The other error headers are pinned in
+//! `tests.rs`: `producer_headers_deduplicate_retries_and_fence_stale_epochs`,
+//! `long_poll_returns_service_unavailable_when_live_waiters_are_full` (a
+//! read's temporary 503) and
 //! `ingress_body_budget_rejects_write_when_budget_is_exhausted`.
 //!
 //! Offsets are opaque here: an offset is only ever echoed back or compared
@@ -11,10 +12,14 @@
 //! PR04). A failing pin is a finding to triage; a later change may edit an
 //! assertion only with a named reason.
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::body::to_bytes;
 use axum::http::Request;
 use tower::ServiceExt;
+use ursula_runtime::ColdStore;
+use ursula_runtime::InMemoryGroupEngineFactory;
 use ursula_runtime::RuntimeConfig;
 
 use super::*;
@@ -204,10 +209,12 @@ async fn stream_seq_check_runs_after_producer_dedup() {
     assert_eq!(read_all(&app, uri).await, "abb");
 }
 
-/// The prefix-count compare-and-set: a writer appends one commit with
-/// `Stream-Seq` = the number of events before it. Every commit holds at
-/// least one event, so a count only beats the stored value when the writer
-/// has seen the whole log.
+/// The prefix-count compare-and-set: a writer reads to the tail
+/// (`Stream-Up-To-Date`) and appends one commit with `Stream-Seq` = the
+/// number of events it read. Every commit holds at least one event, so a
+/// count taken at the tail beats the stored value only if no commit landed
+/// since. A count taken inside a commit (a read cut by `max_bytes`) can beat
+/// it without the writer having seen the whole log.
 #[tokio::test]
 async fn prefix_count_compare_and_set_admits_one_writer_per_prefix() {
     let app = app();
@@ -368,4 +375,26 @@ async fn head_reports_snapshot_and_retention_after_publish_and_advance() {
         value(header(&response, HEADER_STREAM_RETAINED_OFFSET)),
         value(&at)
     );
+}
+
+#[tokio::test]
+async fn temporary_unavailable_answers_carry_retry_after() {
+    // A one-byte hot cap refuses any append of two or more bytes as a
+    // temporary error, whatever the per-record charge.
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+        RuntimeConfig::new(1, 1).with_cold_max_hot_bytes_per_group(Some(1)),
+        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
+        Some(cold_store),
+    )
+    .expect("runtime");
+    let app = router(runtime);
+    let uri = "/contract/unavailable";
+    let response = create(&app, uri, &[], "").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = append(&app, uri, &[], "ab").await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(header(&response, "retry-after"), "1");
+    assert!(body_text(response).await.contains("ColdBackpressure"));
 }
