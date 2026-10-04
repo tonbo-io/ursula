@@ -2,7 +2,7 @@
 // other connection open while pages are rewritten.
 import { spawn } from "node:child_process";
 import { expect, it } from "vitest";
-import { attach } from "../src/index.ts";
+import { attach, loadUrsulaVfs, status } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
 import { integrity, openPlain, runChild, streamPath, ursulaUrl } from "./kit.ts";
 
@@ -54,4 +54,35 @@ it("attach refuses to recover while another connection has the file open", async
 	await new Promise((r) => reader.once("exit", r));
 	attach(file, url);
 	expect(xs(file)).toEqual(["f1", "o1"]);
+});
+
+// Regression (#345): a file with a sidecar passed through to the plain "unix" VFS without a
+// binding: in a process that never attached it, and after a failed re-attach, which dropped the
+// binding before it could fail. The fix must not keep the old binding either (the failed attach
+// may have rewritten the files).
+it("a file with a sidecar opens only while attached here: not before an attach, nor after a failed one", async () => {
+	const path = streamPath();
+	const url = ursulaUrl() + path;
+	const file = freshFile();
+	const child = runChild(file, url, ["CREATE TABLE t(x TEXT)", "INSERT INTO t VALUES ('r1')"], { CHILD_EXIT: "1" });
+	expect((await child.exited).code).toBe(0);
+	loadUrsulaVfs();
+	expect(() => openPlain(file)).toThrow(/unable to open/);
+	attach(file, url);
+	const again = openPlain(file);
+	again.exec("INSERT INTO t VALUES ('r2')");
+	again.close();
+	// A failed re-attach of the bound path drops its binding. Nothing listens on port 1: creating
+	// the stream fails.
+	expect(() => attach(file, `http://127.0.0.1:1${path}`)).toThrow(/create/);
+	expect(() => openPlain(file)).toThrow(/unable to open/);
+	expect(() => status(file)).toThrow(/last attach failed/);
+	attach(file, url);
+	expect(xs(file)).toEqual(["r1", "r2"]);
+	const back = openPlain(file);
+	back.exec("INSERT INTO t VALUES ('r3')");
+	back.close();
+	const fresh = freshFile();
+	attach(fresh, url);
+	expect(xs(fresh)).toEqual(["r1", "r2", "r3"]);
 });

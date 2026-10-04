@@ -88,7 +88,12 @@ it("snapshots + retention bound the stream; fresh and lagging hosts rebuild from
 	expect(status(fresh).epoch).toBe((done.epoch ?? 0) + 1);
 	expect((await owner.exited).code).toBe(0);
 
-	// Byte-identical to the owner's own file, which never saw the zombie row.
+	// Byte-identical to the owner's own file, which never saw the zombie row. A file with a sidecar
+	// opens only once attached in this process: re-attaching it here reuses it (same boot) and adds
+	// only a claim.
+	attach(file, url);
+	expect(status(file).local).toBeGreaterThan(0);
+	expect(status(file).installed).toBe(0);
 	const ownerFile = settle(file);
 	expect(ownerFile.dump["t"]?.length).toBe(48);
 	const rebuilt = readFileSync(fresh);
