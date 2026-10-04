@@ -465,7 +465,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
 
         self.assertIn("- --s3-bucket\n            - \"index-bucket\"", rendered)
         self.assertIn("- --s3-prefix\n            - \"event-index\"", rendered)
-        self.assertIn("- --segment-records\n            - \"4096\"", rendered)
+        self.assertIn("- --segment-bytes\n            - \"33554432\"", rendered)
         self.assertIn("- --worker-id\n            - $(POD_NAME)", rendered)
         self.assertIn("path: /livez", rendered)
         self.assertIn("path: /readyz", rendered)

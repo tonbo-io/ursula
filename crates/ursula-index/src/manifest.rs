@@ -1,29 +1,28 @@
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::EventEntry;
 use crate::IndexError;
 use crate::IndexStatus;
 use crate::object_store::ObjectStore;
 use crate::object_store::digest;
+use crate::part::PartFilter;
+use crate::store::IndexBase;
+use crate::store::SkipCounts;
+use crate::store::SourceBinding;
 
-pub(crate) const FORMAT_VERSION: u32 = 5;
+pub(crate) const FORMAT_VERSION: u32 = 6;
 pub(crate) const CURRENT_KEY: &str = "CURRENT";
+/// The one claim object of a stream: a single open-ended claim from the
+/// first uncovered offset.
+pub(crate) const CLAIM_KEY: &str = "claims/current.json";
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct CompletedRecordRange {
-    pub start_record: u64,
-    pub end_record: u64,
-}
-
+/// The live claim of one stream. Claims coordinate work but are not a
+/// correctness boundary: commits are verified and manifest-CAS guarded.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct RecordSegmentLease {
-    pub start_record: u64,
-    pub end_record: u64,
+pub struct SegmentLease {
+    pub start_offset: u64,
     pub worker_id: String,
     pub expires_at_ms: u64,
-    #[serde(skip)]
-    pub(crate) key: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -33,46 +32,105 @@ pub(crate) struct PartMeta {
     pub(crate) level: u8,
     pub(crate) partition_start_ms: i64,
     pub(crate) entries: u64,
-    pub(crate) min_captured_at_ms: i64,
-    pub(crate) max_captured_at_ms: i64,
-    pub(crate) min_record: u64,
-    pub(crate) max_record: u64,
+    pub(crate) min_t_ms: i64,
+    pub(crate) max_t_ms: i64,
+    pub(crate) max_t_end_ms: i64,
+    pub(crate) min_offset: u64,
+    pub(crate) max_offset: u64,
     pub(crate) bytes: u64,
 }
 
 impl PartMeta {
-    pub(crate) fn overlaps(&self, from_ms: i64, until_ms: i64) -> bool {
-        self.max_captured_at_ms >= from_ms && self.min_captured_at_ms < until_ms
+    pub(crate) fn may_match(&self, filter: &PartFilter) -> bool {
+        let time = if filter.overlap {
+            self.max_t_end_ms >= filter.from_ms && self.min_t_ms < filter.until_ms
+        } else {
+            self.max_t_ms >= filter.from_ms && self.min_t_ms < filter.until_ms
+        };
+        time && self.max_offset >= filter.floor && self.min_offset < filter.through
+    }
+
+    pub(crate) fn overlaps_offsets(&self, start: u64, end: u64) -> bool {
+        self.max_offset >= start && self.min_offset < end
     }
 }
 
+/// Manifest v6. Coverage is the byte range `[floor_offset, durable_offset)`:
+/// one claim per stream commits contiguous ranges from the first uncovered
+/// offset, so covered bytes never have gaps.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Manifest {
     pub(crate) version: u32,
-    pub(crate) source_id: String,
+    pub(crate) source: SourceBinding,
+    pub(crate) extractor_digest: String,
     pub(crate) generation: u64,
-    pub(crate) indexed_from_record: u64,
-    pub(crate) durable_through_record: u64,
-    pub(crate) completed_record_ranges: Vec<CompletedRecordRange>,
+    /// Where the index started reading.
+    pub(crate) indexed_from_offset: u64,
+    /// The source's retained offset as last observed.
+    pub(crate) floor_offset: u64,
+    /// Every complete message before this offset is indexed or counted.
+    pub(crate) durable_offset: u64,
+    /// A restart point that may not be a message boundary (a retained offset
+    /// the index had not reached, or the registration base).
+    pub(crate) resync_offset: Option<u64>,
+    /// Source bytes trimmed by retention before they were indexed, plus
+    /// bytes discarded to resynchronize.
+    pub(crate) trimmed_bytes: u64,
+    pub(crate) skipped: SkipCounts,
     pub(crate) status: IndexStatus,
     pub(crate) parts: Vec<PartMeta>,
 }
 
+/// The fields GC needs to tell a compatible manifest from another format or
+/// source, readable from any manifest version.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ManifestIdentity {
     pub(crate) version: u32,
-    pub(crate) source_id: String,
+    #[serde(default)]
+    pub(crate) source: Option<IdentitySource>,
+    #[serde(default)]
+    pub(crate) extractor_digest: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct IdentitySource {
+    pub(crate) stream_url: String,
+}
+
+/// What a manifest must match to be adopted.
+#[derive(Clone, Debug)]
+pub(crate) struct ManifestBinding {
+    pub(crate) stream_url: String,
+    pub(crate) extractor_digest: String,
+}
+
+impl ManifestIdentity {
+    pub(crate) fn matches(&self, binding: &ManifestBinding) -> bool {
+        self.version == FORMAT_VERSION
+            && self
+                .source
+                .as_ref()
+                .is_some_and(|source| source.stream_url == binding.stream_url)
+            && self.extractor_digest.as_deref() == Some(binding.extractor_digest.as_str())
+    }
 }
 
 impl Manifest {
-    pub(crate) fn new(source_id: String, indexed_from_record: u64) -> Self {
+    pub(crate) fn new(binding: &ManifestBinding, base: &IndexBase, generation: u64) -> Self {
         Self {
             version: FORMAT_VERSION,
-            source_id,
-            generation: 0,
-            indexed_from_record,
-            durable_through_record: indexed_from_record,
-            completed_record_ranges: Vec::new(),
+            source: SourceBinding {
+                stream_url: binding.stream_url.clone(),
+                incarnation: base.incarnation.clone(),
+            },
+            extractor_digest: binding.extractor_digest.clone(),
+            generation,
+            indexed_from_offset: base.offset,
+            floor_offset: base.offset,
+            durable_offset: base.offset,
+            resync_offset: (base.offset > 0).then_some(base.offset),
+            trimmed_bytes: 0,
+            skipped: SkipCounts::default(),
             status: IndexStatus::Ready,
             parts: Vec::new(),
         }
@@ -116,14 +174,13 @@ pub struct GarbageCollectionReport {
 
 pub(crate) async fn initialize(
     store: &ObjectStore,
-    source_id: &str,
-    indexed_from_record: u64,
+    binding: &ManifestBinding,
+    base: &IndexBase,
 ) -> Result<(), IndexError> {
     if store.get(CURRENT_KEY).await?.is_some() {
         return Ok(());
     }
-    let (key, bytes, pointer_bytes) =
-        Manifest::new(source_id.to_owned(), indexed_from_record).encode()?;
+    let (key, bytes, pointer_bytes) = Manifest::new(binding, base, 0).encode()?;
     let _manifest_write = store.put_if_absent(&key, &bytes).await?;
     let _pointer_write = store.put_if_absent(CURRENT_KEY, &pointer_bytes).await?;
     Ok(())
@@ -131,7 +188,7 @@ pub(crate) async fn initialize(
 
 pub(crate) async fn load_published(
     store: &ObjectStore,
-    configured_source: &str,
+    binding: &ManifestBinding,
 ) -> Result<PublishedManifest, IndexError> {
     let current = store
         .get(CURRENT_KEY)
@@ -164,20 +221,23 @@ pub(crate) async fn load_published(
             "CURRENT generation does not match manifest",
         ));
     }
-    if manifest.source_id != configured_source {
+    if manifest.source.stream_url != binding.stream_url {
         return Err(IndexError::SourceMismatch {
-            stored: manifest.source_id,
-            configured: configured_source.to_owned(),
+            stored: manifest.source.stream_url,
+            configured: binding.stream_url.clone(),
         });
     }
-    if manifest.durable_through_record < manifest.indexed_from_record
-        || manifest
-            .completed_record_ranges
-            .iter()
-            .any(|range| range.start_record < manifest.indexed_from_record)
+    if manifest.extractor_digest != binding.extractor_digest {
+        return Err(IndexError::SourceMismatch {
+            stored: format!("extractor {}", manifest.extractor_digest),
+            configured: format!("extractor {}", binding.extractor_digest),
+        });
+    }
+    if manifest.floor_offset < manifest.indexed_from_offset
+        || manifest.durable_offset < manifest.floor_offset
     {
         return Err(IndexError::InvalidSourceResponse(
-            "manifest record ranges precede the index base",
+            "manifest offsets precede the index base",
         ));
     }
     Ok(PublishedManifest {
@@ -185,85 +245,6 @@ pub(crate) async fn load_published(
         manifest_key: pointer.manifest,
         manifest,
     })
-}
-
-pub(crate) fn record_is_covered(ranges: &[CompletedRecordRange], record: u64) -> bool {
-    ranges
-        .iter()
-        .any(|range| range.start_record <= record && record < range.end_record)
-}
-
-pub(crate) fn completed_ranges_for_entries(
-    entries: &[EventEntry],
-) -> Result<Vec<CompletedRecordRange>, IndexError> {
-    let mut ranges = Vec::<CompletedRecordRange>::new();
-    for entry in entries {
-        let end_record = entry
-            .record
-            .checked_add(1)
-            .ok_or(IndexError::InvalidConfig("record segment end overflowed"))?;
-        if let Some(previous) = ranges.last_mut()
-            && previous.end_record == entry.record
-        {
-            previous.end_record = end_record;
-        } else {
-            ranges.push(CompletedRecordRange {
-                start_record: entry.record,
-                end_record,
-            });
-        }
-    }
-    Ok(ranges)
-}
-
-pub(crate) fn normalize_completed_ranges(ranges: &mut Vec<CompletedRecordRange>) {
-    ranges.sort_unstable_by_key(|range| (range.start_record, range.end_record));
-    let mut normalized = Vec::<CompletedRecordRange>::with_capacity(ranges.len());
-    for range in ranges
-        .drain(..)
-        .filter(|range| range.start_record < range.end_record)
-    {
-        if let Some(previous) = normalized.last_mut()
-            && range.start_record <= previous.end_record
-        {
-            previous.end_record = previous.end_record.max(range.end_record);
-            continue;
-        }
-        normalized.push(range);
-    }
-    *ranges = normalized;
-}
-
-pub(crate) fn contiguous_watermark(
-    ranges: &[CompletedRecordRange],
-    indexed_from_record: u64,
-) -> u64 {
-    let mut watermark = indexed_from_record;
-    for range in ranges {
-        if range.start_record > watermark {
-            break;
-        }
-        watermark = watermark.max(range.end_record);
-    }
-    watermark
-}
-
-pub(crate) fn first_uncovered_record(
-    ranges: &[CompletedRecordRange],
-    indexed_from_record: u64,
-    tail_record: u64,
-) -> u64 {
-    let mut next = indexed_from_record;
-    for range in ranges {
-        if range.start_record > next {
-            break;
-        }
-        next = next.max(range.end_record);
-        if next >= tail_record {
-            return tail_record;
-        }
-    }
-    next.min(tail_record)
 }
 
 pub(crate) fn manifest_generation(key: &str) -> Option<u64> {

@@ -170,8 +170,8 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- if lt (.Values.indexer.garbageCollection.graceSeconds | int) 300 -}}
 {{- fail "indexer.garbageCollection.graceSeconds must be at least 300" -}}
 {{- end -}}
-{{- if or (lt (.Values.indexer.workers.concurrency | int64) 1) (lt (.Values.indexer.workers.segmentRecords | int64) 1) (lt (.Values.indexer.workers.leaseMs | int64) 1) -}}
-{{- fail "indexer worker concurrency, segmentRecords, and leaseMs must be positive" -}}
+{{- if or (lt (.Values.indexer.workers.concurrency | int64) 1) (lt (.Values.indexer.workers.segmentBytes | int64) 1) (lt (.Values.indexer.workers.leaseMs | int64) 1) -}}
+{{- fail "indexer worker concurrency, segmentBytes, and leaseMs must be positive" -}}
 {{- end -}}
 {{- $bucket := default .Values.s3.bucket .Values.indexer.s3.bucket | toString | trim -}}
 {{- if eq $bucket "" -}}

@@ -23,7 +23,7 @@ enum Command {
     Server(ServerArgs),
     /// Run the stateless public HTTP/SSE gateway.
     Gateway(Box<GatewayArgs>),
-    /// Run the rebuildable event-time indexer worker pool.
+    /// Run the rebuildable event-time indexer worker pool (experimental).
     Indexer(Box<IndexerArgs>),
 }
 

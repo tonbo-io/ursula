@@ -7,7 +7,7 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
-description = "Rebuildable client-event-time index for Ursula JSON record streams."
+description = "Rebuildable event-time index for Ursula JSON and NDJSON streams (experimental)."
 
 [[bench]]
 name = "event_time_query"
