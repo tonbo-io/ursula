@@ -237,6 +237,37 @@ fn group_engine_leader_hint_is_detected_without_matching_message() {
     assert!(super::is_forward_to_leader(&err));
 }
 
+// A forward hinting this node (a read bounced back during a leadership
+// transfer) must not redirect the client to itself: no 307, so the caller
+// answers the leader-unknown 503. A hint naming a peer redirects there.
+#[test]
+fn leader_redirect_never_points_at_this_node() {
+    let router = ClientWriteLeaderRouter::with_static_topology(
+        Some(2),
+        [
+            (1, "http://node-1/".to_owned()),
+            (2, "http://node-2".to_owned()),
+        ],
+        BTreeMap::new(),
+    );
+    let forward = |leader| RuntimeError::GroupEngine {
+        core_id: ursula_shard::CoreId(0),
+        raft_group_id: RaftGroupId(0),
+        error: GroupEngineError::forward_to_leader_before_proposal(
+            "not leader",
+            Some(leader),
+            None,
+        ),
+    };
+
+    assert!(router.redirect_response(&forward(2), "/b/s").is_none());
+    let redirect = router
+        .redirect_response(&forward(1), "/b/s")
+        .expect("a hint naming a peer redirects");
+    assert_eq!(redirect.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(redirect.headers()[LOCATION], "http://node-1/b/s");
+}
+
 #[test]
 fn runtime_error_response_marks_temporary_errors_retryable() {
     let response = super::runtime_error_response(RuntimeError::LiveReadBackpressure {

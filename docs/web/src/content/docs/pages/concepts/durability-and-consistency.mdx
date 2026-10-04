@@ -17,9 +17,22 @@ Catch-up reads may be served by any replica that has applied the relevant stream
 
 A catch-up client recovering from an acknowledged append can request
 `consistency=leader`. That opt-in routes the ordinary GET through the owning
-Raft leader instead of treating a follower-local tail as authoritative. It is
-not a live-read mode; long-poll and SSE already have leader-owned watcher
-semantics.
+Raft leader instead of treating a follower-local tail as authoritative. The
+leader first confirms with a majority of voters that it still leads (Raft
+ReadIndex) and waits until it has applied everything committed up to that
+point, so the read is **linearizable**: it reflects every append acknowledged
+before the read started, including appends acknowledged by a newer leader. A
+leader cut off from the majority redirects to the new leader or answers `503`
+with `Retry-After` instead of serving its stale state. The confirmation costs
+one round trip to the voters per read. A leader that misses a confirmation under
+load retries it for up to one election timeout before it answers `503`, so a
+client should retry a `503` after `Retry-After`. It is not a live-read mode; long-poll
+and SSE already have leader-owned watcher semantics.
+
+`HEAD`, `GET …/bootstrap`, snapshot reads, the registration of a long-poll
+or SSE reader, and requests that resolve the tail through `HEAD`
+(`offset=now`, SSE start, and a long-poll's timeout answer) take the same leadership
+confirmation on the leader.
 
 `Stream-Up-To-Date` on each read tells the client whether more committed data exists past `next_offset`. `false` means keep paging.
 

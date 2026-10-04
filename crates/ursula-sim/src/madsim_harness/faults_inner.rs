@@ -123,6 +123,7 @@ impl SimFaultPlan {
             SimScenario::HttpLiveProtocolSurface => Vec::new(),
             SimScenario::HttpProducerProtocolSurface => Vec::new(),
             SimScenario::HttpProtocolSurface => Vec::new(),
+            SimScenario::LeaderReadLinearizability => Vec::new(),
             SimScenario::HttpProtocolSurfaceRandomized => vec![SimFaultStep {
                 phase: "http_protocol_surface_workload".to_owned(),
                 action: SimFaultAction::RunHttpProtocolSurfaceWorkload {

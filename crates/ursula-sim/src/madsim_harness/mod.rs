@@ -158,6 +158,7 @@ pub enum SimScenario {
     HttpLiveProtocolSurface,
     HttpProducerProtocolSurface,
     HttpProtocolSurface,
+    LeaderReadLinearizability,
 }
 
 #[derive(Clone)]
@@ -198,6 +199,7 @@ impl SimScenario {
             Self::HttpLiveProtocolSurface => "http-live-protocol-surface",
             Self::HttpProducerProtocolSurface => "http-producer-protocol-surface",
             Self::HttpProtocolSurface => "http-protocol-surface",
+            Self::LeaderReadLinearizability => "leader-read-linearizability",
         }
     }
 }
@@ -533,6 +535,7 @@ use cold_path::run_cold_read_truncate_inner;
 use cold_path::run_cold_write_delay_inner;
 use cold_path::run_cold_write_fault_inner;
 mod http;
+mod leader_reads;
 use http::run_http_live_limit_protocol_surface_inner;
 use http::run_http_live_protocol_surface_inner;
 use http::run_http_producer_protocol_surface_inner;

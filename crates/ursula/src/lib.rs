@@ -562,9 +562,15 @@ impl ClientWriteLeaderRouter {
         }
     }
 
+    /// The hinted leader's base URL. A hint naming this node (a follower's
+    /// read bounced back during a leadership transfer) yields `None`, so the
+    /// client gets the leader-unknown 503 instead of a redirect to itself.
     fn leader_base(&self, err: &RuntimeError) -> Option<(u64, String)> {
         let leader_hint = err.leader_hint()?;
         let leader_id = leader_hint.node_id?;
+        if Some(leader_id) == self.node_id {
+            return None;
+        }
         let leader_base = self
             .peers
             .get(&leader_id)

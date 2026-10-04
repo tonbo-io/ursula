@@ -89,6 +89,7 @@ pub(crate) fn read_stream_read_v1(
         max_len,
         record: request.record,
         max_records: request.max_records,
+        leader_only: request.leader_only,
         record_anchor: request
             .record_anchor
             .map(|anchor| raft_internal_proto::RecordAnchorV1 {
@@ -355,6 +356,57 @@ pub(crate) fn group_engine_client_write_error(
         );
     }
     GroupEngineError::new(format!("OpenRaft client_write: {err}"))
+}
+
+/// Map a failed ReadIndex barrier (`Raft::get_read_linearizer`). Nothing was
+/// proposed. A lost leadership forwards to the known leader (503 while it is
+/// unknown), and a leader that cannot reach a quorum answers leader-unknown
+/// (503) rather than serving a view that may miss a newer leader's
+/// acknowledged writes. A fatal error stays internal.
+///
+/// openraft's error text names internal node addresses (the quorum error
+/// lists every member), so the client sees a fixed message and the full
+/// error is logged at debug level only.
+pub(crate) fn group_engine_linearizable_read_error(
+    err: openraft::error::RaftError<
+        UrsulaRaftTypeConfig,
+        openraft::error::LinearizableReadError<UrsulaRaftTypeConfig>,
+    >,
+    operation: &str,
+    self_id: u64,
+) -> GroupEngineError {
+    tracing::debug!("OpenRaft {operation} could not confirm leadership: {err}");
+    match err.api_error() {
+        Some(openraft::error::LinearizableReadError::ForwardToLeader(forward)) => {
+            group_engine_forward_to_leader_error(
+                format!("OpenRaft {operation} has to forward request to leader"),
+                forward.leader_id,
+                forward.leader_node.as_ref(),
+                self_id,
+                true,
+            )
+        }
+        Some(openraft::error::LinearizableReadError::QuorumNotEnough(_)) => {
+            group_engine_leader_read_unavailable(
+                format!("OpenRaft {operation} could not confirm leadership with a quorum"),
+                self_id,
+            )
+        }
+        None => GroupEngineError::new(format!(
+            "OpenRaft {operation} could not confirm leadership: {err}"
+        )),
+    }
+}
+
+/// The leader-unknown answer (503 with Retry-After) for a leader read that
+/// could not be linearized in time: no quorum confirmed leadership, or the
+/// local state machine did not reach the read index. `message` (the 503
+/// body) names which, without internal addresses.
+pub(crate) fn group_engine_leader_read_unavailable(
+    message: String,
+    self_id: u64,
+) -> GroupEngineError {
+    group_engine_forward_to_leader_error(message, None, None, self_id, true)
 }
 
 /// `before_proposal` is true only for a local leadership check that runs
