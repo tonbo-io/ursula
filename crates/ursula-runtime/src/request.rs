@@ -143,8 +143,10 @@ pub struct HeadStreamResponse {
     pub integrity: StreamIntegritySnapshot,
     pub record_range: Option<StreamRecordRange>,
     /// The stream incarnation's `created_at_ms`, unique per group from
-    /// feature level 1 (C7). Internal: it has no public header. `default` keeps
-    /// HEAD responses forwarded by older followers decodable.
+    /// feature level 1 (C7). HEAD renders it as the public
+    /// `Stream-Incarnation` header, an opaque token that changes when the
+    /// stream is deleted and recreated. `default` keeps HEAD responses
+    /// forwarded by older followers decodable.
     #[serde(default)]
     pub created_at_ms: Option<u64>,
 }

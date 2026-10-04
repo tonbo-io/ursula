@@ -483,6 +483,10 @@ async fn create_append_read_and_head_match_perf_compare_subset() {
         header_str(&response, HEADER_STREAM_NEXT_OFFSET),
         "00000000000000000007"
     );
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_COLD_HOT_START_OFFSET),
+        "00000000000000000000"
+    );
     assert_eq!(header_str(&response, CONTENT_TYPE), "text/plain");
     assert_eq!(
         header_str(&response, HEADER_STREAM_INTEGRITY_LIVE_RECORDS),

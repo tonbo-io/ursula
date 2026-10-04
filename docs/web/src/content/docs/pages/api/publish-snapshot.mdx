@@ -17,7 +17,7 @@ Publishes a new checkpoint blob at the given offset. The snapshot replaces any p
  Stream offset this snapshot represents: the 20-character zero-padded decimal token.
 </ParamField>
 
-For JSON streams, `PUT /{bucket}/{stream}/snapshot?record={record}` resolves a stable record ordinal to its byte offset and publishes at that boundary.
+For JSON streams, `PUT /{bucket}/{stream}/snapshot?record={record}` resolves a stable record ordinal to its offset and publishes at that boundary.
 
 <ParamField header="Content-Type" type="string">
  Content type of the snapshot blob, stored separately from the stream's own content type. Defaults to `application/octet-stream`.
