@@ -2,6 +2,7 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use tracing::Instrument;
+use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::ColdFlushCandidate;
