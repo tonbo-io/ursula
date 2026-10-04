@@ -93,6 +93,7 @@ it("snapshots + retention bound the stream; fresh and lagging hosts rebuild from
 	// only a claim.
 	attach(file, url);
 	expect(status(file).local).toBeGreaterThan(0);
+	expect(status(file).installed).toBe(0);
 	const ownerFile = settle(file);
 	expect(ownerFile.dump["t"]?.length).toBe(48);
 	const rebuilt = readFileSync(fresh);

@@ -118,13 +118,19 @@ it("(d) a file with content but no sidecar is refused, not discarded", () => {
 });
 
 // A cache of one stream must never replay another stream's frames on top of it, nor append page
-// images built on it to a stream that does not hold its history.
-it("(e) attaching the cache of one stream to another is refused", async () => {
+// images built on it to a stream that does not hold its history. Nor is it discarded for an older
+// database when its own stream ends before the offset it acknowledged (the server lost data).
+it("(e) attaching the cache of one stream to another, or to its stream that lost acknowledged data, is refused", async () => {
 	const url = ursulaUrl() + streamPath();
 	const file = freshFile();
 	const child = runChild(file, url, FIRST, { CHILD_EXIT: "1" });
 	expect((await child.exited).code).toBe(0);
 	expect(() => attach(file, ursulaUrl() + streamPath())).toThrow(/is a cache of stream/);
+	// Untrusted files of the same incarnation whose sidecar offset lies beyond the stream's end.
+	rebooted(file);
+	const sidecar = `${file}-ursula`;
+	writeFileSync(sidecar, readFileSync(sidecar, "utf8").replace(/^\d+/, (n) => `${Number(n) + 1_000_000}`));
+	expect(() => attach(file, url)).toThrow(/lost acknowledged data/);
 	expect(statSync(file).size).toBeGreaterThan(0);
 });
 
@@ -176,7 +182,7 @@ it("(g) a same-boot image whose WAL is ahead of its sidecar is trusted", async (
 	expect(rows(file)).toEqual(["1:fir", "2:sec", "3:thi"]);
 });
 
-// Regression (VFS-P1): a stream deleted and recreated at the same path is another incarnation,
+// Regression (#345): a stream deleted and recreated at the same path is another incarnation,
 // whatever its length: resuming the old database from its offset would carry its state into the new
 // stream, and refusing while the new stream is shorter would keep a dead cache.
 it("(h) the cache of a deleted stream is rebuilt from the stream recreated at its path, shorter or longer", async () => {

@@ -118,10 +118,10 @@ wrong stream).
    sidecar is still stamped with the old incarnation, so the next attach discards whatever this one
    wrote and rebuilds from the recreated stream (step 2). A recreate that breaks catch-up first (a
    read beyond the new stream's end, a frame that does not decode) fails the attach the same way.
-   `HEAD` is a leader read and incarnations never repeat (unique per group from feature level 1,
-   which every group runs at from PR13), so a match means every read and the claim in between hit
-   that incarnation. Then, if attach wrote the db file, fsyncs it; writes the sidecar (with the
-   incarnation), and swaps the path's binding to the new attachment.
+   `HEAD` is a leader read and incarnations never repeat (unique per group from feature level 1),
+   so a match means every read and the claim in between hit that incarnation. Then, if attach
+   wrote the db file, fsyncs it; writes the sidecar (with the incarnation), and swaps the path's
+   binding to the new attachment.
 
 An attach that fails after step 1 leaves the path unbound: its files may hold anything between the
 old attachment's state and the stream's, and the stream may hold a newer claim. Opening its main
@@ -137,10 +137,11 @@ replaying from an older offset than the file reflects is idempotent.
 Producer expiry: the server forgets a producer idle for 7 days (and a recreated stream never knew
 it, §6 wrong stream). The owner's next append gets 409 expecting seq 0; it takes the stream back
 only if the stream is still the incarnation it attached to (checked before and after), still ends
-at its own offset, and its new claim (epoch + 1) lands exactly there, else it is fenced. Reads in recovery use `consistency=leader` (a follower may lag an
-acknowledged append). Catch-up reads, `HEAD` and snapshot `GET`s retry `429` and `503` (a leader
-that could not confirm its leadership in time) like appends: no sooner than `Retry-After`, with
-backoff, within `URSULA_VFS_RETRY_MS`; the snapshot thread's retries also end at its stop flag.
+at its own offset, and its new claim (epoch + 1) lands exactly there, else it is fenced. Reads in
+recovery use `consistency=leader` (a follower may lag an acknowledged append). Catch-up reads,
+`HEAD` and snapshot `GET`s retry `429` and `503` (a leader that could not confirm its leadership in
+time) like appends: no sooner than `Retry-After`, with backoff, within `URSULA_VFS_RETRY_MS`; the
+snapshot thread's retries also end at its stop flag.
 
 ## 4. Snapshots and retention (M3)
 
@@ -364,8 +365,10 @@ What attach does in each case:
   producer, and the re-claim finds the incarnation changed and fences and poisons the owner, before
   anything of it lands. Two things can still land: the stray claim of an attach or re-claim racing
   the recreate (a new producer's seq 0 is accepted; the `HEAD` after it then fails the attach or
-  fences the owner), which changes no page and only raises the epoch later claims start from; and
-  a snapshot, or a retention move, from the snapshot thread (§4.3, a window of one publish).
+  fences the owner), which changes no page but raises the epoch later claims start from, and, when
+  the recreated stream already has an owner, makes that owner's next commit see an unexpected next
+  offset, which poisons it (re-attach to recover); and a snapshot, or a retention move, from the
+  snapshot thread (§4.3, a window of one publish).
   At feature level 0 incarnations come from the create's clock and can repeat (a delete and
   recreate in the same millisecond, or a clock stepped back): the two incarnations then share a
   token, the files are trusted, and both share a producer. An owner of the deleted stream at
@@ -374,14 +377,14 @@ What attach does in each case:
   accepted and lands, and its receipt's offset differs from its own (unless neither had
   committed), which poisons it; with fewer, a duplicate whose receipt's offset differs, or a 409
   for a receipt the server no longer holds (poisoned either way; a duplicate answered without a
-  receipt, from feature level 1, fences, §2). Every group runs at feature level 1 or later from
-  PR13, where incarnations are unique per group.
+  receipt, from feature level 1, fences, §2).
 - A rollback journal next to an attached file can only be left by a crash while attach switched
   an empty file to WAL; attach deletes it in every case (rolling it back would truncate the file
   under the pages attach writes next).
 - Network partition or slow server: commits block up to the retry budget, then poison. An attach
-  that fails (server unreachable, refused, the stream recreated meanwhile) leaves the path
-  refusing opens until an attach succeeds (§1, §3), never open unreplicated.
+  that fails after step 1 leaves a file with a sidecar refusing opens until an attach succeeds
+  (§1, §3); a file whose first attach failed before writing its sidecar (the server unreachable,
+  for example) is still a plain file and passes through.
 - Two owners: the later claim wins; the earlier one's next commit fails cleanly
   (`UrsulaReplicationError` with `fenced: true` through the Pi helper).
 - A snapshot that cannot be taken (a long reader pins WAL frames) or published (body too large):
@@ -410,8 +413,8 @@ rebuild, delete `<db>`.
 ## 7. Limits
 
 - 4 KiB pages; WAL mode only; `locking_mode=EXCLUSIVE` unsupported.
-- One owner process per stream at a time; connections in other processes are not replicated (and
-  block recovery).
+- One owner process per stream at a time; connections in other processes that load the extension
+  cannot open the file (§1); processes without it are not replicated (and block recovery).
 - The local files must be on a local filesystem (§6).
 - Commit frames are at most the server's request limit (32 MiB), about 8000 changed pages per
   transaction.
@@ -431,20 +434,22 @@ rebuild, delete `<db>`.
   boot id).
 - e2e against a real node (`clients/sqlite-ursula`): transparency (any schema, byte-identical
   rebuild), the crash matrix (same-boot re-attaches resume from the sidecar, a recovery killed
-  mid-rewrite included, without a snapshot), fencing, recovery exclusion, the local cache (a
-  simulated reboot with a rolled-back db file and sidecar, below retention, a torn first sector and
-  a cut WAL rebuilds byte-identical from snapshot + tail; the same boot reuses the files with no
-  snapshot and no replay from scratch, also for a file rebuilt from a snapshot; a same-boot disk
-  image whose WAL is behind its sidecar is rebuilt and the stream stays intact, one whose WAL is
-  ahead is trusted; discarding is refused while another process has the file open; a replaced db
-  file is rebuilt; a file without a sidecar and the cache of another stream are refused; the cache
-  of a deleted stream is rebuilt from the stream recreated at its path, both shorter than the
-  file's offset and grown past it), a file a previous process attached (it refuses to open before
-  an attach, and after a failed one, until an attach succeeds; then commits replicate again),
-  snapshots and retention (a ~160 MB run; CI also
-  runs it without a cold tier under the default hot limit; fresh and lagging hosts rebuild
-  byte-identical from snapshot + tail; the takeover after the trim fences the old owner), Pi
-  conformance in three modes, and a benchmark (sanity numbers only).
+  mid-rewrite included, without a snapshot), fencing (an owner of a deleted stream included: its
+  next commit fails and nothing of it reaches the recreated stream), recovery exclusion, the local
+  cache (a simulated reboot with a rolled-back db file and sidecar, below retention, a torn first
+  sector and a cut WAL rebuilds byte-identical from snapshot + tail; the same boot reuses the files
+  with no snapshot and no replay from scratch, also for a file rebuilt from a snapshot; a same-boot
+  disk image whose WAL is behind its sidecar is rebuilt and the stream stays intact, one whose WAL
+  is ahead is trusted; discarding is refused while another process has the file open; a replaced db
+  file is rebuilt; a file without a sidecar, the cache of another stream, and files whose sidecar
+  offset lies beyond their stream's end are refused; the cache of a deleted stream is rebuilt from
+  the stream recreated at its path, both shorter than the file's offset and grown past it), a file
+  with a sidecar opening only while attached in the process (refused before an attach, and after a
+  failed re-attach of an attached file, until an attach succeeds; then commits replicate again),
+  snapshots and retention (a ~160 MB run; CI also runs it without a cold tier under the default hot
+  limit; fresh and lagging hosts rebuild byte-identical from snapshot + tail; the takeover after
+  the trim fences the old owner), Pi conformance in three modes, and a benchmark (sanity numbers
+  only).
 - The same Pi conformance, snapshot and benchmark suites on 3 nodes + gateway + MinIO at feature
   level 5 (the snapshot run's ~3.5 MB bodies go to the cold tier), with a 64 KiB snapshot minimum
   so the benchmark's Pi workload snapshots and trims at its database size.

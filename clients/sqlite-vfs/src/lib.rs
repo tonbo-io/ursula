@@ -314,10 +314,14 @@ impl Db {
             (0, [0; 8])
         };
         if mx_frame < self.commit_frame_no {
-            self.poison(format!(
-                "commit acknowledged but not published locally (mxFrame {mx_frame} < frame {})",
-                self.commit_frame_no
-            ));
+            // Already poisoned (the snapshot thread's fence fails the rest of the transaction's
+            // WAL writes): keep that reason.
+            if self.poisoned.is_none() {
+                self.poison(format!(
+                    "commit acknowledged but not published locally (mxFrame {mx_frame} < frame {})",
+                    self.commit_frame_no
+                ));
+            }
             return;
         }
         let wal = WalClaim {
@@ -879,7 +883,8 @@ enum Append {
     Acked { next: Option<u64>, attempts: u32 },
     /// 403: a newer epoch owns the stream.
     Fenced { current: Option<u64> },
-    /// 409 expecting sequence 0: the server expired this idle producer (7 days).
+    /// 409 expecting sequence 0: the server does not know this producer (expired after 7 idle days,
+    /// or the stream was deleted and recreated: `producer_id`); `reclaim` tells them apart.
     ProducerExpired,
     /// A definite rejection, or no answer within the retry budget.
     Failed(String),
@@ -1027,7 +1032,7 @@ fn read_from(url: &str, offset: u64) -> Result<(Vec<u8>, u64), Fail> {
     if status == 416 {
         return Err(Fail::Other(format!(
             "read {url} at {offset}: beyond the end of the stream that acknowledged it (the \
-             server lost acknowledged data?)"
+             server lost acknowledged data?); the local files are kept (delete them to rebuild)"
         )));
     }
     if status != 200 {
@@ -1633,8 +1638,8 @@ unsafe fn init_wal_format(path: &str) -> Result<(), String> {
 
 /// `Some(why)` unless the stream is still the incarnation `expected`: state built from one
 /// incarnation must never reach another. `HEAD` is a leader read and incarnations never repeat
-/// (unique per group from feature level 1, which every group runs at from PR13), so a match also
-/// covers everything done on the stream since the last check that matched.
+/// (unique per group from feature level 1), so a match also covers everything done on the stream
+/// since the last check that matched.
 fn recreated(
     url: &str,
     expected: &str,
@@ -1788,22 +1793,24 @@ unsafe fn attach_files(
             // or a disk image whose WAL lost frames the sidecar counts on: the stream has
             // everything committed.
             s => {
-                match &s {
-                    // The stream at the path is another one (deleted and recreated; or a sidecar
-                    // from before incarnations were recorded): nothing of the old one is wanted,
+                match s.as_ref().map(|s| (s.incarnation.as_deref(), s.offset)) {
+                    // The stream at the path is another one: nothing of the old one is wanted,
                     // whatever the new one's length.
-                    Some(s) if s.incarnation.as_deref() != Some(incarnation.as_str()) => eprintln!(
+                    Some((Some(old), _)) if old != incarnation => eprintln!(
                         "sqlite-ursula-vfs: {path}: the local files are a cache of stream \
-                         incarnation {}, but {url} is now incarnation {incarnation} (deleted and \
-                         recreated): discarding them, rebuilding from the new stream",
-                        s.incarnation.as_deref().unwrap_or("(not recorded)")
+                         incarnation {old}, but {url} is now incarnation {incarnation} (deleted \
+                         and recreated): discarding them"
+                    ),
+                    Some((None, _)) => eprintln!(
+                        "sqlite-ursula-vfs: {path}: the sidecar is from an older version (no \
+                         stream incarnation recorded): discarding the local files"
                     ),
                     // The same incarnation, unless it lost acknowledged data: a sidecar offset
                     // never exceeds an acknowledged one, so a read there answering 416 (beyond the
                     // end) refuses, as for trusted files, instead of rebuilding an older database.
                     // `Gone` (below retention) is fine: the rebuild starts from a snapshot.
-                    Some(s) if s.offset > 0 => {
-                        if let Err(Fail::Other(e)) = read_from(url, s.offset) {
+                    Some((Some(_), offset)) if offset > 0 => {
+                        if let Err(Fail::Other(e)) = read_from(url, offset) {
                             return Err(e);
                         }
                     }
@@ -1811,9 +1818,8 @@ unsafe fn attach_files(
                 }
                 emptied = Some(discard_local(path)?);
                 eprintln!(
-                    "sqlite-ursula-vfs: {path}: local files untrusted (another boot or stream \
-                     incarnation, torn, replaced, or behind their sidecar); discarded them, \
-                     rebuilding from the stream"
+                    "sqlite-ursula-vfs: {path}: local files untrusted (another boot, torn, \
+                     replaced, or behind their sidecar); discarded them, rebuilding from the stream"
                 );
             }
         }
@@ -2730,7 +2736,8 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
             db.fenced = true;
             return db.poison(format!(
                 "fenced: append at {} answered as a duplicate without a receipt: another writer \
-                 holds producer {} at epoch {} past seq {seq} (the stream deleted and recreated?)",
+                 (a foreign one using this Producer-Id?) holds producer {} at epoch {} past seq \
+                 {seq}",
                 db.offset, db.producer, db.epoch
             ));
         }

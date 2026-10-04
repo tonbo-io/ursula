@@ -23,8 +23,9 @@ export function loadUrsulaVfs(path = process.env.SQLITE_URSULA_VFS): DatabaseSyn
  * missing or behind it), claims the stream for this process (fencing every earlier owner)
  * and attaches the file. No connection to `file` may be open; the process keeps a host lock on the file
  * for its lifetime. Returns the stream offset the file reflects. A file that has a sidecar (`<file>-ursula`,
- * written by its first attach) refuses to open in this process until an attach of it succeeds,
- * including after this throws.
+ * written by its first attach) opens in this process only while attached here: not before an attach
+ * of it succeeds, nor after one fails (unless refused up front for open connections, another thread
+ * attaching it, or another process holding it, which leaves the file as it was).
  */
 export function attach(file: string, streamUrl: string): number {
 	const row = loadUrsulaVfs().prepare("SELECT ursula_attach(?, ?) AS n").get(file, streamUrl) as { n: number | bigint };

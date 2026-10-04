@@ -56,10 +56,10 @@ it("attach refuses to recover while another connection has the file open", async
 	expect(xs(file)).toEqual(["f1", "o1"]);
 });
 
-// Regression (VFS-P1): a file with a sidecar passed through to the plain "unix" VFS without a
-// binding (in a process that never attached it, or after a failed attach dropped the binding), so
-// its commits never reached the stream.
-it("a file attached by another process refuses to open until an attach succeeds here, also after a failed one", async () => {
+// Regression (#345): a file with a sidecar passed through to the plain "unix" VFS without a
+// binding (in a process that never attached it), and a failed re-attach left the old binding in
+// place over files it may have rewritten, so commits went out from a state the stream never had.
+it("a file with a sidecar opens only while attached here: not before an attach, nor after a failed one", async () => {
 	const path = streamPath();
 	const url = ursulaUrl() + path;
 	const file = freshFile();
@@ -67,14 +67,17 @@ it("a file attached by another process refuses to open until an attach succeeds 
 	expect((await child.exited).code).toBe(0);
 	loadUrsulaVfs();
 	expect(() => openPlain(file)).toThrow(/unable to open/);
-	// Nothing listens on port 1: creating the stream fails.
-	expect(() => attach(file, `http://127.0.0.1:1${path}`)).toThrow(/create/);
-	expect(() => openPlain(file)).toThrow(/unable to open/);
-	expect(() => status(file)).toThrow(/last attach failed/);
 	attach(file, url);
 	const again = openPlain(file);
 	again.exec("INSERT INTO t VALUES ('r2')");
 	again.close();
+	// A failed re-attach of the bound path drops its binding. Nothing listens on port 1: creating
+	// the stream fails.
+	expect(() => attach(file, `http://127.0.0.1:1${path}`)).toThrow(/create/);
+	expect(() => openPlain(file)).toThrow(/unable to open/);
+	expect(() => status(file)).toThrow(/last attach failed/);
+	attach(file, url);
+	expect(xs(file)).toEqual(["r1", "r2"]);
 	const fresh = freshFile();
 	attach(fresh, url);
 	expect(xs(fresh)).toEqual(["r1", "r2"]);
