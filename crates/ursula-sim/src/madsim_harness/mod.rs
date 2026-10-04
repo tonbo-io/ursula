@@ -1550,10 +1550,7 @@ pub(super) async fn verify_runtime_raft_partial_read(
             offset: offset as u64,
             max_len,
             now_ms: 0,
-            record: None,
-            max_records: None,
             leader_only: false,
-            record_anchor: None,
             read_index: None,
         })
         .await
@@ -1601,10 +1598,7 @@ pub(super) async fn verify_runtime_raft_tail_read(
             offset: request_offset,
             max_len: 8,
             now_ms: 0,
-            record: None,
-            max_records: None,
             leader_only: false,
-            record_anchor: None,
             read_index: None,
         })
         .await
@@ -1672,10 +1666,7 @@ pub(super) async fn verify_runtime_raft_close_stream(
             offset: 0,
             max_len: expected_payload.len().max(64),
             now_ms: 0,
-            record: None,
-            max_records: None,
             leader_only: false,
-            record_anchor: None,
             read_index: None,
         })
         .await
@@ -1777,6 +1768,7 @@ pub(super) async fn verify_runtime_raft_snapshot_publish(
             payload: snapshot_payload.clone().into(),
             cold_body: None,
             now_ms: 0,
+            expected_incarnation: None,
         })
         .await
         .expect("publish runtime raft snapshot");
@@ -2054,10 +2046,7 @@ pub(super) async fn read_local_payload_eventually(
                     offset,
                     max_len,
                     now_ms: 0,
-                    record: None,
-                    max_records: None,
                     leader_only: false,
-                    record_anchor: None,
                     read_index: None,
                 },
                 placement(),

@@ -56,13 +56,6 @@ jobs:
         with:
           rustflags: ""
 
-      # The record-index dense-oracle property at nightly depth (PRs run 16 cases).
-      - name: Record index oracle (256 cases)
-        if: ${{ !inputs.write_ratchet }}
-        env:
-          URSULA_PROPTEST_CASES: "256"
-        run: cargo test -p ursula-stream --lib sparse_index_matches_the_dense_oracle
-
       - name: Build state probe
         run: cargo build -p ursula-state-probe --profile state-probe
 

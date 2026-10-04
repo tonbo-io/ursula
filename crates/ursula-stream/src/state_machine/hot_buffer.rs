@@ -24,10 +24,6 @@ pub(super) struct HotBuffer {
     /// Running sum of `block.bytes.len()` over `blocks` (F6a), so callers
     /// never rescan the buffer per append.
     payload_len: usize,
-    /// Records of this stream counted in the group's hot-record gauge (F6c).
-    /// Maintained by the state machine, which owns the record boundaries;
-    /// the buffer only stores it next to the bytes it describes.
-    accounted_records: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,7 +90,6 @@ impl HotBuffer {
         Self {
             blocks,
             payload_len: bytes,
-            accounted_records: 0,
         }
     }
 
@@ -119,14 +114,6 @@ impl HotBuffer {
         self.blocks
             .len()
             .saturating_mul(std::mem::size_of::<HotBlock>())
-    }
-
-    pub(super) fn accounted_records(&self) -> u64 {
-        self.accounted_records
-    }
-
-    pub(super) fn set_accounted_records(&mut self, records: u64) {
-        self.accounted_records = records;
     }
 
     pub(super) fn hot_start_offset(&self) -> u64 {
@@ -267,6 +254,55 @@ impl HotBuffer {
             }
         }
         segments
+    }
+
+    /// The hot byte at `offset`, or `None` when that byte is not hot.
+    pub(super) fn byte_at(&self, offset: u64) -> Option<u8> {
+        let block = self
+            .blocks
+            .get(self.first_block_ending_after(offset))
+            .filter(|block| block.start_offset <= offset)?;
+        block
+            .bytes
+            .get(offset_delta(block.start_offset, offset))
+            .copied()
+    }
+
+    /// End offsets (the offset after each LF) of the JSON messages that
+    /// start at `start_offset`, scanning hot bytes up to `end_offset`. Stops
+    /// at the last end within `max_bytes` of `start_offset`, except that a
+    /// first message longer than `max_bytes` is returned whole. Stops early
+    /// at a gap in the hot blocks.
+    pub(super) fn lf_ends(&self, start_offset: u64, end_offset: u64, max_bytes: u64) -> Vec<u64> {
+        let limit = start_offset.saturating_add(max_bytes);
+        let mut ends = Vec::new();
+        let mut cursor = start_offset;
+        for block in self
+            .blocks
+            .range(self.first_block_ending_after(start_offset)..)
+        {
+            if block.start_offset > cursor || cursor >= end_offset {
+                break;
+            }
+            let to = end_offset.min(block.end_offset());
+            let Some(bytes) = block.bytes.get(
+                offset_delta(block.start_offset, cursor)..offset_delta(block.start_offset, to),
+            ) else {
+                break;
+            };
+            for index in memchr::memchr_iter(b'\n', bytes) {
+                let end = cursor.saturating_add(len_u64(index)).saturating_add(1);
+                if end > limit && !ends.is_empty() {
+                    return ends;
+                }
+                ends.push(end);
+                if end >= limit {
+                    return ends;
+                }
+            }
+            cursor = to;
+        }
+        ends
     }
 
     /// Whether the hot blocks hold every byte of `[start_offset,

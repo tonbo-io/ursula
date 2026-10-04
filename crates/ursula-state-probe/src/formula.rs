@@ -8,7 +8,7 @@
 use crate::out::Measured;
 use crate::out::Outcome;
 
-/// Receipt-item window per stream (F3).
+/// Receipt window per stream (F3).
 pub const RECEIPT_WINDOW: u64 = 1_024;
 /// Producer ids per stream (F3).
 pub const MAX_PRODUCERS: u64 = 4_096;
@@ -16,14 +16,6 @@ pub const MAX_PRODUCERS: u64 = 4_096;
 pub const MAX_SHARED_REFS: u64 = 64;
 /// Staged external refs per stream (F5).
 pub const MAX_STAGED_EXTERNAL: u64 = 16;
-/// Hot overhead per unflushed record with F6b and F4b (bytes).
-pub const HOT_OVERHEAD_PER_RECORD: f64 = 12.0;
-/// Payload bytes per hot block (F6b).
-pub const HOT_BLOCK_BYTES: u64 = 64 * 1024;
-/// Header bytes allowed per hot block (F6b).
-pub const HOT_BLOCK_HEADER_ALLOWANCE: u64 = 64;
-/// Snapshot bytes of mark fields per cold MiB (F1).
-pub const MARK_SNAPSHOT_BYTES_PER_COLD_MIB: u64 = 32;
 
 /// `Prod(s) <= 0.4 KiB * P(s) + 56 KiB` (I1).
 pub fn producer_bound(producers: u64) -> u64 {
@@ -34,25 +26,6 @@ pub fn producer_bound(producers: u64) -> u64 {
 /// `shared_refs_interval` is the refs one compaction-driver interval may add.
 pub fn per_stream_checks(outcome: &mut Outcome, m: &Measured, shared_refs_interval: u64) {
     for s in &m.snap.streams {
-        let cold_mib = s.cold_mib_ceil();
-        outcome.check(
-            "f1_dense_entries_eq_unflushed",
-            "dense record entries = unflushed records, plus the one straddling the seal point (F1)",
-            s.dense_entries as f64,
-            (s.unflushed_records + 1) as f64,
-        );
-        outcome.check(
-            "f1_mark_snapshot_bytes_per_cold_mib",
-            "snapshot bytes of the mark fields 17-19 <= 32 per cold MiB, and every record \
-             below the seal point sealed into them (F1)",
-            if s.dense_entries > s.unflushed_records + 1 {
-                // Dense offsets below the seal point stand in for marks.
-                (s.record_marks_bytes + s.record_offsets_bytes) as f64
-            } else {
-                s.record_marks_bytes as f64
-            },
-            (MARK_SNAPSHOT_BYTES_PER_COLD_MIB * cold_mib.max(1)) as f64,
-        );
         outcome.check(
             "f2_shared_refs_per_stream",
             "shared refs per stream <= 64 + refs added in one driver interval (F2)",
@@ -80,18 +53,8 @@ pub fn per_stream_checks(outcome: &mut Outcome, m: &Measured, shared_refs_interv
     }
     let g = &m.gauges;
     outcome.check(
-        "f1_record_marks",
-        "record marks <= ceil(cold MiB) + 2 (F1)",
-        g.record_marks as f64,
-        (m.snap
-            .streams
-            .iter()
-            .map(|s| s.cold_mib_ceil() + 2)
-            .sum::<u64>()) as f64,
-    );
-    outcome.check(
         "f3_receipt_items_per_stream",
-        "receipt items per stream <= 1,024 (F3)",
+        "receipts per stream <= 1,024 (F3)",
         g.max_receipt_items_per_stream as f64,
         RECEIPT_WINDOW as f64,
     );
@@ -101,29 +64,6 @@ pub fn per_stream_checks(outcome: &mut Outcome, m: &Measured, shared_refs_interv
         g.ttl_heap_entries as f64,
         (2 * g.ttl_streams) as f64,
     );
-    let unflushed: u64 = m.snap.streams.iter().map(|s| s.unflushed_records).sum();
-    if unflushed > 0 {
-        // Hot overhead per unflushed record: hot-buffer headers (8 B, F4b)
-        // + dense offsets (8 B) for records above the seal point. With F6b the hot buffer holds one header per block of
-        // up to 64 KiB, which is per payload byte rather than per record: the
-        // bound allows one header per started block of each stream's hot
-        // bytes, so per-append headers would still fail it.
-        let overhead = g.hot_overhead_bytes + 8 * unflushed;
-        let block_allowance: u64 = m
-            .snap
-            .streams
-            .iter()
-            .filter(|s| s.hot_bytes > 0)
-            .map(|s| HOT_BLOCK_HEADER_ALLOWANCE * (s.hot_bytes.div_ceil(HOT_BLOCK_BYTES) + 1))
-            .sum();
-        outcome.check(
-            "f6_hot_overhead_per_unflushed_record",
-            "hot overhead per unflushed record <= 12 B (F4b) plus one header per 64 KiB hot \
-             block (F6b)",
-            overhead as f64 / unflushed as f64,
-            HOT_OVERHEAD_PER_RECORD + block_allowance as f64 / unflushed as f64,
-        );
-    }
 }
 
 /// `capacity after flush or retention <= 2 x len + 64` (F7), aggregated over

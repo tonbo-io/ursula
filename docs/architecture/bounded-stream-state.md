@@ -4,7 +4,7 @@ Status: Accepted 2026-10-02. As built in Ursula 0.6.0: every fix below that this
 
 Scope: make the memory and snapshot footprint of every Ursula stream at most a small constant, plus its unflushed hot window, plus 16 bytes per MiB of cold history, without requiring retention. The footprint then no longer grows with record count, but it is not independent of history: it still grows by about 16 MiB per TiB of cold history, per stream and per replica. A history-independent bound is a follow-up (§3, I1). This covers replicated state on every replica, the group snapshots built from it, node-local state outside the state machine, per-request memory, and the S3 objects that state points to. It also fixes the cold-path correctness defects that the audit and its adversarial review found, because several fixes build on them.
 
-Related: issue #17 (stable memory under cold storage) and PR #15 (cold metadata moved into cold-index pages); issue #84 and PR #91 (record coordinates; #84 anticipated a sparse index); #146 (producer receipts); #164, #182, #184 (pack references in replicated state); #278 (legacy pack migration); #57, #58, #167 (TTL sweeps and renewal); #190 (incremental group hot gauge); #194, #198, #212, #252 (snapshot cost and cadence); #111, #274 (WAL reclaim); #210 (the eviction rule); #41 (agent trajectories keep full history); #170 (framed binary records); `docs/architecture/json-record-coordinates-validation.md`; `docs/architecture/raft-wal-production.md`; `docs/architecture/deterministic-simulation-testing.md`; specs `extensions.mdx` §2 and §6, `durable-stream.mdx`, `concepts/exactly-once-writes.mdx`, `operations.mdx`.
+Related: issue #17 (stable memory under cold storage) and PR #15 (cold metadata moved into cold-index pages); issue #84 and PR #91 (JSON record ordinals, removed in 0.6.0; #84 anticipated a sparse index); #146 (producer receipts); #164, #182, #184 (pack references in replicated state); #278 (legacy pack migration); #57, #58, #167 (TTL sweeps and renewal); #190 (incremental group hot gauge); #194, #198, #212, #252 (snapshot cost and cadence); #111, #274 (WAL reclaim); #210 (the eviction rule); #41 (agent trajectories keep full history); #170 (framed binary records); `docs/architecture/raft-wal-production.md`; `docs/architecture/deterministic-simulation-testing.md`; specs `extensions.mdx` §2, `durable-stream.mdx`, `concepts/exactly-once-writes.mdx`, `operations.mdx`.
 
 Conventions: paths are relative to the repository root, and line numbers refer to commit `e6d8d70` (0.5.1). Figures marked *measured* come from the bounded-state probe that milestone B0 commits (§7.1). It drives the real `StreamStateMachine` with the exact commands the runtime issues (L1) and the real `ShardRuntime` with both the in-memory and the single-node OpenRaft engine (L2), and it counts requested heap bytes with a counting allocator, so real RSS is somewhat higher. Defects marked *reproduced* come from the adversarial probes, which also drive the real `ShardRuntime`; B0 commits them as regression tests. Unmarked figures are estimates.
 
@@ -13,7 +13,7 @@ Conventions: paths are relative to the repository root, and line numbers refer t
 1. A stream that lives forever and receives many tiny records grows per-stream state without bound unless the application advances retention. Five replicated structures grow with history: the dense record index (8 B per JSON record), shared pack references (about 250 B per packed flush), producer receipts (about 120 B per append within an epoch), message records on streams that only receive external appends (16 B per record), and `Vec` capacity that is never returned. One node-local structure on every replica, the TTL index, grows by about 104 B per append, and not even retention bounds it.
 2. *Measured*: one stream of 3M records of 200 B holds a 33.5 MB index buffer on every replica and puts 13.6 MB into each 18.9 MB group snapshot. A default-config group of 200 slow streams reaches 1.72 GB of heap and a 584 MB group snapshot after 24 hours, because the flush planner starves one stream and then packs every other stream every second.
 3. The cold path also has correctness defects on the default configuration (§4.2), all *reproduced*. The worst: when a stream holds small hot bytes, receives an append of 1 MiB or more, and then flushes, its cold frontier moves backwards; the large append becomes unreadable, and no group snapshot holding the stream can be restored or installed. Others: `/bootstrap` silently drops bytes after a checkpoint that retention did not follow; cold-index pages keep entries of rejected large appends, which later serve wrong bytes; stream GC after a delete and recreate deletes the new incarnation's objects. They are fixed first, in B1, and ungated where possible.
-4. Target: per stream, replicated state is at most C0 + 8 B per unflushed record + 16 B per MiB of cold history, plus bounded producer state, with C0 about 32 KiB. That stops growth with record count; growth with history remains at about 16 MiB per TiB of cold log per stream per replica, and removing it is a follow-up (offload marks into cold-index pages, about 128 B per GB, or thin old marks to 8 MiB). Per node, nothing is keyed by what was ever seen. Retention is never required.
+4. Target: per stream, replicated state is at most C0 + 8 B per unflushed record + 16 B per MiB of cold history, plus bounded producer state, with C0 about 32 KiB. That stops growth with record count; growth with history remains at about 16 MiB per TiB of cold log per stream per replica, and removing it is a follow-up (offload marks into cold-index pages, about 128 B per GB, or thin old marks to 8 MiB). Per node, nothing is keyed by what was ever seen. Retention is never required. (As built in 0.6.0, the two per-record and per-cold-MiB terms are gone: JSON record ordinals were removed, so per-stream state no longer grows with history; see §5.2.)
 5. The record index keeps exact offsets only for records that are not yet flushed, plus one `(record, offset)` mark per 1 MiB block of cold log. A JSON record boundary is exactly an LF in the stored bytes, so a cold lookup scans at most one block. Apply never stores a record number it cannot recompute: retention into cold history lands on the mark at or below its target.
 6. Pack references compact through the existing `CompactCold`. The Raft engine lacks the all-shared branch that the in-memory engine has; adding it also fixes the legacy-pack migration that bucket purge runs. Every page write for a range whose bytes state proves clears the other entries overlapping it, so compaction never exposes a stale entry.
 7. Producer receipts become a per-stream window of 1,024 items plus each producer's newest acknowledgement, and idle producers expire; duplicates beyond the window answer `204` without ranges, as the base protocol says. Message records collapse at every cold transition. External payload locators are committed first and moved into cold-index pages afterwards, so state holds only the in-flight ones.
@@ -33,7 +33,7 @@ Today they have to trim anyway. `operations.mdx:135` says "There is no automatic
 
 Section 4 lists every source. The ones that dominate long-lived streams of tiny records, all *measured*:
 
-- **Record index.** `StreamRecordIndex.record_offsets` holds one `u64` per retained JSON record, hot or cold (`crates/ursula-stream/src/record_index.rs:6-10`). Heap is 8.4 to 11.2 B per record because the buffer doubles: 33.5 MB of capacity at 3M records. Snapshots spend 2.9 to 4.6 B per record as absolute-offset varints: 13.6 MB of an 18.9 MB snapshot at 3M records. `FlushCold` never touches it. Retention clones it first (`cold.rs:368-385`) and drains without shrinking (`record_index.rs:227`): after trimming 990k of 1M records, 8.04 MB stays allocated for 10k records.
+- **JSON record ordinal index (removed in 0.6.0).** It held one `u64` per retained JSON record, hot or cold. Heap was 8.4 to 11.2 B per record because the buffer doubles: 33.5 MB of capacity at 3M records. Snapshots spent 2.9 to 4.6 B per record as absolute-offset varints: 13.6 MB of an 18.9 MB snapshot at 3M records. Retention cloned it and drained it without shrinking: after trimming 990k of 1M records, 8.04 MB stayed allocated for 10k records. F1 bounded it with sparse marks; 0.6.0 removed it.
 - **Pack references.** Each packed flush adds one shared `ColdChunkRef` per participating stream (`state_machine/cold_state.rs:26-31`): 227 B tight and 421 B with slack in memory, 166 B in snapshots, plus about 260 B of heap and 84 B of snapshot per live pack in the group maps. At 30 KB/s per group that is 308 refs per stream per day, and 1,625 per day under node pressure flushing.
 - **Flush-planner starvation.** With the default `flush_size = flush_max_size = 8 MiB`, the drain pass stops at the first candidate that does not fit and always walks streams in the same order (`cold.rs:71-72, 167`). One stream's hot bytes then grow until the group's admission cap starts rejecting writes, and the group stays in drain mode, packing every other active stream every second. For 200 streams at 30 KB/s per group, onset came at about 15 h. At 24 h: 16.3k refs per stream, a 584 MB group snapshot (234 MB with zstd), 1.72 GB of heap, and 44 s of flush CPU per hour. It reproduces through the real runtime on both engines (onset at about 65 min with 50 streams at 2 KB/s).
 - **Producer receipts.** One receipt per append within an epoch (`state_machine/append.rs:1005`): 1M appends cost 133.5 MB of heap (against 18.7 MB without producers) and 35.9 MB of a 48.1 MB snapshot. A duplicate of the newest sequence scans linearly from the oldest: 0.95 ms at 1M receipts. 100k producer ids with 10 appends each cost 188 MB of heap.
@@ -53,7 +53,7 @@ Section 4 lists every source. The ones that dominate long-lived streams of tiny 
 
 ### 2.4 How we got here
 
-The goal is not new. #17 (2026-06-05) set it: "Fixed number of live streams should have stable memory usage over time", "Cold metadata should not grow forever just because a stream keeps flushing to cold storage", and retention or TTL "can be lazy, but once triggered it must fully reclaim the related in-memory state". PR #15 delivered it by moving per-chunk and external references into S3 cold-index pages and collapsing message records after flush. Three July features then put per-record or per-flush growth back into replicated state, each as a local decision: the dense record index (#91, whose cost `json-record-coordinates-validation.md:64-66` records as accepted), exact producer receipts (#146) and pack-slice references (#182). This document restores #17's goal and extends it to the structures #17 did not name.
+The goal is not new. #17 (2026-06-05) set it: "Fixed number of live streams should have stable memory usage over time", "Cold metadata should not grow forever just because a stream keeps flushing to cold storage", and retention or TTL "can be lazy, but once triggered it must fully reclaim the related in-memory state". PR #15 delivered it by moving per-chunk and external references into S3 cold-index pages and collapsing message records after flush. Three July features then put per-record or per-flush growth back into replicated state, each as a local decision: the dense JSON record ordinal index (#91, which accepted the cost; removed in 0.6.0), exact producer receipts (#146) and pack-slice references (#182). This document restores #17's goal and extends it to the structures #17 did not name.
 
 ## 3. Target invariants
 
@@ -79,7 +79,7 @@ Prod(s) ≤ 0.4 KiB · P(s) + 56 KiB     (P(s) ≤ 4,096; window of 1,024 receip
 
 In the shorthand of "C0 + C1 · unflushed records + C2 · cold MiB": C0 is about 32 KiB, C1 is 8 B plus the record's payload, and C2 is 16 B.
 
-I1 does not grow with record count, but its last term grows with history: 16 B per MiB is about 16 MiB per TiB of cold log, per stream, per replica. This document commits to that bound, not to one independent of the stream's age. **Follow-up for history-independent replicated state:** offload marks into cold-index pages, leaving state about 128 B per GB of cold log, or thin marks older than a cutoff to one per 8 MiB (Q10). Neither is part of B0–B7.
+I1 does not grow with record count, but its last term grows with history: 16 B per MiB is about 16 MiB per TiB of cold log, per stream, per replica. This document commits to that bound, not to one independent of the stream's age. **Follow-up for history-independent replicated state:** offload marks into cold-index pages, leaving state about 128 B per GB of cold log, or thin marks older than a cutoff to one per 8 MiB (Q10). Neither is part of B0–B7. (Superseded in 0.6.0: removing JSON record ordinals removed the marks, so I1's last term is zero.)
 
 **I2. Per group.** The sum of I1 over the group's streams, plus: hot-window real memory (payload plus boundaries) at most the 64 MiB admission cap once admission counts real memory (F6c); shared-pack maps at most one entry per live pack, which is at most 64 per stream; a cold-GC queue bounded while GC is healthy and alerted otherwise. The one documented exception is tenant tombstones, which are O(buckets ever written or purged) by design (F15).
 
@@ -103,7 +103,7 @@ Every growth source the audits found, replicated or not, with the fix that bound
 
 | # | Structure (location) | Repl. | Growth | Cost | Bound today | Fix |
 |---|---|---|---|---|---|---|
-| 1 | Dense record index `record_offsets` (`record_index.rs:6-10`) | yes | O(records), hot and cold | 8 B/record tight, 8.4-11.2 B heap, 2.9-4.6 B in snapshots; 3M records: 33.5 MB buffer, 13.6 of 18.9 MB snapshot | retention only; capacity kept; retention clones it | F1, F7 |
+| 1 | Dense JSON record ordinal index (removed in 0.6.0) | yes | O(records), hot and cold | 8 B/record tight, 8.4-11.2 B heap, 2.9-4.6 B in snapshots; 3M records: 33.5 MB buffer, 13.6 of 18.9 MB snapshot | retention only; capacity kept; retention clones it | F1, F7 |
 | 2 | Shared pack refs `cold_chunks` and group `shared_cold_object_refs/owners` (`cold_state.rs:26-31`; `state_machine.rs:115-122`) | yes | O(packed flushes) | 227 B tight, 421 B with slack, 166 B snapshot per ref; 260 B heap and 84 B snapshot per live pack | retention or delete; Raft engine rejects shared `CompactCold` | F2, F10 |
 | 3 | Producer receipts (`append.rs:1005`) and a copy of the newest receipt's items (`model.rs:120`) | yes | O(appends per epoch) | 115-131 B heap, 24-36 B snapshot per append | epoch bump | F3 |
 | 4 | Producer map (`state_machine.rs:143`) | yes | O(distinct ids) | about 380 B per id; id length unbounded | stream delete | F3 |
@@ -123,7 +123,7 @@ Every growth source the audits found, replicated or not, with the fix that bound
 | 18 | Snapshot build clones and node-wide permit (`ursula-raft/src/state_machine.rs:591-612`) | n/a | O(state) per build; other groups' apply waits | one to two extra copies of group state per build | build concurrency 1 | F12 |
 | 19 | Cold-index page LRU deque (`ursula-runtime/src/cold_index.rs:678-729`) | no | O(lookups) | 156-219 B per lookup; 1.1M lookups of one page: +223 MiB | only when pages exceed capacity | F13 |
 | 20 | Cold-read `readers` map (`ursula-runtime/src/cold_store.rs:1182-1201`) | no | O(streams ever read) | 149 B per stream | restart | F13 |
-| 21 | Read materialization (`crates/ursula/src/lib.rs:3156-3159`; `in_memory.rs:1004-1018, 1106-1185`) | no | O(history) per request | whole range without `max_bytes` or `max_records`, also first SSE and long-poll read | retention only | F11 |
+| 21 | Read materialization (`crates/ursula/src/lib.rs:3156-3159`; `in_memory.rs:1004-1018, 1106-1185`) | no | O(history) per request | whole range without `max_bytes`, also first SSE and long-poll read | retention only | F11 |
 | 22 | `/bootstrap` (`in_memory.rs:1203-1233`; `ursula-raft/src/engine/mod.rs:1003-1018`) | no | O(suffix after snapshot) per request; one plan per message record, O(hot records²) CPU, inside the Raft apply worker | whole suffix; est. ≥ 0.6 s of apply at a full W1 hot window (42k chunks × 14 µs) | snapshot offset | F11 |
 | 23 | In-memory engine admission preview (`in_memory.rs:682-802`) | node memory, CPU | a full copy of the group engine per create and append (`:690, 729`) | 30k appends: 17.7 s with admission, 0.44 s without | none | F9 |
 | 24 | `hot_payload_len` scan (`state_machine/query.rs:153-160`; `hot_buffer.rs:47-49`) | CPU | O(hot chunks) per append | 14 µs at 42k chunks against 0.8 µs for the apply | flush thresholds | F6 |
@@ -164,75 +164,11 @@ Each subsection gives the data-structure change, read and write path changes, sn
 
 Earlier main builds gated the replicated changes below behind replicated per-group upgrade gates (C0); Ursula 0.6.0 removed the gates and runs them unconditionally (format epoch 2).
 
-**`TidyStream { stream_id, now_ms }`** applies the normalizations that `FlushCold` and `AppendExternal` run inline to a stream that is idle: it seals the record index (F1), expires idle producers, evicts producers over the cap and trims receipts (F3), and shrinks capacities (F7). It is idempotent. Each command does bounded work, at most 1M records sealed and 64k receipts trimmed, so a stream with a large backlog converges over several commands without stalling the group's apply. A leader-side maintenance driver issues it for streams whose derived debt exceeds a threshold (dense records below the seal point, receipts beyond the window, idle producers, producers over the cap), at most 64 streams per group per minute, and repeats until no debt remains.
+**`TidyStream { stream_id, now_ms }`** applies the normalizations that `FlushCold` and `AppendExternal` run inline to a stream that is idle: it expires idle producers, evicts producers over the cap and trims receipts (F3), and shrinks capacities (F7). It is idempotent. Each command does bounded work, at most 64k receipts trimmed, so a stream with a large backlog converges over several commands without stalling the group's apply. A leader-side maintenance driver issues it for streams whose derived debt exceeds a threshold (receipts beyond the window, idle producers, producers over the cap; until 0.6.0 also F1's unsealed records), at most 64 streams per group per minute, and repeats until no debt remains.
 
 ### 5.2 F1: sparse cold record marks
 
-**Observation.** For `application/json` streams every stored record is one compact JSON value followed by LF. `normalize_http_write_payload` serializes each message with `serde_json::to_writer` and appends `b'\n'` (`crates/ursula/src/render.rs:725-753`), compact JSON never contains a raw LF, and every write path derives record ends from LF positions with `canonical_json_record_ends` (`record_index.rs:46-65`; inline appends at `append.rs:258-268`; create and external paths at `crates/ursula-runtime/src/request.rs:80, 612`). The dense vector is therefore a cache of LF positions. Once bytes are cold they are immutable, and a mark per MiB plus a bounded scan reproduces the cache exactly, provided the cold bytes are right (F19).
-
-**Data structure.**
-
-```rust
-pub struct StreamRecordIndex {
-    first_record: u64,             // first retained record; meaning unchanged
-    marks: Vec<RecordMark>,        // sealed records: one mark per 1 MiB block that contains a record start
-    dense_first_record: u64,       // records at or above this have exact offsets
-    dense_offsets: VecDeque<u64>,  // start offsets of [dense_first_record, next_record); prefix drains cost O(drained)
-}
-pub struct RecordMark { pub record: u64, pub offset: u64 }
-const MARK_BLOCK_SHIFT: u32 = 20; // fixed by the format
-```
-
-Invariants, maintained by apply and checked at restore where bytes are not needed:
-
-- **M1.** `first_record ≤ dense_first_record ≤ next_record = dense_first_record + dense_offsets.len()`.
-- **M2.** Sealed records exist exactly when `marks` is non-empty, and then `marks[0] = (first_record, retained_offset)`.
-- **M3.** Marks strictly increase in both record and offset, and the last mark's record is below `dense_first_record`.
-- **M4 (locality).** Every sealed record `r` starts in the same 1 MiB block as `mark_le(r)`. Equivalently, sealing emits a mark for each sealed record that starts in a later block than the previous mark.
-- **M5.** Dense offsets strictly increase and are below the tail. With marks present, `dense_offsets[0]` exceeds the last mark's offset; without marks, `dense_offsets[0] = retained_offset`, as today.
-
-**Sealing.** One function, `seal_below(p, budget)` with `p` the seal point (`hot_buffer.first_start_offset()` or the tail). It moves dense records whose end is at or below `p` into the sealed set, oldest first and at most `budget` = 1M records per call, emitting marks per M4, then drains the moved prefix and shrinks (F7). A record that straddles `p` stays dense; flushes can split an append mid-record (`hot_buffer.rs:131-136`). Records of an external append that sits above hot bytes also stay dense until the hot bytes below them flush. Apply calls it at the end of `FlushCold` (`cold.rs:402-518`), `AppendExternal` (`append.rs:419-597`), create with an external body, `AdvanceRetention` (retention can drop the hot bytes below an external append's dense records, so sealing there leaves no debt for the tidy driver), and `TidyStream`. The cost is amortized O(1) per record, and no apply spends more than about 5 ms sealing: a stream with a large dense backlog seals in 1M-record steps.
-
-**Lookups.**
-
-```rust
-enum Locate { Exact(u64), Scan { from_record: u64, from_offset: u64, limit: u64 } }
-fn locate_record(&self, r: u64, tail: u64) -> Result<Locate, RecordIndexError>;
-fn locate_offset(&self, o: u64, tail: u64) -> Result<OffsetLocate, RecordIndexError>; // Exact(r) | Scan{..} | NotBoundary
-```
-
-For a sealed record `r`, let `m = mark_le(r)`. The result is `Exact(m.offset)` when `m.record == r`, and otherwise `Scan` with `limit = min(block_end(m.offset), next anchor offset)`, where the next anchor is the next mark, else `dense_offsets[0]`, else the tail. By M4, `start(r)` lies strictly between `m.offset` and `limit`, so no scan leaves one block. For an offset `o`: `o == m.offset` is exact; `o` at or beyond `block_end(m.offset)` but below the next anchor is `NotBoundary`, because it lies inside the last record that starts in `m`'s block; otherwise the scan counts LFs in `[m.offset, o)` and `o` is a boundary exactly when the byte before it is LF.
-
-**Read path.** `read_stream_plan_after_access` (`in_memory.rs:956-1031`), which both engines use (`crates/ursula-raft/src/engine/mod.rs:814`), turns the two locations of `[r, r_end)` into a byte window plus `RecordTrim { skip, take }`. The window starts at the exact offset or at `m.offset` with `skip = r − m.record`. It ends at the exact end offset or at the end location's `limit`, which always contains the LF that ends record `r_end − 1`. Materialization (`request.rs:268-314`, `in_memory.rs:1106-1185`) becomes a record cursor. It pulls bytes segment by segment, counts `skip` LFs without copying, copies the next `take` records, and stops at the `take`-th LF, at the window end, or at the response cap (F11) with at least one complete record. It then rewrites `offset`, `next_offset`, `record_range`, and `up_to_date = (next_offset == tail)`. A bracketed plan never claims `up_to_date` before trimming, so the follower forwarding check (`ursula-raft/src/engine/mod.rs:846-856`) must use the trimmed result. Over-read is under 1 MiB before the first record and under one cache block after the last; both fall on 1 MiB cold read-cache blocks (`config.rs:472`). The CPU cost is a `memchr` over at most 1 MiB, about 50 µs.
-
-Scans verify the anchors they cross (F19): the byte before each must be LF, and the LF count between two consecutive anchors must equal their record difference. A mismatch fails the read with a corruption error and a metric instead of returning shifted records.
-
-Server-side continuations carry an anchor taken from their own previous response, in a new `ReadStreamRequest` field `record_anchor: Option<RecordAnchor { incarnation, record, offset }>` with `#[serde(default)]`. The `offset` field cannot carry it, because record reads send `offset = 0` (`lib.rs:3141-3142`). That covers the SSE loop (`lib.rs:3800-3850`), including the envelope view, which reads one record per iteration. The engine uses an anchor only if its incarnation matches (unique, F14g) and it validates: a dense anchor must equal the dense offset, and a sealed anchor must lie in its mark's bracket with an LF in the byte before it, which the plan reads. Otherwise it resolves from the mark. The anchor is never parsed from client input, and nodes that do not know the field ignore it. Client loops of `?record=r&max_records=k` pay at most one front scan per request; a node-local anchor cache could remove that later (Q11).
-
-Offset reads never consult the index and do not change. Record headers appear only on record reads (`render.rs:539-545`).
-
-**Writes and acknowledgements.** `StreamResponse::Appended` gains `record_range: Option<StreamRecordRange>`, which apply fills from the prepared range it already computes (`append.rs:270-286, 476-492`). `StreamResponse` is not serialized, so this is a local change. Deduplicated responses carry the stored receipt's range (`ProducerDecision::Duplicate` already holds the items, `append.rs:1019-1025`), or the producer's newest acknowledgement when the duplicate is of the newest sequence and its receipt was evicted (F3). `record_range_for_append` (`query.rs:57-91`) stops consulting the index. Today it searches the dense vector for appends without a producer and as a fallback when a duplicate is not the latest receipt. After F1 that search would fail for sealed records, including an external append that sealed its own records in the same apply. After retention the fallback already fails today with a 500. Close acknowledgements keep using `next_record`. `record_match`, HEAD, `tail_records` resolution and every first/next record header need only `(first_record, next_record)`, which stays O(1).
-
-**Retention and snapshot publish.** Apply never stores a record number it cannot recompute.
-
-- **Dense target:** the exact check, as today.
-- **Sealed target:** apply retains to `m = mark_le(o)`, the last mark at or below the target offset; that is exact when `o == m.offset`. Ordinals never change: `F` becomes `m.record`, and the response's `Stream-Retained-Offset` and `Stream-Record-First` report the effective boundary, as the retention route already returns them (`lib.rs:3456-3485`). At most one 1 MiB block below the requested boundary stays readable, a storage cost only. Retention mutates in place with no clone: it drops marks below `m`, or drains the dense prefix when the target is dense.
-- **Leader-side checks.** The `?record=` routes resolve `O(r)` with a one-record read, as today (`resolve_record_offset`, `lib.rs:3388-3410`). On JSON streams the raw-offset routes check a sealed target with a bounded scan and return 400 for an intra-record offset before proposing.
-- **Publish.** Apply checks dense targets exactly and accepts sealed targets at or below `p(s)`, as today's frontier rule does. The leader-side scan rejects intra-record cold offsets with 400, which closes today's gap in practice: `snapshot_offset_aligned` accepts any offset at or below the cold frontier (`cold.rs:670-686`), so a JSON snapshot at an intra-record cold offset is accepted, contrary to `extensions.mdx:751`.
-
-Neither command gains a field. A wrong scan, from wrong cold bytes or from a delete and recreate between resolution and commit, can make the leader accept or reject the wrong request, as a stale offset can today, but apply still lands on a real boundary, so record coordinates stay exact on every replica. Retention landing below its target needs a one-sentence amendment to `extensions.mdx` §2.2.
-
-**Snapshot codec.** `StreamSnapshotEntryV1` gains `repeated uint64 record_mark_records = 17`, `repeated uint64 record_mark_offsets = 18` and `optional uint64 dense_first_record = 19`, and field 15 holds dense offsets only. Absent fields mean all-dense. They are written only when the index has sealed records. The serde `StreamSnapshot` used by backup export (#154) gets the same fields with `#[serde(default)]`.
-
-**Migration.** None: format epoch 2 starts from empty state. Each stream seals at its next `FlushCold` or `AppendExternal`, at most 1M records per command, and `TidyStream` seals idle streams.
-
-**Gating.** None in 0.6.0. Prerequisites that ship with it: F18's coverage and F19's clip rule and repair.
-
-**Cost.** +1,300 production LoC and +1,800 test LoC; #91 took about 1,600 and 2,000 for the dense form. Medium-high risk, because it touches every record-coordinate path; §6 is the mitigation.
-
-**Effect.** 16 B per MiB of sealed log in memory and about 9 B per mark in snapshots, plus 8 B per unflushed record. W1 at 3M records (600 MB, 4.4 MB of it hot): about 570 marks (9.1 KB) plus 22k dense offsets (176 KB) instead of a 33.5 MB buffer, and about 5 KB of marks in the snapshot instead of 13.6 MB of offsets. W2's 200 streams over 24 h (about 2.6 GB): about 2,600 marks (42 KB) plus, under F10's maximum hot age, 150 to 225 dense records per stream (240 to 360 KB) instead of 33.1 MB of offsets. An earlier probe measured 2,000 B instead of 1,600,000 B for 200k fully sealed records over 124 MiB.
-
-**Tests.** Unit tests for sealing at block boundaries, records larger than 1 MiB, mid-record seal points, the per-call budget, retention onto marks and an empty dense part. A property test against a dense oracle (§6). The `record_coordinates_reference.rs` oracle extended to persistence cases, as `json-record-coordinates-validation.md:15` requires. HTTP tests for each RC invariant. The `append_apply` benchmark reports hot and cold seek and aligned-read latency (`json-record-coordinates-validation.md:62`).
+**Removed in 0.6.0.** F1 bounded the JSON record ordinal index with one mark per MiB of cold log. 0.6.0 removed JSON record ordinals altogether, and with them the index, its marks and `TidyStream`'s sealing step. A JSON message boundary is now an offset whose preceding byte is LF. Snapshot and retention offsets on a JSON stream must be boundaries: apply checks the preceding byte when it is hot; otherwise the HTTP layer reads it from the leader and proposes again pinned to the stream incarnation, and a read that fails answers 503. Retention is exact. Replicated state keeps nothing per message and nothing per MiB of cold log.
 
 ### 5.3 F2: pack-reference compaction
 
@@ -292,13 +228,13 @@ Neither command gains a field. A wrong scan, from wrong cold bytes or from a del
 
 **F4b (with F6b).** The field is gone. In the hot window, message boundaries are the record index's dense offsets for JSON; other content types have no message boundaries at all. Bootstrap uses the dense offsets for one part per JSON record. `snapshot_offset_aligned` uses them for JSON and accepts any offset in `[retained, tail]` for other types, and snapshot field 10 is reserved.
 
-*Implementation notes (as built in 0.6.0).* Streams without a record index keep nothing per message; snapshot stream entry field 20 (`hot_append_starts`, which held per-message starts in earlier 0.6.0 development builds) is reserved. Bootstrap follows the honest-partial rule: there is no cold part. For a stream without a record index it answers the hot range `[S, tail)` as one part when `S` is at or above the seal point, every byte of the range is hot (an external append above hot bytes leaves a cold gap) and the range is at most 8 MiB, and the snapshot alone otherwise; its exact frontier is `max(seal point, retained)`. For JSON, a snapshot offset below the first dense offset at or above the seal point answers the snapshot alone. F6c charges 8 B per hot JSON record (`HOT_RECORD_OVERHEAD_BYTES`) and payload only for other types.
+*Implementation notes (as built in 0.6.0).* No stream keeps anything per message; snapshot stream entry field 20 (`hot_append_starts`, which held per-message starts in earlier 0.6.0 development builds) is reserved. Bootstrap follows the honest-partial rule: there is no cold part. It answers from the hot range `[S, tail)` when `S` is at or above `max(seal point, retained)` and every byte of the range is hot (an external append above hot bytes leaves a cold gap), and the snapshot alone otherwise. A non-JSON stream gets the range as one part when it is at most 8 MiB; a JSON stream gets one part per message, split on LF, up to the last LF within 8 MiB. F6c charges hot payload only.
 
 ### 5.6 F5: external payload locators, commit first and index after
 
 **Today.** For bodies of 1 MiB or more, the HTTP layer stages an object (`lib.rs:1419-1446`). The Raft engine then writes a cold-index page entry at the tail it read before proposing (`ursula-raft/src/engine/mod.rs:1223-1270`, and the create path at `:667-690`). It then proposes `AppendExternal`, whose apply only advances the frontier (`cold_state.rs:33-36`). The page entry is the only locator, and several things go wrong:
 
-- **Rejected proposals.** A rejected proposal (412 on `Stream-Record-Match`, a closed stream, a producer conflict) leaves the entry behind, and it later overlaps different bytes at the same offsets (D3).
+- **Rejected proposals.** A rejected proposal (a closed stream, a producer conflict) leaves the entry behind, and it later overlaps different bytes at the same offsets (D3).
 - **Duplicates.** A deduplicated retry writes an entry at the current tail for an object nobody references.
 - **Ambiguous errors.** The HTTP layer deletes the staged object on any runtime error, including ambiguous ones where the append may still commit (`lib.rs:2482-2485, 2596-2601`).
 
@@ -335,7 +271,7 @@ An earlier design fixed the locator by keeping the `ObjectPayloadRef` in state a
 
 **Today.**
 
-- `advance_retention` clones the whole record index to validate it (`cold.rs:368-385`), then drains without shrinking (`record_index.rs:227`).
+- `advance_retention` cloned the whole JSON record ordinal index to validate it, then drained it without shrinking (the index was removed in 0.6.0).
 - The message-record collapse allocates with the old length (`cold.rs:728`).
 - `flush_prefix` pops chunks without shrinking (`hot_buffer.rs:205-221`).
 - The registry keeps `SlotMap` slots of `sizeof(StreamSlot)` and `HashMap` capacity after deletes.
@@ -387,7 +323,7 @@ Every returned entry is at its stream's true expiry, and every smaller key has a
 
 ### 5.12 F11: read and bootstrap
 
-**Today.** Offset reads default `max_bytes` to `usize::MAX` (`lib.rs:3156-3159`), for SSE and long-poll too. Record reads without `max_records` plan up to the tail (`in_memory.rs:1004-1018`), and the payload is fully assembled before the response is built (`in_memory.rs:1106-1185`). Without retention, one request can materialize a stream's whole history. Bootstrap has three further problems:
+**Today.** Offset reads default `max_bytes` to `usize::MAX` (`lib.rs:3156-3159`), for SSE and long-poll too. Ordinal-addressed reads planned up to the tail as well, and the payload is fully assembled before the response is built (`in_memory.rs:1106-1185`). Without retention, one request can materialize a stream's whole history. Bootstrap has three further problems:
 
 - It keeps only message records that start at or after the snapshot offset (`query.rs:405`), so after a collapse it drops the bytes between the checkpoint and the collapse point (D2).
 - It plans every message record separately, and each `read_plan_at` scans every hot chunk and sorts every ref (`in_memory.rs:1203-1233`): O(hot records²), about 0.6 s at a full W1 hot window.
@@ -449,7 +385,7 @@ Every returned entry is at its stream's true expiry, and every smaller key has a
 
 *Design.* The smallest change that reuses F5:
 
-1. **Staging.** `PUT {stream}/snapshot/{offset}` (and `?record=`) reads the body as a stream. Below the staging threshold, the smaller of `runtime.external_payload_min_size` (1 MiB by default) and the 32 MiB inline cap, the body stays inline and is proposed as today's `PublishSnapshot`. Above it, when a cold store is configured, the HTTP layer streams the body into a new object under `{stream}/external/` (F5's `new_external_payload_path`, uploaded in 8 MiB multipart parts) while hashing it with the same BLAKE3 digest apply uses for inline bodies. Memory per request stays at most one inline cap; admission charges at most 32 MiB of the in-flight budget for a snapshot PUT and admits bodies up to `MAX_COLD_SNAPSHOT_BYTES` = 1 GiB, enforced again while streaming (413).
+1. **Staging.** `PUT {stream}/snapshot/{offset}` reads the body as a stream. Below the staging threshold, the smaller of `runtime.external_payload_min_size` (1 MiB by default) and the 32 MiB inline cap, the body stays inline and is proposed as today's `PublishSnapshot`. Above it, when a cold store is configured, the HTTP layer streams the body into a new object under `{stream}/external/` (F5's `new_external_payload_path`, uploaded in 8 MiB multipart parts) while hashing it with the same BLAKE3 digest apply uses for inline bodies. Memory per request stays at most one inline cap; admission charges at most 32 MiB of the in-flight budget for a snapshot PUT and admits bodies up to `MAX_COLD_SNAPSHOT_BYTES` = 1 GiB, enforced again while streaming (413).
 2. **Command.** A new command, `PublishSnapshotExternal { stream_id, snapshot_offset, content_type, object: ExternalPayloadRef, digest, now_ms }`. It is a new variant rather than an optional field on `PublishSnapshot`, so a binary without it fails loudly instead of applying an empty inline body. Apply runs the existing publish rules unchanged (scope, tail, retained offset, alignment, idempotency by digest) and stores `StreamVisibleSnapshot { offset, content_type, digest, object, payload: [] }`. Group snapshots carry the reference as `StreamVisibleSnapshotV1.object` (field 5).
 3. **Reads.** `GET {stream}/snapshot/{offset}` and `/bootstrap` plan as before; the plan carries the reference instead of bytes, and the HTTP layer streams the object from the cold store in 8 MiB pieces outside the state machine (no S3 inside `with_state_machine`, as F11 requires). The first piece is read before the status line, so a missing object answers 502 rather than a truncated 200. Both set `Content-Length`. Snapshot reads already require the local leader, so no body crosses the Raft gRPC path.
 4. **Object lifecycle, all through existing machinery.** The F5 cleanup rule deletes a staged body after a definite rejection and keeps it after an ambiguous failure. Apply queues a `ColdGcTarget::Paths` entry for a superseded cold body with the F14i grace (300 s), so a read planned before the publish still finds it; for the staged copy of an idempotent repeat (same digest, nothing references it), with the same grace; and for the visible body when the stream is removed (stream GC only reaches externals that pages reference). The orphan sweep (F14h) treats the visible body as a state ref (`stream_referenced_cold_paths`), so it reclaims only staged bodies whose publish never committed, after a day. Bucket purge erases the prefix as before.
@@ -521,51 +457,7 @@ Totals, excluding F15 and F16: about +5,800 / −400 production LoC and +6,500 t
 
 ## 6. Record-coordinate correctness under sparse marks
 
-F1 changes how every record coordinate is resolved, so it carries its own invariants. The dense implementation at `e6d8d70` is the oracle; marks must be invisible, apart from retention landing on a mark. Each invariant names its test.
-
-**RC-1, boundaries are LFs.** On a JSON stream each record is one compact JSON value plus one LF and contains no other LF, on every write path: inline append, create with a body, and external create and append. *Test*: a fuzz test (arbitrary JSON, arrays, escapes, lone surrogates) asserting that the stored bytes' LF positions equal the committed record ends on each path.
-
-**RC-2, oracle equivalence.** In every reachable state, `offset_for(r)` after scanning equals the dense oracle for every retained `r`, and `record_for(o)` agrees for every boundary `o` and rejects every non-boundary. *Test*: a proptest differential suite on `StreamStateMachine` with an in-memory byte store standing in for S3. Random JSON appends of 1 to 2,000 records with sizes from 2 B to 3 MiB, external appends, flushes at random points including mid-record splits, retention at random boundaries, and snapshot round trips at random points. Explicit cases: the D1 sequence (hot prefix, external append, flush, offload, snapshot round trip), and stale page entries from rejected external appends at the same and at overlapping starts.
-
-**RC-3, scan locality.** Resolving a sealed record reads at most one 1 MiB block before the record's start. Resolving a range reads at most one cache block past its end, or exactly one record when that record is larger. *Test*: an instrumented cold store in the RC-2 suite counts bytes read per lookup.
-
-**RC-4, constant-time ranges.** `first_record`, `next_record`, `Stream-Record-Match`, HEAD and `tail_records` resolution never scan. *Test*: a counting store asserts zero cold reads for these operations.
-
-**RC-5, offset reads unchanged.** Offset reads, live or not, return byte-identical bodies and headers. *Test*: an HTTP suite run against both implementations with response diffing.
-
-**RC-6, record reads.** `?record=r&max_records=k` returns exactly the records `[r, min(r + k, next_record))` as complete NDJSON, with `offset = O(r)`, `next_offset = O(r + k')`, the matching record headers, and `up_to_date` exactly when `next_offset` is the tail. Under F11 or P7 caps it may return fewer records, but at least one. *Test*: HTTP vectors from `record_coordinates_reference.rs`, extended to the cold region and to records straddling blocks, chunks and packs.
-
-**RC-7, `tail_records`.** `?tail_records=n` returns the same records as the oracle, whether they are hot, cold or straddle the seal point. *Test*: HTTP.
-
-**RC-8, live reads by record.** SSE and long-poll by record, including the envelope view with one record per event, produce the same event sequence (payloads, `streamNextOffset`, `streamNextRecord`, `streamFirstRecord`) as the oracle, including when a `FlushCold` seals records in the middle of a session. *Test*: HTTP live tests with a flush injected between iterations, plus the madsim cold-path family.
-
-**RC-9, `Stream-Record-Match`.** The decision depends only on `next_record` and is identical to the oracle. *Test*: the existing HTTP and precondition tests run with sealing enabled.
-
-**RC-10, fresh acknowledgements.** Append, close and create responses carry the range computed in apply and never derive it from the index afterwards. *Test*: append immediately followed by a seal in the same apply batch; external appends that seal their own records; an inline append followed by an external append.
-
-**RC-11, duplicate acknowledgements.** A duplicate returns its stored receipt's original byte and record ranges, independent of sealing and retention. A duplicate of a producer's newest sequence always returns its ranges, from the newest acknowledgement if its receipt was evicted. Any other evicted duplicate returns no range, never a recomputed one. *Test*: duplicates of non-latest receipts (a 500 in 0.5.1 after retention); duplicates after sealing; duplicates after eviction, newest and older.
-
-**RC-12, retention by offset.** On a JSON stream, retention to offset `o` succeeds exactly when `o` is a record boundary at or above the current retained offset and at or below the latest snapshot. The effective retained offset is `o` when `o` is dense or a mark, and otherwise the mark at or below `o`. Afterwards `first_record` equals the oracle's ordinal at the effective offset, and no record is renumbered. *Test*: RC-2 suite plus HTTP, with targets in dense, sealed, mark, block-edge and intra-record positions.
-
-**RC-13, retention by record.** `?record=r` resolves `O(r)` and retains as RC-12; the response reports the effective offset and first record. *Test*: HTTP.
-
-**RC-14, snapshot publish.** Publishing by record or offset accepts exactly the record boundaries; an intra-record offset returns 400, which fixes today's acceptance below the cold frontier. Snapshot and bootstrap responses carry oracle-equal `Stream-Record-First` and `Stream-Record-Next`. *Test*: HTTP snapshot and bootstrap suite.
-
-**RC-15, bootstrap.** The parts after the snapshot offset concatenate to the oracle's bytes from that offset, and JSON parts are exactly one record each. This holds after a checkpoint that retention did not follow, after a flush past it, and after an external append that collapses message records. *Test*: HTTP bootstrap tests over hot, cold and mixed suffixes, including those three sequences on both engines.
-
-**RC-16, persistence.** Marks survive snapshot build, restore, WAL replay, snapshot install, backup export and import byte-for-byte. Snapshots from 0.5.x and earlier main builds are refused (format epoch 2). *Test*: codec round-trip property test; a madsim snapshot-install family.
-
-**RC-17, determinism.** All replicas hold identical marks after the same log prefix. *Test*: madsim compares per-group introspection digests across replicas at quiescent points.
-
-**RC-18, transactions.** Removed in 0.6.0 with group transactions: no command rolls back appends, so the record index has no rollback path.
-
-**RC-19, plan and state races.** A plan computed before a concurrent `FlushCold`, seal or retention still returns correct bytes. Trimming depends only on immutable bytes and the plan's skip and take, and retention into sealed history lands on a mark, so a bracketed plan never needs bytes below the new retained offset. Reads below a new retained offset behave as today within the GC grace, which retention now applies to packs (F14i). *Test*: an injected seal or retention between plan and materialize in both engines.
-
-**RC-20, anchors.** A continuation anchor is used only when its incarnation matches and it validates; otherwise the read resolves from the mark. *Test*: SSE across a delete and recreate under the same name; an anchor whose offset is not preceded by LF.
-
-**RC-21, corruption is an error.** A scan that crosses an anchor not preceded by LF, or that finds a different LF count between two anchors than their record difference, fails with a corruption error and never returns shifted records. *Test*: a stale page entry injected under a sealed block.
-
-Acceptance: RC-1 to RC-21 pass in CI. The `append_apply` benchmark reports index bytes per record and per cold MiB, plus hot and cold seek and aligned-read latency, with at least three runs attached to the PR, as `json-record-coordinates-validation.md:60-68` requires.
+**Removed in 0.6.0** with JSON record ordinals (§5.2). The LF boundary checks that replace them are pinned by the state-machine and HTTP tests named in the 0.6.0 PR that removed them.
 
 ## 7. Measurement and gates
 
@@ -596,7 +488,7 @@ A `state-growth` job runs reduced-scale versions of W1 and W3 to W5, plus the re
 
 | Assertion | Target | Fix |
 |---|---|---|
-| marks; dense entries | ≤ ⌈cold MiB⌉ + 2; = unflushed records | F1 |
+| marks; dense entries (removed in 0.6.0) | ≤ ⌈cold MiB⌉ + 2; = unflushed records | F1 |
 | snapshot bytes of mark fields 17 and 18 per cold MiB | ≤ 32 | F1 |
 | shared refs per stream | ≤ 64 + refs added in one driver interval | F2 |
 | receipt items per stream; producers per stream; producer bytes per stream and per group | ≤ 1,024; ≤ 4,096; within Prod(s) | F3 |
@@ -623,15 +515,14 @@ Full-scale runs nightly: W1 at 3M records, W2 over 24 simulated hours at the def
 The invariants in `deterministic-simulation-testing.md:245-258` are all about correctness, and none bounds state. Add:
 
 - **Invariant 9, bounded replicated metadata.** At quiescent points, each stream's replicated metadata, read through introspection (`crates/ursula-sim/src/madsim_harness/introspect.rs`), satisfies I1 with the stream's own U, K and P.
-- **Invariant 10, record-coordinate equivalence.** Every record read, acknowledgement and retention result equals the client-side oracle (RC-2, RC-6 to RC-14).
+- **Invariant 10, record-coordinate equivalence (removed in 0.6.0).** Every record read, acknowledgement and retention result equalled the client-side oracle.
 - **Invariant 11, no stale locators.** After any ambiguous external append or compaction, readable bytes equal acknowledged bytes, and no page entry overlaps differing bytes.
 - **Invariant 12, identical producer state.** Every replica holds the same producers, receipt windows and newest acknowledgements after the same log prefix, whether it replayed the log or installed a snapshot.
 
 Seed families:
 
-- **Cold-path record reads** across flush, seal and compaction boundaries.
-- **Retention by record** into sealed regions.
-- **Snapshot install** with marks, and mid-stream with producers.
+- **Cold-path record reads** across flush, seal and compaction boundaries, and **retention by record** into sealed regions (both removed in 0.6.0).
+- **Snapshot install** mid-stream with producers.
 - **Mixed hot and external appends** (D1) with leader churn and snapshot installs.
 - **Delete and recreate** under the same name with GC pending (D4).
 - **Producer churn** against the receipt and producer bounds.
@@ -642,7 +533,7 @@ Seed families:
 
 Per-group gauges:
 
-- record marks and dense entries
+- record marks and dense entries (removed in 0.6.0)
 - shared refs and live packs
 - staged external refs
 - receipt items, producers and producer bytes
@@ -711,7 +602,7 @@ Alerts:
 
 **Q2. Producers.** Is 7-day idle expiry acceptable for Ursula's exactly-once promise? For the 4,096-producer cap, should a new producer that cannot evict an idle one get `429` (recommended) or evict the least recently seen producer anyway?
 
-**Q5. Response caps.** Can reads and `/bootstrap` cap responses at 8 MiB by default? Do the ursula-index source or the SDKs assume that a record read without `max_records`, or a bootstrap, returns everything up to the tail?
+**Q5. Response caps.** Can reads and `/bootstrap` cap responses at 8 MiB by default? Do the ursula-index source or the SDKs assume that a read without `max_bytes`, or a bootstrap, returns everything up to the tail?
 
 **Q6. Maximum hot age.** Is keeping slow streams' small tails hot for up to 5 minutes acceptable? It bounds how long records stay hot in quiet groups; in the healthy regime it changes slices little (288 against 308 per day), and the large slice reductions come from F10's batching and F2.
 

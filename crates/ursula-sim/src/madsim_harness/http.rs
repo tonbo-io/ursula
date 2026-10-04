@@ -1174,10 +1174,6 @@ pub(super) async fn run_http_producer_protocol_surface_inner(
     )
     .await;
     assert_eq!(create_records.status(), StatusCode::CREATED);
-    assert_eq!(
-        header_str(&create_records, "stream-extensions"),
-        "json-record-coordinates-v1"
-    );
 
     let append_records = send(
         &app,
@@ -1193,8 +1189,7 @@ pub(super) async fn run_http_producer_protocol_surface_inner(
     )
     .await;
     assert_eq!(append_records.status(), StatusCode::OK);
-    assert_eq!(header_str(&append_records, "stream-record-start"), "0");
-    assert_eq!(header_str(&append_records, "stream-record-next"), "2");
+    let records_tail = header_str(&append_records, "stream-next-offset").to_owned();
 
     let duplicate_records = send(
         &app,
@@ -1210,23 +1205,24 @@ pub(super) async fn run_http_producer_protocol_surface_inner(
     )
     .await;
     assert_eq!(duplicate_records.status(), StatusCode::NO_CONTENT);
-    assert_eq!(header_str(&duplicate_records, "stream-record-next"), "2");
+    assert_eq!(
+        header_str(&duplicate_records, "stream-next-offset"),
+        records_tail
+    );
 
-    let record_read = send(
+    let records_read = send(
         &app,
         "GET",
-        &format!("{record_path}?record=1&max_records=1&record_view=envelope"),
+        &format!("{record_path}?offset=-1"),
         &[],
         Body::empty(),
     )
     .await;
-    assert_eq!(record_read.status(), StatusCode::OK);
-    assert_eq!(header_str(&record_read, "stream-record-next"), "2");
-    let record_body = body_bytes(record_read).await;
+    assert_eq!(records_read.status(), StatusCode::OK);
+    let records_body = body_bytes(records_read).await;
     assert_eq!(
-        &record_body[..],
-        br#"{"record":1,"value":{"captured_at_ms":100}}
-"#
+        &records_body[..],
+        b"{\"captured_at_ms\":120}\n{\"captured_at_ms\":100}\n"
     );
 
     trace.push(SimEvent::HttpProducerProtocolSurfaceVerified {

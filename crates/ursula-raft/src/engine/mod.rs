@@ -135,11 +135,7 @@ pub(crate) fn should_forward_stale_follower_read_error(
     is_leader: bool,
     error: &GroupEngineError,
 ) -> bool {
-    !is_leader
-        && matches!(
-            error.code(),
-            Some(StreamErrorCode::InvalidRecordBoundaries | StreamErrorCode::StreamNotFound)
-        )
+    !is_leader && matches!(error.code(), Some(StreamErrorCode::StreamNotFound))
 }
 
 impl RaftGroupEngine {
@@ -906,11 +902,6 @@ impl GroupEngine for RaftGroupEngine {
                 self.cold_store.clone(),
                 self.cold_index_cache.clone(),
             );
-            if !self.raft.is_leader() {
-                // A bracketed record read decides `up_to_date` only after
-                // trimming; on a follower it never claims it (F1).
-                parts.forbid_trimmed_up_to_date();
-            }
             if !self.raft.is_leader() && parts.up_to_date && !parts.closed {
                 if parts.payload_is_empty()
                     && let Some(leader_node) = self.current_leader_node().await

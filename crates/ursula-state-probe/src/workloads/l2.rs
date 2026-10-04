@@ -153,7 +153,6 @@ async fn append(
         stream_seq: None,
         producer: None,
         now_ms,
-        record_match: None,
     })
     .await
     .map_err(|err| anyhow::anyhow!("append: {err}"))?;
@@ -233,22 +232,16 @@ async fn w1(args: &L2Args, sink: &mut Sink) -> Result<Outcome> {
         }
         let (snapshot, stats) = snap(&rt).await?;
         let entry = snapshot.stream_snapshot.streams.first();
-        let record_index_len = entry
-            .and_then(|e| e.record_index.as_ref())
-            .map_or(0, |r| r.dense_len());
         let cold_chunks = entry.map_or(0, |e| e.cold_chunks.len());
         sink.row(&json!({
             "mode": "w1", "engine": args.engine.label(), "admission_mib": args.admission_mib,
             "records": n, "flushes": flushed,
             "elapsed_s": round3(started.elapsed().as_secs_f64()),
-            "record_index_len": record_index_len,
             "cold_chunks": cold_chunks, "group_commit_index": snapshot.group_commit_index,
             "snapshot": stats,
         }))?;
         if n == args.records {
-            outcome.metric_u64("record_index_len", record_index_len as u64);
             outcome.metric_u64("snapshot_bytes", stats.total_bytes);
-            outcome.metric_u64("snapshot_record_offsets_bytes", stats.record_offsets_bytes);
             outcome.metric_u64("flushes", flushed as u64);
         }
     }

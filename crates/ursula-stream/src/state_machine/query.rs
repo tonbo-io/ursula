@@ -6,7 +6,6 @@ use super::COLD_INDEX_PAGE_SPAN_BYTES;
 use super::ColdChunkRef;
 use super::HotPayloadSegment;
 use super::ObjectPayloadRef;
-use super::ProducerRequest;
 use super::StreamBootstrapPlan;
 use super::StreamErrorCode;
 use super::StreamMessageRecord;
@@ -22,85 +21,11 @@ use super::StreamStatus;
 use super::StreamVisibleSnapshot;
 use super::stream_is_expired;
 use super::stream_ttl_renewal_due;
-use crate::RecordIndexError;
-use crate::StreamRecordIndex;
-use crate::StreamRecordRange;
+use crate::json_records::is_json_record_content_type;
 
 impl StreamStateMachine {
     pub fn head(&self, stream_id: &BucketStreamId) -> Option<&StreamMetadata> {
         self.stream_metadata(stream_id)
-    }
-
-    pub fn record_range(
-        &self,
-        stream_id: &BucketStreamId,
-    ) -> Result<Option<StreamRecordRange>, RecordIndexError> {
-        self.stream_slot(stream_id)
-            .and_then(|slot| slot.record_index.as_ref())
-            .map(StreamRecordIndex::range)
-            .transpose()
-    }
-
-    /// Exact start offset of `record`. A sealed record (F1)
-    /// that no mark names fails with [`RecordIndexError::RecordSealed`]; use
-    /// [`Self::locate_record`] to get its bracket.
-    pub fn offset_for_record(
-        &self,
-        stream_id: &BucketStreamId,
-        record: u64,
-    ) -> Result<Option<u64>, RecordIndexError> {
-        let Some(slot) = self.stream_slot(stream_id) else {
-            return Ok(None);
-        };
-        slot.record_index
-            .as_ref()
-            .map(|index| index.exact_offset_for(record, slot.metadata.tail_offset))
-            .transpose()
-    }
-
-    /// Record range of a close acknowledgement (`start == next == tail`) or
-    /// of a producer's newest receipt item. Append acknowledgements carry
-    /// the range apply computed ([`StreamResponse::Appended`]); this never
-    /// derives one from the record index, which may have sealed it (F1,
-    /// RC-10).
-    pub fn record_range_for_append(
-        &self,
-        stream_id: &BucketStreamId,
-        start_offset: u64,
-        next_offset: u64,
-        producer: Option<&ProducerRequest>,
-    ) -> Result<Option<StreamRecordRange>, RecordIndexError> {
-        let Some(slot) = self.stream_slot(stream_id) else {
-            return Ok(None);
-        };
-        if let Some(producer) = producer
-            && let Some(record) = slot.producers.get(&producer.producer_id).and_then(|state| {
-                // The newest receipt's items (F3 never evicts it).
-                state.receipts.back().and_then(|receipt| {
-                    receipt.items.iter().find(|item| {
-                        item.start_offset == start_offset && item.next_offset == next_offset
-                    })
-                })
-            })
-            && let (Some(first_record), Some(next_record)) =
-                (record.record_start, record.record_next)
-        {
-            return Ok(Some(StreamRecordRange {
-                first_record,
-                next_record,
-            }));
-        }
-        let Some(index) = slot.record_index.as_ref() else {
-            return Ok(None);
-        };
-        if start_offset == next_offset && next_offset == slot.metadata.tail_offset {
-            let next_record = index.range()?.next_record;
-            return Ok(Some(StreamRecordRange {
-                first_record: next_record,
-                next_record,
-            }));
-        }
-        Ok(None)
     }
 
     pub fn head_at(&mut self, stream_id: &BucketStreamId, now_ms: u64) -> Option<&StreamMetadata> {
@@ -229,35 +154,10 @@ impl StreamStateMachine {
             .map(|slot| (&slot.metadata.stream_id, slot.append_count))
     }
 
+    /// Hot payload bytes across the group: what admission and the flush
+    /// planner count (F6c).
     pub fn total_hot_payload_bytes(&self) -> u64 {
         self.hot_payload_bytes
-    }
-
-    /// Hot records across the group (F6c).
-    pub fn total_hot_records(&self) -> u64 {
-        self.hot_records
-    }
-
-    /// Hot payload plus per-record overhead across the group (F6c): what
-    /// admission and the flush planner count.
-    pub fn total_hot_real_bytes(&self) -> u64 {
-        self.hot_real_bytes(self.hot_payload_bytes, self.hot_records)
-    }
-
-    /// One stream's hot payload plus per-record overhead (F6c).
-    pub fn hot_real_len(&self, stream_id: &BucketStreamId) -> Option<u64> {
-        self.stream_slot(stream_id).map(|slot| {
-            self.hot_real_bytes(
-                u64::try_from(slot.hot_buffer.len()).unwrap_or(u64::MAX),
-                slot.hot_buffer.accounted_records(),
-            )
-        })
-    }
-
-    /// `payload_bytes` plus [`super::HOT_RECORD_OVERHEAD_BYTES`] for each of
-    /// `records` (F6c). Admission charges incoming writes with it.
-    pub fn hot_real_bytes(&self, payload_bytes: u64, records: u64) -> u64 {
-        payload_bytes.saturating_add(records.saturating_mul(super::HOT_RECORD_OVERHEAD_BYTES))
     }
 
     pub fn bucket_exists(&self, bucket_id: &str) -> bool {
@@ -450,9 +350,6 @@ impl StreamStateMachine {
             segments: segments.into_iter().map(|(_, segment)| segment).collect(),
             up_to_date: next_offset == stream.tail_offset,
             closed: stream.status == StreamStatus::Closed,
-            retained_record_range: None,
-            record_range: None,
-            record_trim: None,
         })
     }
 
@@ -494,15 +391,17 @@ impl StreamStateMachine {
     /// Plans `/bootstrap` with at most `max_update_bytes` of updates
     /// (bounded-stream-state F11).
     ///
-    /// A stream without a record index has no message boundaries: its hot
-    /// range `[S, tail)` is one part when `S` is at or above the seal point,
-    /// every byte of the range is hot and the range fits the cap; otherwise
-    /// the plan is snapshot-only.
+    /// The updates answer the hot range `[S, tail)` from the snapshot
+    /// offset `S`. They need `S` at or above the seal point and every byte of
+    /// the range hot; otherwise the plan is snapshot-only (an honest
+    /// partial).
     ///
-    /// A JSON stream answers one part per record. The updates stop at a
-    /// record boundary; a single record larger than the cap is returned
-    /// whole. A capped plan is an honest partial: `next_offset` is the end
-    /// of the last returned record and `up_to_date` is false.
+    /// A JSON stream answers one part per message, split on LF. The updates
+    /// stop at the last LF within the cap; a single message larger than the
+    /// cap is returned whole. A capped plan is an honest partial:
+    /// `next_offset` is the end of the last returned message and
+    /// `up_to_date` is false. Any other stream answers the range as one
+    /// part, or snapshot-only when it exceeds the cap.
     pub fn bootstrap_plan_with_cap(
         &self,
         stream_id: &BucketStreamId,
@@ -519,12 +418,14 @@ impl StreamStateMachine {
         let snapshot_offset = snapshot
             .as_ref()
             .map_or(slot.retained_offset, |snapshot| snapshot.offset);
-        let exact_frontier = self.exact_message_frontier(stream_id);
+        let exact_frontier = slot.seal_point().max(slot.retained_offset);
         let closed = stream.status == StreamStatus::Closed;
         // Honest partial: the bytes right after the snapshot are cold (or,
-        // without a record index, more than the cap), so bootstrap answers
+        // for a non-JSON stream, more than the cap), so bootstrap answers
         // the snapshot alone. The client continues with ordinary reads from
         // the snapshot, which also report closure once they reach the tail.
+        // An external append above hot bytes leaves a cold gap that
+        // bootstrap does not read.
         let honest_partial = |snapshot: Option<StreamVisibleSnapshot>| StreamBootstrapPlan {
             snapshot,
             updates: Vec::new(),
@@ -533,17 +434,14 @@ impl StreamStateMachine {
             up_to_date: false,
             closed: false,
         };
-        if snapshot_offset < exact_frontier {
+        if snapshot_offset < exact_frontier
+            || !slot.hot_buffer.covers(snapshot_offset, stream.tail_offset)
+        {
             return Ok(honest_partial(snapshot));
         }
-        let Some(messages) = slot.derived_messages_from(snapshot_offset) else {
-            // No record index: the whole hot range `[S, tail)` is one part.
-            // An external append above hot bytes leaves a cold gap that
-            // bootstrap does not read.
+        if !is_json_record_content_type(&stream.content_type) {
             let len = stream.tail_offset.saturating_sub(snapshot_offset);
-            if len > max_update_bytes
-                || !slot.hot_buffer.covers(snapshot_offset, stream.tail_offset)
-            {
+            if len > max_update_bytes {
                 return Ok(honest_partial(snapshot));
             }
             let updates = (len > 0)
@@ -561,33 +459,27 @@ impl StreamStateMachine {
                 up_to_date: true,
                 closed,
             });
-        };
-        let mut updates = Vec::new();
-        let mut update_bytes = 0u64;
-        let mut capped_at = None;
-        // F4b: the records derive from the dense record offsets.
-        for record in messages {
-            let len = record.end_offset.saturating_sub(record.start_offset);
-            let next_bytes = update_bytes.saturating_add(len);
-            if !updates.is_empty() && next_bytes > max_update_bytes {
-                capped_at = Some(record.start_offset);
-                break;
-            }
-            update_bytes = next_bytes;
-            updates.push(record);
         }
-        // The parts must start exactly at the snapshot offset. When the
-        // snapshot offset is no message start, the next exact start lies
-        // past it; answering from there would skip bytes.
-        let first_start = updates
-            .first()
-            .map_or(stream.tail_offset, |record| record.start_offset);
-        if first_start != snapshot_offset {
-            return Ok(honest_partial(snapshot));
-        }
-        let (next_offset, up_to_date, closed) = match capped_at {
-            Some(boundary) => (boundary, false, false),
-            None => (stream.tail_offset, true, closed),
+        let ends = slot
+            .hot_buffer
+            .lf_ends(snapshot_offset, stream.tail_offset, max_update_bytes);
+        let mut start_offset = snapshot_offset;
+        let updates = ends
+            .into_iter()
+            .map(|end_offset| {
+                let record = StreamMessageRecord {
+                    start_offset,
+                    end_offset,
+                };
+                start_offset = end_offset;
+                record
+            })
+            .collect::<Vec<_>>();
+        let next_offset = start_offset;
+        let (up_to_date, closed) = if next_offset == stream.tail_offset {
+            (true, closed)
+        } else {
+            (false, false)
         };
         Ok(StreamBootstrapPlan {
             snapshot,

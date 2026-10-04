@@ -79,7 +79,6 @@ async fn append_external(
             stream_seq: stream_seq.map(str::to_owned),
             producer: None,
             now_ms: 0,
-            record_match: None,
         })
         .await;
     (path, result.is_ok())
@@ -92,10 +91,7 @@ async fn read_all(runtime: &ShardRuntime, stream_id: &BucketStreamId) -> Vec<u8>
             offset: 0,
             max_len: 1 << 20,
             now_ms: 0,
-            record: None,
-            max_records: None,
             leader_only: false,
-            record_anchor: None,
             read_index: None,
         })
         .await

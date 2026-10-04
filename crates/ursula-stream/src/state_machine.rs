@@ -10,10 +10,6 @@
 //! - [`flush_planner`]: leader-side flush passes over a derived hot-stream index.
 //! - [`persist`]: snapshot / restore serialization.
 //! - [`producers`]: F3 receipt window, idle-producer expiry and `TidyStream`.
-//! - [`marks`]: F1 sparse cold record marks — sealing at cold transitions and
-//!   record lookups.
-//! - [`boundaries`]: F4b message boundaries without message records — dense
-//!   record offsets for JSON; other content types have none.
 //! - [`external_locators`]: F5 state-held external payload locators and
 //!   `OffloadColdRefs`, plus the offload pass's query.
 //! - [`hot_buffer`], [`cold_state`], [`ttl`]: internal per-stream data structures.
@@ -36,13 +32,13 @@ use self::cold_gc::ColdGcQueue;
 use self::cold_state::StreamColdState;
 pub use self::gauges::GroupStateGauges;
 use self::hot_buffer::HotBuffer;
-pub use self::marks::RecordPlanError;
-pub use self::marks::RecordReadAnchor;
-pub use self::marks::RecordReadRequest;
 use self::registry::StreamRegistry;
 use self::ttl::TtlEntry;
 use self::ttl::TtlIndex;
 use crate::command::StreamCommand;
+use crate::json_records::canonical_json_record_ends;
+use crate::json_records::is_json_record_content_type;
+use crate::json_records::record_ends_valid;
 use crate::model::AppendExternalInput;
 use crate::model::AppendStreamInput;
 use crate::model::BOOTSTRAP_MAX_UPDATE_BYTES;
@@ -57,7 +53,6 @@ use crate::model::ColdGcTarget;
 use crate::model::ExternalPayloadRef;
 use crate::model::HotPayloadSegment;
 use crate::model::ObjectPayloadRef;
-use crate::model::ProducerAppendRecord;
 use crate::model::ProducerReceipt;
 use crate::model::ProducerRequest;
 use crate::model::ProducerSnapshot;
@@ -72,9 +67,6 @@ use crate::model::StreamReadPlan;
 use crate::model::StreamReadSegment;
 use crate::model::StreamStatus;
 use crate::model::StreamVisibleSnapshot;
-use crate::record_index::StreamRecordIndex;
-use crate::record_index::canonical_json_record_ends;
-use crate::record_index::is_json_record_content_type;
 use crate::response::StreamErrorCode;
 use crate::response::StreamErrorContext;
 use crate::response::StreamResponse;
@@ -85,7 +77,6 @@ use crate::validate::validate_bucket_id;
 use crate::validate::validate_stream_id;
 
 mod append;
-mod boundaries;
 mod cold;
 mod cold_gc;
 mod cold_refs;
@@ -94,7 +85,6 @@ mod external_locators;
 mod flush_planner;
 mod gauges;
 mod hot_buffer;
-mod marks;
 
 pub use self::cold::RETENTION_COLD_GC_GRACE_MS;
 pub use self::cold_refs::SHARED_REF_COMPACTION_THRESHOLD;
@@ -127,24 +117,6 @@ const TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE: usize = 256;
 /// validate the interpretation before using the derived counter.
 pub const COMMITTED_WRITE_UNIT_BYTES: u64 = 10 * 1024;
 
-/// Replicated bookkeeping per unflushed JSON record beyond its payload
-/// (F4b): each hot record costs one 8-byte dense record offset. Admission and
-/// flush thresholds count hot payload plus this much per hot record (F6c), so
-/// a window of tiny records is charged for its real memory. Streams without
-/// a record index keep nothing per message and are charged payload only.
-pub const HOT_RECORD_OVERHEAD_BYTES: u64 = 8;
-
-/// Hot records of one stream (F6c): JSON records that start at or above its
-/// first hot byte. Records of external appends that sit above hot bytes
-/// count too; they occupy the same bookkeeping until the next flush. Zero
-/// for a stream without a record index.
-fn slot_hot_records(slot: &StreamSlot) -> u64 {
-    if slot.hot_buffer.first_start_offset().is_none() {
-        return 0;
-    }
-    slot.derived_hot_messages()
-}
-
 new_key_type! {
     struct StreamKey;
 }
@@ -158,12 +130,10 @@ pub struct StreamStateMachine {
     erased_buckets: HashSet<String>,
     registry: StreamRegistry,
     /// Group-wide hot payload gauge. Kept incrementally so append admission
-    /// and responses do not scan every stream in the group.
+    /// and responses do not scan every stream in the group. Admission and
+    /// flush thresholds count it alone (F6c): the hot window keeps no
+    /// per-message bookkeeping.
     hot_payload_bytes: u64,
-    /// Group-wide count of hot records (F6c): message records that start at
-    /// or above each stream's first hot byte. Derived, never replicated;
-    /// kept incrementally next to `hot_payload_bytes`.
-    hot_records: u64,
     cold_gc: ColdGcQueue,
     /// Live logical references to group-scoped shared cold objects. This is
     /// derived from per-stream cold refs when snapshots are restored.
@@ -192,7 +162,6 @@ struct StreamSlot {
     metadata: StreamMetadata,
     hot_buffer: HotBuffer,
     cold: StreamColdState,
-    record_index: Option<StreamRecordIndex>,
     retained_offset: u64,
     visible_snapshot: Option<StreamVisibleSnapshot>,
     producers: HashMap<String, ProducerState>,
@@ -275,14 +244,11 @@ impl StreamStateMachine {
         self.registry.metadata_mut(stream_id)
     }
 
-    fn insert_stream_slot(&mut self, mut slot: StreamSlot) -> Option<StreamKey> {
+    fn insert_stream_slot(&mut self, slot: StreamSlot) -> Option<StreamKey> {
         let hot_payload_bytes = u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64");
-        let hot_records = slot_hot_records(&slot);
-        slot.hot_buffer.set_accounted_records(hot_records);
         let stream_id = (!slot.hot_buffer.is_empty()).then(|| slot.metadata.stream_id.clone());
         let key = self.registry.insert(slot)?;
         self.hot_payload_bytes = self.hot_payload_bytes.saturating_add(hot_payload_bytes);
-        self.hot_records = self.hot_records.saturating_add(hot_records);
         if let Some(stream_id) = stream_id {
             self.flush_planner.mark_hot(&stream_id);
         }
@@ -290,20 +256,12 @@ impl StreamStateMachine {
     }
 
     /// Re-derives one stream's membership in the flush planner's hot index
-    /// and its share of the group's hot-record gauge (F6c) after its hot
-    /// buffer or message boundaries changed.
+    /// after its hot buffer changed.
     fn sync_hot_index(&mut self, stream_id: &BucketStreamId) {
-        let mut hot = false;
-        if let Some(slot) = self.registry.slot_mut(stream_id) {
-            hot = !slot.hot_buffer.is_empty();
-            let previous = slot.hot_buffer.accounted_records();
-            let current = slot_hot_records(slot);
-            slot.hot_buffer.set_accounted_records(current);
-            self.hot_records = self
-                .hot_records
-                .saturating_sub(previous)
-                .saturating_add(current);
-        }
+        let hot = self
+            .registry
+            .slot(stream_id)
+            .is_some_and(|slot| !slot.hot_buffer.is_empty());
         if hot {
             self.flush_planner.mark_hot(stream_id);
         } else {
@@ -488,7 +446,6 @@ impl StreamStateMachine {
                 stream_seq,
                 producer,
                 now_ms,
-                record_match,
             } => {
                 let response = self.append_borrowed(AppendStreamInput {
                     stream_id,
@@ -498,7 +455,6 @@ impl StreamStateMachine {
                     stream_seq,
                     producer,
                     now_ms,
-                    record_match,
                 });
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
@@ -512,7 +468,6 @@ impl StreamStateMachine {
                 stream_seq,
                 producer,
                 now_ms,
-                record_match,
             } => {
                 let response = self.append_external(AppendExternalInput {
                     stream_id,
@@ -523,7 +478,6 @@ impl StreamStateMachine {
                     stream_seq,
                     producer,
                     now_ms,
-                    record_match,
                 });
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
@@ -534,6 +488,7 @@ impl StreamStateMachine {
                 content_type,
                 payload,
                 now_ms,
+                expected_incarnation,
             } => {
                 let response = self.publish_snapshot(
                     stream_id,
@@ -541,6 +496,7 @@ impl StreamStateMachine {
                     content_type,
                     cold::SnapshotBody::Inline(payload.into()),
                     now_ms,
+                    expected_incarnation,
                 );
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
@@ -552,6 +508,7 @@ impl StreamStateMachine {
                 object,
                 digest,
                 now_ms,
+                expected_incarnation,
             } => {
                 let response = self.publish_snapshot(
                     stream_id,
@@ -559,6 +516,7 @@ impl StreamStateMachine {
                     content_type,
                     cold::SnapshotBody::Object { object, digest },
                     now_ms,
+                    expected_incarnation,
                 );
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
@@ -567,8 +525,14 @@ impl StreamStateMachine {
                 stream_id,
                 retained_offset,
                 now_ms,
+                expected_incarnation,
             } => {
-                let response = self.advance_retention(stream_id, retained_offset, now_ms);
+                let response = self.advance_retention(
+                    stream_id,
+                    retained_offset,
+                    now_ms,
+                    expected_incarnation,
+                );
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
             }
@@ -741,64 +705,25 @@ fn validate_external_payload_ref(payload: &ExternalPayloadRef) -> Result<(), Str
     Ok(())
 }
 
-fn build_record_index(
+/// Checks the message ends of an external create or append (computed by
+/// the proposer from the staged payload): canonical JSON ends for a JSON
+/// stream, none for any other.
+fn validate_record_ends(
     content_type: &str,
     payload_len: u64,
     record_ends: &[u64],
-) -> Result<Option<StreamRecordIndex>, StreamResponse> {
-    if !is_json_record_content_type(content_type) {
-        return record_ends.is_empty().then_some(None).ok_or_else(|| {
-            StreamResponse::error(
-                StreamErrorCode::InvalidRecordBoundaries,
-                "record boundaries are only valid for application/json streams",
-            )
-        });
+) -> Result<(), StreamResponse> {
+    if record_ends_valid(
+        is_json_record_content_type(content_type),
+        payload_len,
+        record_ends,
+    ) {
+        return Ok(());
     }
-    if payload_len > 0 && record_ends.is_empty() {
-        // Pre-extension WAL and snapshot entries have no boundary metadata.
-        // Keep those JSON streams readable without activating coordinates
-        // part-way through their history.
-        return Ok(None);
-    }
-    let mut index = StreamRecordIndex::new();
-    index
-        .append_relative_ends(0, payload_len, record_ends)
-        .map_err(|_| {
-            StreamResponse::error(
-                StreamErrorCode::InvalidRecordBoundaries,
-                "record boundaries do not match the canonical JSON payload",
-            )
-        })?;
-    Ok(Some(index))
-}
-
-fn prepare_record_append(
-    current: Option<&StreamRecordIndex>,
-    json_stream: bool,
-    base_offset: u64,
-    payload_len: u64,
-    record_ends: &[u64],
-) -> Result<Option<crate::PreparedRecordAppend>, StreamResponse> {
-    let Some(current) = current else {
-        if json_stream {
-            return Ok(None);
-        }
-        return record_ends.is_empty().then_some(None).ok_or_else(|| {
-            StreamResponse::error(
-                StreamErrorCode::InvalidRecordBoundaries,
-                "binary streams cannot carry JSON record boundaries",
-            )
-        });
-    };
-    current
-        .prepare_append(base_offset, payload_len, record_ends)
-        .map(Some)
-        .map_err(|_| {
-            StreamResponse::error(
-                StreamErrorCode::InvalidRecordBoundaries,
-                "record boundaries do not match the canonical JSON payload",
-            )
-        })
+    Err(StreamResponse::error(
+        StreamErrorCode::InvalidRecordBoundaries,
+        "message ends do not match the canonical JSON payload",
+    ))
 }
 
 fn compare_stream_ids(left: &BucketStreamId, right: &BucketStreamId) -> std::cmp::Ordering {

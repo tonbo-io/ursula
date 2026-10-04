@@ -162,7 +162,6 @@ pub use error::RuntimeError;
 pub use metrics::RuntimeMailboxSnapshot;
 pub use metrics::RuntimeMetrics;
 pub use metrics::RuntimeMetricsSnapshot;
-pub use metrics::record_coordinate_corruptions;
 pub use read_index::LinearizableReadBarrier;
 pub use read_index::ReadIndexFuture;
 pub use request::AckColdGcResponse;
@@ -204,7 +203,6 @@ pub use request::ReadSnapshotRequest;
 pub use request::ReadSnapshotResponse;
 pub use request::ReadStreamRequest;
 pub use request::ReadStreamResponse;
-pub use request::RecordAnchor;
 pub use request::StreamAppendCount;
 pub use request::TidyStreamResponse;
 pub use request::TidyStreamsRequest;
@@ -250,14 +248,11 @@ pub use ursula_stream::ColdGcPlanEntry;
 pub use ursula_stream::ColdGcTarget;
 pub use ursula_stream::ExternalPayloadRef;
 pub use ursula_stream::FORMAT_EPOCH;
-pub use ursula_stream::HOT_RECORD_OVERHEAD_BYTES;
-pub use ursula_stream::MARK_BLOCK_BYTES;
 pub use ursula_stream::MAX_COLD_SNAPSHOT_BYTES;
 pub use ursula_stream::ProducerRequest;
 pub use ursula_stream::SnapshotDigest;
 pub use ursula_stream::StreamErrorCode;
 pub use ursula_stream::StreamErrorContext;
-pub use ursula_stream::StreamRecordRange;
 pub use ursula_stream::StreamSnapshot;
 pub use ursula_stream::format_epoch_refusal;
 pub use ursula_stream::validate_bucket_id;
@@ -268,8 +263,6 @@ mod cold_drivers_tests;
 mod cold_gc_hygiene_tests;
 #[cfg(test)]
 mod cold_page_repair_tests;
-#[cfg(all(test, not(madsim)))]
-mod cold_record_marks_tests;
 #[cfg(test)]
 mod external_offload_tests;
 #[cfg(test)]

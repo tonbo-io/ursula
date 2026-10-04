@@ -9,10 +9,8 @@ use ursula_stream::ColdChunkRef;
 use ursula_stream::ColdFlushPressure;
 use ursula_stream::ExternalPayloadRef;
 use ursula_stream::ProducerRequest;
-use ursula_stream::StreamErrorCode;
 use ursula_stream::StreamReadPlan;
 use ursula_stream::StreamReadSegment;
-use ursula_stream::StreamRecordRange;
 
 use crate::cold_index::ColdIndexPageCache;
 use crate::cold_index::ColdStoreColdIndexPageStore;
@@ -107,7 +105,6 @@ pub struct CreateStreamResponse {
     pub closed: bool,
     pub already_exists: bool,
     pub group_commit_index: u64,
-    pub record_range: Option<StreamRecordRange>,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
     /// the runtime records its metric without a second state-machine round
     /// trip. `None` from an older leader.
@@ -120,12 +117,11 @@ pub struct HeadStreamRequest {
     pub stream_id: BucketStreamId,
     pub now_ms: u64,
     /// `true` when the HEAD promises linearizability (D10), so the leader
-    /// confirms a read index first: a client HEAD, the `offset=now` and
-    /// record resolutions of a `consistency=leader` read, the JSON
-    /// record-boundary pre-check. `false` for internal HEADs that need only
-    /// the leader's applied state: the `offset=now` and record resolutions
-    /// of `consistency=local` reads, the SSE tail lookup, the long-poll
-    /// timeout answer.
+    /// confirms a read index first: a client HEAD and the `offset=now`
+    /// resolution of a `consistency=leader` read. `false` for internal HEADs
+    /// that need only the leader's applied state: the `offset=now`
+    /// resolution of `consistency=local` reads, the SSE tail lookup, the
+    /// long-poll timeout answer.
     pub linearizable: bool,
     /// The read index this request was linearized at before it was queued
     /// (D10): `ShardRuntime` confirms the group's leadership and waits
@@ -148,7 +144,6 @@ pub struct HeadStreamResponse {
     pub snapshot_offset: Option<u64>,
     pub snapshot_digest: Option<String>,
     pub retained_offset: u64,
-    pub record_range: Option<StreamRecordRange>,
     /// The stream incarnation's `created_at_ms`, unique per group (C7). HEAD renders it as the public
     /// `Stream-Incarnation` header, an opaque token that changes when the
     /// stream is deleted and recreated. `default` keeps HEAD responses
@@ -163,29 +158,13 @@ pub struct ReadStreamRequest {
     pub offset: u64,
     pub max_len: usize,
     pub now_ms: u64,
-    pub record: Option<u64>,
-    pub max_records: Option<u64>,
     /// Require the owning Raft leader's applied state instead of permitting a
     /// local follower read. Recovery paths use this after an acknowledged
     /// write; ordinary catch-up consumers keep the cheaper follower-local
     /// behavior.
     pub leader_only: bool,
-    /// Server-side continuation anchor (F1): the exact start of `record`
-    /// taken from this reader's own previous response. Used only when its
-    /// incarnation matches and it validates; otherwise the read resolves
-    /// from the record index. Never parsed from client input.
-    pub record_anchor: Option<RecordAnchor>,
     /// For a `leader_only` read only; see [`HeadStreamRequest::read_index`].
     pub read_index: Option<u64>,
-}
-
-/// Where record `record` of stream incarnation `incarnation` (its
-/// `created_at_ms`) starts, as a previous read returned it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecordAnchor {
-    pub incarnation: u64,
-    pub record: u64,
-    pub offset: u64,
 }
 
 impl ReadStreamRequest {
@@ -193,10 +172,7 @@ impl ReadStreamRequest {
         self.stream_id == other.stream_id
             && self.offset == other.offset
             && self.max_len == other.max_len
-            && self.record == other.record
-            && self.max_records == other.max_records
             && self.leader_only == other.leader_only
-            && self.record_anchor == other.record_anchor
     }
 }
 
@@ -210,8 +186,6 @@ pub struct ReadStreamResponse {
     pub payload: Vec<u8>,
     pub up_to_date: bool,
     pub closed: bool,
-    pub retained_record_range: Option<StreamRecordRange>,
-    pub record_range: Option<StreamRecordRange>,
 }
 
 pub enum GroupReadStreamBody {
@@ -238,8 +212,6 @@ pub struct GroupReadStreamParts {
     pub content_type: String,
     pub up_to_date: bool,
     pub closed: bool,
-    pub retained_record_range: Option<StreamRecordRange>,
-    pub record_range: Option<StreamRecordRange>,
     pub body: GroupReadStreamBody,
 }
 
@@ -252,8 +224,6 @@ impl GroupReadStreamParts {
             content_type: response.content_type,
             up_to_date: response.up_to_date,
             closed: response.closed,
-            retained_record_range: response.retained_record_range,
-            record_range: response.record_range,
             body: GroupReadStreamBody::Materialized(response.payload),
         }
     }
@@ -272,8 +242,6 @@ impl GroupReadStreamParts {
             content_type: plan.content_type.clone(),
             up_to_date: plan.up_to_date,
             closed: plan.closed,
-            retained_record_range: plan.retained_record_range,
-            record_range: plan.record_range,
             body: GroupReadStreamBody::Planned {
                 stream_id,
                 plan,
@@ -283,21 +251,7 @@ impl GroupReadStreamParts {
         }
     }
 
-    /// Followers never let a trimmed record read claim `up_to_date`; they
-    /// forward or hold reads that reach the tail (F1, design §5.2).
-    pub fn forbid_trimmed_up_to_date(&mut self) {
-        if let GroupReadStreamBody::Planned { plan, .. } = &mut self.body
-            && let Some(trim) = plan.record_trim.as_mut()
-        {
-            trim.claim_up_to_date = false;
-        }
-    }
-
-    pub async fn into_response(mut self) -> Result<ReadStreamResponse, GroupEngineError> {
-        let record_trim = match &self.body {
-            GroupReadStreamBody::Planned { plan, .. } => plan.record_trim.as_deref().cloned(),
-            _ => None,
-        };
+    pub async fn into_response(self) -> Result<ReadStreamResponse, GroupEngineError> {
         let payload = match &self.body {
             GroupReadStreamBody::Materialized(payload) => payload.clone(),
             GroupReadStreamBody::Planned {
@@ -327,30 +281,6 @@ impl GroupReadStreamParts {
                 payload.clone()
             }
         };
-        let payload = match record_trim {
-            Some(trim) => {
-                // F1: cut the bracketed window to the requested records.
-                let trimmed = ursula_stream::trim_record_window(&payload, self.offset, &trim)
-                    .map_err(|err| {
-                        tracing::error!(
-                            offset = self.offset,
-                            error = %err,
-                            "record read found bytes that disagree with the record index"
-                        );
-                        crate::metrics::record_coordinate_corruption();
-                        GroupEngineError::stream(StreamErrorCode::InvalidColdFlush, err.to_string())
-                    })?;
-                self.offset = trimmed.offset;
-                self.next_offset = trimmed.next_offset;
-                self.record_range = Some(trimmed.record_range);
-                self.up_to_date = trimmed.up_to_date;
-                let mut payload = payload;
-                payload.truncate(trimmed.end);
-                payload.drain(..trimmed.start);
-                payload
-            }
-            None => payload,
-        };
         Ok(ReadStreamResponse {
             placement: self.placement,
             offset: self.offset,
@@ -359,8 +289,6 @@ impl GroupReadStreamParts {
             payload,
             up_to_date: self.up_to_date,
             closed: self.closed,
-            retained_record_range: self.retained_record_range,
-            record_range: self.record_range,
         })
     }
 
@@ -390,6 +318,9 @@ pub struct PublishSnapshotRequest {
     /// A body staged as a cold-tier object (bounded-state F16). Proposed as `PublishSnapshotExternal`.
     pub cold_body: Option<ColdSnapshotBody>,
     pub now_ms: u64,
+    /// JSON streams: the incarnation whose byte before `snapshot_offset`
+    /// the proposer read and found LF (see `StreamCommand::PublishSnapshot`).
+    pub expected_incarnation: Option<u64>,
 }
 
 /// A snapshot body staged in the cold tier with the digest computed while
@@ -406,7 +337,6 @@ pub struct PublishSnapshotResponse {
     pub snapshot_offset: u64,
     pub snapshot_digest: String,
     pub group_commit_index: u64,
-    pub record_range: Option<StreamRecordRange>,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
     /// the runtime records its metric without a second state-machine round
     /// trip. `None` from an older leader.
@@ -419,6 +349,8 @@ pub struct AdvanceRetentionRequest {
     pub stream_id: BucketStreamId,
     pub retained_offset: u64,
     pub now_ms: u64,
+    /// As on [`PublishSnapshotRequest::expected_incarnation`].
+    pub expected_incarnation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -426,7 +358,6 @@ pub struct AdvanceRetentionResponse {
     pub placement: ShardPlacement,
     pub retained_offset: u64,
     pub group_commit_index: u64,
-    pub record_range: Option<StreamRecordRange>,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
     /// the runtime records its metric without a second state-machine round
     /// trip. `None` from an older leader.
@@ -494,7 +425,6 @@ pub struct ReadSnapshotResponse {
     /// it from the cold store.
     pub object: Option<ExternalPayloadRef>,
     pub up_to_date: bool,
-    pub record_range: Option<StreamRecordRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -526,7 +456,6 @@ pub struct BootstrapStreamResponse {
     pub next_offset: u64,
     pub up_to_date: bool,
     pub closed: bool,
-    pub record_range: Option<StreamRecordRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -543,7 +472,6 @@ pub struct CloseStreamResponse {
     pub next_offset: u64,
     pub group_commit_index: u64,
     pub deduplicated: bool,
-    pub record_range: Option<StreamRecordRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -692,7 +620,6 @@ pub struct AppendRequest {
     pub stream_seq: Option<String>,
     pub producer: Option<ProducerRequest>,
     pub now_ms: u64,
-    pub record_match: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -706,7 +633,6 @@ pub struct AppendExternalRequest {
     pub stream_seq: Option<String>,
     pub producer: Option<ProducerRequest>,
     pub now_ms: u64,
-    pub record_match: Option<u64>,
 }
 
 impl AppendExternalRequest {
@@ -724,7 +650,6 @@ impl AppendExternalRequest {
             stream_seq: request.stream_seq,
             producer: request.producer,
             now_ms: request.now_ms,
-            record_match: request.record_match,
         }
     }
 }
@@ -748,7 +673,6 @@ impl AppendRequest {
             stream_seq: None,
             producer: None,
             now_ms: 0,
-            record_match: None,
         }
     }
 
@@ -761,7 +685,6 @@ impl AppendRequest {
             stream_seq: None,
             producer: None,
             now_ms: 0,
-            record_match: None,
         }
     }
 
@@ -780,13 +703,12 @@ pub struct AppendResponse {
     pub closed: bool,
     pub deduplicated: bool,
     pub producer: Option<ProducerRequest>,
-    pub record_range: Option<StreamRecordRange>,
     #[serde(default)]
     pub stream_hot_bytes: u64,
     #[serde(default)]
     pub group_hot_bytes: u64,
     /// A duplicate beyond the stream's receipt window (bounded-state F3):
-    /// deduplicated without byte or record ranges. `start_offset` and
+    /// deduplicated without byte ranges. `start_offset` and
     /// `next_offset` then carry no information about the original append.
     #[serde(default)]
     pub receipt_evicted: bool,

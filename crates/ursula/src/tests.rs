@@ -137,10 +137,7 @@ async fn wait_raft_state_machine_payload(
                                     offset: 0,
                                     max_len,
                                     now_ms: 0,
-                                    record: None,
-                                    max_records: None,
                                     leader_only: false,
-                                    record_anchor: None,
                                     read_index: None,
                                 },
                                 placement,
@@ -745,36 +742,6 @@ async fn delete_stream_removes_http_visible_state() {
 }
 
 #[tokio::test]
-async fn closed_record_long_poll_empty_response_includes_record_headers() {
-    let app = test_router();
-    let response = http_put(
-        &app,
-        "/benchcmp/json-record-closed-long-poll",
-        &[
-            (CONTENT_TYPE.as_str(), "application/json"),
-            (HEADER_STREAM_CLOSED, "true"),
-        ],
-        Body::from(r#"{"id":1}"#),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let response = http_get(
-        &app,
-        "/benchcmp/json-record-closed-long-poll?record=1&live=long-poll&timeout_ms=1000",
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        header_str(&response, HEADER_STREAM_EXTENSIONS),
-        JSON_RECORD_COORDINATES_EXTENSION
-    );
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "0");
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "1");
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "1");
-}
-
-#[tokio::test]
 async fn json_mode_normalizes_appends_and_reads_ndjson() {
     let app = test_router();
 
@@ -786,12 +753,6 @@ async fn json_mode_normalizes_appends_and_reads_ndjson() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);
-    assert_eq!(
-        header_str(&response, HEADER_STREAM_EXTENSIONS),
-        JSON_RECORD_COORDINATES_EXTENSION
-    );
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "0");
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "0");
 
     let response = http_post(
         &app,
@@ -801,17 +762,9 @@ async fn json_mode_normalizes_appends_and_reads_ndjson() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        header_str(&response, HEADER_STREAM_EXTENSIONS),
-        JSON_RECORD_COORDINATES_EXTENSION
-    );
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "0");
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "1");
 
     let response = http_head(&app, "/benchcmp/json-mode").await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "0");
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "1");
 
     let response = http_get(&app, "/benchcmp/json-mode").await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -853,8 +806,6 @@ async fn json_message_text_is_stored_verbatim_minus_whitespace() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "1");
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "4");
 
     let response = http_post(
         &app,
@@ -881,21 +832,6 @@ async fn json_message_text_is_stored_verbatim_minus_whitespace() {
     assert_eq!(
         header_str(&response, HEADER_STREAM_NEXT_OFFSET),
         format!("{:020}", expected.len())
-    );
-
-    // The envelope view splices the stored text; a lone surrogate must not
-    // turn it into a 500.
-    let response = http_get(
-        &app,
-        "/benchcmp/json-fidelity?record=1&max_records=2&record_view=envelope",
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_bytes(response).await;
-    assert_eq!(
-        std::str::from_utf8(&body).unwrap(),
-        "{\"record\":1,\"value\":{\"b\":1.50e3,\"a\":-0,\"a\":1e400}}\n\
-         {\"record\":2,\"value\":\"\\ud800 \\u00e9 \\/ \\\"x\\\"\"}\n"
     );
 
     // Close the stream so the SSE response ends at the tail.
@@ -975,7 +911,10 @@ async fn invalid_json_bodies_are_refused_without_committing() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     let response = http_head(&app, "/benchcmp/json-invalid").await;
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "1");
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        format!("{:020}", 14)
+    );
     let response = http_get(&app, "/benchcmp/json-invalid").await;
     let body = body_bytes(response).await;
     assert_eq!(&body[..], b"{\"seed\":true}\n");
@@ -1019,14 +958,7 @@ async fn json_depth_limit_applies_per_message_after_flattening() {
         .await;
         assert_eq!(response.status(), status, "{}", &body[..16]);
     }
-    let response = http_head(&app, "/benchcmp/json-depth").await;
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "3");
-
-    let response = http_get(
-        &app,
-        "/benchcmp/json-depth?record=0&max_records=3&record_view=envelope",
-    )
-    .await;
+    let response = http_get(&app, "/benchcmp/json-depth?offset=-1").await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_bytes(response).await;
     let lines: Vec<&[u8]> = body
@@ -1036,12 +968,7 @@ async fn json_depth_limit_applies_per_message_after_flattening() {
     assert_eq!(lines.len(), 3);
     assert_eq!(
         lines[2],
-        format!(
-            "{{\"record\":2,\"value\":{}{}}}",
-            "[".repeat(127),
-            "]".repeat(127)
-        )
-        .as_bytes()
+        format!("{}{}", "[".repeat(127), "]".repeat(127)).as_bytes()
     );
 }
 
@@ -1108,7 +1035,7 @@ async fn finite_json_reads_negotiate_gzip_without_compressing_sse() {
     let response = send(
         &app,
         "GET",
-        "/benchcmp/compressed-json?record=now&live=sse",
+        "/benchcmp/compressed-json?offset=now&live=sse",
         &[("accept-encoding", "gzip")],
         Body::empty(),
     )
@@ -1121,364 +1048,6 @@ async fn finite_json_reads_negotiate_gzip_without_compressing_sse() {
             .get(axum::http::header::CONTENT_ENCODING)
             .is_none()
     );
-}
-
-#[tokio::test]
-async fn json_record_coordinates_read_complete_records() {
-    let app = test_router();
-    let response = http_put(
-        &app,
-        "/benchcmp/json-record-read",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let response = http_post(
-        &app,
-        "/benchcmp/json-record-read",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(r#"[{"id":1},{"id":2},{"id":3}]"#),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "0");
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "3");
-
-    let response = http_get(&app, "/benchcmp/json-record-read?record=1&max_records=1").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_str(&response, CONTENT_TYPE), "application/x-ndjson");
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "0");
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "1");
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
-    let body = body_bytes(response).await;
-    assert_eq!(&body[..], b"{\"id\":2}\n");
-
-    let response = http_get(&app, "/benchcmp/json-record-read?tail_records=2").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "1");
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "3");
-    let body = body_bytes(response).await;
-    assert_eq!(&body[..], b"{\"id\":2}\n{\"id\":3}\n");
-
-    let response = http_get(
-        &app,
-        "/benchcmp/json-record-read?record=1&max_records=1&record_view=envelope",
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        header_str(&response, CONTENT_TYPE),
-        "application/vnd.durable-stream-records+ndjson"
-    );
-    let body = body_bytes(response).await;
-    assert_eq!(&body[..], b"{\"record\":1,\"value\":{\"id\":2}}\n");
-
-    let response = http_post(
-        &app,
-        "/benchcmp/json-record-read",
-        &[
-            (CONTENT_TYPE.as_str(), "application/json"),
-            (HEADER_STREAM_RECORD_MATCH, "3"),
-        ],
-        Body::from(r#"{"id":4}"#),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "3");
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "4");
-
-    let response = http_post(
-        &app,
-        "/benchcmp/json-record-read",
-        &[
-            (CONTENT_TYPE.as_str(), "application/json"),
-            (HEADER_STREAM_RECORD_MATCH, "3"),
-        ],
-        Body::from(r#"{"id":5}"#),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "4");
-    assert!(response.headers().get(HEADER_STREAM_NEXT_OFFSET).is_some());
-}
-
-#[tokio::test]
-async fn json_record_coordinates_preserve_deduplicated_and_close_only_ranges() {
-    let app = test_router();
-    let response = http_put(
-        &app,
-        "/benchcmp/json-record-dedup",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    for payload in [r#"[{"id":1},{"id":2}]"#, r#"{"ignored":true}"#] {
-        let response = http_post(
-            &app,
-            "/benchcmp/json-record-dedup",
-            &[
-                (CONTENT_TYPE.as_str(), "application/json"),
-                (HEADER_PRODUCER_ID, "browser-tab"),
-                (HEADER_PRODUCER_EPOCH, "0"),
-                (HEADER_PRODUCER_SEQ, "0"),
-            ],
-            Body::from(payload),
-        )
-        .await;
-        assert!(matches!(
-            response.status(),
-            StatusCode::OK | StatusCode::NO_CONTENT
-        ));
-        assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "0");
-        assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
-    }
-
-    let response = http_post(
-        &app,
-        "/benchcmp/json-record-dedup",
-        &[
-            (CONTENT_TYPE.as_str(), "application/json"),
-            (HEADER_STREAM_CLOSED, "true"),
-        ],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "2");
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
-}
-
-#[tokio::test]
-async fn json_record_coordinates_concurrent_appends_receive_disjoint_commit_ranges() {
-    let app = test_router();
-    let response = http_put(
-        &app,
-        "/benchcmp/json-record-concurrent",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let mut writes = Vec::new();
-    for id in 0..16 {
-        let app = app.clone();
-        writes.push(tokio::spawn(async move {
-            http_post(
-                &app,
-                "/benchcmp/json-record-concurrent",
-                &[(CONTENT_TYPE.as_str(), "application/json")],
-                Body::from(format!(r#"{{"id":{id}}}"#)),
-            )
-            .await
-        }));
-    }
-
-    let mut ranges = Vec::new();
-    for write in writes {
-        let response = write.await.expect("write task");
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let start = header_str(&response, HEADER_STREAM_RECORD_START)
-            .parse::<u64>()
-            .expect("record start integer");
-        let next = header_str(&response, HEADER_STREAM_RECORD_NEXT)
-            .parse::<u64>()
-            .expect("record next integer");
-        ranges.push((start, next));
-    }
-    ranges.sort_unstable();
-    assert_eq!(
-        ranges,
-        (0..16)
-            .map(|record| (record, record + 1))
-            .collect::<Vec<_>>()
-    );
-}
-
-#[tokio::test]
-async fn json_record_coordinates_live_reads_resume_by_record() {
-    let app = test_router();
-    let response = http_put(
-        &app,
-        "/benchcmp/json-record-live",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let read = {
-        let app = app.clone();
-        tokio::spawn(async move {
-            http_get(
-                &app,
-                "/benchcmp/json-record-live?record=now&live=long-poll&timeout_ms=1000",
-            )
-            .await
-        })
-    };
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-    let response = http_post(
-        &app,
-        "/benchcmp/json-record-live",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(r#"[{"id":1},{"id":2}]"#),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-    let response = tokio::time::timeout(std::time::Duration::from_secs(1), read)
-        .await
-        .expect("long poll completed")
-        .expect("read task");
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "0");
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
-    let body = body_bytes(response).await;
-    assert_eq!(&body[..], b"{\"id\":1}\n{\"id\":2}\n");
-
-    let response = http_post(
-        &app,
-        "/benchcmp/json-record-live",
-        &[
-            (CONTENT_TYPE.as_str(), "application/json"),
-            (HEADER_STREAM_CLOSED, "true"),
-        ],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-    let response = http_get(
-        &app,
-        "/benchcmp/json-record-live?record=0&record_view=envelope&live=sse",
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        header_str(&response, "stream-data-content-type"),
-        "application/vnd.durable-stream-record+json"
-    );
-    let body = body_bytes(response).await;
-    let body = std::str::from_utf8(&body).expect("utf8 sse body");
-    assert_eq!(body.matches("event: data").count(), 2);
-    assert!(body.contains("data:{\"record\":0,\"value\":{\"id\":1}}"));
-    assert!(body.contains("data:{\"record\":1,\"value\":{\"id\":2}}"));
-    assert!(body.contains("\"streamFirstRecord\":0"));
-    assert!(body.contains("\"streamNextRecord\":2"));
-}
-
-#[tokio::test]
-async fn json_record_coordinates_snapshot_and_bootstrap_headers_are_aligned() {
-    let app = test_router();
-    let response = http_put(
-        &app,
-        "/benchcmp/json-record-snapshot",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(r#"[{"id":1},{"id":2}]"#),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let response = http_put(
-        &app,
-        "/benchcmp/json-record-snapshot/snapshot/1",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(r#"{"count":0}"#),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-    let response = http_get(
-        &app,
-        "/benchcmp/json-record-snapshot?record=0&max_records=1",
-    )
-    .await;
-    let snapshot_offset = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
-
-    let response = http_put(
-        &app,
-        "/benchcmp/json-record-snapshot/snapshot?record=1",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(r#"{"count":1}"#),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET),
-        snapshot_offset
-    );
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "0");
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
-
-    let response = http_put(
-        &app,
-        "/benchcmp/json-record-snapshot/retention?record=1",
-        &[],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "1");
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
-
-    for uri in [
-        format!("/benchcmp/json-record-snapshot/snapshot/{snapshot_offset}"),
-        "/benchcmp/json-record-snapshot/bootstrap".to_owned(),
-    ] {
-        let response = http_get(&app, &uri).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "1");
-        assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
-    }
-}
-
-#[tokio::test]
-async fn json_record_checkpoint_can_publish_and_retain_at_the_record_tail() {
-    let app = test_router();
-    let response = http_put(
-        &app,
-        "/benchcmp/json-record-tail-checkpoint",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(r#"[{"id":1},{"id":2}]"#),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let response = http_put(
-        &app,
-        "/benchcmp/json-record-tail-checkpoint/snapshot?record=2",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(r#"{"count":2}"#),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "0");
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
-
-    let response = http_put(
-        &app,
-        "/benchcmp/json-record-tail-checkpoint/retention?record=2",
-        &[],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "2");
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
-
-    let response = http_get(
-        &app,
-        "/benchcmp/json-record-tail-checkpoint?record=0&max_records=1",
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::GONE);
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "2");
 }
 
 #[tokio::test]
@@ -1993,7 +1562,7 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
     assert_eq!(response.status(), StatusCode::CREATED);
     let response = http_put(
         &app,
-        "/benchcmp/raft-retention/snapshot?record=2",
+        "/benchcmp/raft-retention/snapshot/00000000000000000018",
         &[(CONTENT_TYPE.as_str(), "application/json")],
         Body::from(r#"{"count":2}"#),
     )
@@ -2001,13 +1570,13 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let response = http_put(
         &app,
-        "/benchcmp/raft-retention/retention?record=2",
+        "/benchcmp/raft-retention/retention/00000000000000000018",
         &[],
         Body::empty(),
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let response = http_get(&app, "/benchcmp/raft-retention?record=0&max_records=1").await;
+    let response = http_get(&app, "/benchcmp/raft-retention?offset=0").await;
     assert_eq!(response.status(), StatusCode::GONE);
 
     let response = http_get(&app, "/__ursula/metrics").await;
@@ -4702,9 +4271,9 @@ async fn json_bootstrap_never_merges_cold_messages_into_one_part() {
     .await;
     let response = http_head(&app, stream_uri).await;
     let tail = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
-    // F4b: JSON streams keep dense record offsets, so the first message after
-    // the flush is exact and a snapshot at the flush point bootstraps
-    // complete, one JSON message per update part...
+    // A snapshot at the flush point (a JSON boundary whose preceding byte is
+    // cold, so the server verifies it with a read) bootstraps complete, one
+    // JSON message per update part...
     let response = http_put(
         &app,
         &format!("{stream_uri}/snapshot/{flushed_tail}"),
@@ -4722,8 +4291,10 @@ async fn json_bootstrap_never_merges_cold_messages_into_one_part() {
     assert!(parts[2].contains(r#"{"d":4}"#));
 
     // ...and so is a snapshot one message later.
-    let response = http_get(&app, &format!("{stream_uri}?record=2&max_records=1")).await;
-    let after_c = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+    let after_c = format!(
+        "{:020}",
+        flushed_tail.parse::<u64>().expect("offset") + r#"{"c":3}"#.len() as u64 + 1
+    );
     let response = http_put(
         &app,
         &format!("{stream_uri}/snapshot/{after_c}"),
@@ -4738,6 +4309,118 @@ async fn json_bootstrap_never_merges_cold_messages_into_one_part() {
     assert_eq!(parts.len(), 2);
     assert_eq!(parts[0], r#"{"n":3}"#);
     assert!(parts[1].contains(r#"{"d":4}"#) && !parts[1].contains(r#"{"c":3}"#));
+}
+
+/// PR16 LF obligations: a JSON snapshot or retention offset must follow an
+/// LF byte. A hot offset is checked at apply; a cold one by a leader read
+/// before the server proposes again pinned to the stream incarnation. Both
+/// refuse an intra-message offset with 400.
+#[tokio::test]
+async fn json_snapshot_and_retention_offsets_must_follow_an_lf_hot_and_cold() {
+    let app = cold_test_router();
+    let stream_uri = "/benchcmp/json-lf";
+    let json = [(CONTENT_TYPE.as_str(), "application/json")];
+    let response = http_put(&app, stream_uri, &json, Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    // Two 8-byte messages, flushed, then two hot ones: [0, 16) cold, [16, 32) hot.
+    post_messages(&app, stream_uri, "application/json", &[
+        r#"{"a":1}"#,
+        r#"{"b":2}"#,
+    ])
+    .await;
+    flush_cold(&app, stream_uri, 1024).await;
+    post_messages(&app, stream_uri, "application/json", &[
+        r#"{"c":3}"#,
+        r#"{"d":4}"#,
+    ])
+    .await;
+    let put = |path: String| {
+        let app = app.clone();
+        async move { http_put(&app, &path, &json, Body::from("{}")).await }
+    };
+
+    for offset in [3u64, 20] {
+        let response = put(format!("{stream_uri}/snapshot/{offset:020}")).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "offset {offset}"
+        );
+        let response = put(format!("{stream_uri}/retention/{offset:020}")).await;
+        assert!(
+            matches!(
+                response.status(),
+                StatusCode::BAD_REQUEST | StatusCode::CONFLICT
+            ),
+            "offset {offset}: {}",
+            response.status()
+        );
+    }
+    let head = http_head(&app, stream_uri).await;
+    assert!(head.headers().get(HEADER_STREAM_SNAPSHOT_OFFSET).is_none());
+
+    // Cold boundary (8) and hot boundary (24): accepted; retention is exact.
+    for offset in [8u64, 24] {
+        let response = put(format!("{stream_uri}/snapshot/{offset:020}")).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT, "offset {offset}");
+    }
+    let response = put(format!("{stream_uri}/retention/{:020}", 3)).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = put(format!("{stream_uri}/retention/{:020}", 8)).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_RETAINED_OFFSET),
+        format!("{:020}", 8)
+    );
+    let response = put(format!("{stream_uri}/retention/{:020}", 24)).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_RETAINED_OFFSET),
+        format!("{:020}", 24)
+    );
+}
+
+/// A cold JSON boundary the server cannot read is refused, never accepted
+/// unverified: the check fails closed with 503.
+#[tokio::test]
+async fn json_boundary_lookup_failure_answers_503() {
+    let cold_store = Arc::new(
+        ColdStore::memory()
+            .expect("memory cold store")
+            .without_read_cache(),
+    );
+    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+        RuntimeConfig::new(1, 1),
+        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
+        Some(cold_store.clone()),
+    )
+    .expect("runtime");
+    let app = router(runtime);
+    let stream_uri = "/benchcmp/json-lf-unreadable";
+    let json = [(CONTENT_TYPE.as_str(), "application/json")];
+    let response = http_put(&app, stream_uri, &json, Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    post_messages(&app, stream_uri, "application/json", &[
+        r#"{"a":1}"#,
+        r#"{"b":2}"#,
+    ])
+    .await;
+    flush_cold(&app, stream_uri, 1024).await;
+    cold_store.set_fault_policy(|context| {
+        (context.operation == ursula_runtime::ColdStoreOperation::ReadObjectRange)
+            .then(|| ursula_runtime::ColdStoreFaultEffect::fail("injected read failure"))
+    });
+
+    let response = http_put(
+        &app,
+        &format!("{stream_uri}/snapshot/{:020}", 8),
+        &json,
+        Body::from("{}"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let head = http_head(&app, stream_uri).await;
+    assert!(head.headers().get(HEADER_STREAM_SNAPSHOT_OFFSET).is_none());
 }
 
 #[tokio::test]
@@ -6402,7 +6085,7 @@ mod commit_stall {
 
 // #132: bucket is the top-level tenant namespace. Two tenants using the same
 // bucket-local stream name must not observe each other through appends,
-// record-coordinate reads, snapshots, or retention.
+// reads, snapshots, or retention.
 #[tokio::test]
 async fn tenant_buckets_isolate_identical_stream_names() {
     let app = test_router();
@@ -6423,9 +6106,8 @@ async fn tenant_buckets_isolate_identical_stream_names() {
 
     // Each tenant reads back only its own record under the shared name.
     for (bucket, expected) in [("tenant-a", "a"), ("tenant-b", "b")] {
-        let response = http_get(&app, &format!("/{bucket}/orders?record=0&max_records=10")).await;
+        let response = http_get(&app, &format!("/{bucket}/orders?offset=-1")).await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "1");
         let body = body_bytes(response).await;
         let body = std::str::from_utf8(&body).expect("utf8 body");
         assert!(
@@ -6438,7 +6120,7 @@ async fn tenant_buckets_isolate_identical_stream_names() {
     // tenant-b's readable history for the identically named stream.
     let response = http_put(
         &app,
-        "/tenant-a/orders/snapshot?record=1",
+        "/tenant-a/orders/snapshot/00000000000000000012",
         &[(CONTENT_TYPE.as_str(), "application/json")],
         Body::from(r#"{"count":1}"#),
     )
@@ -6446,19 +6128,18 @@ async fn tenant_buckets_isolate_identical_stream_names() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let response = http_put(
         &app,
-        "/tenant-a/orders/retention?record=1",
+        "/tenant-a/orders/retention/00000000000000000012",
         &[],
         Body::empty(),
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = http_get(&app, "/tenant-a/orders?record=0&max_records=1").await;
+    let response = http_get(&app, "/tenant-a/orders?offset=0").await;
     assert_eq!(response.status(), StatusCode::GONE);
 
-    let response = http_get(&app, "/tenant-b/orders?record=0&max_records=1").await;
+    let response = http_get(&app, "/tenant-b/orders?offset=0").await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "0");
 
     // The snapshot namespace is tenant-scoped as well: tenant-b has none.
     let response = http_head(&app, "/tenant-b/orders").await;
@@ -6572,7 +6253,7 @@ async fn usage_endpoint_reports_per_bucket_committed_counters() {
     // monotonic committed counters.
     let response = http_put(
         &app,
-        "/tenant-a/orders/snapshot?record=2",
+        "/tenant-a/orders/snapshot/00000000000000000020",
         &[(CONTENT_TYPE.as_str(), "application/json")],
         Body::from(r#"{"count":2}"#),
     )
@@ -6580,7 +6261,7 @@ async fn usage_endpoint_reports_per_bucket_committed_counters() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let response = http_put(
         &app,
-        "/tenant-a/orders/retention?record=2",
+        "/tenant-a/orders/retention/00000000000000000020",
         &[],
         Body::empty(),
     )
@@ -6629,13 +6310,14 @@ async fn backup_import_refuses_groups_without_this_format_epoch() {
 // #136: the full recovery drill against the HTTP surface. Build a cluster,
 // write two tenants' streams (records, close state, app snapshot, retention
 // floor), export every group, destroy the cluster, restore into a fresh one,
-// and verify bytes, record coordinates, closed state, retention, snapshots,
+// and verify bytes, offsets, closed state, retention, snapshots,
 // tenant boundaries, and continued appends -- with no offset drift.
 #[tokio::test]
 async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
     let source = test_router();
 
-    // Tenant A: JSON records, app snapshot, retention floor at record 2.
+    // Tenant A: JSON messages, app snapshot, retention floor after the
+    // second message (offset 18).
     let response = http_put(
         &source,
         "/tenant-a/orders",
@@ -6654,7 +6336,7 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let response = http_put(
         &source,
-        "/tenant-a/orders/snapshot?record=2",
+        "/tenant-a/orders/snapshot/00000000000000000018",
         &[(CONTENT_TYPE.as_str(), "application/json")],
         Body::from(r#"{"count":2}"#),
     )
@@ -6662,7 +6344,7 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let response = http_put(
         &source,
-        "/tenant-a/orders/retention?record=2",
+        "/tenant-a/orders/retention/00000000000000000018",
         &[],
         Body::empty(),
     )
@@ -6720,13 +6402,12 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
         assert_eq!(response.status(), StatusCode::OK, "import group {group}");
     }
 
-    // Retention floor survived: reads below record 2 are GONE, the app
-    // snapshot is intact, and the tail record is exactly where it was.
-    let response = http_get(&restored, "/tenant-a/orders?record=0&max_records=1").await;
+    // Retention floor survived: reads below offset 18 are GONE, the app
+    // snapshot is intact, and the tail message is exactly where it was.
+    let response = http_get(&restored, "/tenant-a/orders?offset=0").await;
     assert_eq!(response.status(), StatusCode::GONE);
-    let response = http_get(&restored, "/tenant-a/orders?record=2&max_records=10").await;
+    let response = http_get(&restored, "/tenant-a/orders?offset=18").await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "3");
     let body = body_bytes(response).await;
     assert!(
         std::str::from_utf8(&body)
@@ -6762,10 +6443,10 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
     assert_eq!(response.status(), StatusCode::CONFLICT);
 
     // Tenant boundary: a bucket that never existed stays absent.
-    let response = http_get(&restored, "/tenant-c/orders?record=0").await;
+    let response = http_get(&restored, "/tenant-c/orders?offset=0").await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-    // Continued append lands at the next record with no drift.
+    // Continued append lands at the tail with no drift.
     let response = http_post(
         &restored,
         "/tenant-a/orders",
@@ -6774,9 +6455,8 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
     )
     .await;
     assert!(response.status().is_success());
-    let response = http_get(&restored, "/tenant-a/orders?record=3&max_records=10").await;
+    let response = http_get(&restored, "/tenant-a/orders?offset=27").await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "4");
     let body = body_bytes(response).await;
     assert!(
         std::str::from_utf8(&body)
@@ -6922,7 +6602,7 @@ async fn cluster_wide_purge_reaches_every_distributed_group_leader() {
 
 // #150: administrator-triggered tenant purge. Purging tenant A must remove
 // its streams and bucket while retaining its aggregate accounting counters;
-// tenant B's identically named stream, record coordinates, and snapshot stay
+// tenant B's identically named stream, its offsets, and snapshot stay
 // untouched. A re-run converges on the same report shape with zero counts.
 #[tokio::test]
 async fn purge_endpoint_erases_one_tenant_and_leaves_the_other_intact() {
@@ -6943,7 +6623,7 @@ async fn purge_endpoint_erases_one_tenant_and_leaves_the_other_intact() {
     }
     let response = http_put(
         &app,
-        "/tenant-a/orders/snapshot?record=1",
+        "/tenant-a/orders/snapshot/00000000000000000012",
         &[(CONTENT_TYPE.as_str(), "application/json")],
         Body::from(r#"{"count":1}"#),
     )
@@ -6974,7 +6654,7 @@ async fn purge_endpoint_erases_one_tenant_and_leaves_the_other_intact() {
     );
 
     // Tenant A conceals as not-found across streams and snapshots.
-    let response = http_get(&app, "/tenant-a/orders?record=0&max_records=1").await;
+    let response = http_get(&app, "/tenant-a/orders?offset=0").await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let response = http_get(
         &app,
@@ -6984,9 +6664,8 @@ async fn purge_endpoint_erases_one_tenant_and_leaves_the_other_intact() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     // Tenant B's identically named stream is untouched.
-    let response = http_get(&app, "/tenant-b/orders?record=0&max_records=10").await;
+    let response = http_get(&app, "/tenant-b/orders?offset=-1").await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "1");
     let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("utf8 body");
     assert!(body.contains(r#""who":"b""#));
@@ -7153,15 +6832,12 @@ async fn metrics_expose_per_group_state_gauges() {
         .iter()
         .find(|group| group["streams"] == 1)
         .expect("group holding the stream");
-    assert_eq!(group["dense_record_entries"], 6, "{group}");
-    assert_eq!(group["record_marks"], 0);
-    assert_eq!(group["producers"], 1);
+    assert_eq!(group["producers"], 1, "{group}");
     assert_eq!(group["receipts"], 3);
     assert_eq!(group["ttl_streams"], 1);
     assert!(group["ttl_heap_entries"].as_u64().expect("ttl heap") >= 1);
     // F6b: the three contiguous appends share one hot block.
     assert_eq!(group["hot_chunks"], 1);
-    assert_eq!(group["hot_records"], 6);
     for key in [
         "shared_refs",
         "live_packs",
@@ -7170,279 +6846,10 @@ async fn metrics_expose_per_group_state_gauges() {
         "producer_bytes",
         "hot_payload_bytes",
         "hot_overhead_bytes",
-        "hot_real_bytes",
         "pending_cold_gc",
     ] {
         assert!(group[key].is_u64(), "missing {key}: {group}");
     }
-}
-
-// --- P7: byte-bounded record-aware reads (extensions.md §6.6) ---
-
-/// Record sizes in stored bytes, LF included: 8, 8, 49, 8.
-const P7_RECORDS: [&str; 4] = [
-    r#"{"a":1}"#,
-    r#"{"a":2}"#,
-    r#"{"b":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}"#,
-    r#"{"a":4}"#,
-];
-
-async fn p7_stream(app: &Router, uri: &str, close: bool) {
-    let response = http_put(
-        app,
-        uri,
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-    post_messages(app, uri, "application/json", &P7_RECORDS).await;
-    if close {
-        let response = http_post(
-            app,
-            uri,
-            &[
-                (CONTENT_TYPE.as_str(), "application/json"),
-                (HEADER_STREAM_CLOSED, "true"),
-            ],
-            Body::empty(),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    }
-}
-
-/// Reads `uri` and returns (status, record start, record next, next offset, body).
-async fn p7_read(app: &Router, uri: &str) -> (StatusCode, String, String, String, String) {
-    let response = http_get(app, uri).await;
-    let status = response.status();
-    if status != StatusCode::OK {
-        let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
-        return (status, String::new(), String::new(), String::new(), body);
-    }
-    let start = header_str(&response, HEADER_STREAM_RECORD_START).to_owned();
-    let next = header_str(&response, HEADER_STREAM_RECORD_NEXT).to_owned();
-    let next_offset = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
-    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
-    (status, start, next, next_offset, body)
-}
-
-fn p7_lines(range: std::ops::Range<usize>) -> String {
-    P7_RECORDS[range]
-        .iter()
-        .map(|record| format!("{record}\n"))
-        .collect()
-}
-
-#[tokio::test]
-async fn record_read_max_bytes_returns_longest_complete_record_run() {
-    let app = test_router();
-    let uri = "/benchcmp/p7-records";
-    p7_stream(&app, uri, false).await;
-
-    // Exactly two small records fit (8 + 8 bytes, LF included).
-    let (status, start, next, next_offset, body) =
-        p7_read(&app, &format!("{uri}?record=0&max_bytes=16")).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!((start.as_str(), next.as_str()), ("0", "2"));
-    assert_eq!(body, p7_lines(0..2));
-    let (_, _, _, by_count_offset, _) =
-        p7_read(&app, &format!("{uri}?record=0&max_records=2")).await;
-    assert_eq!(next_offset, by_count_offset);
-
-    // One byte short of the second record's LF: only the first record.
-    let (_, _, next, _, body) = p7_read(&app, &format!("{uri}?record=0&max_bytes=15")).await;
-    assert_eq!(next, "1");
-    assert_eq!(body, p7_lines(0..1));
-
-    // A budget smaller than the first record still returns that record.
-    let (_, _, next, _, body) = p7_read(&app, &format!("{uri}?record=0&max_bytes=1")).await;
-    assert_eq!(next, "1");
-    assert_eq!(body, p7_lines(0..1));
-
-    // A single record larger than max_bytes is returned whole and alone.
-    let (_, start, next, _, body) = p7_read(&app, &format!("{uri}?record=2&max_bytes=10")).await;
-    assert_eq!((start.as_str(), next.as_str()), ("2", "3"));
-    assert_eq!(body, p7_lines(2..3));
-
-    // The large record stops the run that precedes it.
-    let (_, _, next, _, body) = p7_read(&app, &format!("{uri}?record=1&max_bytes=56")).await;
-    assert_eq!(next, "2");
-    assert_eq!(body, p7_lines(1..2));
-    let (_, _, next, _, body) = p7_read(&app, &format!("{uri}?record=1&max_bytes=57")).await;
-    assert_eq!(next, "3");
-    assert_eq!(body, p7_lines(1..3));
-
-    // A budget beyond the tail returns everything.
-    let (_, _, next, _, body) = p7_read(&app, &format!("{uri}?record=0&max_bytes=100000")).await;
-    assert_eq!(next, "4");
-    assert_eq!(body, p7_lines(0..4));
-
-    // tail_records composes with max_bytes.
-    let (_, start, next, _, body) =
-        p7_read(&app, &format!("{uri}?tail_records=2&max_bytes=49")).await;
-    assert_eq!((start.as_str(), next.as_str()), ("2", "3"));
-    assert_eq!(body, p7_lines(2..3));
-
-    // At the tail the read is an empty up-to-date read.
-    let (status, start, next, _, body) =
-        p7_read(&app, &format!("{uri}?record=4&max_bytes=8")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!((start.as_str(), next.as_str()), ("4", "4"));
-    assert!(body.is_empty());
-}
-
-#[tokio::test]
-async fn record_read_max_bytes_combines_with_max_records() {
-    let app = test_router();
-    let uri = "/benchcmp/p7-both";
-    p7_stream(&app, uri, false).await;
-
-    // max_records is the tighter limit.
-    let (status, _, next, _, body) = p7_read(
-        &app,
-        &format!("{uri}?record=0&max_bytes=1000&max_records=1"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(next, "1");
-    assert_eq!(body, p7_lines(0..1));
-
-    // max_bytes is the tighter limit.
-    let (_, _, next, _, body) =
-        p7_read(&app, &format!("{uri}?record=0&max_bytes=20&max_records=3")).await;
-    assert_eq!(next, "2");
-    assert_eq!(body, p7_lines(0..2));
-
-    // Both allow everything up to max_records.
-    let (_, _, next, _, body) = p7_read(
-        &app,
-        &format!("{uri}?record=0&max_bytes=1000&max_records=3"),
-    )
-    .await;
-    assert_eq!(next, "3");
-    assert_eq!(body, p7_lines(0..3));
-}
-
-#[tokio::test]
-async fn record_read_max_bytes_envelope_counts_stored_bytes_only() {
-    let app = test_router();
-    let uri = "/benchcmp/p7-envelope";
-    p7_stream(&app, uri, false).await;
-
-    // Envelope framing does not count: 16 stored bytes still yield two records.
-    let response = http_get(
-        &app,
-        &format!("{uri}?record=0&max_bytes=16&record_view=envelope"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        header_str(&response, CONTENT_TYPE),
-        "application/vnd.durable-stream-records+ndjson"
-    );
-    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
-    let body = body_bytes(response).await;
-    assert_eq!(
-        &body[..],
-        b"{\"record\":0,\"value\":{\"a\":1}}\n{\"record\":1,\"value\":{\"a\":2}}\n"
-    );
-}
-
-#[tokio::test]
-async fn record_read_max_bytes_pages_continue_without_gaps() {
-    let app = test_router();
-    let uri = "/benchcmp/p7-pages";
-    p7_stream(&app, uri, false).await;
-    let (_, _, _, _, full) = p7_read(&app, &format!("{uri}?record=0")).await;
-
-    for max_bytes in [1_usize, 8, 9, 16, 20, 49, 57, 64] {
-        let mut record = 0_u64;
-        let mut pages = String::new();
-        let mut page_count = 0;
-        while record < 4 {
-            let (status, start, next, _, body) = p7_read(
-                &app,
-                &format!("{uri}?record={record}&max_bytes={max_bytes}"),
-            )
-            .await;
-            assert_eq!(status, StatusCode::OK, "{body}");
-            assert_eq!(start, record.to_string());
-            let next: u64 = next.parse().expect("record next");
-            assert!(next > record, "max_bytes={max_bytes} made no progress");
-            let page_records = usize::try_from(next - record).expect("count");
-            assert!(
-                page_records == 1 || body.len() <= max_bytes,
-                "{max_bytes}: {body}"
-            );
-            pages.push_str(&body);
-            record = next;
-            page_count += 1;
-        }
-        assert_eq!(pages, full, "max_bytes={max_bytes}");
-        assert!(page_count <= 4);
-    }
-}
-
-#[tokio::test]
-async fn record_read_max_bytes_rejects_non_positive_values() {
-    let app = test_router();
-    let uri = "/benchcmp/p7-invalid";
-    p7_stream(&app, uri, false).await;
-    for raw in ["0", "-1", "abc", ""] {
-        let response = http_get(&app, &format!("{uri}?record=0&max_bytes={raw}")).await;
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "max_bytes={raw}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn record_read_max_bytes_applies_to_long_poll_and_sse() {
-    let app = test_router();
-    let uri = "/benchcmp/p7-live";
-    p7_stream(&app, uri, true).await;
-
-    let (status, _, next, _, body) = p7_read(
-        &app,
-        &format!("{uri}?record=0&max_bytes=16&live=long-poll&timeout_ms=10"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(next, "2");
-    assert_eq!(body, p7_lines(0..2));
-
-    let response = http_get(&app, &format!("{uri}?record=0&max_bytes=16&live=sse")).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_bytes(response).await;
-    let body = std::str::from_utf8(&body).expect("utf8 sse body");
-    let next_records: Vec<&str> = body
-        .match_indices("\"streamNextRecord\":")
-        .map(|(index, key)| {
-            let rest = &body[index + key.len()..];
-            let end = rest.find(|ch: char| !ch.is_ascii_digit()).expect("digits");
-            &rest[..end]
-        })
-        .collect();
-    assert_eq!(next_records, vec!["2", "3", "4"], "{body}");
-}
-
-#[tokio::test]
-async fn record_read_max_bytes_cuts_cold_windows() {
-    let app = cold_test_router();
-    let uri = "/benchcmp/p7-cold";
-    p7_stream(&app, uri, false).await;
-    flush_cold(&app, uri, 1024).await;
-
-    let (status, _, next, _, body) = p7_read(&app, &format!("{uri}?record=0&max_bytes=16")).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(next, "2");
-    assert_eq!(body, p7_lines(0..2));
-    let (_, _, next, _, body) = p7_read(&app, &format!("{uri}?record=2&max_bytes=1")).await;
-    assert_eq!(next, "3");
-    assert_eq!(body, p7_lines(2..3));
 }
 
 /// `PUT /{bucket}` is a validated no-op: buckets are implicit namespaces.
@@ -7561,8 +6968,8 @@ async fn producer_id_and_stream_seq_length_caps_reject_with_400() {
 }
 
 /// bounded-stream-state F3: a duplicate whose receipt the stream's receipt
-/// window evicted answers `204` with `Producer-Seq` and without byte or
-/// record range headers, and never appends.
+/// window evicted answers `204` with `Producer-Seq` and without a byte
+/// range, and never appends.
 #[tokio::test]
 async fn duplicate_beyond_receipt_window_answers_204_without_ranges() {
     let app = test_router();
@@ -7608,13 +7015,10 @@ async fn duplicate_beyond_receipt_window_answers_204_without_ranges() {
         Some("0")
     );
     assert!(evicted.headers().get(HEADER_STREAM_NEXT_OFFSET).is_none());
-    assert!(evicted.headers().get("Stream-Record-Start").is_none());
-    assert!(evicted.headers().get("Stream-Record-Next").is_none());
 
     let newest = post(1_025).await;
     assert_eq!(newest.status(), StatusCode::NO_CONTENT);
     assert!(newest.headers().get(HEADER_STREAM_NEXT_OFFSET).is_some());
-    assert!(newest.headers().get("Stream-Record-Start").is_some());
 
     let after = http_head(&app, "/benchcmp/receipt-window").await;
     assert_eq!(
@@ -7625,8 +7029,8 @@ async fn duplicate_beyond_receipt_window_answers_204_without_ranges() {
 
 /// bounded-stream-state F11: ordinary reads are capped at 8 MiB, like
 /// bootstrap. A capped offset read is partial and the continuation from
-/// `Stream-Next-Offset` returns the rest; a record read ends at a record.
-/// JSON offset reads at the cap are covered by
+/// `Stream-Next-Offset` returns the rest. JSON offset reads at the cap are
+/// covered by
 /// `capped_and_uncapped_offset_reads_continue_exactly`.
 #[tokio::test]
 async fn reads_are_capped_at_the_server_response_limit() {
@@ -7665,39 +7069,6 @@ async fn reads_are_capped_at_the_server_response_limit() {
     let response = http_get(&app, &format!("/benchcmp/capped-bytes?offset={CAP:020}")).await;
     assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
     assert_eq!(body_bytes(response).await.len(), payload.len() - CAP);
-
-    // JSON stream: 10,000 records of about 1 KiB (just over 9.5 MiB).
-    let response = http_put(
-        &app,
-        "/benchcmp/capped-json",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let value = "v".repeat(1_000);
-    let records = (0..10_000)
-        .map(|index| format!(r#"{{"i":{index},"v":"{value}"}}"#))
-        .collect::<Vec<_>>();
-    let response = http_post(
-        &app,
-        "/benchcmp/capped-json",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(format!("[{}]", records.join(","))),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-    // Record read without max_records stops at a record within the cap.
-    let response = http_get(&app, "/benchcmp/capped-json?record=0").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
-    let next_record = header_str(&response, HEADER_STREAM_RECORD_NEXT)
-        .parse::<u64>()
-        .unwrap();
-    assert!(next_record > 0 && next_record < 10_000);
-    let body = body_bytes(response).await;
-    assert!(body.len() <= CAP && body.ends_with(b"\n"));
 }
 
 /// F11: a JSON offset read without `max_bytes`, or with `max_bytes` above

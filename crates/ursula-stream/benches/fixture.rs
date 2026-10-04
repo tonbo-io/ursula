@@ -74,7 +74,6 @@ pub fn build_state(scenario: FlushScenario) -> StreamStateMachine {
                     stream_seq: None,
                     producer: None,
                     now_ms: 0,
-                    record_match: None,
                 }),
                 StreamResponse::Appended { .. }
             ));

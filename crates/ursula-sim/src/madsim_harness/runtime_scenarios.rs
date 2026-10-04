@@ -82,10 +82,7 @@ pub(super) async fn run_runtime_actor_scheduling_inner(
                 offset: 0,
                 max_len: 3,
                 now_ms: 0,
-                record: None,
-                max_records: None,
                 leader_only: false,
-                record_anchor: None,
                 read_index: None,
             })
             .await
@@ -133,10 +130,7 @@ pub(super) async fn run_runtime_actor_scheduling_inner(
             offset: 0,
             max_len: 16,
             now_ms: 0,
-            record: None,
-            max_records: None,
             leader_only: false,
-            record_anchor: None,
             read_index: None,
         })
         .await
@@ -213,10 +207,7 @@ pub(super) async fn run_runtime_raft_engine_inner(
             offset: 0,
             max_len: 64,
             now_ms: 0,
-            record: None,
-            max_records: None,
             leader_only: false,
-            record_anchor: None,
             read_index: None,
         })
         .await
@@ -308,10 +299,7 @@ pub(super) async fn run_runtime_raft_snapshot_install_inner(
             offset: 0,
             max_len: 64,
             now_ms: 0,
-            record: None,
-            max_records: None,
             leader_only: false,
-            record_anchor: None,
             read_index: None,
         })
         .await
@@ -383,10 +371,7 @@ pub(super) async fn run_runtime_raft_snapshot_install_inner(
             offset: 0,
             max_len: 64,
             now_ms: 0,
-            record: None,
-            max_records: None,
             leader_only: false,
-            record_anchor: None,
             read_index: None,
         })
         .await
@@ -422,10 +407,7 @@ pub(super) async fn run_runtime_raft_snapshot_install_inner(
             offset: 0,
             max_len: 64,
             now_ms: 0,
-            record: None,
-            max_records: None,
             leader_only: false,
-            record_anchor: None,
             read_index: None,
         })
         .await
@@ -924,10 +906,7 @@ pub(super) async fn run_runtime_raft_network_inner(
                 offset: 0,
                 max_len: expected_payload.len().max(64),
                 now_ms: 0,
-                record: None,
-                max_records: None,
                 leader_only: false,
-                record_anchor: None,
                 read_index: None,
             })
             .await
@@ -1194,10 +1173,7 @@ pub(super) async fn run_runtime_raft_network_inner(
                     offset: 0,
                     max_len: expected_payload.len().max(64),
                     now_ms: 0,
-                    record: None,
-                    max_records: None,
                     leader_only: false,
-                    record_anchor: None,
                     read_index: None,
                 })
                 .await
@@ -1568,10 +1544,7 @@ pub(super) async fn run_runtime_raft_network_inner(
                 offset: 0,
                 max_len: expected_payload.len().max(64),
                 now_ms: 0,
-                record: None,
-                max_records: None,
                 leader_only: false,
-                record_anchor: None,
                 read_index: None,
             };
             let cold_live_read = match runtime.read_stream(read_request.clone()).await {
@@ -1803,10 +1776,7 @@ pub(super) async fn run_runtime_multi_client_actors_inner(
                     offset: 0,
                     max_len: 64,
                     now_ms: 0,
-                    record: None,
-                    max_records: None,
                     leader_only: false,
-                    record_anchor: None,
                     read_index: None,
                 })
                 .await
@@ -1832,10 +1802,7 @@ pub(super) async fn run_runtime_multi_client_actors_inner(
                     offset: 0,
                     max_len: 128,
                     now_ms: 0,
-                    record: None,
-                    max_records: None,
                     leader_only: false,
-                    record_anchor: None,
                     read_index: None,
                 })
                 .await
@@ -2003,10 +1970,7 @@ pub(super) async fn run_runtime_cold_flush_worker_inner(
                 offset: 0,
                 max_len: 6,
                 now_ms: 0,
-                record: None,
-                max_records: None,
                 leader_only: false,
-                record_anchor: None,
                 read_index: None,
             })
             .await
@@ -2301,10 +2265,7 @@ pub(super) async fn run_runtime_seeded_interleaving_inner(
                 offset: 0,
                 max_len: 32,
                 now_ms: 0,
-                record: None,
-                max_records: None,
                 leader_only: false,
-                record_anchor: None,
                 read_index: None,
             })
             .await

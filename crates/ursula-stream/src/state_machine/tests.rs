@@ -4,8 +4,6 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 
 use super::*;
-use crate::RecordIndexError;
-use crate::StreamRecordRange;
 
 const OCTET: &str = "application/octet-stream";
 
@@ -280,7 +278,6 @@ fn append_cmd(stream_id: BucketStreamId, payload: &[u8], args: Append) -> Stream
         stream_seq: args.stream_seq,
         producer: args.producer,
         now_ms: args.now_ms,
-        record_match: None,
     }
 }
 
@@ -318,6 +315,7 @@ fn publish_snapshot_cmd(
         content_type: content_type.to_owned(),
         payload: bytes::Bytes::copy_from_slice(payload),
         now_ms,
+        expected_incarnation: None,
     }
 }
 
@@ -330,6 +328,7 @@ fn advance_retention_cmd(
         stream_id,
         retained_offset,
         now_ms,
+        expected_incarnation: None,
     }
 }
 
@@ -412,7 +411,6 @@ fn appended(offset: u64, next_offset: u64) -> StreamResponse {
         deduplicated: false,
         producer: None,
         receipt_evicted: false,
-        record_range: None,
     }
 }
 
@@ -431,7 +429,6 @@ fn appended_by(
         deduplicated,
         producer: Some(producer),
         receipt_evicted: false,
-        record_range: None,
     }
 }
 
@@ -486,10 +483,13 @@ fn create_stream(machine: &mut StreamStateMachine, id: &str) {
     );
 }
 
+/// JSON snapshot and retention offsets must follow an LF byte (PR16). A hot
+/// preceding byte is checked at apply; a cold one only by the proposer,
+/// whose read apply trusts when it names the live incarnation.
 #[test]
-fn json_record_coordinates_survive_flush_restore_and_retention() {
+fn json_snapshot_and_retention_offsets_follow_lf_boundaries() {
     let mut machine = machine();
-    let stream_id = stream("json-records");
+    let stream_id = stream("json-lf");
     assert_eq!(
         machine.apply(create_cmd(stream_id.clone(), Create {
             content_type: "application/json",
@@ -504,93 +504,138 @@ fn json_record_coordinates_survive_flush_restore_and_retention() {
             now_ms: 1,
             ..Append::default()
         })),
-        StreamResponse::Appended {
-            offset: 16,
-            next_offset: 24,
-            closed: false,
-            deduplicated: false,
-            producer: None,
-            receipt_evicted: false,
-            record_range: Some(StreamRecordRange {
-                first_record: 2,
-                next_record: 3,
-            }),
-        }
+        appended(16, 24)
     );
-    assert_eq!(
-        machine.record_range(&stream_id),
-        Ok(Some(StreamRecordRange {
-            first_record: 0,
-            next_record: 3,
-        }))
-    );
-    assert_eq!(machine.offset_for_record(&stream_id, 2), Ok(Some(16)));
+    let incarnation = machine.head(&stream_id).expect("head").created_at_ms;
+    let publish = |offset: u64, expected_incarnation: Option<u64>| StreamCommand::PublishSnapshot {
+        stream_id: stream_id.clone(),
+        snapshot_offset: offset,
+        content_type: "application/json".to_owned(),
+        payload: bytes::Bytes::from_static(b"{}"),
+        now_ms: 2,
+        expected_incarnation,
+    };
+    let retain = |offset: u64, expected_incarnation: Option<u64>| StreamCommand::AdvanceRetention {
+        stream_id: stream_id.clone(),
+        retained_offset: offset,
+        now_ms: 3,
+        expected_incarnation,
+    };
 
+    // Hot: apply reads the preceding byte; an incarnation does not override it.
+    let before = machine.snapshot();
+    for offset in [3, 12, 20] {
+        assert_error_code(
+            machine.apply(publish(offset, Some(incarnation))),
+            StreamErrorCode::InvalidSnapshot,
+        );
+    }
+    assert_eq!(machine.snapshot(), before);
+    assert!(matches!(
+        machine.apply(publish(8, None)),
+        StreamResponse::SnapshotPublished {
+            snapshot_offset: 8,
+            ..
+        }
+    ));
+
+    // Cold: flush the first two messages. Apply cannot read the byte before
+    // 16, so it names the incarnation and waits for a verified proposal.
     let candidate = machine
-        .plan_cold_flush(&stream_id, 1, 1024)
+        .plan_cold_flush(&stream_id, 1, 16)
         .expect("plan cold flush")
         .expect("flush candidate");
-    assert_eq!(
+    assert_eq!(candidate.end_offset, 16);
+    assert!(matches!(
         machine.apply(flush_candidate_cmd(
             stream_id.clone(),
             &candidate,
-            "s3://bucket/json-records"
+            "s3://bucket/json-lf"
         )),
-        StreamResponse::ColdFlushed {
-            hot_start_offset: candidate.end_offset,
+        StreamResponse::ColdFlushed { .. }
+    ));
+    let unverified = machine.apply(publish(16, None));
+    match &unverified {
+        StreamResponse::Error { code, context, .. } => {
+            assert_eq!(*code, StreamErrorCode::JsonBoundaryUnverified);
+            assert_eq!(context, &vec![StreamErrorContext::StreamIncarnation {
+                incarnation
+            }]);
         }
-    );
-    let mut restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
-    // F1 sparse marks: a flushed record keeps only a bracket in state; its
-    // exact offset needs a bounded scan of the cold bytes.
-    assert_eq!(
-        restored.offset_for_record(&stream_id, 1),
-        Err(RecordIndexError::RecordSealed)
+        other => panic!("expected an unverified boundary, got {other:?}"),
+    }
+    // A stale incarnation (a delete and recreate after the proposer's read)
+    // is refused the same way.
+    assert_error_code(
+        machine.apply(publish(16, Some(incarnation + 1))),
+        StreamErrorCode::JsonBoundaryUnverified,
     );
     assert!(matches!(
-        restored.apply(publish_snapshot_cmd(
-            stream_id.clone(),
-            16,
-            "application/json",
-            b"{\"state\":2}",
-            2
-        )),
+        machine.apply(publish(16, Some(incarnation))),
         StreamResponse::SnapshotPublished {
             snapshot_offset: 16,
             ..
         }
     ));
-    assert_eq!(
-        restored.record_range(&stream_id),
-        Ok(Some(StreamRecordRange {
-            first_record: 0,
-            next_record: 3,
-        }))
+
+    // Retention is exact: no rounding to an earlier boundary.
+    assert_error_code(
+        machine.apply(retain(16, None)),
+        StreamErrorCode::JsonBoundaryUnverified,
     );
-    // F1 sparse marks: retention into sealed history lands on the mark at
-    // or below its target, here the stream's first record.
     assert_eq!(
-        restored.apply(advance_retention_cmd(stream_id.clone(), 16, 3)),
+        machine.apply(retain(16, Some(incarnation))),
         StreamResponse::RetentionAdvanced {
-            retained_offset: 0,
-            record_range: Some(StreamRecordRange {
-                first_record: 0,
-                next_record: 3,
-            }),
+            retained_offset: 16
         }
     );
+    // The retained offset and the tail are boundaries by construction.
+    assert!(matches!(
+        machine.apply(publish(24, None)),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore");
+    assert_eq!(restored.snapshot(), machine.snapshot());
+}
+
+#[test]
+fn json_append_of_k_messages_adds_k_committed_records() {
+    let mut machine = machine();
+    let stream_id = stream("json-k");
+    assert!(matches!(
+        machine.apply(create_cmd(stream_id.clone(), Create {
+            content_type: "application/json",
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+    let before = bucket_usage(&machine, "benchcmp").committed_records;
     assert_eq!(
-        restored.record_range(&stream_id),
-        Ok(Some(StreamRecordRange {
-            first_record: 0,
-            next_record: 3,
-        }))
+        machine.apply(append_cmd(stream_id.clone(), b"1\n2\n3\n", Append {
+            content_type: Some("application/json"),
+            ..Append::default()
+        })),
+        appended(0, 6)
     );
+    let response = machine.apply(StreamCommand::AppendExternal {
+        stream_id,
+        content_type: Some("application/json".to_owned()),
+        payload: ExternalPayloadRef {
+            s3_path: "json-k/external.json".to_owned(),
+            payload_len: 4,
+            object_size: 4,
+        },
+        record_ends: vec![2, 4],
+        close_after: false,
+        stream_seq: None,
+        producer: None,
+        now_ms: 1,
+    });
+    assert_eq!(response, appended(6, 10));
     assert_eq!(
-        restored.offset_for_record(&stream_id, 1),
-        Err(RecordIndexError::RecordSealed)
+        bucket_usage(&machine, "benchcmp").committed_records - before,
+        5
     );
-    assert_eq!(restored.offset_for_record(&stream_id, 3), Ok(Some(24)));
 }
 
 #[test]
@@ -659,7 +704,6 @@ fn legacy_external_json_append_without_boundaries_is_rejected_atomically() {
             stream_seq: None,
             producer: None,
             now_ms: 1,
-            record_match: None,
         }),
         StreamErrorCode::InvalidRecordBoundaries,
     );
@@ -1105,7 +1149,7 @@ fn bootstrap_never_returns_collapsed_cold_prefix_as_one_part() {
     assert!(!plan.up_to_date);
 }
 
-/// A stream without a record index has no message boundaries: from a
+/// A non-JSON stream has no message boundaries: from a
 /// snapshot at or above the seal point, bootstrap answers `[S, tail)` as one
 /// part, even when `S` is inside a message.
 #[test]
@@ -1691,9 +1735,9 @@ fn plan_next_cold_flush_drains_distributed_group_hot_bytes() {
         ));
     }
 
-    // F6c: binary streams are charged payload only, 2 x 2 B.
+    // F6c: hot payload only, 2 x 2 B.
     let group_real = 4;
-    assert_eq!(machine.total_hot_real_bytes(), group_real as u64);
+    assert_eq!(machine.total_hot_payload_bytes(), group_real as u64);
     assert_eq!(
         machine
             .plan_next_cold_flush_batch(group_real, 4, 4, 1)
@@ -1910,10 +1954,10 @@ fn flush_planner_drains_largest_streams_first() {
         create_stream(&mut machine, name);
         append_all(&mut machine, name, &[&vec![b'x'; len]]);
     }
-    // F6c: binary streams are charged payload only, 100 in all. Group hot
+    // F6c: hot payload only, 100 in all. Group hot
     // 100 >= 100: drain until below 50 (d-40 and d-30).
     let group_real = 100;
-    assert_eq!(machine.total_hot_real_bytes(), group_real as u64);
+    assert_eq!(machine.total_hot_payload_bytes(), group_real as u64);
     let (pass, _) = machine
         .plan_cold_flush_pass_from(
             planner_request(group_real, 64, usize::MAX, usize::MAX),
@@ -2289,7 +2333,6 @@ fn snapshot_entry(
         cold_index_generation: 0,
         cold_chunks: Vec::new(),
         external_segments: Vec::new(),
-        record_index: None,
         visible_snapshot: None,
         producer_states,
     }
@@ -2388,7 +2431,6 @@ fn close_is_monotonic_and_close_only_is_idempotent() {
             deduplicated: false,
             producer: None,
             receipt_evicted: false,
-            record_range: None,
         }
     );
     assert_eq!(
@@ -2846,7 +2888,6 @@ fn append_conflict_precedence_reports_closed_before_mismatch_or_seq() {
             deduplicated: false,
             producer: None,
             receipt_evicted: false,
-            record_range: None,
         }
     );
 
@@ -2909,10 +2950,7 @@ fn checkpoint_publish_and_retention_advance_are_independent() {
     assert_eq!(machine.retained_offset(&stream("snap")), 0);
     assert_eq!(
         machine.apply(advance_retention_cmd(stream("snap"), 3, 1)),
-        StreamResponse::RetentionAdvanced {
-            retained_offset: 3,
-            record_range: None,
-        }
+        StreamResponse::RetentionAdvanced { retained_offset: 3 }
     );
     assert_err_at(
         machine.read_plan(&stream("snap"), 0, 1),
@@ -3357,7 +3395,6 @@ proptest! {
             )),
             StreamResponse::RetentionAdvanced {
                 retained_offset: snapshot_offset,
-                record_range: None,
             }
         );
 
@@ -4013,7 +4050,6 @@ fn append_external_cmd(stream_id: BucketStreamId, s3_path: &str, len: u64) -> St
         stream_seq: None,
         producer: None,
         now_ms: 0,
-        record_match: None,
     }
 }
 
@@ -4374,74 +4410,4 @@ fn flush_planner_flushes_tails_older_than_the_max_hot_age() {
         .expect("plan pass");
     assert_eq!(pass.candidates.len(), 1);
     assert_eq!(pass.candidates[0].stream_id, stream("young"));
-}
-
-/// bounded-stream-state F6c: the group's hot-record gauge, and so its real
-/// hot size, follows appends, flushes, retention,
-/// deletes and snapshot restore, and agrees with a recount.
-#[test]
-fn hot_real_bytes_track_records_across_every_hot_transition() {
-    // F4b: 8 B per hot record.
-    const OVERHEAD: u64 = crate::HOT_RECORD_OVERHEAD_BYTES;
-    let mut machine = machine();
-    let first = BucketStreamId::new("benchcmp", "run-7-a");
-    let second = BucketStreamId::new("benchcmp", "run-7-b");
-    for stream_id in [&first, &second] {
-        assert!(matches!(
-            machine.apply(create_cmd(stream_id.clone(), Create {
-                content_type: "application/json",
-                ..Create::default()
-            })),
-            StreamResponse::Created { .. }
-        ));
-    }
-    let json_append =
-        |stream_id: &BucketStreamId, body: &'static [u8], record_match| StreamCommand::Append {
-            stream_id: stream_id.clone(),
-            content_type: Some("application/json".to_owned()),
-            payload: bytes::Bytes::from_static(body),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match,
-        };
-    let recount = |machine: &StreamStateMachine| -> u64 {
-        [&first, &second]
-            .into_iter()
-            .map(|stream_id| machine.hot_real_len(stream_id).unwrap_or(0))
-            .sum()
-    };
-    // Three records of 8 bytes, then two of 8 bytes on the other stream.
-    machine.apply(json_append(
-        &first,
-        b"{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n",
-        None,
-    ));
-    machine.apply(json_append(&second, b"{\"b\":1}\n{\"b\":2}\n", None));
-    assert_eq!(machine.total_hot_records(), 5);
-    assert_eq!(machine.total_hot_real_bytes(), 40 + 5 * OVERHEAD);
-    assert_eq!(machine.total_hot_real_bytes(), recount(&machine));
-
-    // Flushing the first record of the first stream removes one record.
-    assert!(matches!(
-        machine.apply(flush_cold_cmd(&machine, first.clone(), 0, 8, "first-0", 8)),
-        StreamResponse::ColdFlushed { .. }
-    ));
-    assert_eq!(machine.total_hot_records(), 4);
-    assert_eq!(machine.total_hot_real_bytes(), 32 + 4 * OVERHEAD);
-
-    // Snapshot restore re-derives the same gauge.
-    let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore");
-    assert_eq!(restored.total_hot_records(), 4);
-    assert_eq!(
-        restored.total_hot_real_bytes(),
-        machine.total_hot_real_bytes()
-    );
-
-    // Deleting a stream drops its records.
-    machine.apply(delete_cmd(second.clone()));
-    assert_eq!(machine.total_hot_records(), 2);
-    assert_eq!(machine.total_hot_real_bytes(), 16 + 2 * OVERHEAD);
-    assert_eq!(machine.total_hot_real_bytes(), recount(&machine));
 }

@@ -1,9 +1,9 @@
 ---
 title: Chat Room
-description: "One JSON stream per room: append messages, replay history by record, and tail new messages live."
+description: "One JSON stream per room: append messages, replay history from an offset, and tail new messages live."
 ---
 
-A chat room is a JSON timeline: every message is one record, Ursula assigns record ordinals in commit order, and every participant replays history and tails the same stream. This mirrors the chat examples in the [upstream Durable Streams repo](https://github.com/durable-streams/durable-streams/tree/main/examples).
+A chat room is a JSON timeline: every chat message is one JSON message in the stream, stored in commit order, and every participant replays history and tails the same stream. This mirrors the chat examples in the [upstream Durable Streams repo](https://github.com/durable-streams/durable-streams/tree/main/examples).
 
 ## One stream per room
 
@@ -12,7 +12,7 @@ curl -X PUT http://127.0.0.1:4437/chat/room-7 \
   -H 'Content-Type: application/json'
 ```
 
-`application/json` streams advertise `json-record-coordinates-v1`: each appended JSON object becomes one complete record with a stable zero-based ordinal, so clients paginate and resume by message, not by offset.
+Each appended JSON object is stored as one line of NDJSON. Positions in the stream are offsets: opaque tokens that Ursula returns in `Stream-Next-Offset`. Clients store and pass back the offsets Ursula returned and never compute one themselves.
 
 ## Send a message
 
@@ -22,43 +22,50 @@ curl -X POST http://127.0.0.1:4437/chat/room-7 \
   --data '{"user":"ada","text":"hello","sent_at":"2026-07-23T09:00:00Z"}'
 ```
 
-Each append returns the record range it created in `Stream-Record-Start` / `Stream-Record-Next`. Appending a top-level JSON array creates one record per element, which is useful for flushing an offline outbox in one request. To make send retries safe against double-posting, add the [exactly-once producer headers](/docs/concepts/exactly-once-writes) with one `Producer-Id` per device.
+Each append returns the room's new tail in `Stream-Next-Offset`. Appending a top-level JSON array stores one message per element, which is useful for flushing an offline outbox in one request. To make send retries safe against double-posting, add the [exactly-once producer headers](/docs/concepts/exactly-once-writes) with one `Producer-Id` per device.
 
-## Load recent history
+JSON messages are validated on append and stored exactly as the sender wrote them, minus insignificant whitespace, so member order and number spelling survive.
 
-Fetch the last 50 messages as self-describing `{record, value}` envelopes, newest ordinals last:
+## Replay history
+
+Read the room from its start, or from an offset the client stored earlier:
 
 ```bash
-curl 'http://127.0.0.1:4437/chat/room-7?tail_records=50&record_view=envelope'
+curl -i 'http://127.0.0.1:4437/chat/room-7?offset=-1'
 ```
 
 ```json
-{"record":118,"value":{"sent_at":"2026-07-23T09:00:00Z","text":"hello","user":"ada"}}
-{"record":119,"value":{"sent_at":"2026-07-23T09:00:07Z","text":"hey ada","user":"lin"}}
+{"user":"ada","text":"hello","sent_at":"2026-07-23T09:00:00Z"}
+{"user":"lin","text":"hey ada","sent_at":"2026-07-23T09:00:07Z"}
 ```
 
-JSON records are validated on append and stored exactly as the sender wrote them, minus insignificant whitespace, so member order and number spelling survive.
+The body is NDJSON, one message per line. A response returns at most 8 MiB and can end mid-line: buffer an incomplete trailing line and continue from the response's `Stream-Next-Offset` until a response carries `Stream-Up-To-Date: true`.
+
+Loading only the last N messages needs a server-side paging primitive that does not exist yet; until it ships, replay from the start or from a stored offset, or keep a [snapshot](/docs/concepts/snapshots) of the recent history.
 
 ## Tail new messages live
 
-`record=now` skips history and streams only messages committed from now on. In envelope mode, every SSE data event carries exactly one `{record, value}` object, so the client parses each event directly:
+`offset=now` skips history and streams only messages committed from now on:
 
 ```ts
 const base = "http://127.0.0.1:4437";
-const es = new EventSource(
-  `${base}/chat/room-7?record=now&record_view=envelope&live=sse`,
-);
+const es = new EventSource(`${base}/chat/room-7?offset=now&live=sse`);
 
+let pending = "";
 es.addEventListener("data", (e) => {
-  const { record, value } = JSON.parse(e.data);
-  renderMessage(record, value);
+  pending += e.data + "\n";
+  const lines = pending.split("\n");
+  pending = lines.pop() ?? "";
+  for (const line of lines) {
+    if (line) renderMessage(JSON.parse(line));
+  }
 });
 ```
 
-Control events publish `streamNextRecord`. Store it and reconnect with `record=<streamNextRecord>` to resume without missing or repeating a message. Deduplicate by `record` if you combine a history fetch with a live tail.
+A data event may hold several messages, one per line; SSE `data:` lines are transport framing, not message boundaries. Control events publish `streamNextOffset`. Store it and reconnect with `offset=<streamNextOffset>` to resume without missing or repeating a message.
 
 ## Next
 
 - [Resumable AI Stream](/docs/examples/resumable-ai-stream): the single-writer variant for streaming model output
-- [Record Coordinates](/docs/concepts/record-coordinates): the complete record replay model
+- [Offsets](/docs/concepts/offsets): how resumption works
 - [Browser Telemetry](/docs/examples/browser-telemetry): an advanced example with event-time indexing with offset locators

@@ -112,12 +112,13 @@ use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
+use ursula_runtime::StreamErrorCode;
+use ursula_runtime::StreamErrorContext;
 use ursula_runtime::new_external_payload_path;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 use wal_disk::WalDiskMonitor;
 
-use crate::render::apply_record_envelope;
 use crate::render::bootstrap_response;
 use crate::render::clamp_sse_text_read;
 use crate::render::http_read_content_type;
@@ -142,7 +143,6 @@ use crate::render::long_poll_no_content_response;
 use crate::render::normalize_http_write_payload;
 use crate::render::offset_now_response;
 use crate::render::read_response;
-use crate::render::record_envelope_response;
 use crate::render::render_metrics;
 use crate::render::render_sse_read;
 use crate::render::response_cursor;
@@ -157,15 +157,10 @@ const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 const HEADER_STREAM_CLOSED: &str = "stream-closed";
 const HEADER_STREAM_CURSOR: &str = "stream-cursor";
 const HEADER_STREAM_EXPIRES_AT: &str = "stream-expires-at";
-const HEADER_STREAM_EXTENSIONS: &str = "stream-extensions";
 const HEADER_STREAM_INCARNATION: &str = "stream-incarnation";
 const HEADER_STREAM_COLD_HOT_START_OFFSET: &str = "stream-cold-hot-start-offset";
 const HEADER_STREAM_DATA_CONTENT_TYPE: &str = "stream-data-content-type";
 const HEADER_STREAM_NEXT_OFFSET: &str = "stream-next-offset";
-const HEADER_STREAM_RECORD_FIRST: &str = "stream-record-first";
-const HEADER_STREAM_RECORD_MATCH: &str = "stream-record-match";
-const HEADER_STREAM_RECORD_NEXT: &str = "stream-record-next";
-const HEADER_STREAM_RECORD_START: &str = "stream-record-start";
 const HEADER_STREAM_SNAPSHOT_OFFSET: &str = "stream-snapshot-offset";
 const HEADER_STREAM_SNAPSHOT_DIGEST: &str = "stream-snapshot-digest";
 const HEADER_STREAM_RETAINED_OFFSET: &str = "stream-retained-offset";
@@ -173,7 +168,6 @@ const HEADER_STREAM_SSE_DATA_ENCODING: &str = "stream-sse-data-encoding";
 const HEADER_STREAM_SEQ: &str = "stream-seq";
 const HEADER_STREAM_TTL: &str = "stream-ttl";
 const HEADER_STREAM_UP_TO_DATE: &str = "stream-up-to-date";
-const JSON_RECORD_COORDINATES_EXTENSION: &str = "json-record-coordinates-v1";
 const HEADER_PRODUCER_ID: &str = "producer-id";
 const HEADER_PRODUCER_EPOCH: &str = "producer-epoch";
 const HEADER_PRODUCER_SEQ: &str = "producer-seq";
@@ -1254,9 +1248,7 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
                         .next()
                         .unwrap_or(content_type)
                         .trim();
-                    media_type == "application/json"
-                        || media_type == "application/x-ndjson"
-                        || media_type == "application/vnd.durable-stream-records+ndjson"
+                    media_type == "application/json" || media_type == "application/x-ndjson"
                 })
         };
     let response_compression = CompressionLayer::new()
@@ -1274,19 +1266,12 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         )
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .route("/{bucket}", put(create_bucket))
-        // Only PUT: a bare GET (the removed latest-snapshot redirect) gets
-        // axum's 405, not a 404 that Loro's client would read as "no snapshot".
-        .route(
-            "/{bucket}/{stream}/snapshot",
-            put(publish_snapshot_at_record),
-        )
+        // A bare GET (the removed latest-snapshot redirect) answers 405, not
+        // a 404 that Loro's client would read as "no snapshot".
+        .route("/{bucket}/{stream}/snapshot", get(removed_latest_snapshot))
         .route(
             "/{bucket}/{stream}/snapshot/{snapshot_offset}",
             put(publish_snapshot).get(read_snapshot),
-        )
-        .route(
-            "/{bucket}/{stream}/retention",
-            put(advance_retention_at_record),
         )
         .route(
             "/{bucket}/{stream}/retention/{retained_offset}",
@@ -1427,9 +1412,6 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
     insert_location(&mut headers, stream_id);
     insert_lifetime_headers(&mut headers, stream_ttl_seconds, stream_expires_at_ms);
     insert_producer_ack(&mut headers, producer);
-    if let Some(record_range) = response.record_range {
-        insert_record_operation_headers(&mut headers, record_range);
-    }
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
     }
@@ -1445,14 +1427,11 @@ pub(crate) fn append_http_response(response: AppendResponse) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     // A duplicate beyond the receipt window (bounded-state F3) is answered
-    // `204` with `Producer-Seq` and without byte or record ranges.
+    // `204` with `Producer-Seq` and without a byte range.
     if !response.receipt_evicted {
         insert_offset(&mut headers, response.next_offset);
     }
     insert_producer_ack(&mut headers, response.producer.as_ref());
-    if let Some(record_range) = response.record_range {
-        insert_record_operation_headers(&mut headers, record_range);
-    }
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
     }
@@ -1643,12 +1622,6 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
     let group_state_gauges = group_state_gauges_json(&state).await;
     if let Some(object) = body.as_object_mut() {
         object.insert("group_state_gauges".to_owned(), group_state_gauges);
-        // F1 anchor verification (RC-21): record reads failed because cold
-        // bytes disagreed with the record marks.
-        object.insert(
-            "record_coordinate_corruptions".to_owned(),
-            serde_json::Value::from(ursula_runtime::record_coordinate_corruptions()),
-        );
         object.insert("process_rss_bytes".to_owned(), serde_json::json!(rss));
         object.insert(
             "node_memory_abort_cap_bytes".to_owned(),
@@ -2540,6 +2513,9 @@ pub(crate) async fn append_stream_by_id(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(response) = removed_surface::reject_removed_append_headers(&headers) {
+        return *response;
+    }
     let close_after = stream_closed(&headers);
 
     if body.is_empty() && close_after {
@@ -2566,9 +2542,6 @@ pub(crate) async fn append_stream_by_id(
                 insert_default_response_headers(&mut headers);
                 insert_offset(&mut headers, response.next_offset);
                 insert_producer_ack(&mut headers, producer.as_ref());
-                if let Some(record_range) = response.record_range {
-                    insert_record_operation_headers(&mut headers, record_range);
-                }
                 insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
                 (StatusCode::NO_CONTENT, headers).into_response()
             }
@@ -2601,10 +2574,6 @@ pub(crate) async fn append_stream_by_id(
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
     request.producer = producer.clone();
-    request.record_match = match stream_record_match(&headers) {
-        Ok(record_match) => record_match,
-        Err(response) => return *response,
-    };
 
     if should_externalize_payload(&state, request.payload.len(), true) {
         return append_stream_external_by_id(state, request_target, request).await;
@@ -2735,9 +2704,6 @@ pub(crate) async fn head_stream_by_id(
             if let Some(incarnation) = response.created_at_ms {
                 insert_u64_header(&mut headers, HEADER_STREAM_INCARNATION, incarnation);
             }
-            if let Some(record_range) = response.record_range {
-                insert_record_head_headers(&mut headers, record_range);
-            }
             if response.closed {
                 insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
             }
@@ -2745,50 +2711,6 @@ pub(crate) async fn head_stream_by_id(
         }
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
-}
-
-fn insert_record_extension(headers: &mut HeaderMap) {
-    insert_extension_token(headers, JSON_RECORD_COORDINATES_EXTENSION);
-}
-
-fn insert_extension_token(headers: &mut HeaderMap, token: &'static str) {
-    let value = match headers
-        .get(HEADER_STREAM_EXTENSIONS)
-        .and_then(|value| value.to_str().ok())
-    {
-        Some(existing) if existing.split(',').any(|item| item.trim() == token) => return,
-        Some(existing) => format!("{existing}, {token}"),
-        None => token.to_owned(),
-    };
-    if let Ok(value) = HeaderValue::from_str(&value) {
-        headers.insert(HEADER_STREAM_EXTENSIONS, value);
-    }
-}
-
-fn insert_record_operation_headers(
-    headers: &mut HeaderMap,
-    record_range: ursula_runtime::StreamRecordRange,
-) {
-    insert_record_extension(headers);
-    insert_u64_header(
-        headers,
-        HEADER_STREAM_RECORD_START,
-        record_range.first_record,
-    );
-    insert_u64_header(headers, HEADER_STREAM_RECORD_NEXT, record_range.next_record);
-}
-
-fn insert_record_head_headers(
-    headers: &mut HeaderMap,
-    record_range: ursula_runtime::StreamRecordRange,
-) {
-    insert_record_extension(headers);
-    insert_u64_header(
-        headers,
-        HEADER_STREAM_RECORD_FIRST,
-        record_range.first_record,
-    );
-    insert_u64_header(headers, HEADER_STREAM_RECORD_NEXT, record_range.next_record);
 }
 
 pub(crate) async fn read_stream(
@@ -2831,37 +2753,11 @@ pub(crate) async fn read_stream_by_id(
         )
             .into_response();
     }
+    if let Err(response) = removed_surface::reject_removed_read_parameters(&query) {
+        return *response;
+    }
     let offset_is_now = query.get("offset").is_some_and(|offset| offset == "now");
-    let record_aware = query.contains_key("record") || query.contains_key("tail_records");
-    let envelope_view = match query.get("record_view").map(String::as_str) {
-        None => false,
-        Some("envelope") if record_aware => true,
-        Some("envelope") => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "record_view requires record or tail_records",
-            )
-                .into_response();
-        }
-        Some(_) => return (StatusCode::BAD_REQUEST, "invalid record_view").into_response(),
-    };
-    if query.contains_key("record") && query.contains_key("tail_records")
-        || record_aware && query.contains_key("offset")
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            "record, tail_records, and offset are mutually exclusive",
-        )
-            .into_response();
-    }
-    if query.contains_key("max_records") && !record_aware {
-        return (
-            StatusCode::BAD_REQUEST,
-            "max_records requires record or tail_records",
-        )
-            .into_response();
-    }
-    if live_mode.is_some() && !query.contains_key("offset") && !record_aware {
+    if live_mode.is_some() && !query.contains_key("offset") {
         return (
             StatusCode::BAD_REQUEST,
             "live reads require a start position",
@@ -2876,70 +2772,29 @@ pub(crate) async fn read_stream_by_id(
     {
         return runtime_error_or_leader_redirect_async(&state, err, &request_target).await;
     }
-    let record = if record_aware {
-        match read_record_start(&state, &stream_id, &query, &request_target, leader_only).await {
-            Ok(record) => Some(record),
-            Err(response) => return *response,
-        }
-    } else {
-        None
+    let offset = match read_offset(
+        &state,
+        &stream_id,
+        query.get("offset").map(String::as_str),
+        &request_target,
+        leader_only,
+    )
+    .await
+    {
+        Ok(offset) => offset,
+        Err(response) => return *response,
     };
-    let max_records = match query.get("max_records") {
-        Some(raw) => match raw.parse::<u64>() {
-            Ok(value) if value > 0 => Some(value),
-            _ => {
-                return (StatusCode::BAD_REQUEST, "max_records must be positive").into_response();
-            }
-        },
-        None => None,
-    };
-    let offset = if record_aware {
-        0
-    } else {
-        match read_offset(
-            &state,
-            &stream_id,
-            query.get("offset").map(String::as_str),
-            &request_target,
-            leader_only,
-        )
-        .await
-        {
-            Ok(offset) => offset,
-            Err(response) => return *response,
-        }
-    };
-    // On a record-aware read `max_bytes` bounds complete records (P7,
-    // extensions.md §6.6) and must be a positive integer; offset reads keep
-    // the base protocol's lenient parsing.
-    // F11: every read is capped at READ_MAX_RESPONSE_BYTES; a capped offset
-    // read may end inside a message.
-    let max_len = match query.get("max_bytes") {
-        Some(raw) if record_aware => match raw.parse::<usize>() {
-            Ok(value) if value > 0 => value,
-            _ => {
-                return (StatusCode::BAD_REQUEST, "max_bytes must be positive").into_response();
-            }
-        },
-        Some(raw) => raw.parse::<usize>().unwrap_or(usize::MAX),
-        None => usize::MAX,
-    };
-    let max_len = max_len.min(READ_MAX_RESPONSE_BYTES);
+    // F11: every read is capped at READ_MAX_RESPONSE_BYTES; a capped read may
+    // end inside a message. `max_bytes` keeps the base protocol's lenient
+    // parsing.
+    let max_len = query
+        .get("max_bytes")
+        .map_or(usize::MAX, |raw| raw.parse::<usize>().unwrap_or(usize::MAX))
+        .min(READ_MAX_RESPONSE_BYTES);
 
     match live_mode {
         Some("sse") => {
-            return sse_stream(
-                state,
-                request_target,
-                stream_id,
-                offset,
-                max_len,
-                record,
-                max_records,
-                envelope_view,
-                &query,
-            )
-            .await;
+            return sse_stream(state, request_target, stream_id, offset, max_len, &query).await;
         }
         Some("long-poll") => {
             return long_poll_stream(
@@ -2948,9 +2803,6 @@ pub(crate) async fn read_stream_by_id(
                 stream_id,
                 offset,
                 max_len,
-                record,
-                max_records,
-                envelope_view,
                 &query,
                 headers,
             )
@@ -2967,89 +2819,15 @@ pub(crate) async fn read_stream_by_id(
             offset,
             max_len,
             now_ms: state.unix_time_ms(),
-            record,
-            max_records,
             leader_only,
-            record_anchor: None,
             read_index: None,
         })
         .await;
     match read {
         Ok(response) if offset_is_now => offset_now_response(response),
-        Ok(response) if envelope_view => record_envelope_response(response, &headers, None),
         Ok(response) => read_response(response, &headers, None),
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
-}
-
-/// Resolves `?record=`/`?tail_records=` to a record through HEAD. The HEAD
-/// is linearizable only for a `consistency=leader` read (D10); otherwise it
-/// reads the leader's applied state without a quorum round trip.
-async fn read_record_start(
-    state: &HttpState,
-    stream_id: &BucketStreamId,
-    query: &HashMap<String, String>,
-    request_target: &str,
-    linearizable: bool,
-) -> Result<u64, BoxResponse> {
-    let head = match state
-        .runtime
-        .head_stream(HeadStreamRequest {
-            stream_id: stream_id.clone(),
-            now_ms: state.unix_time_ms(),
-            linearizable,
-            read_index: None,
-        })
-        .await
-    {
-        Ok(head) => head,
-        Err(err) => {
-            return Err(Box::new(
-                runtime_error_or_leader_redirect_async(state, err, request_target).await,
-            ));
-        }
-    };
-    let Some(range) = head.record_range else {
-        return Err(Box::new(
-            (
-                StatusCode::BAD_REQUEST,
-                "record coordinates are inactive for this stream",
-            )
-                .into_response(),
-        ));
-    };
-    let record = if let Some(raw) = query.get("record") {
-        if raw == "now" {
-            range.next_record
-        } else {
-            raw.parse::<u64>().map_err(|_| {
-                Box::new((StatusCode::BAD_REQUEST, "invalid record").into_response())
-            })?
-        }
-    } else {
-        let count = query
-            .get("tail_records")
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .ok_or_else(|| {
-                Box::new((StatusCode::BAD_REQUEST, "invalid tail_records").into_response())
-            })?;
-        range
-            .next_record
-            .saturating_sub(count)
-            .max(range.first_record)
-    };
-    if record < range.first_record || record > range.next_record {
-        let status = if record < range.first_record {
-            StatusCode::GONE
-        } else {
-            StatusCode::BAD_REQUEST
-        };
-        let mut headers = HeaderMap::new();
-        insert_default_response_headers(&mut headers);
-        insert_record_head_headers(&mut headers, range);
-        return Err(Box::new((status, headers).into_response()));
-    }
-    Ok(record)
 }
 
 #[tracing::instrument(
@@ -3073,11 +2851,6 @@ pub(crate) async fn publish_snapshot(
         Err(response) => return *response,
     };
     let request_target = request_target(&uri);
-    if let Err(response) =
-        check_json_record_boundary(&state, &stream_id, snapshot_offset, &request_target).await
-    {
-        return *response;
-    }
     publish_snapshot_by_offset(
         state,
         request_target,
@@ -3089,67 +2862,81 @@ pub(crate) async fn publish_snapshot(
     .await
 }
 
-/// Leader-side record-boundary check for the raw-offset snapshot and
-/// retention routes (F1, RC-12, RC-14). Stored JSON records end with LF and
-/// contain no other LF, so an offset strictly inside the retained log is a
-/// record boundary exactly when the byte before it is LF. Rejects an
-/// intra-record offset with 400 before proposing; apply still lands on a
-/// real boundary if a racing delete or recreate makes this check stale.
-/// Streams without record coordinates, offsets at the retained offset or
-/// tail, and failed lookups are left to apply. The HEAD stays linearizable:
-/// apply does not re-check JSON boundaries at or below the seal point.
-async fn check_json_record_boundary(
+/// A bare `GET {stream}/snapshot` (the removed latest-snapshot redirect)
+/// answers 405, not 404: Loro's streams client reads a 404 as "no
+/// snapshot" (see `removed_surface`).
+pub(crate) async fn removed_latest_snapshot() -> Response {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        "the latest-snapshot redirect was removed; read Stream-Snapshot-Offset from HEAD",
+    )
+        .into_response()
+}
+
+/// The stream incarnation an apply refusal names when a JSON snapshot or
+/// retention offset needs a proposer-verified boundary (the byte before it
+/// is not hot).
+fn json_boundary_unverified(err: &RuntimeError) -> Option<u64> {
+    if err.stream_error_code() != Some(StreamErrorCode::JsonBoundaryUnverified) {
+        return None;
+    }
+    err.stream_error_context()
+        .iter()
+        .find_map(|context| match context {
+            StreamErrorContext::StreamIncarnation { incarnation } => Some(*incarnation),
+            _ => None,
+        })
+}
+
+/// The JSON LF obligation, proposer side (AUD §2). Apply checks a JSON
+/// snapshot or retention offset whose preceding byte is hot; for any other
+/// offset it refuses with the stream's incarnation, and this reads that
+/// byte on the leader (`consistency=leader`). LF passes, so the caller
+/// proposes again pinned to the incarnation; any other byte answers 400; a
+/// failed read answers 503 (fail closed). A delete and recreate between
+/// this read and the second apply changes the incarnation, so apply refuses
+/// it. Non-JSON streams and hot boundaries never reach this.
+async fn verify_json_boundary(
     state: &HttpState,
     stream_id: &BucketStreamId,
     offset: u64,
-    request_target: &str,
-) -> Result<(), BoxResponse> {
-    let head = match state
-        .runtime
-        .head_stream(HeadStreamRequest {
-            stream_id: stream_id.clone(),
-            now_ms: state.unix_time_ms(),
-            linearizable: true,
-            read_index: None,
-        })
-        .await
-    {
-        Ok(head) => head,
-        Err(err) => {
-            return Err(Box::new(
-                runtime_error_or_leader_redirect_async(state, err, request_target).await,
-            ));
-        }
-    };
-    if head.record_range.is_none() || offset <= head.retained_offset || offset >= head.tail_offset {
-        return Ok(());
-    }
-    let Ok(read) = state
+) -> Result<(), Response> {
+    let read = state
         .runtime
         .read_stream(ReadStreamRequest {
             stream_id: stream_id.clone(),
-            offset: offset - 1,
+            offset: offset.saturating_sub(1),
             max_len: 1,
             now_ms: state.unix_time_ms(),
-            record: None,
-            max_records: None,
-            leader_only: false,
-            record_anchor: None,
+            leader_only: true,
             read_index: None,
         })
-        .await
-    else {
-        return Ok(());
+        .await;
+    let byte = match read {
+        Ok(read) => read.payload.first().copied(),
+        Err(err) => {
+            tracing::warn!(
+                bucket = %stream_id.bucket_id,
+                stream = %stream_id.stream_id,
+                offset,
+                error = %err,
+                "JSON message boundary check failed"
+            );
+            None
+        }
     };
-    match read.payload.first() {
-        Some(b'\n') | None => Ok(()),
-        Some(_) => Err(Box::new(
-            (
-                StatusCode::BAD_REQUEST,
-                format!("offset {offset} is not a JSON record boundary"),
-            )
-                .into_response(),
-        )),
+    match byte {
+        Some(b'\n') => Ok(()),
+        Some(_) => Err((
+            StatusCode::BAD_REQUEST,
+            format!("offset {offset} is not a JSON message boundary"),
+        )
+            .into_response()),
+        None => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("could not verify that offset {offset} is a JSON message boundary"),
+        )
+            .into_response()),
     }
 }
 
@@ -3171,15 +2958,28 @@ async fn publish_snapshot_by_offset(
     let staged_path = cold_body
         .as_ref()
         .map(|cold_body| cold_body.object.s3_path.clone());
-    let request = PublishSnapshotRequest {
-        stream_id,
+    let mut request = PublishSnapshotRequest {
+        stream_id: stream_id.clone(),
         snapshot_offset,
         content_type,
         payload,
         cold_body,
         now_ms: state.unix_time_ms(),
+        expected_incarnation: None,
     };
-    let result = state.runtime.publish_snapshot(request).await;
+    let mut result = state.runtime.publish_snapshot(request.clone()).await;
+    if let Some(incarnation) = result.as_ref().err().and_then(json_boundary_unverified) {
+        if let Err(response) = verify_json_boundary(&state, &stream_id, snapshot_offset).await {
+            // Nothing references the staged body: apply refused it.
+            if let Some(staged_path) = staged_path.as_deref() {
+                delete_unreferenced_staged_payload(&state, staged_path).await;
+            }
+            return response;
+        }
+        request.expected_incarnation = Some(incarnation);
+        request.now_ms = state.unix_time_ms();
+        result = state.runtime.publish_snapshot(request).await;
+    }
     if let (Err(err), Some(staged_path)) = (&result, staged_path.as_deref()) {
         // F5 cleanup rule: delete the staged body only after a definite
         // rejection; the orphan sweep reclaims it otherwise.
@@ -3191,82 +2991,9 @@ async fn publish_snapshot_by_offset(
             insert_default_response_headers(&mut headers);
             insert_snapshot_offset(&mut headers, response.snapshot_offset);
             insert_snapshot_digest(&mut headers, &response.snapshot_digest);
-            if let Some(record_range) = response.record_range {
-                insert_record_head_headers(&mut headers, record_range);
-            }
             (StatusCode::NO_CONTENT, headers).into_response()
         }
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
-    }
-}
-
-pub(crate) async fn publish_snapshot_at_record(
-    State(state): State<HttpState>,
-    OriginalUri(uri): OriginalUri,
-    Path(path): Path<StreamPath>,
-    headers: HeaderMap,
-    RawQuery(raw_query): RawQuery,
-    body: Body,
-) -> Response {
-    if let Err(response) = removed_surface::reject_removed_snapshot_headers(&headers) {
-        return *response;
-    }
-    let query = match parse_query(raw_query.as_deref()) {
-        Ok(query) => query,
-        Err(response) => return *response,
-    };
-    let Some(record) = query.get("record") else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "record query parameter is required",
-        )
-            .into_response();
-    };
-    let record = match record.parse::<u64>() {
-        Ok(record) => record,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid record").into_response(),
-    };
-    let stream_id = path.into_stream_id();
-    let request_target = request_target(&uri);
-    let snapshot_offset =
-        match resolve_record_offset(&state, &stream_id, record, &request_target).await {
-            Ok(offset) => offset,
-            Err(response) => return response,
-        };
-    publish_snapshot_by_offset(
-        state,
-        request_target,
-        stream_id,
-        snapshot_offset,
-        headers,
-        body,
-    )
-    .await
-}
-
-async fn resolve_record_offset(
-    state: &HttpState,
-    stream_id: &BucketStreamId,
-    record: u64,
-    request_target: &str,
-) -> Result<u64, Response> {
-    match state
-        .runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream_id.clone(),
-            offset: 0,
-            max_len: 1,
-            now_ms: state.unix_time_ms(),
-            record: Some(record),
-            max_records: Some(1),
-            leader_only: false,
-            record_anchor: None,
-            read_index: None,
-        })
-        .await
-    {
-        Ok(response) => Ok(response.offset),
-        Err(err) => Err(runtime_error_or_leader_redirect_async(state, err, request_target).await),
     }
 }
 
@@ -3281,60 +3008,22 @@ pub(crate) async fn advance_retention(
         Err(response) => return *response,
     };
     let request_target = request_target(&uri);
-    if let Err(response) =
-        check_json_record_boundary(&state, &stream_id, retained_offset, &request_target).await
-    {
-        return *response;
+    let mut request = AdvanceRetentionRequest {
+        stream_id: stream_id.clone(),
+        retained_offset,
+        now_ms: state.unix_time_ms(),
+        expected_incarnation: None,
+    };
+    let mut result = state.runtime.advance_retention(request.clone()).await;
+    if let Some(incarnation) = result.as_ref().err().and_then(json_boundary_unverified) {
+        if let Err(response) = verify_json_boundary(&state, &stream_id, retained_offset).await {
+            return response;
+        }
+        request.expected_incarnation = Some(incarnation);
+        request.now_ms = state.unix_time_ms();
+        result = state.runtime.advance_retention(request).await;
     }
-    advance_retention_by_offset(state, request_target, stream_id, retained_offset).await
-}
-
-pub(crate) async fn advance_retention_at_record(
-    State(state): State<HttpState>,
-    OriginalUri(uri): OriginalUri,
-    Path(path): Path<StreamPath>,
-    RawQuery(raw_query): RawQuery,
-) -> Response {
-    let query = match parse_query(raw_query.as_deref()) {
-        Ok(query) => query,
-        Err(response) => return *response,
-    };
-    let Some(record) = query.get("record") else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "record query parameter is required",
-        )
-            .into_response();
-    };
-    let record = match record.parse::<u64>() {
-        Ok(record) => record,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid record").into_response(),
-    };
-    let stream_id = path.into_stream_id();
-    let request_target = request_target(&uri);
-    let retained_offset =
-        match resolve_record_offset(&state, &stream_id, record, &request_target).await {
-            Ok(offset) => offset,
-            Err(response) => return response,
-        };
-    advance_retention_by_offset(state, request_target, stream_id, retained_offset).await
-}
-
-async fn advance_retention_by_offset(
-    state: HttpState,
-    request_target: String,
-    stream_id: BucketStreamId,
-    retained_offset: u64,
-) -> Response {
-    match state
-        .runtime
-        .advance_retention(AdvanceRetentionRequest {
-            stream_id,
-            retained_offset,
-            now_ms: state.unix_time_ms(),
-        })
-        .await
-    {
+    match result {
         Ok(response) => {
             let mut headers = HeaderMap::new();
             insert_default_response_headers(&mut headers);
@@ -3343,9 +3032,6 @@ async fn advance_retention_by_offset(
                 HEADER_STREAM_RETAINED_OFFSET,
                 response.retained_offset,
             );
-            if let Some(record_range) = response.record_range {
-                insert_record_head_headers(&mut headers, record_range);
-            }
             (StatusCode::NO_CONTENT, headers).into_response()
         }
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
@@ -3488,9 +3174,6 @@ pub(crate) async fn long_poll_stream(
     stream_id: BucketStreamId,
     offset: u64,
     max_len: usize,
-    record: Option<u64>,
-    max_records: Option<u64>,
-    envelope_view: bool,
     query: &HashMap<String, String>,
     headers: HeaderMap,
 ) -> Response {
@@ -3500,21 +3183,13 @@ pub(crate) async fn long_poll_stream(
         offset,
         max_len: max_len.max(1),
         now_ms: state.unix_time_ms(),
-        record,
-        max_records,
         leader_only: false,
-        record_anchor: None,
         read_index: None,
     });
     match http_time::timeout(Duration::from_millis(timeout_ms), read).await {
         Ok(Ok(response)) if response.payload.is_empty() && response.up_to_date => {
             long_poll_no_content_response(&response, query.get("cursor").map(String::as_str))
         }
-        Ok(Ok(response)) if envelope_view => record_envelope_response(
-            response,
-            &headers,
-            Some(query.get("cursor").map(String::as_str).unwrap_or("")),
-        ),
         Ok(Ok(response)) => read_response(
             response,
             &headers,
@@ -3538,16 +3213,6 @@ pub(crate) async fn long_poll_stream(
                 insert_default_response_headers(&mut headers);
                 insert_offset(&mut headers, head.tail_offset);
                 insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
-                if let (Some(record), Some(record_range)) = (record, head.record_range) {
-                    insert_record_head_headers(&mut headers, record_range);
-                    insert_record_operation_headers(
-                        &mut headers,
-                        ursula_runtime::StreamRecordRange {
-                            first_record: record,
-                            next_record: record,
-                        },
-                    );
-                }
                 if head.closed {
                     insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
                 } else {
@@ -3574,14 +3239,6 @@ struct SseState {
     encode_base64: bool,
     cursor: Option<String>,
     initial_read: bool,
-    record: Option<u64>,
-    max_records: Option<u64>,
-    envelope_view: bool,
-    /// Stream incarnation seen when the session opened (F1 anchors).
-    incarnation: Option<u64>,
-    /// Where `record` starts, from this session's previous response (F1):
-    /// lets a sealed continuation skip the scan from its mark.
-    record_anchor: Option<ursula_runtime::RecordAnchor>,
 }
 
 pub(crate) async fn sse_stream(
@@ -3590,9 +3247,6 @@ pub(crate) async fn sse_stream(
     stream_id: BucketStreamId,
     offset: u64,
     max_len: usize,
-    record: Option<u64>,
-    max_records: Option<u64>,
-    envelope_view: bool,
     query: &HashMap<String, String>,
 ) -> Response {
     // The live-read owner check already confirmed this node; the session's
@@ -3613,14 +3267,13 @@ pub(crate) async fn sse_stream(
         }
     };
 
-    let encode_base64 = !envelope_view && should_base64_encode_sse_data(&head.content_type);
+    let encode_base64 = should_base64_encode_sse_data(&head.content_type);
     state
         .http_metrics
         .sse_streams_opened
         .fetch_add(1, Ordering::Relaxed);
-    // Record-aware reads always return whole records, so only offset reads
-    // need room for one complete UTF-8 code point.
-    let sse_max_len = if encode_base64 || record.is_some() {
+    // A text read needs room for one complete UTF-8 code point.
+    let sse_max_len = if encode_base64 {
         max_len.max(1)
     } else {
         max_len.max(4)
@@ -3635,11 +3288,6 @@ pub(crate) async fn sse_stream(
         encode_base64,
         cursor: query.get("cursor").cloned(),
         initial_read: true,
-        record,
-        max_records,
-        envelope_view,
-        incarnation: head.created_at_ms,
-        record_anchor: None,
     };
     let body_stream = stream::unfold(Some(sse_state), |state| async move {
         let mut state = match state {
@@ -3655,14 +3303,7 @@ pub(crate) async fn sse_stream(
             offset: state.offset,
             max_len: state.max_len,
             now_ms: state.wall_clock.unix_time_ms(),
-            record: state.record,
-            max_records: if state.envelope_view {
-                Some(1)
-            } else {
-                state.max_records
-            },
             leader_only: false,
-            record_anchor: state.record_anchor,
             read_index: None,
         };
         let read = if state.initial_read {
@@ -3682,24 +3323,9 @@ pub(crate) async fn sse_stream(
                 return Some((Ok::<Bytes, Infallible>(Bytes::from(event)), None));
             }
         };
-        if state.envelope_view
-            && let Err(err) = apply_record_envelope(&mut read)
-        {
-            let event = format!("event: error\ndata:{}\n\n", sse_safe_line(&err));
-            return Some((Ok::<Bytes, Infallible>(Bytes::from(event)), None));
-        }
         clamp_sse_text_read(&mut read, state.encode_base64);
 
         state.offset = read.next_offset;
-        state.record = read.record_range.map(|range| range.next_record);
-        state.record_anchor = match (state.incarnation, read.record_range) {
-            (Some(incarnation), Some(range)) => Some(ursula_runtime::RecordAnchor {
-                incarnation,
-                record: range.next_record,
-                offset: read.next_offset,
-            }),
-            _ => None,
-        };
         let done = read.closed && read.up_to_date;
         if !read.payload.is_empty() {
             state
@@ -3722,16 +3348,9 @@ pub(crate) async fn sse_stream(
     insert_header_str(
         &mut headers,
         HEADER_STREAM_DATA_CONTENT_TYPE,
-        if envelope_view {
-            "application/vnd.durable-stream-record+json"
-        } else {
-            http_read_content_type(&head.content_type)
-        },
+        http_read_content_type(&head.content_type),
     );
     insert_cache_control(&mut headers, "no-cache");
-    if head.record_range.is_some() {
-        insert_record_extension(&mut headers);
-    }
     if encode_base64 {
         insert_static(&mut headers, HEADER_STREAM_SSE_DATA_ENCODING, "base64");
     }
@@ -3876,16 +3495,6 @@ pub(crate) fn stream_seq(headers: &HeaderMap) -> Result<Option<String>, String> 
     Ok(Some(value.to_owned()))
 }
 
-fn stream_record_match(headers: &HeaderMap) -> Result<Option<u64>, BoxResponse> {
-    header_value(headers, HEADER_STREAM_RECORD_MATCH)
-        .map(|raw| {
-            raw.parse::<u64>().map_err(|_| {
-                Box::new((StatusCode::BAD_REQUEST, "invalid Stream-Record-Match").into_response())
-            })
-        })
-        .transpose()
-}
-
 pub(crate) fn producer_request(headers: &HeaderMap) -> Result<Option<ProducerRequest>, String> {
     let producer_id = header_value(headers, HEADER_PRODUCER_ID);
     let producer_epoch = header_value(headers, HEADER_PRODUCER_EPOCH);
@@ -4022,6 +3631,3 @@ mod base_contract_tests;
 mod cold_snapshot_tests;
 #[cfg(test)]
 mod staging_cleanup_tests;
-
-#[cfg(test)]
-mod sparse_marks_http_tests;

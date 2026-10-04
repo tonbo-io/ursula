@@ -1,10 +1,9 @@
-//! Bounded-state F4b: no message records in replicated state. JSON streams
-//! use the dense record offsets; every other stream keeps no message
-//! boundaries. Every test checks bootstrap against an oracle of the messages
-//! actually appended: for JSON, one part per record from the snapshot offset
-//! when that offset is at or above the first exact boundary; for any other
-//! stream, `[S, tail)` as one part when `S` is at or above the seal point; an
-//! honest partial otherwise.
+//! Bounded-state F4b: no message records in replicated state. A JSON message
+//! boundary is an offset after an LF byte; every other stream has none.
+//! Every test checks bootstrap against an oracle of the messages actually
+//! appended: when the snapshot offset `S` is at or above the seal point and
+//! `[S, tail)` is all hot, one part per JSON message (split on LF) or one
+//! part in all for any other stream; an honest partial otherwise.
 
 use super::*;
 
@@ -54,7 +53,6 @@ fn append_command(id: &str, content_type: &str, payload: &[u8]) -> StreamCommand
         stream_seq: None,
         producer: None,
         now_ms: 0,
-        record_match: None,
     }
 }
 
@@ -80,7 +78,6 @@ fn append_external(machine: &mut StreamStateMachine, id: &str, path: &str, len: 
         stream_seq: None,
         producer: None,
         now_ms: 0,
-        record_match: None,
     });
     assert!(
         matches!(response, StreamResponse::Appended { .. }),
@@ -117,6 +114,24 @@ fn publish_snapshot(machine: &mut StreamStateMachine, id: &str, offset: u64) -> 
         content_type: OCTET.to_owned(),
         payload: bytes::Bytes::from_static(b"state"),
         now_ms: 0,
+        expected_incarnation: None,
+    })
+}
+
+/// A publish whose proposer verified the byte before `offset` is LF (the
+/// HTTP layer's read), pinned to the stream's incarnation.
+fn publish_snapshot_verified(
+    machine: &mut StreamStateMachine,
+    id: &str,
+    offset: u64,
+) -> StreamResponse {
+    machine.apply(StreamCommand::PublishSnapshot {
+        stream_id: stream(id),
+        snapshot_offset: offset,
+        content_type: OCTET.to_owned(),
+        payload: bytes::Bytes::from_static(b"state"),
+        now_ms: 0,
+        expected_incarnation: incarnation(machine, id),
     })
 }
 
@@ -125,7 +140,12 @@ fn retain(machine: &mut StreamStateMachine, id: &str, offset: u64) -> StreamResp
         stream_id: stream(id),
         retained_offset: offset,
         now_ms: 0,
+        expected_incarnation: incarnation(machine, id),
     })
+}
+
+fn incarnation(machine: &StreamStateMachine, id: &str) -> Option<u64> {
+    machine.head(&stream(id)).map(|head| head.created_at_ms)
 }
 
 fn entry(machine: &StreamStateMachine, id: &str) -> StreamSnapshotEntry {
@@ -174,7 +194,7 @@ fn json_records(count: usize, seed: u64) -> Vec<u8> {
 #[derive(Default)]
 struct Oracle {
     messages: Vec<(u64, u64)>,
-    /// A stream without a record index: no message boundaries.
+    /// A non-JSON stream: no message boundaries.
     binary: bool,
 }
 
@@ -201,9 +221,9 @@ impl Oracle {
     }
 
     /// Asserts the bootstrap plan: exact from the snapshot offset (one part
-    /// per JSON record, one part in all for any other stream), or an honest
-    /// partial when that offset is below the exact frontier or, for a
-    /// binary stream, `[S, tail)` is not all hot.
+    /// per JSON message, one part in all for any other stream), or an honest
+    /// partial when that offset is below the seal point or `[S, tail)` is
+    /// not all hot.
     #[track_caller]
     fn check_bootstrap(&self, machine: &StreamStateMachine, id: &str) {
         let entry = entry(machine, id);
@@ -215,18 +235,8 @@ impl Oracle {
             .as_ref()
             .map_or(retained, |snapshot| snapshot.offset);
         let seal = seal_point(&entry);
-        let frontier = if self.binary {
-            seal
-        } else {
-            self.messages
-                .iter()
-                .map(|(start, _)| *start)
-                .find(|start| *start >= seal)
-                .unwrap_or(tail)
-        }
-        .max(retained);
-        if snapshot_offset < frontier || (self.binary && !hot_covers(&entry, snapshot_offset, tail))
-        {
+        let frontier = seal.max(retained);
+        if snapshot_offset < frontier || !hot_covers(&entry, snapshot_offset, tail) {
             assert!(plan.updates.is_empty(), "{plan:?}");
             assert_eq!(plan.next_offset, snapshot_offset);
             assert!(!plan.up_to_date);
@@ -270,14 +280,13 @@ fn assert_restore_matches_live(machine: &StreamStateMachine, id: &str) -> Stream
         restored.bootstrap_plan(&stream(id)),
         machine.bootstrap_plan(&stream(id))
     );
-    assert_eq!(restored.total_hot_records(), machine.total_hot_records());
     assert_eq!(
-        restored.total_hot_real_bytes(),
-        machine.total_hot_real_bytes()
+        restored.total_hot_payload_bytes(),
+        machine.total_hot_payload_bytes()
     );
     assert_eq!(
-        restored.hot_real_len(&stream(id)),
-        machine.hot_real_len(&stream(id))
+        restored.hot_payload_len(&stream(id)),
+        machine.hot_payload_len(&stream(id))
     );
     restored
 }
@@ -295,9 +304,8 @@ fn binary_bootstrap_of_several_messages_is_one_part_with_no_per_message_charge()
     }]);
     assert_eq!(plan.next_offset, 6);
     assert!(plan.up_to_date);
-    // F6c: hot payload only; nothing is kept per binary message.
-    assert_eq!(machine.total_hot_records(), 0);
-    assert_eq!(machine.total_hot_real_bytes(), 6);
+    // F6c: hot payload only; nothing is kept per message.
+    assert_eq!(machine.total_hot_payload_bytes(), 6);
     assert_restore_matches_live(&machine, "bin");
 
     // An external append above hot bytes leaves a cold gap in `[S, tail)`:
@@ -331,7 +339,7 @@ fn binary_bootstrap_above_the_cap_is_snapshot_only() {
 }
 
 #[test]
-fn json_stream_uses_dense_offsets() {
+fn json_bootstrap_is_one_part_per_message_with_no_per_message_charge() {
     let mut machine = fresh_machine();
     let first = json_records(2, 1);
     create(&mut machine, "json", JSON, &first);
@@ -341,12 +349,15 @@ fn json_stream_uses_dense_offsets() {
     oracle.push_json(0, &first);
     oracle.push_json(first.len() as u64, &second);
     oracle.check_bootstrap(&machine, "json");
-    assert_eq!(machine.total_hot_records(), 5);
+    assert_eq!(
+        machine.total_hot_payload_bytes(),
+        (first.len() + second.len()) as u64
+    );
     assert_restore_matches_live(&machine, "json");
 }
 
 #[test]
-fn flush_that_splits_a_json_record_moves_the_exact_frontier_past_it() {
+fn flush_that_splits_a_json_message_leaves_bootstrap_partial_below_the_seal_point() {
     let mut machine = fresh_machine();
     let mut oracle = Oracle::default();
     create(&mut machine, "s", JSON, b"");
@@ -361,7 +372,7 @@ fn flush_that_splits_a_json_record_moves_the_exact_frontier_past_it() {
     // Flush into the middle of the second record.
     flush(&mut machine, "s", 0, first_len + 3, "chunk-1");
     assert_eq!(seal_point(&entry(&machine, "s")), first_len + 3);
-    // No snapshot: S = 0 lies below the frontier (the third record).
+    // No snapshot: S = 0 lies below the seal point.
     oracle.check_bootstrap(&machine, "s");
     let plan = machine.bootstrap_plan(&stream("s")).expect("plan");
     assert!(!plan.up_to_date);
@@ -372,10 +383,14 @@ fn flush_that_splits_a_json_record_moves_the_exact_frontier_past_it() {
         StreamResponse::SnapshotPublished { .. }
     ));
     oracle.check_bootstrap(&machine, "s");
-    // An intra-record offset above the seal point is not a boundary.
+    // An intra-message offset above the seal point is not a boundary: its
+    // preceding byte is hot and not LF.
     assert!(matches!(
         publish_snapshot(&mut machine, "s", third + 1),
-        StreamResponse::Error { .. }
+        StreamResponse::Error {
+            code: StreamErrorCode::InvalidSnapshot,
+            ..
+        }
     ));
     assert_restore_matches_live(&machine, "s");
 }
@@ -491,10 +506,10 @@ fn restore_matches_live_and_bootstrap_matches_oracle_under_random_workload() {
                     }
                 }
                 8 => {
-                    // JSON: publish at a record boundary (always accepted),
-                    // or try an intra-record offset above the seal point
-                    // (always refused). Binary: any offset in range is
-                    // accepted.
+                    // JSON: publish at a message boundary (always accepted;
+                    // a cold one the proposer verified), or try an
+                    // intra-message offset above the seal point (always
+                    // refused). Binary: any offset in range is accepted.
                     let retained = current
                         .visible_snapshot
                         .as_ref()
@@ -512,7 +527,7 @@ fn restore_matches_live_and_bootstrap_matches_oracle_under_random_workload() {
                         (retained..=tail).collect::<Vec<_>>()
                     };
                     let offset = candidates[next(candidates.len() as u64) as usize];
-                    let response = publish_snapshot(&mut machine, "s", offset);
+                    let response = publish_snapshot_verified(&mut machine, "s", offset);
                     assert!(
                         matches!(response, StreamResponse::SnapshotPublished { .. }),
                         "seed {seed} step {step}: {response:?}"

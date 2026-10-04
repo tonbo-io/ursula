@@ -56,7 +56,6 @@ const PAGE_ORDER = new Map([
   ["concepts/streams", ["Concepts", 1]],
   ["concepts/buckets", ["Concepts", 2]],
   ["concepts/offsets", ["Concepts", 3]],
-  ["concepts/record-coordinates", ["Concepts", 4]],
   ["concepts/read-modes", ["Concepts", 5]],
   ["concepts/exactly-once-writes", ["Concepts", 6]],
   ["concepts/conditional-writes", ["Concepts", 7]],

@@ -401,7 +401,7 @@ async fn stream_incarnation_changes_on_delete_and_recreate() {
 #[tokio::test]
 async fn temporary_unavailable_answers_carry_retry_after() {
     // A one-byte hot cap refuses any append of two or more bytes as a
-    // temporary error, whatever the per-record charge.
+    // temporary error.
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
         RuntimeConfig::new(1, 1).with_cold_max_hot_bytes_per_group(Some(1)),

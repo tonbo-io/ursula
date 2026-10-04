@@ -38,20 +38,8 @@ Response headers include:
 | `Cache-Control` | `no-store`. |
 | `Stream-Cold-Hot-Start-Offset` | Diagnostic and unstable: may change or disappear in any release. Data below this offset has been flushed to cold storage. |
 
-For an `application/json` stream implementing Record Coordinates, `HEAD` also includes:
-
-| Header | Description |
-| --- | --- |
-| `Stream-Extensions` | Contains `json-record-coordinates-v1`. Clients must verify this before relying on record parameters or headers. |
-| `Stream-Record-First` | First retained record ordinal. |
-| `Stream-Record-Next` | Current record tail and next ordinal to be assigned. |
-
 <RequestExample>
 ```bash Example
 curl -I http://127.0.0.1:4437/demo/hello
 ```
 </RequestExample>
-
-<Info>
-See [Record Coordinates](/docs/concepts/record-coordinates) for complete-record replay and client event-time queries.
-</Info>

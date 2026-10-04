@@ -877,9 +877,9 @@ fn classify_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<C
         [] if *method == Method::HEAD => Action::Head,
         [] if *method == Method::DELETE => Action::Delete,
         [suffix] if suffix == "bootstrap" && *method == Method::GET => Action::Read,
+        // The bare path answers 405 upstream (the removed latest-snapshot
+        // redirect), not a 404 that Loro's client reads as "no snapshot".
         [suffix] if suffix == "snapshot" && *method == Method::GET => Action::ReadSnapshot,
-        [suffix] if suffix == "snapshot" && *method == Method::PUT => Action::PublishSnapshot,
-        [suffix] if suffix == "retention" && *method == Method::PUT => Action::Update,
         [suffix, _offset] if suffix == "snapshot" && *method == Method::PUT => {
             Action::PublishSnapshot
         }

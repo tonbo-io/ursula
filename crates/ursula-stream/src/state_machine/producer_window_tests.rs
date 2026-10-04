@@ -68,7 +68,6 @@ fn append(
         stream_seq: None,
         producer: Some(producer(producer_id, seq)),
         now_ms,
-        record_match: None,
     })
 }
 
@@ -105,8 +104,7 @@ fn window_items(machine: &StreamStateMachine, stream_id: &BucketStreamId) -> u64
     let counted = slot
         .producers
         .values()
-        .flat_map(|state| state.receipts.iter())
-        .map(super::producers::receipt_items)
+        .map(|state| state.receipts.len() as u64)
         .sum::<u64>();
     assert_eq!(derived, counted, "derived window item count drifted");
     derived
@@ -340,7 +338,6 @@ fn duplicate_lookup_is_direct_at_a_million_receipts() {
             start_offset: seq,
             next_offset: seq + 1,
             closed: false,
-            items: Vec::new(),
         })
         .collect::<std::collections::VecDeque<_>>();
     let started = std::time::Instant::now();
@@ -373,7 +370,6 @@ fn bootstrap_stays_honest_after_external_appends() {
             stream_seq: None,
             producer: None,
             now_ms: 1,
-            record_match: None,
         });
         assert!(matches!(response, StreamResponse::Appended { .. }));
     };
@@ -389,6 +385,7 @@ fn bootstrap_stays_honest_after_external_appends() {
             content_type: OCTET.to_owned(),
             payload: Bytes::from_static(b"s"),
             now_ms: 1,
+            expected_incarnation: None,
         }),
         StreamResponse::SnapshotPublished { .. }
     ));
@@ -404,6 +401,7 @@ fn bootstrap_stays_honest_after_external_appends() {
             content_type: OCTET.to_owned(),
             payload: Bytes::from_static(b"s"),
             now_ms: 1,
+            expected_incarnation: None,
         }),
         StreamResponse::SnapshotPublished { .. }
     ));
@@ -429,7 +427,6 @@ fn bootstrap_is_partial_when_a_hot_prefix_flush_leaves_an_external_below_the_sea
             stream_seq: None,
             producer: None,
             now_ms: 1,
-            record_match: None,
         }),
         StreamResponse::Appended { .. }
     ));
@@ -447,7 +444,6 @@ fn bootstrap_is_partial_when_a_hot_prefix_flush_leaves_an_external_below_the_sea
             stream_seq: None,
             producer: None,
             now_ms: 1,
-            record_match: None,
         }),
         StreamResponse::Appended { .. }
     ));
@@ -474,6 +470,7 @@ fn bootstrap_is_partial_when_a_hot_prefix_flush_leaves_an_external_below_the_sea
             content_type: OCTET.to_owned(),
             payload: Bytes::from_static(b"s"),
             now_ms: 1,
+            expected_incarnation: None,
         }),
         StreamResponse::SnapshotPublished { .. }
     ));

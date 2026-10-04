@@ -48,9 +48,6 @@ use crate::HEADER_STREAM_TTL;
 use crate::HEADER_STREAM_UP_TO_DATE;
 use crate::HEADER_X_CONTENT_TYPE_OPTIONS;
 use crate::HttpMetricsSnapshot;
-use crate::insert_record_extension;
-use crate::insert_record_head_headers;
-use crate::insert_record_operation_headers;
 
 const JSON_READ_CONTENT_TYPE: &str = "application/x-ndjson";
 
@@ -95,7 +92,6 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         | StreamErrorCode::SnapshotConflict
         | StreamErrorCode::ProducerSeqConflict
         | StreamErrorCode::ImportConflict => StatusCode::CONFLICT,
-        StreamErrorCode::RecordPreconditionFailed => StatusCode::PRECONDITION_FAILED,
         StreamErrorCode::ProducerEpochStale => StatusCode::FORBIDDEN,
         StreamErrorCode::OffsetOutOfRange => StatusCode::RANGE_NOT_SATISFIABLE,
         StreamErrorCode::InvalidBucketId
@@ -110,6 +106,9 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         | StreamErrorCode::ImportInvalid => StatusCode::BAD_REQUEST,
         // F3 producer cap; the plain-text body starts with `producer_limit`.
         StreamErrorCode::ProducerLimit => StatusCode::TOO_MANY_REQUESTS,
+        // The HTTP layer verifies the boundary and proposes again; reaching
+        // a client means the stream changed during the check (fail closed).
+        StreamErrorCode::JsonBoundaryUnverified => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
@@ -215,11 +214,9 @@ pub(crate) fn insert_producer_error_headers(headers: &mut HeaderMap, err: &Runti
                 insert_u64_header(headers, "producer-expected-seq", *expected_seq);
                 insert_u64_header(headers, "producer-received-seq", *received_seq);
             }
-            StreamErrorContext::StreamClosed | StreamErrorContext::StaleColdFlushCandidate => {}
-            StreamErrorContext::RecordTailMismatch { current_record } => {
-                insert_record_extension(headers);
-                insert_u64_header(headers, crate::HEADER_STREAM_RECORD_NEXT, *current_record);
-            }
+            StreamErrorContext::StreamClosed
+            | StreamErrorContext::StaleColdFlushCandidate
+            | StreamErrorContext::StreamIncarnation { .. } => {}
         }
     }
 }
@@ -231,12 +228,6 @@ pub(crate) fn insert_stream_error_headers(headers: &mut HeaderMap, err: &Runtime
         .any(|context| matches!(context, StreamErrorContext::StreamClosed))
     {
         insert_static(headers, HEADER_STREAM_CLOSED, "true");
-    }
-    for context in err.stream_error_context() {
-        if let StreamErrorContext::RecordTailMismatch { current_record } = context {
-            insert_record_extension(headers);
-            insert_u64_header(headers, crate::HEADER_STREAM_RECORD_NEXT, *current_record);
-        }
     }
 }
 
@@ -402,71 +393,11 @@ pub(crate) fn read_response(
     request_headers: &HeaderMap,
     request_cursor: Option<&str>,
 ) -> Response {
-    read_response_with_etag(response, request_headers, request_cursor, None)
-}
-
-pub(crate) fn record_envelope_response(
-    mut response: ReadStreamResponse,
-    request_headers: &HeaderMap,
-    request_cursor: Option<&str>,
-) -> Response {
-    let canonical_etag = read_etag(&response);
-    if let Err(message) = apply_record_envelope(&mut response) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
-    }
-    read_response_with_etag(
-        response,
-        request_headers,
-        request_cursor,
-        Some(canonical_etag),
-    )
-}
-
-pub(crate) fn apply_record_envelope(response: &mut ReadStreamResponse) -> Result<(), String> {
-    let Some(record_range) = response.record_range else {
-        return Err("missing record range".to_owned());
-    };
-    let mut record = record_range.first_record;
-    // The stored message text is spliced in verbatim (P1): re-parsing it would
-    // rewrite literal text and refuse lone-surrogate escapes.
-    let mut payload = Vec::with_capacity(response.payload.len().saturating_add(64));
-    for line in response.payload.split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        payload.extend_from_slice(b"{\"record\":");
-        payload.extend_from_slice(record.to_string().as_bytes());
-        payload.extend_from_slice(b",\"value\":");
-        payload.extend_from_slice(line);
-        payload.extend_from_slice(b"}\n");
-        record = record.saturating_add(1);
-    }
-    if record != record_range.next_record {
-        return Err("record envelope count does not match coordinate range".to_owned());
-    }
-    response.payload = payload;
-    response.content_type = "application/vnd.durable-stream-records+ndjson".to_owned();
-    Ok(())
-}
-
-fn read_response_with_etag(
-    response: ReadStreamResponse,
-    request_headers: &HeaderMap,
-    request_cursor: Option<&str>,
-    canonical_etag: Option<String>,
-) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     insert_content_type(&mut headers, http_read_content_type(&response.content_type));
     insert_offset(&mut headers, response.next_offset);
-    if let Some(retained_record_range) = response.retained_record_range {
-        insert_record_extension(&mut headers);
-        if let Some(record_range) = response.record_range {
-            insert_record_head_headers(&mut headers, retained_record_range);
-            insert_record_operation_headers(&mut headers, record_range);
-        }
-    }
-    let etag = canonical_etag.unwrap_or_else(|| read_etag(&response));
+    let etag = read_etag(&response);
     if let Ok(value) = HeaderValue::from_str(&etag) {
         headers.insert(ETAG, value);
     }
@@ -502,9 +433,6 @@ pub(crate) fn snapshot_response(response: ReadSnapshotResponse) -> Response {
     if response.up_to_date {
         insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
     }
-    if let Some(record_range) = response.record_range {
-        insert_record_head_headers(&mut headers, record_range);
-    }
     (StatusCode::OK, headers, response.payload).into_response()
 }
 
@@ -537,9 +465,6 @@ pub(crate) fn bootstrap_head(response: &BootstrapStreamResponse) -> (String, Hea
     }
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
-    }
-    if let Some(record_range) = response.record_range {
-        insert_record_head_headers(&mut headers, record_range);
     }
     insert_cache_control(&mut headers, "no-store");
     (boundary, headers)
@@ -621,13 +546,6 @@ pub(crate) fn offset_now_response(response: ReadStreamResponse) -> Response {
     insert_content_type(&mut headers, http_read_content_type(&response.content_type));
     insert_offset(&mut headers, response.next_offset);
     insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
-    if let Some(retained_record_range) = response.retained_record_range {
-        insert_record_extension(&mut headers);
-        if let Some(record_range) = response.record_range {
-            insert_record_head_headers(&mut headers, retained_record_range);
-            insert_record_operation_headers(&mut headers, record_range);
-        }
-    }
     insert_cache_control(&mut headers, "no-store");
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
@@ -643,12 +561,6 @@ pub(crate) fn long_poll_no_content_response(
     insert_default_response_headers(&mut headers);
     insert_offset(&mut headers, response.next_offset);
     insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
-    if let (Some(retained_record_range), Some(record_range)) =
-        (response.retained_record_range, response.record_range)
-    {
-        insert_record_head_headers(&mut headers, retained_record_range);
-        insert_record_operation_headers(&mut headers, record_range);
-    }
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
     } else {
@@ -745,14 +657,6 @@ pub(crate) fn render_sse_read(
     body.push_str("data:{\"streamNextOffset\":\"");
     body.push_str(&format!("{:020}", read.next_offset));
     body.push('"');
-    if let Some(retained_record_range) = read.retained_record_range {
-        body.push_str(",\"streamFirstRecord\":");
-        body.push_str(&retained_record_range.first_record.to_string());
-    }
-    if let Some(record_range) = read.record_range {
-        body.push_str(",\"streamNextRecord\":");
-        body.push_str(&record_range.next_record.to_string());
-    }
     if !closed_at_tail {
         body.push_str(",\"streamCursor\":\"");
         body.push_str(&format!(

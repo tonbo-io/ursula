@@ -56,10 +56,7 @@ fn read_req(stream_id: BucketStreamId, offset: u64, max_len: usize) -> ReadStrea
         offset,
         max_len,
         now_ms: 0,
-        record: None,
-        max_records: None,
         leader_only: false,
-        record_anchor: None,
         read_index: None,
     }
 }
@@ -92,7 +89,6 @@ fn append_external_req(
         stream_seq: stream_seq.map(str::to_owned),
         producer: None,
         now_ms: 0,
-        record_match: None,
     }
 }
 
@@ -714,6 +710,7 @@ async fn retention_gc_never_touches_the_boundary_page() {
                 payload: bytes::Bytes::from_static(b"state"),
                 cold_body: None,
                 now_ms: 0,
+                expected_incarnation: None,
             },
             placement,
         )
@@ -725,6 +722,7 @@ async fn retention_gc_never_touches_the_boundary_page() {
                 stream_id: stream.clone(),
                 retained_offset: 4,
                 now_ms: 0,
+                expected_incarnation: None,
             },
             placement,
         )

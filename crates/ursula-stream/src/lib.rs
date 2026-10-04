@@ -7,8 +7,8 @@
 //!   protocol share, and its policy.
 //! - [`response`]: result variants and error codes returned per command.
 //! - [`model`]: persistent data types (metadata, segments, producer state, plans).
-//! - [`record_index`]: retained record-ordinal to offset boundaries: exact for
-//!   unflushed records, sparse 1 MiB marks for sealed cold records (F1).
+//! - [`json_records`]: canonical JSON message text: LF-terminated messages,
+//!   whose ends feed the `committed_records` usage counter.
 //! - [`snapshot`]: snapshot wire format and restoration errors.
 //! - [`state_machine`]: the deterministic [`StreamStateMachine`] that drives a Raft group,
 //!   plus [`GroupStateGauges`], the per-group bounded-state gauges
@@ -21,8 +21,8 @@
 
 mod command;
 mod format;
+mod json_records;
 mod model;
-mod record_index;
 mod response;
 mod snapshot;
 mod state_machine;
@@ -32,6 +32,9 @@ pub use command::COMMAND_LOG_OVERHEAD_BYTES;
 pub use command::StreamCommand;
 pub use format::FORMAT_EPOCH;
 pub use format::format_epoch_refusal;
+pub use json_records::NonCanonicalJsonPayload;
+pub use json_records::canonical_json_record_ends;
+pub use json_records::is_json_record_content_type;
 pub use model::AppendStreamInput;
 pub use model::BOOTSTRAP_MAX_UPDATE_BYTES;
 pub use model::BucketUsage;
@@ -46,7 +49,6 @@ pub use model::ExternalPayloadRef;
 pub use model::HotPayloadSegment;
 pub use model::MAX_COLD_SNAPSHOT_BYTES;
 pub use model::ObjectPayloadRef;
-pub use model::ProducerAppendRecord;
 pub use model::ProducerReceipt;
 pub use model::ProducerRequest;
 pub use model::ProducerSnapshot;
@@ -62,24 +64,6 @@ pub use model::StreamReadPlan;
 pub use model::StreamReadSegment;
 pub use model::StreamStatus;
 pub use model::StreamVisibleSnapshot;
-pub use record_index::MARK_BLOCK_BYTES;
-pub use record_index::MARK_BLOCK_SHIFT;
-pub use record_index::OffsetLocation;
-pub(crate) use record_index::PreparedRecordAppend;
-pub use record_index::RecordBracket;
-pub use record_index::RecordCorruption;
-pub use record_index::RecordIndexError;
-pub use record_index::RecordMark;
-pub use record_index::RecordOffset;
-pub use record_index::RecordTrim;
-pub use record_index::SEAL_BUDGET_RECORDS;
-pub use record_index::StreamRecordIndex;
-pub use record_index::StreamRecordRange;
-pub use record_index::TrimmedRecords;
-pub use record_index::canonical_json_record_ends;
-pub use record_index::is_json_record_content_type;
-pub use record_index::mark_block_end;
-pub use record_index::trim_record_window;
 pub use response::StreamErrorCode;
 pub use response::StreamErrorContext;
 pub use response::StreamResponse;
@@ -94,12 +78,8 @@ pub use state_machine::ColdFlushPassRequest;
 pub use state_machine::ColdFlushPlanStats;
 pub use state_machine::ColdFlushPressure;
 pub use state_machine::GroupStateGauges;
-pub use state_machine::HOT_RECORD_OVERHEAD_BYTES;
 pub use state_machine::MAX_STAGED_EXTERNAL_REFS;
 pub use state_machine::RETENTION_COLD_GC_GRACE_MS;
-pub use state_machine::RecordPlanError;
-pub use state_machine::RecordReadAnchor;
-pub use state_machine::RecordReadRequest;
 pub use state_machine::SHARED_REF_COMPACTION_THRESHOLD;
 pub use state_machine::SHARED_REF_IDLE_MS;
 pub use state_machine::STAGED_EXTERNAL_REF_MAX_AGE_MS;
