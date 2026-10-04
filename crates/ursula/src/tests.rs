@@ -871,165 +871,6 @@ async fn delete_stream_removes_http_visible_state() {
 }
 
 #[tokio::test]
-async fn append_batch_matches_perf_compare_frame_format() {
-    let app = test_router();
-
-    let response = http_put(
-        &app,
-        "/benchcmp/batch-stream",
-        &[(CONTENT_TYPE.as_str(), "text/plain")],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let response = http_post(
-        &app,
-        "/benchcmp/batch-stream/append-batch",
-        &[(CONTENT_TYPE.as_str(), "text/plain")],
-        Body::from(batch_body(&[b"abc".as_slice(), b"de".as_slice()])),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_bytes(response).await;
-    assert_eq!(&body[..], br#"[{"status":204},{"status":204}]"#);
-
-    let response = http_post(
-        &app,
-        "/benchcmp/batch-stream/append-batch",
-        &[(CONTENT_TYPE.as_str(), "text/plain")],
-        Body::from(batch_body(&[b"".as_slice(), b"f".as_slice()])),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_bytes(response).await;
-    assert_eq!(&body[..], br#"[{"status":400},{"status":204}]"#);
-
-    let response = http_get(&app, "/benchcmp/batch-stream?offset=0&max_bytes=8").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
-        "00000000000000000006"
-    );
-    let body = body_bytes(response).await;
-    assert_eq!(&body[..], b"abcdef");
-}
-
-#[tokio::test]
-async fn append_batch_minimal_ack_skips_success_body_but_keeps_item_errors() {
-    let app = test_router();
-
-    let response = http_put(
-        &app,
-        "/benchcmp/batch-minimal",
-        &[(CONTENT_TYPE.as_str(), "text/plain")],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let response = http_post(
-        &app,
-        "/benchcmp/batch-minimal/append-batch",
-        &[
-            (CONTENT_TYPE.as_str(), "text/plain"),
-            (HEADER_PREFER, "return=minimal"),
-        ],
-        Body::from(batch_body(&[b"a".as_slice(), b"b".as_slice()])),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let body = body_bytes(response).await;
-    assert!(body.is_empty());
-
-    let response = http_post(
-        &app,
-        "/benchcmp/batch-minimal/append-batch",
-        &[
-            (CONTENT_TYPE.as_str(), "text/plain"),
-            (HEADER_PREFER, "return=minimal"),
-        ],
-        Body::from(batch_body(&[b"".as_slice(), b"c".as_slice()])),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_bytes(response).await;
-    assert_eq!(&body[..], br#"[{"status":400},{"status":204}]"#);
-
-    let response = http_get(&app, "/benchcmp/batch-minimal?offset=0&max_bytes=16").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_bytes(response).await;
-    assert_eq!(&body[..], b"abc");
-}
-
-#[tokio::test]
-async fn json_append_batch_returns_per_frame_record_ranges() {
-    let app = test_router();
-    let response = http_put(
-        &app,
-        "/benchcmp/json-batch-records",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let response = http_post(
-        &app,
-        "/benchcmp/json-batch-records/append-batch",
-        &[
-            (CONTENT_TYPE.as_str(), "application/json"),
-            (HEADER_PREFER, "return=minimal"),
-            (HEADER_PRODUCER_ID, "json-writer"),
-            (HEADER_PRODUCER_EPOCH, "0"),
-            (HEADER_PRODUCER_SEQ, "0"),
-        ],
-        Body::from(batch_body(&[
-            br#"[{"id":1},{"id":2}]"#.as_slice(),
-            br#"{"id":3}"#.as_slice(),
-        ])),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        header_str(&response, HEADER_STREAM_EXTENSIONS),
-        JSON_RECORD_COORDINATES_EXTENSION
-    );
-    let body = body_bytes(response).await;
-    let body: serde_json::Value = serde_json::from_slice(&body).expect("batch ack JSON");
-    assert_eq!(
-        body,
-        serde_json::json!([
-            {"status": 204, "stream_record_start": 0, "stream_record_next": 2},
-            {"status": 204, "stream_record_start": 2, "stream_record_next": 3}
-        ])
-    );
-
-    let response = http_post(
-        &app,
-        "/benchcmp/json-batch-records/append-batch",
-        &[
-            (CONTENT_TYPE.as_str(), "application/json"),
-            (HEADER_PREFER, "return=minimal"),
-            (HEADER_PRODUCER_ID, "json-writer"),
-            (HEADER_PRODUCER_EPOCH, "0"),
-            (HEADER_PRODUCER_SEQ, "0"),
-        ],
-        Body::from(batch_body(&[br#"{"ignored":true}"#.as_slice()])),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        header_str(&response, HEADER_STREAM_EXTENSIONS),
-        JSON_RECORD_COORDINATES_EXTENSION
-    );
-    let retry_body = body_bytes(response).await;
-    let retry_body: serde_json::Value =
-        serde_json::from_slice(&retry_body).expect("deduplicated batch ack JSON");
-    assert_eq!(retry_body, body);
-}
-
-#[tokio::test]
 async fn closed_record_long_poll_empty_response_includes_record_headers() {
     let app = test_router();
     let response = http_put(
@@ -1057,66 +898,6 @@ async fn closed_record_long_poll_empty_response_includes_record_headers() {
     assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "0");
     assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "1");
     assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "1");
-}
-
-#[tokio::test]
-async fn append_batch_producer_headers_deduplicate_retries() {
-    let app = test_router();
-
-    let response = http_put(&app, "/benchcmp/batch-producer", &[], Body::empty()).await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let response = http_post(
-        &app,
-        "/benchcmp/batch-producer/append-batch",
-        &[
-            (HEADER_PRODUCER_ID, "writer-1"),
-            (HEADER_PRODUCER_EPOCH, "0"),
-            (HEADER_PRODUCER_SEQ, "0"),
-        ],
-        Body::from(batch_body(&[b"ab".as_slice(), b"c".as_slice()])),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_str(&response, HEADER_PRODUCER_EPOCH), "0");
-    assert_eq!(header_str(&response, HEADER_PRODUCER_SEQ), "0");
-    let body = body_bytes(response).await;
-    assert_eq!(&body[..], br#"[{"status":204},{"status":204}]"#);
-
-    let response = http_post(
-        &app,
-        "/benchcmp/batch-producer/append-batch",
-        &[
-            (HEADER_PRODUCER_ID, "writer-1"),
-            (HEADER_PRODUCER_EPOCH, "0"),
-            (HEADER_PRODUCER_SEQ, "0"),
-        ],
-        Body::from(batch_body(&[b"ignored".as_slice()])),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_bytes(response).await;
-    assert_eq!(&body[..], br#"[{"status":204},{"status":204}]"#);
-
-    let response = http_post(
-        &app,
-        "/benchcmp/batch-producer/append-batch",
-        &[
-            (HEADER_PRODUCER_ID, "writer-1"),
-            (HEADER_PRODUCER_EPOCH, "0"),
-            (HEADER_PRODUCER_SEQ, "1"),
-        ],
-        Body::from(batch_body(&[b"d".as_slice()])),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_bytes(response).await;
-    assert_eq!(&body[..], br#"[{"status":204}]"#);
-
-    let response = http_get(&app, "/benchcmp/batch-producer?offset=0&max_bytes=16").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_bytes(response).await;
-    assert_eq!(&body[..], b"abcd");
 }
 
 #[tokio::test]
@@ -1201,15 +982,14 @@ async fn json_message_text_is_stored_verbatim_minus_whitespace() {
     assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "1");
     assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "4");
 
-    let batch = batch_body(&[b"{ \"k\" : [ ] }", b"[ 7 , { } ]"]);
     let response = http_post(
         &app,
-        "/benchcmp/json-fidelity/append-batch",
+        "/benchcmp/json-fidelity",
         &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(batch),
+        Body::from("[ { \"k\" : [ ] } , 7 , { } ]"),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     let expected = "{\"z\":1,\"a\":2}\n\
                     {\"b\":1.50e3,\"a\":-0,\"a\":1e400}\n\
@@ -1309,14 +1089,6 @@ async fn invalid_json_bodies_are_refused_without_committing() {
             String::from_utf8_lossy(&body)
         );
     }
-    let response = http_post(
-        &app,
-        "/benchcmp/json-invalid/append-batch",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::from(batch_body(&[b"{\"ok\":1}", b"{\"bad\":"])),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let response = http_put(
         &app,
         "/benchcmp/json-invalid-create",
@@ -1868,19 +1640,6 @@ async fn json_mode_reads_ndjson_bytes_without_message_boundary_projection() {
     assert_eq!(&body[..], b"{\"mes");
 }
 
-#[test]
-fn append_batch_parser_returns_body_slices() {
-    let body = Bytes::from(batch_body(&[b"abc".as_slice(), b"de".as_slice()]));
-    let base = body.as_ptr();
-    let payloads = parse_append_batch(&body).expect("batch");
-
-    assert_eq!(payloads.len(), 2);
-    assert_eq!(&payloads[0][..], b"abc");
-    assert_eq!(&payloads[1][..], b"de");
-    assert_eq!(payloads[0].as_ptr(), base.wrapping_add(4));
-    assert_eq!(payloads[1].as_ptr(), base.wrapping_add(4 + 3 + 4));
-}
-
 #[tokio::test]
 async fn metrics_expose_per_core_and_group_append_distribution() {
     let app = test_router();
@@ -1888,14 +1647,10 @@ async fn metrics_expose_per_core_and_group_append_distribution() {
     let response = http_put(&app, "/benchcmp/metrics-stream", &[], Body::empty()).await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = http_post(
-        &app,
-        "/benchcmp/metrics-stream/append-batch",
-        &[],
-        Body::from(batch_body(&[b"abc".as_slice(), b"de".as_slice()])),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    for payload in ["abc", "de"] {
+        let response = http_post(&app, "/benchcmp/metrics-stream", &[], Body::from(payload)).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
 
     let response = http_get(&app, "/__ursula/metrics").await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -1927,7 +1682,6 @@ async fn metrics_expose_per_core_and_group_append_distribution() {
     assert!(body.contains("\"per_group_group_mailbox_max_depth\":["));
     assert!(body.contains("\"group_mailbox_full_events\":0"));
     assert!(body.contains("\"per_group_group_mailbox_full_events\":["));
-    assert!(body.contains("\"raft_write_many_batches\":0"));
     assert!(body.contains("\"raft_grpc_append_stream_sessions_opened\":"));
     assert!(body.contains("\"raft_grpc_append_stream_session_failures\":"));
     assert!(body.contains("\"raft_grpc_append_stream_requests\":"));
@@ -1953,23 +1707,6 @@ async fn metrics_expose_per_core_and_group_append_distribution() {
     assert!(body.contains("\"raft_grpc_snapshot_request_bytes\":"));
     assert!(body.contains("\"raft_grpc_snapshot_payload_bytes\":"));
     assert!(body.contains("\"raft_grpc_snapshot_response_bytes\":"));
-    assert!(body.contains("\"per_core_raft_write_many_batches\":[0,0]"));
-    assert!(body.contains("\"per_group_raft_write_many_batches\":["));
-    assert!(body.contains("\"raft_write_many_commands\":0"));
-    assert!(body.contains("\"per_core_raft_write_many_commands\":[0,0]"));
-    assert!(body.contains("\"per_group_raft_write_many_commands\":["));
-    assert!(body.contains("\"raft_write_many_logical_commands\":0"));
-    assert!(body.contains("\"per_core_raft_write_many_logical_commands\":[0,0]"));
-    assert!(body.contains("\"per_group_raft_write_many_logical_commands\":["));
-    assert!(body.contains("\"raft_write_many_responses\":0"));
-    assert!(body.contains("\"per_core_raft_write_many_responses\":[0,0]"));
-    assert!(body.contains("\"per_group_raft_write_many_responses\":["));
-    assert!(body.contains("\"raft_write_many_submit_ns\":0"));
-    assert!(body.contains("\"per_core_raft_write_many_submit_ns\":[0,0]"));
-    assert!(body.contains("\"per_group_raft_write_many_submit_ns\":["));
-    assert!(body.contains("\"raft_write_many_response_ns\":0"));
-    assert!(body.contains("\"per_core_raft_write_many_response_ns\":[0,0]"));
-    assert!(body.contains("\"per_group_raft_write_many_response_ns\":["));
     assert!(body.contains("\"raft_apply_entries\":0"));
     assert!(body.contains("\"per_core_raft_apply_entries\":[0,0]"));
     assert!(body.contains("\"per_group_raft_apply_entries\":["));
@@ -5538,15 +5275,6 @@ async fn http_state_wall_clock_drives_protocol_now_ms() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
-fn batch_body(payloads: &[&[u8]]) -> Vec<u8> {
-    let mut body = Vec::new();
-    for payload in payloads {
-        body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        body.extend_from_slice(payload);
-    }
-    body
-}
-
 // Base-contract pin; see base_contract_tests.rs.
 #[tokio::test]
 async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {
@@ -7959,16 +7687,6 @@ async fn producer_id_and_stream_seq_length_caps_reject_with_400() {
     )
     .await;
     assert!(response.status().is_success(), "{}", response.status());
-
-    // Append batch.
-    let response = http_post(
-        &app,
-        "/benchcmp/caps-a/append-batch",
-        &as_refs(&producer(&over_cap)),
-        Body::from(batch_body(&[b"b".as_slice()])),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     // Close with an empty body.
     let mut headers = producer(&over_cap);

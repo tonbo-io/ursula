@@ -193,11 +193,11 @@ async fn gateway_evicts_cached_leader_on_retryable_leader_unknown_response() {
 
 #[test]
 fn stream_affinity_key_ignores_subresource_and_internal_routes() {
-    let append_batch: Uri = "/bucket/stream/append-batch".parse().expect("uri");
+    let bootstrap: Uri = "/bucket/stream/bootstrap".parse().expect("uri");
     let metrics: Uri = "/__ursula/gateway/metrics".parse().expect("uri");
 
     assert_eq!(
-        stream_affinity_key(&append_batch, None).as_deref(),
+        stream_affinity_key(&bootstrap, None).as_deref(),
         Some("/bucket/stream")
     );
     assert_eq!(stream_affinity_key(&metrics, None), None);
@@ -206,7 +206,7 @@ fn stream_affinity_key_ignores_subresource_and_internal_routes() {
 #[test]
 fn stream_affinity_key_uses_the_middle_path_segment() {
     let journal: Uri = "/bucket/run-42/journal".parse().expect("uri");
-    let queue: Uri = "/bucket/run-42/queue/append-batch".parse().expect("uri");
+    let queue: Uri = "/bucket/run-42/queue/bootstrap".parse().expect("uri");
     let transaction: Uri = "/bucket/run-42/$transaction".parse().expect("uri");
     let unrelated: Uri = "/bucket/run-43/queue".parse().expect("uri");
 

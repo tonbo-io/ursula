@@ -58,8 +58,6 @@ pub use model::ProducerReceipt;
 pub use model::ProducerRequest;
 pub use model::ProducerSnapshot;
 pub use model::SnapshotDigest;
-pub use model::StreamBatchAppend;
-pub use model::StreamBatchAppendItem;
 pub use model::StreamBootstrapPlan;
 pub use model::StreamMessageRecord;
 pub use model::StreamMetadata;

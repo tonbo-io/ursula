@@ -132,16 +132,19 @@ fn committed_write_units_round_each_committed_operation() {
         )),
         StreamResponse::Appended { .. }
     ));
-    let payloads = [vec![b'a'; 5 * 1024], vec![b'b'; 5 * 1024]];
-    let borrowed = payloads.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    machine
-        .append_batch_borrowed(stream("write-units"), Some(OCTET), &borrowed, None, 0)
-        .expect("batch commits");
+    assert!(matches!(
+        machine.apply(append_cmd(
+            stream("write-units"),
+            &vec![b'y'; 10 * 1024],
+            Append::default()
+        )),
+        StreamResponse::Appended { .. }
+    ));
 
     assert_eq!(
         bucket_usage(&machine, "benchcmp").committed_write_units,
         4,
-        "create is one unit, the oversized append is two, and the batch is one"
+        "create is one unit, the oversized append is two, and an exact-unit append is one"
     );
 }
 
@@ -2615,92 +2618,6 @@ fn producer_delayed_retry_returns_its_original_receipt() {
 }
 
 #[test]
-fn producer_append_batch_deduplicates_retries_without_partial_mutation() {
-    let mut machine = machine();
-    create_stream(&mut machine, "producer-batch");
-
-    let first_payloads = [b"ab".as_slice(), b"c".as_slice()];
-    let first = machine
-        .append_batch_borrowed(
-            stream("producer-batch"),
-            Some(OCTET),
-            &first_payloads,
-            Some(producer("writer-1", 0, 0)),
-            0,
-        )
-        .expect("first batch");
-    assert_eq!(first.items, vec![
-        StreamBatchAppendItem {
-            offset: 0,
-            next_offset: 2,
-            closed: false,
-            deduplicated: false,
-            record_range: None,
-        },
-        StreamBatchAppendItem {
-            offset: 2,
-            next_offset: 3,
-            closed: false,
-            deduplicated: false,
-            record_range: None,
-        },
-    ]);
-    assert!(!first.deduplicated);
-
-    let duplicate = machine
-        .append_batch_borrowed(
-            stream("producer-batch"),
-            Some(OCTET),
-            &first_payloads,
-            Some(producer("writer-1", 0, 0)),
-            0,
-        )
-        .expect("duplicate batch");
-    assert!(duplicate.deduplicated);
-    assert!(duplicate.items.iter().all(|item| item.deduplicated));
-    assert_eq!(duplicate.items[0].offset, 0);
-    assert_eq!(duplicate.items[1].next_offset, 3);
-    assert_eq!(
-        machine
-            .read(&stream("producer-batch"), 0, 16)
-            .expect("read")
-            .payload,
-        b"abc"
-    );
-
-    let invalid_payloads = [b"".as_slice()];
-    assert_err_code(
-        machine.append_batch_borrowed(
-            stream("producer-batch"),
-            Some(OCTET),
-            &invalid_payloads,
-            Some(producer("writer-1", 0, 1)),
-            0,
-        ),
-        StreamErrorCode::EmptyAppend,
-    );
-
-    let next_payloads = [b"d".as_slice()];
-    let next = machine
-        .append_batch_borrowed(
-            stream("producer-batch"),
-            Some(OCTET),
-            &next_payloads,
-            Some(producer("writer-1", 0, 1)),
-            0,
-        )
-        .expect("next batch");
-    assert_eq!(next.items[0].offset, 3);
-    assert_eq!(
-        machine
-            .read(&stream("producer-batch"), 0, 16)
-            .expect("read")
-            .payload,
-        b"abcd"
-    );
-}
-
-#[test]
 fn producer_state_survives_snapshot_restore() {
     let mut machine = machine();
     create_stream(&mut machine, "producer-snapshot");
@@ -3321,164 +3238,6 @@ proptest! {
         prop_assert_eq!(
             machine.head(&stream_id).expect("head").tail_offset,
             first_len + next_len
-        );
-    }
-
-    #[test]
-    fn prop_producer_batch_state_survives_snapshot_restore(
-        first_payloads in vec(payload_strategy(), 1..=8),
-        retry_payloads in vec(payload_strategy(), 1..=8),
-        next_payloads in vec(payload_strategy(), 1..=8),
-        duplicate_epoch_payloads in vec(payload_strategy(), 1..=8),
-    ) {
-        let mut machine = machine();
-        create_stream(&mut machine, "prop-producer-batch");
-        let stream_id = stream("prop-producer-batch");
-
-        let first_refs = first_payloads
-            .iter()
-            .map(Vec::as_slice)
-            .collect::<Vec<_>>();
-        let first = machine
-            .append_batch_borrowed(
-                stream_id.clone(),
-                Some(OCTET),
-                &first_refs,
-                Some(producer("writer-1", 0, 0)),
-                0,
-            )
-            .expect("first producer batch");
-        prop_assert!(!first.deduplicated);
-        prop_assert_eq!(first.items.len(), first_payloads.len());
-
-        let mut expected = Vec::new();
-        let mut expected_items = Vec::with_capacity(first_payloads.len());
-        for (item, payload) in first.items.iter().zip(first_payloads.iter()) {
-            let start_offset = u64::try_from(expected.len()).expect("payload len fits u64");
-            expected.extend_from_slice(payload);
-            let next_offset = u64::try_from(expected.len()).expect("payload len fits u64");
-            prop_assert_eq!(item.offset, start_offset);
-            prop_assert_eq!(item.next_offset, next_offset);
-            prop_assert!(!item.closed);
-            prop_assert!(!item.deduplicated);
-            expected_items.push(StreamBatchAppendItem {
-                offset: start_offset,
-                next_offset,
-                closed: false,
-                deduplicated: true,
-                record_range: None,
-            });
-        }
-
-        let snapshot = machine.snapshot();
-        let producer_state = snapshot.streams[0]
-            .producer_states
-            .iter()
-            .find(|state| state.producer_id == "writer-1")
-            .expect("producer state in snapshot");
-        prop_assert_eq!(producer_state.last_items.len(), first_payloads.len());
-        let mut restored = StreamStateMachine::restore(snapshot).expect("restore snapshot");
-
-        let retry_refs = retry_payloads
-            .iter()
-            .map(Vec::as_slice)
-            .collect::<Vec<_>>();
-        let duplicate = restored
-            .append_batch_borrowed(
-                stream_id.clone(),
-                Some(OCTET),
-                &retry_refs,
-                Some(producer("writer-1", 0, 0)),
-                0,
-            )
-            .expect("duplicate producer batch after restore");
-        prop_assert!(duplicate.deduplicated);
-        prop_assert_eq!(duplicate.items, expected_items);
-        prop_assert_eq!(
-            restored
-                .read(&stream_id, 0, expected.len())
-                .expect("read after duplicate producer batch")
-                .payload,
-            expected.clone()
-        );
-
-        let next_refs = next_payloads
-            .iter()
-            .map(Vec::as_slice)
-            .collect::<Vec<_>>();
-        let next = restored
-            .append_batch_borrowed(
-                stream_id.clone(),
-                Some(OCTET),
-                &next_refs,
-                Some(producer("writer-1", 1, 0)),
-                0,
-        )
-        .expect("new producer epoch batch after restore");
-        prop_assert!(!next.deduplicated);
-        let next_start = u64::try_from(expected.len()).expect("payload len fits u64");
-        for (item, payload) in next.items.iter().zip(next_payloads.iter()) {
-            let start_offset = u64::try_from(expected.len()).expect("payload len fits u64");
-            expected.extend_from_slice(payload);
-            let next_offset = u64::try_from(expected.len()).expect("payload len fits u64");
-            prop_assert_eq!(item.offset, start_offset);
-            prop_assert_eq!(item.next_offset, next_offset);
-            prop_assert!(!item.deduplicated);
-        }
-        prop_assert_eq!(next.items[0].offset, next_start);
-
-        let mut restored =
-            StreamStateMachine::restore(restored.snapshot()).expect("restore after epoch batch");
-        let duplicate_epoch_refs = duplicate_epoch_payloads
-            .iter()
-            .map(Vec::as_slice)
-            .collect::<Vec<_>>();
-        let duplicate_epoch = restored
-            .append_batch_borrowed(
-                stream_id.clone(),
-                Some(OCTET),
-                &duplicate_epoch_refs,
-                Some(producer("writer-1", 1, 0)),
-                0,
-            )
-            .expect("duplicate producer epoch batch");
-        prop_assert!(duplicate_epoch.deduplicated);
-        prop_assert_eq!(duplicate_epoch.items.len(), next.items.len());
-        for (duplicate_item, original_item) in duplicate_epoch.items.iter().zip(next.items.iter()) {
-            prop_assert_eq!(duplicate_item.offset, original_item.offset);
-            prop_assert_eq!(duplicate_item.next_offset, original_item.next_offset);
-            prop_assert_eq!(duplicate_item.closed, original_item.closed);
-            prop_assert!(duplicate_item.deduplicated);
-        }
-
-        let stale_response = restored.append_batch_borrowed(
-            stream_id.clone(),
-            Some(OCTET),
-            &duplicate_epoch_refs,
-            Some(producer("writer-1", 0, 1)),
-            0,
-        );
-        prop_assert!(
-            matches!(
-                stale_response,
-                Err(StreamResponse::Error {
-                    code: StreamErrorCode::ProducerEpochStale,
-                    ..
-                })
-            ),
-            "unexpected stale producer batch response: {:?}",
-            stale_response
-        );
-        prop_assert_eq!(
-            restored.head(&stream_id).expect("head").tail_offset,
-            u64::try_from(expected.len()).expect("payload len fits u64")
-        );
-        prop_assert_eq!(
-            restored
-                .read(&stream_id, 0, expected.len())
-                .expect("final producer batch read")
-                .payload,
-            expected
         );
     }
 

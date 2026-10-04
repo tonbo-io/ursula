@@ -912,7 +912,6 @@ fn classify_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<C
         [] if *method == Method::HEAD => Action::Head,
         [] if *method == Method::DELETE => Action::Delete,
         [suffix] if suffix == "bootstrap" && *method == Method::GET => Action::Read,
-        [suffix] if suffix == "append-batch" && *method == Method::POST => Action::Append,
         [suffix] if suffix == "snapshot" && *method == Method::GET => Action::ReadSnapshot,
         [suffix] if suffix == "snapshot" && *method == Method::PUT => Action::PublishSnapshot,
         [suffix] if suffix == "retention" && *method == Method::PUT => Action::Update,

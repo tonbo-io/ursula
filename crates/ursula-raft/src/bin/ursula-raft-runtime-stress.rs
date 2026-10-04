@@ -20,8 +20,6 @@ use tokio::task::JoinSet;
 #[cfg(not(madsim))]
 use ursula_raft::RaftGroupEngineFactory;
 #[cfg(not(madsim))]
-use ursula_runtime::AppendBatchRequest;
-#[cfg(not(madsim))]
 use ursula_runtime::AppendRequest;
 #[cfg(not(madsim))]
 use ursula_runtime::CreateStreamRequest;
@@ -70,25 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     stream_index %= streams.len();
                 }
 
-                let accepted = match args.mode {
-                    StressMode::Append => {
-                        let mut request = AppendRequest::from_bytes(stream, payload.clone());
-                        request.content_type = DEFAULT_CONTENT_TYPE.to_owned();
-                        runtime.append(request).await.map(|_| 1)
-                    }
-                    StressMode::Batch => {
-                        let mut request =
-                            AppendBatchRequest::new(stream, vec![payload.clone(); args.batch_size]);
-                        request.content_type = DEFAULT_CONTENT_TYPE.to_owned();
-                        runtime.append_batch(request).await.map(|response| {
-                            response.items.iter().filter(|item| item.is_ok()).count()
-                        })
-                    }
-                }?;
-                total_appends.fetch_add(
-                    u64::try_from(accepted).expect("accepted count fits u64"),
-                    Ordering::Relaxed,
-                );
+                let mut request = AppendRequest::from_bytes(stream, payload.clone());
+                request.content_type = DEFAULT_CONTENT_TYPE.to_owned();
+                runtime.append(request).await?;
+                total_appends.fetch_add(1, Ordering::Relaxed);
             }
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
@@ -111,13 +94,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .filter(|value| **value > 0)
         .count();
     let counted_appends = total_appends.load(Ordering::Relaxed);
-    println!("mode={}", args.mode.as_str());
     println!("engine=openraft-memory");
     println!("core_count={}", args.core_count);
     println!("raft_group_count={}", args.raft_group_count);
     println!("stream_count={}", args.stream_count);
     println!("producer_count={}", args.producer_count);
-    println!("batch_size={}", args.batch_size);
     println!("payload_bytes={}", args.payload_bytes);
     println!("duration_secs={elapsed:.3}");
     println!("counted_appends={counted_appends}");
@@ -138,22 +119,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!(
         "group_mailbox_max_depth={}",
         snapshot.group_mailbox_max_depth
-    );
-    println!(
-        "raft_write_many_batches={}",
-        snapshot.raft_write_many_batches
-    );
-    println!(
-        "raft_write_many_commands={}",
-        snapshot.raft_write_many_commands
-    );
-    println!(
-        "raft_write_many_responses={}",
-        snapshot.raft_write_many_responses
-    );
-    println!(
-        "raft_write_many_response_ns={}",
-        snapshot.raft_write_many_response_ns
     );
     println!("raft_apply_ns={}", snapshot.raft_apply_ns);
     println!("per_core_appends={:?}", snapshot.per_core_appends);
@@ -206,10 +171,8 @@ struct Args {
     producer_count: usize,
     setup_concurrency: usize,
     mailbox_capacity: usize,
-    batch_size: usize,
     payload_bytes: usize,
     duration: Duration,
-    mode: StressMode,
 }
 
 #[cfg(not(madsim))]
@@ -225,10 +188,8 @@ impl Args {
             producer_count: core_count.saturating_mul(64).max(1),
             setup_concurrency: 1024,
             mailbox_capacity: 1024,
-            batch_size: 16,
             payload_bytes: 100,
             duration: Duration::from_secs(10),
-            mode: StressMode::Batch,
         };
 
         let mut raw_args = std::env::args().skip(1);
@@ -252,18 +213,12 @@ impl Args {
                 "--mailbox-capacity" => {
                     args.mailbox_capacity = parse_next(&mut raw_args, "--mailbox-capacity")?;
                 }
-                "--batch-size" => {
-                    args.batch_size = parse_next(&mut raw_args, "--batch-size")?;
-                }
                 "--payload-bytes" => {
                     args.payload_bytes = parse_next(&mut raw_args, "--payload-bytes")?;
                 }
                 "--duration-secs" => {
                     let seconds = parse_next::<f64>(&mut raw_args, "--duration-secs")?;
                     args.duration = Duration::from_secs_f64(seconds);
-                }
-                "--mode" => {
-                    args.mode = parse_next::<StressMode>(&mut raw_args, "--mode")?;
                 }
                 "--help" | "-h" => return Err(help()),
                 other => return Err(format!("unknown argument '{other}'\n\n{}", help())),
@@ -281,9 +236,6 @@ impl Args {
         }
         if args.producer_count == 0 {
             return Err("--producer-count must be greater than zero".to_owned());
-        }
-        if args.batch_size == 0 {
-            return Err("--batch-size must be greater than zero".to_owned());
         }
         if args.payload_bytes == 0 {
             return Err("--payload-bytes must be greater than zero".to_owned());
@@ -311,37 +263,7 @@ where
         .map_err(|err| format!("invalid {name} '{raw}': {err}"))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(not(madsim))]
-enum StressMode {
-    Append,
-    Batch,
-}
-
-#[cfg(not(madsim))]
-impl StressMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Append => "append",
-            Self::Batch => "batch",
-        }
-    }
-}
-
-#[cfg(not(madsim))]
-impl std::str::FromStr for StressMode {
-    type Err = String;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        match raw {
-            "append" => Ok(Self::Append),
-            "batch" => Ok(Self::Batch),
-            _ => Err("expected append or batch".to_owned()),
-        }
-    }
-}
-
 #[cfg(not(madsim))]
 fn help() -> String {
-    "usage: ursula-raft-runtime-stress [--mode append|batch] [--core-count N] [--raft-group-count N] [--stream-count N] [--producer-count N] [--setup-concurrency N] [--mailbox-capacity N] [--batch-size N] [--payload-bytes N] [--duration-secs N]".to_owned()
+    "usage: ursula-raft-runtime-stress [--core-count N] [--raft-group-count N] [--stream-count N] [--producer-count N] [--setup-concurrency N] [--mailbox-capacity N] [--payload-bytes N] [--duration-secs N]".to_owned()
 }

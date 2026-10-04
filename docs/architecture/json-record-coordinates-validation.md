@@ -78,7 +78,6 @@ The in-memory ordinal index stores one `u64` canonical start offset per retained
 | Live continuation | Long-poll and SSE carry record cursors; envelope SSE emits one record per data event | Live wake/reconnect HTTP test; deterministic HTTP simulation |
 | Retention, snapshots, and bootstrap | JSON logical message boundaries equal record boundaries; snapshot/bootstrap expose retained range | State snapshot/cold-flush test; HTTP snapshot/bootstrap test |
 | Raft, protobuf, WAL, and restart | Record starts and producer ranges are encoded in durable commands and snapshots | Codec/workspace tests; focused WAL restart test; madsim replay |
-| Append Batch | Each normalized frame receives its own range and deduplicated frames recover saved ranges | HTTP and runtime batch tests |
 | Client event time | `captured_at` remains JSON data; `ursula-indexer` persists content-addressed Parquet parts and versioned manifests in S3, with only a disposable local cache | Browser telemetry example; restart with an empty cache, concurrent-writer CAS, pagination, compaction, and retention-gap tests |
 | Base compatibility | Offsets remain opaque and ordinary offset reads remain byte-oriented | Existing Durable Streams HTTP suite and partial-offset JSON test |
 

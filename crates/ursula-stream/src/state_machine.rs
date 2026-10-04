@@ -30,7 +30,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
-use bytes::Bytes;
 use slotmap::Key;
 use slotmap::new_key_type;
 use ursula_shard::BucketStreamId;
@@ -66,8 +65,6 @@ use crate::model::ProducerReceipt;
 use crate::model::ProducerRequest;
 use crate::model::ProducerSnapshot;
 use crate::model::ProducerState;
-use crate::model::StreamBatchAppend;
-use crate::model::StreamBatchAppendItem;
 use crate::model::StreamBootstrapPlan;
 use crate::model::StreamMessageRecord;
 use crate::model::StreamMetadata;
@@ -648,58 +645,6 @@ impl StreamStateMachine {
                     now_ms,
                     record_match,
                 });
-                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
-                response
-            }
-            StreamCommand::AppendBatch {
-                stream_id,
-                content_type,
-                payloads,
-                producer,
-                now_ms,
-            } => {
-                let batch_stream_id = stream_id.clone();
-                let response = match self.append_batch_borrowed(
-                    stream_id,
-                    content_type.as_deref(),
-                    &payloads.iter().map(Bytes::as_ref).collect::<Vec<_>>(),
-                    producer,
-                    now_ms,
-                ) {
-                    Ok(batch) if batch.receipt_evicted => {
-                        let tail = self
-                            .stream_metadata(&batch_stream_id)
-                            .map_or(0, |stream| stream.tail_offset);
-                        StreamResponse::Appended {
-                            offset: tail,
-                            next_offset: tail,
-                            closed: false,
-                            deduplicated: true,
-                            producer: None,
-                            receipt_evicted: true,
-                            record_range: None,
-                        }
-                    }
-                    Ok(batch) => batch
-                        .items
-                        .last()
-                        .map(|item| StreamResponse::Appended {
-                            offset: item.offset,
-                            next_offset: item.next_offset,
-                            closed: item.closed,
-                            deduplicated: item.deduplicated,
-                            producer: None,
-                            receipt_evicted: false,
-                            record_range: item.record_range,
-                        })
-                        .unwrap_or_else(|| {
-                            StreamResponse::error(
-                                StreamErrorCode::EmptyAppend,
-                                "append batch must contain at least one payload",
-                            )
-                        }),
-                    Err(response) => response,
-                };
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
             }

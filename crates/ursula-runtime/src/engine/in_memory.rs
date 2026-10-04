@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::AppendStreamInput;
@@ -28,8 +27,6 @@ use ursula_stream::StreamStateMachine;
 
 use super::GroupAckColdGcFuture;
 use super::GroupAdvanceRetentionFuture;
-use super::GroupAppendBatchFuture;
-use super::GroupAppendBatchResponse;
 use super::GroupAppendFuture;
 use super::GroupAppendTransactionFuture;
 use super::GroupBootstrapStreamFuture;
@@ -92,7 +89,6 @@ use crate::command::GroupWriteCommand;
 use crate::request::AckColdGcResponse;
 use crate::request::AdvanceRetentionRequest;
 use crate::request::AdvanceRetentionResponse;
-use crate::request::AppendBatchRequest;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
 use crate::request::AppendResponse;
@@ -203,12 +199,6 @@ impl InMemoryGroupEngine {
     ) -> Result<GroupWriteResponse, GroupEngineError> {
         match command {
             GroupWriteCommand::Stream(command) => self.apply_stream_command(command, placement),
-            GroupWriteCommand::Batch { commands } => Ok(GroupWriteResponse::Batch(
-                commands
-                    .into_iter()
-                    .map(|command| self.apply_stream_command(command, placement))
-                    .collect(),
-            )),
             GroupWriteCommand::Transaction { commands } => {
                 self.apply_append_transaction(commands, placement)
             }
@@ -290,20 +280,6 @@ impl InMemoryGroupEngine {
                     placement,
                 )
                 .map(GroupWriteResponse::Append),
-            StreamCommand::AppendBatch {
-                stream_id,
-                content_type,
-                payloads,
-                producer,
-                now_ms,
-            } => self.apply_append_batch(
-                stream_id,
-                content_type,
-                payloads,
-                producer,
-                now_ms,
-                placement,
-            ),
             command => {
                 let stream_id = command_stream_id(&command);
                 let command_producer = command_producer(&command);
@@ -359,129 +335,6 @@ impl InMemoryGroupEngine {
                 response
             }
         }
-    }
-
-    fn apply_append_batch(
-        &mut self,
-        stream_id: BucketStreamId,
-        content_type: Option<String>,
-        payloads: Vec<Bytes>,
-        producer: Option<ProducerRequest>,
-        now_ms: u64,
-        placement: ShardPlacement,
-    ) -> Result<GroupWriteResponse, GroupEngineError> {
-        if let Some(producer) = producer {
-            let payload_refs = payloads.iter().map(Bytes::as_ref).collect::<Vec<_>>();
-            let batch = self
-                .state_machine
-                .append_batch_borrowed(
-                    stream_id.clone(),
-                    content_type.as_deref(),
-                    &payload_refs,
-                    Some(producer.clone()),
-                    now_ms,
-                )
-                .map_err(stream_response_error)?;
-            let old_commit_index = self.commit_index;
-            let old_append_count = self.state_machine.stream_append_count(&stream_id);
-            if batch.receipt_evicted {
-                // F3: a duplicate beyond the receipt window, answered once
-                // for the whole batch and without ranges.
-                let tail = self
-                    .state_machine
-                    .head(&stream_id)
-                    .map_or(0, |head| head.tail_offset);
-                return Ok(GroupWriteResponse::AppendBatch(GroupAppendBatchResponse {
-                    placement,
-                    items: vec![Ok(AppendResponse {
-                        placement,
-                        start_offset: tail,
-                        next_offset: tail,
-                        stream_append_count: old_append_count,
-                        group_commit_index: old_commit_index,
-                        closed: false,
-                        deduplicated: true,
-                        producer: None,
-                        record_range: None,
-                        stream_hot_bytes: self.state_machine.hot_real_len(&stream_id).unwrap_or(0),
-                        group_hot_bytes: self.state_machine.total_hot_real_bytes(),
-                        receipt_evicted: true,
-                    })],
-                }));
-            }
-            if !batch.deduplicated {
-                let count = u64::try_from(batch.items.len()).expect("item count fits u64");
-                self.commit_index += count;
-                self.state_machine
-                    .add_stream_append_count(&stream_id, count);
-            }
-            let stream_hot_bytes = self.state_machine.hot_real_len(&stream_id).unwrap_or(0);
-            let group_hot_bytes = self.state_machine.total_hot_real_bytes();
-            let items = batch
-                .items
-                .into_iter()
-                .enumerate()
-                .map(|(index, item)| {
-                    let item_index = u64::try_from(index + 1).expect("item index fits u64");
-                    Ok(AppendResponse {
-                        placement,
-                        start_offset: item.offset,
-                        next_offset: item.next_offset,
-                        stream_append_count: if item.deduplicated {
-                            old_append_count
-                        } else {
-                            old_append_count + item_index
-                        },
-                        group_commit_index: if item.deduplicated {
-                            old_commit_index
-                        } else {
-                            old_commit_index + item_index
-                        },
-                        closed: item.closed,
-                        deduplicated: item.deduplicated,
-                        producer: None,
-                        // F1 (RC-10, RC-11): the range apply computed or the
-                        // stored receipt's, never one derived from the index.
-                        record_range: item.record_range,
-                        stream_hot_bytes,
-                        group_hot_bytes,
-                        receipt_evicted: false,
-                    })
-                })
-                .collect();
-            return Ok(GroupWriteResponse::AppendBatch(GroupAppendBatchResponse {
-                placement,
-                items,
-            }));
-        }
-
-        let mut items = Vec::with_capacity(payloads.len());
-        for payload in payloads {
-            if payload.is_empty() {
-                items.push(Err(GroupEngineError::stream(
-                    StreamErrorCode::EmptyAppend,
-                    "append payload must be non-empty",
-                )));
-                continue;
-            }
-            items.push(self.append_payload(
-                AppendPayloadInput {
-                    stream_id: stream_id.clone(),
-                    content_type: content_type.as_deref(),
-                    payload: &payload,
-                    close_after: false,
-                    stream_seq: None,
-                    producer: None,
-                    now_ms,
-                    record_match: None,
-                },
-                placement,
-            ));
-        }
-        Ok(GroupWriteResponse::AppendBatch(GroupAppendBatchResponse {
-            placement,
-            items,
-        }))
     }
 
     /// The stream's and the group's hot bytes after a write (F6a); a missing
@@ -881,45 +734,6 @@ impl InMemoryGroupEngine {
                 other => {
                     return Err(GroupEngineError::new(format!(
                         "unexpected append write response: {other:?}"
-                    )));
-                }
-            };
-        Ok(response)
-    }
-
-    pub(crate) fn append_batch_with_admission_inner(
-        &mut self,
-        request: AppendBatchRequest,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> Result<GroupAppendBatchResponse, GroupEngineError> {
-        // F9: O(1) admission; see `append_with_admission_inner`. A producer
-        // batch is deduplicated as a whole or not at all.
-        if admission.is_enabled()
-            && !self.state_machine.append_would_deduplicate(
-                &request.stream_id,
-                request.producer.as_ref(),
-                request.now_ms,
-            )
-        {
-            let incoming_bytes = request
-                .payloads
-                .iter()
-                .map(|payload| u64::try_from(payload.len()).expect("payload len fits u64"))
-                .sum();
-            self.check_cold_write_admission(
-                &request.stream_id,
-                admission,
-                incoming_bytes,
-                u64::try_from(request.payloads.len()).unwrap_or(u64::MAX),
-            )?;
-        }
-        let response =
-            match self.apply_committed_write(GroupWriteCommand::from(request), placement)? {
-                GroupWriteResponse::AppendBatch(response) => response,
-                other => {
-                    return Err(GroupEngineError::new(format!(
-                        "unexpected append batch write response: {other:?}"
                     )));
                 }
             };
@@ -2338,29 +2152,6 @@ impl GroupEngine for InMemoryGroupEngine {
         })
     }
 
-    fn append_batch<'a>(
-        &'a mut self,
-        request: AppendBatchRequest,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> GroupAppendBatchFuture<'a> {
-        if admission.is_enabled() {
-            return Box::pin(async move {
-                self.append_batch_with_admission_inner(request, placement, admission)
-            });
-        }
-        Box::pin(async move {
-            self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
-            let command = GroupWriteCommand::from(request);
-            match self.apply_committed_write(command, placement)? {
-                GroupWriteResponse::AppendBatch(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected append batch write response: {other:?}"
-                ))),
-            }
-        })
-    }
-
     fn flush_cold<'a>(
         &'a mut self,
         request: FlushColdRequest,
@@ -2630,7 +2421,6 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::CreateExternal { stream_id, .. }
         | StreamCommand::Append { stream_id, .. }
         | StreamCommand::AppendExternal { stream_id, .. }
-        | StreamCommand::AppendBatch { stream_id, .. }
         | StreamCommand::PublishSnapshot { stream_id, .. }
         | StreamCommand::PublishSnapshotExternal { stream_id, .. }
         | StreamCommand::AdvanceRetention { stream_id, .. }

@@ -40,12 +40,12 @@
 //!   - `sync f(args)`: synchronous `CoreWorker::f(args)`, no reply channel,
 //!   - `actor f(args)`: delegate to the hand-written `GroupActor::f`, which
 //!     returns the loop `ControlFlow` (used by the genuinely non-uniform
-//!     arms: read-watcher registration, append-batch coalescing, engine
+//!     arms: read-watcher registration, append completion, engine
 //!     shutdown).
 //!
 //!   Arguments are context keywords resolved by `group_op_arg!` (`engine`,
 //!   `metrics`, `read_materialization`, `read_watchers`, `placement`,
-//!   `core_id`, `cold_admission`, `pending`) or the name of a `fields`
+//!   `core_id`, `cold_admission`) or the name of a `fields`
 //!   entry, the `reply` channel, or the `guard`, so per-operation
 //!   differences in what a dispatch arm passes stay explicit here.
 //! - `client` picks the generated `ShardRuntime` method, or `none` to keep
@@ -392,17 +392,6 @@ macro_rules! runtime_operations {
                     )
                 }
                 client { pub stream fn append_external }
-            }
-            op AppendBatch {
-                fields { request: AppendBatchRequest }
-                reply { response_tx: AppendBatchResponse }
-                guard { raft_uncommitted }
-                handle { actor handle_append_batch(request, response_tx, raft_uncommitted, pending) }
-                client {
-                    pub stream fn append_batch,
-                    non_empty: payloads,
-                    admit: append_batch_payload_bytes(&request)
-                }
             }
             op SnapshotGroup {
                 fields {}

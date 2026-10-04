@@ -62,11 +62,11 @@
               "action": "run_runtime_raft_network_workload",
               "plan": {
                 "stream_count": 2,
-                "append_batch_lens": [
+                "append_payload_counts": [
                   3,
                   2
                 ],
-                "failover_batch_lens": [
+                "failover_payload_counts": [
                   2,
                   2
                 ],
@@ -2436,11 +2436,11 @@
               "action": "run_runtime_raft_network_workload",
               "plan": {
                 "stream_count": 2,
-                "append_batch_lens": [
+                "append_payload_counts": [
                   2,
                   1
                 ],
-                "failover_batch_lens": [
+                "failover_payload_counts": [
                   1,
                   1
                 ],
@@ -2732,12 +2732,12 @@
               "action": "run_runtime_raft_network_workload",
               "plan": {
                 "stream_count": 3,
-                "append_batch_lens": [
+                "append_payload_counts": [
                   1,
                   1,
                   2
                 ],
-                "failover_batch_lens": [
+                "failover_payload_counts": [
                   2,
                   2,
                   2
@@ -3271,12 +3271,12 @@
               "action": "run_runtime_raft_network_workload",
               "plan": {
                 "stream_count": 3,
-                "append_batch_lens": [
+                "append_payload_counts": [
                   1,
                   1,
                   1
                 ],
-                "failover_batch_lens": [
+                "failover_payload_counts": [
                   2,
                   1,
                   1

@@ -8,7 +8,6 @@ use std::sync::Mutex;
 use axum::body::Body;
 use axum::http::Request;
 use tower::ServiceExt;
-use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::CloseStreamRequest;
@@ -18,7 +17,6 @@ use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamExternalRequest;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::DeleteStreamRequest;
-use ursula_runtime::GroupAppendBatchFuture;
 use ursula_runtime::GroupAppendFuture;
 use ursula_runtime::GroupBucketUsageFuture;
 use ursula_runtime::GroupCloseStreamFuture;
@@ -148,15 +146,6 @@ impl GroupEngine for LostResponseEngine {
                 "injected: response lost after commit",
             ))
         })
-    }
-
-    fn append_batch<'a>(
-        &'a mut self,
-        request: AppendBatchRequest,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> GroupAppendBatchFuture<'a> {
-        self.inner.append_batch(request, placement, admission)
     }
 
     fn snapshot<'a>(&'a mut self, placement: ShardPlacement) -> GroupSnapshotFuture<'a> {

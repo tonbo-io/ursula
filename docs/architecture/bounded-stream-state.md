@@ -373,7 +373,7 @@ An earlier design fixed the locator by keeping the `ObjectPayloadRef` in state a
 
 ### 5.9 F8: TTL index with one armed entry per stream
 
-**Today.** Every append, append batch and external append calls `refresh_ttl_entry` (`append.rs:356, 545, 788`), which pushes a new entry with a cloned `BucketStreamId` even when the expiry did not change (`registry.rs:126-138`). Stale entries leave only when popped after their own expiry (`registry.rs:103-124`). Writes, `FlushCold` and `DeleteStream` never sweep them.
+**Today.** Every append and external append calls `refresh_ttl_entry` (`append.rs:356, 545, 788`), which pushes a new entry with a cloned `BucketStreamId` even when the expiry did not change (`registry.rs:126-138`). Stale entries leave only when popped after their own expiry (`registry.rs:103-124`). Writes, `FlushCold` and `DeleteStream` never sweep them.
 
 **Design.** Keep at most one armed entry per stream. The registry records `armed_at` per key in a side map that is not replicated.
 
@@ -390,7 +390,7 @@ Every returned entry is at its stream's true expiry, and every smaller key has a
 
 **Append counts.** `stream_append_counts` (`in_memory.rs:128`) loses entries only on `Deleted` (`in_memory.rs:594-599`). TTL expiry and `PurgeBucket` leave them. Snapshots filter them out (`in_memory.rs:1247-1273`), so after a recreate a replica that installed a snapshot and a long-lived one disagree. The fix moves the count into `StreamSlot`, so it dies with the slot. `StreamAppendCountV1` frames stay as they are, and the `restore_stream_append_counts` cross-check (`in_memory.rs:2123-2146`) goes away. The count is not exposed over HTTP. Ungated, +40 / −80 LoC.
 
-**Admission.** The default single-node mode clones the whole engine to preview admission on every create, append and append batch (`in_memory.rs:690, 729, 773`): a transient full copy of the group's memory per write, and 17.7 s for 30k appends with the default admission against 0.44 s without. It should use the O(1) `check_cold_write_admission_bytes` that the Raft path uses, plus the read-only `evaluate_producer` when deduplicated retries must bypass backpressure. Ungated, +40 / −90 LoC.
+**Admission.** The default single-node mode clones the whole engine to preview admission on every create and append (`in_memory.rs:690, 729`): a transient full copy of the group's memory per write, and 17.7 s for 30k appends with the default admission against 0.44 s without. It should use the O(1) `check_cold_write_admission_bytes` that the Raft path uses, plus the read-only `evaluate_producer` when deduplicated retries must bypass backpressure. Ungated, +40 / −90 LoC.
 
 ### 5.11 F10: flush planner
 
@@ -548,7 +548,7 @@ Totals, excluding F15 and F16: about +5,800 / −400 production LoC and +6,500 t
 
 F1 changes how every record coordinate is resolved, so it carries its own invariants. The dense implementation at `e6d8d70` is the oracle; marks must be invisible, apart from retention landing on a mark. Each invariant names its test.
 
-**RC-1, boundaries are LFs.** On a JSON stream each record is one compact JSON value plus one LF and contains no other LF, on every write path: inline append, append batch, transaction ops, create with a body, and external create and append. *Test*: a fuzz test (arbitrary JSON, arrays, escapes, lone surrogates) asserting that the stored bytes' LF positions equal the committed record ends on each path.
+**RC-1, boundaries are LFs.** On a JSON stream each record is one compact JSON value plus one LF and contains no other LF, on every write path: inline append, transaction ops, create with a body, and external create and append. *Test*: a fuzz test (arbitrary JSON, arrays, escapes, lone surrogates) asserting that the stored bytes' LF positions equal the committed record ends on each path.
 
 **RC-2, oracle equivalence.** In every reachable state, `offset_for(r)` after scanning equals the dense oracle for every retained `r`, and `record_for(o)` agrees for every boundary `o` and rejects every non-boundary. *Test*: a proptest differential suite on `StreamStateMachine` with an in-memory byte store standing in for S3. Random JSON appends of 1 to 2,000 records with sizes from 2 B to 3 MiB, external appends, flushes at random points including mid-record splits, retention at random boundaries, transactions with rollback, and snapshot round trips at random points. Explicit cases: the D1 sequence (hot prefix, external append, flush, offload, snapshot round trip), and stale page entries from rejected external appends at the same and at overlapping starts.
 
@@ -566,7 +566,7 @@ F1 changes how every record coordinate is resolved, so it carries its own invari
 
 **RC-9, `Stream-Record-Match`.** The decision depends only on `next_record` and is identical to the oracle. *Test*: the existing HTTP and precondition tests run with sealing enabled.
 
-**RC-10, fresh acknowledgements.** Append, append batch, transaction, close and create responses carry the range computed in apply and never derive it from the index afterwards. *Test*: append immediately followed by a seal in the same apply batch; external appends that seal their own records; an inline append followed by an external append.
+**RC-10, fresh acknowledgements.** Append, transaction, close and create responses carry the range computed in apply and never derive it from the index afterwards. *Test*: append immediately followed by a seal in the same apply batch; external appends that seal their own records; an inline append followed by an external append.
 
 **RC-11, duplicate acknowledgements.** A duplicate returns its stored receipt's original byte and record ranges, independent of sealing and retention. A duplicate of a producer's newest sequence always returns its ranges, from the newest acknowledgement if its receipt was evicted. Any other evicted duplicate returns no range, never a recomputed one. *Test*: batch duplicates for non-latest receipts (a 500 today after retention); duplicates after sealing; duplicates after eviction, newest and older.
 

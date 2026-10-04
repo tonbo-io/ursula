@@ -94,7 +94,6 @@ use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGrpcService;
 use ursula_raft::raft_internal_proto;
 use ursula_runtime::AdvanceRetentionRequest;
-use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::AppendResponse;
@@ -147,10 +146,8 @@ use crate::render::insert_u64_header;
 use crate::render::long_poll_no_content_response;
 use crate::render::normalize_http_write_payload;
 use crate::render::offset_now_response;
-use crate::render::parse_append_batch;
 use crate::render::read_response;
 use crate::render::record_envelope_response;
-use crate::render::render_batch_results;
 use crate::render::render_metrics;
 use crate::render::render_sse_read;
 use crate::render::response_cursor;
@@ -194,7 +191,6 @@ const GROUP_APPEND_TRANSACTION_EXTENSION: &str = "group-append-transaction-v1";
 const HEADER_PRODUCER_ID: &str = "producer-id";
 const HEADER_PRODUCER_EPOCH: &str = "producer-epoch";
 const HEADER_PRODUCER_SEQ: &str = "producer-seq";
-const HEADER_PREFER: &str = "prefer";
 const HEADER_X_CONTENT_TYPE_OPTIONS: &str = "x-content-type-options";
 const HEADER_CROSS_ORIGIN_RESOURCE_POLICY: &str = "cross-origin-resource-policy";
 const HEADER_URSULA_RAFT_LEADER_ID: &str = "x-ursula-raft-leader-id";
@@ -208,8 +204,6 @@ const MALLOC_CONF_ENV_VAR: &str = if cfg!(target_vendor = "apple") {
 } else {
     "MALLOC_CONF"
 };
-const APPEND_BATCH_MAX_ITEMS: usize = 512;
-const APPEND_BATCH_MAX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// Server-side cap on one read response (bounded-stream-state F11), the same
 /// 8 MiB that caps bootstrap updates. A request's `max_bytes` is clamped to
@@ -1380,7 +1374,6 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
                 .delete(delete_stream)
                 .head(head_stream),
         )
-        .route("/{bucket}/{stream}/append-batch", post(append_batch))
         .route(
             "/{bucket}/{affinity}/$transaction",
             post(append_transaction),
@@ -1412,10 +1405,6 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
                 .get(read_stream)
                 .delete(delete_stream)
                 .head(head_stream),
-        )
-        .route(
-            "/{bucket}/{affinity}/{stream}/append-batch",
-            post(append_batch),
         )
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .layer(middleware::from_fn(path_affinity_extension_middleware))
@@ -2881,80 +2870,6 @@ pub(crate) async fn append_stream_external_by_id(
             runtime_error_or_leader_redirect_async(&state, err, &request_target).await
         }
     }
-}
-
-#[tracing::instrument(
-    name = "http.append_batch",
-    skip_all,
-    fields(bucket = %path.bucket, affinity = ?path.affinity, stream = %path.stream, bytes = body.len(), payloads = tracing::field::Empty),
-)]
-pub(crate) async fn append_batch(
-    State(state): State<HttpState>,
-    OriginalUri(uri): OriginalUri,
-    Path(path): Path<StreamPath>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    if body.len() > APPEND_BATCH_MAX_BYTES {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "append batch is too large").into_response();
-    }
-    let producer = match producer_request(&headers) {
-        Ok(producer) => producer,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
-    let minimal_ack = prefers_minimal_response(&headers);
-    let payloads = match parse_append_batch(&body) {
-        Ok(payloads) => payloads,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
-    tracing::Span::current().record("payloads", payloads.len());
-    if payloads.len() > APPEND_BATCH_MAX_ITEMS {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "append batch contains too many items",
-        )
-            .into_response();
-    }
-
-    let stream_id = path.into_stream_id();
-    let content_type = request_content_type(&headers);
-    let payloads = match payloads
-        .into_iter()
-        .map(|payload| normalize_http_write_payload(&content_type, payload, false))
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(payloads) => payloads,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
-    let mut request = AppendBatchRequest::new(stream_id, payloads);
-    request.content_type = content_type;
-    request.producer = producer.clone();
-    request.now_ms = state.unix_time_ms();
-    let response = match state.runtime.append_batch(request).await {
-        Ok(response) => response,
-        Err(err) => {
-            return runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri))
-                .await;
-        }
-    };
-
-    let mut headers = HeaderMap::new();
-    insert_default_response_headers(&mut headers);
-    insert_producer_ack(&mut headers, producer.as_ref());
-    let has_record_ranges = response.items.iter().any(|item| {
-        item.as_ref()
-            .is_ok_and(|response| response.record_range.is_some())
-    });
-    if has_record_ranges {
-        insert_record_extension(&mut headers);
-    }
-    if minimal_ack && response.items.iter().all(Result::is_ok) && !has_record_ranges {
-        return (StatusCode::NO_CONTENT, headers).into_response();
-    }
-
-    insert_content_type(&mut headers, "application/json");
-    let body = render_batch_results(&response.items);
-    (StatusCode::OK, headers, body).into_response()
 }
 
 #[tracing::instrument(
@@ -4461,17 +4376,6 @@ pub(crate) fn producer_request(headers: &HeaderMap) -> Result<Option<ProducerReq
             producer_seq.expect("checked present"),
         )?,
     }))
-}
-
-pub(crate) fn prefers_minimal_response(headers: &HeaderMap) -> bool {
-    headers
-        .get(HEADER_PREFER)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(',')
-                .any(|part| part.trim().eq_ignore_ascii_case("return=minimal"))
-        })
 }
 
 pub(crate) fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {

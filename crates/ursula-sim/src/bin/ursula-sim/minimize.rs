@@ -1006,16 +1006,16 @@ fn runtime_raft_network_single_stream_schedule(
         if let ursula_sim::SimFaultAction::RunRuntimeRaftNetworkWorkload { plan } = &mut step.action
         {
             plan.stream_count = 1;
-            plan.append_batch_lens.truncate(1);
-            plan.failover_batch_lens.truncate(1);
+            plan.append_payload_counts.truncate(1);
+            plan.failover_payload_counts.truncate(1);
             plan.producer_sessions = false;
             plan.producer_epoch_bumps = false;
             plan.concurrent_producers = false;
-            if plan.append_batch_lens.is_empty() {
-                plan.append_batch_lens.push(2);
+            if plan.append_payload_counts.is_empty() {
+                plan.append_payload_counts.push(2);
             }
-            if plan.failover_batch_lens.is_empty() {
-                plan.failover_batch_lens.push(1);
+            if plan.failover_payload_counts.is_empty() {
+                plan.failover_payload_counts.push(1);
             }
         }
     }
@@ -1136,23 +1136,23 @@ fn runtime_raft_network_workload_candidate_plans(
         reduced.concurrent_producers = false;
         candidates.push(("disable_runtime_raft_producer_sessions".to_owned(), reduced));
     }
-    if plan.append_batch_lens.iter().any(|len| *len > 1) {
+    if plan.append_payload_counts.iter().any(|count| *count > 1) {
         let mut reduced = plan.clone();
-        for len in &mut reduced.append_batch_lens {
-            *len = 1;
+        for count in &mut reduced.append_payload_counts {
+            *count = 1;
         }
         candidates.push((
-            "shrink_runtime_raft_append_batches_to_one".to_owned(),
+            "shrink_runtime_raft_append_payload_counts_to_one".to_owned(),
             reduced,
         ));
     }
-    if plan.failover_batch_lens.iter().any(|len| *len > 1) {
+    if plan.failover_payload_counts.iter().any(|count| *count > 1) {
         let mut reduced = plan.clone();
-        for len in &mut reduced.failover_batch_lens {
-            *len = 1;
+        for count in &mut reduced.failover_payload_counts {
+            *count = 1;
         }
         candidates.push((
-            "shrink_runtime_raft_failover_batches_to_one".to_owned(),
+            "shrink_runtime_raft_failover_payload_counts_to_one".to_owned(),
             reduced,
         ));
     }
