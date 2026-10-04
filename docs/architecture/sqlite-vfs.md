@@ -26,7 +26,7 @@ WAL commit is appended to the stream *before* any of the transaction's frames re
   latest snapshot in bytes (§4.1), the kernel boot id it was written in, the stream's path and its
   `Stream-Incarnation`, the db file's inode and its claim on the local WAL (generation and last
   commit frame, §6), replaced atomically against a process crash (temp file, rename; no fsync).
-- Offsets are opaque (D7): the VFS keeps every offset as the string the server wrote
+- Offsets are opaque: the VFS keeps every offset as the string the server wrote
   (`Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Retained-Offset`), compares offsets only
   as strings (the protocol orders them lexicographically), and never computes one. `-1`, the
   protocol's "beginning of the stream", also stands for "none" (no snapshot, no local state). A
@@ -74,8 +74,8 @@ unless an attach racing the recreate claimed under the old id (§6, wrong stream
   above the stream's last one (409), so a writer outside this protocol that appended with a higher
   one since the owner's last commit fences and poisons the owner at its next commit; one with a
   lower or equal `Stream-Seq` is refused itself and never lands. One that appends without
-  `Stream-Seq` goes unnoticed: its bytes then fail every later replay (the frames no longer
-  decode), and attach refuses.
+  `Stream-Seq` goes unnoticed: its bytes then fail every replay that crosses them (the frames no
+  longer decode; attach refuses) until the owner publishes a snapshot past them.
 - The overlay belongs to the write transaction: it is cleared whenever the WAL write lock is taken
   or released, so a rolled-back transaction's spilled frames never shadow a later one's.
 - Any write to the main db file outside a checkpoint (a rollback journal, `journal_mode=MEMORY`) is
@@ -368,8 +368,10 @@ What attach does in each case:
   from a version with numeric offsets (sidecar format 1, no `v=`), or without the WAL claim or the
   incarnation, rebuilds once (such a sidecar is not trusted; it is still parsed, for the stream
   path, the incarnation and the read check at its offset). Older versions take this one's sidecar
-  for a torn one and rebuild, or refuse it, so after a downgrade delete `<db>` (it is rebuilt from
-  the stream). Snapshot bodies of the numeric-offset versions (`"USS1"`) are not read: a stream
+  for a torn one and rebuild, or refuse it, and none of them reads a `"USS2"` snapshot body: after a
+  downgrade, a stream this version has snapshotted cannot be attached (attach under a new stream
+  URL, as for `"USS1"` below); one it has not snapshotted is rebuilt from the stream after deleting
+  `<db>`. Snapshot bodies of the numeric-offset versions (`"USS1"`) are not read: a stream
   whose latest snapshot is one cannot be attached (attach fails on its snapshot; deleting the local
   files does not help): attach under a new stream URL. Versions before the incarnation-scoped
   `Producer-Id` (§2) append as `sqlite-ursula-vfs`, a producer this version's claims do not fence:

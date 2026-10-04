@@ -954,14 +954,8 @@ fn producer_id(incarnation: &str) -> String {
 /// only with its receipt (`Stream-Next-Offset`, checked by `commit`): they are sent after a
 /// verified claim (see `claim_once`), which makes this owner the only writer of its incarnation's
 /// producer at its epoch, so whatever holds (epoch, seq) there is ours. A claim's answer is
-/// verified separately. `stream_seq`: a commit's `Stream-Seq` (see `stream_seq`).
-fn append(
-    url: &str,
-    producer: &str,
-    body: &[u8],
-    (epoch, seq): (u64, u64),
-    stream_seq: Option<&str>,
-) -> Append {
+/// verified separately. Commits also carry their `Stream-Seq` (see `stream_seq`).
+fn append(url: &str, producer: &str, body: &[u8], epoch: u64, seq: u64) -> Append {
     let deadline = Instant::now() + retry_budget();
     let mut backoff = Duration::from_millis(20);
     let mut attempts = 0;
@@ -973,8 +967,8 @@ fn append(
             .header("producer-id", producer)
             .header("producer-epoch", epoch.to_string())
             .header("producer-seq", seq.to_string());
-        if let Some(s) = stream_seq {
-            req = req.header("stream-seq", s);
+        if seq > 0 {
+            req = req.header("stream-seq", stream_seq((epoch, seq)));
         }
         let sent = req.send(body);
         let mut retry_after = None;
@@ -1000,7 +994,7 @@ fn append(
                         return Append::ProducerExpired;
                     }
                     // Neither a producer sequence conflict nor a closed stream: the `Stream-Seq`.
-                    409 if stream_seq.is_some()
+                    409 if seq > 0
                         && !r.headers().contains_key("producer-expected-seq")
                         && !r.headers().contains_key("stream-closed") =>
                     {
@@ -1626,7 +1620,7 @@ enum Claimed {
 fn claim_once(url: &str, producer: &str, epoch: u64, from: &str) -> Result<Claimed, String> {
     let nonce = nonce()?;
     let frame = frame::encode_claim(epoch, &nonce);
-    let next = match append(url, producer, &frame, (epoch, 0), None) {
+    let next = match append(url, producer, &frame, epoch, 0) {
         Append::Acked {
             next: Some(next), ..
         } => next,
@@ -1672,7 +1666,7 @@ fn find_claim(
     epoch: u64,
     nonce: &[u8; 16],
 ) -> Result<Option<bool>, String> {
-    let (mut used, mut index, mut found, mut last_ours) = (0, 0, None, false);
+    let (mut used, mut found, mut last_ours) = (0, None, false);
     while let Decoded::Frame { record, len } = frame::decode(&buf[used..])? {
         last_ours = record
             == Record::Claim {
@@ -1680,10 +1674,9 @@ fn find_claim(
                 nonce: *nonce,
             };
         if last_ours {
-            found = Some(index == 0);
+            found = Some(used == 0);
         }
         used += len;
-        index += 1;
     }
     if exact && used != buf.len() {
         return Err("the answered offset is not a frame boundary".into());
@@ -1800,8 +1793,9 @@ fn recreated(
 /// snapshot when the file is behind it (or below the stream's retention), replays the frames after
 /// it, claims, and replays up to the claim, all from the stream's `incarnation` (checked by the
 /// `HEAD` before and after: a stream deleted and recreated meanwhile fails the attach, and the
-/// sidecar, still stamped with the old incarnation, makes the next one rebuild). Returns the epoch
-/// claimed and the latest snapshot's offset (`START` for none).
+/// sidecar, still stamped with the old incarnation, makes the next one rebuild; a newer owner's
+/// claim replayed after ours fails it too). Returns the epoch claimed and the latest snapshot's
+/// offset (`START` for none).
 unsafe fn sync(
     url: &str,
     incarnation: &str,
@@ -1841,6 +1835,15 @@ unsafe fn sync(
     let producer = producer_id(incarnation);
     let (epoch, claimed) = claim(url, &producer, applier.epoch + 1, pos)?;
     unsafe { catch_up(url, pos, Some(claimed.as_str()), applier)? };
+    // The replay may run past our claim into a newer owner's (a lower epoch than ours is refused
+    // by the server, so a higher one landed after it): this owner is already fenced, and a
+    // snapshot it took would record an epoch below the highest claimed before it.
+    if applier.epoch > epoch {
+        return Err(Fail::Other(format!(
+            "fenced: another owner claimed epoch {} during attach; attach again",
+            applier.epoch
+        )));
+    }
     if let Some(e) = recreated(url, incarnation, &|| false)? {
         return Err(Fail::Other(format!("{e} during attach; attach again")));
     }
@@ -2893,19 +2896,14 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
     }
     let (body, raw) = frame::encode_commit(size, &pages);
     let t = Instant::now();
-    let send = |db: &Db| {
-        let seq = (db.epoch, db.seq + 1);
-        let token = stream_seq(seq);
-        append(&db.url, &db.producer, &body, seq, Some(token.as_str()))
-    };
-    let mut outcome = send(&*db);
+    let mut outcome = append(&db.url, &db.producer, &body, db.epoch, db.seq + 1);
     // An unknown producer: expired, or this owner's stream was deleted and the one recreated at
     // its path never knew it (`producer_id`); `reclaim` tells them apart.
     if let Append::ProducerExpired = outcome {
         if let Err(e) = reclaim(db) {
             return db.poison(e);
         }
-        outcome = send(&*db);
+        outcome = append(&db.url, &db.producer, &body, db.epoch, db.seq + 1);
     }
     let seq = db.seq + 1;
     let append_time = t.elapsed();
