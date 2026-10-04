@@ -12,7 +12,7 @@ api: "POST /{bucket}/{stream}"
 </ParamField>
 
 <ParamField header="Content-Type" type="string" required>
- Must match the stream's content type (set at PUT or first POST) after normalization: parameters are trimmed, lowercased and joined with `; `. Required when the body is non-empty. A mismatch returns `409`.
+ Must match the stream's content type (set when the stream was created with `PUT`) after normalization: parameters are trimmed, lowercased and joined with `; `. Required when the body is non-empty. A mismatch returns `409`.
 </ParamField>
 
 <ParamField header="Stream-Closed" type="string">
@@ -20,7 +20,7 @@ api: "POST /{bucket}/{stream}"
 </ParamField>
 
 <ParamField header="Stream-Seq" type="string">
- Client-supplied monotonic sequence token. The server tracks the last accepted value per stream and rejects any append whose `Stream-Seq` is not lexicographically greater than the previous one. At most 256 bytes.
+ A compare-and-set token. The append is accepted only when the value is bytewise greater than the last `Stream-Seq` accepted on this stream; it is then stored. An equal or smaller value answers `409` with `Stream-Next-Offset` at the tail. Without the header the append is not checked and the stored value is unchanged. Printable ASCII, at most 256 bytes. See [how `Stream-Seq` is checked](/docs/concepts/conditional-writes#how-stream-seq-is-checked).
 </ParamField>
 
 <ParamField header="Producer-Id" type="string">
@@ -50,13 +50,14 @@ api: "POST /{bucket}/{stream}"
 | `204` | Append successful (default success response, no body). |
 | `200` | Append successful with body - returned when a `Producer-Id` was supplied and the append was not deduplicated, so the response carries producer ack headers. |
 | `400` | Empty body without `Stream-Closed: true`, missing content type, invalid JSON or UTF-8, a JSON message nested deeper than 127 levels, or a `Producer-Id` or `Stream-Seq` longer than 256 bytes. |
+| `403` | `Producer-Epoch` is older than the last epoch accepted for this `Producer-Id`. The response's `Producer-Epoch` is the current epoch. |
 | `404` | Stream not found. |
-| `409` | Content type does not match the stream, stream is already closed, or sequence/producer conflict. |
+| `409` | Content type does not match the stream, stream is already closed, `Stream-Seq` not greater than the stored value, or `Producer-Seq` out of order. |
 | `412` | `Stream-Record-Match` did not match the current JSON record tail. |
 | `413` | Body larger than 32 MiB. |
 | `503` | Cold-write backpressure. Retry after the duration in `Retry-After`. |
 
-Response headers include `Stream-Next-Offset` (always). When a `Producer-Id` was supplied, the server echoes the accepted `Producer-Epoch` and `Producer-Seq` so the producer can confirm what was durably recorded. `Stream-Closed: true` is set if this request closed the stream. `ETag` is set on reads only, not on appends.
+Response headers include `Stream-Next-Offset`, except on a duplicate whose receipt has left the stream's receipt window ([exactly-once writes](/docs/concepts/exactly-once-writes#how-dedup-works)). When a `Producer-Id` was supplied, the server echoes the accepted `Producer-Epoch` and `Producer-Seq` so the producer can confirm what was durably recorded. `Stream-Closed: true` is set if this request closed the stream. `ETag` is set on reads only, not on appends.
 
 For an `application/json` stream advertising `json-record-coordinates-v1`, the response also includes `Stream-Record-Start` and `Stream-Record-Next`. A JSON object creates one record, and a top-level array creates one record per element. The returned half-open range identifies exactly the records created by this request.
 
@@ -88,10 +89,6 @@ curl -X POST http://127.0.0.1:4437/demo/hello \
 ## JSON message text
 
 Ursula validates every JSON body and stores each message as you wrote it, minus insignificant whitespace (spaces, tabs and line breaks outside strings), followed by one LF. Member order, duplicate members, number spelling such as `1.50e3` or `1e400`, and string escapes, including escapes of unpaired surrogates, are kept byte for byte, and every read returns that text. A top-level array is split into one message per element. A message may nest at most 127 levels. See [JSON message text](/docs/specs/extensions#json-message-text). Releases before this rule re-serialized messages; see the [release notes](/docs/release-notes).
-
-<Note>
-The server may coalesce multiple concurrent appends into a single batch for performance.
-</Note>
 
 <Info>
 See [Record Coordinates](/docs/concepts/record-coordinates) for record ranges, complete-record reads, and the difference between committed record order and client event time.

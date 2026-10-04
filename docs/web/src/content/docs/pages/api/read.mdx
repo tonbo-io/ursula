@@ -16,11 +16,11 @@ api: "GET /{bucket}/{stream}"
 </ParamField>
 
 <ParamField query="cursor" type="string">
- Opaque cursor token returned by a previous read. Alternative to `offset`.
+ On a long-poll or SSE read, the `Stream-Cursor` value from the previous live response. It lets caches tell successive live requests apart. It is not a position and never replaces `offset`.
 </ParamField>
 
-<ParamField query="stream-cursor" type="string">
- Alias for `cursor`.
+<ParamField query="consistency" type="string">
+ `local` (default) or `leader`, on catch-up reads only. `leader` makes the read linearizable: it includes every append acknowledged before the request, at the cost of one round trip from the group's leader to a majority of voters. Use it to read back your own acknowledged writes. Combining it with `live` answers `400`. See [Read path](/docs/specs/extensions#92-leader-consistency).
 </ParamField>
 
 <ParamField query="record" type="string">
@@ -44,7 +44,7 @@ api: "GET /{bucket}/{stream}"
 </ParamField>
 
 <ParamField query="max_bytes" type="number">
- On an offset read, the maximum bytes to read in one response or SSE data batch. For UTF-8 SSE data, Ursula may shorten the emitted batch so `Stream-Next-Offset` lands on a valid text boundary.
+ On an offset read, the maximum bytes to read in one response or SSE data batch. Every response is capped at 8 MiB; a larger value is clamped, and a value that is not a decimal integer is ignored. A shortened response has no `Stream-Up-To-Date`; continue from `Stream-Next-Offset`. For UTF-8 SSE data, Ursula may shorten the emitted batch so `Stream-Next-Offset` lands on a valid text boundary.
 
  With `record` or `tail_records`, a positive integer that bounds complete records instead: the response holds the longest run of whole records whose stored size (each message plus its LF) is at most `max_bytes`, and always at least one record when one exists, even if it alone is larger. It never ends inside a record.
 </ParamField>
@@ -67,7 +67,7 @@ api: "GET /{bucket}/{stream}"
     ```
  </Tab>
  <Tab title="SSE">
- `live=sse`. Opens a persistent Server-Sent Events connection. The server pushes data events as new entries are appended. Includes periodic heartbeat comments.
+ `live=sse`. Opens a persistent Server-Sent Events connection. The server pushes data events as new entries are appended. It sends no heartbeats, so a proxy with an idle timeout may close a quiet connection; reconnect from the last control event's `streamNextOffset`.
 
     ```bash
     curl 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
@@ -79,13 +79,17 @@ api: "GET /{bucket}/{stream}"
 
 | Status | Meaning |
 | ------ | ------------------------------------------------------------- |
-| `200` | Data returned (catch-up or long-poll with data). |
-| `204` | No new data at the requested offset (catch-up only). |
-| `400` | Invalid offset or live mode. |
+| `200` | Data returned. A catch-up read at the tail answers `200` with an empty body and `Stream-Up-To-Date: true`. |
+| `204` | Long-poll only: `timeout_ms` passed without new data, or the stream is closed and the read is at its tail (answered at once with `Stream-Closed: true`, which signals end of stream). |
+| `304` | `If-None-Match` matched the response's `ETag`. |
+| `307` | In a cluster, this node could not serve the read as the stream's group leader (a long-poll or SSE read on a follower, or a `consistency=leader` read on a node that lost leadership). `Location` is the same request on the leader. |
+| `400` | Invalid offset, live mode or `consistency`, or `consistency=leader` with `live`. |
 | `404` | Stream not found or expired. |
-| `410` | Requested offset has been trimmed (data no longer available). |
+| `410` | Requested offset has been trimmed. `Stream-Next-Offset` is the earliest offset still readable. |
+| `416` | Requested offset is beyond the stream's tail. `Stream-Next-Offset` is the tail. |
+| `503` | The group has no known leader, the leader could not confirm its leadership in time (`consistency=leader` and live reads), or this node holds too many live readers. Retry after `Retry-After`. |
 
-Response headers include `Stream-Next-Offset`, `Stream-Cursor`, `ETag`, `Stream-Up-To-Date`, `Stream-Closed`, and `Content-Type`.
+Response headers include `Stream-Next-Offset`, `ETag`, `Stream-Up-To-Date`, `Stream-Closed`, and `Content-Type`. Long-poll responses for an open stream also carry `Stream-Cursor`.
 
 Record-aware responses also advertise `json-record-coordinates-v1` in `Stream-Extensions` and include `Stream-Record-First`, `Stream-Record-Start`, and `Stream-Record-Next`. Continue with `record=<Stream-Record-Next>`. A record below `Stream-Record-First` returns `410`, and a record beyond the current tail returns `400`.
 
@@ -99,7 +103,6 @@ In SSE mode, the server sends:
 
 - **Data events** (`event: data`): stream payload in the `data` field. The response `Stream-Data-Content-Type` header identifies the data payload type (`application/x-ndjson` for JSON streams, the original content type for other streams). SSE `data:` lines are transport lines, not guaranteed message boundaries. JSON clients should buffer until newline before parsing records. For binary streams, data is base64-encoded (controlled by the `Stream-Sse-Data-Encoding` header).
 - **Control events** (`event: control`): JSON metadata including the current offset and stream state.
-- **Heartbeat comments**: periodic `:` lines to keep the connection alive through proxies.
 
 <RequestExample>
 ```bash Catch-up
@@ -118,8 +121,8 @@ curl 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
 curl -i 'http://127.0.0.1:4437/demo/hello?record=42&max_records=100'
 ```
 
-```bash Read complete JSON records, at most 16 MiB
-curl -i 'http://127.0.0.1:4437/demo/hello?record=42&max_bytes=16777216'
+```bash Read complete JSON records, at most 1 MiB
+curl -i 'http://127.0.0.1:4437/demo/hello?record=42&max_bytes=1048576'
 ```
 
 ```bash Read the latest JSON records with ordinals
