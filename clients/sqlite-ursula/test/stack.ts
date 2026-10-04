@@ -5,7 +5,6 @@
 // - E2E_NODES=3: three nodes (memory Raft WAL) behind an `ursula gateway`, with S3 (MinIO at
 //   URSULA_S3_ENDPOINT) as the cold store, raised to feature level 5 (snapshot bodies in the cold
 //   tier).
-// Process and S3 helpers trimmed from clients/pi-durable-ursula/test/stack.
 import { type ChildProcess, spawn } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import { createHash, createHmac } from "node:crypto";

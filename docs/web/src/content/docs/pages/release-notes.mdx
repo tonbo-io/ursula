@@ -36,7 +36,6 @@ Every `application/json` stream now follows [JSON message text](/docs/specs/exte
 
 - **Keyed streams.** Create a stream with `Content-Type: application/json; profile=keyed-batch-v1` to get writer-declared key-value batches (`keyed-batch-v1`), validated at append time with `422` for grammar errors, and the `GET {stream}/keyed-state` resource (`keyed-state-v1`) that serves the folded state with `Stream-Keyed-Through`, `Stream-Keyed-After` and `min_through_record` waits. Needs feature level 1. See [Keyed streams](/docs/concepts/keyed-streams).
 - **Keyed-state indexer.** `ursula indexer --keyed-source-url …` runs the projection engine, and nodes proxy to it through `server.keyed_state_upstream`. Bucket purge drains every indexer listed in `keyed_state.indexer_urls` and erases `.keyed/{bucket}/`; its response gains `keyed_drain_complete`, `keyed_drain_error`, `keyed_indexers_drained` and `keyed_prefix_absent`.
-- **Pi Durable.** `clients/pi-durable-ursula` implements Pi Durable's `Storage` on a keyed stream. See [Pi Durable on Ursula](/docs/examples/pi-durable).
 - **Byte-bounded record reads.** `max_bytes` now works with `record=` and `tail_records=`: it bounds complete records and may be combined with `max_records`. It used to be rejected with `400`.
 - **Bucket stream listing.** `GET /{bucket}/streams?prefix=&after=&limit=` lists a bucket's streams. See [List streams](/docs/api/list-streams).
 - **Feature levels.** `GET` and `POST /__ursula/feature-level` on the admin plane, and `ursulactl cluster feature-level` and `cluster enable-feature`.

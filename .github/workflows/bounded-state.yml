@@ -5,8 +5,8 @@ name: Bounded state
 #   counters, snapshot sizes and heap figures compared with
 #   crates/ursula-state-probe/ratchet.json, plus the §7.2 formula checks.
 # - nightly: full-scale W1 to W6 and L2 runs, JSONL published as artifacts.
-#   (Scheduled workflows run from the default branch once this file lands there;
-#   until then trigger it with workflow_dispatch.)
+# - write_ratchet (workflow_dispatch): runs the reduced-scale suite, rewrites ratchet.json from it
+#   instead of comparing, and uploads the new file as an artifact.
 
 on:
   pull_request:
@@ -25,6 +25,11 @@ on:
         options:
           - pr
           - nightly
+      write_ratchet:
+        description: "Rewrite ratchet.json from a reduced-scale run and upload it (ignores suite)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -39,8 +44,8 @@ env:
 jobs:
   state-growth:
     name: State growth ratchet
-    if: github.event_name == 'push' || github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.suite == 'pr')
-    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && (inputs.suite == 'pr' || inputs.write_ratchet))
+    runs-on: depot-ubuntu-24.04-8
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -53,6 +58,7 @@ jobs:
 
       # The record-index dense-oracle property at nightly depth (PRs run 16 cases).
       - name: Record index oracle (256 cases)
+        if: ${{ !inputs.write_ratchet }}
         env:
           URSULA_PROPTEST_CASES: "256"
         run: cargo test -p ursula-stream --lib sparse_index_matches_the_dense_oracle
@@ -61,27 +67,44 @@ jobs:
         run: cargo build -p ursula-state-probe --profile state-probe
 
       - name: Run reduced-scale suite against the ratchet
+        if: ${{ !inputs.write_ratchet }}
         run: |
-          ./target/state-probe/ursula-state-probe --quiet --out-dir target/state-probe \
+          ./target/state-probe/ursula-state-probe --quiet --out-dir target/state-probe-results \
             gate --suite pr --ratchet crates/ursula-state-probe/ratchet.json
+
+      - name: Rewrite the ratchet from the reduced-scale suite
+        if: ${{ inputs.write_ratchet }}
+        run: |
+          ./target/state-probe/ursula-state-probe --quiet --out-dir target/state-probe-results \
+            gate --suite pr --ratchet crates/ursula-state-probe/ratchet.json --write-ratchet
+          git diff -- crates/ursula-state-probe/ratchet.json
+
+      - name: Upload the rewritten ratchet
+        if: ${{ inputs.write_ratchet }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: ratchet-${{ github.sha }}
+          path: crates/ursula-state-probe/ratchet.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Summarize
         if: always()
-        run: python3 crates/ursula-state-probe/summarize.py target/state-probe || true
+        run: python3 crates/ursula-state-probe/summarize.py target/state-probe-results || true
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v6
         with:
           name: state-growth-${{ github.sha }}
-          path: target/state-probe
+          path: target/state-probe-results
           if-no-files-found: warn
           retention-days: 14
 
   nightly:
     name: Bounded state nightly
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.suite == 'nightly')
-    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.suite == 'nightly' && !inputs.write_ratchet)
+    runs-on: depot-ubuntu-24.04-8
     timeout-minutes: 240
     steps:
       - name: Checkout

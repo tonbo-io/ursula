@@ -1,4 +1,4 @@
-// A real Pi Harness with a faux model and an `echo` tool (copied from clients/pi-durable-ursula).
+// A real Pi Harness with a faux model and an `echo` tool.
 import { Type } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
