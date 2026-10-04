@@ -75,7 +75,8 @@ appended with the idempotent producer (`Producer-Id` per database, `Producer-Epo
    writing it (a connection that read before the WAL is deleted would recover the stale WAL and
    checkpoint it over the replayed pages at its close), and the file keeps its inode throughout
    (a discard truncates it, §6; a snapshot is written over it, §4.3), so a connection that opened
-   the path meanwhile waits on the lock and then reads the rewritten file. Within the process,
+   the path meanwhile gets SQLITE_BUSY until the lock drops (a busy timeout retries) and then reads
+   the rewritten file. Within the process,
    opens of the main db through the VFS fail with `SQLITE_BUSY` while attach runs. Then attach
    folds the local WAL into the db file itself (the frames SQLite's recovery would read, up to the
    last commit, a later frame winning, the file cut to that commit's size), fsyncs it, rewrites the
@@ -172,9 +173,10 @@ retained stream always holds a readable snapshot at or above its start.
 Attach installs a snapshot when the file is behind the latest one: it verifies the body (offset,
 size, checksum), locks other processes out of the file (§3), deletes its WAL, writes the image over
 the db file in place (same inode, cut to the image's size), then replays the tail. A crash midway
-leaves a mix of old pages and the image's, every one holding the state at the sidecar's offset or a
-later one: the next attach trusts the files if the sidecar claims no WAL frame and installs the
-snapshot again, and rebuilds otherwise (the claimed frames went with the WAL). A tail read that hits
+leaves a mix of old pages and the image's. Either way the next attach installs the snapshot again: if
+the sidecar claims no WAL frame, the old pages hold the state at its offset or a later one (the db
+file alone held it) and the files can be trusted; if it claims frames, those went with the deleted
+WAL (the old pages may predate the offset) and the files are rebuilt. A tail read that hits
 `410` (retention moved under a stale `HEAD`), or a snapshot superseded between `HEAD` and `GET` (a
 404, or a body cut short when its cold object is deleted after the grace), restarts attach from
 `HEAD`, up to ten times.

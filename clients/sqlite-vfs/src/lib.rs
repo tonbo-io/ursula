@@ -679,7 +679,8 @@ fn read_sidecar(path: &str) -> Result<Option<Sidecar>, String> {
 /// Empties a database's local files (a cache of the stream) so attach rebuilds them: never while
 /// another process has the file open, and never the host lock (held). The db file is truncated, not
 /// unlinked, and returned still locked (`lock_unused`) for the rebuild to write: a connection that
-/// opened the path meanwhile waits on the lock and then reads the rebuilt file, never a deleted
+/// opened the path meanwhile gets SQLITE_BUSY until the lock drops (a busy timeout retries) and
+/// then reads the rebuilt file, never a deleted
 /// inode. Every attach then removes `-journal`, and the fresh path `-wal` and `-shm`, and rewrites
 /// the sidecar: until then the sidecar marks whatever is left untrusted, so a crash midway discards
 /// again. A snapshot temp file an older version may have left is removed too.
@@ -717,7 +718,8 @@ fn abort_in_replay() -> Option<u64> {
 /// its close, silently rolling the file back. Meanwhile a connection's first read fails with
 /// SQLITE_BUSY. The file keeps its inode throughout (`discard_local` truncates, `install` writes
 /// in place), so a connection that opened the path meanwhile reads the rewritten file once the
-/// lock drops, not a deleted one whose checkpoint would land in the shared `-wal`/`-shm`.
+/// lock drops, not a deleted one, whose checkpoint would copy the shared `-wal`'s frames into the
+/// dead inode and mark them checkpointed in the shared `-shm`.
 ///
 /// The lock lives as long as `f` and any other descriptor of this process on the file: closing any
 /// of them drops it, so the caller keeps `f` open and opens no other one meanwhile. No connection
@@ -2179,7 +2181,7 @@ unsafe extern "C" fn x_open(
             return ffi::SQLITE_CANTOPEN;
         }
         // Counted before the open, so attach (which refuses while any is counted) and an open
-        // cannot pass each other; refused while attach rewrites the file (`Attaching`).
+        // cannot pass each other; refused while `attach` runs on the path (`Attaching`).
         let main = match name {
             Some(name) if flags & ffi::SQLITE_OPEN_MAIN_DB != 0 => {
                 let mut reg = registry();
