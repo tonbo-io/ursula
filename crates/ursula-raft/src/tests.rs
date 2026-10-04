@@ -36,6 +36,7 @@ use ursula_control::ControlCommand;
 use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::AppendTransactionRequest;
+use ursula_runtime::BootstrapStreamRequest;
 use ursula_runtime::CloseStreamRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
@@ -47,6 +48,7 @@ use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::ProducerRequest;
+use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::ReadStreamResponse;
 use ursula_runtime::RuntimeConfig;
@@ -1196,6 +1198,134 @@ async fn three_node_openraft_group_replicates_group_writes() {
     }
 
     shutdown_all(&engines).await;
+}
+
+/// D10: a leader cut off from the quorum keeps believing it leads, but it
+/// must not answer a `consistency=leader` read, HEAD, bootstrap, snapshot
+/// read or live-read registration from its own state: a new leader has
+/// acknowledged a write it never saw. Each answers a forward or a
+/// leader-unknown error (HTTP 307 or 503), never the stale view.
+#[tokio::test]
+async fn deposed_leader_refuses_linearizable_reads() {
+    let policy = InProcessRaftNetworkPolicy::default();
+    let (_registry, mut engines, old_leader) =
+        build_three_node_cluster("ursula-deposed-leader-read-test", Some(policy.clone())).await;
+    let old_index = usize::try_from(old_leader - 1).expect("leader id fits usize");
+    let stream_id = bsid("deposed-leader-read");
+    create_stream_via_raft(&engines[old_index], stream_id.clone()).await;
+    engines[old_index]
+        .raft
+        .client_write(append_command(stream_id.clone(), b"before"))
+        .await
+        .expect("append before the partition");
+    let leader_read = ReadStreamRequest {
+        leader_only: true,
+        ..read_req(stream_id.clone(), 64)
+    };
+    let healthy = engines[old_index]
+        .read_stream(leader_read.clone(), placement())
+        .await
+        .expect("linearizable read on a healthy leader");
+    assert_eq!(healthy.payload, b"before");
+
+    for node_id in (1..=3).filter(|node_id| *node_id != old_leader) {
+        policy.partition_bidirectional(old_leader, node_id);
+    }
+    let survivor_index = usize::from(old_index == 0);
+    let new_leader = engines[survivor_index]
+        .raft
+        .wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| {
+                metrics
+                    .current_leader
+                    .is_some_and(|leader| leader != old_leader)
+            },
+            "majority elects a new leader",
+        )
+        .await
+        .expect("wait for a new leader")
+        .current_leader
+        .expect("new leader id");
+    let new_index = usize::try_from(new_leader - 1).expect("leader id fits usize");
+    let acked = engines[new_index]
+        .raft
+        .client_write(append_command(stream_id.clone(), b"after"))
+        .await
+        .expect("append acknowledged by the new leader");
+    match write_result_from_raft_response(acked.data).expect("decode append response") {
+        Ok(GroupWriteResponse::Append(response)) => assert_eq!(response.next_offset, 11),
+        other => panic!("unexpected append response: {other:?}"),
+    }
+    assert!(
+        engines[old_index].raft.is_leader(),
+        "the cut-off leader still believes it leads, so only the read barrier stops it"
+    );
+
+    let old = &mut engines[old_index];
+    assert_refused(
+        "consistency=leader read",
+        old.read_stream(leader_read, placement()).await,
+    );
+    assert_refused(
+        "HEAD",
+        old.head_stream(
+            HeadStreamRequest {
+                stream_id: stream_id.clone(),
+                now_ms: 0,
+            },
+            placement(),
+        )
+        .await,
+    );
+    assert_refused(
+        "bootstrap",
+        old.bootstrap_stream(
+            BootstrapStreamRequest {
+                stream_id: stream_id.clone(),
+                now_ms: 0,
+            },
+            placement(),
+        )
+        .await,
+    );
+    assert_refused(
+        "snapshot read",
+        old.read_snapshot(
+            ReadSnapshotRequest {
+                stream_id: stream_id.clone(),
+                snapshot_offset: None,
+                now_ms: 0,
+            },
+            placement(),
+        )
+        .await,
+    );
+    assert_refused(
+        "live-read registration",
+        old.require_local_live_read_owner(placement()).await,
+    );
+
+    shutdown_all(&engines).await;
+}
+
+#[track_caller]
+fn assert_refused<T>(what: &str, result: Result<T, GroupEngineError>) {
+    match result {
+        Ok(_) => panic!("{what}: the deposed leader served its stale view"),
+        Err(err) => {
+            assert!(
+                err.leader_hint().is_some(),
+                "{what}: expected a forward or leader-unknown error, got {err:?}"
+            );
+            // openraft's quorum error lists every member's address; the client
+            // sees a fixed message instead.
+            assert!(
+                !err.to_string().contains("node-"),
+                "{what}: refusal leaks member addresses: {err}"
+            );
+        }
+    }
 }
 
 // NOTE: tokio-level fault-injection tests for partition/heal replication and
@@ -2705,8 +2835,10 @@ async fn openraft_snapshot_carries_feature_level() {
 /// F1 follow-up: a forwarded read carries the continuation anchor to the
 /// leader over gRPC, so a follower's SSE or record read continues from it;
 /// a request from an older follower (no field) decodes with no anchor.
+/// `leader_only` (field 6) travels too, so the leader linearizes a forwarded
+/// `consistency=leader` read.
 #[test]
-fn forwarded_reads_carry_the_record_anchor_over_grpc() {
+fn forwarded_reads_carry_the_record_anchor_and_leader_only_over_grpc() {
     use prost::Message;
 
     let request = ursula_runtime::ReadStreamRequest {
@@ -2716,7 +2848,7 @@ fn forwarded_reads_carry_the_record_anchor_over_grpc() {
         now_ms: 77,
         record: Some(1_234),
         max_records: Some(5),
-        leader_only: false,
+        leader_only: true,
         record_anchor: Some(ursula_runtime::RecordAnchor {
             incarnation: 42,
             record: 1_234,
@@ -2738,6 +2870,7 @@ fn forwarded_reads_carry_the_record_anchor_over_grpc() {
         record: Some(1_234),
         max_records: Some(5),
         record_anchor: None,
+        leader_only: false,
     }
     .encode_to_vec();
     let decoded =

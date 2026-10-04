@@ -175,6 +175,13 @@ macro_rules! runtime_operations {
                 handle { call require_live_read_owner(engine, placement) }
                 client { none }
             }
+            op AcceptsLocalWrites {
+                fields {}
+                reply { response_tx: bool }
+                guard { none }
+                handle { call accepts_local_writes(engine) }
+                client { none }
+            }
             op CloseStream {
                 fields { request: CloseStreamRequest }
                 reply { response_tx: CloseStreamResponse }

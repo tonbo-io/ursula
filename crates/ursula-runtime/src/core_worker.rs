@@ -787,6 +787,14 @@ impl CoreWorker {
             .map_err(|err| RuntimeError::group_engine(placement, err))
     }
 
+    /// Plain leadership check with no quorum round trip, for background
+    /// leader-side work (cold compaction) that does not serve a client read.
+    pub(crate) async fn accepts_local_writes(
+        group: &mut Box<dyn GroupEngine>,
+    ) -> Result<bool, RuntimeError> {
+        Ok(group.accepts_local_writes())
+    }
+
     pub(crate) fn cancel_read_watcher(
         read_watchers: &mut ReadWatchers,
         metrics: Arc<RuntimeMetricsInner>,

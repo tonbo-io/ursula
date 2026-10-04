@@ -294,6 +294,10 @@ fn generate_leader_failover(seed: u64) -> SimSchedule {
     SimSchedule::for_scenario(seed, SimScenario::LeaderFailover)
 }
 
+fn generate_leader_read_linearizability(seed: u64) -> SimSchedule {
+    SimSchedule::for_scenario(seed, SimScenario::LeaderReadLinearizability)
+}
+
 /// A named contiguous seed range bound to one schedule generator.
 struct SeedFamily {
     name: &'static str,
@@ -308,6 +312,20 @@ struct SeedFamily {
 /// NOTE: `scripts/dst/audits.py` parses this table (the `name`, `start`, and
 /// `end` fields) for the seed-inventory audit; keep the field layout intact.
 const SEED_FAMILIES: &[SeedFamily] = &[
+    SeedFamily {
+        name: "leader-read-linearizability",
+        start: 360,
+        end: 364,
+        kind: "leader-read-linearizability",
+        generate: generate_leader_read_linearizability,
+    },
+    SeedFamily {
+        name: "leader-read-linearizability-extended",
+        start: 700,
+        end: 799,
+        kind: "leader-read-linearizability",
+        generate: generate_leader_read_linearizability,
+    },
     SeedFamily {
         name: "runtime-interleaving",
         start: 72,

@@ -617,6 +617,12 @@ pub enum SimEvent {
         current_leader_id: u64,
         flushed_count: usize,
     },
+    LeaderReadObserved {
+        phase: String,
+        probe: String,
+        status: u16,
+        next_offset: Option<u64>,
+    },
     InvariantFailed {
         invariant: String,
         after_event: String,

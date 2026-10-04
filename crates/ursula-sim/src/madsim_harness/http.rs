@@ -54,7 +54,7 @@ fn http_surface_app(
 ///
 /// The status and header expectations stay at the call site; this only folds
 /// the `HttpRequest::builder()` / `oneshot` / double-`expect` plumbing.
-async fn send(
+pub(super) async fn send(
     app: &Router,
     method: &str,
     uri: &str,
@@ -82,7 +82,7 @@ fn header_str<'a>(response: &'a Response, name: &str) -> &'a str {
         .expect("header value is valid utf-8")
 }
 
-async fn body_bytes(response: Response) -> Bytes {
+pub(super) async fn body_bytes(response: Response) -> Bytes {
     to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body")

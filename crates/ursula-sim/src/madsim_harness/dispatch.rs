@@ -36,6 +36,7 @@ use super::has_stop_current_leader_in_fault_plan;
 use super::has_stop_seeded_follower_in_fault_plan;
 use super::has_verify_runtime_cold_live_reads_in_fault_plan;
 use super::http_protocol_surface_plan_from_fault_plan;
+use super::leader_reads::run_leader_read_linearizability_inner;
 use super::run_cold_delete_fault_inner;
 use super::run_cold_live_read_inner;
 use super::run_cold_read_delay_inner;
@@ -246,7 +247,18 @@ impl ThreeNodeRaftSim {
             SimScenario::RuntimeRaftSnapshotInstall => {
                 Self::run_runtime_raft_snapshot_install_report(config)
             }
+            SimScenario::LeaderReadLinearizability => {
+                Self::run_leader_read_linearizability_report(config)
+            }
         }
+    }
+
+    pub fn run_leader_read_linearizability_report(config: ThreeNodeRaftSimConfig) -> SimReport {
+        report_of(
+            SimScenario::LeaderReadLinearizability,
+            config.seed,
+            run_leader_read_linearizability_inner(config),
+        )
     }
 
     pub fn run_partition_heal_report(config: ThreeNodeRaftSimConfig) -> SimReport {

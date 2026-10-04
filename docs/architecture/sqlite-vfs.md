@@ -103,7 +103,10 @@ replaying from an older offset than the file reflects is idempotent.
 Producer expiry: the server forgets a producer idle for 7 days. The owner's next append gets 409
 expecting seq 0; it takes the stream back only if the stream still ends at its own offset and its
 new claim (epoch + 1) lands exactly there, else it is fenced. Reads in recovery use
-`consistency=leader` (a follower may lag an acknowledged append).
+`consistency=leader` (a follower may lag an acknowledged append). Catch-up reads, `HEAD` and
+snapshot `GET`s retry `429` and `503` (a leader that could not confirm its leadership in time)
+like appends: no sooner than `Retry-After`, with backoff, within `URSULA_VFS_RETRY_MS`; the
+snapshot thread's retries also end at its stop flag.
 
 ## 4. Snapshots and retention (M3)
 
