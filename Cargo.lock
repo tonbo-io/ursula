@@ -4358,6 +4358,7 @@ dependencies = [
 name = "ursula"
 version = "0.5.1"
 dependencies = [
+ "anyhow",
  "axum 0.8.9",
  "base64 0.22.1",
  "blake3",

@@ -11,28 +11,37 @@ use crate::IndexError;
 use crate::IndexStatus;
 use crate::QueryCursor;
 use crate::QueryResult;
-use crate::SourceEnvelope;
 use crate::cache::EventIndexCache;
 use crate::cache::IndexCaches;
 use crate::cache::VerifiedParquetReader;
 use crate::manifest;
-use crate::manifest::CompletedRecordRange;
+use crate::manifest::CLAIM_KEY;
 use crate::manifest::GarbageCollectionReport;
 use crate::manifest::Manifest;
+use crate::manifest::ManifestBinding;
 use crate::manifest::ManifestIdentity;
 use crate::manifest::PartMeta;
 use crate::manifest::PublishedManifest;
-use crate::manifest::RecordSegmentLease;
+use crate::manifest::SegmentLease;
 use crate::object_store::ConditionalWrite;
 use crate::object_store::ObjectInfo;
 use crate::object_store::ObjectStore;
 use crate::object_store::digest;
 use crate::part;
+use crate::part::PartFilter;
+use crate::store::Coverage;
+use crate::store::IndexBase;
+use crate::store::MatchMode;
+use crate::store::QueryRequest;
+use crate::store::Segment;
+use crate::store::SkipCounts;
+use crate::store::SkipKind;
+use crate::store::SourceBinding;
 
 const MAX_PUBLISH_ATTEMPTS: usize = 8;
 const EVENT_TIME_PARTITION_MS: i64 = 24 * 60 * 60 * 1_000;
 
-/// S3-authoritative event-time index over one JSON record stream.
+/// S3-authoritative event-time index over one source stream.
 ///
 /// S3 (or the filesystem development backend) holds the only durable state;
 /// the local cache is disposable. Concurrent instances coordinate through
@@ -42,146 +51,135 @@ pub struct EventIndex {
     store: ObjectStore,
     cache: IndexCaches,
     config: EventIndexConfig,
+    binding: ManifestBinding,
     published: PublishedManifest,
-    active: Vec<EventEntry>,
 }
 
 impl EventIndex {
-    /// Open an index whose base is source record zero.
+    /// Open the index in `store`, creating it at `base` if the namespace is
+    /// empty. An existing index keeps its own base.
     pub async fn open(
         store: impl Into<ObjectStore>,
         cache: EventIndexCache,
         config: EventIndexConfig,
-    ) -> Result<Self, IndexError> {
-        Self::open_from_record(store, cache, config, 0).await
-    }
-
-    /// Open an index over a retained stream whose oldest readable source
-    /// record is `indexed_from_record`.
-    pub async fn open_from_record(
-        store: impl Into<ObjectStore>,
-        cache: EventIndexCache,
-        config: EventIndexConfig,
-        indexed_from_record: u64,
+        base: IndexBase,
     ) -> Result<Self, IndexError> {
         let store = store.into();
         validate_config(&config)?;
-        manifest::initialize(&store, &config.source_id, indexed_from_record).await?;
-        let published = manifest::load_published(&store, &config.source_id).await?;
-        if published.manifest.indexed_from_record != indexed_from_record {
-            return Err(IndexError::IndexBaseMismatch {
-                stored: published.manifest.indexed_from_record,
-                configured: indexed_from_record,
-            });
-        }
+        let binding = ManifestBinding {
+            stream_url: config.source_url.clone(),
+            extractor_digest: config.extractor.digest().to_owned(),
+        };
+        manifest::initialize(&store, &binding, &base).await?;
+        let published = manifest::load_published(&store, &binding).await?;
         Ok(Self {
             store,
             cache: cache.0,
             config,
+            binding,
             published,
-            active: Vec::new(),
         })
+    }
+
+    pub fn config(&self) -> &EventIndexConfig {
+        &self.config
     }
 
     pub fn status(&self) -> &IndexStatus {
         &self.published.manifest.status
     }
 
-    pub fn durable_through_record(&self) -> u64 {
-        self.published.manifest.durable_through_record
+    pub fn source(&self) -> &SourceBinding {
+        &self.published.manifest.source
     }
 
-    pub fn indexed_from_record(&self) -> u64 {
-        self.published.manifest.indexed_from_record
+    pub fn indexed_from_offset(&self) -> u64 {
+        self.published.manifest.indexed_from_offset
     }
 
-    pub fn indexed_through_record(&self) -> u64 {
-        self.active
-            .last()
-            .map_or(self.published.manifest.durable_through_record, |entry| {
-                entry.record.saturating_add(1)
-            })
+    pub fn floor_offset(&self) -> u64 {
+        self.published.manifest.floor_offset
+    }
+
+    pub fn durable_offset(&self) -> u64 {
+        self.published.manifest.durable_offset
+    }
+
+    /// A restart point that may not be a message boundary.
+    pub fn resync_offset(&self) -> Option<u64> {
+        self.published.manifest.resync_offset
+    }
+
+    pub fn trimmed_bytes(&self) -> u64 {
+        self.published.manifest.trimmed_bytes
+    }
+
+    pub fn skipped(&self) -> SkipCounts {
+        self.published.manifest.skipped
     }
 
     pub fn part_count(&self) -> usize {
         self.published.manifest.parts.len()
     }
 
-    pub fn completed_record_ranges(&self) -> &[CompletedRecordRange] {
-        &self.published.manifest.completed_record_ranges
+    pub fn coverage(&self) -> Coverage {
+        let manifest = &self.published.manifest;
+        Coverage {
+            from: manifest.indexed_from_offset,
+            floor: manifest.floor_offset,
+            through: manifest.durable_offset,
+            durable: manifest.durable_offset,
+            complete: manifest.trimmed_bytes == 0,
+            trimmed_bytes: manifest.trimmed_bytes,
+        }
     }
 
-    /// Claim the oldest currently-uncovered source range. Claims coordinate
-    /// work but are not a correctness boundary: duplicate processing remains
-    /// safe because segment publication is immutable and manifest-CAS guarded.
-    pub async fn claim_next_segment(
+    /// Take the stream's single claim, which starts at the first uncovered
+    /// offset and stays open until it commits. Returns `None` when there is
+    /// nothing to index yet (or only a partial tail and `allow_partial` is
+    /// off) or another worker holds a live claim.
+    pub async fn claim_segment(
         &mut self,
-        tail_record: u64,
-        segment_records: u64,
+        tail: u64,
+        segment_bytes: u64,
         allow_partial: bool,
         worker_id: &str,
         now_ms: u64,
         lease_ms: u64,
-    ) -> Result<Option<RecordSegmentLease>, IndexError> {
-        if segment_records == 0 || lease_ms == 0 || worker_id.is_empty() {
+    ) -> Result<Option<SegmentLease>, IndexError> {
+        if segment_bytes == 0 || lease_ms == 0 || worker_id.is_empty() {
             return Err(IndexError::InvalidConfig(
-                "segment records, lease duration, and worker id must be non-empty",
+                "segment bytes, lease duration, and worker id must be non-empty",
             ));
         }
         for _attempt in 0..MAX_PUBLISH_ATTEMPTS {
             self.refresh().await?;
             ensure_ready(&self.published.manifest.status)?;
-            let mut covered = self.published.manifest.completed_record_ranges.clone();
-            for (_key, claim) in self.load_claims().await? {
-                if claim.expires_at_ms > now_ms {
-                    covered.push(CompletedRecordRange {
-                        start_record: claim.start_record,
-                        end_record: claim.end_record,
-                    });
-                }
-            }
-            manifest::normalize_completed_ranges(&mut covered);
-            let start_record = manifest::first_uncovered_record(
-                &covered,
-                self.published.manifest.indexed_from_record,
-                tail_record,
-            );
-            if start_record >= tail_record {
+            let start_offset = self.published.manifest.durable_offset;
+            if tail <= start_offset
+                || (!allow_partial && tail.saturating_sub(start_offset) < segment_bytes)
+            {
                 return Ok(None);
             }
-            let next_covered_record = covered
-                .iter()
-                .find(|range| range.start_record > start_record)
-                .map_or(tail_record, |range| range.start_record);
-            let end_record = start_record
-                .saturating_add(segment_records)
-                .min(tail_record)
-                .min(next_covered_record);
-            if !allow_partial && end_record.saturating_sub(start_record) < segment_records {
-                return Ok(None);
-            }
-            let key = format!("claims/{start_record:020}.json");
-            let claim = RecordSegmentLease {
-                start_record,
-                end_record,
+            let claim = SegmentLease {
+                start_offset,
                 worker_id: worker_id.to_owned(),
                 expires_at_ms: now_ms.saturating_add(lease_ms),
-                key: key.clone(),
             };
             let bytes = serde_json::to_vec(&claim)?;
-            match self.store.put_if_absent(&key, &bytes).await? {
+            match self.store.put_if_absent(CLAIM_KEY, &bytes).await? {
                 ConditionalWrite::Written => return Ok(Some(claim)),
                 ConditionalWrite::Conflict => {
-                    let Some(stored) = self.store.get(&key).await? else {
+                    let Some(stored) = self.store.get(CLAIM_KEY).await? else {
                         continue;
                     };
-                    let existing: RecordSegmentLease = serde_json::from_slice(&stored.bytes)?;
-                    if existing.expires_at_ms > now_ms {
-                        continue;
+                    let existing: SegmentLease = serde_json::from_slice(&stored.bytes)?;
+                    if existing.expires_at_ms > now_ms && existing.worker_id != worker_id {
+                        return Ok(None);
                     }
                     match self
                         .store
-                        .compare_and_swap(&key, &stored.etag, &bytes)
+                        .compare_and_swap(CLAIM_KEY, &stored.etag, &bytes)
                         .await?
                     {
                         ConditionalWrite::Written => return Ok(Some(claim)),
@@ -193,21 +191,176 @@ impl EventIndex {
         Err(IndexError::PublishConflict)
     }
 
+    /// Delete the claim if it is still `claim`; a claim another worker took
+    /// over after expiry is left alone.
+    pub async fn release_claim(&self, claim: &SegmentLease) -> Result<(), IndexError> {
+        let Some(stored) = self.store.get(CLAIM_KEY).await? else {
+            return Ok(());
+        };
+        let existing: SegmentLease = serde_json::from_slice(&stored.bytes)?;
+        if &existing == claim {
+            self.store.delete(CLAIM_KEY).await?;
+        }
+        Ok(())
+    }
+
     pub async fn finish_segment(
         &mut self,
-        claim: &RecordSegmentLease,
-        envelopes: Vec<SourceEnvelope>,
+        claim: &SegmentLease,
+        segment: Segment,
     ) -> Result<(), IndexError> {
-        let maximum_len = claim.end_record.saturating_sub(claim.start_record);
-        let actual_len = u64::try_from(envelopes.len())
-            .map_err(|_error| IndexError::InvalidConfig("record segment is too large"))?;
-        if actual_len == 0 || actual_len > maximum_len {
+        if segment.start != claim.start_offset {
             return Err(IndexError::InvalidSourceResponse(
-                "source returned an invalid claimed record segment length",
+                "segment does not start at its claim",
             ));
         }
-        self.commit_envelopes(claim.start_record, envelopes).await?;
-        self.store.delete(&claim.key).await
+        self.commit_segment(segment).await?;
+        self.release_claim(claim).await
+    }
+
+    /// Publish one segment idempotently. Bytes another worker already
+    /// covered must have produced exactly the same entries; only the
+    /// uncovered suffix adds entries, skip counts and trimmed bytes. A
+    /// segment that starts below the floor is stale and dropped: the next
+    /// claim starts at the floor.
+    pub async fn commit_segment(&mut self, segment: Segment) -> Result<(), IndexError> {
+        validate_segment(&segment)?;
+        if segment.end == segment.start {
+            return Ok(());
+        }
+        for _attempt in 0..MAX_PUBLISH_ATTEMPTS {
+            self.refresh().await?;
+            ensure_ready(&self.published.manifest.status)?;
+            let floor = self.published.manifest.floor_offset;
+            let durable = self.published.manifest.durable_offset;
+            if segment.start < floor {
+                return Ok(());
+            }
+            if segment.start > durable {
+                return Err(IndexError::InvalidSourceResponse(
+                    "segment starts beyond the durable offset",
+                ));
+            }
+            let covered_end = durable.min(segment.end);
+            if covered_end > segment.start {
+                if !segment.is_boundary(covered_end) {
+                    return Err(IndexError::RecordConflict {
+                        offset: covered_end,
+                    });
+                }
+                self.verify_committed(&segment, covered_end).await?;
+            }
+            if covered_end >= segment.end {
+                return Ok(());
+            }
+            let entries = segment
+                .entries
+                .iter()
+                .copied()
+                .filter(|entry| entry.offset >= covered_end)
+                .collect::<Vec<_>>();
+            let mut skipped = SkipCounts::default();
+            let mut trimmed = 0_u64;
+            for skip in segment
+                .skips
+                .iter()
+                .filter(|skip| skip.offset >= covered_end)
+            {
+                if skip.kind == SkipKind::Trimmed {
+                    trimmed = trimmed.saturating_add(skip.len);
+                } else {
+                    skipped.add(skip.kind);
+                }
+            }
+            let parts = self.upload_day_partitions(&entries).await?;
+            let mut next = self.draft_manifest();
+            next.durable_offset = segment.end;
+            next.skipped.merge(skipped);
+            next.trimmed_bytes = next.trimmed_bytes.saturating_add(trimmed);
+            if next
+                .resync_offset
+                .is_some_and(|offset| offset < next.durable_offset)
+            {
+                next.resync_offset = None;
+            }
+            next.parts.extend(parts);
+            if self.publish(next).await? {
+                return Ok(());
+            }
+        }
+        Err(IndexError::PublishConflict)
+    }
+
+    /// Require the committed entries in `[segment.start, covered_end)` to
+    /// equal this segment's entries there exactly.
+    async fn verify_committed(
+        &self,
+        segment: &Segment,
+        covered_end: u64,
+    ) -> Result<(), IndexError> {
+        let in_range =
+            |entry: &EventEntry| entry.offset >= segment.start && entry.offset < covered_end;
+        let mut mine = segment
+            .entries
+            .iter()
+            .copied()
+            .filter(in_range)
+            .collect::<Vec<_>>();
+        let mut committed = Vec::new();
+        for meta in self
+            .published
+            .manifest
+            .parts
+            .iter()
+            .filter(|meta| meta.overlaps_offsets(segment.start, covered_end))
+        {
+            let path = self.cache.parts().materialize(&self.store, meta).await?;
+            committed.extend(part::read_all(&path)?.into_iter().filter(in_range));
+        }
+        mine.sort_unstable_by_key(|entry| entry.offset);
+        committed.sort_unstable_by_key(|entry| entry.offset);
+        committed.dedup();
+        if mine == committed {
+            return Ok(());
+        }
+        let offset = mine
+            .iter()
+            .zip(&committed)
+            .find(|(left, right)| left != right)
+            .map(|(left, right)| left.offset.min(right.offset))
+            .or_else(|| {
+                mine.get(committed.len())
+                    .or_else(|| committed.get(mine.len()))
+                    .map(|entry| entry.offset)
+            })
+            .unwrap_or(segment.start);
+        Err(IndexError::RecordConflict { offset })
+    }
+
+    /// Follow the source's retained offset. Entries before the floor are no
+    /// longer returned. If retention passed bytes that were never indexed,
+    /// they are counted as trimmed and indexing restarts at `retained`,
+    /// which may not be a message boundary.
+    pub async fn advance_floor(&mut self, retained: u64) -> Result<(), IndexError> {
+        for _attempt in 0..MAX_PUBLISH_ATTEMPTS {
+            self.refresh().await?;
+            if retained <= self.published.manifest.floor_offset {
+                return Ok(());
+            }
+            let mut next = self.draft_manifest();
+            next.floor_offset = retained;
+            if retained > next.durable_offset {
+                next.trimmed_bytes = next
+                    .trimmed_bytes
+                    .saturating_add(retained.saturating_sub(next.durable_offset));
+                next.durable_offset = retained;
+                next.resync_offset = Some(retained);
+            }
+            if self.publish(next).await? {
+                return Ok(());
+            }
+        }
+        Err(IndexError::PublishConflict)
     }
 
     pub fn needs_partition_compaction(&self, fan_in: usize, max_entries: u64) -> bool {
@@ -217,152 +370,11 @@ impl EventIndex {
     }
 
     pub async fn refresh(&mut self) -> Result<(), IndexError> {
-        let latest = manifest::load_published(&self.store, &self.config.source_id).await?;
+        let latest = manifest::load_published(&self.store, &self.binding).await?;
         if latest.pointer_etag != self.published.pointer_etag {
             self.published = latest;
-            self.reconcile_active().await?;
         }
         Ok(())
-    }
-
-    async fn reconcile_active(&mut self) -> Result<(), IndexError> {
-        let checkpoint = self.published.manifest.durable_through_record;
-        if self
-            .active
-            .first()
-            .is_none_or(|entry| entry.record >= checkpoint)
-        {
-            return Ok(());
-        }
-        let first_record = self.active.first().map_or(checkpoint, |entry| entry.record);
-        let committed = self
-            .committed_entries_between(first_record, checkpoint.saturating_sub(1))
-            .await?;
-        for active in self.active.iter().filter(|entry| entry.record < checkpoint) {
-            let matches = committed.iter().any(|committed| committed == active);
-            if !matches {
-                return Err(IndexError::RecordConflict {
-                    record: active.record,
-                });
-            }
-        }
-        self.active.retain(|entry| entry.record >= checkpoint);
-        Ok(())
-    }
-
-    pub async fn ingest_envelope(&mut self, envelope: SourceEnvelope) -> Result<(), IndexError> {
-        let entry = self.envelope_entry(&envelope)?;
-        self.ingest(entry).await
-    }
-
-    pub async fn ingest(&mut self, entry: EventEntry) -> Result<(), IndexError> {
-        let expected = self.indexed_through_record();
-        if entry.record != expected {
-            return Err(IndexError::UnexpectedRecord {
-                expected,
-                actual: entry.record,
-            });
-        }
-        ensure_ready(&self.published.manifest.status)?;
-        self.active.push(entry);
-        if self.active.len() >= self.config.flush_entries {
-            self.flush().await?;
-        }
-        Ok(())
-    }
-
-    pub async fn flush(&mut self) -> Result<(), IndexError> {
-        if self.active.is_empty() {
-            return Ok(());
-        }
-        let entries = self.active.clone();
-        self.publish_entries(&entries).await?;
-        self.active.clear();
-        Ok(())
-    }
-
-    /// Publish one independently processed source-record segment. Segments may
-    /// complete out of order; the durable watermark advances only across a
-    /// gap-free prefix starting at record zero.
-    pub async fn commit_envelopes(
-        &mut self,
-        start_record: u64,
-        envelopes: Vec<SourceEnvelope>,
-    ) -> Result<(), IndexError> {
-        if start_record < self.published.manifest.indexed_from_record {
-            return Err(IndexError::InvalidSourceResponse(
-                "record segment starts before the index base",
-            ));
-        }
-        if envelopes.is_empty() {
-            return Err(IndexError::InvalidSourceResponse(
-                "record segment must not be empty",
-            ));
-        }
-        let mut entries = Vec::with_capacity(envelopes.len());
-        for (index, envelope) in envelopes.into_iter().enumerate() {
-            let relative = u64::try_from(index)
-                .map_err(|_error| IndexError::InvalidConfig("record segment is too large"))?;
-            let expected = start_record
-                .checked_add(relative)
-                .ok_or(IndexError::InvalidConfig("record segment end overflowed"))?;
-            if envelope.record != expected {
-                return Err(IndexError::UnexpectedRecord {
-                    expected,
-                    actual: envelope.record,
-                });
-            }
-            entries.push(self.envelope_entry(&envelope)?);
-        }
-        self.publish_entries(&entries).await
-    }
-
-    /// Publish entries idempotently: already-covered records are verified
-    /// against their committed values, the rest are uploaded and added to the
-    /// manifest under conditional-publish retry.
-    async fn publish_entries(&mut self, entries: &[EventEntry]) -> Result<(), IndexError> {
-        for _attempt in 0..MAX_PUBLISH_ATTEMPTS {
-            self.refresh().await?;
-            ensure_ready(&self.published.manifest.status)?;
-            let (committed, uncovered): (Vec<_>, Vec<_>) =
-                entries.iter().copied().partition(|entry| {
-                    manifest::record_is_covered(
-                        &self.published.manifest.completed_record_ranges,
-                        entry.record,
-                    )
-                });
-            self.verify_committed_entries(&committed).await?;
-            if uncovered.is_empty() {
-                return Ok(());
-            }
-            let new_ranges = manifest::completed_ranges_for_entries(&uncovered)?;
-            let uploaded_parts = self.upload_day_partitions(&uncovered).await?;
-            let mut next = self.draft_manifest();
-            next.completed_record_ranges.extend(new_ranges);
-            manifest::normalize_completed_ranges(&mut next.completed_record_ranges);
-            next.durable_through_record = manifest::contiguous_watermark(
-                &next.completed_record_ranges,
-                next.indexed_from_record,
-            );
-            next.parts.extend(uploaded_parts);
-            if self.publish(next).await? {
-                return Ok(());
-            }
-        }
-        Err(IndexError::PublishConflict)
-    }
-
-    fn envelope_entry(&self, envelope: &SourceEnvelope) -> Result<EventEntry, IndexError> {
-        let captured_at_ms =
-            crate::store::record_timestamp(&envelope.value, &self.config.timestamp_field)
-                .ok_or_else(|| IndexError::InvalidTimestamp {
-                    record: envelope.record,
-                    field: self.config.timestamp_field.clone(),
-                })?;
-        Ok(EventEntry {
-            captured_at_ms,
-            record: envelope.record,
-        })
     }
 
     /// Clone the published manifest as the base of the next generation.
@@ -381,7 +393,7 @@ impl EventIndex {
         let mut partitions = BTreeMap::<i64, Vec<EventEntry>>::new();
         for entry in entries.iter().copied() {
             partitions
-                .entry(event_time_partition(entry.captured_at_ms))
+                .entry(event_time_partition(entry.t_ms))
                 .or_default()
                 .push(entry);
         }
@@ -396,86 +408,21 @@ impl EventIndex {
         Ok(metas)
     }
 
-    /// Materialize every published part overlapping the inclusive record range
-    /// and return its entries.
-    async fn committed_entries_between(
-        &self,
-        min_record: u64,
-        max_record: u64,
-    ) -> Result<Vec<EventEntry>, IndexError> {
-        let mut committed = Vec::new();
-        for meta in self
-            .published
-            .manifest
-            .parts
-            .iter()
-            .filter(|meta| meta.max_record >= min_record && meta.min_record <= max_record)
-        {
-            let path = self.cache.parts().materialize(&self.store, meta).await?;
-            committed.extend(part::read_all(&path)?);
-        }
-        Ok(committed)
-    }
-
-    async fn verify_committed_entries(&self, expected: &[EventEntry]) -> Result<(), IndexError> {
-        let (Some(first), Some(last)) = (expected.first(), expected.last()) else {
-            return Ok(());
-        };
-        let committed = self
-            .committed_entries_between(first.record, last.record)
-            .await?;
-        for entry in expected {
-            if !committed.iter().any(|candidate| candidate == entry) {
-                return Err(IndexError::RecordConflict {
-                    record: entry.record,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn mark_retention_gap(
-        &mut self,
-        first_available_record: u64,
-    ) -> Result<(), IndexError> {
-        self.flush().await?;
-        let expected_record = self.indexed_through_record();
-        if first_available_record <= expected_record {
-            return Err(IndexError::InvalidSourceResponse(
-                "retention gap does not advance beyond expected record",
-            ));
-        }
-        self.publish_status(IndexStatus::RetentionGap {
-            expected_record,
-            first_available_record,
-        })
-        .await?;
-        Err(IndexError::RetentionGap {
-            expected_record,
-            first_available_record,
-        })
-    }
-
-    pub async fn mark_blocked(&mut self, record: u64, reason: String) -> Result<(), IndexError> {
-        self.flush().await?;
-        if record != self.indexed_through_record() {
-            return Err(IndexError::UnexpectedRecord {
-                expected: self.indexed_through_record(),
-                actual: record,
-            });
-        }
-        self.publish_status(IndexStatus::Blocked { record, reason })
-            .await
-    }
-
-    pub async fn mark_segment_blocked(
-        &mut self,
-        record: u64,
-        reason: String,
-    ) -> Result<(), IndexError> {
+    pub async fn mark_blocked(&mut self, offset: u64, reason: String) -> Result<(), IndexError> {
         self.refresh().await?;
-        self.publish_status(IndexStatus::Blocked { record, reason })
+        self.publish_status(IndexStatus::Blocked { offset, reason })
             .await
+    }
+
+    /// Record that the source answered 404 (`gone`) or answers again.
+    pub async fn set_source_gone(&mut self, gone: bool) -> Result<(), IndexError> {
+        self.refresh().await?;
+        let status = match (&self.published.manifest.status, gone) {
+            (IndexStatus::Ready, true) => IndexStatus::SourceGone,
+            (IndexStatus::SourceGone, false) => IndexStatus::Ready,
+            _ => return Ok(()),
+        };
+        self.publish_status(status).await
     }
 
     pub async fn clear_blocked(&mut self) -> Result<(), IndexError> {
@@ -483,79 +430,68 @@ impl EventIndex {
         match self.published.manifest.status {
             IndexStatus::Ready => Ok(()),
             IndexStatus::Blocked { .. } => self.publish_status(IndexStatus::Ready).await,
-            IndexStatus::RetentionGap { .. } => Err(IndexError::CannotResume(
-                "a retention gap requires rebuilding the index",
+            IndexStatus::SourceGone => Err(IndexError::CannotResume(
+                "the source stream is gone; indexing resumes when it answers again",
             )),
         }
     }
 
-    pub async fn query(
-        &mut self,
-        from_ms: i64,
-        until_ms: i64,
-        after: Option<QueryCursor>,
-        through_record: Option<u64>,
-        limit: usize,
-    ) -> Result<QueryResult, IndexError> {
-        if from_ms >= until_ms || limit == 0 {
+    /// Start over in place for a recreated source stream: publish an empty
+    /// manifest at `base`. The old parts become unreferenced and GC removes
+    /// them after the grace period.
+    pub async fn restart(&mut self, base: IndexBase) -> Result<(), IndexError> {
+        for _attempt in 0..MAX_PUBLISH_ATTEMPTS {
+            self.refresh().await?;
+            let generation = self.published.manifest.generation.saturating_add(1);
+            if self
+                .publish(Manifest::new(&self.binding, &base, generation))
+                .await?
+            {
+                return self.store.delete(CLAIM_KEY).await;
+            }
+        }
+        Err(IndexError::PublishConflict)
+    }
+
+    pub async fn query(&mut self, request: QueryRequest) -> Result<QueryResult, IndexError> {
+        if request.from_ms >= request.until_ms || request.limit == 0 {
             return Err(IndexError::InvalidQuery);
         }
         self.refresh().await?;
-        if let IndexStatus::RetentionGap {
-            expected_record,
-            first_available_record,
-        } = self.published.manifest.status
-        {
-            return Err(IndexError::RetentionGap {
-                expected_record,
-                first_available_record,
-            });
-        }
-        let indexed_through_record = self.indexed_through_record();
-        let through_record = through_record.unwrap_or(indexed_through_record);
-        if through_record < self.published.manifest.indexed_from_record
-            || through_record > indexed_through_record
-        {
+        let manifest = &self.published.manifest;
+        let through = request.through.unwrap_or(manifest.durable_offset);
+        if through > manifest.durable_offset || through < manifest.indexed_from_offset {
             return Err(IndexError::InvalidQuery);
         }
+        let filter = PartFilter {
+            from_ms: request.from_ms,
+            until_ms: request.until_ms,
+            overlap: request.match_mode == MatchMode::Overlap,
+            floor: manifest.floor_offset,
+            through,
+            after: request.after.map(|after| (after.t_ms, after.offset)),
+        };
         let mut entries = Vec::new();
-        for meta in self
-            .published
-            .manifest
-            .parts
-            .iter()
-            .filter(|meta| meta.overlaps(from_ms, until_ms))
-        {
+        for meta in manifest.parts.iter().filter(|meta| meta.may_match(&filter)) {
             let ranges = self.cache.ranges()?;
             let layout = ranges.layout(&self.store, meta).await?;
             let reader = VerifiedParquetReader::new(self.store.clone(), ranges.clone(), layout);
-            entries.extend(part::read_part_range_async(reader, from_ms, until_ms).await?);
-        }
-        entries.extend(
-            self.active
-                .iter()
-                .copied()
-                .filter(|entry| entry.captured_at_ms >= from_ms && entry.captured_at_ms < until_ms),
-        );
-        entries.retain(|entry| entry.record < through_record);
-        if let Some(after) = after {
-            entries.retain(|entry| {
-                (entry.captured_at_ms, entry.record) > (after.captured_at_ms, after.record)
-            });
+            entries.extend(part::read_part_range_async(reader, filter).await?);
         }
         entries.sort_unstable();
-        entries.dedup_by_key(|entry| entry.record);
-        let has_more = entries.len() > limit;
-        entries.truncate(limit);
+        entries.dedup_by_key(|entry| entry.offset);
+        let has_more = entries.len() > request.limit;
+        entries.truncate(request.limit);
         let next = has_more
             .then(|| entries.last().copied().map(QueryCursor::from))
             .flatten();
+        let mut coverage = self.coverage();
+        coverage.through = through;
         Ok(QueryResult {
-            indexed_from_record: self.published.manifest.indexed_from_record,
-            indexed_through_record,
-            durable_through_record: self.published.manifest.durable_through_record,
-            through_record,
-            records: entries,
+            source: self.published.manifest.source.clone(),
+            coverage,
+            skipped: self.published.manifest.skipped,
+            entries,
             next,
         })
     }
@@ -604,8 +540,13 @@ impl EventIndex {
                 let path = self.cache.parts().materialize(&self.store, meta).await?;
                 entries.extend(part::read_all(&path)?);
             }
+            // Entries are unique by offset; those below the floor are no
+            // longer fetchable and are dropped.
+            let floor = self.published.manifest.floor_offset;
+            entries.sort_unstable_by_key(|entry| entry.offset);
+            entries.dedup_by_key(|entry| entry.offset);
+            entries.retain(|entry| entry.offset >= floor);
             entries.sort_unstable();
-            entries.dedup_by_key(|entry| entry.record);
             let partition_start_ms = candidate
                 .first()
                 .map(|meta| meta.partition_start_ms)
@@ -614,13 +555,15 @@ impl EventIndex {
                 .first()
                 .and_then(|meta| meta.level.checked_add(1))
                 .ok_or(IndexError::InvalidQuery)?;
-            let meta = self
-                .write_and_upload_part(&entries, output_level, partition_start_ms)
-                .await?;
             let mut next = self.draft_manifest();
             next.parts
                 .retain(|part| !candidate_keys.contains(part.key.as_str()));
-            next.parts.push(meta);
+            if !entries.is_empty() {
+                next.parts.push(
+                    self.write_and_upload_part(&entries, output_level, partition_start_ms)
+                        .await?,
+                );
+            }
             if self.publish(next).await? {
                 return Ok(true);
             }
@@ -669,13 +612,10 @@ impl EventIndex {
                 .await?
                 .ok_or_else(|| IndexError::MissingObject(key.clone()))?;
             let identity: ManifestIdentity = serde_json::from_slice(&object.bytes)?;
-            if identity.version != manifest::FORMAT_VERSION
-                || identity.source_id != self.config.source_id
-            {
+            if !identity.matches(&self.binding) {
                 tracing::warn!(
                     manifest = %key,
                     version = identity.version,
-                    source_id = %identity.source_id,
                     "skipping incompatible manifest during event-index garbage collection"
                 );
                 retained_manifests.remove(key);
@@ -689,8 +629,7 @@ impl EventIndex {
         }
         let part_objects = self.store.list("parts/").await?;
         let layout_objects = self.store.list("layouts/").await?;
-        let latest = manifest::load_published(&self.store, &self.config.source_id).await?;
-        let durable_through_record = latest.manifest.durable_through_record;
+        let latest = manifest::load_published(&self.store, &self.binding).await?;
         retained_manifests.insert(latest.manifest_key);
         for part in latest.manifest.parts {
             retained_parts.insert(part.key);
@@ -705,9 +644,7 @@ impl EventIndex {
             .and_then(|duration| u64::try_from(duration.as_millis()).ok());
         let mut stale_claims = Vec::new();
         for (key, claim) in self.load_claims().await? {
-            if claim.end_record <= durable_through_record
-                || now_ms.is_some_and(|now_ms| claim.expires_at_ms <= now_ms)
-            {
+            if now_ms.is_some_and(|now_ms| claim.expires_at_ms <= now_ms) {
                 stale_claims.push(key);
             }
         }
@@ -728,7 +665,7 @@ impl EventIndex {
         })
     }
 
-    async fn load_claims(&self) -> Result<Vec<(String, RecordSegmentLease)>, IndexError> {
+    async fn load_claims(&self) -> Result<Vec<(String, SegmentLease)>, IndexError> {
         let mut claims = Vec::new();
         for object in self.store.list("claims/").await? {
             if !object.key.ends_with(".json") {
@@ -737,8 +674,14 @@ impl EventIndex {
             let Some(stored) = self.store.get(&object.key).await? else {
                 continue;
             };
-            let claim: RecordSegmentLease = serde_json::from_slice(&stored.bytes)?;
-            claims.push((object.key, claim));
+            match serde_json::from_slice::<SegmentLease>(&stored.bytes) {
+                Ok(claim) => claims.push((object.key, claim)),
+                Err(error) => tracing::warn!(
+                    key = %object.key,
+                    %error,
+                    "skipping unreadable event-index claim"
+                ),
+            }
         }
         Ok(claims)
     }
@@ -763,12 +706,14 @@ impl EventIndex {
     ) -> Result<PartMeta, IndexError> {
         if entries
             .iter()
-            .any(|entry| event_time_partition(entry.captured_at_ms) != partition_start_ms)
+            .any(|entry| event_time_partition(entry.t_ms) != partition_start_ms)
         {
             return Err(IndexError::InvalidSourceResponse(
                 "part entries cross an event-time partition boundary",
             ));
         }
+        let first = entries.first().ok_or(IndexError::InvalidQuery)?;
+        let last = entries.last().ok_or(IndexError::InvalidQuery)?;
         let temporary = tempfile::NamedTempFile::new_in(self.cache.parts().directory())?;
         part::write_part(temporary.path(), entries, self.config.row_group_entries)?;
         let bytes = fs::read(temporary.path())?;
@@ -779,8 +724,6 @@ impl EventIndex {
         let layout_key = format!("layouts/{}.json", digest(&layout_bytes));
         let _write = self.store.put_if_absent(&key, &bytes).await?;
         let _layout_write = self.store.put_if_absent(&layout_key, &layout_bytes).await?;
-        let first = entries.first().ok_or(IndexError::InvalidQuery)?;
-        let last = entries.last().ok_or(IndexError::InvalidQuery)?;
         Ok(PartMeta {
             key,
             layout_key,
@@ -788,18 +731,23 @@ impl EventIndex {
             partition_start_ms,
             entries: u64::try_from(entries.len())
                 .map_err(|_error| IndexError::InvalidConfig("part is too large"))?,
-            min_captured_at_ms: first.captured_at_ms,
-            max_captured_at_ms: last.captured_at_ms,
-            min_record: entries
+            min_t_ms: first.t_ms,
+            max_t_ms: last.t_ms,
+            max_t_end_ms: entries
                 .iter()
-                .map(|entry| entry.record)
-                .min()
-                .ok_or(IndexError::InvalidQuery)?,
-            max_record: entries
-                .iter()
-                .map(|entry| entry.record)
+                .map(|entry| entry.t_end_ms)
                 .max()
-                .ok_or(IndexError::InvalidQuery)?,
+                .unwrap_or(last.t_ms),
+            min_offset: entries
+                .iter()
+                .map(|entry| entry.offset)
+                .min()
+                .unwrap_or(first.offset),
+            max_offset: entries
+                .iter()
+                .map(|entry| entry.offset)
+                .max()
+                .unwrap_or(last.offset),
             bytes: u64::try_from(bytes.len())
                 .map_err(|_error| IndexError::InvalidConfig("part is too large"))?,
         })
@@ -818,8 +766,7 @@ impl EventIndex {
             .await?
         {
             ConditionalWrite::Written => {
-                self.published =
-                    manifest::load_published(&self.store, &self.config.source_id).await?;
+                self.published = manifest::load_published(&self.store, &self.binding).await?;
                 Ok(true)
             }
             ConditionalWrite::Conflict => {
@@ -830,9 +777,33 @@ impl EventIndex {
     }
 }
 
-fn event_time_partition(captured_at_ms: i64) -> i64 {
-    captured_at_ms
-        .div_euclid(EVENT_TIME_PARTITION_MS)
+/// Every entry and skip lies inside `[start, end)`.
+fn validate_segment(segment: &Segment) -> Result<(), IndexError> {
+    let inside = |offset: u64, len: u64| {
+        offset >= segment.start
+            && offset
+                .checked_add(len)
+                .is_some_and(|end| end <= segment.end)
+    };
+    if segment.start > segment.end
+        || !segment
+            .entries
+            .iter()
+            .all(|entry| inside(entry.offset, entry.len))
+        || !segment
+            .skips
+            .iter()
+            .all(|skip| inside(skip.offset, skip.len))
+    {
+        return Err(IndexError::InvalidSourceResponse(
+            "segment entries lie outside the segment",
+        ));
+    }
+    Ok(())
+}
+
+fn event_time_partition(t_ms: i64) -> i64 {
+    t_ms.div_euclid(EVENT_TIME_PARTITION_MS)
         .saturating_mul(EVENT_TIME_PARTITION_MS)
 }
 
@@ -896,16 +867,13 @@ fn eligible_for_gc(modified: Option<SystemTime>, cutoff: SystemTime) -> bool {
 }
 
 fn validate_config(config: &EventIndexConfig) -> Result<(), IndexError> {
-    if config.flush_entries == 0 {
-        return Err(IndexError::InvalidConfig("flush_entries must be positive"));
-    }
     if config.row_group_entries == 0 {
         return Err(IndexError::InvalidConfig(
             "row_group_entries must be positive",
         ));
     }
-    if config.source_id.is_empty() {
-        return Err(IndexError::InvalidConfig("source_id must not be empty"));
+    if config.source_url.is_empty() {
+        return Err(IndexError::InvalidConfig("source URL must not be empty"));
     }
     Ok(())
 }
@@ -913,17 +881,11 @@ fn validate_config(config: &EventIndexConfig) -> Result<(), IndexError> {
 fn ensure_ready(status: &IndexStatus) -> Result<(), IndexError> {
     match status {
         IndexStatus::Ready => Ok(()),
-        IndexStatus::Blocked { record, reason } => Err(IndexError::Blocked {
-            record: *record,
+        IndexStatus::Blocked { offset, reason } => Err(IndexError::Blocked {
+            offset: *offset,
             reason: reason.clone(),
         }),
-        IndexStatus::RetentionGap {
-            expected_record,
-            first_available_record,
-        } => Err(IndexError::RetentionGap {
-            expected_record: *expected_record,
-            first_available_record: *first_available_record,
-        }),
+        IndexStatus::SourceGone => Err(IndexError::SourceGone),
     }
 }
 
@@ -934,11 +896,15 @@ mod tests {
     use crate::EventEntry;
     use crate::EventIndexConfig;
     use crate::cache::EventIndexCache;
+    use crate::extract::Extractor;
     use crate::index::EventIndex;
     use crate::index::eligible_for_gc;
     use crate::index::select_compaction;
     use crate::manifest::PartMeta;
     use crate::object_store::FsObjectStore;
+    use crate::store::IndexBase;
+    use crate::store::QueryRequest;
+    use crate::store::Segment;
 
     #[test]
     fn missing_modification_time_is_not_eligible_for_gc() {
@@ -956,10 +922,11 @@ mod tests {
                     level,
                     partition_start_ms: 0,
                     entries: 1,
-                    min_captured_at_ms: 0,
-                    max_captured_at_ms: 0,
-                    min_record: ordinal,
-                    max_record: ordinal,
+                    min_t_ms: 0,
+                    max_t_ms: 0,
+                    max_t_end_ms: 0,
+                    min_offset: ordinal,
+                    max_offset: ordinal,
                     bytes: 1,
                 });
             }
@@ -980,34 +947,43 @@ mod tests {
         let objects = tempfile::TempDir::new()?;
         let cache = tempfile::TempDir::new()?;
         let store = FsObjectStore::new(objects.path())?;
+        let mut config =
+            EventIndexConfig::new("narrow-range-test", Extractor::timestamp_field("t")?);
+        config.row_group_entries = 1_000;
         let mut index = EventIndex::open(
             store.clone(),
             EventIndexCache::serving(cache.path(), 16 * 1024 * 1024)?,
-            EventIndexConfig {
-                source_id: "narrow-range-test".to_owned(),
-                flush_entries: 10_000,
-                row_group_entries: 1_000,
-                timestamp_field: "captured_at".to_owned(),
-            },
+            config,
+            IndexBase::default(),
         )
         .await?;
-        for record in 0..10_000_u64 {
-            index
-                .ingest(EventEntry {
-                    captured_at_ms: i64::try_from(record)?,
-                    record,
+        let entries = (0..10_000_u64)
+            .map(|ordinal| -> anyhow::Result<EventEntry> {
+                Ok(EventEntry {
+                    t_ms: i64::try_from(ordinal)?,
+                    t_end_ms: i64::try_from(ordinal)?,
+                    offset: ordinal.saturating_mul(10),
+                    len: 10,
                 })
-                .await?;
-        }
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        index
+            .commit_segment(Segment {
+                start: 0,
+                end: 100_000,
+                entries,
+                skips: Vec::new(),
+            })
+            .await?;
         let part_bytes = index
             .published
             .manifest
             .parts
             .first()
-            .ok_or_else(|| anyhow::anyhow!("flush did not publish a part"))?
+            .ok_or_else(|| anyhow::anyhow!("commit did not publish a part"))?
             .bytes;
-        let result = index.query(4_500, 4_510, None, None, 100).await?;
-        assert_eq!(result.records.len(), 10);
+        let result = index.query(QueryRequest::window(4_500, 4_510, 100)).await?;
+        assert_eq!(result.entries.len(), 10);
         assert!(store.range_read_bytes() < part_bytes);
         Ok(())
     }

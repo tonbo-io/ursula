@@ -87,9 +87,9 @@ curl http://127.0.0.1:4437/__ursula/metrics
   `kubectl port-forward`.
 - Clusters that serve the [SQLite VFS](/docs/examples/sqlite-vfs) need per-group admission caps of at least 64 MiB (`standard` or `large` preset) so a 32 MiB commit can be admitted.
 
-## Optional: event-time indexer
+## Optional: event-time indexer (experimental)
 
-`ursula-indexer` is an optional worker pool that builds queryable event-time indexes from streams, kept outside the voter processes so query and compaction work never touches commit latency:
+`ursula-indexer` is an optional worker pool that builds queryable event-time indexes from `application/json` and `application/x-ndjson` streams, kept outside the voter processes so query and compaction work never touches commit latency. It is experimental: its API and S3 format may change in a minor release, which then needs a new or emptied `indexer.s3.prefix` and re-registration.
 
 ```yaml
 indexer:
@@ -102,7 +102,7 @@ indexer:
       eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ursula-index
 ```
 
-Register streams dynamically with `PUT /v1/indexes/{id}` on the internal indexer Service. No Helm upgrade is needed. The Service is an internal ClusterIP. If remote applications need read access, front it with an authenticated, path-aware proxy and never expose the registration or administration routes.
+Register streams dynamically with `PUT /v1/indexes/{id}` on the internal indexer Service; see [Browser Telemetry](/docs/examples/browser-telemetry#event-time-queries-experimental). No Helm upgrade is needed. The Service is an internal ClusterIP. If remote applications need read access, front it with an authenticated, path-aware proxy and never expose the registration or administration routes.
 
 ## Without Kubernetes (bare metal / VMs)
 

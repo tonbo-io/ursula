@@ -9,8 +9,8 @@ The chart is designed for fresh static-membership clusters. It does not perform 
 - Run three Ursula voter pods across three availability zones for the normal production profile; use five voters only when tolerating two simultaneous voter failures is worth the additional write quorum cost.
 - Give each voter its own zonal persistent volume for the Raft log, and configure shared S3 for cold chunks and externalized snapshots. Do not use `raft.storageMode=memory` or disable persistence in production.
 - Run at least two stateless gateway replicas behind an authenticated TLS ingress or load balancer. Keep the server and peer Services private.
-- Run a fixed event-time indexer worker pool. Users register JSON streams dynamically over HTTP after stream creation; adding a stream never requires a Helm upgrade.
-- Keep S3 authoritative and treat indexer `emptyDir` volumes as disposable caches. Each source gets a logical S3 namespace, while workers claim record ranges across namespaces so hot streams can use multiple pods and small streams can share pods.
+- Optionally run a fixed event-time indexer worker pool (experimental). Users register JSON or NDJSON streams dynamically over HTTP after stream creation; adding a stream never requires a Helm upgrade.
+- Keep S3 authoritative and treat indexer `emptyDir` volumes as disposable caches. Each source gets a logical S3 namespace, and workers claim streams across namespaces so small streams can share pods.
 - Run two or more indexer workers across zones when event-time query availability or ingestion capacity matters. Claims reduce duplicate work; immutable parts and manifest CAS remain the correctness boundary.
 - Give Ursula and the indexer pool separate workload identities with least-privilege access to non-overlapping S3 prefixes. Enable bucket versioning, encryption, lifecycle policy, access logging, and alerts for indexer readiness, blocked streams, source lag, task backlog, S3 errors, storage growth, and pod restarts.
 
@@ -227,7 +227,9 @@ disable the cache explicitly.
 
 ## Event-Time Indexer
 
-The optional `ursula-indexer` runs as a fixed, cluster-level worker Deployment because it is a rebuildable projection, not part of the Raft write path. Pod count is independent of stream count. Registrations are stored in one conditionally updated S3 catalog object, and each registered source receives its own manifest, retained-record base, checkpoint, parts, claims, and error status below the pool prefix.
+**Experimental.** The indexer's HTTP API and S3 format may change in a minor release, which then needs a new or emptied `indexer.s3.prefix` and re-registration.
+
+The optional `ursula-indexer` runs as a fixed, cluster-level worker Deployment because it is a rebuildable projection, not part of the Raft write path. Pod count is independent of stream count. Registrations are stored in one conditionally updated S3 catalog object, and each registered source receives its own manifest, base and retained floor, indexed offset, parts, claim, skip counts, and status below the pool prefix.
 
 On EKS, prefer a separate IRSA or Pod Identity role for the indexer:
 
@@ -246,15 +248,15 @@ indexer:
       eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ursula-index
 ```
 
-After a user creates an `application/json` stream, register it through the internal indexer Service:
+After a user creates an `application/json` or `application/x-ndjson` stream, register it through the internal indexer Service:
 
 ```bash
 curl -X PUT http://ursula-indexer:4493/v1/indexes/browser-session-42 \
   -H 'Content-Type: application/json' \
-  -d '{"stream_url":"http://ursula-gateway:4437/sessions/browser-session-42","timestamp_field":"captured_at"}'
+  -d '{"stream_url":"http://ursula-gateway:4437/sessions/browser-session-42","extract":{"time":["/captured_at"]}}'
 ```
 
-Registration performs a HEAD preflight and rejects sources that are not JSON or do not advertise `json-record-coordinates-v1`. Workers split source order into claimed record ranges. Different workers may build ranges from the same hot stream concurrently; ranges may finish out of order, but `durable_through_record` advances only through the contiguous completed prefix. Claims are expiring efficiency hints rather than locks, so worker death cannot strand correctness and duplicate work converges through immutable content-addressed parts plus S3 manifest CAS.
+Registration performs a HEAD preflight, rejects sources of any other content type, and records the stream's `Stream-Incarnation`. Each stream has one claim at a time, which starts at the first unindexed byte; a worker reads up to `indexer.workers.segmentBytes` with ordinary offset reads and commits the messages it framed. Claims are expiring efficiency hints rather than locks, so worker death cannot strand correctness: overlapping commits must produce identical entries, and duplicate work converges through immutable content-addressed parts plus S3 manifest CAS. Messages without a usable event time are skipped and counted, retention is followed with a floor, and a deleted and recreated stream restarts its registration. See the [indexer README](https://github.com/tonbo-io/ursula/blob/main/crates/ursula-index/README.md) for the extractor, query, and status formats.
 
 Query one registration at `/v1/indexes/{id}/events`; inspect or resume it at `/v1/indexes/{id}/status` and `/v1/indexes/{id}/status/resume`. `GET /v1/indexes` lists registrations and `DELETE /v1/indexes/{id}` stops future scheduling without deleting authoritative index objects. Do not expose the Service directly to the internet: registration, deletion, and resume are administrative operations. Put authentication and path-aware authorization in a separate ingress or API gateway if applications need remote query access.
 
@@ -512,10 +514,9 @@ container receives only chart-managed container settings plus explicit
 | `indexer.cache.servingMaxBytes` | `1073741824` | Shared serving-cache budget across every registration in one worker pod. |
 | `indexer.cache.maintenanceMaxBytes` | `268435456` | Shared compaction/GC cache budget across every registration in one worker pod. |
 | `indexer.cache.emptyDir.sizeLimit` | `2Gi` | Disposable local cache volume limit; durable index state remains in S3. |
-| `indexer.ingest.flushEntries` | `65536` | Maximum buffered entries before a part flush. |
-| `indexer.ingest.readBatchRecords` | `4096` | Maximum records requested in one source HTTP read. |
-| `indexer.workers.concurrency` | `4` | Concurrent record-range tasks per worker pod. |
-| `indexer.workers.segmentRecords` | `4096` | Maximum source records in one independently claimable work segment; effective size is capped by `readBatchRecords`. |
+| `indexer.ingest.flushEntries` | `65536` | Maximum entries in one committed segment, and so in one level-0 part. |
+| `indexer.workers.concurrency` | `4` | Concurrent stream tasks per worker pod. |
+| `indexer.workers.segmentBytes` | `33554432` | Source bytes read before a segment is committed; a shorter tail segment waits for `indexer.ingest.tailFlushIntervalMs`. Replaces `readBatchRecords` and `segmentRecords`. |
 | `indexer.workers.leaseMs` | `60000` | Claim duration used to reduce duplicate processing; not a correctness boundary. |
 | `indexer.compaction.fanIn` | `8` | Number of same-partition parts selected for bounded compaction. |
 | `indexer.compaction.maxEntries` | `1000000` | Maximum entries loaded by one compaction; must cover one configured fan-in. |

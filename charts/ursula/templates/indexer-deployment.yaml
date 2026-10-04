@@ -72,10 +72,8 @@ spec:
             - {{ $root.Values.indexer.ingest.flushEntries | int64 | quote }}
             - --row-group-entries
             - {{ $root.Values.indexer.ingest.rowGroupEntries | int64 | quote }}
-            - --read-batch-records
-            - {{ $root.Values.indexer.ingest.readBatchRecords | int64 | quote }}
-            - --segment-records
-            - {{ $root.Values.indexer.workers.segmentRecords | int64 | quote }}
+            - --segment-bytes
+            - {{ $root.Values.indexer.workers.segmentBytes | int64 | quote }}
             - --worker-concurrency
             - {{ $root.Values.indexer.workers.concurrency | quote }}
             - --segment-lease-ms

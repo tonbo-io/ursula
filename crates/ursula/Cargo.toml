@@ -64,6 +64,7 @@ ursula-shard = { workspace = true }
 madsim = { workspace = true }
 
 [dev-dependencies]
+anyhow = { workspace = true }
 criterion = { workspace = true }
 flate2 = { workspace = true }
 proptest = { workspace = true }

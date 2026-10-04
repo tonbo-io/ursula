@@ -26,10 +26,8 @@ export function createTelemetryCollector({
         keepalive,
       });
       if (!response.ok) throw new Error(`telemetry append failed: ${response.status}`);
-      return {
-        recordStart: Number(response.headers.get("Stream-Record-Start")),
-        recordNext: Number(response.headers.get("Stream-Record-Next")),
-      };
+      // The stream's new tail: an opaque offset to resume reading from.
+      return { nextOffset: response.headers.get("Stream-Next-Offset") };
     } catch (error) {
       queue = batch.concat(queue);
       throw error;

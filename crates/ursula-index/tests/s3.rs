@@ -12,8 +12,12 @@ use ursula_index::EventEntry;
 use ursula_index::EventIndex;
 use ursula_index::EventIndexCache;
 use ursula_index::EventIndexConfig;
+use ursula_index::Extractor;
+use ursula_index::IndexBase;
+use ursula_index::QueryRequest;
 use ursula_index::S3ObjectStore;
 use ursula_index::S3ObjectStoreConfig;
+use ursula_index::Segment;
 
 #[tokio::test]
 async fn real_s3_conditional_publish_and_cache_recovery() -> anyhow::Result<()> {
@@ -38,31 +42,34 @@ async fn real_s3_conditional_publish_and_cache_recovery() -> anyhow::Result<()> 
         region: region.clone(),
         endpoint: endpoint.clone(),
     };
-    let source_config = EventIndexConfig {
-        source_id: "s3-integration-source".to_owned(),
-        flush_entries: 1,
-        row_group_entries: 8,
-        timestamp_field: "captured_at".to_owned(),
-    };
+    let mut source_config = EventIndexConfig::new(
+        "s3-integration-source",
+        Extractor::timestamp_field("captured_at")?,
+    );
+    source_config.row_group_entries = 8;
     let first_cache = TempDir::new()?;
     let mut writer = EventIndex::open(
         S3ObjectStore::new(store_config.clone())?,
         EventIndexCache::serving(first_cache.path(), 16 * 1024 * 1024)?,
         source_config.clone(),
+        IndexBase::default(),
     )
     .await?;
-    writer
-        .ingest(EventEntry {
-            captured_at_ms: 200,
-            record: 0,
-        })
-        .await?;
-    writer
-        .ingest(EventEntry {
-            captured_at_ms: 100,
-            record: 1,
-        })
-        .await?;
+    for (offset, t_ms) in [(0_u64, 200_i64), (10, 100)] {
+        writer
+            .commit_segment(Segment {
+                start: offset,
+                end: offset.saturating_add(10),
+                entries: vec![EventEntry {
+                    t_ms,
+                    t_end_ms: t_ms,
+                    offset,
+                    len: 10,
+                }],
+                skips: Vec::new(),
+            })
+            .await?;
+    }
     assert!(writer.compact_partition_once(2, 2).await?);
     let gc = writer
         .garbage_collect(1, std::time::Duration::ZERO, SystemTime::now())
@@ -77,17 +84,18 @@ async fn real_s3_conditional_publish_and_cache_recovery() -> anyhow::Result<()> 
         S3ObjectStore::new(store_config)?,
         EventIndexCache::serving(empty_cache.path(), 16 * 1024 * 1024)?,
         source_config,
+        IndexBase::default(),
     )
     .await?;
-    let result = reader.query(0, 1_000, None, None, 10).await?;
-    assert_eq!(result.durable_through_record, 2);
+    let result = reader.query(QueryRequest::window(0, 1_000, 10)).await?;
+    assert_eq!(result.coverage.durable, 20);
     assert_eq!(
         result
-            .records
+            .entries
             .iter()
-            .map(|entry| entry.record)
+            .map(|entry| entry.offset)
             .collect::<Vec<_>>(),
-        vec![1, 0]
+        vec![10, 0]
     );
 
     let mut builder = opendal::services::S3::default().bucket(&bucket).root(&root);

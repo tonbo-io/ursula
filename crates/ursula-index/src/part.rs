@@ -45,11 +45,46 @@ pub(crate) struct PartLayout {
     pub(crate) units: Vec<PartUnit>,
 }
 
+const T_MS: &str = "t_ms";
+const T_END_MS: &str = "t_end_ms";
+const OFFSET: &str = "offset";
+const LEN: &str = "len";
+
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("captured_at_ms", DataType::Int64, false),
-        Field::new("record", DataType::UInt64, false),
+        Field::new(T_MS, DataType::Int64, false),
+        Field::new(T_END_MS, DataType::Int64, false),
+        Field::new(OFFSET, DataType::UInt64, false),
+        Field::new(LEN, DataType::UInt64, false),
     ]))
+}
+
+/// Row predicate shared by part pruning and the Parquet row filter.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PartFilter {
+    pub(crate) from_ms: i64,
+    pub(crate) until_ms: i64,
+    pub(crate) overlap: bool,
+    /// Entries before this offset are below retention.
+    pub(crate) floor: u64,
+    /// Entries at or after this offset are past the pinned watermark.
+    pub(crate) through: u64,
+    /// Only entries after this `(t_ms, offset)` cursor.
+    pub(crate) after: Option<(i64, u64)>,
+}
+
+impl PartFilter {
+    pub(crate) fn matches(&self, t_ms: i64, t_end_ms: i64, offset: u64) -> bool {
+        let in_window = if self.overlap {
+            t_ms < self.until_ms && t_end_ms >= self.from_ms
+        } else {
+            t_ms >= self.from_ms && t_ms < self.until_ms
+        };
+        in_window
+            && offset >= self.floor
+            && offset < self.through
+            && self.after.is_none_or(|after| (t_ms, offset) > after)
+    }
 }
 
 pub(crate) fn write_part(
@@ -57,10 +92,16 @@ pub(crate) fn write_part(
     entries: &[EventEntry],
     row_group_entries: usize,
 ) -> Result<(), IndexError> {
-    let captured_at =
-        Int64Array::from_iter_values(entries.iter().map(|entry| entry.captured_at_ms));
-    let records = UInt64Array::from_iter_values(entries.iter().map(|entry| entry.record));
-    let batch = RecordBatch::try_new(schema(), vec![Arc::new(captured_at), Arc::new(records)])?;
+    let t_ms = Int64Array::from_iter_values(entries.iter().map(|entry| entry.t_ms));
+    let t_end_ms = Int64Array::from_iter_values(entries.iter().map(|entry| entry.t_end_ms));
+    let offsets = UInt64Array::from_iter_values(entries.iter().map(|entry| entry.offset));
+    let lens = UInt64Array::from_iter_values(entries.iter().map(|entry| entry.len));
+    let batch = RecordBatch::try_new(schema(), vec![
+        Arc::new(t_ms),
+        Arc::new(t_end_ms),
+        Arc::new(offsets),
+        Arc::new(lens),
+    ])?;
     let properties = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::default()))
         .set_statistics_enabled(EnabledStatistics::Page)
@@ -76,8 +117,7 @@ pub(crate) fn write_part(
 
 pub(crate) async fn read_part_range_async<T>(
     reader: T,
-    from_ms: i64,
-    until_ms: i64,
+    filter: PartFilter,
 ) -> Result<Vec<EventEntry>, IndexError>
 where
     T: AsyncFileReader + Send + Unpin + 'static,
@@ -85,26 +125,44 @@ where
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
     let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await?;
     let descriptor = builder.metadata().file_metadata().schema_descr_ptr();
-    let projection = ProjectionMask::leaves(&descriptor, [0]);
+    let leaves = descriptor
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| matches!(column.name(), T_MS | T_END_MS | OFFSET))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let projection = ProjectionMask::leaves(&descriptor, leaves);
     let predicate = ArrowPredicateFn::new(projection, move |batch| {
-        let values = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| ArrowError::CastError("captured_at_ms is not int64".to_owned()))?;
-        Ok(BooleanArray::from_iter(values.iter().map(|value| {
-            value.map(|value| value >= from_ms && value < until_ms)
-        })))
+        let t_ms = int64_column(&batch, T_MS)?
+            .ok_or_else(|| ArrowError::SchemaError("t_ms column is missing".to_owned()))?;
+        let offsets = uint64_column(&batch, OFFSET)?
+            .ok_or_else(|| ArrowError::SchemaError("offset column is missing".to_owned()))?;
+        let t_end_ms = int64_column(&batch, T_END_MS)?;
+        let ends = t_end_ms.map(|column| column.values());
+        Ok(BooleanArray::from_iter(
+            t_ms.values()
+                .iter()
+                .zip(offsets.values().iter())
+                .enumerate()
+                .map(|(row, (t_ms, offset))| {
+                    let t_end_ms = ends
+                        .and_then(|ends| ends.get(row))
+                        .copied()
+                        .unwrap_or(*t_ms);
+                    Some(filter.matches(*t_ms, t_end_ms, *offset))
+                }),
+        ))
     });
-    let filter = RowFilter::new(vec![Box::new(predicate)]);
+    let row_filter = RowFilter::new(vec![Box::new(predicate)]);
     let batches = builder
-        .with_row_filter(filter)
+        .with_row_filter(row_filter)
         .build()?
         .try_collect::<Vec<_>>()
         .await?;
     let mut entries = Vec::new();
     for batch in &batches {
-        append_batch(&mut entries, batch)?;
+        append_record_batch(&mut entries, batch)?;
     }
     Ok(entries)
 }
@@ -208,47 +266,85 @@ pub(crate) fn read_all(path: &Path) -> Result<Vec<EventEntry>, IndexError> {
     let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options)?.build()?;
     let mut entries = Vec::new();
     for batch in reader {
-        append_batch(&mut entries, &batch?)?;
+        append_record_batch(&mut entries, &batch?)?;
     }
     Ok(entries)
 }
 
+/// Columns are found by name. `t_ms`, `offset` and `len` are required;
+/// `t_end_ms` defaults to `t_ms`, and unknown columns are ignored, so later
+/// columns are additive.
 pub(crate) fn validate(path: &Path) -> Result<(), IndexError> {
     let file = File::open(path)?;
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
     let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options)?;
-    let fields = builder.schema().fields();
-    let valid = match (fields.first(), fields.get(1)) {
-        (Some(captured_at), Some(record)) if fields.len() == 2 => {
-            captured_at.name() == "captured_at_ms"
-                && captured_at.data_type() == &DataType::Int64
-                && record.name() == "record"
-                && record.data_type() == &DataType::UInt64
-        }
-        _ => false,
+    let schema = builder.schema();
+    let has = |name: &str, data_type: &DataType| {
+        schema
+            .field_with_name(name)
+            .is_ok_and(|field| field.data_type() == data_type)
     };
+    let valid = has(T_MS, &DataType::Int64)
+        && has(OFFSET, &DataType::UInt64)
+        && has(LEN, &DataType::UInt64)
+        && (schema.field_with_name(T_END_MS).is_err() || has(T_END_MS, &DataType::Int64));
     if !valid {
         return Err(IndexError::InvalidPartSchema);
     }
     Ok(())
 }
 
-fn append_batch(entries: &mut Vec<EventEntry>, batch: &RecordBatch) -> Result<(), IndexError> {
-    let captured_at = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| ArrowError::CastError("captured_at_ms is not int64".to_owned()))?;
-    let records = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| ArrowError::CastError("record is not uint64".to_owned()))?;
-    entries.extend(captured_at.values().iter().zip(records.values()).map(
-        |(&captured_at_ms, &record)| EventEntry {
-            captured_at_ms,
-            record,
-        },
-    ));
+fn int64_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<Option<&'a Int64Array>, ArrowError> {
+    batch
+        .column_by_name(name)
+        .map(|column| {
+            column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| ArrowError::CastError(format!("{name} is not int64")))
+        })
+        .transpose()
+}
+
+fn uint64_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<Option<&'a UInt64Array>, ArrowError> {
+    batch
+        .column_by_name(name)
+        .map(|column| {
+            column
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| ArrowError::CastError(format!("{name} is not uint64")))
+        })
+        .transpose()
+}
+
+fn append_record_batch(
+    entries: &mut Vec<EventEntry>,
+    batch: &RecordBatch,
+) -> Result<(), IndexError> {
+    let missing = |name: &str| ArrowError::SchemaError(format!("{name} column is missing"));
+    let t_ms = int64_column(batch, T_MS)?.ok_or_else(|| missing(T_MS))?;
+    let offsets = uint64_column(batch, OFFSET)?.ok_or_else(|| missing(OFFSET))?;
+    let lens = uint64_column(batch, LEN)?.ok_or_else(|| missing(LEN))?;
+    let ends = int64_column(batch, T_END_MS)?.map(|column| column.values());
+    entries.extend(
+        t_ms.values()
+            .iter()
+            .zip(offsets.values().iter())
+            .zip(lens.values().iter())
+            .enumerate()
+            .map(|(row, ((&t_ms, &offset), &len))| EventEntry {
+                t_ms,
+                t_end_ms: ends.and_then(|ends| ends.get(row)).copied().unwrap_or(t_ms),
+                offset,
+                len,
+            }),
+    );
     Ok(())
 }

@@ -404,6 +404,8 @@ gateway:
   initContainers: []
 
 indexer:
+  # Experimental in 0.6: the API and the S3 format may change in a minor
+  # release, which then needs a new or emptied prefix and re-registration.
   # Deploy a fixed worker pool. Streams are registered dynamically over HTTP;
   # pod count is independent of stream count.
   enabled: false
@@ -440,18 +442,19 @@ indexer:
     emptyDir:
       sizeLimit: 2Gi
   ingest:
+    # Maximum entries in one committed segment, and so in one level-0 part.
     flushEntries: 65536
     rowGroupEntries: 16384
-    readBatchRecords: 4096
     pollIntervalMs: 250
     # Bound near-tail indexing latency without publishing one tiny Parquet part
     # on every poll. Full worker segments are published immediately.
     tailFlushIntervalMs: 5000
   workers:
-    # Concurrent range tasks per pod. One hot stream may occupy several slots.
+    # Concurrent stream tasks per pod.
     concurrency: 4
-    # A hot stream is split into independently claimed source-record ranges.
-    segmentRecords: 4096
+    # Source bytes read before a segment is committed. Each stream has one
+    # claim at a time, which starts at its first unindexed byte.
+    segmentBytes: 33554432
     # Claims reduce duplicate work only; manifest CAS remains authoritative.
     leaseMs: 60000
   compaction:
