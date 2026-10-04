@@ -630,7 +630,7 @@ Clients **MUST** check `stream-sse-data-encoding` before interpreting `event: da
  - Indicates SSE streaming mode.
 
 - `max_bytes` (optional)
- - Maximum bytes to read in one data batch before SSE framing. For non-base64 UTF-8 data, servers **MUST NOT** emit invalid UTF-8; if a read window ends inside a code point, servers shorten the emitted payload and set `streamNextOffset` to the actual emitted byte position. For `application/x-ndjson` SSE payloads, servers **SHOULD** prefer ending at the last complete newline-delimited record when one is available, but **MAY** emit a partial record to make progress.
+ - Maximum bytes to read in one data batch before SSE framing. For non-base64 UTF-8 data, servers **MUST NOT** emit invalid UTF-8; if a read window ends inside a code point, servers shorten the emitted payload and set `streamNextOffset` to the offset just past the emitted data. For `application/x-ndjson` SSE payloads, servers **SHOULD** prefer ending at the last complete newline-delimited record when one is available, but **MAY** emit a partial record to make progress.
 
 #### Response Codes
 

@@ -28,10 +28,11 @@ Response headers include:
 | Header | Description |
 | ------------------------ | --------------------------------------------------------- |
 | `Content-Type` | The stream's content type. |
-| `Stream-Next-Offset` | The next writable offset (= current length). |
+| `Stream-Next-Offset` | The stream's tail: the offset the next append starts at. |
 | `ETag` | Stream state ETag (encodes offset and open/closed state). |
 | `Stream-Closed` | Present and `true` if the stream is closed. |
 | `Stream-Snapshot-Offset` | Present if a snapshot exists, showing its offset. |
+| `Stream-Incarnation` | An opaque token for this incarnation of the stream. It changes when the stream is deleted and recreated at the same URL; compare it only for equality. |
 | `Stream-TTL` | Remaining TTL in seconds (if a TTL was set). |
 | `Stream-Expires-At` | Expiration timestamp (if set). |
 | `Cache-Control` | `no-store`. |

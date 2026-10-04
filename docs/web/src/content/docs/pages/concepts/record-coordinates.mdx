@@ -3,7 +3,7 @@ title: Record Coordinates
 sidebarTitle: Record Coordinates
 ---
 
-JSON streams can expose a stable record number for every committed JSON value. Use records when your application thinks in events or messages and needs to replay complete values, count progress, or resume without parsing an opaque byte offset.
+JSON streams can expose a stable record number for every committed JSON value. Use records when your application thinks in events or messages and needs to replay complete values, count progress, or resume without handling opaque offsets.
 
 Record Coordinates are available only on `application/json` streams that advertise `json-record-coordinates-v1` in the `Stream-Extensions` response header.
 

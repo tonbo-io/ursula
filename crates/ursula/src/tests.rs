@@ -969,6 +969,86 @@ async fn delete_stream_removes_http_visible_state() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+/// Every offset header HEAD and a retention advance return is a 20-digit
+/// string, like `Stream-Next-Offset`, so clients compare them as strings.
+#[tokio::test]
+async fn head_offset_headers_are_twenty_digits() {
+    let app = test_router();
+    let uri = "/benchcmp/head-offsets";
+    let text = [(CONTENT_TYPE.as_str(), "text/plain")];
+    let response = http_put(&app, uri, &text, Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    for body in ["ab", "c"] {
+        let response = http_post(&app, uri, &text, Body::from(body)).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    let response = http_put(
+        &app,
+        &format!("{uri}/snapshot/00000000000000000002"),
+        &[],
+        Body::from("state"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = http_put(
+        &app,
+        &format!("{uri}/retention/00000000000000000002"),
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_RETAINED_OFFSET),
+        "00000000000000000002"
+    );
+
+    let response = http_head(&app, uri).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    for (name, value) in [
+        (HEADER_STREAM_NEXT_OFFSET, "00000000000000000003"),
+        (HEADER_STREAM_SNAPSHOT_OFFSET, "00000000000000000002"),
+        (HEADER_STREAM_RETAINED_OFFSET, "00000000000000000002"),
+        (HEADER_STREAM_COLD_HOT_START_OFFSET, "00000000000000000000"),
+    ] {
+        assert_eq!(header_str(&response, name), value, "{name}");
+    }
+}
+
+/// `Stream-Incarnation` changes when a stream is deleted and recreated. The
+/// group is raised to feature level 1, where incarnations are unique per
+/// group even when both creates land in the same millisecond.
+#[tokio::test]
+async fn head_stream_incarnation_changes_on_delete_and_recreate() {
+    async fn incarnation(app: &Router, uri: &str) -> String {
+        let response = http_head(app, uri).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        header_str(&response, HEADER_STREAM_INCARNATION).to_owned()
+    }
+
+    let app = test_router();
+    let response = http_post(
+        &app,
+        "/__ursula/feature-level",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"level":1}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let uri = "/benchcmp/incarnation";
+
+    let response = http_put(&app, uri, &[], Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let first = incarnation(&app, uri).await;
+    assert_eq!(incarnation(&app, uri).await, first);
+
+    let response = http_delete(&app, uri).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = http_put(&app, uri, &[], Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_ne!(incarnation(&app, uri).await, first);
+}
+
 #[tokio::test]
 async fn append_batch_matches_perf_compare_frame_format() {
     let app = test_router();

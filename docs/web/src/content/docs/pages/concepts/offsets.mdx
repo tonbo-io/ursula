@@ -7,7 +7,7 @@ An offset is a position inside a stream. Clients use offsets to read from a spec
 
 ## Format
 
-Offsets are numeric (`u64` byte positions internally) but are returned to clients as 20-character zero-padded decimal strings, for example `"00000000000000000042"`, so they sort lexicographically. Treat them as opaque tokens: read the value from the server's response and pass it back unchanged.
+Offsets are opaque tokens. Ursula returns them as 20-character strings, for example `"00000000000000000042"`, but their content carries no meaning for clients. Take each offset from a server response and pass it back unchanged. To tell which of two offsets of the same stream comes first, compare them lexicographically. Don't parse offsets or compute new ones from them.
 
 Two special values are accepted on read requests:
 
@@ -18,14 +18,18 @@ Two special values are accepted on read requests:
 
 After every read or append, the server returns two related headers:
 
-- **`Stream-Next-Offset`**: always present. The numeric position to use for the next request.
-- **`Stream-Cursor`**: set on live (long-poll, SSE) responses. An opaque token that bundles the stream identity and epoch with the offset, so a reconnecting client lands on the same stream version it was reading before.
+- **`Stream-Next-Offset`**: always present. The offset to pass back on the next request.
+- **`Stream-Cursor`**: set on live (long-poll, SSE) responses. A counter for caches, not a position: echo it as `?cursor=` on the next live request. Each response's cursor is past the one the request sent, so successive long-poll URLs differ and a cache can't serve the same empty response in a loop.
 
-For pure catch-up reads, `Stream-Next-Offset` is enough. For live tailing across reconnects, prefer `Stream-Cursor` (passed as `?cursor=`). It surfaces stream re-creation as a clean error rather than silently re-reading new data under the same name.
+Resume from `Stream-Next-Offset` in every read mode. `Stream-Cursor` carries no stream identity, so it doesn't reveal that a stream was recreated; see [Recreated streams](#recreated-streams).
 
 ## Stability across snapshots
 
-Offsets are byte positions, not sequence numbers, and they're stable across snapshot publishes. Publishing a snapshot at offset 100 does not renumber later offsets or delete earlier data. A separate retention advance makes data before offset 100 eligible for garbage collection. Reads to trimmed offsets return `410 Gone` with a `stream-earliest-offset` header pointing at the first still-available position.
+Offsets are stable across snapshot publishes. Publishing a snapshot at an offset doesn't renumber later offsets or delete earlier data. A separate retention advance trims the data before its offset. A read at a trimmed offset returns `410 Gone`, and its `Stream-Next-Offset` header is the earliest offset still readable, which `HEAD` also reports as `Stream-Retained-Offset`.
+
+## Recreated streams
+
+An offset doesn't identify which stream it came from. If a stream is deleted and recreated at the same URL, an offset saved from the old stream may be accepted by the new one and return the new stream's data. `HEAD` returns a `Stream-Incarnation` token that changes when a stream is deleted and recreated. A client that keeps offsets across a possible recreate should store the incarnation with them and compare it for equality before resuming.
 
 ## Related
 

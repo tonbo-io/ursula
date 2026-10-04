@@ -47,7 +47,7 @@ Each entry has:
 | `stream_id` | Bucket-local path: `stream`, or `affinity/stream` for a stream created through the [path affinity](/docs/specs/extensions#17-path-affinity) form. |
 | `status` | `Open` or `Closed`. |
 | `content_type` | The stream's content type, for example `application/json`. |
-| `tail_offset` | Current tail as an integer byte offset. |
+| `tail_offset` | Current tail offset, as an integer. |
 | `created_at_ms` | Creation time in Unix milliseconds. Unique per Raft group from feature level 1, so it also identifies a stream incarnation. |
 
 Streams whose TTL or expiry time has passed are not listed. Ursula does not report `last_write_at_ms`, which the specification makes optional.
