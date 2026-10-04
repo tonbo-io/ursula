@@ -64,7 +64,6 @@ pub struct UrsulaConfig {
     pub storage: StorageConfig,
     pub governance: GovernanceConfig,
     pub observability: ObservabilityConfig,
-    pub keyed_state: KeyedStateConfig,
 }
 
 /// HTTP server binding and admission settings.
@@ -83,10 +82,6 @@ pub struct ServerConfig {
     pub admin_listen: String,
     /// Process-wide cap on accepted write body bytes held by the HTTP layer.
     pub http_inflight_body_size: HumanSize,
-    /// Base URL of the keyed-state indexer (`ursula indexer` in keyed mode)
-    /// that serves `{stream_url}/keyed-state` (keyed-streams P3). When unset,
-    /// the resource answers 404 and nothing advertises `keyed-state-v1`.
-    pub keyed_state_upstream: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -96,7 +91,6 @@ impl Default for ServerConfig {
             cluster_listen: None,
             admin_listen: "127.0.0.1:4438".to_string(),
             http_inflight_body_size: HumanSize::mib(256),
-            keyed_state_upstream: None,
         }
     }
 }
@@ -669,48 +663,6 @@ impl Default for ColdHealthConfig {
             hot_size_high: HumanSize::mib(48),
             hot_size_low: HumanSize::mib(32),
             errors_per_tick_high: 1,
-        }
-    }
-}
-
-/// Keyed-state projection settings (keyed-streams §3.4, §3.8).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct KeyedStateConfig {
-    /// Base URLs of every keyed-state indexer pod (for example
-    /// `http://indexer-0.indexer:4440`), in failover order: the node sends
-    /// every keyed-state read to the first healthy pod (the primary, then
-    /// the standbys). When non-empty this list takes precedence over
-    /// `server.keyed_state_upstream` for routing. Bucket purge sends
-    /// `POST {url}/v1/keyed/drain` to each one and erases `.keyed/{bucket}/`
-    /// only after all of them acknowledge (U23). Empty when no indexer runs.
-    pub indexer_urls: Vec<String>,
-    /// Per-indexer timeout of one drain request; a pod that does not
-    /// acknowledge in time leaves the purge incomplete (retry it).
-    pub drain_timeout: HumanDuration,
-    /// TCP connect timeout of a keyed-state request to one indexer pod.
-    pub upstream_connect_timeout: HumanDuration,
-    /// How long a keyed-state request waits for one pod's response headers,
-    /// beyond the read's own `timeout_ms`, before it fails over to the next
-    /// pod. A pod that sent its headers then gets as long again for its
-    /// body. The last pod tried gets the rest of the request's budget.
-    pub failover_header_timeout: HumanDuration,
-    /// How long a pod that failed (connection error, header timeout, 502,
-    /// 503, 504) stays out of the failover order before the node probes its
-    /// `/readyz` again; a successful probe makes it eligible again, so the
-    /// primary takes traffic back. At least one second, so a pod returning
-    /// to service has revalidated its view of `CURRENT` (P3.6).
-    pub unhealthy_backoff: HumanDuration,
-}
-
-impl Default for KeyedStateConfig {
-    fn default() -> Self {
-        Self {
-            indexer_urls: Vec::new(),
-            drain_timeout: HumanDuration::sec(60),
-            upstream_connect_timeout: HumanDuration::sec(2),
-            failover_header_timeout: HumanDuration::sec(10),
-            unhealthy_backoff: HumanDuration::sec(2),
         }
     }
 }

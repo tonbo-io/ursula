@@ -5,38 +5,20 @@
 //! - [`cache`]: disposable local caches for whole parts and verified Parquet
 //!   page ranges.
 //! - [`catalog`]: dynamic index registrations shared by a worker pool.
-//! - [`clock`]: the injectable wall clock of the keyed engine and the
-//!   in-memory store (simulation, design U21).
 //! - [`index`]: the S3-authoritative ingest/flush/query/compact/GC engine.
-//! - [`keyed`]: the `keyed-batch-v1` record format (validator and parser),
-//!   the reference fold of keyed state, and the keyed projection engine's
-//!   data plane (part v2, k-way merge, runs and compaction, manifest v6),
-//!   and the keyed engine service (ingest, publish, compaction, GC, the
-//!   internal `/v1/keyed` API).
 //! - [`manifest`]: the conditionally published manifest state model.
-//! - [`memory_store`]: the in-memory conditional object store of the
-//!   indexer simulation.
-//! - `object_store` (private; types re-exported): conditional object
-//!   operations for S3, the filesystem and memory, with request counting by
-//!   S3 class and the one fault-injection mechanism, [`ObjectHooks`]
-//!   (latency, failures, CAS conflicts, ambiguous writes, observation of
-//!   applied mutations), used by crash tests and the simulation.
+//! - [`object_store`]: conditional object operations for S3 and local tests.
 //! - [`part`]: immutable sorted Parquet parts.
-//! - `rt` (private): the task and timer seam, madsim under `cfg(madsim)`.
 //! - [`service`]: command arguments and the long-running indexer service entrypoint.
 //! - [`source`]: HTTP client for the upstream record stream.
 //! - [`store`]: shared event, query, status, configuration, and error types.
 
 mod cache;
 mod catalog;
-pub mod clock;
 mod index;
-pub mod keyed;
 mod manifest;
-pub mod memory_store;
 mod object_store;
 mod part;
-mod rt;
 pub mod service;
 mod source;
 mod store;
@@ -49,21 +31,10 @@ pub use index::EventIndex;
 pub use manifest::CompletedRecordRange;
 pub use manifest::GarbageCollectionReport;
 pub use manifest::RecordSegmentLease;
-pub use memory_store::MemoryObjectStore;
-pub use object_store::AppliedChange;
-pub use object_store::FaultDecision;
 pub use object_store::FsObjectStore;
-pub use object_store::ObjectFault;
-pub use object_store::ObjectHooks;
-pub use object_store::ObjectOp;
-pub use object_store::ObjectRequestCounters;
-pub use object_store::ObjectRequestCounts;
 pub use object_store::ObjectStore;
-pub use object_store::ObservedStore;
 pub use object_store::S3ObjectStore;
 pub use object_store::S3ObjectStoreConfig;
-#[cfg(madsim)]
-pub use rt::reset_random_for_sim;
 pub use source::SourceBatch;
 pub use source::SourceClient;
 pub use source::SourceRecordRange;

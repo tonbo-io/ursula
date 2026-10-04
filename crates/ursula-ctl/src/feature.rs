@@ -1,4 +1,4 @@
-//! Replicated group feature levels (keyed-streams design C0, §6.3).
+//! Replicated group feature levels (design C0).
 //!
 //! `ursulactl cluster enable-feature --level N` raises every Raft group's
 //! replicated feature level to `N` in three steps:

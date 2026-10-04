@@ -1,4 +1,4 @@
-//! Replicated group feature levels (design C0, keyed-streams §6.2–§6.4).
+//! Replicated group feature levels (design C0).
 //!
 //! Every Raft group carries a replicated `u32` feature level, raised only by
 //! [`StreamCommand::SetFeatureLevel`] and never lowered. A release that adds
@@ -14,12 +14,10 @@
 //!
 //! - [`FEATURE_LEVEL_BASELINE`] (0): behavior of every release before C0.
 //!   Snapshots and groups without a recorded level are at 0.
-//! - [`FEATURE_LEVEL_KEYED_STREAMS`] (1): keyed-streams milestone M1 and
-//!   bounded-state Lb1 — C7 unique stream incarnation (`created_at_ms`
-//!   strictly increases per group), C8 apply-time reservation of the
-//!   `keyed-state` stream name, F14a/F14g incarnation-scoped cold objects and
-//!   stream GC, creation of `application/json; profile=keyed-batch-v1`
-//!   streams, F3 producer-state bounds (a 1,024-item receipt window beyond
+//! - [`FEATURE_LEVEL_KEYED_STREAMS`] (1): bounded-state Lb1 — C7 unique
+//!   stream incarnation (`created_at_ms` strictly increases per group),
+//!   F14a/F14g incarnation-scoped cold objects and stream GC, F3
+//!   producer-state bounds (a 1,024-item receipt window beyond
 //!   each producer's newest receipt, duplicates beyond it deduplicated
 //!   without ranges, 7-day idle-producer expiry), F4a message-record
 //!   collapse at every cold transition, `TidyStream`, F18 step 2 cold
@@ -65,9 +63,6 @@
 //!   queued for cold GC. Bodies of up to [`crate::MAX_COLD_SNAPSHOT_BYTES`]
 //!   are accepted this way.
 //!
-//! Later core-track changes (C1, C3, C4, U22) take the remaining levels in
-//! release order.
-//!
 //! No downgrade: once a group's level is raised, a binary whose
 //! [`MAX_SUPPORTED_FEATURE_LEVEL`] is lower must not run it. Snapshots record
 //! their level and restoring one above this binary's supported level fails
@@ -79,8 +74,8 @@
 /// Level of every group before any feature level is set.
 pub const FEATURE_LEVEL_BASELINE: u32 = 0;
 
-/// Keyed-streams M1: C7 unique incarnation, C8 apply-time `keyed-state`
-/// reservation, and `keyed-batch-v1` stream creation.
+/// Bounded-state Lb1: C7 unique incarnation, incarnation-scoped cold objects,
+/// producer-state bounds and `TidyStream`.
 pub const FEATURE_LEVEL_KEYED_STREAMS: u32 = 1;
 
 /// Bounded-state Lb2: F1 sparse cold record marks.
@@ -132,10 +127,10 @@ mod tests {
 
     #[test]
     fn gate_names_required_and_current_level() {
-        let Err(message) = check_feature_level(0, 1, "keyed stream create") else {
+        let Err(message) = check_feature_level(0, 1, "stream tidy") else {
             panic!("level 0 must not satisfy level 1");
         };
-        assert!(message.starts_with("keyed stream create requires group feature level 1"));
+        assert!(message.starts_with("stream tidy requires group feature level 1"));
         assert!(message.contains("at level 0"));
     }
 }

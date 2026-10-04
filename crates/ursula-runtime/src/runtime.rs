@@ -765,12 +765,10 @@ impl ShardRuntime {
     }
 
     /// Removes the entire bucket erasure domain, including external payloads
-    /// and stage-before-commit orphans, and the bucket's keyed-state
-    /// projection namespaces `.keyed/{bucket}/` (keyed-streams U23), then
-    /// verifies the authoritative store no longer lists an object below
-    /// either prefix. Call only after every group has durably installed the
-    /// bucket tombstone, legacy shared-pack debt has converged to zero, and
-    /// every keyed-state indexer has acknowledged `drain(bucket)`.
+    /// and stage-before-commit orphans, then verifies the authoritative store
+    /// no longer lists an object below the prefix. Call only after every
+    /// group has durably installed the bucket tombstone and legacy
+    /// shared-pack debt has converged to zero.
     pub async fn erase_bucket_cold_prefix_and_prove(
         &self,
         bucket_id: &str,
@@ -778,13 +776,7 @@ impl ShardRuntime {
         let Some(cold_store) = self.cold_store.as_ref() else {
             return Ok(());
         };
-        for prefix in [
-            crate::cold_bucket_prefix(bucket_id),
-            ursula_shard::keyed_namespace::keyed_bucket_prefix(bucket_id),
-        ] {
-            erase_prefix_and_prove(cold_store, &prefix).await?;
-        }
-        Ok(())
+        erase_prefix_and_prove(cold_store, &crate::cold_bucket_prefix(bucket_id)).await
     }
 
     pub async fn bucket_usage_all_groups(
@@ -1304,16 +1296,8 @@ impl ShardRuntime {
                 ColdGcTarget::Paths(paths) => {
                     let mut outcome = Ok(());
                     for path in paths {
-                        // A keyed stream's deleted incarnation enqueues its
-                        // projection namespace as a prefix (U22). Every
-                        // other path names one object (F14g containment).
-                        let removed =
-                            if ursula_shard::keyed_namespace::is_keyed_incarnation_prefix(path) {
-                                cold_store.remove_all(path).await
-                            } else {
-                                cold_store.delete_chunk(path).await
-                            };
-                        if let Err(err) = removed {
+                        // Every path names one object (F14g containment).
+                        if let Err(err) = cold_store.delete_chunk(path).await {
                             outcome = Err(err);
                             break;
                         }

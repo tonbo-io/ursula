@@ -4400,7 +4400,7 @@ fn feature_gate_rejects_below_required_level_deterministically() {
         message,
         next_offset,
         context,
-    }) = machine.require_feature_level(1, "keyed stream create")
+    }) = machine.require_feature_level(1, "stream tidy")
     else {
         panic!("level 0 must not satisfy level 1");
     };
@@ -4413,10 +4413,7 @@ fn feature_gate_rejects_below_required_level_deterministically() {
     assert!(context.is_empty());
 
     machine.apply(set_feature_level_cmd(1));
-    assert_eq!(
-        machine.require_feature_level(1, "keyed stream create"),
-        Ok(())
-    );
+    assert_eq!(machine.require_feature_level(1, "stream tidy"), Ok(()));
     assert_eq!(machine.require_feature_level(0, "anything"), Ok(()));
 }
 
@@ -4662,28 +4659,6 @@ fn c7_last_created_at_ms_survives_snapshot_round_trip_and_legacy_decode() {
 }
 
 #[test]
-fn c8_keyed_state_affinity_stream_is_reserved_on_apply_only_from_level_one() {
-    let keyed_state = BucketStreamId::with_affinity("benchcmp", "session", "keyed-state");
-    let mut legacy = machine();
-    assert_eq!(
-        legacy.apply(create_cmd(keyed_state.clone(), Create::default())),
-        created(keyed_state.clone(), 0)
-    );
-
-    let mut machine = machine();
-    machine.apply(set_feature_level_cmd(1));
-    assert_error_code(
-        machine.apply(create_cmd(keyed_state, Create::default())),
-        StreamErrorCode::InvalidStreamId,
-    );
-    // The two-segment stream named `keyed-state` stays valid.
-    assert_eq!(
-        machine.apply(create_cmd(stream("keyed-state"), Create::default())),
-        created(stream("keyed-state"), 0)
-    );
-}
-
-#[test]
 fn f14g_stream_gc_entries_name_the_incarnation_only_from_level_one() {
     let mut legacy = machine();
     create_stream(&mut legacy, "gc");
@@ -4836,65 +4811,6 @@ proptest! {
             prop_assert!(hot_start > 0 && hot_start >= snapshot_offset);
         }
     }
-}
-
-#[test]
-fn keyed_stream_create_is_gated_at_keyed_feature_level() {
-    const KEYED: &str = "application/json; profile=keyed-batch-v1";
-    let mut machine = machine();
-    let before = machine.snapshot();
-    assert_error_code(
-        machine.apply(create_cmd(stream("keyed"), Create {
-            content_type: KEYED,
-            ..Create::default()
-        })),
-        StreamErrorCode::FeatureNotEnabled,
-    );
-    assert_error_code(
-        machine.apply(StreamCommand::CreateExternal {
-            stream_id: stream("keyed-external"),
-            content_type: KEYED.to_owned(),
-            initial_payload: ExternalPayloadRef {
-                s3_path: "external/keyed.json".to_owned(),
-                payload_len: 11,
-                object_size: 11,
-            },
-            record_ends: vec![11],
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
-            attrs: None,
-            now_ms: 0,
-        }),
-        StreamErrorCode::FeatureNotEnabled,
-    );
-    assert_eq!(machine.snapshot(), before);
-
-    // Plain JSON and a quoted profile are not keyed and stay ungated.
-    for (name, content_type) in [
-        ("plain", "application/json"),
-        ("quoted", "application/json; profile=\"keyed-batch-v1\""),
-    ] {
-        assert!(matches!(
-            machine.apply(create_cmd(stream(name), Create {
-                content_type,
-                ..Create::default()
-            })),
-            StreamResponse::Created { .. }
-        ));
-    }
-
-    machine.apply(set_feature_level_cmd(crate::FEATURE_LEVEL_KEYED_STREAMS));
-    assert!(matches!(
-        machine.apply(create_cmd(stream("keyed"), Create {
-            content_type: KEYED,
-            payload: b"{\"ops\":[]}\n".to_vec(),
-            ..Create::default()
-        })),
-        StreamResponse::Created { .. }
-    ));
 }
 
 #[test]
@@ -5081,88 +4997,6 @@ fn d1_read_plan_keeps_hot_bytes_between_cold_ranges() {
         .collect::<Vec<_>>();
     assert_eq!(shape, vec![("cold", 0), ("hot", 0), ("cold", 7)]);
     StreamStateMachine::restore(machine.snapshot()).expect("restore with a hot gap");
-}
-
-#[test]
-fn u22_keyed_stream_delete_enqueues_its_incarnation_namespace_prefix() {
-    const KEYED: &str = "application/json; profile=keyed-batch-v1";
-    let mut machine = machine();
-    machine.apply(set_feature_level_cmd(crate::FEATURE_LEVEL_KEYED_STREAMS));
-    let keyed = Create {
-        content_type: KEYED,
-        ..Create::default()
-    };
-    assert!(matches!(
-        machine.apply(create_cmd(stream("harness"), keyed.clone())),
-        StreamResponse::Created { .. }
-    ));
-    // A plain JSON stream is not keyed and has no projection namespace.
-    assert!(matches!(
-        machine.apply(create_cmd(stream("plain"), Create {
-            content_type: "application/json",
-            ..Create::default()
-        })),
-        StreamResponse::Created { .. }
-    ));
-    let first = created_at_ms(&machine, "harness");
-    assert_eq!(
-        machine.apply(delete_cmd(stream("plain"))),
-        StreamResponse::Deleted
-    );
-    assert_eq!(
-        machine.apply(delete_cmd(stream("harness"))),
-        StreamResponse::Deleted
-    );
-    assert!(matches!(
-        machine.apply(create_cmd(stream("harness"), keyed)),
-        StreamResponse::Created { .. }
-    ));
-    let second = created_at_ms(&machine, "harness");
-    assert_ne!(first, second);
-
-    // The stream had no cold objects, so the namespace prefix is the only
-    // entry, and it names the deleted incarnation, never the recreated one.
-    let entries = machine.pending_cold_gc_batch(8);
-    let expected =
-        ursula_shard::keyed_namespace::keyed_incarnation_prefix(&stream("harness"), first);
-    assert_eq!(expected, format!(".keyed/benchcmp/harness/{first:016x}/"));
-    assert_eq!(entries.len(), 1, "{entries:?}");
-    assert_eq!(entries[0].bucket_id, "benchcmp");
-    assert_eq!(entries[0].target, ColdGcTarget::Paths(vec![expected]));
-}
-
-#[test]
-fn u22_keyed_stream_purge_enqueues_each_namespace_prefix() {
-    const KEYED: &str = "application/json; profile=keyed-batch-v1";
-    let mut machine = machine();
-    machine.apply(set_feature_level_cmd(crate::FEATURE_LEVEL_KEYED_STREAMS));
-    let affinity = BucketStreamId::with_affinity("benchcmp", "run", "log");
-    assert!(matches!(
-        machine.apply(create_cmd(affinity.clone(), Create {
-            content_type: KEYED,
-            ..Create::default()
-        })),
-        StreamResponse::Created { .. }
-    ));
-    assert!(matches!(
-        machine.apply(StreamCommand::PurgeBucket {
-            bucket_id: "benchcmp".to_owned(),
-        }),
-        StreamResponse::BucketPurged {
-            removed_streams: 1,
-            pending_cold_gc_entries: 1,
-            ..
-        }
-    ));
-    let entries = machine.pending_cold_gc_batch(8);
-    let ColdGcTarget::Paths(paths) = &entries[0].target else {
-        panic!("expected a path entry: {entries:?}");
-    };
-    assert_eq!(paths.len(), 1);
-    assert!(
-        paths[0].starts_with(".keyed/benchcmp/run%2Flog/"),
-        "{paths:?}"
-    );
 }
 
 /// Publishes one shared slice `[start, end)` of `pack` for `id`.

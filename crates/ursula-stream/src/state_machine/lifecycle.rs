@@ -115,27 +115,9 @@ impl StreamStateMachine {
         }
     }
 
-    /// Keyed streams (`application/json; profile=keyed-batch-v1`) may be
-    /// created only at [`FEATURE_LEVEL_KEYED_STREAMS`]: below it an older
-    /// binary could re-normalize their records (design §6.3).
-    ///
-    /// [`FEATURE_LEVEL_KEYED_STREAMS`]: crate::FEATURE_LEVEL_KEYED_STREAMS
-    fn require_keyed_create_level(&self, content_type: &str) -> Result<(), StreamResponse> {
-        if !ursula_shard::is_keyed_batch_content_type(content_type) {
-            return Ok(());
-        }
-        self.require_feature_level(
-            crate::feature::FEATURE_LEVEL_KEYED_STREAMS,
-            "keyed stream create",
-        )
-    }
-
     pub(super) fn create_stream(&mut self, input: CreateStreamInput) -> StreamResponse {
         let attrs = normalize_stream_attrs(input.attrs.clone());
         if let Err(response) = self.validate_stream_scope(&input.stream_id) {
-            return response;
-        }
-        if let Err(response) = self.require_keyed_create_level(&input.content_type) {
             return response;
         }
         if let Err(response) = validate_stream_attrs(attrs.as_ref()) {
@@ -306,9 +288,6 @@ impl StreamStateMachine {
             return response;
         }
         if let Err(response) = self.validate_stream_scope(&input.stream_id) {
-            return response;
-        }
-        if let Err(response) = self.require_keyed_create_level(&input.content_type) {
             return response;
         }
         if let Err(response) = validate_stream_attrs(attrs.as_ref()) {
@@ -702,23 +681,6 @@ impl StreamStateMachine {
                 ColdGcTarget::Paths(vec![object.s3_path.clone()]),
             );
         }
-        // A keyed stream's projection namespaces live outside its cold
-        // objects and may exist even when it never flushed. Enqueue the
-        // removed incarnation's prefix; a recreated stream has a new
-        // incarnation (C7), so its namespace is never swept (U22).
-        if self.incarnation_scoped_cold_objects()
-            && ursula_shard::is_keyed_batch_content_type(&slot.metadata.content_type)
-        {
-            self.cold_gc.enqueue(
-                stream_id.bucket_id.clone(),
-                ColdGcTarget::Paths(vec![
-                    ursula_shard::keyed_namespace::keyed_incarnation_prefix(
-                        stream_id,
-                        slot.metadata.created_at_ms,
-                    ),
-                ]),
-            );
-        }
         self.release_shared_cold_objects(&stream_id.bucket_id, shared_paths, 0);
         true
     }
@@ -733,7 +695,7 @@ impl StreamStateMachine {
                 message,
             ));
         }
-        if let Err(message) = validate_stream_id(stream_id, self.feature_level) {
+        if let Err(message) = validate_stream_id(stream_id) {
             return Err(StreamResponse::error(
                 StreamErrorCode::InvalidStreamId,
                 message,

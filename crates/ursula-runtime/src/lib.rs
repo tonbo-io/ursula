@@ -315,8 +315,6 @@ mod external_offload_tests;
 #[cfg(test)]
 mod incarnation_gc_tests;
 #[cfg(test)]
-mod keyed_lifecycle_tests;
-#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tidy_driver_tests;

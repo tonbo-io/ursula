@@ -1,10 +1,10 @@
 # Bounded Per-Stream State for Long-Lived Streams
 
-Status: Accepted 2026-10-02 as part of the keyed-streams epic. Implementation in progress on `agent/keyed-streams`.
+Status: Accepted 2026-10-02.
 
-Scope: make the memory and snapshot footprint of every Ursula stream at most a small constant, plus its unflushed hot window, plus 16 bytes per MiB of cold history, without requiring retention. The footprint then no longer grows with record count, but it is not independent of history: it still grows by about 16 MiB per TiB of cold history, per stream and per replica. A history-independent bound is a follow-up (§3, I1). This covers replicated state on every replica, the group snapshots built from it, node-local state outside the state machine, per-request memory, and the S3 objects that state points to. It also fixes the cold-path correctness defects that the audit and its adversarial review found, because several fixes build on them. Keyed streams and Pi Durable are out of scope; they consume this work.
+Scope: make the memory and snapshot footprint of every Ursula stream at most a small constant, plus its unflushed hot window, plus 16 bytes per MiB of cold history, without requiring retention. The footprint then no longer grows with record count, but it is not independent of history: it still grows by about 16 MiB per TiB of cold history, per stream and per replica. A history-independent bound is a follow-up (§3, I1). This covers replicated state on every replica, the group snapshots built from it, node-local state outside the state machine, per-request memory, and the S3 objects that state points to. It also fixes the cold-path correctness defects that the audit and its adversarial review found, because several fixes build on them.
 
-Related: issue #17 (stable memory under cold storage) and PR #15 (cold metadata moved into cold-index pages); issue #84 and PR #91 (record coordinates; #84 anticipated a sparse index); #146 (producer receipts); #164, #182, #184 (pack references in replicated state); #278 (legacy pack migration); #57, #58, #167 (TTL sweeps and renewal); #190 (incremental group hot gauge); #194, #198, #212, #252 (snapshot cost and cadence); #111, #274 (WAL reclaim); #210 (the eviction rule); #41 (agent trajectories keep full history); #170 (framed binary records); `docs/architecture/json-record-coordinates-validation.md`; `docs/architecture/raft-wal-production.md`; `docs/architecture/deterministic-simulation-testing.md`; `docs/architecture/keyed-streams-pi-durable.md` §6.2 (this document defines its C0 to C7; Pi keeps C8 and C9); specs `extensions.mdx` §2 and §6, `durable-stream.mdx`, `concepts/exactly-once-writes.mdx`, `operations.mdx`.
+Related: issue #17 (stable memory under cold storage) and PR #15 (cold metadata moved into cold-index pages); issue #84 and PR #91 (record coordinates; #84 anticipated a sparse index); #146 (producer receipts); #164, #182, #184 (pack references in replicated state); #278 (legacy pack migration); #57, #58, #167 (TTL sweeps and renewal); #190 (incremental group hot gauge); #194, #198, #212, #252 (snapshot cost and cadence); #111, #274 (WAL reclaim); #210 (the eviction rule); #41 (agent trajectories keep full history); #170 (framed binary records); `docs/architecture/json-record-coordinates-validation.md`; `docs/architecture/raft-wal-production.md`; `docs/architecture/deterministic-simulation-testing.md`; specs `extensions.mdx` §2 and §6, `durable-stream.mdx`, `concepts/exactly-once-writes.mdx`, `operations.mdx`.
 
 Conventions: paths are relative to the repository root, and line numbers refer to commit `e6d8d70` (0.5.1). Figures marked *measured* come from the bounded-state probe that milestone B0 commits (§7.1). It drives the real `StreamStateMachine` with the exact commands the runtime issues (L1) and the real `ShardRuntime` with both the in-memory and the single-node OpenRaft engine (L2), and it counts requested heap bytes with a counting allocator, so real RSS is somewhat higher. Defects marked *reproduced* come from the adversarial probes, which also drive the real `ShardRuntime`; B0 commits them as regression tests. Unmarked figures are estimates.
 
@@ -18,9 +18,9 @@ Conventions: paths are relative to the repository root, and line numbers refer t
 6. Pack references compact through the existing `CompactCold`. The Raft engine lacks the all-shared branch that the in-memory engine has; adding it also fixes the legacy-pack migration that bucket purge runs. Every page write for a range whose bytes state proves clears the other entries overlapping it, so compaction never exposes a stale entry.
 7. Producer receipts become a per-stream window of 1,024 items plus each producer's newest acknowledgement, and idle producers expire; duplicates beyond the window answer `204` without ranges, as the base protocol says. Message records collapse at every cold transition. External payload locators are committed first and moved into cold-index pages afterwards, so state holds only the in-flight ones.
 8. Two other defects get their own fixes: the flush planner's head-of-line starvation with its O(S²) planning, and the per-append TTL heap. Node-local leaks (page-cache LRU deque, cold-read `readers` map, engine append counts), unbounded per-request materialization, quadratic bootstrap planning and byte-blind snapshot cadence are fixed alongside.
-9. Replicated changes are gated by a group feature level. Four levels keep the risky changes apart, so sparse marks ship alone, and their behavior-preserving parts ship ungated first. It is the same mechanism as Pi's C0.
+9. Replicated changes are gated by a group feature level. Four levels keep the risky changes apart, so sparse marks ship alone, and their behavior-preserving parts ship ungated first.
 10. Milestones: B0 harness; B1 correctness defects and ungated fixes; B2 pack-reference driver, orphan sweep and decode support; B3 level Lb1 (state hygiene); B4 level Lb2 (sparse marks); B5 level Lb3 (external locators); B6 hot window and snapshot cadence; B7 hardening with a 72-hour soak gate. About +5,800 / −400 production LoC and +6,500 test LoC, twice the first estimate; #91, which built the dense index, took about 1,600 production lines alone.
-11. This is a production prerequisite for Pi Durable, through B4, but it is general Ursula work that does not depend on keyed streams and can start now.
+11. This is general Ursula work and can start now.
 
 ## 2. Problem
 
@@ -110,7 +110,7 @@ Every growth source the audits found, replicated or not, with the fix that bound
 | 4 | Producer map (`state_machine.rs:143`) | yes | O(distinct ids) | about 380 B per id; id length unbounded | stream delete | F3 |
 | 5 | `message_records` (`state_machine.rs:138`) | yes | O(records since `FlushCold`); forever on external-only streams | 16 B/record heap, 12-15 B snapshot; 5,000-record external body: 120 KB heap, 91 KB snapshot per append | `FlushCold` or retention; collapse keeps capacity | F4, F7 |
 | 6 | Hot window chunk overhead (`hot_buffer.rs:7-17, 88-97`) | yes | O(unflushed appends) | about 64 B tight per record beyond payload; 2.6 MB deque kept after one flush window | flush thresholds and group cap, both payload-only | F6, F7 |
-| 7 | External locators in state (planned by Pi C6) `external_segments` (`cold_state.rs:9`) | yes | O(external appends) if shipped as written | est. 120 B snapshot, 170 B heap per append of 1 MiB or more | retention only | F5 |
+| 7 | External locators in state (planned by an earlier design) `external_segments` (`cold_state.rs:9`) | yes | O(external appends) if shipped as written | est. 120 B snapshot, 170 B heap per append of 1 MiB or more | retention only | F5 |
 | 8 | Visible snapshot payload (`model.rs:264-273`) | yes | O(1), up to the 32 MiB body cap; at Lb5 a reference above the staging threshold | inline on every replica and every group snapshot | replacement | F16 |
 | 9 | `last_stream_seq` and producer id length (`append.rs:347-349`; `state_machine.rs:752-761`) | yes | O(1), length unbounded through `$transaction` JSON | up to 32 MiB | replacement | F3 |
 | 10 | Engine `stream_append_counts` (`ursula-runtime/src/engine/in_memory.rs:128`) | frames | one leaked entry per TTL-expired or purged stream | est. 150 B per removed stream | restart or snapshot install | F9 |
@@ -173,7 +173,7 @@ Each subsection gives the data-structure change, read and write path changes, sn
 - Each gated call site checks one predicate, such as `self.feature_level >= LB1`. The check and the old path are deleted once the oldest supported release always runs at that level.
 - A gated command never depends on an optional field that a proposer below the level would omit. At a raised level apply decides from state alone, so a command proposed before the raise and applied after it is decided identically on every replica.
 
-**Raising.** `ursulactl cluster raise-feature-level --to N` reads each node's maximum supported level from the node admin info endpoint (a new field), requires every voter and learner of every group to support `N`, then proposes `SetFeatureLevel` to each group. The raise to Lb2 also requires every group to report a completed page-repair cycle (F19). Levels are never lowered. Membership changes refuse to add a node whose maximum is below the group's level. Once raised, binaries below the level cannot restore the group's snapshots, so downgrades are unsupported, as Pi §6.3 already states.
+**Raising.** `ursulactl cluster raise-feature-level --to N` reads each node's maximum supported level from the node admin info endpoint (a new field), requires every voter and learner of every group to support `N`, then proposes `SetFeatureLevel` to each group. The raise to Lb2 also requires every group to report a completed page-repair cycle (F19). Levels are never lowered. Membership changes refuse to add a node whose maximum is below the group's level. Once raised, binaries below the level cannot restore the group's snapshots, so downgrades are unsupported.
 
 **Levels.** Levels follow release order, and each costs one predicate per call site. This document defines five:
 
@@ -183,7 +183,7 @@ Each subsection gives the data-structure change, read and write path changes, sn
 - **Lb4, hot representation:** F4b.
 - **Lb5, cold snapshots:** F16 (§5.16), feature level 5 (`FEATURE_LEVEL_COLD_SNAPSHOTS`).
 
-Pi's keyed level (Pi C8) and these share one sequence: numbers are assigned at release, and a level may carry items from both tracks when they release together.
+Numbers are assigned at release, and a level may carry several items when they release together.
 
 **`TidyStream { stream_id, now_ms }`** (Lb1) applies the normalizations that `FlushCold` and `AppendExternal` run inline: collapse message records (F4a), trim receipts and expire idle producers (F3), shrink capacities (F7), and from Lb2 seal the record index (F1). It is idempotent. Each command does bounded work, at most 1M records sealed and 64k receipts trimmed, so a legacy stream converges over several commands without stalling the group's apply. A leader-side maintenance driver issues it for streams whose derived debt exceeds a threshold (dense records below the seal point, receipts beyond the window, idle producers, capacity slack), at most 64 streams per group per minute, and repeats until no debt remains. This is how idle legacy streams converge after a raise without any O(group) apply.
 
@@ -327,7 +327,7 @@ Neither command gains a field. A wrong scan, from wrong cold bytes or from a del
 - **Duplicates.** A deduplicated retry writes an entry at the current tail for an object nobody references.
 - **Ambiguous errors.** The HTTP layer deletes the staged object on any runtime error, including ambiguous ones where the append may still commit (`lib.rs:2482-2485, 2596-2601`).
 
-Pi's C6 fixes the locator by keeping the `ObjectPayloadRef` in state at apply, at about 120 B of snapshot per append "until offloaded (a follow-up)". This design makes the offload part of the fix: state is the staging area, pages are the durable index.
+An earlier design fixed the locator by keeping the `ObjectPayloadRef` in state at apply, at about 120 B of snapshot per append "until offloaded (a follow-up)". This design makes the offload part of the fix: state is the staging area, pages are the durable index.
 
 **Design.**
 
@@ -340,7 +340,7 @@ Pi's C6 fixes the locator by keeping the `ObjectPayloadRef` in state at apply, a
 
 **Implementation note.** Lb3 is feature level 3 (`FEATURE_LEVEL_EXTERNAL_LOCATORS`). The offload runs as its own leader-side worker every 2 s whenever a cold store is configured, rather than inside F2's driver loop, because that loop only runs when `compaction_enabled` is set and the offload bounds replicated state. A ref's age comes from the write time in its object name; a name without one counts as due. The cleanup rule also deletes the staged object of a create that answers already-exists. The orphan sweep (F14h) reads state refs before pages, and the offload writes pages before it removes refs, so a ref moving from state to pages is always seen in one of them.
 
-**Codec and gating.** No new codec field; `external_segments` is field 9 already. The apply change and the new `OffloadColdRefs` command are gated at Lb3. Lb3 may trail the other levels: until it ships, deployments that cannot afford the staging path keep `external_payload_min_size` above the 32 MiB body cap, as Pi does.
+**Codec and gating.** No new codec field; `external_segments` is field 9 already. The apply change and the new `OffloadColdRefs` command are gated at Lb3. Lb3 may trail the other levels: until it ships, deployments that cannot afford the staging path keep `external_payload_min_size` above the 32 MiB body cap.
 
 **Cost.** +500 production LoC, +600 test LoC. Medium-high risk, since this is the data path for large appends; madsim ambiguous-commit seeds mitigate it (§7.4).
 
@@ -460,7 +460,7 @@ Every returned entry is at its stream's true expiry, and every smaller key has a
 - **(f) Retention GC.** Only deployments that trim need this: a leader-side pass deletes pages wholly below the retained offset together with their exclusive chunks and externals, through a gated `EnqueueColdGc` command. It is not needed for boundedness. *Status (2026-10-03):* shipped without a replicated command, after an AWS run showed nothing below the retained offset was ever deleted. The F19 repair cursor runs it on the leader: once a retained offset has been observed for the F14i grace (leader-local clock, restarted on failover), it deletes the pages that lie wholly below it and hold only entries below it, then the objects only those pages name (`crates/ursula-runtime/src/retention_gc.rs`). It never writes the boundary page and never deletes an object a kept page names: page writes are unconditional PUTs and leadership is checked only when a step starts, so a deposed leader rewriting the boundary page could drop an entry a new leader just flushed, which at Lb1 is the chunk's only reference. This leaves at most about one page span of objects below the retained offset per stream. Follow-up: conditional PUTs on page writes for repair, flush and compaction, which would remove that hazard everywhere. Direct external refs that retention drops from state are still left to the orphan sweep.
 - **(g) Incarnation-scoped objects (D4).**
   1. *B1, ungated.* The GC worker acknowledges a stream entry without deleting anything when a stream with that name exists again, and checks again before deleting pages; (h) reclaims the old incarnation's unreferenced objects later. Deleting a live stream's data becomes a bounded leak, and the window left is a recreate during an in-progress sweep. F19's repair drops page entries whose objects predate the stream's creation.
-  2. *Lb1.* A create assigns a unique incarnation, `created_at_ms := max(now_ms, group.last_created_at_ms + 1)`, which is Pi's C7. `last_created_at_ms` (header field 10) starts at the raise as the maximum of its `now_ms` and every live stream's `created_at_ms`. A stream created at Lb1 or later keeps its cold-index pages under generation = incarnation; the page key's generation component and snapshot field 7 already exist and are always 0 today (`cold_index.rs:37`; `cold_state.rs:22-24`). Its chunk and external names gain an `{incarnation:016x}/` component. Stream GC entries carry the incarnation (`ColdGcEntryV1` field 6) and delete only that incarnation's names and generation. Legacy entries delete only legacy-format names directly under `chunks/` and `external/`, and generation-0 pages, which also stops today's recursive sweep from reaching an affinity stream under the same name.
+  2. *Lb1.* A create assigns a unique incarnation, `created_at_ms := max(now_ms, group.last_created_at_ms + 1)`. `last_created_at_ms` (header field 10) starts at the raise as the maximum of its `now_ms` and every live stream's `created_at_ms`. A stream created at Lb1 or later keeps its cold-index pages under generation = incarnation; the page key's generation component and snapshot field 7 already exist and are always 0 today (`cold_index.rs:37`; `cold_state.rs:22-24`). Its chunk and external names gain an `{incarnation:016x}/` component. Stream GC entries carry the incarnation (`ColdGcEntryV1` field 6) and delete only that incarnation's names and generation. Legacy entries delete only legacy-format names directly under `chunks/` and `external/`, and generation-0 pages, which also stops today's recursive sweep from reaching an affinity stream under the same name.
 - **(h) Orphan sweep (D5, B2, ungated).** Publishes with ambiguous outcomes keep their objects on purpose (`runtime.rs:404-414, 537-546`), and nothing reclaims them; packs live under `{bucket}/_packs/{group}/` (`cold_store.rs:1328-1331`), outside every stream prefix. A per-group leader job lists the group's pack prefix and walks stream prefixes with F19's cursor, deleting objects older than a day that no state ref, cold-index page or GC entry references; packs need only the group's ref maps. It wires up the existing `cold_orphan_cleanup_*` counters (`metrics.rs:413-415`).
 - **(i) Retention grace (D6, Lb1).** Retention releases dropped pack slices with no grace (`cold.rs:706`). It uses `compaction_gc_grace` instead, so a read planned before the retention still finds its bytes. The not-before time is replicated, hence the gate.
 
@@ -470,7 +470,7 @@ Every returned entry is at its stream's true expiry, and every smaller key has a
 
 **F15, tenant tombstones.** `bucket_usage` keeps a row of about 200 B per bucket ever written in every group. `erased_buckets` keeps about 95 B per purged bucket in every group, and `PurgeBucket` runs on all groups (`runtime.rs:579-600`). Both are deliberate (#258, #280), and both grow with tenant churn rather than records. Options: a gated `PruneBucketUsage { bucket_id, observed }` sent after the meter durably records the counters; fences held in the meta group, with only a 16-byte fingerprint set in data groups. Q9 asks the maintainers to decide.
 
-**F16, visible snapshot.** O(1) per stream, but inline up to the 32 MiB body cap on every replica and in every group snapshot. Accepted for Pi Durable's SQLite VFS, which publishes the database file itself as the snapshot (`docs/architecture/keyed-streams-pi-durable.md`), and implemented at Lb5 as follows.
+**F16, visible snapshot.** O(1) per stream, but inline up to the 32 MiB body cap on every replica and in every group snapshot. Accepted for the SQLite VFS, which publishes the database file itself as the snapshot, and implemented at Lb5 as follows.
 
 *Design (Lb5, feature level 5).* The smallest change that reuses F5:
 
@@ -537,20 +537,18 @@ New stale entries stop at Lb3, when F5 removes the pre-proposal write.
 | F13 node caches | none | +100 | +120 | low | B1 |
 | F14 cold-object hygiene | (a), (b) defer, (g) 2, (i) at Lb1; (f) gated | +600 | +500 | medium | B1 (b, e, g 1), B2 (h), B3 (a, b defer, g 2, i), B6 (c, d) |
 | F15 | next level, if accepted | +100 | +100 | low | decision in B7 |
-| F16 cold snapshots | Lb5 | +450 | +200 | medium | after B7 (Pi Durable VFS, M2) |
+| F16 cold snapshots | Lb5 | +450 | +200 | medium | after B7 (SQLite VFS) |
 | F17 hardening | none | +150 | +100 | low | B7 |
 | F18 cold coverage | B1 rule none; representation Lb1 | +80 | +150 | low | B1, B3 |
 | F19 page-entry hygiene | none | +200 | +250 | medium | B1 |
 
 Totals, excluding F15 and F16: about +5,800 / −400 production LoC and +6,500 test LoC, plus the harness (§7.1). The first estimate was half of this; the history of #91, `PurgeBucket` (#157, #282) and bucket quotas (#158) supports the larger figures.
 
-Mapping to the Pi plan: F0 is Pi C0, F1 is C1, F2 is C2, F3 replaces C3 with a different window, F4a is C4, F6a is C5, F5 with F19 replaces C6 with the offload made mandatory, and F14g contains C7. Pi's C8 and C9 remain Pi items; C8 takes a level from F0 in release order.
-
 ## 6. Record-coordinate correctness under sparse marks
 
 F1 changes how every record coordinate is resolved, so it carries its own invariants. The dense implementation at `e6d8d70` is the oracle; marks must be invisible, apart from retention landing on a mark. Each invariant names its test.
 
-**RC-1, boundaries are LFs.** On a JSON stream each record is one compact JSON value plus one LF and contains no other LF, on every write path: inline append, append batch, transaction ops, create with a body, and external create and append. *Test*: a fuzz test (arbitrary JSON, arrays, escapes, lone surrogates once Pi's P1 lands) asserting that the stored bytes' LF positions equal the committed record ends on each path.
+**RC-1, boundaries are LFs.** On a JSON stream each record is one compact JSON value plus one LF and contains no other LF, on every write path: inline append, append batch, transaction ops, create with a body, and external create and append. *Test*: a fuzz test (arbitrary JSON, arrays, escapes, lone surrogates) asserting that the stored bytes' LF positions equal the committed record ends on each path.
 
 **RC-2, oracle equivalence.** In every reachable state, `offset_for(r)` after scanning equals the dense oracle for every retained `r`, and `record_for(o)` agrees for every boundary `o` and rejects every non-boundary. *Test*: a proptest differential suite on `StreamStateMachine` with an in-memory byte store standing in for S3. Random JSON appends of 1 to 2,000 records with sizes from 2 B to 3 MiB, external appends, flushes at random points including mid-record splits, retention at random boundaries, transactions with rollback, and snapshot round trips at random points. Explicit cases: the D1 sequence (hot prefix, external append, flush, offload, snapshot round trip), and stale page entries from rejected external appends at the same and at overlapping starts.
 
@@ -706,7 +704,7 @@ Alerts:
 
 ## 8. Milestones
 
-The workstream starts now. It does not depend on keyed streams and touches no protocol surface except the receipt window (F3), retention granularity in cold history (F1), bootstrap parts and response caps (F11), and binary bootstrap parts (F4a, F4b).
+The workstream starts now. It touches no protocol surface except the receipt window (F3), retention granularity in cold history (F1), bootstrap parts and response caps (F11), and binary bootstrap parts (F4a, F4b).
 
 **B0, harness (about 1.5 weeks).** Port the probe and the adversarial reproductions (§7.1), add the per-group gauges, and land the CI ratchet job and the nightly job. *Exit*: CI reproduces the audit's figures within 10% at reduced scale and runs D1 to D4 as expected failures; the nightly job publishes W1 to W6; dashboards exist.
 
@@ -744,8 +742,6 @@ The workstream starts now. It does not depend on keyed streams and touches no pr
 
 **B7, hardening (about 2 weeks, then ongoing).** The 72-hour soak gate (§7.5), F17, decisions on F15 and F16, and removal of the legacy paths (pre-level code, legacy pack migration) after the deprecation window. *Exit*: the soak gate passes and `operations.mdx` no longer names retention as the way to bound memory. *Status (2026-10-02):* the soak is deferred to a run on AWS (ECS or EKS) against real S3; it has not run, so the gate is open. (Its script drove the Pi Durable adapter and was removed with it.)
 
-**Relation to Pi Durable.** The Pi plan's core items C0 to C7 are this workstream (§5.20). Pi's M1 does not wait for it: it runs without trimming, with growth like a JSONL file, and needs only F0's plumbing from B1 to gate keyed creates. Pi's M2 needs unique incarnations (C7, F14g at Lb1, or carried on Pi's keyed level if that releases first). Pi production depends on B4. Until B5 ships, Pi clusters keep `external_payload_min_size` above the 32 MiB body cap, as Pi §3.3 requires, which also keeps D1 and D3 unreachable for them. B6 is recommended before production.
-
 ## 9. Rejected alternatives
 
 **Require retention.** Applications publish snapshots and trim to stay bounded. This contradicts the principle and discards the history these streams exist for (#41). It makes Raft memory depend on applications or indexers staying alive; Pi's review measured unbounded growth during an indexer outage. It still leaves receipts, producer ids, the TTL heap and `Vec` capacity unbounded.
@@ -768,7 +764,7 @@ The workstream starts now. It does not depend on keyed streams and touches no pr
 
 **Bump `RAFT_GRPC_PROTOCOL_VERSION` with a full restart.** This breaks the graceful mixed-version rollouts shipped since 0.4 (#178, #200, #233).
 
-**Keep external locators in state permanently** (Pi C6 as written). That is 120 B per external append, 7.5 times the marks' constant, for no benefit, since the offload needs no byte copy.
+**Keep external locators in state permanently** (as an earlier design proposed). That is 120 B per external append, 7.5 times the marks' constant, for no benefit, since the offload needs no byte copy.
 
 **Make the legacy migration the permanent pack compactor.** It snapshots every group per pass, compacts one chunk per command, deletes replacements on ambiguous errors, and #278 plans to remove it.
 
@@ -789,7 +785,7 @@ The workstream starts now. It does not depend on keyed streams and touches no pr
    - `extensions.mdx:751`: state bootstrap parts for cold binary history (Lb1).
    - `extensions.mdx:786`, `durable-stream.mdx:329` and `exactly-once-writes.mdx:16, 31`: limit exact ranges to the receipt window and the newest sequence (Lb1).
    - `operations.mdx:135`: retention is not needed for memory.
-5. **Response caps.** Can reads and `/bootstrap` cap responses at 8 MiB by default? Do the ursula-index source, the SDKs or Pi assume that a record read without `max_records`, or a bootstrap, returns everything up to the tail?
+5. **Response caps.** Can reads and `/bootstrap` cap responses at 8 MiB by default? Do the ursula-index source or the SDKs assume that a record read without `max_records`, or a bootstrap, returns everything up to the tail?
 6. **Maximum hot age.** Is keeping slow streams' small tails hot for up to 5 minutes acceptable? It bounds how long records stay hot in quiet groups; in the healthy regime it changes slices little (288 against 308 per day), and the large slice reductions come from F10's batching and F2.
 7. **Defaults.** Should compaction become on by default once discovery is debt-driven (F14d), S3 snapshots the default whenever a cold store exists (F12b, which also turns on S3-health leadership shedding), and snapshot cadence byte-based with a 1 GiB node log budget (F12e)? Is the inline backend meant for production clusters at all?
 8. **Visible snapshots.** Decided 2026-10-03: externalize above the staging threshold at Lb5 (F16, §5.16), up to 1 GiB.

@@ -134,8 +134,7 @@ jobs:
             --seed-range 137..=140 \
             --seed-family http-protocol-surface-randomized \
             --seed-family runtime-raft-network-cold-live-write-recovery \
-            --seed-family runtime-interleaving \
-            --seed-family keyed-indexer
+            --seed-family runtime-interleaving
           mkdir -p target/ursula-sim-seed-146-cold-write-delay-minimize
           jq '.[] | select(.schedule.seed == 146)' crates/ursula-sim/corpus/schedule-smoke.json \
             > target/ursula-sim-seed-146-cold-write-delay-minimize/seed-146-record.json
