@@ -218,7 +218,7 @@ How a 0.6 node refuses old data, and what it prints, is listed under [Startup fa
 
 - **Raft WAL directory.** `{raft.wal.path}/raft-log/FORMAT_EPOCH` records the epoch. A directory that holds data without the marker, or a marker of another epoch, is refused. The marker is written after every check passes.
 - **Object storage.** `URSULA_FORMAT_EPOCH` sits at `storage.cold.root` when the cold backend is S3, otherwise at the S3 snapshot namespace (`storage.snapshot.s3_prefix`) when snapshots live on S3. A namespace that holds objects without the marker is refused, so it must be used only by this cluster. With a memory cold store and inline snapshots there is no object-storage check.
-- **Peers.** Before it writes the markers, a node with configured peers asks each one, in parallel with a 2-second budget, whether it speaks Raft protocol 2. A peer that refuses ends startup; an unreachable peer is skipped, because a fresh cluster starts its pods in parallel.
+- **Peers.** Before it writes the markers, a node with configured peers asks each one, in parallel (2 seconds to connect plus 2 seconds for the answer, about 4 seconds at most), whether it speaks Raft protocol 2. A peer that refuses ends startup; an unreachable peer is skipped, because a fresh cluster starts its pods in parallel.
 - **Readiness.** Any later Raft protocol mismatch, inbound or outbound, is logged at error level and makes `/__ursula/ready` answer `503` with `"reason": "format_epoch_mismatch"` until the node restarts.
 - **Backups.** Backups use format version 2. `ursulactl backup-restore` and `backup-create` refuse a cluster that reports another version, and a server refuses to import a group without format epoch 2 (`400`).
 

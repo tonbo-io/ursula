@@ -1,5 +1,9 @@
 //! Replicated group feature levels (design C0).
 //!
+//! Since format epoch 2 every group starts at the top level and the server's
+//! `POST /__ursula/feature-level` proposes nothing, so step 2 below is a
+//! no-op; PR14 removes this module.
+//!
 //! `ursulactl cluster enable-feature --level N` raises every Raft group's
 //! replicated feature level to `N` in three steps:
 //!

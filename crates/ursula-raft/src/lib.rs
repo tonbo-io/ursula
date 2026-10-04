@@ -54,7 +54,6 @@ pub use engine::RaftGroupEngine;
 pub use engine::RaftGroupEngineFactory;
 pub use engine::RegisteredRaftGroupEngineFactory;
 pub use engine::StaticGrpcRaftGroupEngineFactory;
-pub use format_epoch::FORMAT_EPOCH_PROBE_GROUP;
 pub use format_epoch::FormatEpochMismatch;
 pub use format_epoch::PeerFormatEpoch;
 pub use format_epoch::probe_peer_format_epoch;

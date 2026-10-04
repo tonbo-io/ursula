@@ -147,13 +147,8 @@ pub struct SnapshotPointer {
 
 /// Wire envelope of a [`SnapshotPointer`] (bounded-state F12a).
 ///
-/// JSON is the legacy envelope: it spells inline snapshot bytes as a JSON
-/// number array, several bytes of text per byte. MessagePack carries them as
-/// one `bin` value. Every decoder accepts both, telling them apart by the
-/// first byte (a JSON object starts with `{` or whitespace; a MessagePack
-/// map with named fields starts with a map marker). Emission switches to
-/// MessagePack only at feature level 1 (Lb1), once every member can decode
-/// it.
+/// MessagePack is the only envelope written; a leading `{` or whitespace
+/// marks the 0.5.x JSON envelope, which [`Self::decode`] refuses (E6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotEnvelope {
     Json,
@@ -161,15 +156,6 @@ pub enum SnapshotEnvelope {
 }
 
 impl SnapshotEnvelope {
-    /// The envelope a group at `feature_level` emits.
-    pub fn for_feature_level(feature_level: u32) -> Self {
-        if feature_level >= ursula_stream::FEATURE_LEVEL_KEYED_STREAMS {
-            Self::MessagePack
-        } else {
-            Self::Json
-        }
-    }
-
     /// The envelope `bytes` were written in.
     pub fn detect(bytes: &[u8]) -> Self {
         match bytes.first() {
@@ -206,17 +192,9 @@ impl SnapshotEnvelope {
 }
 
 impl SnapshotPointer {
-    /// Legacy JSON envelope; see [`Self::encode_for_feature_level`].
+    /// 0.5.x JSON envelope, kept to build E6 test inputs until PR17.
     pub fn encode(&self) -> Result<Vec<u8>, SnapshotStoreError> {
         SnapshotEnvelope::Json.encode(self)
-    }
-
-    /// Encodes in the envelope a group at `feature_level` emits (F12a).
-    pub fn encode_for_feature_level(
-        &self,
-        feature_level: u32,
-    ) -> Result<Vec<u8>, SnapshotStoreError> {
-        SnapshotEnvelope::for_feature_level(feature_level).encode(self)
     }
 
     /// Decodes the MessagePack envelope; refuses JSON (E6).
@@ -225,7 +203,7 @@ impl SnapshotPointer {
     }
 }
 
-/// Whether `bytes` hold the legacy JSON envelope (F12a decode support).
+/// Whether `bytes` hold the 0.5.x JSON envelope (refused by decode, E6).
 pub fn is_json_snapshot_envelope(bytes: &[u8]) -> bool {
     SnapshotEnvelope::detect(bytes) == SnapshotEnvelope::Json
 }

@@ -21,7 +21,8 @@ use ursula_runtime::format_marker::MarkerState;
 use ursula_runtime::format_marker::classify_data_dir;
 use ursula_runtime::format_marker::write_data_dir_marker;
 
-/// Budget for the parallel startup peer probes.
+/// Per-step timeout of each parallel startup peer probe: 2 s to connect and
+/// 2 s for the request, so one probe takes at most about 4 s.
 const PEER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) async fn check_and_stamp_format_epoch(

@@ -116,8 +116,12 @@ fn group_object_name(raft_group_id: u32) -> String {
     format!("group-{raft_group_id:04}.snapshot")
 }
 
-const E9_EPOCH_ONLY: &str = "this ursulactl reads and writes format epoch 2 only (Ursula 0.5.x \
-                             backups and clusters cannot be mixed with 0.6)";
+fn e9_epoch_only() -> String {
+    format!(
+        "this ursulactl reads and writes format epoch {BACKUP_FORMAT_VERSION} only (Ursula 0.5.x \
+         backups and clusters cannot be mixed with 0.6)"
+    )
+}
 
 /// E9: the target cluster must speak this tool's backup format (the format
 /// epoch), checked before the first export or import.
@@ -126,7 +130,7 @@ fn check_cluster_format(info: &BackupInfo) -> Result<()> {
         bail!(
             "target cluster speaks backup format {}; {}",
             info.format_version,
-            E9_EPOCH_ONLY
+            e9_epoch_only()
         );
     }
     Ok(())
@@ -321,7 +325,7 @@ pub async fn verify(store: &BackupStore) -> Result<VerifyReport> {
         bail!(
             "backup manifest format_version {}; {}",
             manifest.format_version,
-            E9_EPOCH_ONLY
+            e9_epoch_only()
         );
     }
     let expected = u32::try_from(manifest.groups.len()).unwrap_or(u32::MAX);

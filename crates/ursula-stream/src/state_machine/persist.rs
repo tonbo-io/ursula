@@ -125,9 +125,8 @@ impl StreamStateMachine {
             );
         }
         if snapshot.feature_level > self.feature_level {
-            // Raising the level is `SetFeatureLevel`'s job, behind the
-            // operator's all-nodes support check; an import that raised it
-            // would let replicas on an older binary diverge.
+            // Unreachable at format epoch 2: every group is at the top level
+            // and `restore` refuses any other. PR14 removes the level.
             return StreamResponse::error(
                 StreamErrorCode::ImportConflict,
                 format!(
@@ -140,8 +139,8 @@ impl StreamStateMachine {
         let streams = u64::try_from(snapshot.streams.len()).unwrap_or(u64::MAX);
         match Self::restore(snapshot) {
             Ok(mut restored) => {
-                // The feature level is neither raised (checked above) nor
-                // lowered by importing a backup taken at a lower level.
+                // A no-op at format epoch 2 (`restore` refuses any level but
+                // the top one); PR14 removes the level.
                 restored.feature_level = self.feature_level;
                 // C7: the counter never goes backwards, so a later create
                 // never reuses an incarnation this group already assigned.

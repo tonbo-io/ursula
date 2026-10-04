@@ -69,10 +69,12 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
     // E5: the format-epoch frame comes first and is checked before any other
     // frame is decoded, so a 0.5.x snapshot fails here rather than on a
     // stream frame it would misread.
+    // A first frame that does not decode is corruption, not an old
+    // snapshot; only a frame that decodes but is not `FormatEpoch` gets E5.
     let first = if cursor.has_remaining() {
         proto::SnapshotFrameV1::decode_length_delimited(&mut cursor)
-            .ok()
-            .and_then(|frame| frame.frame)
+            .map_err(|err| SnapshotStoreError::Deserialize(format!("snapshot frame: {err}")))?
+            .frame
     } else {
         None
     };

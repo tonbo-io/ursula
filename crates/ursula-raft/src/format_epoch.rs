@@ -30,7 +30,7 @@ pub(crate) const PROTOCOL_MISMATCH_TEXT: &str = "raft grpc protocol mismatch";
 
 /// The group id the startup probe names. No node registers it, so a peer on
 /// the same protocol answers `NOT_FOUND` without touching any group.
-pub const FORMAT_EPOCH_PROBE_GROUP: u32 = u32::MAX;
+pub(crate) const FORMAT_EPOCH_PROBE_GROUP: u32 = u32::MAX;
 
 /// A recorded Raft protocol (format-epoch) mismatch. The process-wide
 /// instance ([`FormatEpochMismatch::global`]) is what the gRPC plane records
@@ -95,7 +95,7 @@ pub enum PeerFormatEpoch {
 }
 
 /// Probe one peer's Raft protocol version with a `Vote` for
-/// [`FORMAT_EPOCH_PROBE_GROUP`]. Both 0.5.x and this binary check the version
+/// `FORMAT_EPOCH_PROBE_GROUP`. Both 0.5.x and this binary check the version
 /// before the group and the payload, so the probe has no side effect.
 pub async fn probe_peer_format_epoch(url: &str, timeout: Duration) -> PeerFormatEpoch {
     probe_peer_with_protocol(url, crate::grpc::RAFT_GRPC_PROTOCOL_VERSION, timeout).await
