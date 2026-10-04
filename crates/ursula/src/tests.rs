@@ -866,56 +866,7 @@ async fn append_conflict_precedence_reports_closed_header_before_mismatch_or_seq
     );
 }
 
-#[tokio::test]
-async fn stream_seq_header_rejects_regressing_appends() {
-    let app = test_router();
-
-    let response = http_put(
-        &app,
-        "/benchcmp/seq-stream",
-        &[(CONTENT_TYPE.as_str(), "text/plain")],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let response = http_post(
-        &app,
-        "/benchcmp/seq-stream",
-        &[
-            (CONTENT_TYPE.as_str(), "text/plain"),
-            (HEADER_STREAM_SEQ, "0002"),
-        ],
-        Body::from("a"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-    let response = http_post(
-        &app,
-        "/benchcmp/seq-stream",
-        &[
-            (CONTENT_TYPE.as_str(), "text/plain"),
-            (HEADER_STREAM_SEQ, "0002"),
-        ],
-        Body::from("b"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-
-    let response = http_post(
-        &app,
-        "/benchcmp/seq-stream",
-        &[
-            (CONTENT_TYPE.as_str(), "text/plain"),
-            (HEADER_STREAM_SEQ, "0003"),
-        ],
-        Body::from("c"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-}
-
+// Base-contract pin; see base_contract_tests.rs.
 #[tokio::test]
 async fn producer_headers_deduplicate_retries_and_fence_stale_epochs() {
     let app = test_router();
@@ -2248,6 +2199,7 @@ async fn long_poll_times_out_with_no_content_and_cleans_waiter() {
     assert!(body.contains("\"live_read_waiters\":0"));
 }
 
+// Base-contract pin; see base_contract_tests.rs.
 #[tokio::test]
 async fn long_poll_returns_service_unavailable_when_live_waiters_are_full() {
     let runtime =
@@ -5895,6 +5847,7 @@ fn batch_body(payloads: &[&[u8]]) -> Vec<u8> {
     body
 }
 
+// Base-contract pin; see base_contract_tests.rs.
 #[tokio::test]
 async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {
     let app = Router::new()
