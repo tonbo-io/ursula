@@ -60,6 +60,7 @@ use crate::metrics::RuntimeMetrics;
 use crate::metrics::RuntimeMetricsInner;
 use crate::metrics::elapsed_ns;
 use crate::metrics::is_stale_cold_flush_candidate_error;
+use crate::read_index::ReadIndexBarriers;
 use crate::request::AckColdGcResponse;
 use crate::request::AdvanceRetentionRequest;
 use crate::request::AdvanceRetentionResponse;
@@ -222,6 +223,8 @@ pub struct ShardRuntime {
     compaction_debt: Arc<std::sync::Mutex<CompactionDebt>>,
     /// Exclusive chunks below this many bytes are compaction debt (F14d).
     compaction_debt_chunk_bytes: Arc<AtomicU64>,
+    /// Each started group's ReadIndex barrier, installed by its core worker.
+    read_barriers: ReadIndexBarriers,
 }
 
 /// Node-local position of one group's cold-index repair cursor.
@@ -287,6 +290,7 @@ impl ShardRuntime {
         ));
         let engine_factory: Arc<dyn GroupEngineFactory> = Arc::new(engine_factory);
         let read_materialization = Arc::new(Semaphore::new(config.mailbox_capacity.max(1)));
+        let read_barriers = ReadIndexBarriers::default();
         let mut mailboxes = Vec::with_capacity(usize::from(shard_map.core_count()));
         for raw_core_id in 0..shard_map.core_count() {
             let core_id = CoreId(raw_core_id);
@@ -303,6 +307,7 @@ impl ShardRuntime {
                 raft_uncommitted_bytes: raft_uncommitted_bytes.clone(),
                 live_read_max_waiters_per_core: config.live_read_max_waiters_per_core,
                 read_materialization: read_materialization.clone(),
+                read_barriers: read_barriers.clone(),
             };
             spawn_core_worker(config.threading, worker)?;
             mailboxes.push(CoreMailbox { core_id, tx });
@@ -319,6 +324,7 @@ impl ShardRuntime {
             compaction_debt_chunk_bytes: Arc::new(AtomicU64::new(
                 DEFAULT_COMPACTION_DEBT_CHUNK_BYTES,
             )),
+            read_barriers,
         })
     }
 
@@ -431,11 +437,84 @@ impl ShardRuntime {
         .await
     }
 
+    /// Confirms a read index for `placement`'s group before a linearizable
+    /// read is queued (D10), so the group actor never waits on the
+    /// quorum round trip and commands behind the read are not held by it.
+    /// `None` when the group has no barrier yet or this replica does not
+    /// lead: the engine then forwards, refuses, or linearizes the read
+    /// itself, as before.
+    async fn confirm_read_index(
+        &self,
+        placement: ShardPlacement,
+    ) -> Result<Option<u64>, RuntimeError> {
+        let Some(barrier) = self.read_barriers.get(placement.raft_group_id) else {
+            return Ok(None);
+        };
+        barrier
+            .confirm()
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err))
+    }
+
+    /// Client HEAD (linearizable) or an internal one that reads the
+    /// leader's applied state (`request.linearizable == false`).
+    pub async fn head_stream(
+        &self,
+        mut request: HeadStreamRequest,
+    ) -> Result<HeadStreamResponse, RuntimeError> {
+        let placement = self.shard_map.locate(&request.stream_id);
+        request.read_index = if request.linearizable {
+            self.confirm_read_index(placement).await?
+        } else {
+            None
+        };
+        self.queue_head_stream(request).await
+    }
+
+    /// A `leader_only` (`consistency=leader`) read is linearized before it
+    /// is queued; other reads are served from local state as before.
+    pub async fn read_stream(
+        &self,
+        mut request: ReadStreamRequest,
+    ) -> Result<ReadStreamResponse, RuntimeError> {
+        let placement = self.shard_map.locate(&request.stream_id);
+        request.read_index = if request.leader_only {
+            self.confirm_read_index(placement).await?
+        } else {
+            None
+        };
+        self.queue_read_stream(request).await
+    }
+
+    pub async fn read_snapshot(
+        &self,
+        mut request: ReadSnapshotRequest,
+    ) -> Result<ReadSnapshotResponse, RuntimeError> {
+        let placement = self.shard_map.locate(&request.stream_id);
+        request.read_index = self.confirm_read_index(placement).await?;
+        self.queue_read_snapshot(request).await
+    }
+
+    pub async fn bootstrap_stream(
+        &self,
+        mut request: BootstrapStreamRequest,
+    ) -> Result<BootstrapStreamResponse, RuntimeError> {
+        let placement = self.shard_map.locate(&request.stream_id);
+        request.read_index = self.confirm_read_index(placement).await?;
+        self.queue_bootstrap_stream(request).await
+    }
+
+    /// Live-read registration (SSE, long-poll) requires this replica to be
+    /// the linearizable leader. A confirmed read index proves it without a
+    /// group-actor round trip; otherwise the engine decides.
     pub async fn require_local_live_read_owner(
         &self,
         stream_id: &BucketStreamId,
     ) -> Result<(), RuntimeError> {
         let placement = self.shard_map.locate(stream_id);
+        if self.confirm_read_index(placement).await?.is_some() {
+            return Ok(());
+        }
         let (response_tx, response_rx) = oneshot::channel();
         self.group_rpc(
             placement,

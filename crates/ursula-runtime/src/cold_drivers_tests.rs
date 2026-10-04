@@ -97,6 +97,7 @@ async fn read_all(runtime: &ShardRuntime, stream_id: &BucketStreamId) -> Vec<u8>
             max_records: None,
             leader_only: false,
             record_anchor: None,
+            read_index: None,
         })
         .await
         .expect("read stream")
@@ -308,6 +309,7 @@ async fn f2_driver_deletes_the_replacement_of_a_rejected_compaction() {
             max_records: None,
             leader_only: false,
             record_anchor: None,
+            read_index: None,
         })
         .await
         .expect("read retained suffix");

@@ -271,6 +271,7 @@ fn read_req(stream_id: ursula_shard::BucketStreamId, max_len: usize) -> ReadStre
         max_records: None,
         leader_only: false,
         record_anchor: None,
+        read_index: None,
     }
 }
 
@@ -1275,6 +1276,8 @@ async fn deposed_leader_refuses_linearizable_reads() {
             HeadStreamRequest {
                 stream_id: stream_id.clone(),
                 now_ms: 0,
+                linearizable: true,
+                read_index: None,
             },
             placement(),
         )
@@ -1286,6 +1289,7 @@ async fn deposed_leader_refuses_linearizable_reads() {
             BootstrapStreamRequest {
                 stream_id: stream_id.clone(),
                 now_ms: 0,
+                read_index: None,
             },
             placement(),
         )
@@ -1298,6 +1302,7 @@ async fn deposed_leader_refuses_linearizable_reads() {
                 stream_id: stream_id.clone(),
                 snapshot_offset: None,
                 now_ms: 0,
+                read_index: None,
             },
             placement(),
         )
@@ -2115,6 +2120,8 @@ async fn raft_group_engine_implements_runtime_group_engine_over_openraft() {
             HeadStreamRequest {
                 stream_id: stream_id.clone(),
                 now_ms: 0,
+                linearizable: true,
+                read_index: None,
             },
             placement(),
         )
@@ -2644,9 +2651,11 @@ async fn openraft_snapshot_carries_feature_level() {
 /// leader over gRPC, so a follower's SSE or record read continues from it;
 /// a request from an older follower (no field) decodes with no anchor.
 /// `leader_only` (field 6) travels too, so the leader linearizes a forwarded
-/// `consistency=leader` read.
+/// `consistency=leader` read, and so does `HeadStreamReadV1.applied_state_only`
+/// (field 1), so the leader linearizes a forwarded client HEAD and not an
+/// internal one.
 #[test]
-fn forwarded_reads_carry_the_record_anchor_and_leader_only_over_grpc() {
+fn forwarded_reads_carry_the_record_anchor_and_linearizability_over_grpc() {
     use prost::Message;
 
     let request = ursula_runtime::ReadStreamRequest {
@@ -2662,6 +2671,7 @@ fn forwarded_reads_carry_the_record_anchor_and_leader_only_over_grpc() {
             record: 1_234,
             offset: 987_654,
         }),
+        read_index: None,
     };
     let wire = crate::forward::read_stream_read_v1(&request)
         .expect("wire read")
@@ -2686,4 +2696,20 @@ fn forwarded_reads_carry_the_record_anchor_and_leader_only_over_grpc() {
     let served = crate::grpc::read_stream_request_from_v1(request.stream_id.clone(), 77, decoded)
         .expect("served request");
     assert_eq!(served.record_anchor, None);
+
+    // A forwarded client HEAD stays linearizable on the leader; an internal
+    // one does not.
+    for linearizable in [true, false] {
+        let head = HeadStreamRequest {
+            stream_id: request.stream_id.clone(),
+            now_ms: 77,
+            linearizable,
+            read_index: None,
+        };
+        let wire = crate::forward::head_stream_read_v1(&head).encode_to_vec();
+        let decoded = crate::raft_internal_proto::HeadStreamReadV1::decode(wire.as_slice())
+            .expect("decode head");
+        let served = crate::grpc::head_stream_request_from_v1(head.stream_id.clone(), 77, decoded);
+        assert_eq!(served, head);
+    }
 }

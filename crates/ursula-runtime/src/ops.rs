@@ -88,7 +88,7 @@ macro_rules! runtime_operations {
                 reply { response_tx: HeadStreamResponse }
                 guard { none }
                 handle { call head_stream(engine, metrics, request, placement) }
-                client { pub stream fn head_stream }
+                client { stream fn queue_head_stream }
             }
             op ReadStream {
                 fields { request: ReadStreamRequest }
@@ -104,7 +104,7 @@ macro_rules! runtime_operations {
                         response_tx
                     )
                 }
-                client { pub stream fn read_stream }
+                client { stream fn queue_read_stream }
             }
             op PublishSnapshot {
                 fields { request: PublishSnapshotRequest }
@@ -143,14 +143,14 @@ macro_rules! runtime_operations {
                 reply { response_tx: ReadSnapshotResponse }
                 guard { none }
                 handle { call read_snapshot(engine, metrics, request, placement) }
-                client { pub stream fn read_snapshot }
+                client { stream fn queue_read_snapshot }
             }
             op BootstrapStream {
                 fields { request: BootstrapStreamRequest }
                 reply { response_tx: BootstrapStreamResponse }
                 guard { none }
                 handle { call bootstrap_stream(engine, metrics, request, placement) }
-                client { pub stream fn bootstrap_stream }
+                client { stream fn queue_bootstrap_stream }
             }
             op WaitRead {
                 fields { request: ReadStreamRequest, waiter_id: u64 }

@@ -79,6 +79,7 @@ fn read_req(stream_id: BucketStreamId, offset: u64, max_len: usize) -> ReadStrea
         max_records: None,
         leader_only: false,
         record_anchor: None,
+        read_index: None,
     }
 }
 
@@ -882,6 +883,7 @@ async fn bootstrap_issues_one_read_plan_for_all_updates() {
             BootstrapStreamRequest {
                 stream_id: stream.clone(),
                 now_ms: 0,
+                read_index: None,
             },
             placement,
         )
@@ -997,6 +999,7 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
                 max_records: None,
                 leader_only: false,
                 record_anchor: None,
+                read_index: None,
             },
             placement,
         )
@@ -1017,6 +1020,8 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
             HeadStreamRequest {
                 stream_id: stream.clone(),
                 now_ms: 2_499,
+                linearizable: true,
+                read_index: None,
             },
             placement,
         )
@@ -1042,6 +1047,7 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
                 max_records: None,
                 leader_only: false,
                 record_anchor: None,
+                read_index: None,
             },
             placement,
         )
@@ -1571,6 +1577,8 @@ async fn head_stream_reflects_append_and_closed_state_on_owner_group() {
         .head_stream(HeadStreamRequest {
             stream_id: stream,
             now_ms: 0,
+            linearizable: true,
+            read_index: None,
         })
         .await
         .expect("head stream");
@@ -3075,6 +3083,8 @@ async fn close_stream_allows_close_only_and_rejects_later_appends() {
         .head_stream(HeadStreamRequest {
             stream_id: stream,
             now_ms: 0,
+            linearizable: true,
+            read_index: None,
         })
         .await
         .expect("head stream");
@@ -3103,6 +3113,8 @@ async fn delete_stream_removes_state_on_owner_group() {
         .head_stream(HeadStreamRequest {
             stream_id: stream.clone(),
             now_ms: 0,
+            linearizable: true,
+            read_index: None,
         })
         .await
         .expect_err("head after delete rejected");
@@ -3354,6 +3366,8 @@ async fn runtime_read_uses_group_read_parts_fast_path() {
         .head_stream(HeadStreamRequest {
             stream_id: stream,
             now_ms: 0,
+            linearizable: true,
+            read_index: None,
         })
         .await
         .expect("head stream");
@@ -3400,6 +3414,8 @@ async fn read_materialization_is_bounded_without_blocking_group_actor() {
         runtime.head_stream(HeadStreamRequest {
             stream_id: first_stream,
             now_ms: 0,
+            linearizable: true,
+            read_index: None,
         }),
     )
     .await

@@ -2221,6 +2221,7 @@ async fn sparse_marks_scenario(seed: u64) {
                     max_records: None,
                     leader_only: false,
                     record_anchor: None,
+                    read_index: None,
                 },
                 placement(),
             )
@@ -2360,6 +2361,7 @@ async fn sparse_marks_read(
                 max_records: Some(max_records),
                 leader_only: false,
                 record_anchor: None,
+                read_index: None,
             },
             placement(),
         )

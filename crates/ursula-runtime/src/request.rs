@@ -119,6 +119,21 @@ pub struct CreateStreamResponse {
 pub struct HeadStreamRequest {
     pub stream_id: BucketStreamId,
     pub now_ms: u64,
+    /// `true` when the HEAD promises linearizability (D10), so the leader
+    /// confirms a read index first: a client HEAD, the `offset=now` and
+    /// record resolutions of a `consistency=leader` read, the JSON
+    /// record-boundary pre-check. `false` for internal HEADs that need only
+    /// the leader's applied state: the `offset=now` and record resolutions
+    /// of `consistency=local` reads, the SSE tail lookup, the long-poll
+    /// timeout answer.
+    pub linearizable: bool,
+    /// The read index this request was linearized at before it was queued
+    /// (D10): `ShardRuntime` confirms the group's leadership and waits
+    /// for the local apply outside the group actor, then sets it. The
+    /// engine serves the read without a quorum round trip only while this
+    /// replica leads and has applied that index. Callers leave it `None`;
+    /// the runtime overwrites it.
+    pub read_index: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +176,8 @@ pub struct ReadStreamRequest {
     /// incarnation matches and it validates; otherwise the read resolves
     /// from the record index. Never parsed from client input.
     pub record_anchor: Option<RecordAnchor>,
+    /// For a `leader_only` read only; see [`HeadStreamRequest::read_index`].
+    pub read_index: Option<u64>,
 }
 
 /// Where record `record` of stream incarnation `incarnation` (its
@@ -480,6 +497,8 @@ pub struct ReadSnapshotRequest {
     pub stream_id: BucketStreamId,
     pub snapshot_offset: Option<u64>,
     pub now_ms: u64,
+    /// See [`HeadStreamRequest::read_index`].
+    pub read_index: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -502,6 +521,8 @@ pub struct ReadSnapshotResponse {
 pub struct BootstrapStreamRequest {
     pub stream_id: BucketStreamId,
     pub now_ms: u64,
+    /// See [`HeadStreamRequest::read_index`].
+    pub read_index: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

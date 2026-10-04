@@ -39,15 +39,14 @@ pub(crate) async fn forward_head_stream_to_leader(
     leader_node: &BasicNode,
     request: HeadStreamRequest,
 ) -> Result<HeadStreamResponse, GroupEngineError> {
+    let head = head_stream_read_v1(&request);
     forward_typed_read_to_leader(
         placement,
         leader_node,
         request.stream_id,
         request.now_ms,
         "head",
-        raft_internal_proto::group_read_request_v1::Read::Head(
-            raft_internal_proto::HeadStreamReadV1 {},
-        ),
+        raft_internal_proto::group_read_request_v1::Read::Head(head),
     )
     .await
 }
@@ -72,6 +71,15 @@ pub(crate) async fn forward_read_stream_to_leader(
         raft_internal_proto::group_read_request_v1::Read::ReadStream(read),
     )
     .await
+}
+
+/// The wire form of a forwarded HEAD: whether the leader linearizes it.
+pub(crate) fn head_stream_read_v1(
+    request: &HeadStreamRequest,
+) -> raft_internal_proto::HeadStreamReadV1 {
+    raft_internal_proto::HeadStreamReadV1 {
+        applied_state_only: !request.linearizable,
+    }
 }
 
 /// The wire form of a forwarded read, including the F1 continuation anchor

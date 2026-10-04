@@ -86,6 +86,7 @@ use ursula_runtime::GroupTouchStreamAccessFuture;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::InMemoryGroupEngineFactory;
+use ursula_runtime::LinearizableReadBarrier;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::PlanGroupColdFlushRequest;
 use ursula_runtime::ProducerRequest;
@@ -1111,6 +1112,10 @@ impl GroupEngine for MadsimScopedGroupEngine {
         self.inner.accepts_local_writes()
     }
 
+    fn linearizable_read_barrier(&self) -> Option<Arc<dyn LinearizableReadBarrier>> {
+        leader_reads::ScopedReadBarrier::wrap(self.seed, self.inner.linearizable_read_barrier())
+    }
+
     fn create_stream<'a>(
         &'a mut self,
         request: CreateStreamRequest,
@@ -1568,6 +1573,7 @@ pub(super) async fn verify_runtime_raft_partial_read(
             max_records: None,
             leader_only: false,
             record_anchor: None,
+            read_index: None,
         })
         .await
         .expect("runtime raft partial read");
@@ -1618,6 +1624,7 @@ pub(super) async fn verify_runtime_raft_tail_read(
             max_records: None,
             leader_only: false,
             record_anchor: None,
+            read_index: None,
         })
         .await
         .expect("runtime raft tail read");
@@ -1688,6 +1695,7 @@ pub(super) async fn verify_runtime_raft_close_stream(
             max_records: None,
             leader_only: false,
             record_anchor: None,
+            read_index: None,
         })
         .await
         .expect("read closed runtime raft stream");
@@ -1812,6 +1820,7 @@ pub(super) async fn verify_runtime_raft_snapshot_publish(
                 stream_id: stream.clone(),
                 snapshot_offset: requested_offset,
                 now_ms: 0,
+                read_index: None,
             })
             .await
             .expect("read runtime raft snapshot");
@@ -1846,6 +1855,7 @@ pub(super) async fn verify_runtime_raft_snapshot_publish(
         .bootstrap_stream(BootstrapStreamRequest {
             stream_id: stream.clone(),
             now_ms: 0,
+            read_index: None,
         })
         .await
         .expect("bootstrap runtime raft stream after snapshot publish");
@@ -2067,6 +2077,7 @@ pub(super) async fn read_local_payload_eventually(
                     max_records: None,
                     leader_only: false,
                     record_anchor: None,
+                    read_index: None,
                 },
                 placement(),
             )

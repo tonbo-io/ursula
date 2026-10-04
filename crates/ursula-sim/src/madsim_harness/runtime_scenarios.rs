@@ -86,6 +86,7 @@ pub(super) async fn run_runtime_actor_scheduling_inner(
                 max_records: None,
                 leader_only: false,
                 record_anchor: None,
+                read_index: None,
             })
             .await
     });
@@ -136,6 +137,7 @@ pub(super) async fn run_runtime_actor_scheduling_inner(
             max_records: None,
             leader_only: false,
             record_anchor: None,
+            read_index: None,
         })
         .await
         .expect("read through hosted runtime actors");
@@ -215,6 +217,7 @@ pub(super) async fn run_runtime_raft_engine_inner(
             max_records: None,
             leader_only: false,
             record_anchor: None,
+            read_index: None,
         })
         .await
         .expect("read through runtime-owned raft engine");
@@ -309,6 +312,7 @@ pub(super) async fn run_runtime_raft_snapshot_install_inner(
             max_records: None,
             leader_only: false,
             record_anchor: None,
+            read_index: None,
         })
         .await
         .expect("read before runtime raft snapshot");
@@ -383,6 +387,7 @@ pub(super) async fn run_runtime_raft_snapshot_install_inner(
             max_records: None,
             leader_only: false,
             record_anchor: None,
+            read_index: None,
         })
         .await
         .expect("read restored runtime raft snapshot");
@@ -421,6 +426,7 @@ pub(super) async fn run_runtime_raft_snapshot_install_inner(
             max_records: None,
             leader_only: false,
             record_anchor: None,
+            read_index: None,
         })
         .await
         .expect("read after runtime raft snapshot restore append");
@@ -922,6 +928,7 @@ pub(super) async fn run_runtime_raft_network_inner(
                 max_records: None,
                 leader_only: false,
                 record_anchor: None,
+                read_index: None,
             })
             .await
             .expect("read through runtime-owned multi-node raft engine");
@@ -1191,6 +1198,7 @@ pub(super) async fn run_runtime_raft_network_inner(
                     max_records: None,
                     leader_only: false,
                     record_anchor: None,
+                    read_index: None,
                 })
                 .await
                 .expect("read after runtime-owned raft leader failover");
@@ -1564,6 +1572,7 @@ pub(super) async fn run_runtime_raft_network_inner(
                 max_records: None,
                 leader_only: false,
                 record_anchor: None,
+                read_index: None,
             };
             let cold_live_read = match runtime.read_stream(read_request.clone()).await {
                 Ok(read) => read,
@@ -1798,6 +1807,7 @@ pub(super) async fn run_runtime_multi_client_actors_inner(
                     max_records: None,
                     leader_only: false,
                     record_anchor: None,
+                    read_index: None,
                 })
                 .await
                 .expect("read after first multi-client append");
@@ -1826,6 +1836,7 @@ pub(super) async fn run_runtime_multi_client_actors_inner(
                     max_records: None,
                     leader_only: false,
                     record_anchor: None,
+                    read_index: None,
                 })
                 .await
                 .expect("read after second multi-client append");
@@ -1996,6 +2007,7 @@ pub(super) async fn run_runtime_cold_flush_worker_inner(
                 max_records: None,
                 leader_only: false,
                 record_anchor: None,
+                read_index: None,
             })
             .await
             .expect("read cold and hot payload through hosted runtime actors");
@@ -2293,6 +2305,7 @@ pub(super) async fn run_runtime_seeded_interleaving_inner(
                 max_records: None,
                 leader_only: false,
                 record_anchor: None,
+                read_index: None,
             })
             .await
         {

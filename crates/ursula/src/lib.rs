@@ -3011,6 +3011,8 @@ pub(crate) async fn head_stream_by_id(
         .head_stream(HeadStreamRequest {
             stream_id,
             now_ms: state.unix_time_ms(),
+            linearizable: true,
+            read_index: None,
         })
         .await
     {
@@ -3187,7 +3189,7 @@ pub(crate) async fn read_stream_by_id(
         return runtime_error_or_leader_redirect_async(&state, err, &request_target).await;
     }
     let record = if record_aware {
-        match read_record_start(&state, &stream_id, &query, &request_target).await {
+        match read_record_start(&state, &stream_id, &query, &request_target, leader_only).await {
             Ok(record) => Some(record),
             Err(response) => return *response,
         }
@@ -3211,6 +3213,7 @@ pub(crate) async fn read_stream_by_id(
             &stream_id,
             query.get("offset").map(String::as_str),
             &request_target,
+            leader_only,
         )
         .await
         {
@@ -3283,6 +3286,7 @@ pub(crate) async fn read_stream_by_id(
             max_records,
             leader_only,
             record_anchor: None,
+            read_index: None,
         })
         .await;
     let read = match read {
@@ -3306,17 +3310,23 @@ pub(crate) async fn read_stream_by_id(
     }
 }
 
+/// Resolves `?record=`/`?tail_records=` to a record through HEAD. The HEAD
+/// is linearizable only for a `consistency=leader` read (D10); otherwise it
+/// reads the leader's applied state without a quorum round trip.
 async fn read_record_start(
     state: &HttpState,
     stream_id: &BucketStreamId,
     query: &HashMap<String, String>,
     request_target: &str,
+    linearizable: bool,
 ) -> Result<u64, BoxResponse> {
     let head = match state
         .runtime
         .head_stream(HeadStreamRequest {
             stream_id: stream_id.clone(),
             now_ms: state.unix_time_ms(),
+            linearizable,
+            read_index: None,
         })
         .await
     {
@@ -3414,7 +3424,8 @@ pub(crate) async fn publish_snapshot(
 /// intra-record offset with 400 before proposing; apply still lands on a
 /// real boundary if a racing delete or recreate makes this check stale.
 /// Streams without record coordinates, offsets at the retained offset or
-/// tail, and failed lookups are left to apply.
+/// tail, and failed lookups are left to apply. The HEAD stays linearizable:
+/// apply does not re-check JSON boundaries at or below the seal point.
 async fn check_json_record_boundary(
     state: &HttpState,
     stream_id: &BucketStreamId,
@@ -3426,6 +3437,8 @@ async fn check_json_record_boundary(
         .head_stream(HeadStreamRequest {
             stream_id: stream_id.clone(),
             now_ms: state.unix_time_ms(),
+            linearizable: true,
+            read_index: None,
         })
         .await
     {
@@ -3450,6 +3463,7 @@ async fn check_json_record_boundary(
             max_records: None,
             leader_only: false,
             record_anchor: None,
+            read_index: None,
         })
         .await
     else {
@@ -3575,6 +3589,7 @@ async fn resolve_record_offset(
             max_records: Some(1),
             leader_only: false,
             record_anchor: None,
+            read_index: None,
         })
         .await
     {
@@ -3686,6 +3701,7 @@ pub(crate) async fn read_snapshot(
             stream_id,
             snapshot_offset: Some(snapshot_offset),
             now_ms: state.unix_time_ms(),
+            read_index: None,
         })
         .await
     {
@@ -3735,6 +3751,7 @@ pub(crate) async fn bootstrap_stream(
         .bootstrap_stream(BootstrapStreamRequest {
             stream_id,
             now_ms: state.unix_time_ms(),
+            read_index: None,
         })
         .await
     {
@@ -3758,11 +3775,14 @@ fn parse_snapshot_offset(raw: &str) -> Result<u64, BoxResponse> {
         .map_err(|_| Box::new((StatusCode::BAD_REQUEST, "invalid snapshot offset").into_response()))
 }
 
+/// `offset=now` resolves the tail through HEAD, linearizable only for a
+/// `consistency=leader` read (D10).
 pub(crate) async fn read_offset(
     state: &HttpState,
     stream_id: &BucketStreamId,
     raw: Option<&str>,
     request_target: &str,
+    linearizable: bool,
 ) -> Result<u64, BoxResponse> {
     match raw {
         Some("-1") => Ok(0),
@@ -3771,6 +3791,8 @@ pub(crate) async fn read_offset(
             .head_stream(HeadStreamRequest {
                 stream_id: stream_id.clone(),
                 now_ms: state.unix_time_ms(),
+                linearizable,
+                read_index: None,
             })
             .await
         {
@@ -3822,6 +3844,7 @@ async fn end_capped_json_read_at_record_boundary(
             max_records: None,
             record_anchor: None,
             leader_only,
+            read_index: None,
         })
         .await?;
     if let Some(newline) = whole.payload.iter().position(|byte| *byte == b'\n') {
@@ -3884,6 +3907,7 @@ pub(crate) async fn long_poll_stream(
         max_records,
         leader_only: false,
         record_anchor: None,
+        read_index: None,
     });
     let read = async {
         match read.await {
@@ -3915,11 +3939,15 @@ pub(crate) async fn long_poll_stream(
             Some(query.get("cursor").map(String::as_str).unwrap_or("")),
         ),
         Ok(Err(err)) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
+        // The 204's tail comes from the leader's applied state: live reads
+        // promise no linearizability beyond their owner check (D10).
         Err(_) => match state
             .runtime
             .head_stream(HeadStreamRequest {
                 stream_id: stream_id.clone(),
                 now_ms: state.unix_time_ms(),
+                linearizable: false,
+                read_index: None,
             })
             .await
         {
@@ -3988,11 +4016,15 @@ pub(crate) async fn sse_stream(
     envelope_view: bool,
     query: &HashMap<String, String>,
 ) -> Response {
+    // The live-read owner check already confirmed this node; the session's
+    // starting HEAD reads the leader's applied state.
     let head = match state
         .runtime
         .head_stream(HeadStreamRequest {
             stream_id: stream_id.clone(),
             now_ms: state.unix_time_ms(),
+            linearizable: false,
+            read_index: None,
         })
         .await
     {
@@ -4053,6 +4085,7 @@ pub(crate) async fn sse_stream(
             },
             leader_only: false,
             record_anchor: state.record_anchor,
+            read_index: None,
         };
         let read = if state.initial_read {
             state.initial_read = false;
