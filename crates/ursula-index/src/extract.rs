@@ -625,7 +625,10 @@ mod tests {
                 unit: TimeUnit::Auto,
             },
         ] {
-            assert!(Extractor::new(config).is_err());
+            assert!(matches!(
+                Extractor::new(config),
+                Err(crate::IndexError::InvalidExtractor(_))
+            ));
         }
         let first = Extractor::timestamp_field("captured_at").expect("valid");
         let second = Extractor::new(ExtractorConfig {

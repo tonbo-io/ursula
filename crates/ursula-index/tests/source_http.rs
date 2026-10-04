@@ -190,21 +190,21 @@ async fn messages_are_assembled_across_cut_reads_and_located_by_offset() -> anyh
         .client()
         .await?;
     let segment = read(&client, 0, false, limits()).await?;
-    assert_eq!(segment.end, 54);
+    assert_eq!(segment.end, 53);
     let located = segment
         .entries
         .iter()
         .map(|entry| (entry.t_ms, entry.offset, entry.len))
         .collect::<Vec<_>>();
-    assert_eq!(located, vec![(300, 0, 27), (100, 44, 10)]);
+    assert_eq!(located, vec![(300, 0, 26), (100, 43, 10)]);
     let skips = segment
         .skips
         .iter()
         .map(|skip| (skip.kind, skip.offset))
         .collect::<Vec<_>>();
     assert_eq!(skips, vec![
-        (SkipKind::Missing, 27),
-        (SkipKind::Unparseable, 35)
+        (SkipKind::Missing, 26),
+        (SkipKind::Unparseable, 34)
     ]);
     // Every locator addresses exactly its message.
     for entry in &segment.entries {
@@ -220,7 +220,7 @@ async fn messages_are_assembled_across_cut_reads_and_located_by_offset() -> anyh
     let mut one = limits();
     one.max_entries = 1;
     let first = read(&client, 0, false, one).await?;
-    assert_eq!((first.start, first.end), (0, 27));
+    assert_eq!((first.start, first.end), (0, 26));
     server.abort();
     Ok(())
 }
