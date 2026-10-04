@@ -286,7 +286,7 @@ PUT {stream_url}/snapshot?record={record}
 PUT {stream_url}/retention?record={record}
 ```
 
-The server resolves the stable record ordinal to the canonical byte boundary before applying the operation.
+The server resolves the stable record ordinal to its offset before applying the operation.
 
 Publishing a new snapshot replaces the previously visible snapshot immediately. The superseded snapshot MAY be garbage-collected asynchronously after the new snapshot becomes visible. Clients MUST NOT depend on older snapshots remaining readable after overwrite.
 
@@ -871,7 +871,7 @@ Implementations MUST preserve these invariants:
 2. Ordinals are contiguous in committed stream order and are never reused.
 3. One atomic append receives one contiguous ordinal range or no range.
 4. A deduplicated append returns its original ordinal range, or no range once its receipt left the receipt window.
-5. `O(r)` always identifies the first canonical byte of record `r`.
+5. `O(r)` always identifies the start of record `r`.
 6. Offset reads and record reads expose the same canonical JSON sequence.
 7. Record-aware reads never return partial records.
 8. Flush, compaction, snapshot, restart, and retention never change a surviving record's ordinal.

@@ -8,9 +8,8 @@
 //! `ingress_body_budget_rejects_write_when_budget_is_exhausted`.
 //!
 //! Offsets are opaque here: an offset is only ever echoed back or compared
-//! with another offset, never computed (one bridge in the HEAD test, until
-//! PR04). A failing pin is a finding to triage; a later change may edit an
-//! assertion only with a named reason.
+//! with another offset, never computed. A failing pin is a finding to
+//! triage; a later change may edit an assertion only with a named reason.
 
 use std::sync::Arc;
 
@@ -363,18 +362,13 @@ async fn head_reports_snapshot_and_retention_after_publish_and_advance() {
     let digest = header(&response, HEADER_STREAM_SNAPSHOT_DIGEST).to_owned();
     let response = send(&app, "PUT", &format!("{uri}/retention/{at}"), &[], "").await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(header(&response, HEADER_STREAM_RETAINED_OFFSET), at);
 
     let response = send(&app, "HEAD", uri, &[], "").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(header(&response, HEADER_STREAM_SNAPSHOT_OFFSET), at);
     assert_eq!(header(&response, HEADER_STREAM_SNAPSHOT_DIGEST), digest);
-    // Compared by value until PR04 pads Stream-Retained-Offset; PR04 replaces
-    // this with string equality.
-    let value = |offset: &str| offset.parse::<u64>().expect("decimal offset");
-    assert_eq!(
-        value(header(&response, HEADER_STREAM_RETAINED_OFFSET)),
-        value(&at)
-    );
+    assert_eq!(header(&response, HEADER_STREAM_RETAINED_OFFSET), at);
 }
 
 #[tokio::test]

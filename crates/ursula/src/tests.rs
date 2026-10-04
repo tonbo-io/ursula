@@ -483,6 +483,10 @@ async fn create_append_read_and_head_match_perf_compare_subset() {
         header_str(&response, HEADER_STREAM_NEXT_OFFSET),
         "00000000000000000007"
     );
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_COLD_HOT_START_OFFSET),
+        "00000000000000000000"
+    );
     assert_eq!(header_str(&response, CONTENT_TYPE), "text/plain");
     assert_eq!(
         header_str(&response, HEADER_STREAM_INTEGRITY_LIVE_RECORDS),
@@ -967,52 +971,6 @@ async fn delete_stream_removes_http_visible_state() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
-}
-
-/// Every offset header HEAD and a retention advance return is a 20-digit
-/// string, like `Stream-Next-Offset`, so clients compare them as strings.
-#[tokio::test]
-async fn head_offset_headers_are_twenty_digits() {
-    let app = test_router();
-    let uri = "/benchcmp/head-offsets";
-    let text = [(CONTENT_TYPE.as_str(), "text/plain")];
-    let response = http_put(&app, uri, &text, Body::empty()).await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-    for body in ["ab", "c"] {
-        let response = http_post(&app, uri, &text, Body::from(body)).await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    }
-    let response = http_put(
-        &app,
-        &format!("{uri}/snapshot/00000000000000000002"),
-        &[],
-        Body::from("state"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let response = http_put(
-        &app,
-        &format!("{uri}/retention/00000000000000000002"),
-        &[],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        header_str(&response, HEADER_STREAM_RETAINED_OFFSET),
-        "00000000000000000002"
-    );
-
-    let response = http_head(&app, uri).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    for (name, value) in [
-        (HEADER_STREAM_NEXT_OFFSET, "00000000000000000003"),
-        (HEADER_STREAM_SNAPSHOT_OFFSET, "00000000000000000002"),
-        (HEADER_STREAM_RETAINED_OFFSET, "00000000000000000002"),
-        (HEADER_STREAM_COLD_HOT_START_OFFSET, "00000000000000000000"),
-    ] {
-        assert_eq!(header_str(&response, name), value, "{name}");
-    }
 }
 
 /// `Stream-Incarnation` changes when a stream is deleted and recreated. The
