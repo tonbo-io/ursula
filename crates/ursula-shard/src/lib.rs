@@ -2,11 +2,7 @@
 //!
 //! Module map:
 //!
-//! - [`content_type`]: content-type normalization and JSON profile detection
-//!   (`keyed-batch-v1` activation), shared by node, gateway and indexer.
-//! - [`keyed_namespace`]: object-store layout of keyed-state projection
-//!   namespaces (`.keyed/{bucket}/{key}/{incarnation:016x}/`), shared by
-//!   node lifecycle (stream-delete GC, bucket purge) and the indexer.
+//! - [`content_type`]: content-type normalization, shared by node and gateway.
 //! - crate root: shard and Raft group identifiers, [`BucketStreamId`],
 //!   reserved affinity stream IDs and the static shard map.
 
@@ -16,13 +12,8 @@ use serde::Deserialize;
 use serde::Serialize;
 
 pub mod content_type;
-pub mod keyed_namespace;
 
-pub use content_type::KEYED_BATCH_CONTENT_TYPE;
-pub use content_type::KEYED_BATCH_PROFILE;
-pub use content_type::is_keyed_batch_content_type;
 pub use content_type::normalize_content_type;
-pub use content_type::profile_of;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CoreId(pub u16);
@@ -33,24 +24,11 @@ pub struct ShardId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct RaftGroupId(pub u32);
 
-/// Name of the keyed-state read resource, `{stream_url}/keyed-state`
-/// (keyed-streams P3).
-pub const KEYED_STATE_RESOURCE: &str = "keyed-state";
-
-/// HTTP and routing predicate: returns whether a local stream ID collides
-/// with a two-segment stream subresource when used in the three-segment
-/// path-affinity form. Node and gateway routing use it, so `keyed-state`
-/// is reserved here at once (keyed-streams U5); replicated apply uses
-/// [`is_baseline_reserved_affinity_stream_id`] plus the group's feature level
-/// instead (C8).
+/// Returns whether a local stream ID collides with a two-segment stream
+/// subresource when used in the three-segment path-affinity form. Node and
+/// gateway routing and replicated apply share this list; changing it changes
+/// replicated apply.
 pub fn is_reserved_affinity_stream_id(stream_id: &str) -> bool {
-    is_baseline_reserved_affinity_stream_id(stream_id) || stream_id == KEYED_STATE_RESOURCE
-}
-
-/// Apply-time predicate at feature level 0: the subresource names every
-/// release reserves under an affinity path. Changing this list changes
-/// replicated apply, so additions go through a feature level instead.
-pub fn is_baseline_reserved_affinity_stream_id(stream_id: &str) -> bool {
     matches!(
         stream_id,
         "$transaction" | "append-batch" | "attrs" | "bootstrap" | "retention" | "snapshot"
@@ -224,11 +202,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn routing_reserves_keyed_state_while_the_baseline_apply_list_does_not() {
-        assert!(is_reserved_affinity_stream_id(KEYED_STATE_RESOURCE));
-        assert!(!is_baseline_reserved_affinity_stream_id(
-            KEYED_STATE_RESOURCE
-        ));
+    fn subresource_names_are_reserved_affinity_stream_ids() {
         for name in [
             "$transaction",
             "append-batch",
@@ -238,7 +212,6 @@ mod tests {
             "snapshot",
         ] {
             assert!(is_reserved_affinity_stream_id(name));
-            assert!(is_baseline_reserved_affinity_stream_id(name));
         }
         assert!(!is_reserved_affinity_stream_id("journal"));
     }

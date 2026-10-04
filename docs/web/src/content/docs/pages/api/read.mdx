@@ -87,9 +87,9 @@ api: "GET /{bucket}/{stream}"
 
 Response headers include `Stream-Next-Offset`, `Stream-Cursor`, `ETag`, `Stream-Up-To-Date`, `Stream-Closed`, and `Content-Type`.
 
-Record-aware responses also advertise `json-record-coordinates-v1` in `Stream-Extensions` and include `Stream-Record-First`, `Stream-Record-Start`, and `Stream-Record-Next`. Continue with `record=<Stream-Record-Next>`. A record below `Stream-Record-First` returns `410`, and a record beyond the current tail returns `400`. On a [keyed stream](/docs/concepts/keyed-streams), `Stream-Extensions` also contains `keyed-batch-v1`.
+Record-aware responses also advertise `json-record-coordinates-v1` in `Stream-Extensions` and include `Stream-Record-First`, `Stream-Record-Start`, and `Stream-Record-Next`. Continue with `record=<Stream-Record-Next>`. A record below `Stream-Record-First` returns `410`, and a record beyond the current tail returns `400`.
 
-Releases before record-aware `max_bytes` reject it with `400`. A node that advertises `keyed-state-v1` for a stream always supports it on that stream.
+Releases before record-aware `max_bytes` reject it with `400`.
 
 Streams written with `Content-Type: application/json` are returned as newline-delimited JSON with response `Content-Type: application/x-ndjson`, one stored message per line, exactly as written minus insignificant whitespace ([JSON message text](/docs/specs/extensions#json-message-text)). On an offset read, `max_bytes` applies to the encoded byte stream, so a response can end mid-line. Resume from `Stream-Next-Offset` and buffer any incomplete trailing line before parsing. `HEAD` reports the configured stream content type, while read responses report the wire representation.
 

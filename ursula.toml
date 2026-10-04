@@ -39,13 +39,6 @@ listen = "127.0.0.1:4437"
 # built-in or preset default; the built-in default is 256MiB.
 # http_inflight_body_size = "256MiB"   # default: 256 MiB
 
-# Base URL of the keyed-state indexer (`ursula indexer` in keyed mode) that
-# serves `{stream_url}/keyed-state` for keyed streams. When unset, the
-# resource answers 404 and HEAD/create never advertise keyed-state-v1.
-# The `--keyed-state-upstream` CLI flag overrides this value. A non-empty
-# keyed_state.indexer_urls takes precedence over it for reads.
-# keyed_state_upstream = "http://127.0.0.1:7071"
-
 # ------------------------------------------------------------------------------
 # [runtime]  — Per-core runtime sizing and admission controls
 # ------------------------------------------------------------------------------
@@ -304,18 +297,3 @@ backend = "auto"
 # Enable tokio-console integration (requires building with tokio_unstable).
 # Can also be enabled by setting URSULA_TOKIO_CONSOLE=1.
 tokio_console = false
-
-# ------------------------------------------------------------------------------
-# [keyed_state]  — Keyed-state projection (keyed-streams)
-# ------------------------------------------------------------------------------
-[keyed_state]
-# Base URL of every keyed-state indexer pod, in failover order: keyed-state
-# reads go to the first healthy pod (primary, then standbys; active/standby,
-# not load sharding), and bucket purge drains each one
-# (POST {url}/v1/keyed/drain) before erasing .keyed/{bucket}/. Empty with
-# server.keyed_state_upstream set: that upstream is the one pod.
-indexer_urls = []
-drain_timeout = "60s"
-# upstream_connect_timeout = "2s"   # TCP connect timeout per pod attempt
-# failover_header_timeout = "10s"   # header wait beyond timeout_ms before failing over
-# unhealthy_backoff = "2s"          # a failed pod is probed (/readyz) after this; >= 1s

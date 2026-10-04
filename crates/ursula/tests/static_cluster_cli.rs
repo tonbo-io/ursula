@@ -717,7 +717,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
     std::fs::remove_dir_all(&root).expect("remove temp root");
 }
 
-/// Keyed-streams C0 end to end: `ursulactl cluster enable-feature` against a
+/// Feature levels (C0) end to end: `ursulactl cluster enable-feature` against a
 /// real three-node gRPC Raft cluster raises every group's level through each
 /// group's leader and verifies every replica.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

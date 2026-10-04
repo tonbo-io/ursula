@@ -1,10 +1,10 @@
 # Bounded Per-Stream State for Long-Lived Streams
 
-Status: Accepted 2026-10-02 as part of the keyed-streams epic. Implementation in progress on `agent/keyed-streams`.
+Status: Accepted 2026-10-02.
 
-Scope: make the memory and snapshot footprint of every Ursula stream at most a small constant, plus its unflushed hot window, plus 16 bytes per MiB of cold history, without requiring retention. The footprint then no longer grows with record count, but it is not independent of history: it still grows by about 16 MiB per TiB of cold history, per stream and per replica. A history-independent bound is a follow-up (§3, I1). This covers replicated state on every replica, the group snapshots built from it, node-local state outside the state machine, per-request memory, and the S3 objects that state points to. It also fixes the cold-path correctness defects that the audit and its adversarial review found, because several fixes build on them. Keyed streams and Pi Durable are out of scope; they consume this work.
+Scope: make the memory and snapshot footprint of every Ursula stream at most a small constant, plus its unflushed hot window, plus 16 bytes per MiB of cold history, without requiring retention. The footprint then no longer grows with record count, but it is not independent of history: it still grows by about 16 MiB per TiB of cold history, per stream and per replica. A history-independent bound is a follow-up (§3, I1). This covers replicated state on every replica, the group snapshots built from it, node-local state outside the state machine, per-request memory, and the S3 objects that state points to. It also fixes the cold-path correctness defects that the audit and its adversarial review found, because several fixes build on them.
 
-Related: issue #17 (stable memory under cold storage) and PR #15 (cold metadata moved into cold-index pages); issue #84 and PR #91 (record coordinates; #84 anticipated a sparse index); #146 (producer receipts); #164, #182, #184 (pack references in replicated state); #278 (legacy pack migration); #57, #58, #167 (TTL sweeps and renewal); #190 (incremental group hot gauge); #194, #198, #212, #252 (snapshot cost and cadence); #111, #274 (WAL reclaim); #210 (the eviction rule); #41 (agent trajectories keep full history); #170 (framed binary records); `docs/architecture/json-record-coordinates-validation.md`; `docs/architecture/raft-wal-production.md`; `docs/architecture/deterministic-simulation-testing.md`; `docs/architecture/keyed-streams-pi-durable.md` §6.2 (this document defines its C0 to C7; Pi keeps C8 and C9); specs `extensions.mdx` §2 and §6, `durable-stream.mdx`, `concepts/exactly-once-writes.mdx`, `operations.mdx`.
+Related: issue #17 (stable memory under cold storage) and PR #15 (cold metadata moved into cold-index pages); issue #84 and PR #91 (record coordinates; #84 anticipated a sparse index); #146 (producer receipts); #164, #182, #184 (pack references in replicated state); #278 (legacy pack migration); #57, #58, #167 (TTL sweeps and renewal); #190 (incremental group hot gauge); #194, #198, #212, #252 (snapshot cost and cadence); #111, #274 (WAL reclaim); #210 (the eviction rule); #41 (agent trajectories keep full history); #170 (framed binary records); `docs/architecture/json-record-coordinates-validation.md`; `docs/architecture/raft-wal-production.md`; `docs/architecture/deterministic-simulation-testing.md`; specs `extensions.mdx` §2 and §6, `durable-stream.mdx`, `concepts/exactly-once-writes.mdx`, `operations.mdx`.
 
 Conventions: paths are relative to the repository root, and line numbers refer to commit `e6d8d70` (0.5.1). Figures marked *measured* come from the bounded-state probe that milestone B0 commits (§7.1). It drives the real `StreamStateMachine` with the exact commands the runtime issues (L1) and the real `ShardRuntime` with both the in-memory and the single-node OpenRaft engine (L2), and it counts requested heap bytes with a counting allocator, so real RSS is somewhat higher. Defects marked *reproduced* come from the adversarial probes, which also drive the real `ShardRuntime`; B0 commits them as regression tests. Unmarked figures are estimates.
 
@@ -20,7 +20,7 @@ Conventions: paths are relative to the repository root, and line numbers refer t
 8. Two other defects get their own fixes: the flush planner's head-of-line starvation with its O(S²) planning, and the per-append TTL heap. Node-local leaks (page-cache LRU deque, cold-read `readers` map, engine append counts), unbounded per-request materialization, quadratic bootstrap planning and byte-blind snapshot cadence are fixed alongside.
 9. Replicated changes are gated by a group feature level. Four levels keep the risky changes apart, so sparse marks ship alone, and their behavior-preserving parts ship ungated first. It is the same mechanism as Pi's C0.
 10. Milestones: B0 harness; B1 correctness defects and ungated fixes; B2 pack-reference driver, orphan sweep and decode support; B3 level Lb1 (state hygiene); B4 level Lb2 (sparse marks); B5 level Lb3 (external locators); B6 hot window and snapshot cadence; B7 hardening with a 72-hour soak gate. About +5,800 / −400 production LoC and +6,500 test LoC, twice the first estimate; #91, which built the dense index, took about 1,600 production lines alone.
-11. This is a production prerequisite for Pi Durable, through B4, but it is general Ursula work that does not depend on keyed streams and can start now.
+11. This is general Ursula work and can start now.
 
 ## 2. Problem
 
@@ -183,7 +183,7 @@ Each subsection gives the data-structure change, read and write path changes, sn
 - **Lb4, hot representation:** F4b.
 - **Lb5, cold snapshots:** F16 (§5.16), feature level 5 (`FEATURE_LEVEL_COLD_SNAPSHOTS`).
 
-Pi's keyed level (Pi C8) and these share one sequence: numbers are assigned at release, and a level may carry items from both tracks when they release together.
+Numbers are assigned at release, and a level may carry several items when they release together.
 
 **`TidyStream { stream_id, now_ms }`** (Lb1) applies the normalizations that `FlushCold` and `AppendExternal` run inline: collapse message records (F4a), trim receipts and expire idle producers (F3), shrink capacities (F7), and from Lb2 seal the record index (F1). It is idempotent. Each command does bounded work, at most 1M records sealed and 64k receipts trimmed, so a legacy stream converges over several commands without stalling the group's apply. A leader-side maintenance driver issues it for streams whose derived debt exceeds a threshold (dense records below the seal point, receipts beyond the window, idle producers, capacity slack), at most 64 streams per group per minute, and repeats until no debt remains. This is how idle legacy streams converge after a raise without any O(group) apply.
 
@@ -470,7 +470,7 @@ Every returned entry is at its stream's true expiry, and every smaller key has a
 
 **F15, tenant tombstones.** `bucket_usage` keeps a row of about 200 B per bucket ever written in every group. `erased_buckets` keeps about 95 B per purged bucket in every group, and `PurgeBucket` runs on all groups (`runtime.rs:579-600`). Both are deliberate (#258, #280), and both grow with tenant churn rather than records. Options: a gated `PruneBucketUsage { bucket_id, observed }` sent after the meter durably records the counters; fences held in the meta group, with only a 16-byte fingerprint set in data groups. Q9 asks the maintainers to decide.
 
-**F16, visible snapshot.** O(1) per stream, but inline up to the 32 MiB body cap on every replica and in every group snapshot. Accepted for Pi Durable's SQLite VFS, which publishes the database file itself as the snapshot (`docs/architecture/keyed-streams-pi-durable.md`), and implemented at Lb5 as follows.
+**F16, visible snapshot.** O(1) per stream, but inline up to the 32 MiB body cap on every replica and in every group snapshot. Accepted for the SQLite VFS, which publishes the database file itself as the snapshot, and implemented at Lb5 as follows.
 
 *Design (Lb5, feature level 5).* The smallest change that reuses F5:
 
@@ -706,7 +706,7 @@ Alerts:
 
 ## 8. Milestones
 
-The workstream starts now. It does not depend on keyed streams and touches no protocol surface except the receipt window (F3), retention granularity in cold history (F1), bootstrap parts and response caps (F11), and binary bootstrap parts (F4a, F4b).
+The workstream starts now. It touches no protocol surface except the receipt window (F3), retention granularity in cold history (F1), bootstrap parts and response caps (F11), and binary bootstrap parts (F4a, F4b).
 
 **B0, harness (about 1.5 weeks).** Port the probe and the adversarial reproductions (§7.1), add the per-group gauges, and land the CI ratchet job and the nightly job. *Exit*: CI reproduces the audit's figures within 10% at reduced scale and runs D1 to D4 as expected failures; the nightly job publishes W1 to W6; dashboards exist.
 
@@ -743,8 +743,6 @@ The workstream starts now. It does not depend on keyed streams and touches no pr
 **B6, hot window and snapshot cadence (about 3 weeks).** F6b, F6c, F4b (defines Lb4), F12b, F12e, F14c and F14d, and compaction on by default. *Exit*: hot overhead in W1 is at most payload plus 24 B per record with F6b and 12 B with F4b; snapshot bytes written per appended log byte average at most 0.6 on W1 and on a uniform 128-group workload, with unpurged log within the node budget; compaction issues no LIST.
 
 **B7, hardening (about 2 weeks, then ongoing).** The 72-hour soak gate (§7.5), F17, decisions on F15 and F16, and removal of the legacy paths (pre-level code, legacy pack migration) after the deprecation window. *Exit*: the soak gate passes and `operations.mdx` no longer names retention as the way to bound memory. *Status (2026-10-02):* the soak is deferred to a run on AWS (ECS or EKS) against real S3; it has not run, so the gate is open. (Its script drove the Pi Durable adapter and was removed with it.)
-
-**Relation to Pi Durable.** The Pi plan's core items C0 to C7 are this workstream (§5.20). Pi's M1 does not wait for it: it runs without trimming, with growth like a JSONL file, and needs only F0's plumbing from B1 to gate keyed creates. Pi's M2 needs unique incarnations (C7, F14g at Lb1, or carried on Pi's keyed level if that releases first). Pi production depends on B4. Until B5 ships, Pi clusters keep `external_payload_min_size` above the 32 MiB body cap, as Pi §3.3 requires, which also keeps D1 and D3 unreachable for them. B6 is recommended before production.
 
 ## 9. Rejected alternatives
 

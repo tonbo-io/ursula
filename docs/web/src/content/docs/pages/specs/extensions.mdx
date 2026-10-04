@@ -10,7 +10,7 @@ title: "Durable Streams Extensions"
 
 ## Abstract
 
-This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, optional path affinity, snapshot and bootstrap semantics, multipart bootstrap delivery, mutable stream attributes, Ursula-specific append batching for high-throughput small-event writes, stable record coordinates for JSON streams, a JSON message text rule, and keyed streams: a writer-declared keyed record format with a keyed-state read resource.
+This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, optional path affinity, snapshot and bootstrap semantics, multipart bootstrap delivery, mutable stream attributes, Ursula-specific append batching for high-throughput small-event writes, stable record coordinates for JSON streams, a JSON message text rule, and read path parameters.
 
 The snapshot and bootstrap design in sections 2 and 3 was proposed by [Loro](https://loro.dev/); Ursula adopts that design.
 
@@ -32,7 +32,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 6. [JSON Record Coordinates](#6-json-record-coordinates)
 7. [Ordinary SSE Compatibility](#7-ordinary-sse-compatibility)
 8. [URL Encoding](#8-url-encoding)
-9. [Keyed Streams](#9-keyed-streams)
+9. [Read Path](#9-read-path)
 
 ---
 
@@ -48,15 +48,13 @@ This document registers the following extension tokens:
 |---|---|---|
 | `path-affinity-v1` | Section 1.7 | streams addressed through the affinity form |
 | `group-append-transaction-v1` | Section 1.8 | `$transaction` responses |
-| `json-record-coordinates-v1` | Section 6 | `application/json` streams, including keyed streams |
-| `keyed-batch-v1` | Section 9.1 | keyed streams |
-| `keyed-state-v1` | Section 9.2 | keyed streams on which the server serves the keyed-state resource |
+| `json-record-coordinates-v1` | Section 6 | `application/json` streams |
 
 [JSON Message Text](#json-message-text) has no token: it applies to every `application/json` stream.
 
 ## JSON Message Text
 
-This section defines the "normalized message" that the base protocol's JSON mode refers to. It is a storage rule, not an optional extension, and has no extension token. A server MUST apply it to every stream whose content type is `application/json` (with or without parameters, including keyed streams, Section 9).
+This section defines the "normalized message" that the base protocol's JSON mode refers to. It is a storage rule, not an optional extension, and has no extension token. A server MUST apply it to every stream whose content type is `application/json` (with or without parameters).
 
 It applies to every JSON write: the body of a creating `PUT`, the body of `POST`, each Append Batch frame (Section 4), and each `$transaction` operation whose content type is JSON (Section 1.8). It applies to every read representation: the default NDJSON view, the record envelope view (Section 6.8), SSE, and bootstrap parts (Section 3).
 
@@ -193,7 +191,7 @@ For example, `/workflow/run-42/journal` and `/workflow/run-42/queue` have the sa
 - Within one bucket, streams with the same `affinity_key` MUST route to the same Raft group.
 - Streams with different affinity keys MAY still share a Raft group. Clients MUST NOT infer isolation, group IDs, or physical placement from different keys.
 - Path affinity changes placement only. It does not by itself make separate HTTP operations atomic.
-- `$transaction`, `append-batch`, `attrs`, `bootstrap`, `keyed-state`, `retention`, and `snapshot` are reserved local stream IDs under an affinity path because those names identify affinity-level operations or stream subresources on the two-segment form.
+- `$transaction`, `append-batch`, `attrs`, `bootstrap`, `retention`, and `snapshot` are reserved local stream IDs under an affinity path because those names identify affinity-level operations or stream subresources on the two-segment form.
 
 Responses for a stream addressed through the affinity form MUST advertise `path-affinity-v1` in `Stream-Extensions`. Responses for ordinary two-segment stream URLs MUST NOT advertise it merely because the server supports the extension.
 
@@ -227,7 +225,7 @@ The server MUST commit every operation in one Raft entry or commit none of them.
 
 Each operation accepts `stream`, `content_type`, `payload_base64`, and the optional fields `close_after`, `stream_seq`, `producer`, and `record_match`. `producer` uses the same `producer_id`, `producer_epoch`, and `producer_seq` fields as the producer extension. Payload bytes use standard padded base64 so the transaction envelope can carry arbitrary stream content without JSON reinterpretation.
 
-An operation's `content_type` is normalized exactly as a `Content-Type` request header is before it is compared with the target stream's content type: the value is split at `;`, each part is trimmed of surrounding whitespace, empty parts are dropped, each part is ASCII-lowercased, and the parts are joined with `; `. A `content_type` of `Application/JSON` therefore matches an `application/json` stream. The decoded payload of an operation that targets a JSON stream is then subject to [JSON Message Text](#json-message-text), and, for a keyed stream, to Section 9.1.
+An operation's `content_type` is normalized exactly as a `Content-Type` request header is before it is compared with the target stream's content type: the value is split at `;`, each part is trimmed of surrounding whitespace, empty parts are dropped, each part is ASCII-lowercased, and the parts are joined with `; `. A `content_type` of `Application/JSON` therefore matches an `application/json` stream. The decoded payload of an operation that targets a JSON stream is then subject to [JSON Message Text](#json-message-text).
 
 The response is `200 OK` with a JSON array of append acknowledgements in request order. Any operation failure returns the normal Durable Streams error status for that failure, such as `412 Precondition Failed`, and no operation is visible. Responses MUST advertise both `path-affinity-v1` and `group-append-transaction-v1` in `Stream-Extensions`.
 
@@ -753,7 +751,7 @@ Record-aware reads MAY also specify `max_bytes=<positive-integer>`. On a record-
 
 Offset reads keep the base protocol's `max_bytes` semantics, including responses that end inside a JSON record.
 
-A server that advertises `keyed-state-v1` (Section 9.2) for a stream MUST support `max_bytes` on that stream's record-aware reads. Other servers that implement this extension SHOULD support it; a client that has not verified support by that token MUST be prepared for an older server to reject the parameter with `400 Bad Request`.
+A server that implements this extension MUST support `max_bytes` on record-aware reads.
 
 ### 6.7. Record-Aligned Read Responses
 
@@ -897,280 +895,10 @@ Ordinary SSE behavior, including binary stream handling, is defined by `docs/spe
 
 ---
 
-## 9. Keyed Streams
+## 9. Read Path
 
-A keyed stream is a JSON stream whose messages are writer-declared batches of key-value mutations. The server validates each batch's grammar at append time, never runs application logic, and exposes the folded key-value state through a read resource. The log remains the source of truth: keyed state is a deterministic function of the stream's records and MAY be rebuilt from them at any time.
+This section collects read parameters that apply to every stream and are not defined by the base protocol.
 
-Keyed streams are an Ursula-specific extension. They register two tokens: `keyed-batch-v1` for the record format (Section 9.1) and `keyed-state-v1` for the read resource (Section 9.2).
+### 9.1. Long-Poll Timeout
 
-### 9.1. Record Format and Fold
-
-#### 9.1.1. Activation
-
-A stream is a keyed stream if and only if its normalized content type equals exactly:
-
-```
-application/json; profile=keyed-batch-v1
-```
-
-Normalization is the rule of Section 1.8: split at `;`, trim each part, drop empty parts, ASCII-lowercase each part, and join with `; `. `Application/JSON;Profile=keyed-batch-v1` therefore activates the extension; a quoted `profile="keyed-batch-v1"` or any additional parameter does not. The content type is fixed at stream creation, so a stream cannot become keyed, or stop being keyed, after it is created.
-
-> **Note (informative).** `application/json` defines no parameters [RFC8259], and a `profile` value is a URI in [RFC6906]. Using `profile=keyed-batch-v1` on `application/json` therefore deviates from [RFC6838] Section 4.3 and [RFC6906]. The deviation is deliberate: generic clients that select JSON mode by the `application/json` media type keep doing so on keyed streams, and a reader that does not understand the extension can still read a keyed log as ordinary JSON.
-
-A keyed stream is an `application/json` stream for every other purpose. A server that implements keyed streams:
-
-- MUST apply [JSON Message Text](#json-message-text) to every keyed stream;
-- MUST implement JSON Record Coordinates (Section 6) on every keyed stream, so record ordinals, `Stream-Record-Match` and record-aware reads are available.
-
-Every write that targets a keyed stream (the creating `PUT` body, `POST`, each Append Batch frame, and each `$transaction` operation) MUST carry a content type that normalizes to exactly the stream's content type. A mismatch MUST be rejected with `409 Conflict`, as for any other content-type mismatch.
-
-#### 9.1.2. Grammar
-
-After JSON Message Text flattening, every message written with the activation content type MUST match this grammar:
-
-```
-message = JSON object with exactly one member whose name, after unescaping, is "ops";
-          other members: any JSON value, ignored by the fold and stored verbatim;
-          the names of the message's own members MUST NOT contain escapes that
-          encode unpaired surrogates (names inside values are unrestricted)
-ops     = JSON array of zero or more op
-op      = ["p", key, value]        ; put
-        / ["d", key]               ; point delete
-        / ["x", key, key]          ; range delete [start, end); start < end
-key     = JSON string whose characters are exactly the canonical unpadded
-          base64url encoding ([RFC4648] Section 5) of 1..4096 octets:
-          no "=" padding, zero pad bits, and no backslash escapes
-value   = any JSON value
-```
-
-- Op codes (`"p"`, `"d"`, `"x"`) and the member name `ops` are compared after JSON unescaping, so `"p"` is the op code `p` and a member named `"ops"` is the `ops` member. An object with two members that both unescape to `ops` does not match.
-- Keys are checked on the raw characters between the quotes. A key that contains any backslash escape does not match, even if it unescapes to a canonical encoding.
-- In a range delete, `start < end` compares the decoded octet strings in unsigned lexicographic order.
-- A put of the literal `null` makes the key visible with value `null`. It is not a delete.
-- An `ops` array MAY be empty. There is no limit on the number of ops in one message.
-
-#### 9.1.3. Validation
-
-The server MUST validate a write against Section 9.1.2 whenever the write's normalized content type equals the activation content type, before it looks up the target stream.
-
-- The server MUST validate every message of a request before committing any of them. If any message fails, the server MUST respond `422 Unprocessable Content` and commit nothing from the request. For Append Batch this fails the whole request rather than one frame, as JSON syntax errors already do.
-- The plain-text response body SHOULD read `invalid keyed batch at message <i>: <reason>`, where `<i>` is the zero-based message index after flattening. For Append Batch the body SHOULD read `invalid keyed batch at frame <f> message <i>: <reason>`.
-- JSON syntax, UTF-8 and depth errors remain `400 Bad Request` under JSON Message Text.
-- Precedence is `400` (JSON text), then `422` (grammar), then the apply-time statuses (`404`, `409`, `412`, and so on). An ungrammatical request sent with the activation content type to an absent or non-keyed stream is therefore answered `422`.
-
-#### 9.1.4. Fold
-
-Let `state(D)` be the key-value state after records `0 … D−1`. It is computed by applying the records in ordinal order, and the ops within each record in array order:
-
-- A put `["p", k, v]` in record `r` sets `k → (r, v)`.
-- A point delete `["d", k]` removes `k`.
-- A range delete `["x", s, e]` removes every key `k` with `s ≤ k < e` in unsigned octet order.
-
-A key is visible in `state(D)` when the last op that applies to it is a put. Its `record` is the ordinal of the record containing that put, and its value is that put's value text as stored under JSON Message Text. `state(0)` is empty.
-
-The server MUST NOT derive keys or values that no op declares. Members of a message other than `ops` MUST be stored verbatim and MUST NOT affect the fold.
-
-#### 9.1.5. Advertisement
-
-Responses to `HEAD`, to the creating `PUT`, to appends (including Append Batch and `$transaction` responses that include a keyed stream), and to record-aware reads of a keyed stream MUST advertise `keyed-batch-v1` in `Stream-Extensions`, together with `json-record-coordinates-v1`. Responses for other streams MUST NOT advertise `keyed-batch-v1`.
-
-A client that writes keyed batches SHOULD verify `keyed-batch-v1` on the create or `HEAD` response before its first append. A server that does not advertise it would store such messages under ordinary JSON rules without validating them.
-
-#### 9.1.6. Limits
-
-- Keys are 1..4096 octets after decoding.
-- Message depth follows [JSON Message Text](#json-message-text): at most 127.
-- The request body is bounded by the server's request limit. Ursula accepts at most 32 MiB and answers `413 Payload Too Large` above it.
-- There is no limit on the number of ops per message.
-
-#### 9.1.7. Snapshots, Retention, and Bootstrap
-
-Snapshots, retention and `/bootstrap` keep their generic semantics on keyed streams; there are no keyed-specific rules.
-
-Retention removes the records keyed state is built from. A server that maintains keyed state incrementally needs the record before its published frontier, and a rebuild needs every record from `0`. Once the first retained record ordinal `F` (Section 6.1) passes what the server needs, keyed state can no longer advance or be rebuilt, and the keyed-state resource answers `500 Internal Server Error` for any `min_through_record` above the state it holds (Section 9.2.6). Writers that rely on keyed state SHOULD NOT advance retention on keyed streams.
-
-`/bootstrap` returns the batch log, not keyed state. Clients SHOULD read state through the keyed-state resource.
-
-#### 9.1.8. Format Evolution
-
-A change to the grammar or fold ships as a new profile and token, such as `keyed-batch-v2`, for new streams. A server that has advertised `keyed-batch-v1` MUST keep validating and folding `keyed-batch-v1` streams for as long as it serves them. Application-level schema versions belong inside the application's own keys and values.
-
-#### 9.1.9. Example
-
-```http
-POST {stream_url}
-Content-Type: application/json; profile=keyed-batch-v1
-Stream-Record-Match: 103
-
-{"o":17,"ops":[["p","AW5leHRfaWQA",130],["d","QQIAAAAAAAAAgA"],["x","VAAAAAAAAAAEAAAAAAAAAAA","VAAAAAAAAAAEAAAAAAAAAGc"]]}
-```
-
-The successful response includes:
-
-```http
-Stream-Extensions: json-record-coordinates-v1, keyed-batch-v1
-Stream-Record-Start: 103
-Stream-Record-Next: 104
-Stream-Next-Offset: <opaque-offset>
-```
-
-The member `o` is ignored by the fold and stored verbatim.
-
-### 9.2. Keyed-State Resource
-
-The keyed-state resource serves `state(D)` (Section 9.1.4) of a keyed stream for some published `D`. Its extension token is `keyed-state-v1`.
-
-#### 9.2.1. Request
-
-```
-GET {stream_url}/keyed-state?key={k}
-GET {stream_url}/keyed-state?[start={k} | after={k}][&end={k}][&limit={n}]
-```
-
-Both forms accept `&min_through_record={r}` and `&timeout_ms={t}`. The resource exists for both the two-segment and the affinity form of a stream URL; `keyed-state` is a reserved local stream ID under an affinity path (Section 1.7).
-
-Only `GET` is defined. Every other method, including `HEAD`, MUST be answered `405 Method Not Allowed` with `Allow: GET`. A server that does not serve keyed state for any stream MAY instead answer `404 Not Found` to every method.
-
-Parameters:
-
-- Every key parameter `k` is the canonical unpadded base64url encoding of 1..4096 octets, as in Section 9.1.2.
-- `key=k` is a point read of one key. It MUST NOT be combined with `start`, `after`, `end` or `limit`.
-- The range is `[lo, hi)` in unsigned octet order. `lo` is `start` (inclusive) or `after` (exclusive); the two are mutually exclusive, and the default is before the first key. `hi` is `end` (exclusive), and the default is after the last key. If `lo ≥ hi`, nothing is selected.
-- `limit` is the maximum number of rows, an integer in `1..1000`. The default is `100`.
-- `min_through_record=r` is a non-negative integer: the response MUST reflect `state(D)` with `D ≥ r` (Section 9.2.4).
-- `timeout_ms=t` bounds the wait for `min_through_record`. The default is `1000`. An unparseable value means the default, and a parsed value is clamped to `1..60000`. It is ignored without `min_through_record`.
-- A repeated parameter, a forbidden combination, an invalid key, an out-of-range `limit`, or an unparseable `min_through_record` MUST be rejected with `400 Bad Request`.
-- Unrecognized parameters are ignored, as on the other read surfaces.
-
-Request targets can be long: two 4096-octet keys produce a request target of about 11 KB. Deployments SHOULD accept request lines of at least 12 KiB on this resource.
-
-#### 9.2.2. Response Body
-
-On `200 OK` the body has the media type:
-
-```
-application/vnd.durable-stream-keyed-rows+ndjson
-```
-
-It contains one line per visible key in the selected range, in ascending unsigned octet order of the decoded keys. Each line is a JSON object with exactly the members `key`, `record` and `value`, in that order:
-
-```json
-{"key":"AW5leHRfaWQA","record":103,"value":130}
-{"key":"AW93bmVyAA","record":42,"value":{"epoch":42,"nonce":"c0ffee00112233445566778899aabbcc"}}
-```
-
-- `key` is the key in canonical base64url.
-- `record` is the ordinal of the record containing the last put applied to the key in `state(D)`. It is a function of `state(D)` alone, so internal compaction or a rebuild never changes it.
-- `value` is the put's value text exactly as stored under [JSON Message Text](#json-message-text), embedded verbatim.
-
-An empty selection, including a point read of a key that is not visible, is a `200 OK` with an empty body.
-
-#### 9.2.3. Response Headers
-
-- `Stream-Keyed-Through: D` MUST be present on every `200` and `204`. `D` is exclusive: the response reflects every record below `D` and none at or above it.
-- `Cache-Control: no-store` MUST be present on every `200` and `204`.
-- `Stream-Keyed-After: k` names the last returned key. It MUST be present when the server stopped before the end of the selected range, because of `limit` or the response budget, and MAY be present otherwise. Its absence means the range is exhausted. A client continues with `after=k` and the same `end`.
-- `Stream-Extensions` MUST include `keyed-state-v1` on every response of this resource for a keyed stream, except `404`.
-
-The response budget is 4 MiB of uncompressed body. The server MUST NOT add a row that would take the body past the budget, except that the first row of a response is always returned whole.
-
-#### 9.2.4. Consistency
-
-- Every `200` and `204` MUST reflect exactly one `state(D)`, with `D` at most the stream's record tail `N`. Rows of one response never mix states.
-- For one stream incarnation, once a response has carried `Stream-Keyed-Through: D`, no later `200` or `204` carries a smaller `D`, unless the stream's log itself was rewound by an operator restore; `D` then restarts from the state rebuilt from the restored log.
-- A deleted and recreated stream at the same URL is a new incarnation. Its keyed state MUST NOT be served from the old incarnation's state.
-- With `min_through_record=r`, the server MUST respond with `D ≥ r`, waiting up to `timeout_ms` for keyed state to reach `r`. If `D < r` when the timeout elapses, it MUST respond `204 No Content` with `Stream-Keyed-Through: D`. Without `min_through_record`, any published `D` MAY be returned.
-- A keyed stream for which no keyed state has been built yet is served as `state(0)`.
-- Pagination is keyset-monotone: a client paging with `after` sees no key twice, but each page MAY reflect a different `D`, so rows changed between pages MAY be missed. A client that needs one consistent view across pages passes the highest `D` it has seen as `min_through_record` and reconciles by `D`.
-
-A writer achieves read-your-writes for its record `s` by passing `min_through_record=s+1`.
-
-#### 9.2.5. Waiting and Coalescing
-
-The server MAY coalesce concurrent requests that wait on the same stream, and MAY space successive publications of keyed state by a minimum interval. Correctness MUST NOT depend on either. A request whose `min_through_record` is above the published `D` causes the server to make progress toward it; keyed state of a stream that nobody reads need not be maintained.
-
-#### 9.2.6. Errors
-
-- `400 Bad Request` for invalid parameters (Section 9.2.1).
-- `404 Not Found` when the stream does not exist, is not a keyed stream, or the server does not serve keyed state for it.
-- `400 Bad Request` with `Stream-Record-Next: N` when `min_through_record` exceeds the stream's record tail `N`.
-- `500 Internal Server Error` with a plain-text reason naming a record ordinal when a permanent condition prevents producing `state(D)` for any `D ≥ r`: a source record that cannot be applied, an irreparable continuity break, or source records below the first retained ordinal (Section 9.1.7).
-- `503 Service Unavailable` with `Retry-After` when the resource is temporarily unavailable, including transient failures to read the source log and keyed state that is ahead of its source log (`D > N`) while it is re-validated or rebuilt.
-
-Precedence is the parameter `400`, then `404`, then the beyond-tail `400`, then `5xx`, then `204`. A `503` MAY precede `404` when the server cannot determine whether the stream exists.
-
-#### 9.2.7. Advertisement
-
-Responses to the creating `PUT` and to `HEAD {stream_url}` of a keyed stream MUST advertise `keyed-state-v1` when the server serves this resource for that stream, and MUST NOT advertise it otherwise. A server that advertises `keyed-state-v1` for a stream MUST also support `max_bytes` on that stream's record-aware reads (Section 6.6).
-
-#### 9.2.8. Example
-
-```http
-GET {stream_url}/keyed-state?start=AQ&end=Ag&limit=2&min_through_record=104&timeout_ms=5000
-```
-
-```http
-HTTP/1.1 200 OK
-Content-Type: application/vnd.durable-stream-keyed-rows+ndjson
-Stream-Extensions: keyed-state-v1
-Stream-Keyed-Through: 104
-Stream-Keyed-After: AW93bmVyAA
-Cache-Control: no-store
-
-{"key":"AW5leHRfaWQA","record":103,"value":130}
-{"key":"AW93bmVyAA","record":42,"value":{"epoch":42,"nonce":"c0ffee00112233445566778899aabbcc"}}
-```
-
-The client continues with `after=AW93bmVyAA&end=Ag`.
-
-### 9.3. Correctness Requirements
-
-Implementations MUST preserve these invariants. Each is testable against a reference fold over the stream's records.
-
-1. A message is committed to a keyed stream only if it matches Section 9.1.2. Every committed record of a keyed stream is grammatical.
-2. A request with any ungrammatical message commits nothing and is answered `422`; a request with invalid JSON text is answered `400`; grammar validation precedes every apply-time status.
-3. Stored record bytes equal the writer's text with insignificant whitespace removed, and every read surface (offset reads, record reads, envelope, SSE, bootstrap, and keyed-state `value`) returns those bytes.
-4. Every `200` and `204` from the keyed-state resource reflects exactly one `state(D)` with `D ≤ N`, and its rows equal the reference fold `state(D)` restricted to the selected range, in ascending unsigned octet order.
-5. A row's `record` is the ordinal of the record holding the key's last applied put in `state(D)`, and is unchanged by any internal compaction or rebuild.
-6. A response to `min_through_record=r` either has `D ≥ r` or is `204` with `Stream-Keyed-Through` below `r`.
-7. For one incarnation, served `D` never decreases, except after an operator restore of the log.
-8. Keyed state is served only for the incarnation it was built from, and only while it is consistent with the source log's records below `D`.
-9. A response stops before the end of the selected range only with `Stream-Keyed-After` naming its last row; paging with `after` until `Stream-Keyed-After` is absent visits every key of the range at most once.
-10. No response exceeds `limit` rows, and no response exceeds the 4 MiB budget unless it contains exactly one row.
-11. `HEAD` and every method other than `GET` on the resource return `405` with `Allow: GET`, unless the server serves keyed state for no stream (Section 9.2.1).
-12. A keyed stream with no built state is served as `state(0)`.
-13. Non-keyed streams are unaffected: they never advertise `keyed-batch-v1` or `keyed-state-v1`, and a `GET` of their keyed-state resource answers `404`.
-
-Conformance tests SHOULD cover: escaped and duplicate `ops` members; unpaired-surrogate escapes in top-level member names (rejected) and in member names inside values (accepted); non-canonical keys (`AB`, `AA==`, `+/`, the empty string) and escaped keys; range deletes with `start ≥ end`; depth 127, 128 and 129, bare and inside an array body; `1e400`; `lo ≥ hi`; repeated parameters; `HEAD` and other methods; out-of-range and unparseable `timeout_ms`; wait timeouts; keyed state ahead of the source log; an invalid batch sent to a non-keyed or absent stream; `max_bytes` with `max_records` and with `record_view=envelope`; a stream with no built state; and deleting and recreating the same stream URL within one millisecond.
-
-### 9.4. Tuple Layer (Informative)
-
-The server treats keys as opaque octet strings. This appendix describes the order-preserving tuple encoding that Pi Durable's owner uses to build keys, so that prefix and range reads over the keyed-state resource return rows in a useful order. Other applications MAY use any encoding.
-
-| Component | Encoding | Order |
-|---|---|---|
-| tag | 1 octet family tag | — |
-| `u64(x)` | 8 octets, big-endian | ascending |
-| `u64desc(x)` | 8 octets, big-endian, of `2^64−1−x` | descending |
-| `u8(e)` | 1 octet enumeration value | — |
-| `str(s)`, short form | WTF-8 of the JavaScript string (valid surrogate pairs become 4-octet UTF-8; a lone surrogate becomes `ED A0..BF xx`), with each `00` octet escaped as `00 FF`, followed by a `00` terminator. Used when the result is at most 1024 octets. | groups by string |
-| `str(s)`, long form | `FE` followed by `SHA-256(WTF-8(s))`: 33 octets | exact match only |
-| `strinc(p)` | strip trailing `FF` octets, then increment the last octet | prefix successor |
-
-- A key is the concatenation of its components, encoded with base64url for the wire.
-- `TextEncoder` is unsuitable for `str` because it replaces lone surrogates with U+FFFD, which would merge distinct strings.
-- The short and long forms never collide: a short form never starts with `FE`, because its first octet is `00` or a WTF-8 lead octet at most `F4`.
-- The code is not prefix-free. A short form is a prefix of the short forms of its NUL-extensions: `str("k")` = `6B 00` is a prefix of `str("k\u0000z")` = `6B 00 FF 7A 00`. A range `[p, strinc(p))` that ends in a `str()` component therefore also returns rows for every string that extends the target with U+0000. Readers that scan such a prefix need to compare the full string, which the application stores in the value or in a row the key points to, and skip mismatches.
-- Long forms appear only where the application needs exact matches, never in positions that are scanned by prefix for ordering.
-- The range of all keys with prefix `p` is `start=p&end=strinc(p)`.
-
-Vectors:
-
-| Tuple | Key (base64url) |
-|---|---|
-| tag `0x33`, `str("\ud800")`, `u64(5)` | `M-2ggAAAAAAAAAAABQ` |
-| tag `0x33`, `str("\ud801")`, `u64(5)` | `M-2ggQAAAAAAAAAABQ` |
-| tag `0x42`, `u64(1)`, `str("R" × 2000)` (long form) | `QgAAAAAAAAAB_qlzUi6syczOrf_AEPEPP8d5ztBpK79Sfr0W73LnIc4y` |
-| tag `0x01`, `str("owner")` | `AW93bmVyAA` |
-
-The first two vectors show that lone surrogates stay distinct.
+`timeout_ms={t}` bounds how long a `live=long-poll` read waits for new data before the server answers `204 No Content`. The default is `1000`. An unparseable value means the default, and a parsed value is clamped to `1..60000`. It is ignored on reads that do not wait.

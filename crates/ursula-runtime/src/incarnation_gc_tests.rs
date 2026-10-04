@@ -35,7 +35,7 @@ fn spawn(cold_store: Arc<ColdStore>) -> ShardRuntime {
     .expect("spawn runtime")
 }
 
-async fn raise_to_keyed_level(runtime: &ShardRuntime) {
+async fn raise_to_level_one(runtime: &ShardRuntime) {
     for (group, result) in runtime
         .set_feature_level_all_groups(FEATURE_LEVEL_KEYED_STREAMS)
         .await
@@ -221,7 +221,7 @@ async fn d4_two_segment_stream_gc_does_not_reach_affinity_streams_under_its_name
 async fn incarnation_scoped_recreate_reads_its_own_pages_and_gc_reclaims_the_old_incarnation() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = spawn(cold_store.clone());
-    raise_to_keyed_level(&runtime).await;
+    raise_to_level_one(&runtime).await;
     let stream = BucketStreamId::new("d4-bucket", "scoped");
 
     create(&runtime, &stream).await;
@@ -239,7 +239,7 @@ async fn incarnation_scoped_recreate_reads_its_own_pages_and_gc_reclaims_the_old
     flush(&runtime, &stream, 4).await;
     let new_generation = generation(&runtime, &stream).await;
     assert!(new_generation > old_generation);
-    // HEAD exposes the unique incarnation for the keyed-state proxy (C7).
+    // HEAD exposes the unique incarnation (C7).
     let head = runtime
         .head_stream(HeadStreamRequest {
             stream_id: stream.clone(),
@@ -276,7 +276,7 @@ async fn incarnation_scoped_recreate_reads_its_own_pages_and_gc_reclaims_the_old
 async fn incarnation_scoped_stream_gc_reclaims_external_payloads() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = spawn(cold_store.clone());
-    raise_to_keyed_level(&runtime).await;
+    raise_to_level_one(&runtime).await;
     let stream = BucketStreamId::new("d4-bucket", "external");
 
     let stage = |payload: &'static [u8]| {

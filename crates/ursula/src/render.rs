@@ -50,7 +50,6 @@ use crate::HEADER_STREAM_TTL;
 use crate::HEADER_STREAM_UP_TO_DATE;
 use crate::HEADER_X_CONTENT_TYPE_OPTIONS;
 use crate::HttpMetricsSnapshot;
-use crate::insert_keyed_extension_for;
 use crate::insert_record_extension;
 use crate::insert_record_head_headers;
 use crate::insert_record_operation_headers;
@@ -486,8 +485,7 @@ pub(crate) fn read_response(
     request_headers: &HeaderMap,
     request_cursor: Option<&str>,
 ) -> Response {
-    let keyed = ursula_shard::is_keyed_batch_content_type(&response.content_type);
-    read_response_with_etag(response, request_headers, request_cursor, None, keyed)
+    read_response_with_etag(response, request_headers, request_cursor, None)
 }
 
 pub(crate) fn record_envelope_response(
@@ -496,8 +494,6 @@ pub(crate) fn record_envelope_response(
     request_cursor: Option<&str>,
 ) -> Response {
     let canonical_etag = read_etag(&response);
-    // The envelope replaces the content type; decide keyed beforehand.
-    let keyed = ursula_shard::is_keyed_batch_content_type(&response.content_type);
     if let Err(message) = apply_record_envelope(&mut response) {
         return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
     }
@@ -506,7 +502,6 @@ pub(crate) fn record_envelope_response(
         request_headers,
         request_cursor,
         Some(canonical_etag),
-        keyed,
     )
 }
 
@@ -542,7 +537,6 @@ fn read_response_with_etag(
     request_headers: &HeaderMap,
     request_cursor: Option<&str>,
     canonical_etag: Option<String>,
-    keyed: bool,
 ) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
@@ -554,9 +548,6 @@ fn read_response_with_etag(
             insert_record_head_headers(&mut headers, retained_record_range);
             insert_record_operation_headers(&mut headers, record_range);
         }
-    }
-    if keyed {
-        insert_keyed_extension_for(&mut headers, ursula_shard::KEYED_BATCH_CONTENT_TYPE);
     }
     let etag = canonical_etag.unwrap_or_else(|| read_etag(&response));
     if let Ok(value) = HeaderValue::from_str(&etag) {
@@ -713,7 +704,6 @@ pub(crate) fn offset_now_response(response: ReadStreamResponse) -> Response {
             insert_record_operation_headers(&mut headers, record_range);
         }
     }
-    insert_keyed_extension_for(&mut headers, &response.content_type);
     insert_cache_control(&mut headers, "no-store");
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
@@ -735,7 +725,6 @@ pub(crate) fn long_poll_no_content_response(
         insert_record_head_headers(&mut headers, retained_record_range);
         insert_record_operation_headers(&mut headers, record_range);
     }
-    insert_keyed_extension_for(&mut headers, &response.content_type);
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
     } else {

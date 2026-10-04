@@ -1,4 +1,4 @@
-//! Stream registry: the keyed slot store plus its TTL expiry index.
+//! Stream registry: the id-indexed slot store plus its TTL expiry index.
 //!
 //! `keys` and `slots` form a bijection — every id in `keys` points at a live
 //! slot, and slots are reachable only through it. Keeping the fields private

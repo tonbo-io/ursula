@@ -425,40 +425,6 @@ core_count = 2
     }
 
     #[test]
-    fn keyed_state_upstream_loads_and_requires_an_http_url() {
-        let tmp = temp_config(
-            ".toml",
-            r#"
-[server]
-keyed_state_upstream = "http://127.0.0.1:7071"
-"#,
-        );
-        let config = load_config(Some(tmp.path()), None, Some(1)).unwrap();
-        assert_eq!(
-            config.server.keyed_state_upstream.as_deref(),
-            Some("http://127.0.0.1:7071")
-        );
-        assert_eq!(
-            load_config(None, None, Some(1))
-                .unwrap()
-                .server
-                .keyed_state_upstream,
-            None
-        );
-
-        for bad in ["127.0.0.1:7071", "ftp://indexer", "http://"] {
-            let tmp = temp_config(
-                ".toml",
-                &format!("[server]\nkeyed_state_upstream = \"{bad}\"\n"),
-            );
-            let msg = load_config(Some(tmp.path()), None, Some(1))
-                .unwrap_err()
-                .to_string();
-            assert!(msg.contains("keyed_state_upstream"), "{bad}: {msg}");
-        }
-    }
-
-    #[test]
     fn validation_rejects_disk_without_path() {
         let tmp = temp_config(
             ".toml",
@@ -821,77 +787,5 @@ kms_key_id = "arn:aws:kms:us-east-1:111122223333:key/test"
             s3.kms_key_id.as_deref(),
             Some("arn:aws:kms:us-east-1:111122223333:key/test")
         );
-    }
-}
-
-#[cfg(test)]
-mod keyed_state_tests {
-    use std::time::Duration;
-
-    use crate::config::UrsulaConfig;
-
-    #[test]
-    fn keyed_state_indexer_urls_parse_and_default_empty() {
-        let config = UrsulaConfig::default();
-        assert!(config.keyed_state.indexer_urls.is_empty());
-        assert_eq!(
-            config.keyed_state.drain_timeout.as_duration(),
-            Duration::from_secs(60)
-        );
-        let mut config: UrsulaConfig = toml::from_str(
-            r#"
-[keyed_state]
-indexer_urls = ["http://indexer-0:4440", "https://indexer-1:4440"]
-drain_timeout = "5s"
-"#,
-        )
-        .expect("valid config");
-        assert_eq!(config.keyed_state.indexer_urls.len(), 2);
-        assert_eq!(
-            config.keyed_state.drain_timeout.as_duration(),
-            Duration::from_secs(5)
-        );
-        config.raft.node_id = 1;
-        config.validate().expect("valid keyed_state config");
-        config.keyed_state.indexer_urls = vec!["indexer-0:4440".to_owned()];
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn keyed_state_failover_settings_default_and_validate() {
-        let config = UrsulaConfig::default();
-        assert_eq!(
-            config.keyed_state.upstream_connect_timeout.as_duration(),
-            Duration::from_secs(2)
-        );
-        assert_eq!(
-            config.keyed_state.failover_header_timeout.as_duration(),
-            Duration::from_secs(10)
-        );
-        assert_eq!(
-            config.keyed_state.unhealthy_backoff.as_duration(),
-            Duration::from_secs(2)
-        );
-        let mut config: UrsulaConfig = toml::from_str(
-            r#"
-[keyed_state]
-indexer_urls = ["http://primary:4440", "http://standby:4440"]
-upstream_connect_timeout = "500ms"
-failover_header_timeout = "3s"
-unhealthy_backoff = "5s"
-"#,
-        )
-        .expect("valid config");
-        config.raft.node_id = 1;
-        config.validate().expect("valid failover config");
-        assert_eq!(
-            config.keyed_state.unhealthy_backoff.as_duration(),
-            Duration::from_secs(5)
-        );
-        config.keyed_state.unhealthy_backoff = Duration::from_millis(500).into();
-        assert!(config.validate().is_err());
-        config.keyed_state.unhealthy_backoff = Duration::from_secs(1).into();
-        config.keyed_state.failover_header_timeout = Duration::ZERO.into();
-        assert!(config.validate().is_err());
     }
 }

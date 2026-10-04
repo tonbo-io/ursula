@@ -46,7 +46,7 @@ Each entry has:
 | ----- | ----------- |
 | `stream_id` | Bucket-local path: `stream`, or `affinity/stream` for a stream created through the [path affinity](/docs/specs/extensions#17-path-affinity) form. |
 | `status` | `Open` or `Closed`. |
-| `content_type` | The stream's content type, for example `application/json; profile=keyed-batch-v1`. |
+| `content_type` | The stream's content type, for example `application/json`. |
 | `tail_offset` | Current tail as an integer byte offset. |
 | `created_at_ms` | Creation time in Unix milliseconds. Unique per Raft group from feature level 1, so it also identifies a stream incarnation. |
 

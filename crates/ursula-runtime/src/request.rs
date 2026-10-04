@@ -143,8 +143,7 @@ pub struct HeadStreamResponse {
     pub integrity: StreamIntegritySnapshot,
     pub record_range: Option<StreamRecordRange>,
     /// The stream incarnation's `created_at_ms`, unique per group from
-    /// feature level 1 (C7). Internal: the keyed-state proxy passes it to the
-    /// indexer as the incarnation; it has no public header. `default` keeps
+    /// feature level 1 (C7). Internal: it has no public header. `default` keeps
     /// HEAD responses forwarded by older followers decodable.
     #[serde(default)]
     pub created_at_ms: Option<u64>,

@@ -88,7 +88,7 @@ Every Raft group carries a replicated feature level, `0` until an operator raise
 
 | Level | Enables | Status |
 | --- | --- | --- |
-| 1 | Keyed streams: `application/json; profile=keyed-batch-v1` creation, the reserved `keyed-state` name under affinity paths, and unique stream incarnations. Bounded state, first step: a 1,024-item producer receipt window per stream with 7-day idle-producer expiry, message-record collapse at every cold flush, incarnation-scoped cold objects and stream GC, and a compact MessagePack snapshot envelope | Supported by this release |
+| 1 | Unique stream incarnations. Bounded state, first step: a 1,024-item producer receipt window per stream with 7-day idle-producer expiry, message-record collapse at every cold flush, incarnation-scoped cold objects and stream GC, and a compact MessagePack snapshot envelope | Supported by this release |
 | 2 | Sparse cold record marks: the JSON record index keeps exact offsets only for unflushed records plus one mark per MiB of cold log. Retention into sealed history lands on the mark at or below its target. Raised only for groups whose leader completed a cold-index page-repair cycle | Supported by this release |
 | 3 | External payload locators committed first and indexed after, so state holds only in-flight ones | Supported by this release |
 | 4 | Compact hot-window representation: message records are removed. JSON streams take message boundaries from the record index's unflushed offsets, other streams keep one 8-byte start per unflushed message, so the hot window costs 8 bytes per record beyond its payload instead of 24. Streams convert on their next write, flush, retention or tidy pass | Supported by this release |
@@ -108,28 +108,9 @@ Raising a group to `N` enables every level up to `N`. Levels are never lowered. 
 
 ### Memory without retention
 
-Per-stream replicated state, on every replica, is at most about 32 KiB plus 8 bytes per unflushed record plus 16 bytes per MiB of cold log, plus bounded producer state, without retention. It does not grow with record count, but it does grow with history: about 16 MiB per TiB of cold log, per stream, per replica. A bound independent of history length (moving marks into cold-index pages, or thinning old marks) is planned, not shipped. Each level removes one growth source, so the bound holds once every level through 3 is raised; at level 1 the producer receipts, message records and cold-object bookkeeping are bounded, and the JSON record index still costs 8 bytes per retained record until level 2. Level 4 shrinks the hot window's bookkeeping from 24 to 8 bytes per unflushed record, and cold admission and the flush thresholds charge that smaller figure. Retention stays available as a storage-cost tool, but it is not the way to bound memory, and [keyed streams](/docs/concepts/keyed-streams#retention) must not be trimmed at all.
-
-Two other memory bounds are separate from replicated state. A keyed-stream owner (such as the Pi Durable client) is bounded by its configured cache and overlay budgets. The keyed-state indexer process is bounded by `--keyed-admission-budget-bytes` (default 1 GiB, shared by ingest pages, folded-but-unpublished records and compaction buffers) plus its caches; when too many streams need ingestion at once, keyed-state reads answer `503` with `Retry-After` and clients retry ([indexer flags](/docs/configuration#keyed-indexer-flags)).
+Per-stream replicated state, on every replica, is at most about 32 KiB plus 8 bytes per unflushed record plus 16 bytes per MiB of cold log, plus bounded producer state, without retention. It does not grow with record count, but it does grow with history: about 16 MiB per TiB of cold log, per stream, per replica. A bound independent of history length (moving marks into cold-index pages, or thinning old marks) is planned, not shipped. Each level removes one growth source, so the bound holds once every level through 3 is raised; at level 1 the producer receipts, message records and cold-object bookkeeping are bounded, and the JSON record index still costs 8 bytes per retained record until level 2. Level 4 shrinks the hot window's bookkeeping from 24 to 8 bytes per unflushed record, and cold admission and the flush thresholds charge that smaller figure. Retention stays available as a storage-cost tool, but it is not the way to bound memory.
 
 The per-group gauges under `group_state_gauges` in `/__ursula/metrics` show what each group holds.
-
-## Keyed state
-
-Keyed streams need a keyed-state indexer. With Helm, set `keyedIndexer.enabled=true` with cold storage enabled ([Deploy](/docs/deploy-cluster#optional-keyed-state-indexer)); the chart wires every node's `keyed_state.indexer_urls` to its pods, pod 0 first. Day-2 notes:
-
-- **Active/standby.** Every node sends keyed-state reads to the first healthy pod in `keyed_state.indexer_urls` (the primary) and fails over to the next one (a standby) on a connection error, a header timeout or a `502`/`503`/`504`, within the read's own budget. A failed pod is probed at `/readyz` after `keyed_state.unhealthy_backoff` and takes traffic back once it answers. Readers see at most a slower read during a switch, never a lower `Stream-Keyed-Through`; with every pod down the node answers `503` with `Retry-After`. Multi-pod load sharding (rendezvous hashing) belongs to the horizontal-scaling work; today the extra pods are standbys.
-
-- **Scaling the indexer.** `keyedIndexer.replicaCount` sets both the pod count (one primary, the rest standbys) and the list of pods the nodes fail over across and drain on purge. Changing it changes the node config, so the upgrade rolls the voters as well; do it through the graceful rollout or drain procedure. Until every node has the new list, a purge may miss a new pod's in-flight work or fail on a removed one, so avoid purges during the change. Retry a purge that reports `keyed_drain_complete=false`.
-- **Rolling the indexer.** Indexer pods hold only a cache, so restarting them is safe at any time; while the primary restarts the nodes read from a standby. Keyed-state reads may answer `503` while no pod is ready, and readers retry.
-
-- **Requests.** `keyed_state_requests` in `/__ursula/metrics` counts the node's keyed-state responses by status (`status_200`, `status_204`, `status_400`, `status_404`, `status_500`, `status_503`, `status_other`). A rising `status_503` means the indexer is unreachable or rebuilding; `status_500` means a stream's state cannot advance (see below).
-- **Failover.** `keyed_state_upstream` in `/__ursula/metrics` reports the node's view of the pods: `active_pod` (index of the pod that takes new reads, `null` when none is healthy), `active_url`, `failovers` (attempts that moved on to the next pod), `unhealthy_pods`, and per pod `url`, `healthy`, `requests` and `failures`. Alert when `active_pod` is not `0` for long, or when `unhealthy_pods` equals the pod count.
-- **Indexer restarts and loss.** The indexer's local disk is a cache and its object-store projections are rebuildable from the log. Restarting or replacing pods only costs latency. Deleting `.keyed/` makes every keyed stream rebuild from record 0 on its next read.
-- **Restore.** After restoring the cluster from a backup, projections that are ahead of or different from the restored logs fail the indexer's continuity check and are rebuilt; keyed-state answers `503` for those streams until they catch up. `.keyed/` does not need to be backed up.
-- **Delete.** Deleting a keyed stream also queues its projection for cold GC. A stream recreated at the same path is a new incarnation and never sees the old state.
-- **Purge.** Bucket purge drains every indexer before erasing projections; see [Tenant offboarding](#tenant-offboarding-bucket-purge).
-- **Retention.** Do not advance retention on keyed streams. Once the first retained record passes what the projection needs, keyed state answers `500` naming the record and cannot be rebuilt.
 
 ## Usage export
 
@@ -161,7 +142,7 @@ Counters are monotonic and survive snapshots, stream deletion, and bucket purge.
 
 ```bash
 curl -X DELETE http://127.0.0.1:4438/__ursula/purge/tenant-a
-# {"bucket":"tenant-a","removed_streams":12,"groups_with_streams":[0,3,5],"cold_gc_entries_reclaimed":12,"cold_gc_pending_entries":0,"cold_gc_complete":true,"cold_gc_error":null,"bucket_prefix_absent":true,"keyed_drain_complete":true,"keyed_drain_error":null,"keyed_indexers_drained":2,"keyed_prefix_absent":true}
+# {"bucket":"tenant-a","removed_streams":12,"groups_with_streams":[0,3,5],"cold_gc_entries_reclaimed":12,"cold_gc_pending_entries":0,"cold_gc_complete":true,"cold_gc_error":null,"bucket_prefix_absent":true}
 ```
 
 Semantics:
@@ -171,7 +152,6 @@ Semantics:
 - **Isolated.** Other buckets' streams, offsets, checksums, snapshots, and object-store prefixes are untouched. Packs written by legacy versions may contain several buckets, so purge first rewrites their live slices into bucket-scoped objects and reports incomplete until that compatibility debt reaches zero.
 - **Accounting residue.** The retained entry contains only aggregate counters and zero-valued content gauges, not stream data. Ursula does not currently provide an acknowledgement protocol for erasing it after an external meter persists the final delta. Use opaque bucket IDs if retaining the identifier itself would violate an erasure requirement.
 - **Physical absence proof.** `cold_gc_entries_reclaimed` is diagnostic only. After a second replicated purge proves every group's bucket-specific GC queue is empty, Ursula recursively deletes the complete `{bucket}/` erasure domain and lists the authoritative object store to prove it contains no files. Only `cold_gc_complete=true`, `cold_gc_pending_entries=0`, `bucket_prefix_absent=true`, and no error constitute the proof. If object storage is unavailable or still lists a file, the response remains incomplete and a later idempotent request retries the proof.
-- **Keyed-state projections.** After the tombstone, purge sends `POST {url}/v1/keyed/drain` with `{"bucket":"…"}` to every `keyed_state.indexer_urls` entry. Each indexer pod blocks new work for the bucket, waits for its in-flight operations and answers `200`. Only when every pod has acknowledged does purge continue; it then erases and proves empty both `{bucket}/` and `.keyed/{bucket}/` (`bucket_prefix_absent` and `keyed_prefix_absent`). A missing acknowledgement reports `keyed_drain_complete=false` with `keyed_drain_error`, erases nothing, and the idempotent purge is retried.
 - **Backups.** A purged tenant may persist inside backups taken before the purge until those backups age out; restore replays whatever the manifest contains. Deleting old backup sets is part of completing an offboarding with erasure obligations.
 
 ## Cleaning S3

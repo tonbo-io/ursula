@@ -36,13 +36,6 @@ pub struct ServerArgs {
     /// Raft node identity.  Must be unique per node in a cluster.
     #[arg(long)]
     node_id: Option<u64>,
-
-    /// Base URL of the keyed-state indexer serving `/v1/keyed`; overrides
-    /// `server.keyed_state_upstream` (a non-empty `keyed_state.indexer_urls`
-    /// still takes precedence for reads). Unset with no `indexer_urls`:
-    /// `{stream}/keyed-state` is 404.
-    #[arg(long)]
-    keyed_state_upstream: Option<String>,
 }
 
 pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -56,11 +49,7 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         preset = Some(Preset::Default);
     }
 
-    let mut config = load_config(config_path.as_deref(), preset, args.node_id)?;
-    if let Some(upstream) = args.keyed_state_upstream {
-        config.server.keyed_state_upstream = Some(upstream);
-        config.validate()?;
-    }
+    let config = load_config(config_path.as_deref(), preset, args.node_id)?;
 
     let tokio_console =
         config.observability.tokio_console || std::env::var_os("URSULA_TOKIO_CONSOLE").is_some();
@@ -205,28 +194,9 @@ async fn init_state(
         ursula_config::WalBackend::Memory => "memory",
         ursula_config::WalBackend::Disk => "disk",
     };
-    let keyed_state_config = keyed_state_routing(config);
     let mut state = state
         .with_runtime_config(&config.runtime)
-        .with_keyed_state_config(&keyed_state_config)
         .with_wal_backend(wal_backend);
-    if !keyed_state_config.indexer_urls.is_empty() {
-        let upstream = crate::keyed_state::KeyedStateUpstream::with_pods(
-            &keyed_state_config.indexer_urls,
-            crate::keyed_state::FailoverOptions::from_config(&keyed_state_config),
-        )
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
-        let pods = upstream
-            .pod_urls()
-            .map(url::Url::as_str)
-            .collect::<Vec<_>>()
-            .join(", ");
-        tracing::info!(
-            pods,
-            "serving keyed-state through the indexer (failover order)"
-        );
-        state = state.with_keyed_state_upstream(upstream);
-    }
     if let Some(wal_path) = config.raft.wal.resolved_path() {
         let monitor = crate::bootstrap::initialize_wal_disk_monitor(
             &wal_path,
@@ -242,27 +212,6 @@ async fn init_state(
         );
     }
     Ok(state)
-}
-
-/// The effective `[keyed_state]`: `keyed_state.indexer_urls` is both the
-/// read failover order (primary first) and the bucket-purge drain list. With
-/// none listed, the single `server.keyed_state_upstream` (one pod, or a load
-/// balancer) is both; a listed order takes precedence over it.
-fn keyed_state_routing(config: &ursula_config::UrsulaConfig) -> ursula_config::KeyedStateConfig {
-    let mut keyed_state = config.keyed_state.clone();
-    match &config.server.keyed_state_upstream {
-        Some(upstream) if keyed_state.indexer_urls.is_empty() => {
-            keyed_state.indexer_urls.push(upstream.clone());
-        }
-        Some(upstream) if !keyed_state.indexer_urls.contains(upstream) => {
-            tracing::warn!(
-                upstream,
-                "server.keyed_state_upstream is not used for keyed-state reads: keyed_state.indexer_urls lists the pods in failover order"
-            );
-        }
-        _ => {}
-    }
-    keyed_state
 }
 
 fn parse_start_maintenance_drained(value: Option<&OsStr>) -> Result<bool, std::io::Error> {
@@ -416,28 +365,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::io::Write;
 
-    use super::keyed_state_routing;
     use super::parse_start_maintenance_drained;
-
-    #[test]
-    fn keyed_state_indexer_urls_take_precedence_over_the_single_upstream() {
-        let mut config = ursula_config::UrsulaConfig::default();
-        assert!(keyed_state_routing(&config).indexer_urls.is_empty());
-        config.server.keyed_state_upstream = Some("http://lb:4493".to_owned());
-        assert_eq!(keyed_state_routing(&config).indexer_urls, vec![
-            "http://lb:4493".to_owned()
-        ]);
-        config.keyed_state.indexer_urls = vec![
-            "http://primary:4493".to_owned(),
-            "http://standby:4493".to_owned(),
-        ];
-        assert_eq!(keyed_state_routing(&config).indexer_urls, vec![
-            "http://primary:4493".to_owned(),
-            "http://standby:4493".to_owned()
-        ]);
-        config.server.keyed_state_upstream = None;
-        assert_eq!(keyed_state_routing(&config).indexer_urls.len(), 2);
-    }
 
     #[test]
     fn startup_maintenance_drain_is_strict_and_opt_in() {

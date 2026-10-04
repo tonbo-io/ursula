@@ -5,13 +5,6 @@
 //!
 //! - [`json_text`]: JSON Message Text (P1): validation, flattening and lexical
 //!   minification of `application/json` write bodies.
-//! - [`keyed_state`]: `{stream_url}/keyed-state` (keyed-streams P3): parameter
-//!   validation, stream resolution and forwarding to the indexer's `/v1/keyed`.
-//! - `keyed_upstream`: active/standby failover over the keyed-state indexer
-//!   pods (ordered list, health backoff, `/readyz` prober, failover metrics).
-//! - `keyed_lifecycle`: keyed-state lifecycle on the node: the bucket-purge
-//!   drain fan-out to keyed-state indexers (U23) and keyed-state request
-//!   counters (U24).
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
 //! - `bucket_listing`: `GET /{bucket}/streams` across Raft groups, fetching
 //!   the share of a group this node does not host from one of its voters
@@ -23,9 +16,6 @@ mod bootstrap;
 mod bucket_listing;
 mod cold_snapshot;
 pub mod json_text;
-mod keyed_lifecycle;
-pub mod keyed_state;
-mod keyed_upstream;
 mod otel_metrics;
 pub mod server;
 mod http_time {
@@ -75,7 +65,6 @@ use axum::middleware::Next;
 use axum::middleware::{self};
 use axum::response::IntoResponse;
 use axum::response::Response;
-use axum::routing::any;
 use axum::routing::get;
 use axum::routing::post;
 use axum::routing::put;
@@ -208,7 +197,6 @@ const HEADER_STREAM_SEQ: &str = "stream-seq";
 const HEADER_STREAM_TTL: &str = "stream-ttl";
 const HEADER_STREAM_UP_TO_DATE: &str = "stream-up-to-date";
 const JSON_RECORD_COORDINATES_EXTENSION: &str = "json-record-coordinates-v1";
-const KEYED_BATCH_EXTENSION: &str = ursula_shard::KEYED_BATCH_PROFILE;
 const PATH_AFFINITY_EXTENSION: &str = "path-affinity-v1";
 const GROUP_APPEND_TRANSACTION_EXTENSION: &str = "group-append-transaction-v1";
 const HEADER_PRODUCER_ID: &str = "producer-id";
@@ -341,7 +329,6 @@ struct CreateStreamHttpResponseInput<'a> {
     stream_ttl_seconds: Option<u64>,
     stream_expires_at_ms: Option<u64>,
     producer: Option<&'a ProducerRequest>,
-    keyed_state_served: bool,
 }
 
 pub trait WallClock: Send + Sync + 'static {
@@ -372,15 +359,6 @@ pub struct HttpState {
     /// (e.g. ursulactl auto-enabling empty-log rejoin only for `memory`).
     wal_backend: &'static str,
     wal_disk: WalDiskMonitor,
-    /// Indexer pods serving `/v1/keyed`, in failover order; `None` means
-    /// keyed state is not served
-    /// (`{stream_url}/keyed-state` answers 404 and nothing advertises
-    /// `keyed-state-v1`).
-    keyed_state_upstream: Option<Arc<keyed_state::KeyedStateUpstream>>,
-    /// Bucket-purge drain fan-out to the keyed-state indexer pods (U23).
-    keyed_drain: keyed_lifecycle::KeyedStateDrain,
-    /// Keyed-state responses by status (U24).
-    keyed_state_metrics: Arc<keyed_lifecycle::KeyedStateRequestMetrics>,
 }
 
 impl HttpState {
@@ -403,9 +381,6 @@ impl HttpState {
             external_payload_min_bytes: 1024 * 1024,
             wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
-            keyed_state_upstream: None,
-            keyed_drain: keyed_lifecycle::KeyedStateDrain::default(),
-            keyed_state_metrics: Arc::default(),
         }
     }
 
@@ -425,9 +400,6 @@ impl HttpState {
             external_payload_min_bytes: 1024 * 1024,
             wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
-            keyed_state_upstream: None,
-            keyed_drain: keyed_lifecycle::KeyedStateDrain::default(),
-            keyed_state_metrics: Arc::default(),
         }
     }
 
@@ -468,9 +440,6 @@ impl HttpState {
             external_payload_min_bytes: 1024 * 1024,
             wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
-            keyed_state_upstream: None,
-            keyed_drain: keyed_lifecycle::KeyedStateDrain::default(),
-            keyed_state_metrics: Arc::default(),
         }
     }
 
@@ -502,18 +471,6 @@ impl HttpState {
         self
     }
 
-    /// Serve `{stream_url}/keyed-state` through these indexer pods
-    /// (keyed-streams P3, U7), first healthy pod first.
-    pub fn with_keyed_state_upstream(mut self, upstream: keyed_state::KeyedStateUpstream) -> Self {
-        self.keyed_state_upstream = Some(Arc::new(upstream));
-        self
-    }
-
-    /// Whether `keyed-state-v1` is served (and advertised) for keyed streams.
-    pub(crate) fn serves_keyed_state(&self) -> bool {
-        self.keyed_state_upstream.is_some()
-    }
-
     /// Record the raft WAL backend so it appears in the metrics JSON.
     pub fn with_wal_backend(mut self, backend: &'static str) -> Self {
         self.wal_backend = backend;
@@ -538,12 +495,6 @@ impl HttpState {
             self.external_payload_min_bytes = usize::try_from(min_size.as_bytes())
                 .expect("config validation ensures payload size fits usize");
         }
-        self
-    }
-
-    /// Apply the keyed-state settings: the indexer pods bucket purge drains.
-    pub fn with_keyed_state_config(mut self, config: &ursula_config::KeyedStateConfig) -> Self {
-        self.keyed_drain = keyed_lifecycle::KeyedStateDrain::from_config(config);
         self
     }
 
@@ -1426,7 +1377,6 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
                     media_type == "application/json"
                         || media_type == "application/x-ndjson"
                         || media_type == "application/vnd.durable-stream-records+ndjson"
-                        || media_type == keyed_state::KEYED_ROWS_CONTENT_TYPE
                 })
         };
     let response_compression = CompressionLayer::new()
@@ -1482,14 +1432,6 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
                 .head(head_stream),
         )
         .route("/{bucket}/{stream}/append-batch", post(append_batch))
-        .route(
-            "/{bucket}/{stream}/keyed-state",
-            any(keyed_state::keyed_state),
-        )
-        .route(
-            "/{bucket}/{affinity}/{stream}/keyed-state",
-            any(keyed_state::keyed_state),
-        )
         .route(
             "/{bucket}/{affinity}/$transaction",
             post(append_transaction),
@@ -1652,7 +1594,6 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
         stream_ttl_seconds,
         stream_expires_at_ms,
         producer,
-        keyed_state_served,
     } = input;
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
@@ -1664,8 +1605,6 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
     if let Some(record_range) = response.record_range {
         insert_record_operation_headers(&mut headers, record_range);
     }
-    insert_keyed_extension_for(&mut headers, content_type);
-    insert_keyed_state_extension_for(&mut headers, content_type, keyed_state_served);
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
     }
@@ -1701,10 +1640,9 @@ pub(crate) fn append_http_response(response: AppendResponse) -> Response {
 }
 
 /// Administrator-triggered tenant offboarding (#150): purges the bucket from
-/// every Raft group, drains every keyed-state indexer pod (U23), then runs
-/// one cold-GC pass so the enqueued cold-object prefixes are reclaimed
-/// before the report returns, and finally erases and proves empty both
-/// `{bucket}/` and `.keyed/{bucket}/`. Idempotent — purging an
+/// every Raft group, then runs one cold-GC pass so the enqueued cold-object
+/// prefixes are reclaimed before the report returns, and finally erases and
+/// proves empty `{bucket}/`. Idempotent — purging an
 /// absent bucket returns the same report shape with zero counts, and a
 /// crashed purge converges on re-run because cold reclamation is
 /// list-then-delete over object prefixes.
@@ -1741,9 +1679,6 @@ pub(crate) async fn purge_bucket(
             "cold_gc_complete": false,
             "cold_gc_error": null,
             "bucket_prefix_absent": false,
-            "keyed_drain_complete": false,
-            "keyed_drain_error": null,
-            "keyed_prefix_absent": false,
             "legacy_shared_chunks_pending": legacy.pending_chunks,
         }))
         .into_response();
@@ -1755,33 +1690,6 @@ pub(crate) async fn purge_bucket(
             return runtime_error_or_leader_redirect_async(&state, err, &target).await;
         }
     };
-    // After the tombstone, nodes answer 404 for the bucket's streams, so no
-    // new keyed-state work arrives. Every indexer pod must still block new
-    // work for the bucket and finish its in-flight ingestion before
-    // `.keyed/{bucket}/` is erased, or a late publish could recreate objects
-    // below the proven-empty prefix (keyed-streams U23). Without every
-    // acknowledgement the purge stays incomplete and is retried.
-    if let Err(err) = state.keyed_drain.drain_bucket(&bucket).await {
-        tracing::warn!(
-            bucket = %bucket,
-            error = %err,
-            "keyed-state indexer drain failed; bucket erasure deferred"
-        );
-        return axum::Json(serde_json::json!({
-            "bucket": bucket,
-            "removed_streams": report.removed_streams,
-            "groups_with_streams": report.groups_with_streams,
-            "cold_gc_entries_reclaimed": 0,
-            "cold_gc_pending_entries": report.pending_cold_gc_entries,
-            "cold_gc_complete": false,
-            "cold_gc_error": null,
-            "bucket_prefix_absent": false,
-            "keyed_drain_complete": false,
-            "keyed_drain_error": err,
-            "keyed_prefix_absent": false,
-        }))
-        .into_response();
-    }
     // Reclaim the just-enqueued cold prefixes now instead of waiting for the
     // background worker's next pass. Failures leave entries queued for the
     // worker; the purge itself is already durable.
@@ -1837,12 +1745,6 @@ pub(crate) async fn purge_bucket(
         "cold_gc_complete": cold_gc_complete,
         "cold_gc_error": cold_gc_error,
         "bucket_prefix_absent": bucket_prefix_absent,
-        "keyed_drain_complete": true,
-        "keyed_drain_error": null,
-        "keyed_indexers_drained": state.keyed_drain.indexer_count(),
-        // `erase_bucket_cold_prefix_and_prove` erases and proves
-        // `{bucket}/` and `.keyed/{bucket}/` together.
-        "keyed_prefix_absent": bucket_prefix_absent,
     }))
     .into_response()
 }
@@ -2176,19 +2078,6 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         object.insert(
             "record_coordinate_corruptions".to_owned(),
             serde_json::Value::from(ursula_runtime::record_coordinate_corruptions()),
-        );
-        object.insert(
-            "keyed_state_requests".to_owned(),
-            serde_json::to_value(state.keyed_state_metrics.snapshot())
-                .unwrap_or(serde_json::Value::Null),
-        );
-        object.insert(
-            "keyed_state_upstream".to_owned(),
-            state
-                .keyed_state_upstream
-                .as_ref()
-                .and_then(|upstream| serde_json::to_value(upstream.snapshot()).ok())
-                .unwrap_or(serde_json::Value::Null),
         );
         object.insert("process_rss_bytes".to_owned(), serde_json::json!(rss));
         object.insert(
@@ -2950,9 +2839,6 @@ pub(crate) async fn create_stream_by_id(
         Ok(payload) => payload,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
-    if let Err(response) = validate_keyed_write(&content_type, &request.initial_payload, None) {
-        return *response;
-    }
     request.close_after = stream_closed(&request_headers);
     request.stream_seq = match stream_seq(&request_headers) {
         Ok(stream_seq) => stream_seq,
@@ -2978,7 +2864,6 @@ pub(crate) async fn create_stream_by_id(
             stream_ttl_seconds,
             stream_expires_at_ms,
             producer: producer.as_ref(),
-            keyed_state_served: state.serves_keyed_state(),
         }),
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
@@ -3018,7 +2903,6 @@ pub(crate) async fn create_stream_external_by_id(
                 stream_ttl_seconds,
                 stream_expires_at_ms,
                 producer: producer.as_ref(),
-                keyed_state_served: state.serves_keyed_state(),
             })
         }
         Err(err) => {
@@ -3065,7 +2949,7 @@ pub(crate) async fn append_stream_by_id(
         return match state
             .runtime
             .close_stream(CloseStreamRequest {
-                stream_id: stream_id.clone(),
+                stream_id,
                 stream_seq,
                 producer: producer.clone(),
                 now_ms: state.unix_time_ms(),
@@ -3075,18 +2959,6 @@ pub(crate) async fn append_stream_by_id(
             Ok(response) => {
                 let mut headers = HeaderMap::new();
                 insert_default_response_headers(&mut headers);
-                // RT4 (§9.1.5): a close-only POST carries no content type, so
-                // learn whether the stream is keyed from its head.
-                if let Ok(head) = state
-                    .runtime
-                    .head_stream(HeadStreamRequest {
-                        stream_id,
-                        now_ms: state.unix_time_ms(),
-                    })
-                    .await
-                {
-                    insert_keyed_extension_for(&mut headers, &head.content_type);
-                }
                 insert_offset(&mut headers, response.next_offset);
                 insert_producer_ack(&mut headers, producer.as_ref());
                 if let Some(record_range) = response.record_range {
@@ -3111,10 +2983,6 @@ pub(crate) async fn append_stream_by_id(
         Ok(payload) => payload,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
-    if let Err(response) = validate_keyed_write(&content_type, &payload, None) {
-        return *response;
-    }
-    let keyed = ursula_shard::is_keyed_batch_content_type(&content_type);
     let mut request = AppendRequest::from_bytes(stream_id, payload);
     request.content_type = content_type;
     request.close_after = close_after;
@@ -3134,12 +3002,11 @@ pub(crate) async fn append_stream_by_id(
     };
 
     if should_externalize_payload(&state, request.payload.len(), true) {
-        let response = append_stream_external_by_id(state, request_target, request).await;
-        return advertise_keyed_on_success(response, keyed);
+        return append_stream_external_by_id(state, request_target, request).await;
     }
 
     match state.runtime.append(request).await {
-        Ok(response) => advertise_keyed_on_success(append_http_response(response), keyed),
+        Ok(response) => append_http_response(response),
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
@@ -3218,14 +3085,6 @@ pub(crate) async fn append_batch(
         Ok(payloads) => payloads,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
-    // Every frame is validated before any is committed: one bad frame fails
-    // the whole request (`extensions.md` §9.1.3).
-    for (frame, payload) in payloads.iter().enumerate() {
-        if let Err(response) = validate_keyed_write(&content_type, payload, Some(frame)) {
-            return *response;
-        }
-    }
-    let keyed = ursula_shard::is_keyed_batch_content_type(&content_type);
     let mut request = AppendBatchRequest::new(stream_id, payloads);
     request.content_type = content_type;
     request.producer = producer.clone();
@@ -3247,9 +3106,6 @@ pub(crate) async fn append_batch(
     });
     if has_record_ranges {
         insert_record_extension(&mut headers);
-    }
-    if keyed && response.items.iter().any(Result::is_ok) {
-        insert_keyed_extension_for(&mut headers, ursula_shard::KEYED_BATCH_CONTENT_TYPE);
     }
     if minimal_ack && response.items.iter().all(Result::is_ok) && !has_record_ranges {
         return (StatusCode::NO_CONTENT, headers).into_response();
@@ -3291,7 +3147,6 @@ pub(crate) async fn append_transaction(
     };
     let now_ms = state.unix_time_ms();
     let mut operations = Vec::with_capacity(transaction.operations.len());
-    let mut keyed = false;
     for operation in transaction.operations {
         if let Err(message) = check_transaction_operation_identifiers(&operation) {
             return (StatusCode::BAD_REQUEST, message).into_response();
@@ -3313,7 +3168,6 @@ pub(crate) async fn append_transaction(
             Ok(payload) => payload,
             Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
         };
-        keyed |= ursula_shard::is_keyed_batch_content_type(&content_type);
         operations.push(AppendRequest {
             stream_id: BucketStreamId::with_affinity(
                 path.bucket.clone(),
@@ -3328,15 +3182,6 @@ pub(crate) async fn append_transaction(
             now_ms,
             record_match: operation.record_match,
         });
-    }
-    // RT5 (§9.1.3): every op is decoded and normalized (400) before any op's
-    // keyed grammar is validated (422), as append-batch does.
-    for operation in &operations {
-        if let Err(response) =
-            validate_keyed_write(&operation.content_type, &operation.payload, None)
-        {
-            return *response;
-        }
     }
     let response = match state
         .runtime
@@ -3362,12 +3207,6 @@ pub(crate) async fn append_transaction(
     let mut response_headers = HeaderMap::new();
     insert_default_response_headers(&mut response_headers);
     insert_content_type(&mut response_headers, "application/json");
-    if keyed {
-        insert_keyed_extension_for(
-            &mut response_headers,
-            ursula_shard::KEYED_BATCH_CONTENT_TYPE,
-        );
-    }
     (StatusCode::OK, response_headers, body).into_response()
 }
 
@@ -3521,12 +3360,6 @@ pub(crate) async fn head_stream_by_id(
             let mut headers = HeaderMap::new();
             insert_default_response_headers(&mut headers);
             insert_content_type(&mut headers, &response.content_type);
-            insert_keyed_extension_for(&mut headers, &response.content_type);
-            insert_keyed_state_extension_for(
-                &mut headers,
-                &response.content_type,
-                state.serves_keyed_state(),
-            );
             insert_offset(&mut headers, response.tail_offset);
             insert_u64_header(
                 &mut headers,
@@ -3600,78 +3433,6 @@ pub(crate) async fn head_stream_by_id(
 
 fn insert_record_extension(headers: &mut HeaderMap) {
     insert_extension_token(headers, JSON_RECORD_COORDINATES_EXTENSION);
-}
-
-/// Advertises `keyed-batch-v1` together with `json-record-coordinates-v1`
-/// when `content_type` is the keyed activation type (`extensions.md`
-/// §9.1.5); responses for other streams never carry `keyed-batch-v1`.
-pub(crate) fn insert_keyed_extension_for(headers: &mut HeaderMap, content_type: &str) {
-    if ursula_shard::is_keyed_batch_content_type(content_type) {
-        insert_record_extension(headers);
-        insert_extension_token(headers, KEYED_BATCH_EXTENSION);
-    }
-}
-
-/// Advertises `keyed-state-v1` on the create and `HEAD` responses of a keyed
-/// stream when this node serves the resource (`extensions.md` §9.2.7).
-pub(crate) fn insert_keyed_state_extension_for(
-    headers: &mut HeaderMap,
-    content_type: &str,
-    served: bool,
-) {
-    if served && ursula_shard::is_keyed_batch_content_type(content_type) {
-        insert_extension_token(headers, keyed_state::KEYED_STATE_EXTENSION);
-    }
-}
-
-/// Adds the keyed advertisement to a successful write response whose request
-/// content type is keyed. Apply refuses a content type that differs from the
-/// stream's (409), so success proves the target stream is keyed.
-fn advertise_keyed_on_success(mut response: Response, keyed: bool) -> Response {
-    if keyed && response.status().is_success() {
-        insert_keyed_extension_for(
-            response.headers_mut(),
-            ursula_shard::KEYED_BATCH_CONTENT_TYPE,
-        );
-    }
-    response
-}
-
-/// Validates a P1-normalized JSON write body against `keyed-batch-v1`
-/// (`extensions.md` §9.1.3) when the request content type is the keyed
-/// activation type; other content types pass untouched. `frame` names the
-/// append-batch frame in the error text. Runs before the stream is looked
-/// up, so precedence is 400 (JSON), 422 (grammar), then apply statuses.
-fn validate_keyed_write(
-    content_type: &str,
-    normalized: &[u8],
-    frame: Option<usize>,
-) -> Result<(), Box<Response>> {
-    if !ursula_shard::is_keyed_batch_content_type(content_type) {
-        return Ok(());
-    }
-    // P1 stores one minified message per LF-terminated line; a minified
-    // message never contains a raw LF, and its text is valid UTF-8.
-    let messages = normalized
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| std::str::from_utf8(line).unwrap_or_default());
-    let Err(invalid) = ursula_index::keyed::validate_messages(messages) else {
-        return Ok(());
-    };
-    let status = if invalid.error.reason().is_json_syntax() {
-        StatusCode::BAD_REQUEST
-    } else {
-        StatusCode::UNPROCESSABLE_ENTITY
-    };
-    let message = match frame {
-        Some(frame) => format!(
-            "invalid keyed batch at frame {frame} message {}: {}",
-            invalid.index, invalid.error
-        ),
-        None => invalid.to_string(),
-    };
-    Err(Box::new((status, message).into_response()))
 }
 
 fn insert_extension_token(headers: &mut HeaderMap, token: &'static str) {
@@ -4630,7 +4391,6 @@ pub(crate) async fn long_poll_stream(
             Ok(head) => {
                 let mut headers = HeaderMap::new();
                 insert_default_response_headers(&mut headers);
-                insert_keyed_extension_for(&mut headers, &head.content_type);
                 insert_offset(&mut headers, head.tail_offset);
                 insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
                 if let (Some(record), Some(record_range)) = (record, head.record_range) {
@@ -4839,7 +4599,6 @@ pub(crate) async fn sse_stream(
     if head.record_range.is_some() {
         insert_record_extension(&mut headers);
     }
-    insert_keyed_extension_for(&mut headers, &head.content_type);
     if encode_base64 {
         insert_static(&mut headers, HEADER_STREAM_SSE_DATA_ENCODING, "base64");
     }
@@ -5169,13 +4928,7 @@ mod base_contract_tests;
 #[cfg(test)]
 mod cold_snapshot_tests;
 #[cfg(test)]
-mod keyed_indexer_tests;
-#[cfg(test)]
 mod staging_cleanup_tests;
 
-#[cfg(test)]
-mod keyed_lifecycle_tests;
-#[cfg(test)]
-mod keyed_state_tests;
 #[cfg(test)]
 mod sparse_marks_http_tests;
