@@ -3,6 +3,16 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
+## 0.6.1
+
+A patch release on format epoch 2: no storage, snapshot or Raft protocol change. Upgrade from 0.6.0 with an ordinary rolling restart.
+
+### Fixed
+
+- **A memory-WAL voter restarted empty no longer passes readiness.** On restart it rejoins as a voter with an empty log for the groups it bootstraps, and an idle leader never backfills it. `ursulactl` counted such a voter ready whenever the peers' commit index was within `--lag-tolerance`, so `repair-restarted-voter` skipped those groups and a rollout continued with two real copies. A voter that has applied nothing while its peers have committed entries is now never ready, and `repair-restarted-voter` rebuilds it through the learner catch-up path; `classify-amnesiac` counts it as a missing group.
+- **The leadership balancer hands a group only to a caught-up peer.** It used to hand leadership to a voter that had not replicated the leader's log; the transfer then left the leader muted while the target could not win, and the next restart fence timed out with "leader … is stale". The balancer now waits until the leader's replication metrics show the target matched its last log entry.
+- **The restart fence waits out an in-flight leadership transfer.** `prepare-restart` now waits 1.5 s (the Raft minimum election timeout) after fencing the surviving voters before it checks leadership, so a transfer accepted just before the fence settles first.
+
 ## 0.6.0
 
 **0.6.0 is a breaking release.** It changes the storage format (format epoch 2) and removes several protocol features (listed in the release notes). It refuses to start on data written by 0.5.x (Raft WAL directories, object-storage prefixes, snapshots and backups) and will not join a cluster with 0.5.x nodes. There is no in-place upgrade, no automatic migration and no rollback.

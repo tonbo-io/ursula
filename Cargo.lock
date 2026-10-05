@@ -4362,6 +4362,7 @@ dependencies = [
  "tracing",
  "url",
  "ursula-config",
+ "ursula-ctl",
  "ursula-gateway",
  "ursula-index",
  "ursula-observability",

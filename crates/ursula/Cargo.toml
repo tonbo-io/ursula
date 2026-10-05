@@ -71,6 +71,7 @@ flate2 = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true }
+ursula-ctl = { workspace = true }
 
 [[bench]]
 name = "json_text"

@@ -167,15 +167,14 @@ pub fn classify_amnesiac_voter(
         let missing_group_ids = target
             .per_group
             .values()
-            .filter(|group| {
-                !group.ready && !group.voter_member && group.target_applied_index.is_none()
-            })
+            .filter(|group| !group.ready && group.target_applied_index.is_none())
             .map(|group| group.raft_group_id)
             .collect::<Vec<_>>();
         if missing_group_ids.is_empty()
-            || target.per_group.values().any(|group| {
-                !group.ready && (group.voter_member || group.target_applied_index.is_some())
-            })
+            || target
+                .per_group
+                .values()
+                .any(|group| !group.ready && group.target_applied_index.is_some())
             || reports
                 .iter()
                 .any(|(node_id, report)| node_id != target_id && !report.all_ready)
@@ -239,6 +238,11 @@ pub fn classify_amnesiac_voter(
 /// A target node is ready when, in every raft group that any peer reports:
 ///   1. The target is listed in voter_ids (membership intact).
 ///   2. The target's last_applied_index >= max peer committed_index - lag_tolerance.
+///   3. The target has applied something once any peer has committed past the
+///      initial membership entry. An empty voter (a memory-WAL node that
+///      re-initialized its membership on restart) is never ready, whatever the
+///      lag tolerance: the leader may never backfill it, and counting it ready
+///      leaves the group on two real copies.
 ///
 /// Groups invisible to the target (e.g. because it just restarted and hasn't
 /// caught up enough to know about them) are treated as not-ready.
@@ -276,7 +280,9 @@ pub fn check_readiness(
         let within_lag = catch_up_gap
             .map(|gap| gap <= lag_tolerance)
             .unwrap_or(false);
-        let ready = voter_member && within_lag && target_group.is_some();
+        let empty_replica =
+            target_applied.is_none() && peer_max_committed.is_some_and(|committed| committed > 0);
+        let ready = voter_member && within_lag && target_group.is_some() && !empty_replica;
         if !ready {
             all_ready = false;
         }
@@ -487,6 +493,32 @@ mod tests {
         let report = check_readiness(&snapshot, 1, 5);
         assert!(report.all_ready, "{report:?}");
         assert!(!report.per_group.contains_key(&8));
+    }
+
+    #[test]
+    fn readiness_rejects_an_empty_voter_within_lag_tolerance() {
+        let snapshot = ClusterSnapshot {
+            per_node: vec![
+                view(3, vec![group(5, 3, Some(1), None, None, vec![1, 2, 3])]),
+                view(1, vec![group(5, 1, Some(1), Some(11), Some(11), vec![
+                    1, 2, 3,
+                ])]),
+            ],
+        };
+        let report = check_readiness(&snapshot, 3, 16);
+        assert!(!report.all_ready, "{report:?}");
+        assert!(!report.per_group[&5].ready);
+    }
+
+    #[test]
+    fn classifies_an_empty_voter_as_missing() {
+        let mut snapshot = amnesiac_snapshot();
+        snapshot.per_node[2].groups[1] = group(8, 3, Some(2), None, None, vec![1, 2, 3]);
+        let candidate = classify_amnesiac_voter(&snapshot, &[1, 2, 3], 64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.node_id, 3);
+        assert_eq!(candidate.missing_group_ids, vec![8]);
     }
 
     fn amnesiac_snapshot() -> ClusterSnapshot {
