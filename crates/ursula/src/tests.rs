@@ -4878,6 +4878,81 @@ async fn http_state_wall_clock_drives_protocol_now_ms() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+/// A live read with a `Stream-Incarnation` precondition ends when its
+/// stream is recreated, here after TTL expiry, which deletes nothing a
+/// waiter would notice (D12).
+#[tokio::test]
+async fn pinned_long_poll_ends_when_an_expired_stream_is_recreated() {
+    let now_ms = Arc::new(AtomicU64::new(1_000));
+    let state = HttpState::new(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    )
+    .with_wall_clock(TestWallClock {
+        now_ms: Arc::clone(&now_ms),
+    });
+    let app = cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::default(),
+    ));
+    let uri = "/benchcmp/pinned-live-read";
+    let response = http_put(
+        &app,
+        uri,
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_STREAM_TTL, "1"),
+        ],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let old = header_str(&response, HEADER_STREAM_INCARNATION).to_owned();
+    let tail = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+
+    let poll = tokio::spawn({
+        let app = app.clone();
+        let old = old.clone();
+        async move {
+            send(
+                &app,
+                "GET",
+                &format!("{uri}?offset={tail}&live=long-poll&timeout_ms=30000"),
+                &[(HEADER_STREAM_INCARNATION, old.as_str())],
+                Body::empty(),
+            )
+            .await
+        }
+    });
+    // Let the poll park before the stream expires and is created again.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    now_ms.store(2_000, Ordering::Relaxed);
+    let response = http_put(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let current = header_str(&response, HEADER_STREAM_INCARNATION).to_owned();
+    assert_ne!(current, old);
+
+    let response = tokio::time::timeout(Duration::from_secs(10), poll)
+        .await
+        .expect("the pinned long-poll ends on recreate")
+        .expect("poll task");
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(header_str(&response, HEADER_STREAM_INCARNATION), current);
+}
+
 // Base-contract pin; see base_contract_tests.rs.
 #[tokio::test]
 async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {

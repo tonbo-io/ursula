@@ -1,7 +1,8 @@
 //! Pins of the base protocol contract that the 0.6.0 removals must keep:
 //! `Stream-Seq` as a compare-and-set, `Stream-Next-Offset` as the exact
 //! resume point, the HEAD snapshot and retention headers, `Stream-Incarnation`
-//! as a token that changes on delete and recreate, `Retry-After` on an
+//! as a token that changes on delete and recreate and as an optional request
+//! precondition (D12), `Retry-After` on an
 //! append's temporary 503, a duplicate beyond the receipt window answered 204
 //! without `Stream-Next-Offset`, and the producer-cap 429. The other error headers are pinned in
 //! `tests.rs`: `producer_headers_deduplicate_retries_and_fence_stale_epochs`,
@@ -472,4 +473,132 @@ async fn producer_cap_answers_429_with_producer_limit_and_no_retry_after() {
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(response.headers().get("retry-after").is_none());
     assert!(body_text(response).await.contains("producer_limit"));
+}
+
+/// `Stream-Incarnation` as a request precondition (D12), when it holds: a
+/// request with the current incarnation, or without the header, answers as
+/// the base protocol does, and every successful stream response names the
+/// incarnation that served it.
+#[tokio::test]
+async fn stream_incarnation_precondition_that_holds_changes_nothing() {
+    let app = app();
+    let uri = "/contract/incarnation-holds";
+    let response = create(&app, uri, &[], "").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let current = header(&response, HEADER_STREAM_INCARNATION).to_owned();
+    let response = send(&app, "HEAD", uri, &[], "").await;
+    assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+    let matching = [(HEADER_STREAM_INCARNATION, current.as_str())];
+
+    for headers in [&[][..], &matching[..]] {
+        let response = create(&app, uri, headers, "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+        let response = append(&app, uri, headers, "ab").await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+        let at = next_offset(&response);
+        let response = send(&app, "GET", &format!("{uri}?offset=-1"), headers, "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+        let response = send(
+            &app,
+            "GET",
+            &format!("{uri}?offset={at}&live=long-poll&timeout_ms=1"),
+            headers,
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+        let response = send(&app, "HEAD", uri, headers, "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+        let snapshot = format!("{uri}/snapshot/{at}");
+        let response = send(&app, "PUT", &snapshot, headers, "state").await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+        let response = send(&app, "GET", &snapshot, headers, "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+        let response = send(&app, "GET", &format!("{uri}/bootstrap"), headers, "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+        let response = send(&app, "PUT", &format!("{uri}/retention/{at}"), headers, "").await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+    }
+    let response = send(&app, "DELETE", uri, &matching, "").await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = send(&app, "HEAD", uri, &[], "").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// `Stream-Incarnation` as a request precondition (D12), when it fails: a
+/// client holding a deleted incarnation's token is refused with 412 and the
+/// current token, and nothing changes. A 404 stays a 404, a `PUT` with the
+/// header creates nothing, and a malformed value answers 400.
+#[tokio::test]
+async fn stream_incarnation_precondition_refuses_a_recreated_stream() {
+    let app = app();
+    let uri = "/contract/incarnation-refuses";
+    let response = create(&app, uri, &[], "abc").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let old = header(&response, HEADER_STREAM_INCARNATION).to_owned();
+    let at = next_offset(&response);
+    let response = send(&app, "DELETE", uri, &[], "").await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = create(&app, uri, &[], "abc").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let current = header(&response, HEADER_STREAM_INCARNATION).to_owned();
+    assert_ne!(current, old);
+    let stale = [(HEADER_STREAM_INCARNATION, old.as_str())];
+
+    let refused = [
+        append(&app, uri, &stale, "x").await,
+        send(&app, "GET", &format!("{uri}?offset=-1"), &stale, "").await,
+        send(&app, "HEAD", uri, &stale, "").await,
+        send(
+            &app,
+            "PUT",
+            &format!("{uri}/snapshot/{at}"),
+            &stale,
+            "state",
+        )
+        .await,
+        send(&app, "PUT", &format!("{uri}/retention/{at}"), &stale, "").await,
+        send(&app, "DELETE", uri, &stale, "").await,
+        create(&app, uri, &stale, "").await,
+    ];
+    for response in refused {
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+    }
+    // Nothing applied: the stream holds its own bytes, no snapshot, no trim.
+    assert_eq!(read_all(&app, uri).await, "abc");
+    let response = send(&app, "HEAD", uri, &[], "").await;
+    assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+    assert!(
+        response
+            .headers()
+            .get(HEADER_STREAM_SNAPSHOT_OFFSET)
+            .is_none()
+    );
+
+    let response = send(&app, "DELETE", uri, &[], "").await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = append(&app, uri, &stale, "x").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = create(&app, uri, &stale, "").await;
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert!(response.headers().get(HEADER_STREAM_INCARNATION).is_none());
+    let response = send(&app, "HEAD", uri, &[], "").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    for malformed in ["", "x", "01", "-1", "1 2"] {
+        let response = create(&app, uri, &[(HEADER_STREAM_INCARNATION, malformed)], "").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{malformed:?}");
+    }
+    let response = send(&app, "HEAD", uri, &[], "").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
