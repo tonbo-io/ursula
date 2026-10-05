@@ -104,7 +104,6 @@ use ursula_runtime::DeleteStreamRequest;
 use ursula_runtime::ErrorStatus;
 use ursula_runtime::ExternalPayloadRef;
 use ursula_runtime::HeadStreamRequest;
-use ursula_runtime::HeadStreamResponse;
 use ursula_runtime::ImportGroupStateRequest;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::ProducerRequest;
