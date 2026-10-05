@@ -180,6 +180,9 @@ raft:
   # Fresh-cluster bootstrap flag. Set to false after the first successful ready.
   initMembership: false
   # Idempotent per-group bootstrap flag. Persistent groups may keep this enabled across restarts.
+  # With storageMode=memory a restarted pod rejoins as an empty voter (and initializes again
+  # unless S3 snapshots are configured and a leader is visible) until
+  # `ursulactl repair-restarted-voter` rebuilds it (see README, Bootstrap Behavior).
   initMembershipPerGroup: true
   # Storage mode: logDir for durable Raft logs, memory for ephemeral tests.
   storageMode: logDir
