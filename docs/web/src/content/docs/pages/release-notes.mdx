@@ -3,18 +3,24 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
-## Unreleased: bounded stream state
+## 0.6.0
 
-This release changes the storage format to epoch 2, stores JSON messages exactly as written, and stops per-stream replicated memory from growing with message count or cold history, without retention (see [Memory without retention](/docs/operations#memory-without-retention)). Read the upgrade notes before rolling it out.
+**0.6.0 is a breaking release.** It changes the storage format (format epoch 2) and removes several protocol features (listed in the release notes). It refuses to start on data written by 0.5.x (Raft WAL directories, object-storage prefixes, snapshots and backups) and will not join a cluster with 0.5.x nodes. There is no in-place upgrade, no automatic migration and no rollback.
 
-### Upgrade notes
+- **If you run 0.5.x with data you need to keep, do not upgrade yet.** Stay on 0.5.1 and [open an issue](https://github.com/tonbo-io/ursula/issues) so we can work out a migration path with you.
+- **New deployments install on fresh storage:** empty PVCs and a never-used object-storage prefix.
+- **`helm upgrade` from 0.5.x stops at the first pod.** Recover with `helm rollback`.
 
-This release changes the storage format to epoch 2. There is no in-place upgrade from 0.5.x and no rollback; see [Upgrading to 0.6](/docs/operations#upgrading-to-06).
+This release changes the storage format to epoch 2, removes the protocol features listed under [Removed](#removed), stores JSON messages exactly as written, and stops per-stream replicated memory from growing with message count or cold history, without retention (see [Memory without retention](/docs/operations#memory-without-retention)).
 
-1. **Install fresh.** A node of this release refuses Raft WAL directories, snapshots, object-storage prefixes and backups written by 0.5.x, and will not start next to 0.5.x nodes; 0.5.x refuses this release's WAL, snapshots and backups. Run `helm uninstall`, delete the PVCs, and install with a new `s3.prefix` (with cold storage off and S3 snapshots, also a new `snapshotStore.prefix`). With the event-time indexer, use a new or emptied `indexer.s3.prefix` and register the indexes again. SQLite VFS clients delete `<db>`, `<db>-wal` and `<db>-ursula` first.
-2. **Move data over HTTP.** Re-create streams on the new cluster; to keep data, read each stream from the old cluster and write it to the new one.
-3. **Never reuse a prefix** that an earlier release, or a failed upgrade attempt, wrote to.
-4. **`helm upgrade` stalls at the first pod.** The new pod exits at startup or reports not ready (`/__ursula/ready` answers `503` with `format_epoch_mismatch`), so no second voter is replaced. Recover with `helm rollback`, then install fresh.
+### Installing 0.6.0
+
+See [Upgrading to 0.6](/docs/operations#upgrading-to-06).
+
+1. **Install fresh.** Install with a new `s3.prefix` and empty PVCs (with cold storage off and S3 snapshots, also a new `snapshotStore.prefix`). With the event-time indexer, use a new or emptied `indexer.s3.prefix` and register the indexes again ([Event-time indexer](#event-time-indexer-experimental)).
+2. **Never reuse a prefix** that an earlier release, or a failed upgrade attempt, wrote to.
+3. **`helm upgrade` from 0.5.x stops at the first pod.** The new pod exits at startup or reports not ready (`/__ursula/ready` answers `503` with `format_epoch_mismatch`), so no second voter is replaced and the refused pod writes nothing. Recover with `helm rollback`.
+4. **SQLite VFS.** Stop every owner of a stream before upgrading the extension, then delete `<db>`, `<db>-wal` and `<db>-ursula` or attach under a new stream URL ([SQLite VFS](#sqlite-vfs)).
 
 ### Always on
 
@@ -35,12 +41,11 @@ Every `application/json` stream now follows [JSON message text](/docs/specs/exte
 
 - Every read surface returns the stored text: NDJSON reads, SSE and bootstrap parts.
 - Offsets, ETags and byte counts refer to the stored text, so a message's size can differ from what the previous release would have stored for the same input.
-- Messages stored before the upgrade are not rewritten.
 - Clients that parse records must accept unpaired surrogate escapes and numbers outside the double range. Ursula's event-time indexer does.
 
 ### New
 
-- **`Stream-Incarnation` as a request precondition.** Every request that addresses a stream may carry `Stream-Incarnation`; the server compares it with the stream's incarnation atomically with the request (a write when it is applied) and answers `412 Precondition Failed` (a refused write applies nothing) when the stream was deleted and recreated, including by TTL expiry and a later create. A `PUT` with it for a missing stream answers `412` and creates nothing; a `404`, `410` or `416` stays as it is; a long-poll or SSE read with it ends when its stream is recreated. Without the header nothing changes. Every successful stream response except a `DELETE` now carries `Stream-Incarnation`, not only `HEAD`. The SQLite VFS sends it on every request after attach, so an owner of a deleted stream can no longer reach the stream recreated at its path, and the event-time indexer sends it on reads. See [Stream incarnation](/docs/specs/extensions#24-snapshot-metadata-on-head-and-stream-incarnation).
+- **`Stream-Incarnation` as a request precondition.** Every request that addresses a stream may carry `Stream-Incarnation`; the server compares it with the stream's incarnation atomically with the request (a write when it is applied) and answers `412 Precondition Failed` (a refused write applies nothing) when the stream was deleted and recreated, including by TTL expiry and a later create. A `PUT` with it for a missing stream answers `412` and creates nothing; a `404`, `410` or `416` stays as it is; a long-poll or SSE read with it ends when its stream is recreated. Without the header nothing changes. A read refused by the precondition returns no data but, like any request that reaches a stream, may still renew the sliding TTL of the stream now at that path. Every successful stream response except a `DELETE` now carries `Stream-Incarnation`, not only `HEAD`. The SQLite VFS sends it on every request after attach, so an owner of a deleted stream can no longer reach the stream recreated at its path, and the event-time indexer sends it on reads. See [Stream incarnation](/docs/specs/extensions#24-snapshot-metadata-on-head-and-stream-incarnation).
 - **Metrics.** `/__ursula/metrics` adds `group_state_gauges` (per-group state sizes).
 - **External payload locators.** External appends commit their locator in replicated state first and the leader indexes it afterwards, so `runtime.external_payload_min_size` may be lowered.
 - **Compact hot window.** Replicated state keeps nothing per message, and cold admission and flush thresholds charge hot payload only.
@@ -63,11 +68,24 @@ Every `application/json` stream now follows [JSON message text](/docs/specs/exte
 - **Format epoch 2.** The Raft WAL directory and the object-storage prefix carry a format-epoch marker, every snapshot starts with a format-epoch frame, snapshot pointers are MessagePack only, the WAL journal header, the Raft gRPC protocol (now also on forwarded reads and writes), S3 snapshot references and backups are version 2, and `ursulactl` checks the target cluster's backup format before the first import. A node checks its WAL directory, its object-storage prefix and its peers before it writes anything, and `/__ursula/ready` answers `503` with `format_epoch_mismatch` after any later Raft protocol mismatch.
 - **Reserved bucket IDs.** `snapshots` (the default raft-snapshot namespace in the object store) and IDs starting with `__` answer `400`.
 - **`PUT /{bucket}` validates the bucket ID.** It answers `400` for an ID that does not match `[a-z0-9_-]{4,64}` and `201` otherwise, and still changes no state: buckets are implicit namespaces. See [Buckets](/docs/concepts/buckets).
-- **Helm chart defaults.** The chart now renders `coldStorage.compaction.enabled: true` and `snapshotStore.backend: auto` (previously `false` and `inline`), so releases with cold storage get compaction and S3 snapshots on upgrade. Set the old values to keep the old behaviour.
+- **Helm chart defaults.** The chart now renders `coldStorage.compaction.enabled: true` and `snapshotStore.backend: auto` (previously `false` and `inline`), so a release with cold storage gets compaction and S3 snapshots unless its values set the old ones.
 - **TTL renewal is monotonic.** A read or write never moves a stream's expiry earlier. Before, a request stamped by a node whose clock lagged the node that last renewed the stream could shorten the stream's life by that lag.
 - **`consistency=leader` reads are linearizable.** Before it answers a `consistency=leader` read, `HEAD`, `/bootstrap`, a snapshot read or a long-poll/SSE registration, the leader confirms with a majority of voters that it still leads (Raft ReadIndex) and waits until it has applied everything committed up to that point. Each such request costs one round trip to the voters, shared by concurrent requests to the same Raft group. On the leader, the confirmation runs before the request reaches the group, so appends and other reads to that group do not queue behind it. `offset=now` without `consistency=leader`, an SSE session's tail lookup after its registration, and the long-poll timeout answer take no confirmation. A leader cut off from the majority, or one that cannot confirm in time, answers `503` with `Retry-After` instead of serving state that may miss appends a newer leader acknowledged. Before, a deposed leader could serve these reads stale, and a follower dropped `consistency=leader` when it forwarded the read.
 - **SQLite VFS: opaque offsets.** `ursula_attach`, `ursula_status`, `ursula_stats` and `@tonbo-io/sqlite-ursula` (`attach`, `status`, `drainStats`) return stream offsets as the server's strings (`"-1"` for none) instead of numbers; compare them as strings. The extension never computes an offset: it verifies its claim by reading from the tail it caught up to, and every commit carries a `Stream-Seq`, so a foreign append with a higher one fences the owner. The sidecar (`<db>-ursula`, format 2) and the snapshot body (`USS2`) changed: the first attach after the upgrade rebuilds the local file, and a stream whose latest snapshot is an older body (`USS1`) cannot be attached: attach under a new stream URL (deleting the local files is not enough).
 - **Bucket purge is admin-plane only.** `DELETE /__ursula/purge/{bucket}` is served only on the admin listener (`server.admin_listen`, loopback by default); the client listener answers `404`. A Raft group whose leader is unknown or changing answers `503` with `Retry-After` instead of redirecting (`307`) to a peer's client URL; purge is idempotent, so retry it. `/__ursula/usage` stays on both listeners. See [bucket purge](/docs/operations#tenant-offboarding-bucket-purge).
+
+### SQLite VFS
+
+- **Trusted network only.** The extension speaks plain HTTP to Ursula, with no TLS and no credentials. Run it, and the Ursula or `ursulagw` endpoint it talks to, on a network you trust.
+- **The local file is a cache.** A commit is durable once Ursula acknowledges it; the extension no longer fsyncs the WAL or the sidecar on every commit. After every reboot (a new kernel boot id), and whenever the local files cannot be verified, attach rebuilds the database from its latest snapshot plus the tail since it. In the 0.6 benchmarks a fresh host took 16 to 27 s to attach a 1 GB database, so a fleet-wide rolling reboot is a burst of snapshot reads, and a stream whose snapshots cannot be published replays from the last one it has. See the [SQLite VFS design](https://github.com/tonbo-io/ursula/blob/main/docs/architecture/sqlite-vfs.md).
+- **Owners are bound to a stream incarnation.** The extension's `Producer-Id` is `sqlite-ursula-vfs/<Stream-Incarnation>` and every request after attach carries `Stream-Incarnation`, so an owner of a deleted stream is fenced instead of writing into the stream recreated at its path. Versions with the old `Producer-Id` and this one do not fence each other: stop every owner of a stream before upgrading (or downgrading) the extension.
+
+### Event-time indexer (experimental)
+
+- **API break.** Query and status return `(offset, len)` locators with opaque `next` and `through` tokens instead of record ordinals. The 0.5.1 query parameters `after_captured_at_ms`, `after_record` and `through_record` answer `400`, and unknown registration fields answer `422`. Registration takes `extract` (JSON pointers, with fallbacks and units) and `start`; the legacy `timestamp_field` is still accepted. Re-register every index under a new or emptied `indexer.s3.prefix`.
+- **NDJSON sources** (`application/x-ndjson`) are indexed, and nested or unit-ful timestamps (OTLP JSON) are supported. Messages without a usable event time are skipped and counted instead of blocking the index.
+- **Chart values.** `indexer.workers.segmentBytes` replaces `readBatchRecords` and `segmentRecords`.
+- **Polling cost.** Every indexer pod sends a `HEAD` (always confirmed by a ReadIndex) for every registration on every poll (`indexer.ingest.pollIntervalMs`, default 250 ms), and each one costs the stream's leader a ReadIndex round trip to its voters, even when the stream is idle. Keep registrations few, or raise the poll interval.
 
 ### Removed
 

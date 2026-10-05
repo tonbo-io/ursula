@@ -48,6 +48,37 @@ for chart in charts/ursula charts/ursula-chaos; do
   fi
 done
 
+# The docs' release notes have a section for the release, and a GitHub
+# release-body notice (`release.yml` puts it above the generated notes) opens
+# with the same paragraph as that section.
+notes=docs/web/src/content/docs/pages/release-notes.mdx
+if ! grep -qxF "## ${workspace}" "${notes}"; then
+  echo "${notes} has no '## ${workspace}' section" >&2
+  status=1
+fi
+notice=".github/release-notes/${workspace}.md"
+if [ -f "${notice}" ]; then
+  first=$(head -n 1 "${notice}")
+  if [ -z "${first}" ]; then
+    echo "${notice} starts with an empty line" >&2
+    status=1
+  elif ! grep -qxF "${first}" "${notes}"; then
+    echo "${notes} does not contain the first line of ${notice}" >&2
+    status=1
+  fi
+fi
+
+# The docs' install commands pin the released image and chart.
+pins=$(grep -rhoE 'ghcr\.io/tonbo-io/ursula:[0-9][^ ]*|charts/ursula --version [0-9][^ ]*' \
+  docs/web/src/content/docs/pages || true)
+while IFS= read -r pin; do
+  [ -n "${pin}" ] || continue
+  if [ "${pin##*[: ]}" != "${workspace}" ]; then
+    echo "docs pin '${pin}' is not ${workspace}" >&2
+    status=1
+  fi
+done <<<"${pins}"
+
 if [ "${status}" -ne 0 ]; then
   cat >&2 <<EOF
 

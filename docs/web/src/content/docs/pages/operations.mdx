@@ -184,14 +184,21 @@ Node-level loss: replace the host with the same `node_id` and cluster config, an
 
 ## Upgrading to 0.6
 
-Ursula 0.6 changes the storage format to epoch 2. A 0.6 node refuses Raft WAL directories, snapshots, object-storage prefixes and backups written by 0.5.x, and will not start next to 0.5.x nodes; 0.5.x refuses 0.6's WAL, snapshots and backups. There is no in-place upgrade and no rollback.
+**0.6.0 is a breaking release.** It changes the storage format (format epoch 2) and removes several protocol features (listed in the release notes). It refuses to start on data written by 0.5.x (Raft WAL directories, object-storage prefixes, snapshots and backups) and will not join a cluster with 0.5.x nodes. There is no in-place upgrade, no automatic migration and no rollback.
 
-1. **Install fresh.** Run `helm uninstall`, delete the PVCs, and install with a new `s3.prefix`. With cold storage off and S3 snapshots, also use a new `snapshotStore.prefix`. With the event-time indexer, use a new or emptied `indexer.s3.prefix` and register the indexes again.
-2. **Move data over HTTP.** Re-create the streams on the new cluster. To keep data, read each stream from the old cluster and write it to the new one.
-3. **Reset SQLite VFS clients.** Delete `<db>`, `<db>-wal` and `<db>-ursula` before attaching, or attach under a new stream URL.
-4. **Never reuse a prefix** that an earlier release, or a failed upgrade attempt, wrote to.
+- **If you run 0.5.x with data you need to keep, do not upgrade yet.** Stay on 0.5.1 and [open an issue](https://github.com/tonbo-io/ursula/issues) so we can work out a migration path with you.
+- **New deployments install on fresh storage:** empty PVCs and a never-used object-storage prefix.
+- **`helm upgrade` from 0.5.x stops at the first pod.** Recover with `helm rollback`.
 
-`helm upgrade` from 0.5.x stalls at the first new pod, with the default `RollingUpdate` strategy and also with `OnDelete` plus the graceful rollout: the new pod exits at startup or reports not ready, so no second voter is replaced. Recover with `helm rollback`, then do the fresh install. The refused pod wrote nothing, so the old pods are unaffected.
+The removed protocol features, and every behaviour change, are listed in the [0.6.0 release notes](/docs/release-notes#removed).
+
+To install 0.6:
+
+1. **Install fresh.** Install with a new `s3.prefix` and empty PVCs. With cold storage off and S3 snapshots, also use a new `snapshotStore.prefix`. With the event-time indexer, use a new or emptied `indexer.s3.prefix` and register the indexes again; the registration and query formats changed ([release notes](/docs/release-notes#event-time-indexer-experimental)).
+2. **Reset SQLite VFS clients.** Stop every owner of a stream before upgrading the extension, then delete `<db>`, `<db>-wal` and `<db>-ursula` before attaching, or attach under a new stream URL.
+3. **Never reuse a prefix** that an earlier release, or a failed upgrade attempt, wrote to.
+
+`helm upgrade` from 0.5.x stalls at the first new pod, with the default `RollingUpdate` strategy and also with `OnDelete` plus the graceful rollout: the new pod exits at startup or reports not ready, so no second voter is replaced. Recover with `helm rollback`. The refused pod wrote nothing, so the old pods are unaffected.
 
 How a 0.6 node refuses old data, and what it prints, is listed under [Startup failures](/docs/troubleshooting#startup-failures). Every startup refusal happens before the node writes anything:
 

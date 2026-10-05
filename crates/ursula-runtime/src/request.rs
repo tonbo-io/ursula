@@ -113,7 +113,9 @@ pub struct CreateStreamResponse {
     pub already_exists: bool,
     pub group_commit_index: u64,
     /// The stream incarnation (`created_at_ms`) the write applied to,
-    /// rendered as `Stream-Incarnation` (D12). `0` from an older leader.
+    /// rendered as `Stream-Incarnation` (D12). Every epoch-2 leader sets
+    /// it, and a stream's `created_at_ms` is never `0`; `0` means unknown
+    /// and renders no header.
     #[serde(default)]
     pub incarnation: u64,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
@@ -195,7 +197,9 @@ pub struct ReadStreamResponse {
     pub up_to_date: bool,
     pub closed: bool,
     /// The incarnation (`created_at_ms`) of the stream that served the
-    /// read (D12). `0` from an older leader.
+    /// read (D12). Every epoch-2 leader sets it, and a stream's
+    /// `created_at_ms` is never `0`; `0` means unknown and renders no
+    /// header.
     #[serde(default)]
     pub incarnation: u64,
 }
@@ -358,7 +362,9 @@ pub struct PublishSnapshotResponse {
     pub snapshot_digest: String,
     pub group_commit_index: u64,
     /// The stream incarnation (`created_at_ms`) the write applied to,
-    /// rendered as `Stream-Incarnation` (D12). `0` from an older leader.
+    /// rendered as `Stream-Incarnation` (D12). Every epoch-2 leader sets
+    /// it, and a stream's `created_at_ms` is never `0`; `0` means unknown
+    /// and renders no header.
     #[serde(default)]
     pub incarnation: u64,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
@@ -384,7 +390,9 @@ pub struct AdvanceRetentionResponse {
     pub retained_offset: u64,
     pub group_commit_index: u64,
     /// The stream incarnation (`created_at_ms`) the write applied to,
-    /// rendered as `Stream-Incarnation` (D12). `0` from an older leader.
+    /// rendered as `Stream-Incarnation` (D12). Every epoch-2 leader sets
+    /// it, and a stream's `created_at_ms` is never `0`; `0` means unknown
+    /// and renders no header.
     #[serde(default)]
     pub incarnation: u64,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
@@ -508,7 +516,9 @@ pub struct CloseStreamResponse {
     pub group_commit_index: u64,
     pub deduplicated: bool,
     /// The stream incarnation (`created_at_ms`) the write applied to,
-    /// rendered as `Stream-Incarnation` (D12). `0` from an older leader.
+    /// rendered as `Stream-Incarnation` (D12). Every epoch-2 leader sets
+    /// it, and a stream's `created_at_ms` is never `0`; `0` means unknown
+    /// and renders no header.
     #[serde(default)]
     pub incarnation: u64,
 }
@@ -750,7 +760,9 @@ pub struct AppendResponse {
     /// `next_offset` then carry no information about the original append.
     pub receipt_evicted: bool,
     /// The stream incarnation (`created_at_ms`) the write applied to,
-    /// rendered as `Stream-Incarnation` (D12). `0` from an older leader.
+    /// rendered as `Stream-Incarnation` (D12). Every epoch-2 leader sets
+    /// it, and a stream's `created_at_ms` is never `0`; `0` means unknown
+    /// and renders no header.
     #[serde(default)]
     pub incarnation: u64,
 }
