@@ -945,8 +945,8 @@ enum Append {
 }
 
 /// The `Producer-Id` of every owner of one stream incarnation: owners of the same incarnation fence
-/// each other by epoch; to the stream recreated at the path, an owner of the deleted one is an
-/// unknown producer (see `commit`).
+/// each other by epoch (a recreated stream refuses an owner of the deleted one with 412, see
+/// `append`).
 fn producer_id(incarnation: &str) -> String {
     format!("{PRODUCER}/{incarnation}")
 }
@@ -1112,6 +1112,11 @@ fn read_from(url: &str, incarnation: &str, offset: &str) -> Result<(Vec<u8>, Str
         )));
     }
     if status == 416 {
+        // The server answers 416, not 412, for a stream recreated shorter than `offset` (RFC 9110
+        // §13.2.1): only a HEAD tells the two apart, and a recreate rebuilds.
+        if head(url, &|| false).is_ok_and(|h| h.incarnation.as_deref() != Some(incarnation)) {
+            return Err(Fail::Other(recreated_error(url, incarnation)));
+        }
         return Err(Fail::Other(format!(
             "read {url} at {offset}: beyond the end of the stream that acknowledged it (the \
              server lost acknowledged data?); the local files are kept (delete them to rebuild)"

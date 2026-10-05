@@ -220,7 +220,10 @@ impl StreamCommand {
             Self::ImportSnapshot { snapshot } => {
                 len_u64(snapshot.streams.len()).saturating_mul(COMMAND_LOG_OVERHEAD_BYTES)
             }
-            Self::IfIncarnation { command, .. } => return command.log_bytes_estimate(),
+            // The wrapped command plus the expected incarnation (a u64).
+            Self::IfIncarnation { command, .. } => {
+                return command.log_bytes_estimate().saturating_add(8);
+            }
             _ => 0,
         };
         COMMAND_LOG_OVERHEAD_BYTES.saturating_add(variable)

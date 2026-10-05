@@ -141,7 +141,9 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
    stream only if the answer was its own end. Lost: epoch + 1. 403: the server's epoch + 1.
 6. Replays up to the claim. Every read and the claim carried step 2's incarnation, which the
    server checked atomically with each, so all of them hit that incarnation. A stream deleted and
-   recreated meanwhile answers `412` to the first of them that reaches it: the round fails, and
+   recreated meanwhile answers `412` to the first of them that reaches it (a read at an offset the
+   recreated stream does not have answers `410` or `416` instead, RFC 9110 §13.2.1; attach then
+   retries from `HEAD`, or, on a `416`, `HEAD`s to tell a recreate from lost data): the round fails, and
    attach starts again from step 2 (up to three more rounds), which, the sidecar still being
    stamped with the old incarnation, discards whatever this round wrote and rebuilds from the
    recreated stream. If the replay up to the claim reaches a newer owner's claim (a higher epoch,
@@ -411,7 +413,8 @@ What attach does in each case:
   producer's seq 0; commits of an old owner accepted under that claim's `Producer-Id`; a snapshot
   or retention move between the thread's `HEAD` and its `PUT`) are closed for owners of this
   version. An owner of an earlier version still has them: stop such owners before deleting a
-  stream you will recreate.
+  stream you will recreate. The precondition needs a server of Ursula 0.6.0 or later; an older
+  server ignores the header (attach does not detect this), so the windows stay open there.
 - A rollback journal next to an attached file can only be left by a crash while attach switched
   an empty file to WAL; attach deletes it in every case (rolling it back would truncate the file
   under the pages attach writes next).

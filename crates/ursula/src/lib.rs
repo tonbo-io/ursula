@@ -2675,8 +2675,7 @@ pub(crate) async fn head_stream_by_id(
         .await
     {
         Ok(response) => {
-            if let Some(refused) =
-                read_precondition_failed(if_incarnation, response.created_at_ms)
+            if let Some(refused) = read_precondition_failed(if_incarnation, response.created_at_ms)
             {
                 return refused;
             }
@@ -2852,9 +2851,7 @@ pub(crate) async fn read_stream_by_id(
                 read_response(response, &headers, None)
             }
         }
-        Err(err) => {
-            read_error_response(&state, err, &request_target, &stream_id, if_incarnation).await
-        }
+        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
 
@@ -3141,14 +3138,7 @@ pub(crate) async fn read_snapshot(
             rendered
         }
         Err(err) => {
-            read_error_response(
-                &state,
-                err,
-                &request_target(&uri),
-                &stream_id,
-                if_incarnation,
-            )
-            .await
+            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
         }
     }
 }
@@ -3285,9 +3275,7 @@ pub(crate) async fn long_poll_stream(
                 )
             }
         }
-        Ok(Err(err)) => {
-            read_error_response(&state, err, &request_target, &stream_id, if_incarnation).await
-        }
+        Ok(Err(err)) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
         // The 204's tail comes from the leader's applied state: live reads
         // promise no linearizability beyond their owner check (D10).
         Err(_) => match state
@@ -3301,8 +3289,7 @@ pub(crate) async fn long_poll_stream(
             .await
         {
             Ok(head) => {
-                if let Some(refused) =
-                    read_precondition_failed(if_incarnation, head.created_at_ms)
+                if let Some(refused) = read_precondition_failed(if_incarnation, head.created_at_ms)
                 {
                     return refused;
                 }
@@ -3608,12 +3595,7 @@ pub(crate) fn incarnation_precondition(headers: &HeaderMap) -> Result<Option<u64
         return Err(malformed());
     };
     match value.parse::<u64>() {
-        Ok(incarnation)
-            if value.bytes().all(|byte| byte.is_ascii_digit())
-                && incarnation.to_string() == value =>
-        {
-            Ok(Some(incarnation))
-        }
+        Ok(incarnation) if incarnation.to_string() == value => Ok(Some(incarnation)),
         _ => Err(malformed()),
     }
 }
@@ -3636,41 +3618,6 @@ fn read_precondition_failed(expected: Option<u64>, served: u64) -> Option<Respon
     })
 }
 
-/// The error answer of a read with a `Stream-Incarnation` precondition
-/// (D12). A 410 or 416 may come from a stream recreated since the client
-/// last saw it, whose offsets are another stream's: the precondition is
-/// then the answer (412), as it is evaluated before the range (RFC 9110
-/// §13.2.2). The stream's current incarnation comes from a HEAD of the
-/// leader's applied state. A 404 stays a 404.
-async fn read_error_response(
-    state: &HttpState,
-    err: RuntimeError,
-    request_target: &str,
-    stream_id: &BucketStreamId,
-    if_incarnation: Option<u64>,
-) -> Response {
-    if if_incarnation.is_some()
-        && matches!(
-            err.stream_error_code(),
-            Some(StreamErrorCode::StreamGone | StreamErrorCode::OffsetOutOfRange)
-        )
-        && let Ok(head) = state
-            .runtime
-            .head_stream(HeadStreamRequest {
-                stream_id: stream_id.clone(),
-                now_ms: state.unix_time_ms(),
-                linearizable: false,
-                read_index: None,
-            })
-            .await
-        && let Some(refused) = read_precondition_failed(if_incarnation, head.created_at_ms)
-    {
-        return refused;
-    }
-    runtime_error_or_leader_redirect_async(state, err, request_target).await
-}
-
-/// The incarnation a HEAD reports; `0` (unknown) from an older peer.
 pub(crate) fn stream_closed(headers: &HeaderMap) -> bool {
     headers
         .get(HEADER_STREAM_CLOSED)

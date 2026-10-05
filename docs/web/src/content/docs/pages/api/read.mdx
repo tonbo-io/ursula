@@ -72,7 +72,7 @@ api: "GET /{bucket}/{stream}"
 | `400` | Invalid offset, live mode or `consistency`, `consistency=leader` with `live`, or a read parameter removed in 0.6.0 (see the [release notes](/docs/release-notes)). |
 | `404` | Stream not found or expired. |
 | `410` | Requested offset has been trimmed. `Stream-Next-Offset` is the earliest offset still readable. |
-| `412` | `Stream-Incarnation` did not match: the stream was deleted and recreated. The response's `Stream-Incarnation` is the current token. Checked before the offset, so a stale offset answers `412`, not `410` or `416`. |
+| `412` | `Stream-Incarnation` did not match: the stream was deleted and recreated. The response's `Stream-Incarnation` is the current token. A read that would answer `404`, `410` or `416` without the header still does. |
 | `416` | Requested offset is beyond the stream's tail. `Stream-Next-Offset` is the tail. |
 | `503` | The group has no known leader, the leader could not confirm its leadership in time (`consistency=leader` and live reads), or this node holds too many live readers. Retry after `Retry-After`. |
 

@@ -521,16 +521,6 @@ pub struct DeleteStreamRequest {
     pub if_incarnation: Option<u64>,
 }
 
-impl DeleteStreamRequest {
-    /// A delete without the `Stream-Incarnation` precondition.
-    pub fn new(stream_id: BucketStreamId) -> Self {
-        Self {
-            stream_id,
-            if_incarnation: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteStreamResponse {
     pub placement: ShardPlacement,
