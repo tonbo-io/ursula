@@ -40,12 +40,13 @@ or SSE reader take the same leadership confirmation on the leader, as do
 `offset=now` on a `consistency=leader` read.
 A long-poll or SSE reader takes everything else it needs from that
 registration: its `offset=now` position, whether the stream exists, its
-content type and incarnation, and the `416` check for an offset beyond the
-tail all come from the leader's state at or after the confirmed point. Its
+content type and incarnation all come from the leader's state at or after the
+confirmed point. A long-poll also answers `416` there for an offset beyond the
+tail; an SSE session reports it as an `error` event from its first read. Its
 first read is served only by that leader while it still leads; a node that
 lost leadership in between redirects or answers `503` instead of asking a new
 leader that may not have applied everything yet. A long-poll that times out
-answers `204` at the offset it waited at, never below the requested offset.
+answers `204` at the requested offset.
 `offset=now` without `consistency=leader` skips the confirmation and uses the
 leader's applied state, so right after a leader change it may resolve to a
 tail that lags the committed one.

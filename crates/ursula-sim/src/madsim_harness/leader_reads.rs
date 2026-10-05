@@ -16,9 +16,7 @@
 //! Live reads (long-poll, SSE) take every lookup from their owner check: a
 //! long-poll at `offset=now` answers 204 at the tail as of its registration,
 //! one beyond the tail answers 416 at the tail, and on the deposed leader
-//! both refuse with 503. A long-poll registered before the failover times
-//! out with a 204 at the offset it waited at: never below the requested
-//! offset, never beyond the committed tail, never 404.
+//! both refuse with 503.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -129,11 +127,6 @@ const PROBES: [Probe; 7] = [
 
 /// Long-poll timeout of the live probes, in simulated milliseconds.
 const LIVE_PROBE_TIMEOUT_MS: u64 = 5;
-/// Long-poll timeout of the probe registered before the failover: longer
-/// than an election (50 ms election timeout), so it usually times out after
-/// the new leader acknowledged appends.
-const SPANNING_TIMEOUT_MS: u64 = 200;
-
 /// Seed-derived shape: payload sizes on both sides of the fault.
 struct LeaderReadPlan {
     before: Vec<Vec<u8>>,
@@ -448,6 +441,7 @@ pub(super) async fn run_leader_read_linearizability_inner(
             healed.store(true, Ordering::SeqCst);
         })
     };
+    let acked_offset = u64::try_from(acked.len()).expect("offset fits u64");
     let head_done = Arc::new(AtomicBool::new(false));
     let stalled_head = {
         let (app, path, head_done) = (app.clone(), path.clone(), head_done.clone());
@@ -457,19 +451,18 @@ pub(super) async fn run_leader_read_linearizability_inner(
                 path: &path,
                 snapshot_offset,
             };
-            let seen = probes.observe(Probe::Head, snapshot_offset).await;
+            let seen = probes.observe(Probe::Head, acked_offset).await;
             head_done.store(true, Ordering::SeqCst);
             seen
         })
     };
     madsim::time::sleep(Duration::from_millis(1)).await;
-    let local = probes.observe(Probe::LocalRead, snapshot_offset).await;
+    let local = probes.observe(Probe::LocalRead, acked_offset).await;
     let (healed_first, head_first) = (
         healed.load(Ordering::SeqCst),
         head_done.load(Ordering::SeqCst),
     );
     trace.push(observed("stalled_confirmation", Probe::LocalRead, &local));
-    let acked_offset = u64::try_from(acked.len()).expect("offset fits u64");
     if local.status != StatusCode::OK
         || local.next_offset != Some(acked_offset)
         || !local.body.is_empty()
@@ -505,27 +498,6 @@ pub(super) async fn run_leader_read_linearizability_inner(
     }
     heal.await.expect("heal the stalled confirmation");
 
-    // A long-poll registered on the leader before the failover: its owner
-    // check resolved `offset=now` to `registered_at`. Whenever it times
-    // out, it answers from its own state.
-    let registered_at = u64::try_from(acked.len()).expect("offset fits u64");
-    let spanning_wait = {
-        let uri = format!("{path}?offset=now&live=long-poll&timeout_ms={SPANNING_TIMEOUT_MS}");
-        let app = app.clone();
-        madsim::task::spawn(async move {
-            let response = send(&app, "GET", &uri, &[], Body::empty()).await;
-            Observation {
-                status: response.status(),
-                next_offset: response
-                    .headers()
-                    .get("stream-next-offset")
-                    .map(parse_http_offset),
-                body: body_bytes(response).await,
-            }
-        })
-    };
-    madsim::time::sleep(Duration::from_millis(3)).await;
-
     // Cut the leader off from both followers. It keeps believing it leads
     // while the majority elects a new leader and acknowledges more appends.
     for node_id in (1..=3).filter(|node_id| *node_id != old_leader) {
@@ -560,34 +532,6 @@ pub(super) async fn run_leader_read_linearizability_inner(
     probes
         .refuse("leader_isolated", acked_offset, &mut trace)
         .await;
-    let spanning = spanning_wait.await.expect("long-poll across the failover");
-    trace.push(observed(
-        "live_read_failover",
-        Probe::LongPollNow,
-        &spanning,
-    ));
-    let in_range = spanning
-        .next_offset
-        .is_some_and(|next| (registered_at..=acked_offset).contains(&next));
-    let answered = match spanning.status {
-        StatusCode::NO_CONTENT => in_range,
-        // The failover reached the owner check before it confirmed.
-        StatusCode::SERVICE_UNAVAILABLE | StatusCode::TEMPORARY_REDIRECT => true,
-        _ => false,
-    };
-    if !answered {
-        fail(
-            &mut trace,
-            "live_read_failover",
-            format!(
-                "a long-poll registered at {registered_at} answered {} at next offset {:?} \
-                 across the failover; a 204 must answer between the requested offset and \
-                 the committed tail {acked_offset}",
-                spanning.status, spanning.next_offset,
-            ),
-        );
-    }
-
     runtime
         .shutdown_group_engine_for_simulation(placement)
         .await

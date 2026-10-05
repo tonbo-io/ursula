@@ -3220,8 +3220,6 @@ fn parse_snapshot_offset(raw: &str) -> Result<u64, BoxResponse> {
         .map_err(|_| Box::new((StatusCode::BAD_REQUEST, "invalid snapshot offset").into_response()))
 }
 
-/// `offset=now` resolves the tail through HEAD, linearizable only for a
-/// `consistency=leader` read (D10).
 /// A catch-up read's start position. Its `offset=now` HEAD is linearizable
 /// for `consistency=leader`; for `consistency=local` it reads the leader's
 /// applied state, which a just-elected leader may not have brought up to
@@ -3330,12 +3328,10 @@ pub(crate) async fn long_poll_stream(
             }
         }
         Ok(Err(err)) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
-        // The waiter's own state: the offset it waited at (never below the
-        // request, never beyond the tail the owner applied) and the
-        // incarnation it is pinned to. A waiter waits only at the tail of
-        // an open stream, so `Stream-Up-To-Date` and `Stream-Closed` hold
-        // as the owner read them only when the offset is that tail (a
-        // timeout before the first read completes may leave it below).
+        // The requested offset (the 416 check above keeps it within the
+        // owner's tail) and the incarnation the waiter is pinned to.
+        // `Stream-Up-To-Date` and `Stream-Closed` hold as the owner read
+        // them only when that offset is the owner's tail.
         Err(_) => {
             if let Some(refused) = read_precondition_failed(if_incarnation, head.created_at_ms) {
                 return refused;

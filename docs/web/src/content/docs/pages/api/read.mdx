@@ -58,7 +58,7 @@ api: "GET /{bucket}/{stream}"
 </Tabs>
 
 <ParamField header="Stream-Incarnation" type="string">
- Optional precondition: the stream's incarnation token, as a previous response's `Stream-Incarnation` header returned it. The read is answered only if the stream that serves it is still that incarnation; otherwise it answers `412`. A long-poll or SSE read with it ends when the stream it was opened against is deleted or recreated (a long-poll answers `404` or `412`; an SSE stream ends with an `error` event). Without the header, the request behaves exactly as described here. A malformed value answers `400`. See [`Stream-Incarnation`](/docs/specs/extensions#24-snapshot-metadata-on-head-and-stream-incarnation).
+ Optional precondition: the stream's incarnation token, as a previous response's `Stream-Incarnation` header returned it. The read is answered only if the stream that serves it is still that incarnation; otherwise it answers `412`. A long-poll or SSE read with it ends when the stream it was opened against is deleted or recreated (a long-poll answers `404` or `412`; an SSE stream ends with an `error` event). Without the header, a long-poll still ends when the stream it registered against is recreated, usually with `416`; otherwise the request behaves exactly as described here. A malformed value answers `400`. See [`Stream-Incarnation`](/docs/specs/extensions#24-snapshot-metadata-on-head-and-stream-incarnation).
 </ParamField>
 
 ## Response
