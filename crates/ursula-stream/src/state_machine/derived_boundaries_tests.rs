@@ -228,7 +228,7 @@ impl Oracle {
     fn check_bootstrap(&self, machine: &StreamStateMachine, id: &str) {
         let entry = entry(machine, id);
         let tail = entry.metadata.tail_offset;
-        let retained = entry.retained_offset.unwrap_or(0);
+        let retained = entry.retained_offset;
         let plan = machine.bootstrap_plan(&stream(id)).expect("bootstrap plan");
         let snapshot_offset = plan
             .snapshot
@@ -514,7 +514,7 @@ fn restore_matches_live_and_bootstrap_matches_oracle_under_random_workload() {
                         .visible_snapshot
                         .as_ref()
                         .map_or(0, |snapshot| snapshot.offset)
-                        .max(current.retained_offset.unwrap_or(0));
+                        .max(current.retained_offset);
                     let candidates = if json {
                         oracle
                             .messages

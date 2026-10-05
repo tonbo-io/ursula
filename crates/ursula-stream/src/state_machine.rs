@@ -92,7 +92,6 @@ pub use self::cold_refs::SHARED_REF_IDLE_MS;
 pub use self::cold_refs::SharedRefCandidate;
 pub use self::cold_refs::SharedRefCompactionRequest;
 pub use self::cold_refs::SharedRefIdleTracker;
-pub use self::cold_refs::is_legacy_cross_bucket_pack;
 pub use self::cold_refs::plan_shared_ref_run;
 pub use self::external_locators::MAX_STAGED_EXTERNAL_REFS;
 pub use self::external_locators::STAGED_EXTERNAL_REF_MAX_AGE_MS;
@@ -138,10 +137,6 @@ pub struct StreamStateMachine {
     /// Live logical references to group-scoped shared cold objects. This is
     /// derived from per-stream cold refs when snapshots are restored.
     shared_cold_object_refs: HashMap<String, u64>,
-    /// Every bucket whose bytes have ever occupied a still-live shared object.
-    /// Keep owners after an individual bucket releases its references so the
-    /// eventual physical-delete work is attributed to every erasure proof.
-    shared_cold_object_owners: HashMap<String, HashSet<String>>,
     /// Per-bucket committed usage for this group; see [`BucketUsage`] for the
     /// monotonic-versus-gauge split. Mutated only by the accounting helpers
     /// below so every counter change stays deterministic and auditable.
@@ -190,25 +185,24 @@ impl StreamStateMachine {
         self.registry.metadata(stream_id)
     }
 
-    fn retain_shared_cold_object(&mut self, path: &str, bucket_id: &str) {
+    fn retain_shared_cold_object(&mut self, path: &str) {
         let refs = self
             .shared_cold_object_refs
             .entry(path.to_owned())
             .or_default();
         *refs = refs.saturating_add(1);
-        self.shared_cold_object_owners
-            .entry(path.to_owned())
-            .or_default()
-            .insert(bucket_id.to_owned());
     }
 
+    /// Drops one reference to each shared object in `paths`, and enqueues
+    /// GC for the releasing bucket once an object is unreferenced. Shared
+    /// packs live under `{bucket}/_packs/{group:08x}/`, so the releasing
+    /// bucket is the object's only possible owner.
     fn release_shared_cold_objects(
         &mut self,
         bucket_id: &str,
         paths: impl IntoIterator<Item = String>,
         not_before_ms: u64,
     ) {
-        let mut reclaim = Vec::new();
         for path in paths {
             let Some(refs) = self.shared_cold_object_refs.get_mut(&path) else {
                 continue;
@@ -216,24 +210,14 @@ impl StreamStateMachine {
             *refs = refs.saturating_sub(1);
             if *refs == 0 {
                 self.shared_cold_object_refs.remove(&path);
-                let mut owners = self
-                    .shared_cold_object_owners
-                    .remove(&path)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                owners.sort();
-                reclaim.push((path, owners));
-            }
-        }
-        for (path, mut owners) in reclaim {
-            if owners.is_empty() {
-                owners.push(bucket_id.to_owned());
-            }
-            for owner in owners {
+                debug_assert!(
+                    path.strip_prefix(bucket_id)
+                        .is_some_and(|rest| rest.starts_with('/')),
+                    "shared object '{path}' is outside bucket '{bucket_id}'"
+                );
                 self.cold_gc.enqueue_after(
-                    owner,
-                    ColdGcTarget::Paths(vec![path.clone()]),
+                    bucket_id.to_owned(),
+                    ColdGcTarget::Paths(vec![path]),
                     not_before_ms,
                 );
             }

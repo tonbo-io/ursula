@@ -31,7 +31,8 @@ message ColdChunkRefV1 {
   uint64 object_offset = 5;
   // Shared objects may contain slices from more than one stream.
   bool shared_object = 6;
-  // BLAKE3 digest of this logical slice. Empty on legacy references.
+  // BLAKE3 digest of this logical slice. Empty means unverified; flush and
+  // compaction then skip the digest check.
   string payload_digest = 7;
 }
 

@@ -7,7 +7,6 @@
 //! - `w1`: one stream, inline appends, a flush worker pass every tick.
 //! - `w2`: N trickle streams in one group, a flush worker pass every tick.
 //! - `compact`: `CompactCold` of shared pack slices on both engines.
-//! - `legacy`: `migrate_legacy_shared_cold_once` (the purge path) on both engines.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -25,7 +24,6 @@ use ursula_runtime::ColdStore;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::CompactColdRequest;
 use ursula_runtime::CreateStreamRequest;
-use ursula_runtime::FlushColdRequest;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::InMemoryGroupEngineFactory;
 use ursula_runtime::PlanGroupColdFlushRequest;
@@ -49,7 +47,6 @@ pub enum L2Mode {
     W1,
     W2,
     Compact,
-    Legacy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -109,7 +106,6 @@ pub fn default_name(args: &L2Args) -> String {
         L2Mode::W1 => format!("l2_w1_{}", args.engine.label()),
         L2Mode::W2 => format!("l2_w2_{}", args.engine.label()),
         L2Mode::Compact => "l2_compact_both_engines".to_owned(),
-        L2Mode::Legacy => "l2_legacy_migration_both_engines".to_owned(),
     })
 }
 
@@ -190,7 +186,6 @@ pub fn run(args: &L2Args, sink: &mut Sink) -> Result<Outcome> {
             L2Mode::W1 => w1(args, sink).await,
             L2Mode::W2 => w2(args, sink).await,
             L2Mode::Compact => compact(sink).await,
-            L2Mode::Legacy => legacy(sink).await,
         }
     })
 }
@@ -426,71 +421,6 @@ async fn compact(sink: &mut Sink) -> Result<Outcome> {
         outcome.check(
             &format!("f2_shared_compact_cold_{}", engine.label()),
             "CompactCold of shared pack slices succeeds (F2 Raft branch); value 1 = refused",
-            if ok { 0.0 } else { 1.0 },
-            0.0,
-        );
-    }
-    Ok(outcome)
-}
-
-/// `migrate_legacy_shared_cold_once` (called by bucket purge) on a stream that
-/// holds one legacy cross-bucket shared chunk.
-async fn legacy_on(engine: Engine) -> Result<(Value, bool)> {
-    let cold: ColdStoreHandle = Arc::new(ColdStore::memory().context("memory cold store")?);
-    let rt = spawn(engine, cold.clone(), None)?;
-    let a = BucketStreamId::new("bkt1", "h1-log");
-    create(&rt, &a).await?;
-    let mut rng = payload::Rng::new(4);
-    let record = payload::json_record(&mut rng, 0, 200);
-    append(&rt, &a, record.clone(), T0).await?;
-    let (snapshot, _) = snap(&rt).await?;
-    let generation = snapshot
-        .stream_snapshot
-        .streams
-        .iter()
-        .find(|e| e.metadata.stream_id == a)
-        .map(|e| e.cold_index_generation)
-        .context("stream a in snapshot")?;
-    let path = "_packs/00000000/legacy-cross-bucket.bin".to_owned();
-    let size = cold
-        .write_chunk(&path, &record)
-        .await
-        .context("write legacy pack")?;
-    let flush = rt
-        .flush_cold(FlushColdRequest {
-            cold_generation: generation,
-            stream_id: a.clone(),
-            chunk: ColdChunkRef {
-                start_offset: 0,
-                end_offset: record.len() as u64,
-                s3_path: path,
-                object_size: size,
-                object_offset: 0,
-                shared_object: true,
-                payload_digest: blake3::hash(&record).to_hex().to_string(),
-            },
-        })
-        .await;
-    let migrate = rt.migrate_legacy_shared_cold_once(16, 0).await;
-    let ok = flush.is_ok() && migrate.is_ok();
-    Ok((
-        json!({
-            "engine": engine.label(),
-            "legacy_flush": match &flush { Ok(_) => "ok".to_owned(), Err(e) => format!("ERR {e}") },
-            "migrate_legacy_shared_cold_once": match &migrate { Ok(r) => format!("OK {r:?}"), Err(e) => format!("ERR {e}") },
-        }),
-        ok,
-    ))
-}
-
-async fn legacy(sink: &mut Sink) -> Result<Outcome> {
-    let mut outcome = Outcome::default();
-    for engine in [Engine::Memory, Engine::Raft] {
-        let (row, ok) = legacy_on(engine).await?;
-        sink.row(&row)?;
-        outcome.check(
-            &format!("f2_legacy_pack_migration_{}", engine.label()),
-            "legacy shared-pack migration succeeds (F2 Raft branch); value 1 = refused",
             if ok { 0.0 } else { 1.0 },
             0.0,
         );

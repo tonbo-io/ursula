@@ -47,7 +47,6 @@ async fn live_cold_generation(runtime: &ShardRuntime, stream_id: &BucketStreamId
         .await
         .expect("head")
         .created_at_ms
-        .expect("incarnation")
 }
 
 fn runtime(core_count: usize, group_count: usize) -> ShardRuntime {
@@ -1409,7 +1408,6 @@ async fn install_group_snapshot_rejects_mismatched_placement_before_routing() {
             streams: Vec::new(),
             pending_cold_gc: Vec::new(),
             next_cold_gc_seq: 0,
-            shared_cold_object_owners: Vec::new(),
             bucket_usage: Vec::new(),
             last_created_at_ms: 0,
             format_epoch: ursula_stream::FORMAT_EPOCH,
@@ -2041,135 +2039,6 @@ async fn node_pressure_drains_small_groups_below_the_watermark() {
     // Largest first: each group flushed only its largest stream.
     assert_eq!(flushed, usize::try_from(GROUPS).expect("fits"));
     assert_eq!(after, u64::from(GROUPS) * 768);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn legacy_cross_bucket_pack_is_rewritten_before_bucket_erasure_proof() {
-    let cold_store = Arc::new(memory_cold_store());
-    let runtime = spawn_with_cold_store(RuntimeConfig::new(2, 8), cold_store.clone());
-    let group_id = RaftGroupId(3);
-    let stream_a = stream_in_bucket_on_group(&runtime, group_id, "legacy-erasure-a", "shared-a");
-    let stream_b = stream_in_bucket_on_group(&runtime, group_id, "legacy-erasure-b", "shared-b");
-    for stream in [&stream_a, &stream_b] {
-        create_stream(&runtime, stream).await;
-    }
-    append_bytes(&runtime, &stream_a, b"aaaa").await;
-    append_bytes(&runtime, &stream_b, b"bbbb").await;
-
-    let legacy_path = "_packs/00000003/legacy-cross-bucket.bin";
-    cold_store
-        .write_chunk(legacy_path, b"aaaabbbb")
-        .await
-        .expect("write legacy pack");
-    for (stream, object_offset, digest) in [
-        (&stream_a, 0, blake3::hash(b"aaaa").to_hex().to_string()),
-        (&stream_b, 4, blake3::hash(b"bbbb").to_hex().to_string()),
-    ] {
-        let chunk = ColdChunkRef {
-            start_offset: 0,
-            end_offset: 4,
-            s3_path: legacy_path.to_owned(),
-            object_size: 8,
-            object_offset,
-            shared_object: true,
-            payload_digest: digest,
-        };
-        runtime
-            .flush_cold(FlushColdRequest {
-                cold_generation: live_cold_generation(&runtime, stream).await,
-                stream_id: stream.clone(),
-                chunk,
-            })
-            .await
-            .expect("publish legacy shared slice");
-    }
-    let migration = runtime
-        .migrate_legacy_shared_cold_once(1, 0)
-        .await
-        .expect("rewrite first legacy slice");
-    assert_eq!(migration.observed_chunks, 2);
-    assert_eq!(migration.migrated_chunks, 1);
-    assert_eq!(migration.pending_chunks, 1);
-    let intermediate = runtime
-        .snapshot_group(group_id)
-        .await
-        .expect("snapshot partial legacy migration");
-    assert_eq!(
-        intermediate.stream_snapshot.shared_cold_object_owners.len(),
-        1
-    );
-    assert_eq!(
-        intermediate.stream_snapshot.shared_cold_object_owners[0].bucket_ids,
-        vec!["legacy-erasure-a".to_owned(), "legacy-erasure-b".to_owned()]
-    );
-
-    let migration = runtime
-        .migrate_legacy_shared_cold_once(2, 0)
-        .await
-        .expect("rewrite final legacy slice");
-    assert_eq!(migration.observed_chunks, 1);
-    assert_eq!(migration.migrated_chunks, 1);
-    assert_eq!(migration.pending_chunks, 0);
-    runtime
-        .run_cold_gc_all_groups_once(256)
-        .await
-        .expect("delete legacy pack for every bucket owner");
-    let legacy_a = ColdChunkRef {
-        start_offset: 0,
-        end_offset: 4,
-        s3_path: legacy_path.to_owned(),
-        object_size: 8,
-        object_offset: 0,
-        shared_object: true,
-        ..Default::default()
-    };
-    assert!(
-        cold_store.read_chunk_range(&legacy_a, 0, 4).await.is_err(),
-        "the cross-bucket physical object must be absent"
-    );
-
-    let page_store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-    async fn rewritten(
-        page_store: &ColdStoreColdIndexPageStore,
-        runtime: &ShardRuntime,
-        stream: &BucketStreamId,
-    ) -> ColdChunkRef {
-        // C7/F14g: pages live under the stream's incarnation generation.
-        load_cold_chunks_from_pages(page_store, &[ColdIndexPageKey {
-            stream_id: stream.clone(),
-            generation: live_cold_generation(runtime, stream).await,
-            page_id: 0,
-        }])
-        .await
-        .expect("load rewritten index")
-        .into_iter()
-        .next()
-        .expect("rewritten exclusive chunk")
-    }
-    let a_chunk = rewritten(&page_store, &runtime, &stream_a).await;
-    let b_chunk = rewritten(&page_store, &runtime, &stream_b).await;
-    assert!(!a_chunk.shared_object);
-    assert!(!b_chunk.shared_object);
-    assert!(a_chunk.s3_path.starts_with("legacy-erasure-a/"));
-    assert!(b_chunk.s3_path.starts_with("legacy-erasure-b/"));
-
-    let purge = runtime
-        .purge_bucket_all_groups("legacy-erasure-a")
-        .await
-        .expect("purge migrated bucket");
-    assert_eq!(purge.removed_streams, 1);
-    runtime
-        .run_cold_gc_all_groups_once(256)
-        .await
-        .expect("erase migrated bucket");
-    assert!(cold_store.read_chunk_range(&a_chunk, 0, 4).await.is_err());
-    assert_eq!(
-        cold_store
-            .read_chunk_range(&b_chunk, 0, 4)
-            .await
-            .expect("other bucket remains readable"),
-        b"bbbb"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3906,7 +3775,6 @@ impl GroupEngine for BlockingReadEngine {
                     streams: Vec::new(),
                     pending_cold_gc: Vec::new(),
                     next_cold_gc_seq: 0,
-                    shared_cold_object_owners: Vec::new(),
                     bucket_usage: Vec::new(),
                     last_created_at_ms: 0,
                     format_epoch: ursula_stream::FORMAT_EPOCH,
@@ -3972,7 +3840,7 @@ impl GroupEngine for RecordingEngine {
                 snapshot_offset: None,
                 snapshot_digest: None,
                 retained_offset: 0,
-                created_at_ms: None,
+                created_at_ms: 1,
             })
         })
     }
@@ -4101,7 +3969,6 @@ impl GroupEngine for RecordingEngine {
                     streams: Vec::new(),
                     pending_cold_gc: Vec::new(),
                     next_cold_gc_seq: 0,
-                    shared_cold_object_owners: Vec::new(),
                     bucket_usage: Vec::new(),
                     last_created_at_ms: 0,
                     format_epoch: ursula_stream::FORMAT_EPOCH,

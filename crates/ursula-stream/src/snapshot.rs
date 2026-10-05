@@ -19,24 +19,14 @@ pub struct StreamSnapshot {
     /// fails to decode instead of being misread.
     pub format_epoch: u32,
     pub buckets: Vec<String>,
-    /// Permanent bucket-erasure fences. Absent in legacy snapshots.
-    #[serde(default)]
+    /// Permanent bucket-erasure fences.
     pub erased_buckets: Vec<String>,
     pub streams: Vec<StreamSnapshotEntry>,
-    #[serde(default)]
     pub pending_cold_gc: Vec<ColdGcEntry>,
-    #[serde(default)]
     pub next_cold_gc_seq: u64,
-    /// Bucket erasure owners retained until a shared physical object is
-    /// deleted. Absent in snapshots written before bucket-scoped proof.
-    #[serde(default)]
-    pub shared_cold_object_owners: Vec<SharedColdObjectOwnersSnapshot>,
-    /// Monotonic per-bucket usage counters. Absent in legacy snapshots, in
-    /// which case the monotonic counters restart from the restored gauges.
-    #[serde(default)]
+    /// Monotonic per-bucket usage counters.
     pub bucket_usage: Vec<BucketUsageSnapshot>,
     /// Largest `created_at_ms` this group assigned (C7, F14g).
-    #[serde(default)]
     pub last_created_at_ms: u64,
 }
 
@@ -50,17 +40,10 @@ impl Default for StreamSnapshot {
             streams: Vec::new(),
             pending_cold_gc: Vec::new(),
             next_cold_gc_seq: 0,
-            shared_cold_object_owners: Vec::new(),
             bucket_usage: Vec::new(),
             last_created_at_ms: 0,
         }
     }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SharedColdObjectOwnersSnapshot {
-    pub s3_path: String,
-    pub bucket_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,14 +52,11 @@ pub struct StreamSnapshotEntry {
     pub hot_start_offset: u64,
     pub payload: Vec<u8>,
     pub hot_segments: Vec<HotPayloadSegment>,
-    #[serde(default)]
     pub cold_index_generation: u64,
     pub cold_chunks: Vec<ColdChunkRef>,
     pub external_segments: Vec<ObjectPayloadRef>,
-    /// Independent destructive-retention floor. `None` denotes a legacy
-    /// snapshot where the visible snapshot offset also implied retention.
-    #[serde(default)]
-    pub retained_offset: Option<u64>,
+    /// Independent destructive-retention floor.
+    pub retained_offset: u64,
     pub visible_snapshot: Option<StreamVisibleSnapshot>,
     pub producer_states: Vec<ProducerSnapshot>,
 }
@@ -116,6 +96,10 @@ pub enum StreamSnapshotError {
     },
     #[error("{}", snapshot_format_epoch_message(.found))]
     FormatEpoch { found: u32 },
+    #[error("snapshot cold GC entry {seq} has no owning bucket")]
+    UnattributedColdGc { seq: u64 },
+    #[error("snapshot cold GC entry {seq} targets a stream without a cold generation")]
+    ColdGcWithoutGeneration { seq: u64 },
 }
 
 fn snapshot_format_epoch_message(found: &u32) -> String {

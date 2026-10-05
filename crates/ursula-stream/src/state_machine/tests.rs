@@ -75,20 +75,6 @@ fn usage_tracks_appends_retention_and_stream_lifecycle() {
 }
 
 #[test]
-fn usage_decodes_the_pre_contract_counter_name() {
-    let usage: crate::model::BucketUsage = serde_json::from_value(serde_json::json!({
-        "committed_append_bytes": 100,
-        "committed_records": 7,
-        "committed_write_units_10kib": 3,
-        "retained_bytes": 60,
-        "stream_count": 2
-    }))
-    .expect("legacy usage snapshot");
-
-    assert_eq!(usage.committed_write_units, 3);
-}
-
-#[test]
 fn usage_does_not_count_deduplicated_appends() {
     let mut machine = machine();
     create_stream(&mut machine, "dedup");
@@ -716,23 +702,6 @@ fn producer(id: &str, epoch: u64, seq: u64) -> ProducerRequest {
         producer_epoch: epoch,
         producer_seq: seq,
     }
-}
-
-#[test]
-fn cold_flush_command_decodes_pre_pack_wal_records() {
-    let command = flush_cold_cmd_at(stream("legacy-cold-wal"), 1, 0, 4, "legacy.bin", 4);
-    let mut value = serde_json::to_value(&command).expect("encode cold flush command");
-    let chunk = value
-        .get_mut("FlushCold")
-        .and_then(|variant| variant.get_mut("chunk"))
-        .and_then(serde_json::Value::as_object_mut)
-        .expect("cold flush chunk");
-    assert!(chunk.remove("object_offset").is_some());
-    assert!(chunk.remove("shared_object").is_some());
-    assert!(chunk.remove("payload_digest").is_some());
-
-    let decoded: StreamCommand = serde_json::from_value(value).expect("decode pre-pack WAL record");
-    assert_eq!(decoded, command);
 }
 
 #[test]
@@ -1409,7 +1378,7 @@ fn delete_stream_enqueues_cold_gc_then_ack_drains_it() {
 #[test]
 fn shared_cold_object_is_reclaimed_after_last_stream_reference() {
     let mut machine = machine();
-    let pack_path = "_packs/00000000/shared.bin";
+    let pack_path = "benchcmp/_packs/00000000/shared.bin";
     for (id, object_offset) in [("pack-a", 0), ("pack-b", 4)] {
         create_stream(&mut machine, id);
         machine.apply(append_cmd(stream(id), b"abcd", Append::default()));
@@ -1462,6 +1431,43 @@ fn shared_cold_object_is_reclaimed_after_last_stream_reference() {
         })
         .collect::<Vec<_>>();
     assert_eq!(shared_reclaims, vec![vec![pack_path.to_owned()]]);
+}
+
+#[test]
+fn flush_cold_refuses_a_shared_object_outside_the_stream_bucket() {
+    let mut machine = machine();
+    create_stream(&mut machine, "foreign-pack");
+    machine.apply(append_cmd(
+        stream("foreign-pack"),
+        b"abcd",
+        Append::default(),
+    ));
+    let response = machine.apply(StreamCommand::FlushCold {
+        cold_generation: machine
+            .cold_index_generation(&stream("foreign-pack"))
+            .unwrap_or_default(),
+        stream_id: stream("foreign-pack"),
+        chunk: ColdChunkRef {
+            start_offset: 0,
+            end_offset: 4,
+            s3_path: "benchcmp-other/_packs/00000000/shared.bin".to_owned(),
+            object_size: 4,
+            object_offset: 0,
+            shared_object: true,
+            payload_digest: String::new(),
+        },
+    });
+    assert!(
+        matches!(
+            &response,
+            StreamResponse::Error {
+                code: StreamErrorCode::InvalidColdFlush,
+                message,
+                ..
+            } if message.contains("outside bucket")
+        ),
+        "{response:?}"
+    );
 }
 
 #[test]
@@ -2326,7 +2332,7 @@ fn snapshot_entry(
             created_at_ms: 0,
             last_ttl_touch_at_ms: 0,
         },
-        retained_offset: None,
+        retained_offset: 0,
         hot_start_offset: 0,
         payload,
         hot_segments: Vec::new(),
@@ -2357,7 +2363,6 @@ fn snapshot_restore_rejects_invalid_entries() {
         StreamStateMachine::restore(StreamSnapshot {
             pending_cold_gc: Vec::new(),
             next_cold_gc_seq: 0,
-            shared_cold_object_owners: Vec::new(),
             buckets: vec!["benchcmp".to_owned(), "benchcmp".to_owned()],
             erased_buckets: Vec::new(),
             streams: Vec::new(),
@@ -2373,7 +2378,6 @@ fn snapshot_restore_rejects_invalid_entries() {
         StreamStateMachine::restore(StreamSnapshot {
             pending_cold_gc: Vec::new(),
             next_cold_gc_seq: 0,
-            shared_cold_object_owners: Vec::new(),
             buckets: vec!["benchcmp".to_owned()],
             erased_buckets: Vec::new(),
             streams: vec![entry],
@@ -2412,6 +2416,33 @@ fn snapshot_restore_rejects_invalid_entries() {
         )),
         Err(StreamSnapshotError::DuplicateProducer { .. })
     ));
+
+    // Every epoch-2 GC entry names its bucket, and a `Stream` entry its
+    // cold generation.
+    let restore_gc = |bucket_id: &str, cold_generation: Option<u64>| {
+        StreamStateMachine::restore(StreamSnapshot {
+            pending_cold_gc: vec![ColdGcEntry {
+                seq: 4,
+                bucket_id: bucket_id.to_owned(),
+                not_before_ms: 0,
+                target: ColdGcTarget::Stream(stream("gone")),
+                cold_generation,
+                defer_attempts: 0,
+            }],
+            next_cold_gc_seq: 5,
+            buckets: vec!["benchcmp".to_owned()],
+            ..StreamSnapshot::default()
+        })
+    };
+    assert!(restore_gc("benchcmp", Some(1)).is_ok());
+    assert_eq!(
+        restore_gc("", Some(1)).expect_err("unattributed entry"),
+        StreamSnapshotError::UnattributedColdGc { seq: 4 }
+    );
+    assert_eq!(
+        restore_gc("benchcmp", None).expect_err("stream entry without generation"),
+        StreamSnapshotError::ColdGcWithoutGeneration { seq: 4 }
+    );
 }
 
 #[test]
@@ -3876,7 +3907,7 @@ fn c7_created_at_ms_is_unique_under_a_frozen_clock() {
 }
 
 #[test]
-fn c7_last_created_at_ms_survives_snapshot_round_trip_and_legacy_decode() {
+fn c7_last_created_at_ms_survives_snapshot_round_trip_and_is_normalized() {
     let mut machine = machine();
     create_stream(&mut machine, "a");
     assert_eq!(
@@ -3890,16 +3921,13 @@ fn c7_last_created_at_ms_survives_snapshot_round_trip_and_legacy_decode() {
     create_stream(&mut restored, "a");
     assert_eq!(created_at_ms(&restored, "a"), 2);
 
-    // A snapshot without the field restores normalized upwards, above every
+    // A snapshot whose counter lags restores normalized upwards, above every
     // live incarnation's creation time.
-    let mut value = serde_json::to_value(restored.snapshot()).expect("encode snapshot");
-    value
-        .as_object_mut()
-        .expect("snapshot object")
-        .remove("last_created_at_ms");
-    let legacy: StreamSnapshot = serde_json::from_value(value).expect("decode legacy snapshot");
-    assert_eq!(legacy.last_created_at_ms, 0);
-    let mut restored = StreamStateMachine::restore(legacy).expect("restore legacy snapshot");
+    let lagging = StreamSnapshot {
+        last_created_at_ms: 0,
+        ..restored.snapshot()
+    };
+    let mut restored = StreamStateMachine::restore(lagging).expect("restore lagging snapshot");
     assert_eq!(restored.last_created_at_ms(), 2);
     create_stream(&mut restored, "b");
     assert_eq!(created_at_ms(&restored, "b"), 3);
@@ -4226,7 +4254,6 @@ fn shared_ref_candidates_follow_threshold_idle_and_pack_occupancy() {
         now_ms: 10_000,
         max_run_bytes: 8,
         limit: 16,
-        legacy_packs_only: false,
     };
     let candidates = machine.shared_ref_candidates(&request, &mut tracker);
     assert_eq!(
@@ -4305,58 +4332,6 @@ fn shared_ref_candidates_follow_threshold_idle_and_pack_occupancy() {
     machine.apply(StreamCommand::AckColdGc { up_to_seq: last });
     let referenced = machine.group_referenced_cold_paths();
     assert!(!referenced.contains("benchcmp/_packs/00000000/busy-0.bin"));
-}
-
-/// The legacy-pack filter (#278) on F2 discovery: only slices of packs
-/// outside the stream's own `{bucket}/_packs/` count, any one makes the
-/// stream a candidate, the run covers only them, and the idle tracker is not
-/// touched.
-#[test]
-fn shared_ref_candidates_legacy_filter_selects_only_legacy_pack_slices() {
-    let mut machine = machine();
-    for id in ["legacy", "modern"] {
-        create_stream(&mut machine, id);
-    }
-    for (index, pack) in [
-        "_packs/old-0.bin",
-        "_packs/old-1.bin",
-        "benchcmp/_packs/0/new.bin",
-    ]
-    .iter()
-    .enumerate()
-    {
-        let start = u64::try_from(index).unwrap() * 4;
-        machine.apply(append_cmd(stream("legacy"), b"abcd", Append::default()));
-        flush_shared_slice(&mut machine, "legacy", start, start + 4, pack);
-    }
-    machine.apply(append_cmd(stream("modern"), b"abcd", Append::default()));
-    flush_shared_slice(&mut machine, "modern", 0, 4, "benchcmp/_packs/0/new.bin");
-
-    let mut tracker = SharedRefIdleTracker::default();
-    let candidates = machine.shared_ref_candidates(
-        &SharedRefCompactionRequest::legacy_packs(u64::MAX, 16),
-        &mut tracker,
-    );
-    assert_eq!(candidates.len(), 1);
-    let legacy = &candidates[0];
-    assert_eq!(legacy.stream_id, stream("legacy"));
-    assert_eq!(legacy.shared_refs, 2, "only legacy slices count");
-    assert_eq!(
-        legacy
-            .run
-            .iter()
-            .map(|chunk| chunk.s3_path.as_str())
-            .collect::<Vec<_>>(),
-        vec!["_packs/old-0.bin", "_packs/old-1.bin"]
-    );
-    assert!(
-        tracker.is_empty(),
-        "the legacy filter leaves the idle tracker alone"
-    );
-    assert!(crate::is_legacy_cross_bucket_pack(
-        &stream("legacy"),
-        &legacy.run[0]
-    ));
 }
 
 /// bounded-stream-state F10 maximum hot age: in a group below its flush

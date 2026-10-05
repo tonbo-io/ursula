@@ -1670,11 +1670,6 @@
           "minimum": 1,
           "description": "Committed raft log entries per group between automatic snapshots."
         },
-        "snapshotPressureUnpurgedLogs": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Aggregate unpurged raft entries per node that trigger pressure snapshots."
-        },
         "snapshotPressureMaxGroupsPerTick": {
           "type": "integer",
           "minimum": 1,

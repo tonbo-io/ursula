@@ -1458,39 +1458,6 @@ pub(crate) async fn purge_bucket(
     State(state): State<HttpState>,
     Path(bucket): Path<String>,
 ) -> Response {
-    // Packs written before bucket erasure domains may contain several
-    // tenants. Rewrite a bounded number of their live slices on every retry
-    // and do not remove the target bucket until the global legacy debt reaches
-    // zero. Control retries this idempotent request, so large migrations
-    // converge without exceeding its claim lease. This compatibility pass may
-    // be removed only after every supported snapshot has zero shared chunks
-    // outside `{bucket}/_packs/` and the oldest deployable writer uses the
-    // bucket-scoped pack path.
-    let legacy = match state
-        .runtime
-        .migrate_legacy_shared_cold_once(LEGACY_SHARED_MIGRATION_MAX_CHUNKS, 0)
-        .await
-    {
-        Ok(report) => report,
-        Err(err) => {
-            let target = format!("/__ursula/purge/{bucket}");
-            return runtime_error_or_leader_redirect_async(&state, err, &target).await;
-        }
-    };
-    if legacy.pending_chunks > 0 {
-        return axum::Json(serde_json::json!({
-            "bucket": bucket,
-            "removed_streams": 0,
-            "groups_with_streams": [],
-            "cold_gc_entries_reclaimed": 0,
-            "cold_gc_pending_entries": legacy.pending_chunks,
-            "cold_gc_complete": false,
-            "cold_gc_error": null,
-            "bucket_prefix_absent": false,
-            "legacy_shared_chunks_pending": legacy.pending_chunks,
-        }))
-        .into_response();
-    }
     let report = match state.runtime.purge_bucket_all_groups(&bucket).await {
         Ok(report) => report,
         Err(err) => {
@@ -1558,7 +1525,6 @@ pub(crate) async fn purge_bucket(
 }
 
 const COLD_GC_PURGE_BATCH_MAX_ENTRIES: usize = 4096;
-const LEGACY_SHARED_MIGRATION_MAX_CHUNKS: usize = 32;
 
 /// `PUT /{bucket}`: buckets are implicit namespaces, created on a group by
 /// the first stream create there, so this only validates the bucket ID and
@@ -2705,9 +2671,11 @@ pub(crate) async fn head_stream_by_id(
                 HEADER_STREAM_RETAINED_OFFSET,
                 response.retained_offset,
             );
-            if let Some(incarnation) = response.created_at_ms {
-                insert_u64_header(&mut headers, HEADER_STREAM_INCARNATION, incarnation);
-            }
+            insert_u64_header(
+                &mut headers,
+                HEADER_STREAM_INCARNATION,
+                response.created_at_ms,
+            );
             if response.closed {
                 insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
             }

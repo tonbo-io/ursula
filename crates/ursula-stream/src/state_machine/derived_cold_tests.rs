@@ -237,7 +237,7 @@ fn shared_pack_stream(id: &str) -> StreamStateMachine {
         chunk: ColdChunkRef {
             start_offset: 0,
             end_offset: 4,
-            s3_path: "_packs/0/pack.bin".to_owned(),
+            s3_path: format!("{BUCKET}/_packs/0/pack.bin"),
             object_size: 64,
             object_offset: 16,
             shared_object: true,
@@ -271,7 +271,7 @@ fn f14i_retention_keeps_dropped_pack_slices_for_the_grace() {
     assert_eq!(pending.len(), 1, "{pending:?}");
     assert_eq!(
         pending[0].target,
-        ColdGcTarget::Paths(vec!["_packs/0/pack.bin".to_owned()])
+        ColdGcTarget::Paths(vec![format!("{BUCKET}/_packs/0/pack.bin")])
     );
     assert_eq!(
         pending[0].not_before_ms,

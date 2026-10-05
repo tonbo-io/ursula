@@ -138,7 +138,6 @@ pub fn pr_suite() -> Result<Vec<Job>> {
             "l2_compact",
             Workload::L2(parse::<L2Args>("--mode=compact")?),
         ),
-        job("l2_legacy", Workload::L2(parse::<L2Args>("--mode=legacy")?)),
         job(
             "cadence_w1",
             Workload::Cadence(parse::<CadenceArgs>(
@@ -220,7 +219,6 @@ pub fn nightly_suite() -> Result<Vec<Job>> {
             "l2_compact",
             Workload::L2(parse::<L2Args>("--mode=compact")?),
         ),
-        job("l2_legacy", Workload::L2(parse::<L2Args>("--mode=legacy")?)),
         job("planner", Workload::Planner(parse::<PlannerArgs>("")?)),
         job("w3_r1", Workload::W3(parse::<W3Args>("--appends=100000")?)),
         job(
