@@ -266,6 +266,7 @@ The `ursula-stream` crate uses `proptest` for state machine property testing in 
    - `feat(ursula-stream): add snapshot validation`
    - `fix(ursula-raft): preserve snapshot metadata`
    - `docs(web): remove redundant subtitles`
+7. **Semantic PR titles**: PR titles must follow the same semantic commit message format (including component scope where applicable), because squash merge uses the PR title as the resulting commit's first line.
 
 ## Architecture Boundaries
 
