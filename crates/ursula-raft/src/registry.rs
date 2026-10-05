@@ -618,7 +618,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             target_rejoin.observe_inbound_append(&rpc);
         }
         let leader = rpc.vote;
-        let prev_log_id = rpc.prev_log_id.clone();
+        let prev_log_id = rpc.prev_log_id;
         let response = target.append_entries(rpc).await.map_err(|err| {
             RPCError::Network(NetworkError::from_string(format!(
                 "remote AppendEntries on node {}: {err}",
