@@ -261,9 +261,9 @@ fn restart_fence_layout(nodes: &[NodeInfo], target: &NodeInfo) -> Result<(u64, V
     Ok((leader_anchor, fenced_node_ids))
 }
 
-/// The server's Raft `election_timeout_min` (fixed in
-/// `ursula-raft/src/engine/factory.rs`).
-const RESTART_FENCE_TRANSFER_SETTLE: Duration = Duration::from_millis(1_500);
+/// The server's Raft `election_timeout_min`.
+const RESTART_FENCE_TRANSFER_SETTLE: Duration =
+    Duration::from_millis(ursula_raft::GROUP_ELECTION_TIMEOUT_MIN_MS);
 
 async fn pin_restart_leaders(
     nodes: &[NodeInfo],
