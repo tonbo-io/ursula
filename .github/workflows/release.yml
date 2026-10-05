@@ -237,9 +237,9 @@ jobs:
           fi
 
           if ! gh release view "$tag" --repo "$REPOSITORY" >/dev/null 2>&1; then
-            # A release that needs a notice (a breaking one) commits it as
-            # .github/release-notes/<version>.md; gh puts it above the
-            # generated notes.
+            # A release that needs a body (a breaking notice, a patch summary)
+            # commits it as .github/release-notes/<version>.md; gh puts it
+            # above the generated notes.
             notes=()
             notice=".github/release-notes/${RELEASE_VERSION}.md"
             if [ -f "$notice" ]; then
