@@ -1,22 +1,44 @@
 {
-  "name": "@tonbo-io/sqlite-ursula",
-  "version": "0.0.0",
-  "private": true,
+  "name": "@tonbo/sqlite-ursula",
+  "version": "0.6.2",
   "description": "SQLite replicated through an Ursula stream by the sqlite-ursula-vfs extension, with Pi Durable's official SqliteStorage on top",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tonbo-io/ursula.git",
+    "directory": "clients/sqlite-ursula"
+  },
+  "homepage": "https://ursula.tonbo.io/docs/examples/sqlite-vfs",
+  "bugs": {
+    "url": "https://github.com/tonbo-io/ursula/issues"
+  },
   "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
   "engines": {
     "node": ">=22.19.0"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p .",
     "test:e2e": "vitest --run"
   },
   "dependencies": {
-    "@earendil-works/chord": "1.0.0",
-    "@earendil-works/pi-durable": "1.0.0"
+    "@earendil-works/pi-durable": "^1.0.0"
   },
   "devDependencies": {
+    "@earendil-works/chord": "1.0.0",
     "@earendil-works/pi-ai": "1.0.0",
     "@types/node": "22.20.5",
     "typescript": "7.0.2",

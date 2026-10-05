@@ -1,0 +1,363 @@
+name: npm Publish
+
+# Publishes clients/sqlite-ursula to npm with its SQLite extension (clients/sqlite-vfs) prebuilt: one
+# package per platform, `@tonbo/sqlite-ursula-<platform>` (package.json and the library, nothing
+# else), and `@tonbo/sqlite-ursula`, which lists them as exact-version optionalDependencies so npm
+# installs only the one matching the host's os, cpu and libc.
+#
+# build (each platform) -> pack -> smoke (installs the tarballs on each platform) -> publish
+# (platform packages first, the main package last). With dry_run, the default, the last step is
+# `npm publish --dry-run`. Either way the tarballs are kept as the run's `npm-packages` artifact.
+
+run-name: npm ${{ inputs.dry_run == false && 'publish' || 'dry run' }} of ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to build
+        required: true
+        default: main
+        type: string
+      dry_run:
+        description: Build, pack and smoke-test, then run npm publish --dry-run
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  source:
+    name: Resolve ${{ inputs.ref }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      dry_run: ${{ steps.resolve.outputs.dry_run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # Every later job builds this commit, even if the ref moves meanwhile. Only an explicit
+      # dry_run=false publishes.
+      - name: Resolve the commit and the version
+        id: resolve
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          RUN_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          version=$(jq -r .version clients/sqlite-ursula/package.json)
+          if [ "$DRY_RUN" = false ]; then dry_run=false; else dry_run=true; fi
+          # npm provenance names the commit the run was dispatched on as the packages' source.
+          if [ "$dry_run" = false ] && [ "$sha" != "$RUN_SHA" ]; then
+            echo "::error::ref is $sha, but the run is on $RUN_SHA. Dispatch the workflow on the ref you publish (gh workflow run npm-publish.yml --ref <ref> -f ref=<ref>), so the provenance names the commit the packages are built from."
+            exit 1
+          fi
+          printf 'sha=%s\nversion=%s\ndry_run=%s\n' "$sha" "$version" "$dry_run" >>"$GITHUB_OUTPUT"
+          echo "@tonbo/sqlite-ursula $version from $sha (dry run: $dry_run)" >>"$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: source
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on glibc 2.28 (manylinux_2_28, AlmaLinux 8), so the library loads on any glibc at
+          # least that new: Debian 11, Ubuntu 20.04, Amazon Linux 2023, RHEL 8 and later.
+          - platform: linux-x64-gnu
+            runner: depot-ubuntu-24.04-8
+            image: quay.io/pypa/manylinux_2_28_x86_64:2026.10.03-1@sha256:39df0042d5cc900b085aa25a0659368b42a0006c54c474299b785b44c1b4ff82
+          - platform: linux-arm64-gnu
+            runner: depot-ubuntu-24.04-arm-8
+            image: quay.io/pypa/manylinux_2_28_aarch64:2026.10.03-1@sha256:f5f03dedf61b47d69d0742d36047db78adeee3bdb7a9910ff52304750ecf2514
+          # Linked dynamically against musl: Alpine's node cannot load a statically linked library.
+          - platform: linux-x64-musl
+            runner: depot-ubuntu-24.04-8
+            image: public.ecr.aws/docker/library/alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
+          - platform: darwin-arm64
+            runner: macos-15
+    env:
+      # As in integration.yml: keeps libsqlite3-sys from probing (and linking) a system libsqlite3.
+      # The extension only calls the host's SQLite through sqlite3_api_routines.
+      SQLITE3_LIB_DIR: /nonexistent
+      # No debug info in the shipped library (the crate's release profile keeps it for profiling).
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_STRIP: debuginfo
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+          persist-credentials: false
+
+      # The repository's toolchain (rust-toolchain.toml), minimal profile, inside the build image.
+      - name: Build in the image
+        if: runner.os == 'Linux'
+        env:
+          IMAGE: ${{ matrix.image }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          test -n "$toolchain"
+          rustflags=
+          case "$PLATFORM" in *-musl) rustflags="-C target-feature=-crt-static" ;; esac
+          docker run --rm -v "$PWD:/src" -w /src/clients/sqlite-vfs \
+            -e SQLITE3_LIB_DIR -e CARGO_PROFILE_RELEASE_DEBUG -e CARGO_PROFILE_RELEASE_STRIP -e CARGO_TERM_COLOR \
+            -e TOOLCHAIN="$toolchain" -e RUSTFLAGS="$rustflags" \
+            "$IMAGE" sh -euxc '
+              if command -v apk >/dev/null; then apk add --no-cache curl gcc musl-dev; fi
+              (cd / && curl --proto "=https" --tlsv1.2 --retry 5 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain "$TOOLCHAIN")
+              "$HOME/.cargo/bin/cargo" +"$TOOLCHAIN" build --locked --release
+            '
+
+      - name: Install Rust toolchain
+        if: runner.os == 'macOS'
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          rustflags: ""
+          cache: false
+
+      - name: Build on macOS
+        if: runner.os == 'macOS'
+        working-directory: clients/sqlite-vfs
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: cargo build --locked --release
+
+      - name: Check the library
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          case "$PLATFORM" in
+            darwin-*)
+              lib=clients/sqlite-vfs/target/release/libsqlite_ursula_vfs.dylib
+              otool -L "$lib"
+              vtool -show-build "$lib"
+              ;;
+            *)
+              lib=clients/sqlite-vfs/target/release/libsqlite_ursula_vfs.so
+              readelf -d "$lib" | grep NEEDED
+              ;;
+          esac
+          # The newest glibc symbol version the library needs is the oldest glibc it loads on.
+          case "$PLATFORM" in
+            *-gnu)
+              objdump -T "$lib" | grep -o 'GLIBC_[0-9][0-9.]*' | sort -uV
+              floor=$(objdump -T "$lib" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -n1)
+              echo "$PLATFORM: needs glibc $floor or later" >>"$GITHUB_STEP_SUMMARY"
+              if [ "$(printf '%s\n' "$floor" 2.28 | sort -V | tail -n1)" != 2.28 ]; then
+                echo "::error::$PLATFORM needs glibc $floor, newer than 2.28"
+                exit 1
+              fi
+              ;;
+          esac
+          ls -l "$lib"
+          mkdir -p "$RUNNER_TEMP/extension/$PLATFORM"
+          cp "$lib" "$RUNNER_TEMP/extension/$PLATFORM/"
+
+      - name: Upload the extension
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: extension-${{ matrix.platform }}
+          path: ${{ runner.temp }}/extension
+          if-no-files-found: error
+          retention-days: 7
+
+  pack:
+    name: Pack
+    needs: [source, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+          persist-credentials: false
+
+      - name: Install Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+
+      - name: Download the extensions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: extension-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/extension
+
+      # scripts/pack.mjs fails unless every package holds exactly the files it should.
+      - name: Build and pack
+        working-directory: clients/sqlite-ursula
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts
+          npm run build
+          out="$RUNNER_TEMP/npm-packages"
+          node scripts/pack.mjs "$RUNNER_TEMP/extension" "$out"
+          {
+            echo '| Tarball | Bytes |'
+            echo '| --- | ---: |'
+            while read -r tarball; do
+              echo "| $tarball | $(wc -c <"$out/$tarball") |"
+              echo "== $tarball" >&2
+              tar -tvzf "$out/$tarball" >&2
+            done <"$out/publish-order.txt"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the tarballs
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: npm-tarballs
+          path: ${{ runner.temp }}/npm-packages
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke:
+    name: Smoke ${{ matrix.platform }}
+    needs: [source, pack]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Node 22.19.0, the oldest the package supports. Linux runs in containers with old C
+        # libraries: Debian 11 (glibc 2.31) and Alpine 3.22 (musl).
+        include:
+          - platform: linux-x64-gnu
+            runner: depot-ubuntu-24.04-8
+            image: public.ecr.aws/docker/library/node:22.19.0-bullseye-slim@sha256:8efd3ed25d83b4328df873ed9853a5bd97ffce8eb3498785e45c3e7297571f0e
+          - platform: linux-arm64-gnu
+            runner: depot-ubuntu-24.04-arm-8
+            image: public.ecr.aws/docker/library/node:22.19.0-bullseye-slim@sha256:8efd3ed25d83b4328df873ed9853a5bd97ffce8eb3498785e45c3e7297571f0e
+          - platform: linux-x64-musl
+            runner: depot-ubuntu-24.04-8
+            image: public.ecr.aws/docker/library/node:22.19.0-alpine3.22@sha256:d2166de198f26e17e5a442f537754dd616ab069c47cc57b889310a717e0abbf9
+          - platform: darwin-arm64
+            runner: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: clients/sqlite-ursula/scripts
+
+      - name: Download the tarballs
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: npm-tarballs
+          path: ${{ runner.temp }}/npm-packages
+
+      - name: Install Node
+        if: runner.os == 'macOS'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22.19.0
+
+      # The main package and this platform's, into a scratch project. The main package's other
+      # optional dependencies are not on npm yet (or do not match this platform): npm skips them.
+      - name: Install the tarballs and load the extension
+        env:
+          IMAGE: ${{ matrix.image }}
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ needs.source.outputs.version }}
+        run: |
+          set -euo pipefail
+          scratch="$RUNNER_TEMP/scratch"
+          mkdir -p "$scratch"
+          cp "$RUNNER_TEMP/npm-packages/tonbo-sqlite-ursula-$VERSION.tgz" \
+            "$RUNNER_TEMP/npm-packages/tonbo-sqlite-ursula-$PLATFORM-$VERSION.tgz" \
+            clients/sqlite-ursula/scripts/smoke.mjs "$scratch/"
+          echo '{ "private": true }' >"$scratch/package.json"
+          smoke='npm install --no-audit --no-fund ./*.tgz && ls node_modules/@tonbo && node smoke.mjs'
+          if [ -n "$IMAGE" ]; then
+            docker run --rm -v "$scratch:/smoke" -w /smoke "$IMAGE" sh -euxc "$smoke"
+          else
+            cd "$scratch" && sh -euxc "$smoke"
+          fi
+
+  publish:
+    name: ${{ needs.source.outputs.dry_run == 'false' && 'Publish' || 'Publish (dry run)' }}
+    needs: [source, smoke]
+    # GitHub-hosted: npm accepts provenance, and trusted publishing, only from GitHub-hosted runners.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+    steps:
+      - name: Download the tarballs
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: npm-tarballs
+          path: npm-packages
+
+      # Before publishing, so a failed publish still leaves the exact tarballs to retry with.
+      - name: Upload the tarballs
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: npm-packages
+          path: npm-packages
+          if-no-files-found: error
+          retention-days: 30
+
+      # Node 24 bundles npm 11, and trusted publishing needs npm 11.5.1 or later.
+      - name: Install Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # Auth, either of:
+      # - Trusted publishing (OIDC), the default: each package's settings on npmjs.com trust this
+      #   repository's npm-publish.yml. `npm publish` then trades the job's GitHub OIDC token
+      #   (id-token: write) for a short-lived publish token. No secret is involved. npm lets a
+      #   package trust a workflow only once the package exists, so this cannot publish a package's
+      #   first version.
+      # - An NPM_TOKEN repository secret: a granular access token that can publish the @tonbo
+      #   packages, given to npm as NODE_AUTH_TOKEN through the .npmrc that setup-node wrote. npm
+      #   tries OIDC first and falls back to the token when the exchange fails. Without the secret,
+      #   NODE_AUTH_TOKEN is empty and only OIDC can authenticate.
+      # --provenance signs a provenance statement with the same OIDC token, whichever path publishes.
+      - name: ${{ needs.source.outputs.dry_run == 'false' && 'npm publish' || 'npm publish --dry-run' }}
+        working-directory: npm-packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DRY_RUN: ${{ needs.source.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          echo "npm $(npm --version)"
+          dry_run=()
+          if [ "$DRY_RUN" != false ]; then dry_run=(--dry-run); fi
+          # Platform packages first, the main package last (publish-order.txt), so the main
+          # package's optional dependencies resolve as soon as it is visible. A version already on
+          # npm is skipped, so a failed run can be run again.
+          while read -r tarball; do
+            spec=$(tar -xOzf "$tarball" package/package.json | jq -r '"\(.name)@\(.version)"')
+            if npm view "$spec" version >/dev/null 2>&1; then
+              echo "::notice::$spec is already on npm, skipped"
+              continue
+            fi
+            npm publish "./$tarball" --provenance --access public "${dry_run[@]}"
+          done <publish-order.txt

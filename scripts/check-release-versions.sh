@@ -48,6 +48,14 @@ for chart in charts/ursula charts/ursula-chaos; do
   fi
 done
 
+# The npm client ships with the release (.github/workflows/npm-publish.yml
+# publishes it, and its prebuilt extensions, at this version).
+npm_version=$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' clients/sqlite-ursula/package.json | head -n 1)
+if [ "${npm_version}" != "${workspace}" ]; then
+  echo "clients/sqlite-ursula/package.json version is ${npm_version}, workspace is ${workspace}" >&2
+  status=1
+fi
+
 # The docs' release notes have a section for the release, and a GitHub
 # release-body notice (`release.yml` puts it above the generated notes) opens
 # with the same paragraph as that section.

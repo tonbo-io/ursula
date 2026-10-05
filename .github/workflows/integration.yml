@@ -214,6 +214,7 @@ jobs:
           cd clients/sqlite-ursula
           npm ci
           npm run typecheck
+          npm run build
           URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npm run test:e2e
 
       # Without a cold tier the default per-group hot limit trips after ~68 MB of frames: the
