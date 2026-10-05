@@ -722,28 +722,24 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cli_repair_restarted_voter_rebuilds_an_empty_reinitialized_voter() {
-    // A memory-WAL voter restarted empty re-runs per-group Initialize for the
-    // groups it bootstraps (2 and 5 of 6 for node 3), so it reports itself a
-    // voter with nothing applied. A leader that already matched it never
-    // backfills it (OpenRaft does not revert matching progress), so the
-    // survivors' old route to node 3 goes through a proxy the test cuts.
-    // `repair_restarted_voter` must still rebuild those idle groups even
-    // though the peers' commit index is within the lag tolerance.
+async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
+    // A memory-WAL voter restarted empty must not re-run per-group Initialize
+    // for the groups it bootstraps (2 and 5 of 6 for node 3): it must never
+    // report itself a voter with nothing applied. The leaders see it lost the
+    // entries it had acknowledged and rebuild it through remove, learner,
+    // catch-up and promote with no operator. `repair_restarted_voter`, which
+    // a prepared rollout still runs, then finds nothing left to do.
     let _guard = static_cluster_cli_test_guard().await;
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
-        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping restart repair test");
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping restart self-heal test");
         return;
     };
     let ports = [free_port(), free_port(), free_port()];
-    let node3_listen = std::net::SocketAddr::from(([127, 0, 0, 1], ports[2]));
-    let proxy = BlockableProxy::spawn(node3_listen).await;
-    let peers = vec![
-        (1, format!("http://127.0.0.1:{}", ports[0])),
-        (2, format!("http://127.0.0.1:{}", ports[1])),
-        (3, format!("http://{}", proxy.addr)),
-    ];
     let public = |node_id: u64| format!("http://127.0.0.1:{}", ports[(node_id - 1) as usize]);
+    let peers = [1_u64, 2, 3]
+        .into_iter()
+        .map(|node_id| (node_id, public(node_id)))
+        .collect::<Vec<_>>();
 
     let mut children = Vec::new();
     let mut nodes = Vec::new();
@@ -785,37 +781,36 @@ async fn cli_repair_restarted_voter_rebuilds_an_empty_reinitialized_voter() {
         .expect("prepare node 3 restart");
 
     drop(children.pop());
-    proxy.block();
     let (child, admin_port) = spawn_per_group_memory_node(binary, 3, ports[2], &peers, true);
     children.push(child);
     nodes[2] = ctl_node(3, admin_port, &public(3));
     wait_until_ready(&client, &public(3), &mut children).await;
 
-    // Precondition: node 3 is an empty voter for the groups it re-initialized,
-    // and the peers' commit index is within the lag tolerance.
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    // Node 3 heals by itself; it is never an empty voter on the way.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let snapshot = ctl.fetch_cluster(&nodes).await.expect("fetch cluster");
-        let empty_voters = [2_u64, 5]
-            .into_iter()
-            .filter(|group_id| {
-                let target = snapshot.node(3).and_then(|view| view.group(*group_id));
-                let peer_committed = snapshot
-                    .peer_views(*group_id, 3)
-                    .values()
-                    .filter_map(|group| group.committed_index)
-                    .max();
-                target.is_some_and(|group| {
-                    group.voter_ids.contains(&3) && group.last_applied_index.is_none()
-                }) && peer_committed.is_some_and(|committed| (1..=16).contains(&committed))
-            })
-            .count();
-        if empty_voters == 2 {
+        for group_id in 0..6_u64 {
+            let target = snapshot.node(3).and_then(|view| view.group(group_id));
+            let peer_committed = snapshot
+                .peer_views(group_id, 3)
+                .values()
+                .filter_map(|group| group.committed_index)
+                .max();
+            let empty_voter = target.is_some_and(|group| {
+                group.voter_ids.contains(&3) && group.last_applied_index.is_none()
+            }) && peer_committed.is_some_and(|committed| committed > 0);
+            assert!(
+                !empty_voter,
+                "node 3 reported itself an empty voter of group {group_id}: {snapshot:?}"
+            );
+        }
+        if ursula_ctl::plan::check_readiness(&snapshot, 3, 0).all_ready {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "node 3 never reported empty voters for groups 2 and 5: {snapshot:?}"
+            "node 3 never healed back to a caught-up voter: {snapshot:?}"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -830,7 +825,7 @@ async fn cli_repair_restarted_voter_rebuilds_an_empty_reinitialized_voter() {
     };
     ursula_ctl::repair_restarted_voter(&nodes, &nodes[2], &ctl, &drain_options, &repair_options)
         .await
-        .expect("repair restarted node 3");
+        .expect("repair after self-heal is a no-op");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -846,62 +841,6 @@ async fn cli_repair_restarted_voter_rebuilds_an_empty_reinitialized_voter() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     drop(children);
-}
-
-/// A TCP forwarder standing in for one node's Raft address. Blocking it cuts
-/// every route that still points at the old address without touching the
-/// node's own listener.
-struct BlockableProxy {
-    addr: std::net::SocketAddr,
-    blocked: Arc<std::sync::atomic::AtomicBool>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl BlockableProxy {
-    async fn spawn(upstream: std::net::SocketAddr) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind proxy");
-        let addr = listener.local_addr().expect("proxy addr");
-        let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = Arc::clone(&blocked);
-        let task = tokio::spawn(async move {
-            loop {
-                let Ok((mut inbound, _)) = listener.accept().await else {
-                    continue;
-                };
-                let flag = Arc::clone(&flag);
-                tokio::spawn(async move {
-                    if flag.load(std::sync::atomic::Ordering::SeqCst) {
-                        return;
-                    }
-                    let Ok(mut outbound) = tokio::net::TcpStream::connect(upstream).await else {
-                        return;
-                    };
-                    if flag.load(std::sync::atomic::Ordering::SeqCst) {
-                        return;
-                    }
-                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
-                });
-            }
-        });
-        Self {
-            addr,
-            blocked,
-            task,
-        }
-    }
-
-    fn block(&self) {
-        self.blocked
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-impl Drop for BlockableProxy {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
 }
 
 fn spawn_per_group_memory_node(

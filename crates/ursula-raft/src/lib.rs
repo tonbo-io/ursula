@@ -21,6 +21,8 @@
 //! - [`forward`]: leader-forwarding helpers used by the engine when a node is a follower.
 //! - [`snapshot_cadence`]: the byte-based snapshot cadence policy (F12e) and
 //!   the per-group log gauges the snapshot driver reads.
+//! - [`rejoin`]: memory-WAL rejoin: the bootstrap probe, the vote gate of an
+//!   emptied replica, and the leader-side heal driver.
 //! - [`snapshot_codec`]: the group-snapshot frame codec; [`group_snapshot_frames`]
 //!   and [`decode_group_snapshot`] are re-exported for measurement tools.
 
@@ -37,6 +39,7 @@ mod log_store;
 mod meta;
 mod read_index;
 mod registry;
+mod rejoin;
 mod rt;
 #[cfg(madsim)]
 mod sim_runtime;
@@ -101,6 +104,9 @@ pub use registry::RaftGroupHandle;
 pub use registry::RaftGroupHandleRegistry;
 pub use registry::SingleNodeRaftNetwork;
 pub use registry::SingleNodeRaftNetworkFactory;
+pub use rejoin::AdoptSurvivorOutcome;
+pub use rejoin::GroupRejoin;
+pub use rejoin::run_rejoin_heal;
 #[cfg(madsim)]
 pub use sim_runtime::MadsimOpenRaftRuntime;
 pub use snapshot_codec::decode_group_snapshot;

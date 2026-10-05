@@ -58,6 +58,7 @@ use crate::format_epoch::observe_outbound_status;
 use crate::format_epoch::record_format_epoch_mismatch;
 use crate::forward::write_commands_on_raft;
 use crate::raft_internal_proto;
+use crate::rejoin::GroupRejoin;
 use crate::types::UrsulaAppendEntriesRequest;
 use crate::types::UrsulaAppendEntriesResponse;
 use crate::types::UrsulaRaftTypeConfig;
@@ -922,6 +923,7 @@ pub(crate) fn validate_grpc_metadata(protocol_version: u32) -> Result<(), GrpcRp
 pub struct GrpcRaftNetworkFactory {
     raft_group_id: RaftGroupId,
     reconnect_threshold: u32,
+    rejoin: Option<Arc<GroupRejoin>>,
 }
 
 impl GrpcRaftNetworkFactory {
@@ -929,11 +931,20 @@ impl GrpcRaftNetworkFactory {
         Self {
             raft_group_id,
             reconnect_threshold: 8,
+            rejoin: None,
         }
     }
 
     pub fn with_reconnect_threshold(mut self, threshold: u32) -> Self {
         self.reconnect_threshold = threshold;
+        self
+    }
+
+    /// This node's memory-WAL rejoin state for the group: replication
+    /// answers that show a follower lost its log go to it instead of to
+    /// OpenRaft.
+    pub fn with_rejoin(mut self, rejoin: Option<Arc<GroupRejoin>>) -> Self {
+        self.rejoin = rejoin;
         self
     }
 }
@@ -942,12 +953,14 @@ impl RaftNetworkFactory<UrsulaRaftTypeConfig> for GrpcRaftNetworkFactory {
     type Network = GrpcRaftNetwork;
 
     async fn new_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
-        GrpcRaftNetwork::with_threshold(
+        let mut network = GrpcRaftNetwork::with_threshold(
             self.raft_group_id,
             target,
             node.addr.clone(),
             self.reconnect_threshold,
-        )
+        );
+        network.rejoin = self.rejoin.clone();
+        network
     }
 }
 
@@ -965,6 +978,7 @@ pub struct GrpcRaftNetwork {
     /// HTTP/2 streams stay borked, no auto-heal).
     consecutive_failures: u32,
     reconnect_threshold: u32,
+    rejoin: Option<Arc<GroupRejoin>>,
 }
 
 impl Debug for GrpcRaftNetwork {
@@ -1001,6 +1015,7 @@ impl GrpcRaftNetwork {
             channel_generation,
             consecutive_failures: 0,
             reconnect_threshold,
+            rejoin: None,
         }
     }
 
@@ -1561,7 +1576,16 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
         record_append_logical_sample(append_logical_sample(&rpc, envelope.encoded_len()));
         let ack = self.append_rpc(envelope, option).await?;
         GRPC_APPEND_RESPONSE_BYTES.fetch_add(ack.encoded_len() as u64, Ordering::Relaxed);
-        self.decode_rpc_ack("Append", &ack.payload)
+        let response: UrsulaAppendEntriesResponse = self.decode_rpc_ack("Append", &ack.payload)?;
+        if let Some(rejoin) = &self.rejoin
+            && rejoin.follower_lost_log(self.target, &rpc.vote, rpc.prev_log_id.as_ref(), &response)
+        {
+            return Err(raft_rpc_network_error(format!(
+                "node {} at {} lost Raft log entries it had acknowledged",
+                self.target, self.endpoint
+            )));
+        }
+        Ok(response)
     }
 
     async fn vote(

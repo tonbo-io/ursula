@@ -889,6 +889,10 @@ fn admin_ops_router(state: HttpState) -> Router {
             post(transfer_raft_leader),
         )
         .route(
+            "/__ursula/raft/{raft_group_id}/rejoin/adopt-survivor/{node_id}",
+            post(adopt_rejoin_survivor),
+        )
+        .route(
             "/__ursula/leadership-shed/maintenance",
             post(mark_maintenance_drain).delete(clear_maintenance_drain),
         );
@@ -2329,6 +2333,52 @@ pub(crate) async fn transfer_raft_leader(
 
 pub(crate) fn parse_raft_group_id(raw: u64) -> Result<RaftGroupId, std::num::TryFromIntError> {
     u32::try_from(raw).map(RaftGroupId)
+}
+
+/// Operator recovery after a majority of a memory-WAL group restarted empty:
+/// run it on every replica of the group with the same survivor (the replica
+/// whose log is kept). An empty replica may then vote for the survivor; the
+/// survivor, while it leads, replicates the emptied followers from the start.
+pub(crate) async fn adopt_rejoin_survivor(
+    State(state): State<HttpState>,
+    Path((raft_group_id, survivor)): Path<(u64, u64)>,
+) -> Response {
+    let (raft_group_id, _raft) = match resolve_raft_group(&state, raft_group_id) {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
+    };
+    let Some(registry) = state.raft_registry() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "raft registry is not configured for this server",
+        )
+            .into_response();
+    };
+    match registry
+        .adopt_rejoin_survivor(raft_group_id, survivor)
+        .await
+    {
+        Ok(outcome) => {
+            let (action, followers): (&str, Vec<u64>) = match outcome {
+                ursula_raft::AdoptSurvivorOutcome::VoteReleased => ("vote_released", Vec::new()),
+                ursula_raft::AdoptSurvivorOutcome::FollowersReset(followers) => {
+                    ("followers_reset", followers.into_iter().collect())
+                }
+                ursula_raft::AdoptSurvivorOutcome::NotLeader => ("survivor_not_leader", Vec::new()),
+            };
+            json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "raft_group_id": raft_group_id.0,
+                    "survivor": survivor,
+                    "action": action,
+                    "followers": followers,
+                })
+                .to_string(),
+            )
+        }
+        Err(err) => (StatusCode::CONFLICT, format!("adopt survivor: {err}")).into_response(),
+    }
 }
 
 /// Resolves the raft registry, parses the group id, and looks up the live group

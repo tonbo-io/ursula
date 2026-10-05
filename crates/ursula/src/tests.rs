@@ -2559,6 +2559,31 @@ async fn static_grpc_memory_node_rejoins_all_groups_through_membership_replaceme
         .await
         .expect("warm stale empty node 3 groups");
 
+    // The leaders rebuild the emptied node 3 by themselves (remove, learner,
+    // catch-up from the purged snapshot, promote).
+    for (group_index, stream_id) in streams_by_group.iter().enumerate() {
+        let raft_group_id = RaftGroupId(group_index as u32);
+        stale_replacement
+            .registry
+            .get(raft_group_id)
+            .expect("stale replacement group")
+            .wait(Some(Duration::from_secs(30)))
+            .metrics(
+                |metrics| metrics.membership_config.voter_ids().any(|id| id == 3),
+                format!("emptied node 3 healed back into group {group_index}"),
+            )
+            .await
+            .expect("wait for node 3 self-heal");
+        wait_raft_state_machine_payload(
+            &stale_replacement.registry,
+            stale_replacement.runtime.locate(stream_id),
+            stream_id,
+            format!("before-{group_index}-after-stop-{group_index}").as_bytes(),
+            "emptied memory node healed from the surviving quorum",
+        )
+        .await;
+    }
+
     let rejected_quiesce = client
         .post(format!("{}/__ursula/raft/quiesce-for-restart", peers[2].1))
         .send()
@@ -2578,37 +2603,9 @@ async fn static_grpc_memory_node_rejoins_all_groups_through_membership_replaceme
         .post(format!("{}/__ursula/raft/quiesce-for-restart", peers[2].1))
         .send()
         .await
-        .expect("quiesce stale replacement before membership replacement");
+        .expect("quiesce stale replacement before restarting it");
     assert_eq!(quiesce.status(), StatusCode::OK);
 
-    // Remove the quiesced target from each committed membership. This resets
-    // leader replication progress durably and does not depend on a one-shot,
-    // process-local log-reversion permission surviving until the next process.
-    for raw_group_id in 0u32..6 {
-        let raft_group_id = RaftGroupId(raw_group_id);
-        let observer_raft = nodes[0]
-            .registry
-            .get(raft_group_id)
-            .expect("observer group");
-        let leader_id = observer_raft
-            .metrics()
-            .borrow_watched()
-            .current_leader
-            .expect("surviving leader remains elected");
-        let leader_base = peers
-            .iter()
-            .find(|(node_id, _)| *node_id == leader_id)
-            .map(|(_, base_url)| base_url.as_str())
-            .expect("leader peer base url");
-        let detach = client
-            .post(format!(
-                "{leader_base}/__ursula/raft/{raw_group_id}/membership?voters=1%2C2"
-            ))
-            .send()
-            .await
-            .expect("detach node 3 through committed membership");
-        assert_eq!(detach.status(), StatusCode::OK);
-    }
     stale_replacement.shutdown().await;
 
     let restarted_listener = tokio::net::TcpListener::bind(addrs[2])
@@ -2633,83 +2630,7 @@ async fn static_grpc_memory_node_rejoins_all_groups_through_membership_replaceme
         .await
         .expect("warm final empty node 3 groups");
 
-    for raw_group_id in 0u32..6 {
-        let raft_group_id = RaftGroupId(raw_group_id);
-        let observer_raft = nodes[0]
-            .registry
-            .get(raft_group_id)
-            .expect("observer group");
-        let leader_id = observer_raft
-            .metrics()
-            .borrow_watched()
-            .current_leader
-            .expect("surviving leader remains elected");
-        let leader_base = peers
-            .iter()
-            .find(|(node_id, _)| *node_id == leader_id)
-            .map(|(_, base_url)| base_url.as_str())
-            .expect("leader peer base url");
-        let attach = client
-            .post(format!(
-                "{leader_base}/__ursula/raft/{raw_group_id}/learners/3"
-            ))
-            .query(&[("addr", peers[2].1.as_str()), ("blocking", "false")])
-            .send()
-            .await
-            .expect("attach restarted node 3 as non-blocking learner");
-        assert_eq!(attach.status(), StatusCode::OK);
-    }
-
-    for raw_group_id in 0u32..6 {
-        let raft_group_id = RaftGroupId(raw_group_id);
-        let observer_raft = nodes[0]
-            .registry
-            .get(raft_group_id)
-            .expect("observer group");
-        let required_applied = observer_raft
-            .metrics()
-            .borrow_watched()
-            .last_applied
-            .map(|log_id| log_id.index);
-        restarted
-            .registry
-            .get(raft_group_id)
-            .expect("restarted learner group")
-            .wait(Some(Duration::from_secs(10)))
-            .applied_index_at_least(
-                required_applied,
-                format!("restarted learner caught up group {raw_group_id}"),
-            )
-            .await
-            .expect("wait for non-blocking learner catch-up");
-    }
-
-    for raw_group_id in 0u32..6 {
-        let raft_group_id = RaftGroupId(raw_group_id);
-        let observer_raft = nodes[0]
-            .registry
-            .get(raft_group_id)
-            .expect("observer group");
-        let leader_id = observer_raft
-            .metrics()
-            .borrow_watched()
-            .current_leader
-            .expect("surviving leader remains elected");
-        let leader_base = peers
-            .iter()
-            .find(|(node_id, _)| *node_id == leader_id)
-            .map(|(_, base_url)| base_url.as_str())
-            .expect("leader peer base url");
-        let promote = client
-            .post(format!(
-                "{leader_base}/__ursula/raft/{raw_group_id}/membership?voters=1%2C2%2C3"
-            ))
-            .send()
-            .await
-            .expect("promote caught-up node 3 learner");
-        assert_eq!(promote.status(), StatusCode::OK);
-    }
-
+    // Restarted empty a second time, it is rebuilt again.
     for (group_index, stream_id) in streams_by_group.iter().enumerate() {
         let raft_group_id = RaftGroupId(group_index as u32);
         let restarted_raft = restarted
@@ -2717,7 +2638,7 @@ async fn static_grpc_memory_node_rejoins_all_groups_through_membership_replaceme
             .get(raft_group_id)
             .expect("restarted group");
         restarted_raft
-            .wait(Some(Duration::from_secs(10)))
+            .wait(Some(Duration::from_secs(30)))
             .metrics(
                 |metrics| metrics.membership_config.voter_ids().any(|id| id == 3),
                 format!("restarted node 3 rejoined group {group_index}"),
@@ -2758,7 +2679,6 @@ async fn static_grpc_memory_restart_with_bootstrap_marker_fails_fast() {
 
     let engine_config = ursula_raft::RaftEngineConfig {
         memory_bootstrap_marker_dir: Some(marker_dir.path().to_path_buf()),
-        rejoin_probe: Duration::from_millis(100),
         bootstrap_peer_probe: Duration::from_millis(100),
         bootstrap_peer_probe_interval: Duration::from_millis(20),
         bootstrap_peer_connect: Duration::from_millis(20),

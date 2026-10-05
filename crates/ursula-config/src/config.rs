@@ -152,9 +152,11 @@ pub struct RaftConfig {
     /// each entry's voters must be a non-empty subset of `peers`.
     #[serde(default)]
     pub groups: Vec<RaftGroupConfig>,
-    /// How long a restarting node waits to observe an already-established
-    /// (or freshly re-elected) leader before deciding the group is truly new
-    /// and bootstrapping it. Must exceed the election window.
+    /// How long a restarting disk-WAL node with S3 snapshots and an empty
+    /// log directory waits to observe an already-established (or freshly
+    /// re-elected) leader before deciding the group is truly new and
+    /// bootstrapping it. Must exceed the election window. A memory-WAL node
+    /// asks every voter instead and initializes only when all are empty.
     pub rejoin_probe: HumanDuration,
     /// Timeout for probing static peers during bootstrap before logging a
     /// warning. Continues retrying indefinitely.

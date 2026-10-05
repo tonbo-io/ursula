@@ -3,6 +3,17 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
+## 0.6.2
+
+0.6.2 is a drop-in patch for 0.6.1: format epoch 2 is unchanged, with no storage, snapshot or Raft protocol change. Upgrade in place with an ordinary rolling restart. 0.6.1 and 0.6.2 voters run side by side safely during the upgrade; a group whose leader still runs 0.6.1 is rebuilt by the graceful-rollout hook as before.
+
+### Fixed
+
+- **A memory-WAL node restarted alone heals itself.** It no longer initializes the groups it bootstraps again (it does so only when every configured voter reports an empty group and no leader), and the leaders rebuild it with no operator: a leader that sees a follower lose entries it had acknowledged commits a voter set without it, adds it back as a learner, and promotes it once it has caught up, the same sequence as `ursulactl repair-restarted-voter`. The steps are read off the current membership, so a leader change, a second restart or `repair-restarted-voter` running at the same time converge. Leadership handoffs skip such a follower until it is rebuilt.
+- **An empty memory-WAL replica never votes before it has caught up.** Until it holds the log its leader had committed when it first heard from it, it refuses every candidate with a non-empty log, so it can no longer help elect a leader that lacks entries committed with its lost copy. A fresh group's first election is unaffected.
+- **A majority of a memory-WAL group restarted at once stops the group instead of losing writes.** No leader is elected from the incomplete logs and writes are refused (`503` while no leader exists) until an operator adopts the survivor's log with `POST /__ursula/raft/{group}/rejoin/adopt-survivor/{node}` on every node of the group. A restart of every node still initializes the groups again, empty. See [Restarting a memory-WAL node](/docs/operations#restarting-a-memory-wal-node).
+- `ursulactl repair-restarted-voter` accepts a group the leader already rebuilt.
+
 ## 0.6.1
 
 0.6.1 is a drop-in patch for 0.6.0: format epoch 2 is unchanged, with no storage, snapshot or Raft protocol change. Upgrade from 0.6.0 in place with an ordinary rolling restart (`helm upgrade`); no fresh install or data move is needed.
@@ -15,9 +26,9 @@ The chart's graceful-rollout hook runs the `ursulactl` of the chart's image, so 
 - **The leadership balancer hands a group only to a caught-up peer.** It used to hand leadership to a voter that had not replicated the leader's log; the transfer then left the leader muted while the target could not win, and the next restart fence timed out with "leader … is stale". The balancer now waits until the leader's replication metrics show the target matched its last log entry.
 - **The restart fence waits out an in-flight leadership transfer.** The restart fence (`prepare-restart`, `prepare-amnesiac-restart`, `repair-restarted-voter`) now waits 1.5 s (the Raft minimum election timeout) after fencing the surviving voters before it checks leadership, so a transfer accepted just before the fence settles first.
 
-### Known issue: a restarted memory-WAL node rejoins as an empty voter
+### Known issue (fixed in 0.6.2): a restarted memory-WAL node rejoins as an empty voter
 
-This is not fixed in 0.6.1. A node on `raft.wal.backend = "memory"` restarts with an empty Raft log, but the group leaders still count it as a voter, do not resend what it lost, and it grants its vote to any candidate. Until it is rebuilt, each of its groups holds two real copies while reporting three, and one more failure can lose acknowledged writes. A prepared rollout rebuilds it (`repair-restarted-voter`, fixed above); a crash, OOM kill, eviction or node loss does not. Production clusters must use the disk WAL. On a memory-WAL cluster, after any unplanned restart run `ursulactl verify-cluster` and, if it reports the node unready, `ursulactl repair-restarted-voter --node N`. See [Restarting a memory-WAL node](/docs/operations#restarting-a-memory-wal-node).
+A node on `raft.wal.backend = "memory"` restarts with an empty Raft log, but the group leaders still count it as a voter, do not resend what it lost, and it grants its vote to any candidate. Until it is rebuilt, each of its groups holds two real copies while reporting three, and one more failure can lose acknowledged writes. A prepared rollout rebuilds it (`repair-restarted-voter`, fixed above); a crash, OOM kill, eviction or node loss does not. Production clusters must use the disk WAL. On a memory-WAL cluster, after any unplanned restart run `ursulactl verify-cluster` and, if it reports the node unready, `ursulactl repair-restarted-voter --node N`. See [Restarting a memory-WAL node](/docs/operations#restarting-a-memory-wal-node).
 
 ## 0.6.0
 
