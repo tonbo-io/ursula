@@ -674,8 +674,9 @@ what it receives in a buffer on local disk. Changes then go to object storage in
 Object", https://blog.cloudflare.com/sqlite-in-durable-objects/). A VFS append is acknowledged when 2
 of the group's 3 replicas, one per AZ, hold it: in memory with the memory WAL, or written and flushed
 to the Raft log on local disk with the disk WAL. Ursula documents the multi-peer memory WAL as
-volatile and requires the disk WAL for production clusters. The disk-WAL column is the like-for-like
-one. Spreading followers over data centers rather than AZs is likely the stronger geographic
+volatile and requires the disk WAL for production clusters: a restarted memory-WAL replica rejoins
+as an empty voter, so until it is rebuilt a VFS commit has two real copies, not three. The disk-WAL
+column is the like-for-like one. Spreading followers over data centers rather than AZs is likely the stronger geographic
 guarantee, which favours the DO.
 
 **Timing.** On deployed Workers an object's clock does not advance while JavaScript runs. It catches

@@ -122,7 +122,7 @@ redirect URL configuration.
 
 ## Bootstrap Behavior
 
-`raft.initMembershipPerGroup` defaults to `true` so a fresh cluster can initialize per-group Raft membership automatically. Initialization checks the durable Raft log before changing membership, so persistent `logDir` deployments can keep the value enabled across restarts and upgrades. Memory Raft storage cannot recover a lost log and retains a separate automatic-restart guard.
+`raft.initMembershipPerGroup` defaults to `true` so a fresh cluster can initialize per-group Raft membership automatically. Initialization checks the durable Raft log before changing membership, so persistent `logDir` deployments can keep the value enabled across restarts and upgrades. Memory Raft storage (`raft.storageMode=memory`) has no such guard in the chart: a restarted memory pod initializes again the groups it bootstraps (unless S3 snapshots are configured and it sees a leader within `raft.rejoin_probe`) and rejoins every group as a voter, by the leaders' count, with an empty log that the leaders do not backfill. Only a prepared rollout rebuilds it (`ursulactl repair-restarted-voter`, run by the graceful-rollout hook); after a crash, OOM kill or eviction run that command yourself. This is one more reason production must use `logDir`.
 
 ## Static Membership And `server.replicaCount`
 

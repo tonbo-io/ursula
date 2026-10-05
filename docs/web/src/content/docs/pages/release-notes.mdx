@@ -13,6 +13,10 @@ A patch release on format epoch 2: no storage, snapshot or Raft protocol change.
 - **The leadership balancer hands a group only to a caught-up peer.** It used to hand leadership to a voter that had not replicated the leader's log; the transfer then left the leader muted while the target could not win, and the next restart fence timed out with "leader … is stale". The balancer now waits until the leader's replication metrics show the target matched its last log entry.
 - **The restart fence waits out an in-flight leadership transfer.** The restart fence (`prepare-restart`, `prepare-amnesiac-restart`, `repair-restarted-voter`) now waits 1.5 s (the Raft minimum election timeout) after fencing the surviving voters before it checks leadership, so a transfer accepted just before the fence settles first.
 
+### Known issue: a restarted memory-WAL node rejoins as an empty voter
+
+This is not fixed in 0.6.1. A node on `raft.wal.backend = "memory"` restarts with an empty Raft log, but the group leaders still count it as a voter, do not resend what it lost, and it grants its vote to any candidate. Until it is rebuilt, each of its groups holds two real copies while reporting three, and one more failure can lose acknowledged writes. A prepared rollout rebuilds it (`repair-restarted-voter`, fixed above); a crash, OOM kill, eviction or node loss does not. Production clusters must use the disk WAL. On a memory-WAL cluster, after any unplanned restart run `ursulactl verify-cluster` and, if it reports the node unready, `ursulactl repair-restarted-voter --node N`. See [Restarting a memory-WAL node](/docs/operations#restarting-a-memory-wal-node).
+
 ## 0.6.0
 
 **0.6.0 is a breaking release.** It changes the storage format (format epoch 2) and removes several protocol features (listed in the release notes). It refuses to start on data written by 0.5.x (Raft WAL directories, object-storage prefixes, snapshots and backups) and will not join a cluster with 0.5.x nodes. There is no in-place upgrade, no automatic migration and no rollback.
