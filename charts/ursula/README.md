@@ -77,6 +77,16 @@ kubectl port-forward svc/ursula 4437:4437
 curl http://127.0.0.1:4437/__ursula/metrics
 ```
 
+Operator endpoints such as bucket purge (`DELETE /__ursula/purge/{bucket}`) are
+served only on the admin listener, which `server.adminListen` keeps on pod
+loopback (`127.0.0.1:4438`) and no Service exposes. Reach it on one voter pod
+with `kubectl port-forward` (or run `curl` inside the pod with `kubectl exec`):
+
+```bash
+kubectl port-forward pod/ursula-0 4438:4438
+curl -X DELETE http://127.0.0.1:4438/__ursula/purge/tenant-a
+```
+
 ## Expose With Ingress
 
 Set `gateway.ingress.enabled=true` to create a Kubernetes Ingress for the

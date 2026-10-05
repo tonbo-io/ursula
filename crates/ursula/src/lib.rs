@@ -827,8 +827,8 @@ pub fn router_with_http_state(state: HttpState) -> Router {
 }
 
 /// Admin-plane routes: the mutating operator surface (raft group operations,
-/// maintenance drain, cold-flush trigger) plus read-only metrics so operator
-/// tooling works over a single tunnel. Production binds this to
+/// maintenance drain, cold-flush trigger, bucket purge) plus read-only metrics
+/// and usage so operator tooling works over a single tunnel. Production binds this to
 /// `server.admin_listen` (loopback by default) — nodes expose no
 /// cluster-mutation endpoints on the client or cluster planes.
 pub fn admin_router(state: HttpState) -> Router {
@@ -836,22 +836,22 @@ pub fn admin_router(state: HttpState) -> Router {
         Router::new()
             .route("/__ursula/metrics", get(metrics))
             .route("/__ursula/usage", get(bucket_usage))
-            .route(
-                "/__ursula/purge/{bucket}",
-                axum::routing::delete(purge_bucket),
-            )
             .with_state(state),
     )
 }
 
-/// The mutating admin routes without the metrics alias. The single-router
-/// convenience mergers use this directly because the client plane already
-/// serves `/__ursula/metrics`.
+/// The mutating admin routes without the metrics and usage aliases. The
+/// single-router convenience mergers use this directly because the client
+/// plane already serves `/__ursula/metrics` and `/__ursula/usage`.
 fn admin_ops_router(state: HttpState) -> Router {
     let router = Router::new()
         .route(
             "/__ursula/flush-cold/{bucket}/{stream}",
             post(flush_cold_stream),
+        )
+        .route(
+            "/__ursula/purge/{bucket}",
+            axum::routing::delete(purge_bucket),
         )
         .route("/__ursula/backup/info", get(backup_info))
         .route(
@@ -1261,10 +1261,6 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         .route("/__ursula/metrics", get(metrics))
         .route(READINESS_PATH, get(readiness))
         .route("/__ursula/usage", get(bucket_usage))
-        .route(
-            "/__ursula/purge/{bucket}",
-            axum::routing::delete(purge_bucket),
-        )
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .route("/{bucket}", put(create_bucket))
         // The bare path (the removed latest-snapshot redirect and the removed
@@ -1463,10 +1459,7 @@ pub(crate) async fn purge_bucket(
 ) -> Response {
     let report = match state.runtime.purge_bucket_all_groups(&bucket).await {
         Ok(report) => report,
-        Err(err) => {
-            let target = format!("/__ursula/purge/{bucket}");
-            return runtime_error_or_leader_redirect_async(&state, err, &target).await;
-        }
+        Err(err) => return purge_error_response(err),
     };
     // Reclaim the just-enqueued cold prefixes now instead of waiting for the
     // background worker's next pass. Failures leave entries queued for the
@@ -1492,10 +1485,7 @@ pub(crate) async fn purge_bucket(
     // background worker can all make it zero without proving cold absence.
     let proof = match state.runtime.purge_bucket_all_groups(&bucket).await {
         Ok(report) => report,
-        Err(err) => {
-            let target = format!("/__ursula/purge/{bucket}");
-            return runtime_error_or_leader_redirect_async(&state, err, &target).await;
-        }
+        Err(err) => return purge_error_response(err),
     };
     let bucket_prefix_absent = if proof.pending_cold_gc_entries == 0 && cold_gc_error.is_none() {
         match state
@@ -1525,6 +1515,16 @@ pub(crate) async fn purge_bucket(
         "bucket_prefix_absent": bucket_prefix_absent,
     }))
     .into_response()
+}
+
+/// Purge runs on the admin listener, so it never redirects to a peer's client
+/// URL. A group whose leader is unknown or moving answers `503` with
+/// `Retry-After`; purge is idempotent, so the caller retries the whole request.
+fn purge_error_response(err: RuntimeError) -> Response {
+    if is_forward_to_leader(&err) {
+        return leader_unknown_retry_response(err);
+    }
+    runtime_error_response(err)
 }
 
 const COLD_GC_PURGE_BATCH_MAX_ENTRIES: usize = 4096;
@@ -3760,8 +3760,8 @@ fn is_forward_to_leader(err: &RuntimeError) -> bool {
     err.leader_hint().is_some()
 }
 
-/// 503 + `Retry-After: 1` for a write that hit a non-leader while the group has
-/// no known leader. Retryable: a new leader should be elected shortly.
+/// 503 + `Retry-After: 1` for a request that must reach the group leader but
+/// cannot be redirected (purge) or has no known leader. Retryable.
 fn leader_unknown_retry_response(err: RuntimeError) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
