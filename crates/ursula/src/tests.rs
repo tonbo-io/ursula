@@ -2603,7 +2603,7 @@ async fn static_grpc_memory_node_rejoins_all_groups_through_membership_replaceme
         .post(format!("{}/__ursula/raft/quiesce-for-restart", peers[2].1))
         .send()
         .await
-        .expect("quiesce stale replacement before membership replacement");
+        .expect("quiesce stale replacement before restarting it");
     assert_eq!(quiesce.status(), StatusCode::OK);
 
     stale_replacement.shutdown().await;
@@ -2679,7 +2679,6 @@ async fn static_grpc_memory_restart_with_bootstrap_marker_fails_fast() {
 
     let engine_config = ursula_raft::RaftEngineConfig {
         memory_bootstrap_marker_dir: Some(marker_dir.path().to_path_buf()),
-        rejoin_probe: Duration::from_millis(100),
         bootstrap_peer_probe: Duration::from_millis(100),
         bootstrap_peer_probe_interval: Duration::from_millis(20),
         bootstrap_peer_connect: Duration::from_millis(20),

@@ -8,8 +8,10 @@
 //! - **Bootstrap decision** ([`bootstrap_decision`]): a group's initializer
 //!   runs `Initialize` only when every configured voter answers a probe
 //!   `Vote` with an empty log and no leader. The probe carries the lowest
-//!   possible vote (term 0, the prober's id) and no log, so OpenRaft refuses
-//!   it without changing any state. One peer that holds committed entries or
+//!   possible vote (term 0, the prober's id) and no log. A peer that holds
+//!   the group refuses it; a peer with no vote yet may grant it, which only
+//!   records a term-0 vote that `Initialize` overwrites and that never
+//!   counts as initialized. One peer that holds committed entries or
 //!   follows a leader means the group exists: the replica waits to be
 //!   replicated to instead of founding a second group.
 //! - **Vote gate** ([`VoteGate`]): from start until it holds the log that a
@@ -507,8 +509,10 @@ pub fn bootstrap_decision<'a>(
     }
 }
 
-/// The probe vote: the lowest vote a node can send, with no log. OpenRaft
-/// refuses it (a lower or incomparable vote) without changing any state.
+/// The probe vote: the lowest vote a node can send, with no log. A peer that
+/// holds the group refuses it. A peer with no vote yet may grant it, which
+/// only records a term-0 vote: harmless, since that never counts as
+/// initialized and `Initialize` overwrites it.
 pub fn bootstrap_probe_vote(node_id: u64) -> UrsulaVoteRequest {
     UrsulaVoteRequest::new(UrsulaVote::new(0, node_id), None)
 }
@@ -519,6 +523,9 @@ pub(crate) struct HealView {
     pub is_leader: bool,
     /// The effective membership is a single (non-joint) config.
     pub uniform: bool,
+    /// The joint config was already the effective one on the previous
+    /// tick: nothing is flattening it.
+    pub stale_joint: bool,
     pub voters: BTreeSet<u64>,
     pub learners: BTreeSet<u64>,
     pub reverted: BTreeSet<u64>,
@@ -537,8 +544,11 @@ pub(crate) enum HealStep {
     RemoveLearner { target: u64 },
     /// Add a configured voter that is missing as a learner.
     AddLearner { target: u64 },
-    /// Promote a caught-up learner back to the configured voter set.
+    /// Promote a caught-up learner: `voters` is the current voters plus it.
     Promote { target: u64, voters: BTreeSet<u64> },
+    /// Flatten a joint config whose second step was never proposed (the
+    /// proposing future timed out or its leader stepped down).
+    FinishJoint,
 }
 
 fn quorum(voter_count: usize) -> usize {
@@ -547,8 +557,11 @@ fn quorum(voter_count: usize) -> usize {
 
 /// The next heal step for a group this node leads, if any.
 pub(crate) fn plan_heal_step(view: &HealView) -> Option<HealStep> {
-    if !view.is_leader || !view.uniform {
+    if !view.is_leader {
         return None;
+    }
+    if !view.uniform {
+        return view.stale_joint.then_some(HealStep::FinishJoint);
     }
     if let Some(target) = view.voters.intersection(&view.reverted).next() {
         // The removal commits only with a quorum of the current voters that
@@ -571,21 +584,26 @@ pub(crate) fn plan_heal_step(view: &HealView) -> Option<HealStep> {
     if !view.voters.is_subset(&view.configured) {
         return None;
     }
-    let mut missing = view.configured.difference(&view.voters);
-    let (Some(target), None) = (missing.next(), missing.next()) else {
-        return None;
-    };
-    if !view.learners.contains(target) {
-        return Some(HealStep::AddLearner { target: *target });
-    }
-    let matched = view.matched.get(target).copied().flatten();
-    if matched >= view.committed {
+    // Several configured voters can be missing at once (two overlapping
+    // restarts in a group of five): promote whichever caught up first, and
+    // add the others back as learners one step at a time.
+    let missing = view.configured.difference(&view.voters);
+    let caught_up = missing.clone().find(|target| {
+        view.learners.contains(target)
+            && view.matched.get(target).copied().flatten() >= view.committed
+    });
+    if let Some(target) = caught_up {
+        let mut voters = view.voters.clone();
+        voters.insert(*target);
         return Some(HealStep::Promote {
             target: *target,
-            voters: view.configured.clone(),
+            voters,
         });
     }
-    None
+    missing
+        .clone()
+        .find(|target| !view.learners.contains(target))
+        .map(|target| HealStep::AddLearner { target: *target })
 }
 
 fn heal_view(
@@ -597,6 +615,7 @@ fn heal_view(
     HealView {
         is_leader: metrics.state == ServerState::Leader,
         uniform: membership.get_joint_config().len() == 1,
+        stale_joint: false,
         voters: membership.voter_ids().collect(),
         learners: membership.learner_ids().collect(),
         reverted: rejoin.reverted_followers(&metrics.vote),
@@ -626,6 +645,8 @@ pub async fn run_rejoin_heal(
     interval: Duration,
 ) {
     let configured_ids = configured.keys().copied().collect::<BTreeSet<_>>();
+    // The log id of the joint config seen on the previous tick, if any.
+    let mut last_joint = None;
     loop {
         crate::rt::time::sleep(interval).await;
         let step = {
@@ -633,7 +654,11 @@ pub async fn run_rejoin_heal(
             if metrics.running_state.is_err() {
                 return;
             }
-            plan_heal_step(&heal_view(&metrics, &rejoin, &configured_ids))
+            let mut view = heal_view(&metrics, &rejoin, &configured_ids);
+            let joint = (!view.uniform).then(|| *metrics.membership_config.log_id());
+            view.stale_joint = joint.is_some() && joint == last_joint;
+            last_joint = joint;
+            plan_heal_step(&view)
         };
         let Some(step) = step else {
             continue;
@@ -679,13 +704,21 @@ pub async fn run_rejoin_heal(
             )
             .await
             .map(|result| result.map(|_| ()).map_err(|err| err.to_string())),
+            // A no-op change on a joint config is OpenRaft's own second step:
+            // it commits the new config alone.
+            HealStep::FinishJoint => crate::rt::time::timeout(
+                REJOIN_HEAL_STEP_TIMEOUT,
+                raft.change_membership(ChangeMembers::AddVoterIds(BTreeSet::new()), false),
+            )
+            .await
+            .map(|result| result.map(|_| ()).map_err(|err| err.to_string())),
         };
         match result {
             Ok(Ok(())) => match &step {
                 HealStep::RemoveVoter { target, .. } | HealStep::RemoveLearner { target } => {
                     rejoin.clear_reverted(*target);
                 }
-                HealStep::AddLearner { .. } => {}
+                HealStep::AddLearner { .. } | HealStep::FinishJoint => {}
                 HealStep::Promote { target, .. } => tracing::info!(
                     node_id,
                     raft_group_id = group,
@@ -719,6 +752,11 @@ mod tests {
 
     fn leader(term: u64, node_id: u64) -> UrsulaVote {
         UrsulaVote::new_committed(term, node_id)
+    }
+
+    fn log_id(term: u64, node_id: u64, index: u64) -> LogIdOf<UrsulaRaftTypeConfig> {
+        type LeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
+        openraft::LogId::new(LeaderId::new(term, node_id), index)
     }
 
     fn follower(last_applied: Option<u64>) -> LocalReplica {
@@ -831,12 +869,18 @@ mod tests {
             PeerGroupLog::from_vote_response(&following),
             PeerGroupLog::Initialized
         );
+        let holding = UrsulaVoteResponse::new(vote(2, 2), Some(log_id(2, 2, 5)), false);
+        assert_eq!(
+            PeerGroupLog::from_vote_response(&holding),
+            PeerGroupLog::Initialized
+        );
     }
 
     fn view(voters: &[u64], learners: &[u64], reverted: &[u64]) -> HealView {
         HealView {
             is_leader: true,
             uniform: true,
+            stale_joint: false,
             voters: voters.iter().copied().collect(),
             learners: learners.iter().copied().collect(),
             reverted: reverted.iter().copied().collect(),
@@ -885,12 +929,66 @@ mod tests {
         let mut follower_view = view(&[1, 2, 3], &[], &[3]);
         follower_view.is_leader = false;
         assert_eq!(plan_heal_step(&follower_view), None);
+        // A voter outside the static config: not a restart repair, leave it
+        // to the operator.
+        assert_eq!(plan_heal_step(&view(&[1, 2, 4], &[], &[])), None);
+    }
+
+    #[test]
+    fn the_heal_driver_rebuilds_two_overlapping_restarts_in_a_group_of_five() {
+        let five = |voters: &[u64], learners: &[u64], reverted: &[u64]| HealView {
+            configured: BTreeSet::from([1, 2, 3, 4, 5]),
+            ..view(voters, learners, reverted)
+        };
+        // 4 and 5 restarted: both are removed while three healthy voters
+        // remain a quorum.
+        assert!(matches!(
+            plan_heal_step(&five(&[1, 2, 3, 4, 5], &[], &[4, 5])),
+            Some(HealStep::RemoveVoter { .. })
+        ));
+        assert!(matches!(
+            plan_heal_step(&five(&[1, 2, 3, 4], &[], &[4])),
+            Some(HealStep::RemoveVoter { target: 4, .. })
+        ));
+        assert_eq!(
+            plan_heal_step(&five(&[1, 2, 3], &[], &[])),
+            Some(HealStep::AddLearner { target: 4 })
+        );
+        // 4 caught up while 5 is not back yet: promote 4 alone.
+        let mut partly = five(&[1, 2, 3], &[4], &[]);
+        partly.matched.insert(4, Some(10));
+        assert_eq!(
+            plan_heal_step(&partly),
+            Some(HealStep::Promote {
+                target: 4,
+                voters: BTreeSet::from([1, 2, 3, 4]),
+            })
+        );
+        partly.matched.insert(4, Some(9));
+        assert_eq!(
+            plan_heal_step(&partly),
+            Some(HealStep::AddLearner { target: 5 })
+        );
+        let mut last = five(&[1, 2, 3, 4], &[5], &[]);
+        last.matched.insert(5, Some(10));
+        assert_eq!(
+            plan_heal_step(&last),
+            Some(HealStep::Promote {
+                target: 5,
+                voters: BTreeSet::from([1, 2, 3, 4, 5]),
+            })
+        );
+    }
+
+    #[test]
+    fn the_heal_driver_flattens_only_a_joint_config_nothing_else_finishes() {
         let mut joint = view(&[1, 2, 3], &[], &[3]);
         joint.uniform = false;
+        // Just entered: OpenRaft's own second step is still on its way.
         assert_eq!(plan_heal_step(&joint), None);
-        // Two configured voters missing, or a voter outside the static
-        // config: not a restart repair, leave it to the operator.
-        assert_eq!(plan_heal_step(&view(&[1], &[], &[])), None);
-        assert_eq!(plan_heal_step(&view(&[1, 2, 4], &[], &[])), None);
+        joint.stale_joint = true;
+        assert_eq!(plan_heal_step(&joint), Some(HealStep::FinishJoint));
+        joint.is_leader = false;
+        assert_eq!(plan_heal_step(&joint), None);
     }
 }

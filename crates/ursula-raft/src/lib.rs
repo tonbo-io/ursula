@@ -105,12 +105,7 @@ pub use registry::RaftGroupHandleRegistry;
 pub use registry::SingleNodeRaftNetwork;
 pub use registry::SingleNodeRaftNetworkFactory;
 pub use rejoin::AdoptSurvivorOutcome;
-pub use rejoin::BootstrapDecision;
 pub use rejoin::GroupRejoin;
-pub use rejoin::PeerGroupLog;
-pub use rejoin::REJOIN_HEAL_INTERVAL;
-pub use rejoin::bootstrap_decision;
-pub use rejoin::bootstrap_probe_vote;
 pub use rejoin::run_rejoin_heal;
 #[cfg(madsim)]
 pub use sim_runtime::MadsimOpenRaftRuntime;

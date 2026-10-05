@@ -175,7 +175,6 @@ fn spawn_deferred_membership_initialization(
     raft_group_id: RaftGroupId,
     raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
     nodes: BTreeMap<u64, BasicNode>,
-    marker_path: Option<PathBuf>,
     engine_config: RaftEngineConfig,
 ) {
     tokio::spawn(async move {
@@ -198,10 +197,7 @@ fn spawn_deferred_membership_initialization(
                 "raft bootstrap: node {node_id} group {} failed to initialize membership: {err}",
                 raft_group_id.0
             );
-            return;
         }
-
-        write_bootstrap_marker(node_id, raft_group_id, marker_path.as_deref());
     });
 }
 
@@ -231,8 +227,8 @@ fn write_bootstrap_marker(
     }
 }
 
-/// Ask one voter what it holds for the group with the side-effect-free
-/// bootstrap probe vote. `None`: no answer (unreachable, or the group is not
+/// Ask one voter what it holds for the group with the bootstrap probe vote
+/// (see [`bootstrap_probe_vote`]). `None`: no answer (unreachable, or the group is not
 /// registered there yet).
 async fn probe_peer_group_log(
     raft_group_id: RaftGroupId,
@@ -284,7 +280,7 @@ fn spawn_memory_wal_membership_initialization(
             }
             let leader_seen = raft.metrics().borrow_watched().current_leader.is_some();
             let answers = if leader_seen {
-                vec![Some(PeerGroupLog::Initialized)]
+                Vec::new()
             } else {
                 futures_util::future::join_all(peers.iter().map(|(peer_id, address)| {
                     probe_peer_group_log(
@@ -297,7 +293,12 @@ fn spawn_memory_wal_membership_initialization(
                 }))
                 .await
             };
-            match bootstrap_decision(&answers) {
+            let decision = if leader_seen {
+                BootstrapDecision::Rejoin
+            } else {
+                bootstrap_decision(&answers)
+            };
+            match decision {
                 BootstrapDecision::Initialize => {
                     if let Err(err) = raft.initialize(nodes).await {
                         tracing::error!(
@@ -664,30 +665,6 @@ impl StaticGrpcRaftGroupEngineFactory {
             .is_some_and(|path| path.exists())
     }
 
-    #[cfg(test)]
-    fn mark_raft_memory_bootstrap_seen(
-        &self,
-        raft_group_id: RaftGroupId,
-    ) -> Result<(), GroupEngineError> {
-        if !self.uses_memory_log_store() {
-            return Ok(());
-        }
-        let Some(path) = self.raft_memory_bootstrap_marker_path(raft_group_id) else {
-            return Ok(());
-        };
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                GroupEngineError::new(format!("create raft-memory bootstrap marker dir: {err}"))
-            })?;
-        }
-        std::fs::write(&path, b"initialized\n").map_err(|err| {
-            GroupEngineError::new(format!(
-                "write raft-memory bootstrap marker {}: {err}",
-                path.display()
-            ))
-        })
-    }
-
     fn peer_nodes(&self) -> BTreeMap<u64, BasicNode> {
         self.peers
             .iter()
@@ -921,7 +898,6 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                             placement.raft_group_id,
                             engine.raft_handle(),
                             self.peer_nodes_for_group(placement.raft_group_id)?,
-                            self.raft_memory_bootstrap_marker_path(placement.raft_group_id),
                             self.engine_config.clone(),
                         );
                     }
@@ -1025,9 +1001,13 @@ mod tests {
             .with_engine_config(engine_config.clone());
         assert!(memory_factory.uses_memory_log_store());
         assert!(!memory_factory.raft_memory_bootstrap_seen(RaftGroupId(0)));
-        memory_factory
-            .mark_raft_memory_bootstrap_seen(RaftGroupId(0))
-            .expect("write marker");
+        write_bootstrap_marker(
+            1,
+            RaftGroupId(0),
+            memory_factory
+                .raft_memory_bootstrap_marker_path(RaftGroupId(0))
+                .as_deref(),
+        );
         assert!(memory_factory.raft_memory_bootstrap_seen(RaftGroupId(0)));
 
         let durable_factory = factory_for_node(1)
