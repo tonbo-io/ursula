@@ -240,7 +240,11 @@ pub fn spawn_leadership_balancer(
                         .map(|log_id| log_id.index());
                     handoff_target_caught_up(metrics.last_log_index, matched)
                 };
-                if !caught_up {
+                // A follower that lost its log still shows the matched index
+                // it reached before its restart until it is rebuilt.
+                if !caught_up
+                    || registry.is_reverted_follower(RaftGroupId(action.group_id), action.target)
+                {
                     tracing::debug!(
                         "leadership-balance: node {my_id} skips group {} -> node {}: target has not matched the leader's last log",
                         action.group_id,

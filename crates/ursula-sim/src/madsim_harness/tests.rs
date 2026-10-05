@@ -2760,3 +2760,385 @@ async fn ambiguous_compaction(commits: bool) {
         }
     }
 }
+
+// Memory-WAL rejoin (0.6.2). Every node runs the production rejoin state:
+// the vote gate screens the votes delivered to it, the network layer reports
+// followers that lost their log, and a heal driver rebuilds them.
+
+/// Seeds of the memory-WAL rejoin scenarios.
+const MEMORY_WAL_REJOIN_SEEDS: [u64; 4] = [1, 2, 7, 12];
+
+fn rejoin_configured_voters() -> BTreeMap<u64, BasicNode> {
+    (1..=3)
+        .map(|node_id| (node_id, BasicNode::new(format!("node-{node_id}"))))
+        .collect()
+}
+
+struct RejoinCluster {
+    registry: InProcessRaftRegistry,
+    policy: InProcessRaftNetworkPolicy,
+    config: Arc<Config>,
+    engines: BTreeMap<u64, RaftGroupEngine>,
+    rejoins: BTreeMap<u64, Arc<ursula_raft::GroupRejoin>>,
+}
+
+impl RejoinCluster {
+    async fn start() -> Self {
+        let config = Arc::new(
+            Config {
+                cluster_name: "ursula-sim-memory-wal-rejoin".to_owned(),
+                heartbeat_interval: 10,
+                election_timeout_min: 50,
+                election_timeout_max: 100,
+                ..Default::default()
+            }
+            .validate()
+            .expect("valid raft config"),
+        );
+        let mut cluster = Self {
+            registry: InProcessRaftRegistry::default(),
+            policy: sim_network_policy(),
+            config,
+            engines: BTreeMap::new(),
+            rejoins: BTreeMap::new(),
+        };
+        for node_id in 1..=3 {
+            cluster.start_empty(node_id).await;
+        }
+        cluster.engines[&1]
+            .initialize_membership(rejoin_configured_voters())
+            .await
+            .expect("initialize the group");
+        cluster.wait_leader(Duration::from_secs(5)).await;
+        cluster
+    }
+
+    /// Start `node_id` with an empty memory log, as a restarted process does.
+    async fn start_empty(&mut self, node_id: u64) {
+        let rejoin = Arc::new(ursula_raft::GroupRejoin::new(
+            node_id,
+            placement().raft_group_id,
+        ));
+        let engine = RaftGroupEngine::new_node_with_log_store_and_network(
+            placement(),
+            node_id,
+            self.config.clone(),
+            InProcessRaftNetworkFactory::new(self.registry.clone())
+                .with_source(node_id)
+                .with_policy(self.policy.clone())
+                .with_rejoin(rejoin.clone()),
+            RaftGroupLogStore::shared(),
+            None,
+            None,
+        )
+        .await
+        .expect("start a memory-WAL node");
+        rejoin.bind(&engine.raft_handle());
+        self.registry.register_rejoin(node_id, rejoin.clone());
+        self.registry.register(node_id, engine.raft_handle());
+        madsim::task::spawn(ursula_raft::run_rejoin_heal(
+            engine.raft_handle(),
+            rejoin.clone(),
+            rejoin_configured_voters(),
+            Duration::from_millis(50),
+        ));
+        self.engines.insert(node_id, engine);
+        self.rejoins.insert(node_id, rejoin);
+    }
+
+    /// Crash `node_ids` at once and start them again with empty logs.
+    async fn restart_empty(&mut self, node_ids: &[u64]) {
+        for node_id in node_ids {
+            self.registry.unregister(*node_id);
+            let engine = self.engines.remove(node_id).expect("running node");
+            engine.shutdown().await.expect("stop node");
+        }
+        for node_id in node_ids {
+            self.start_empty(*node_id).await;
+        }
+    }
+
+    fn metrics(&self, node_id: u64) -> openraft::RaftMetrics<UrsulaRaftTypeConfig> {
+        openraft::rt::WatchReceiver::borrow_watched(&self.engines[&node_id].raft_handle().metrics())
+            .clone()
+    }
+
+    fn leader(&self) -> Option<u64> {
+        self.engines
+            .keys()
+            .copied()
+            .find(|node_id| self.metrics(*node_id).state == openraft::ServerState::Leader)
+    }
+
+    async fn wait_leader(&self, timeout: Duration) -> u64 {
+        let deadline = madsim::time::Instant::now() + timeout;
+        loop {
+            if let Some(leader) = self.leader() {
+                return leader;
+            }
+            assert!(
+                madsim::time::Instant::now() < deadline,
+                "no leader within {timeout:?}"
+            );
+            madsim::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn applied(&self, node_id: u64) -> Option<u64> {
+        self.metrics(node_id)
+            .last_applied
+            .map(|log_id| log_id.index)
+    }
+
+    /// `node_id` is a voter of the leader's membership and holds everything
+    /// the leader committed.
+    fn healed(&self, leader: u64, node_id: u64) -> bool {
+        let leader_metrics = self.metrics(leader);
+        let voter = leader_metrics
+            .membership_config
+            .voter_ids()
+            .any(|voter| voter == node_id);
+        let committed = leader_metrics.committed.map(|log_id| log_id.index);
+        voter && committed.is_some() && self.applied(node_id) >= committed
+    }
+
+    async fn append(
+        &mut self,
+        node_id: u64,
+        stream: &BucketStreamId,
+        payload: &[u8],
+    ) -> Result<(), String> {
+        let engine = self.engines.get_mut(&node_id).expect("running node");
+        let append = engine.append(
+            AppendRequest::from_bytes(stream.clone(), payload.to_vec()),
+            placement(),
+            ColdWriteAdmission::default(),
+        );
+        match madsim::time::timeout(Duration::from_secs(2), append).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_) => Err("append timed out".to_owned()),
+        }
+    }
+
+    async fn read_everywhere(&self, stream: &BucketStreamId, acknowledged: &[u8]) {
+        for (node_id, engine) in &self.engines {
+            read_local_payload_eventually(
+                engine,
+                *node_id,
+                stream,
+                0,
+                acknowledged.len() + 16,
+                acknowledged,
+                "every replica holds every acknowledged byte",
+            )
+            .await;
+        }
+    }
+}
+
+/// Write `count` records through the leader, recording the acknowledged
+/// bytes.
+async fn rejoin_write(
+    cluster: &mut RejoinCluster,
+    stream: &BucketStreamId,
+    acknowledged: &mut Vec<u8>,
+    first: usize,
+    count: usize,
+) {
+    for index in first..first + count {
+        let leader = cluster.wait_leader(Duration::from_secs(5)).await;
+        let payload = format!("record-{index};").into_bytes();
+        cluster
+            .append(leader, stream, &payload)
+            .await
+            .unwrap_or_else(|err| panic!("append record {index}: {err}"));
+        acknowledged.extend_from_slice(&payload);
+    }
+}
+
+async fn rejoin_cluster_with_records(stream: &BucketStreamId) -> (RejoinCluster, Vec<u8>) {
+    let mut cluster = RejoinCluster::start().await;
+    let leader = cluster.wait_leader(Duration::from_secs(5)).await;
+    cluster
+        .engines
+        .get_mut(&leader)
+        .expect("leader")
+        .create_stream(
+            CreateStreamRequest::new(stream.clone(), "application/octet-stream"),
+            placement(),
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("create stream");
+    let mut acknowledged = Vec::new();
+    rejoin_write(&mut cluster, stream, &mut acknowledged, 0, 8).await;
+    let committed = cluster.applied(leader).expect("leader applied");
+    for node_id in 1..=3 {
+        cluster.engines[&node_id]
+            .raft_handle()
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index_at_least(Some(committed), "every replica applied the records")
+            .await
+            .expect("replicas caught up before the restart");
+    }
+    (cluster, acknowledged)
+}
+
+/// A minority (one follower) restarts with an empty memory log while writes
+/// continue. It must not count as a voter with an empty log: the leader sees
+/// it lost acknowledged entries and rebuilds it through remove, learner,
+/// catch-up and promote, with no operator; its vote gate opens once it holds
+/// the log again.
+#[test]
+fn memory_wal_minority_restart_heals_to_a_voter() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("MEMORY_WAL_REJOIN_SEEDS", &MEMORY_WAL_REJOIN_SEEDS) {
+        run_with_madsim(seed, async move {
+            let stream = BucketStreamId::new("simulated", "rejoin-minority");
+            let (mut cluster, mut acknowledged) = rejoin_cluster_with_records(&stream).await;
+            let leader = cluster.wait_leader(Duration::from_secs(5)).await;
+            let restarted = seeded_follower_id(seed, leader);
+            cluster.restart_empty(&[restarted]).await;
+            assert!(
+                !cluster.rejoins[&restarted].vote_gate_open(),
+                "a restarted replica starts with its vote gate closed"
+            );
+
+            // Writes keep flowing while the replica heals.
+            rejoin_write(&mut cluster, &stream, &mut acknowledged, 8, 24).await;
+
+            let deadline = madsim::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                let leader = cluster.wait_leader(Duration::from_secs(5)).await;
+                if cluster.healed(leader, restarted) && cluster.rejoins[&restarted].vote_gate_open()
+                {
+                    break;
+                }
+                assert!(
+                    madsim::time::Instant::now() < deadline,
+                    "seed {seed}: node {restarted} never healed back to a caught-up voter: \
+                     leader {leader} membership {:?}, applied {:?}",
+                    cluster.metrics(leader).membership_config,
+                    cluster.applied(restarted)
+                );
+                madsim::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            rejoin_write(&mut cluster, &stream, &mut acknowledged, 32, 4).await;
+            cluster.read_everywhere(&stream, &acknowledged).await;
+        });
+    }
+}
+
+/// A majority restarts with empty memory logs at once. The group must stop
+/// accepting writes instead of electing a leader from incomplete data, and
+/// lose no acknowledged write; once the operator adopts the survivor's log,
+/// the group heals. Even seeds restart both followers (the leader survives
+/// and keeps leading, unable to commit); odd seeds restart the leader and one
+/// follower (the survivor campaigns and is refused).
+#[test]
+fn memory_wal_majority_restart_stops_writes_until_the_operator_adopts_the_survivor() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("MEMORY_WAL_REJOIN_SEEDS", &MEMORY_WAL_REJOIN_SEEDS) {
+        run_with_madsim(seed, async move {
+            let stream = BucketStreamId::new("simulated", "rejoin-majority");
+            let (mut cluster, mut acknowledged) = rejoin_cluster_with_records(&stream).await;
+            let leader = cluster.wait_leader(Duration::from_secs(5)).await;
+            let survivor = if seed % 2 == 0 {
+                leader
+            } else {
+                seeded_follower_id(seed, leader)
+            };
+            let restarted = (1..=3)
+                .filter(|node_id| *node_id != survivor)
+                .collect::<Vec<_>>();
+            cluster.restart_empty(&restarted).await;
+
+            // No write is accepted and no emptied replica leads.
+            madsim::time::sleep(Duration::from_secs(3)).await;
+            for attempt in 0..3 {
+                let writer = cluster.leader().unwrap_or(survivor);
+                assert!(
+                    restarted
+                        .iter()
+                        .all(|node_id| Some(*node_id) != cluster.leader()),
+                    "seed {seed}: an emptied replica became leader"
+                );
+                let refused = cluster
+                    .append(writer, &stream, format!("refused-{attempt};").as_bytes())
+                    .await;
+                assert!(
+                    refused.is_err(),
+                    "seed {seed}: a write was acknowledged while a majority was empty"
+                );
+            }
+            for node_id in &restarted {
+                assert!(
+                    !cluster.rejoins[node_id].vote_gate_open(),
+                    "seed {seed}: emptied node {node_id} opened its vote gate"
+                );
+            }
+            // The survivor still holds every acknowledged byte.
+            read_local_payload_eventually(
+                &cluster.engines[&survivor],
+                survivor,
+                &stream,
+                0,
+                acknowledged.len() + 16,
+                &acknowledged,
+                "the survivor holds every acknowledged byte",
+            )
+            .await;
+
+            // Operator recovery: adopt the survivor's log on every replica.
+            for node_id in 1..=3 {
+                let raft = cluster.engines[&node_id].raft_handle();
+                cluster.rejoins[&node_id]
+                    .adopt_survivor(&raft, survivor)
+                    .await
+                    .unwrap_or_else(|err| panic!("adopt survivor on node {node_id}: {err}"));
+            }
+            let deadline = madsim::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Some(leader) = cluster.leader()
+                    && restarted
+                        .iter()
+                        .all(|node_id| cluster.healed(leader, *node_id))
+                {
+                    assert_eq!(leader, survivor, "seed {seed}: only the survivor may lead");
+                    break;
+                }
+                assert!(
+                    madsim::time::Instant::now() < deadline,
+                    "seed {seed}: the group never healed after the operator adopted node {survivor}"
+                );
+                madsim::time::sleep(Duration::from_millis(50)).await;
+            }
+            // An unacknowledged write may have committed after recovery; the
+            // acknowledged prefix must be intact everywhere.
+            let leader = cluster.wait_leader(Duration::from_secs(5)).await;
+            let read = cluster.engines[&leader]
+                .sim_read_local_stream(
+                    ReadStreamRequest {
+                        stream_id: stream.clone(),
+                        offset: 0,
+                        max_len: 1 << 20,
+                        now_ms: 0,
+                        leader_only: false,
+                        read_index: None,
+                    },
+                    placement(),
+                )
+                .await
+                .expect("read the healed stream");
+            assert!(
+                read.payload.starts_with(&acknowledged),
+                "seed {seed}: an acknowledged write was lost"
+            );
+            acknowledged = read.payload.to_vec();
+            rejoin_write(&mut cluster, &stream, &mut acknowledged, 100, 4).await;
+            cluster.read_everywhere(&stream, &acknowledged).await;
+        });
+    }
+}

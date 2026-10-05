@@ -164,6 +164,11 @@ pub fn spawn_commit_stall_watchdog(
                 );
                 let mut handed_off = false;
                 for target in &action.targets {
+                    // A follower that lost its log can never win: handing it
+                    // leadership would only park the group in a transfer.
+                    if registry.is_reverted_follower(RaftGroupId(action.group_id), *target) {
+                        continue;
+                    }
                     match raft.trigger().transfer_leader(*target).await {
                         Ok(()) => {
                             tracing::warn!(
