@@ -1,0 +1,79 @@
+name: CI S3 backend
+description: >-
+  Real AWS S3 through GitHub OIDC when this run may assume the CI role, otherwise MinIO on
+  127.0.0.1:9000. Exports the URSULA_S3_* contract the tests read.
+inputs:
+  role-arn: { description: "vars.URSULA_CI_AWS_ROLE_ARN (empty selects MinIO)", required: false, default: "" }
+  bucket: { description: "vars.URSULA_CI_S3_BUCKET", required: false, default: "" }
+  region: { description: "vars.URSULA_CI_S3_REGION", required: false, default: us-east-1 }
+  job-key: { description: "Unique per job in the run (github.job plus matrix values)", required: true }
+  duration-seconds: { description: "Credential lifetime; must outlive the rest of the job", required: false, default: "3600" }
+outputs:
+  mode: { description: "aws or minio", value: "${{ steps.mode.outputs.mode }}" }
+  prefix: { description: "ci/<run_id>-<attempt>/<job-key>", value: "${{ steps.mode.outputs.prefix }}" }
+runs:
+  using: composite
+  steps:
+    - id: mode
+      shell: bash
+      env:
+        EVENT: ${{ github.event_name }}
+        ROLE_ARN: ${{ inputs.role-arn }}
+        BUCKET: ${{ inputs.bucket }}
+        JOB_KEY: ${{ inputs.job-key }}
+        TRUSTED: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || ((github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main') }}
+      run: |
+        # Callers may only run on these events: the trust policy cannot tell pull_request_target,
+        # workflow_run or issue_comment apart from main.
+        case "$EVENT" in
+          pull_request | push | schedule | workflow_dispatch) ;;
+          *) echo "::error title=S3 backend::event '$EVENT' must not run a job that can assume the CI role"; exit 1 ;;
+        esac
+        case "$JOB_KEY" in '' | *[!A-Za-z0-9._-]*) echo "::error title=S3 backend::bad job-key '$JOB_KEY'"; exit 1 ;; esac
+        prefix="ci/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${JOB_KEY}"
+        # The OIDC request URL exists only when GitHub issues this job a token (absent on fork and
+        # Dependabot PRs), so the choice does not depend on predicting GitHub's rules.
+        if [ "$TRUSTED" = true ] && [ -n "$ROLE_ARN" ] && [ -n "$BUCKET" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          if [ -n "${URSULA_S3_ENDPOINT:-}${AWS_ENDPOINT_URL:-}" ]; then
+            echo "::error title=S3 backend::URSULA_S3_ENDPOINT / AWS_ENDPOINT_URL must be unset for AWS mode"; exit 1
+          fi
+          mode=aws
+          echo "S3 backend: aws (s3://$BUCKET/$prefix/)" >> "$GITHUB_STEP_SUMMARY"
+        else
+          mode=minio
+          if [ "$TRUSTED" = true ]; then
+            echo "::warning title=S3 backend::MinIO: URSULA_CI_AWS_ROLE_ARN or URSULA_CI_S3_BUCKET unset, or no OIDC token"
+          else
+            echo "::notice title=S3 backend::MinIO: fork PRs and runs outside main cannot assume the CI role"
+          fi
+          echo "S3 backend: minio" >> "$GITHUB_STEP_SUMMARY"
+        fi
+        echo "mode=$mode" >> "$GITHUB_OUTPUT"
+        echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+    # No continue-on-error: a refused AssumeRole fails the job rather than hiding trust-policy drift
+    # behind MinIO.
+    - if: steps.mode.outputs.mode == 'aws'
+      uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+      with:
+        role-to-assume: ${{ inputs.role-arn }}
+        aws-region: ${{ inputs.region }}
+        role-session-name: ursula-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.job-key }}
+        role-duration-seconds: ${{ inputs.duration-seconds }}
+        inline-session-policy: >-
+          {"Version":"2012-10-17","Statement":[
+          {"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::${{ inputs.bucket }}"},
+          {"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:AbortMultipartUpload"],
+          "Resource":"arn:aws:s3:::${{ inputs.bucket }}/${{ steps.mode.outputs.prefix }}/*"}]}
+    - if: steps.mode.outputs.mode == 'aws'
+      shell: bash
+      env: { BUCKET: "${{ inputs.bucket }}", PREFIX: "${{ steps.mode.outputs.prefix }}", REGION: "${{ inputs.region }}" }
+      run: |
+        # Only after the credentials exist; cleanup and the leak guard key on URSULA_S3_PREFIX.
+        { echo "URSULA_S3_BUCKET=$BUCKET"; echo "URSULA_S3_PREFIX=$PREFIX"; echo "URSULA_S3_REGION=$REGION"
+          echo "AWS_EC2_METADATA_DISABLED=true"; } >> "$GITHUB_ENV"
+    - if: steps.mode.outputs.mode == 'minio'
+      shell: bash
+      run: |
+        "$GITHUB_WORKSPACE/scripts/minio_ci.sh"
+        { echo "URSULA_S3_ENDPOINT=http://127.0.0.1:9000"; echo "URSULA_S3_ACCESS_KEY=minioadmin"
+          echo "URSULA_S3_SECRET_KEY=minioadmin"; } >> "$GITHUB_ENV"

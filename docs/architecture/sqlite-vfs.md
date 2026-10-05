@@ -490,9 +490,10 @@ rebuild, delete `<db>`.
   and retention (a ~160 MB run; CI also runs it without a cold tier under the default hot limit;
   fresh and lagging hosts rebuild byte-identical from snapshot + tail; the takeover after the trim
   fences the old owner), Pi conformance in three modes, and a benchmark (sanity numbers only).
-- The same Pi conformance, snapshot and benchmark suites on 3 nodes + gateway + MinIO (the
-  snapshot run's ~3.5 MB bodies go to the cold tier), with a 64 KiB snapshot minimum
-  so the benchmark's Pi workload snapshots and trims at its database size.
+- The same Pi conformance, snapshot and benchmark suites on 3 nodes + gateway + S3 (AWS S3 in CI,
+  MinIO locally and for fork PRs; the snapshot run's ~3.5 MB bodies go to the cold tier), plus a
+  12 MiB snapshot body that exercises the multipart path, with a 64 KiB snapshot minimum so the
+  benchmark's Pi workload snapshots and trims at its database size.
 
 ## 9. Performance
 

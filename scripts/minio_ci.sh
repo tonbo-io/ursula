@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Starts MinIO for the CI jobs that need S3 (the sqlite-vfs cluster e2e and the memory soak) at
-# 127.0.0.1:9000 (minioadmin / minioadmin) and waits until it is live. The test stack creates its
-# own S3 buckets.
+# Starts MinIO at 127.0.0.1:9000 (minioadmin / minioadmin) and waits until it is live: for local
+# runs, and for the CI jobs that need S3 but cannot assume the AWS role (fork PRs, runs outside
+# main, or URSULA_CI_AWS_ROLE_ARN unset; see .github/actions/ci-s3). The test stack creates its own
+# S3 buckets.
 #
 # Tries, in order: a MinIO binary (MINIO_BIN or `minio` on PATH), a container (MINIO_IMAGE, else
 # quay.io/minio/minio then cgr.dev/chainguard/minio; Docker Hub's minio/minio is gone), and finally
@@ -38,6 +39,7 @@ if [ -z "$started" ]; then
     *) echo "unsupported architecture $(uname -m)" >&2; exit 1 ;;
   esac
   bin="${RUNNER_TEMP:-/tmp}/minio"
+  # Linux only; on macOS use brew (`minio` on PATH) or Docker.
   curl -fsSL -o "$bin" "https://dl.min.io/server/minio/release/linux-$arch/minio"
   chmod +x "$bin"
   run_binary "$bin"

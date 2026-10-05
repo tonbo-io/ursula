@@ -184,6 +184,7 @@ cargo test --workspace --lib --bins
 
 - `crates/ursula/tests/static_cluster_cli.rs`: Full static gRPC Raft cluster tests (spawns real processes).
 - `crates/ursula-runtime/tests/s3_cold_path.rs`: S3 cold-path integration test. Requires `URSULA_COLD_S3_INTEGRATION=1` and `URSULA_COLD_S3_BUCKET` environment variable.
+- The S3 tests (`s3_cold_path.rs`, the S3 cold-manifest restart in `static_cluster_cli.rs`, and `crates/ursula-index/tests/s3.rs`) put their roots under `URSULA_S3_PREFIX` when it is set. CI's Integration workflow runs them on real AWS S3 through GitHub OIDC (`.github/actions/ci-s3`), one prefix per job; fork PRs fall back to MinIO.
 
 ```bash
 # S3 integration test
