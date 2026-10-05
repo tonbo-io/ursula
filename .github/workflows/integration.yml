@@ -2,8 +2,9 @@ name: Integration
 
 # Verification that the main CI workflow (ci.yml) does not already run: every Rust integration test
 # target, and the sqlite-vfs extension (lint, units, build) with its TypeScript e2e suite against a
-# release `ursula` built once per run, on a single node and on 3 nodes + gateway + MinIO. Lint, unit
-# tests and the DST seeds run in ci.yml.
+# release `ursula` built once per run, on a single node and on 3 nodes + gateway + S3. S3 is real
+# AWS S3 through OIDC (.github/actions/ci-s3) on same-repo PRs and main, MinIO for fork PRs. Lint,
+# unit tests and the DST seeds run in ci.yml.
 
 on:
   pull_request:
@@ -25,53 +26,78 @@ jobs:
   integration:
     name: Rust integration tests
     runs-on: depot-ubuntu-24.04-8
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # Keeps the job's OIDC request variables out of cargo, build scripts and tests: a speed bump
+      # against env-scraping code, not a boundary.
+      NO_OIDC: env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           rustflags: ""
 
-      # The S3 tests (the runtime's cold path, the CLI cold-manifest restart, which exercises the
-      # format-epoch marker against real S3 listing, and ursula-index's conditional publish) run
-      # against MinIO. Each uses its own per-run root in one bucket.
-      - name: Start MinIO
-        run: scripts/minio_ci.sh
+      # Integration test targets only (`tests/*.rs` of every crate, including ursula-index's,
+      # which the main CI does not run); lib and bin unit tests run in ci.yml. ursula-sim runs
+      # under madsim in ci.yml's DST job. Built before any AWS credential exists.
+      - name: Build all integration targets
+        run: $NO_OIDC cargo test --workspace --exclude ursula-sim --test '*' --no-run
 
-      - name: Create the S3 test bucket
+      # AWS S3 through the CI role (one prefix per job) on same-repo PRs and main, MinIO otherwise.
+      - name: S3 backend
+        id: s3
+        uses: ./.github/actions/ci-s3
+        with:
+          role-arn: ${{ vars.URSULA_CI_AWS_ROLE_ARN }}
+          bucket: ${{ vars.URSULA_CI_S3_BUCKET }}
+          region: ${{ vars.URSULA_CI_S3_REGION || 'us-east-1' }}
+          job-key: ${{ github.job }}
+
+      - name: Create the MinIO test bucket
+        if: steps.s3.outputs.mode == 'minio'
         env:
           AWS_ACCESS_KEY_ID: minioadmin
           AWS_SECRET_ACCESS_KEY: minioadmin
           AWS_DEFAULT_REGION: us-east-1
-        run: |
-          if ! command -v aws >/dev/null 2>&1; then
-            python3 -m pip install --quiet --user awscli
-            export PATH="$HOME/.local/bin:$PATH"
-          fi
-          aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://ursula-ci
+        run: aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://ursula-ci
 
-      # Integration test targets only (`tests/*.rs` of every crate, including ursula-index's,
-      # which the main CI does not run); lib and bin unit tests run in ci.yml. ursula-sim runs
-      # under madsim in ci.yml's DST job.
+      # The S3 tests (the runtime's cold path, the CLI cold-manifest restart, which exercises the
+      # format-epoch marker against real S3 listing, and ursula-index's conditional publish) each
+      # use their own root under URSULA_S3_PREFIX. On AWS the TOML names no endpoint and no keys:
+      # the AWS_* session credentials and SSE-S3 apply, as in production. Inside the 3600 s session.
       - name: Test all integration targets
+        timeout-minutes: 55
         env:
-          URSULA_COLD_S3_INTEGRATION: "1"
-          URSULA_COLD_S3_BUCKET: ursula-ci
-          URSULA_COLD_S3_ENDPOINT: http://127.0.0.1:9000
-          URSULA_COLD_S3_REGION: us-east-1
-          URSULA_COLD_S3_ACCESS_KEY_ID: minioadmin
-          URSULA_COLD_S3_SECRET_ACCESS_KEY: minioadmin
-          URSULA_COLD_S3_SSE: none
-          URSULA_EVENT_INDEX_S3_INTEGRATION: "1"
-          URSULA_EVENT_INDEX_S3_BUCKET: ursula-ci
-          URSULA_EVENT_INDEX_S3_ENDPOINT: http://127.0.0.1:9000
-          URSULA_EVENT_INDEX_S3_REGION: us-east-1
-          AWS_ACCESS_KEY_ID: minioadmin
-          AWS_SECRET_ACCESS_KEY: minioadmin
-          AWS_REGION: us-east-1
-        run: cargo test --workspace --exclude ursula-sim --test '*'
+          MODE: ${{ steps.s3.outputs.mode }}
+        run: |
+          export URSULA_COLD_S3_INTEGRATION=1 URSULA_EVENT_INDEX_S3_INTEGRATION=1
+          if [ "$MODE" = aws ]; then
+            export URSULA_COLD_S3_BUCKET="$URSULA_S3_BUCKET" URSULA_COLD_S3_REGION="$URSULA_S3_REGION"
+            export URSULA_EVENT_INDEX_S3_BUCKET="$URSULA_S3_BUCKET" URSULA_EVENT_INDEX_S3_REGION="$URSULA_S3_REGION"
+          else
+            export URSULA_COLD_S3_BUCKET=ursula-ci URSULA_COLD_S3_REGION=us-east-1
+            export URSULA_COLD_S3_ENDPOINT=http://127.0.0.1:9000 URSULA_COLD_S3_SSE=none
+            export URSULA_COLD_S3_ACCESS_KEY_ID=minioadmin URSULA_COLD_S3_SECRET_ACCESS_KEY=minioadmin
+            export URSULA_EVENT_INDEX_S3_BUCKET=ursula-ci URSULA_EVENT_INDEX_S3_REGION=us-east-1
+            export URSULA_EVENT_INDEX_S3_ENDPOINT=http://127.0.0.1:9000
+            export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1
+          fi
+          $NO_OIDC cargo test --workspace --exclude ursula-sim --test '*'
+
+      - name: Delete this job's S3 prefix
+        if: always() && env.URSULA_S3_PREFIX != ''
+        continue-on-error: true
+        timeout-minutes: 10
+        env: { AWS_EC2_METADATA_DISABLED: "true" }
+        run: |
+          case "$URSULA_S3_PREFIX" in ci/*/*) ;; *) echo "::error::refusing to delete '$URSULA_S3_PREFIX'"; exit 1 ;; esac
+          aws s3 rm "s3://$URSULA_S3_BUCKET/$URSULA_S3_PREFIX/" --recursive --only-show-errors
 
   build-ursula:
     name: Build release ursula
@@ -81,7 +107,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           rustflags: ""
 
@@ -109,7 +135,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           rustflags: ""
           cache-workspaces: clients/sqlite-vfs
@@ -144,7 +170,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           rustflags: ""
           cache-workspaces: clients/sqlite-vfs
@@ -199,20 +225,20 @@ jobs:
           URSULA_COLD=none URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/snapshot.e2e.ts
 
   sqlite-vfs-e2e-cluster:
-    name: sqlite-vfs e2e (3 nodes + gateway + MinIO)
+    name: sqlite-vfs e2e (3 nodes + gateway + S3)
     needs: [build-ursula, sqlite-vfs]
     runs-on: depot-ubuntu-24.04-8
     timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write
     env:
-      URSULA_S3_ENDPOINT: http://127.0.0.1:9000
-      URSULA_S3_ACCESS_KEY: minioadmin
-      URSULA_S3_SECRET_KEY: minioadmin
+      # Keeps the job's OIDC request variables out of npm and test processes: a speed bump against
+      # env-scraping code, not a boundary.
+      NO_OIDC: env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
-      - name: Start MinIO
-        run: scripts/minio_ci.sh
 
       - name: Install Node
         uses: actions/setup-node@v6
@@ -231,12 +257,37 @@ jobs:
           name: sqlite-ursula-vfs
           path: ${{ runner.temp }}/vfs
 
-      # Snapshot bodies above 1 MiB go to the cold tier (S3). The benchmark's Pi turns snapshot and
-      # trim as they go (a 64 KiB minimum, so the threshold is the database size).
-      - name: Pi conformance (3 modes), snapshots + retention, benchmark through the gateway
-        timeout-minutes: 30
+      # Before any AWS credential exists. The tree's install scripts are not needed.
+      - name: Install dependencies
         run: |
           chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
           cd clients/sqlite-ursula
-          npm ci
-          E2E_NODES=3 URSULA_VFS_SNAPSHOT_MIN_BYTES=65536 URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/conformance.e2e.ts test/snapshot.e2e.ts test/bench.e2e.ts
+          $NO_OIDC npm ci --ignore-scripts
+
+      # AWS S3 through the CI role (one prefix per job) on same-repo PRs and main, MinIO otherwise.
+      - name: S3 backend
+        id: s3
+        uses: ./.github/actions/ci-s3
+        with:
+          role-arn: ${{ vars.URSULA_CI_AWS_ROLE_ARN }}
+          bucket: ${{ vars.URSULA_CI_S3_BUCKET }}
+          region: ${{ vars.URSULA_CI_S3_REGION || 'us-east-1' }}
+          job-key: ${{ github.job }}
+
+      # Snapshot bodies above 1 MiB go to the cold tier (S3); cold-snapshot.e2e.ts publishes one above
+      # the 8 MiB part size (a multipart upload). The benchmark's Pi turns snapshot and trim as they go
+      # (a 64 KiB minimum, so the threshold is the database size).
+      - name: Pi conformance (3 modes), snapshots + retention, multipart snapshot, benchmark through the gateway
+        timeout-minutes: 30
+        run: |
+          cd clients/sqlite-ursula
+          E2E_NODES=3 URSULA_VFS_SNAPSHOT_MIN_BYTES=65536 URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" $NO_OIDC npx vitest --run test/conformance.e2e.ts test/snapshot.e2e.ts test/cold-snapshot.e2e.ts test/bench.e2e.ts
+
+      - name: Delete this job's S3 prefix
+        if: always() && env.URSULA_S3_PREFIX != ''
+        continue-on-error: true
+        timeout-minutes: 10
+        env: { AWS_EC2_METADATA_DISABLED: "true" }
+        run: |
+          case "$URSULA_S3_PREFIX" in ci/*/*) ;; *) echo "::error::refusing to delete '$URSULA_S3_PREFIX'"; exit 1 ;; esac
+          aws s3 rm "s3://$URSULA_S3_BUCKET/$URSULA_S3_PREFIX/" --recursive --only-show-errors

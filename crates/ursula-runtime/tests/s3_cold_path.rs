@@ -28,7 +28,11 @@ async fn s3_cold_path_flushes_reads_and_cleans_up_object() {
         .as_nanos();
     let cold_cfg = ursula_runtime::ColdConfig {
         backend: ColdBackend::S3,
-        root: Some(format!("ursula-runtime-s3-cold-{suffix}")),
+        // CI scopes each job's credentials to URSULA_S3_PREFIX.
+        root: Some(match std::env::var("URSULA_S3_PREFIX") {
+            Ok(prefix) => format!("{prefix}/ursula-runtime-s3-cold-{suffix}"),
+            Err(_) => format!("ursula-runtime-s3-cold-{suffix}"),
+        }),
         s3: Some(ursula_config::S3Config {
             bucket: std::env::var("URSULA_COLD_S3_BUCKET").ok(),
             region: std::env::var("URSULA_COLD_S3_REGION").ok(),

@@ -579,7 +579,11 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time after unix epoch")
         .as_nanos();
-    let cold_root = format!("ursula-cli-s3-cold-restart/{suffix}");
+    // CI scopes each job's credentials to URSULA_S3_PREFIX.
+    let cold_root = match std::env::var("URSULA_S3_PREFIX") {
+        Ok(prefix) => format!("{prefix}/ursula-cli-s3-cold-restart/{suffix}"),
+        Err(_) => format!("ursula-cli-s3-cold-restart/{suffix}"),
+    };
 
     let ports = [free_port(), free_port(), free_port()];
     let peers: Vec<(u64, String)> = ports

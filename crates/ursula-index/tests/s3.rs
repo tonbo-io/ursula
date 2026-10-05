@@ -35,7 +35,14 @@ async fn real_s3_conditional_publish_and_cache_recovery() -> anyhow::Result<()> 
     let unique = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
-    let root = format!("ursula-index-integration/{}-{unique}", std::process::id());
+    // CI scopes each job's credentials to URSULA_S3_PREFIX.
+    let root = format!(
+        "{}ursula-index-integration/{}-{unique}",
+        std::env::var("URSULA_S3_PREFIX")
+            .map(|prefix| format!("{prefix}/"))
+            .unwrap_or_default(),
+        std::process::id()
+    );
     let store_config = S3ObjectStoreConfig {
         bucket: bucket.clone(),
         root: root.clone(),

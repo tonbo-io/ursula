@@ -2,11 +2,12 @@
 // except where noted. The per-group hot admission limit always stays at its default.
 // - Default: one `ursula server` node with a memory Raft WAL and an in-memory cold store
 //   (URSULA_COLD=none for none).
-// - E2E_NODES=3: three nodes (memory Raft WAL) behind an `ursula gateway`, with S3 (MinIO at
-//   URSULA_S3_ENDPOINT) as the cold store (snapshot bodies in the cold tier).
+// - E2E_NODES=3: three nodes (memory Raft WAL) behind an `ursula gateway`, with S3 as the cold
+//   store (snapshot bodies in the cold tier). See `resolveS3` for the backends: an endpoint
+//   (MinIO) with static keys, or AWS S3 with the ambient AWS_* credentials (URSULA_S3_BUCKET).
 import { type ChildProcess, spawn } from "node:child_process";
 import { appendFileSync } from "node:fs";
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -167,7 +168,7 @@ async function startSingle(): Promise<Stack> {
 	return { url, nodes: [{ url, pid: node.pid }], stop };
 }
 
-// ---- S3 (MinIO): bucket creation with a minimal path-style SigV4 request
+// ---- S3: backend resolution, and MinIO bucket creation with a minimal path-style SigV4 request
 
 const sha256 = (data: string): string => createHash("sha256").update(data).digest("hex");
 const hmac = (key: string | Buffer, data: string): Buffer => createHmac("sha256", key).update(data).digest();
@@ -191,17 +192,64 @@ async function createS3Bucket(endpoint: string, bucket: string, accessKey: strin
 		signal: AbortSignal.timeout(10_000),
 	});
 	const body = await r.text();
-	if (!r.ok && !body.includes("BucketAlreadyOwnedByYou")) throw new Error(`create S3 bucket ${bucket}: ${r.status} ${body}`);
+	if (!r.ok && !body.includes("BucketAlreadyOwnedByYou")) throw new Error(`create S3 bucket ${bucket}: ${r.status} ${body.slice(0, 500)}`);
+}
+
+/** Where the cluster's cold tier lives: the bucket, the root inside it, and the node TOML/env. */
+interface S3Target {
+	readonly bucket: string;
+	readonly root: string;
+	readonly toml: readonly string[];
+	readonly env: NodeJS.ProcessEnv;
+}
+
+/**
+ * 1. URSULA_S3_ENDPOINT set (MinIO): static keys (default minioadmin). With URSULA_S3_BUCKET too,
+ *    that existing bucket under URSULA_S3_PREFIX; otherwise a new bucket per stack, root `ursula`.
+ * 2. Otherwise URSULA_S3_BUCKET set (AWS): the existing bucket under URSULA_S3_PREFIX, no endpoint
+ *    and no keys in the TOML (the nodes inherit AWS_*, and SSE-S3 applies, as in production).
+ * 3. Otherwise there is no S3 to run against.
+ * A shared bucket gets a per-stack root `<prefix>/sqlite-<pid>-<ts36>-<8 hex>`.
+ */
+async function resolveS3(): Promise<S3Target> {
+	const endpoint = (process.env.URSULA_S3_ENDPOINT ?? "").replace(/\/+$/, "");
+	const shared = process.env.URSULA_S3_BUCKET ?? "";
+	const region = process.env.URSULA_S3_REGION ?? process.env.AWS_REGION ?? "us-east-1";
+	const prefix = (process.env.URSULA_S3_PREFIX ?? "").replace(/^\/+|\/+$/g, "");
+	const nonce = `sqlite-${process.pid}-${Date.now().toString(36)}-${randomBytes(4).toString("hex")}`;
+	const sharedRoot = prefix === "" ? nonce : `${prefix}/${nonce}`;
+	if (endpoint !== "") {
+		const accessKey = process.env.URSULA_S3_ACCESS_KEY ?? "minioadmin";
+		const secretKey = process.env.URSULA_S3_SECRET_KEY ?? "minioadmin";
+		const bucket = shared !== "" ? shared : `sqlite-${process.pid}-${Date.now().toString(36)}`;
+		if (shared === "") await createS3Bucket(endpoint, bucket, accessKey, secretKey, region);
+		return {
+			bucket,
+			root: shared !== "" ? sharedRoot : "ursula",
+			toml: [
+				`bucket = "${bucket}"`,
+				`region = "${region}"`,
+				`endpoint = "${endpoint}"`,
+				`access_key_id = "${accessKey}"`,
+				`secret_access_key = "${secretKey}"`,
+				'server_side_encryption = "none"',
+			],
+			// A developer shell's session token would otherwise ride along with the static keys.
+			env: { AWS_ACCESS_KEY_ID: accessKey, AWS_SECRET_ACCESS_KEY: secretKey, AWS_REGION: region, AWS_SESSION_TOKEN: undefined },
+		};
+	}
+	if (shared !== "") {
+		if (process.env.AWS_ENDPOINT_URL) throw new Error("AWS S3 mode (URSULA_S3_BUCKET) needs AWS_ENDPOINT_URL unset");
+		if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
+			throw new Error("AWS S3 mode (URSULA_S3_BUCKET) needs AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY");
+		}
+		return { bucket: shared, root: sharedRoot, toml: [`bucket = "${shared}"`, `region = "${region}"`], env: {} };
+	}
+	throw new Error("E2E_NODES=3 needs S3: URSULA_S3_ENDPOINT (MinIO) or URSULA_S3_BUCKET (AWS)");
 }
 
 async function startCluster(): Promise<Stack> {
-	const endpoint = (process.env.URSULA_S3_ENDPOINT ?? "").replace(/\/+$/, "");
-	if (endpoint === "") throw new Error("E2E_NODES=3 needs S3 at URSULA_S3_ENDPOINT");
-	const accessKey = process.env.URSULA_S3_ACCESS_KEY ?? "minioadmin";
-	const secretKey = process.env.URSULA_S3_SECRET_KEY ?? "minioadmin";
-	const region = process.env.URSULA_S3_REGION ?? "us-east-1";
-	const bucket = `sqlite-${process.pid}-${Date.now().toString(36)}`;
-	await createS3Bucket(endpoint, bucket, accessKey, secretKey, region);
+	const s3 = await resolveS3();
 	const dir = mkdtempSync(join(tmpdir(), "sqlite-ursula-cluster-"));
 	// Defaults are the e2e shape; the soak (test/soak.e2e.ts) raises them with E2E_GROUPS,
 	// E2E_CORES and E2E_WAL=disk.
@@ -243,18 +291,13 @@ async function startCluster(): Promise<Stack> {
 				"",
 				"[storage.cold]",
 				'backend = "s3"',
-				'root = "ursula"',
+				`root = "${s3.root}"`,
 				"",
 				"[storage.cold.s3]",
-				`bucket = "${bucket}"`,
-				`region = "${region}"`,
-				`endpoint = "${endpoint}"`,
-				`access_key_id = "${accessKey}"`,
-				`secret_access_key = "${secretKey}"`,
-				'server_side_encryption = "none"',
+				...s3.toml,
 			);
 			writeFileSync(config, `${lines.join("\n")}\n`);
-			procs.push(new Proc(ursulaBin(), ["server", "--config", config], nodeDir, { AWS_ACCESS_KEY_ID: accessKey, AWS_SECRET_ACCESS_KEY: secretKey, AWS_REGION: region }, `node${node.id}`));
+			procs.push(new Proc(ursulaBin(), ["server", "--config", config], nodeDir, s3.env, `node${node.id}`));
 		}
 		await Promise.all(nodes.map((node, i) => waitReady(`http://127.0.0.1:${node.port}/__ursula/ready`, procs[i] as Proc)));
 		const gatewayPort = await freePort();
