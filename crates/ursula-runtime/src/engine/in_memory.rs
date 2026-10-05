@@ -195,6 +195,21 @@ impl InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
         match command {
+            // The `Stream-Incarnation` precondition (D12) is checked before
+            // anything the wrapped command does here (a create's implicit
+            // bucket included), so a refusal changes nothing.
+            StreamCommand::IfIncarnation {
+                incarnation,
+                command,
+            } => {
+                if let Some(refusal) = self
+                    .state_machine
+                    .incarnation_precondition(&command, incarnation)
+                {
+                    return self.group_response_from_stream(refusal, None, placement);
+                }
+                self.apply_stream_command(*command, placement)
+            }
             // Appends skip `StreamStateMachine::apply` to keep the exact
             // borrowed fast path (no TTL sweep on the append hot path).
             StreamCommand::Append {
@@ -303,6 +318,7 @@ impl InMemoryGroupEngine {
                     already_exists: false,
                     group_commit_index: self.commit_index,
                     hot_backlog: Some(self.write_hot_backlog(Some(&stream_id))),
+                    incarnation: response_incarnation(&self.state_machine, Some(&stream_id)),
                 }))
             }
             StreamResponse::AlreadyExists {
@@ -316,6 +332,7 @@ impl InMemoryGroupEngine {
                 already_exists: true,
                 group_commit_index: self.commit_index,
                 hot_backlog: Some(self.write_hot_backlog(stream_id.as_ref())),
+                incarnation: response_incarnation(&self.state_machine, stream_id.as_ref()),
             })),
             StreamResponse::Appended {
                 offset,
@@ -345,6 +362,7 @@ impl InMemoryGroupEngine {
                     stream_hot_bytes,
                     group_hot_bytes,
                     receipt_evicted,
+                    incarnation: response_incarnation(&self.state_machine, Some(&stream_id)),
                 }))
             }
             StreamResponse::SnapshotPublished {
@@ -359,6 +377,7 @@ impl InMemoryGroupEngine {
                         snapshot_digest,
                         group_commit_index: self.commit_index,
                         hot_backlog: Some(self.write_hot_backlog(stream_id.as_ref())),
+                        incarnation: response_incarnation(&self.state_machine, stream_id.as_ref()),
                     },
                 ))
             }
@@ -381,6 +400,7 @@ impl InMemoryGroupEngine {
                         retained_offset,
                         group_commit_index: self.commit_index,
                         hot_backlog: Some(self.write_hot_backlog(stream_id.as_ref())),
+                        incarnation: response_incarnation(&self.state_machine, stream_id.as_ref()),
                     },
                 ))
             }
@@ -434,7 +454,7 @@ impl InMemoryGroupEngine {
                 deduplicated,
                 ..
             } => {
-                require_response_stream_id(stream_id, "closed")?;
+                let stream_id = require_response_stream_id(stream_id, "closed")?;
                 if !deduplicated {
                     self.commit_index += 1;
                 }
@@ -443,6 +463,7 @@ impl InMemoryGroupEngine {
                     next_offset,
                     group_commit_index: self.commit_index,
                     deduplicated,
+                    incarnation: response_incarnation(&self.state_machine, Some(&stream_id)),
                 }))
             }
             StreamResponse::Deleted => {
@@ -733,6 +754,7 @@ impl InMemoryGroupEngine {
                     stream_hot_bytes,
                     group_hot_bytes,
                     receipt_evicted,
+                    incarnation: response_incarnation(&self.state_machine, Some(&stream_id)),
                 })
             }
             StreamResponse::Error {
@@ -1567,6 +1589,7 @@ impl GroupEngine for InMemoryGroupEngine {
                 .head_at(&request.stream_id, request.now_ms)
                 .map(|metadata| metadata.tail_offset)
                 .unwrap_or(snapshot.offset);
+            let incarnation = response_incarnation(&self.state_machine, Some(&request.stream_id));
             Ok(ReadSnapshotResponse {
                 placement,
                 snapshot_offset: snapshot.offset,
@@ -1576,6 +1599,7 @@ impl GroupEngine for InMemoryGroupEngine {
                 payload: snapshot.payload,
                 object: snapshot.object,
                 up_to_date: snapshot.offset == tail_offset,
+                incarnation,
             })
         })
     }
@@ -1591,6 +1615,9 @@ impl GroupEngine for InMemoryGroupEngine {
                 .state_machine
                 .bootstrap_plan(&request.stream_id)
                 .map_err(stream_response_error)?;
+            // Read before the cold reads below; `&mut self` keeps the
+            // state from changing until the response is built.
+            let incarnation = response_incarnation(&self.state_machine, Some(&request.stream_id));
             let snapshot_offset = plan.snapshot.as_ref().map(|snapshot| snapshot.offset);
             let snapshot_content_type = plan
                 .snapshot
@@ -1624,6 +1651,7 @@ impl GroupEngine for InMemoryGroupEngine {
                 next_offset: plan.next_offset,
                 up_to_date: plan.up_to_date,
                 closed: plan.closed,
+                incarnation,
             })
         })
     }
@@ -2123,7 +2151,20 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::DeleteStream { stream_id }
         | StreamCommand::TidyStream { stream_id, .. }
         | StreamCommand::OffloadColdRefs { stream_id, .. } => Some(stream_id.clone()),
+        StreamCommand::IfIncarnation { command, .. } => command_stream_id(command),
     }
+}
+
+/// [`StreamStateMachine::stream_incarnation`] for a response, read from the
+/// state that just served the write or read; `0` for a stream that no
+/// longer exists.
+fn response_incarnation(
+    state_machine: &StreamStateMachine,
+    stream_id: Option<&BucketStreamId>,
+) -> u64 {
+    stream_id
+        .and_then(|stream_id| state_machine.stream_incarnation(stream_id))
+        .unwrap_or(0)
 }
 
 fn require_response_stream_id(

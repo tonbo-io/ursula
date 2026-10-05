@@ -344,6 +344,7 @@ impl StreamStateMachine {
             ));
         }
         Ok(StreamReadPlan {
+            incarnation: stream.created_at_ms,
             offset,
             next_offset,
             content_type: stream.content_type.clone(),

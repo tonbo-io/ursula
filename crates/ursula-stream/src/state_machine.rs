@@ -561,6 +561,13 @@ impl StreamStateMachine {
             StreamCommand::OffloadColdRefs { stream_id, refs } => {
                 self.offload_cold_refs(&stream_id, &refs)
             }
+            StreamCommand::IfIncarnation {
+                incarnation,
+                command,
+            } => match self.incarnation_precondition(&command, incarnation) {
+                Some(refusal) => refusal,
+                None => self.apply(*command),
+            },
         }
     }
 }

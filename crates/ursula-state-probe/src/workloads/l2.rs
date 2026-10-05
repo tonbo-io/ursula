@@ -149,6 +149,7 @@ async fn append(
         stream_seq: None,
         producer: None,
         now_ms,
+        if_incarnation: None,
     })
     .await
     .map_err(|err| anyhow::anyhow!("append: {err}"))?;

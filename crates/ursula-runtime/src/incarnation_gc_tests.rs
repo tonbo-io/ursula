@@ -55,6 +55,7 @@ async fn delete(runtime: &ShardRuntime, stream: &BucketStreamId) {
     runtime
         .delete_stream(DeleteStreamRequest {
             stream_id: stream.clone(),
+            if_incarnation: None,
         })
         .await
         .expect("delete stream");
@@ -263,6 +264,7 @@ async fn incarnation_scoped_stream_gc_reclaims_external_payloads() {
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
             now_ms: 0,
+            if_incarnation: None,
         })
         .await
         .expect("create with external payload");
@@ -277,6 +279,7 @@ async fn incarnation_scoped_stream_gc_reclaims_external_payloads() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            if_incarnation: None,
         })
         .await
         .expect("append external payload");

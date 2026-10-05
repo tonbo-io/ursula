@@ -57,9 +57,21 @@ impl From<crate::request::ImportGroupStateRequest> for StreamCommand {
     }
 }
 
+/// Wraps `command` in the `Stream-Incarnation` precondition (D12) when the
+/// request carried one; a request without it proposes `command` unchanged.
+fn if_incarnation(command: StreamCommand, incarnation: Option<u64>) -> StreamCommand {
+    match incarnation {
+        Some(incarnation) => StreamCommand::IfIncarnation {
+            incarnation,
+            command: Box::new(command),
+        },
+        None => command,
+    }
+}
+
 impl From<CreateStreamRequest> for StreamCommand {
     fn from(request: CreateStreamRequest) -> Self {
-        Self::CreateStream {
+        let command = Self::CreateStream {
             stream_id: request.stream_id,
             content_type: request.content_type,
             initial_payload: request.initial_payload,
@@ -69,13 +81,14 @@ impl From<CreateStreamRequest> for StreamCommand {
             stream_ttl_seconds: request.stream_ttl_seconds,
             stream_expires_at_ms: request.stream_expires_at_ms,
             now_ms: request.now_ms,
-        }
+        };
+        if_incarnation(command, request.if_incarnation)
     }
 }
 
 impl From<CreateStreamExternalRequest> for StreamCommand {
     fn from(request: CreateStreamExternalRequest) -> Self {
-        Self::CreateExternal {
+        let command = Self::CreateExternal {
             stream_id: request.stream_id,
             content_type: request.content_type,
             initial_payload: request.initial_payload,
@@ -86,13 +99,14 @@ impl From<CreateStreamExternalRequest> for StreamCommand {
             stream_ttl_seconds: request.stream_ttl_seconds,
             stream_expires_at_ms: request.stream_expires_at_ms,
             now_ms: request.now_ms,
-        }
+        };
+        if_incarnation(command, request.if_incarnation)
     }
 }
 
 impl From<AppendRequest> for StreamCommand {
     fn from(request: AppendRequest) -> Self {
-        Self::Append {
+        let command = Self::Append {
             stream_id: request.stream_id,
             content_type: Some(request.content_type),
             payload: request.payload,
@@ -100,13 +114,14 @@ impl From<AppendRequest> for StreamCommand {
             stream_seq: request.stream_seq,
             producer: request.producer,
             now_ms: request.now_ms,
-        }
+        };
+        if_incarnation(command, request.if_incarnation)
     }
 }
 
 impl From<AppendExternalRequest> for StreamCommand {
     fn from(request: AppendExternalRequest) -> Self {
-        Self::AppendExternal {
+        let command = Self::AppendExternal {
             stream_id: request.stream_id,
             content_type: Some(request.content_type),
             payload: request.payload,
@@ -115,13 +130,14 @@ impl From<AppendExternalRequest> for StreamCommand {
             stream_seq: request.stream_seq,
             producer: request.producer,
             now_ms: request.now_ms,
-        }
+        };
+        if_incarnation(command, request.if_incarnation)
     }
 }
 
 impl From<PublishSnapshotRequest> for StreamCommand {
     fn from(request: PublishSnapshotRequest) -> Self {
-        match request.cold_body {
+        let command = match request.cold_body {
             Some(body) => Self::PublishSnapshotExternal {
                 stream_id: request.stream_id,
                 snapshot_offset: request.snapshot_offset,
@@ -139,37 +155,41 @@ impl From<PublishSnapshotRequest> for StreamCommand {
                 now_ms: request.now_ms,
                 expected_incarnation: request.expected_incarnation,
             },
-        }
+        };
+        if_incarnation(command, request.if_incarnation)
     }
 }
 
 impl From<AdvanceRetentionRequest> for StreamCommand {
     fn from(request: AdvanceRetentionRequest) -> Self {
-        Self::AdvanceRetention {
+        let command = Self::AdvanceRetention {
             stream_id: request.stream_id,
             retained_offset: request.retained_offset,
             now_ms: request.now_ms,
             expected_incarnation: request.expected_incarnation,
-        }
+        };
+        if_incarnation(command, request.if_incarnation)
     }
 }
 
 impl From<CloseStreamRequest> for StreamCommand {
     fn from(request: CloseStreamRequest) -> Self {
-        Self::Close {
+        let command = Self::Close {
             stream_id: request.stream_id,
             stream_seq: request.stream_seq,
             producer: request.producer,
             now_ms: request.now_ms,
-        }
+        };
+        if_incarnation(command, request.if_incarnation)
     }
 }
 
 impl From<DeleteStreamRequest> for StreamCommand {
     fn from(request: DeleteStreamRequest) -> Self {
-        Self::DeleteStream {
+        let command = Self::DeleteStream {
             stream_id: request.stream_id,
-        }
+        };
+        if_incarnation(command, request.if_incarnation)
     }
 }
 

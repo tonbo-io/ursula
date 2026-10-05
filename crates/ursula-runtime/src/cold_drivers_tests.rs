@@ -271,6 +271,7 @@ async fn f2_driver_deletes_the_replacement_of_a_rejected_compaction() {
                     cold_body: None,
                     now_ms: 0,
                     expected_incarnation: None,
+                    if_incarnation: None,
                 })
                 .await
                 .expect("publish checkpoint");
@@ -280,6 +281,7 @@ async fn f2_driver_deletes_the_replacement_of_a_rejected_compaction() {
                     retained_offset: 12,
                     now_ms: 0,
                     expected_incarnation: None,
+                    if_incarnation: None,
                 })
                 .await
                 .expect("advance retention");
@@ -365,6 +367,7 @@ async fn f2_rejected_external_append_under_a_packed_trickle_reads_correctly_afte
             stream_seq: Some("1".to_owned()),
             producer: None,
             now_ms: 0,
+            if_incarnation: None,
         })
         .await
         .expect_err("a regressed stream seq rejects the external append");
@@ -398,6 +401,7 @@ async fn f2_rejected_external_append_under_a_packed_trickle_reads_correctly_afte
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            if_incarnation: None,
         })
         .await
         .expect("committed external append");
@@ -470,6 +474,7 @@ async fn f14h_orphan_sweep_reclaims_only_unreferenced_objects_after_the_grace() 
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            if_incarnation: None,
         })
         .await
         .expect("committed external append");

@@ -147,6 +147,11 @@ pub enum StreamErrorCode {
     /// A new producer would exceed the stream's producer cap and no producer
     /// has been idle long enough to evict (F3).
     ProducerLimit,
+    /// A `Stream-Incarnation` precondition (D12) failed: the stream is
+    /// another incarnation (its current one is in
+    /// [`StreamErrorContext::StreamIncarnation`]), or a create found no
+    /// stream. Nothing was applied.
+    IncarnationMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,7 +166,8 @@ pub enum StreamErrorContext {
         received_seq: u64,
     },
     /// The stream incarnation (`created_at_ms`) a
-    /// [`StreamErrorCode::JsonBoundaryUnverified`] refusal saw.
+    /// [`StreamErrorCode::JsonBoundaryUnverified`] or
+    /// [`StreamErrorCode::IncarnationMismatch`] refusal saw.
     StreamIncarnation {
         incarnation: u64,
     },
