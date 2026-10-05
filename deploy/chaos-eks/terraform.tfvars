@@ -3,7 +3,7 @@ cluster_name  = "ursula-chaos-jul21-eks"
 namespace     = "ursula"
 status_bucket = "ursula-chaos-status-tonbo"
 status_key    = "status.json"
-image_tag     = "sha-879f089"
+image_tag     = "0.6.0"
 
 server_fullname  = "ursula"
 headless_service = "ursula-headless"

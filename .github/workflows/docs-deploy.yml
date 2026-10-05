@@ -1,10 +1,12 @@
 name: Deploy docs
 
-# Frozen until the 0.6.0 release: main documents 0.6.0 before it is published, so pushes to main do
-# not deploy. Dispatch by hand with the ref to publish (the release commit, once 0.6.0 is out); a
-# follow-up after the release restores the push trigger.
-
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - docs/web/**
+      - .github/workflows/docs-deploy.yml
   workflow_dispatch:
     inputs:
       ref:
@@ -31,7 +33,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Install Node
         uses: actions/setup-node@v6
