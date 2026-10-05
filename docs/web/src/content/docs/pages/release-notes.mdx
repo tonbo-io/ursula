@@ -5,7 +5,7 @@ description: Changes that affect clients and operators, newest first.
 
 ## 0.6.0
 
-**0.6.0 is a breaking release.** It changes the storage format (format epoch 2) and removes several protocol features (listed below). It refuses to start on data written by 0.5.x (Raft WAL directories, object-storage prefixes, snapshots and backups) and will not join a cluster with 0.5.x nodes. There is no in-place upgrade, no automatic migration and no rollback.
+**0.6.0 is a breaking release.** It changes the storage format (format epoch 2) and removes several protocol features (listed in the release notes). It refuses to start on data written by 0.5.x (Raft WAL directories, object-storage prefixes, snapshots and backups) and will not join a cluster with 0.5.x nodes. There is no in-place upgrade, no automatic migration and no rollback.
 
 - **If you run 0.5.x with data you need to keep, do not upgrade yet.** Stay on 0.5.1 and [open an issue](https://github.com/tonbo-io/ursula/issues) so we can work out a migration path with you.
 - **New deployments install on fresh storage:** empty PVCs and a never-used object-storage prefix.
@@ -85,7 +85,7 @@ Every `application/json` stream now follows [JSON message text](/docs/specs/exte
 - **API break.** Query and status return `(offset, len)` locators with opaque `next` and `through` tokens instead of record ordinals. The 0.5.1 query parameters `after_captured_at_ms`, `after_record` and `through_record` answer `400`, and unknown registration fields answer `422`. Registration takes `extract` (JSON pointers, with fallbacks and units) and `start`; the legacy `timestamp_field` is still accepted. Re-register every index under a new or emptied `indexer.s3.prefix`.
 - **NDJSON sources** (`application/x-ndjson`) are indexed, and nested or unit-ful timestamps (OTLP JSON) are supported. Messages without a usable event time are skipped and counted instead of blocking the index.
 - **Chart values.** `indexer.workers.segmentBytes` replaces `readBatchRecords` and `segmentRecords`.
-- **Polling cost.** Every indexer pod sends a `consistency=leader` `HEAD` for every registration on every poll (`indexer.ingest.pollIntervalMs`, default 250 ms), and each one costs the stream's leader a ReadIndex round trip to its voters, even when the stream is idle. Keep registrations few, or raise the poll interval.
+- **Polling cost.** Every indexer pod sends a `HEAD` (always confirmed by a ReadIndex) for every registration on every poll (`indexer.ingest.pollIntervalMs`, default 250 ms), and each one costs the stream's leader a ReadIndex round trip to its voters, even when the stream is idle. Keep registrations few, or raise the poll interval.
 
 ### Removed
 

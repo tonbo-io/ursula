@@ -184,7 +184,7 @@ Node-level loss: replace the host with the same `node_id` and cluster config, an
 
 ## Upgrading to 0.6
 
-**0.6.0 is a breaking release.** It changes the storage format (format epoch 2) and removes several protocol features (listed below). It refuses to start on data written by 0.5.x (Raft WAL directories, object-storage prefixes, snapshots and backups) and will not join a cluster with 0.5.x nodes. There is no in-place upgrade, no automatic migration and no rollback.
+**0.6.0 is a breaking release.** It changes the storage format (format epoch 2) and removes several protocol features (listed in the release notes). It refuses to start on data written by 0.5.x (Raft WAL directories, object-storage prefixes, snapshots and backups) and will not join a cluster with 0.5.x nodes. There is no in-place upgrade, no automatic migration and no rollback.
 
 - **If you run 0.5.x with data you need to keep, do not upgrade yet.** Stay on 0.5.1 and [open an issue](https://github.com/tonbo-io/ursula/issues) so we can work out a migration path with you.
 - **New deployments install on fresh storage:** empty PVCs and a never-used object-storage prefix.
