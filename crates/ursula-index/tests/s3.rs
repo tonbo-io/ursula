@@ -35,7 +35,14 @@ async fn real_s3_conditional_publish_and_cache_recovery() -> anyhow::Result<()> 
     let unique = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
-    let root = format!("ursula-index-integration/{}-{unique}", std::process::id());
+    // CI scopes each job's credentials to URSULA_S3_PREFIX.
+    let root = format!(
+        "{}ursula-index-integration/{}-{unique}",
+        std::env::var("URSULA_S3_PREFIX")
+            .map(|prefix| format!("{prefix}/"))
+            .unwrap_or_default(),
+        std::process::id()
+    );
     let store_config = S3ObjectStoreConfig {
         bucket: bucket.clone(),
         root: root.clone(),
@@ -71,8 +78,14 @@ async fn real_s3_conditional_publish_and_cache_recovery() -> anyhow::Result<()> 
             .await?;
     }
     assert!(writer.compact_partition_once(2, 2).await?);
+    // S3 stamps LastModified with its own clock, which may run ahead of the runner's: judge the
+    // zero-grace cutoff a minute later so the parts just written count as old enough.
     let gc = writer
-        .garbage_collect(1, std::time::Duration::ZERO, SystemTime::now())
+        .garbage_collect(
+            1,
+            std::time::Duration::ZERO,
+            SystemTime::now() + std::time::Duration::from_secs(60),
+        )
         .await?;
     assert_eq!(gc.deleted_parts, 2);
     assert_eq!(gc.deleted_layouts, 2);
