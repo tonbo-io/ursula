@@ -833,6 +833,8 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                             ))
                         })
                     }),
+                // The group's write fence, should anything here propose.
+                rejoin: self.registry.rejoin(placement.raft_group_id),
             };
             let stream_id = BucketStreamId::new(request.bucket_id, request.stream_id);
             let result = match required(request.read, "group_read.read")

@@ -12,7 +12,6 @@ use openraft::Raft;
 use openraft::RaftNetworkV2;
 use openraft::SnapshotPolicy;
 use openraft::network::RPCOption;
-use openraft::rt::WatchReceiver;
 use tokio::time::Instant;
 use tonic::transport::Endpoint;
 use ursula_runtime::ColdStoreHandle;
