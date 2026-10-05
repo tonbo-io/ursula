@@ -57,6 +57,10 @@ api: "GET /{bucket}/{stream}"
  </Tab>
 </Tabs>
 
+<ParamField header="Stream-Incarnation" type="string">
+ Optional precondition: the stream's incarnation token, as a previous response's `Stream-Incarnation` header returned it. The read is answered only if the stream that serves it is still that incarnation; otherwise it answers `412`. A long-poll or SSE read with it ends when the stream it was opened against is deleted or recreated (a long-poll answers `404` or `412`; an SSE stream ends with an `error` event). Without the header, the request behaves exactly as described here. A malformed value answers `400`. See [`Stream-Incarnation`](/docs/specs/extensions#24-snapshot-metadata-on-head-and-stream-incarnation).
+</ParamField>
+
 ## Response
 
 | Status | Meaning |
@@ -68,10 +72,11 @@ api: "GET /{bucket}/{stream}"
 | `400` | Invalid offset, live mode or `consistency`, `consistency=leader` with `live`, or a read parameter removed in 0.6.0 (see the [release notes](/docs/release-notes)). |
 | `404` | Stream not found or expired. |
 | `410` | Requested offset has been trimmed. `Stream-Next-Offset` is the earliest offset still readable. |
+| `412` | `Stream-Incarnation` did not match: the stream was deleted and recreated. The response's `Stream-Incarnation` is the current token. Checked before the offset, so a stale offset answers `412`, not `410` or `416`. |
 | `416` | Requested offset is beyond the stream's tail. `Stream-Next-Offset` is the tail. |
 | `503` | The group has no known leader, the leader could not confirm its leadership in time (`consistency=leader` and live reads), or this node holds too many live readers. Retry after `Retry-After`. |
 
-Response headers include `Stream-Next-Offset`, `ETag`, `Stream-Up-To-Date`, `Stream-Closed`, and `Content-Type`. Long-poll responses for an open stream also carry `Stream-Cursor`.
+Response headers include `Stream-Next-Offset`, `Stream-Incarnation`, `ETag`, `Stream-Up-To-Date`, `Stream-Closed`, and `Content-Type`; the SSE response and the long-poll `204` carry `Stream-Incarnation` too. Long-poll responses for an open stream also carry `Stream-Cursor`.
 
 Streams written with `Content-Type: application/json` are returned as newline-delimited JSON with response `Content-Type: application/x-ndjson`, one stored message per line, exactly as written minus insignificant whitespace ([JSON message text](/docs/specs/extensions#json-message-text)). On an offset read, `max_bytes` applies to the encoded byte stream, so a response can end mid-line. Resume from `Stream-Next-Offset` and buffer any incomplete trailing line before parsing. `HEAD` reports the configured stream content type, while read responses report the wire representation.
 
