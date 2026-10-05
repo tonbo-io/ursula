@@ -6674,7 +6674,7 @@ async fn cluster_wide_purge_reaches_every_distributed_group_leader() {
         .delete(format!("{}/__ursula/purge/multi-leader-purge", peers[0].1))
         .send()
         .await
-        .expect("one cluster-wide purge request must not enter a redirect loop");
+        .expect("cluster-wide purge request");
     assert_eq!(response.status(), StatusCode::OK);
     let report: serde_json::Value = response.json().await.expect("purge report JSON");
     assert_eq!(report["removed_streams"], 6);

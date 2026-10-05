@@ -3760,8 +3760,8 @@ fn is_forward_to_leader(err: &RuntimeError) -> bool {
     err.leader_hint().is_some()
 }
 
-/// 503 + `Retry-After: 1` for a write that hit a non-leader while the group has
-/// no known leader. Retryable: a new leader should be elected shortly.
+/// 503 + `Retry-After: 1` for a request that must reach the group leader but
+/// cannot be redirected (purge) or has no known leader. Retryable.
 fn leader_unknown_retry_response(err: RuntimeError) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
