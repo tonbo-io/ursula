@@ -23,6 +23,8 @@
 //!   the per-group log gauges the snapshot driver reads.
 //! - [`rejoin`]: memory-WAL rejoin: the bootstrap probe, the vote gate of an
 //!   emptied replica, and the leader-side heal driver.
+//! - [`restart_guard`]: memory-WAL full-restart guard: the per-group
+//!   "initialized" marker in object storage and the bootstrap decision table.
 //! - [`snapshot_codec`]: the group-snapshot frame codec; [`group_snapshot_frames`]
 //!   and [`decode_group_snapshot`] are re-exported for measurement tools.
 
@@ -40,6 +42,7 @@ mod meta;
 mod read_index;
 mod registry;
 mod rejoin;
+mod restart_guard;
 mod rt;
 #[cfg(madsim)]
 mod sim_runtime;
@@ -106,7 +109,14 @@ pub use registry::SingleNodeRaftNetwork;
 pub use registry::SingleNodeRaftNetworkFactory;
 pub use rejoin::AdoptSurvivorOutcome;
 pub use rejoin::GroupRejoin;
+pub use rejoin::PeerGroupLog;
+pub use rejoin::bootstrap_probe_vote;
 pub use rejoin::run_rejoin_heal;
+pub use restart_guard::InitMarkerStore;
+pub use restart_guard::MemoryInitMarkers;
+pub use restart_guard::MemoryWalBootstrap;
+pub use restart_guard::RestartGuard;
+pub use restart_guard::run_memory_wal_bootstrap;
 #[cfg(madsim)]
 pub use sim_runtime::MadsimOpenRaftRuntime;
 pub use snapshot_codec::decode_group_snapshot;

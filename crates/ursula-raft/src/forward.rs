@@ -353,6 +353,30 @@ pub(crate) fn group_engine_leader_read_unavailable(
     group_engine_forward_to_leader_error(message, None, None, self_id, true)
 }
 
+/// A memory-WAL group could not record its "initialized" marker in object
+/// storage, so it proposes no client write yet: a retryable 503, nothing was
+/// proposed.
+pub(crate) fn group_engine_initialized_marker_unavailable(
+    raft_group_id: ursula_shard::RaftGroupId,
+    err: &str,
+    self_id: u64,
+) -> GroupEngineError {
+    tracing::warn!(
+        raft_group_id = raft_group_id.0,
+        "memory-WAL group refuses a write until its initialized marker is in object storage: {err}"
+    );
+    group_engine_forward_to_leader_error(
+        format!(
+            "raft group {} cannot record its initialized marker in object storage yet",
+            raft_group_id.0
+        ),
+        None,
+        None,
+        self_id,
+        true,
+    )
+}
+
 /// `before_proposal` is true only for a local leadership check that runs
 /// before anything is proposed (RT1); a forward OpenRaft reports after
 /// `client_write` is ambiguous, because the entry may already have committed.

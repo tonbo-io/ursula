@@ -2780,6 +2780,10 @@ struct RejoinCluster {
     config: Arc<Config>,
     engines: BTreeMap<u64, RaftGroupEngine>,
     rejoins: BTreeMap<u64, Arc<ursula_raft::GroupRejoin>>,
+    /// Object storage for the "initialized" markers. With it, node 1 is the
+    /// group's initializer and bootstraps it the way a memory-WAL node does
+    /// (probe, marker, `Initialize`) on every start.
+    markers: Option<Arc<ursula_raft::MemoryInitMarkers>>,
 }
 
 impl RejoinCluster {
@@ -2801,6 +2805,7 @@ impl RejoinCluster {
             config,
             engines: BTreeMap::new(),
             rejoins: BTreeMap::new(),
+            markers: None,
         };
         for node_id in 1..=3 {
             cluster.start_empty(node_id).await;
@@ -2813,13 +2818,44 @@ impl RejoinCluster {
         cluster
     }
 
+    /// A cluster whose group keeps its "initialized" marker in (simulated)
+    /// object storage; node 1 bootstraps it.
+    async fn start_with_markers(config_name: &str) -> Self {
+        let config = Arc::new(
+            Config {
+                cluster_name: config_name.to_owned(),
+                heartbeat_interval: 10,
+                election_timeout_min: 50,
+                election_timeout_max: 100,
+                ..Default::default()
+            }
+            .validate()
+            .expect("valid raft config"),
+        );
+        let mut cluster = Self {
+            registry: InProcessRaftRegistry::default(),
+            policy: sim_network_policy(),
+            config,
+            engines: BTreeMap::new(),
+            rejoins: BTreeMap::new(),
+            markers: Some(Arc::new(ursula_raft::MemoryInitMarkers::default())),
+        };
+        for node_id in 1..=3 {
+            cluster.start_empty(node_id).await;
+        }
+        cluster
+    }
+
     /// Start `node_id` with an empty memory log, as a restarted process does.
     async fn start_empty(&mut self, node_id: u64) {
-        let rejoin = Arc::new(ursula_raft::GroupRejoin::new(
-            node_id,
-            placement().raft_group_id,
-        ));
-        let engine = RaftGroupEngine::new_node_with_log_store_and_network(
+        let rejoin = Arc::new(
+            ursula_raft::GroupRejoin::new(node_id, placement().raft_group_id).with_init_markers(
+                self.markers
+                    .clone()
+                    .map(|markers| markers as Arc<dyn ursula_raft::InitMarkerStore>),
+            ),
+        );
+        let mut engine = RaftGroupEngine::new_node_with_log_store_and_network(
             placement(),
             node_id,
             self.config.clone(),
@@ -2842,6 +2878,24 @@ impl RejoinCluster {
             rejoin_configured_voters(),
             Duration::from_millis(50),
         ));
+        if self.markers.is_some() {
+            engine.set_rejoin(rejoin.clone());
+            if node_id == 1 {
+                let registry = self.registry.clone();
+                madsim::task::spawn(ursula_raft::run_memory_wal_bootstrap(
+                    node_id,
+                    engine.raft_handle(),
+                    rejoin.clone(),
+                    rejoin_configured_voters(),
+                    move |peer_id, _address| {
+                        let registry = registry.clone();
+                        async move { in_process_probe(&registry, node_id, peer_id).await }
+                    },
+                    Duration::from_millis(50),
+                    Duration::from_secs(5),
+                ));
+            }
+        }
         self.engines.insert(node_id, engine);
         self.rejoins.insert(node_id, rejoin);
     }
@@ -2935,6 +2989,28 @@ impl RejoinCluster {
             .await;
         }
     }
+}
+
+/// The bootstrap probe vote of `node_id` to `peer_id`, screened by the
+/// peer's vote gate as the network would.
+async fn in_process_probe(
+    registry: &InProcessRaftRegistry,
+    node_id: u64,
+    peer_id: u64,
+) -> Option<ursula_raft::PeerGroupLog> {
+    let target = registry.get(peer_id)?;
+    let request = ursula_raft::bootstrap_probe_vote(node_id);
+    if let Some(refusal) = registry
+        .rejoin(peer_id)
+        .and_then(|rejoin| rejoin.screen_vote(&request))
+    {
+        return Some(ursula_raft::PeerGroupLog::from_vote_response(&refusal));
+    }
+    target
+        .vote(request)
+        .await
+        .ok()
+        .map(|response| ursula_raft::PeerGroupLog::from_vote_response(&response))
 }
 
 /// Write `count` records through the leader, recording the acknowledged
@@ -3139,6 +3215,116 @@ fn memory_wal_majority_restart_stops_writes_until_the_operator_adopts_the_surviv
             acknowledged = read.payload.to_vec();
             rejoin_write(&mut cluster, &stream, &mut acknowledged, 100, 4).await;
             cluster.read_everywhere(&stream, &acknowledged).await;
+        });
+    }
+}
+
+/// Every voter of a memory-WAL group restarts empty at once. Before any write
+/// was acknowledged (no marker), the group bootstraps again by itself. After
+/// acknowledged writes (marker in object storage), it must stop instead of
+/// re-initializing: no leader, writes refused, while the store is unreadable
+/// as well. Only the operator's explicit acceptance of the loss initializes
+/// it again.
+#[test]
+fn memory_wal_full_restart_stops_writes_until_the_operator_accepts_the_loss() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("MEMORY_WAL_REJOIN_SEEDS", &MEMORY_WAL_REJOIN_SEEDS) {
+        run_with_madsim(seed, async move {
+            let group = placement().raft_group_id;
+            let mut cluster =
+                RejoinCluster::start_with_markers("ursula-sim-memory-wal-full-restart").await;
+            let markers = cluster.markers.clone().expect("marker store");
+            cluster.wait_leader(Duration::from_secs(5)).await;
+            assert!(
+                !markers.contains(group),
+                "seed {seed}: no marker before the first write"
+            );
+
+            // A crash of every voter before any write needs no operator.
+            cluster.restart_empty(&[1, 2, 3]).await;
+            let leader = cluster.wait_leader(Duration::from_secs(5)).await;
+
+            let stream = BucketStreamId::new("simulated", "full-restart");
+            cluster
+                .engines
+                .get_mut(&leader)
+                .expect("leader")
+                .create_stream(
+                    CreateStreamRequest::new(stream.clone(), "application/octet-stream"),
+                    placement(),
+                    ColdWriteAdmission::default(),
+                )
+                .await
+                .expect("create stream");
+            assert!(
+                markers.contains(group),
+                "seed {seed}: the first write marks the group"
+            );
+            let mut acknowledged = Vec::new();
+            rejoin_write(&mut cluster, &stream, &mut acknowledged, 0, 8).await;
+
+            // Every voter restarts empty while object storage is unreachable:
+            // the initializer cannot check the marker and does not initialize.
+            markers.set_unreachable(true);
+            cluster.restart_empty(&[1, 2, 3]).await;
+            madsim::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(cluster.leader(), None, "seed {seed}: initialized blind");
+            assert!(!cluster.rejoins[&1].restart_guard().stopped_for_operator());
+
+            // Readable again: the marker says the group held writes. It stops.
+            markers.set_unreachable(false);
+            let deadline = madsim::time::Instant::now() + Duration::from_secs(5);
+            while !cluster.rejoins[&1].restart_guard().stopped_for_operator() {
+                assert!(
+                    madsim::time::Instant::now() < deadline,
+                    "seed {seed}: the initializer never stopped for the operator"
+                );
+                madsim::time::sleep(Duration::from_millis(50)).await;
+            }
+            madsim::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(
+                cluster.leader(),
+                None,
+                "seed {seed}: a fully restarted group elected a leader"
+            );
+            for node_id in 1..=3 {
+                assert!(
+                    !cluster.engines[&node_id]
+                        .raft_handle()
+                        .is_initialized()
+                        .await
+                        .expect("is_initialized"),
+                    "seed {seed}: node {node_id} re-initialized the group"
+                );
+                let refused = cluster.append(node_id, &stream, b"refused;").await;
+                assert!(
+                    refused.is_err(),
+                    "seed {seed}: node {node_id} acknowledged a write after a full restart"
+                );
+            }
+            // Only the stopped initializer accepts the loss.
+            assert!(!cluster.rejoins[&2].restart_guard().accept_data_loss());
+
+            // Operator: accept the loss. The group initializes again, empty,
+            // and takes writes.
+            assert!(cluster.rejoins[&1].restart_guard().accept_data_loss());
+            let leader = cluster.wait_leader(Duration::from_secs(5)).await;
+            assert!(!cluster.rejoins[&1].restart_guard().stopped_for_operator());
+            let fresh = BucketStreamId::new("simulated", "after-reinitialize");
+            cluster
+                .engines
+                .get_mut(&leader)
+                .expect("leader")
+                .create_stream(
+                    CreateStreamRequest::new(fresh.clone(), "application/octet-stream"),
+                    placement(),
+                    ColdWriteAdmission::default(),
+                )
+                .await
+                .expect("create stream after re-initialize");
+            let mut after = Vec::new();
+            rejoin_write(&mut cluster, &fresh, &mut after, 0, 4).await;
+            cluster.read_everywhere(&fresh, &after).await;
         });
     }
 }

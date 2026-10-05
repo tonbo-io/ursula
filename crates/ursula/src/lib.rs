@@ -893,6 +893,10 @@ fn admin_ops_router(state: HttpState) -> Router {
             post(adopt_rejoin_survivor),
         )
         .route(
+            "/__ursula/raft/{raft_group_id}/rejoin/reinitialize",
+            post(reinitialize_rejoin_group),
+        )
+        .route(
             "/__ursula/leadership-shed/maintenance",
             post(mark_maintenance_drain).delete(clear_maintenance_drain),
         );
@@ -1116,6 +1120,13 @@ async fn readiness(State(state): State<HttpState>) -> Response {
     // again, so a rolling update stops at it (format epoch 2, E8).
     let format_epoch_mismatch = state.format_epoch_mismatch.recorded();
     let ready = !disk.pressure && !format_epoch_mismatch;
+    // Memory-WAL groups whose voters all restarted empty after holding
+    // writes: they refuse writes until an operator re-initializes them. Not
+    // a readiness failure (the node serves its other groups).
+    let full_restart_groups = state
+        .raft_registry()
+        .map(RaftGroupHandleRegistry::full_restart_stopped_groups)
+        .unwrap_or_default();
     let status = if ready {
         StatusCode::OK
     } else {
@@ -1133,6 +1144,7 @@ async fn readiness(State(state): State<HttpState>) -> Response {
                 None
             },
             "format_epoch_mismatch": format_epoch_mismatch,
+            "memory_wal_full_restart_groups": full_restart_groups,
             "wal_disk_pressure": disk.pressure,
             "wal_available_bytes": disk.available_bytes,
             "wal_min_available_bytes": disk.min_available_bytes,
@@ -2378,6 +2390,59 @@ pub(crate) async fn adopt_rejoin_survivor(
             )
         }
         Err(err) => (StatusCode::CONFLICT, format!("adopt survivor: {err}")).into_response(),
+    }
+}
+
+/// Operator recovery after a restart of every voter of a memory-WAL group:
+/// initialize the group again, empty, accepting the loss of what it held. Run
+/// it on the node that reports the group in `memory_wal_full_restart_groups`
+/// (readiness); it requires `accept_data_loss=true`.
+pub(crate) async fn reinitialize_rejoin_group(
+    State(state): State<HttpState>,
+    Path(raft_group_id): Path<u64>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let query = match parse_query(raw_query.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
+    };
+    if query.get("accept_data_loss").map(String::as_str) != Some("true") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "re-initializing a group drops every write it held; pass accept_data_loss=true",
+        )
+            .into_response();
+    }
+    let (raft_group_id, _raft) = match resolve_raft_group(&state, raft_group_id) {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
+    };
+    let Some(registry) = state.raft_registry() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "raft registry is not configured for this server",
+        )
+            .into_response();
+    };
+    match registry.accept_rejoin_data_loss(raft_group_id) {
+        Ok(true) => json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "raft_group_id": raft_group_id.0,
+                "action": "reinitialize_accepted",
+            })
+            .to_string(),
+        ),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            format!(
+                "raft group {} has not stopped for a full restart on this node; run it on the \
+                 node whose readiness lists the group in memory_wal_full_restart_groups",
+                raft_group_id.0
+            ),
+        )
+            .into_response(),
+        Err(err) => (StatusCode::CONFLICT, format!("reinitialize: {err}")).into_response(),
     }
 }
 

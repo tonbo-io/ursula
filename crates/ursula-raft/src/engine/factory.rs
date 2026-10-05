@@ -12,7 +12,6 @@ use openraft::Raft;
 use openraft::RaftNetworkV2;
 use openraft::SnapshotPolicy;
 use openraft::network::RPCOption;
-use openraft::rt::WatchReceiver;
 use tokio::time::Instant;
 use tonic::transport::Endpoint;
 use ursula_runtime::ColdStoreHandle;
@@ -33,13 +32,15 @@ use crate::log_store::CoreFileLogWriter;
 use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RaftGroupLogStore;
 use crate::registry::RaftGroupHandleRegistry;
-use crate::rejoin::BootstrapDecision;
 use crate::rejoin::GroupRejoin;
 use crate::rejoin::PeerGroupLog;
 use crate::rejoin::REJOIN_HEAL_INTERVAL;
-use crate::rejoin::bootstrap_decision;
 use crate::rejoin::bootstrap_probe_vote;
 use crate::rejoin::run_rejoin_heal;
+use crate::restart_guard::InitMarkerStore;
+use crate::restart_guard::MemoryWalBootstrap;
+use crate::restart_guard::run_init_marker_driver;
+use crate::restart_guard::run_memory_wal_bootstrap;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::types::UrsulaRaftTypeConfig;
 
@@ -47,6 +48,10 @@ use crate::types::UrsulaRaftTypeConfig;
 /// `ursulactl`'s restart fence waits this long for an in-flight leadership
 /// transfer to settle, so it reads the same constant.
 pub const GROUP_ELECTION_TIMEOUT_MIN_MS: u64 = 1500;
+
+/// How often a memory-WAL replica checks whether an unmarked group already
+/// holds writes (an upgraded 0.6.1 group) and must be marked.
+const INIT_MARKER_DRIVER_INTERVAL: Duration = Duration::from_secs(2);
 
 #[cfg(test)]
 fn parse_positive_millis(raw: Option<&str>, default_ms: u64) -> u64 {
@@ -68,6 +73,9 @@ pub struct RaftEngineConfig {
     pub snapshot_build_max_concurrency: usize,
     pub snapshot_logs_since_last: u64,
     pub max_in_snapshot_log_to_keep: u64,
+    /// Object storage for the memory-WAL groups' "initialized" markers
+    /// (`None`: no object storage, a full restart cannot be detected).
+    pub init_markers: Option<Arc<dyn InitMarkerStore>>,
 }
 
 impl Default for RaftEngineConfig {
@@ -84,6 +92,7 @@ impl Default for RaftEngineConfig {
             snapshot_build_max_concurrency: 1,
             snapshot_logs_since_last: 5_000,
             max_in_snapshot_log_to_keep: 64,
+            init_markers: None,
         }
     }
 }
@@ -104,6 +113,7 @@ impl From<&ursula_config::RaftConfig> for RaftEngineConfig {
             snapshot_build_max_concurrency: cfg.snapshot_build_max_concurrency,
             snapshot_logs_since_last: cfg.snapshot_logs_since_last,
             max_in_snapshot_log_to_keep: cfg.max_in_snapshot_log_to_keep,
+            init_markers: None, // set by caller from the object-storage config
         }
     }
 }
@@ -245,91 +255,38 @@ async fn probe_peer_group_log(
         .map(|response| PeerGroupLog::from_vote_response(&response))
 }
 
-/// Membership bootstrap of a memory-WAL initializer. Its log is empty after
-/// every start, so an empty log says nothing about the group: it runs
-/// `Initialize` only once every other configured voter answered that it is
-/// empty too and no leader was seen. One voter holding the group means this
-/// is a restart; the replica then waits to be replicated to, and the
-/// leader's heal driver rebuilds it.
+/// Membership bootstrap of a memory-WAL initializer over gRPC; see
+/// [`run_memory_wal_bootstrap`]. One voter holding the group means this is a
+/// restart; the replica then waits to be replicated to, and the leader's heal
+/// driver rebuilds it.
 fn spawn_memory_wal_membership_initialization(
     node_id: u64,
     raft_group_id: RaftGroupId,
     raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
+    rejoin: Arc<GroupRejoin>,
     nodes: BTreeMap<u64, BasicNode>,
     marker_path: Option<PathBuf>,
     engine_config: RaftEngineConfig,
 ) {
     tokio::spawn(async move {
-        let peers = nodes
-            .iter()
-            .filter(|(peer_id, _)| **peer_id != node_id)
-            .map(|(peer_id, node)| (*peer_id, node.addr.clone()))
-            .collect::<Vec<_>>();
-        let mut next_warning = Instant::now() + engine_config.bootstrap_peer_probe;
-        loop {
-            match raft.is_initialized().await {
-                Ok(true) => return,
-                Ok(false) => {}
-                Err(err) => {
-                    tracing::error!(
-                        "raft bootstrap: node {node_id} group {} failed to check initialization: {err}",
-                        raft_group_id.0
-                    );
-                    return;
-                }
-            }
-            let leader_seen = raft.metrics().borrow_watched().current_leader.is_some();
-            let answers = if leader_seen {
-                Vec::new()
-            } else {
-                futures_util::future::join_all(peers.iter().map(|(peer_id, address)| {
-                    probe_peer_group_log(
-                        raft_group_id,
-                        node_id,
-                        *peer_id,
-                        address,
-                        engine_config.bootstrap_peer_connect,
-                    )
-                }))
-                .await
-            };
-            let decision = if leader_seen {
-                BootstrapDecision::Rejoin
-            } else {
-                bootstrap_decision(&answers)
-            };
-            match decision {
-                BootstrapDecision::Initialize => {
-                    if let Err(err) = raft.initialize(nodes).await {
-                        tracing::error!(
-                            "raft bootstrap: node {node_id} group {} failed to initialize membership: {err}",
-                            raft_group_id.0
-                        );
-                        return;
-                    }
-                    write_bootstrap_marker(node_id, raft_group_id, marker_path.as_deref());
-                    return;
-                }
-                BootstrapDecision::Rejoin => {
-                    tracing::warn!(
-                        "raft bootstrap: memory-WAL node {node_id} group {} restarted empty in an initialized group; not re-initializing, waiting to be rebuilt from the leader",
-                        raft_group_id.0
-                    );
-                    write_bootstrap_marker(node_id, raft_group_id, marker_path.as_deref());
-                    return;
-                }
-                BootstrapDecision::Wait => {}
-            }
-            if Instant::now() >= next_warning {
-                let answered = answers.iter().filter(|answer| answer.is_some()).count();
-                tracing::warn!(
-                    "raft bootstrap: memory-WAL node {node_id} group {} waits for every voter before initializing; {answered}/{} answered",
-                    raft_group_id.0,
-                    peers.len()
-                );
-                next_warning = Instant::now() + engine_config.bootstrap_peer_probe;
-            }
-            tokio::time::sleep(engine_config.bootstrap_peer_probe_interval).await;
+        let connect = engine_config.bootstrap_peer_connect;
+        let outcome = run_memory_wal_bootstrap(
+            node_id,
+            raft,
+            rejoin,
+            nodes,
+            move |peer_id, address| async move {
+                probe_peer_group_log(raft_group_id, node_id, peer_id, &address, connect).await
+            },
+            engine_config.bootstrap_peer_probe_interval,
+            engine_config.bootstrap_peer_probe,
+        )
+        .await;
+        if matches!(
+            outcome,
+            MemoryWalBootstrap::Initialized | MemoryWalBootstrap::Rejoined
+        ) {
+            write_bootstrap_marker(node_id, raft_group_id, marker_path.as_deref());
         }
     });
 }
@@ -815,10 +772,13 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 })?);
             // A memory-WAL replica starts with an empty log after every
             // restart: screen its votes and watch its followers (`rejoin`).
-            let rejoin = self
-                .uses_memory_log_store()
-                .then(|| Arc::new(GroupRejoin::new(self.node_id, placement.raft_group_id)));
-            let engine = if let Some(log_stores) = &self.log_stores {
+            let rejoin = self.uses_memory_log_store().then(|| {
+                Arc::new(
+                    GroupRejoin::new(self.node_id, placement.raft_group_id)
+                        .with_init_markers(self.engine_config.init_markers.clone()),
+                )
+            });
+            let mut engine = if let Some(log_stores) = &self.log_stores {
                 RaftGroupEngine::new_node_full(
                     placement,
                     self.node_id,
@@ -859,6 +819,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 .register_read_barrier(placement.raft_group_id, engine.read_barrier.clone());
             if let Some(rejoin) = &rejoin {
                 rejoin.bind(&engine.raft_handle());
+                engine.set_rejoin(rejoin.clone());
                 self.registry
                     .register_rejoin(placement.raft_group_id, rejoin.clone());
             }
@@ -872,9 +833,14 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             {
                 tokio::spawn(run_rejoin_heal(
                     engine.raft_handle(),
-                    rejoin,
+                    rejoin.clone(),
                     configured,
                     REJOIN_HEAL_INTERVAL,
+                ));
+                tokio::spawn(run_init_marker_driver(
+                    engine.raft_handle(),
+                    rejoin,
+                    INIT_MARKER_DRIVER_INTERVAL,
                 ));
             }
             if self.should_initialize_membership(placement.raft_group_id) {
@@ -883,6 +849,9 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                         self.node_id,
                         placement.raft_group_id,
                         engine.raft_handle(),
+                        self.registry
+                            .rejoin(placement.raft_group_id)
+                            .expect("a memory-WAL group registered its rejoin state"),
                         self.peer_nodes_for_group(placement.raft_group_id)?,
                         self.raft_memory_bootstrap_marker_path(placement.raft_group_id),
                         self.engine_config.clone(),
