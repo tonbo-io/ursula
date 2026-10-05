@@ -99,6 +99,17 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
         snapshot_store.is_some(),
     );
     engine_config.snapshot_drive_interval_ms = snapshot_drive_interval_ms as u64;
+    // Memory-WAL groups keep their "initialized" marker in the same
+    // namespace as the format-epoch marker, so a restart of every voter
+    // stops the group instead of re-initializing it.
+    engine_config.init_markers = ursula_runtime::format_marker::FormatEpochNamespace::from_config(
+        &config.storage.cold,
+        &config.storage.snapshot,
+    )
+    .map_err(|err| RuntimeError::ColdStoreConfig {
+        message: err.to_string(),
+    })?
+    .map(|namespace| Arc::new(namespace) as Arc<dyn ursula_raft::InitMarkerStore>);
     let registry = RaftGroupHandleRegistry::default()
         .with_snapshot_install_max_concurrency(config.raft.snapshot_install_max_concurrency);
     if start_maintenance_drained {

@@ -112,11 +112,13 @@ use crate::forward::forward_purge_bucket_to_leader;
 use crate::forward::forward_read_stream_to_leader;
 use crate::forward::group_engine_client_write_error;
 use crate::forward::group_engine_forward_to_leader_error;
+use crate::forward::group_engine_initialized_marker_unavailable;
 use crate::forward::write_result_from_raft_response;
 use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RaftGroupLogStore;
 use crate::read_index::ReadIndexBarrier;
 use crate::registry::SingleNodeRaftNetworkFactory;
+use crate::rejoin::GroupRejoin;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::state_machine::SnapshotBuildCoordinator;
 use crate::state_machine::SnapshotInstallCoordinator;
@@ -130,6 +132,9 @@ pub struct RaftGroupEngine {
     /// The group's coalescing ReadIndex barrier, shared with the runtime and
     /// with forwarded gRPC reads (through the registry).
     pub(crate) read_barrier: Arc<ReadIndexBarrier>,
+    /// Memory-WAL only: no client write is proposed before the group's
+    /// "initialized" marker is in object storage (`restart_guard`).
+    pub(crate) rejoin: Option<Arc<GroupRejoin>>,
 }
 
 pub(crate) fn should_forward_stale_follower_read_error(
@@ -390,6 +395,7 @@ impl RaftGroupEngine {
             placement,
             cold_store,
             cold_index_cache,
+            rejoin: None,
         })
     }
 
@@ -435,6 +441,12 @@ impl RaftGroupEngine {
             )
             .await
             .is_ok()
+    }
+
+    /// Attach the group's memory-WAL rejoin state: client writes then wait
+    /// for the group's "initialized" marker (see `restart_guard`).
+    pub fn set_rejoin(&mut self, rejoin: Arc<GroupRejoin>) {
+        self.rejoin = Some(rejoin);
     }
 
     pub fn raft_handle(&self) -> Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine> {
@@ -498,6 +510,23 @@ impl RaftGroupEngine {
         &self,
         command: GroupWriteCommand,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
+        // Memory WAL: a leader proposes no client write before the group's
+        // "initialized" marker is in object storage (`restart_guard`). A
+        // follower or an uninitialized replica writes no marker: its write
+        // fails below, and a fresh group must stay unmarked until it really
+        // takes a write.
+        let guard = self.rejoin.as_ref().map(|rejoin| rejoin.restart_guard());
+        if let Some(guard) = guard
+            && self.raft.is_leader()
+            && let Err(err) = guard.ensure_marked().await
+        {
+            let self_id = self.raft.metrics().borrow_watched().id;
+            return Err(group_engine_initialized_marker_unavailable(
+                self.placement.raft_group_id,
+                &err,
+                self_id,
+            ));
+        }
         let response = match self.raft.client_write(command).await {
             Ok(response) => response,
             Err(err) => {
@@ -505,6 +534,17 @@ impl RaftGroupEngine {
                 return Err(group_engine_client_write_error(err, self_id));
             }
         };
+        // It became leader between the check and the proposal: the write
+        // committed, but it is not acknowledged before the marker exists.
+        if let Some(guard) = guard
+            && let Err(err) = guard.ensure_marked().await
+        {
+            return Err(GroupEngineError::new(format!(
+                "raft group {} committed the write but could not record its initialized marker \
+                 in object storage, so the write is not acknowledged: {err}",
+                self.placement.raft_group_id.0
+            )));
+        }
         write_result_from_raft_response(response.data)?
     }
 

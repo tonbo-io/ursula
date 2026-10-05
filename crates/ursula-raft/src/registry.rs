@@ -1094,6 +1094,32 @@ impl RaftGroupHandleRegistry {
         rejoin.adopt_survivor(&raft, survivor).await
     }
 
+    /// Memory-WAL groups whose initializer on this node stopped because every
+    /// voter restarted empty after the group held writes.
+    pub fn full_restart_stopped_groups(&self) -> Vec<u32> {
+        self.rejoins
+            .lock()
+            .expect("raft group rejoin mutex")
+            .iter()
+            .filter(|(_, rejoin)| rejoin.restart_guard().stopped_for_operator())
+            .map(|(group, _)| *group)
+            .collect()
+    }
+
+    /// Operator recovery after a restart of every voter of a memory-WAL
+    /// group: let this node's stopped initializer run `Initialize` again,
+    /// dropping what the group held. `Ok(false)`: the group has not stopped
+    /// on this node.
+    pub fn accept_rejoin_data_loss(&self, raft_group_id: RaftGroupId) -> Result<bool, String> {
+        let rejoin = self.rejoin(raft_group_id).ok_or_else(|| {
+            format!(
+                "raft group {} has no memory-WAL rejoin state (not a memory-WAL group)",
+                raft_group_id.0
+            )
+        })?;
+        Ok(rejoin.restart_guard().accept_data_loss())
+    }
+
     /// The group's shared cold-index page cache, if one was registered.
     pub fn cold_index_cache(&self, raft_group_id: RaftGroupId) -> Option<GroupColdIndexCache> {
         self.cold_index_caches

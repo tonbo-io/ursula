@@ -705,9 +705,38 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 .map(|payload| decode_wire(&payload, "group command"))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+            // Memory WAL: a leader proposes nothing before the group's
+            // initialized marker is in object storage (`restart_guard`).
+            let rejoin = self.registry.rejoin(placement.raft_group_id);
+            let guard = rejoin
+                .as_ref()
+                .filter(|_| !commands.is_empty())
+                .map(|rejoin| rejoin.restart_guard());
+            if let Some(guard) = guard
+                && raft.is_leader()
+                && let Err(err) = guard.ensure_marked().await
+            {
+                return Err(tonic::Status::unavailable(format!(
+                    "raft group {} cannot record its initialized marker in object storage yet: {err}",
+                    placement.raft_group_id.0
+                )));
+            }
             let results = write_commands_on_raft(raft, commands)
                 .await
-                .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?
+                .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
+            // Became leader after the check: not acknowledged before the
+            // marker exists.
+            if let Some(guard) = guard
+                && results.iter().any(Result::is_ok)
+                && let Err(err) = guard.ensure_marked().await
+            {
+                return Err(tonic::Status::internal(format!(
+                    "raft group {} could not record its initialized marker in object storage; \
+                     the write outcome is unknown: {err}",
+                    placement.raft_group_id.0
+                )));
+            }
+            let results = results
                 .into_iter()
                 .map(|result| match result {
                     Ok(response) => raft_internal_proto::GroupWriteResultV1 {
