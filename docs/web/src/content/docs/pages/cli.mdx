@@ -113,6 +113,8 @@ Per-node fields, all optional except `id`:
 
 On clusters running the volatile `raft.wal.backend = "memory"`, a restarted node has no prior Raft log. `prepare-restart` quiesces the target and pins every group leader to one surviving voter. After the platform replacement starts, `repair-restarted-voter` commits a survivor-only voter set for each unready group, adds the target as a blocking learner, and promotes it only after catch-up. Those membership transitions survive leader changes, process restarts, and a partially completed multi-group repair.
 
+An unplanned restart (crash, OOM kill, eviction) gets no such repair: the node rejoins as a voter with an empty log that the leaders do not backfill, and its vote still counts. Run `verify-cluster` after one, and `repair-restarted-voter --node N` if it reports the node unready (see [Restarting a memory-WAL node](/docs/operations#restarting-a-memory-wal-node)).
+
 Do not bypass the detach, learner, and promotion sequence with OpenRaft's process-local log-reversion trigger. It cannot provide durable progress across hundreds of independent groups. The rollout controller leaves the target drained and releases survivor fences on failure, so a later attempt can safely resume the committed membership state.
 
 The rebuild after an amnesiac restart installs snapshots for every group and can take 10+ minutes. `wait` is progress-gated, so no timeout tuning is needed: a rebuild that keeps advancing is never timed out, and `--stall-timeout-secs` (default 90) only aborts a node that stops making progress.
