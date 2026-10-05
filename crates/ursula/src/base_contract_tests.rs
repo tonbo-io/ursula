@@ -498,7 +498,8 @@ async fn stream_incarnation_precondition_that_holds_changes_nothing() {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
         let at = next_offset(&response);
-        let response = send(&app, "GET", &format!("{uri}?offset=-1"), headers, "").await;
+        // At the tail: the first round's retention trims the start.
+        let response = send(&app, "GET", &format!("{uri}?offset={at}"), headers, "").await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
         let response = send(
