@@ -11,12 +11,17 @@ api: "DELETE /{bucket}/{stream}"
  Stream ID within the bucket.
 </ParamField>
 
+<ParamField header="Stream-Incarnation" type="string">
+ Optional precondition: the stream's incarnation token, as a previous response's `Stream-Incarnation` header returned it. The delete applies only if the stream is still that incarnation; otherwise it answers `412` and deletes nothing. Without the header, the request behaves exactly as described here. A malformed value answers `400`. See [`Stream-Incarnation`](/docs/specs/extensions#24-snapshot-metadata-on-head-and-stream-incarnation).
+</ParamField>
+
 ## Response
 
 | Status | Meaning |
 | ------ | ----------------- |
 | `204` | Stream deleted. |
 | `404` | Stream not found. |
+| `412` | `Stream-Incarnation` did not match: the stream is another incarnation, which was not deleted. The response's `Stream-Incarnation` is its token. |
 
 <RequestExample>
 ```bash Example

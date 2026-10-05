@@ -31,6 +31,9 @@ pub struct CreateStreamRequest {
     pub stream_ttl_seconds: Option<u64>,
     pub stream_expires_at_ms: Option<u64>,
     pub now_ms: u64,
+    /// `Stream-Incarnation` request precondition (D12): apply only to this
+    /// incarnation of the stream. `None` for a request without the header.
+    pub if_incarnation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +48,9 @@ pub struct CreateStreamExternalRequest {
     pub stream_ttl_seconds: Option<u64>,
     pub stream_expires_at_ms: Option<u64>,
     pub now_ms: u64,
+    /// See [`CreateStreamRequest::if_incarnation`].
+    #[serde(default)]
+    pub if_incarnation: Option<u64>,
 }
 
 impl CreateStreamExternalRequest {
@@ -64,6 +70,7 @@ impl CreateStreamExternalRequest {
             stream_ttl_seconds: request.stream_ttl_seconds,
             stream_expires_at_ms: request.stream_expires_at_ms,
             now_ms: request.now_ms,
+            if_incarnation: request.if_incarnation,
         }
     }
 }
@@ -86,6 +93,7 @@ impl CreateStreamRequest {
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
             now_ms: 0,
+            if_incarnation: None,
         }
     }
 }
@@ -104,6 +112,10 @@ pub struct CreateStreamResponse {
     pub closed: bool,
     pub already_exists: bool,
     pub group_commit_index: u64,
+    /// The stream incarnation (`created_at_ms`) the write applied to,
+    /// rendered as `Stream-Incarnation` (D12). `0` from an older leader.
+    #[serde(default)]
+    pub incarnation: u64,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
     /// the runtime records its metric without a second state-machine round
     /// trip.
@@ -182,6 +194,10 @@ pub struct ReadStreamResponse {
     pub payload: Vec<u8>,
     pub up_to_date: bool,
     pub closed: bool,
+    /// The incarnation (`created_at_ms`) of the stream that served the
+    /// read (D12). `0` from an older leader.
+    #[serde(default)]
+    pub incarnation: u64,
 }
 
 pub enum GroupReadStreamBody {
@@ -203,6 +219,8 @@ pub enum GroupReadStreamBody {
 
 pub struct GroupReadStreamParts {
     pub placement: ShardPlacement,
+    /// See [`ReadStreamResponse::incarnation`].
+    pub incarnation: u64,
     pub offset: u64,
     pub next_offset: u64,
     pub content_type: String,
@@ -215,6 +233,7 @@ impl GroupReadStreamParts {
     pub fn from_response(response: ReadStreamResponse) -> Self {
         Self {
             placement: response.placement,
+            incarnation: response.incarnation,
             offset: response.offset,
             next_offset: response.next_offset,
             content_type: response.content_type,
@@ -233,6 +252,7 @@ impl GroupReadStreamParts {
     ) -> Self {
         Self {
             placement,
+            incarnation: plan.incarnation,
             offset: plan.offset,
             next_offset: plan.next_offset,
             content_type: plan.content_type.clone(),
@@ -285,6 +305,7 @@ impl GroupReadStreamParts {
             payload,
             up_to_date: self.up_to_date,
             closed: self.closed,
+            incarnation: self.incarnation,
         })
     }
 
@@ -317,6 +338,9 @@ pub struct PublishSnapshotRequest {
     /// JSON streams: the incarnation whose byte before `snapshot_offset`
     /// the proposer read and found LF (see `StreamCommand::PublishSnapshot`).
     pub expected_incarnation: Option<u64>,
+    /// `Stream-Incarnation` request precondition (D12): apply only to this
+    /// incarnation of the stream. `None` for a request without the header.
+    pub if_incarnation: Option<u64>,
 }
 
 /// A snapshot body staged in the cold tier with the digest computed while
@@ -333,6 +357,10 @@ pub struct PublishSnapshotResponse {
     pub snapshot_offset: u64,
     pub snapshot_digest: String,
     pub group_commit_index: u64,
+    /// The stream incarnation (`created_at_ms`) the write applied to,
+    /// rendered as `Stream-Incarnation` (D12). `0` from an older leader.
+    #[serde(default)]
+    pub incarnation: u64,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
     /// the runtime records its metric without a second state-machine round
     /// trip.
@@ -346,6 +374,8 @@ pub struct AdvanceRetentionRequest {
     pub now_ms: u64,
     /// As on [`PublishSnapshotRequest::expected_incarnation`].
     pub expected_incarnation: Option<u64>,
+    /// See [`PublishSnapshotRequest::if_incarnation`].
+    pub if_incarnation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,6 +383,10 @@ pub struct AdvanceRetentionResponse {
     pub placement: ShardPlacement,
     pub retained_offset: u64,
     pub group_commit_index: u64,
+    /// The stream incarnation (`created_at_ms`) the write applied to,
+    /// rendered as `Stream-Incarnation` (D12). `0` from an older leader.
+    #[serde(default)]
+    pub incarnation: u64,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
     /// the runtime records its metric without a second state-machine round
     /// trip.
@@ -419,6 +453,8 @@ pub struct ReadSnapshotResponse {
     /// it from the cold store.
     pub object: Option<ExternalPayloadRef>,
     pub up_to_date: bool,
+    /// See [`ReadStreamResponse::incarnation`].
+    pub incarnation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -450,6 +486,8 @@ pub struct BootstrapStreamResponse {
     pub next_offset: u64,
     pub up_to_date: bool,
     pub closed: bool,
+    /// See [`ReadStreamResponse::incarnation`].
+    pub incarnation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -458,6 +496,9 @@ pub struct CloseStreamRequest {
     pub stream_seq: Option<String>,
     pub producer: Option<ProducerRequest>,
     pub now_ms: u64,
+    /// `Stream-Incarnation` request precondition (D12): apply only to this
+    /// incarnation of the stream. `None` for a request without the header.
+    pub if_incarnation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -466,11 +507,18 @@ pub struct CloseStreamResponse {
     pub next_offset: u64,
     pub group_commit_index: u64,
     pub deduplicated: bool,
+    /// The stream incarnation (`created_at_ms`) the write applied to,
+    /// rendered as `Stream-Incarnation` (D12). `0` from an older leader.
+    #[serde(default)]
+    pub incarnation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteStreamRequest {
     pub stream_id: BucketStreamId,
+    /// `Stream-Incarnation` request precondition (D12): apply only to this
+    /// incarnation of the stream. `None` for a request without the header.
+    pub if_incarnation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -604,6 +652,9 @@ pub struct AppendRequest {
     pub stream_seq: Option<String>,
     pub producer: Option<ProducerRequest>,
     pub now_ms: u64,
+    /// `Stream-Incarnation` request precondition (D12): apply only to this
+    /// incarnation of the stream. `None` for a request without the header.
+    pub if_incarnation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -616,6 +667,9 @@ pub struct AppendExternalRequest {
     pub stream_seq: Option<String>,
     pub producer: Option<ProducerRequest>,
     pub now_ms: u64,
+    /// See [`AppendRequest::if_incarnation`].
+    #[serde(default)]
+    pub if_incarnation: Option<u64>,
 }
 
 impl AppendExternalRequest {
@@ -633,6 +687,7 @@ impl AppendExternalRequest {
             stream_seq: request.stream_seq,
             producer: request.producer,
             now_ms: request.now_ms,
+            if_incarnation: request.if_incarnation,
         }
     }
 }
@@ -656,6 +711,7 @@ impl AppendRequest {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            if_incarnation: None,
         }
     }
 
@@ -668,6 +724,7 @@ impl AppendRequest {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            if_incarnation: None,
         }
     }
 
@@ -692,6 +749,10 @@ pub struct AppendResponse {
     /// deduplicated without byte ranges. `start_offset` and
     /// `next_offset` then carry no information about the original append.
     pub receipt_evicted: bool,
+    /// The stream incarnation (`created_at_ms`) the write applied to,
+    /// rendered as `Stream-Incarnation` (D12). `0` from an older leader.
+    #[serde(default)]
+    pub incarnation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

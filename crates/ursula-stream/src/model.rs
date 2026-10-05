@@ -228,6 +228,10 @@ pub enum StreamReadSegment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamReadPlan {
+    /// The incarnation (`created_at_ms`) of the stream that served the
+    /// plan, rendered as `Stream-Incarnation` and checked against a read's
+    /// precondition (D12).
+    pub incarnation: u64,
     pub offset: u64,
     pub next_offset: u64,
     pub content_type: String,

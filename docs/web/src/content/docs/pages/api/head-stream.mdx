@@ -11,6 +11,10 @@ api: "HEAD /{bucket}/{stream}"
  Stream ID within the bucket.
 </ParamField>
 
+<ParamField header="Stream-Incarnation" type="string">
+ Optional precondition: the stream's incarnation token, as a previous response's `Stream-Incarnation` header returned it. The `HEAD` answers `200` only if the stream is still that incarnation; otherwise `412`, with the current token in `Stream-Incarnation`. Without the header, the request behaves exactly as described here. A malformed value answers `400`. See [`Stream-Incarnation`](/docs/specs/extensions#24-snapshot-metadata-on-head-and-stream-incarnation).
+</ParamField>
+
 ## Response
 
 | Status | Meaning |
@@ -18,6 +22,7 @@ api: "HEAD /{bucket}/{stream}"
 | `200` | Stream found. |
 | `307` | In a cluster, this node could not answer as the stream's group leader. `Location` is the same request on the leader. |
 | `404` | Stream not found or expired. |
+| `412` | `Stream-Incarnation` did not match. The response's `Stream-Incarnation` is the current token. |
 | `503` | The group has no known leader, or the leader could not confirm its leadership in time. Retry after `Retry-After`. |
 
 `HEAD` is linearizable: the leader confirms with a majority of voters that it still leads before it answers, so the response reflects every append acknowledged before the request started. See [Durability and consistency](/docs/concepts/durability-and-consistency#consistency).

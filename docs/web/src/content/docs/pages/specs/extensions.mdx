@@ -127,7 +127,7 @@ Publishing a snapshot MUST NOT change the earliest retained offset. Retention is
 PUT {stream_url}/retention/{retained_offset}
 ```
 
-The server MUST reject a retention boundary that is not aligned to committed data (for a JSON stream, not a message boundary: `400 Bad Request`), moves backward, or is newer than the latest published snapshot. As for a snapshot, a JSON retention boundary the server cannot verify MUST NOT be applied (`503 Service Unavailable`). After success, offsets less than `retained_offset` MUST return `410 Gone`. A server MAY retain less than requested, at a committed boundary at or below `retained_offset`; the success response's `Stream-Retained-Offset` then reports the effective boundary, and offsets below it MUST return `410 Gone`. Ursula retains exactly the requested offset.
+Like every request that addresses a stream, a retention request MAY carry the `Stream-Incarnation` precondition (Section 2.4); its success response carries `Stream-Incarnation`. The server MUST reject a retention boundary that is not aligned to committed data (for a JSON stream, not a message boundary: `400 Bad Request`), moves backward, or is newer than the latest published snapshot. As for a snapshot, a JSON retention boundary the server cannot verify MUST NOT be applied (`503 Service Unavailable`). After success, offsets less than `retained_offset` MUST return `410 Gone`. A server MAY retain less than requested, at a committed boundary at or below `retained_offset`; the success response's `Stream-Retained-Offset` then reports the effective boundary, and offsets below it MUST return `410 Gone`. Ursula retains exactly the requested offset.
 
 > **Note (informative).** Ursula checks a JSON boundary at apply time when the byte before the offset is still in memory. Otherwise it reads that byte from the leader (as a `consistency=leader` read), and applies the operation only if the stream was not deleted and recreated in between; a failed read answers `503`.
 
@@ -137,7 +137,7 @@ Publishing a new snapshot replaces the previously visible snapshot immediately. 
 
 Snapshot creation MUST NOT block concurrent appends. The snapshot's consistency boundary is `snapshot_offset`. Updates at or beyond that offset MUST NOT be folded into the snapshot.
 
-### 2.4. Snapshot Metadata on HEAD
+### 2.4. Snapshot Metadata on HEAD and Stream Incarnation
 
 ```
 HEAD {stream_url}
@@ -157,7 +157,21 @@ Servers MUST include `Stream-Snapshot-Offset` and `Stream-Snapshot-Digest` when 
 - Absence of `Stream-Snapshot-Offset` means the stream has no visible snapshot.
 - To read the latest snapshot, a client takes `Stream-Snapshot-Offset` from `HEAD` and fetches it with Read Snapshot (Section 2.5).
 - A server implementing this extension MUST send `Stream-Retained-Offset` on every successful `HEAD`. Reads at offsets below it MUST return `410 Gone`. Before any retention advance it is the offset of the stream's first byte. Like every offset, it is opaque: clients pass it back as `offset` or compare it lexicographically with other offsets of the same stream.
-- A server implementing this extension MUST send `Stream-Incarnation` on every successful `HEAD`. It MUST change when the stream is deleted and recreated at the same URL, and MUST NOT change otherwise. Clients MUST compare it only for equality. Offsets do not identify an incarnation, so a client that stores offsets and snapshot offsets across a possible recreate SHOULD store the incarnation with them and check it on `HEAD` before resuming. An operator restore from backup keeps each stream's incarnation although it can rewind the stream to the backup's tail; offsets read after the backup was taken are not valid on the restored stream.
+- A server implementing this extension MUST send `Stream-Incarnation` on every successful `HEAD`. It MUST change when the stream is deleted and recreated at the same URL, and MUST NOT change otherwise. Clients MUST compare it only for equality. Offsets do not identify an incarnation, so a client that stores offsets and snapshot offsets across a possible recreate SHOULD store the incarnation with them and send it as a request precondition (below). An operator restore from backup keeps each stream's incarnation although it can rewind the stream to the backup's tail; offsets read after the backup was taken are not valid on the restored stream.
+
+**`Stream-Incarnation` on responses:**
+
+A server implementing this extension MUST send `Stream-Incarnation` on every successful response of a request that addresses a stream: create (`201` and `200`), append and close, every read (catch-up, the long-poll `204`, and the SSE response), `HEAD`, bootstrap, snapshot publish and read, and retention. A client learns the token from its first request, without a separate `HEAD`.
+
+**`Stream-Incarnation` as a request precondition:**
+
+Requests address streams by URL only, so a client holding state from a deleted incarnation (offsets, producer state, a local cache) would otherwise act on a stream recreated at the same URL, including one recreated by TTL expiry and a later create, without any delete. Every request that addresses a stream MAY carry `Stream-Incarnation`: create (`PUT`), append (`POST`, including close), every read (catch-up, long-poll, SSE), `HEAD`, `DELETE`, bootstrap, snapshot publish and read, and retention.
+
+- **Absent:** the request behaves as the base protocol and this extension define it, unchanged.
+- **Present:** the server compares the value for equality with the stream's current incarnation, atomically with the operation. A write is compared when it is applied: a write that was accepted before a delete and recreate but applied after it is refused. A read is compared against the same stream state that serves it. A live read (long-poll or SSE) ends when the stream it was opened against is deleted or recreated: a long-poll answers `404` or `412`, and an SSE stream ends with an `error` event.
+- **Mismatch:** `412 Precondition Failed`. A refused write applies nothing; a refused read returns no data, though, like any request that reaches a stream, it may still renew that stream's sliding TTL. The response carries the current `Stream-Incarnation` when the stream exists. `412`, not `409`, so it never mixes with `Stream-Seq` and producer conflicts.
+- **Evaluation** follows RFC 9110 §13.2: a request that would answer `404` without the header still answers `404`, except that a `PUT` with the header for a stream that does not exist answers `412` and creates nothing. Likewise a read that would answer `410` or `416` without the header still does; only a request that would otherwise succeed (or a `PUT` that would create) is answered `412`.
+- **Malformed:** a value that is not a token the server could have issued, or more than one value, answers `400 Bad Request`.
 
 ### 2.5. Read Snapshot
 

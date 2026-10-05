@@ -17,15 +17,20 @@ api: "GET /{bucket}/{stream}/snapshot/{offset}"
  Snapshot offset: the 20-character zero-padded decimal token returned by previous reads or `Stream-Snapshot-Offset` headers.
 </ParamField>
 
+<ParamField header="Stream-Incarnation" type="string">
+ Optional precondition: the stream's incarnation token, as a previous response's `Stream-Incarnation` header returned it. The read is answered only if the stream that serves it is still that incarnation; otherwise it answers `412`. Without the header, the request behaves exactly as described here. A malformed value answers `400`. See [`Stream-Incarnation`](/docs/specs/extensions#24-snapshot-metadata-on-head-and-stream-incarnation).
+</ParamField>
+
 | Status | Meaning |
 | ------ | -------------------------------------- |
 | `200` | Snapshot blob returned. |
 | `307` | In a cluster, this node is not the stream's group leader. `Location` is the same request on the leader. |
 | `404` | Stream, snapshot, or offset not found. |
+| `412` | `Stream-Incarnation` did not match. The response's `Stream-Incarnation` is the current token. |
 | `502` | The snapshot body is in the cold tier and could not be read. |
 | `503` | The group has no known leader, or the leader could not confirm its leadership in time. Retry after `Retry-After`. |
 
-Response headers include `Content-Type`, `Content-Length`, `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, and `Stream-Up-To-Date: true` when the snapshot offset is the stream's tail. A body stored in the cold tier is streamed from it.
+Response headers include `Content-Type`, `Content-Length`, `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, `Stream-Incarnation`, and `Stream-Up-To-Date: true` when the snapshot offset is the stream's tail. A body stored in the cold tier is streamed from it.
 
 <RequestExample>
 ```bash Read specific offset

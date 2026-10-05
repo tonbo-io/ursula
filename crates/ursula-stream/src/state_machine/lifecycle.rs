@@ -12,6 +12,7 @@ use super::ProducerReceipt;
 use super::ProducerRequest;
 use super::ProducerState;
 use super::StreamColdState;
+use super::StreamCommand;
 use super::StreamErrorCode;
 use super::StreamErrorContext;
 use super::StreamMetadata;
@@ -507,6 +508,86 @@ impl StreamStateMachine {
         }
         self.release_shared_cold_objects(&stream_id.bucket_id, shared_paths, 0);
         true
+    }
+
+    /// The incarnation (`created_at_ms`) of the stream held in state, or
+    /// `None` when there is none. A response that renders
+    /// `Stream-Incarnation` reads it from the state that served it.
+    pub fn stream_incarnation(&self, stream_id: &BucketStreamId) -> Option<u64> {
+        self.stream_metadata(stream_id)
+            .map(|stream| stream.created_at_ms)
+    }
+
+    /// The `Stream-Incarnation` precondition (D12) of `command` at apply
+    /// time: `None` when it may apply, else the refusal, with nothing
+    /// changed. It applies when its stream is the incarnation `expected`.
+    /// Evaluation follows RFC 9110 §13.2: a command on a missing (or
+    /// expired) stream applies and answers its usual 404, except a create,
+    /// which is refused so that it creates nothing; a stream of any other
+    /// incarnation refuses it, naming the current one. A create whose ids
+    /// are invalid, or whose bucket was erased, keeps its own error.
+    /// Commands that never carry the precondition apply unchanged.
+    pub fn incarnation_precondition(
+        &self,
+        command: &StreamCommand,
+        expected: u64,
+    ) -> Option<StreamResponse> {
+        let (stream_id, now_ms, create) = match command {
+            StreamCommand::CreateStream {
+                stream_id, now_ms, ..
+            }
+            | StreamCommand::CreateExternal {
+                stream_id, now_ms, ..
+            } => (stream_id, Some(*now_ms), true),
+            StreamCommand::Append {
+                stream_id, now_ms, ..
+            }
+            | StreamCommand::AppendExternal {
+                stream_id, now_ms, ..
+            }
+            | StreamCommand::PublishSnapshot {
+                stream_id, now_ms, ..
+            }
+            | StreamCommand::PublishSnapshotExternal {
+                stream_id, now_ms, ..
+            }
+            | StreamCommand::AdvanceRetention {
+                stream_id, now_ms, ..
+            }
+            | StreamCommand::Close {
+                stream_id, now_ms, ..
+            } => (stream_id, Some(*now_ms), false),
+            // A delete carries no clock: it removes an expired stream too.
+            StreamCommand::DeleteStream { stream_id } => (stream_id, None, false),
+            _ => return None,
+        };
+        let current = self
+            .stream_metadata(stream_id)
+            .filter(|stream| now_ms.is_none_or(|now_ms| !stream_is_expired(stream, now_ms)))
+            .map(|stream| stream.created_at_ms);
+        match current {
+            Some(current) if current == expected => None,
+            Some(current) => Some(StreamResponse::error_with_context(
+                StreamErrorCode::IncarnationMismatch,
+                format!("stream '{stream_id}' is incarnation {current}, not {expected}"),
+                vec![StreamErrorContext::StreamIncarnation {
+                    incarnation: current,
+                }],
+            )),
+            None if create
+                && validate_bucket_id(&stream_id.bucket_id).is_ok()
+                && validate_stream_id(stream_id).is_ok()
+                && !self.erased_buckets.contains(&stream_id.bucket_id) =>
+            {
+                Some(StreamResponse::error(
+                    StreamErrorCode::IncarnationMismatch,
+                    format!(
+                        "stream '{stream_id}' does not exist, so it is not incarnation {expected}"
+                    ),
+                ))
+            }
+            None => None,
+        }
     }
 
     pub(super) fn validate_stream_scope(

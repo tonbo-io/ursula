@@ -79,6 +79,7 @@ async fn append_external(
             stream_seq: stream_seq.map(str::to_owned),
             producer: None,
             now_ms: 0,
+            if_incarnation: None,
         })
         .await;
     (path, result.is_ok())

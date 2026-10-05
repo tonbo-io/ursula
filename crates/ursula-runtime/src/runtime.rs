@@ -385,6 +385,19 @@ impl ShardRuntime {
         &self,
         request: ReadStreamRequest,
     ) -> Result<ReadStreamResponse, RuntimeError> {
+        self.wait_read_stream_pinned(request, None).await
+    }
+
+    /// [`Self::wait_read_stream`] for a live read opened against stream
+    /// incarnation `incarnation` (D12): the wait also ends, with a read of
+    /// whatever the stream now is, when the stream is recreated, so the
+    /// caller sees the changed `ReadStreamResponse::incarnation`. A delete
+    /// ends every wait already (the re-read finds no stream).
+    pub async fn wait_read_stream_pinned(
+        &self,
+        request: ReadStreamRequest,
+        incarnation: Option<u64>,
+    ) -> Result<ReadStreamResponse, RuntimeError> {
         let placement = self.shard_map.locate(&request.stream_id);
         let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
         let waiter_id = self.next_waiter_id.fetch_add(1, Ordering::Relaxed);
@@ -396,6 +409,7 @@ impl ShardRuntime {
             command: GroupCommand::WaitRead {
                 request,
                 waiter_id,
+                incarnation,
                 response_tx,
             },
         })

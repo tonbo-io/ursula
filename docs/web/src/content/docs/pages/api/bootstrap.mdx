@@ -15,6 +15,10 @@ Returns the stream's latest snapshot (if any) plus the retained updates after th
 
 Bootstrap does not accept `?live=sse`. Combining the multipart body with an SSE event stream is rejected with `400`. To go live after bootstrap, finish the multipart response, then open a separate `GET /{bucket}/{stream}?offset=<Stream-Next-Offset>&live=sse`.
 
+<ParamField header="Stream-Incarnation" type="string">
+ Optional precondition: the stream's incarnation token, as a previous response's `Stream-Incarnation` header returned it. The read is answered only if the stream that serves it is still that incarnation; otherwise it answers `412`. Without the header, the request behaves exactly as described here. A malformed value answers `400`. See [`Stream-Incarnation`](/docs/specs/extensions#24-snapshot-metadata-on-head-and-stream-incarnation).
+</ParamField>
+
 ## Response
 
 | Status | Meaning |
@@ -24,6 +28,7 @@ Bootstrap does not accept `?live=sse`. Combining the multipart body with an SSE 
 | `400` | Invalid query parameters (including `live=sse`). |
 | `404` | Stream not found or expired. |
 | `410` | Requested offset has been trimmed. |
+| `412` | `Stream-Incarnation` did not match. The response's `Stream-Incarnation` is the current token. |
 | `503` | The group has no known leader, or the leader could not confirm its leadership in time. Retry after `Retry-After`. |
 
 Bootstrap is served by the group's leader after it confirms with a majority of voters that it still leads, so the response reflects every append and snapshot acknowledged before the request. See [Durability and consistency](/docs/concepts/durability-and-consistency#consistency).
@@ -35,6 +40,7 @@ Response headers include:
 | `Content-Type` | `multipart/mixed; boundary=...` |
 | `Stream-Next-Offset` | The offset after the last included update, or the snapshot point when the response has no update parts. Continue reading from here. |
 | `Stream-Snapshot-Offset` | The snapshot offset, or `-1` if no snapshot exists. |
+| `Stream-Incarnation` | The incarnation token of the stream that served the response. |
 | `Stream-Up-To-Date` | `true` when the response reaches the stream's tail. Absent on a partial response. |
 | `Stream-Closed` | Present and `true` if the stream is closed and the response reaches its tail. |
 | `Cache-Control` | `no-store`. |

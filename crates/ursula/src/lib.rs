@@ -127,6 +127,7 @@ use crate::render::insert_content_type;
 use crate::render::insert_cursor;
 use crate::render::insert_default_response_headers;
 use crate::render::insert_header_str;
+use crate::render::insert_incarnation;
 use crate::render::insert_lifetime_headers;
 use crate::render::insert_location;
 use crate::render::insert_offset;
@@ -1414,6 +1415,7 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
     insert_content_type(&mut headers, content_type);
     insert_offset(&mut headers, response.next_offset);
     insert_location(&mut headers, stream_id);
+    insert_incarnation(&mut headers, response.incarnation);
     insert_lifetime_headers(&mut headers, stream_ttl_seconds, stream_expires_at_ms);
     insert_producer_ack(&mut headers, producer);
     if response.closed {
@@ -1435,6 +1437,7 @@ pub(crate) fn append_http_response(response: AppendResponse) -> Response {
     if !response.receipt_evicted {
         insert_offset(&mut headers, response.next_offset);
     }
+    insert_incarnation(&mut headers, response.incarnation);
     insert_producer_ack(&mut headers, response.producer.as_ref());
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
@@ -2380,7 +2383,12 @@ pub(crate) async fn create_stream_by_id(
         Ok(lifetime) => lifetime,
         Err(response) => return *response,
     };
+    let if_incarnation = match incarnation_precondition(&request_headers) {
+        Ok(if_incarnation) => if_incarnation,
+        Err(response) => return *response,
+    };
     let mut request = CreateStreamRequest::new(stream_id.clone(), content_type.clone());
+    request.if_incarnation = if_incarnation;
     request.content_type_explicit = content_type_explicit;
     request.now_ms = state.unix_time_ms();
     request.initial_payload = match normalize_http_write_payload(&content_type, body.clone(), true)
@@ -2486,6 +2494,10 @@ pub(crate) async fn append_stream_by_id(
     if let Err(response) = removed_surface::reject_removed_append_headers(&headers) {
         return *response;
     }
+    let if_incarnation = match incarnation_precondition(&headers) {
+        Ok(if_incarnation) => if_incarnation,
+        Err(response) => return *response,
+    };
     let close_after = stream_closed(&headers);
 
     if body.is_empty() && close_after {
@@ -2504,6 +2516,7 @@ pub(crate) async fn append_stream_by_id(
                 stream_seq,
                 producer: producer.clone(),
                 now_ms: state.unix_time_ms(),
+                if_incarnation,
             })
             .await
         {
@@ -2511,6 +2524,7 @@ pub(crate) async fn append_stream_by_id(
                 let mut headers = HeaderMap::new();
                 insert_default_response_headers(&mut headers);
                 insert_offset(&mut headers, response.next_offset);
+                insert_incarnation(&mut headers, response.incarnation);
                 insert_producer_ack(&mut headers, producer.as_ref());
                 insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
                 (StatusCode::NO_CONTENT, headers).into_response()
@@ -2533,6 +2547,7 @@ pub(crate) async fn append_stream_by_id(
     };
     let mut request = AppendRequest::from_bytes(stream_id, payload);
     request.content_type = content_type;
+    request.if_incarnation = if_incarnation;
     request.close_after = close_after;
     request.stream_seq = match stream_seq(&headers) {
         Ok(stream_seq) => stream_seq,
@@ -2590,19 +2605,28 @@ pub(crate) async fn delete_stream(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
     Path(path): Path<StreamPath>,
+    headers: HeaderMap,
 ) -> Response {
     let stream_id = path.into_stream_id();
-    delete_stream_by_id(state, request_target(&uri), stream_id).await
+    delete_stream_by_id(state, request_target(&uri), stream_id, headers).await
 }
 
 pub(crate) async fn delete_stream_by_id(
     state: HttpState,
     request_target: String,
     stream_id: BucketStreamId,
+    headers: HeaderMap,
 ) -> Response {
+    let if_incarnation = match incarnation_precondition(&headers) {
+        Ok(if_incarnation) => if_incarnation,
+        Err(response) => return *response,
+    };
     match state
         .runtime
-        .delete_stream(DeleteStreamRequest { stream_id })
+        .delete_stream(DeleteStreamRequest {
+            stream_id,
+            if_incarnation,
+        })
         .await
     {
         Ok(_) => {
@@ -2618,9 +2642,10 @@ pub(crate) async fn head_stream(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
     Path(path): Path<StreamPath>,
+    headers: HeaderMap,
 ) -> Response {
     let stream_id = path.into_stream_id();
-    head_stream_by_id(state, request_target(&uri), stream_id).await
+    head_stream_by_id(state, request_target(&uri), stream_id, headers).await
 }
 
 #[tracing::instrument(
@@ -2632,7 +2657,12 @@ pub(crate) async fn head_stream_by_id(
     state: HttpState,
     request_target: String,
     stream_id: BucketStreamId,
+    request_headers: HeaderMap,
 ) -> Response {
+    let if_incarnation = match incarnation_precondition(&request_headers) {
+        Ok(if_incarnation) => if_incarnation,
+        Err(response) => return *response,
+    };
     match state
         .runtime
         .head_stream(HeadStreamRequest {
@@ -2644,6 +2674,10 @@ pub(crate) async fn head_stream_by_id(
         .await
     {
         Ok(response) => {
+            if let Some(refused) = read_precondition_failed(if_incarnation, response.created_at_ms)
+            {
+                return refused;
+            }
             let mut headers = HeaderMap::new();
             insert_default_response_headers(&mut headers);
             insert_content_type(&mut headers, &response.content_type);
@@ -2671,11 +2705,7 @@ pub(crate) async fn head_stream_by_id(
                 HEADER_STREAM_RETAINED_OFFSET,
                 response.retained_offset,
             );
-            insert_u64_header(
-                &mut headers,
-                HEADER_STREAM_INCARNATION,
-                response.created_at_ms,
-            );
+            insert_incarnation(&mut headers, response.created_at_ms);
             if response.closed {
                 insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
             }
@@ -2715,6 +2745,10 @@ pub(crate) async fn read_stream_by_id(
     if let Err(response) = removed_surface::reject_removed_read_parameters(&query) {
         return *response;
     }
+    let if_incarnation = match incarnation_precondition(&headers) {
+        Ok(if_incarnation) => if_incarnation,
+        Err(response) => return *response,
+    };
     let live_mode = query.get("live").map(String::as_str);
     let leader_only = match query.get("consistency").map(String::as_str) {
         None | Some("local") => false,
@@ -2766,7 +2800,16 @@ pub(crate) async fn read_stream_by_id(
 
     match live_mode {
         Some("sse") => {
-            return sse_stream(state, request_target, stream_id, offset, max_len, &query).await;
+            return sse_stream(
+                state,
+                request_target,
+                stream_id,
+                offset,
+                max_len,
+                &query,
+                if_incarnation,
+            )
+            .await;
         }
         Some("long-poll") => {
             return long_poll_stream(
@@ -2777,6 +2820,7 @@ pub(crate) async fn read_stream_by_id(
                 max_len,
                 &query,
                 headers,
+                if_incarnation,
             )
             .await;
         }
@@ -2796,8 +2840,16 @@ pub(crate) async fn read_stream_by_id(
         })
         .await;
     match read {
-        Ok(response) if offset_is_now => offset_now_response(response),
-        Ok(response) => read_response(response, &headers, None),
+        Ok(response) => {
+            if let Some(refused) = read_precondition_failed(if_incarnation, response.incarnation) {
+                return refused;
+            }
+            if offset_is_now {
+                offset_now_response(response)
+            } else {
+                read_response(response, &headers, None)
+            }
+        }
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
@@ -2927,6 +2979,10 @@ async fn publish_snapshot_by_offset(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    let if_incarnation = match incarnation_precondition(&headers) {
+        Ok(if_incarnation) => if_incarnation,
+        Err(response) => return *response,
+    };
     let content_type = request_content_type(&headers);
     let (payload, cold_body) =
         match cold_snapshot::receive_snapshot_body(&state, &stream_id, &content_type, body).await {
@@ -2945,6 +3001,7 @@ async fn publish_snapshot_by_offset(
         cold_body,
         now_ms: state.unix_time_ms(),
         expected_incarnation: None,
+        if_incarnation,
     };
     let mut result = state.runtime.publish_snapshot(request.clone()).await;
     if let Some(incarnation) = result.as_ref().err().and_then(json_boundary_unverified) {
@@ -2972,6 +3029,7 @@ async fn publish_snapshot_by_offset(
             insert_default_response_headers(&mut headers);
             insert_snapshot_offset(&mut headers, response.snapshot_offset);
             insert_snapshot_digest(&mut headers, &response.snapshot_digest);
+            insert_incarnation(&mut headers, response.incarnation);
             (StatusCode::NO_CONTENT, headers).into_response()
         }
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
@@ -2982,10 +3040,15 @@ pub(crate) async fn advance_retention(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
     Path(path): Path<RetentionPath>,
+    headers: HeaderMap,
 ) -> Response {
     let (stream_id, retained_offset) = path.into_parts();
     let retained_offset = match parse_snapshot_offset(&retained_offset) {
         Ok(offset) => offset,
+        Err(response) => return *response,
+    };
+    let if_incarnation = match incarnation_precondition(&headers) {
+        Ok(if_incarnation) => if_incarnation,
         Err(response) => return *response,
     };
     let request_target = request_target(&uri);
@@ -2994,6 +3057,7 @@ pub(crate) async fn advance_retention(
         retained_offset,
         now_ms: state.unix_time_ms(),
         expected_incarnation: None,
+        if_incarnation,
     };
     let mut result = state.runtime.advance_retention(request.clone()).await;
     if let Some(incarnation) = result.as_ref().err().and_then(json_boundary_unverified) {
@@ -3015,6 +3079,7 @@ pub(crate) async fn advance_retention(
                 HEADER_STREAM_RETAINED_OFFSET,
                 response.retained_offset,
             );
+            insert_incarnation(&mut headers, response.incarnation);
             (StatusCode::NO_CONTENT, headers).into_response()
         }
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
@@ -3030,16 +3095,21 @@ pub(crate) async fn read_snapshot(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
     Path(path): Path<SnapshotPath>,
+    headers: HeaderMap,
 ) -> Response {
     let (stream_id, snapshot_offset) = path.into_parts();
     let snapshot_offset = match parse_snapshot_offset(&snapshot_offset) {
         Ok(offset) => offset,
         Err(response) => return *response,
     };
+    let if_incarnation = match incarnation_precondition(&headers) {
+        Ok(if_incarnation) => if_incarnation,
+        Err(response) => return *response,
+    };
     match state
         .runtime
         .read_snapshot(ReadSnapshotRequest {
-            stream_id,
+            stream_id: stream_id.clone(),
             snapshot_offset: Some(snapshot_offset),
             now_ms: state.unix_time_ms(),
             read_index: None,
@@ -3047,6 +3117,9 @@ pub(crate) async fn read_snapshot(
         .await
     {
         Ok(mut response) => {
+            if let Some(refused) = read_precondition_failed(if_incarnation, response.incarnation) {
+                return refused;
+            }
             let object = response.object.take();
             let mut rendered = snapshot_response(response);
             if let Some(object) = object {
@@ -3073,10 +3146,15 @@ pub(crate) async fn bootstrap_stream(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
     Path(path): Path<StreamPath>,
+    headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> Response {
     let query = match parse_query(raw_query.as_deref()) {
         Ok(query) => query,
+        Err(response) => return *response,
+    };
+    let if_incarnation = match incarnation_precondition(&headers) {
+        Ok(if_incarnation) => if_incarnation,
         Err(response) => return *response,
     };
     if query.contains_key("live") {
@@ -3096,10 +3174,15 @@ pub(crate) async fn bootstrap_stream(
         })
         .await
     {
-        Ok(response) => match response.snapshot_object.clone() {
-            None => bootstrap_response(response),
-            Some(object) => cold_snapshot::bootstrap_response(&state, response, object).await,
-        },
+        Ok(response) => {
+            if let Some(refused) = read_precondition_failed(if_incarnation, response.incarnation) {
+                return refused;
+            }
+            match response.snapshot_object.clone() {
+                None => bootstrap_response(response),
+                Some(object) => cold_snapshot::bootstrap_response(&state, response, object).await,
+            }
+        }
         Err(err) => {
             runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
         }
@@ -3151,6 +3234,9 @@ pub(crate) async fn read_offset(
     }
 }
 
+/// A long-poll with a `Stream-Incarnation` precondition (`if_incarnation`)
+/// waits on that incarnation only: it ends with 412 when the stream it was
+/// opened against is recreated, and with 404 when it is deleted (D12).
 pub(crate) async fn long_poll_stream(
     state: HttpState,
     request_target: String,
@@ -3159,25 +3245,35 @@ pub(crate) async fn long_poll_stream(
     max_len: usize,
     query: &HashMap<String, String>,
     headers: HeaderMap,
+    if_incarnation: Option<u64>,
 ) -> Response {
     let timeout_ms = long_poll_timeout_ms(query);
-    let read = state.runtime.wait_read_stream(ReadStreamRequest {
-        stream_id: stream_id.clone(),
-        offset,
-        max_len: max_len.max(1),
-        now_ms: state.unix_time_ms(),
-        leader_only: false,
-        read_index: None,
-    });
+    let read = state.runtime.wait_read_stream_pinned(
+        ReadStreamRequest {
+            stream_id: stream_id.clone(),
+            offset,
+            max_len: max_len.max(1),
+            now_ms: state.unix_time_ms(),
+            leader_only: false,
+            read_index: None,
+        },
+        if_incarnation,
+    );
     match http_time::timeout(Duration::from_millis(timeout_ms), read).await {
-        Ok(Ok(response)) if response.payload.is_empty() && response.up_to_date => {
-            long_poll_no_content_response(&response, query.get("cursor").map(String::as_str))
+        Ok(Ok(response)) => {
+            if let Some(refused) = read_precondition_failed(if_incarnation, response.incarnation) {
+                return refused;
+            }
+            if response.payload.is_empty() && response.up_to_date {
+                long_poll_no_content_response(&response, query.get("cursor").map(String::as_str))
+            } else {
+                read_response(
+                    response,
+                    &headers,
+                    Some(query.get("cursor").map(String::as_str).unwrap_or("")),
+                )
+            }
         }
-        Ok(Ok(response)) => read_response(
-            response,
-            &headers,
-            Some(query.get("cursor").map(String::as_str).unwrap_or("")),
-        ),
         Ok(Err(err)) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
         // The 204's tail comes from the leader's applied state: live reads
         // promise no linearizability beyond their owner check (D10).
@@ -3192,9 +3288,14 @@ pub(crate) async fn long_poll_stream(
             .await
         {
             Ok(head) => {
+                if let Some(refused) = read_precondition_failed(if_incarnation, head.created_at_ms)
+                {
+                    return refused;
+                }
                 let mut headers = HeaderMap::new();
                 insert_default_response_headers(&mut headers);
                 insert_offset(&mut headers, head.tail_offset);
+                insert_incarnation(&mut headers, head.created_at_ms);
                 insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
                 if head.closed {
                     insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
@@ -3222,8 +3323,15 @@ struct SseState {
     encode_base64: bool,
     cursor: Option<String>,
     initial_read: bool,
+    /// The incarnation a session with a `Stream-Incarnation` precondition
+    /// was opened against (D12): a read of any other one ends it.
+    incarnation: Option<u64>,
 }
 
+/// An SSE session with a `Stream-Incarnation` precondition (`if_incarnation`)
+/// answers 412 when the stream is another incarnation, and ends with an
+/// `error` event when the stream it was opened against is deleted or
+/// recreated (D12).
 pub(crate) async fn sse_stream(
     state: HttpState,
     request_target: String,
@@ -3231,6 +3339,7 @@ pub(crate) async fn sse_stream(
     offset: u64,
     max_len: usize,
     query: &HashMap<String, String>,
+    if_incarnation: Option<u64>,
 ) -> Response {
     // The live-read owner check already confirmed this node; the session's
     // starting HEAD reads the leader's applied state.
@@ -3249,6 +3358,9 @@ pub(crate) async fn sse_stream(
             return runtime_error_or_leader_redirect_async(&state, err, &request_target).await;
         }
     };
+    if let Some(refused) = read_precondition_failed(if_incarnation, head.created_at_ms) {
+        return refused;
+    }
 
     let encode_base64 = should_base64_encode_sse_data(&head.content_type);
     state
@@ -3271,6 +3383,7 @@ pub(crate) async fn sse_stream(
         encode_base64,
         cursor: query.get("cursor").cloned(),
         initial_read: true,
+        incarnation: if_incarnation,
     };
     let body_stream = stream::unfold(Some(sse_state), |state| async move {
         let mut state = match state {
@@ -3293,9 +3406,27 @@ pub(crate) async fn sse_stream(
             state.initial_read = false;
             state.runtime.read_stream(read_request).await
         } else {
-            state.runtime.wait_read_stream(read_request).await
+            state
+                .runtime
+                .wait_read_stream_pinned(read_request, state.incarnation)
+                .await
         };
         let mut read = match read {
+            Ok(read)
+                if state
+                    .incarnation
+                    .is_some_and(|incarnation| incarnation != read.incarnation) =>
+            {
+                state
+                    .http_metrics
+                    .sse_error_events
+                    .fetch_add(1, Ordering::Relaxed);
+                let event = format!(
+                    "event: error\ndata:{}\n\n",
+                    sse_safe_line("the stream was deleted and recreated (Stream-Incarnation)")
+                );
+                return Some((Ok::<Bytes, Infallible>(Bytes::from(event)), None));
+            }
             Ok(read) => read,
             Err(err) => {
                 state
@@ -3334,6 +3465,7 @@ pub(crate) async fn sse_stream(
         http_read_content_type(&head.content_type),
     );
     insert_cache_control(&mut headers, "no-cache");
+    insert_incarnation(&mut headers, head.created_at_ms);
     if encode_base64 {
         insert_static(&mut headers, HEADER_STREAM_SSE_DATA_ENCODING, "base64");
     }
@@ -3442,6 +3574,47 @@ pub(crate) fn parse_stream_expires_at(raw: &str) -> Result<u64, String> {
         .map_err(|_| "stream-expires-at must be an RFC3339 timestamp".to_owned())?;
     u64::try_from(expires_at.timestamp_millis())
         .map_err(|_| "stream-expires-at must not be before the Unix epoch".to_owned())
+}
+
+/// The `Stream-Incarnation` request precondition (D12): `None` without the
+/// header. The value is compared for equality only; anything that is not a
+/// token the server could have issued (one canonical decimal integer) is
+/// malformed and answers 400, as do repeated values.
+pub(crate) fn incarnation_precondition(headers: &HeaderMap) -> Result<Option<u64>, BoxResponse> {
+    let mut values = headers.get_all(HEADER_STREAM_INCARNATION).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    let malformed =
+        || Box::new((StatusCode::BAD_REQUEST, "malformed Stream-Incarnation").into_response());
+    if values.next().is_some() {
+        return Err(malformed());
+    }
+    let Some(value) = value.to_str().ok().map(str::trim) else {
+        return Err(malformed());
+    };
+    match value.parse::<u64>() {
+        Ok(incarnation) if incarnation.to_string() == value => Ok(Some(incarnation)),
+        _ => Err(malformed()),
+    }
+}
+
+/// A read's `Stream-Incarnation` precondition (D12), checked against the
+/// incarnation of the stream state that served it: `Some(412)` on a
+/// mismatch, naming the current incarnation.
+fn read_precondition_failed(expected: Option<u64>, served: u64) -> Option<Response> {
+    let expected = expected?;
+    (expected != served).then(|| {
+        let mut headers = HeaderMap::new();
+        insert_default_response_headers(&mut headers);
+        insert_incarnation(&mut headers, served);
+        (
+            StatusCode::PRECONDITION_FAILED,
+            headers,
+            format!("Stream-Incarnation {expected} does not match the stream"),
+        )
+            .into_response()
+    })
 }
 
 pub(crate) fn stream_closed(headers: &HeaderMap) -> bool {

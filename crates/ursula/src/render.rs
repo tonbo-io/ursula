@@ -41,6 +41,7 @@ use crate::HEADER_PRODUCER_SEQ;
 use crate::HEADER_STREAM_CLOSED;
 use crate::HEADER_STREAM_CURSOR;
 use crate::HEADER_STREAM_EXPIRES_AT;
+use crate::HEADER_STREAM_INCARNATION;
 use crate::HEADER_STREAM_NEXT_OFFSET;
 use crate::HEADER_STREAM_SNAPSHOT_DIGEST;
 use crate::HEADER_STREAM_SNAPSHOT_OFFSET;
@@ -109,6 +110,17 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         // The HTTP layer verifies the boundary and proposes again; reaching
         // a client means the stream changed during the check (fail closed).
         StreamErrorCode::JsonBoundaryUnverified => StatusCode::SERVICE_UNAVAILABLE,
+        // D12: 412, never 409, so it does not mix with `Stream-Seq` and
+        // producer conflicts.
+        StreamErrorCode::IncarnationMismatch => StatusCode::PRECONDITION_FAILED,
+    }
+}
+
+/// `Stream-Incarnation` (D12): the opaque token of the stream incarnation
+/// that served a response. `0` means unknown (an older peer) and is omitted.
+pub(crate) fn insert_incarnation(headers: &mut HeaderMap, incarnation: u64) {
+    if incarnation != 0 {
+        insert_u64_header(headers, HEADER_STREAM_INCARNATION, incarnation);
     }
 }
 
@@ -228,6 +240,15 @@ pub(crate) fn insert_stream_error_headers(headers: &mut HeaderMap, err: &Runtime
         .any(|context| matches!(context, StreamErrorContext::StreamClosed))
     {
         insert_static(headers, HEADER_STREAM_CLOSED, "true");
+    }
+    // A failed `Stream-Incarnation` precondition names the current
+    // incarnation when the stream exists (D12).
+    if err.stream_error_code() == Some(StreamErrorCode::IncarnationMismatch) {
+        for context in err.stream_error_context() {
+            if let StreamErrorContext::StreamIncarnation { incarnation } = context {
+                insert_incarnation(headers, *incarnation);
+            }
+        }
     }
 }
 
@@ -397,6 +418,7 @@ pub(crate) fn read_response(
     insert_default_response_headers(&mut headers);
     insert_content_type(&mut headers, http_read_content_type(&response.content_type));
     insert_offset(&mut headers, response.next_offset);
+    insert_incarnation(&mut headers, response.incarnation);
     let etag = read_etag(&response);
     if let Ok(value) = HeaderValue::from_str(&etag) {
         headers.insert(ETAG, value);
@@ -430,6 +452,7 @@ pub(crate) fn snapshot_response(response: ReadSnapshotResponse) -> Response {
     insert_snapshot_offset(&mut headers, response.snapshot_offset);
     insert_snapshot_digest(&mut headers, &response.snapshot_digest);
     insert_offset(&mut headers, response.next_offset);
+    insert_incarnation(&mut headers, response.incarnation);
     if response.up_to_date {
         insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
     }
@@ -455,6 +478,7 @@ pub(crate) fn bootstrap_head(response: &BootstrapStreamResponse) -> (String, Hea
         &mut headers,
         &format!("multipart/mixed; boundary={boundary}"),
     );
+    insert_incarnation(&mut headers, response.incarnation);
     match response.snapshot_offset {
         Some(snapshot_offset) => insert_snapshot_offset(&mut headers, snapshot_offset),
         None => insert_static(&mut headers, HEADER_STREAM_SNAPSHOT_OFFSET, "-1"),
@@ -545,6 +569,7 @@ pub(crate) fn offset_now_response(response: ReadStreamResponse) -> Response {
     insert_default_response_headers(&mut headers);
     insert_content_type(&mut headers, http_read_content_type(&response.content_type));
     insert_offset(&mut headers, response.next_offset);
+    insert_incarnation(&mut headers, response.incarnation);
     insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
     insert_cache_control(&mut headers, "no-store");
     if response.closed {
@@ -560,6 +585,7 @@ pub(crate) fn long_poll_no_content_response(
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     insert_offset(&mut headers, response.next_offset);
+    insert_incarnation(&mut headers, response.incarnation);
     insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");

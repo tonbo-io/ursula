@@ -43,6 +43,10 @@ api: "PUT /{bucket}/{stream}"
  Producer sequence number (must accompany `Producer-Id`).
 </ParamField>
 
+<ParamField header="Stream-Incarnation" type="string">
+ Optional precondition: the stream's incarnation token, as a previous response's `Stream-Incarnation` header returned it. The create applies only if the stream exists as that incarnation (it then answers as a create of an existing stream: `200` or `409`); a missing stream answers `412` and is not created. Without the header, the request behaves exactly as described here. A malformed value answers `400`. See [`Stream-Incarnation`](/docs/specs/extensions#24-snapshot-metadata-on-head-and-stream-incarnation).
+</ParamField>
+
 <ParamField body="body" type="binary">
  Optional initial payload. If provided, becomes the first entry in the stream.
 </ParamField>
@@ -56,8 +60,9 @@ api: "PUT /{bucket}/{stream}"
 | `400` | Invalid bucket ID, invalid stream ID (including one that starts with `$`), invalid headers, or bad JSON payload. |
 | `404` | The bucket was purged; its ID is permanently fenced. |
 | `409` | Stream already exists with a different content type, closed state or lifetime, or `Producer-Seq` is not `0`. |
+| `412` | `Stream-Incarnation` did not match: the stream is another incarnation (its token is in the response's `Stream-Incarnation`), or it does not exist. Nothing was created. |
 
-Response headers include `Location`, `Content-Type`, `Stream-Next-Offset`, and lifetime headers (`Stream-TTL` / `Stream-Expires-At`) when set. `Stream-Closed: true` is set if the create request also closed the stream. `ETag` is set on reads only.
+Response headers include `Location`, `Content-Type`, `Stream-Next-Offset`, `Stream-Incarnation`, and lifetime headers (`Stream-TTL` / `Stream-Expires-At`) when set. `Stream-Closed: true` is set if the create request also closed the stream. `ETag` is set on reads only.
 
 In an `application/json` stream, a top-level JSON array in the initial payload creates one message per element.
 

@@ -89,6 +89,7 @@ fn append_external_req(
         stream_seq: stream_seq.map(str::to_owned),
         producer: None,
         now_ms: 0,
+        if_incarnation: None,
     }
 }
 
@@ -468,6 +469,7 @@ async fn f14b_cold_gc_continues_past_a_failing_group() {
         runtime
             .delete_stream(DeleteStreamRequest {
                 stream_id: stream.clone(),
+                if_incarnation: None,
             })
             .await
             .expect("delete stream");
@@ -589,6 +591,7 @@ fn create_external_req(
         stream_ttl_seconds: None,
         stream_expires_at_ms: None,
         now_ms: 0,
+        if_incarnation: None,
     }
 }
 
@@ -711,6 +714,7 @@ async fn retention_gc_never_touches_the_boundary_page() {
                 cold_body: None,
                 now_ms: 0,
                 expected_incarnation: None,
+                if_incarnation: None,
             },
             placement,
         )
@@ -723,6 +727,7 @@ async fn retention_gc_never_touches_the_boundary_page() {
                 retained_offset: 4,
                 now_ms: 0,
                 expected_incarnation: None,
+                if_incarnation: None,
             },
             placement,
         )

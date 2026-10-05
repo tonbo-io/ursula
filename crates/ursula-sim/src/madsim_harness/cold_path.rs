@@ -585,6 +585,7 @@ pub(super) async fn run_cold_delete_fault_inner(
     runtime
         .delete_stream(DeleteStreamRequest {
             stream_id: config.stream.clone(),
+            if_incarnation: None,
         })
         .await
         .expect("delete old stream before stale cold candidate");

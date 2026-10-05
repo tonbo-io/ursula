@@ -73,6 +73,7 @@ async fn delete(runtime: &ShardRuntime, stream: &BucketStreamId) {
     runtime
         .delete_stream(DeleteStreamRequest {
             stream_id: stream.clone(),
+            if_incarnation: None,
         })
         .await
         .expect("delete stream");
@@ -315,6 +316,7 @@ async fn retain_past_last_pack_reference() -> (Arc<ColdStore>, String) {
             cold_body: None,
             now_ms: crate::runtime::unix_time_ms(),
             expected_incarnation: None,
+            if_incarnation: None,
         })
         .await
         .expect("publish checkpoint");
@@ -324,6 +326,7 @@ async fn retain_past_last_pack_reference() -> (Arc<ColdStore>, String) {
             retained_offset: 4,
             now_ms: crate::runtime::unix_time_ms(),
             expected_incarnation: None,
+            if_incarnation: None,
         })
         .await
         .expect("advance retention");
