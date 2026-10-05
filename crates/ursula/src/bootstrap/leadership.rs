@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Duration;
 
+use openraft::rt::WatchReceiver;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_shard::RaftGroupId;
 
@@ -18,8 +19,9 @@ use ursula_shard::RaftGroupId;
 /// policy says they may campaign. That prevents balancing into a hard-yielded
 /// peer that cannot safely lead. Cold-health remains campaign-eligible because
 /// it is a cluster-wide pressure signal under backlog: excluding every hot
-/// peer can deadlock leadership movement. `transfer_leader` still brings
-/// lagging eligible targets up to date before handing off.
+/// peer can deadlock leadership movement. A planned handoff fires only when
+/// the leader's replication metrics show the target matched its last log;
+/// otherwise the group is retried on a later tick.
 /// One planned leader handoff for the M1 balancer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LeadershipBalanceAction {
@@ -165,6 +167,20 @@ pub(crate) fn plan_leadership_balance_with_eligible_nodes(
     actions
 }
 
+/// A handoff target is caught up when the leader's replication metrics show it
+/// matched the leader's last log entry. OpenRaft submits a transfer even when
+/// the target never catches up, and the leader then stops heartbeating the
+/// group until a new leader appears; a target that cannot win (an empty or
+/// lagging voter) would strand the group.
+pub(crate) fn handoff_target_caught_up(
+    leader_last_log_index: Option<u64>,
+    target_matched_index: Option<u64>,
+) -> bool {
+    leader_last_log_index
+        .zip(target_matched_index)
+        .is_some_and(|(last, matched)| matched >= last)
+}
+
 /// Config-driven leadership balancer.
 pub fn spawn_leadership_balancer(
     registry: &RaftGroupHandleRegistry,
@@ -213,6 +229,25 @@ pub fn spawn_leadership_balancer(
                 let Some(raft) = registry.get(RaftGroupId(action.group_id)) else {
                     continue;
                 };
+                let caught_up = {
+                    let metrics_rx = raft.metrics();
+                    let metrics = metrics_rx.borrow_watched();
+                    let matched = metrics
+                        .replication
+                        .as_ref()
+                        .and_then(|replication| replication.get(&action.target))
+                        .and_then(|matched| matched.as_ref())
+                        .map(|log_id| log_id.index());
+                    handoff_target_caught_up(metrics.last_log_index, matched)
+                };
+                if !caught_up {
+                    tracing::debug!(
+                        "leadership-balance: node {my_id} skips group {} -> node {}: target has not matched the leader's last log",
+                        action.group_id,
+                        action.target
+                    );
+                    continue;
+                }
                 match raft.trigger().transfer_leader(action.target).await {
                     Ok(()) => tracing::warn!(
                         "leadership-balance: node {my_id} handing group {} -> node {} (fair={})",

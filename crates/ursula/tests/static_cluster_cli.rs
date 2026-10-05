@@ -721,6 +721,243 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
     std::fs::remove_dir_all(&root).expect("remove temp root");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_repair_restarted_voter_rebuilds_an_empty_reinitialized_voter() {
+    // A memory-WAL voter restarted empty re-runs per-group Initialize for the
+    // groups it bootstraps (2 and 5 of 6 for node 3), so it reports itself a
+    // voter with nothing applied. A leader that already matched it never
+    // backfills it (OpenRaft does not revert matching progress), so the
+    // survivors' old route to node 3 goes through a proxy the test cuts.
+    // `repair_restarted_voter` must still rebuild those idle groups even
+    // though the peers' commit index is within the lag tolerance.
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping restart repair test");
+        return;
+    };
+    let ports = [free_port(), free_port(), free_port()];
+    let node3_listen = std::net::SocketAddr::from(([127, 0, 0, 1], ports[2]));
+    let proxy = BlockableProxy::spawn(node3_listen).await;
+    let peers = vec![
+        (1, format!("http://127.0.0.1:{}", ports[0])),
+        (2, format!("http://127.0.0.1:{}", ports[1])),
+        (3, format!("http://{}", proxy.addr)),
+    ];
+    let public = |node_id: u64| format!("http://127.0.0.1:{}", ports[(node_id - 1) as usize]);
+
+    let mut children = Vec::new();
+    let mut nodes = Vec::new();
+    for node_id in [1_u64, 2, 3] {
+        let port = ports[(node_id - 1) as usize];
+        let (child, admin_port) = spawn_per_group_memory_node(binary, node_id, port, &peers, false);
+        children.push(child);
+        nodes.push(ctl_node(node_id, admin_port, &public(node_id)));
+    }
+    let client = reqwest::Client::new();
+    for node_id in [1_u64, 2, 3] {
+        wait_until_ready(&client, &public(node_id), &mut children).await;
+    }
+    for index in 0..6 {
+        put_until_created(
+            &client,
+            &format!("{}/benchcmp/restart-repair-{index}", public(1)),
+        )
+        .await;
+    }
+
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client");
+    let drain_options = ursula_ctl::DrainOptions {
+        drain_timeout: Duration::from_secs(60),
+        ready_timeout: Duration::from_secs(60),
+        poll_interval: Duration::from_millis(200),
+        lag_tolerance: 16,
+        dry_run: false,
+    };
+    let outcome = ursula_ctl::drain_node(&nodes, &nodes[2], &ctl, &drain_options)
+        .await
+        .expect("drain node 3");
+    assert!(
+        matches!(outcome, ursula_ctl::DrainOutcome::Drained),
+        "{outcome:?}"
+    );
+    ursula_ctl::prepare_restart(&nodes, &nodes[2], &ctl, &drain_options)
+        .await
+        .expect("prepare node 3 restart");
+
+    drop(children.pop());
+    proxy.block();
+    let (child, admin_port) = spawn_per_group_memory_node(binary, 3, ports[2], &peers, true);
+    children.push(child);
+    nodes[2] = ctl_node(3, admin_port, &public(3));
+    wait_until_ready(&client, &public(3), &mut children).await;
+
+    // Precondition: node 3 is an empty voter for the groups it re-initialized,
+    // and the peers' commit index is within the lag tolerance.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let snapshot = ctl.fetch_cluster(&nodes).await.expect("fetch cluster");
+        let empty_voters = [2_u64, 5]
+            .into_iter()
+            .filter(|group_id| {
+                let target = snapshot.node(3).and_then(|view| view.group(*group_id));
+                let peer_committed = snapshot
+                    .peer_views(*group_id, 3)
+                    .values()
+                    .filter_map(|group| group.committed_index)
+                    .max();
+                target.is_some_and(|group| {
+                    group.voter_ids.contains(&3) && group.last_applied_index.is_none()
+                }) && peer_committed.is_some_and(|committed| (1..=16).contains(&committed))
+            })
+            .count();
+        if empty_voters == 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 3 never reported empty voters for groups 2 and 5: {snapshot:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let repair_options = ursula_ctl::MembershipRepairOptions {
+        max_concurrency: 6,
+        operation_timeout: Duration::from_secs(5),
+        operation_reconcile_timeout: Duration::from_secs(30),
+        stall_timeout: Duration::from_secs(30),
+        ready_timeout: Duration::from_secs(60),
+        poll_interval: Duration::from_millis(200),
+    };
+    ursula_ctl::repair_restarted_voter(&nodes, &nodes[2], &ctl, &drain_options, &repair_options)
+        .await
+        .expect("repair restarted node 3");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let snapshot = ctl.fetch_cluster(&nodes).await.expect("fetch cluster");
+        let report = ursula_ctl::plan::check_readiness(&snapshot, 3, 0);
+        if report.all_ready {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "repair left node 3 behind: {report:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    drop(children);
+}
+
+/// A TCP forwarder standing in for one node's Raft address. Blocking it cuts
+/// every route that still points at the old address without touching the
+/// node's own listener.
+struct BlockableProxy {
+    addr: std::net::SocketAddr,
+    blocked: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl BlockableProxy {
+    async fn spawn(upstream: std::net::SocketAddr) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let addr = listener.local_addr().expect("proxy addr");
+        let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&blocked);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else {
+                    continue;
+                };
+                let flag = Arc::clone(&flag);
+                tokio::spawn(async move {
+                    if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    let Ok(mut outbound) = tokio::net::TcpStream::connect(upstream).await else {
+                        return;
+                    };
+                    if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                });
+            }
+        });
+        Self {
+            addr,
+            blocked,
+            task,
+        }
+    }
+
+    fn block(&self) {
+        self.blocked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for BlockableProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn spawn_per_group_memory_node(
+    binary: &str,
+    node_id: u64,
+    port: u16,
+    peers: &[(u64, String)],
+    start_drained: bool,
+) -> (ChildGuard, u16) {
+    let config_path = std::env::temp_dir().join(format!(
+        "ursula-per-group-node-{node_id}-{port}-{}.toml",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_nanos()
+    ));
+    let admin_port = write_node_toml(
+        &config_path,
+        port,
+        node_id,
+        6,
+        peers,
+        true,
+        "memory",
+        None,
+        "memory",
+        None,
+    );
+    let config = std::fs::read_to_string(&config_path).expect("read node config");
+    std::fs::write(
+        &config_path,
+        config.replace(
+            "init_membership_per_group = false",
+            "init_membership_per_group = true",
+        ),
+    )
+    .expect("enable per-group membership initialization");
+    let mut command = Command::new(binary);
+    command.arg("server").arg("--config").arg(&config_path);
+    if start_drained {
+        command.env("URSULA_START_MAINTENANCE_DRAINED", "true");
+    }
+    let mut guard = spawn_child(command, format!("per-group-node-{node_id}-{port}"));
+    guard.config_path = Some(config_path);
+    (guard, admin_port)
+}
+
+fn ctl_node(node_id: u64, admin_port: u16, public_url: &str) -> ursula_ctl::NodeInfo {
+    ursula_ctl::NodeInfo {
+        id: node_id,
+        admin_url: url::Url::parse(&format!("http://127.0.0.1:{admin_port}")).expect("admin url"),
+        host: "127.0.0.1".to_owned(),
+        http_url: Some(url::Url::parse(public_url).expect("public url")),
+    }
+}
+
 async fn static_cluster_cli_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
     // These tests spawn real Ursula clusters on localhost. Keep them serial so
     // small CI runners do not race several multi-process clusters at once, and

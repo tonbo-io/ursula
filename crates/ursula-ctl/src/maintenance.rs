@@ -261,6 +261,10 @@ fn restart_fence_layout(nodes: &[NodeInfo], target: &NodeInfo) -> Result<(u64, V
     Ok((leader_anchor, fenced_node_ids))
 }
 
+/// The server's Raft `election_timeout_min`.
+const RESTART_FENCE_TRANSFER_SETTLE: Duration =
+    Duration::from_millis(ursula_raft::GROUP_ELECTION_TIMEOUT_MIN_MS);
+
 async fn pin_restart_leaders(
     nodes: &[NodeInfo],
     target: &NodeInfo,
@@ -285,6 +289,13 @@ async fn pin_restart_leaders(
                 .with_context(|| format!("mark restart-fence node {node_id} drained"));
         }
         marked.push(*node_id);
+    }
+    if !marked.is_empty() {
+        // A TransferLeader accepted just before the mark still elects its
+        // target after the server's election_timeout_min, bypassing the
+        // drained node's disabled elections. Let that land before the first
+        // convergence pass reads leadership.
+        tokio::time::sleep(RESTART_FENCE_TRANSFER_SETTLE).await;
     }
 
     let deadline = Instant::now() + drain_options.drain_timeout;
