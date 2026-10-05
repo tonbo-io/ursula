@@ -47,6 +47,7 @@ use crate::request::GroupReadStreamParts;
 use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
 use crate::request::ImportGroupStateRequest;
+use crate::request::LiveReadOwner;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
@@ -80,8 +81,8 @@ pub type GroupReadStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ReadStreamResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupReadStreamPartsFuture<'a> =
     Pin<Box<dyn Future<Output = Result<GroupReadStreamParts, GroupEngineError>> + Send + 'a>>;
-pub type GroupRequireLiveReadOwnerFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<(), GroupEngineError>> + Send + 'a>>;
+pub type GroupOpenLiveReadFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<LiveReadOwner, GroupEngineError>> + Send + 'a>>;
 pub type GroupPublishSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = Result<PublishSnapshotResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupAdvanceRetentionFuture<'a> =
@@ -248,11 +249,24 @@ pub trait GroupEngine: Send + 'static {
         })
     }
 
-    fn require_local_live_read_owner<'a>(
+    /// Live-read registration (SSE, long-poll): requires this replica to
+    /// own the stream's live reads and reads the stream's state there (see
+    /// [`LiveReadOwner`]). A replicated engine confirms it leads at a read
+    /// index (`request.read_index` when the runtime already confirmed one)
+    /// and never forwards. The default, for an engine without replicas, is
+    /// a plain HEAD.
+    fn open_live_read<'a>(
         &'a mut self,
-        _placement: ShardPlacement,
-    ) -> GroupRequireLiveReadOwnerFuture<'a> {
-        Box::pin(async { Ok(()) })
+        request: HeadStreamRequest,
+        placement: ShardPlacement,
+    ) -> GroupOpenLiveReadFuture<'a> {
+        Box::pin(async move {
+            let head = self.head_stream(request, placement).await?;
+            Ok(LiveReadOwner {
+                read_index: None,
+                head,
+            })
+        })
     }
 
     fn publish_snapshot<'a>(

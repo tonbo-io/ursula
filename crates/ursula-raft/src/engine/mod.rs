@@ -649,12 +649,27 @@ impl RaftGroupEngine {
         operation: &str,
         read_index: Option<u64>,
     ) -> Result<(), GroupEngineError> {
+        self.linearizable_read_index(operation, read_index)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`Self::require_linearizable_leader_read`] that also returns the
+    /// read index the read is served at: `read_index` itself when it was
+    /// already confirmed and applied, otherwise the index of a new round.
+    pub(crate) async fn linearizable_read_index(
+        &self,
+        operation: &str,
+        read_index: Option<u64>,
+    ) -> Result<u64, GroupEngineError> {
         self.require_local_leader_for_read(operation).await?;
-        if read_index.is_some_and(|read_index| self.applied_index() >= read_index) {
-            return Ok(());
+        if let Some(read_index) = read_index
+            && self.applied_index() >= read_index
+        {
+            return Ok(read_index);
         }
         match self.read_barrier.round().await? {
-            Some(_) => Ok(()),
+            Some(read_index) => Ok(read_index),
             None => Err(self.not_leader_for_read(operation).await),
         }
     }
@@ -825,6 +840,15 @@ impl GroupEngine for RaftGroupEngine {
     ) -> GroupReadStreamPartsFuture<'a> {
         Box::pin(async move {
             let original_request = request.clone();
+            // A live read pinned to its owner's confirmed read index is
+            // served only here, while this replica leads and has applied
+            // that index; it is never forwarded (a just-elected leader may
+            // not have applied what the owner confirmed).
+            let owner_pinned = !request.leader_only && request.read_index.is_some();
+            if owner_pinned {
+                self.require_linearizable_leader_read("live read_stream", request.read_index)
+                    .await?;
+            }
             if request.leader_only {
                 // A follower forwards with `leader_only` set, so the leader
                 // linearizes the read too (field 6 of `ReadStreamReadV1`).
@@ -840,6 +864,9 @@ impl GroupEngine for RaftGroupEngine {
                     request.read_index,
                 )
                 .await?;
+            }
+            if owner_pinned && !self.raft.is_leader() {
+                return Err(self.not_leader_for_read("live read_stream").await);
             }
             if !self.raft.is_leader() {
                 match self
@@ -880,7 +907,11 @@ impl GroupEngine for RaftGroupEngine {
                 // cursor is beyond only the follower's local tail. Forward
                 // instead of exposing a false permanent boundary error.
                 Err(error)
-                    if should_forward_stale_follower_read_error(self.raft.is_leader(), &error) =>
+                    if !owner_pinned
+                        && should_forward_stale_follower_read_error(
+                            self.raft.is_leader(),
+                            &error,
+                        ) =>
                 {
                     if let Some(leader_node) = self.current_leader_node().await {
                         let response = forward_read_stream_to_leader(
@@ -902,6 +933,9 @@ impl GroupEngine for RaftGroupEngine {
                 self.cold_store.clone(),
                 self.cold_index_cache.clone(),
             );
+            if owner_pinned && !self.raft.is_leader() {
+                return Err(self.not_leader_for_read("live read_stream").await);
+            }
             if !self.raft.is_leader() && parts.up_to_date && !parts.closed {
                 if parts.payload_is_empty()
                     && let Some(leader_node) = self.current_leader_node().await
@@ -917,13 +951,30 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
-    fn require_local_live_read_owner<'a>(
+    fn open_live_read<'a>(
         &'a mut self,
-        _placement: ShardPlacement,
-    ) -> ursula_runtime::GroupRequireLiveReadOwnerFuture<'a> {
+        request: HeadStreamRequest,
+        placement: ShardPlacement,
+    ) -> ursula_runtime::GroupOpenLiveReadFuture<'a> {
         Box::pin(async move {
-            self.require_linearizable_leader_read("live_read", None)
-                .await
+            let read_index = self
+                .linearizable_read_index("live_read", request.read_index)
+                .await?;
+            self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
+                .await?;
+            let head = self
+                .with_state_machine(move |state_machine| {
+                    Box::pin(async move {
+                        state_machine
+                            .engine
+                            .head_stream_after_access(&request, placement)
+                    })
+                })
+                .await??;
+            Ok(ursula_runtime::LiveReadOwner {
+                read_index: Some(read_index),
+                head,
+            })
         })
     }
 

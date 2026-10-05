@@ -103,8 +103,10 @@ use ursula_runtime::CreateStreamResponse;
 use ursula_runtime::DeleteStreamRequest;
 use ursula_runtime::ErrorStatus;
 use ursula_runtime::ExternalPayloadRef;
+use ursula_runtime::GroupEngineError;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::ImportGroupStateRequest;
+use ursula_runtime::LiveReadOwner;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::ProducerRequest;
 use ursula_runtime::PublishSnapshotRequest;
@@ -2770,25 +2772,44 @@ pub(crate) async fn read_stream_by_id(
         )
             .into_response();
     }
-    if matches!(live_mode, Some("sse" | "long-poll"))
-        && let Err(err) = state
+    // A live read takes every lookup from its owner check (D10): `offset=now`,
+    // existence, content type and incarnation come from state this replica
+    // read at or after the read index it confirmed, never from a later HEAD
+    // that a just-elected leader could answer from a lagging state.
+    let (live_owner, offset) = if matches!(live_mode, Some("sse" | "long-poll")) {
+        let start = if offset_is_now {
+            None
+        } else {
+            match parse_read_offset(query.get("offset").map(String::as_str)) {
+                Ok(offset) => Some(offset),
+                Err(response) => return *response,
+            }
+        };
+        let owner = match state
             .runtime
-            .require_local_live_read_owner(&stream_id)
+            .open_live_read(stream_id.clone(), state.unix_time_ms())
             .await
-    {
-        return runtime_error_or_leader_redirect_async(&state, err, &request_target).await;
-    }
-    let offset = match read_offset(
-        &state,
-        &stream_id,
-        query.get("offset").map(String::as_str),
-        &request_target,
-        leader_only,
-    )
-    .await
-    {
-        Ok(offset) => offset,
-        Err(response) => return *response,
+        {
+            Ok(owner) => owner,
+            Err(err) => {
+                return runtime_error_or_leader_redirect_async(&state, err, &request_target).await;
+            }
+        };
+        let offset = start.unwrap_or(owner.head.tail_offset);
+        (Some(owner), offset)
+    } else {
+        match read_offset(
+            &state,
+            &stream_id,
+            query.get("offset").map(String::as_str),
+            &request_target,
+            leader_only,
+        )
+        .await
+        {
+            Ok(offset) => (None, offset),
+            Err(response) => return *response,
+        }
     };
     // F11: every read is capped at READ_MAX_RESPONSE_BYTES; a capped read may
     // end inside a message. `max_bytes` keeps the base protocol's lenient
@@ -2798,24 +2819,24 @@ pub(crate) async fn read_stream_by_id(
         .map_or(usize::MAX, |raw| raw.parse::<usize>().unwrap_or(usize::MAX))
         .min(READ_MAX_RESPONSE_BYTES);
 
-    match live_mode {
-        Some("sse") => {
+    match (live_mode, live_owner) {
+        (Some("sse"), Some(owner)) => {
             return sse_stream(
                 state,
-                request_target,
                 stream_id,
+                owner,
                 offset,
                 max_len,
                 &query,
                 if_incarnation,
-            )
-            .await;
+            );
         }
-        Some("long-poll") => {
+        (Some("long-poll"), Some(owner)) => {
             return long_poll_stream(
                 state,
                 request_target,
                 stream_id,
+                owner,
                 offset,
                 max_len,
                 &query,
@@ -2824,8 +2845,8 @@ pub(crate) async fn read_stream_by_id(
             )
             .await;
         }
-        Some(_) => return (StatusCode::BAD_REQUEST, "invalid live mode").into_response(),
-        None => {}
+        (Some(_), _) => return (StatusCode::BAD_REQUEST, "invalid live mode").into_response(),
+        (None, _) => {}
     }
 
     let read = state
@@ -3201,6 +3222,10 @@ fn parse_snapshot_offset(raw: &str) -> Result<u64, BoxResponse> {
 
 /// `offset=now` resolves the tail through HEAD, linearizable only for a
 /// `consistency=leader` read (D10).
+/// A catch-up read's start position. Its `offset=now` HEAD is linearizable
+/// for `consistency=leader`; for `consistency=local` it reads the leader's
+/// applied state, which a just-elected leader may not have brought up to
+/// the committed tail, so it can resolve to a lagging tail.
 pub(crate) async fn read_offset(
     state: &HttpState,
     stream_id: &BucketStreamId,
@@ -3209,7 +3234,6 @@ pub(crate) async fn read_offset(
     linearizable: bool,
 ) -> Result<u64, BoxResponse> {
     match raw {
-        Some("-1") => Ok(0),
         Some("now") => match state
             .runtime
             .head_stream(HeadStreamRequest {
@@ -3227,26 +3251,57 @@ pub(crate) async fn read_offset(
                 Err(Box::new(response))
             }
         },
+        raw => parse_read_offset(raw),
+    }
+}
+
+/// A read's numeric start position: `-1` and an omitted offset are `0`.
+/// `now` is resolved by the caller.
+pub(crate) fn parse_read_offset(raw: Option<&str>) -> Result<u64, BoxResponse> {
+    match raw {
+        Some("-1") | None => Ok(0),
         Some(raw) => raw
             .parse::<u64>()
             .map_err(|_| Box::new((StatusCode::BAD_REQUEST, "invalid offset").into_response())),
-        None => Ok(0),
     }
 }
 
 /// A long-poll with a `Stream-Incarnation` precondition (`if_incarnation`)
 /// waits on that incarnation only: it ends with 412 when the stream it was
 /// opened against is recreated, and with 404 when it is deleted (D12).
+///
+/// Every lookup comes from `owner` (D10): the waiter is pinned to the
+/// incarnation the owner read and to its read index, an offset beyond the
+/// owner's tail answers 416, and the timeout 204 answers from the waiter's
+/// own state rather than a later HEAD.
 pub(crate) async fn long_poll_stream(
     state: HttpState,
     request_target: String,
     stream_id: BucketStreamId,
+    owner: LiveReadOwner,
     offset: u64,
     max_len: usize,
     query: &HashMap<String, String>,
     headers: HeaderMap,
     if_incarnation: Option<u64>,
 ) -> Response {
+    let head = owner.head;
+    if offset > head.tail_offset {
+        let err = RuntimeError::GroupEngine {
+            core_id: head.placement.core_id,
+            raft_group_id: head.placement.raft_group_id,
+            error: GroupEngineError::stream_with_next_offset(
+                StreamErrorCode::OffsetOutOfRange,
+                format!(
+                    "offset {offset} is beyond stream '{stream_id}' tail {}",
+                    head.tail_offset
+                ),
+                Some(head.tail_offset),
+            ),
+        };
+        return runtime_error_or_leader_redirect_async(&state, err, &request_target).await;
+    }
+    let incarnation = if_incarnation.or((head.created_at_ms != 0).then_some(head.created_at_ms));
     let timeout_ms = long_poll_timeout_ms(query);
     let read = state.runtime.wait_read_stream_pinned(
         ReadStreamRequest {
@@ -3255,9 +3310,9 @@ pub(crate) async fn long_poll_stream(
             max_len: max_len.max(1),
             now_ms: state.unix_time_ms(),
             leader_only: false,
-            read_index: None,
+            read_index: owner.read_index,
         },
-        if_incarnation,
+        incarnation,
     );
     match http_time::timeout(Duration::from_millis(timeout_ms), read).await {
         Ok(Ok(response)) => {
@@ -3275,40 +3330,34 @@ pub(crate) async fn long_poll_stream(
             }
         }
         Ok(Err(err)) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
-        // The 204's tail comes from the leader's applied state: live reads
-        // promise no linearizability beyond their owner check (D10).
-        Err(_) => match state
-            .runtime
-            .head_stream(HeadStreamRequest {
-                stream_id: stream_id.clone(),
-                now_ms: state.unix_time_ms(),
-                linearizable: false,
-                read_index: None,
-            })
-            .await
-        {
-            Ok(head) => {
-                if let Some(refused) = read_precondition_failed(if_incarnation, head.created_at_ms)
-                {
-                    return refused;
-                }
-                let mut headers = HeaderMap::new();
-                insert_default_response_headers(&mut headers);
-                insert_offset(&mut headers, head.tail_offset);
-                insert_incarnation(&mut headers, head.created_at_ms);
-                insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
-                if head.closed {
-                    insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
-                } else {
-                    insert_cursor(
-                        &mut headers,
-                        response_cursor(head.tail_offset, query.get("cursor").map(String::as_str)),
-                    );
-                }
-                (StatusCode::NO_CONTENT, headers).into_response()
+        // The waiter's own state: the offset it waited at (never below the
+        // request, never beyond the tail the owner applied) and the
+        // incarnation it is pinned to. A waiter waits only at the tail of
+        // an open stream, so `Stream-Up-To-Date` and `Stream-Closed` hold
+        // as the owner read them only when the offset is that tail (a
+        // timeout before the first read completes may leave it below).
+        Err(_) => {
+            if let Some(refused) = read_precondition_failed(if_incarnation, head.created_at_ms) {
+                return refused;
             }
-            Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
-        },
+            let at_tail = offset == head.tail_offset;
+            let mut headers = HeaderMap::new();
+            insert_default_response_headers(&mut headers);
+            insert_offset(&mut headers, offset);
+            insert_incarnation(&mut headers, head.created_at_ms);
+            if at_tail {
+                insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
+            }
+            if at_tail && head.closed {
+                insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
+            } else {
+                insert_cursor(
+                    &mut headers,
+                    response_cursor(offset, query.get("cursor").map(String::as_str)),
+                );
+            }
+            (StatusCode::NO_CONTENT, headers).into_response()
+        }
     }
 }
 
@@ -3326,38 +3375,28 @@ struct SseState {
     /// The incarnation a session with a `Stream-Incarnation` precondition
     /// was opened against (D12): a read of any other one ends it.
     incarnation: Option<u64>,
+    /// The owner's confirmed read index, pinning the session's first read
+    /// to the owner (D10); later reads are plain live reads.
+    owner_read_index: Option<u64>,
 }
 
 /// An SSE session with a `Stream-Incarnation` precondition (`if_incarnation`)
 /// answers 412 when the stream is another incarnation, and ends with an
 /// `error` event when the stream it was opened against is deleted or
 /// recreated (D12).
-pub(crate) async fn sse_stream(
+///
+/// The session's content type and incarnation come from `owner` (D10), and
+/// its first read is pinned to the owner's read index.
+pub(crate) fn sse_stream(
     state: HttpState,
-    request_target: String,
     stream_id: BucketStreamId,
+    owner: LiveReadOwner,
     offset: u64,
     max_len: usize,
     query: &HashMap<String, String>,
     if_incarnation: Option<u64>,
 ) -> Response {
-    // The live-read owner check already confirmed this node; the session's
-    // starting HEAD reads the leader's applied state.
-    let head = match state
-        .runtime
-        .head_stream(HeadStreamRequest {
-            stream_id: stream_id.clone(),
-            now_ms: state.unix_time_ms(),
-            linearizable: false,
-            read_index: None,
-        })
-        .await
-    {
-        Ok(head) => head,
-        Err(err) => {
-            return runtime_error_or_leader_redirect_async(&state, err, &request_target).await;
-        }
-    };
+    let head = owner.head;
     if let Some(refused) = read_precondition_failed(if_incarnation, head.created_at_ms) {
         return refused;
     }
@@ -3384,6 +3423,7 @@ pub(crate) async fn sse_stream(
         cursor: query.get("cursor").cloned(),
         initial_read: true,
         incarnation: if_incarnation,
+        owner_read_index: owner.read_index,
     };
     let body_stream = stream::unfold(Some(sse_state), |state| async move {
         let mut state = match state {
@@ -3400,7 +3440,11 @@ pub(crate) async fn sse_stream(
             max_len: state.max_len,
             now_ms: state.wall_clock.unix_time_ms(),
             leader_only: false,
-            read_index: None,
+            read_index: if state.initial_read {
+                state.owner_read_index
+            } else {
+                None
+            },
         };
         let read = if state.initial_read {
             state.initial_read = false;

@@ -12,6 +12,13 @@
 //! its probes must answer 503 (leader unknown, retry) instead of a view that
 //! misses the writes the new leader acknowledged. Once the new leader serves,
 //! the probes see both sides of the failover.
+//!
+//! Live reads (long-poll, SSE) take every lookup from their owner check: a
+//! long-poll at `offset=now` answers 204 at the tail as of its registration,
+//! one beyond the tail answers 416 at the tail, and on the deposed leader
+//! both refuse with 503. A long-poll registered before the failover times
+//! out with a 204 at the offset it waited at: never below the requested
+//! offset, never beyond the committed tail, never 404.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -87,6 +94,12 @@ enum Probe {
     /// A `consistency=local` tail lookup (`offset=now`): no linearizability
     /// promise, so its internal HEAD takes no confirmation either.
     LocalRead,
+    /// A long-poll at `offset=now` that times out: 204 at the tail.
+    LongPollNow,
+    /// A long-poll one byte beyond the tail: 416 at the tail.
+    LongPollBeyond,
+    /// An SSE session at `offset=now`; only its status is observed.
+    SseNow,
 }
 
 impl Probe {
@@ -97,16 +110,29 @@ impl Probe {
             Self::Bootstrap => "bootstrap",
             Self::Snapshot => "snapshot_read",
             Self::LocalRead => "consistency_local_read",
+            Self::LongPollNow => "long_poll_now",
+            Self::LongPollBeyond => "long_poll_beyond_tail",
+            Self::SseNow => "sse_now",
         }
     }
 }
 
-const PROBES: [Probe; 4] = [
+const PROBES: [Probe; 7] = [
     Probe::CatchUpRead,
     Probe::Head,
     Probe::Bootstrap,
     Probe::Snapshot,
+    Probe::LongPollNow,
+    Probe::LongPollBeyond,
+    Probe::SseNow,
 ];
+
+/// Long-poll timeout of the live probes, in simulated milliseconds.
+const LIVE_PROBE_TIMEOUT_MS: u64 = 5;
+/// Long-poll timeout of the probe registered before the failover: longer
+/// than an election (50 ms election timeout), so it usually times out after
+/// the new leader acknowledged appends.
+const SPANNING_TIMEOUT_MS: u64 = 200;
 
 /// Seed-derived shape: payload sizes on both sides of the fault.
 struct LeaderReadPlan {
@@ -146,7 +172,8 @@ struct Probes<'a> {
 }
 
 impl Probes<'_> {
-    async fn observe(&self, probe: Probe) -> Observation {
+    /// `tail` is the acknowledged tail, for the probe beyond it.
+    async fn observe(&self, probe: Probe, tail: u64) -> Observation {
         let path = self.path;
         let uri = match probe {
             Probe::CatchUpRead => format!("{path}?offset=0&consistency=leader"),
@@ -154,6 +181,14 @@ impl Probes<'_> {
             Probe::Head => path.to_owned(),
             Probe::Bootstrap => format!("{path}/bootstrap"),
             Probe::Snapshot => format!("{path}/snapshot/{}", http_offset(self.snapshot_offset)),
+            Probe::LongPollNow => {
+                format!("{path}?offset=now&live=long-poll&timeout_ms={LIVE_PROBE_TIMEOUT_MS}")
+            }
+            Probe::LongPollBeyond => format!(
+                "{path}?offset={}&live=long-poll&timeout_ms={LIVE_PROBE_TIMEOUT_MS}",
+                http_offset(tail + 1)
+            ),
+            Probe::SseNow => format!("{path}?offset=now&live=sse"),
         };
         let method = if matches!(probe, Probe::Head) {
             "HEAD"
@@ -166,10 +201,16 @@ impl Probes<'_> {
             .headers()
             .get("stream-next-offset")
             .map(parse_http_offset);
+        // An SSE body never ends; dropping it closes the session.
+        let body = if matches!(probe, Probe::SseNow) {
+            Bytes::new()
+        } else {
+            body_bytes(response).await
+        };
         Observation {
             status,
             next_offset,
-            body: body_bytes(response).await,
+            body,
         }
     }
 
@@ -177,23 +218,33 @@ impl Probes<'_> {
     async fn serve_acked(&self, phase: &str, acked: &[u8], trace: &mut SimTrace) {
         let acked_offset = u64::try_from(acked.len()).expect("offset fits u64");
         for probe in PROBES {
-            let seen = self.observe(probe).await;
-            let (want_offset, want_body) = match probe {
-                Probe::CatchUpRead => (acked_offset, Some(acked)),
+            let seen = self.observe(probe, acked_offset).await;
+            let (want_status, want_offset, want_body) = match probe {
+                Probe::CatchUpRead => (StatusCode::OK, Some(acked_offset), Some(acked)),
                 Probe::LocalRead => unreachable!("observed only by the stalled_confirmation phase"),
-                Probe::Head | Probe::Bootstrap => (acked_offset, None),
-                Probe::Snapshot => (self.snapshot_offset, Some(SNAPSHOT_BODY)),
+                Probe::Head | Probe::Bootstrap => (StatusCode::OK, Some(acked_offset), None),
+                Probe::Snapshot => (
+                    StatusCode::OK,
+                    Some(self.snapshot_offset),
+                    Some(SNAPSHOT_BODY),
+                ),
+                Probe::LongPollNow => (StatusCode::NO_CONTENT, Some(acked_offset), Some(&b""[..])),
+                Probe::LongPollBeyond => {
+                    (StatusCode::RANGE_NOT_SATISFIABLE, Some(acked_offset), None)
+                }
+                Probe::SseNow => (StatusCode::OK, None, None),
             };
-            if seen.status != StatusCode::OK
-                || seen.next_offset != Some(want_offset)
+            if seen.status != want_status
+                || seen.next_offset != want_offset
                 || want_body.is_some_and(|body| seen.body[..] != *body)
             {
                 fail(
                     trace,
                     phase,
                     format!(
-                        "{} answered {} at next offset {:?} ({} body bytes); every append \
-                         through {want_offset} was acknowledged first",
+                        "{} answered {} at next offset {:?} ({} body bytes), not {want_status} \
+                         at {want_offset:?}; every append through {acked_offset} was \
+                         acknowledged first",
                         probe.name(),
                         seen.status,
                         seen.next_offset,
@@ -209,7 +260,7 @@ impl Probes<'_> {
     /// retryable 503.
     async fn refuse(&self, phase: &str, acked_offset: u64, trace: &mut SimTrace) {
         for probe in PROBES {
-            let seen = self.observe(probe).await;
+            let seen = self.observe(probe, acked_offset).await;
             if seen.status.is_success() {
                 fail(
                     trace,
@@ -406,13 +457,13 @@ pub(super) async fn run_leader_read_linearizability_inner(
                 path: &path,
                 snapshot_offset,
             };
-            let seen = probes.observe(Probe::Head).await;
+            let seen = probes.observe(Probe::Head, snapshot_offset).await;
             head_done.store(true, Ordering::SeqCst);
             seen
         })
     };
     madsim::time::sleep(Duration::from_millis(1)).await;
-    let local = probes.observe(Probe::LocalRead).await;
+    let local = probes.observe(Probe::LocalRead, snapshot_offset).await;
     let (healed_first, head_first) = (
         healed.load(Ordering::SeqCst),
         head_done.load(Ordering::SeqCst),
@@ -454,6 +505,27 @@ pub(super) async fn run_leader_read_linearizability_inner(
     }
     heal.await.expect("heal the stalled confirmation");
 
+    // A long-poll registered on the leader before the failover: its owner
+    // check resolved `offset=now` to `registered_at`. Whenever it times
+    // out, it answers from its own state.
+    let registered_at = u64::try_from(acked.len()).expect("offset fits u64");
+    let spanning_wait = {
+        let uri = format!("{path}?offset=now&live=long-poll&timeout_ms={SPANNING_TIMEOUT_MS}");
+        let app = app.clone();
+        madsim::task::spawn(async move {
+            let response = send(&app, "GET", &uri, &[], Body::empty()).await;
+            Observation {
+                status: response.status(),
+                next_offset: response
+                    .headers()
+                    .get("stream-next-offset")
+                    .map(parse_http_offset),
+                body: body_bytes(response).await,
+            }
+        })
+    };
+    madsim::time::sleep(Duration::from_millis(3)).await;
+
     // Cut the leader off from both followers. It keeps believing it leads
     // while the majority elects a new leader and acknowledges more appends.
     for node_id in (1..=3).filter(|node_id| *node_id != old_leader) {
@@ -488,6 +560,33 @@ pub(super) async fn run_leader_read_linearizability_inner(
     probes
         .refuse("leader_isolated", acked_offset, &mut trace)
         .await;
+    let spanning = spanning_wait.await.expect("long-poll across the failover");
+    trace.push(observed(
+        "live_read_failover",
+        Probe::LongPollNow,
+        &spanning,
+    ));
+    let in_range = spanning
+        .next_offset
+        .is_some_and(|next| (registered_at..=acked_offset).contains(&next));
+    let answered = match spanning.status {
+        StatusCode::NO_CONTENT => in_range,
+        // The failover reached the owner check before it confirmed.
+        StatusCode::SERVICE_UNAVAILABLE | StatusCode::TEMPORARY_REDIRECT => true,
+        _ => false,
+    };
+    if !answered {
+        fail(
+            &mut trace,
+            "live_read_failover",
+            format!(
+                "a long-poll registered at {registered_at} answered {} at next offset {:?} \
+                 across the failover; a 204 must answer between the requested offset and \
+                 the committed tail {acked_offset}",
+                spanning.status, spanning.next_offset,
+            ),
+        );
+    }
 
     runtime
         .shutdown_group_engine_for_simulation(placement)

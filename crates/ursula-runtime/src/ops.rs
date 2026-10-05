@@ -187,12 +187,12 @@ macro_rules! runtime_operations {
                 }
                 client { none }
             }
-            op RequireLiveReadOwner {
-                fields {}
-                reply { response_tx: () }
+            op OpenLiveRead {
+                fields { request: HeadStreamRequest }
+                reply { response_tx: LiveReadOwner }
                 guard { none }
-                handle { call require_live_read_owner(engine, placement) }
-                client { none }
+                handle { call open_live_read(engine, metrics, request, placement) }
+                client { stream fn queue_open_live_read }
             }
             op AcceptsLocalWrites {
                 fields {}
