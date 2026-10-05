@@ -24,7 +24,6 @@ use ursula_runtime::ColdStore;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::CompactColdRequest;
 use ursula_runtime::CreateStreamRequest;
-use ursula_runtime::FlushColdRequest;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::InMemoryGroupEngineFactory;
 use ursula_runtime::PlanGroupColdFlushRequest;
