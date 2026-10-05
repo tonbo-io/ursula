@@ -267,6 +267,8 @@ The `ursula-stream` crate uses `proptest` for state machine property testing in 
    - `fix(ursula-raft): preserve snapshot metadata`
    - `docs(web): remove redundant subtitles`
 7. **Semantic PR titles**: PR titles must follow the same semantic commit message format (including component scope where applicable), because squash merge uses the PR title as the resulting commit's first line.
+8. **No co-author information**: Do not include co-author information or `Co-authored-by` trailers in commit messages or PR descriptions.
+9. **Concise commit bodies**: Keep any explanation after the first line brief and focused on the reason for the change and essential context. Omit redundant details, exhaustive change lists, and work logs; omit the body when the subject is sufficient.
 
 ## Architecture Boundaries
 
