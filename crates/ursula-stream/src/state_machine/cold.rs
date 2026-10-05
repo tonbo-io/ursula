@@ -365,6 +365,22 @@ impl StreamStateMachine {
                 "cold chunk S3 path must not be empty",
             ));
         }
+        // Shared-object GC is queued for the releasing bucket, so a shared
+        // object must live under `{bucket}/`.
+        if chunk.shared_object
+            && !chunk
+                .s3_path
+                .strip_prefix(stream_id.bucket_id.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+        {
+            return Err(StreamResponse::error(
+                StreamErrorCode::InvalidColdFlush,
+                format!(
+                    "shared cold object '{}' is outside bucket '{}'",
+                    chunk.s3_path, stream_id.bucket_id
+                ),
+            ));
+        }
         if chunk.object_size == 0 {
             return Err(StreamResponse::error(
                 StreamErrorCode::InvalidColdFlush,

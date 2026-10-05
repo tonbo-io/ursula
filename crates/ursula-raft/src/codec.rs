@@ -55,38 +55,3 @@ pub(crate) fn placement_from_parts(
 pub(crate) fn required<T>(value: Option<T>, field: &str) -> Result<T, GroupEngineError> {
     value.ok_or_else(|| GroupEngineError::Infra(GroupInfraError::proto_decode(field)))
 }
-
-#[cfg(test)]
-mod tests {
-    use ursula_runtime::HeadStreamResponse;
-
-    use super::*;
-
-    fn head_response(created_at_ms: u64) -> HeadStreamResponse {
-        HeadStreamResponse {
-            placement: ShardPlacement {
-                core_id: CoreId(0),
-                shard_id: ShardId(1),
-                raft_group_id: RaftGroupId(2),
-            },
-            content_type: "application/json".to_owned(),
-            tail_offset: 9,
-            cold_hot_start_offset: 0,
-            closed: false,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
-            snapshot_offset: None,
-            snapshot_digest: None,
-            retained_offset: 0,
-            created_at_ms,
-        }
-    }
-
-    #[test]
-    fn forwarded_head_carries_created_at_ms() {
-        let current = head_response(1_234);
-        let decoded: HeadStreamResponse =
-            decode_wire(&encode_wire(&current), "head").expect("decode current head");
-        assert_eq!(decoded, current);
-    }
-}

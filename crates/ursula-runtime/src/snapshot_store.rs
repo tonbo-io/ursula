@@ -59,7 +59,7 @@ pub enum SnapshotLocation {
     /// Bytes live inline in the location. Round-trips through openraft with no
     /// external store touch.
     Inline {
-        #[serde(with = "serde_bytes_vec")]
+        #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
     },
     /// Bytes live on the local filesystem at `path` (dev / single-host).
@@ -112,38 +112,6 @@ impl SnapshotLocation {
             Self::S3 { compression, .. } => *compression,
             Self::Inline { .. } | Self::Local { .. } => SnapshotCompression::None,
         }
-    }
-}
-
-mod serde_bytes_vec {
-    use serde::Deserializer;
-    use serde::Serializer;
-
-    pub fn serialize<S: Serializer>(bytes: &[u8], ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_bytes(bytes)
-    }
-
-    /// Accepts only `bytes` (MessagePack bin, F12a).
-    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<u8>, D::Error> {
-        struct BytesVisitor;
-
-        impl serde::de::Visitor<'_> for BytesVisitor {
-            type Value = Vec<u8>;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a byte string")
-            }
-
-            fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
-                Ok(bytes.to_vec())
-            }
-
-            fn visit_byte_buf<E: serde::de::Error>(self, bytes: Vec<u8>) -> Result<Vec<u8>, E> {
-                Ok(bytes)
-            }
-        }
-
-        de.deserialize_byte_buf(BytesVisitor)
     }
 }
 

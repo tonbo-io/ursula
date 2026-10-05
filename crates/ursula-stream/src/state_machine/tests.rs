@@ -1434,6 +1434,43 @@ fn shared_cold_object_is_reclaimed_after_last_stream_reference() {
 }
 
 #[test]
+fn flush_cold_refuses_a_shared_object_outside_the_stream_bucket() {
+    let mut machine = machine();
+    create_stream(&mut machine, "foreign-pack");
+    machine.apply(append_cmd(
+        stream("foreign-pack"),
+        b"abcd",
+        Append::default(),
+    ));
+    let response = machine.apply(StreamCommand::FlushCold {
+        cold_generation: machine
+            .cold_index_generation(&stream("foreign-pack"))
+            .unwrap_or_default(),
+        stream_id: stream("foreign-pack"),
+        chunk: ColdChunkRef {
+            start_offset: 0,
+            end_offset: 4,
+            s3_path: "benchcmp-other/_packs/00000000/shared.bin".to_owned(),
+            object_size: 4,
+            object_offset: 0,
+            shared_object: true,
+            payload_digest: String::new(),
+        },
+    });
+    assert!(
+        matches!(
+            &response,
+            StreamResponse::Error {
+                code: StreamErrorCode::InvalidColdFlush,
+                message,
+                ..
+            } if message.contains("outside bucket")
+        ),
+        "{response:?}"
+    );
+}
+
+#[test]
 fn compact_cold_enqueues_inputs_with_gc_grace() {
     let mut machine = machine();
     create_stream(&mut machine, "compact");

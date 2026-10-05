@@ -158,21 +158,19 @@ impl StreamStateMachine {
                     tail_offset: entry.metadata.tail_offset,
                 });
             }
-            let retained_offset = entry.retained_offset;
-            if retained_offset > entry.metadata.tail_offset {
+            if entry.retained_offset > entry.metadata.tail_offset {
                 return Err(StreamSnapshotError::SnapshotOffsetOutOfRange {
                     stream_id,
-                    snapshot_offset: retained_offset,
+                    snapshot_offset: entry.retained_offset,
                     tail_offset: entry.metadata.tail_offset,
                 });
             }
-            let hot_segments = entry.hot_segments;
-            if !hot_segments_match_payload(&hot_segments, entry.payload.len())
+            if !hot_segments_match_payload(&entry.hot_segments, entry.payload.len())
                 || !payload_sources_cover_retained_suffix(
                     &entry.cold_chunks,
                     &entry.external_segments,
-                    &hot_segments,
-                    retained_offset,
+                    &entry.hot_segments,
+                    entry.retained_offset,
                     entry.metadata.tail_offset,
                 )
             {
@@ -186,14 +184,13 @@ impl StreamStateMachine {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));
             }
             let producer_states = restore_producer_states(&stream_id, entry.producer_states)?;
-            let visible_snapshot = entry.visible_snapshot;
             let shared_cold_paths = entry
                 .cold_chunks
                 .iter()
                 .filter(|chunk| chunk.shared_object)
                 .map(|chunk| chunk.s3_path.clone())
                 .collect::<Vec<_>>();
-            let hot_buffer = HotBuffer::from_snapshot(entry.payload, &hot_segments);
+            let hot_buffer = HotBuffer::from_snapshot(entry.payload, &entry.hot_segments);
             let slot = StreamSlot {
                 metadata: entry.metadata,
                 hot_buffer,
@@ -202,8 +199,8 @@ impl StreamStateMachine {
                     entry.cold_chunks,
                     entry.external_segments,
                 ),
-                retained_offset,
-                visible_snapshot,
+                retained_offset: entry.retained_offset,
+                visible_snapshot: entry.visible_snapshot,
                 receipt_window: super::producers::ReceiptWindow::rebuild(&producer_states),
                 producers: producer_states,
                 append_count: 0,
