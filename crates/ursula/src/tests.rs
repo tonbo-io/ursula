@@ -6558,6 +6558,35 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
     assert!(conflicted, "expected at least one bucket-owning group");
 }
 
+// D10 / AUD §4.8: purge is an admin-plane route. The client listener does not
+// serve it; `/__ursula/usage` stays on both listeners for Cloud's meter.
+#[tokio::test]
+async fn purge_is_served_on_the_admin_listener_only() {
+    let state = HttpState::new(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    );
+    let client = client_router_with_admission(state.clone(), IngressAdmission::default());
+    let admin = admin_router(state);
+
+    let response = http_delete(&client, "/__ursula/purge/tenant-x").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = http_delete(&admin, "/__ursula/purge/tenant-x").await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for app in [&client, &admin] {
+        let response = http_get(app, "/__ursula/usage").await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_wide_purge_reaches_every_distributed_group_leader() {
     let mut listeners = Vec::new();

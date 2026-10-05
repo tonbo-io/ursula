@@ -114,7 +114,9 @@ Counters are monotonic and survive snapshots, stream deletion, and bucket purge.
 
 ## Tenant offboarding (bucket purge)
 
-`DELETE /__ursula/purge/{bucket}` (admin plane) erases one tenant's complete bucket domain: every stream in every Raft group, the bucket, cold chunks and indexes, external payloads, and any uncommitted object-store staging orphan below `{bucket}/`. The replicated purge also installs a permanent bucket-erasure fence in every group. It retains only the bucket's aggregate usage counters, because deleting a counter before an asynchronous meter observes it would erase committed billable work. The response is a completion report an operator can attest to:
+`DELETE /__ursula/purge/{bucket}` erases one tenant's complete bucket domain: every stream in every Raft group, the bucket, cold chunks and indexes, external payloads, and any uncommitted object-store staging orphan below `{bucket}/`. The replicated purge also installs a permanent bucket-erasure fence in every group. It retains only the bucket's aggregate usage counters, because deleting a counter before an asynchronous meter observes it would erase committed billable work. The response is a completion report an operator can attest to:
+
+Purge is served only on the admin listener (`server.admin_listen`, loopback `127.0.0.1:4438` by default); the client listener answers `404`. On Kubernetes the chart keeps the admin listener on pod loopback, so reach it through `kubectl port-forward pod/<voter-pod> 4438:4438` or `kubectl exec`; any one voter accepts the request for the whole cluster.
 
 ```bash
 curl -X DELETE http://127.0.0.1:4438/__ursula/purge/tenant-a
@@ -123,6 +125,7 @@ curl -X DELETE http://127.0.0.1:4438/__ursula/purge/tenant-a
 
 Semantics:
 
+- **Retry on `503`.** A Raft group whose leader is unknown or changing answers `503` with `Retry-After`, never a redirect to a peer. Because purge is idempotent, retry the same request.
 - **Idempotent and resumable.** Re-purging an erased bucket returns the same report shape with zero removals. A purge interrupted mid-way converges on re-run: the permanent fence and stream removal are replicated commands per group, while cold reclamation and the complete bucket-prefix erasure are repeatable object-store operations.
 - **Permanently fenced.** Commands linearized after purge cannot create the bucket or append to its streams. The fence survives Raft snapshots and restore; data-plane access continues to conceal the erased namespace as `404 Not Found` instead of recreating it.
 - **Isolated.** Other buckets' streams, offsets, checksums, snapshots, and object-store prefixes are untouched. Every cold object, shared packs included, lives under its own bucket's `{bucket}/` prefix.

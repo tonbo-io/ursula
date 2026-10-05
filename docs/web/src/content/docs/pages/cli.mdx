@@ -44,7 +44,7 @@ Mutating verbs exit `0` on success and `2` on an abort (drain timeout, no safe t
 
 ## The admin plane
 
-Nodes carry **no cluster-mutation surface on the network**. The mutating operator endpoints (raft snapshot/purge/membership/learners/leader-transfer, maintenance drain, cold-flush trigger) plus metrics are served on a separate **admin plane** bound to `server.admin_listen`, which defaults to loopback (`127.0.0.1:4438`). The public client plane (`:4437`) serves only stream traffic and read-only metrics.
+Nodes carry **no cluster-mutation surface on the network**. The mutating operator endpoints (raft snapshot/purge/membership/learners/leader-transfer, maintenance drain, cold-flush trigger, bucket purge) plus metrics and usage are served on a separate **admin plane** bound to `server.admin_listen`, which defaults to loopback (`127.0.0.1:4438`). The public client plane (`:4437`) serves only stream traffic and read-only metrics and usage.
 
 `status` and `wait-ready` prefer each node's `http_url` because read-only metrics are available on the client plane, and fall back to `admin_url`. Mutating verbs always use `admin_url`.
 
