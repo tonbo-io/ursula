@@ -552,11 +552,13 @@ impl GroupActor {
         &mut self,
         request: ReadStreamRequest,
         waiter_id: u64,
+        incarnation: Option<u64>,
         response_tx: oneshot::Sender<Result<ReadStreamResponse, RuntimeError>>,
     ) -> ControlFlow<()> {
         let watcher = ReadWatcher {
             waiter_id,
             request,
+            incarnation,
             response_tx,
         };
         CoreWorker::wait_read_stream(

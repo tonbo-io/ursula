@@ -27,6 +27,10 @@ For an `application/json` stream the offset must be a message boundary: a `Strea
  The snapshot blob bytes. Bodies of up to **32 MiB** are stored inline in the stream's replicated state. On a node with a cold backend, a body of at least `runtime.external_payload_min_size` (1 MiB by default) is streamed into the cold tier instead, and bodies of up to **1 GiB** are accepted. Larger bodies return `413`.
 </ParamField>
 
+<ParamField header="Stream-Incarnation" type="string">
+ Optional precondition: the stream's incarnation token, as a previous response's `Stream-Incarnation` header returned it. The request applies only if the stream is still that incarnation, checked atomically with the write; otherwise it answers `412` and changes nothing. Without the header, the request behaves exactly as described here. A malformed value answers `400`. See [`Stream-Incarnation`](/docs/specs/extensions#24-snapshot-metadata-on-head-and-stream-incarnation).
+</ParamField>
+
 ## Response
 
 | Status | Meaning |
@@ -36,11 +40,12 @@ For an `application/json` stream the offset must be a message boundary: a `Strea
 | `404` | Stream not found or expired. |
 | `409` | Stale publish (a newer snapshot exists) or offset out of range. |
 | `410` | Snapshot offset is older than the retained stream history. |
+| `412` | `Stream-Incarnation` did not match: the stream was deleted and recreated. Nothing was published; the response's `Stream-Incarnation` is the current token. |
 | `413` | Snapshot body exceeds the maximum allowed size (32 MiB inline, 1 GiB in the cold tier). |
 | `502` | The cold backend failed while storing the body. |
 | `503` | JSON stream only: Ursula could not read the byte before the offset to check the boundary. Nothing was published; retry. |
 
-Response headers include `Stream-Next-Offset`, `Stream-Snapshot-Offset`, and `Stream-Snapshot-Digest`. Repeating the same offset, content type, and body is idempotent and returns the same digest. Reusing an offset with different content returns `409`.
+Response headers include `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, and `Stream-Incarnation`. Repeating the same offset, content type, and body is idempotent and returns the same digest. Reusing an offset with different content returns `409`.
 
 <RequestExample>
 ```bash Example

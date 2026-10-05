@@ -57,11 +57,22 @@ When the facts are decided somewhere else, such as a database transaction or a [
 4. **Old owners.** Once the new owner's first append is accepted, appends with the old epoch answer `403`. Before that, an old owner can still publish only facts that committed, and `Stream-Seq` accepts each of those at most once and in commit order.
 5. **Gaps.** If a fact can no longer be published, for example because the source pruned it, append a snapshot or reset marker that tells readers to resynchronize. A fact skipped once can never be appended later, because its number is no longer greater than the stored value.
 
-## When to use what
+## Guarding against a recreated stream (`Stream-Incarnation`)
+
+`Stream-Seq` and the producer headers are state of one stream. A stream deleted and recreated at the same URL (by a `DELETE` and a `PUT`, or by TTL expiry and a later `PUT`) starts without either, so they can't tell a client that its offsets, producer state or cached data belong to a stream that no longer exists. `Stream-Incarnation` does:
+
+- Every successful response that addresses a stream, except a `DELETE`, carries `Stream-Incarnation`, an opaque token of the stream's incarnation. Keep it with whatever you derived from the stream.
+- Send it back as a request header on any later request: appends, reads (including long-poll and SSE), `HEAD`, `DELETE`, a `PUT` of an existing stream, bootstrap, snapshot publish and read, retention. The server compares it for equality with the stream's current incarnation, atomically with the request (a write when it is applied), and answers `412 Precondition Failed` when the stream is another incarnation; a refused write applies nothing. The `412` carries the current token.
+- A request that would answer `404` (or, for a read, `410` or `416`) without the header still does. A `PUT` with the header for a missing stream answers `412` and creates nothing.
+- Without the header nothing changes.
+
+`412` never mixes with the `409`s above: a `Stream-Seq` or producer conflict is about the same stream; a `412` means the stream you knew is gone. Start over from the new stream: discard derived state, read from its start or bootstrap, and keep the new token.
+
 
 - **Prefix-count `Stream-Seq`**: several writers extend one log, and each commit must be validated against everything before it.
 - **Commit-number `Stream-Seq`**: one logical publisher, possibly failing over between owners, must not publish a fact twice or out of order.
 - **Producer headers** ([exactly-once writes](/docs/concepts/exactly-once-writes)): retries of the same append must not be written twice.
+- **`Stream-Incarnation`**: any client that keeps offsets, producer state or a cache across requests, so it never acts on a stream recreated at the same URL. Combine it with the others.
 - **Neither**: append-only workloads where every write is independent, such as event logging. Just `POST`.
 
 Ursula has no precondition on the stream's tail offset (`If-Match`).

@@ -173,6 +173,18 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
         refs: Vec<ObjectPayloadRef>,
     },
+    /// The `Stream-Incarnation` request precondition (D12): `command` (a
+    /// create, append, close, delete, snapshot publish or retention move)
+    /// applies only if its stream is the incarnation `incarnation` (its
+    /// `created_at_ms`) when this entry applies; otherwise apply refuses it
+    /// with [`crate::StreamErrorCode::IncarnationMismatch`] and changes
+    /// nothing (see [`crate::StreamStateMachine::incarnation_precondition`]).
+    /// A request without the header is never wrapped, so its command and log
+    /// encoding are unchanged.
+    IfIncarnation {
+        incarnation: u64,
+        command: Box<StreamCommand>,
+    },
 }
 
 /// Fixed per-command allowance of [`StreamCommand::log_bytes_estimate`]:
@@ -207,6 +219,10 @@ impl StreamCommand {
                 .saturating_mul(CHUNK_REF_LOG_BYTES),
             Self::ImportSnapshot { snapshot } => {
                 len_u64(snapshot.streams.len()).saturating_mul(COMMAND_LOG_OVERHEAD_BYTES)
+            }
+            // The wrapped command plus the expected incarnation (a u64).
+            Self::IfIncarnation { command, .. } => {
+                return command.log_bytes_estimate().saturating_add(8);
             }
             _ => 0,
         };
@@ -302,6 +318,10 @@ impl fmt::Display for StreamCommand {
             Self::OffloadColdRefs { stream_id, refs } => {
                 write!(f, "offload_cold_refs:{stream_id}:{} refs", refs.len())
             }
+            Self::IfIncarnation {
+                incarnation,
+                command,
+            } => write!(f, "{command}:if_incarnation={incarnation}"),
         }
     }
 }

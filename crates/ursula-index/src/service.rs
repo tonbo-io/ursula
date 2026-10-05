@@ -872,7 +872,10 @@ async fn index_source(
             index.config().extractor.clone(),
         )
     };
+    // Bound to the HEAD's incarnation: bytes of a stream recreated since
+    // then are refused, not indexed into this incarnation's namespace.
     let read = source
+        .bound_to(head.incarnation.clone())
         .read_segment(
             claim.start_offset,
             resync,
@@ -892,6 +895,12 @@ async fn index_source(
         }
         Ok(SegmentRead::Retained { retained_offset }) => {
             index.advance_floor(retained_offset).await?;
+            index.release_claim(&claim).await?;
+            return Ok(Backlog::More);
+        }
+        // The stream was recreated since the HEAD: the next pass's HEAD
+        // sees the new incarnation and restarts the index onto it.
+        Err(IndexError::SourceRecreated) => {
             index.release_claim(&claim).await?;
             return Ok(Backlog::More);
         }

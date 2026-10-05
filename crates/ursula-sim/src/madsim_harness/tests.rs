@@ -2058,6 +2058,7 @@ fn external_append_request(stream: &BucketStreamId, path: &str, len: u64) -> App
         stream_seq: None,
         producer: None,
         now_ms: 0,
+        if_incarnation: None,
     }
 }
 

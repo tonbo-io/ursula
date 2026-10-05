@@ -47,9 +47,11 @@ it). The write of the commit frame's page data (the frame whose header has a non
 after commit") is the commit point: the transaction's final page images become one commit frame,
 appended with the idempotent producer (`Producer-Id` `sqlite-ursula-vfs/<Stream-Incarnation>`,
 `Producer-Epoch` per owner, `Producer-Seq` per append). The id names the stream incarnation, an
-opaque token compared for equality only: the owners of one incarnation fence each other by epoch,
-and to a stream recreated at the same path an owner of the deleted one is an unknown producer,
-unless an attach racing the recreate claimed under the old id (§6, wrong stream).
+opaque token compared for equality only: the owners of one incarnation fence each other by epoch.
+Every request after attach's first `HEAD` (appends, reads, snapshot and retention `PUT`s, snapshot
+`GET`s) also carries that incarnation as the `Stream-Incarnation` request precondition, which the
+server checks atomically with the request (an append at Raft apply): a stream recreated at the
+same path refuses everything of an owner of the deleted one with `412` (§6, wrong stream).
 
 - **Acknowledged**: the overlay goes to the local WAL, later writes of the transaction (checksum
   rewrites of spilled frames, padding) go straight to it, and when the write transaction ends (the
@@ -124,7 +126,8 @@ unless an attach racing the recreate claimed under the old id (§6, wrong stream
    the state at the WAL's last commit, replayed ones later commits; replay is idempotent). A crash
    between that sidecar and the delete leaves commits in a WAL the `:0` claim rejects: a rebuild.
 4. `HEAD`s the stream and compares its `Stream-Incarnation` with step 2's (a change fails the
-   attach, as in step 6). If its latest snapshot is ahead of the file (a fresh host, or a file left
+   attach round, as in step 6). From here on every request carries step 2's incarnation as the
+   `Stream-Incarnation` precondition. If its latest snapshot is ahead of the file (a fresh host, or a file left
    below the retention), installs it (§4.3). Then replays frames to the tail.
 5. Claims with the incarnation's `Producer-Id` (§2): appends a claim at (epoch = highest seen + 1,
    seq 0) and reads it back. A 2xx alone proves nothing (two owners claiming the same epoch both
@@ -136,19 +139,19 @@ unless an attach racing the recreate claimed under the old id (§6, wrong stream
    is unknown), our claim being among the frames at all suffices: the server applies one append
    per (producer, epoch, seq 0) and answers every other with its receipt, so our claim is in the
    stream only if the answer was its own end. Lost: epoch + 1. 403: the server's epoch + 1.
-6. Replays up to the claim and `HEAD`s the stream again: if its incarnation is no longer step 2's
-   (deleted and recreated meanwhile), the attach fails and the application retries it. The
-   sidecar is still stamped with the old incarnation, so the next attach discards whatever this one
-   wrote and rebuilds from the recreated stream (step 2). A recreate that breaks catch-up first (a
-   read beyond the new stream's end, a frame that does not decode) fails the attach the same way.
-   If the replay up to the claim reaches a newer owner's claim (a higher epoch, which the server
-   accepts from this producer only after ours), the attach fails as fenced and the application
-   retries it: this owner is already fenced, and a snapshot it took would record an epoch below
-   the highest one claimed before it (§4.2).
-   `HEAD` is a leader read and incarnations never repeat (unique per group),
-   so a match means every read and the claim in between hit that incarnation. Then, if attach
-   wrote the db file, fsyncs it; writes the sidecar (with the incarnation), and swaps the path's
-   binding to the new attachment.
+6. Replays up to the claim. Every read and the claim carried step 2's incarnation, which the
+   server checked atomically with each, so all of them hit that incarnation. A stream deleted and
+   recreated meanwhile answers `412` to the first of them that reaches it (a read at an offset the
+   recreated stream does not have answers `410` or `416` instead, RFC 9110 §13.2.1; attach then
+   retries from `HEAD`, or, on a `416`, `HEAD`s to tell a recreate from lost data): the round fails, and
+   attach starts again from step 2 (up to three more rounds), which, the sidecar still being
+   stamped with the old incarnation, discards whatever this round wrote and rebuilds from the
+   recreated stream. If the replay up to the claim reaches a newer owner's claim (a higher epoch,
+   which the server accepts from this producer only after ours), the attach fails as fenced and
+   the application retries it: this owner is already fenced, and a snapshot it took would record an
+   epoch below the highest one claimed before it (§4.2). Then, if attach wrote the db file, fsyncs
+   it; writes the sidecar (with the incarnation), and swaps the path's binding to the new
+   attachment.
 
 An attach that fails after step 1 leaves the path unbound: its files may hold anything between the
 old attachment's state and the stream's, and the stream may hold a newer claim. Opening its main
@@ -161,11 +164,11 @@ The new epoch fences every earlier owner at the server: their next append gets 4
 page images per read batch (last image per page, truncate to the batch's smallest size first), so
 replaying from an older offset than the file reflects is idempotent.
 
-Producer expiry: the server forgets a producer idle for 7 days (and a recreated stream never knew
-it, §6 wrong stream). The owner's next append gets 409 expecting seq 0; it takes the stream back
-only if the stream is still the incarnation it attached to (checked before and after), still ends
-at its own offset, and its new claim (epoch + 1) is the first frame after it (read and decoded
-from that offset, as in step 5), else it is fenced. Reads in
+Producer expiry: the server forgets a producer idle for 7 days. The owner's next append gets 409
+expecting seq 0; it takes the stream back only if the stream still ends at its own offset and its
+new claim (epoch + 1) is the first frame after it (read and decoded from that offset, as in step
+5), else it is fenced. Both requests carry the incarnation, so a recreated stream (which answers
+`412` before any producer check) fences the owner instead. Reads in
 recovery use `consistency=leader` (a follower may lag an acknowledged append). Catch-up reads,
 `HEAD` and snapshot `GET`s retry `429` and `503` (a leader that could not confirm its leadership in
 time) like appends: no sooner than `Retry-After`, with backoff, within `URSULA_VFS_RETRY_MS`; the
@@ -230,7 +233,7 @@ zombie with a higher one could then fence the new owner).
 ### 4.3 Publishing, retention, and attach
 
 1. `PUT {stream}/snapshot/{W}` (retried while the outcome is unknown; publishing is idempotent),
-   unless a `HEAD` just before shows the stream was recreated (below). 409/410: a newer snapshot
+   with the `Stream-Incarnation` precondition (a recreated stream answers `412`; below). 409/410: a newer snapshot
    exists; nothing to do.
 2. `GET {stream}/snapshot/{W}` until it returns exactly the published bytes.
 3. Only then `PUT {stream}/retention/{P}`, where `P` is the *previous* snapshot's offset (the latest
@@ -255,15 +258,11 @@ WAL (the old pages may predate the offset) and the files are rebuilt. A tail rea
 
 Any owner may publish a snapshot of its own offset, a fenced one included: its state at its offset
 is a true prefix of the incarnation it attached to. The snapshot and retention endpoints know no
-producer, so the thread `HEAD`s the stream before the snapshot `PUT` and again before the
-retention `PUT` and, if it was recreated, does not publish (or move retention) and fences the
-owner (§6, wrong stream). Neither check is atomic with its `PUT`: a stream deleted and recreated
-between the first and the snapshot `PUT` gets the old database's image as its snapshot at `W`,
-which an attach of a file behind `W` would install, and one recreated between the second and the
-retention `PUT` gets its retention set to `P`, dropping its frames below `P` (the new stream's own
-snapshot permitting). Each window is one `HEAD` round trip; closing them needs an incarnation
-precondition on both endpoints at the server. Retention never passes the
-latest snapshot (the server refuses).
+producer, so the snapshot `PUT`, its read-back `GET` and the retention `PUT` carry the
+incarnation as the `Stream-Incarnation` precondition, checked by the server atomically with each:
+a stream deleted and recreated meanwhile answers `412`, and the thread publishes nothing there (nor
+moves its retention) and fences the owner (§6, wrong stream). Retention never passes the latest
+snapshot (the server refuses).
 
 ### 4.4 Snapshot bodies on the server
 
@@ -404,23 +403,18 @@ What attach does in each case:
   has grown past it. Attach creates a missing stream, so attaching after the stream was deleted
   (by mistake, or by a fresh install that did not carry it over) creates an empty one and discards
   the local files, which may be the only copy left: copy `<db>` aside first. A recreate during
-  attach fails it, and the next attach rebuilds (§3).
-  While attached, the owner's appends carry its incarnation's `Producer-Id` (§2), normally a
-  producer the recreated stream never had: a commit (seq >= 1) gets 409 expecting seq 0, as for an
-  expired producer, and the re-claim finds the incarnation changed and fences and poisons the
-  owner, before anything of it lands. Three things can still land. The stray claim of an attach or
-  re-claim racing the recreate (a new producer's seq 0 is accepted; the `HEAD` after it then fails
-  the attach or fences the owner) changes no page but raises the epoch later claims start from.
-  It also registers the deleted incarnation's `Producer-Id` in the recreated stream at its epoch:
-  an owner of the deleted stream still attached at that epoch, with no commit since its claim,
-  then has its commits accepted there until either owner (the recreated stream's is under another
-  `Producer-Id`, so not fenced by epoch) commits with the higher `Stream-Seq` (§2), which refuses
-  the other's next commit (possibly the new owner's, when the stray claim's epoch is above its
-  own), or until the old owner's snapshot thread's `HEAD`. Offsets are opaque, so neither owner
-  notices the other's frames by where its own landed. And the snapshot thread can publish a
-  snapshot, or move retention (§4.3, a window of one `HEAD` round trip each). Stop every owner
-  before deleting a stream you will recreate; closing these windows needs an incarnation
-  precondition on appends and on the snapshot and retention endpoints at the server.
+  attach fails that round, and attach rebuilds from the recreated stream (§3).
+  While attached, every request of the owner carries its incarnation as the `Stream-Incarnation`
+  precondition, which the server checks atomically with the request (an append when Raft applies
+  it, so a commit proposed before a delete and recreate and applied after is refused too): the
+  recreated stream answers `412` to the owner's next commit, claim, re-claim, read, snapshot
+  publish or retention move, nothing of it lands, and the owner is fenced and poisoned. The
+  windows earlier versions had (a stray claim of an attach racing the recreate, accepted as a new
+  producer's seq 0; commits of an old owner accepted under that claim's `Producer-Id`; a snapshot
+  or retention move between the thread's `HEAD` and its `PUT`) are closed for owners of this
+  version. An owner of an earlier version still has them: stop such owners before deleting a
+  stream you will recreate. The precondition needs a server of Ursula 0.6.0 or later; an older
+  server ignores the header (attach does not detect this), so the windows stay open there.
 - A rollback journal next to an attached file can only be left by a crash while attach switched
   an empty file to WAL; attach deletes it in every case (rolling it back would truncate the file
   under the pages attach writes next).

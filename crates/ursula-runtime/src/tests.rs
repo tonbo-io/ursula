@@ -332,6 +332,8 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             already_exists: false,
             group_commit_index: 1,
             hot_backlog: Some(crate::request::WriteHotBacklog::default()),
+            // The first incarnation of an empty group (C7).
+            incarnation: 1,
         })
     );
 
@@ -364,6 +366,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             stream_hot_bytes: 3,
             group_hot_bytes: 3,
             receipt_evicted: false,
+            incarnation: 1,
         })
     );
 
@@ -547,6 +550,7 @@ async fn cold_index_read_materializes_overlapping_flush_objects_once() {
         })],
         up_to_date: true,
         closed: false,
+        incarnation: 0,
     };
 
     let payload = InMemoryGroupEngine::read_payload_from_plan(
@@ -611,6 +615,7 @@ async fn cold_read_refreshes_page_when_its_object_was_collected() {
         })],
         up_to_date: true,
         closed: false,
+        incarnation: 0,
     };
     let read = || {
         InMemoryGroupEngine::read_payload_from_plan(Some(&cold_store), Some(&cache), &stream, &plan)
@@ -811,6 +816,7 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
             now_ms: 0,
+            if_incarnation: None,
         })
         .await
         .expect("create external stream");
@@ -833,6 +839,7 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            if_incarnation: None,
         })
         .await
         .expect("append external payload");
@@ -1367,6 +1374,7 @@ async fn snapshot_after_stream_delete_installs_without_dangling_append_count() {
     source
         .delete_stream(DeleteStreamRequest {
             stream_id: stream.clone(),
+            if_incarnation: None,
         })
         .await
         .expect("delete");
@@ -1838,7 +1846,10 @@ async fn packed_cold_object_survives_until_last_stream_is_deleted() {
     assert_eq!(chunks[0].s3_path, chunks[1].s3_path);
 
     runtime
-        .delete_stream(DeleteStreamRequest { stream_id: first })
+        .delete_stream(DeleteStreamRequest {
+            stream_id: first,
+            if_incarnation: None,
+        })
         .await
         .expect("delete first packed stream");
     runtime
@@ -1854,7 +1865,10 @@ async fn packed_cold_object_survives_until_last_stream_is_deleted() {
     );
 
     runtime
-        .delete_stream(DeleteStreamRequest { stream_id: second })
+        .delete_stream(DeleteStreamRequest {
+            stream_id: second,
+            if_incarnation: None,
+        })
         .await
         .expect("delete second packed stream");
     runtime
@@ -2079,6 +2093,7 @@ async fn all_stale_packed_candidates_reclaim_unpublished_object() {
         runtime
             .delete_stream(DeleteStreamRequest {
                 stream_id: stream.clone(),
+                if_incarnation: None,
             })
             .await
             .expect("delete planned stream");
@@ -2154,6 +2169,7 @@ async fn cold_gc_worker_physically_reclaims_deleted_stream_chunks() {
     runtime
         .delete_stream(DeleteStreamRequest {
             stream_id: stream.clone(),
+            if_incarnation: None,
         })
         .await
         .expect("delete stream");
@@ -2364,6 +2380,7 @@ async fn stale_cold_flush_batch_after_delete_recreate_is_classified_for_cleanup(
     runtime
         .delete_stream(DeleteStreamRequest {
             stream_id: stream.clone(),
+            if_incarnation: None,
         })
         .await
         .expect("delete old stream");
@@ -2776,6 +2793,7 @@ async fn wait_read_stream_completes_on_close_at_tail() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            if_incarnation: None,
         })
         .await
         .expect("close stream");
@@ -2853,11 +2871,13 @@ fn cancel_read_watcher_removes_group_local_waiter() {
             waiter_id: 1,
             request: read_req(stream.clone(), 0, 16),
             response_tx: first_tx,
+            incarnation: None,
         },
         ReadWatcher {
             waiter_id: 2,
             request: read_req(stream.clone(), 0, 16),
             response_tx: second_tx,
+            incarnation: None,
         },
     ]);
 
@@ -2897,11 +2917,13 @@ async fn notify_read_watchers_shares_identical_reads_across_watchers() {
             waiter_id: 1,
             request: request.clone(),
             response_tx: first_tx,
+            incarnation: None,
         },
         ReadWatcher {
             waiter_id: 2,
             request,
             response_tx: second_tx,
+            incarnation: None,
         },
     ]);
 
@@ -2962,6 +2984,7 @@ async fn close_stream_allows_close_only_and_rejects_later_appends() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            if_incarnation: None,
         })
         .await
         .expect("close stream");
@@ -3005,6 +3028,7 @@ async fn delete_stream_removes_state_on_owner_group() {
     let deleted = runtime
         .delete_stream(DeleteStreamRequest {
             stream_id: stream.clone(),
+            if_incarnation: None,
         })
         .await
         .expect("delete stream");
@@ -3683,6 +3707,7 @@ impl GroupEngine for BlockingReadEngine {
                 payload: Vec::new(),
                 up_to_date: true,
                 closed: false,
+                incarnation: 0,
             })
         })
     }
@@ -3713,6 +3738,7 @@ impl GroupEngine for BlockingReadEngine {
                         release: self.release.clone(),
                         payload: b"ready".to_vec(),
                     },
+                    incarnation: 0,
                 });
             }
             let response = ReadStreamResponse {
@@ -3723,6 +3749,7 @@ impl GroupEngine for BlockingReadEngine {
                 payload: Vec::new(),
                 up_to_date: true,
                 closed: false,
+                incarnation: 0,
             };
             Ok(GroupReadStreamParts::from_response(response))
         })
@@ -3818,6 +3845,7 @@ impl GroupEngine for RecordingEngine {
                 already_exists: false,
                 group_commit_index: self.commit_index,
                 hot_backlog: None,
+                incarnation: 0,
             })
         })
     }
@@ -3860,6 +3888,7 @@ impl GroupEngine for RecordingEngine {
                 payload: Vec::new(),
                 up_to_date: true,
                 closed: false,
+                incarnation: 0,
             })
         })
     }
@@ -3895,6 +3924,7 @@ impl GroupEngine for RecordingEngine {
                 next_offset: self.commit_index,
                 group_commit_index: self.commit_index,
                 deduplicated: false,
+                incarnation: 0,
             })
         })
     }
@@ -3938,6 +3968,7 @@ impl GroupEngine for RecordingEngine {
                 stream_hot_bytes: 0,
                 group_hot_bytes: 0,
                 receipt_evicted: false,
+                incarnation: 0,
             })
         })
     }

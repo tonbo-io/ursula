@@ -69,7 +69,17 @@ macro_rules! runtime_operations {
                 fields { request: CreateStreamRequest }
                 reply { response_tx: CreateStreamResponse }
                 guard { raft_uncommitted }
-                handle { call create_stream(engine, metrics, request, placement, cold_admission) }
+                handle {
+                    call create_stream(
+                        engine,
+                        metrics,
+                        read_materialization,
+                        read_watchers,
+                        request,
+                        placement,
+                        cold_admission
+                    )
+                }
                 client {
                     pub stream fn create_stream,
                     admit: u64::try_from(request.initial_payload.len())
@@ -80,7 +90,16 @@ macro_rules! runtime_operations {
                 fields { request: CreateStreamExternalRequest }
                 reply { response_tx: CreateStreamResponse }
                 guard { none }
-                handle { call create_stream_external(engine, metrics, request, placement) }
+                handle {
+                    call create_stream_external(
+                        engine,
+                        metrics,
+                        read_materialization,
+                        read_watchers,
+                        request,
+                        placement
+                    )
+                }
                 client { pub stream fn create_stream_external }
             }
             op HeadStream {
@@ -153,10 +172,10 @@ macro_rules! runtime_operations {
                 client { stream fn queue_bootstrap_stream }
             }
             op WaitRead {
-                fields { request: ReadStreamRequest, waiter_id: u64 }
+                fields { request: ReadStreamRequest, waiter_id: u64, incarnation: Option<u64> }
                 reply { response_tx: ReadStreamResponse }
                 guard { none }
-                handle { actor handle_wait_read(request, waiter_id, response_tx) }
+                handle { actor handle_wait_read(request, waiter_id, incarnation, response_tx) }
                 client { none }
             }
             op CancelWaitRead {

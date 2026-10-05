@@ -21,10 +21,11 @@
 //!   `Producer-Seq` per append; commits also carry `Stream-Seq`, see `stream_seq`): an append
 //!   whose outcome is unknown is retried with the same sequence until the server answers (a
 //!   duplicate is acknowledged without being applied twice);
-//!   403 means another owner claimed the stream. An owner of a deleted stream is an unknown
-//!   producer in the stream recreated at its path (unless an attach racing the recreate claimed
-//!   there under the old id; see the design doc, §6): its next append is answered as an expired
-//!   producer's, and the re-claim that follows finds the incarnation changed and fences it.
+//!   403 means another owner claimed the stream. Every request after attach's first `HEAD` carries
+//!   that `HEAD`'s `Stream-Incarnation` as a precondition, which the server checks atomically with
+//!   the request (a write at Raft apply): nothing of an owner reaches a stream deleted and
+//!   recreated at its path, and the server's 412 fences and poisons the owner (an attach that
+//!   meets one rebuilds against the new stream; see the design doc, §6).
 //! * WAL writes of an attached database go to a per-database overlay (reads and the file size see
 //!   it). The write of the commit frame's page data (the frame whose header carries a non-zero
 //!   "db size after commit") is the commit point: the transaction's final page images become one
@@ -930,8 +931,11 @@ enum Append {
     Acked { next: Option<String>, attempts: u32 },
     /// 403: a newer epoch owns the stream.
     Fenced { current: Option<u64> },
-    /// 409 expecting sequence 0: the server does not know this producer (expired after 7 idle days,
-    /// or the stream was deleted and recreated: `producer_id`); `reclaim` tells them apart.
+    /// 412: the stream is no longer the incarnation the append was sent to (deleted and
+    /// recreated); nothing was appended.
+    Recreated,
+    /// 409 expecting sequence 0: the server does not know this producer: it expired it after 7
+    /// idle days (a recreated stream answers 412 first).
     ProducerExpired,
     /// 409 refusing the commit's `Stream-Seq` (not above the stream's last one): another writer
     /// appended with a higher one (see `stream_seq`).
@@ -941,13 +945,14 @@ enum Append {
 }
 
 /// The `Producer-Id` of every owner of one stream incarnation: owners of the same incarnation fence
-/// each other by epoch; to the stream recreated at the path, an owner of the deleted one is an
-/// unknown producer (see `commit`).
+/// each other by epoch (a recreated stream refuses an owner of the deleted one with 412, see
+/// `append`).
 fn producer_id(incarnation: &str) -> String {
     format!("{PRODUCER}/{incarnation}")
 }
 
-/// One idempotent append by `producer`: retried with the same producer sequence until the outcome
+/// One idempotent append by `producer` to stream incarnation `incarnation` (sent as the
+/// `Stream-Incarnation` precondition): retried with the same producer sequence until the outcome
 /// is known.
 ///
 /// A duplicate answer is taken as proof of *our* earlier attempt only for commits (seq >= 1), and
@@ -955,7 +960,14 @@ fn producer_id(incarnation: &str) -> String {
 /// verified claim (see `claim_once`), which makes this owner the only writer of its incarnation's
 /// producer at its epoch, so whatever holds (epoch, seq) there is ours. A claim's answer is
 /// verified separately. Commits also carry their `Stream-Seq` (see `stream_seq`).
-fn append(url: &str, producer: &str, body: &[u8], epoch: u64, seq: u64) -> Append {
+fn append(
+    url: &str,
+    incarnation: &str,
+    producer: &str,
+    body: &[u8],
+    epoch: u64,
+    seq: u64,
+) -> Append {
     let deadline = Instant::now() + retry_budget();
     let mut backoff = Duration::from_millis(20);
     let mut attempts = 0;
@@ -964,6 +976,7 @@ fn append(url: &str, producer: &str, body: &[u8], epoch: u64, seq: u64) -> Appen
         let mut req = agent()
             .post(url)
             .header("content-type", CONTENT_TYPE)
+            .header("stream-incarnation", incarnation)
             .header("producer-id", producer)
             .header("producer-epoch", epoch.to_string())
             .header("producer-seq", seq.to_string());
@@ -990,6 +1003,8 @@ fn append(url: &str, producer: &str, body: &[u8], epoch: u64, seq: u64) -> Appen
                             current: header_u64(&r, "producer-epoch"),
                         };
                     }
+                    // The stream was deleted and recreated: nothing was appended.
+                    412 => return Append::Recreated,
                     409 if seq > 0 && header_u64(&r, "producer-expected-seq") == Some(0) => {
                         return Append::ProducerExpired;
                     }
@@ -1062,20 +1077,25 @@ impl From<Fail> for String {
     }
 }
 
-/// One read from `offset`: the bytes and the server's offset after them (empty at the tail). Reads
+/// One read from `offset` of stream incarnation `incarnation` (a 412 when it is not, see
+/// `recreated_error`): the bytes and the server's offset after them (empty at the tail). Reads
 /// the leader's applied state: a follower may lag behind an acknowledged append (a claim, a
 /// commit). A 200 without a usable `Stream-Next-Offset` is an error: offsets are never computed.
-fn read_from(url: &str, offset: &str) -> Result<(Vec<u8>, String), Fail> {
+fn read_from(url: &str, incarnation: &str, offset: &str) -> Result<(Vec<u8>, String), Fail> {
     let mut r = read_retrying(
         || {
             agent()
                 .get(format!("{url}?offset={offset}&consistency=leader"))
+                .header("stream-incarnation", incarnation)
                 .call()
         },
         &|| false,
     )
     .map_err(|e| format!("read {url} at {offset}: {e}"))?;
     let status = r.status().as_u16();
+    if status == 412 {
+        return Err(Fail::Other(recreated_error(url, incarnation)));
+    }
     let next = header_offset(&r, "stream-next-offset");
     if status == 204 {
         return Ok((Vec::new(), next.unwrap_or_else(|| offset.to_owned())));
@@ -1092,6 +1112,11 @@ fn read_from(url: &str, offset: &str) -> Result<(Vec<u8>, String), Fail> {
         )));
     }
     if status == 416 {
+        // The server answers 416, not 412, for a stream recreated shorter than `offset` (RFC 9110
+        // §13.2.1): only a HEAD tells the two apart, and a recreate rebuilds.
+        if head(url, &|| false).is_ok_and(|h| h.incarnation.as_deref() != Some(incarnation)) {
+            return Err(Fail::Other(recreated_error(url, incarnation)));
+        }
         return Err(Fail::Other(format!(
             "read {url} at {offset}: beyond the end of the stream that acknowledged it (the \
              server lost acknowledged data?); the local files are kept (delete them to rebuild)"
@@ -1171,15 +1196,24 @@ fn head(url: &str, stopped: &dyn Fn() -> bool) -> Result<Head, String> {
 /// `stopped` ends the retries of a 429/503 early (see `read_retrying`).
 fn get_snapshot(
     url: &str,
+    incarnation: &str,
     offset: &str,
     stopped: &dyn Fn() -> bool,
 ) -> Result<Option<Vec<u8>>, String> {
     let mut r = read_retrying(
-        || bulk_agent().get(format!("{url}/snapshot/{offset}")).call(),
+        || {
+            bulk_agent()
+                .get(format!("{url}/snapshot/{offset}"))
+                .header("stream-incarnation", incarnation)
+                .call()
+        },
         stopped,
     )
     .map_err(|e| format!("get snapshot {offset}: {e}"))?;
     let status = r.status().as_u16();
+    if status == 412 {
+        return Err(recreated_error(url, incarnation));
+    }
     // A body cut short: the snapshot was superseded and its cold object deleted (after its grace)
     // while it was streaming, or the connection dropped. Either way, start again from `HEAD`.
     let Ok(body) = r.body_mut().with_config().limit(2 << 30).read_to_vec() else {
@@ -1195,11 +1229,13 @@ fn get_snapshot(
     }
 }
 
-/// `PUT` with retries while the outcome is unknown (transport errors, 5xx): both publishing a
-/// snapshot and advancing retention are idempotent. Returns the status and response. Gives up
-/// once `stopped` (a re-attach is waiting for the snapshot thread).
+/// `PUT` to stream incarnation `incarnation` (a 412 when it is not) with retries while the outcome
+/// is unknown (transport errors, 5xx): both publishing a snapshot and advancing retention are
+/// idempotent. Returns the status and response. Gives up once `stopped` (a re-attach is waiting
+/// for the snapshot thread).
 fn put_idempotent(
     url: &str,
+    incarnation: &str,
     body: &[u8],
     stopped: &dyn Fn() -> bool,
 ) -> Result<(u16, ureq::http::Response<ureq::Body>), String> {
@@ -1209,6 +1245,7 @@ fn put_idempotent(
         let unknown = match bulk_agent()
             .put(url)
             .header("content-type", CONTENT_TYPE)
+            .header("stream-incarnation", incarnation)
             .send(body)
         {
             Ok(r) if r.status().as_u16() < 500 => return Ok((r.status().as_u16(), r)),
@@ -1542,6 +1579,7 @@ impl Applier {
 /// everything applied (replay from there is idempotent).
 unsafe fn catch_up(
     url: &str,
+    incarnation: &str,
     pos: &mut String,
     until: Option<&str>,
     applier: &mut Applier,
@@ -1551,7 +1589,7 @@ unsafe fn catch_up(
         if buf.is_empty() && until.is_some_and(|u| pos.as_str() >= u) {
             break;
         }
-        let (bytes, next) = read_from(url, &at)?;
+        let (bytes, next) = read_from(url, incarnation, &at)?;
         if bytes.is_empty() {
             if !buf.is_empty() || until.is_some() {
                 return Err(Fail::Other(format!(
@@ -1608,6 +1646,8 @@ enum Claimed {
     /// claim at the same epoch was answered as a duplicate of theirs.
     Lost,
     Fenced(Option<u64>),
+    /// The stream is no longer the incarnation claimed (412).
+    Recreated,
 }
 
 /// Appends a claim at (`epoch`, seq 0) and verifies our claim among the frames read back (see
@@ -1617,10 +1657,16 @@ enum Claimed {
 /// Offsets are opaque, so the claim's start is not computed from its end: `from` is a frame
 /// boundary at or before the stream's tail before the claim (the tail catch-up recorded, or the
 /// owner's own offset), and the frames from there to the answered offset are read and decoded.
-fn claim_once(url: &str, producer: &str, epoch: u64, from: &str) -> Result<Claimed, String> {
+fn claim_once(
+    url: &str,
+    incarnation: &str,
+    producer: &str,
+    epoch: u64,
+    from: &str,
+) -> Result<Claimed, String> {
     let nonce = nonce()?;
     let frame = frame::encode_claim(epoch, &nonce);
-    let next = match append(url, producer, &frame, epoch, 0) {
+    let next = match append(url, incarnation, producer, &frame, epoch, 0) {
         Append::Acked {
             next: Some(next), ..
         } => next,
@@ -1628,6 +1674,7 @@ fn claim_once(url: &str, producer: &str, epoch: u64, from: &str) -> Result<Claim
             return Err(format!("claim {url}: no Stream-Next-Offset"));
         }
         Append::Fenced { current } => return Ok(Claimed::Fenced(current)),
+        Append::Recreated => return Ok(Claimed::Recreated),
         Append::ProducerExpired | Append::SeqConflict(_) => {
             unreachable!("a claim has sequence 0 and no Stream-Seq")
         }
@@ -1635,7 +1682,7 @@ fn claim_once(url: &str, producer: &str, epoch: u64, from: &str) -> Result<Claim
     };
     let (mut buf, mut at) = (Vec::new(), from.to_owned());
     while at.as_str() < next.as_str() {
-        let (bytes, n) = read_from(url, &at).map_err(String::from)?;
+        let (bytes, n) = read_from(url, incarnation, &at).map_err(String::from)?;
         if bytes.is_empty() {
             return Err(format!(
                 "claim {url}: the stream ends at {at}, before the claim's end {next}"
@@ -1686,7 +1733,13 @@ fn find_claim(
 
 /// Claims the stream with an epoch above every earlier owner's; returns it and the claim's end.
 /// `from`: a frame boundary at or before the tail (see `claim_once`).
-fn claim(url: &str, producer: &str, epoch: u64, from: &str) -> Result<(u64, String), String> {
+fn claim(
+    url: &str,
+    incarnation: &str,
+    producer: &str,
+    epoch: u64,
+    from: &str,
+) -> Result<(u64, String), String> {
     // Test hook URSULA_VFS_FIRST_CLAIM_EPOCH: the process's first claim uses this epoch.
     static HOOKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let mut epoch = match first_claim_epoch() {
@@ -1694,34 +1747,31 @@ fn claim(url: &str, producer: &str, epoch: u64, from: &str) -> Result<(u64, Stri
         _ => epoch,
     };
     for _ in 0..16 {
-        match claim_once(url, producer, epoch, from)? {
+        match claim_once(url, incarnation, producer, epoch, from)? {
             Claimed::Won { next, .. } => return Ok((epoch, next)),
             Claimed::Lost => epoch += 1,
             Claimed::Fenced(current) => epoch = current.unwrap_or(epoch).max(epoch) + 1,
+            Claimed::Recreated => return Err(recreated_error(url, incarnation)),
         }
     }
     Err(format!("claim {url}: lost 16 claim races"))
 }
 
 /// The server does not know this owner's producer: it expired it (7 days without a write) and
-/// forgot its epoch, or the stream was deleted and recreated, which knows no producer of the
-/// deleted one (`producer_id`). Taking the stream back is safe only if it is still the incarnation
-/// this owner attached to and nobody wrote since this owner's last frame: the stream must end at
-/// our offset, and our new claim (one epoch up, fencing any later owner's older epochs) must be
-/// ours (verified) and be the first frame after it, the incarnation unchanged after it. Otherwise
-/// another owner wrote or claimed, or the stream is another one, and this one is fenced.
+/// forgot its epoch. Taking the stream back is safe only if nobody wrote since this owner's last
+/// frame: the stream must end at our offset, and our new claim (one epoch up, fencing any later
+/// owner's older epochs) must be ours (verified) and be the first frame after it. Otherwise
+/// another owner wrote or claimed, and this one is fenced; so it is when the stream turns out to
+/// be another incarnation (every request here carries ours as a precondition).
 fn reclaim(db: &mut Db) -> Result<(), String> {
-    fn same(db: &mut Db) -> Result<(), String> {
-        match recreated(&db.url, &db.incarnation, &|| false)? {
-            Some(e) => {
-                db.fenced = true;
-                Err(format!("fenced: {e}"))
-            }
-            None => Ok(()),
+    let fenced = |db: &mut Db, e: String| {
+        if is_recreated(&e) {
+            db.fenced = true;
         }
-    }
-    same(db)?;
-    let (bytes, _) = read_from(&db.url, &db.offset)?;
+        e
+    };
+    let (bytes, _) =
+        read_from(&db.url, &db.incarnation, &db.offset).map_err(|e| fenced(db, String::from(e)))?;
     if !bytes.is_empty() {
         db.fenced = true;
         return Err(format!(
@@ -1730,13 +1780,18 @@ fn reclaim(db: &mut Db) -> Result<(), String> {
         ));
     }
     let epoch = db.epoch + 1;
-    match claim_once(&db.url, &db.producer, epoch, &db.offset)? {
+    let claimed = claim_once(&db.url, &db.incarnation, &db.producer, epoch, &db.offset)
+        .map_err(|e| fenced(db, e))?;
+    match claimed {
         Claimed::Won { first: true, next } => {
-            same(db)?;
             db.epoch = epoch;
             db.seq = 0;
             db.offset = next;
             Ok(())
+        }
+        Claimed::Recreated => {
+            db.fenced = true;
+            Err(recreated_error(&db.url, &db.incarnation))
         }
         _ => {
             db.fenced = true;
@@ -1771,31 +1826,27 @@ unsafe fn init_wal_format(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `Some(why)` unless the stream is still the incarnation `expected`: state built from one
-/// incarnation must never reach another. `HEAD` is a leader read and incarnations never repeat
-/// (unique per group), so a match also covers everything done on the stream
-/// since the last check that matched.
-fn recreated(
-    url: &str,
-    expected: &str,
-    stopped: &dyn Fn() -> bool,
-) -> Result<Option<String>, String> {
-    let now = head(url, stopped)?.incarnation;
-    Ok((now.as_deref() != Some(expected)).then(|| {
-        format!(
-            "{url} was deleted and recreated (incarnation {expected} is now {})",
-            now.as_deref().unwrap_or("unknown")
-        )
-    }))
+/// Marks the error of a request refused because the stream is no longer the incarnation it was
+/// sent to (`is_recreated`): state built from one incarnation never reaches another.
+const RECREATED: &str = "deleted and recreated";
+
+/// The error for a 412: `url` is no longer stream incarnation `incarnation`.
+fn recreated_error(url: &str, incarnation: &str) -> String {
+    format!("fenced: {url} was {RECREATED} (no longer incarnation {incarnation}, 412)")
+}
+
+/// Whether `e` reports the stream deleted and recreated (`recreated_error`).
+fn is_recreated(e: &str) -> bool {
+    e.contains(RECREATED)
 }
 
 /// Brings the db file from `pos` to the stream's tail and claims the stream: installs the latest
 /// snapshot when the file is behind it (or below the stream's retention), replays the frames after
-/// it, claims, and replays up to the claim, all from the stream's `incarnation` (checked by the
-/// `HEAD` before and after: a stream deleted and recreated meanwhile fails the attach, and the
-/// sidecar, still stamped with the old incarnation, makes the next one rebuild; a newer owner's
-/// claim replayed after ours fails it too). Returns the epoch claimed and the latest snapshot's
-/// offset (`START` for none).
+/// it, claims, and replays up to the claim, all from the stream's `incarnation` (every request
+/// carries it as a precondition: a stream deleted and recreated meanwhile fails this round with
+/// `recreated_error`, and `attach_files_rebuilding` rebuilds against the new one; a newer owner's
+/// claim replayed after ours fails the attach). Returns the epoch claimed and the latest
+/// snapshot's offset (`START` for none).
 unsafe fn sync(
     url: &str,
     incarnation: &str,
@@ -1804,14 +1855,12 @@ unsafe fn sync(
 ) -> Result<(u64, String), Fail> {
     let head = head(url, &|| false)?;
     if head.incarnation.as_deref() != Some(incarnation) {
-        return Err(Fail::Other(format!(
-            "{url} was deleted and recreated during attach; attach again"
-        )));
+        return Err(Fail::Other(recreated_error(url, incarnation)));
     }
     if let Some(s) = head.snapshot.as_deref()
         && pos.as_str() < s
     {
-        let Some(body) = get_snapshot(url, s, &|| false)? else {
+        let Some(body) = get_snapshot(url, incarnation, s, &|| false)? else {
             return Err(Fail::Gone(format!("snapshot {s} superseded")));
         };
         let snap = snapshot::decode(&body)?;
@@ -1830,11 +1879,11 @@ unsafe fn sync(
         )));
     }
     // From the beginning (`START`), a stream trimmed with no snapshot visible answers 410: `Gone`.
-    unsafe { catch_up(url, pos, None, applier)? };
+    unsafe { catch_up(url, incarnation, pos, None, applier)? };
     // `pos` is now the tail as catch-up found it: the claim is checked from there.
     let producer = producer_id(incarnation);
-    let (epoch, claimed) = claim(url, &producer, applier.epoch + 1, pos)?;
-    unsafe { catch_up(url, pos, Some(claimed.as_str()), applier)? };
+    let (epoch, claimed) = claim(url, incarnation, &producer, applier.epoch + 1, pos)?;
+    unsafe { catch_up(url, incarnation, pos, Some(claimed.as_str()), applier)? };
     // The replay may run past our claim into a higher one: another owner claimed meanwhile
     // (normally after ours, as the server refuses a lower epoch from this producer; a stray claim
     // under a deleted incarnation's producer is not epoch-fenced and may precede it). Either way
@@ -1845,9 +1894,6 @@ unsafe fn sync(
             "fenced: another owner claimed epoch {} during attach; attach again",
             applier.epoch
         )));
-    }
-    if let Some(e) = recreated(url, incarnation, &|| false)? {
-        return Err(Fail::Other(format!("{e} during attach; attach again")));
     }
     Ok((epoch, head.snapshot.unwrap_or_else(|| START.into())))
 }
@@ -1888,7 +1934,7 @@ unsafe fn attach(path: &str, url: &str) -> Result<String, String> {
         snapper.stop();
         let _ = thread.join();
     }
-    let outcome = unsafe { attach_files(&path, &url) };
+    let outcome = unsafe { attach_files_rebuilding(&path, &url) };
     let mut reg = registry();
     reg.attaching.remove(&path);
     match outcome {
@@ -1905,6 +1951,25 @@ unsafe fn attach(path: &str, url: &str) -> Result<String, String> {
             reg.dbs.remove(&path);
             reg.failed.insert(path, e.clone());
             Err(e)
+        }
+    }
+}
+
+/// `attach_files`, again when the stream was deleted and recreated during it (a 412): the files,
+/// stamped with the old incarnation, are then discarded and rebuilt from the new stream. Bounded,
+/// so a stream recreated over and over fails the attach instead of looping.
+unsafe fn attach_files_rebuilding(
+    path: &str,
+    url: &str,
+) -> Result<(String, Arc<Mutex<Db>>, SnapshotThread), String> {
+    let mut tries = 0;
+    loop {
+        match unsafe { attach_files(path, url) } {
+            Err(e) if is_recreated(&e) && tries < 3 => {
+                tries += 1;
+                eprintln!("sqlite-ursula-vfs: {path}: attach: {e}; rebuilding");
+            }
+            outcome => return outcome,
         }
     }
 }
@@ -1961,7 +2026,7 @@ unsafe fn attach_files(
                     // snapshot.
                     Some((old, version, offset)) => {
                         if offset != START
-                            && let Err(Fail::Other(e)) = read_from(url, offset)
+                            && let Err(Fail::Other(e)) = read_from(url, &incarnation, offset)
                         {
                             return Err(e);
                         }
@@ -2275,9 +2340,9 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
     let copy = copy_started.elapsed();
     let body = snapshot::encode(&offset, epoch, &image);
     // This state is a prefix of the incarnation it was attached to, not of a stream recreated at
-    // the same path since: never publish it there (the snapshot endpoint knows no producer), and
-    // stop this owner's commits now rather than at its next append (which the recreated stream
-    // answers as an unknown producer's, and `reclaim` fences).
+    // the same path since: the publish and the retention move carry the incarnation, so the
+    // server refuses them there (412), and this owner's commits stop now rather than at its next
+    // append (which the recreated stream refuses the same way).
     let fence = |what: String, e: String| {
         // Not `poison()`: the overlay belongs to a write transaction that may be in flight; it
         // clears it itself when it ends, and `x_write` refuses its commit (`poisoned`).
@@ -2290,16 +2355,33 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
         d.fenced = true;
         d.poisoned = Some(why);
     };
-    if let Some(e) = recreated(&url, &incarnation, &stopped)? {
-        fence(format!("snapshot at {offset} not published"), e);
-        return Ok(true);
-    }
-    match put_idempotent(&format!("{url}/snapshot/{offset}"), &body, &stopped)? {
+    match put_idempotent(
+        &format!("{url}/snapshot/{offset}"),
+        &incarnation,
+        &body,
+        &stopped,
+    )? {
         (200..=299, _) => {}
+        (412, _) => {
+            fence(
+                format!("snapshot at {offset} not published"),
+                recreated_error(&url, &incarnation),
+            );
+            return Ok(true);
+        }
         (409 | 410, _) => {
             // A snapshot at or past `offset` exists (another owner's, or this file's before a
-            // re-attach): it covers the log counted up to the window.
-            let newer = head(&url, &stopped)?.snapshot;
+            // re-attach): it covers the log counted up to the window, unless the stream is
+            // another incarnation by now.
+            let head = head(&url, &stopped)?;
+            if head.incarnation.as_deref() != Some(incarnation.as_str()) {
+                fence(
+                    format!("snapshot at {offset} not published"),
+                    recreated_error(&url, &incarnation),
+                );
+                return Ok(true);
+            }
+            let newer = head.snapshot;
             let mut d = lock(db);
             if let Some(newer) = newer.filter(|n| *n > d.snapshot) {
                 d.snapshot = newer;
@@ -2320,9 +2402,17 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
         if stopped() {
             return Ok(true);
         }
-        if get_snapshot(&url, &offset, &stopped)?.as_deref() == Some(&body[..]) {
-            verified = true;
-            break;
+        match get_snapshot(&url, &incarnation, &offset, &stopped) {
+            Ok(read) if read.as_deref() == Some(&body[..]) => {
+                verified = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(e) if is_recreated(&e) => {
+                fence(format!("snapshot at {offset} not read back"), e);
+                return Ok(true);
+            }
+            Err(e) => return Err(e),
         }
         std::thread::sleep(Duration::from_millis(25 * i));
     }
@@ -2350,12 +2440,19 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
     // Retention trails one snapshot behind: a host that read the previous snapshot (or whose file
     // is past it) still finds the frames after it, and the newer snapshot has read back.
     if previous > retained && previous < offset {
-        // Checked again: the publish and its read-back are a window for a recreate too.
-        if let Some(e) = recreated(&url, &incarnation, &stopped)? {
-            fence(format!("retention not moved to {previous}"), e);
-            return Ok(true);
-        }
-        match put_idempotent(&format!("{url}/retention/{previous}"), &[], &stopped)? {
+        match put_idempotent(
+            &format!("{url}/retention/{previous}"),
+            &incarnation,
+            &[],
+            &stopped,
+        )? {
+            (412, _) => {
+                fence(
+                    format!("retention not moved to {previous}"),
+                    recreated_error(&url, &incarnation),
+                );
+                return Ok(true);
+            }
             (200..=299, r) => {
                 let effective = header_offset(&r, "stream-retained-offset").unwrap_or(previous);
                 let mut d = lock(db);
@@ -2898,14 +2995,27 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
     }
     let (body, raw) = frame::encode_commit(size, &pages);
     let t = Instant::now();
-    let mut outcome = append(&db.url, &db.producer, &body, db.epoch, db.seq + 1);
-    // An unknown producer: expired, or this owner's stream was deleted and the one recreated at
-    // its path never knew it (`producer_id`); `reclaim` tells them apart.
+    let mut outcome = append(
+        &db.url,
+        &db.incarnation,
+        &db.producer,
+        &body,
+        db.epoch,
+        db.seq + 1,
+    );
+    // An unknown producer: the server expired it (`reclaim`).
     if let Append::ProducerExpired = outcome {
         if let Err(e) = reclaim(db) {
             return db.poison(e);
         }
-        outcome = append(&db.url, &db.producer, &body, db.epoch, db.seq + 1);
+        outcome = append(
+            &db.url,
+            &db.incarnation,
+            &db.producer,
+            &body,
+            db.epoch,
+            db.seq + 1,
+        );
     }
     let seq = db.seq + 1;
     let append_time = t.elapsed();
@@ -2939,6 +3049,11 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
                 "fenced: epoch {} superseded by {current:?} (403)",
                 db.epoch
             ));
+        }
+        // The stream at the path is another incarnation: this commit reached nothing.
+        Append::Recreated => {
+            db.fenced = true;
+            return db.poison(recreated_error(&db.url, &db.incarnation));
         }
         // Not this owner's own retry (that is a duplicate, answered before `Stream-Seq` is
         // checked), nor an older owner's (fenced by epoch): a writer outside this protocol.
@@ -3362,10 +3477,10 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         });
-        let (bytes, next) = read_from(&url, "4").map_err(String::from).unwrap();
+        let (bytes, next) = read_from(&url, "1", "4").map_err(String::from).unwrap();
         assert_eq!((&bytes[..], next.as_str()), (&b"abc"[..], "7"));
         assert_eq!(head(&url, &|| false).unwrap().retained, "2");
-        let refused = get_snapshot(&url, "9", &|| false).unwrap_err();
+        let refused = get_snapshot(&url, "1", "9", &|| false).unwrap_err();
         assert!(refused.contains("503"), "{refused}");
         let refused = head(&url, &|| true).err().unwrap();
         assert!(refused.contains("503"), "{refused}");

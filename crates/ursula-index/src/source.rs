@@ -107,12 +107,29 @@ pub struct ReadLimits {
 pub struct SourceClient {
     client: reqwest::Client,
     stream_url: Url,
+    /// Sent as `Stream-Incarnation` on reads (D12), so a read never serves
+    /// bytes of a stream recreated since the HEAD that reported it.
+    incarnation: Option<String>,
 }
 
 impl SourceClient {
     /// `client` is shared by every source of one process.
     pub fn new(client: reqwest::Client, stream_url: Url) -> Self {
-        Self { client, stream_url }
+        Self {
+            client,
+            stream_url,
+            incarnation: None,
+        }
+    }
+
+    /// This client with reads bound to stream incarnation `incarnation`
+    /// (from a HEAD): a read of any other incarnation fails with
+    /// [`IndexError::SourceRecreated`]. `None` sends no precondition.
+    pub fn bound_to(&self, incarnation: Option<String>) -> Self {
+        Self {
+            incarnation,
+            ..self.clone()
+        }
     }
 
     /// HEAD the source. `None` means the stream does not exist (404).
@@ -154,7 +171,14 @@ impl SourceClient {
             // A follower may not yet have applied a delete and recreate that
             // HEAD (always the leader) already reported.
             .append_pair("consistency", "leader");
-        let response = self.client.get(url).send().await?;
+        let mut request = self.client.get(url);
+        if let Some(incarnation) = &self.incarnation {
+            request = request.header(HEADER_INCARNATION, incarnation);
+        }
+        let response = request.send().await?;
+        if response.status() == StatusCode::PRECONDITION_FAILED {
+            return Err(IndexError::SourceRecreated);
+        }
         if response.status() == StatusCode::GONE {
             let retained_offset = offset_header(response.headers(), HEADER_NEXT_OFFSET)?.ok_or(
                 IndexError::InvalidSourceResponse("410 response omitted Stream-Next-Offset"),

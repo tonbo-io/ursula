@@ -51,7 +51,9 @@ it("a fenced writer's commit fails, stays out of its file, and the new owner is 
 });
 
 // Regression (#345): owners appended under one Producer-Id whatever the stream's incarnation, so an
-// owner of a deleted stream could keep committing into the stream recreated at its path.
+// owner of a deleted stream could keep committing into the stream recreated at its path. Every
+// request now carries the owner's Stream-Incarnation, which the server checks atomically (D12): the
+// recreated stream answers the commit 412.
 it("an owner of a deleted stream is fenced at its next commit; nothing of it reaches the recreated stream", async () => {
 	const url = ursulaUrl() + streamPath();
 	const fileA = freshFile();

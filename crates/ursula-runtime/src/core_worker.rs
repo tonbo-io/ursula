@@ -148,7 +148,19 @@ pub(crate) type ReadWatchers = HashMap<BucketStreamId, Vec<ReadWatcher>>;
 pub(crate) struct ReadWatcher {
     pub(crate) waiter_id: u64,
     pub(crate) request: ReadStreamRequest,
+    /// The stream incarnation a live read with a `Stream-Incarnation`
+    /// precondition was opened against (D12): a read of any other
+    /// incarnation releases the watcher instead of parking it.
+    pub(crate) incarnation: Option<u64>,
     pub(crate) response_tx: oneshot::Sender<Result<ReadStreamResponse, RuntimeError>>,
+}
+
+impl ReadWatcher {
+    /// Whether a read of stream incarnation `incarnation` is still the
+    /// stream this watcher waits on.
+    fn waits_on(&self, incarnation: u64) -> bool {
+        self.incarnation.is_none_or(|pinned| pinned == incarnation)
+    }
 }
 
 fn live_read_watcher_count(read_watchers: &HashMap<BucketStreamId, Vec<ReadWatcher>>) -> u64 {
@@ -730,7 +742,12 @@ impl CoreWorker {
             elapsed_ns(exec_started_at),
         );
         match parts {
-            Ok(parts) if parts.payload_is_empty() && parts.up_to_date && !parts.closed => {
+            Ok(parts)
+                if parts.payload_is_empty()
+                    && parts.up_to_date
+                    && !parts.closed
+                    && watcher.waits_on(parts.incarnation) =>
+            {
                 if watcher.response_tx.is_closed() {
                     return;
                 }
@@ -1295,6 +1312,8 @@ impl CoreWorker {
     pub(crate) async fn create_stream(
         group: &mut Box<dyn GroupEngine>,
         metrics: Arc<RuntimeMetricsInner>,
+        read_materialization: Arc<Semaphore>,
+        read_watchers: &mut ReadWatchers,
         request: CreateStreamRequest,
         placement: ShardPlacement,
         admission: ColdWriteAdmission,
@@ -1328,8 +1347,23 @@ impl CoreWorker {
                 placement.raft_group_id,
                 elapsed_ns(started_at),
             );
-            record_write_hot_backlog(group, &metrics, response.hot_backlog, stream_id, placement)
-                .await;
+            record_write_hot_backlog(
+                group,
+                &metrics,
+                response.hot_backlog,
+                stream_id.clone(),
+                placement,
+            )
+            .await;
+            Self::notify_pinned_read_watchers(
+                group,
+                metrics,
+                read_materialization,
+                read_watchers,
+                &stream_id,
+                placement,
+            )
+            .await;
         }
         Ok(response)
     }
@@ -1337,6 +1371,8 @@ impl CoreWorker {
     pub(crate) async fn create_stream_external(
         group: &mut Box<dyn GroupEngine>,
         metrics: Arc<RuntimeMetricsInner>,
+        read_materialization: Arc<Semaphore>,
+        read_watchers: &mut ReadWatchers,
         request: CreateStreamExternalRequest,
         placement: ShardPlacement,
     ) -> Result<CreateStreamResponse, RuntimeError> {
@@ -1358,8 +1394,23 @@ impl CoreWorker {
                 placement.raft_group_id,
                 elapsed_ns(started_at),
             );
-            record_write_hot_backlog(group, &metrics, response.hot_backlog, stream_id, placement)
-                .await;
+            record_write_hot_backlog(
+                group,
+                &metrics,
+                response.hot_backlog,
+                stream_id.clone(),
+                placement,
+            )
+            .await;
+            Self::notify_pinned_read_watchers(
+                group,
+                metrics,
+                read_materialization,
+                read_watchers,
+                &stream_id,
+                placement,
+            )
+            .await;
         }
         Ok(response)
     }
@@ -1506,6 +1557,44 @@ impl CoreWorker {
         Ok(response)
     }
 
+    /// A create may replace an expired stream that live reads still wait
+    /// on. Watchers pinned to an incarnation (D12) re-read and, the stream
+    /// being another incarnation now, end; the others keep waiting exactly
+    /// as before.
+    pub(crate) async fn notify_pinned_read_watchers(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        read_materialization: Arc<Semaphore>,
+        read_watchers: &mut ReadWatchers,
+        stream_id: &BucketStreamId,
+        placement: ShardPlacement,
+    ) {
+        let Some(watchers) = read_watchers.remove(stream_id) else {
+            return;
+        };
+        let (pinned, unpinned): (Vec<_>, Vec<_>) = watchers
+            .into_iter()
+            .partition(|watcher| watcher.incarnation.is_some());
+        if !pinned.is_empty() {
+            read_watchers.insert(stream_id.clone(), pinned);
+            Self::notify_read_watchers(
+                group,
+                metrics,
+                read_materialization,
+                read_watchers,
+                stream_id,
+                placement,
+            )
+            .await;
+        }
+        if !unpinned.is_empty() {
+            read_watchers
+                .entry(stream_id.clone())
+                .or_default()
+                .extend(unpinned);
+        }
+    }
+
     pub(crate) async fn notify_read_watchers(
         group: &mut Box<dyn GroupEngine>,
         metrics: Arc<RuntimeMetricsInner>,
@@ -1542,7 +1631,20 @@ impl CoreWorker {
                 .map_err(|err| RuntimeError::group_engine(placement, err));
             match parts {
                 Ok(parts) if parts.payload_is_empty() && parts.up_to_date && !parts.closed => {
-                    pending.extend(watchers);
+                    // A watcher pinned to another incarnation is released
+                    // with this read: its stream was recreated (D12).
+                    let (waiting, recreated): (Vec<_>, Vec<_>) = watchers
+                        .into_iter()
+                        .partition(|watcher| watcher.waits_on(parts.incarnation));
+                    pending.extend(waiting);
+                    if !recreated.is_empty() {
+                        Self::send_read_parts_to_watchers(
+                            placement,
+                            read_materialization.clone(),
+                            parts,
+                            recreated,
+                        );
+                    }
                 }
                 Ok(parts) => {
                     Self::send_read_parts_to_watchers(

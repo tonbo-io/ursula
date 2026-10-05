@@ -316,6 +316,10 @@ pub enum IndexError {
     InvalidSourceResponse(&'static str),
     #[error("the source stream does not exist")]
     SourceGone,
+    /// A read bound to a stream incarnation found another one (412, D12):
+    /// the stream was deleted and recreated since its HEAD.
+    #[error("the source stream was recreated")]
+    SourceRecreated,
     #[error("event index lock poisoned")]
     LockPoisoned,
     #[error("blocking event-index worker failed")]

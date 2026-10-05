@@ -1642,6 +1642,7 @@ pub(super) async fn verify_runtime_raft_close_stream(
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            if_incarnation: None,
         })
         .await
         .expect("close runtime raft stream");
@@ -1769,6 +1770,7 @@ pub(super) async fn verify_runtime_raft_snapshot_publish(
             cold_body: None,
             now_ms: 0,
             expected_incarnation: None,
+            if_incarnation: None,
         })
         .await
         .expect("publish runtime raft snapshot");

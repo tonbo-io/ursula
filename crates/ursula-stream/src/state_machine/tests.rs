@@ -469,6 +469,47 @@ fn create_stream(machine: &mut StreamStateMachine, id: &str) {
     );
 }
 
+/// D12: the `Stream-Incarnation` precondition rides in the command and is
+/// checked at apply, so an append proposed against one incarnation and
+/// applied after a delete and recreate is refused and appends nothing.
+#[test]
+fn incarnation_precondition_refuses_a_command_proposed_before_a_recreate() {
+    let mut machine = machine();
+    let stream_id = stream("if-incarnation");
+    create_stream(&mut machine, "if-incarnation");
+    let old = machine.stream_incarnation(&stream_id).expect("created");
+    let if_incarnation = |incarnation, payload: &[u8]| StreamCommand::IfIncarnation {
+        incarnation,
+        command: Box::new(append_cmd(stream_id.clone(), payload, Append::default())),
+    };
+    let proposed = if_incarnation(old, b"stale");
+
+    assert_eq!(
+        machine.apply(delete_cmd(stream_id.clone())),
+        StreamResponse::Deleted
+    );
+    create_stream(&mut machine, "if-incarnation");
+    let current = machine.stream_incarnation(&stream_id).expect("recreated");
+    assert_ne!(current, old);
+
+    let StreamResponse::Error { code, context, .. } = machine.apply(proposed) else {
+        panic!("a stale incarnation's append applied");
+    };
+    assert_eq!(code, StreamErrorCode::IncarnationMismatch);
+    assert_eq!(context, vec![StreamErrorContext::StreamIncarnation {
+        incarnation: current
+    }]);
+    assert_eq!(
+        machine.head_at(&stream_id, 0).expect("stream").tail_offset,
+        0
+    );
+
+    assert!(matches!(
+        machine.apply(if_incarnation(current, b"fresh")),
+        StreamResponse::Appended { offset: 0, .. }
+    ));
+}
+
 /// JSON snapshot and retention offsets must follow an LF byte (PR16). A hot
 /// preceding byte is checked at apply; a cold one only by the proposer,
 /// whose read apply trusts when it names the live incarnation.

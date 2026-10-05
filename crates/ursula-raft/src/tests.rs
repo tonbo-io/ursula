@@ -442,6 +442,7 @@ fn raft_group_write_response_round_trips_through_wire_codec() {
         already_exists: false,
         group_commit_index: 11,
         hot_backlog: None,
+        incarnation: 7,
     });
 
     let encoded = encode_wire(&response);
@@ -2150,6 +2151,7 @@ async fn raft_group_engine_preserves_stream_error_next_offset() {
                 stream_seq: None,
                 producer: None,
                 now_ms: 0,
+                if_incarnation: None,
             },
             placement(),
         )
