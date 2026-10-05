@@ -340,7 +340,7 @@ impl StreamStateMachine {
         self.remove_hot_payload_bytes(hot_bytes_before.saturating_sub(hot_bytes_after));
         self.sync_hot_index(&stream_id);
         if let Some(path) = shared_path {
-            self.retain_shared_cold_object(&path, &stream_id.bucket_id);
+            self.retain_shared_cold_object(&path);
         }
         StreamResponse::ColdFlushed {
             hot_start_offset: self.hot_start_offset(&stream_id),
@@ -501,7 +501,7 @@ impl StreamStateMachine {
         {
             return StreamResponse::error(
                 StreamErrorCode::InvalidColdFlush,
-                "cold compaction requires two raw chunks or one legacy shared chunk",
+                "cold compaction requires two raw chunks or one shared chunk",
             );
         }
         if replacement.s3_path.trim().is_empty() || replacement.object_size == 0 {
@@ -557,7 +557,7 @@ impl StreamStateMachine {
             if !slot.cold.remove_shared_chunks(&old_chunks) {
                 return StreamResponse::error(
                     StreamErrorCode::InvalidColdFlush,
-                    "legacy shared compaction input no longer matches the stream state",
+                    "shared compaction input no longer matches the stream state",
                 );
             }
         }

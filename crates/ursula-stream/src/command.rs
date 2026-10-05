@@ -31,7 +31,6 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
         content_type: String,
         initial_payload: ExternalPayloadRef,
-        #[serde(default)]
         record_ends: Vec<u64>,
         close_after: bool,
         stream_seq: Option<String>,
@@ -53,7 +52,6 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
         content_type: Option<String>,
         payload: ExternalPayloadRef,
-        #[serde(default)]
         record_ends: Vec<u64>,
         close_after: bool,
         stream_seq: Option<String>,
@@ -69,7 +67,6 @@ pub enum StreamCommand {
         content_type: String,
         payload: Bytes,
         now_ms: u64,
-        #[serde(default)]
         expected_incarnation: Option<u64>,
     },
     /// Publishes a snapshot whose body the proposer staged as a cold-tier
@@ -83,7 +80,6 @@ pub enum StreamCommand {
         object: ExternalPayloadRef,
         digest: String,
         now_ms: u64,
-        #[serde(default)]
         expected_incarnation: Option<u64>,
     },
     /// `expected_incarnation` as on [`Self::PublishSnapshot`].
@@ -91,7 +87,6 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
         retained_offset: u64,
         now_ms: u64,
-        #[serde(default)]
         expected_incarnation: Option<u64>,
     },
     TouchStreamAccess {

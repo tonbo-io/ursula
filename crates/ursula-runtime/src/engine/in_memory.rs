@@ -829,7 +829,7 @@ impl InMemoryGroupEngine {
             snapshot_offset: snapshot.as_ref().map(|snapshot| snapshot.offset),
             snapshot_digest: snapshot.map(|snapshot| snapshot.digest),
             retained_offset: self.state_machine.retained_offset(&request.stream_id),
-            created_at_ms: Some(created_at_ms),
+            created_at_ms,
         })
     }
 

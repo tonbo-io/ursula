@@ -154,8 +154,7 @@ async fn d4_recreate_with_gc_pending_keeps_new_incarnation_objects() {
         })
         .await
         .expect("head")
-        .created_at_ms
-        .expect("incarnation");
+        .created_at_ms;
     let new_chunks = page_chunks(&cold_store, &stream, generation).await;
     assert_eq!(new_chunks.len(), 1);
 

@@ -132,8 +132,6 @@
     "cadence_w1.f12_snapshot_bytes_per_log_byte": true,
     "l2_compact.f2_shared_compact_cold_memory": true,
     "l2_compact.f2_shared_compact_cold_raft": true,
-    "l2_legacy.f2_legacy_pack_migration_memory": true,
-    "l2_legacy.f2_legacy_pack_migration_raft": true,
     "planner.f10_starved_stream_planned": false,
     "w1.f2_shared_refs_per_stream": true,
     "w1.f3_producer_bytes_per_stream": true,

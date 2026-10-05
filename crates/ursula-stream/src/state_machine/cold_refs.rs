@@ -42,11 +42,6 @@ pub struct SharedRefCompactionRequest {
     pub max_run_bytes: u64,
     /// Maximum candidates returned.
     pub limit: usize,
-    /// The legacy-pack filter (#278): only shared refs into pre-erasure-domain
-    /// packs ([`is_legacy_cross_bucket_pack`]) count, every stream holding one
-    /// is a candidate regardless of `min_refs` and `idle_ms`, and the idle
-    /// tracker is left untouched.
-    pub legacy_packs_only: bool,
 }
 
 impl SharedRefCompactionRequest {
@@ -58,33 +53,8 @@ impl SharedRefCompactionRequest {
             now_ms,
             max_run_bytes,
             limit,
-            legacy_packs_only: false,
         }
     }
-
-    /// The legacy-pack migration's filter: every stream holding a shared ref
-    /// into a pre-erasure-domain pack, with its oldest contiguous run of them.
-    pub fn legacy_packs(max_run_bytes: u64, limit: usize) -> Self {
-        Self {
-            min_refs: 1,
-            idle_ms: 0,
-            now_ms: 0,
-            max_run_bytes,
-            limit,
-            legacy_packs_only: true,
-        }
-    }
-}
-
-/// Whether `chunk` is a shared slice of a pack written before bucket erasure
-/// domains, which may hold several tenants: its path is not under the
-/// stream's own `{bucket}/_packs/` prefix.
-pub fn is_legacy_cross_bucket_pack(stream_id: &BucketStreamId, chunk: &ColdChunkRef) -> bool {
-    chunk.shared_object
-        && !chunk
-            .s3_path
-            .strip_prefix(stream_id.bucket_id.as_str())
-            .is_some_and(|rest| rest.starts_with("/_packs/"))
 }
 
 /// A stream the driver should compact, with the run it should compact.
@@ -184,36 +154,16 @@ impl StreamStateMachine {
         for slot in self.registry.slots() {
             let stream_id = &slot.metadata.stream_id;
             let refs = slot.cold.cold_chunks();
-            let run = if request.legacy_packs_only {
-                let legacy = refs
-                    .iter()
-                    .filter(|chunk| is_legacy_cross_bucket_pack(stream_id, chunk))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if legacy.is_empty() {
-                    continue;
-                }
-                (
-                    legacy.len(),
-                    plan_shared_ref_run(&legacy, request.max_run_bytes),
-                )
-            } else {
-                let shared_refs = refs.iter().filter(|chunk| chunk.shared_object).count();
-                if shared_refs == 0 {
-                    continue;
-                }
-                let idle_for =
-                    tracker.observe(stream_id, slot.metadata.tail_offset, request.now_ms);
-                seen.insert(stream_id.clone());
-                if shared_refs < request.min_refs.max(1) && idle_for < request.idle_ms {
-                    continue;
-                }
-                (
-                    shared_refs,
-                    plan_shared_ref_run(refs, request.max_run_bytes),
-                )
-            };
-            let (shared_refs, run) = run;
+            let shared_refs = refs.iter().filter(|chunk| chunk.shared_object).count();
+            if shared_refs == 0 {
+                continue;
+            }
+            let idle_for = tracker.observe(stream_id, slot.metadata.tail_offset, request.now_ms);
+            seen.insert(stream_id.clone());
+            if shared_refs < request.min_refs.max(1) && idle_for < request.idle_ms {
+                continue;
+            }
+            let run = plan_shared_ref_run(refs, request.max_run_bytes);
             if run.is_empty() {
                 continue;
             }
@@ -230,11 +180,9 @@ impl StreamStateMachine {
                 run,
             });
         }
-        if !request.legacy_packs_only {
-            tracker
-                .tails
-                .retain(|stream_id, _| seen.contains(stream_id));
-        }
+        tracker
+            .tails
+            .retain(|stream_id, _| seen.contains(stream_id));
         candidates.sort_by(|left, right| {
             left.min_pack_live_slices
                 .cmp(&right.min_pack_live_slices)

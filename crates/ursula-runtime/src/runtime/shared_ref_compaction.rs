@@ -20,11 +20,6 @@
 //!    driver deletes the replacement. An ambiguous outcome keeps both; the
 //!    orphan sweep (F14h) reclaims the replacement if nothing references it,
 //!    and a retried compaction's page write clips the earlier entry.
-//!
-//! The legacy-pack migration that bucket purge runs (#278) is the same
-//! driver with the legacy-pack filter
-//! ([`SharedRefCompactionRequest::legacy_packs`]): it compacts runs of shared
-//! slices of pre-erasure-domain packs instead of cloning every group's state.
 
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
@@ -40,18 +35,12 @@ use crate::cold_store::ColdStoreHandle;
 use crate::cold_store::new_cold_chunk_path_in_generation;
 use crate::error::RuntimeError;
 use crate::request::CompactColdRequest;
-use crate::runtime::LegacySharedMigrationReport;
 
-/// Upper bound on the logical bytes of one legacy-pack migration run (the
-/// default `compaction_max_size`).
-const LEGACY_MIGRATION_MAX_RUN_BYTES: u64 = 16 * 1024 * 1024;
-
-/// What happened to one planned run. Rejections and ambiguous outcomes carry
-/// the publish error, which the legacy migration returns to its caller.
+/// What happened to one planned run.
 enum SharedRunOutcome {
     Compacted { slices: u64, bytes: u64 },
-    Rejected(RuntimeError),
-    Ambiguous(RuntimeError),
+    Rejected,
+    Ambiguous,
 }
 
 impl ShardRuntime {
@@ -75,7 +64,6 @@ impl ShardRuntime {
                 now_ms: unix_time_ms(),
                 max_run_bytes: config.max_run_bytes,
                 limit: config.max_streams.max(1),
-                legacy_packs_only: false,
             })
             .await?;
         report.candidates = u64::try_from(candidates.len()).unwrap_or(u64::MAX);
@@ -102,10 +90,10 @@ impl ShardRuntime {
                     report.compacted_slices = report.compacted_slices.saturating_add(slices);
                     report.compacted_bytes = report.compacted_bytes.saturating_add(bytes);
                 }
-                Ok(SharedRunOutcome::Rejected(_)) => {
+                Ok(SharedRunOutcome::Rejected) => {
                     report.rejected = report.rejected.saturating_add(1);
                 }
-                Ok(SharedRunOutcome::Ambiguous(_)) => {
+                Ok(SharedRunOutcome::Ambiguous) => {
                     report.ambiguous = report.ambiguous.saturating_add(1);
                     break;
                 }
@@ -148,81 +136,6 @@ impl ShardRuntime {
         report
     }
 
-    /// Rewrites a bounded number of pre-erasure-domain shared pack slices as
-    /// stream-exclusive objects (#278), through the F2 driver with the
-    /// legacy-pack filter: discovery is the `shared_ref_candidates` state
-    /// query (read on followers too, so the global debt is counted on every
-    /// node), and each stream's oldest contiguous run of legacy slices becomes
-    /// one exclusive chunk published with `CompactCold`. At most `max_chunks`
-    /// slices are rewritten per call. A failed publish is returned (a
-    /// redirect lets bucket purge forward to the leader); a definite
-    /// rejection deletes the replacement and an ambiguous outcome keeps it for
-    /// the orphan sweep.
-    pub async fn migrate_legacy_shared_cold_once(
-        &self,
-        max_chunks: usize,
-        gc_grace_ms: u64,
-    ) -> Result<LegacySharedMigrationReport, RuntimeError> {
-        let Some(cold_store) = self.cold_store.as_ref() else {
-            return Ok(LegacySharedMigrationReport::default());
-        };
-        let mut candidates = Vec::new();
-        for group_id in 0..self.shard_map.raft_group_count() {
-            candidates.extend(
-                self.plan_shared_ref_compaction(
-                    RaftGroupId(group_id),
-                    SharedRefCompactionRequest::legacy_packs(
-                        LEGACY_MIGRATION_MAX_RUN_BYTES,
-                        usize::MAX,
-                    ),
-                )
-                .await?,
-            );
-        }
-        let observed_chunks = candidates.iter().fold(0_usize, |total, candidate| {
-            total.saturating_add(candidate.shared_refs)
-        });
-        let mut migrated_chunks = 0_usize;
-        for mut candidate in candidates {
-            let budget = max_chunks.saturating_sub(migrated_chunks);
-            if budget == 0 {
-                break;
-            }
-            candidate.run.truncate(budget);
-            let slices = candidate.run.len();
-            let raft_group_id = self.locate(&candidate.stream_id).raft_group_id;
-            self.repair_cold_index(raft_group_id, RepairColdIndexRequest {
-                after: None,
-                max_streams: 1,
-                stream: Some(candidate.stream_id.clone()),
-                retention_gc_now_ms: None,
-            })
-            .await?;
-            match self
-                .compact_shared_run(
-                    cold_store,
-                    &candidate.stream_id,
-                    candidate.cold_generation,
-                    candidate.run,
-                    gc_grace_ms,
-                )
-                .await?
-            {
-                SharedRunOutcome::Compacted { .. } => {
-                    migrated_chunks = migrated_chunks.saturating_add(slices);
-                }
-                SharedRunOutcome::Rejected(err) | SharedRunOutcome::Ambiguous(err) => {
-                    return Err(err);
-                }
-            }
-        }
-        Ok(LegacySharedMigrationReport {
-            observed_chunks,
-            migrated_chunks,
-            pending_chunks: observed_chunks.saturating_sub(migrated_chunks),
-        })
-    }
-
     /// Rewrites one contiguous run of a stream's shared slices into one
     /// exclusive chunk and publishes it with `CompactCold`. A read or write
     /// error before the publish leaves state untouched.
@@ -235,9 +148,8 @@ impl ShardRuntime {
         gc_grace_ms: u64,
     ) -> Result<SharedRunOutcome, RuntimeError> {
         let (Some(first), Some(last)) = (run.first(), run.last()) else {
-            return Ok(SharedRunOutcome::Rejected(RuntimeError::ColdStoreIo {
-                message: "shared-ref compaction run is empty".to_owned(),
-            }));
+            tracing::warn!(stream = %stream_id, "shared-ref compaction run is empty");
+            return Ok(SharedRunOutcome::Rejected);
         };
         let (start_offset, end_offset) = (first.start_offset, last.end_offset);
         let total_bytes = end_offset.saturating_sub(start_offset);
@@ -325,7 +237,7 @@ impl ShardRuntime {
                     error = %err,
                     "shared-ref compaction rejected"
                 );
-                Ok(SharedRunOutcome::Rejected(err))
+                Ok(SharedRunOutcome::Rejected)
             }
             Err(err) => {
                 tracing::warn!(
@@ -334,7 +246,7 @@ impl ShardRuntime {
                     error = %err,
                     "shared-ref compaction outcome is ambiguous; keeping its replacement"
                 );
-                Ok(SharedRunOutcome::Ambiguous(err))
+                Ok(SharedRunOutcome::Ambiguous)
             }
         }
     }

@@ -25,7 +25,7 @@ use serde::Serialize;
 
 /// Node identities that may persist an external snapshot pointer for each
 /// group. S3 pruning is enabled only after every expected voter has published
-/// its current reference, which makes rolling upgrades fail closed.
+/// its current reference, so pruning fails closed while any voter has not.
 #[derive(Debug, Clone)]
 pub struct SnapshotReferenceConfig {
     pub node_id: u64,
@@ -57,7 +57,7 @@ pub struct SnapshotKey {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SnapshotLocation {
     /// Bytes live inline in the location. Round-trips through openraft with no
-    /// external store touch — matches the legacy in-memory snapshot shape.
+    /// external store touch.
     Inline {
         #[serde(with = "serde_bytes_vec")]
         bytes: Vec<u8>,
@@ -69,17 +69,13 @@ pub enum SnapshotLocation {
         key: String,
         /// Logical snapshot size after decompression.
         size_bytes: u64,
-        /// Physical object size in S3. Legacy pointers omit this and use
-        /// `size_bytes` as both logical and physical size.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        stored_size_bytes: Option<u64>,
+        /// Physical object size in S3.
+        stored_size_bytes: u64,
         /// Compression applied to the S3 object body.
-        #[serde(default)]
         compression: SnapshotCompression,
         /// The object key is content-addressed and may be referenced by
         /// several replicas or snapshot pointers. Shared objects must only be
         /// removed by reference-aware pruning.
-        #[serde(default)]
         shared_object: bool,
     },
 }
@@ -106,10 +102,8 @@ impl SnapshotLocation {
             Self::Inline { bytes } => bytes.len() as u64,
             Self::Local { size_bytes, .. } => *size_bytes,
             Self::S3 {
-                size_bytes,
-                stored_size_bytes,
-                ..
-            } => stored_size_bytes.unwrap_or(*size_bytes),
+                stored_size_bytes, ..
+            } => *stored_size_bytes,
         }
     }
 
@@ -122,7 +116,6 @@ impl SnapshotLocation {
 }
 
 mod serde_bytes_vec {
-    use serde::Deserialize;
     use serde::Deserializer;
     use serde::Serializer;
 
@@ -130,10 +123,27 @@ mod serde_bytes_vec {
         ser.serialize_bytes(bytes)
     }
 
+    /// Accepts only `bytes` (MessagePack bin, F12a).
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<u8>, D::Error> {
-        // Accept both `bytes` (MessagePack bin, F12a) and the JSON number
-        // array that serde_json writes for `serialize_bytes`.
-        serde_bytes::ByteBuf::deserialize(de).map(serde_bytes::ByteBuf::into_vec)
+        struct BytesVisitor;
+
+        impl serde::de::Visitor<'_> for BytesVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a byte string")
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
+                Ok(bytes.to_vec())
+            }
+
+            fn visit_byte_buf<E: serde::de::Error>(self, bytes: Vec<u8>) -> Result<Vec<u8>, E> {
+                Ok(bytes)
+            }
+        }
+
+        de.deserialize_byte_buf(BytesVisitor)
     }
 }
 
@@ -664,7 +674,7 @@ mod s3 {
                 Ok(SnapshotLocation::S3 {
                     key: object_key,
                     size_bytes,
-                    stored_size_bytes: Some(stored_size_bytes),
+                    stored_size_bytes,
                     compression: SnapshotCompression::Zstd,
                     shared_object: true,
                 })
@@ -690,7 +700,7 @@ mod s3 {
                 Ok(SnapshotLocation::S3 {
                     key: object_key,
                     size_bytes,
-                    stored_size_bytes: Some(stored_size_bytes),
+                    stored_size_bytes,
                     compression: SnapshotCompression::Zstd,
                     shared_object: true,
                 })
@@ -1155,7 +1165,7 @@ mod tests {
             SnapshotLocation::S3 {
                 key: "snapshots/group-7/a.snap".into(),
                 size_bytes: 123,
-                stored_size_bytes: Some(45),
+                stored_size_bytes: 45,
                 compression: SnapshotCompression::Zstd,
                 shared_object: true,
             },
@@ -1213,7 +1223,7 @@ mod tests {
                 location: SnapshotLocation::S3 {
                     key: "snapshots/group-3/abc.snap".into(),
                     size_bytes: 77,
-                    stored_size_bytes: Some(40),
+                    stored_size_bytes: 40,
                     compression: SnapshotCompression::Zstd,
                     shared_object: true,
                 },
@@ -1258,25 +1268,6 @@ mod tests {
         assert_eq!(back.location.size_hint(), 12345);
     }
 
-    #[test]
-    fn pointer_decode_defaults_legacy_s3_objects_to_unshared() {
-        let bytes = rmp_serde::to_vec_named(&serde_json::json!({
-            "snapshot_id": "group-7-2-500",
-            "location": {
-                "kind": "s3",
-                "key": "snapshots/group-7/legacy.snap",
-                "size_bytes": 123,
-                "compression": "none"
-            }
-        }))
-        .unwrap();
-        let pointer = SnapshotPointer::decode(&bytes).unwrap();
-        assert!(matches!(pointer.location, SnapshotLocation::S3 {
-            shared_object: false,
-            ..
-        }));
-    }
-
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn s3_memory_roundtrip() {
@@ -1296,8 +1287,7 @@ mod tests {
                 assert_eq!(*size_bytes, payload.len() as u64);
                 assert_eq!(*compression, SnapshotCompression::Zstd);
                 assert!(*shared_object);
-                assert!(stored_size_bytes.is_some());
-                assert!(stored_size_bytes.unwrap() < *size_bytes);
+                assert!(*stored_size_bytes < *size_bytes);
             }
             other => panic!("expected S3 location, got {other:?}"),
         }
@@ -1333,32 +1323,6 @@ mod tests {
             b'x';
             64 * 1024
         ]);
-    }
-
-    #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn s3_download_accepts_legacy_uncompressed_pointer() {
-        let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
-        let key = test_key(5, "group-5-T1-N1-10");
-        let loc = store
-            .upload(key, b"legacy body".to_vec().into())
-            .await
-            .unwrap();
-        let SnapshotLocation::S3 { key, .. } = loc else {
-            panic!("expected s3 location")
-        };
-        store
-            .write_raw_for_tests(&key, b"legacy body".to_vec())
-            .await
-            .unwrap();
-        let legacy = SnapshotLocation::S3 {
-            key,
-            size_bytes: b"legacy body".len() as u64,
-            stored_size_bytes: None,
-            compression: SnapshotCompression::None,
-            shared_object: false,
-        };
-        assert_eq!(store.download(&legacy).await.unwrap(), b"legacy body");
     }
 
     #[cfg(not(madsim))]

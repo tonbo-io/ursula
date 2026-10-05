@@ -184,10 +184,6 @@ pub struct RaftConfig {
     /// = "0s"`) and OpenRaft's own policy runs. The driver snapshots by log
     /// bytes instead (`snapshot_log_budget`).
     pub snapshot_logs_since_last: u64,
-    /// Retained for configuration compatibility. The snapshot driver's
-    /// pressure pass now follows `snapshot_log_budget` (bounded-stream-state
-    /// F12e).
-    pub snapshot_pressure_unpurged_logs: u64,
     /// Maximum groups snapshotted by one driver tick, including pressure
     /// passes.
     pub snapshot_pressure_max_groups_per_tick: usize,
@@ -229,7 +225,6 @@ impl Default for RaftConfig {
             snapshot_build_max_concurrency: 1,
             snapshot_install_max_concurrency: 1,
             snapshot_logs_since_last: 5_000,
-            snapshot_pressure_unpurged_logs: 65_536,
             snapshot_pressure_max_groups_per_tick: 16,
             snapshot_log_budget: HumanSize::gib(1),
             snapshot_backstop_logs: 100_000,
@@ -531,9 +526,6 @@ pub struct RaftSnapshotConfig {
     /// health. Explicit `0s` disables the manual driver and keeps openraft's
     /// entry-count policy (`raft.snapshot_logs_since_last`).
     pub drive_interval: Option<HumanDuration>,
-    /// Retained for configuration compatibility. Snapshot driving no longer
-    /// forces cold flushes; the cold worker owns flush concurrency.
-    pub drive_flush_concurrency: usize,
 }
 
 impl Default for RaftSnapshotConfig {
@@ -542,7 +534,6 @@ impl Default for RaftSnapshotConfig {
             backend: RaftSnapshotBackend::Auto,
             s3_prefix: None,
             drive_interval: None,
-            drive_flush_concurrency: 4,
         }
     }
 }

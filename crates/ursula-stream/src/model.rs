@@ -107,7 +107,6 @@ pub struct ObjectPayloadRef {
     pub end_offset: u64,
     pub s3_path: String,
     pub object_size: u64,
-    #[serde(default)]
     pub object_offset: u64,
 }
 
@@ -135,8 +134,7 @@ pub struct ColdGcEntry {
     /// Physical packs never cross this boundary.
     pub bucket_id: String,
     /// Earliest wall-clock timestamp at which the physical object may be
-    /// reclaimed. Zero preserves the immediate behavior of legacy entries.
-    #[serde(default)]
+    /// reclaimed. Zero means immediately.
     pub not_before_ms: u64,
     pub target: ColdGcTarget,
     /// Cold generation of the removed incarnation for a
@@ -250,9 +248,7 @@ pub struct StreamVisibleSnapshot {
     pub content_type: String,
     /// Inline body. Empty when `object` holds the body.
     pub payload: Vec<u8>,
-    /// BLAKE3 digest over the content type and body. Empty only when
-    /// decoding legacy snapshots; restore recomputes it.
-    #[serde(default)]
+    /// BLAKE3 digest over the content type and body.
     pub digest: String,
     /// Cold-tier object holding the whole body (bounded-state F16). `payload_len` is the body length.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -320,7 +316,6 @@ pub struct BucketUsage {
     /// the unit separately so this state is a usage fact rather than a price
     /// name. Kept in replicated state because a gateway cannot distinguish
     /// "commit succeeded, response was lost" from "the write never committed".
-    #[serde(default, alias = "committed_write_units_10kib")]
     pub committed_write_units: u64,
     pub retained_bytes: u64,
     pub stream_count: u64,

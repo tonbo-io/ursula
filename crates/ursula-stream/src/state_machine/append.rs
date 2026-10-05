@@ -597,26 +597,18 @@ struct ProducerReceiptRange {
     closed: bool,
 }
 
-/// O(1) duplicate lookup (F3): receipts hold contiguous sequences, so the
-/// receipt of `seq` sits at `seq - front.seq`. Falls back to a binary search
-/// for receipt lists restored from older snapshots.
+/// O(1) duplicate lookup (F3): within an epoch a producer's sequences are
+/// accepted only as `0, 1, 2, ...` and receipts are evicted from the front,
+/// so the receipt of `seq` sits at `seq - front.seq`.
 pub(super) fn find_receipt(
     receipts: &std::collections::VecDeque<ProducerReceipt>,
     seq: u64,
 ) -> Option<&ProducerReceipt> {
     let front = receipts.front()?;
-    let direct = seq
-        .checked_sub(front.producer_seq)
+    seq.checked_sub(front.producer_seq)
         .and_then(|index| usize::try_from(index).ok())
         .and_then(|index| receipts.get(index))
-        .filter(|receipt| receipt.producer_seq == seq);
-    if direct.is_some() {
-        return direct;
-    }
-    receipts
-        .binary_search_by_key(&seq, |receipt| receipt.producer_seq)
-        .ok()
-        .and_then(|index| receipts.get(index))
+        .filter(|receipt| receipt.producer_seq == seq)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

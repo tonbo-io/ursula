@@ -72,11 +72,6 @@ impl UrsulaConfig {
             self.validate_groups(&peer_ids)?;
         }
         self.validate_non_zero_durations()?;
-        if self.raft.snapshot_pressure_unpurged_logs == 0 {
-            return Err(ValidationError::Other(
-                "raft.snapshot_pressure_unpurged_logs must be non-zero".into(),
-            ));
-        }
         if self.raft.snapshot_pressure_max_groups_per_tick == 0 {
             return Err(ValidationError::Other(
                 "raft.snapshot_pressure_max_groups_per_tick must be non-zero".into(),
@@ -255,20 +250,9 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_pressure_limits_must_be_non_zero() {
+    fn snapshot_pressure_batch_must_be_non_zero() {
         let mut config = UrsulaConfig::default();
         config.raft.node_id = 1;
-        config.raft.snapshot_pressure_unpurged_logs = 0;
-        let error = config
-            .validate()
-            .expect_err("zero unpurged-log watermark must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("snapshot_pressure_unpurged_logs")
-        );
-
-        config.raft.snapshot_pressure_unpurged_logs = 1;
         config.raft.snapshot_pressure_max_groups_per_tick = 0;
         let error = config
             .validate()

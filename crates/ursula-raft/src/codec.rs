@@ -62,7 +62,7 @@ mod tests {
 
     use super::*;
 
-    fn head_response(created_at_ms: Option<u64>) -> HeadStreamResponse {
+    fn head_response(created_at_ms: u64) -> HeadStreamResponse {
         HeadStreamResponse {
             placement: ShardPlacement {
                 core_id: CoreId(0),
@@ -83,20 +83,10 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_head_carries_created_at_ms_and_decodes_from_older_followers() {
-        let current = head_response(Some(1_234));
+    fn forwarded_head_carries_created_at_ms() {
+        let current = head_response(1_234);
         let decoded: HeadStreamResponse =
             decode_wire(&encode_wire(&current), "head").expect("decode current head");
         assert_eq!(decoded, current);
-
-        // A follower without the field forwards a map without it.
-        let mut legacy = serde_json::to_value(head_response(None)).expect("head to value");
-        legacy
-            .as_object_mut()
-            .expect("head object")
-            .remove("created_at_ms");
-        let decoded: HeadStreamResponse =
-            decode_wire(&encode_wire(&legacy), "legacy head").expect("decode legacy head");
-        assert_eq!(decoded, head_response(None));
     }
 }

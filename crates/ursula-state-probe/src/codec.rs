@@ -80,8 +80,6 @@ pub struct SnapStats {
     pub zstd3_bytes: u64,
     pub frames: u64,
     pub header_bytes: u64,
-    pub header_shared_owner_bytes: u64,
-    pub header_shared_owner_count: u64,
     pub header_bucket_usage_bytes: u64,
     pub header_bucket_usage_count: u64,
     pub header_erased_bucket_bytes: u64,
@@ -205,12 +203,9 @@ pub fn measure(snapshot: GroupSnapshot, with_zstd: bool) -> Result<SnapStats> {
             proto::snapshot_frame_v1::Frame::Header(h) => {
                 st.header_bytes += len;
                 let full = h.encoded_len();
-                st.header_shared_owner_bytes +=
-                    header_delta(&h, full, |x| x.shared_cold_object_owners.clear());
                 st.header_bucket_usage_bytes += header_delta(&h, full, |x| x.bucket_usage.clear());
                 st.header_erased_bucket_bytes +=
                     header_delta(&h, full, |x| x.erased_buckets.clear());
-                st.header_shared_owner_count += n(h.shared_cold_object_owners.len());
                 st.header_bucket_usage_count += n(h.bucket_usage.len());
                 st.header_erased_bucket_count += n(h.erased_buckets.len());
             }

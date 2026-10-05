@@ -2430,11 +2430,9 @@ async fn openraft_snapshot_round_trips_group_state() {
     }
 }
 
-/// F1 follow-up: a forwarded read carries the continuation anchor to the
-/// leader over gRPC, so a follower's SSE or record read continues from it;
-/// a request from an older follower (no field) decodes with no anchor.
-/// `leader_only` (field 6) travels too, so the leader linearizes a forwarded
-/// `consistency=leader` read, and so does `HeadStreamReadV1.applied_state_only`
+/// A forwarded read carries `leader_only` (field 6) to the leader over gRPC,
+/// so the leader linearizes a forwarded `consistency=leader` read, and so
+/// does `HeadStreamReadV1.applied_state_only`
 /// (field 1), so the leader linearizes a forwarded client HEAD and not an
 /// internal one.
 #[test]

@@ -165,8 +165,7 @@ async fn raft_orphan_sweep_reclaims_only_unreferenced_objects() {
         })
         .await
         .expect("head")
-        .created_at_ms
-        .expect("incarnation");
+        .created_at_ms;
     let orphan_chunk = new_cold_chunk_path_in_generation(&a, generation, 0, 2);
     let orphan_external = new_external_payload_path(&b);
     for path in [&orphan_pack, &orphan_chunk, &orphan_external] {
