@@ -33,11 +33,14 @@
 //! A group whose majority restarted empty has no quorum of healthy voters:
 //! the leader never removes a voter then, and the empty replicas never vote
 //! for a candidate. The group stops accepting writes until an operator picks
-//! the survivor ([`GroupRejoin::adopt_survivor`]).
+//! the survivor ([`GroupRejoin::adopt_survivor`]). A group whose every voter
+//! restarted empty is stopped by its "initialized" marker in object storage
+//! instead (`crate::restart_guard`).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::PoisonError;
@@ -54,6 +57,8 @@ use openraft::vote::RaftLeaderId;
 use ursula_shard::RaftGroupId;
 
 use crate::registry::RaftGroupHandle;
+use crate::restart_guard::InitMarkerStore;
+use crate::restart_guard::RestartGuard;
 use crate::types::UrsulaAppendEntriesRequest;
 use crate::types::UrsulaAppendEntriesResponse;
 use crate::types::UrsulaRaftTypeConfig;
@@ -211,6 +216,7 @@ pub struct GroupRejoin {
     metrics: OnceLock<MetricsReceiver>,
     gate: Mutex<VoteGate>,
     reverted: Mutex<RevertedFollowers>,
+    restart_guard: RestartGuard,
 }
 
 impl fmt::Debug for GroupRejoin {
@@ -231,7 +237,25 @@ impl GroupRejoin {
             metrics: OnceLock::new(),
             gate: Mutex::new(VoteGate::default()),
             reverted: Mutex::new(RevertedFollowers::default()),
+            restart_guard: RestartGuard::new(raft_group_id, None),
         }
+    }
+
+    /// Keep the group's "initialized" marker in `store` (object storage), so
+    /// a restart of every voter stops the group instead of re-initializing
+    /// it (see `crate::restart_guard`).
+    pub fn with_init_markers(mut self, store: Option<Arc<dyn InitMarkerStore>>) -> Self {
+        self.restart_guard = RestartGuard::new(self.raft_group_id, store);
+        self
+    }
+
+    pub fn raft_group_id(&self) -> RaftGroupId {
+        self.raft_group_id
+    }
+
+    /// The group's full-restart guard.
+    pub fn restart_guard(&self) -> &RestartGuard {
+        &self.restart_guard
     }
 
     /// Attach the group's Raft metrics. Call once the Raft exists and before
