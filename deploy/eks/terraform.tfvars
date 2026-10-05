@@ -1,6 +1,6 @@
 name       = "ursula-chaos-jul21"
 aws_region = "us-east-1"
-image_tag  = "0.6.0"
+image_tag  = "0.6.1"
 
 cluster_endpoint_public_access_cidrs = ["8.216.133.37/32"]
 
