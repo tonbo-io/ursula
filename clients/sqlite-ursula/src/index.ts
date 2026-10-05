@@ -5,15 +5,20 @@
 import { DatabaseSync } from "node:sqlite";
 import { type SqliteExecutor, SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { type NodeSqliteStorageOptions, openNodeSqliteDatabase } from "@earendil-works/pi-durable/storage/sqlite/node";
+import { prebuiltExtension } from "./platform.ts";
 
 let control: DatabaseSync | undefined;
 
-/** Loads the extension once per process (path from SQLITE_URSULA_VFS) and returns the control connection. */
+/**
+ * Loads the extension once per process and returns the control connection. The library is `path`,
+ * else SQLITE_URSULA_VFS when set, else the prebuilt one for this platform
+ * (`@tonbo/sqlite-ursula-<platform>`, an optional dependency).
+ */
 export function loadUrsulaVfs(path = process.env.SQLITE_URSULA_VFS): DatabaseSync {
 	if (control !== undefined) return control;
-	if (path === undefined || path.length === 0) throw new Error("set SQLITE_URSULA_VFS to the built extension");
+	const library = path === undefined || path.length === 0 ? prebuiltExtension() : path;
 	const db = new DatabaseSync(":memory:", { allowExtension: true });
-	db.loadExtension(path);
+	db.loadExtension(library);
 	control = db;
 	return db;
 }

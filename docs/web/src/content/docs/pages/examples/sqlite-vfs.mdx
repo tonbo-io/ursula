@@ -3,7 +3,7 @@ title: SQLite on Ursula
 sidebarTitle: SQLite (VFS)
 ---
 
-`sqlite-ursula-vfs` is a SQLite loadable extension that replicates a database file to an Ursula stream. Your application keeps using SQLite unchanged, for example `node:sqlite` or Pi Durable's official `SqliteStorage`: every commit is appended to the stream before it reaches the local file, and any host can rebuild the database from the stream. The extension lives in [`clients/sqlite-vfs`](https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-vfs), and the TypeScript helpers in [`clients/sqlite-ursula`](https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-ursula).
+`sqlite-ursula-vfs` is a SQLite loadable extension that replicates a database file to an Ursula stream. Your application keeps using SQLite unchanged, for example `node:sqlite` or Pi Durable's official `SqliteStorage`: every commit is appended to the stream before it reaches the local file, and any host can rebuild the database from the stream. The extension lives in [`clients/sqlite-vfs`](https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-vfs), and the TypeScript helpers in [`clients/sqlite-ursula`](https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-ursula), published to npm as `@tonbo/sqlite-ursula` with the extension prebuilt.
 
 How it works:
 
@@ -18,20 +18,29 @@ How it works:
 - For databases whose snapshots exceed 1 MiB, a cold backend, so snapshot bodies are stored in the cold tier (up to 1 GiB). Without it, snapshots are kept inline, up to 32 MiB.
 - Snapshots above 32 MiB must go straight to a node, or through a gateway whose `--max-request-body-bytes` is raised.
 
-## Build and load
+## Install and load
+
+```bash
+npm install @tonbo/sqlite-ursula
+```
+
+The package needs Node.js 22.19 or later. It ships the extension prebuilt for Linux x64 and arm64 with glibc 2.28 or later (Debian 11, Ubuntu 20.04, Amazon Linux 2023 and newer), Linux x64 with musl (Alpine), and macOS 11 or later on Apple silicon. npm installs only the build for your platform.
+
+On other platforms, build the extension and point `SQLITE_URSULA_VFS` at it. The variable also overrides the prebuilt extension.
 
 ```bash
 cd clients/sqlite-vfs
 cargo build --release   # target/release/libsqlite_ursula_vfs.so (.dylib on macOS)
+export SQLITE_URSULA_VFS=$PWD/target/release/libsqlite_ursula_vfs.so
 ```
 
-The extension calls whatever SQLite loads it, so it works with `node:sqlite` (Node.js 22.19 or later). Load it once per process: it registers the `ursula` VFS as SQLite's default.
+The extension calls whatever SQLite loads it, here `node:sqlite`. Load it once per process: it registers the `ursula` VFS as SQLite's default. `attach` and `openUrsulaPiStorage` load it if you have not.
 
 ```ts
-import { attach, loadUrsulaVfs, status } from "@tonbo-io/sqlite-ursula";
+import { attach, loadUrsulaVfs, status } from "@tonbo/sqlite-ursula";
 import { DatabaseSync } from "node:sqlite";
 
-loadUrsulaVfs("/path/to/libsqlite_ursula_vfs.so"); // or set SQLITE_URSULA_VFS
+loadUrsulaVfs(); // the prebuilt extension, or the one SQLITE_URSULA_VFS names
 
 // Catch the file up (from the latest snapshot if it is missing or behind), claim the stream,
 // and attach. No connection to the file may be open yet.
@@ -53,7 +62,7 @@ From SQL, the same functions are `ursula_attach(path, url)`, `ursula_status(path
 `openUrsulaPiStorage` attaches the file and opens it with Pi's own node driver:
 
 ```ts
-import { openUrsulaPiStorage, UrsulaReplicationError } from "@tonbo-io/sqlite-ursula";
+import { openUrsulaPiStorage, UrsulaReplicationError } from "@tonbo/sqlite-ursula";
 
 const storage = await openUrsulaPiStorage("/data/harness-1.db", "https://ursula.example.com/pi/harness-1");
 // hand `storage` to the Pi harness; storage.close(ctx) on shutdown
