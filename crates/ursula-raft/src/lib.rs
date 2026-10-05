@@ -49,6 +49,7 @@ mod types;
 pub use engine::ColdRaftGroupEngineFactory;
 pub use engine::DurableRaftGroupEngineFactory;
 pub use engine::DurableRaftLogStoreFactory;
+pub use engine::GROUP_ELECTION_TIMEOUT_MIN_MS;
 pub use engine::RaftEngineConfig;
 pub use engine::RaftGroupEngine;
 pub use engine::RaftGroupEngineFactory;

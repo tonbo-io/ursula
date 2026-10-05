@@ -43,6 +43,7 @@ mod test_reexports {
     pub(crate) use super::egress::plan_cluster_egress_shed;
     pub(crate) use super::egress::spawn_egress_gate;
     pub(crate) use super::leadership::LeadershipBalanceAction;
+    pub(crate) use super::leadership::handoff_target_caught_up;
     pub(crate) use super::leadership::plan_leadership_balance;
     pub(crate) use super::leadership::plan_leadership_balance_with_eligible_nodes;
     pub(crate) use super::snapshot::group_log_progress;

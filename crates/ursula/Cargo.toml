@@ -71,6 +71,9 @@ flate2 = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true }
+# Path-only: a versionless dev-dependency is dropped from the published
+# manifest, so `ursula` publishes without waiting for `ursula-ctl`.
+ursula-ctl = { path = "../ursula-ctl" }
 
 [[bench]]
 name = "json_text"

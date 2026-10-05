@@ -32,6 +32,11 @@ use crate::registry::RaftGroupHandleRegistry;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::types::UrsulaRaftTypeConfig;
 
+/// Minimum election timeout of every data-group Raft, in milliseconds.
+/// `ursulactl`'s restart fence waits this long for an in-flight leadership
+/// transfer to settle, so it reads the same constant.
+pub const GROUP_ELECTION_TIMEOUT_MIN_MS: u64 = 1500;
+
 #[cfg(test)]
 fn parse_positive_millis(raw: Option<&str>, default_ms: u64) -> u64 {
     raw.and_then(|raw| raw.parse::<u64>().ok())
@@ -683,7 +688,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 // election_timeout_min, and election_timeout_min must stay above
                 // worst-case fault-induced inter-heartbeat arrival.
                 heartbeat_interval: 250,
-                election_timeout_min: 1500,
+                election_timeout_min: GROUP_ELECTION_TIMEOUT_MIN_MS,
                 election_timeout_max: 3000,
                 install_snapshot_timeout: self.engine_config.install_snapshot_timeout_ms,
                 max_in_snapshot_log_to_keep: self.engine_config.max_in_snapshot_log_to_keep,
