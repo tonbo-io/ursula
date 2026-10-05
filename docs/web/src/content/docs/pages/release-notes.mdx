@@ -5,7 +5,9 @@ description: Changes that affect clients and operators, newest first.
 
 ## 0.6.2
 
-0.6.2 is a drop-in patch for 0.6.1: format epoch 2 is unchanged, with no change to existing storage records, snapshots or the Raft protocol. It adds one small marker object per memory-WAL group in object storage, which 0.6.1 ignores. Upgrade in place with an ordinary rolling restart. 0.6.1 and 0.6.2 voters run side by side safely during the upgrade; a group whose leader still runs 0.6.1 is rebuilt by the graceful-rollout hook as before.
+0.6.2 is a drop-in patch for 0.6.x: format epoch 2 is unchanged, with no change to existing storage records, snapshots or the Raft protocol. It adds one small marker object per memory-WAL group in object storage, which 0.6.0 and 0.6.1 ignore. Upgrade from 0.6.0 or 0.6.1 in place with an ordinary rolling restart (`helm upgrade`); no fresh install or data move is needed.
+
+0.6.0 or 0.6.1 voters and 0.6.2 voters run side by side safely during the upgrade; a group whose leader still runs 0.6.0 or 0.6.1 is rebuilt by the graceful-rollout hook as before, which runs the `ursulactl` of the chart's image.
 
 ### Fixed
 
