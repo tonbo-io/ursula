@@ -38,7 +38,6 @@ pub struct CreateStreamExternalRequest {
     pub stream_id: BucketStreamId,
     pub content_type: String,
     pub initial_payload: ExternalPayloadRef,
-    #[serde(default)]
     pub record_ends: Vec<u64>,
     pub close_after: bool,
     pub stream_seq: Option<String>,
@@ -107,8 +106,7 @@ pub struct CreateStreamResponse {
     pub group_commit_index: u64,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
     /// the runtime records its metric without a second state-machine round
-    /// trip. `None` from an older leader.
-    #[serde(default)]
+    /// trip.
     pub hot_backlog: Option<WriteHotBacklog>,
 }
 
@@ -146,10 +144,8 @@ pub struct HeadStreamResponse {
     pub retained_offset: u64,
     /// The stream incarnation's `created_at_ms`, unique per group (C7). HEAD renders it as the public
     /// `Stream-Incarnation` header, an opaque token that changes when the
-    /// stream is deleted and recreated. `default` keeps HEAD responses
-    /// forwarded by older followers decodable.
-    #[serde(default)]
-    pub created_at_ms: Option<u64>,
+    /// stream is deleted and recreated.
+    pub created_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,8 +335,7 @@ pub struct PublishSnapshotResponse {
     pub group_commit_index: u64,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
     /// the runtime records its metric without a second state-machine round
-    /// trip. `None` from an older leader.
-    #[serde(default)]
+    /// trip.
     pub hot_backlog: Option<WriteHotBacklog>,
 }
 
@@ -360,8 +355,7 @@ pub struct AdvanceRetentionResponse {
     pub group_commit_index: u64,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
     /// the runtime records its metric without a second state-machine round
-    /// trip. `None` from an older leader.
-    #[serde(default)]
+    /// trip.
     pub hot_backlog: Option<WriteHotBacklog>,
 }
 
@@ -485,8 +479,7 @@ pub struct DeleteStreamResponse {
     pub group_commit_index: u64,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
     /// the runtime records its metric without a second state-machine round
-    /// trip. `None` from an older leader.
-    #[serde(default)]
+    /// trip.
     pub hot_backlog: Option<WriteHotBacklog>,
 }
 
@@ -511,17 +504,9 @@ pub struct DeferColdGcResponse {
 pub struct PurgeBucketResponse {
     pub placement: ShardPlacement,
     pub removed_streams: u64,
-    /// Rolling-upgrade compatibility for <=0.4.5 voters, which did not return
-    /// a bucket-specific cold-GC count. Missing is mapped to maximally pending,
-    /// never to zero, so a mixed-version cluster cannot forge absence proof.
-    /// Remove after the minimum supported rolling source is >=0.4.6.
-    #[serde(default = "unknown_pending_cold_gc_entries")]
+    /// Cold-GC entries this group still holds for the bucket.
     pub pending_cold_gc_entries: u64,
     pub group_commit_index: u64,
-}
-
-const fn unknown_pending_cold_gc_entries() -> u64 {
-    u64::MAX
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -541,8 +526,7 @@ pub struct FlushColdResponse {
     pub group_commit_index: u64,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
     /// the runtime records its metric without a second state-machine round
-    /// trip. `None` from an older leader.
-    #[serde(default)]
+    /// trip.
     pub hot_backlog: Option<WriteHotBacklog>,
 }
 
@@ -627,7 +611,6 @@ pub struct AppendExternalRequest {
     pub stream_id: BucketStreamId,
     pub content_type: String,
     pub payload: ExternalPayloadRef,
-    #[serde(default)]
     pub record_ends: Vec<u64>,
     pub close_after: bool,
     pub stream_seq: Option<String>,
@@ -703,14 +686,11 @@ pub struct AppendResponse {
     pub closed: bool,
     pub deduplicated: bool,
     pub producer: Option<ProducerRequest>,
-    #[serde(default)]
     pub stream_hot_bytes: u64,
-    #[serde(default)]
     pub group_hot_bytes: u64,
     /// A duplicate beyond the stream's receipt window (bounded-state F3):
     /// deduplicated without byte ranges. `start_offset` and
     /// `next_offset` then carry no information about the original append.
-    #[serde(default)]
     pub receipt_evicted: bool,
 }
 
@@ -718,21 +698,4 @@ pub struct AppendResponse {
 pub struct StreamAppendCount {
     pub stream_id: BucketStreamId,
     pub append_count: u64,
-}
-
-#[cfg(test)]
-mod compatibility_tests {
-    use super::PurgeBucketResponse;
-
-    #[test]
-    fn legacy_purge_response_is_never_interpreted_as_absence_proof() {
-        let response: PurgeBucketResponse = serde_json::from_value(serde_json::json!({
-            "placement": {"core_id": 0, "shard_id": 0, "raft_group_id": 7},
-            "removed_streams": 0,
-            "group_commit_index": 8
-        }))
-        .expect("decode <=0.4.5 purge response");
-
-        assert_eq!(response.pending_cold_gc_entries, u64::MAX);
-    }
 }

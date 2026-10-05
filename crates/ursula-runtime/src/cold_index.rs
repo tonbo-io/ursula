@@ -193,7 +193,7 @@ fn decode_page(key: &ColdIndexPageKey, bytes: &[u8]) -> io::Result<ColdIndexPage
         ));
     }
     let version = cursor.read_u16()?;
-    if !matches!(version, 1 | COLD_INDEX_PAGE_VERSION) {
+    if version != COLD_INDEX_PAGE_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported cold index page version {version}"),
@@ -218,9 +218,9 @@ fn decode_page(key: &ColdIndexPageKey, bytes: &[u8]) -> io::Result<ColdIndexPage
 
     let mut body = Cursor::new(body);
     let bucket_id = body.read_string()?;
-    // Version 2 carries an affinity marker; marker 1 (a grouped stream) is
-    // no longer valid.
-    if version >= 2 && body.read_u8()? != 0 {
+    // The affinity marker is always 0; marker 1 (a grouped stream) is no
+    // longer valid.
+    if body.read_u8()? != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "cold index page has invalid affinity marker",

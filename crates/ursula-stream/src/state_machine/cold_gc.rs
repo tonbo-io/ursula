@@ -120,10 +120,7 @@ impl ColdGcQueue {
     pub(super) fn len_for_bucket(&self, bucket_id: &str) -> usize {
         self.pending
             .iter()
-            // Snapshots written before bucket-scoped proof have no owner.
-            // Treat that unknown debt as relevant to every bucket until GC
-            // drains it; guessing an owner could produce a false absence proof.
-            .filter(|entry| entry.bucket_id.is_empty() || entry.bucket_id == bucket_id)
+            .filter(|entry| entry.bucket_id == bucket_id)
             .count()
     }
 
@@ -191,22 +188,5 @@ mod tests {
         );
         assert_eq!(queue.defer(0, 1_000), Some(1));
         assert_eq!(queue.batch(1)[0].not_before_ms, 9_000);
-    }
-
-    #[test]
-    fn legacy_unattributed_gc_debt_blocks_every_bucket_proof() {
-        let queue = ColdGcQueue::from_parts(
-            vec![ColdGcEntry {
-                seq: 7,
-                bucket_id: String::new(),
-                not_before_ms: 0,
-                target: ColdGcTarget::Paths(vec!["_packs/legacy.bin".to_owned()]),
-                cold_generation: None,
-                defer_attempts: 0,
-            }],
-            8,
-        );
-        assert_eq!(queue.len_for_bucket("bucket-a"), 1);
-        assert_eq!(queue.len_for_bucket("bucket-b"), 1);
     }
 }

@@ -42,7 +42,7 @@ impl StreamStateMachine {
                     cold_index_generation: slot.cold.cold_generation(),
                     cold_chunks: slot.cold.cold_chunks().to_vec(),
                     external_segments: slot.cold.external_segments().to_vec(),
-                    retained_offset: Some(slot.retained_offset),
+                    retained_offset: slot.retained_offset,
                     visible_snapshot: slot.visible_snapshot.clone(),
                     producer_states,
                 }
@@ -52,21 +52,6 @@ impl StreamStateMachine {
             compare_stream_ids(&left.metadata.stream_id, &right.metadata.stream_id)
         });
 
-        let mut shared_cold_object_owners = self
-            .shared_cold_object_owners
-            .iter()
-            .filter(|(path, _)| self.shared_cold_object_refs.contains_key(*path))
-            .map(|(path, owners)| {
-                let mut bucket_ids = owners.iter().cloned().collect::<Vec<_>>();
-                bucket_ids.sort();
-                crate::SharedColdObjectOwnersSnapshot {
-                    s3_path: path.clone(),
-                    bucket_ids,
-                }
-            })
-            .collect::<Vec<_>>();
-        shared_cold_object_owners.sort_by(|left, right| left.s3_path.cmp(&right.s3_path));
-
         StreamSnapshot {
             format_epoch: crate::FORMAT_EPOCH,
             buckets,
@@ -74,7 +59,6 @@ impl StreamStateMachine {
             streams,
             pending_cold_gc: self.cold_gc.entries().cloned().collect(),
             next_cold_gc_seq: self.cold_gc.next_seq(),
-            shared_cold_object_owners,
             bucket_usage: self.bucket_usage_report(),
             last_created_at_ms: self.last_created_at_ms,
         }
@@ -174,36 +158,19 @@ impl StreamStateMachine {
                     tail_offset: entry.metadata.tail_offset,
                 });
             }
-            let retained_offset = entry.retained_offset.unwrap_or_else(|| {
-                entry
-                    .visible_snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.offset)
-                    .unwrap_or(0)
-            });
-            if retained_offset > entry.metadata.tail_offset {
+            if entry.retained_offset > entry.metadata.tail_offset {
                 return Err(StreamSnapshotError::SnapshotOffsetOutOfRange {
                     stream_id,
-                    snapshot_offset: retained_offset,
+                    snapshot_offset: entry.retained_offset,
                     tail_offset: entry.metadata.tail_offset,
                 });
             }
-            let hot_segments = if entry.hot_segments.is_empty() && !entry.payload.is_empty() {
-                vec![HotPayloadSegment {
-                    start_offset: entry.hot_start_offset,
-                    end_offset: entry.metadata.tail_offset,
-                    payload_start: 0,
-                    payload_end: entry.payload.len(),
-                }]
-            } else {
-                entry.hot_segments
-            };
-            if !hot_segments_match_payload(&hot_segments, entry.payload.len())
+            if !hot_segments_match_payload(&entry.hot_segments, entry.payload.len())
                 || !payload_sources_cover_retained_suffix(
                     &entry.cold_chunks,
                     &entry.external_segments,
-                    &hot_segments,
-                    retained_offset,
+                    &entry.hot_segments,
+                    entry.retained_offset,
                     entry.metadata.tail_offset,
                 )
             {
@@ -217,20 +184,13 @@ impl StreamStateMachine {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));
             }
             let producer_states = restore_producer_states(&stream_id, entry.producer_states)?;
-            let visible_snapshot = entry.visible_snapshot.map(|mut snapshot| {
-                if snapshot.digest.is_empty() {
-                    snapshot.digest =
-                        super::snapshot_digest(&snapshot.content_type, &snapshot.payload);
-                }
-                snapshot
-            });
             let shared_cold_paths = entry
                 .cold_chunks
                 .iter()
                 .filter(|chunk| chunk.shared_object)
                 .map(|chunk| chunk.s3_path.clone())
                 .collect::<Vec<_>>();
-            let hot_buffer = HotBuffer::from_snapshot(entry.payload, &hot_segments);
+            let hot_buffer = HotBuffer::from_snapshot(entry.payload, &entry.hot_segments);
             let slot = StreamSlot {
                 metadata: entry.metadata,
                 hot_buffer,
@@ -239,8 +199,8 @@ impl StreamStateMachine {
                     entry.cold_chunks,
                     entry.external_segments,
                 ),
-                retained_offset,
-                visible_snapshot,
+                retained_offset: entry.retained_offset,
+                visible_snapshot: entry.visible_snapshot,
                 receipt_window: super::producers::ReceiptWindow::rebuild(&producer_states),
                 producers: producer_states,
                 append_count: 0,
@@ -249,31 +209,27 @@ impl StreamStateMachine {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));
             }
             for path in shared_cold_paths {
-                machine.retain_shared_cold_object(&path, &stream_id.bucket_id);
+                machine.retain_shared_cold_object(&path);
             }
         }
 
-        for record in snapshot.shared_cold_object_owners {
-            if machine
-                .shared_cold_object_refs
-                .contains_key(&record.s3_path)
+        for entry in &snapshot.pending_cold_gc {
+            if entry.bucket_id.is_empty() {
+                return Err(StreamSnapshotError::UnattributedColdGc { seq: entry.seq });
+            }
+            if matches!(entry.target, super::ColdGcTarget::Stream(_))
+                && entry.cold_generation.is_none()
             {
-                machine
-                    .shared_cold_object_owners
-                    .entry(record.s3_path)
-                    .or_default()
-                    .extend(record.bucket_ids);
+                return Err(StreamSnapshotError::ColdGcWithoutGeneration { seq: entry.seq });
             }
         }
-
         machine.cold_gc =
             ColdGcQueue::from_parts(snapshot.pending_cold_gc, snapshot.next_cold_gc_seq);
         machine.normalize_last_created_at_ms();
 
         // Usage restore: gauges are recomputed from the restored slots so a
         // snapshot can never carry gauge drift forward; only the monotonic
-        // counters are taken from the snapshot. Legacy snapshots without the
-        // field restart the monotonic counters from the recomputed gauges.
+        // counters are taken from the snapshot.
         let mut recomputed: HashMap<String, super::BucketUsage> = HashMap::new();
         for slot in machine.registry.slots() {
             let usage = recomputed
@@ -291,11 +247,6 @@ impl StreamStateMachine {
             usage.committed_append_bytes = persisted.usage.committed_append_bytes;
             usage.committed_records = persisted.usage.committed_records;
             usage.committed_write_units = persisted.usage.committed_write_units;
-        }
-        for usage in recomputed.values_mut() {
-            if usage.committed_append_bytes == 0 {
-                usage.committed_append_bytes = usage.retained_bytes;
-            }
         }
         machine.bucket_usage = recomputed;
 

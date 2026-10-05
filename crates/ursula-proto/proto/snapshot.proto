@@ -27,20 +27,20 @@ message SnapshotHeaderV1 {
   repeated string buckets = 3;
   uint64 next_cold_gc_seq = 4;
   // Monotonic per-bucket usage counters; gauges are recomputed from the
-  // restored streams. Absent in legacy snapshots.
+  // restored streams.
   repeated BucketUsageV1 bucket_usage = 5;
   // Field 6 held the removed per-bucket data-plane quota records.
   reserved 6;
   reserved "bucket_quotas";
   // Unit used to derive every committed_write_units counter in this snapshot.
-  // Absent means the original 10 KiB contract for backward compatibility.
+  // Every writer sets it; presence stays on the wire and an absent value is
+  // refused as corruption.
   optional uint64 committed_write_unit_bytes = 7;
-  // Bucket owners whose bytes have occupied a still-live shared object.
-  // Retained until physical deletion so per-bucket erasure proof survives
-  // snapshots taken during legacy pack migration.
-  repeated SharedColdObjectOwnersV1 shared_cold_object_owners = 8;
-  // Permanent bucket-erasure fences. Absent in snapshots written before
-  // tenant physical-erasure proof became part of the contract.
+  // Field 8 held the removed shared-object owner map: a shared pack lives
+  // under its bucket's prefix, so it has exactly one owner.
+  reserved 8;
+  reserved "shared_cold_object_owners";
+  // Permanent bucket-erasure fences.
   repeated string erased_buckets = 9;
   // Field 10 held a removed replicated per-group version (C0).
   reserved 10;
@@ -48,11 +48,6 @@ message SnapshotHeaderV1 {
   // Largest stream created_at_ms the group assigned (C7). Restore raises it
   // to every live stream's created_at_ms.
   uint64 last_created_at_ms = 11;
-}
-
-message SharedColdObjectOwnersV1 {
-  string s3_path = 1;
-  repeated string bucket_ids = 2;
 }
 
 message BucketUsageV1 {
@@ -96,6 +91,8 @@ message StreamSnapshotEntryV1 {
   // coordinates); JSON message boundaries are the LF bytes themselves.
   reserved 14, 15, 17, 18, 19;
   reserved "first_record", "record_offsets", "record_mark_records", "record_mark_offsets", "dense_first_record";
+  // Destructive-retention floor. Every writer sets it; presence stays on the
+  // wire and an absent value is refused as corruption.
   optional uint64 retained_offset = 16;
   // Field 20 held the removed hot append starts; streams without a record
   // index keep no per-message boundaries.

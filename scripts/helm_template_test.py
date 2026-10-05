@@ -405,15 +405,13 @@ class HelmTemplateConfigTest(unittest.TestCase):
     def test_snapshot_pressure_limits_are_rendered(self) -> None:
         config = render_config(
             "--set",
-            "raft.snapshotPressureUnpurgedLogs=32768",
-            "--set",
             "raft.snapshotPressureMaxGroupsPerTick=8",
             "--set",
             "s3.bucket=bkt",
         )
         parsed = tomllib.loads(config)
 
-        self.assertEqual(parsed["raft"]["snapshot_pressure_unpurged_logs"], 32768)
+        self.assertNotIn("snapshot_pressure_unpurged_logs", parsed["raft"])
         self.assertEqual(parsed["raft"]["snapshot_pressure_max_groups_per_tick"], 8)
 
     def test_snapshot_s3_renders_complete_config(self) -> None:

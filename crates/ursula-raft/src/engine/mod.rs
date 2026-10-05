@@ -1379,10 +1379,7 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupPlanSharedRefCompactionFuture<'a> {
         Box::pin(async move {
-            // The legacy-pack migration counts the global debt on every node
-            // (bucket purge must not proceed while any group holds legacy
-            // slices); its publishes still redirect to the leader.
-            if !request.legacy_packs_only && !self.raft.is_leader() {
+            if !self.raft.is_leader() {
                 return Ok(Vec::new());
             }
             self.with_state_machine(move |state_machine| {

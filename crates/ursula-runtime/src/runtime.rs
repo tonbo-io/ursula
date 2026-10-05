@@ -245,13 +245,6 @@ pub struct PurgeBucketReport {
     pub pending_cold_gc_entries: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LegacySharedMigrationReport {
-    pub observed_chunks: usize,
-    pub migrated_chunks: usize,
-    pub pending_chunks: usize,
-}
-
 impl ShardRuntime {
     pub fn spawn(config: RuntimeConfig) -> Result<Self, RuntimeError> {
         Self::spawn_with_engine_factory(config, InMemoryGroupEngineFactory::default())
@@ -844,8 +837,7 @@ impl ShardRuntime {
     /// Removes the entire bucket erasure domain, including external payloads
     /// and stage-before-commit orphans, then verifies the authoritative store
     /// no longer lists an object below the prefix. Call only after every
-    /// group has durably installed the bucket tombstone and legacy
-    /// shared-pack debt has converged to zero.
+    /// group has durably installed the bucket tombstone.
     pub async fn erase_bucket_cold_prefix_and_prove(
         &self,
         bucket_id: &str,

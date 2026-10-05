@@ -70,7 +70,6 @@ async fn generation(runtime: &ShardRuntime, stream_id: &BucketStreamId) -> u64 {
         .await
         .expect("head")
         .created_at_ms
-        .expect("incarnation")
 }
 
 async fn append(runtime: &ShardRuntime, stream_id: &BucketStreamId, payload: &[u8]) {

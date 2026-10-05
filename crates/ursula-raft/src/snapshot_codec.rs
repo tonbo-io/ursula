@@ -19,7 +19,6 @@ use ursula_stream::HotPayloadSegment;
 use ursula_stream::ObjectPayloadRef;
 use ursula_stream::ProducerReceipt;
 use ursula_stream::ProducerSnapshot;
-use ursula_stream::SharedColdObjectOwnersSnapshot;
 use ursula_stream::StreamMetadata;
 use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamSnapshotEntry;
@@ -137,9 +136,12 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
             "snapshot missing footer frame".to_owned(),
         ));
     }
-    let snapshot_write_unit = header
-        .committed_write_unit_bytes
-        .unwrap_or(ursula_stream::COMMITTED_WRITE_UNIT_BYTES);
+    // Header field 7 stays `optional` on the wire; every writer sets it, so
+    // an absent value is corruption.
+    let snapshot_write_unit = required(
+        header.committed_write_unit_bytes,
+        "snapshot header committed_write_unit_bytes",
+    )?;
     if snapshot_write_unit != ursula_stream::COMMITTED_WRITE_UNIT_BYTES {
         return Err(SnapshotStoreError::Deserialize(format!(
             "snapshot committed write unit is {snapshot_write_unit} bytes; this build uses {}",
@@ -157,14 +159,6 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
             streams,
             pending_cold_gc,
             next_cold_gc_seq: header.next_cold_gc_seq,
-            shared_cold_object_owners: header
-                .shared_cold_object_owners
-                .into_iter()
-                .map(|record| SharedColdObjectOwnersSnapshot {
-                    s3_path: record.s3_path,
-                    bucket_ids: record.bucket_ids,
-                })
-                .collect(),
             bucket_usage: header
                 .bucket_usage
                 .into_iter()
@@ -235,14 +229,6 @@ impl GroupSnapshotFrameIter {
             buckets: stream_snapshot.buckets.clone(),
             erased_buckets: stream_snapshot.erased_buckets.clone(),
             next_cold_gc_seq: stream_snapshot.next_cold_gc_seq,
-            shared_cold_object_owners: stream_snapshot
-                .shared_cold_object_owners
-                .iter()
-                .map(|record| proto::SharedColdObjectOwnersV1 {
-                    s3_path: record.s3_path.clone(),
-                    bucket_ids: record.bucket_ids.clone(),
-                })
-                .collect(),
             bucket_usage: stream_snapshot
                 .bucket_usage
                 .iter()
@@ -331,10 +317,13 @@ fn stream_to_proto(
             .into_iter()
             .map(producer_to_proto)
             .collect(),
-        retained_offset: entry.retained_offset,
+        retained_offset: Some(entry.retained_offset),
     })
 }
 
+/// Entry field 16 `retained_offset` stays `optional` on the wire; every
+/// writer sets it, so an absent value is corruption. (Dropping `optional`
+/// would make writers omit a zero.)
 fn stream_from_proto(
     entry: proto::StreamSnapshotEntryV1,
 ) -> Result<StreamSnapshotEntry, SnapshotStoreError> {
@@ -354,7 +343,7 @@ fn stream_from_proto(
             .into_iter()
             .map(object_ref_from_proto)
             .collect(),
-        retained_offset: entry.retained_offset,
+        retained_offset: required(entry.retained_offset, "snapshot stream retained_offset")?,
         visible_snapshot: entry.visible_snapshot.map(visible_snapshot_from_proto),
         producer_states: entry
             .producer_states
@@ -630,8 +619,8 @@ mod tests {
                         seq: 7,
                         bucket_id: "bucket".to_owned(),
                         not_before_ms: 0,
-                        target: ColdGcTarget::Stream(BucketStreamId::new("bucket", "legacy")),
-                        cold_generation: None,
+                        target: ColdGcTarget::Stream(BucketStreamId::new("bucket", "deleted")),
+                        cold_generation: Some(1_233),
                         defer_attempts: 0,
                     },
                     ColdGcEntry {
@@ -644,10 +633,6 @@ mod tests {
                     },
                 ],
                 next_cold_gc_seq: 9,
-                shared_cold_object_owners: vec![SharedColdObjectOwnersSnapshot {
-                    s3_path: "_packs/legacy.bin".to_owned(),
-                    bucket_ids: vec!["bucket".to_owned(), "other-bucket".to_owned()],
-                }],
                 bucket_usage: vec![ursula_stream::BucketUsageSnapshot {
                     bucket_id: "bucket".to_owned(),
                     usage: ursula_stream::BucketUsage {
@@ -734,6 +719,11 @@ mod tests {
         entry.producer_states[0].last_seen_ms = None;
         let error = stream_from_proto(entry).expect_err("absent last_seen_ms");
         assert!(error.to_string().contains("last_seen_ms"), "{error}");
+        // So does entry field 16.
+        let mut entry = stream_to_proto(stream_snapshot.streams[0].clone()).expect("encode entry");
+        entry.retained_offset = None;
+        let error = stream_from_proto(entry).expect_err("absent retained_offset");
+        assert!(error.to_string().contains("retained_offset"), "{error}");
         let snapshot = GroupSnapshot {
             placement: ShardPlacement {
                 core_id: CoreId(0),
@@ -778,9 +768,8 @@ mod tests {
             buckets: Vec::new(),
             erased_buckets: Vec::new(),
             next_cold_gc_seq: 0,
-            shared_cold_object_owners: Vec::new(),
             bucket_usage: Vec::new(),
-            committed_write_unit_bytes: None,
+            committed_write_unit_bytes: Some(ursula_stream::COMMITTED_WRITE_UNIT_BYTES),
             last_created_at_ms: 0,
         }
     }
@@ -853,9 +842,8 @@ mod tests {
                     buckets: Vec::new(),
                     erased_buckets: Vec::new(),
                     next_cold_gc_seq: 0,
-                    shared_cold_object_owners: Vec::new(),
                     bucket_usage: Vec::new(),
-                    committed_write_unit_bytes: None,
+                    committed_write_unit_bytes: Some(ursula_stream::COMMITTED_WRITE_UNIT_BYTES),
                     last_created_at_ms: 0,
                 },
             )),
@@ -870,7 +858,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_snapshot_with_a_different_write_unit() {
+    fn rejects_a_snapshot_with_a_different_or_absent_write_unit() {
+        for (unit, expected) in [(Some(4096), "4096"), (None, "committed_write_unit_bytes")] {
+            let error = decode_group_snapshot(&write_unit_snapshot(unit))
+                .expect_err("unit mismatch must fail restore");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    fn write_unit_snapshot(committed_write_unit_bytes: Option<u64>) -> Vec<u8> {
         let header = proto::SnapshotHeaderV1 {
             placement: Some(placement_to_proto(ShardPlacement {
                 core_id: CoreId(0),
@@ -881,28 +877,19 @@ mod tests {
             buckets: Vec::new(),
             erased_buckets: Vec::new(),
             next_cold_gc_seq: 0,
-            shared_cold_object_owners: Vec::new(),
             bucket_usage: Vec::new(),
-            committed_write_unit_bytes: Some(4096),
+            committed_write_unit_bytes,
             last_created_at_ms: 0,
         };
-        let bytes = [
+        [
             epoch_frame(ursula_stream::FORMAT_EPOCH),
             encode_frame(proto::SnapshotFrameV1 {
                 frame: Some(proto::snapshot_frame_v1::Frame::Header(header)),
             })
             .expect("encode header"),
-            encode_frame(proto::SnapshotFrameV1 {
-                frame: Some(proto::snapshot_frame_v1::Frame::Footer(
-                    proto::SnapshotFooterV1 {},
-                )),
-            })
-            .expect("encode footer"),
+            footer_frame(),
         ]
-        .concat();
-
-        let error = decode_group_snapshot(&bytes).expect_err("unit mismatch must fail restore");
-        assert!(error.to_string().contains("4096"), "{error}");
+        .concat()
     }
 
     /// Bounded-state F16: a cold snapshot body travels through the codec as

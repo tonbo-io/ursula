@@ -1,6 +1,6 @@
-//! Raft-engine regression tests for `CompactCold` with all-shared inputs
+//! Raft-engine regression test for `CompactCold` with all-shared inputs
 //! (bounded-stream-state F2, Raft branch): direct shared-to-exclusive
-//! compaction, legacy pack migration and the bucket purge that depends on it.
+//! compaction.
 
 use std::sync::Arc;
 
@@ -17,7 +17,6 @@ use ursula_runtime::RuntimeConfig;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::load_cold_chunks_from_pages;
 use ursula_shard::BucketStreamId;
-use ursula_shard::RaftGroupId;
 
 use super::ColdRaftGroupEngineFactory;
 
@@ -28,18 +27,6 @@ fn spawn_raft_with_cold_store(config: RuntimeConfig, cold_store: Arc<ColdStore>)
         Some(cold_store),
     )
     .expect("spawn raft runtime")
-}
-
-fn stream_in_bucket_on_group(
-    runtime: &ShardRuntime,
-    group_id: RaftGroupId,
-    bucket_id: &str,
-    prefix: &str,
-) -> BucketStreamId {
-    (0..10_000)
-        .map(|index| BucketStreamId::new(bucket_id, format!("{prefix}-{index}")))
-        .find(|stream| runtime.locate(stream).raft_group_id == group_id)
-        .expect("stream on group")
 }
 
 /// C7/F14g: the cold generation of the stream's live incarnation.
@@ -54,7 +41,6 @@ async fn cold_generation(runtime: &ShardRuntime, stream: &BucketStreamId) -> u64
         .await
         .expect("head stream")
         .created_at_ms
-        .expect("incarnation")
 }
 
 async fn create_and_append(runtime: &ShardRuntime, stream: &BucketStreamId, payload: &[u8]) {
@@ -105,7 +91,7 @@ async fn raft_compacts_shared_slice_into_exclusive_chunk() {
     let stream = BucketStreamId::new("raft-compact", "shared");
     create_and_append(&runtime, &stream, b"aaaa").await;
 
-    let pack = "_packs/00000000/shared-compact.bin";
+    let pack = "raft-compact/_packs/00000000/shared-compact.bin";
     cold_store
         .write_chunk(pack, b"aaaabbbb")
         .await
@@ -160,78 +146,4 @@ async fn raft_compacts_shared_slice_into_exclusive_chunk() {
         .await
         .expect("read compacted stream");
     assert_eq!(read.payload, b"aaaa");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn raft_legacy_cross_bucket_pack_migration_and_bucket_purge() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let runtime = spawn_raft_with_cold_store(RuntimeConfig::new(1, 2), cold_store.clone());
-    let group_id = RaftGroupId(1);
-    let stream_a = stream_in_bucket_on_group(&runtime, group_id, "legacy-raft-a", "shared-a");
-    let stream_b = stream_in_bucket_on_group(&runtime, group_id, "legacy-raft-b", "shared-b");
-    create_and_append(&runtime, &stream_a, b"aaaa").await;
-    create_and_append(&runtime, &stream_b, b"bbbb").await;
-
-    let legacy_path = "_packs/00000001/legacy-cross-bucket.bin";
-    cold_store
-        .write_chunk(legacy_path, b"aaaabbbb")
-        .await
-        .expect("write legacy pack");
-    for (stream, object_offset, payload) in [
-        (&stream_a, 0, b"aaaa".as_slice()),
-        (&stream_b, 4, b"bbbb".as_slice()),
-    ] {
-        runtime
-            .flush_cold(FlushColdRequest {
-                cold_generation: cold_generation(&runtime, stream).await,
-                stream_id: stream.clone(),
-                chunk: shared_slice(legacy_path, object_offset, payload),
-            })
-            .await
-            .expect("publish legacy shared slice");
-    }
-
-    let migration = runtime
-        .migrate_legacy_shared_cold_once(2, 0)
-        .await
-        .expect("raft engine migrates legacy shared slices");
-    assert_eq!(migration.observed_chunks, 2);
-    assert_eq!(migration.migrated_chunks, 2);
-    assert_eq!(migration.pending_chunks, 0);
-    runtime
-        .run_cold_gc_all_groups_once(256)
-        .await
-        .expect("delete legacy pack");
-    let legacy = shared_slice(legacy_path, 0, b"aaaa");
-    assert!(cold_store.read_chunk_range(&legacy, 0, 4).await.is_err());
-
-    let a_chunks = page_chunks(&cold_store, &stream_a).await;
-    let b_chunks = page_chunks(&cold_store, &stream_b).await;
-    assert_eq!(a_chunks.len(), 1);
-    assert_eq!(b_chunks.len(), 1);
-    assert!(a_chunks.iter().all(|chunk| !chunk.shared_object));
-    assert!(a_chunks[0].s3_path.starts_with("legacy-raft-a/"));
-
-    let purge = runtime
-        .purge_bucket_all_groups("legacy-raft-a")
-        .await
-        .expect("purge migrated bucket on raft");
-    assert_eq!(purge.removed_streams, 1);
-    runtime
-        .run_cold_gc_all_groups_once(256)
-        .await
-        .expect("erase migrated bucket");
-    assert!(
-        cold_store
-            .read_chunk_range(&a_chunks[0], 0, 4)
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        cold_store
-            .read_chunk_range(&b_chunks[0], 0, 4)
-            .await
-            .expect("other bucket remains readable"),
-        b"bbbb"
-    );
 }

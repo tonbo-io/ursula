@@ -768,7 +768,7 @@ pub(crate) fn is_stale_cold_flush_candidate_error(err: &RuntimeError) -> bool {
 }
 
 /// Records the hot backlog a write response carried (F6a), falling back to
-/// a state-machine query when the response came from an older leader.
+/// a state-machine query when the response carries none.
 pub(crate) async fn record_write_hot_backlog(
     group: &mut Box<dyn GroupEngine>,
     metrics: &RuntimeMetricsInner,
