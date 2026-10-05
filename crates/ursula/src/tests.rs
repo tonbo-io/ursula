@@ -1242,10 +1242,22 @@ async fn long_poll_times_out_with_no_content_and_cleans_waiter() {
         "00000000000000000000"
     );
 
-    let response = http_get(&app, "/__ursula/metrics").await;
-    let body = body_bytes(response).await;
-    let body = std::str::from_utf8(&body).expect("utf8 body");
-    assert!(body.contains("\"live_read_waiters\":0"));
+    // The timed-out waiter is cancelled asynchronously (its drop queues the
+    // cancel), so the gauge reaches 0 shortly after the 204.
+    let mut cleaned = false;
+    for _ in 0..100 {
+        let response = http_get(&app, "/__ursula/metrics").await;
+        let body = body_bytes(response).await;
+        if std::str::from_utf8(&body)
+            .expect("utf8 body")
+            .contains("\"live_read_waiters\":0")
+        {
+            cleaned = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(cleaned, "the timed-out long-poll waiter is cleaned up");
 }
 
 // Base-contract pin; see base_contract_tests.rs.

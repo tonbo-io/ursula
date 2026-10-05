@@ -126,7 +126,8 @@ message GroupReadRequestV1 {
 }
 
 message HeadStreamReadV1 {
-  // Set by internal HEADs that read the leader's applied state. Unset (a
+  // Set by the `offset=now` HEAD of a `consistency=local` catch-up read,
+  // which reads the leader's applied state. Unset (a
   // HEAD that must reflect every acknowledged write, or a sender that omits
   // the field) the leader linearizes the HEAD (ReadIndex) before serving it.
   bool applied_state_only = 1;

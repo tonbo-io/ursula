@@ -57,6 +57,7 @@ use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
 use crate::request::ImportGroupStateRequest;
 use crate::request::ImportGroupStateResponse;
+use crate::request::LiveReadOwner;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
@@ -785,14 +786,23 @@ impl CoreWorker {
         }
     }
 
-    pub(crate) async fn require_live_read_owner(
+    pub(crate) async fn open_live_read(
         group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        request: HeadStreamRequest,
         placement: ShardPlacement,
-    ) -> Result<(), RuntimeError> {
-        group
-            .require_local_live_read_owner(placement)
+    ) -> Result<LiveReadOwner, RuntimeError> {
+        let exec_started_at = Instant::now();
+        let response = group
+            .open_live_read(request, placement)
             .await
-            .map_err(|err| RuntimeError::group_engine(placement, err))
+            .map_err(|err| RuntimeError::group_engine(placement, err));
+        metrics.record_group_engine_exec(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(exec_started_at),
+        );
+        response
     }
 
     /// Plain leadership check with no quorum round trip, for background

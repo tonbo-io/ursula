@@ -67,6 +67,7 @@ use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::GroupFlushColdFuture;
 use ursula_runtime::GroupHeadStreamFuture;
 use ursula_runtime::GroupInstallSnapshotFuture;
+use ursula_runtime::GroupOpenLiveReadFuture;
 use ursula_runtime::GroupPlanColdFlushFuture;
 use ursula_runtime::GroupPlanNextColdFlushBatchFuture;
 use ursula_runtime::GroupPublishSnapshotFuture;
@@ -74,7 +75,6 @@ use ursula_runtime::GroupPurgeBucketFuture;
 use ursula_runtime::GroupReadSnapshotFuture;
 use ursula_runtime::GroupReadStreamFuture;
 use ursula_runtime::GroupReadStreamPartsFuture;
-use ursula_runtime::GroupRequireLiveReadOwnerFuture;
 use ursula_runtime::GroupShutdownFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
@@ -1187,12 +1187,13 @@ impl GroupEngine for MadsimScopedGroupEngine {
         }))
     }
 
-    fn require_local_live_read_owner<'a>(
+    fn open_live_read<'a>(
         &'a mut self,
+        request: HeadStreamRequest,
         placement: ShardPlacement,
-    ) -> GroupRequireLiveReadOwnerFuture<'a> {
+    ) -> GroupOpenLiveReadFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
-            self.inner.require_local_live_read_owner(placement).await
+            self.inner.open_live_read(request, placement).await
         }))
     }
 

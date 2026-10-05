@@ -1291,7 +1291,16 @@ async fn deposed_leader_refuses_linearizable_reads() {
     );
     assert_refused(
         "live-read registration",
-        old.require_local_live_read_owner(placement()).await,
+        old.open_live_read(
+            HeadStreamRequest {
+                stream_id: stream_id.clone(),
+                now_ms: 0,
+                linearizable: true,
+                read_index: None,
+            },
+            placement(),
+        )
+        .await,
     );
 
     shutdown_all(&engines).await;

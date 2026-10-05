@@ -38,9 +38,18 @@ section of the extensions specification states this contract normatively.
 `HEAD`, `GET …/bootstrap`, snapshot reads and the registration of a long-poll
 or SSE reader take the same leadership confirmation on the leader, as do
 `offset=now` on a `consistency=leader` read.
-Reads that promise no linearizability skip it and use the leader's applied
-state: `offset=now` without `consistency=leader`, an SSE session's tail
-lookup after its registration, and a long-poll's timeout answer.
+A long-poll or SSE reader takes everything else it needs from that
+registration: its `offset=now` position, whether the stream exists, its
+content type and incarnation all come from the leader's state at or after the
+confirmed point. A long-poll also answers `416` there for an offset beyond the
+tail; an SSE session reports it as an `error` event from its first read. Its
+first read is served only by that leader while it still leads; a node that
+lost leadership in between redirects or answers `503` instead of asking a new
+leader that may not have applied everything yet. A long-poll that times out
+answers `204` at the requested offset.
+`offset=now` without `consistency=leader` skips the confirmation and uses the
+leader's applied state, so right after a leader change it may resolve to a
+tail that lags the committed one.
 
 With `consistency=leader`, `Stream-Up-To-Date: true` on a read means it reached the committed tail. On a local read it means the tail as the serving node knew it: a leader that has lost leadership without knowing it yet can mark a stale tail. A response without it is partial; keep reading from `Stream-Next-Offset`.
 

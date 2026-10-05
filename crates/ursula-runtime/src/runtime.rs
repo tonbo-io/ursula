@@ -86,6 +86,7 @@ use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
 use crate::request::ImportGroupStateRequest;
 use crate::request::ImportGroupStateResponse;
+use crate::request::LiveReadOwner;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
@@ -425,7 +426,7 @@ impl ShardRuntime {
     }
 
     /// Whether the local replica of the stream's group currently leads, by
-    /// its own view. Unlike `require_local_live_read_owner` this takes no
+    /// its own view. Unlike `open_live_read` this takes no
     /// quorum round trip; it gates background leader-side work only.
     async fn accepts_local_writes(&self, stream_id: &BucketStreamId) -> Result<bool, RuntimeError> {
         let placement = self.shard_map.locate(stream_id);
@@ -474,17 +475,17 @@ impl ShardRuntime {
     }
 
     /// A `leader_only` (`consistency=leader`) read is linearized before it
-    /// is queued; other reads are served from local state as before.
+    /// is queued. Other reads are served from local state as before, except
+    /// a live read pinned to its owner's read index
+    /// ([`ReadStreamRequest::read_index`]), which keeps that index.
     pub async fn read_stream(
         &self,
         mut request: ReadStreamRequest,
     ) -> Result<ReadStreamResponse, RuntimeError> {
-        let placement = self.shard_map.locate(&request.stream_id);
-        request.read_index = if request.leader_only {
-            self.confirm_read_index(placement).await?
-        } else {
-            None
-        };
+        if request.leader_only {
+            let placement = self.shard_map.locate(&request.stream_id);
+            request.read_index = self.confirm_read_index(placement).await?;
+        }
         self.queue_read_stream(request).await
     }
 
@@ -506,24 +507,25 @@ impl ShardRuntime {
         self.queue_bootstrap_stream(request).await
     }
 
-    /// Live-read registration (SSE, long-poll) requires this replica to be
-    /// the linearizable leader. A confirmed read index proves it without a
-    /// group-actor round trip; otherwise the engine decides.
-    pub async fn require_local_live_read_owner(
+    /// Live-read registration (SSE, long-poll): this replica must be the
+    /// linearizable leader of the stream's group. Confirms a read index and
+    /// reads the stream's state on this replica at or after it, without
+    /// forwarding; see [`LiveReadOwner`]. A replica that does not lead
+    /// answers the leader redirect (or 503). When the group has no barrier
+    /// yet, the engine confirms the index itself.
+    pub async fn open_live_read(
         &self,
-        stream_id: &BucketStreamId,
-    ) -> Result<(), RuntimeError> {
-        let placement = self.shard_map.locate(stream_id);
-        if self.confirm_read_index(placement).await?.is_some() {
-            return Ok(());
-        }
-        let (response_tx, response_rx) = oneshot::channel();
-        self.group_rpc(
-            placement,
-            None,
-            GroupCommand::RequireLiveReadOwner { response_tx },
-            response_rx,
-        )
+        stream_id: BucketStreamId,
+        now_ms: u64,
+    ) -> Result<LiveReadOwner, RuntimeError> {
+        let placement = self.shard_map.locate(&stream_id);
+        let read_index = self.confirm_read_index(placement).await?;
+        self.queue_open_live_read(HeadStreamRequest {
+            stream_id,
+            now_ms,
+            linearizable: true,
+            read_index,
+        })
         .await
     }
 
