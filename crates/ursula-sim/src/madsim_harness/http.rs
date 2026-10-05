@@ -552,12 +552,22 @@ pub(super) async fn run_http_protocol_surface_randomized_inner(
         let timeout = send(&app, "GET", &timeout_uri, &[], Body::empty()).await;
         assert_eq!(timeout.status(), StatusCode::NO_CONTENT);
 
-        let metrics = send(&app, "GET", "/__ursula/metrics", &[], Body::empty()).await;
-        assert_eq!(metrics.status(), StatusCode::OK);
-        let metrics_body = body_bytes(metrics).await;
-        let metrics_body =
-            std::str::from_utf8(&metrics_body).expect("utf8 randomized live-timeout metrics");
-        assert!(metrics_body.contains("\"live_read_waiters\":0"));
+        // The timed-out waiter is cancelled asynchronously (its drop queues
+        // the cancel), so the gauge reaches 0 shortly after the 204.
+        let mut cleaned = false;
+        for _ in 0..50 {
+            let metrics = send(&app, "GET", "/__ursula/metrics", &[], Body::empty()).await;
+            assert_eq!(metrics.status(), StatusCode::OK);
+            let metrics_body = body_bytes(metrics).await;
+            let metrics_body =
+                std::str::from_utf8(&metrics_body).expect("utf8 randomized live-timeout metrics");
+            if metrics_body.contains("\"live_read_waiters\":0") {
+                cleaned = true;
+                break;
+            }
+            madsim::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(cleaned, "the timed-out long-poll waiter is cleaned up");
         trace.push(SimEvent::HttpProtocolSurfaceRandomizedLiveTimeoutVerified {
             stream: config.stream.clone(),
             timeout_ms,

@@ -130,10 +130,10 @@ pub struct HeadStreamRequest {
     pub now_ms: u64,
     /// `true` when the HEAD promises linearizability (D10), so the leader
     /// confirms a read index first: a client HEAD and the `offset=now`
-    /// resolution of a `consistency=leader` read. `false` for internal HEADs
-    /// that need only the leader's applied state: the `offset=now`
-    /// resolution of `consistency=local` reads, the SSE tail lookup, the
-    /// long-poll timeout answer.
+    /// resolution of a `consistency=leader` read. `false` for the `offset=now`
+    /// resolution of `consistency=local` catch-up reads, which needs only
+    /// the leader's applied state. Live reads take no separate HEAD; see
+    /// [`LiveReadOwner`].
     pub linearizable: bool,
     /// The read index this request was linearized at before it was queued
     /// (D10): `ShardRuntime` confirms the group's leadership and waits
@@ -173,8 +173,28 @@ pub struct ReadStreamRequest {
     /// write; ordinary catch-up consumers keep the cheaper follower-local
     /// behavior.
     pub leader_only: bool,
-    /// For a `leader_only` read only; see [`HeadStreamRequest::read_index`].
+    /// For a `leader_only` read, the index the runtime confirmed before
+    /// queueing it; see [`HeadStreamRequest::read_index`]. Without
+    /// `leader_only`, a live read sets it to its owner's confirmed index
+    /// ([`LiveReadOwner::read_index`]): the engine then serves the read only
+    /// while this replica leads and has applied that index, never forwards
+    /// it, and otherwise answers the leader redirect or 503. `None` for
+    /// every other read.
     pub read_index: Option<u64>,
+}
+
+/// What a live read (SSE, long-poll) learned from its owner check (D10):
+/// this replica confirmed it leads the stream's group at `read_index` and
+/// read `head` from state at or after that index. The live read resolves
+/// `offset=now`, existence, content type, incarnation and the 416 check
+/// from `head`, and pins its later reads to `read_index`
+/// ([`ReadStreamRequest::read_index`]), so no lookup of a live read is
+/// answered by a replica that has not applied what the owner confirmed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveReadOwner {
+    /// `None` for an engine without a Raft log (single-node, in-memory).
+    pub read_index: Option<u64>,
+    pub head: HeadStreamResponse,
 }
 
 impl ReadStreamRequest {
@@ -183,6 +203,7 @@ impl ReadStreamRequest {
             && self.offset == other.offset
             && self.max_len == other.max_len
             && self.leader_only == other.leader_only
+            && self.read_index.is_some() == other.read_index.is_some()
     }
 }
 
