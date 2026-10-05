@@ -237,6 +237,14 @@ jobs:
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
             external_locators_survive producer_state_matches --nocapture
 
+      # Memory-WAL rejoin (0.6.2): a minority restarted empty heals itself to
+      # a voter while writes continue; a majority restarted empty stops writes
+      # without losing an acknowledged one until the operator adopts the
+      # survivor.
+      - name: Run memory-WAL rejoin scenarios
+        run: |
+          RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- memory_wal_ --nocapture
+
       - name: Verify expected-failure replay and minimization
         run: |
           assert_minimized_failure_trace() {

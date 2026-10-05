@@ -58,6 +58,8 @@ curl -X DELETE http://127.0.0.1:4438/__ursula/leadership-shed/maintenance
 
 The leader-transfer endpoint refuses with `409 Conflict` if the receiving node isn't the current leader and `400 Bad Request` if the target isn't a voter. This is why `ursulactl` is the safer way to chain these calls: it consults metrics first.
 
+On a memory-WAL cluster the group leader keeps every group at its configured voters: if the membership endpoint drops a configured voter, the leader adds it back as a learner and promotes it again once it has caught up (see [Restarting a memory-WAL node](#restarting-a-memory-wal-node)). Membership changes there are for repair, not for shrinking a group.
+
 The membership endpoint has the same leader-only contract: it answers `409 Conflict` (with the current leader's id in the body) when the receiving node does not lead the group, and `400 Bad Request` without a non-empty `voters` query parameter. On success it returns the log index at which the new voter set was committed. It replaces the whole voter set in one call, so include every node that should remain a voter.
 
 ### Maintenance drain
@@ -78,21 +80,30 @@ The membership endpoint has the same leader-only contract: it answers `409 Confl
 
 ### Rejoining a wiped node
 
-Rebuild a wiped voter through committed membership: remove it from each affected voter set, attach it as a blocking learner with its current address, and promote it only after snapshot and log catch-up. Use `ursulactl repair-restarted-voter` for the cluster-wide, resumable sequence. A process-local log-reversion trigger is not a durable recovery contract and is not exposed by Ursula's admin API.
+Rebuild a wiped voter through committed membership: remove it from each affected voter set, attach it as a blocking learner with its current address, and promote it only after snapshot and log catch-up. Use `ursulactl repair-restarted-voter` for the cluster-wide, resumable sequence. A process-local log-reversion trigger is not a durable recovery contract; the admin API uses it only to adopt a survivor after a majority of a memory-WAL group restarted (below). A memory-WAL node restarted alone is rebuilt automatically from 0.6.2.
 
 ### Restarting a memory-WAL node
 
-Every restart of a node on `raft.wal.backend = "memory"`, planned or not, wipes it, and it comes back as an *amnesiac voter*. Production clusters must use the disk WAL; the memory WAL is for development, benchmarks and chaos (`raft.wal.allow_volatile_multi_peer`).
+Every restart of a node on `raft.wal.backend = "memory"`, planned or not, wipes it: it comes back with an empty Raft log. Production clusters must use the disk WAL; the memory WAL is for development, benchmarks and chaos (`raft.wal.allow_volatile_multi_peer`). From 0.6.2 a restarted node is rebuilt automatically when it is the only one of its groups to lose its log, and a group that loses the log on a majority of its voters stops instead of losing acknowledged writes.
 
-What happens to each group on the restarted node:
+**A minority restarts (one node of three).** Nothing to do. For each group on the restarted node:
 
-- **It starts with an empty Raft log.** Where it is the group's per-group membership initializer (`raft.init_membership_per_group = true`, the chart default; group `g` belongs to the `g mod voters`-th voter), it runs membership initialization again and reports itself a voter holding only the bootstrap membership entry, unless S3 snapshots are configured (`storage.cold.backend = "s3"` with `storage.snapshot.backend` `auto` or `s3`) and it sees a leader within `raft.rejoin_probe` (6 s by default); then it reports no membership, as on the other groups. `raft.memory_bootstrap_marker_dir` does not help: it is unset by default and in the chart, and when set it makes such a restart fail instead of rejoining.
-- **The leader still counts it as a voter and does not resend what it lost.** The leader keeps the replication progress it recorded before the restart (Ursula does not enable OpenRaft's log-reversion reset), so an idle group can leave the node empty indefinitely.
-- **It grants its vote to any candidate**, because an empty log is never newer than the candidate's. It can elect a peer that lacks entries that were committed with this node's copy before the restart.
+- **It does not initialize the group again.** A per-group membership initializer (`raft.init_membership_per_group = true`, the chart default) runs `Initialize` only when every other configured voter answers that it holds nothing for the group either and no leader is seen; a fresh install still bootstraps this way. One voter holding entries or following a leader means the group exists, and the node waits to be replicated to. It waits for every voter, not a quorum, so a fresh install with a voter that never comes up stays uninitialized (it logs "waits for every voter before initializing").
+- **It does not vote until it has caught up.** Until the node holds the log that its leader had committed when it first heard from that leader, it refuses every vote for a candidate whose log is not empty and, once it has seen committed entries, every candidate. It can never help elect a leader that lacks entries committed with its lost copy.
+- **The leader rebuilds it.** The leader sees the node answer that it lacks entries it had acknowledged, and runs the same sequence as `ursulactl repair-restarted-voter`: commit a voter set without the node, add it back as a learner, wait until it has replicated the commit index, promote it. Each step is read off the current membership, so a leader change, another restart of the node, or `repair-restarted-voter` running at the same time all converge. Leadership handoffs (the balancer, the commit-stall watchdog) skip the node until then.
 
-Until the node is rebuilt, the group holds two real copies while reporting three. One more failure, including the next node in a rolling restart, can lose acknowledged writes or leave the group without a leader.
+`ursulactl verify-cluster` shows the node unready until every group has promoted it. The chart's graceful-rollout hook still runs `repair-restarted-voter` after a prepared restart; it finds nothing left to do. During a rolling upgrade from 0.6.1, a group whose leader still runs 0.6.1 is not rebuilt automatically; the hook rebuilds it, and the 0.6.2 node refuses to vote meanwhile.
 
-The rebuild is `ursulactl repair-restarted-voter --node N`: for every unready group it commits a voter set without the node, attaches it as a blocking learner, and promotes it after catch-up. The chart's graceful-rollout hook runs it after every prepared restart, and from 0.6.1 `ursulactl` readiness (`verify-cluster`, `wait`) counts an empty voter as unready (the pod's `/readyz` probe does not), so a prepared rollout rebuilds every group. Nothing rebuilds the node after an unplanned restart (crash, OOM kill, eviction, node loss): run `ursulactl verify-cluster`, and if it reports the node unready, run `ursulactl repair-restarted-voter --node N` before restarting anything else.
+**A majority restarts at once (two nodes of three), or every node.** The group stops accepting writes and waits for an operator. The empty nodes refuse every candidate, and a surviving leader never removes a voter because the removal could not commit, so no leader with an incomplete log is ever elected and no acknowledged write is silently lost. Writes answer `503` with `Retry-After` while no leader exists; a surviving node that still believes it leads accepts writes it cannot commit, so they time out. A restart of every node of a group leaves nothing to keep: the groups initialize again, empty (the format-epoch marker in object storage is written on the first pod's start, before any group exists, so it cannot tell a full restart from a fresh install).
+
+To recover from a majority restart, pick the survivor whose log you keep: on each affected group, the voter with the highest `last_log_index` in `GET /__ursula/metrics`. Acknowledged writes that only the lost nodes held are gone; adopting the survivor accepts that. Then run, on every node of the group (through each node's admin listener, as below):
+
+```bash
+# group 42, survivor node 1
+curl -X POST http://127.0.0.1:4438/__ursula/raft/42/rejoin/adopt-survivor/1
+```
+
+On an empty node this lets it vote for the survivor (and only the survivor) while it is behind (`"action": "vote_released"`). On the survivor, if it still leads, it lets it replicate the emptied nodes from the start (`"followers_reset"`); if it does not lead (`"survivor_not_leader"`), it wins the next election once the others released their vote. The group then heals as after a minority restart. This is the only use of OpenRaft's one-shot log-reversion reset; it is process-local, so repeat the call if the survivor restarts or loses leadership before the emptied nodes caught up.
 
 `POST /__ursula/cluster-probe` also exists on the client plane, but it is machinery rather than an operator surface: nodes send each other heartbeat-sized bodies through it to verify cluster-plane egress, and it bypasses ingress admission.
 

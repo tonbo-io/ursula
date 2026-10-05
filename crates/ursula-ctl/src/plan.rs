@@ -240,7 +240,8 @@ pub fn classify_amnesiac_voter(
 ///   2. The target's last_applied_index >= max peer committed_index - lag_tolerance.
 ///   3. The target has applied something once any peer has committed past the
 ///      initial membership entry. An empty voter (a memory-WAL node that
-///      re-initialized its membership on restart) is never ready, whatever the
+///      re-initialized its membership on restart: 0.6.1 and earlier, or a
+///      0.6.1 leader during a rolling upgrade) is never ready, whatever the
 ///      lag tolerance: the leader may never backfill it, and counting it ready
 ///      leaves the group on two real copies.
 ///

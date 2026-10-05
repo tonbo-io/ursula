@@ -48,9 +48,9 @@ The local `raft.node_id` must appear in `[[raft.peers]]`. The peer list always i
 Use `raft.wal.backend = "disk"` for a real cluster. Memory WAL remains available
 for development, benchmarks, and chaos tests, but more than one configured peer
 requires `raft.wal.allow_volatile_multi_peer = true` so the loss-on-restart
-contract is explicit. A restarted memory-WAL node rejoins as an empty voter that
-the leaders do not backfill, so rebuild it with `ursulactl repair-restarted-voter`
-after any restart the rollout hook did not handle (see
+contract is explicit. A memory-WAL node restarted alone is rebuilt by its group
+leaders; a group whose majority restarted at once stops accepting writes until an
+operator adopts the survivor (see
 [Restarting a memory-WAL node](/docs/operations#restarting-a-memory-wal-node)).
 
 ### `storage.cold.s3.bucket is required when cold backend is 's3'`

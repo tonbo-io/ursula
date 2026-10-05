@@ -47,6 +47,8 @@ use ursula_shard::ShardPlacement;
 
 use crate::meta::MetaRaftTypeConfig;
 use crate::read_index::ReadIndexBarrier;
+use crate::rejoin::AdoptSurvivorOutcome;
+use crate::rejoin::GroupRejoin;
 use crate::snapshot_codec::decode_group_snapshot;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::state_machine::SnapshotBuildCoordinator;
@@ -153,6 +155,9 @@ impl RaftNetworkV2<MetaRaftTypeConfig> for SingleNodeRaftNetwork {
 pub struct InProcessRaftRegistry {
     nodes: Arc<Mutex<BTreeMap<u64, Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>>>>,
     full_snapshot_calls: Arc<Mutex<BTreeMap<u64, usize>>>,
+    /// Each node's memory-WAL rejoin state, screening the votes and appends
+    /// delivered to it.
+    rejoins: Arc<Mutex<BTreeMap<u64, Arc<GroupRejoin>>>>,
 }
 
 impl InProcessRaftRegistry {
@@ -181,6 +186,23 @@ impl InProcessRaftRegistry {
             .cloned()
     }
 
+    /// Screen the votes and appends delivered to `node_id` through its
+    /// memory-WAL rejoin state (replaces a previous registration).
+    pub fn register_rejoin(&self, node_id: u64, rejoin: Arc<GroupRejoin>) {
+        self.rejoins
+            .lock()
+            .expect("in-process raft rejoin mutex")
+            .insert(node_id, rejoin);
+    }
+
+    pub fn rejoin(&self, node_id: u64) -> Option<Arc<GroupRejoin>> {
+        self.rejoins
+            .lock()
+            .expect("in-process raft rejoin mutex")
+            .get(&node_id)
+            .cloned()
+    }
+
     pub fn full_snapshot_count(&self, node_id: u64) -> usize {
         self.full_snapshot_calls
             .lock()
@@ -205,6 +227,7 @@ pub struct InProcessRaftNetworkFactory {
     registry: InProcessRaftRegistry,
     source: Option<u64>,
     policy: InProcessRaftNetworkPolicy,
+    rejoin: Option<Arc<GroupRejoin>>,
 }
 
 impl InProcessRaftNetworkFactory {
@@ -213,7 +236,15 @@ impl InProcessRaftNetworkFactory {
             registry,
             source: None,
             policy: InProcessRaftNetworkPolicy::default(),
+            rejoin: None,
         }
+    }
+
+    /// The sending node's memory-WAL rejoin state: replication answers that
+    /// show a follower lost its log go to it instead of to OpenRaft.
+    pub fn with_rejoin(mut self, rejoin: Arc<GroupRejoin>) -> Self {
+        self.rejoin = Some(rejoin);
+        self
     }
 
     pub fn with_source(mut self, source: u64) -> Self {
@@ -236,6 +267,7 @@ impl RaftNetworkFactory<UrsulaRaftTypeConfig> for InProcessRaftNetworkFactory {
             target,
             registry: self.registry.clone(),
             policy: self.policy.clone(),
+            rejoin: self.rejoin.clone(),
         }
     }
 }
@@ -494,6 +526,7 @@ pub struct InProcessRaftNetwork {
     target: u64,
     registry: InProcessRaftRegistry,
     policy: InProcessRaftNetworkPolicy,
+    rejoin: Option<Arc<GroupRejoin>>,
 }
 
 impl InProcessRaftNetwork {
@@ -581,12 +614,26 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             target: self.target,
             kind: InProcessRaftRpcKind::AppendEntries,
         });
-        target.append_entries(rpc).await.map_err(|err| {
+        if let Some(target_rejoin) = self.registry.rejoin(self.target) {
+            target_rejoin.observe_inbound_append(&rpc);
+        }
+        let leader = rpc.vote;
+        let prev_log_id = rpc.prev_log_id;
+        let response = target.append_entries(rpc).await.map_err(|err| {
             RPCError::Network(NetworkError::from_string(format!(
                 "remote AppendEntries on node {}: {err}",
                 self.target
             )))
-        })
+        })?;
+        if let Some(rejoin) = &self.rejoin
+            && rejoin.follower_lost_log(self.target, &leader, prev_log_id.as_ref(), &response)
+        {
+            return Err(RPCError::Network(NetworkError::from_string(format!(
+                "node {} lost Raft log entries it had acknowledged",
+                self.target
+            ))));
+        }
+        Ok(response)
     }
 
     async fn vote(
@@ -611,6 +658,13 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             target: self.target,
             kind: InProcessRaftRpcKind::Vote,
         });
+        if let Some(refusal) = self
+            .registry
+            .rejoin(self.target)
+            .and_then(|rejoin| rejoin.screen_vote(&rpc))
+        {
+            return Ok(refusal);
+        }
         target.vote(rpc).await.map_err(|err| {
             RPCError::Network(NetworkError::from_string(format!(
                 "remote Vote on node {}: {err}",
@@ -842,6 +896,9 @@ pub struct RaftGroupHandleRegistry {
     /// Each group's coalescing ReadIndex barrier, so forwarded gRPC reads
     /// share confirmation rounds with the group's local reads.
     read_barriers: Arc<Mutex<BTreeMap<u32, Arc<ReadIndexBarrier>>>>,
+    /// Memory-WAL rejoin state per group: the vote gate and the followers a
+    /// leader saw lose their log.
+    rejoins: Arc<Mutex<BTreeMap<u32, Arc<GroupRejoin>>>>,
     dynamic_hosted_groups: Arc<Mutex<BTreeSet<RaftGroupId>>>,
     leadership_shed: LeadershipShedFlag,
     transport_shutdown: watch::Sender<bool>,
@@ -857,6 +914,7 @@ impl Default for RaftGroupHandleRegistry {
             groups: Arc::new(Mutex::new(BTreeMap::new())),
             cold_index_caches: Arc::new(Mutex::new(BTreeMap::new())),
             read_barriers: Arc::new(Mutex::new(BTreeMap::new())),
+            rejoins: Arc::new(Mutex::new(BTreeMap::new())),
             dynamic_hosted_groups: Arc::new(Mutex::new(BTreeSet::new())),
             leadership_shed: Arc::new(AtomicU8::new(0)),
             transport_shutdown,
@@ -990,6 +1048,50 @@ impl RaftGroupHandleRegistry {
             .expect("raft group read barrier mutex")
             .get(&raft_group_id.0)
             .cloned()
+    }
+
+    /// Records the group's memory-WAL rejoin state. Register it before the
+    /// Raft handle, so no vote reaches the group unscreened.
+    pub fn register_rejoin(&self, raft_group_id: RaftGroupId, rejoin: Arc<GroupRejoin>) {
+        self.rejoins
+            .lock()
+            .expect("raft group rejoin mutex")
+            .insert(raft_group_id.0, rejoin);
+    }
+
+    /// The group's memory-WAL rejoin state, if it has one.
+    pub fn rejoin(&self, raft_group_id: RaftGroupId) -> Option<Arc<GroupRejoin>> {
+        self.rejoins
+            .lock()
+            .expect("raft group rejoin mutex")
+            .get(&raft_group_id.0)
+            .cloned()
+    }
+
+    /// Whether `target` lost its log under this node's leadership of the
+    /// group (leadership handoffs skip such a follower).
+    pub fn is_reverted_follower(&self, raft_group_id: RaftGroupId, target: u64) -> bool {
+        self.rejoin(raft_group_id)
+            .is_some_and(|rejoin| rejoin.is_reverted_follower(target))
+    }
+
+    /// Operator recovery after a majority restart of a memory-WAL group; see
+    /// [`GroupRejoin::adopt_survivor`].
+    pub async fn adopt_rejoin_survivor(
+        &self,
+        raft_group_id: RaftGroupId,
+        survivor: u64,
+    ) -> Result<AdoptSurvivorOutcome, String> {
+        let raft = self
+            .require_group(raft_group_id)
+            .map_err(|err| err.to_string())?;
+        let rejoin = self.rejoin(raft_group_id).ok_or_else(|| {
+            format!(
+                "raft group {} has no memory-WAL rejoin state (not a memory-WAL group)",
+                raft_group_id.0
+            )
+        })?;
+        rejoin.adopt_survivor(&raft, survivor).await
     }
 
     /// The group's shared cold-index page cache, if one was registered.
@@ -1172,6 +1274,9 @@ impl RaftGroupHandleRegistry {
         request: AppendEntriesRequest<UrsulaRaftTypeConfig>,
     ) -> Result<AppendEntriesResponse<UrsulaRaftTypeConfig>, GroupEngineError> {
         let raft = self.require_group(raft_group_id)?;
+        if let Some(rejoin) = self.rejoin(raft_group_id) {
+            rejoin.observe_inbound_append(&request);
+        }
         raft.append_entries(request)
             .await
             .map_err(|err| GroupEngineError::new(format!("OpenRaft AppendEntries: {err}")))
@@ -1183,6 +1288,12 @@ impl RaftGroupHandleRegistry {
         request: VoteRequest<UrsulaRaftTypeConfig>,
     ) -> Result<VoteResponse<UrsulaRaftTypeConfig>, GroupEngineError> {
         let raft = self.require_group(raft_group_id)?;
+        if let Some(refusal) = self
+            .rejoin(raft_group_id)
+            .and_then(|rejoin| rejoin.screen_vote(&request))
+        {
+            return Ok(refusal);
+        }
         raft.vote(request)
             .await
             .map_err(|err| GroupEngineError::new(format!("OpenRaft Vote: {err}")))

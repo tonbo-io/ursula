@@ -753,6 +753,11 @@ pub async fn repair_restarted_voter(
             )
         })?;
         let voters = group.voter_ids.iter().copied().collect::<BTreeSet<_>>();
+        // A 0.6.2 leader rebuilds a restarted memory-WAL voter by itself, the
+        // same way; it may already have promoted it again.
+        if voters == configured_node_ids {
+            continue;
+        }
         if voters != survivor_node_ids {
             bail!(
                 "group {} did not converge to survivor voter set {:?}: {:?}",
@@ -987,7 +992,10 @@ async fn wait_repair_learners_caught_up(
                     "restart anchor {leader_anchor} lost group {group_id} during learner catch-up"
                 )
             })?;
-            if !anchor_group.learner_ids.contains(&target.id) {
+            // The leader's own heal driver may have promoted it already.
+            if !anchor_group.learner_ids.contains(&target.id)
+                && !anchor_group.voter_ids.contains(&target.id)
+            {
                 bail!(
                     "group {group_id} does not contain restarted node {} as a learner",
                     target.id
