@@ -48,6 +48,20 @@ for chart in charts/ursula charts/ursula-chaos; do
   fi
 done
 
+# The docs' release notes have a section for the release, and a GitHub
+# release-body notice (`release.yml` puts it above the generated notes) opens
+# with the same paragraph as that section.
+notes=docs/web/src/content/docs/pages/release-notes.mdx
+if ! grep -qxF "## ${workspace}" "${notes}"; then
+  echo "${notes} has no '## ${workspace}' section" >&2
+  status=1
+fi
+notice=".github/release-notes/${workspace}.md"
+if [ -f "${notice}" ] && ! grep -qxF "$(head -n 1 "${notice}")" "${notes}"; then
+  echo "${notes} does not contain the first line of ${notice}" >&2
+  status=1
+fi
+
 if [ "${status}" -ne 0 ]; then
   cat >&2 <<EOF
 

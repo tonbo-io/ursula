@@ -1,5 +1,7 @@
 # Codebase Size Reduction Plan
 
+> **Historical.** A plan from July 2026, before Ursula 0.6.0; its names, paths and line counts describe the code of that time, including features 0.6.0 removed. It is not maintained.
+
 ## Objective
 
 Shrink the Ursula workspace from ~93.9k lines of Rust (66.4k production, 27.5k

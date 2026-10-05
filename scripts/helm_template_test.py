@@ -411,7 +411,6 @@ class HelmTemplateConfigTest(unittest.TestCase):
         )
         parsed = tomllib.loads(config)
 
-        self.assertNotIn("snapshot_pressure_unpurged_logs", parsed["raft"])
         self.assertEqual(parsed["raft"]["snapshot_pressure_max_groups_per_tick"], 8)
 
     def test_snapshot_s3_renders_complete_config(self) -> None:

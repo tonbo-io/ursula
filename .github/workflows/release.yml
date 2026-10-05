@@ -237,10 +237,19 @@ jobs:
           fi
 
           if ! gh release view "$tag" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            # A release that needs a notice (a breaking one) commits it as
+            # .github/release-notes/<version>.md; gh puts it above the
+            # generated notes.
+            notes=()
+            notice=".github/release-notes/${RELEASE_VERSION}.md"
+            if [ -f "$notice" ]; then
+              notes=(--notes-file "$notice")
+            fi
             gh release create "$tag" \
               --repo "$REPOSITORY" \
               --verify-tag \
               --title "Ursula $RELEASE_VERSION" \
+              "${notes[@]}" \
               --generate-notes
           fi
 

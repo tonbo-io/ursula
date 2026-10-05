@@ -1,8 +1,8 @@
 name: Deploy docs
 
-# Frozen until the 0.6.0 release: main is removing features that 0.5.1 users still need documented,
-# so pushes to main do not deploy. Dispatch by hand with the ref to publish; the release PR restores
-# the push trigger.
+# Frozen until the 0.6.0 release: main documents 0.6.0 before it is published, so pushes to main do
+# not deploy. Dispatch by hand with the ref to publish (the release commit, once 0.6.0 is out); a
+# follow-up after the release restores the push trigger.
 
 on:
   workflow_dispatch:

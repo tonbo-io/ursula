@@ -117,7 +117,8 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
 }
 
 /// `Stream-Incarnation` (D12): the opaque token of the stream incarnation
-/// that served a response. `0` means unknown (an older peer) and is omitted.
+/// that served a response. `0` means unknown and is omitted; every epoch-2
+/// leader sets it, and a stream's `created_at_ms` is never `0`.
 pub(crate) fn insert_incarnation(headers: &mut HeaderMap, incarnation: u64) {
     if incarnation != 0 {
         insert_u64_header(headers, HEADER_STREAM_INCARNATION, incarnation);
