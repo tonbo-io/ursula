@@ -58,6 +58,12 @@ evidence scope attached. Milestones advance only after their exit criteria.
 An interrupted migration is a runtime operation status, not automatically a
 blocked implementation milestone.
 
+M4 is the final milestone of this epic. Completing M4 completes the epic only
+when every preceding milestone, every constituent story and the cross-cutting
+acceptance gates have passed with recorded evidence, and the documented change
+is ready to merge. Autopilot code alone does not satisfy that definition. The
+follow-up items outside the initial contract above are not completion gates.
+
 ## M1 — durable control plane and replication policy
 
 | Story | Deliverable and exit criteria | Dependencies | Status |
@@ -65,7 +71,7 @@ blocked implementation milestone.
 | HS-101 | Persist and restore meta vote, log, committed/applied state and snapshots; recover correctly after compaction and crash/restart without resurrecting discarded intent | M0 | Complete: commit `b7352ea` |
 | HS-102 | Implement default/per-group RF=3/5 and one-domain-loss policy; infer/validate existing placements on adoption; reject invalid policies and bootstrap drift | M0 | Complete: commit `5c7e413` (deterministic policy/adoption layer) |
 | HS-103 | Concrete multi-node meta transport, independent meta voters, one-time bootstrap, cluster identity and trusted client/cluster/admin node directory | HS-101, HS-102 | Complete: commit `73f6970` (coordinated static-to-managed adoption) |
-| HS-104 | Ordered placement/policy projections with full-snapshot resync; data/node startup restores assignments without reinitializing from stale TOML | HS-103 | In progress: commits `d591c26`, `73f6970`, `a5e6740`, `064a1af`, `8b88822`, `d0d3bb9`, `82e1563`, `f5124a8`, `43f48d8` (ordered node/gateway recovery, pruning and intent-aware inventory consumers; active-assignment binary recovery acceptance pending) |
+| HS-104 | Ordered placement/policy projections with full-snapshot resync; data/node startup restores assignments without reinitializing from stale TOML | HS-103 | In progress: commits `d591c26`, `73f6970`, `a5e6740`, `064a1af`, `8b88822`, `d0d3bb9`, `82e1563`, `f5124a8`, `43f48d8`, `db45b1a` (ordered consumers and binary learner recovery during external S3 snapshot prefetch; remaining active-assignment recovery phases pending) |
 
 M1 acceptance includes multi-node meta leader turnover and a durable full
 restart after snapshot/log compaction. Test RF=3/quorum=2 and RF=5/quorum=3,
@@ -86,10 +92,10 @@ already accepts the meta type config.
 | --- | --- | --- | --- |
 | HS-201 | Intent-bound state transitions, operation idempotency, epoch CAS, source/target policy and membership-step evidence; no successful finish without verified placement | M1 | In progress: commits `6530772`, `e877d48` (replicated intent and automatic physical execution; complete fault acceptance pending) |
 | HS-202 | Durable dynamic group prepare/release on the owning core; joining replicas never initialize themselves; revoked replicas cannot be recreated by traffic | HS-104, HS-201 | In progress: commits `064a1af`, `cf05e16`, `e7f12bf`, `dc54f53`, `8b88822`, `e877d48`, `d0d3bb9` (physical retirement, automatic execution and real outside-bootstrap joining/restart; install-boundary acceptance pending) |
-| HS-203 | Resumable learner catch-up, fixed-prefix applied verification, joint-membership reconciliation, leader handoff and final membership verification | HS-201, HS-202 | In progress: commits `3504fb5`, `e877d48` (fenced steps and autonomous executor, RF3/RF5 replacement and explicit 3→5→3; binary-restart/S3/fault acceptance pending) |
+| HS-203 | Resumable learner catch-up, fixed-prefix applied verification, joint-membership reconciliation, leader handoff and final membership verification | HS-201, HS-202 | In progress: commits `3504fb5`, `e877d48`, `db45b1a` (fenced execution, RF3/RF5 replacement, explicit 3→5→3 and MinIO snapshot-prefetch process recovery; joint/install-apply fault acceptance pending) |
 | HS-204 | Durably allocated executor generations and process-incarnation fencing, receiving-process barriers and exclusion with maintenance; delayed old/raw requests cannot bypass authority | HS-201; required before managed mutations are exposed | In progress: commits `6530772`, `064a1af`, `8b88822`, `3504fb5`, `e877d48`, `f5124a8`, `43f48d8` (durable generations, process/pruning barriers, takeover and intent-aware maintenance exclusion; supported disruption lifecycle and fault acceptance pending) |
-| HS-205 | Dynamic node/gateway routing, per-group readiness/quorum inventory, reference protection, actor/background-work retirement and safe per-core journal reclamation | HS-202, HS-203, HS-204 | In progress: commits `cf05e16`, `e7f12bf`, `dc54f53`, `8b88822`, `ebe8dd7`, `d0d3bb9`, `82e1563`, `f5124a8`, `43f48d8` (retirement, routing, pruning, assignment roles and per-group quorum verification; real S3/fault acceptance pending) |
-| HS-206 | Supported operation API and CLI submit/status/wait/resume with admin authority and error semantics; real-process E2E plus DST at every migration boundary | HS-201 through HS-205 | In progress: commits `e877d48`, `ebe8dd7`, `d0d3bb9`, `43f48d8` (operation/registration API/CLI, joining and mixed-RF quorum observations; install/joint faults, S3 and DST pending) |
+| HS-205 | Dynamic node/gateway routing, per-group readiness/quorum inventory, reference protection, actor/background-work retirement and safe per-core journal reclamation | HS-202, HS-203, HS-204 | In progress: commits `cf05e16`, `e7f12bf`, `dc54f53`, `8b88822`, `ebe8dd7`, `d0d3bb9`, `82e1563`, `f5124a8`, `43f48d8`, `db45b1a` (retirement, routing, inventory/quorum and real S3 snapshot pins/reference cleanup; complete fault acceptance pending) |
+| HS-206 | Supported operation API and CLI submit/status/wait/resume with admin authority and error semantics; real-process E2E plus DST at every migration boundary | HS-201 through HS-205 | In progress: commits `e877d48`, `ebe8dd7`, `d0d3bb9`, `43f48d8`, `db45b1a` (operation/registration API/CLI, joining, quorum observations and MinIO snapshot-prefetch process faults; install-apply/joint faults and new DST pending) |
 
 Start with one global active operation. M2 must move a group to a node that
 did not statically host it. Cover RF=3 and RF=5 replica replacements, and
@@ -212,6 +218,8 @@ unevacuated machine. Physical provisioning remains outside the Raft controller.
 | 2026-10-06 | HS-104 / HS-204 / HS-205 | Commit `43f48d8` derives maintenance inventory v3 from placement plus durable assignment roles (voter, preparing learner, learner, retiring). Includes projection index and unresolved receiver/assignment state. Migration participants remain maintenance-ineligible; separate serving/registration eligibility uses local actual Raft membership, recovery and applied state under the allowed intent | RF3/RF5 native fixtures verify pre-core preparation, recognized learners, learner exclusion from quorum counts and HTTP serving readiness during learner/joint phases. Expected inventory never comes from observed handles. Native fixture refresh installs real fresh views explicitly; it has no production refresh task |
 | 2026-10-06 | HS-205 / HS-206 | Commit `43f48d8` adds `ursulactl operation verify-quorum`: discovers the complete live directory from fresh meta state, captures native uniform/joint configuration and fixed prefixes per group, pins process identities, preserves each constituent denominator, and rechecks data/meta state before reporting. Explicit exclusions do not rewrite membership. Maintenance eligibility and full redundancy are separate from quorum availability; output never grants disruption permission | Real seven-server binary fixture uses the original six-node admin-only manifest, discovers voter 7, verifies mixed RF3/RF5, stops RF5 voters 4/5, observes three survivors against the original five, rejects a two-survivor selection, then restarts both processes. This does not certify an AZ-loss schedule, evacuation or physical removal |
 | 2026-10-06 | Validation | Against `43f48d8`: workspace lib/bin tests 981 passed, 3 ignored; doc tests, all-target Clippy with `-D warnings`, format, seven DST audits, madsim Raft lib check and smoke (0.48s) passed. Final binary migration CLI fixtures passed in 30.21s; managed adoption/restart passed in 26.54s. Eight focused local inventory tests and RF3/RF5 joint tests passed | Native host only; no cross-compilation. Existing madsim warnings remain. Inline/local snapshots and native joint interruption do not prove install/joint OS-process failure, S3 or new migration-boundary DST |
+| 2026-10-06 | HS-104 / HS-203 / HS-205 / HS-206 | Commit `db45b1a` adds an opt-in native MinIO fixture with real seven-server binaries, data disk WAL, independent meta Raft and S3 snapshots. A destination-only HTTP proxy blocks an actual `.snap` GET after the target publishes its durable S3 pin. RF3 kills both destination and controller and observes controller takeover; RF5 kills the destination. Both restore the original local journals, claim higher executor generations, publish exact target membership/epoch and preserve writes acknowledged before and during the fault | Verify every final voter's reference points at a readable S3 object, removed replicas have no external pointer/pins, and obsolete retained-node pins converge to at most the current pointer. Repeat after full seven-node restart; original bootstrap manifest verifies both group quorums and maintenance eligibility. Fault is external prefetch before pointer application, not a kill during durable snapshot application or joint membership |
+| 2026-10-06 | Validation | Against `db45b1a`: workspace lib/bin 981 passed, 3 ignored; all three binary migration CLI tests explicitly including the opt-in test passed in 74.02s. Doc tests, all-target Clippy with `-D warnings`, format, seven tracked-source DST audits, madsim Raft lib check and existing smoke (0.43s) passed | Native `aarch64-apple-darwin` only. MinIO `RELEASE.2025-10-15T17-29-55Z` (`go1.26.3 darwin/arm64`), AWS CLI `2.33.19` (`exe/arm64`), dummy credentials and an isolated local bucket. No AWS behavior, one-hour object GC cutoff/deletion, cold-manifest replay, new migration DST, CI or deployment evidence is claimed |
 
 ## Current execution checkpoint
 
@@ -293,15 +301,40 @@ Final data/meta reads refuse drift. RF5 three-survivor availability remains
 distinct from restored five-voter redundancy. This is read-only evidence,
 not a disruption reservation or physical-removal gate.
 
-Next verify interruption during
-replica preparation/snapshot install and joint membership, lost replies and
-delayed old receiver requests, S3 migration and migration-boundary DST.
+Commit `db45b1a` exercises actual external S3 snapshot prefetch with native MinIO
+and seven server processes. The receiver's durable assignment exists before
+its blocked GET; the named object already has a target pin. Destination and
+controller crashes at that boundary recover through the supported CLI and
+server executor. Both RF3/RF5 final layouts preserve acknowledged data, exact
+uniform membership and epoch, valid target references and obsolete-pin cleanup
+through full restart. This covers a prefetch process fault, not interruption
+during durable pointer application or joint membership; it does not test AWS,
+cold-manifest replay or the one-hour object deletion cutoff.
+
+Reproduce after building the native `ursula` binary:
+
+```bash
+CARGO_INCREMENTAL=0 cargo build -p ursula --bin ursula
+CARGO_INCREMENTAL=0 cargo test -p ursula-ctl --test managed_migration_cli \
+  snapshot_fault -- --ignored --nocapture
+```
+
+The fixture starts and stops its own local MinIO and creates a temporary bucket
+using dummy credentials. `URSULA_MINIO_BINARY` and `URSULA_AWS_CLI` can select
+native executables; `URSULA_BINARY` can select the native server executable.
+Default test runs intentionally skip this external-tool fixture; the final
+validation above explicitly included it.
+
+Next verify interruption during durable snapshot application and joint
+membership, remaining prepare/release recovery phases, lost replies, delayed
+old receiver requests and migration-boundary DST.
 Established startup continues
 restoring assigned data from its bound checkpoint even under meta minority.
 
-M1 stays open for active-assignment binary startup/recovery acceptance; the
-intent-aware consumers are implemented. M2 stays open for install/joint
-binary restart, S3 and full fault acceptance. Ten native fixtures exercise endpoint
+M1 stays open for the remaining active-assignment binary startup/recovery
+acceptance; intent-aware consumers and the snapshot-prefetch restart slice are
+verified. M2 stays open for install-apply/joint binary restart and full fault
+acceptance. Ten native fixtures exercise endpoint
 and automatic execution with actual data/meta consensus, disk WAL and inline
 snapshots. HTTP identity replacement and executor interruption are in-process;
 separate subprocess tests cover receiver-ledger recovery independently. The

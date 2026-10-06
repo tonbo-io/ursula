@@ -1368,3 +1368,43 @@ lib check and smoke (0.48s) pass. Both binary migration fixtures pass in 30.21s;
 managed adoption/restart passes in 26.54s. All use the native Mac host. Active
 assignment startup/recovery during install/joint OS-process faults, real S3
 migration and new migration-boundary DST are next; M3/M4 remain in scope.
+
+### Implementation checkpoint: native S3 snapshot-prefetch crash recovery
+
+Commit `db45b1a` adds an explicitly opted-in fixture using native MinIO, real
+Ursula/ursulactl processes, data disk WAL and independent meta Raft. The original
+six-node recipe adopts mixed RF3/RF5 groups; a registered seventh process uses
+a destination-only S3 HTTP proxy. Aggressive snapshot/log compaction supplies
+external snapshots to the joining learner. The proxy blocks its actual `.snap`
+GET, and direct S3 reads confirm a durable target pin protecting that object.
+
+For RF3, kill the destination and current controller at the blocked GET and
+observe a higher executor generation while both remain down. For RF5, kill the
+destination at its blocked GET. In each case, acknowledge another foreground
+write through the surviving data quorum, restart using the original local
+journals, resume S3 traffic and finish through the supported operation CLI.
+Require a changed destination process identity, higher executor generation,
+published epoch 1, exact uniform RF3 `{1,2,7}` / RF5 `{1,2,4,5,7}` membership
+without learners, and every acknowledged payload through all live front doors.
+
+After settlement, query actual S3 reference and pin objects. Every target voter
+must publish a reference to a readable, nonempty snapshot object; removed
+replicas retain no external pointer or pin. Abandoned pins on retained replicas
+must converge to at most their current pointer. Full seven-process restart
+preserves the complete meta state, data and those reference invariants. The
+original bootstrap admin manifest discovers the complete directory and verifies
+both group quorums and maintenance eligibility.
+
+This boundary is external snapshot prefetch before durable pointer application.
+It does not establish interruption safety during snapshot application or joint
+membership. MinIO validates actual S3 API/SigV4/OpenDAL behavior; no AWS behavior,
+cold-manifest replay or one-hour-aged object deletion is certified. See the epic
+tracker for the explicit reproduction command and local executable overrides.
+
+Final workspace lib/bin tests pass 981 with 3 ignored. All three binary migration
+CLI fixtures, explicitly including this opt-in test, pass in 74.02s. Doc tests,
+all-target Clippy with `-D warnings`, format, seven tracked-source DST audits,
+madsim Raft lib check and existing smoke (0.43s) pass. MinIO and AWS CLI report
+native `darwin/arm64` / `exe/arm64`; the server is arm64 Mach-O. Remaining
+install-apply/joint process faults and migration DST keep M1/M2 open; M3/M4
+remain in the epic's scope.
