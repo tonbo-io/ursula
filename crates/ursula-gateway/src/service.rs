@@ -49,6 +49,14 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
         None => Gateway::new(config.clone()),
     };
 
+    if let Some(path) = &args.managed_bootstrap {
+        let bootstrap: ursula_control::ClusterBootstrap =
+            serde_json::from_slice(&std::fs::read(path)?)?;
+        gateway = gateway.with_managed_directory(bootstrap)?;
+        gateway.refresh_managed_directory().await?;
+        tracing::info!(bootstrap = %path.display(), "gateway managed routing enabled");
+    }
+
     if let Some(policy_path) = &args.quota_policy {
         let provider = StaticQuotaProvider::from_file(policy_path)?;
         tracing::info!(policy = %policy_path.display(), "gateway quotas enabled");
@@ -82,7 +90,7 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
                 gateway.handle(req).await
             },
         ))
-        .with_state(gateway);
+        .with_state(Arc::clone(&gateway));
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     tracing::info!(
@@ -91,13 +99,35 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
         "Ursula gateway starting"
     );
 
-    serve_until_shutdown(
+    let refresh_task = args.managed_bootstrap.as_ref().map(|_| {
+        let handle = tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(args.managed_refresh_ms.get()));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Startup already installed a fresh view; consume the immediate tick.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if let Err(reason) = gateway.refresh_managed_directory().await {
+                    tracing::debug!(%reason, "gateway retains last managed routing directory");
+                }
+            }
+        });
+        let guard = DirectoryRefreshTask(handle.abort_handle());
+        (handle, guard)
+    });
+
+    let result = serve_until_shutdown(
         listener,
         app,
         shutdown_signal(),
         Some(Duration::from_secs(args.graceful_shutdown_timeout)),
     )
-    .await?;
+    .await;
+    if let Some((handle, guard)) = refresh_task {
+        drop(guard);
+        let _joined = handle.await;
+    }
 
     // Stop the exporter after the server drains so the final usage window is
     // flushed rather than stranded.
@@ -108,7 +138,17 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
         let _joined = exporter.await;
     }
 
+    result?;
     Ok(())
+}
+
+// Also cancel refresh if the serving future is cancelled or exits with error.
+struct DirectoryRefreshTask(tokio::task::AbortHandle);
+
+impl Drop for DirectoryRefreshTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Builds the opt-in access-control hooks from CLI arguments. All-absent means
@@ -146,8 +186,21 @@ pub struct GatewayArgs {
     listen: SocketAddr,
 
     /// Upstream Ursula node URL. Repeat for each node.
-    #[arg(long, required = true)]
+    #[arg(
+        long,
+        required_unless_present = "managed_bootstrap",
+        conflicts_with = "managed_bootstrap"
+    )]
     upstream: Vec<String>,
+
+    /// Original ClusterBootstrap JSON. Discover live nodes through its bound
+    /// meta quorum instead of a static list; never extend the initial recipe.
+    #[arg(long)]
+    managed_bootstrap: Option<PathBuf>,
+
+    /// Managed full-directory refresh interval in milliseconds.
+    #[arg(long, default_value = "1000", requires = "managed_bootstrap")]
+    managed_refresh_ms: NonZeroU64,
 
     /// Timeout for sending the upstream request and receiving response headers, in seconds.
     /// Streamed response bodies such as SSE live reads are not covered by this timeout.
@@ -232,6 +285,42 @@ mod tests {
     use axum::Router;
     use tokio::sync::oneshot;
     use ursula_observability::serve::serve_until_shutdown;
+
+    use super::GatewayArgs;
+
+    #[derive(clap::Parser)]
+    struct Cli {
+        #[command(flatten)]
+        gateway: GatewayArgs,
+    }
+
+    #[test]
+    fn managed_directory_and_static_upstreams_are_explicit_alternatives() {
+        use clap::Parser;
+        let _managed = Cli::try_parse_from(["gw", "--managed-bootstrap", "recipe.json"]).unwrap();
+        let _static = Cli::try_parse_from(["gw", "--upstream", "http://node:4437"]).unwrap();
+        assert!(Cli::try_parse_from(["gw"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "gw",
+                "--upstream",
+                "http://node:4437",
+                "--managed-bootstrap",
+                "recipe.json"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "gw",
+                "--managed-bootstrap",
+                "recipe.json",
+                "--managed-refresh-ms",
+                "0"
+            ])
+            .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn serve_with_shutdown_does_not_return_before_shutdown_signal() {

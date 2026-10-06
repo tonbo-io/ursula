@@ -15,6 +15,7 @@
 //! - [`admission`]: opt-in per-tenant rate, live-read, and body-size limits.
 //! - [`usage`]: opt-in per-tenant request/byte accounting and batch export.
 //! - [`service`]: command arguments and the long-running gateway service entrypoint.
+//! - [`managed`]: ordered trusted routing directory from the managed meta quorum.
 
 use std::collections::HashMap;
 use std::error::Error as _;
@@ -51,6 +52,7 @@ use ursula_shard::StaticShardMap;
 pub mod admission;
 pub mod auth;
 pub mod cors;
+mod managed;
 pub mod service;
 pub mod usage;
 
@@ -145,6 +147,7 @@ pub struct Gateway {
     leader_affinity: Arc<Mutex<HashMap<String, String>>>,
     metrics: Arc<GatewayMetrics>,
     cors: Option<crate::cors::CorsPolicy>,
+    managed: Option<Arc<managed::ManagedDirectory>>,
 }
 
 impl std::fmt::Debug for Gateway {
@@ -181,6 +184,7 @@ impl Gateway {
             leader_affinity: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(GatewayMetrics::default()),
             cors,
+            managed: None,
         }
     }
 
@@ -208,6 +212,41 @@ impl Gateway {
     pub fn with_usage_collector(mut self, collector: Arc<UsageCollector>) -> Self {
         self.usage = Some(collector);
         self
+    }
+
+    /// Use the immutable original bootstrap recipe to discover live routing
+    /// nodes from the meta quorum. The caller refreshes before serving traffic
+    /// and periodically afterwards; cached routes grant no mutation authority.
+    pub fn with_managed_directory(
+        mut self,
+        bootstrap: ursula_control::ClusterBootstrap,
+    ) -> Result<Self, String> {
+        let bootstrap = bootstrap.normalize()?;
+        let groups = bootstrap.identity.group_count as usize;
+        if self
+            .config
+            .raft_group_count
+            .is_some_and(|count| count != groups)
+        {
+            return Err("gateway group count differs from managed routing identity".to_owned());
+        }
+        self.shard_map = Some(StaticShardMap::new(1, groups).map_err(|error| error.to_string())?);
+        self.managed = Some(Arc::new(managed::ManagedDirectory::new(bootstrap)?));
+        Ok(self)
+    }
+
+    /// Refresh a complete routing hint. Failure keeps the last installed view;
+    /// a newly started gateway has no managed upstream until a refresh succeeds.
+    pub async fn refresh_managed_directory(&self) -> Result<(), String> {
+        if let Some(directory) = &self.managed
+            && directory.refresh().await?
+        {
+            self.leader_affinity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+        Ok(())
     }
 
     pub async fn handle(&self, req: Request<Body>) -> AxumResponse {
@@ -317,6 +356,11 @@ impl Gateway {
         match self.forward(&upstream, &parts, body_bytes, tail).await {
             Ok(response) => response,
             Err(e) => {
+                // The request may already have reached the leader. Evict the
+                // hint for a subsequent client retry, without replaying here.
+                if let Some(key) = upstream_pin_key(&parts.uri, self.shard_map.as_ref()) {
+                    self.forget_leader_if_matches(&key, &upstream);
+                }
                 error!(error = %e, "gateway request failed");
                 e.into_response()
             }
@@ -420,6 +464,10 @@ impl Gateway {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&key)
                 .cloned()
+            && self
+                .managed
+                .as_ref()
+                .is_none_or(|directory| directory.is_serving_origin(&upstream))
         {
             self.metrics
                 .leader_cache_hits
@@ -430,6 +478,12 @@ impl Gateway {
             .leader_cache_misses
             .fetch_add(1, Ordering::Relaxed);
         let mut rng = rand::rng();
+        if let Some(directory) = &self.managed {
+            return directory
+                .upstreams(uri, self.shard_map.as_ref())
+                .choose(&mut rng)
+                .cloned();
+        }
         self.config.upstreams.choose(&mut rng).cloned()
     }
 
@@ -459,7 +513,17 @@ impl Gateway {
                 .contains_key(HEADER_URSULA_RAFT_LEADER_ID)
         {
             let response_headers = copy_forwarded_headers(upstream_resp.headers(), false);
-            if let Some(leader_upstream) = self.resolve_leader_upstream(&response_headers) {
+            let mut leader = self.resolve_leader_upstream(&response_headers);
+            if leader.is_none() && self.managed.is_some() {
+                // A new registered node may lead before the periodic refresh.
+                // Never learn an arbitrary redirect origin without the bound
+                // meta directory; coalesce concurrent refresh attempts.
+                if let Err(reason) = self.refresh_managed_directory().await {
+                    tracing::debug!(%reason, "managed redirect directory refresh unavailable");
+                }
+                leader = self.resolve_leader_upstream(&response_headers);
+            }
+            if let Some(leader_upstream) = leader {
                 self.metrics
                     .leader_redirects
                     .fetch_add(1, Ordering::Relaxed);
@@ -480,6 +544,16 @@ impl Gateway {
                     Ordering::Relaxed,
                 );
                 return Self::build_response(leader_resp, tail);
+            }
+            if self.managed.is_some() {
+                // A self-directed 307 would loop through this gateway. The
+                // client can retry after discovery/quorum becomes available.
+                return Ok((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [("retry-after", "1")],
+                    "managed leader is absent from the installed routing directory",
+                )
+                    .into_response());
             }
         }
 
@@ -604,13 +678,28 @@ impl Gateway {
             .map_err(|e| GatewayError::ResponseBuild(e.to_string()))
     }
 
-    fn resolve_leader_upstream(&self, response_headers: &HeaderMap) -> Option<&str> {
+    fn resolve_leader_upstream(&self, response_headers: &HeaderMap) -> Option<String> {
         let location = response_headers.get(LOCATION)?.to_str().ok()?;
+        let origin = reqwest::Url::parse(location)
+            .ok()?
+            .origin()
+            .ascii_serialization();
+        if let Some(directory) = &self.managed {
+            let id = response_headers
+                .get(HEADER_URSULA_RAFT_LEADER_ID)?
+                .to_str()
+                .ok()?
+                .parse()
+                .ok()?;
+            return directory.leader_origin(id, &origin);
+        }
         self.config
             .upstreams
             .iter()
-            .find(|u| location.starts_with(*u))
-            .map(String::as_str)
+            .find(|u| {
+                reqwest::Url::parse(u).is_ok_and(|url| url.origin().ascii_serialization() == origin)
+            })
+            .cloned()
     }
 
     fn remember_leader(&self, key: String, upstream: String) {

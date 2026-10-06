@@ -353,7 +353,7 @@ impl Cluster {
         self.nodes.insert(id, node);
     }
 
-    async fn configuration(&self, group: u32, voters: BTreeSet<u64>) {
+    async fn configuration(&self, group: u32, voters: BTreeSet<u64>) -> u64 {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             for id in &voters {
@@ -367,12 +367,75 @@ impl Cluster {
                 {
                     assert_eq!(actual.voter_sets, vec![voters.clone()]);
                     assert!(actual.learners.is_empty());
-                    return;
+                    return actual.leader_id;
                 }
             }
             assert!(
                 Instant::now() < deadline,
                 "no actual uniform group configuration"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn start_gateway(&self, refresh_ms: u64) -> (Process, String) {
+        let path = self.root.path().join("gateway-bootstrap.json");
+        let view = self.view().await;
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&view.state.cluster_bootstrap.unwrap().recipe).unwrap(),
+        )
+        .unwrap();
+        let address = format!("127.0.0.1:{}", port());
+        let log = self.root.path().join(format!("gateway-{refresh_ms}.log"));
+        let file = std::fs::File::create(&log).unwrap();
+        let child = Command::new(&self.binary)
+            .args(["gateway", "--listen", &address, "--managed-bootstrap"])
+            .arg(path)
+            .args(["--managed-refresh-ms", &refresh_ms.to_string()])
+            .env("RUST_LOG", "ursula_gateway=debug")
+            .stdout(Stdio::from(file.try_clone().unwrap()))
+            .stderr(Stdio::from(file))
+            .spawn()
+            .unwrap();
+        (Process { child, log }, format!("http://{address}"))
+    }
+
+    async fn gateway_payload(
+        &mut self,
+        gateway: &mut Process,
+        origin: &str,
+        name: &str,
+        body: &str,
+        write: bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            self.alive();
+            if let Some(status) = gateway.child.try_wait().unwrap() {
+                panic!(
+                    "gateway exited {status}: {}",
+                    std::fs::read_to_string(&gateway.log).unwrap()
+                );
+            }
+            let request = if write {
+                self.client
+                    .put(format!("{origin}/benchcmp/{name}"))
+                    .body(body.to_owned())
+            } else {
+                self.client
+                    .get(format!("{origin}/benchcmp/{name}?offset=0&max_bytes=4096"))
+            };
+            if let Ok(response) = request.send().await
+                && response.status().is_success()
+                && (write || response.bytes().await.unwrap().as_ref() == body.as_bytes())
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "gateway request failed: {}",
+                std::fs::read_to_string(&gateway.log).unwrap()
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -455,6 +518,16 @@ async fn binaries_join_outside_bootstrap_directory_and_restore_rf3_rf5() {
     for name in &names {
         cluster.write(name, "acknowledged-before-node-join").await;
     }
+    let (mut gateway, gateway_origin) = cluster.start_gateway(600000).await;
+    cluster
+        .gateway_payload(
+            &mut gateway,
+            &gateway_origin,
+            &names[0],
+            "acknowledged-before-node-join",
+            false,
+        )
+        .await;
     let node = NodeRegistration {
         node_id: 7,
         client_url: format!("http://127.0.0.1:{}", port()),
@@ -525,6 +598,161 @@ async fn binaries_join_outside_bootstrap_directory_and_restore_rf3_rf5() {
                 .await;
         }
     }
+    // Both possible old leaders (1 and 2) are removed. Node 7 is the only
+    // retained voter, so the supported executor hands leadership to it.
+    let id = cluster
+        .submit("gateway-new-node-leader", 1, "4,5,7", None)
+        .await;
+    cluster.wait(id).await;
+    assert_eq!(cluster.configuration(0, BTreeSet::from([4, 5, 7])).await, 7);
+    cluster.ready().await;
+    for name in &names {
+        cluster
+            .gateway_payload(
+                &mut gateway,
+                &gateway_origin,
+                name,
+                "acknowledged-before-node-join",
+                false,
+            )
+            .await;
+    }
+    let new_name = (0..100)
+        .map(|n| format!("gateway-new-leader-{n}"))
+        .find(|name| {
+            map.locate(&BucketStreamId::new("benchcmp", name.clone()))
+                .raft_group_id
+                == RaftGroupId(0)
+        })
+        .unwrap();
+    cluster
+        .gateway_payload(
+            &mut gateway,
+            &gateway_origin,
+            &new_name,
+            "gateway-new-node-write",
+            true,
+        )
+        .await;
+    cluster
+        .gateway_payload(
+            &mut gateway,
+            &gateway_origin,
+            &new_name,
+            "gateway-new-node-write",
+            false,
+        )
+        .await;
+    // Meta loses its majority while RF3 and RF5 retain their data majorities.
+    let (mut periodic, periodic_origin) = cluster.start_gateway(100).await;
+    cluster
+        .gateway_payload(
+            &mut periodic,
+            &periodic_origin,
+            &new_name,
+            "gateway-new-node-write",
+            false,
+        )
+        .await;
+    let log_offset = std::fs::read(&periodic.log).unwrap().len();
+    cluster.processes.remove(&1);
+    cluster.processes.remove(&2);
+    let view = cluster.configs[&3]
+        .control
+        .as_ref()
+        .unwrap()
+        .local_identity(&cluster.configs[&3])
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if ursula_raft::read_control_projection(
+            &view.cluster,
+            3,
+            &cluster.nodes[&3].cluster_url,
+            Duration::from_secs(2),
+        )
+        .await
+        .is_err()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "metadata minority still returned a fresh projection"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    loop {
+        let log = std::fs::read(&periodic.log).unwrap();
+        if String::from_utf8_lossy(&log[log_offset..])
+            .contains("gateway retains last managed routing directory")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "periodic gateway did not observe unavailable meta quorum"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for name in &names {
+        cluster
+            .gateway_payload(
+                &mut gateway,
+                &gateway_origin,
+                name,
+                "acknowledged-before-node-join",
+                false,
+            )
+            .await;
+    }
+    cluster
+        .gateway_payload(
+            &mut gateway,
+            &gateway_origin,
+            &new_name,
+            "gateway-new-node-write",
+            false,
+        )
+        .await;
+    let minority_name = (0..100)
+        .map(|n| format!("gateway-meta-minority-{n}"))
+        .find(|name| {
+            map.locate(&BucketStreamId::new("benchcmp", name.clone()))
+                .raft_group_id
+                == RaftGroupId(0)
+        })
+        .unwrap();
+    cluster
+        .gateway_payload(
+            &mut periodic,
+            &periodic_origin,
+            &minority_name,
+            "gateway-write-under-meta-minority",
+            true,
+        )
+        .await;
+    cluster
+        .gateway_payload(
+            &mut periodic,
+            &periodic_origin,
+            &minority_name,
+            "gateway-write-under-meta-minority",
+            false,
+        )
+        .await;
+    cluster
+        .gateway_payload(
+            &mut periodic,
+            &periodic_origin,
+            &names[1],
+            "acknowledged-before-node-join",
+            false,
+        )
+        .await;
+    cluster.start(1, "meta-quorum-return");
+    cluster.start(2, "meta-quorum-return");
+    cluster.ready().await;
     let before = cluster.view().await;
     cluster.processes.clear();
     for id in 1..=7 {
@@ -532,7 +760,7 @@ async fn binaries_join_outside_bootstrap_directory_and_restore_rf3_rf5() {
     }
     cluster.ready().await;
     assert_eq!(cluster.view().await.state, before.state);
-    cluster.configuration(0, BTreeSet::from([1, 2, 7])).await;
+    cluster.configuration(0, BTreeSet::from([4, 5, 7])).await;
     cluster
         .configuration(1, BTreeSet::from([1, 2, 4, 5, 7]))
         .await;
@@ -541,6 +769,24 @@ async fn binaries_join_outside_bootstrap_directory_and_restore_rf3_rf5() {
             .payloads(name, "acknowledged-before-node-join")
             .await;
     }
+    cluster
+        .gateway_payload(
+            &mut gateway,
+            &gateway_origin,
+            &new_name,
+            "gateway-new-node-write",
+            false,
+        )
+        .await;
+    cluster
+        .gateway_payload(
+            &mut periodic,
+            &periodic_origin,
+            &minority_name,
+            "gateway-write-under-meta-minority",
+            false,
+        )
+        .await;
     cluster
         .write("after-new-node-restart", "acknowledged-after-node-join")
         .await;

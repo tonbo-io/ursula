@@ -64,8 +64,8 @@ fn header_forwarding_applies_proxy_rules() {
 
 // Owns a mock upstream server for one test. Dropping it aborts the server
 // task so tests do not need repeated cleanup code.
-struct TestUpstream {
-    url: String,
+pub(super) struct TestUpstream {
+    pub(super) url: String,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -90,7 +90,7 @@ async fn spawn_upstream_with_url(app_for_url: impl FnOnce(String) -> Router) -> 
     TestUpstream { url, task }
 }
 
-async fn spawn_upstream(app: Router) -> TestUpstream {
+pub(super) async fn spawn_upstream(app: Router) -> TestUpstream {
     spawn_upstream_with_url(|_| app).await
 }
 
@@ -120,7 +120,7 @@ async fn spawn_raft_redirect_upstreams(leader_app: Router) -> (TestUpstream, Tes
     (leader, follower)
 }
 
-fn test_config(upstreams: Vec<String>) -> GatewayConfig {
+pub(super) fn test_config(upstreams: Vec<String>) -> GatewayConfig {
     GatewayConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         upstreams,
@@ -153,6 +153,46 @@ fn gateway_reuses_learned_stream_leader() {
     let metrics = gateway.metrics_snapshot();
     assert_eq!(metrics.leader_cache_hits, 1);
     assert_eq!(metrics.leader_cache_entries, 1);
+}
+
+#[tokio::test]
+async fn gateway_evicts_unreachable_cached_leader_without_replaying_write() {
+    let mut upstream = spawn_upstream(Router::new()).await;
+    upstream.task.abort();
+    let _cancelled = (&mut upstream.task).await;
+    let gateway = Gateway::new(test_config(vec![upstream.url.clone()]));
+    gateway.remember_leader("/bucket/stream".to_owned(), upstream.url.clone());
+    let response = gateway
+        .handle(
+            Request::builder()
+                .method("POST")
+                .uri("/bucket/stream")
+                .body(Body::from("one-attempt"))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(gateway.metrics_snapshot().leader_cache_entries, 0);
+    assert_eq!(gateway.metrics_snapshot().leader_cache_evictions, 1);
+}
+
+#[test]
+fn gateway_redirect_requires_exact_origin() {
+    let gateway = Gateway::new(test_config(vec!["http://node.test:4437".to_owned()]));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        LOCATION,
+        "http://node.test:44370/bucket/stream".parse().unwrap(),
+    );
+    assert!(gateway.resolve_leader_upstream(&headers).is_none());
+    headers.insert(
+        LOCATION,
+        "http://node.test:4437/bucket/stream".parse().unwrap(),
+    );
+    assert_eq!(
+        gateway.resolve_leader_upstream(&headers).as_deref(),
+        Some("http://node.test:4437")
+    );
 }
 
 #[tokio::test]
