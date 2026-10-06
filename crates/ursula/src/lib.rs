@@ -266,6 +266,7 @@ impl WallClock for SystemWallClock {
 #[derive(Clone)]
 pub struct HttpState {
     process_incarnation: ProcessIncarnation,
+    configured_node_id: Option<u64>,
     runtime: ShardRuntime,
     raft_registry: Option<RaftGroupHandleRegistry>,
     client_write_router: Option<ClientWriteLeaderRouter>,
@@ -316,9 +317,15 @@ impl HttpState {
         otel_metrics::register(&self.runtime.metrics());
     }
 
+    pub(crate) fn with_configured_node_id(mut self, node_id: u64) -> Self {
+        self.configured_node_id = Some(node_id);
+        self
+    }
+
     pub fn new(runtime: ShardRuntime) -> Self {
         Self {
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
+            configured_node_id: None,
             runtime,
             raft_registry: None,
             client_write_router: None,
@@ -340,6 +347,7 @@ impl HttpState {
         let leadership_shed = raft_registry.leadership_shed_flag();
         Self {
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
+            configured_node_id: None,
             runtime,
             raft_registry: Some(raft_registry),
             client_write_router: None,
@@ -385,6 +393,7 @@ impl HttpState {
                 per_group_voters,
             )),
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
+            configured_node_id: None,
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
             node_memory: NodeMemoryMonitor::default(),
@@ -1719,9 +1728,11 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
             "process_node_id".to_owned(),
             serde_json::json!(
                 state
-                    .client_write_router
-                    .as_ref()
-                    .and_then(|topology| topology.node_id)
+                    .configured_node_id
+                    .or_else(|| state
+                        .client_write_router
+                        .as_ref()
+                        .and_then(|topology| topology.node_id))
                     .or_else(|| raft_groups.first().map(|group| group.node_id))
             ),
         );
