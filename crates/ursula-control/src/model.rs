@@ -99,6 +99,8 @@ impl MigrationPhase {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupMigration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<crate::ManagedMigration>,
     pub migration_id: u64,
     pub raft_group_id: RaftGroupId,
     pub from_voters: BTreeSet<NodeId>,

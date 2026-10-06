@@ -18,6 +18,23 @@ use crate::policy::PlacementPolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlCommand {
+    SubmitMigration {
+        request: crate::MigrationRequest,
+        now_ms: u64,
+    },
+    ClaimMigrationExecutor {
+        migration_id: u64,
+        expected_generation: u64,
+        claim_key: ursula_proto::admin::ProcessIncarnation,
+        executor: crate::ReceiverProcess,
+        now_ms: u64,
+    },
+    UpdateMigration {
+        token: crate::MigrationToken,
+        expected_revision: u64,
+        update: crate::MigrationUpdate,
+        now_ms: u64,
+    },
     BootstrapCluster {
         bootstrap: ClusterBootstrap,
         memberships: BTreeMap<RaftGroupId, VerifiedGroupMembership>,
@@ -103,7 +120,10 @@ pub enum ControlCommand {
 impl ControlCommand {
     pub fn now_ms(&self) -> u64 {
         match self {
-            Self::BootstrapCluster { now_ms, .. }
+            Self::SubmitMigration { now_ms, .. }
+            | Self::ClaimMigrationExecutor { now_ms, .. }
+            | Self::UpdateMigration { now_ms, .. }
+            | Self::BootstrapCluster { now_ms, .. }
             | Self::RegisterManagedNode { now_ms, .. }
             | Self::RegisterNode { now_ms, .. }
             | Self::SetNodeState { now_ms, .. }
@@ -124,6 +144,9 @@ impl ControlCommand {
 impl fmt::Display for ControlCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::SubmitMigration { .. } => "submit_migration",
+            Self::ClaimMigrationExecutor { .. } => "claim_migration_executor",
+            Self::UpdateMigration { .. } => "update_migration",
             Self::BootstrapCluster { .. } => "bootstrap_cluster",
             Self::RegisterManagedNode { .. } => "register_managed_node",
             Self::RegisterNode { .. } => "register_node",
@@ -146,6 +169,7 @@ impl fmt::Display for ControlCommand {
 pub enum ControlResponse {
     Ok,
     MigrationStarted { migration_id: u64 },
+    ExecutorClaimed { token: crate::MigrationToken },
     Rejected { reason: String },
 }
 
@@ -160,6 +184,7 @@ impl fmt::Display for ControlResponse {
         f.write_str(match self {
             Self::Ok => "ok",
             Self::MigrationStarted { .. } => "migration_started",
+            Self::ExecutorClaimed { .. } => "executor_claimed",
             Self::Rejected { .. } => "rejected",
         })
     }

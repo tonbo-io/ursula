@@ -53,7 +53,9 @@ use crate::raft_internal_proto::meta_raft_internal_client::MetaRaftInternalClien
 use crate::raft_internal_proto::meta_raft_internal_server::MetaRaftInternal;
 use crate::raft_internal_proto::meta_raft_internal_server::MetaRaftInternalServer;
 
-pub const META_RAFT_PROTOCOL_VERSION: u32 = 1;
+// Version 2 requires intent-bound managed transitions and durable executor
+// generations. Never mix its state-machine semantics with a version-1 peer.
+pub const META_RAFT_PROTOCOL_VERSION: u32 = 2;
 pub const META_RAFT_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const META_RAFT_STATUS_PATH: &str = "/ursula.raft.v1.MetaRaftInternal/Status";
 pub const META_RAFT_READ_BOOTSTRAP_STATE_PATH: &str =

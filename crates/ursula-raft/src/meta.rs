@@ -646,6 +646,10 @@ impl MetaRaftStateMachine {
                 ));
             }
             machine.state = serde_json::from_slice(&snapshot.bytes).map_err(invalid_snapshot)?;
+            machine
+                .state
+                .validate_migration_state()
+                .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))?;
             machine.last_applied_log_id = snapshot.meta.last_log_id;
             machine.last_membership = snapshot.meta.last_membership.clone();
         }
@@ -798,6 +802,9 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
             ));
         }
         let state: ControlPlaneState = serde_json::from_slice(&bytes).map_err(invalid_snapshot)?;
+        state
+            .validate_migration_state()
+            .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))?;
         if let Some(identity) = self
             .durable_store
             .as_ref()

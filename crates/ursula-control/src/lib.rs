@@ -9,6 +9,7 @@
 //! - [`command`]: replicated control requests and responses.
 //! - [`cluster`]: immutable routing identity and trusted bootstrap inventory.
 //! - [`model`]: nodes, placements and migration records.
+//! - [`migration`]: intent-bound managed migrations and executor/evidence ordering.
 //! - [`policy`]: managed replication and failure-domain validation.
 //! - [`projection`]: complete ordered control snapshots and identity/rollback guards.
 //! - [`state`]: deterministic control state transitions.
@@ -16,6 +17,7 @@
 
 mod cluster;
 mod command;
+mod migration;
 mod model;
 mod policy;
 mod projection;
@@ -33,6 +35,15 @@ pub use cluster::RoutingHashVersion;
 pub use cluster::VerifiedGroupMembership;
 pub use command::ControlCommand;
 pub use command::ControlResponse;
+pub use migration::ExecutorAssignment;
+pub use migration::FinalMembershipEvidence;
+pub use migration::ManagedMigration;
+pub use migration::MigrationRequest;
+pub use migration::MigrationToken;
+pub use migration::MigrationUpdate;
+pub use migration::ReceiverProcess;
+pub use migration::ReplicaAppliedEvidence;
+pub use migration::ReplicaRetirementEvidence;
 pub use model::ClusterNode;
 pub use model::DataGroupPlacement;
 pub use model::GroupMigration;
@@ -58,6 +69,8 @@ mod policy_tests;
 
 #[cfg(test)]
 mod cluster_tests;
+#[cfg(test)]
+mod migration_tests;
 
 pub use projection::ControlProjection;
 pub use projection::ProjectionCursor;

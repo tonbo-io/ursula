@@ -146,11 +146,17 @@ async fn bound_meta_transport_rejects_routing_drift_and_missing_binding_before_d
     .await;
     assert!(MetaRaftGrpcService::new("other-cluster", &node.handle).is_err());
     let mut client = MetaRaftInternalClient::connect(endpoint).await.unwrap();
-    for (groups, cores, hash) in [(2, 1, 1), (1, 2, 1), (1, 1, 2), (0, 0, 0)] {
+    for (groups, cores, hash, version) in [
+        (2, 1, 1, META_RAFT_PROTOCOL_VERSION),
+        (1, 2, 1, META_RAFT_PROTOCOL_VERSION),
+        (1, 1, 2, META_RAFT_PROTOCOL_VERSION),
+        (0, 0, 0, META_RAFT_PROTOCOL_VERSION),
+        (1, 1, 1, 1),
+    ] {
         let envelope = MetaRaftRpcEnvelopeV1 {
             cluster_id: CLUSTER.to_owned(),
             target_node_id: 7,
-            protocol_version: META_RAFT_PROTOCOL_VERSION,
+            protocol_version: version,
             group_count: groups,
             core_count: cores,
             routing_hash_version: hash,
@@ -197,7 +203,7 @@ async fn bound_meta_transport_rejects_routing_drift_and_missing_binding_before_d
                 .full_snapshot(MetaRaftSnapshotRequestV1 {
                     cluster_id: CLUSTER.to_owned(),
                     target_node_id: 7,
-                    protocol_version: META_RAFT_PROTOCOL_VERSION,
+                    protocol_version: version,
                     group_count: groups,
                     core_count: cores,
                     routing_hash_version: hash,
@@ -367,12 +373,86 @@ async fn bound_meta_bootstrap_records_replicate_and_survive_compaction_and_full_
             .await
             .is_err()
     );
+    // Exercise a persisted managed intent, not a real data migration. Data
+    // certificates and receiver declarations here are deliberately synthetic.
+    assert_eq!(
+        handle
+            .write(ControlCommand::RegisterManagedNode {
+                node: bound_identity(4, "http://data4:4439".to_owned()).node,
+                now_ms: 3,
+            })
+            .await
+            .unwrap(),
+        ControlResponse::Ok
+    );
+    let request = ursula_control::MigrationRequest {
+        operation_key: "durable-move".to_owned(),
+        raft_group_id: RaftGroupId(0),
+        expected_epoch: 0,
+        source_membership: memberships[&RaftGroupId(0)].clone(),
+        target_voters: [2, 3, 4].into(),
+        target_policy: None,
+    };
+    assert_eq!(
+        handle
+            .write(ControlCommand::SubmitMigration {
+                request: request.clone(),
+                now_ms: 3
+            })
+            .await
+            .unwrap(),
+        ControlResponse::MigrationStarted { migration_id: 1 }
+    );
+    let executor = ursula_control::ReceiverProcess {
+        node_id: 1,
+        incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(100),
+    };
+    let ControlResponse::ExecutorClaimed { token } = handle
+        .write(ControlCommand::ClaimMigrationExecutor {
+            migration_id: 1,
+            expected_generation: 0,
+            claim_key: ursula_proto::admin::ProcessIncarnation::from_bits(101),
+            executor: executor.clone(),
+            now_ms: 3,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("claim failed");
+    };
+    assert_eq!(
+        handle
+            .write(ControlCommand::UpdateMigration {
+                token: token.clone(),
+                expected_revision: 0,
+                update: ursula_control::MigrationUpdate::AuthorizeReceivers,
+                now_ms: 3
+            })
+            .await
+            .unwrap(),
+        ControlResponse::Ok
+    );
     let prefix = applied(handle).await;
     wait_state(&nodes, prefix).await;
-    let expected = handle.read_state(Clone::clone).await.unwrap();
     for node in nodes.iter().flatten() {
         snapshot_and_purge(&node.handle).await;
     }
+    assert_eq!(
+        handle
+            .write(ControlCommand::UpdateMigration {
+                token: token.clone(),
+                expected_revision: 1,
+                update: ursula_control::MigrationUpdate::RecordError {
+                    reason: "lost receiver activation reply".to_owned()
+                },
+                now_ms: 4
+            })
+            .await
+            .unwrap(),
+        ControlResponse::Ok
+    );
+    wait_state(&nodes, applied(handle).await).await;
+    let expected = handle.read_state(Clone::clone).await.unwrap();
     let source = handle.raft_handle().get_snapshot().await.unwrap().unwrap();
     let mut incompatible = expected.clone();
     incompatible
@@ -443,6 +523,50 @@ async fn bound_meta_bootstrap_records_replicate_and_survive_compaction_and_full_
             identities[0].cluster
         );
     }
+    assert_eq!(
+        handle
+            .write(ControlCommand::SubmitMigration { request, now_ms: 5 })
+            .await
+            .unwrap(),
+        ControlResponse::MigrationStarted { migration_id: 1 }
+    );
+    let ControlResponse::ExecutorClaimed { token: replacement } = handle
+        .write(ControlCommand::ClaimMigrationExecutor {
+            migration_id: 1,
+            expected_generation: token.generation,
+            claim_key: ursula_proto::admin::ProcessIncarnation::from_bits(201),
+            executor,
+            now_ms: 5,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("replacement claim failed");
+    };
+    assert!(replacement.generation > token.generation);
+    assert!(
+        handle
+            .write(ControlCommand::UpdateMigration {
+                token,
+                expected_revision: 2,
+                update: ursula_control::MigrationUpdate::Cancel,
+                now_ms: 5
+            })
+            .await
+            .unwrap()
+            .is_rejected()
+    );
+    let recovered = handle.read_state(Clone::clone).await.unwrap();
+    assert_eq!(recovered.active_migration, Some(1));
+    assert!(
+        recovered.migrations[&1]
+            .managed
+            .as_ref()
+            .unwrap()
+            .receiver_activation_authorized
+    );
+    assert!(recovered.next_executor_generation > replacement.generation);
+    recovered.validate_migration_state().unwrap();
     for node in nodes.into_iter().flatten() {
         stop(node).await;
     }
@@ -540,6 +664,7 @@ async fn meta_transport_rejects_wrong_identity_and_version_before_payload_decode
         ("other-cluster", 7, META_RAFT_PROTOCOL_VERSION),
         (CLUSTER, 8, META_RAFT_PROTOCOL_VERSION),
         (CLUSTER, 7, 0),
+        (CLUSTER, 7, 1),
     ] {
         let envelope = MetaRaftRpcEnvelopeV1 {
             cluster_id: cluster_id.to_owned(),

@@ -40,6 +40,12 @@ pub struct ControlPlaneState {
     pub managed_placement: Option<ManagedPlacement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_bootstrap: Option<ClusterBootstrapRecord>,
+    #[serde(default = "initial_executor_generation")]
+    pub next_executor_generation: u64,
+}
+
+fn initial_executor_generation() -> u64 {
+    1
 }
 
 impl Default for ControlPlaneState {
@@ -59,11 +65,51 @@ impl ControlPlaneState {
             config,
             managed_placement: None,
             cluster_bootstrap: None,
+            next_executor_generation: 1,
         }
     }
 
     pub fn apply(&mut self, command: ControlCommand) -> ControlResponse {
+        if self.cluster_bootstrap.is_some()
+            && matches!(
+                &command,
+                ControlCommand::BeginMigration { .. }
+                    | ControlCommand::BeginPolicyMigration { .. }
+                    | ControlCommand::AdvanceMigration { .. }
+                    | ControlCommand::SetLearnerStatus { .. }
+                    | ControlCommand::RecordMigrationError { .. }
+                    | ControlCommand::CommitPlacement { .. }
+                    | ControlCommand::FinishMigration { .. }
+                    | ControlCommand::EvictLearner { .. }
+            )
+        {
+            return reject(
+                "bootstrapped clusters require intent-bound managed migration commands".to_owned(),
+            );
+        }
         match command {
+            ControlCommand::SubmitMigration { request, now_ms } => {
+                self.submit_managed_migration(request, now_ms)
+            }
+            ControlCommand::ClaimMigrationExecutor {
+                migration_id,
+                expected_generation,
+                claim_key,
+                executor,
+                now_ms,
+            } => self.claim_migration_executor(
+                migration_id,
+                expected_generation,
+                claim_key,
+                executor,
+                now_ms,
+            ),
+            ControlCommand::UpdateMigration {
+                token,
+                expected_revision,
+                update,
+                now_ms,
+            } => self.update_managed_migration(token, expected_revision, update, now_ms),
             ControlCommand::BootstrapCluster {
                 bootstrap,
                 memberships,
@@ -315,6 +361,7 @@ impl ControlPlaneState {
             || self.active_migration.is_some()
             || self.managed_placement.is_some()
             || self.next_migration_id != 1
+            || self.next_executor_generation != 1
         {
             return reject("cluster bootstrap requires an empty control state; existing control state needs explicit adoption".to_owned());
         }
@@ -659,7 +706,7 @@ impl ControlPlaneState {
         None
     }
 
-    fn begin_migration(
+    pub(crate) fn begin_migration(
         &mut self,
         raft_group_id: RaftGroupId,
         target_voters: BTreeSet<NodeId>,
@@ -731,8 +778,12 @@ impl ControlPlaneState {
             .collect();
 
         let migration_id = self.next_migration_id.max(1);
-        self.next_migration_id = migration_id.saturating_add(1);
+        let Some(next_id) = migration_id.checked_add(1) else {
+            return reject("migration id space exhausted".to_owned());
+        };
+        self.next_migration_id = next_id;
         self.migrations.insert(migration_id, GroupMigration {
+            managed: None,
             migration_id,
             raft_group_id,
             from_voters,

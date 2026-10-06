@@ -4414,6 +4414,7 @@ dependencies = [
  "serde_json",
  "toml",
  "url",
+ "ursula-proto",
  "ursula-shard",
 ]
 

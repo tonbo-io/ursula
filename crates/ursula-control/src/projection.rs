@@ -32,6 +32,7 @@ impl ControlProjection {
             || self.state.active_migration.is_some()
             || self.state.managed_placement.is_some()
             || self.state.next_migration_id != 1
+            || self.state.next_executor_generation != 1
         {
             return Err("pre-adoption state must be completely empty".to_owned());
         }
@@ -56,6 +57,7 @@ impl ControlProjection {
             .managed_placement
             .as_ref()
             .ok_or_else(|| "projection requires persisted replication policies".to_owned())?;
+        self.state.validate_migration_state()?;
         if managed.group_count != self.identity.group_count
             || self.state.placements.len() != self.identity.group_count as usize
             || managed.groups.len() != self.state.placements.len()
