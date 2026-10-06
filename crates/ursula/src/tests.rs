@@ -4838,27 +4838,51 @@ async fn startup_maintenance_drain_disables_groups_registered_after_the_fence() 
         .registry
         .get(RaftGroupId(0))
         .expect("drained follower group");
+    // Do not let the separate memory-recovery gate hide a broken maintenance
+    // fence. Every replica must finish recovery while the leader still ticks.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while nodes
+            .iter()
+            .any(|node| !node.registry.recovery_barriers_ready())
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all memory recovery barriers must open before testing the maintenance fence");
+    // Stop both other Raft engines so only the drained follower can campaign.
+    // Disabling a peer's election flag can be overwritten by recovery policy;
+    // disabling its ticker alone does not stop all outbound replication.
+    for node in &nodes[..2] {
+        node.registry
+            .get(RaftGroupId(0))
+            .expect("other peer group")
+            .runtime_config()
+            .tick(false);
+    }
+    // Capture before shutdown: an unfenced follower can start its election
+    // while we are awaiting the two peers' shutdown acknowledgements.
     let term_before = follower.metrics().borrow_watched().current_term;
-    nodes[0]
-        .registry
-        .get(RaftGroupId(0))
-        .expect("leader group")
-        .runtime_config()
-        .heartbeat(false);
-    nodes[1]
-        .registry
-        .get(RaftGroupId(0))
-        .expect("other follower group")
-        .runtime_config()
-        .elect(false);
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    for node in &nodes[..2] {
+        node.registry
+            .get(RaftGroupId(0))
+            .expect("other peer group")
+            .shutdown()
+            .await
+            .expect("stop other peer raft engine");
+    }
+    tokio::time::sleep(Duration::from_secs(15)).await;
 
     let metrics = follower.metrics().borrow_watched().clone();
     assert_eq!(
         metrics.current_term, term_before,
-        "maintenance-drained follower must not campaign after its leader lease expires"
+        "maintenance-drained follower must not campaign after its leader lease expires: {metrics:?}"
     );
     assert_ne!(metrics.current_leader, Some(3));
+    assert_ne!(
+        metrics.vote.leader_id.node_id, 3,
+        "maintenance-drained follower must not cast a self-vote, even without enough peers to become leader: {metrics:?}"
+    );
 
     for node in nodes {
         node.shutdown().await;
