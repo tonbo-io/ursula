@@ -78,13 +78,13 @@ pub(crate) struct CoreFileLogWriter {
 }
 
 #[derive(Debug)]
-struct JournalLock {
+pub(crate) struct JournalLock {
     _file: File,
     path: PathBuf,
 }
 
 impl JournalLock {
-    fn acquire(journal_path: &Path) -> Result<Self, io::Error> {
+    pub(crate) fn acquire(journal_path: &Path) -> Result<Self, io::Error> {
         let mut lock_name = journal_path.as_os_str().to_owned();
         lock_name.push(".lock");
         let path = PathBuf::from(lock_name);
@@ -921,7 +921,7 @@ fn reclaim_core_journal_if_needed(
 
 /// Frames Raft log records as length-delimited MessagePack for the shared
 /// journal (see [`crate::codec::encode_wire`]).
-struct WireCodec<T>(PhantomData<T>);
+pub(crate) struct WireCodec<T>(PhantomData<T>);
 
 impl<T: Serialize + DeserializeOwned> journal::FrameCodec for WireCodec<T> {
     type Record = T;

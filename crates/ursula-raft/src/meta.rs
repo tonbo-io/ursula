@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::io;
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -24,12 +25,15 @@ use openraft::storage::EntryResponder;
 use openraft::storage::RaftLogStorage;
 use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
+use serde::Deserialize;
+use serde::Serialize;
 use ursula_control::ControlCommand;
 use ursula_control::ControlPlaneState;
 use ursula_control::ControlResponse;
 use ursula_control::NodeId;
 use ursula_shard::RaftGroupId;
 
+use crate::log_store::MetaRaftFileLogStore;
 use crate::registry::SingleNodeRaftNetworkFactory;
 
 #[cfg(madsim)]
@@ -136,7 +140,7 @@ impl MetaRaftHandle {
         NF: RaftNetworkFactory<MetaRaftTypeConfig>,
         LS: RaftLogStorage<MetaRaftTypeConfig>,
     {
-        let raft = MetaRaft::new(
+        Self::new_node_with_state_machine(
             node_id,
             config,
             network_factory,
@@ -144,7 +148,45 @@ impl MetaRaftHandle {
             MetaRaftStateMachine::default(),
         )
         .await
-        .map_err(|err| MetaRaftError::with_source("create meta OpenRaft group", err))?;
+    }
+
+    /// Recover one durable meta replica. Initialization remains an explicit,
+    /// one-time bootstrap operation; reopening never creates a new membership.
+    pub async fn new_durable_node_with_network<NF>(
+        node_id: u64,
+        config: Arc<Config>,
+        network_factory: NF,
+        journal_path: impl Into<PathBuf>,
+    ) -> Result<Self, MetaRaftError>
+    where
+        NF: RaftNetworkFactory<MetaRaftTypeConfig>,
+    {
+        let path = journal_path.into();
+        let (store, state_machine) = crate::log_store::spawn_log_store_blocking(None, move || {
+            let store = MetaRaftFileLogStore::open(path)?;
+            let state_machine = MetaRaftStateMachine::open_durable(store.clone())?;
+            Ok((store, state_machine))
+        })
+        .await
+        .map_err(|err| MetaRaftError::with_source("recover durable meta storage", err))?;
+        Self::new_node_with_state_machine(node_id, config, network_factory, store, state_machine)
+            .await
+    }
+
+    async fn new_node_with_state_machine<NF, LS>(
+        node_id: u64,
+        config: Arc<Config>,
+        network_factory: NF,
+        log_store: LS,
+        state_machine: MetaRaftStateMachine,
+    ) -> Result<Self, MetaRaftError>
+    where
+        NF: RaftNetworkFactory<MetaRaftTypeConfig>,
+        LS: RaftLogStorage<MetaRaftTypeConfig>,
+    {
+        let raft = MetaRaft::new(node_id, config, network_factory, log_store, state_machine)
+            .await
+            .map_err(|err| MetaRaftError::with_source("create meta OpenRaft group", err))?;
 
         Ok(Self { raft })
     }
@@ -348,15 +390,36 @@ pub struct MetaRaftStateMachine {
     last_applied_log_id: Option<LogIdOf<MetaRaftTypeConfig>>,
     last_membership: StoredMembershipOf<MetaRaftTypeConfig>,
     current_snapshot: Arc<Mutex<Option<MetaCurrentSnapshot>>>,
+    durable_store: Option<Arc<MetaRaftFileLogStore>>,
 }
 
-#[derive(Debug, Clone)]
-struct MetaCurrentSnapshot {
-    meta: SnapshotMetaOf<MetaRaftTypeConfig>,
-    bytes: Vec<u8>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MetaCurrentSnapshot {
+    pub(crate) meta: SnapshotMetaOf<MetaRaftTypeConfig>,
+    #[serde(with = "serde_bytes")]
+    pub(crate) bytes: Vec<u8>,
 }
 
 impl MetaRaftStateMachine {
+    pub fn open_durable(store: Arc<MetaRaftFileLogStore>) -> io::Result<Self> {
+        let snapshot = store.snapshot()?;
+        let mut machine = Self::default();
+        if let Some(snapshot) = &snapshot {
+            if snapshot.meta.last_membership.log_id() > &snapshot.meta.last_log_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "meta snapshot membership exceeds its applied log",
+                ));
+            }
+            machine.state = serde_json::from_slice(&snapshot.bytes).map_err(invalid_snapshot)?;
+            machine.last_applied_log_id = snapshot.meta.last_log_id;
+            machine.last_membership = snapshot.meta.last_membership.clone();
+        }
+        machine.current_snapshot = Arc::new(Mutex::new(snapshot));
+        machine.durable_store = Some(store);
+        Ok(machine)
+    }
+
     pub fn state(&self) -> &ControlPlaneState {
         &self.state
     }
@@ -426,6 +489,7 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
             state: self.state.clone(),
             meta: self.snapshot_meta(),
             current_snapshot: self.current_snapshot.clone(),
+            durable_store: self.durable_store.clone(),
         }
     }
 
@@ -441,13 +505,30 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
         snapshot: SnapshotDataOf<MetaRaftTypeConfig>,
     ) -> Result<(), io::Error> {
         let bytes = snapshot.into_inner();
-        self.state = serde_json::from_slice(&bytes).map_err(invalid_snapshot)?;
-        self.last_applied_log_id = meta.last_log_id;
-        self.last_membership = meta.last_membership.clone();
-        *self.current_snapshot.lock().expect("snapshot mutex") = Some(MetaCurrentSnapshot {
+        if meta.last_log_id < self.last_applied_log_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stale meta snapshot",
+            ));
+        }
+        if meta.last_membership.log_id() > &meta.last_log_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "meta snapshot membership exceeds its applied log",
+            ));
+        }
+        let state = serde_json::from_slice(&bytes).map_err(invalid_snapshot)?;
+        let current = MetaCurrentSnapshot {
             meta: meta.clone(),
             bytes,
-        });
+        };
+        if let Some(store) = &self.durable_store {
+            store.persist_snapshot(current.clone()).await?;
+        }
+        self.state = state;
+        self.last_applied_log_id = meta.last_log_id;
+        self.last_membership = meta.last_membership.clone();
+        *self.current_snapshot.lock().expect("snapshot mutex") = Some(current);
         Ok(())
     }
 
@@ -471,15 +552,26 @@ pub struct MetaRaftSnapshotBuilder {
     state: ControlPlaneState,
     meta: SnapshotMetaOf<MetaRaftTypeConfig>,
     current_snapshot: Arc<Mutex<Option<MetaCurrentSnapshot>>>,
+    durable_store: Option<Arc<MetaRaftFileLogStore>>,
 }
 
 impl RaftSnapshotBuilder<MetaRaftTypeConfig> for MetaRaftSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<SnapshotOf<MetaRaftTypeConfig>, io::Error> {
         let bytes = serde_json::to_vec(&self.state).map_err(invalid_snapshot)?;
-        *self.current_snapshot.lock().expect("snapshot mutex") = Some(MetaCurrentSnapshot {
+        let snapshot = MetaCurrentSnapshot {
             meta: self.meta.clone(),
             bytes: bytes.clone(),
-        });
+        };
+        if let Some(store) = &self.durable_store {
+            store.persist_snapshot(snapshot.clone()).await?;
+        }
+        let mut current = self.current_snapshot.lock().expect("snapshot mutex");
+        if current
+            .as_ref()
+            .is_none_or(|old| old.meta.last_log_id <= snapshot.meta.last_log_id)
+        {
+            *current = Some(snapshot);
+        }
         Ok(SnapshotOf::<MetaRaftTypeConfig> {
             meta: self.meta.clone(),
             snapshot: Cursor::new(bytes),

@@ -15,6 +15,7 @@
 //! - [`maintenance`]: configuration-backed local Raft maintenance eligibility.
 //! - [`state_machine`]: per-group [`RaftGroupStateMachine`] and snapshot builder.
 //! - [`meta`]: meta-group OpenRaft type config and control-plane state machine.
+//! - `log_store::meta`: durable meta journal, snapshots, and recovery guards.
 //! - [`engine`]: [`RaftGroupEngine`] + `GroupEngine` impl, with the engine
 //!   factories under `engine::factory`.
 //! - [`format_epoch`]: the Raft protocol (format-epoch) peer probe and the
@@ -88,6 +89,7 @@ pub use grpc::raft_grpc_metrics_snapshot;
 pub use grpc::raft_grpc_service;
 pub use grpc::request_self_election_via_transfer;
 pub use log_store::MemoryRaftLogStore;
+pub use log_store::MetaRaftFileLogStore;
 pub use log_store::MetaRaftLogStore;
 pub use log_store::RaftGroupFileLogStore;
 pub use log_store::RaftGroupLogStore;

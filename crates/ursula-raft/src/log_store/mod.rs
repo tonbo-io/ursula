@@ -1,17 +1,22 @@
 mod file;
 mod memory;
+mod meta;
 
 use std::collections::BTreeMap;
 use std::io;
 
 pub(crate) use file::CoreFileLogWriter;
+pub(crate) use file::JournalLock;
 pub use file::RaftGroupFileLogStore;
+pub(crate) use file::WireCodec;
 pub(crate) use file::elapsed_ns;
 #[cfg(test)]
 pub(crate) use file::read_wire_frames;
+pub(crate) use file::spawn_log_store_blocking;
 pub use memory::MemoryRaftLogStore;
 pub use memory::MetaRaftLogStore;
 pub use memory::RaftGroupLogStore;
+pub use meta::MetaRaftFileLogStore;
 use openraft::RaftTypeConfig;
 use openraft::alias::EntryOf;
 use openraft::alias::LogIdOf;
