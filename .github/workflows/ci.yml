@@ -51,6 +51,28 @@ jobs:
       - name: Create disposable Kubernetes cluster
         uses: helm/kind-action@v1.14.0
 
+      - name: Verify replacement-wait regression control
+        run: |
+          source_file=charts/ursula/files/graceful-rollout.sh
+          cp "$source_file" "$RUNNER_TEMP/rollout-fixed.sh"
+          trap 'cp "$RUNNER_TEMP/rollout-fixed.sh" "$source_file"' EXIT
+          python3 - <<'PYCONTROL'
+          from pathlib import Path
+          p = Path("charts/ursula/files/graceful-rollout.sh")
+          s = p.read_text()
+          start = s.index('    if [ "${attempts}" -ge 300 ]; then')
+          end = s.index('    sleep 1', start)
+          p.write_text(s[:start] + '    [ "${attempts}" -lt 300 ]\n' + s[end:])
+          PYCONTROL
+          if python3 scripts/rollout_replacement_wait_test.py >"$RUNNER_TEMP/rollout-control.log" 2>&1; then
+            cat "$RUNNER_TEMP/rollout-control.log"
+            echo 'regression failed to detect unbounded wait' >&2
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/rollout-control.log"
+          grep -q 'AssertionError: 0 != 1' "$RUNNER_TEMP/rollout-control.log"
+          cp "$RUNNER_TEMP/rollout-fixed.sh" "$source_file"
+
       - name: Validate Helm chart
         run: |
           helm lint charts/ursula
