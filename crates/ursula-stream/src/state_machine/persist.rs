@@ -1,8 +1,4 @@
 //! Snapshot / restore serialization for the Raft state machine.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use super::BucketStreamId;
 use super::ColdChunkRef;
@@ -334,10 +330,16 @@ fn hot_segments_match_payload(segments: &[HotPayloadSegment], payload_len: usize
         {
             return false;
         }
-        let Ok(logical_len) = usize::try_from(segment.end_offset - segment.start_offset) else {
+        let (Some(logical_span), Some(stored_len)) = (
+            segment.end_offset.checked_sub(segment.start_offset),
+            segment.payload_end.checked_sub(segment.payload_start),
+        ) else {
             return false;
         };
-        if logical_len != segment.payload_end - segment.payload_start {
+        let Ok(logical_len) = usize::try_from(logical_span) else {
+            return false;
+        };
+        if logical_len != stored_len {
             return false;
         }
         expected_payload_start = segment.payload_end;

@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use ursula_shard::BucketStreamId;
 
 pub fn validate_bucket_id(bucket_id: &str) -> Result<(), String> {
@@ -41,7 +37,13 @@ pub fn validate_stream_id(stream_id: &BucketStreamId) -> Result<(), String> {
     if local.starts_with('$') {
         return Err("stream_id must not start with '$'".to_owned());
     }
-    let combined_len = stream_id.bucket_id.len() + 1 + local.len();
+    // Two in-memory string lengths cannot overflow `usize`; saturating keeps any
+    // impossible overflow on the rejected side of the limit.
+    let combined_len = stream_id
+        .bucket_id
+        .len()
+        .saturating_add(1)
+        .saturating_add(local.len());
     if combined_len > 122 {
         return Err(format!(
             "bucket/stream identity must not exceed 122 bytes, got {combined_len} bytes"

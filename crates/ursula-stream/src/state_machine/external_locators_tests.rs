@@ -1,9 +1,5 @@
 //! Bounded-state F5: external payload locators committed in state at apply
 //! and removed by `OffloadColdRefs`.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use super::*;
 
@@ -91,7 +87,7 @@ fn object(start: u64, end: u64, path: &str) -> ObjectPayloadRef {
         start_offset: start,
         end_offset: end,
         s3_path: path.to_owned(),
-        object_size: end - start,
+        object_size: end.checked_sub(start).unwrap(),
         object_offset: 0,
     }
 }

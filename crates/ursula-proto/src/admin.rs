@@ -201,10 +201,6 @@ impl From<ProcessIncarnation> for String {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 mod tests {
     use super::MaintenanceFence;
     use super::ProcessIncarnation;
@@ -215,11 +211,9 @@ mod tests {
         let fence = MaintenanceFence::new(id.to_owned(), id.to_owned(), u64::MAX).unwrap();
         assert_eq!(fence.header_value().parse::<MaintenanceFence>(), Ok(fence));
         for generation in ["0", "01", "+1", "-1", " 1", "18446744073709551616", ""] {
-            assert!(
-                format!("{id}:{generation}:{id}")
-                    .parse::<MaintenanceFence>()
-                    .is_err()
-            );
+            format!("{id}:{generation}:{id}")
+                .parse::<MaintenanceFence>()
+                .expect_err("a non-canonical or out-of-range generation must be rejected");
         }
         for value in [
             format!("{id}:1"),
@@ -227,7 +221,9 @@ mod tests {
             format!("bad:1:{id}"),
             format!("{id}:1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
         ] {
-            assert!(value.parse::<MaintenanceFence>().is_err());
+            value
+                .parse::<MaintenanceFence>()
+                .expect_err("a malformed fence header must be rejected");
         }
     }
 
@@ -246,7 +242,8 @@ mod tests {
             "\"00000000000000000000000000000000",
             "g0000000000000000000000000000000",
         ] {
-            assert!(ProcessIncarnation::try_from(invalid.to_owned()).is_err());
+            ProcessIncarnation::try_from(invalid.to_owned())
+                .expect_err("a non-canonical incarnation must be rejected");
         }
     }
 }

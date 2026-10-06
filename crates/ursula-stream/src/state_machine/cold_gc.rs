@@ -4,10 +4,6 @@
 //! compacted) their reclamation is deferred to a background worker on the
 //! leader. This queue stamps each batch with a monotonically increasing
 //! sequence number so draining can be confirmed by a replicated `AckColdGc`.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::collections::VecDeque;
 
@@ -84,15 +80,16 @@ impl ColdGcQueue {
 
     /// Drain every entry with `seq <= up_to_seq`; returns how many were removed.
     pub(super) fn ack(&mut self, up_to_seq: u64) -> u64 {
-        let before = self.pending.len();
+        let mut removed = 0u64;
         while self
             .pending
             .front()
             .is_some_and(|entry| entry.seq <= up_to_seq)
         {
             self.pending.pop_front();
+            removed = removed.saturating_add(1);
         }
-        u64::try_from(before - self.pending.len()).expect("removed fits u64")
+        removed
     }
 
     /// Moves the entry `seq` to the tail under the next sequence number, due
