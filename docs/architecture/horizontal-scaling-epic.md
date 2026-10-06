@@ -79,10 +79,10 @@ already accepts the meta type config.
 | Story | Deliverable and exit criteria | Dependencies | Status |
 | --- | --- | --- | --- |
 | HS-201 | Intent-bound state transitions, operation idempotency, epoch CAS, source/target policy and membership-step evidence; no successful finish without verified placement | M1 | In progress: commit `6530772` (replicated metadata protocol; physical executor integration pending) |
-| HS-202 | Durable dynamic group prepare/release on the owning core; joining replicas never initialize themselves; revoked replicas cannot be recreated by traffic | HS-104, HS-201 | In progress: commits `064a1af`, `cf05e16` (durable hosting authority and per-group WAL reclamation; complete prepare/release pending) |
+| HS-202 | Durable dynamic group prepare/release on the owning core; joining replicas never initialize themselves; revoked replicas cannot be recreated by traffic | HS-104, HS-201 | In progress: commits `064a1af`, `cf05e16`, `e7f12bf` (durable hosting, WAL reclamation and owning-core retirement; complete prepare/release pending) |
 | HS-203 | Resumable learner catch-up, fixed-prefix applied verification, joint-membership reconciliation, leader handoff and final membership verification | HS-201, HS-202 | Planned |
 | HS-204 | Durably allocated executor generations and process-incarnation fencing, receiving-process barriers and exclusion with maintenance; delayed old/raw requests cannot bypass authority | HS-201; required before managed mutations are exposed | In progress: commits `6530772`, `064a1af` (durable generations and receiver lifecycle admission; managed submission/reconciliation and full maintenance integration pending) |
-| HS-205 | Dynamic node/gateway routing, per-group readiness/quorum inventory, reference protection, actor/background-work retirement and safe per-core journal reclamation | HS-202, HS-203, HS-204 | In progress: commit `cf05e16` (per-group WAL reclamation primitive; inventory/snapshot/background integration pending) |
+| HS-205 | Dynamic node/gateway routing, per-group readiness/quorum inventory, reference protection, actor/background-work retirement and safe per-core journal reclamation | HS-202, HS-203, HS-204 | In progress: commits `cf05e16`, `e7f12bf` (WAL, actor and snapshot retirement; cold-work barriers and dynamic inventory pending) |
 | HS-206 | Supported operation API and CLI submit/status/wait/resume with admin authority and error semantics; real-process E2E plus DST at every migration boundary | HS-201 through HS-205 | Planned |
 
 Start with one global active operation. M2 must move a group to a node that
@@ -186,11 +186,17 @@ unevacuated machine. Physical provisioning remains outside the Raft controller.
 | 2026-10-06 | HS-202 | Three new tests plus a subprocess child reproduce retained neighbor vote/committed/purged state and later appends, direct and queued delayed old-owner refusal after a new owner opens, single-owner enforcement, unopened recovered-group reclamation, in-process reopening, failed replacement/poisoning and process-exit recovery | Actual filesystem/process storage evidence; no actual Raft membership movement or full replica cleanup claim |
 | 2026-10-06 | M1/M2 | Workspace lib/bin tests: 939 passed, 3 ignored; doc tests, workspace Clippy, format, all seven DST audits, madsim Raft check and existing smoke passed. Static follower forwarding passed (4.27s), mixed-RF/meta3/meta5 CLI adoption/restart passed (27.79s). After the final nonexistent-journal parent fsync fix, all 39 log-store tests passed (3 ignored), and Clippy/format/audits passed again | Existing CLI/DST remain fixed-layout compatibility evidence. The new ignored child is explicitly invoked by its parent storage test; migration acceptance remains open |
 
+| 2026-10-06 | HS-202 / HS-205 | Commit `e7f12bf` integrates revoked owning-core actor shutdown, coalesced cleanup independent of caller cancellation, registry/read-barrier/cache removal, snapshot lifecycle close/drain, external reference/pin retirement, snapshot metadata deletion and shared-core WAL reclamation. Retained finished builders release permits; old snapshot objects stay sealed across a new replica lifecycle | Runtime kernel implemented; external cold-work barriers and durable receiver prepare/release integration remain pending |
+| 2026-10-06 | HS-202 / HS-205 | Four new tests reproduce live pin drain and failure/retry, same-pointer prefetch owner isolation, and actual disk/OpenRaft cleanup while a queued builder delays retirement, the original caller is cancelled and a neighbor group continues. Reopening is uninitialized and old handles/builders remain fenced | The native kernel fixture uses RF1; S3 reference tests use mock stores. This is not RF3/RF5 migration or receiver binary-restart acceptance |
+| 2026-10-06 | M1/M2 | Workspace lib/bin tests: 943 passed, 3 ignored; doc tests, workspace Clippy, format, seven DST audits, madsim Raft check and existing smoke passed. Static follower forwarding passed (0.13s), mixed-RF/meta3/meta5 adoption/restart CLI passed (30.86s) | Existing CLI/DST remain fixed-layout compatibility evidence; full migration and scaling exit criteria remain open |
+
 ## Current execution checkpoint
 
 Current implementation stories: **HS-202/HS-104** explicit prepare/release and
 intent-aware startup, alongside **HS-204/HS-203** managed submission and actual
-membership reconciliation. Commit `cf05e16` supplies physical shared-core WAL
+membership reconciliation. Commit `e7f12bf` adds cancellation-independent,
+coalesced owning-core actor retirement, registry/cache/read-barrier removal,
+snapshot work/pin draining and reference/metadata cleanup. Commit `cf05e16` supplies physical shared-core WAL
 reclamation and permanent old log-store owner invalidation. Commit `064a1af`
 supplies durable receiving-process lifecycle admission, monotonic local
 assignments and retirement tombstones;
@@ -204,13 +210,12 @@ Established startup restores settled data from the bound projection checkpoint
 (`a5e6740`) even without meta quorum. Local assignments now override stale cached
 voters and legacy hosting before actor construction; explicitly assigned
 nonvoters restore without membership initialization. Dynamic prepare/release
-handlers, live inventory/maintenance/snapshot consumers, actor/background teardown
-and snapshot-metadata/reference retirement remain required. Per-group WAL
-reclamation now exists, but is not yet integrated with a complete receiver
-release path. Queue barriers alone
-cannot resolve possibly committed membership changes. Next add owning-core
-retirement and per-group snapshot/background barriers, then wire durable
-prepare/release to those cleanup primitives. Persist every managed submission,
+handlers and live inventory/maintenance/snapshot consumers remain required.
+Actor, snapshot and WAL cleanup are integrated in the runtime kernel, but cold
+flush/GC/orphan work outside the actor still needs a per-group close/drain barrier
+before a complete receiver release can be certified. Queue barriers alone
+cannot resolve possibly committed membership changes. Next close that cold-work
+gap, then wire durable prepare/release to the cleanup kernel. Persist every managed submission,
 reconcile actual data Raft membership/applied state and lost replies, and wire
 physical receipts to the resumable executor.
 

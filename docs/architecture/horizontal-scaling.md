@@ -696,9 +696,44 @@ passed again. The new subprocess child is ignored in the default runner and
 invoked explicitly by its parent test.
 
 This proves physical per-group WAL reclamation, not complete replica release.
-The supported prepare/release path still needs owning-core actor retirement,
-registry/read-barrier/cache removal, background-driver shutdown, persisted
-snapshot-metadata cleanup and external snapshot-reference retirement before it
-can certify `local_records_reclaimed` or expose a successful release receipt.
+The supported prepare/release path still needs full background-work draining
+and fenced receiver integration before it can certify `local_records_reclaimed`
+or expose a successful release receipt.
 The low-level reclamation API does not perform meta authorization or membership
 verification. Those responsibilities remain in the fenced migration executor.
+
+### Implementation checkpoint: owning-core replica retirement
+
+Commit `e7f12bf` adds `ShardRuntime::retire_group_engine`. Hosting must already be
+revoked. The owning core removes its mailbox/read barrier, queues shutdown after
+already forwarded commands, and runs detached cleanup; duplicate callers share
+the completion, and cancelling a caller does not cancel retirement. Other groups
+on that core continue processing. Recreating an engine requires successful prior
+cleanup. Ordinary shutdown still preserves durable state.
+
+The disk factory removes the stopped Raft from the registry, read barriers,
+rejoin state and cold-index cache, closes the group's snapshot lifecycle, clears
+prefetch ownership and waits for admitted work and pin leases. It then publishes
+a null current reference, removes pins, reclaims the group's WAL records and
+deletes/fsyncs persisted snapshot metadata. Failed reference cleanup stays closed
+and is retryable. A new prepared replica gets a fresh snapshot lifecycle; old
+builders and handles remain sealed. Builders admitted before close are drained,
+including builders allocated but not yet started. A completed builder releases
+its node build permit even if the builder object remains retained. Prefetch
+guards remove only their own cache entry, so an old guard cannot erase a newer
+entry for the same snapshot pointer.
+
+Four tests cover reference pin drain, failed publication/retry, prefetch ownership
+and real disk/OpenRaft/runtime teardown. The native fixture uses two RF1 groups
+on one core: a queued snapshot delays one group's cleanup while its neighbor
+writes, a cancelled caller is replaced by a duplicate waiter, metadata and WAL
+records disappear, and reopening does not initialize membership. Reference
+tests use mock S3 stores. All 943 workspace lib/bin tests passed (3 ignored),
+with doc tests, Clippy, format, seven DST audits, madsim Raft check, existing smoke
+and static/managed CLI regressions. This does not prove an RF3/RF5 move.
+
+Cold flush, GC, compaction and orphan sweep can execute S3 work outside the actor
+after obtaining a plan. They still need the group lifecycle barrier; actor and
+snapshot draining alone cannot certify a complete release. The receiver release
+endpoint is not exposed until that boundary and durable assignment/receipt
+integration are implemented.
