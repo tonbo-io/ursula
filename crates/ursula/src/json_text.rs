@@ -183,14 +183,6 @@ pub fn minify(input: &str) -> String {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
-#[expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 mod tests {
     use super::*;
 
@@ -245,12 +237,12 @@ mod tests {
         assert_eq!(stored(&wrapped), Err(JsonTextError::TooDeep));
         // Objects count like arrays.
         let objects = format!("{}1{}", "{\"k\":".repeat(127), "}".repeat(127));
-        assert!(stored(&objects).is_ok());
+        stored(&objects).expect("127 nested objects must be accepted");
         let objects = format!("{}1{}", "{\"k\":".repeat(128), "}".repeat(128));
         assert_eq!(stored(&objects), Err(JsonTextError::TooDeep));
         // A bracket inside a string is not nesting.
         let in_string = format!("[\"{}\"]", "[".repeat(500));
-        assert!(stored(&in_string).is_ok());
+        stored(&in_string).expect("brackets inside a string are not nesting");
     }
 
     #[test]
@@ -363,15 +355,20 @@ mod tests {
         }
 
         struct Ws<'a> {
-            pieces: &'a [String],
-            next: usize,
+            pieces: std::iter::Cycle<std::slice::Iter<'a, String>>,
         }
 
-        impl Ws<'_> {
-            fn take(&mut self) -> &str {
-                let piece = &self.pieces[self.next % self.pieces.len()];
-                self.next += 1;
-                piece
+        impl<'a> Ws<'a> {
+            fn new(pieces: &'a [String]) -> Self {
+                Self {
+                    pieces: pieces.iter().cycle(),
+                }
+            }
+
+            fn take(&mut self) -> &'a str {
+                self.pieces
+                    .next()
+                    .expect("the whitespace strategy yields at least one piece")
             }
         }
 
@@ -423,7 +420,7 @@ mod tests {
 
             #[test]
             fn stored_is_the_minified_writer_text(value in json(), pieces in whitespace()) {
-                let mut ws = Ws { pieces: &pieces, next: 0 };
+                let mut ws = Ws::new(&pieces);
                 let mut body = ws.take().to_owned();
                 render(&value, &mut ws, &mut body);
                 body.push_str(ws.take());
@@ -433,7 +430,7 @@ mod tests {
                         .iter()
                         .map(|item| {
                             let mut text = String::new();
-                            render(item, &mut Ws { pieces: &pieces, next: 0 }, &mut text);
+                            render(item, &mut Ws::new(&pieces), &mut text);
                             format!("{}\n", minify(&text))
                         })
                         .collect::<String>(),

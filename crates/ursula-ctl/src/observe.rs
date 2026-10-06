@@ -1,10 +1,6 @@
 //! Read-only verbs that operate on `/__ursula/metrics`. These are direct ports
 //! of the retired `ursula_ec2.py` `status` / `wait-ready` — same metrics surface, no SSH
 //! dependency.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -48,7 +44,8 @@ pub async fn collect_status(client: &MetricsClient, nodes: &[NodeInfo]) -> Statu
                         continue;
                     }
                     if let Some(leader) = group.current_leader {
-                        *counts.entry(leader).or_default() += 1;
+                        let count = counts.entry(leader).or_default();
+                        *count = count.saturating_add(1);
                     }
                 }
                 per_node.push(NodeStatus {
@@ -103,14 +100,14 @@ pub async fn wait_ready(
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<ClusterSnapshot> {
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
     let mut last_summary = String::from("no metrics yet");
     loop {
         let snapshot = client.try_fetch_cluster(nodes).await;
         if cluster_ready(&snapshot, nodes.len(), expected_groups, &mut last_summary) {
             return Ok(snapshot);
         }
-        if Instant::now() >= deadline {
+        if started.elapsed() >= timeout {
             bail!("cluster not ready after {:?}: {last_summary}", timeout);
         }
         tokio::time::sleep(poll_interval).await;

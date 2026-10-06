@@ -250,10 +250,6 @@ fn non_empty(value: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 mod tests {
     use super::*;
 
@@ -271,12 +267,10 @@ mod tests {
                 .as_str(),
             "00000000000000000000000000000001"
         );
-        assert!(
-            StaticNodeProvider::from_bytes(
-                br#"{"nodes":[{"id":1,"host":"node","expected_process_incarnation":"invalid"}]}"#
-            )
-            .is_err()
-        );
+        StaticNodeProvider::from_bytes(
+            br#"{"nodes":[{"id":1,"host":"node","expected_process_incarnation":"invalid"}]}"#,
+        )
+        .expect_err("an invalid process incarnation must be rejected");
     }
 
     #[tokio::test]
@@ -302,12 +296,10 @@ mod tests {
             node.http_url.as_ref().unwrap().host_str(),
             Some("replacement.invalid")
         );
-        assert!(
-            StaticNodeProvider::from_bytes(
-                br#"{"nodes":[{"id":1,"host":"replacement","metrics_url":"invalid"}]}"#
-            )
-            .is_err()
-        );
+        StaticNodeProvider::from_bytes(
+            br#"{"nodes":[{"id":1,"host":"replacement","metrics_url":"invalid"}]}"#,
+        )
+        .expect_err("an invalid metrics URL must be rejected");
     }
 
     #[test]
@@ -324,7 +316,8 @@ mod tests {
         let provider = StaticNodeProvider::from_text_sniffed(yaml).unwrap();
         assert_eq!(provider.nodes.len(), 1);
 
-        assert!(StaticNodeProvider::from_text_sniffed("not a manifest").is_err());
+        StaticNodeProvider::from_text_sniffed("not a manifest")
+            .expect_err("a text that is not a manifest must be rejected");
     }
 
     #[test]
@@ -355,10 +348,6 @@ admin_url = "http://127.0.0.1:5442"
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 mod fence_tests {
     use serde_json::json;
 
@@ -384,20 +373,19 @@ mod fence_tests {
         );
         let mut inconsistent = saved.clone();
         inconsistent["nodes"][1]["expected_maintenance_fence"]["generation"] = json!(4);
-        assert!(
-            StaticNodeProvider::from_bytes(&serde_json::to_vec(&inconsistent).unwrap()).is_err()
-        );
+        StaticNodeProvider::from_bytes(&serde_json::to_vec(&inconsistent).unwrap())
+            .expect_err("inconsistent maintenance fences must be rejected");
         inconsistent = saved;
         inconsistent["nodes"][1]
             .as_object_mut()
             .unwrap()
             .remove("expected_maintenance_fence");
-        assert!(
-            StaticNodeProvider::from_bytes(&serde_json::to_vec(&inconsistent).unwrap()).is_err()
-        );
+        StaticNodeProvider::from_bytes(&serde_json::to_vec(&inconsistent).unwrap())
+            .expect_err("a missing maintenance fence on one node must be rejected");
         let mut conflict = manifest;
         conflict["nodes"][0]["expected_maintenance_fence"] = token;
         conflict["nodes"][0]["expected_maintenance_fence"]["generation"] = json!(4);
-        assert!(StaticNodeProvider::from_bytes(&serde_json::to_vec(&conflict).unwrap()).is_err());
+        StaticNodeProvider::from_bytes(&serde_json::to_vec(&conflict).unwrap())
+            .expect_err("a conflicting maintenance fence must be rejected");
     }
 }

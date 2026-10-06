@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -77,7 +73,8 @@ impl CommitStallTracker {
         let mut leader_count: HashMap<u64, usize> = HashMap::new();
         for snap in snaps {
             if let Some(leader) = snap.current_leader {
-                *leader_count.entry(leader).or_insert(0) += 1;
+                let count = leader_count.entry(leader).or_insert(0);
+                *count = count.saturating_add(1);
             }
         }
         let mut actions = Vec::new();

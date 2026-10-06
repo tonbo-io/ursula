@@ -6,10 +6,6 @@
 //! replicated state never holds the body. Reads and `/bootstrap` stream the
 //! object back in bounded pieces. Without a cold store, or for bodies under
 //! the staging threshold, publish keeps the inline path and its 32 MiB cap.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::io;
 
@@ -196,12 +192,14 @@ async fn object_stream(
         let cold_store = cold_store.clone();
         let object = object.clone();
         async move {
-            if offset >= size {
+            let remaining = size.saturating_sub(offset);
+            if remaining == 0 {
                 return Ok(None);
             }
-            let len = (size - offset).min(COLD_SNAPSHOT_READ_PIECE_BYTES);
+            let len = remaining.min(COLD_SNAPSHOT_READ_PIECE_BYTES);
             let piece = read_piece(&cold_store, &object, offset, len).await?;
-            Ok(Some((piece, offset + len)))
+            // `len <= remaining`, so `offset + len <= size` and never saturates.
+            Ok(Some((piece, offset.saturating_add(len))))
         }
     });
     Ok(stream::once(async move { Ok(first) }).chain(rest))
@@ -260,7 +258,8 @@ pub(crate) async fn bootstrap_response(
     };
     let (boundary, mut headers) = render::bootstrap_head(&response);
     let (prefix, suffix) = render::bootstrap_multipart_around_snapshot(&response, &boundary);
-    let len = u64::try_from(prefix.len() + suffix.len())
+    // Two in-memory buffers cannot sum past `usize::MAX`, so this never saturates.
+    let len = u64::try_from(prefix.len().saturating_add(suffix.len()))
         .expect("multipart len fits u64")
         .saturating_add(object.payload_len);
     let body = match object_stream(cold_store, object).await {

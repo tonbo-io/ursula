@@ -1,8 +1,4 @@
 #![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
-#![expect(
     clippy::assertions_on_result_states,
     reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
 )]
@@ -37,7 +33,9 @@ fn request(operation: u128, executor: u128, target: u64) -> OwnershipRequest {
         .map(|id| NodeInfo {
             id,
             host: format!("voter-{id}"),
-            admin_url: format!("http://127.0.0.1:{}", 1000 + id).parse().unwrap(),
+            admin_url: format!("http://127.0.0.1:{}", 1000_u64.checked_add(id).unwrap())
+                .parse()
+                .unwrap(),
             http_url: Some(format!("http://voter-{id}:4437").parse().unwrap()),
             metrics_url: None,
             expected_process_incarnation: Some(ProcessIncarnation::from_bits(u128::from(id))),
@@ -337,7 +335,7 @@ fn observation(
         .collect();
     super::PrefixObservation {
         started_ms: start,
-        completed_ms: start + 100,
+        completed_ms: start.checked_add(100).unwrap(),
         verification: crate::quorum::QuorumVerification {
             version: 3,
             participation_certified: true,
@@ -408,10 +406,10 @@ fn host_publication() -> super::PublishHostInventory {
         now_ms: 1500,
         process_plan: plan,
         observation: proof,
-        pods: (1..=3)
+        pods: (1_u64..=3)
             .map(|id| {
                 json!({"kind":"Pod", "metadata":{
-            "namespace":"ursula", "name":format!("voters-{}", id-1), "uid":format!("pod-{id}"),
+            "namespace":"ursula", "name":format!("voters-{}", id.checked_sub(1).unwrap()), "uid":format!("pod-{id}"),
             "ownerReferences":[{"kind":"StatefulSet", "uid":"statefulset-uid", "controller":true}]},
             "spec":{"nodeName":format!("host-{id}")},
             "status":{"conditions":[{"type":"Ready", "status":"True"}]}})

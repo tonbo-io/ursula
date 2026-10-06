@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::time::Duration;
 
 use ursula_raft::LeadershipShedReason;
@@ -69,9 +65,19 @@ async fn trigger_snapshot_build(
         tracing::error!("snapshot driver trigger group {raft_group_id} error: {err}");
         return Ok(false);
     }
-    let deadline = tokio::time::Instant::now() + SNAPSHOT_HANDOFF_WAIT;
-    while coordinator.handoff_pending(raft_group_id) && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    let claimed = async {
+        while coordinator.handoff_pending(raft_group_id) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    if tokio::time::timeout(SNAPSHOT_HANDOFF_WAIT, claimed)
+        .await
+        .is_err()
+    {
+        tracing::debug!(
+            raft_group_id,
+            "snapshot driver: handoff not claimed in time"
+        );
     }
     // Unclaimed: OpenRaft dropped the trigger (e.g. a build was already running).
     Ok(!coordinator.reclaim_handoff(raft_group_id))
@@ -209,11 +215,11 @@ pub fn spawn_snapshot_driver(
                 false
             };
             if bad_tick {
-                consecutive_bad += 1;
+                consecutive_bad = consecutive_bad.saturating_add(1);
                 consecutive_good = 0;
             } else {
                 consecutive_bad = 0;
-                consecutive_good += 1;
+                consecutive_good = consecutive_good.saturating_add(1);
             }
 
             if !yielded && consecutive_bad >= unhealthy_ticks {

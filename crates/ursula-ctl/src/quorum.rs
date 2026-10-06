@@ -2,10 +2,6 @@
 //!
 //! This evidence is scoped to one observation. Physical disruption still needs
 //! an exclusive reservation and incarnation-aware lifecycle fencing.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -17,7 +13,6 @@ use anyhow::bail;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::time::Instant;
 use ursula_proto::admin::MaintenanceFence;
 use ursula_proto::admin::MaintenanceFenceState;
 use ursula_proto::admin::ProcessIncarnation;
@@ -288,7 +283,6 @@ async fn verify_observed_quorum(
     {
         bail!("quorum verification requires unique voters and nonempty configured groups/cores");
     }
-    let deadline = Instant::now() + options.timeout;
     let observe = async {
         let initial = client.fetch_cluster(nodes).await?;
         validate_observed_inventory(
@@ -394,17 +388,15 @@ async fn verify_observed_quorum(
             tokio::time::sleep(options.poll_interval).await;
         }
     };
-    tokio::time::timeout_at(deadline, observe)
+    tokio::time::timeout(options.timeout, observe)
         .await
         .context("fresh quorum verification deadline reached")?
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 mod tests {
+    use tokio::time::Instant;
+
     use super::*;
     use crate::metrics::NodeMetricsView;
     use crate::metrics::RaftGroupView;
@@ -526,7 +518,8 @@ mod tests {
         let voters = BTreeSet::from([1, 2, 3]);
         let survivors = BTreeSet::from([1, 2]);
         assert!(validate_observed_inventory(&sample, &voters, &survivors, 2, false).unwrap());
-        assert!(validate_inventory(&sample, &voters, 2, false).is_err());
+        validate_inventory(&sample, &voters, 2, false)
+            .expect_err("inventory without the third voter must be rejected");
         assert_eq!(
             apply_evidence(&sample, &prefixes(20))
                 .unwrap()
@@ -539,43 +532,40 @@ mod tests {
                 group.voter_ids = vec![1, 2];
             }
         }
-        assert!(validate_observed_inventory(&sample, &voters, &survivors, 2, false).is_err());
+        validate_observed_inventory(&sample, &voters, &survivors, 2, false)
+            .expect_err("survivors that drop a configured voter must be rejected");
     }
 
     #[test]
     fn survivor_observation_cannot_exclude_a_second_required_replica() {
         let mut sample = snapshot();
         sample.per_node.retain(|node| node.node.id == 1);
-        assert!(
-            validate_observed_inventory(
-                &sample,
-                &BTreeSet::from([1, 2, 3]),
-                &BTreeSet::from([1]),
-                2,
-                false
-            )
-            .is_err()
+        validate_observed_inventory(
+            &sample,
+            &BTreeSet::from([1, 2, 3]),
+            &BTreeSet::from([1]),
+            2,
+            false,
+        )
+        .expect_err("survivor observation of a single replica must be rejected");
+        validate_observed_inventory(
+            &sample,
+            &BTreeSet::from([1, 2, 3]),
+            &BTreeSet::from([1, 2]),
+            2,
+            false,
+        )
+        .expect_err(
+            "survivor observation that excludes a second required replica must be rejected",
         );
-        assert!(
-            validate_observed_inventory(
-                &sample,
-                &BTreeSet::from([1, 2, 3]),
-                &BTreeSet::from([1, 2]),
-                2,
-                false
-            )
-            .is_err()
-        );
-        assert!(
-            validate_observed_inventory(
-                &sample,
-                &BTreeSet::from([1, 2, 3]),
-                &BTreeSet::from([1, 4]),
-                2,
-                false
-            )
-            .is_err()
-        );
+        validate_observed_inventory(
+            &sample,
+            &BTreeSet::from([1, 2, 3]),
+            &BTreeSet::from([1, 4]),
+            2,
+            false,
+        )
+        .expect_err("survivor observation that names an unknown node must be rejected");
     }
 
     #[tokio::test]
@@ -610,27 +600,31 @@ mod tests {
         for node in &mut sample.per_node {
             node.groups.pop();
         }
-        assert!(validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, false).is_err());
+        validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, false)
+            .expect_err("a group missing on every node must be rejected");
     }
 
     #[test]
     fn duplicate_node_or_group_is_rejected() {
         let mut sample = snapshot();
         sample.per_node[2] = sample.per_node[1].clone();
-        assert!(validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, false).is_err());
+        validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, false)
+            .expect_err("a duplicate node must be rejected");
         let mut sample = snapshot();
         sample.per_node[0].groups[1] = sample.per_node[0].groups[0].clone();
-        assert!(validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, false).is_err());
+        validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, false)
+            .expect_err("a duplicate group must be rejected");
     }
 
     #[test]
     fn stale_term_or_changed_leader_cannot_reuse_a_prefix() {
         let mut sample = snapshot();
         sample.per_node[2].groups[0].current_term = Some(8);
-        assert!(apply_evidence(&sample, &prefixes(20)).is_err());
+        apply_evidence(&sample, &prefixes(20)).expect_err("a stale term must not reuse a prefix");
         sample.per_node[2].groups[0].current_term = Some(7);
         sample.per_node[2].groups[0].current_leader = Some(2);
-        assert!(apply_evidence(&sample, &prefixes(20)).is_err());
+        apply_evidence(&sample, &prefixes(20))
+            .expect_err("a changed leader must not reuse a prefix");
     }
 
     #[test]
@@ -638,7 +632,8 @@ mod tests {
         let mut sample = snapshot();
         sample.per_node[0].raft_maintenance = None;
         sample.per_node[0].groups[0].maintenance = None;
-        assert!(validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, false).is_err());
+        validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, false)
+            .expect_err("legacy metrics must not certify participation without opt-in");
         assert!(!validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, true).unwrap());
     }
 
@@ -652,7 +647,8 @@ mod tests {
                 1 => group.maintenance.as_mut().unwrap().membership_joint = true,
                 _ => group.maintenance.as_mut().unwrap().recovery_ready = false,
             }
-            assert!(validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, true).is_err());
+            validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, true)
+                .expect_err("a learner, joint membership or closed recovery must be ineligible");
         }
     }
 

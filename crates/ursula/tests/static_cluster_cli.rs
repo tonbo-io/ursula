@@ -5,14 +5,6 @@
     clippy::string_slice,
     reason = "integration tests assert by panicking, as clippy.toml allows for unit tests"
 )]
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
-#![expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 use std::collections::HashSet;
 use std::fs::File;
 use std::net::TcpListener;
@@ -122,7 +114,9 @@ printf '{"process_incarnation":"%s","maintenance_fence":%s}\n' "${STARTUP_RETURN
         spawn_child(command, format!("startup-admission-{port}-{refuse}"))
     };
     let mut rejected = start(true, &retired, "");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(10))
+        .unwrap();
     loop {
         if let Some(exit) = rejected.child.try_wait().unwrap() {
             assert!(!exit.success());
@@ -135,8 +129,10 @@ printf '{"process_incarnation":"%s","maintenance_fence":%s}\n' "${STARTUP_RETURN
         !logs.exists(),
         "no format stamp or Raft log may precede admission"
     );
-    assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
-    assert!(std::net::TcpStream::connect(("127.0.0.1", admin_port)).is_err());
+    std::net::TcpStream::connect(("127.0.0.1", port))
+        .expect_err("the HTTP listener must not be bound before admission");
+    std::net::TcpStream::connect(("127.0.0.1", admin_port))
+        .expect_err("the admin listener must not be bound before admission");
     let rejected_boot = std::fs::read_to_string(&captured).unwrap();
     assert_eq!(rejected_boot.len(), 32);
     drop(rejected);
@@ -152,7 +148,9 @@ printf '{"process_incarnation":"%s","maintenance_fence":%s}\n' "${STARTUP_RETURN
         (retired.clone(), "00000000000000000000000000000000"),
     ] {
         let mut rejected = start(false, &authority, returned_boot);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(10))
+            .unwrap();
         loop {
             if let Some(exit) = rejected.child.try_wait().unwrap() {
                 assert!(!exit.success());
@@ -162,8 +160,10 @@ printf '{"process_incarnation":"%s","maintenance_fence":%s}\n' "${STARTUP_RETURN
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(!logs.exists());
-        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
-        assert!(std::net::TcpStream::connect(("127.0.0.1", admin_port)).is_err());
+        std::net::TcpStream::connect(("127.0.0.1", port))
+            .expect_err("the HTTP listener must not be bound after a refused admission");
+        std::net::TcpStream::connect(("127.0.0.1", admin_port))
+            .expect_err("the admin listener must not be bound after a refused admission");
     }
     let mut survivors = Vec::new();
     for (index, (node_id, _)) in peers.iter().enumerate().skip(1) {
@@ -302,7 +302,9 @@ async fn cli_sigterm_drains_listeners_and_exits_cleanly() {
 
     // The server drains its listeners and must exit 0 well inside the 20s
     // forced-exit grace period; a SIGKILL'd or crashed exit fails the test.
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .unwrap();
     let exit_status = loop {
         if let Some(status) = child.child.try_wait().expect("poll child") {
             break status;
@@ -331,13 +333,8 @@ async fn cli_static_grpc_raft_cluster_forwards_follower_writes() {
     let ports = [free_port(), free_port(), free_port()];
     let peers: Vec<(u64, String)> = ports
         .iter()
-        .enumerate()
-        .map(|(index, port)| {
-            (
-                u64::try_from(index + 1).expect("node id fits u64"),
-                format!("http://127.0.0.1:{port}"),
-            )
-        })
+        .zip(1_u64..)
+        .map(|(port, node_id)| (node_id, format!("http://127.0.0.1:{port}")))
         .collect();
 
     let children = vec![
@@ -505,13 +502,8 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
     let ports = [free_port(), free_port(), free_port()];
     let peers: Vec<(u64, String)> = ports
         .iter()
-        .enumerate()
-        .map(|(index, port)| {
-            (
-                u64::try_from(index + 1).expect("node id fits u64"),
-                format!("http://127.0.0.1:{port}"),
-            )
-        })
+        .zip(1_u64..)
+        .map(|(port, node_id)| (node_id, format!("http://127.0.0.1:{port}")))
         .collect();
     let root = std::env::temp_dir().join(format!(
         "ursula-cli-durable-cluster-{}-{}",
@@ -647,13 +639,8 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
     let ports = [free_port(), free_port(), free_port()];
     let peers: Vec<(u64, String)> = ports
         .iter()
-        .enumerate()
-        .map(|(index, port)| {
-            (
-                u64::try_from(index + 1).expect("node id fits u64"),
-                format!("http://127.0.0.1:{port}"),
-            )
-        })
+        .zip(1_u64..)
+        .map(|(port, node_id)| (node_id, format!("http://127.0.0.1:{port}")))
         .collect();
     let initial_peers = peers[..2].to_vec();
     let root = std::env::temp_dir().join(format!(
@@ -822,13 +809,8 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
     let ports = [free_port(), free_port(), free_port()];
     let peers: Vec<(u64, String)> = ports
         .iter()
-        .enumerate()
-        .map(|(index, port)| {
-            (
-                u64::try_from(index + 1).expect("node id fits u64"),
-                format!("http://127.0.0.1:{port}"),
-            )
-        })
+        .zip(1_u64..)
+        .map(|(port, node_id)| (node_id, format!("http://127.0.0.1:{port}")))
         .collect();
     let root = std::env::temp_dir().join(format!(
         "ursula-cli-s3-cold-cluster-restart-{}-{suffix}",
@@ -969,7 +951,7 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
         return;
     };
     let ports = [free_port(), free_port(), free_port()];
-    let public = |node_id: u64| format!("http://127.0.0.1:{}", ports[(node_id - 1) as usize]);
+    let public = |node_id: u64| format!("http://127.0.0.1:{}", node_port(&ports, node_id));
     let peers = [1_u64, 2, 3]
         .into_iter()
         .map(|node_id| (node_id, public(node_id)))
@@ -978,7 +960,7 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
     let mut children = Vec::new();
     let mut nodes = Vec::new();
     for node_id in [1_u64, 2, 3] {
-        let port = ports[(node_id - 1) as usize];
+        let port = node_port(&ports, node_id);
         let (child, admin_port) = spawn_per_group_memory_node(binary, node_id, port, &peers, false);
         children.push(child);
         nodes.push(ctl_node(node_id, admin_port, &public(node_id)));
@@ -1210,7 +1192,9 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
     }
 
     // Node 3 heals by itself; it is never an empty voter on the way.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(60))
+        .unwrap();
     loop {
         let snapshot = ctl.fetch_cluster(&nodes).await.expect("fetch cluster");
         for group_id in 0..6_u64 {
@@ -1250,7 +1234,9 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
         .await
         .expect("repair after self-heal is a no-op");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .unwrap();
     loop {
         let snapshot = ctl.fetch_cluster(&nodes).await.expect("fetch cluster");
         let report = ursula_ctl::plan::check_readiness(&snapshot, 3, 0);
@@ -1337,8 +1323,8 @@ fn native_host_inventory(
 ) -> ursula_ctl::reservation::PublishHostInventory {
     ursula_ctl::reservation::PublishHostInventory {
         now_ms: native_epoch_ms(), process_plan:nodes.to_vec(), observation,
-        pods:(1..=3).map(|id|serde_json::json!({"kind":"Pod","metadata":{
-            "namespace":"native","name":format!("voters-{}",id-1),
+        pods:(1_u64..=3).map(|id|serde_json::json!({"kind":"Pod","metadata":{
+            "namespace":"native","name":format!("voters-{}",id.checked_sub(1).unwrap()),
             "uid":if id==3 {"native-original".to_owned()}else{format!("native-pod-{id}")},
             "ownerReferences":[{"kind":"StatefulSet","uid":"native-sts","controller":true}]},
             "spec":{"nodeName":format!("native-host-{id}")},"status":{"conditions":[{"type":"Ready","status":"True"}]}})).collect(),
@@ -1408,13 +1394,13 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
     let _guard = static_cluster_cli_test_guard().await;
     let binary = env!("CARGO_BIN_EXE_ursula");
     let ports = [free_port(), free_port(), free_port()];
-    let public = |id: u64| format!("http://127.0.0.1:{}", ports[(id - 1) as usize]);
+    let public = |id: u64| format!("http://127.0.0.1:{}", node_port(&ports, id));
     let peers = (1..=3).map(|id| (id, public(id))).collect::<Vec<_>>();
     let mut children = Vec::new();
     let mut nodes = Vec::new();
     for id in 1..=3 {
         let (child, admin) =
-            spawn_per_group_memory_node(binary, id, ports[(id - 1) as usize], &peers, false);
+            spawn_per_group_memory_node(binary, id, node_port(&ports, id), &peers, false);
         children.push(child);
         nodes.push(ctl_node(id, admin, &public(id)));
     }
@@ -1500,7 +1486,9 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
     for node in nodes.iter().filter(|node| node.id != 3) {
         ctl.set_maintenance_fence(node, false).await.unwrap();
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(60))
+        .unwrap();
     let admitted = loop {
         let started_ms = native_epoch_ms();
         match ursula_ctl::quorum::verify_surviving_quorum(&nodes, 3, &ctl, &options).await {
@@ -1587,7 +1575,9 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
     child.config_path = Some(replacement_config);
     children.push(child);
     wait_until_ready(&client, &public(3), &mut children).await;
-    assert!(ctl.fetch_node(&nodes[2]).await.is_err());
+    ctl.fetch_node(&nodes[2])
+        .await
+        .expect_err("a restarted node must not match its pinned process incarnation");
     // Each client pins fetched boot identities for its lifetime. The durable
     // reservation, rather than the old transport cache, admits this new boot.
     let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).unwrap();
@@ -1610,7 +1600,9 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
         // persistent binding. Never clear that binding merely on timeout.
         children[2].child.kill().unwrap();
         children[2].child.wait().unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(60))
+            .unwrap();
         let survivor_observation = loop {
             let started_ms = native_epoch_ms();
             match ursula_ctl::quorum::verify_surviving_quorum(&nodes, 3, &ctl, &options).await {
@@ -1638,15 +1630,13 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
                 observation: survivor_observation,
             })
             .unwrap();
-        assert!(
-            state
-                .recover_host(HostRequest::RestageHostReplacement {
-                    fence: state.operation().unwrap().fence.clone(),
-                    candidate: candidate.clone(),
-                    now_ms: native_epoch_ms()
-                })
-                .is_err()
-        );
+        state
+            .recover_host(HostRequest::RestageHostReplacement {
+                fence: state.operation().unwrap().fence.clone(),
+                candidate: candidate.clone(),
+                now_ms: native_epoch_ms(),
+            })
+            .expect_err("restaging must be refused once the replacement's termination is admitted");
         let started_ms = native_epoch_ms();
         assert!(children[2].child.try_wait().unwrap().is_some());
         state = state
@@ -1695,7 +1685,9 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
             .await;
             assert_eq!(
                 offset.parse::<u64>().unwrap(),
-                previous + u64::try_from(last_payload.len()).unwrap()
+                previous
+                    .checked_add(u64::try_from(last_payload.len()).unwrap())
+                    .unwrap()
             );
         }
         drop(children.pop());
@@ -1782,7 +1774,9 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
     for node in &nodes {
         ctl.set_maintenance_fence(node, true).await.unwrap();
     }
-    let completion_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let completion_deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(60))
+        .unwrap();
     let completion = loop {
         let started_ms = native_epoch_ms();
         match ursula_ctl::quorum::verify_quorum(&nodes, &ctl, &options).await {
@@ -1890,8 +1884,8 @@ async fn cli_sigterm_hands_off_memory_leaders_and_bounds_quorum_loss() {
     let ports = [free_port(), free_port(), free_port()];
     let peers = ports
         .iter()
-        .enumerate()
-        .map(|(index, port)| ((index + 1) as u64, format!("http://127.0.0.1:{port}")))
+        .zip(1_u64..)
+        .map(|(port, node_id)| (node_id, format!("http://127.0.0.1:{port}")))
         .collect::<Vec<_>>();
     let mut children = Vec::new();
     let mut nodes = Vec::new();
@@ -1899,7 +1893,7 @@ async fn cli_sigterm_hands_off_memory_leaders_and_bounds_quorum_loss() {
         let (child, admin_port) = spawn_per_group_memory_node(
             binary,
             *node_id,
-            ports[(*node_id - 1) as usize],
+            node_port(&ports, *node_id),
             &peers,
             false,
         );
@@ -1919,7 +1913,9 @@ async fn cli_sigterm_hands_off_memory_leaders_and_bounds_quorum_loss() {
         .await;
     }
     let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(2)).expect("ctl client");
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(60))
+        .unwrap();
     let snapshot = loop {
         let snapshot = ctl.fetch_cluster(&nodes).await.expect("fetch cluster");
         if nodes.iter().all(|node| {
@@ -2007,7 +2003,9 @@ async fn sigterm_and_wait_for_clean_exit(child: &mut ChildGuard) {
         .status()
         .expect("send SIGTERM");
     assert!(status.success());
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(10))
+        .unwrap();
     loop {
         if let Some(status) = child.child.try_wait().expect("poll child") {
             assert!(
@@ -2047,6 +2045,11 @@ async fn static_cluster_cli_test_guard() -> tokio::sync::MutexGuard<'static, ()>
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
         .await
+}
+
+/// Port of 1-based `node_id` in the three-node `ports` array.
+fn node_port(ports: &[u16; 3], node_id: u64) -> u16 {
+    ports[usize::try_from(node_id.checked_sub(1).unwrap()).unwrap()]
 }
 
 fn free_port() -> u16 {

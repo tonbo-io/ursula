@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::collections::HashMap;
 
 pub(crate) fn leader_counts(
@@ -10,7 +6,8 @@ pub(crate) fn leader_counts(
     let mut leader_count = HashMap::new();
     for snap in snaps {
         if let Some(leader) = snap.current_leader {
-            *leader_count.entry(leader).or_insert(0) += 1;
+            let count = leader_count.entry(leader).or_insert(0_usize);
+            *count = count.saturating_add(1);
         }
     }
     leader_count

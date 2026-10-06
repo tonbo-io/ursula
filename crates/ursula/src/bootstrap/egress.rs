@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -43,7 +39,8 @@ pub(crate) struct ClusterEgressProbeGroup {
 }
 
 fn remote_peers_needed_for_quorum(total_voters: usize) -> usize {
-    (total_voters / 2 + 1).saturating_sub(1)
+    // A quorum is `total_voters / 2 + 1` voters and this node is one of them.
+    total_voters / 2
 }
 
 pub(crate) fn cluster_egress_probe_groups(
@@ -135,7 +132,8 @@ pub(crate) fn plan_cluster_egress_shed(
             group_id: snap.raft_group_id,
             target,
         });
-        *planned_load.entry(target).or_insert(0) += 1;
+        let target_load = planned_load.entry(target).or_insert(0);
+        *target_load = target_load.saturating_add(1);
         if let Some(load) = planned_load.get_mut(&node_id) {
             *load = load.saturating_sub(1);
         }
@@ -203,7 +201,7 @@ pub fn spawn_egress_gate(
                     if let Ok(resp) = client.post(&probe_url).body(payload.clone()).send().await
                         && resp.status().is_success()
                     {
-                        healthy_peers += 1;
+                        healthy_peers = healthy_peers.saturating_add(1);
                     }
                 }
                 if healthy_peers < group.needed_peers {
@@ -218,10 +216,10 @@ pub fn spawn_egress_gate(
             }
             let can_reach_quorum = degraded_probe.is_none();
             if can_reach_quorum {
-                consecutive_good += 1;
+                consecutive_good = consecutive_good.saturating_add(1);
                 consecutive_bad = 0;
             } else {
-                consecutive_bad += 1;
+                consecutive_bad = consecutive_bad.saturating_add(1);
                 consecutive_good = 0;
             }
 

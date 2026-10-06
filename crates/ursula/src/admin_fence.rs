@@ -205,10 +205,6 @@ impl Drop for AdmittedMutation {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 mod tests {
     use std::time::Duration;
 
@@ -226,27 +222,46 @@ mod tests {
         .unwrap()
     }
 
+    /// Asserts that `result` is a rejection of the given variant. The success
+    /// type needs no `Debug`, so the value is not printed on a wrong success.
+    macro_rules! assert_rejected {
+        ($result:expr, $variant:pat $(,)?) => {{
+            let result = $result;
+            match result {
+                Err(rejection) => {
+                    assert!(matches!(rejection, $variant), "{rejection:?}");
+                }
+                Ok(_) => panic!("expected a rejection, got success"),
+            }
+        }};
+    }
+
     #[tokio::test]
     async fn startup_retains_closed_authority_and_generation_before_first_request() {
         let pending =
             AdminMutationFence::from_startup(MaintenanceFenceState::Activating { fence: token(7) });
-        assert!(pending.admit_mutation(None).await.is_err());
-        assert!(
-            pending
-                .admit_mutation(Some(&token(7).header_value()))
-                .await
-                .is_err()
+        assert_rejected!(
+            pending.admit_mutation(None).await,
+            FenceRejection::Uncertain
         );
-        assert!(pending.activate(token(6), async { Ok(()) }).await.is_err());
+        assert_rejected!(
+            pending.admit_mutation(Some(&token(7).header_value())).await,
+            FenceRejection::Uncertain
+        );
+        assert_rejected!(
+            pending.activate(token(6), async { Ok(()) }).await,
+            FenceRejection::Changed
+        );
         let changed_executor =
             MaintenanceFence::new(format!("{:032x}", 1), format!("{:032x}", 8), 7).unwrap();
-        assert!(
-            pending
-                .activate(changed_executor, async { Ok(()) })
-                .await
-                .is_err()
+        assert_rejected!(
+            pending.activate(changed_executor, async { Ok(()) }).await,
+            FenceRejection::Changed
         );
-        assert!(pending.activate(token(7), async { Ok(()) }).await.is_ok());
+        pending
+            .activate(token(7), async { Ok(()) })
+            .await
+            .expect("the pending executor must be able to retry its own activation");
         pending
             .admit_mutation(Some(&token(7).header_value()))
             .await
@@ -255,19 +270,28 @@ mod tests {
 
         let idle =
             AdminMutationFence::from_startup(MaintenanceFenceState::Retired { fence: token(7) });
-        assert!(idle.admit_mutation(None).await.is_err());
-        for generation in [6, 7] {
-            assert!(
-                idle.activate(token(generation), async { Ok(()) })
-                    .await
-                    .is_err()
-            );
-        }
-        assert!(idle.activate(token(8), async { Ok(()) }).await.is_ok());
+        assert_rejected!(idle.admit_mutation(None).await, FenceRejection::Retired);
+        assert_rejected!(
+            idle.activate(token(6), async { Ok(()) }).await,
+            FenceRejection::Changed
+        );
+        assert_rejected!(
+            idle.activate(token(7), async { Ok(()) }).await,
+            FenceRejection::Retired
+        );
+        idle.activate(token(8), async { Ok(()) })
+            .await
+            .expect("a newer generation must supersede a retired executor");
 
         let initial = AdminMutationFence::from_startup(MaintenanceFenceState::AwaitingReservation);
-        assert!(initial.admit_mutation(None).await.is_err());
-        assert!(initial.activate(token(1), async { Ok(()) }).await.is_ok());
+        assert_rejected!(
+            initial.admit_mutation(None).await,
+            FenceRejection::Uncertain
+        );
+        initial
+            .activate(token(1), async { Ok(()) })
+            .await
+            .expect("the first reservation must activate an awaiting process");
     }
 
     #[tokio::test]
@@ -275,7 +299,9 @@ mod tests {
         let gate = AdminMutationFence::default();
         let old = token(1);
         let new = token(2);
-        assert!(gate.activate(old.clone(), async { Ok(()) }).await.is_ok());
+        gate.activate(old.clone(), async { Ok(()) })
+            .await
+            .expect("the first executor must activate");
         let guard = gate
             .admit_mutation(Some(&old.header_value()))
             .await
@@ -291,14 +317,15 @@ mod tests {
                 })
                 .await
         });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), &mut takeover)
-                .await
-                .is_err()
-        );
+        tokio::time::timeout(Duration::from_millis(30), &mut takeover)
+            .await
+            .expect_err("takeover must wait for the in-flight mutation");
         guard.complete();
         observed.await.unwrap();
-        assert!(takeover.await.unwrap().is_ok());
+        takeover
+            .await
+            .unwrap()
+            .expect("takeover must activate once in-flight work completes");
         assert!(matches!(
             gate.admit_mutation(Some(&old.header_value())).await,
             Err(FenceRejection::Changed)
@@ -307,23 +334,37 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("new admitted"))
             .complete();
-        assert!(gate.retire(old, async { Ok(()) }).await.is_err());
+        assert_rejected!(
+            gate.retire(old, async { Ok(()) }).await,
+            FenceRejection::Changed
+        );
     }
 
     #[tokio::test]
     async fn retirement_cannot_be_reactivated_or_downgraded() {
         let gate = AdminMutationFence::default();
         let old = token(1);
-        assert!(gate.activate(old.clone(), async { Ok(()) }).await.is_ok());
-        assert!(gate.retire(old.clone(), async { Ok(()) }).await.is_ok());
-        assert!(gate.retire(old.clone(), async { Ok(()) }).await.is_ok());
+        gate.activate(old.clone(), async { Ok(()) })
+            .await
+            .expect("the executor must activate");
+        gate.retire(old.clone(), async { Ok(()) })
+            .await
+            .expect("the active executor must retire");
+        gate.retire(old.clone(), async { Ok(()) })
+            .await
+            .expect("retiring a retired executor again must be idempotent");
         assert!(matches!(
             gate.activate(old.clone(), async { Ok(()) }).await,
             Err(FenceRejection::Retired)
         ));
-        assert!(gate.admit_mutation(None).await.is_err());
-        assert!(gate.activate(token(2), async { Ok(()) }).await.is_ok());
-        assert!(gate.retire(old, async { Ok(()) }).await.is_err());
+        assert_rejected!(gate.admit_mutation(None).await, FenceRejection::Retired);
+        gate.activate(token(2), async { Ok(()) })
+            .await
+            .expect("a newer generation must supersede a retired executor");
+        assert_rejected!(
+            gate.retire(old, async { Ok(()) }).await,
+            FenceRejection::Changed
+        );
         assert_eq!(gate.snapshot().await, MaintenanceFenceState::Active {
             fence: token(2)
         });
@@ -332,28 +373,36 @@ mod tests {
     #[tokio::test]
     async fn failed_activation_closes_prior_authority_and_can_retry_only_pending_identity() {
         let gate = AdminMutationFence::default();
-        assert!(gate.activate(token(1), async { Ok(()) }).await.is_ok());
-        assert!(
+        gate.activate(token(1), async { Ok(()) })
+            .await
+            .expect("the first executor must activate");
+        assert_rejected!(
             gate.activate(token(2), async { Err("queue failed".to_owned()) })
-                .await
-                .is_err()
+                .await,
+            FenceRejection::Barrier(_)
         );
         assert_eq!(gate.snapshot().await, MaintenanceFenceState::Activating {
             fence: token(2)
         });
-        assert!(
-            gate.admit_mutation(Some(&token(1).header_value()))
-                .await
-                .is_err()
+        assert_rejected!(
+            gate.admit_mutation(Some(&token(1).header_value())).await,
+            FenceRejection::Uncertain
         );
-        assert!(gate.activate(token(1), async { Ok(()) }).await.is_err());
-        assert!(gate.activate(token(2), async { Ok(()) }).await.is_ok());
+        assert_rejected!(
+            gate.activate(token(1), async { Ok(()) }).await,
+            FenceRejection::Changed
+        );
+        gate.activate(token(2), async { Ok(()) })
+            .await
+            .expect("the pending identity must be able to retry");
     }
 
     #[tokio::test]
     async fn cancelled_retirement_cannot_reopen_authority() {
         let gate = AdminMutationFence::default();
-        assert!(gate.activate(token(1), async { Ok(()) }).await.is_ok());
+        gate.activate(token(1), async { Ok(()) })
+            .await
+            .expect("the first executor must activate");
         let target = gate.clone();
         let (entered, observed) = tokio::sync::oneshot::channel();
         let retirement = tokio::spawn(async move {
@@ -370,19 +419,25 @@ mod tests {
         assert_eq!(gate.snapshot().await, MaintenanceFenceState::Retiring {
             fence: token(1)
         });
-        assert!(gate.activate(token(1), async { Ok(()) }).await.is_err());
-        assert!(
-            gate.admit_mutation(Some(&token(1).header_value()))
-                .await
-                .is_err()
+        assert_rejected!(
+            gate.activate(token(1), async { Ok(()) }).await,
+            FenceRejection::Retired
         );
-        assert!(gate.retire(token(1), async { Ok(()) }).await.is_ok());
+        assert_rejected!(
+            gate.admit_mutation(Some(&token(1).header_value())).await,
+            FenceRejection::Uncertain
+        );
+        gate.retire(token(1), async { Ok(()) })
+            .await
+            .expect("a cancelled retirement must be retryable");
     }
 
     #[tokio::test]
     async fn cancelled_activation_never_restores_previous_executor() {
         let gate = AdminMutationFence::default();
-        assert!(gate.activate(token(1), async { Ok(()) }).await.is_ok());
+        gate.activate(token(1), async { Ok(()) })
+            .await
+            .expect("the first executor must activate");
         let target = gate.clone();
         let (entered, observed) = tokio::sync::oneshot::channel();
         let activation = tokio::spawn(async move {
@@ -399,13 +454,17 @@ mod tests {
         assert_eq!(gate.snapshot().await, MaintenanceFenceState::Activating {
             fence: token(2)
         });
-        assert!(gate.activate(token(1), async { Ok(()) }).await.is_err());
-        assert!(
-            gate.admit_mutation(Some(&token(1).header_value()))
-                .await
-                .is_err()
+        assert_rejected!(
+            gate.activate(token(1), async { Ok(()) }).await,
+            FenceRejection::Changed
         );
-        assert!(gate.activate(token(2), async { Ok(()) }).await.is_ok());
+        assert_rejected!(
+            gate.admit_mutation(Some(&token(1).header_value())).await,
+            FenceRejection::Uncertain
+        );
+        gate.activate(token(2), async { Ok(()) })
+            .await
+            .expect("a cancelled activation must be retryable by its own identity");
     }
 
     #[tokio::test]
@@ -417,7 +476,10 @@ mod tests {
             .unwrap_or_else(|_| panic!("legacy admitted"));
         drop(guard);
         assert!(gate.is_uncertain());
-        assert!(gate.admit_mutation(None).await.is_err());
-        assert!(gate.activate(token(1), async { Ok(()) }).await.is_err());
+        assert_rejected!(gate.admit_mutation(None).await, FenceRejection::Uncertain);
+        assert_rejected!(
+            gate.activate(token(1), async { Ok(()) }).await,
+            FenceRejection::Uncertain
+        );
     }
 }

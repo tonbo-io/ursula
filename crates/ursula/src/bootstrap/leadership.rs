@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -128,7 +124,7 @@ pub(crate) fn plan_leadership_balance_with_eligible_nodes(
     if my_load <= fair {
         return Vec::new();
     }
-    let mut excess = my_load - fair;
+    let mut excess = my_load.saturating_sub(fair);
     let mut groups_we_lead: Vec<&ursula_raft::RaftGroupMetricsSnapshot> = snaps
         .iter()
         .filter(|s| s.current_leader == Some(my_id))
@@ -163,11 +159,12 @@ pub(crate) fn plan_leadership_balance_with_eligible_nodes(
             target,
             fair,
         });
-        *planned_load.entry(target).or_insert(0) += 1;
+        let target_load = planned_load.entry(target).or_insert(0);
+        *target_load = target_load.saturating_add(1);
         if let Some(slot) = planned_load.get_mut(&my_id) {
             *slot = slot.saturating_sub(1);
         }
-        excess -= 1;
+        excess = excess.saturating_sub(1);
     }
     actions
 }

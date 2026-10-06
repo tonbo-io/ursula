@@ -1,11 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
-#![expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -368,9 +360,9 @@ fn parses_membership_voter_ids() {
         parse_voter_ids("3,1,2").expect("parse voters"),
         BTreeSet::from([1, 2, 3])
     );
-    assert!(parse_voter_ids("").is_err());
-    assert!(parse_voter_ids("1,,2").is_err());
-    assert!(parse_voter_ids("1,node-2").is_err());
+    parse_voter_ids("").expect_err("an empty voter list must be rejected");
+    parse_voter_ids("1,,2").expect_err("an empty node id between commas must be rejected");
+    parse_voter_ids("1,node-2").expect_err("a non-numeric voter id must be rejected");
 }
 
 #[test]
@@ -2152,11 +2144,9 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
 
     options.group_count = 6;
     nodes.pop().unwrap().shutdown().await;
-    assert!(
-        ursula_ctl::quorum::verify_quorum(&manifest, &client, &options)
-            .await
-            .is_err()
-    );
+    ursula_ctl::quorum::verify_quorum(&manifest, &client, &options)
+        .await
+        .expect_err("quorum verification must fail while a voter is down");
     let survivor = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             match ursula_ctl::quorum::verify_surviving_quorum(&manifest, 3, &client, &options).await
@@ -2174,11 +2164,9 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
     assert_eq!(survivor.verification.prefixes.len(), 6);
     assert_eq!(survivor.verification.applied.len(), 2);
     nodes.pop().unwrap().shutdown().await;
-    assert!(
-        ursula_ctl::quorum::verify_surviving_quorum(&manifest, 3, &client, &options)
-            .await
-            .is_err()
-    );
+    ursula_ctl::quorum::verify_surviving_quorum(&manifest, 3, &client, &options)
+        .await
+        .expect_err("surviving-quorum verification must fail with one voter left");
 
     for node in nodes {
         node.shutdown().await;
@@ -5622,7 +5610,7 @@ mod snapshot_driver {
     fn log(log_bytes: u64, last_snapshot_bytes: u64) -> GroupLogProgress {
         GroupLogProgress {
             log_bytes,
-            log_entries: 1 + log_bytes / 256,
+            log_entries: (log_bytes / 256).saturating_add(1),
             last_snapshot_bytes,
             has_snapshot: last_snapshot_bytes > 0,
         }
@@ -7904,13 +7892,14 @@ async fn cancelled_http_caller_cannot_release_an_unfinished_executor_mutation() 
             .activate(executor_token(1), async { Ok(()) })
             .await
     });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(30), &mut takeover)
-            .await
-            .is_err()
-    );
+    tokio::time::timeout(Duration::from_millis(30), &mut takeover)
+        .await
+        .expect_err("takeover must wait for the abandoned in-flight mutation");
     finish.notify_one();
-    assert!(takeover.await.unwrap().is_ok());
+    takeover
+        .await
+        .unwrap()
+        .expect("takeover must activate once the in-flight mutation finishes");
     assert_eq!(executed.load(Ordering::SeqCst), 1);
     assert!(!state.admin_fence.is_uncertain());
 }
@@ -7922,7 +7911,8 @@ fn executor_json_requires_canonical_ids_and_nonzero_generation() {
         json!({"reservation_id": format!("{:032x}", 1), "executor_id": format!("{:032x}", 1), "generation": 0}),
         json!({"reservation_id": format!("{:032x}", 1), "executor_id": format!("{:032x}", 1), "generation": 1, "extra": true}),
     ] {
-        assert!(serde_json::from_value::<MaintenanceFence>(body).is_err());
+        serde_json::from_value::<MaintenanceFence>(body)
+            .expect_err("a malformed executor token must be rejected");
     }
     let fence = executor_token(1);
     assert_eq!(
@@ -7968,11 +7958,9 @@ async fn executor_activation_waits_for_the_actual_raft_api_queue() {
         )
         .await
     });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(30), &mut activation)
-            .await
-            .is_err()
-    );
+    tokio::time::timeout(Duration::from_millis(30), &mut activation)
+        .await
+        .expect_err("activation must wait for the raft API queue");
     release.send(()).unwrap();
     assert_eq!(activation.await.unwrap().status(), StatusCode::OK);
     registry.quiesce_for_restart().await.unwrap();
@@ -8025,13 +8013,14 @@ async fn cli_uses_saved_executor_identity_and_never_refreshes_after_takeover() {
             .to_string()
             .contains("412")
     );
-    assert!(old_client.fetch_node(&old_node).await.is_err());
-    assert!(
-        old_client
-            .pin_nodes(std::slice::from_ref(&old_node), None, false)
-            .await
-            .is_err()
-    );
+    old_client
+        .fetch_node(&old_node)
+        .await
+        .expect_err("the replaced executor must not read the node");
+    old_client
+        .pin_nodes(std::slice::from_ref(&old_node), None, false)
+        .await
+        .expect_err("the replaced executor must not pin the node");
     assert!(registry.is_leadership_shed());
     new_client
         .set_maintenance_drain(&node, false)
@@ -8043,13 +8032,14 @@ async fn cli_uses_saved_executor_identity_and_never_refreshes_after_takeover() {
     // retired token or discover a new authority from reported server state.
     let resumed = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
     resumed.set_maintenance_fence(&node, true).await.unwrap();
-    assert!(resumed.set_maintenance_fence(&node, false).await.is_err());
-    assert!(
-        old_client
-            .set_maintenance_fence(&old_node, false)
-            .await
-            .is_err()
-    );
+    resumed
+        .set_maintenance_fence(&node, false)
+        .await
+        .expect_err("a retired token must never be activated again");
+    old_client
+        .set_maintenance_fence(&old_node, false)
+        .await
+        .expect_err("the replaced executor must stay rejected after retirement");
     assert!(resumed.set_maintenance_drain(&node, true).await.is_err());
     server.abort();
 }
@@ -8073,12 +8063,10 @@ async fn explicit_replacement_binding_preserves_token_and_rejects_another_execut
         expected_maintenance_fence: Some(executor_token(1)),
     };
     let client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
-    assert!(
-        client
-            .pin_nodes(std::slice::from_ref(&node), None, false)
-            .await
-            .is_err()
-    );
+    client
+        .pin_nodes(std::slice::from_ref(&node), None, false)
+        .await
+        .expect_err("pinning without an explicit replacement must fail on an incarnation mismatch");
     let client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
     let pinned = client
         .pin_nodes(std::slice::from_ref(&node), Some(1), false)
@@ -8096,7 +8084,10 @@ async fn explicit_replacement_binding_preserves_token_and_rejects_another_execut
     other.expected_maintenance_fence = Some(executor_token(2));
     client.set_maintenance_fence(&other, false).await.unwrap();
     let client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
-    assert!(client.pin_nodes(&[node], Some(1), false).await.is_err());
+    client
+        .pin_nodes(&[node], Some(1), false)
+        .await
+        .expect_err("replacement must reject a node bound to another executor");
     server.abort();
 }
 

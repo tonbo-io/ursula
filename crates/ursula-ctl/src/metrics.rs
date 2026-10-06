@@ -806,10 +806,6 @@ impl ClusterSnapshot {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -920,7 +916,10 @@ mod tests {
             .unwrap();
         *a_identity.lock().unwrap() = Some(ProcessIncarnation::from_bits(3));
         let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
-        assert!(client.pin_nodes(&nodes, None, false).await.is_err());
+        client
+            .pin_nodes(&nodes, None, false)
+            .await
+            .expect_err("a changed process incarnation must not match the saved manifest");
         let replaced = MetricsClient::new(Duration::from_secs(1))
             .unwrap()
             .pin_nodes(&nodes, Some(1), false)
@@ -935,13 +934,11 @@ mod tests {
             nodes[1].expected_process_incarnation
         );
         *b_identity.lock().unwrap() = Some(ProcessIncarnation::from_bits(4));
-        assert!(
-            MetricsClient::new(Duration::from_secs(1))
-                .unwrap()
-                .pin_nodes(&nodes, Some(1), false)
-                .await
-                .is_err()
-        );
+        MetricsClient::new(Duration::from_secs(1))
+            .unwrap()
+            .pin_nodes(&nodes, Some(1), false)
+            .await
+            .expect_err("a changed survivor incarnation must not be replaced silently");
         a_task.abort();
         b_task.abort();
     }
@@ -949,13 +946,11 @@ mod tests {
     #[tokio::test]
     async fn legacy_identity_requires_explicit_manifest_migration_and_never_matches_a_saved_pin() {
         let (mut node, _, _, task) = incarnation_node(1, None).await;
-        assert!(
-            MetricsClient::new(Duration::from_secs(1))
-                .unwrap()
-                .pin_nodes(&[node.clone()], None, false)
-                .await
-                .is_err()
-        );
+        MetricsClient::new(Duration::from_secs(1))
+            .unwrap()
+            .pin_nodes(&[node.clone()], None, false)
+            .await
+            .expect_err("a legacy identity must require explicit manifest migration");
         let migrated = MetricsClient::new(Duration::from_secs(1))
             .unwrap()
             .pin_nodes(&[node.clone()], None, true)
@@ -963,13 +958,11 @@ mod tests {
             .unwrap();
         assert!(migrated[0].expected_process_incarnation.is_none());
         node.expected_process_incarnation = Some(ProcessIncarnation::from_bits(1));
-        assert!(
-            MetricsClient::new(Duration::from_secs(1))
-                .unwrap()
-                .fetch_node(&node)
-                .await
-                .is_err()
-        );
+        MetricsClient::new(Duration::from_secs(1))
+            .unwrap()
+            .fetch_node(&node)
+            .await
+            .expect_err("a legacy identity must never match a saved pin");
         task.abort();
     }
 

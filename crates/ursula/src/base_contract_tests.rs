@@ -13,10 +13,6 @@
 //! Offsets are opaque here: an offset is only ever echoed back or compared
 //! with another offset, never computed. A failing pin is a finding to
 //! triage; a later change may edit an assertion only with a named reason.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::sync::Arc;
 
@@ -258,7 +254,7 @@ async fn prefix_count_compare_and_set_admits_one_writer_per_prefix() {
     assert_eq!(suffix, winner_commit);
 
     // It retries at n + k and wins.
-    let seq = pad20(3 + suffix.lines().count());
+    let seq = pad20(suffix.lines().count().checked_add(3).unwrap());
     let response = append(
         &app,
         uri,
