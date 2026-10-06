@@ -33,6 +33,11 @@ enum Command {
     Status(ObserveArgs),
     /// Produce a read-only manifest with fixed server-instance identities.
     PinIncarnations(PinIncarnationsArgs),
+    /// Activate an already-admitted reservation token on every pinned process.
+    /// Does not acquire a shared cell reservation.
+    ActivateMaintenanceFence(ObserveArgs),
+    /// Retire the same token on every pinned process before external release.
+    RetireMaintenanceFence(ObserveArgs),
     /// Block until every node reports the expected number of raft groups and initialized groups have leaders.
     WaitReady(WaitReadyArgs),
     /// Mark one node as draining and transfer away every leadership it holds.
@@ -328,6 +333,10 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::ActivateMaintenanceFence(args) => {
+            run_maintenance_fence_subcommand(args, false).await
+        }
+        Command::RetireMaintenanceFence(args) => run_maintenance_fence_subcommand(args, true).await,
         Command::WaitReady(args) => run_wait_ready_subcommand(args).await,
         Command::Drain(args) => run_drain_subcommand(args).await,
         Command::Undrain(args) => run_undrain_subcommand(args).await,
@@ -450,6 +459,30 @@ async fn run_restore_subcommand(args: BackupCreateArgs) -> Result<()> {
 }
 
 /// Load the manifest and return its node list.
+async fn run_maintenance_fence_subcommand(args: ObserveArgs, retire: bool) -> Result<()> {
+    let nodes = load_nodes(&args.config).await?;
+    if nodes.is_empty()
+        || nodes.iter().any(|node| {
+            node.expected_maintenance_fence.is_none() || node.expected_process_incarnation.is_none()
+        })
+    {
+        bail!(
+            "maintenance lifecycle requires a token and process identity for every configured voter"
+        );
+    }
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let mut acknowledged = std::collections::BTreeMap::new();
+    for node in &nodes {
+        let state = client.set_maintenance_fence(node, retire).await?;
+        acknowledged.insert(node.id, state);
+    }
+    println!(
+        "{}",
+        serde_json::json!({"nodes": acknowledged, "cell_reservation_acquired": false, "physical_hosts_fenced": false})
+    );
+    Ok(())
+}
+
 async fn load_nodes(config: &std::path::Path) -> Result<Vec<NodeInfo>> {
     let manifest = StaticNodeProvider::from_path(config)
         .with_context(|| format!("load node config {}", config.display()))?;
