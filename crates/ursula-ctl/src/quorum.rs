@@ -11,6 +11,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use futures_util::StreamExt;
+use serde::Deserialize;
 use serde::Serialize;
 use tokio::time::Instant;
 use ursula_proto::admin::MaintenanceFence;
@@ -39,7 +40,8 @@ pub struct QuorumVerificationOptions {
     pub allow_legacy_eligibility: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuorumVerification {
     pub version: u32,
     pub participation_certified: bool,

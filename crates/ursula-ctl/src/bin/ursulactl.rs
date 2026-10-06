@@ -38,6 +38,11 @@ enum Command {
     ActivateMaintenanceFence(ObserveArgs),
     /// Retire the same token on every pinned process before external release.
     RetireMaintenanceFence(ObserveArgs),
+    /// Produce a whole-object reservation CAS proposal without contacting Kubernetes.
+    ReservationPropose(ReservationProposeArgs),
+    /// Verify the exact original proposal's API receipt and emit its persistent state.
+    /// Ownership alone never grants disruption or release.
+    ReservationAcknowledge(ReservationAcknowledgeArgs),
     /// Block until every node reports the expected number of raft groups and initialized groups have leaders.
     WaitReady(WaitReadyArgs),
     /// Mark one node as draining and transfer away every leadership it holds.
@@ -94,6 +99,28 @@ enum Command {
     /// Restore a verified backup into a fresh, empty cluster with the same
     /// raft group count.
     Restore(BackupCreateArgs),
+}
+
+#[derive(Args, Debug)]
+struct ReservationProposeArgs {
+    /// Expected immutable cell identity, as JSON.
+    #[arg(long)]
+    cell: PathBuf,
+    /// One complete ConfigMap GET response, including UID and resourceVersion.
+    #[arg(long)]
+    snapshot: PathBuf,
+    /// Explicit ownership or Pod-replacement progress request, as JSON.
+    #[arg(long)]
+    request: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct ReservationAcknowledgeArgs {
+    #[command(flatten)]
+    proposal: ReservationProposeArgs,
+    /// Successful API update response; a proposal/dry-run/conflict is not a receipt.
+    #[arg(long)]
+    response: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -337,6 +364,29 @@ async fn main() -> Result<()> {
             run_maintenance_fence_subcommand(args, false).await
         }
         Command::RetireMaintenanceFence(args) => run_maintenance_fence_subcommand(args, true).await,
+        Command::ReservationPropose(args) => {
+            let (_, proposal) = reservation_proposal(&args)?;
+            println!("{}", serde_json::to_string(proposal.document())?);
+            Ok(())
+        }
+        Command::ReservationAcknowledge(args) => {
+            let (snapshot, proposal) = reservation_proposal(&args.proposal)?;
+            let response = read_reservation_json(&args.response)?;
+            let acknowledged = snapshot.acknowledge(&proposal, response)?;
+            let state = acknowledged.state();
+            let operation = state.operation();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "nodes": operation.map(|operation| &operation.process_plan),
+                    "reservation": state,
+                    "reservation_proposal_acknowledged": true,
+                    "disruption_authorized": false,
+                    "physical_hosts_fenced": false,
+                })
+            );
+            Ok(())
+        }
         Command::WaitReady(args) => run_wait_ready_subcommand(args).await,
         Command::Drain(args) => run_drain_subcommand(args).await,
         Command::Undrain(args) => run_undrain_subcommand(args).await,
@@ -458,7 +508,34 @@ async fn run_restore_subcommand(args: BackupCreateArgs) -> Result<()> {
     Ok(())
 }
 
-/// Load the manifest and return its node list.
+/// Read one bounded JSON input without invoking any external operation.
+fn read_reservation_json<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("open reservation JSON {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(2_097_153).read_to_end(&mut bytes)?;
+    if bytes.len() > 2_097_152 {
+        bail!("reservation JSON exceeds the 2 MiB transport bound");
+    }
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse reservation JSON {}", path.display()))
+}
+
+fn reservation_proposal(
+    args: &ReservationProposeArgs,
+) -> Result<(
+    ursula_ctl::reservation::ConfigMapSnapshot,
+    ursula_ctl::reservation::CasProposal,
+)> {
+    let cell = read_reservation_json(&args.cell)?;
+    let document = read_reservation_json(&args.snapshot)?;
+    let request = read_reservation_json(&args.request)?;
+    let snapshot = ursula_ctl::reservation::ConfigMapSnapshot::parse(document, &cell)?;
+    let proposal = snapshot.transition(request)?;
+    Ok((snapshot, proposal))
+}
+
 async fn run_maintenance_fence_subcommand(args: ObserveArgs, retire: bool) -> Result<()> {
     let nodes = load_nodes(&args.config).await?;
     if nodes.is_empty()

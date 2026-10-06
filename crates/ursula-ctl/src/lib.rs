@@ -17,6 +17,7 @@
 //! - [`maintenance`]: node-maintenance verbs (drain, restart repair, catch-up).
 //! - [`provider`]: cluster manifest loading and node addressing.
 //! - [`quorum`]: fresh fixed-prefix verification with explicit configured inventory.
+//! - [`reservation`]: pure shared maintenance ownership and ConfigMap CAS proposals.
 
 pub mod backup;
 pub mod maintenance;
@@ -25,6 +26,7 @@ pub mod observe;
 pub mod plan;
 pub mod provider;
 pub mod quorum;
+pub mod reservation;
 
 pub use maintenance::CatchUpOptions;
 pub use maintenance::CatchUpOutcome;
