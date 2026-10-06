@@ -71,9 +71,23 @@ pub struct RaftGroupMetricsSnapshot {
     pub purged: Option<RaftLogProgressSnapshot>,
     pub voter_ids: Vec<u64>,
     pub learner_ids: Vec<u64>,
+    /// Process-local participation and effective-membership status. Missing
+    /// fields deserialize closed; an old metrics record is not a health proof.
+    #[serde(default)]
+    pub maintenance: RaftGroupMaintenanceState,
     /// Log applied since this replica's last snapshot (F12e).
     #[serde(default)]
     pub log: crate::snapshot_cadence::GroupLogProgress,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RaftGroupMaintenanceState {
+    pub running: bool,
+    pub recovery_ready: bool,
+    pub accepting_transfers: bool,
+    pub membership_joint: bool,
+    pub membership_log_index: Option<u64>,
+    pub stopped_for_operator: bool,
 }
 
 /// Static gRPC Raft cluster membership configuration.

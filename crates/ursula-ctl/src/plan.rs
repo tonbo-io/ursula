@@ -28,11 +28,28 @@ impl DrainPlan {
 /// is both caught up and currently carrying the fewest leaders. Returns an empty
 /// plan if the target leads nothing.
 pub fn plan_drain(snapshot: &ClusterSnapshot, target_node_id: u64) -> DrainPlan {
+    plan_drain_at_barriers(snapshot, target_node_id, &BTreeMap::new())
+}
+
+/// Use a fixed observed committed prefix while waiting for successor apply.
+/// Otherwise continuously advancing writes and sequential metrics sampling
+/// can move the target forever. The actual Raft handoff still waits for the
+/// successor's log to cover the leader's transfer request before campaigning.
+pub(crate) fn plan_drain_at_barriers(
+    snapshot: &ClusterSnapshot,
+    target_node_id: u64,
+    required: &BTreeMap<u64, u64>,
+) -> DrainPlan {
     let led = snapshot.groups_led_by(target_node_id);
     let mut leader_counts = leader_counts(snapshot);
     let mut transfers = Vec::with_capacity(led.len());
     for group in led {
-        let Some(successor) = pick_successor(snapshot, &group, target_node_id, &leader_counts)
+        let barrier = required
+            .get(&group.raft_group_id)
+            .copied()
+            .or(group.committed_index);
+        let Some(successor) =
+            pick_successor(snapshot, &group, target_node_id, &leader_counts, barrier)
         else {
             tracing::warn!(
                 "no eligible successor voter; restart cannot proceed safely: raft_group_id={} target={target_node_id}",
@@ -77,6 +94,7 @@ fn pick_successor(
     group: &RaftGroupView,
     target_node_id: u64,
     leader_counts: &BTreeMap<u64, usize>,
+    required_applied: Option<u64>,
 ) -> Option<u64> {
     let peer_views = snapshot.peer_views(group.raft_group_id, target_node_id);
     let mut scored: Vec<(u64, usize, Option<u64>)> = group
@@ -84,14 +102,26 @@ fn pick_successor(
         .iter()
         .copied()
         .filter(|id| *id != target_node_id)
+        .filter(|id| {
+            peer_views.get(id).is_some_and(|peer| {
+                peer.participation_ready()
+                    && peer
+                        .maintenance
+                        .as_ref()
+                        .is_none_or(|health| health.accepting_transfers)
+                    && peer.voter_ids.contains(id)
+                    && peer.last_applied_index.is_some()
+                    && peer.last_applied_index >= required_applied
+            })
+        })
         .map(|id| {
             let applied = peer_views.get(&id).and_then(|view| view.last_applied_index);
             let leader_count = leader_counts.get(&id).copied().unwrap_or(0);
             (id, leader_count, applied)
         })
         .collect();
-    // Prefer fewer leaders first, then highest applied. Unknown peers sort last
-    // within the same leader-count bucket but are still candidates.
+    // Eligible, observed, caught-up peers only; prefer fewer leaders first,
+    // then highest applied.
     scored.sort_by(|a, b| match (a.1, b.1) {
         (a_count, b_count) if a_count != b_count => a_count.cmp(&b_count),
         _ => match (a.2, b.2) {
@@ -108,6 +138,7 @@ fn pick_successor(
 pub struct ReadinessReport {
     pub all_ready: bool,
     pub per_group: BTreeMap<u64, GroupReadiness>,
+    pub maintenance_issues: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +285,10 @@ pub fn check_readiness(
 ) -> ReadinessReport {
     let target_view = snapshot.node(target_node_id);
     let mut all_group_ids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let maintenance = target_view.and_then(|view| view.raft_maintenance.as_ref());
+    if let Some(report) = maintenance {
+        all_group_ids.extend(report.expected_groups.keys().copied().map(u64::from));
+    }
     for view in &snapshot.per_node {
         for g in &view.groups {
             if !group_is_initialized(g) {
@@ -264,7 +299,9 @@ pub fn check_readiness(
     }
 
     let mut per_group = BTreeMap::new();
-    let mut all_ready = !all_group_ids.is_empty() && target_view.is_some();
+    let mut all_ready = !all_group_ids.is_empty()
+        && target_view.is_some()
+        && maintenance.is_none_or(|report| report.node_id == target_node_id && report.ready());
     for group_id in all_group_ids {
         let peers = snapshot.peer_views(group_id, target_node_id);
         let target_group = target_view.and_then(|v| v.group(group_id));
@@ -283,7 +320,10 @@ pub fn check_readiness(
             .unwrap_or(false);
         let empty_replica =
             target_applied.is_none() && peer_max_committed.is_some_and(|committed| committed > 0);
-        let ready = voter_member && within_lag && target_group.is_some() && !empty_replica;
+        let ready = voter_member
+            && within_lag
+            && target_group.is_some_and(RaftGroupView::participation_ready)
+            && !empty_replica;
         if !ready {
             all_ready = false;
         }
@@ -299,6 +339,25 @@ pub fn check_readiness(
     ReadinessReport {
         all_ready,
         per_group,
+        maintenance_issues: maintenance
+            .map(|report| {
+                report
+                    .node_issues
+                    .iter()
+                    .map(|issue| format!("{issue:?}"))
+                    .chain(
+                        report
+                            .group_issues
+                            .iter()
+                            .map(|(id, issues)| format!("group {id}: {issues:?}")),
+                    )
+                    .chain(
+                        (report.node_id != target_node_id || report.version != 1)
+                            .then(|| "invalid maintenance report identity or version".to_owned()),
+                    )
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -328,6 +387,7 @@ mod tests {
             node: node(node_id),
             groups,
             wal_backend: None,
+            raft_maintenance: None,
         }
     }
 
@@ -348,6 +408,7 @@ mod tests {
             last_applied_index: applied,
             voter_ids: voters,
             learner_ids: vec![],
+            maintenance: None,
         }
     }
 
@@ -361,6 +422,7 @@ mod tests {
             last_applied_index: None,
             voter_ids: vec![],
             learner_ids: vec![],
+            maintenance: None,
         }
     }
 
@@ -371,7 +433,7 @@ mod tests {
                 view(1, vec![group(7, 1, Some(1), Some(100), Some(100), vec![
                     1, 2, 3,
                 ])]),
-                view(2, vec![group(7, 2, Some(1), Some(98), Some(100), vec![
+                view(2, vec![group(7, 2, Some(1), Some(100), Some(100), vec![
                     1, 2, 3,
                 ])]),
                 view(3, vec![group(7, 3, Some(1), Some(95), Some(100), vec![
@@ -383,6 +445,103 @@ mod tests {
         assert_eq!(plan.transfers.len(), 1);
         assert_eq!(plan.transfers[0].raft_group_id, 7);
         assert_eq!(plan.transfers[0].preferred_successor, 2);
+    }
+
+    #[test]
+    fn drain_never_selects_an_unknown_lagging_recovering_or_drained_successor() {
+        let mut snapshot = ClusterSnapshot {
+            per_node: vec![
+                view(1, vec![group(7, 1, Some(1), Some(100), Some(100), vec![
+                    1, 2, 3,
+                ])]),
+                view(2, vec![group(7, 2, Some(1), Some(99), Some(100), vec![
+                    1, 2, 3,
+                ])]),
+            ],
+        };
+        assert!(plan_drain(&snapshot, 1).is_empty());
+        let peer = &mut snapshot.per_node[1].groups[0];
+        peer.last_applied_index = Some(100);
+        peer.maintenance = Some(ursula_raft::RaftGroupMaintenanceState {
+            running: true,
+            recovery_ready: false,
+            accepting_transfers: true,
+            membership_joint: false,
+            membership_log_index: Some(0),
+            stopped_for_operator: false,
+        });
+        assert!(plan_drain(&snapshot, 1).is_empty());
+        snapshot.per_node[1].groups[0]
+            .maintenance
+            .as_mut()
+            .unwrap()
+            .recovery_ready = true;
+        assert_eq!(plan_drain(&snapshot, 1).transfers[0].preferred_successor, 2);
+        snapshot.per_node[1].groups[0]
+            .maintenance
+            .as_mut()
+            .unwrap()
+            .accepting_transfers = false;
+        assert!(plan_drain(&snapshot, 1).is_empty());
+    }
+
+    #[test]
+    fn drain_apply_barrier_does_not_chase_continuously_advancing_writes() {
+        let snapshot = ClusterSnapshot {
+            per_node: vec![
+                view(1, vec![group(7, 1, Some(1), Some(110), Some(110), vec![
+                    1, 2, 3,
+                ])]),
+                view(2, vec![group(7, 2, Some(1), Some(100), Some(100), vec![
+                    1, 2, 3,
+                ])]),
+            ],
+        };
+        assert!(plan_drain(&snapshot, 1).is_empty());
+        let plan = plan_drain_at_barriers(&snapshot, 1, &BTreeMap::from([(7, 100)]));
+        assert_eq!(plan.transfers[0].preferred_successor, 2);
+        assert!(plan_drain_at_barriers(&snapshot, 1, &BTreeMap::from([(7, 101)])).is_empty());
+    }
+
+    #[test]
+    fn configured_maintenance_inventory_catches_a_group_missing_from_every_peer() {
+        let mut snapshot = ClusterSnapshot {
+            per_node: (1..=3)
+                .map(|id| {
+                    view(id, vec![group(7, id, Some(1), Some(100), Some(100), vec![
+                        1, 2, 3,
+                    ])])
+                })
+                .collect(),
+        };
+        snapshot.per_node[0].raft_maintenance = Some(ursula_raft::RaftMaintenanceReport {
+            version: 1,
+            node_id: 1,
+            lag_tolerance: 16,
+            expected_groups: BTreeMap::from([
+                (7, BTreeSet::from([1, 2, 3])),
+                (8, BTreeSet::from([1, 2, 3])),
+            ]),
+            node_issues: vec![],
+            group_issues: BTreeMap::from([(8, vec![
+                ursula_raft::RaftMaintenanceIssue::MissingGroup,
+            ])]),
+        });
+        let report = check_readiness(&snapshot, 1, 16);
+        assert!(!report.all_ready);
+        assert!(!report.per_group[&8].ready);
+        assert!(
+            report
+                .maintenance_issues
+                .iter()
+                .any(|issue| issue.contains("MissingGroup"))
+        );
+        snapshot.per_node[0]
+            .raft_maintenance
+            .as_mut()
+            .unwrap()
+            .node_id = 2;
+        assert!(!check_readiness(&snapshot, 1, 16).all_ready);
     }
 
     #[test]

@@ -12,6 +12,7 @@
 //! - [`log_store`]: in-memory and durable file-backed Raft log stores (see
 //!   `log_store::memory` and `log_store::file`).
 //! - [`registry`]: [`RaftGroupHandleRegistry`] and the single-node test network.
+//! - [`maintenance`]: configuration-backed local Raft maintenance eligibility.
 //! - [`state_machine`]: per-group [`RaftGroupStateMachine`] and snapshot builder.
 //! - [`meta`]: meta-group OpenRaft type config and control-plane state machine.
 //! - [`engine`]: [`RaftGroupEngine`] + `GroupEngine` impl, with the engine
@@ -40,6 +41,7 @@ mod format_epoch;
 mod forward;
 mod grpc;
 mod log_store;
+mod maintenance;
 mod meta;
 mod read_index;
 mod registry;
@@ -87,6 +89,9 @@ pub use log_store::MemoryRaftLogStore;
 pub use log_store::MetaRaftLogStore;
 pub use log_store::RaftGroupFileLogStore;
 pub use log_store::RaftGroupLogStore;
+pub use maintenance::RaftMaintenanceIssue;
+pub use maintenance::RaftMaintenanceReport;
+pub use maintenance::check_raft_maintenance;
 pub use meta::MetaNodeRegistration;
 pub use meta::MetaRaft;
 pub use meta::MetaRaftError;
@@ -129,6 +134,7 @@ pub use snapshot_codec::group_snapshot_frames;
 pub use state_machine::RaftGroupSnapshotBuilder;
 pub use state_machine::RaftGroupStateMachine;
 pub use state_machine::SnapshotBuildCoordinator;
+pub use types::RaftGroupMaintenanceState;
 pub use types::RaftGroupMetricsSnapshot;
 pub use types::RaftGroupResponse;
 pub use types::RaftLogProgressSnapshot;

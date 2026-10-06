@@ -24,6 +24,7 @@ use crate::plan::DrainPlan;
 use crate::plan::check_readiness;
 use crate::plan::classify_amnesiac_voter;
 use crate::plan::plan_drain;
+use crate::plan::plan_drain_at_barriers;
 use crate::provider::NodeInfo;
 
 /// Knobs for [`drain_node`].
@@ -142,7 +143,16 @@ pub async fn drain_node(
             return Err(err).context("pre-flight metrics");
         }
     };
-    let plan = plan_drain(&snapshot, target.id);
+    let mut barriers = snapshot
+        .groups_led_by(target.id)
+        .into_iter()
+        .filter_map(|group| {
+            group
+                .committed_index
+                .map(|index| (group.raft_group_id, index))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let plan = plan_drain_at_barriers(&snapshot, target.id, &barriers);
     tracing::info!(
         "drain plan computed: target_node_id={} led_groups={}",
         target.id,
@@ -178,8 +188,17 @@ pub async fn drain_node(
             }
             return Ok(DrainOutcome::Drained);
         }
-        let plan = plan_drain(&snap, target.id);
+        for group in snap.groups_led_by(target.id) {
+            if let Some(index) = group.committed_index {
+                barriers.entry(group.raft_group_id).or_insert(index);
+            }
+        }
+        let plan = plan_drain_at_barriers(&snap, target.id, &barriers);
         if plan.transfers.is_empty() {
+            if Instant::now() < deadline {
+                tokio::time::sleep(options.poll_interval).await;
+                continue;
+            }
             clear_maintenance_drain(client, target).await;
             return Ok(DrainOutcome::Aborted {
                 reason: format!(
@@ -1989,7 +2008,7 @@ fn stable_non_target_leader(
 }
 
 pub(crate) fn format_unready(report: &crate::plan::ReadinessReport) -> String {
-    let mut parts = Vec::new();
+    let mut parts = report.maintenance_issues.clone();
     for (id, g) in &report.per_group {
         if !g.ready {
             parts.push(format!(
@@ -2045,6 +2064,7 @@ mod tests {
         survivor_terms_aligned: AtomicUsize,
         transient_dual_leader_reports: AtomicUsize,
         survivor_fenced: AtomicBool,
+        recovery_gate_ready: AtomicBool,
         drained_nodes: Mutex<Vec<u64>>,
         undrained_nodes: Mutex<Vec<u64>>,
         quiesced_nodes: Mutex<Vec<u64>>,
@@ -2152,7 +2172,15 @@ mod tests {
                 "committed_index": 100,
                 "last_applied_index": 100,
                 "voter_ids": [1, 2, 3],
-                "learner_ids": []
+                "learner_ids": [],
+                "maintenance": {
+                    "running": true,
+                    "recovery_ready": state.cluster.recovery_gate_ready.load(Ordering::SeqCst),
+                    "accepting_transfers": true,
+                    "membership_joint": false,
+                    "membership_log_index": 0,
+                    "stopped_for_operator": false
+                }
             }]
         }))
     }
@@ -2341,6 +2369,7 @@ mod tests {
             survivor_terms_aligned: AtomicUsize::new(0),
             transient_dual_leader_reports: AtomicUsize::new(0),
             survivor_fenced: AtomicBool::new(false),
+            recovery_gate_ready: AtomicBool::new(true),
             drained_nodes: Mutex::new(Vec::new()),
             undrained_nodes: Mutex::new(Vec::new()),
             quiesced_nodes: Mutex::new(Vec::new()),
@@ -2678,6 +2707,27 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn drain_requires_recovery_proofs_before_any_maintenance_mutation() {
+        let (nodes, cluster) = mock_cluster(LeaderScenario::Stable).await;
+        cluster.recovery_gate_ready.store(false, Ordering::SeqCst);
+        let error = drain_node(
+            &nodes,
+            &nodes[2],
+            &MetricsClient::new(Duration::from_secs(1)).unwrap(),
+            &DrainOptions {
+                ready_timeout: Duration::ZERO,
+                poll_interval: Duration::from_millis(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("pre-flight cluster readiness"));
+        assert!(cluster.drained_nodes.lock().unwrap().is_empty());
+        assert!(cluster.operations.lock().unwrap().is_empty());
+    }
+
     fn group(
         raft_group_id: u64,
         node_id: u64,
@@ -2694,6 +2744,7 @@ mod tests {
             last_applied_index: Some(applied),
             voter_ids: vec![1, 2, 3],
             learner_ids: vec![],
+            maintenance: None,
         }
     }
 
@@ -2705,16 +2756,19 @@ mod tests {
                     node: n(1, "10.0.0.1"),
                     groups: vec![group(7, 1, Some(1), 50, 50)],
                     wal_backend: None,
+                    raft_maintenance: None,
                 },
                 NodeMetricsView {
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(1), 100, 100)],
                     wal_backend: None,
+                    raft_maintenance: None,
                 },
                 NodeMetricsView {
                     node: n(3, "10.0.0.3"),
                     groups: vec![group(7, 3, Some(1), 95, 100)],
                     wal_backend: None,
+                    raft_maintenance: None,
                 },
             ],
         };
@@ -2733,6 +2787,7 @@ mod tests {
                 node: n(2, "10.0.0.2"),
                 groups: vec![group(7, 2, Some(2), 100, 100)],
                 wal_backend: None,
+                raft_maintenance: None,
             }],
         };
         let report = check_readiness(&snapshot, 1, 5);
@@ -2760,6 +2815,7 @@ mod tests {
                 ready: false,
             });
             ReadinessReport {
+                maintenance_issues: vec![],
                 all_ready: false,
                 per_group,
             }
@@ -2803,6 +2859,7 @@ mod tests {
                 ready: false,
             });
             ReadinessReport {
+                maintenance_issues: vec![],
                 all_ready: false,
                 per_group,
             }
@@ -2836,11 +2893,13 @@ mod tests {
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(2), 100, 100)],
                     wal_backend: Some("memory".into()),
+                    raft_maintenance: None,
                 },
                 NodeMetricsView {
                     node: n(3, "10.0.0.3"),
                     groups: vec![group(7, 3, Some(2), 100, 100)],
                     wal_backend: Some("memory".into()),
+                    raft_maintenance: None,
                 },
             ],
         };
@@ -2852,11 +2911,13 @@ mod tests {
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(2), 100, 100)],
                     wal_backend: Some("memory".into()),
+                    raft_maintenance: None,
                 },
                 NodeMetricsView {
                     node: n(3, "10.0.0.3"),
                     groups: vec![group(7, 3, Some(3), 100, 100)],
                     wal_backend: Some("memory".into()),
+                    raft_maintenance: None,
                 },
             ],
         };
@@ -2943,11 +3004,13 @@ mod tests {
                     node: n(1, "10.0.0.1"),
                     groups: vec![group(7, 1, Some(2), 50, 50)],
                     wal_backend: None,
+                    raft_maintenance: None,
                 },
                 NodeMetricsView {
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(2), 100, 100)],
                     wal_backend: None,
+                    raft_maintenance: None,
                 },
             ],
         };
@@ -2964,16 +3027,19 @@ mod tests {
                     node: n(1, "10.0.0.1"),
                     groups: vec![group(7, 1, Some(2), 100, 100)],
                     wal_backend: None,
+                    raft_maintenance: None,
                 },
                 NodeMetricsView {
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(2), 100, 100)],
                     wal_backend: None,
+                    raft_maintenance: None,
                 },
                 NodeMetricsView {
                     node: n(3, "10.0.0.3"),
                     groups: vec![group(7, 3, Some(1), 100, 100)],
                     wal_backend: None,
+                    raft_maintenance: None,
                 },
             ],
         };
@@ -2995,16 +3061,19 @@ mod tests {
                     node: n(1, "10.0.0.1"),
                     groups: vec![group(159, 1, Some(1), 100, 100)],
                     wal_backend: Some("memory".into()),
+                    raft_maintenance: None,
                 },
                 NodeMetricsView {
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(159, 2, Some(3), 100, 100)],
                     wal_backend: Some("memory".into()),
+                    raft_maintenance: None,
                 },
                 NodeMetricsView {
                     node: n(3, "10.0.0.3"),
                     groups: vec![group(159, 3, Some(1), 100, 100)],
                     wal_backend: Some("memory".into()),
+                    raft_maintenance: None,
                 },
             ],
         };
@@ -3024,16 +3093,19 @@ mod tests {
                     node: n(1, "10.0.0.1"),
                     groups: vec![empty_target_group],
                     wal_backend: Some("memory".into()),
+                    raft_maintenance: None,
                 },
                 NodeMetricsView {
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(2), 100, 100)],
                     wal_backend: Some("memory".into()),
+                    raft_maintenance: None,
                 },
                 NodeMetricsView {
                     node: n(3, "10.0.0.3"),
                     groups: vec![group(7, 3, Some(2), 100, 100)],
                     wal_backend: Some("memory".into()),
+                    raft_maintenance: None,
                 },
             ],
         };

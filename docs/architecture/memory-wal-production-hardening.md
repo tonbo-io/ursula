@@ -26,7 +26,7 @@ worktree `/private/tmp/ursula-mem-review-c61cb60`.
 | --- | --- | --- | --- |
 | 1 | Fix early vote eligibility after memory-WAL state loss | Regression reproducing stale AppendEntries plus one state loss; acknowledged tail survives; real gRPC coverage; explanation of the recovery barrier | Implemented; real-gRPC regression and local cluster checks passed; CI/deployment pending |
 | 2 | Make snapshot reference publication failures recoverable | Temporary reference PUT failure followed by successful retry without restarting the Raft group; retain snapshot GC protection | Implemented; local fault, GC and concurrent-pointer tests passed; new CI/deployment pending |
-| 3 | Raft-aware maintenance gates and automatic fenced replacement | Refuse a second planned disruption until every affected group regains healthy membership and catches up; replace dead-node voters without duplicate node identities | Recovery-proof readiness added; full membership/count/disruption gates and fenced replacement pending |
+| 3 | Raft-aware maintenance gates and automatic fenced replacement | Refuse a second planned disruption until every affected group regains healthy membership and catches up; replace dead-node voters without duplicate node identities | Configuration-backed local eligibility and CLI gates implemented; serialized disruption, fresh cluster proof and fenced replacement pending |
 | 4 | Node memory budget and backpressure | Bounded retained/uncommitted logs, hot data, request queues and concurrent rebuilds under production limits and S3 degradation; reject load before OOM | Pending |
 | 5 | Business retry and Raft observability | Invalidate dead leader routes; retry only replay-safe operations within a total budget; reviewed metrics and alerts for quorum risk, stopped groups and stalled recovery; synthetic append/read | Pending |
 | 6 | Production-scale qualification | Isolated fault injection with production topology/workload; measured write-recovery and full-redundancy RTO; RPO zero inside the failure model; ongoing Turn continuity; memory/disk comparison | Dedicated test cell selected; measure baselines before proposing numeric RTO targets |
@@ -63,7 +63,7 @@ from a recovered prefix that is still missing the acknowledged tail. A first inb
 AppendEntries is not fresh evidence of post-restart recovery; neither taking a maximum
 commit index nor replaying historical learner/promotion records proves freshness.
 
-The implementation obtains a post-start outbound ReadIndex proof from the current leader and requires local application through its returned index before reopening voting and campaigning. Inbound AppendEntries can establish that a group exists, but cannot establish the recovery target. Disable automatic elections from bind onward and reject a TransferLeader that targets an unrecovered replica. Combine recovery eligibility with maintenance election policy so undrain cannot bypass recovery and recovery cannot clear maintenance. Readiness refuses incomplete recovery gates, and leadership balancing and SIGTERM discovery use recovery eligibility as well as the node's shed policy. Initial bootstrap is not fully recovered redundancy until these barriers finish; inject the next single-loss fault only after this startup recovery phase. Full expected-group, running-state, membership and cluster catch-up maintenance gates remain milestone 3.
+The implementation obtains a post-start outbound ReadIndex proof from the current leader and requires local application through its returned index before reopening voting and campaigning. Inbound AppendEntries can establish that a group exists, but cannot establish the recovery target. Disable automatic elections from bind onward and reject a TransferLeader that targets an unrecovered replica. Combine recovery eligibility with maintenance election policy so undrain cannot bypass recovery and recovery cannot clear maintenance. Readiness refuses incomplete recovery gates, and leadership balancing and SIGTERM discovery use recovery eligibility as well as the node's shed policy. Initial bootstrap is not fully recovered redundancy until these barriers finish; inject the next single-loss fault only after this startup recovery phase. Further maintenance gates are described below.
 
 Fresh initialization explicitly opens participation only after every configured voter answers empty and the shared initialized marker permits bootstrap. Explicit operator majority-loss recovery remains a separate data-loss acceptance path. Recovery proof and eligibility are process-local and cannot survive another memory-WAL restart.
 
@@ -141,6 +141,59 @@ The unchanged CI scripts for smoke corpus/PR seeds, bounded-state seed families,
 and memory-WAL scenarios passed locally. All three memory-WAL families also passed
 seeds 1–32, including the subsequent single loss. Remote checks must run again on
 the updated head before their results apply to the snapshot-reference changes.
+
+At `ad40f9d1ad30be0b6d698fc2fefa2edf38397078`, remote DST, amd64 Rust,
+lint, Helm, documentation, protocol, real-S3 integration, SQLite VFS E2E,
+memory/disk soak, state-growth and candidate-artifact checks passed. ARM Rust
+failed when a real-process restart test could not drain two remaining led groups
+within 60 seconds. The failure is confirmed; its exact cause has not been
+reproduced locally. The next changes tighten drain preflight and successor
+eligibility and include group metrics and child logs in that failure diagnostic.
+They require new remote checks, including ARM, before claiming resolution.
+
+## Configuration-backed maintenance eligibility
+
+Kubernetes readiness and metrics use a shared local Raft report whose expected
+group IDs and voters come from static configuration. Missing groups cannot be
+hidden by taking the union of observed metrics. Require a running, non-shutdown
+group, completed recovery proof, no operator stop, uniform full voter membership,
+no learners, local application through the effective membership entry, and a
+known leader in the expected voter set. Bound local committed-to-applied lag by
+the existing 16-entry maintenance tolerance. Operator permission to campaign
+after majority loss is not equivalent to a completed recovery proof.
+
+The CLI consumes this report and the per-group participation state before
+mutating maintenance policy. Reject management endpoints reporting another
+node's identity. Select only observed voters with open recovery gates, eligible
+transfer policy and application through a captured committed prefix. Keep that
+prefix fixed during a drain so continuous writes do not make the pre-transfer
+eligibility target move indefinitely; the Raft transfer protocol still waits for
+its recipient to flush the transfer request's log prefix before campaigning.
+An unavailable successor is polled within the existing deadline, not nominated.
+
+The retained 0.6.2 rolling-upgrade source lacks the additive report and uses
+legacy checks until replaced. It cannot certify the repaired participation
+contract. Remove that fallback once no supported upgrade source predates the
+report. For new replicas, the rollout waits for the Ursula startup probe before
+opening the management tunnel, repairs membership, waits for catch-up and
+releases prepared-restart policy, then requires Ready and cluster verification.
+Waiting for Ready before membership repair would deadlock with the stronger gate.
+
+Local validation passed 834 workspace library/binary tests with one pre-existing
+ignored stress test, workspace doc tests, all-targets Clippy, formatting and all
+seven DST audits. All eight static-cluster entries passed locally (real S3
+skipped without opt-in), plus rollout ordering/startup-probe shell regressions
+and strict Helm lint. Focused cases cover a group missing from every observation,
+incomplete promotion, closed recovery gates before any maintenance mutation,
+wrong endpoint identity and continuous-write drain barriers.
+The unchanged CI smoke-corpus/PR-seed, bounded-state and memory-WAL scripts also
+passed locally on the maintenance changes.
+
+This report is local eligibility, not a continuously refreshed quorum proof or
+a cluster-wide maintenance reservation. It cannot serialize two independently
+authorized disruptions, fence a lost host, or prove a replacement has exclusive
+ownership of a Raft node identity. Those parts of milestone 3 remain pending;
+direct Pod deletion also bypasses a Kubernetes PDB.
 
 ## Qualification parameters
 

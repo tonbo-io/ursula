@@ -1340,6 +1340,19 @@ impl RaftGroupHandleRegistry {
                 purged: metrics.purged.map(log_progress_snapshot),
                 voter_ids: membership.voter_ids().collect(),
                 learner_ids: membership.learner_ids().collect(),
+                maintenance: crate::types::RaftGroupMaintenanceState {
+                    running: metrics.running_state.is_ok()
+                        && metrics.state != openraft::ServerState::Shutdown,
+                    recovery_ready: self
+                        .rejoin(RaftGroupId(raft_group_id))
+                        .is_none_or(|rejoin| rejoin.vote_gate_open()),
+                    accepting_transfers: self.leadership_shed_state().should_accept_transfer(),
+                    membership_joint: membership.get_joint_config().len() != 1,
+                    membership_log_index: metrics.membership_config.log_id().map(|id| id.index()),
+                    stopped_for_operator: self
+                        .rejoin(RaftGroupId(raft_group_id))
+                        .is_some_and(|rejoin| rejoin.restart_guard().stopped_for_operator()),
+                },
                 log,
             });
         }

@@ -205,6 +205,7 @@ mod tests {
             last_applied_index: Some(1),
             voter_ids: vec![1, 2, 3],
             learner_ids: vec![],
+            maintenance: None,
         }
     }
 
@@ -218,6 +219,7 @@ mod tests {
             last_applied_index: None,
             voter_ids: vec![],
             learner_ids: vec![],
+            maintenance: None,
         }
     }
 
@@ -229,11 +231,13 @@ mod tests {
                     node: node(1),
                     groups: vec![group(7, Some(1)), group(8, Some(2))],
                     wal_backend: None,
+                    raft_maintenance: None,
                 },
                 NodeMetricsView {
                     node: node(2),
                     groups: vec![group(7, Some(1)), group(8, Some(2))],
                     wal_backend: None,
+                    raft_maintenance: None,
                 },
             ],
         };
@@ -248,6 +252,7 @@ mod tests {
                 node: node(1),
                 groups: vec![group(7, None)],
                 wal_backend: None,
+                raft_maintenance: None,
             }],
         };
         let mut summary = String::new();
@@ -262,6 +267,7 @@ mod tests {
                 node: node(1),
                 groups: vec![group(7, Some(1)), empty_group(8)],
                 wal_backend: None,
+                raft_maintenance: None,
             }],
         };
         let mut summary = String::new();

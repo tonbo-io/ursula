@@ -14,6 +14,11 @@ export NAMESPACE STATEFULSET REPLICAS EXPECTED_GROUPS TARGET_IMAGE CTL ROLLOUT_S
 
 # shellcheck source=graceful-rollout.sh
 . "${test_dir}/graceful-rollout.sh"
+original_wait_for_pod_started=$(declare -f wait_for_pod_started)
+# Existing resume fixtures use the same pod-identity preconditions for
+# listener startup and final readiness. The ordering regression below gives
+# those stages distinct behavior.
+wait_for_pod_started() { wait_for_pod_ready "$1"; }
 original_write_manifest=$(declare -f write_manifest)
 original_record_state=$(declare -f record_state)
 
@@ -62,6 +67,7 @@ wait_for_pod_ready() {
   [ "$1" = "1" ]
   [ "${replacement_count}" -ge 1 ]
 }
+wait_for_pod_started() { wait_for_pod_ready "$1"; }
 
 start_forward() {
   [ "$1" = "1" ]
@@ -182,6 +188,7 @@ kubectl() {
 }
 desired_revision() { printf '%s' ursula-revision-15; }
 wait_for_pod_ready() { [ "$1" = "2" ]; }
+wait_for_pod_started() { wait_for_pod_ready "$1"; }
 start_forward() { [ "$1" = "2" ]; legacy_forward=1; }
 strict_verify() { legacy_verifies=$((legacy_verifies + 1)); }
 replace_pod() { legacy_destructive_call=1; return 1; }
@@ -321,6 +328,7 @@ CTL
   }
   desired_revision() { printf '%s' ursula-new-target; }
   wait_for_pod_ready() { [ "$1" = 2 ]; }
+  wait_for_pod_started() { wait_for_pod_ready "$1"; }
   start_forward() { [ "$1" = 2 ]; superseded_forward=1; }
   strict_verify() { superseded_verified=1; }
   pod_matches_target() {
@@ -410,6 +418,7 @@ REPLICAS=3
 desired_revision() { printf '%s' ursula-recovered; }
 replace_pod() { [ "$1" = "2" ]; recovered_replaced=1; }
 wait_for_pod_ready() { [ "$1" = "2" ]; }
+wait_for_pod_started() { wait_for_pod_ready "$1"; }
 pod_matches_target() { [ "$1" = "2" ] && [ "$2" = "ursula-recovered" ]; }
 start_forward() { [ "$1" = "2" ]; recovered_forward=1; }
 strict_verify() { recovered_verified=1; }
@@ -445,6 +454,7 @@ wait_for_template() { :; }
 start_ready_forwards() { call_order="${call_order} ready"; }
 resume_if_needed() { call_order="${call_order} resume"; }
 wait_for_pod_ready() { call_order="${call_order} wait"; }
+wait_for_pod_started() { wait_for_pod_ready "$1"; }
 start_forward() { :; }
 strict_verify() { :; }
 desired_revision() { printf '%s' ursula-current; }
@@ -601,5 +611,55 @@ for replicas in 1 3 5; do
   python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "${MANIFEST}"
   rm -f "${MANIFEST}"
 done
+
+# A replacement serves admin RPCs before it is a repaired Raft voter. Waiting
+# for final Ready before repair would deadlock this rollout permanently.
+(
+  ROLLOUT_SOURCE_ONLY=1
+  . "${test_dir}/graceful-rollout.sh"
+  recovery_order=
+  repaired=0
+  caught_up=0
+  released=0
+  final_ready=0
+  TARGET_REVISION=revision-ready-contract
+  CTL=ready_contract_ctl
+  wait_for_pod_started() { recovery_order="${recovery_order} started"; }
+  start_forward() { recovery_order="${recovery_order} forward"; }
+  pod_matches_target() { return 0; }
+  repair_restarted_voter() { repaired=1; recovery_order="${recovery_order} repaired"; }
+  ready_contract_ctl() {
+    [ "$1" = wait ]
+    [ "${repaired}" = 1 ]
+    caught_up=1
+    recovery_order="${recovery_order} caught-up"
+  }
+  finish_prepared_restart() {
+    [ "${caught_up}" = 1 ]
+    released=1
+    recovery_order="${recovery_order} released"
+  }
+  wait_for_pod_ready() {
+    [ "${repaired}" = 1 ] && [ "${caught_up}" = 1 ] && [ "${released}" = 1 ]
+    final_ready=1
+    recovery_order="${recovery_order} ready"
+  }
+  strict_verify() { [ "${final_ready}" = 1 ]; recovery_order="${recovery_order} verified"; }
+  record_state() { [ "$1" = complete ]; recovery_order="${recovery_order} complete"; }
+  finish_recovery_restart 2 3
+  [ "${recovery_order}" = " started forward repaired caught-up released ready verified complete" ]
+)
+
+# Check the real startup gate independently of its fixtures above. It must
+# observe the Ursula container's completed TCP startup probe, not Pod Ready.
+(
+  eval "${original_wait_for_pod_started}"
+  NAMESPACE=ursula
+  STATEFULSET=ursula
+  kubectl() {
+    [ "$*" = '-n ursula wait --for=jsonpath={.status.containerStatuses[?(@.name=="ursula")].started}=true pod/ursula-2 --timeout=15m' ]
+  }
+  wait_for_pod_started 2
+)
 
 echo "graceful-rollout.sh: all checks passed"

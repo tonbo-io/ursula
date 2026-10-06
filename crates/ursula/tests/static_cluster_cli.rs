@@ -774,7 +774,13 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
         .expect("drain node 3");
     assert!(
         matches!(outcome, ursula_ctl::DrainOutcome::Drained),
-        "{outcome:?}"
+        "{outcome:?}; metrics={:?}; children={}",
+        ctl.try_fetch_cluster(&nodes).await,
+        children
+            .iter()
+            .map(child_report)
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     ursula_ctl::prepare_restart(&nodes, &nodes[2], &ctl, &drain_options)
         .await

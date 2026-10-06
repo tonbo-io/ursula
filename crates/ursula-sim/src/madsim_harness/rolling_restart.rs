@@ -193,8 +193,24 @@ impl RollingRestartValidator {
                     last_applied_index: metrics.last_applied.map(|log_id| log_id.index),
                     voter_ids,
                     learner_ids,
+                    maintenance: Some(ursula_raft::RaftGroupMaintenanceState {
+                        running: metrics.running_state.is_ok()
+                            && metrics.state != openraft::ServerState::Shutdown,
+                        recovery_ready: self
+                            .registry
+                            .rejoin(node_id)
+                            .is_none_or(|rejoin| rejoin.vote_gate_open()),
+                        accepting_transfers: true,
+                        membership_joint: membership.get_joint_config().len() != 1,
+                        membership_log_index: metrics.membership_config.log_id().map(|id| id.index),
+                        stopped_for_operator: self
+                            .registry
+                            .rejoin(node_id)
+                            .is_some_and(|rejoin| rejoin.restart_guard().stopped_for_operator()),
+                    }),
                 }],
                 wal_backend: None,
+                raft_maintenance: None,
             };
             per_node.push(view);
         }
