@@ -2494,3 +2494,6 @@ fn forwarded_reads_carry_linearizability_over_grpc() {
         assert_eq!(served, head);
     }
 }
+#[cfg(not(madsim))]
+#[path = "replica_retirement_tests.rs"]
+mod replica_retirement;

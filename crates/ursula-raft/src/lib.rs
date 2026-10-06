@@ -29,6 +29,7 @@
 //!   the per-group log gauges the snapshot driver reads.
 //! - [`snapshot_references`]: prepared external-pointer pins and recoverable
 //!   current-reference publication outside RaftCore.
+//! - [`group_lifecycle`]: close/drain barriers for detached snapshot work.
 //! - [`rejoin`]: memory-WAL rejoin: the bootstrap probe, the vote gate of an
 //!   emptied replica, and the leader-side heal driver.
 //! - [`restart_guard`]: memory-WAL full-restart guard: the per-group
@@ -39,6 +40,7 @@
 pub mod raft_internal_proto {
     tonic::include_proto!("ursula.raft.v1");
 }
+mod group_lifecycle;
 
 mod codec;
 mod engine;

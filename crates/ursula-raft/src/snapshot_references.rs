@@ -13,16 +13,20 @@ use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::SnapshotLocation;
 use ursula_runtime::SnapshotStoreError;
 
+use crate::group_lifecycle::GroupActivity;
+use crate::group_lifecycle::GroupActivityGuard;
 use crate::rt::sync::Mutex as AsyncMutex;
 
 #[derive(Debug, Default)]
 pub(crate) struct SnapshotReferences {
+    pub(crate) activity: Arc<GroupActivity>,
     serial: AsyncMutex<()>,
     state: Mutex<ReferenceState>,
 }
 
 #[derive(Debug, Default)]
 struct ReferenceState {
+    retirement_complete: bool,
     current_known: bool,
     current: Option<SnapshotLocation>,
     active: BTreeMap<String, (SnapshotLocation, usize)>,
@@ -42,6 +46,7 @@ impl ReferenceState {
 pub(crate) struct SnapshotReferenceLease {
     references: Arc<SnapshotReferences>,
     key: String,
+    _activity: GroupActivityGuard,
 }
 
 impl Drop for SnapshotReferenceLease {
@@ -67,6 +72,7 @@ impl SnapshotReferences {
         group: u32,
         location: &SnapshotLocation,
     ) -> Result<Option<SnapshotReferenceLease>, SnapshotStoreError> {
+        let activity = self.activity.enter().map_err(SnapshotStoreError::Backend)?;
         let SnapshotLocation::S3 { key, .. } = location else {
             return Ok(None);
         };
@@ -90,6 +96,7 @@ impl SnapshotReferences {
         Ok(Some(SnapshotReferenceLease {
             references: self.clone(),
             key: key.clone(),
+            _activity: activity,
         }))
     }
 
@@ -109,6 +116,7 @@ impl SnapshotReferences {
         store: &SharedSnapshotStore,
         group: u32,
     ) -> Result<(), SnapshotStoreError> {
+        let _activity = self.activity.enter().map_err(SnapshotStoreError::Backend)?;
         let _serial = self.serial.lock().await;
         let (known, current) = {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -133,5 +141,43 @@ impl SnapshotReferences {
             .retained();
         let cleanup = store.reconcile_reference_pins(group, &retained).await;
         publication.and(cleanup)
+    }
+
+    pub(crate) fn retirement_complete(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retirement_complete
+    }
+
+    /// Call after closing entry and draining cached/active snapshot work.
+    /// Failure leaves the lifecycle closed and permits an explicit retry.
+    pub(crate) async fn retire(
+        &self,
+        store: &SharedSnapshotStore,
+        group: u32,
+    ) -> Result<(), SnapshotStoreError> {
+        self.activity.close();
+        self.activity.drain().await;
+        let _serial = self.serial.lock().await;
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if !state.active.is_empty() {
+                return Err(SnapshotStoreError::Backend(
+                    "snapshot pins did not drain".to_owned(),
+                ));
+            }
+            state.current_known = true;
+            state.current = None;
+        }
+        store
+            .publish_reference(group, &SnapshotLocation::Inline { bytes: Vec::new() })
+            .await?;
+        store.reconcile_reference_pins(group, &[]).await?;
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retirement_complete = true;
+        Ok(())
     }
 }

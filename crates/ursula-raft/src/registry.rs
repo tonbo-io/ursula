@@ -954,11 +954,13 @@ struct PrefetchedInstallSnapshot {
 struct PrefetchedSnapshotGuard {
     snapshot_install: SnapshotInstallCoordinator,
     cache_key: String,
+    marker: Arc<crate::state_machine::PrefetchedSnapshotMarker>,
 }
 
 impl Drop for PrefetchedSnapshotGuard {
     fn drop(&mut self) {
-        self.snapshot_install.clear_prefetched_key(&self.cache_key);
+        self.snapshot_install
+            .clear_prefetched_owner(&self.cache_key, &self.marker);
     }
 }
 
@@ -1053,11 +1055,56 @@ impl RaftGroupHandleRegistry {
             .expect("raft group handle registry mutex");
         raft.runtime_config().elect(
             self.leadership_shed_state().should_campaign()
+                && self.managed_group_hosting(placement.raft_group_id) != Some(false)
                 && self
                     .rejoin(placement.raft_group_id)
                     .is_none_or(|rejoin| rejoin.may_campaign()),
         );
         groups.insert(placement.raft_group_id.0, raft);
+    }
+
+    pub(crate) async fn retire_stopped_group(
+        &self,
+        group: RaftGroupId,
+    ) -> Result<(), GroupEngineError> {
+        if self.managed_group_hosting(group) != Some(false) {
+            return Err(GroupEngineError::new(
+                "group retirement requires managed revocation",
+            ));
+        }
+        let raft = self
+            .groups
+            .lock()
+            .expect("raft group handle registry mutex")
+            .remove(&group.0);
+        if let Some(raft) = raft {
+            // Retry can reach this path after a failed/dropped actor shutdown.
+            raft.shutdown().await.map_err(|error| {
+                GroupEngineError::new(format!("stop retired Raft core: {error}"))
+            })?;
+        }
+        self.read_barriers
+            .lock()
+            .expect("raft group read barrier mutex")
+            .remove(&group.0);
+        self.rejoins
+            .lock()
+            .expect("raft group rejoin mutex")
+            .remove(&group.0);
+        self.cold_index_caches
+            .lock()
+            .expect("raft group cold index cache mutex")
+            .remove(&group.0);
+        self.dynamic_hosted_groups
+            .lock()
+            .expect("raft dynamic hosted groups mutex")
+            .remove(&group);
+        self.snapshot_install
+            .retire_group(group.0, &self.snapshot_store())
+            .await?;
+        self.snapshot_build_coordinator()
+            .forget_stopped_group(group.0);
+        Ok(())
     }
 
     /// Records the group's shared cold-index page cache, so forwarded reads
@@ -1182,6 +1229,9 @@ impl RaftGroupHandleRegistry {
     }
 
     pub fn get(&self, raft_group_id: RaftGroupId) -> Option<RaftGroupHandle> {
+        if self.managed_group_hosting(raft_group_id) == Some(false) {
+            return None;
+        }
         self.groups
             .lock()
             .expect("raft group handle registry mutex")
@@ -1210,7 +1260,17 @@ impl RaftGroupHandleRegistry {
         *self
             .managed_hosted_groups
             .lock()
-            .expect("managed hosting mutex") = Some(groups);
+            .expect("managed hosting mutex") = Some(groups.clone());
+        for (group, raft) in self
+            .groups
+            .lock()
+            .expect("raft group handle registry mutex")
+            .iter()
+        {
+            if !groups.contains(&RaftGroupId(*group)) {
+                raft.runtime_config().elect(false);
+            }
+        }
     }
 
     pub fn managed_group_hosting(&self, group: RaftGroupId) -> Option<bool> {
@@ -1446,6 +1506,8 @@ impl RaftGroupHandleRegistry {
         snapshot: TypeConfigSnapshotOf<UrsulaRaftTypeConfig>,
     ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, GroupEngineError> {
         let raft = self.require_group(raft_group_id)?;
+        let references = self.snapshot_install.references(raft_group_id.0);
+        let _activity = references.activity.enter().map_err(GroupEngineError::new)?;
         let _install_permit = self.snapshot_install.acquire().await?;
         let prefetched = self
             .prefetch_snapshot_for_install(raft_group_id, snapshot)
@@ -1521,7 +1583,7 @@ impl RaftGroupHandleRegistry {
             snapshot_id,
             location,
         };
-        let cache_key = self.snapshot_install.cache_prefetched(
+        let (cache_key, marker) = self.snapshot_install.cache_prefetched(
             &pointer.snapshot_id,
             &pointer.location,
             group_snapshot,
@@ -1530,6 +1592,7 @@ impl RaftGroupHandleRegistry {
         let guard = PrefetchedSnapshotGuard {
             snapshot_install: self.snapshot_install.clone(),
             cache_key,
+            marker,
         };
         let pointer_bytes = pointer.encode_binary().map_err(|err| {
             GroupEngineError::new(format!(
@@ -1608,6 +1671,9 @@ pub(crate) fn log_progress_snapshot(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(madsim))]
+    #[path = "registry_retirement_tests.rs"]
+    mod retirement_tests;
     use bytes::Bytes;
     use ursula_runtime::GroupSnapshot;
     use ursula_runtime::SnapshotStore;

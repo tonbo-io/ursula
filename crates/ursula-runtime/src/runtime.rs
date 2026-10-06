@@ -289,6 +289,7 @@ impl ShardRuntime {
                 rx,
                 engine_factory: engine_factory.clone(),
                 groups: HashMap::new(),
+                retirements: HashMap::new(),
                 metrics: metrics.clone(),
                 group_mailbox_capacity: config.mailbox_capacity.max(1),
                 cold_write_admission,
@@ -1608,6 +1609,24 @@ impl ShardRuntime {
         self.send_core_command(
             mailbox,
             CoreCommand::ShutdownGroupEngine {
+                placement,
+                response_tx,
+            },
+            response_rx,
+        )
+        .await
+    }
+
+    /// Retire a revoked replica on its owning core. Unlike ordinary shutdown,
+    /// this invokes the factory's durable cleanup after draining the actor.
+    /// Caller cancellation does not cancel admitted core cleanup work.
+    pub async fn retire_group_engine(&self, group: RaftGroupId) -> Result<(), RuntimeError> {
+        let placement = self.placement_for_group(group)?;
+        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send_core_command(
+            mailbox,
+            CoreCommand::RetireGroupEngine {
                 placement,
                 response_tx,
             },

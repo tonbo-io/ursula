@@ -750,6 +750,41 @@ impl StaticGrpcRaftGroupEngineFactory {
 }
 
 impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
+    fn retire<'a>(
+        &'a self,
+        placement: ShardPlacement,
+        metrics: GroupEngineMetrics,
+    ) -> ursula_runtime::GroupShutdownFuture<'a> {
+        Box::pin(async move {
+            let stores = self
+                .log_stores
+                .as_ref()
+                .ok_or_else(|| GroupEngineError::new("managed retirement requires disk WAL"))?;
+            self.registry
+                .retire_stopped_group(placement.raft_group_id)
+                .await?;
+            stores.reclaim_stopped_group_wal(placement, metrics).await?;
+            let metadata = stores.snapshot_metadata_path(placement);
+            crate::log_store::spawn_log_store_blocking(None, move || {
+                for path in [&metadata, &metadata.with_extension("json.tmp")] {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                if let Some(parent) = metadata.parent()
+                    && parent.exists()
+                {
+                    std::fs::File::open(parent)?.sync_all()?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| GroupEngineError::new(format!("retire snapshot metadata: {error}")))
+        })
+    }
+
     fn hosts_group(&self, placement: ShardPlacement) -> bool {
         if let Some(allowed) = self.registry.managed_group_hosting(placement.raft_group_id) {
             return allowed;
@@ -788,6 +823,9 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     self.node_id, placement.raft_group_id.0
                 )));
             }
+            self.registry
+                .snapshot_install_coordinator()
+                .begin_group(placement.raft_group_id.0)?;
             let mut raft_config = Config {
                 cluster_name: format!("ursula-group-{}", placement.raft_group_id.0),
                 // Timeouts tuned for a multi-AZ EC2 cluster carrying chaos faults.

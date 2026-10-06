@@ -72,6 +72,7 @@ use crate::request::TidyStreamsResponse;
 use crate::rt::sync::Semaphore;
 use crate::rt::sync::mpsc;
 use crate::rt::sync::oneshot;
+use crate::rt::sync::watch;
 use crate::rt::time::Instant;
 use crate::trace::Traced;
 
@@ -120,6 +121,10 @@ pub(crate) enum CoreCommand {
         placement: ShardPlacement,
         response_tx: oneshot::Sender<Result<(), RuntimeError>>,
     },
+    RetireGroupEngine {
+        placement: ShardPlacement,
+        response_tx: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     #[cfg(madsim)]
     InstallGroupEngine {
         placement: ShardPlacement,
@@ -133,6 +138,7 @@ pub(crate) struct CoreWorker {
     pub(crate) rx: mpsc::Receiver<Traced<CoreCommand>>,
     pub(crate) engine_factory: Arc<dyn GroupEngineFactory>,
     pub(crate) groups: HashMap<RaftGroupId, GroupMailbox>,
+    pub(crate) retirements: HashMap<RaftGroupId, watch::Receiver<Option<Result<(), RuntimeError>>>>,
     pub(crate) metrics: Arc<RuntimeMetricsInner>,
     pub(crate) group_mailbox_capacity: usize,
     pub(crate) cold_write_admission: ColdWriteAdmission,
@@ -216,6 +222,28 @@ impl Drop for WaitReadCancel {
     }
 }
 
+fn forward_retirement(
+    mut completion: watch::Receiver<Option<Result<(), RuntimeError>>>,
+    placement: ShardPlacement,
+    response: oneshot::Sender<Result<(), RuntimeError>>,
+) {
+    crate::rt::spawn(async move {
+        loop {
+            let result = completion.borrow_and_update().clone();
+            if let Some(result) = result {
+                let _ = response.send(result);
+                return;
+            }
+            if completion.changed().await.is_err() {
+                let _ = response.send(Err(RuntimeError::ResponseDropped {
+                    core_id: placement.core_id,
+                }));
+                return;
+            }
+        }
+    });
+}
+
 impl CoreWorker {
     pub(crate) async fn run(mut self) {
         while let Some(Traced {
@@ -274,6 +302,13 @@ impl CoreWorker {
             } => {
                 debug_assert_eq!(placement.core_id, self.core_id);
                 self.shutdown_group_engine(placement, response_tx).await;
+            }
+            CoreCommand::RetireGroupEngine {
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.retire_group_engine(placement, response_tx);
             }
             #[cfg(madsim)]
             CoreCommand::InstallGroupEngine {
@@ -346,14 +381,15 @@ impl CoreWorker {
         &mut self,
         placement: ShardPlacement,
     ) -> Result<GroupMailbox, RuntimeError> {
+        let engine_factory = self.engine_factory.clone();
+        if !engine_factory.hosts_group(placement) {
+            return Err(RuntimeError::GroupNotHosted {
+                core_id: placement.core_id,
+                raft_group_id: placement.raft_group_id,
+            });
+        }
+        self.finish_previous_retirement(placement)?;
         if !self.groups.contains_key(&placement.raft_group_id) {
-            let engine_factory = self.engine_factory.clone();
-            if !engine_factory.hosts_group(placement) {
-                return Err(RuntimeError::GroupNotHosted {
-                    core_id: placement.core_id,
-                    raft_group_id: placement.raft_group_id,
-                });
-            }
             let metrics = GroupEngineMetrics {
                 inner: self.metrics.clone(),
             };
@@ -408,11 +444,87 @@ impl CoreWorker {
         }
     }
 
+    fn finish_previous_retirement(
+        &mut self,
+        placement: ShardPlacement,
+    ) -> Result<(), RuntimeError> {
+        if let Some(retirement) = self.retirements.get(&placement.raft_group_id) {
+            if retirement.borrow().as_ref() != Some(&Ok(())) {
+                return Err(RuntimeError::group_engine(
+                    placement,
+                    GroupEngineError::new("previous replica retirement is incomplete"),
+                ));
+            }
+            self.retirements.remove(&placement.raft_group_id);
+        }
+        Ok(())
+    }
+
+    fn retire_group_engine(
+        &mut self,
+        placement: ShardPlacement,
+        response_tx: oneshot::Sender<Result<(), RuntimeError>>,
+    ) {
+        if self.engine_factory.hosts_group(placement) {
+            let _ = response_tx.send(Err(RuntimeError::group_engine(
+                placement,
+                GroupEngineError::new("replica retirement requires revoked hosting"),
+            )));
+            return;
+        }
+        if let Some(previous) = self.retirements.get(&placement.raft_group_id) {
+            let completion = previous.borrow().clone();
+            if completion.as_ref().is_none_or(Result::is_ok) {
+                forward_retirement(previous.clone(), placement, response_tx);
+                return;
+            }
+        }
+        let group = self.groups.remove(&placement.raft_group_id);
+        self.read_barriers.remove(placement.raft_group_id);
+        let factory = self.engine_factory.clone();
+        let metrics = GroupEngineMetrics {
+            inner: self.metrics.clone(),
+        };
+        let (completion_tx, completion_rx) = watch::channel(None);
+        self.retirements
+            .insert(placement.raft_group_id, completion_rx.clone());
+        forward_retirement(completion_rx, placement, response_tx);
+        // Wait on this actor and its cleanup without stalling unrelated groups
+        // sharing the core. Duplicate retirements share the same completion.
+        crate::rt::spawn(async move {
+            let result = async {
+                if let Some(group) = group {
+                    let (stop_tx, stop_rx) = oneshot::channel();
+                    if let Err(command) = group
+                        .send(GroupCommand::ShutdownEngine {
+                            response_tx: stop_tx,
+                        })
+                        .await
+                    {
+                        (*command).send_error(RuntimeError::MailboxClosed {
+                            core_id: placement.core_id,
+                        });
+                    }
+                    stop_rx.await.map_err(|_| RuntimeError::ResponseDropped {
+                        core_id: placement.core_id,
+                    })??;
+                }
+                factory
+                    .retire(placement, metrics)
+                    .await
+                    .map_err(|error| RuntimeError::group_engine(placement, error))
+            }
+            .await;
+            completion_tx.send_replace(Some(result));
+        });
+    }
+
     pub(crate) async fn install_group_engine(
         &mut self,
         placement: ShardPlacement,
         engine: Box<dyn GroupEngine>,
     ) -> Result<(), RuntimeError> {
+        self.finish_previous_retirement(placement)?;
         if self.groups.contains_key(&placement.raft_group_id) {
             return Err(RuntimeError::GroupEngine {
                 core_id: placement.core_id,
@@ -443,6 +555,15 @@ impl CoreWorker {
     }
 
     async fn warm_groups(&mut self, placements: Vec<ShardPlacement>) -> Result<(), RuntimeError> {
+        for placement in &placements {
+            if !self.engine_factory.hosts_group(*placement) {
+                return Err(RuntimeError::GroupNotHosted {
+                    core_id: placement.core_id,
+                    raft_group_id: placement.raft_group_id,
+                });
+            }
+            self.finish_previous_retirement(*placement)?;
+        }
         let placements = placements
             .into_iter()
             .filter(|placement| !self.groups.contains_key(&placement.raft_group_id))

@@ -582,6 +582,20 @@ pub trait GroupEngine: Send + 'static {
 }
 
 pub trait GroupEngineFactory: Send + Sync + 'static {
+    /// Reclaim a revoked, stopped replica's durable local resources. Ordinary
+    /// shutdown preserves state; retirement requires explicit factory support.
+    fn retire<'a>(
+        &'a self,
+        _placement: ShardPlacement,
+        _metrics: GroupEngineMetrics,
+    ) -> GroupShutdownFuture<'a> {
+        Box::pin(async {
+            Err(GroupEngineError::new(
+                "group factory does not support replica retirement",
+            ))
+        })
+    }
+
     fn hosts_group(&self, _placement: ShardPlacement) -> bool {
         true
     }

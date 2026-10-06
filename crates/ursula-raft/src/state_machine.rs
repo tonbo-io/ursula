@@ -56,6 +56,7 @@ use ursula_shard::ShardPlacement;
 
 use crate::engine::group_engine_io_error;
 use crate::engine::invalid_data;
+use crate::group_lifecycle::GroupActivityGuard;
 use crate::log_store::elapsed_ns;
 use crate::rt::sync::OwnedSemaphorePermit;
 use crate::rt::sync::Semaphore;
@@ -128,6 +129,15 @@ impl SnapshotBuildCoordinator {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Arc::clone(gauges.entry(raft_group_id).or_default())
+    }
+
+    pub(crate) fn forget_stopped_group(&self, group: u32) {
+        self.handoffs().remove(&group);
+        self.inner
+            .log_gauges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&group);
     }
 
     /// The log progress of every group with a gauge (F12e).
@@ -237,7 +247,11 @@ struct SnapshotInstallCoordinatorInner {
 }
 
 #[derive(Debug)]
+pub(crate) struct PrefetchedSnapshotMarker;
+
+#[derive(Debug)]
 pub(crate) struct PrefetchedGroupSnapshot {
+    marker: Arc<PrefetchedSnapshotMarker>,
     pub(crate) snapshot: GroupSnapshot,
     reference: Option<SnapshotReferenceLease>,
 }
@@ -304,17 +318,70 @@ impl SnapshotInstallCoordinator {
         location: &SnapshotLocation,
         snapshot: GroupSnapshot,
         reference: Option<SnapshotReferenceLease>,
-    ) -> String {
+    ) -> (String, Arc<PrefetchedSnapshotMarker>) {
         let key = Self::cache_key(snapshot_id, location);
+        let marker = Arc::new(PrefetchedSnapshotMarker);
         self.inner
             .prefetched
             .lock()
             .expect("snapshot install prefetch cache mutex")
             .insert(key.clone(), PrefetchedGroupSnapshot {
+                marker: marker.clone(),
                 snapshot,
                 reference,
             });
-        key
+        (key, marker)
+    }
+
+    pub(crate) fn clear_prefetched_owner(&self, key: &str, marker: &Arc<PrefetchedSnapshotMarker>) {
+        let mut entries = self
+            .inner
+            .prefetched
+            .lock()
+            .expect("snapshot install prefetch cache mutex");
+        if entries
+            .get(key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.marker, marker))
+        {
+            entries.remove(key);
+        }
+    }
+
+    pub(crate) fn begin_group(&self, group: u32) -> Result<(), GroupEngineError> {
+        let mut references = self
+            .inner
+            .references
+            .lock()
+            .expect("snapshot references mutex");
+        if let Some(old) = references.get(&group)
+            && old.activity.is_closed()
+        {
+            if !old.retirement_complete() {
+                return Err(GroupEngineError::new(
+                    "snapshot retirement has not completed",
+                ));
+            }
+            references.insert(group, Arc::default());
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn retire_group(
+        &self,
+        group: u32,
+        store: &SharedSnapshotStore,
+    ) -> Result<(), GroupEngineError> {
+        let references = self.references(group);
+        references.activity.close();
+        self.inner
+            .prefetched
+            .lock()
+            .expect("snapshot install prefetch cache mutex")
+            .retain(|_, entry| entry.snapshot.placement.raft_group_id.0 != group);
+        references
+            .retire(store, group)
+            .await
+            .map_err(|error| GroupEngineError::new(format!("retire snapshot references: {error}")))
     }
 
     pub(crate) fn take_prefetched(
@@ -440,6 +507,10 @@ impl RaftGroupStateMachine {
     }
 
     pub(crate) async fn restore_persisted_snapshot(&mut self) -> Result<(), io::Error> {
+        let references = self
+            .snapshot_install
+            .references(self.placement.raft_group_id.0);
+        let _activity = references.activity.enter().map_err(io::Error::other)?;
         let Some(path) = &self.snapshot_metadata_path else {
             return Ok(());
         };
@@ -624,6 +695,10 @@ impl RaftGroupStateMachine {
         &mut self,
         build_permit: OwnedSemaphorePermit,
     ) -> RaftGroupSnapshotBuilder {
+        let references = self
+            .snapshot_install
+            .references(self.placement.raft_group_id.0);
+        let scheduled_activity = references.activity.enter().ok();
         let snapshot = self
             .group_snapshot()
             .await
@@ -635,13 +710,12 @@ impl RaftGroupStateMachine {
             current_snapshot: self.current_snapshot.clone(),
             snapshot_store: self.snapshot_store.clone(),
             metrics: self.metrics.clone(),
-            _build_permit: build_permit,
+            _build_permit: Some(build_permit),
+            scheduled_activity,
             snapshot_metadata_path: self.snapshot_metadata_path.clone(),
             log_gauge: Arc::clone(&self.log_gauge),
             log_mark: self.log_gauge.mark(),
-            references: self
-                .snapshot_install
-                .references(self.placement.raft_group_id.0),
+            references,
         }
     }
 
@@ -779,6 +853,10 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         meta: &SnapshotMetaOf<UrsulaRaftTypeConfig>,
         snapshot: SnapshotDataOf<UrsulaRaftTypeConfig>,
     ) -> Result<(), io::Error> {
+        let references = self
+            .snapshot_install
+            .references(self.placement.raft_group_id.0);
+        let _activity = references.activity.enter().map_err(io::Error::other)?;
         let pointer_bytes = snapshot.into_inner();
         let pointer = SnapshotPointer::decode(&pointer_bytes)
             .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
@@ -861,7 +939,8 @@ pub struct RaftGroupSnapshotBuilder {
     current_snapshot: Arc<Mutex<Option<CurrentSnapshot>>>,
     snapshot_store: SharedSnapshotStore,
     metrics: Option<GroupEngineMetrics>,
-    _build_permit: OwnedSemaphorePermit,
+    _build_permit: Option<OwnedSemaphorePermit>,
+    scheduled_activity: Option<GroupActivityGuard>,
     snapshot_metadata_path: Option<PathBuf>,
     log_gauge: Arc<GroupLogGauge>,
     /// The applied log this snapshot covers (F12e).
@@ -871,6 +950,14 @@ pub struct RaftGroupSnapshotBuilder {
 
 impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<SnapshotOf<UrsulaRaftTypeConfig>, io::Error> {
+        let _activity = match self.scheduled_activity.take() {
+            Some(activity) => activity,
+            None => self.references.activity.enter().map_err(io::Error::other)?,
+        };
+        let _build_permit = self
+            ._build_permit
+            .take()
+            .ok_or_else(|| io::Error::other("snapshot builder was already consumed"))?;
         let started_at = Instant::now();
         let stream_count = self.snapshot.stream_snapshot.streams.len();
         let snapshot_id = self.meta.snapshot_id.clone();
@@ -1131,7 +1218,8 @@ mod tests {
             current_snapshot,
             snapshot_store: default_snapshot_store(),
             metrics: None,
-            _build_permit: test_build_permit().await,
+            _build_permit: Some(test_build_permit().await),
+            scheduled_activity: None,
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
             references: Arc::default(),
@@ -1194,7 +1282,8 @@ mod tests {
             current_snapshot: Arc::new(Mutex::new(None)),
             snapshot_store: default_snapshot_store(),
             metrics: None,
-            _build_permit: test_build_permit().await,
+            _build_permit: Some(test_build_permit().await),
+            scheduled_activity: None,
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
             references: Arc::default(),
@@ -1332,7 +1421,8 @@ mod tests {
             current_snapshot: current_snapshot.clone(),
             snapshot_store: snapshot_store.clone(),
             metrics: None,
-            _build_permit: test_build_permit().await,
+            _build_permit: Some(test_build_permit().await),
+            scheduled_activity: None,
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
             references: Arc::default(),
@@ -1349,7 +1439,8 @@ mod tests {
             current_snapshot: current_snapshot.clone(),
             snapshot_store: snapshot_store.clone(),
             metrics: None,
-            _build_permit: test_build_permit().await,
+            _build_permit: Some(test_build_permit().await),
+            scheduled_activity: None,
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
             references: Arc::default(),
@@ -1383,7 +1474,8 @@ mod tests {
             current_snapshot,
             snapshot_store,
             metrics: None,
-            _build_permit: test_build_permit().await,
+            _build_permit: Some(test_build_permit().await),
+            scheduled_activity: None,
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
             references: Arc::default(),
@@ -1465,7 +1557,8 @@ mod tests {
             current_snapshot: current_snapshot.clone(),
             snapshot_store: Arc::new(FailingSnapshotStore),
             metrics: None,
-            _build_permit: test_build_permit().await,
+            _build_permit: Some(test_build_permit().await),
+            scheduled_activity: None,
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
             references: Arc::default(),
