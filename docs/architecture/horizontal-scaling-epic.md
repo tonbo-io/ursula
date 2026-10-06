@@ -1,6 +1,6 @@
 # Horizontal Scaling Epic
 
-Status: active; M1 consumers and M2 automatic migration acceptance in progress under a persistent goal.
+Status: active; M1 complete, M2 automatic migration fault/DST acceptance in progress under a persistent goal.
 Last updated: 2026-10-06.
 
 - Tracking issue: [#2: dynamic group membership](https://github.com/tonbo-io/ursula/issues/2).
@@ -55,8 +55,8 @@ are follow-up work outside the initial contract.
 | Milestone | Outcome | Depends on | Status | Exit evidence |
 | --- | --- | --- | --- | --- |
 | M0 | Isolated worktree, RF-aware design, stories and progress ledger | None | Complete: commit `4fe583d` | Worktree/baseline verified; document links and diff checks |
-| M1 | Durable control plane with persisted RF=3/5 policy | M0 | In progress | Durable restart/transport/bootstrap tests, RF/domain-policy tests |
-| M2 | One supported, recoverable group/policy migration | M1 | In progress: prerequisites for HS-104 | Subset-layout move E2E, migration-boundary DST, routing/cleanup/fencing evidence |
+| M1 | Durable control plane with persisted RF=3/5 policy | M0 | Complete: audit at `78f19a7` | [Depot run 37534952152](https://github.com/tonbo-io/ursula/actions/runs/37534952152); requirement mapping below |
+| M2 | One supported, recoverable group/policy migration | M1 | In progress | Subset-layout move E2E, migration-boundary DST, routing/cleanup/fencing evidence |
 | M3 | Operator scale-out/scale-in and bounded batch rebalance | M2 | Planned | RF=3: 3→6→3; RF=5: 5→10→5; mixed-RF E2E and capacity measurements |
 | M4 | Autopilot submits safe plans through the supported executor | M3 | Planned | Deterministic policy tests, failure schedules, bounded churn and load response |
 
@@ -78,7 +78,7 @@ follow-up items outside the initial contract above are not completion gates.
 | HS-101 | Persist and restore meta vote, log, committed/applied state and snapshots; recover correctly after compaction and crash/restart without resurrecting discarded intent | M0 | Complete: commit `b7352ea` |
 | HS-102 | Implement default/per-group RF=3/5 and one-domain-loss policy; infer/validate existing placements on adoption; reject invalid policies and bootstrap drift | M0 | Complete: commit `5c7e413` (deterministic policy/adoption layer) |
 | HS-103 | Concrete multi-node meta transport, independent meta voters, one-time bootstrap, cluster identity and trusted client/cluster/admin node directory | HS-101, HS-102 | Complete: commit `73f6970` (coordinated static-to-managed adoption) |
-| HS-104 | Ordered placement/policy projections with full-snapshot resync; data/node startup restores assignments without reinitializing from stale TOML | HS-103 | In progress: commits `d591c26`, `73f6970`, `a5e6740`, `064a1af`, `8b88822`, `d0d3bb9`, `82e1563`, `f5124a8`, `43f48d8`, `db45b1a`, `bb7a9cd` (ordered consumers and binary assignment recovery during S3 prefetch and committed joint; M1 completion audit pending) |
+| HS-104 | Ordered placement/policy projections with full-snapshot resync; data/node startup restores assignments without reinitializing from stale TOML | HS-103 | Complete: ordered consumers/cache in `d591c26` / `a5e6740`, dynamic startup/hosting in `064a1af` / `8b88822` / `d0d3bb9`, routing/inventory/pruning integration through `43f48d8`, binary active-assignment recovery in `db45b1a` / `bb7a9cd`; audited at `78f19a7` |
 
 M1 acceptance includes multi-node meta leader turnover and a durable full
 restart after snapshot/log compaction. Test RF=3/quorum=2 and RF=5/quorum=3,
@@ -106,8 +106,13 @@ not make M2's remaining migration fault matrix a new M1 prerequisite.
 | HS-104: ordered full projections and startup from persisted assignments | `complete_projection_rpc_requires_bootstrap_and_a_live_meta_quorum` verifies full-view resync after compaction and stale-view rejection. Bound cache tests reject regression, conflicting indexes and corrupt/foreign checkpoints. The managed adoption binary test restarts data voters under meta minority from cached projections without inventing fresh control authority. The outside-bootstrap migration fixture verifies settled node-7 assignment recovery with unchanged old TOML; S3-prefetch and committed-joint binary faults additionally cover active-assignment recovery. |
 | Static/dev compatibility | Managed mode is opt-in. Workspace unit/bin checks include existing static/dev configuration and routing behavior; the historical focused static follower-forwarding regression passed against the implementation before the move to Depot. M1 does not claim new static-mode scaling behavior. |
 
-The current remote run validates the implementation SHA separately from this
-documentation audit. Record its terminal results before advancing the scoreboard.
+M1 passed this audit against implementation SHA
+`78f19a7cc659331c044d8f56eb12a1e79d4970d6` and terminal-success
+[Depot run 37534952152](https://github.com/tonbo-io/ursula/actions/runs/37534952152).
+Actual logs confirm all four migration fixtures and managed adoption/restart
+passed with Bash `-e -o pipefail`; the earlier masked-green run is not the
+completion evidence. M2's additional boundary/DST and M3/M4 acceptance gates
+remain open independently of M1 completion.
 
 ## M2 — one complete migration
 
@@ -251,10 +256,11 @@ unevacuated machine. Physical provisioning remains outside the Raft controller.
 | 2026-10-06 | Remote result audit | Run `37533668030` at `700e871` finished with a misleading green workflow: full logs prove 981 unit/bin passes (3 ignored), doc/format/Clippy passes, seven DST audits and existing smoke passes, and all four native migration fixtures including MinIO pass in 90.55s. The managed-adoption test actually failed immediately with `Address already in use`; its piped `tee` hid Cargo's exit status | Partial passing evidence only; the run does not satisfy the complete acceptance gate. Commit `be5c5a0` explicitly selects Bash with pipefail for every run step and reserves distinct adoption listener ports below the native runners' default ephemeral range. Revalidate on Depot before advancing M1 |
 | 2026-10-06 | HS-206 simulation prerequisite | Commit `853155d` introduces explicit harness-owned restartable receiver disks under `cfg(madsim)`, reusing production CAS/authority validation with atomic before/after-commit faults. Four storage checks cover identity/exclusivity/isolation, commit-side recovery, lost prepare-receipt replay and pending work across newer generation/process | Remote validation pending. This supplies a storage seam; it is not a complete executor migration DST schedule. Bound meta persistence/transport and fault-schedule integration remain pending |
 | 2026-10-06 | Remote follow-up | [Depot run 37534513860](https://github.com/tonbo-io/ursula/actions/runs/37534513860) at `e622256bd68f626726b1b4113d473dc8ddb5a0aa` passed format/Clippy, seven DST audits, all four new simulated-receiver checks and the existing smoke replay. Pipefail correctly reported failures: one positive receiver unit request hit transient meta-leader read unavailability; the joint binary fixture hit the same ephemeral listener race in its separate port helper. Three other migration fixtures passed, including MinIO | Full run failed; adoption step was skipped. Commit `0c5f3f4` adds bounded retries only for the positive learner request's pre-admission `Unavailable` meta read, leaving other errors and all authority assertions strict. Commit `8b27364` makes migration fixture ports unique and outside the native runners' default ephemeral range. Corrected remote validation remains required |
+| 2026-10-06 | M1 completion / final native Depot checks | [Depot run 37534952152](https://github.com/tonbo-io/ursula/actions/runs/37534952152) at `78f19a7cc659331c044d8f56eb12a1e79d4970d6` completed successfully in all three jobs. Logs confirm format, workspace all-target Clippy, 981 unit/bin tests (3 ignored), doc tests, four migration CLI fixtures explicitly including MinIO (88.69s), independent meta3/meta5 managed adoption/restart (22.36s), seven DST audits, madsim Raft lib check, four simulated receiver storage checks and existing smoke (1.07s) | M1 and HS-104 complete against the requirement mapping above. Bash pipefail is active and each acceptance test's actual pass line is verified. M2 remains open for remaining fault boundaries and complete migration DST; M3 capacity/scale acceptance and M4 autopilot remain in scope. All compute-intensive validation ran remotely on native Depot Ubuntu ARM; no local build/test or cross-compilation |
 
 ## Current execution checkpoint
 
-Current implementation stories: **HS-104/HS-205/HS-206** dynamic live inventory,
+Current implementation stories: **HS-201 through HS-206** migration fault/DST acceptance, dynamic live inventory,
 routing/readiness, intent-aware maintenance and real-process migration
 acceptance, alongside **HS-203/HS-204** migration-boundary fault/restart coverage.
 Commit `e877d48` connects the durable intent and receiver protocols to an automatic
@@ -373,8 +379,8 @@ CARGO_INCREMENTAL=0 cargo test -p ursula-ctl --test managed_migration_cli \
   joint_fault -- --nocapture
 ```
 
-The M1 completion audit above maps its exact exit criteria to existing checks;
-its final scoreboard update awaits corrected remote adoption validation.
+The M1 completion audit above maps its exact exit criteria to passing checks;
+the corrected native Depot run closes its final validation gate.
 Next add migration-boundary DST,
 remaining snapshot/prepare/release process faults, lost replies and delayed old
 receiver requests. File-backed receiver open still rejects madsim; commit
@@ -384,9 +390,9 @@ into the harness without host files or a separate protocol model.
 Established startup continues
 restoring assigned data from its bound checkpoint even under meta minority.
 
-M1 stays open pending its completion audit; ordered consumers, settled recovery,
-meta-minority startup, S3 prefetch and committed-joint active-assignment restart
-now have native evidence. M2 stays open for the remaining snapshot/recovery
+M1 is complete: ordered consumers, settled recovery, meta-minority startup,
+S3 prefetch and committed-joint active-assignment restart have native evidence.
+M2 stays open for the remaining snapshot/recovery
 boundaries, delayed requests and migration DST. Ten native fixtures exercise endpoint
 and automatic execution with actual data/meta consensus, disk WAL and inline
 snapshots. HTTP identity replacement and executor interruption are in-process;
@@ -397,9 +403,9 @@ outside-bootstrap joining with mixed-RF migrations, gateway discovery, meta
 minority data continuity and full restart. Existing DST
 smoke checks compatibility, not the new executor's fault boundaries.
 M3 manual scaling/batches and M4 autopilot remain in the active goal's scope.
-Partial native Depot CI evidence is recorded above. The first run's masked
-adoption failure is fixed in source and awaits corrected remote validation;
-deployment and scaling-performance acceptance are still open. No external
+Complete native Depot checks for `78f19a7` are recorded above; earlier failed
+runs retain their explicit evidence boundaries. Full migration-boundary DST
+and scaling-performance acceptance are still open. No external
 blocker is recorded.
 
 For each implementation increment, update the relevant story and this

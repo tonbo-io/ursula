@@ -1478,3 +1478,29 @@ the full workflow failed on separate native fixture issues recorded in the
 epic tracker. These are storage-seam checks, not complete
 executor DST schedules. The bound meta persistence/transport harness and
 migration-boundary fault schedules remain the next integration work.
+
+### Implementation checkpoint: M1 audit and native Depot acceptance
+
+The epic tracker now maps every HS-101 through HS-104 and M1 exit requirement
+to executable evidence. M1 is complete against `78f19a7` and terminal-success
+[Depot run 37534952152](https://github.com/tonbo-io/ursula/actions/runs/37534952152).
+Native Ubuntu ARM checks pass format, workspace all-target Clippy, 981 unit/bin
+tests (3 ignored), doc tests, all four binary migration fixtures including
+MinIO (88.69s), independent meta3/meta5 adoption/restart (22.36s), seven DST
+audits, madsim Raft check, four receiver storage checks and existing smoke
+(1.07s). This follows the user's instruction to run all builds/tests remotely
+while the local device is on battery; no local compilation/test or cross-target
+compilation was used for this increment.
+
+Two earlier CI runs exposed fixture issues, retained in the progress ledger.
+An implicit shell let `tee` hide a failing test; explicit Bash now uses
+`-e -o pipefail`, and final acceptance includes inspecting actual test results.
+Both real-process fixtures allocate distinct listener ports below the native
+runners' default ephemeral range. A positive learner-admission test retries
+only a transient pre-admission `Unavailable` meta read during leadership
+turnover; process/generation/CAS rejections still fail the strict assertions.
+
+M2 remains open for complete migration-boundary DST and remaining snapshot,
+prepare/release and delayed-request fault acceptance. M3 capacity operations,
+performance acceptance and M4 autopilot remain in the active epic. M1 completion
+does not close those later milestones.
