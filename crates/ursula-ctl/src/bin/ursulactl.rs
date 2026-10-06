@@ -149,6 +149,7 @@ enum ReservationSourceField {
 #[derive(clap::ValueEnum, Clone, Debug)]
 enum ReservationField {
     State,
+    Hosts,
     Manifest,
     Stage,
     SourceNodeId,
@@ -187,6 +188,16 @@ struct ReservationRequestArgs {
 
 #[derive(Subcommand, Debug)]
 enum ReservationRequestAction {
+    PublishHostInventory {
+        #[arg(long)]
+        pods: PathBuf,
+        #[arg(long)]
+        nodes: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        observation: PathBuf,
+    },
     Reserve {
         #[arg(long)]
         operation_id: String,
@@ -530,6 +541,17 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string(state)?);
                 return Ok(());
             }
+            if matches!(args.field, ReservationField::Hosts) {
+                println!(
+                    "{}",
+                    serde_json::to_string(
+                        state
+                            .hosts()
+                            .context("pre-fault host inventory has not been published")?
+                    )?
+                );
+                return Ok(());
+            }
             if matches!(args.field, ReservationField::Stage) {
                 let stage = match state.operation() {
                     None => "idle",
@@ -562,7 +584,7 @@ async fn main() -> Result<()> {
                 ),
                 ReservationField::OperationId => println!("{}", operation.fence.reservation_id()),
                 ReservationField::Fence => println!("{}", serde_json::to_string(&operation.fence)?),
-                ReservationField::State | ReservationField::Stage => {
+                ReservationField::State | ReservationField::Stage | ReservationField::Hosts => {
                     bail!("unexpected reservation projection")
                 }
             }
@@ -750,6 +772,28 @@ async fn run_reservation_request(args: ReservationRequestArgs) -> Result<()> {
     use ursula_ctl::reservation::ReservationRequest;
     let now_ms = wall_clock_unix_ms();
     let request = match args.action {
+        ReservationRequestAction::PublishHostInventory {
+            pods,
+            nodes,
+            config,
+            observation,
+        } => {
+            let objects = |path: &std::path::Path| -> Result<Vec<serde_json::Value>> {
+                let value: serde_json::Value = read_reservation_json(path)?;
+                value
+                    .get("items")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .context("inventory input must be a Kubernetes List with complete objects")
+            };
+            ReservationRequest::Inventory(ursula_ctl::reservation::PublishHostInventory {
+                now_ms,
+                pods: objects(&pods)?,
+                nodes: objects(&nodes)?,
+                process_plan: load_nodes(&config).await?,
+                observation: read_reservation_json(&observation)?,
+            })
+        }
         ReservationRequestAction::Reserve {
             operation_id,
             executor_id,

@@ -20,11 +20,15 @@ use ursula_proto::admin::ProcessIncarnation;
 use crate::NodeInfo;
 use crate::quorum::QuorumVerification;
 
+mod hosts;
 mod inventory;
 mod store;
 #[cfg(test)]
 mod tests;
 
+pub use hosts::HostInventory;
+pub use hosts::HostVoter;
+pub use hosts::PublishHostInventory;
 pub use store::CasProposal;
 pub use store::ConfigMapSnapshot;
 
@@ -70,6 +74,8 @@ pub struct Reservation {
     generation: u64,
     operation: Option<Operation>,
     completion: Option<Completion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hosts: Option<HostInventory>,
 }
 
 /// A CLI verification observation; not authentication or provider fencing.
@@ -133,6 +139,7 @@ pub enum OwnershipRequest {
 pub enum ReservationRequest {
     Ownership(OwnershipRequest),
     Progress(ProgressRequest),
+    Inventory(PublishHostInventory),
 }
 
 // Serde's buffered internally tagged/untagged deserializers cannot parse
@@ -214,6 +221,9 @@ impl<'de> Deserialize<'de> for ReservationRequest {
                     .map(Self::Progress)
                     .map_err(parse_error)
             }
+            Some("publish_host_inventory") => serde_json::from_value(value)
+                .map(Self::Inventory)
+                .map_err(parse_error),
             _ => Err(<D::Error as serde::de::Error>::custom(
                 "unsupported reservation action",
             )),
@@ -266,6 +276,7 @@ impl Reservation {
             generation: 0,
             operation: None,
             completion: None,
+            hosts: None,
         };
         state.validate()?;
         Ok(state)
@@ -287,13 +298,38 @@ impl Reservation {
         self.operation.as_ref()
     }
 
+    pub fn hosts(&self) -> Option<&HostInventory> {
+        self.hosts.as_ref()
+    }
+
     pub fn validate(&self) -> Result<()> {
-        if self.version != 1
+        if !matches!(self.version, 1 | 2)
             || self.cell.group_count == 0
             || self.cell.core_count == 0
             || self.cell.voter_ids != BTreeSet::from([1, 2, 3])
         {
             bail!("unsupported reservation schema or three-voter inventory");
+        }
+        if (self.version == 2) != self.hosts.is_some() {
+            bail!("host inventory requires an explicit schema-2 CAS migration");
+        }
+        if let Some(hosts) = &self.hosts {
+            hosts.validate(&self.cell)?;
+            if let Some(receipt) = &self.completion {
+                no_regression(&receipt.observation, &hosts.observation)?;
+                if hosts.observation.started_ms < receipt.observation.completed_ms
+                    && serde_json::to_value(&hosts.observation)?
+                        != serde_json::to_value(&receipt.observation)?
+                {
+                    bail!("host inventory predates previous completion");
+                }
+            }
+            if hosts.observation.verification.maintenance_fence.is_some()
+                && self.completion.as_ref().map(|receipt| &receipt.fence)
+                    != hosts.observation.verification.maintenance_fence.as_ref()
+            {
+                bail!("host inventory has no matching executor retirement receipt");
+            }
         }
         for (value, label) in [
             (&self.cell.namespace, "namespace"),
@@ -362,6 +398,16 @@ impl Reservation {
                 .find(|node| node.id == operation.source.node_id)
                 .context("missing selected source")?;
             let bound_source = operation.replacement.as_ref().unwrap_or(&operation.source);
+            if let Some(hosts) = &self.hosts {
+                let mut original_plan = operation.process_plan.clone();
+                let original = original_plan
+                    .iter_mut()
+                    .find(|node| node.id == operation.source.node_id)
+                    .context("missing original catalogued voter")?;
+                original.expected_process_incarnation =
+                    Some(operation.source.process_incarnation.clone());
+                hosts.validate_source(&operation.source, &original_plan, operation.acquired_ms)?;
+            }
             if operation.replacement.as_ref().is_some_and(|replacement| {
                 replacement.node_id != operation.source.node_id
                     || replacement.pod_name != operation.source.pod_name
@@ -394,6 +440,9 @@ impl Reservation {
                 original_target.expected_process_incarnation =
                     Some(operation.source.process_incarnation.clone());
                 validate_processes(&original_plan, admission)?;
+                if let Some(hosts) = &self.hosts {
+                    no_regression(&hosts.observation, admission)?;
+                }
             }
             if target.expected_process_incarnation.as_ref()
                 != Some(&bound_source.process_incarnation)
@@ -424,8 +473,11 @@ impl Reservation {
                     bail!("another source remains reserved; only that operation may be resumed");
                 }
                 if let Some(receipt) = &self.completion {
-                    validate_processes(&process_plan, &receipt.observation)?;
-                    if source.node_id == receipt.replacement.node_id
+                    if self.hosts.is_none() {
+                        validate_processes(&process_plan, &receipt.observation)?;
+                    }
+                    if self.hosts.is_none()
+                        && source.node_id == receipt.replacement.node_id
                         && source != receipt.replacement
                     {
                         bail!("selected source no longer matches the last replacement identity");
@@ -433,6 +485,9 @@ impl Reservation {
                     if now_ms < receipt.observation.completed_ms {
                         bail!("next operation predates previous completion");
                     }
+                }
+                if let Some(hosts) = &self.hosts {
+                    hosts.validate_source(&source, &process_plan, now_ms)?;
                 }
                 let fence = MaintenanceFence::new(operation_id, executor_id, next.generation)
                     .map_err(anyhow::Error::msg)?;
@@ -486,6 +541,22 @@ fn validate_prefix(
     observation: &PrefixObservation,
     retired: bool,
 ) -> Result<()> {
+    validate_observed_prefix(cell, &cell.voter_ids, observation)?;
+    let proof = &observation.verification;
+    if proof.maintenance_fence.as_ref() != Some(fence)
+        || proof.maintenance_executor_certified == retired
+        || proof.maintenance_executor_retired_certified != retired
+    {
+        bail!("incorrectly fenced all-voter prefix evidence");
+    }
+    Ok(())
+}
+
+fn validate_observed_prefix(
+    cell: &CellIdentity,
+    observed: &BTreeSet<u64>,
+    observation: &PrefixObservation,
+) -> Result<()> {
     let proof = &observation.verification;
     let group_count =
         usize::try_from(cell.group_count).context("group inventory exceeds address space")?;
@@ -494,23 +565,20 @@ fn validate_prefix(
         || proof.version != 3
         || !proof.participation_certified
         || !proof.process_incarnations_certified
-        || proof.maintenance_fence.as_ref() != Some(fence)
-        || proof.maintenance_executor_certified == retired
-        || proof.maintenance_executor_retired_certified != retired
         || proof
             .process_incarnations
             .keys()
             .copied()
             .collect::<BTreeSet<_>>()
-            != cell.voter_ids
-        || proof.applied.keys().copied().collect::<BTreeSet<_>>() != cell.voter_ids
+            != *observed
+        || proof.applied.keys().copied().collect::<BTreeSet<_>>() != *observed
         || proof.prefixes.len() != group_count
         || !proof.prefixes.keys().copied().eq(0..cell.group_count)
     {
         bail!("incomplete or incorrectly fenced all-voter prefix evidence");
     }
     for (group, prefix) in &proof.prefixes {
-        if *group != prefix.raft_group_id || !cell.voter_ids.contains(&prefix.leader_id) {
+        if *group != prefix.raft_group_id || !observed.contains(&prefix.leader_id) {
             bail!("prefix identity is outside the cell");
         }
     }
@@ -601,6 +669,9 @@ impl Reservation {
                 if let Some(receipt) = &self.completion {
                     no_regression(&receipt.observation, &observation)?;
                 }
+                if let Some(hosts) = &self.hosts {
+                    no_regression(&hosts.observation, &observation)?;
+                }
                 operation.admission = Some(observation);
             }
             ProgressRequest::BindPodReplacement {
@@ -627,6 +698,13 @@ impl Reservation {
                     || replacement.process_incarnation == operation.source.process_incarnation
                 {
                     bail!("original Pod UID/process has not been retired");
+                }
+                if let Some(hosts) = &self.hosts {
+                    let old = hosts.voter(operation.source.node_id)?;
+                    let new = HostVoter::capture(&self.cell, replacement.clone(), &node)?;
+                    if !old.same_host(&new) {
+                        bail!("planned Pod replacement cannot change a catalogued physical host");
+                    }
                 }
                 if process_plan.len() != operation.process_plan.len() {
                     bail!("replacement changed inventory");
@@ -675,6 +753,13 @@ impl Reservation {
                     bail!("completion predates disruption admission");
                 }
                 no_regression(admitted, &observation)?;
+                if let Some(hosts) = &mut next.hosts {
+                    hosts.complete_pod_replacement(
+                        replacement,
+                        &operation.process_plan,
+                        &observation,
+                    )?;
+                }
                 next.completion = Some(Completion {
                     fence: operation.fence.clone(),
                     source: operation.source.clone(),

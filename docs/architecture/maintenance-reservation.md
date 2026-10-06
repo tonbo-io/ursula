@@ -68,6 +68,27 @@ voter after the reservation was released and another voter was disrupted.
 Takeover also retains the original admission boundary: recertification must not
 turn missing data into a new, lower accepted prefix.
 
+## Pre-fault physical inventory
+
+The optional `publish_host_inventory` transition records every voter's source identity, Node name and `topology.kubernetes.io/zone` in the same persistent ConfigMap. This is an idle-only whole-object CAS migration from schema 1 to schema 2: it preserves the store UID, global generation and any completion receipt, and races with ownership through the same resourceVersion. A missing store cannot be initialized by capture. Schema-1 consumers reject schema-2 state; deploy a supporting CLI before this explicit migration. The current chart does not publish inventories automatically.
+
+Before the first inventory migration, stop every legacy executor and reconcile any pending provider operation and previous physical owner. Capture does not reconstruct the original host of an already-observed fault or prove a former owner has stopped. Enabling automatic recovery requires a healthy, settled pre-fault inventory; neither a recreated Node nor a new store may establish that history retroactively.
+
+Capture requires three nondeleting Ready Pods and Nodes, exact StatefulSet ownership, distinct Pod/Node/provider identities and failure domains, a complete pinned process plan, and a fresh schema-3 full-group/all-replica participation proof. Kubernetes Ready alone is insufficient. The observation may have no executor, or certify the last completed executor as retired; active or unrelated executor evidence is refused. The platform must sample complete identities before and after the Raft observation, reject changed objects/processes, and submit the exact resulting proposal. The policy validates supplied observations; it cannot authenticate them or make separately sampled Kubernetes and Raft objects atomic.
+
+Later healthy capture may update Pod/process incarnations only on the same Node UID, provider identity, Node name and failure domain, after full nonregressing Raft recovery. A recreated same-name Node cannot replace the old host record. A physical host change requires a fenced host transition, which remains outstanding. Once an operation is reserved, capture is refused; takeover retains the entire catalog. A catalogued planned Pod replacement must stay on that physical host. Completion updates its selected Pod/process identity and the all-retired write boundary atomically with release. Existing schema-1 planned consumers keep their current behavior until migration.
+
+Build the capture request from Kubernetes List objects and a fresh `verify-quorum` observation, then use the existing proposal/acknowledgement interface:
+
+```sh
+ursulactl reservation-request publish-host-inventory \
+  --pods pods.json --nodes nodes.json --config pinned-processes.json \
+  --observation quorum.json > request.json
+ursulactl reservation-read --cell cell.json --snapshot committed.json --field hosts
+```
+
+Capturing inventory grants no disruption authority and proves no physical host fence. Automatic capture/reconciliation, irreversible provider termination, persistent stale-Pod retirement intents and abrupt-host qualification remain required before automatic host recovery can be claimed.
+
 Verification files and API receipts are operational evidence, not authenticated
 capabilities. The reviewed platform adapter must actually obtain them, supply its
 current clock, reconcile the selected physical identities and activate/retire
@@ -79,7 +100,7 @@ prove that a provider operation completed.
 `--cell` is the expected `CellIdentity` JSON; `--snapshot` is one full ConfigMap
 GET response; `--request` is the explicit JSON transition. Each input is bounded
 at 2 MiB. The request's `action` is `reserve`, `takeover`, `admit_pod_deletion`,
-`bind_pod_replacement` or `complete_pod_replacement`. Reserve/takeover supply
+`bind_pod_replacement`, `complete_pod_replacement` or `publish_host_inventory`. Reserve/takeover and host capture supply
 `now_ms`; every progress request carries its exact current `fence`. Prefix
 observations have the unchanged CLI output shape
 `{ "started_ms": ..., "completed_ms": ..., "verification": ... }`.
