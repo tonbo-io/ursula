@@ -1031,3 +1031,69 @@ adoption/recovery. Dynamic registration/joining beyond the bootstrap directory,
 complete live routing/inventory/maintenance/snapshot consumers, migration-time
 binary/S3 restart, joint-boundary DST and full scale/performance/autopilot gates
 remain open. M1/M2 and the complete epic are still active.
+
+### Implementation checkpoint: dynamic readiness and real binary migration
+
+Commit `ebe8dd7` replaces boot-time membership in the managed node's maintenance
+inventory with voters from its complete validated placement projection. After
+placement changes, removed groups cease to be expected and newly assigned groups
+become mandatory. Local observations cannot shrink this inventory. A missing
+assigned group, unexpected resident group, joint/incomplete voter configuration,
+unapplied membership, stopped/recovering replica, excessive lag or missing leader
+keeps the node unready. The same complete-voter check works for RF3 and RF5.
+
+Maintenance report version 2 denotes explicit managed assignments. An active
+node with zero assigned replicas and zero observed replicas can serve the front
+door and be ready to receive future assignments. Zero node IDs and unknown
+report versions fail closed. Static report version 1 retains its existing
+nonempty-inventory requirement. Managed readiness also requires an installed
+projection and a serving node state; cached projection recovery remains usable
+for established data under meta minority. This local eligibility does not
+provide fresh quorum evidence, reserve a disruption budget or establish physical
+removal eligibility. Cluster-wide maintenance/snapshot consumers remain separate
+integration work.
+
+`crates/ursula-ctl/tests/managed_migration_cli.rs` now runs six actual Ursula
+processes and actual `ursulactl operation submit/status/resume` commands. It
+starts with meta3, RF3 group 0 and RF5 group 1, disk WAL and an explicitly idle
+node 6. It stops destination 5, accepts an immutable move to `{1,3,5}`, observes
+the durable executor assignment and kills that controller. While both processes
+stay down, it requires a higher generation from another real meta leader and
+acknowledges new writes in both RF3 and RF5 groups through their remaining
+majorities. Restarting the controller and destination produces changed process
+identity, recertified receiving processes and completion of the same operation.
+Replaying the original CLI arguments returns the same ID.
+
+The test then changes the actual group policy/voters from RF3 to RF5
+`{1,2,3,4,5}` and back to RF3 `{2,4,6}`. This exercises reuse of a previously
+retired replica, movement to an idle node, cleanup and dynamic public routing.
+Every public front door must read the pre-migration and neighboring-group
+payloads. Pre-fault and during-fault acknowledged payloads survive those moves
+and a full six-process restart. The exact durable control state is preserved,
+placement epoch advances to 3, and new post-restart writes remain readable from
+every front door. Dynamic readiness is checked after each settled operation and
+restart; unassigned managed nodes must pass, while static setup checks only
+explicit static voter roles.
+
+This test proves actual process recovery before receiver activation: destination
+discovery blocks activation while node 5 is down. It does not interrupt a native
+snapshot install or committed joint transition. Snapshots/cold data here are
+inline/local; no S3 migration, outside-bootstrap registration/joining,
+capacity/performance or new DST boundary coverage is claimed.
+
+Run the fixture with:
+
+```sh
+cargo build -p ursula --bin ursula
+cargo test -p ursula-ctl --test managed_migration_cli -- --nocapture
+```
+
+Workspace integration builds provide both binaries automatically; a custom
+server binary may be selected with `URSULA_BINARY`. Final fixture run passed in
+26.33s. Two pure inventory tests cover managed idle/unknown/wrong identity,
+unexpected/missing replicas and complete RF5 membership. Final workspace lib/bin
+tests passed (969 passed, 3 ignored), along with workspace doc tests, Clippy with
+`-D warnings`, format, seven DST audits, madsim Raft check and existing smoke
+(0.39s). Existing mixed-RF/meta3/meta5 adoption/restart CLI passed (28.27s).
+M1/M2 remain open for the outstanding cross-cutting and fault gates; M3/M4 remain
+in the active epic.
