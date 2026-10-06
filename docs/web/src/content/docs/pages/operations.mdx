@@ -8,7 +8,7 @@ The first tool to reach for is [`ursulactl`](/docs/cli). It covers the raft-awar
 
 | Surface | When to reach for it |
 |---------|---------------------|
-| [`ursulactl`](/docs/cli) | Day-2 cluster ops over HTTP: drain, restart, status, wait-ready. |
+| [`ursulactl`](/docs/cli) | Day-2 cluster ops over HTTP: drain, wait, verify-cluster, status, wait-ready. |
 | `/__ursula/metrics` and the `/__ursula/raft/...` admin endpoints | Custom tooling. ursulactl uses these underneath. The surface is small and stable enough to script directly. |
 
 There is no Prometheus scrape and no general-purpose orchestrator yet.
@@ -19,10 +19,11 @@ There is no Prometheus scrape and no general-purpose orchestrator yet.
 curl http://127.0.0.1:4437/__ursula/metrics | jq .
 ```
 
-The JSON snapshot covers per-core mailbox depth, append/read counters, latency
-histograms, per-group leader and `last_applied`, hot/cold bytes, cold-flush
-backlog, WAL physical/reclaim/recovery work, WAL disk-pressure admission, HTTP
-status counters, live-read watchers, and cold-write admission state. Start here
+The JSON snapshot covers per-core mailbox depth, append/read counters,
+cumulative timing counters (`*_ns`), per-group leader and `last_applied_index`,
+hot/cold bytes, cold-flush backlog, WAL physical/reclaim/recovery work, WAL
+disk-pressure admission, SSE stream counters, live-read waiters, and cold-write
+admission state. Start here
 when triaging slowness, lag, or `503`s. `GET /__ursula/ready` provides the
 process-level readiness signal; `ursulactl status` is a friendlier read of the
 leadership-related fields across the whole cluster.
@@ -222,7 +223,7 @@ What you can additionally rely on:
   data and peers written by Ursula 0.5.x (format epoch 1) and does not migrate
   them. See [Upgrading to 0.6](#upgrading-to-06).
 
-Node-level loss: replace the host with the same `node_id` and cluster config, and it rehydrates from peers. Use `ursulactl wait-ready` afterwards to confirm the replacement is voting and caught up before declaring the recovery done. Total-cluster loss: restore the latest verified backup into a fresh cluster as above.
+Node-level loss: replace the host with the same `node_id` and cluster config, and it rehydrates from peers. Run `ursulactl wait --node <id>` and then `ursulactl verify-cluster` to confirm the replacement is voting and caught up before declaring the recovery done; `wait-ready` only checks group counts and leaders. Total-cluster loss: restore the latest verified backup into a fresh cluster as above.
 
 ## Upgrading to 0.6
 

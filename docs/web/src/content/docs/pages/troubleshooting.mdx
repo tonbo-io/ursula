@@ -14,12 +14,11 @@ Useful jq selectors:
 
 | What you need | jq filter |
 | ------------- | --------- |
-| Per-group leader / term | `.raft_groups[] | {id, leader_id, current_term, last_applied}` |
-| Hot bytes per group | `.raft_groups[] | {id, hot_bytes_total}` |
-| Cold backpressure events | `.cold_backpressure_events_total` |
-| Per-core mailbox depth | `.cores[] | {core_id, mailbox_pending}` |
-| Live-read watcher counts | `.cores[] | {core_id, live_read_watchers_active}` |
-| HTTP error counters | `.http.responses_by_status` |
+| Per-group leader / term | `.raft_groups[] | {raft_group_id, current_leader, current_term, committed_index, last_applied_index}` |
+| Hot bytes per group (array indexed by group ID) | `.per_group_cold_hot_bytes` |
+| Cold backpressure events | `.cold_backpressure_events` |
+| Per-core mailbox depth (array indexed by core) | `.mailbox_depths` |
+| Live-read waiters per core | `.per_core_live_read_waiters` |
 | WAL disk pressure | `{available: .wal_available_bytes, minimum: .wal_min_available_bytes, pressure: .wal_disk_pressure}` |
 | WAL reclaim/restart | `{physical: .wal_physical_bytes, reclaims: .wal_reclaims, recovered_bytes: .wal_recovery_bytes, recovery_ns: .wal_recovery_ns}` |
 
@@ -101,7 +100,7 @@ by the OS lock, not the file's existence.
 
 ### A fresh cluster never elects leaders
 
-`/__ursula/metrics` on each node should show non-zero `leader_id` and a stable `current_term`. If groups stay leaderless:
+`/__ursula/metrics` on each node should show a non-null `current_leader` and a stable `current_term`. If groups stay leaderless:
 
 - First start must include `raft.init_membership_per_group = true` (or `raft.init_membership = true`) on every voting node.
 - Every peer URL must be reachable from every node.
@@ -172,7 +171,7 @@ The first read of a cold offset triggers an S3 `GetObject` range read. It runs o
 
 ## Replication and consensus
 
-### A group has no leader (`leader_id == 0`)
+### A group has no leader (`current_leader` is null)
 
 Either an election is in progress or quorum is lost for that group. Only streams hashed to that group are affected.
 
@@ -181,11 +180,11 @@ Either an election is in progress or quorum is lost for that group. Only streams
 
 ### One follower lags behind
 
-State-machine apply runs on the follower's owner core. If CPU is pinned, `last_applied` trails. Check:
+State-machine apply runs on the follower's owner core. If CPU is pinned, `last_applied_index` trails `committed_index`. Check:
 
 - Per-core mailbox depth (sustained queueing means saturation).
 - Disk pressure if `raft.wal.backend = "disk"` (fsync latency).
-- A pathological hot stream forcing constant cold flushes (`hot_bytes_total` per group).
+- A pathological hot stream forcing constant cold flushes (`per_group_cold_hot_bytes`).
 
 ### Manually trigger a snapshot
 
@@ -205,7 +204,7 @@ Purge only after the snapshot replicates. Otherwise a slow follower may need log
 - `storage.cold.backend` is `none`, or set to `memory` when you expected `s3`.
 - IAM permissions missing. Required: `s3:GetObject`, `s3:PutObject`, `s3:ListBucket`, `s3:DeleteObject`.
 - `storage.cold.s3.endpoint` unreachable.
-- Cold flush worker stalled (`cold_backpressure_events_total` climbing).
+- Cold flush worker stalled (`cold_backpressure_events` climbing).
 
 If hot bytes grow unbounded, you'll eventually hit `storage.cold.max_hot_size_per_group` and writes start returning `503`. Fix the backend before that.
 
