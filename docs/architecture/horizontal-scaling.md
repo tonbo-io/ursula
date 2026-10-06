@@ -386,6 +386,11 @@ does not establish the durable, multi-operator scaling contract above.
 
 Acceptance uses real-process E2E plus DST fault schedules:
 
+Local device builds and tests must use the native host target only, per the
+2026-10-06 request (`aarch64-apple-darwin` on the current Mac). Do not
+cross-compile locally. Simulation via `--cfg madsim` still uses this host
+target. Native validation on other platforms is separate evidence.
+
 - Move a group in a configured subset layout onto a node that did not host it.
   Then expand 3 to 6 nodes and shrink 6 to 3 with RF=3 and stable stream/group
   identities. Repeat 5 to 10 to 5 with RF=5, plus a mixed-RF layout and explicit
@@ -1234,3 +1239,60 @@ recovery through migration, S3 migration, fresh gateway restart during meta
 minority, migration-boundary DST or capacity/autopilot acceptance. Intent-aware
 maintenance and snapshot consumers are the next integration work; the complete
 epic remains active.
+
+### Implementation checkpoint: membership-aware snapshot pruning
+
+Commit `f5124a8` separates snapshot deletion policy from boot-time voter TOML.
+Managed startup disables external pruning for every group before actors and
+snapshot drivers start. A fresh, ordered meta projection can enable settled
+groups with their resolved voters. Active migration intent or a non-retired
+local receiver fence pauses the affected group. An unknown fence binding or a
+missing/ineligible local node pauses all groups. Cached startup placement can
+restore serving but cannot resume deletion. The consumer refuses a view older
+than the installed cursor before updating pruning policy.
+
+Each external prune owns a per-group read lease through listing, reference
+reads and remote DELETE completion. Policy changes acquire the write lease,
+draining prior deletion and blocking later pruning. The owned task survives
+caller cancellation, so aborting a snapshot builder cannot prematurely certify
+the receiver. Other groups continue independently. Receiver activation first
+persists `Activating`, then pauses/drains pruning before reconciliation and
+process certification. Every participant must be certified before preparation
+or membership execution. Physical group retirement also drains deletion before
+removing actors/references. Snapshot uploads, reads and data writes continue
+through their existing admission paths while pruning is paused.
+
+Receiver finalization requires published target placement and all removed
+replica cleanup receipts. Persisting `Retired` then enables pruning with the
+exact target voters. Periodic fresh views repair this policy after restart and
+may conservatively pause finalization until the operation finishes. Every
+target voter must publish its primary reference before pruning; all discovered
+primary references and pins remain protected. Removed source voters are no
+longer required after their physical reference retirement. The grace period
+and retained-object rules remain in force.
+
+Meta RPC protocol and required receiver inventory protocol are now **v3**.
+V2 meta envelopes fail before decode; old or unversioned receiver inventories
+cannot supply the required pruning barrier certification. Mixed meta RPC
+versions are unsupported: stop control activity for the upgrade. This changes
+neither on-disk state schemas nor stream format epoch 2. No mixed-version
+rolling-upgrade compatibility is established.
+
+Two kernel tests use OpenDAL Memory with synthetic reference files: RF3 source
+reference removal and complete RF5 target requirements; cancelled pruning and
+pause/drain while a neighboring group prunes. One actual TCP data/meta Raft
+fixture loops RF3/RF5 with a pruning probe. It withholds receiver certification
+while deletion is blocked, interrupts executor tasks, transfers actual meta
+leadership, requires a higher generation, then resumes to final target policy.
+It also refuses stale projection rollback and unversioned inventory. That
+probe proves protocol ordering, not S3 network behavior or OS-process restart.
+
+Final workspace lib/bin tests pass 979 with 3 ignored; workspace doc tests,
+all-target Clippy with `-D warnings`, format, seven DST audits, madsim Raft lib
+check and existing smoke corpus (1.59s) pass. Both real binary migration CLI
+fixtures pass in 26.61s; managed adoption/restart passes in 26.70s. All runs use
+native `aarch64-apple-darwin`; the server is an arm64 Mach-O executable.
+An initial build failed after the generated target directory disappeared;
+the complete rebuild and final checks pass. Real S3 migration, install/joint
+binary faults and migration-boundary DST remain open. Intent-aware maintenance
+is the next integration work; the entire epic remains active.
