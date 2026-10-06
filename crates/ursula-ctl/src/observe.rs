@@ -192,6 +192,7 @@ mod tests {
             admin_url: Url::parse(&format!("http://10.0.0.{id}:4438")).unwrap(),
             host: format!("10.0.0.{id}"),
             http_url: Some(Url::parse(&format!("http://10.0.0.{id}/")).unwrap()),
+            metrics_url: None,
         }
     }
 

@@ -21,10 +21,16 @@ pub struct NodeInfo {
     pub admin_url: Url,
     /// Address shown in reports. Defaults to the admin URL's host.
     pub host: String,
-    /// Optional public client-plane URL. `status` and `wait-ready` prefer it
-    /// for read-only metrics and fall back to `admin_url` when absent.
+    /// Advertised public client/Raft address for learner attachment and
+    /// survivor handoff. Metrics use it when `metrics_url` is absent, then
+    /// fall back to `admin_url`.
     #[serde(default)]
     pub http_url: Option<Url>,
+    /// Optional read-only metrics endpoint, independent of the advertised
+    /// Raft/client address. Rollouts use their admin tunnel so a replacement
+    /// can be inspected before its cluster DNS record becomes reachable.
+    #[serde(default)]
+    pub metrics_url: Option<Url>,
 }
 
 #[allow(async_fn_in_trait)]
@@ -128,6 +134,8 @@ struct RawNode {
     #[serde(default)]
     http_url: Option<String>,
     #[serde(default)]
+    metrics_url: Option<String>,
+    #[serde(default)]
     host: Option<String>,
 }
 
@@ -166,11 +174,19 @@ impl RawNode {
             Url::parse(&format!("http://{host}:{admin_port}"))
                 .with_context(|| format!("synthesize admin_url for node {}", self.id))?
         };
+        let metrics_url = self
+            .metrics_url
+            .as_deref()
+            .and_then(non_empty)
+            .map(Url::parse)
+            .transpose()
+            .with_context(|| format!("invalid metrics_url for node {}", self.id))?;
         Ok(NodeInfo {
             id: self.id,
             admin_url,
             host,
             http_url,
+            metrics_url,
         })
     }
 }
@@ -196,6 +212,23 @@ mod tests {
         assert_eq!(nodes[0].host, "203.0.113.10");
         // admin_url defaults to host:4438.
         assert_eq!(nodes[0].admin_url.as_str(), "http://203.0.113.10:4438/");
+    }
+
+    #[test]
+    fn metrics_tunnel_is_independent_of_the_advertised_peer_address() {
+        let provider = StaticNodeProvider::from_bytes(br#"{"nodes":[{"id":1,"http_url":"http://replacement.invalid:4437","admin_url":"http://127.0.0.1:15438","metrics_url":"http://127.0.0.1:15438"}]}"#).unwrap();
+        let node = &provider.nodes[0];
+        assert_eq!(node.metrics_url.as_ref(), Some(&node.admin_url));
+        assert_eq!(
+            node.http_url.as_ref().unwrap().host_str(),
+            Some("replacement.invalid")
+        );
+        assert!(
+            StaticNodeProvider::from_bytes(
+                br#"{"nodes":[{"id":1,"host":"replacement","metrics_url":"invalid"}]}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

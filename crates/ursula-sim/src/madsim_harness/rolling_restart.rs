@@ -228,6 +228,7 @@ fn synthetic_node_info(node_id: u64) -> NodeInfo {
             .expect("synthetic admin url"),
         host: format!("node-{node_id}"),
         http_url: None,
+        metrics_url: None,
     }
 }
 

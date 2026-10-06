@@ -1044,6 +1044,7 @@ fn ctl_node(node_id: u64, admin_port: u16, public_url: &str) -> ursula_ctl::Node
         admin_url: url::Url::parse(&format!("http://127.0.0.1:{admin_port}")).expect("admin url"),
         host: "127.0.0.1".to_owned(),
         http_url: Some(url::Url::parse(public_url).expect("public url")),
+        metrics_url: None,
     }
 }
 

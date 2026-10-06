@@ -2412,6 +2412,7 @@ mod tests {
                 admin_url: url.clone(),
                 host: address.to_string(),
                 http_url: Some(url),
+                metrics_url: None,
             });
         }
         (nodes, cluster)
@@ -2423,6 +2424,7 @@ mod tests {
             admin_url: url::Url::parse(&format!("http://{host}:4438")).unwrap(),
             host: host.to_owned(),
             http_url: Some(url::Url::parse(&format!("http://{host}:8080")).unwrap()),
+            metrics_url: None,
         }
     }
 

@@ -350,7 +350,10 @@ impl MetricsClient {
 }
 
 fn metrics_base_url(node: &NodeInfo) -> &url::Url {
-    node.http_url.as_ref().unwrap_or(&node.admin_url)
+    node.metrics_url
+        .as_ref()
+        .or(node.http_url.as_ref())
+        .unwrap_or(&node.admin_url)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -531,12 +534,58 @@ impl ClusterSnapshot {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
     use axum::Router;
     use axum::http::StatusCode;
     use axum::routing::post;
     use url::Url;
 
     use super::*;
+
+    #[tokio::test]
+    async fn tunneled_metrics_do_not_replace_the_advertised_learner_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let query = Arc::new(Mutex::new(None));
+        let received = query.clone();
+        let app = Router::new()
+            .route(
+                "/__ursula/metrics",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "raft_groups": [{"raft_group_id": 0, "node_id": 1}]
+                    }))
+                }),
+            )
+            .route(
+                "/__ursula/raft/0/learners/1",
+                post(move |axum::extract::RawQuery(value)| async move {
+                    *received.lock().unwrap() = value;
+                    StatusCode::OK
+                }),
+            );
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let tunnel = Url::parse(&format!("http://{address}")).unwrap();
+        let advertised = Url::parse("http://replacement.invalid:4437").unwrap();
+        let node = NodeInfo {
+            id: 1,
+            admin_url: tunnel.clone(),
+            host: "replacement".to_owned(),
+            http_url: Some(advertised.clone()),
+            metrics_url: Some(tunnel),
+        };
+        let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
+        let view = client.fetch_node(&node).await.unwrap();
+        assert_eq!(view.node.http_url, Some(advertised.clone()));
+        client.add_learner(&node, 0, &node).await.unwrap();
+        assert_eq!(
+            query.lock().unwrap().as_deref(),
+            Some(format!("addr={advertised}&blocking=false").as_str())
+        );
+        task.abort();
+    }
 
     #[tokio::test]
     async fn metrics_refuse_an_admin_tunnel_that_reaches_a_different_voter() {
@@ -552,6 +601,7 @@ mod tests {
             admin_url: Url::parse(&format!("http://{address}")).unwrap(),
             host: address.to_string(),
             http_url: None,
+            metrics_url: None,
         };
         let error = MetricsClient::new(Duration::from_secs(1))
             .unwrap()
@@ -569,6 +619,7 @@ mod tests {
             admin_url: Url::parse("http://127.0.0.1:4438")?,
             host: "127.0.0.1".to_owned(),
             http_url: Some(Url::parse("http://127.0.0.1:4437")?),
+            metrics_url: None,
         };
 
         assert_eq!(metrics_base_url(&node).port(), Some(4437));
@@ -582,6 +633,7 @@ mod tests {
             admin_url: Url::parse("http://127.0.0.1:4438")?,
             host: "127.0.0.1".to_owned(),
             http_url: None,
+            metrics_url: None,
         };
 
         assert_eq!(metrics_base_url(&node).port(), Some(4438));
@@ -603,6 +655,7 @@ mod tests {
             admin_url: Url::parse(&format!("http://{address}"))?,
             host: address.to_string(),
             http_url: None,
+            metrics_url: None,
         })
     }
 

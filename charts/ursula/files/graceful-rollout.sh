@@ -36,6 +36,9 @@ write_manifest() {
       printf '    {\n'
       printf '      "id": %s,\n' "$((ordinal + 1))"
       printf '      "admin_url": "http://127.0.0.1:%s",\n' "$((FORWARD_PORT_BASE + ordinal))"
+      # Metrics use the same Pod-bound tunnel. Keep http_url as the real peer
+      # address: learner attachment persists it in Raft membership.
+      printf '      "metrics_url": "http://127.0.0.1:%s",\n' "$((FORWARD_PORT_BASE + ordinal))"
       printf '      "host": "%s-%s",\n' "${STATEFULSET}" "${ordinal}"
       printf '      "http_url": "http://%s-%s.%s-headless.%s.svc.cluster.local:%s"\n' \
         "${STATEFULSET}" "${ordinal}" "${STATEFULSET}" "${NAMESPACE}" "${CLIENT_PORT}"
