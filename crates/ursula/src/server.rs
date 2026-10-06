@@ -256,7 +256,17 @@ async fn serve(
     let admin_listen: SocketAddr = config.server.admin_listen.parse()?;
 
     let shutdown = Arc::new(Notify::new());
-    spawn_shutdown_signal_task(shutdown.clone(), state.raft_registry().cloned());
+    spawn_shutdown_signal_task(
+        shutdown.clone(),
+        state.raft_registry().cloned(),
+        config.raft.node_id,
+        config
+            .raft
+            .peers
+            .iter()
+            .map(|peer| (peer.node_id, peer.url.clone()))
+            .collect(),
+    );
 
     let admin_app = crate::admin_router(state.clone());
     let admin_listener = tokio::net::TcpListener::bind(admin_listen).await?;
@@ -333,29 +343,50 @@ async fn notified(shutdown: Arc<Notify>) {
 /// in-flight request (or a long live-read poll) cannot block termination past
 /// what systemd/Kubernetes allot before SIGKILL.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
+/// Leave most of the overall grace period for draining HTTP requests.
+const SHUTDOWN_HANDOFF_GRACE: Duration = Duration::from_secs(5);
 
 /// Translate SIGTERM (systemd stop, Kubernetes pod termination) and Ctrl-C
-/// into one graceful-shutdown notification. A second signal, or the grace
-/// deadline expiring, exits immediately: quorum replication and the WAL make
-/// abrupt exit safe for acknowledged data, so the escape hatch stays cheap.
+/// into a bounded leadership handoff followed by listener draining. A second
+/// signal, or the overall grace deadline expiring, exits immediately. Memory
+/// WAL still loses all local state on exit; this is an availability optimization,
+/// not protection against overlapping voter losses.
 fn spawn_shutdown_signal_task(
     shutdown: Arc<Notify>,
     raft_registry: Option<ursula_raft::RaftGroupHandleRegistry>,
+    node_id: u64,
+    peers: Vec<(u64, String)>,
 ) {
     tokio::spawn(async move {
         shutdown_signal().await;
         tracing::info!(
-            "received shutdown signal; draining listeners (forced exit after {SHUTDOWN_GRACE:?})"
+            "received shutdown signal; handing off leadership before draining listeners (forced exit after {SHUTDOWN_GRACE:?})"
         );
-        if let Some(registry) = raft_registry {
-            registry.shutdown_transport();
-        }
-        shutdown.notify_waiters();
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
         tokio::select! {
+            () = async {
+                if let Some(registry) = raft_registry {
+                    let result = tokio::time::timeout(
+                        SHUTDOWN_HANDOFF_GRACE,
+                        crate::bootstrap::handoff_shutdown_leadership(&registry, node_id, &peers),
+                    ).await;
+                    let remaining_leaders = registry.metrics_snapshot().iter()
+                        .filter(|snapshot| snapshot.current_leader == Some(node_id)).count();
+                    if matches!(result, Ok(0)) {
+                        tracing::info!(remaining_leaders, "shutdown leadership handoff complete");
+                    } else {
+                        tracing::warn!(remaining_leaders, timed_out = result.is_err(),
+                            "shutdown leadership handoff incomplete; continuing bounded shutdown");
+                    }
+                    registry.shutdown_transport();
+                }
+                shutdown.notify_waiters();
+                std::future::pending::<()>().await;
+            } => {}
             () = shutdown_signal() => {
                 tracing::warn!("second shutdown signal; exiting immediately");
             }
-            () = tokio::time::sleep(SHUTDOWN_GRACE) => {
+            () = tokio::time::sleep_until(deadline) => {
                 tracing::warn!("shutdown grace period expired; exiting with drains incomplete");
             }
         }

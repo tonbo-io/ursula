@@ -149,6 +149,18 @@ message GroupReadResponseV1 {
   bytes payload = 2;
 }
 
+// A fresh quorum-confirmed recovery boundary. It is requested by a memory-WAL
+// replica after starting empty; delayed inbound AppendEntries are not evidence.
+message RejoinBarrierRequestV1 {
+  uint32 raft_group_id = 1;
+  uint32 protocol_version = 2;
+}
+
+message RejoinBarrierResponseV1 {
+  bytes vote = 1;
+  uint64 index = 2;
+}
+
 service RaftInternal {
   rpc Append(RaftRpcEnvelopeV1) returns (RaftRpcAckV1);
   rpc AppendStream(stream RaftAppendStreamRequest) returns (stream RaftAppendStreamResponse);
@@ -156,5 +168,6 @@ service RaftInternal {
   rpc FullSnapshot(RaftFullSnapshotRequestV1) returns (RaftFullSnapshotAckV1);
   rpc GroupWrite(GroupWriteRequestV1) returns (GroupWriteResponseV1);
   rpc GroupRead(GroupReadRequestV1) returns (GroupReadResponseV1);
+  rpc RejoinBarrier(RejoinBarrierRequestV1) returns (RejoinBarrierResponseV1);
   rpc TransferLeader(RaftTransferLeaderRequestV1) returns (RaftTransferLeaderAckV1);
 }

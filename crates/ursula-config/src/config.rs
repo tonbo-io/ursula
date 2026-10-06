@@ -101,8 +101,9 @@ impl Default for ServerConfig {
 pub struct RuntimeConfig {
     /// Number of CPU cores / tokio worker threads to use.
     pub core_count: usize,
-    /// Soft RSS cap. When the process RSS exceeds this value, new writes are
-    /// rejected with HTTP 503. `None` disables the monitor.
+    /// Emergency RSS abort threshold. Exceeding it aborts the process; it does
+    /// not reject writes with HTTP 503 or perform a graceful leadership handoff.
+    /// With memory WAL, this loses all local Raft logs. `None` disables the monitor.
     pub node_memory_abort_cap_size: Option<HumanSize>,
     /// Minimum payload size that triggers external cold-store staging instead
     /// of inline hot-ring storage. `None` uses the default (1 MiB).

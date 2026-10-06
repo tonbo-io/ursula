@@ -730,6 +730,16 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             target: self.target,
             kind: InProcessRaftRpcKind::TransferLeader,
         });
+        if *req.to_node_id() == self.target
+            && self
+                .registry
+                .rejoin(self.target)
+                .is_some_and(|rejoin| !rejoin.may_campaign())
+        {
+            return Err(RPCError::Network(NetworkError::from_string(
+                "memory-WAL recovery barrier is not applied; refusing leadership transfer",
+            )));
+        }
         target.handle_transfer_leader(req).await.map_err(|err| {
             RPCError::Network(NetworkError::from_string(format!(
                 "remote TransferLeader on node {}: {err}",
@@ -1003,8 +1013,12 @@ impl RaftGroupHandleRegistry {
             .groups
             .lock()
             .expect("raft group handle registry mutex");
-        raft.runtime_config()
-            .elect(self.leadership_shed_state().should_campaign());
+        raft.runtime_config().elect(
+            self.leadership_shed_state().should_campaign()
+                && self
+                    .rejoin(placement.raft_group_id)
+                    .is_none_or(|rejoin| rejoin.may_campaign()),
+        );
         groups.insert(placement.raft_group_id.0, raft);
     }
 
@@ -1223,7 +1237,7 @@ impl RaftGroupHandleRegistry {
         let previous_state = LeadershipShedState::from_bits_truncate(previous);
         let current = LeadershipShedState::from_bits_truncate(previous | reason.bit());
         if previous_state.should_campaign() != current.should_campaign() {
-            self.set_registered_group_elections(current.should_campaign());
+            self.set_registered_group_elections();
         }
         if previous & reason.bit() == 0 {
             tracing::warn!("leadership-shed: mark {reason}; state={current}");
@@ -1237,25 +1251,56 @@ impl RaftGroupHandleRegistry {
         let previous_state = LeadershipShedState::from_bits_truncate(previous);
         let current = LeadershipShedState::from_bits_truncate(previous & !reason.bit());
         if previous_state.should_campaign() != current.should_campaign() {
-            self.set_registered_group_elections(current.should_campaign());
+            self.set_registered_group_elections();
         }
         if previous & reason.bit() != 0 {
             tracing::warn!("leadership-shed: clear {reason}; state={current}");
         }
     }
 
-    fn set_registered_group_elections(&self, enabled: bool) {
+    fn set_registered_group_elections(&self) {
         let groups = self
             .groups
             .lock()
             .expect("raft group handle registry mutex");
-        for raft in groups.values() {
-            raft.runtime_config().elect(enabled);
+        for (group, raft) in groups.iter() {
+            raft.runtime_config().elect(
+                self.leadership_shed_state().should_campaign()
+                    && self
+                        .rejoin(RaftGroupId(*group))
+                        .is_none_or(|rejoin| rejoin.may_campaign()),
+            );
+        }
+    }
+
+    /// Serialize recovery-barrier changes with maintenance policy updates.
+    pub(crate) fn refresh_group_elections(&self, group: RaftGroupId) {
+        let groups = self
+            .groups
+            .lock()
+            .expect("raft group handle registry mutex");
+        if let Some(raft) = groups.get(&group.0) {
+            raft.runtime_config().elect(
+                self.leadership_shed_state().should_campaign()
+                    && self
+                        .rejoin(group)
+                        .is_none_or(|rejoin| rejoin.may_campaign()),
+            );
         }
     }
 
     pub fn is_leadership_shed(&self) -> bool {
         self.leadership_shed_state().is_shed()
+    }
+
+    /// A memory-WAL node cannot receive a planned leadership handoff until
+    /// every registered group has applied its fresh recovery barrier.
+    pub fn recovery_barriers_ready(&self) -> bool {
+        self.rejoins
+            .lock()
+            .expect("raft group rejoin registry mutex")
+            .values()
+            .all(|rejoin| rejoin.may_campaign())
     }
 
     pub fn metrics_snapshot(&self) -> Vec<RaftGroupMetricsSnapshot> {
@@ -1412,6 +1457,16 @@ impl RaftGroupHandleRegistry {
         request: TransferLeaderRequest<UrsulaRaftTypeConfig>,
     ) -> Result<(), GroupEngineError> {
         let raft = self.require_group(raft_group_id)?;
+        if *request.to_node_id() == raft.metrics().borrow_watched().id
+            && (!self.leadership_shed_state().should_campaign()
+                || self
+                    .rejoin(raft_group_id)
+                    .is_some_and(|rejoin| !rejoin.may_campaign()))
+        {
+            return Err(GroupEngineError::new(
+                "memory-WAL recovery barrier is not applied; refusing leadership transfer",
+            ));
+        }
         raft.handle_transfer_leader(request)
             .await
             .map_err(|err| GroupEngineError::new(format!("OpenRaft handle_transfer_leader: {err}")))

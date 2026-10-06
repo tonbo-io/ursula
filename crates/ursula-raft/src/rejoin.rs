@@ -1,9 +1,11 @@
-//! Memory-WAL rejoin (0.6.2): a replica that restarted with an empty Raft log
+//! Memory-WAL rejoin: a replica that restarted with an empty Raft log
 //! heals itself, and never votes before it holds the group's log again.
 //!
 //! A memory-WAL replica loses its Raft log when its process restarts. Three
-//! server-side pieces keep that from costing an acknowledged write. None of
-//! them changes a message, the apply path or anything persisted.
+//! server-side pieces protect acknowledged writes. Recovery uses a fresh
+//! outbound ReadIndex proof; replicated commands and persisted formats are
+//! unchanged. During a rolling upgrade, the probe can use the 0.6.2 read and
+//! vote RPCs until every peer supports the explicit recovery-barrier RPC.
 //!
 //! - **Bootstrap decision** ([`bootstrap_decision`]): a group's initializer
 //!   runs `Initialize` only when every configured voter answers a probe
@@ -15,7 +17,7 @@
 //!   follows a leader means the group exists: the replica waits to be
 //!   replicated to instead of founding a second group.
 //! - **Vote gate** ([`VoteGate`]): from start until it holds the log that a
-//!   leader had committed when it first heard from that leader, the replica
+//!   leader confirmed in a fresh post-start ReadIndex round, the replica
 //!   refuses every candidate whose log is non-empty, and every candidate
 //!   once it has seen that the group has committed entries. A fresh group's
 //!   first election (candidates whose log is only the membership entry at
@@ -80,7 +82,6 @@ fn log_index(log_id: Option<&LogIdOf<UrsulaRaftTypeConfig>>) -> Option<u64> {
 
 fn local_replica(metrics: &RaftMetrics<UrsulaRaftTypeConfig>) -> LocalReplica {
     LocalReplica {
-        is_leader: metrics.state == ServerState::Leader,
         last_applied: log_index(metrics.last_applied.as_ref()),
     }
 }
@@ -88,7 +89,6 @@ fn local_replica(metrics: &RaftMetrics<UrsulaRaftTypeConfig>) -> LocalReplica {
 /// What this replica knows about itself when it screens a vote.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct LocalReplica {
-    pub is_leader: bool,
     pub last_applied: Option<u64>,
 }
 
@@ -101,12 +101,12 @@ pub(crate) enum VoteScreen {
     Refuse,
 }
 
-/// The catch-up point: the commit index of the first AppendEntries this
-/// replica received from the highest leader it has heard from.
+/// The catch-up point from a fresh outbound quorum-confirmed probe. The legacy
+/// RPC bridge uses the leader's last log as a conservative bound.
 #[derive(Debug, Clone)]
 struct CatchUpTarget {
     leader: UrsulaVote,
-    commit_index: Option<u64>,
+    commit_index: u64,
 }
 
 /// Per-group vote gate of a memory-WAL replica (pure state; see the module
@@ -129,23 +129,40 @@ impl VoteGate {
     }
 
     /// Record an inbound AppendEntries from `leader`.
-    pub(crate) fn observe_append(&mut self, leader: &UrsulaVote, leader_commit: Option<u64>) {
+    pub(crate) fn observe_append(&mut self, _leader: &UrsulaVote, leader_commit: Option<u64>) {
         if self.open {
             return;
         }
         if leader_commit.is_some_and(|index| index >= 1) {
             self.initialized_seen = true;
         }
+    }
+
+    /// Only this process's outbound recovery probe may establish a catch-up
+    /// target. Inbound replication may have been delayed across the restart.
+    pub(crate) fn confirm_barrier(&mut self, leader: UrsulaVote, commit_index: u64) {
+        if self.open || !leader.is_committed() {
+            return;
+        }
+        self.initialized_seen |= commit_index >= 1;
         let newer_leader = match &self.catch_up {
             None => true,
-            Some(target) => leader > &target.leader,
+            Some(target) => leader > target.leader,
         };
         if newer_leader {
             self.catch_up = Some(CatchUpTarget {
-                leader: *leader,
-                commit_index: leader_commit,
+                leader,
+                commit_index,
             });
+        } else if let Some(target) = &mut self.catch_up
+            && target.leader == leader
+        {
+            target.commit_index = target.commit_index.max(commit_index);
         }
+    }
+
+    fn allow_fresh_bootstrap(&mut self) {
+        self.open = true;
     }
 
     /// Open the gate if the replica has caught up.
@@ -156,15 +173,11 @@ impl VoteGate {
     }
 
     fn caught_up(&self, local: LocalReplica) -> bool {
-        if local.is_leader {
-            return true;
-        }
-        self.catch_up
-            .as_ref()
-            .is_some_and(|target| match target.commit_index {
-                None => true,
-                Some(commit) => local.last_applied.is_some_and(|applied| applied >= commit),
-            })
+        self.catch_up.as_ref().is_some_and(|target| {
+            local
+                .last_applied
+                .is_some_and(|applied| applied >= target.commit_index)
+        })
     }
 
     /// Decide one vote request from `candidate`, whose last log index is
@@ -261,6 +274,7 @@ impl GroupRejoin {
     /// Attach the group's Raft metrics. Call once the Raft exists and before
     /// it is reachable from the network.
     pub fn bind(&self, raft: &RaftGroupHandle) {
+        raft.runtime_config().elect(false);
         let _ = self.metrics.set(raft.metrics());
     }
 
@@ -278,6 +292,33 @@ impl GroupRejoin {
             gate.refresh(local);
         }
         gate.is_open()
+    }
+
+    /// Called only after every peer was proven empty and the initialized
+    /// marker was absent (or the operator explicitly accepted data loss).
+    pub(crate) fn allow_fresh_bootstrap(&self) {
+        self.gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .allow_fresh_bootstrap();
+    }
+
+    pub(crate) fn confirm_barrier(&self, leader: UrsulaVote, commit_index: u64) {
+        self.gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .confirm_barrier(leader, commit_index);
+    }
+
+    /// Campaigning is subject to both this barrier and the node's shed policy.
+    pub(crate) fn may_campaign(&self) -> bool {
+        self.vote_gate_open()
+            || self
+                .gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .released_for
+                == Some(self.node_id)
     }
 
     /// Follower side: screen an inbound vote request. `Some` is the refusal
@@ -331,18 +372,6 @@ impl GroupRejoin {
         prev_log_id: Option<&LogIdOf<UrsulaRaftTypeConfig>>,
         response: &UrsulaAppendEntriesResponse,
     ) -> bool {
-        // Replicating as an established leader proves this replica holds every
-        // committed entry; open its gate now rather than at the next vote, so
-        // it can grant the vote of a peer it hands leadership to.
-        if leader.is_committed() && *leader.leader_id().node_id() == self.node_id {
-            self.gate
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .refresh(LocalReplica {
-                    is_leader: true,
-                    last_applied: None,
-                });
-        }
         if !matches!(response, UrsulaAppendEntriesResponse::Conflict) {
             return false;
         }
@@ -442,6 +471,10 @@ impl GroupRejoin {
             return Err("group metrics are not bound yet".to_owned());
         };
         if metrics.state != ServerState::Leader {
+            self.gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .release_for(survivor);
             return Ok(AdoptSurvivorOutcome::NotLeader);
         }
         let targets = self.reverted_followers(&metrics.vote);
@@ -784,10 +817,7 @@ mod tests {
     }
 
     fn follower(last_applied: Option<u64>) -> LocalReplica {
-        LocalReplica {
-            is_leader: false,
-            last_applied,
-        }
+        LocalReplica { last_applied }
     }
 
     #[test]
@@ -807,6 +837,7 @@ mod tests {
         assert_eq!(gate.screen(3, Some(0), follower(None)), VoteScreen::Refuse);
 
         gate.observe_append(&leader(2, 1), Some(11));
+        gate.confirm_barrier(leader(2, 1), 11);
         assert_eq!(
             gate.screen(2, Some(12), follower(Some(10))),
             VoteScreen::Refuse
@@ -824,10 +855,10 @@ mod tests {
     #[test]
     fn the_catch_up_point_follows_the_highest_leader() {
         let mut gate = VoteGate::default();
-        gate.observe_append(&leader(2, 1), Some(5));
+        gate.confirm_barrier(leader(2, 1), 5);
         // A deposed leader's lower commit does not lower the target.
-        gate.observe_append(&leader(1, 3), Some(1));
-        gate.observe_append(&leader(3, 2), Some(9));
+        gate.confirm_barrier(leader(1, 3), 1);
+        gate.confirm_barrier(leader(3, 2), 9);
         assert_eq!(
             gate.screen(2, Some(9), follower(Some(5))),
             VoteScreen::Refuse
@@ -836,19 +867,52 @@ mod tests {
     }
 
     #[test]
-    fn a_leader_opens_its_gate_and_an_operator_release_names_one_candidate() {
+    fn fresh_bootstrap_opens_its_gate_and_an_operator_release_names_one_candidate() {
         let mut gate = VoteGate::default();
-        let leading = LocalReplica {
-            is_leader: true,
-            last_applied: None,
-        };
-        assert_eq!(gate.screen(2, Some(4), leading), VoteScreen::Pass);
+        gate.allow_fresh_bootstrap();
+        assert_eq!(gate.screen(2, Some(4), follower(None)), VoteScreen::Pass);
 
         let mut gate = VoteGate::default();
         gate.observe_append(&leader(4, 1), Some(20));
         gate.release_for(3);
         assert_eq!(gate.screen(2, Some(20), follower(None)), VoteScreen::Refuse);
         assert_eq!(gate.screen(3, Some(20), follower(None)), VoteScreen::Pass);
+    }
+
+    #[test]
+    fn delayed_replication_never_releases_a_restarted_vote_gate() {
+        let mut gate = VoteGate::default();
+        gate.observe_append(&leader(2, 1), Some(5));
+        gate.observe_append(&leader(2, 1), Some(12));
+        assert_eq!(
+            gate.screen(3, Some(5), follower(Some(5))),
+            VoteScreen::Refuse
+        );
+        // Even applying every inbound entry is not a post-start proof.
+        assert_eq!(
+            gate.screen(3, Some(12), follower(Some(12))),
+            VoteScreen::Refuse
+        );
+        gate.confirm_barrier(leader(2, 1), 12);
+        assert_eq!(
+            gate.screen(3, Some(5), follower(Some(5))),
+            VoteScreen::Refuse
+        );
+        assert_eq!(
+            gate.screen(3, Some(12), follower(Some(12))),
+            VoteScreen::Pass
+        );
+    }
+
+    #[test]
+    fn heartbeat_without_commit_and_uncommitted_proof_never_open_the_gate() {
+        let mut gate = VoteGate::default();
+        gate.observe_append(&leader(2, 1), None);
+        gate.refresh(follower(None));
+        assert!(!gate.is_open());
+        gate.confirm_barrier(vote(3, 1), 20);
+        gate.refresh(follower(Some(20)));
+        assert!(!gate.is_open());
     }
 
     #[test]

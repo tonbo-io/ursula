@@ -72,6 +72,7 @@ pub use grpc::RAFT_GRPC_FULL_SNAPSHOT_PATH;
 pub use grpc::RAFT_GRPC_GROUP_READ_PATH;
 pub use grpc::RAFT_GRPC_GROUP_WRITE_PATH;
 pub use grpc::RAFT_GRPC_MAX_MESSAGE_BYTES;
+pub use grpc::RAFT_GRPC_REJOIN_BARRIER_PATH;
 pub use grpc::RAFT_GRPC_TRANSFER_LEADER_PATH;
 pub use grpc::RAFT_GRPC_VOTE_PATH;
 pub use grpc::RaftGrpcMetricsSnapshot;

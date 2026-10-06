@@ -303,7 +303,7 @@ accepted. The entrypoint should only guard runtime-derived pod ordinal state.
 {{- fail "raft.logDir must be non-empty when raft.storageMode=logDir" -}}
 {{- end -}}
 {{- if and ($storageMode | eq "memory") (gt $replicaCount 1) (not .Values.raft.allowVolatileMultiPeer) -}}
-{{- fail "multi-pod raft.storageMode=memory is volatile; set raft.allowVolatileMultiPeer=true only for development, benchmark, or chaos use" -}}
+{{- fail "multi-pod raft.storageMode=memory requires raft.allowVolatileMultiPeer=true to accept the volatile-WAL durability contract; see README Bootstrap Behavior for recovery guarantees and S3 marker prerequisites" -}}
 {{- end -}}
 {{- if and ($storageMode | eq "logDir") (gt (.Values.raft.minAvailableBytes | int64) 0) (le (.Values.raft.resumeAvailableBytes | int64) (.Values.raft.minAvailableBytes | int64)) -}}
 {{- fail "raft.resumeAvailableBytes must exceed raft.minAvailableBytes when disk-pressure admission is enabled" -}}

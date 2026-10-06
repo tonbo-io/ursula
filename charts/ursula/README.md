@@ -2,12 +2,12 @@
 
 This chart installs Ursula as a static-membership Raft cluster on Kubernetes. The default install starts three voter pods, 64 Raft groups, durable per-pod Raft log PVCs, a headless peer Service, an internal client/admin ClusterIP Service, a quorum-protecting PodDisruptionBudget, default multi-pod spread hints, an optional stateless gateway Deployment, and a Helm test that verifies cluster readiness with `ursulactl wait-ready`.
 
-The chart is designed for fresh static-membership clusters. It does not perform online Raft voter expansion, voter removal, leader handoff during Kubernetes rolling updates, or dynamic voter reconfiguration. Those operations belong to the future Ursula operator workflow.
+The chart uses a fixed configured voter set. Its optional graceful-rollout hook hands off leadership and verifies one replacement at a time; memory-WAL leaders also repair a restarted voter through learner catch-up. Online changes to the configured voter count still require a future Ursula operator workflow.
 
 ## Recommended Production Topology
 
 - Run three Ursula voter pods across three availability zones for the normal production profile; use five voters only when tolerating two simultaneous voter failures is worth the additional write quorum cost.
-- Give each voter its own zonal persistent volume for the Raft log, and configure shared S3 for cold chunks and externalized snapshots. Do not use `raft.storageMode=memory` or disable persistence in production.
+- The default durability profile gives each voter its own zonal persistent volume for the Raft log and uses shared S3 for cold chunks and externalized snapshots. A memory-WAL deployment must explicitly accept the different durability contract and satisfy the object-storage prerequisites under [Bootstrap Behavior](#bootstrap-behavior).
 - Run at least two stateless gateway replicas behind an authenticated TLS ingress or load balancer. Keep the server and peer Services private.
 - Optionally run a fixed event-time indexer worker pool (experimental). Users register JSON or NDJSON streams dynamically over HTTP after stream creation; adding a stream never requires a Helm upgrade.
 - Keep S3 authoritative and treat indexer `emptyDir` volumes as disposable caches. Each source gets a logical S3 namespace, and workers claim streams across namespaces so small streams can share pods.
@@ -122,7 +122,23 @@ redirect URL configuration.
 
 ## Bootstrap Behavior
 
-`raft.initMembershipPerGroup` defaults to `true` so a fresh cluster can initialize per-group Raft membership automatically. Initialization checks the durable Raft log before changing membership, so persistent `logDir` deployments can keep the value enabled across restarts and upgrades. Memory Raft storage (`raft.storageMode=memory`) loses the log on every restart: a restarted memory pod initializes a group again only when every configured voter reports it empty, refuses to vote until it has caught up, and is rebuilt by the group leaders through learner catch-up. If a majority of a group restarts at once, the group stops accepting writes until an operator adopts the survivor (see the operations guide). This is one more reason production must use `logDir`.
+`raft.initMembershipPerGroup` defaults to `true` so a fresh cluster can initialize per-group Raft membership automatically. Persistent `logDir` deployments can keep it enabled across restarts and upgrades: initialization checks existing Raft state before changing membership.
+
+### Memory-WAL Durability Contract
+
+`raft.storageMode=memory` loses the node's local Raft logs and replicated state on every process restart, including OOM or the emergency RSS abort threshold. Set `persistence.enabled=false` and explicitly opt in with `raft.allowVolatileMultiPeer=true`. A PVC does not make memory WAL persistent.
+
+From 0.6.2, the recovery behavior is per Raft group:
+
+- **A minority of voters restart:** surviving leaders automatically remove an amnesiac voter, add it as a learner, wait for catch-up, and promote it. For three voters, this covers one unrecovered voter at a time. Wait for every group to regain its caught-up voter set before restarting another node; overlapping restarts count as simultaneous loss. The process has no published recovery-time upper bound.
+- **A quorum of voters lose state:** the affected groups stop completing writes. Acknowledged writes held only by the lost voters may already be gone. Recovery requires an operator to adopt a surviving log and accept that loss; automatic repair does not reconstruct it from S3.
+- **All voters lose state:** with shared S3 object storage, `URSULA_GROUP_INITIALIZED/group-{id}` markers prevent groups that previously held writes from silently bootstrapping empty. They remain stopped until an operator calls the initializer's `rejoin/reinitialize?accept_data_loss=true` endpoint. The marker detects prior use; it is not a backup of the lost log.
+
+The full-restart guard requires shared S3 cold storage or an S3 snapshot store, an unchanged object-storage root/prefix, and preservation of the initialized markers. Before acknowledging the first write, the group leader stores its marker; if it cannot do so, writes fail closed. If the initializer cannot read the marker, it retries without initializing. Without shared object storage, an all-empty restart cannot be distinguished from a fresh cluster and may initialize empty. During an upgrade from 0.6.1, all replicas must run 0.6.2 before relying on this guard.
+
+The repaired vote gate in this source requires a fresh post-start quorum-confirmed leader barrier and local application through its index before restoring voting, automatic elections or targeted leadership transfers. A delayed old AppendEntries cannot provide that proof. All voters must run the repaired gate before relying on this guarantee; unpatched 0.6.2 has a reproduced early-release defect. A rolling upgrade can obtain proof from an older leader through its existing linearizable read and vote RPCs.
+
+These recovery mechanisms do not by themselves establish production qualification: test the chosen topology under single-voter loss, delayed replication, snapshot-store failures, and production memory limits. Readiness refuses a node with incomplete recovery barriers, but does not yet certify full configured membership, expected group count and cluster-wide catch-up; use `ursulactl verify-cluster` and the serialized rollout hook as additional maintenance gates. See the [operations guide](https://ursula.tonbo.io/docs/operations#restarting-a-memory-wal-node) for the recovery endpoints and their limits.
 
 ## Static Membership And `server.replicaCount`
 
@@ -349,6 +365,7 @@ operationally safe restarts on an initialized cluster.
 | --- | --- | --- |
 | `server.replicaCount` | `3` | Fresh-cluster static voter pod count. Supported values are `1`, `3`, and `5`. Changing this on an initialized cluster is unsafe without the future operator workflow. |
 | `server.podManagementPolicy` | `Parallel` | StatefulSet pod management policy. `Parallel` starts all static voters without serializing on per-pod readiness. |
+| `server.terminationGracePeriodSeconds` | `30` | Must exceed the server's overall 20-second shutdown budget, including up to 5 seconds for leadership handoff before Raft transport closes. |
 | `server.updateStrategy` | `RollingUpdate` | StatefulSet update strategy. Use `OnDelete` only with an external controller that drains, prepares, restarts, catches up, and verifies one voter at a time. Helm clears stale `rollingUpdate` state with a pre-upgrade migration hook. |
 | `server.onDeleteMigration.enabled` | `true` | Run the Helm pre-upgrade migration when using `OnDelete`. Disable when a GitOps PreSync hook performs the equivalent patch. |
 | `server.gracefulRollout.enabled` | `false` | Run the post-upgrade job that drains, replaces and verifies one voter at a time. Only meaningful with `OnDelete`, which otherwise stages a template nothing applies. |
@@ -395,11 +412,11 @@ container receives only chart-managed container settings plus explicit
 | --- | --- | --- |
 | `raft.groupCount` | `64` | Number of Raft groups. Helm tests expect every node to report this count. |
 | `raft.initMembershipPerGroup` | `true` | Idempotent per-group membership bootstrap flag; persistent groups may keep it enabled across restarts. |
-| `raft.storageMode` | `logDir` | Raft storage mode: `logDir` for durable logs, `memory` for ephemeral testing. |
+| `raft.storageMode` | `logDir` | Raft storage mode: `logDir` persists logs locally; `memory` uses volatile quorum-replicated logs. See the memory-WAL durability contract above. |
 | `raft.logDir` | `/var/lib/ursula/raft` | Raft log directory mounted to the `raft-data` volume. |
 | `raft.minAvailableBytes` | `536870912` | Reject writes and readiness below this many free bytes on the WAL filesystem. `0` disables the guard. |
 | `raft.resumeAvailableBytes` | `1073741824` | Free bytes required before WAL disk pressure clears; must exceed the minimum. |
-| `raft.allowVolatileMultiPeer` | `false` | Required explicit opt-in for multi-pod memory WAL; intended only for development, benchmarks, or chaos. |
+| `raft.allowVolatileMultiPeer` | `false` | Required explicit acceptance of the memory-WAL durability contract for multi-pod clusters. Shared S3 initialized markers are required to detect an all-voter restart. |
 | `raft.maxUncommittedBytesPerGroup` | `null` | Optional per-group cap for raft-submitted but not-yet-applied payload bytes. Renders `raft.max_uncommitted_size_per_group` in the generated config when set; `0` disables the cap. |
 | `raft.snapshotLogsSinceLast` | `5000` | Committed log entries per group between automatic full-state snapshots. Higher values trade log memory for lower snapshot CPU and tail latency. |
 | `raft.snapshotPressureMaxGroupsPerTick` | `16` | Maximum groups snapshotted by one pressure pass. |

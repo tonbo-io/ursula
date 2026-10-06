@@ -78,23 +78,37 @@ The membership endpoint has the same leader-only contract: it answers `409 Confl
 
 `ursulactl drain` wraps exactly this pair: mark first so the node stops re-acquiring groups, then transfer leaderships away explicitly instead of waiting for the balancer. The mark stays set until `ursulactl undrain` clears it. If a rollout ever dies mid-way, a node can be left refusing leadership. Run `ursulactl undrain` (or `DELETE` the mark directly) to recover. Peers read each other's shed state (`GET /__ursula/leadership-shed` on the cluster-plane listener) when deciding which nodes are eligible to pick up leaderships, so a drained node stops attracting groups cluster-wide, not just locally.
 
+### Graceful voter shutdown
+
+On the first SIGTERM or Ctrl-C, the voter marks itself maintenance-drained to
+prevent re-acquiring leadership. It keeps Raft transport available while attempting
+to hand off each leadership to an eligible voter whose replication has matched the
+leader's last log, skipping followers known to have lost their logs. It waits for
+observed leadership changes for up to five seconds, then closes Raft transport and
+drains HTTP listeners. The overall shutdown deadline remains twenty seconds from
+the first signal; a second signal exits immediately. The chart gives voter pods
+thirty seconds by default. This reduces planned-stop election pauses; it cannot
+prevent local memory-WAL loss on exit or handle SIGKILL and OOM.
+
 ### Rejoining a wiped node
 
 Rebuild a wiped voter through committed membership: remove it from each affected voter set, attach it as a blocking learner with its current address, and promote it only after snapshot and log catch-up. Use `ursulactl repair-restarted-voter` for the cluster-wide, resumable sequence. A process-local log-reversion trigger is not a durable recovery contract; the admin API uses it only to adopt a survivor after a majority of a memory-WAL group restarted (below). A memory-WAL node restarted alone is rebuilt automatically from 0.6.2.
 
 ### Restarting a memory-WAL node
 
-Every restart of a node on `raft.wal.backend = "memory"`, planned or not, wipes it: it comes back with an empty Raft log. Production clusters must use the disk WAL; the memory WAL is for development, benchmarks and chaos (`raft.wal.allow_volatile_multi_peer`). From 0.6.2 a restarted node is rebuilt automatically when it is the only one of its groups to lose its log, and a group that loses the log on a majority of its voters, or on all of them, stops instead of losing acknowledged writes (a restart of every voter is detected only with object storage).
+Every restart of a node on `raft.wal.backend = "memory"`, planned or not, wipes its local Raft log and replicated state. Multi-peer deployments must explicitly accept this volatile-WAL contract with `raft.wal.allow_volatile_multi_peer`. From 0.6.2 a restarted node is rebuilt automatically from surviving voters when a minority lose state. If a quorum loses state, affected groups stop completing writes; acknowledged writes held only on the lost voters may already be gone. A restart of every voter is detected by initialized markers only with shared object storage. These mechanisms do not establish a recovery-time upper bound or production qualification under delayed RPCs and snapshot-store failures.
 
-**A minority restarts (one node of three).** Nothing to do. For each group on the restarted node:
+`runtime.node_memory_abort_cap_size` is an emergency process-abort threshold, not HTTP admission control. Exceeding it calls `abort()` without graceful leadership handoff; with memory WAL, that loses the node's local state just like OOM. It does not return `503`. Leave room below the container memory limit for normal operation and recovery, and use write admission and backpressure to manage load.
+
+**A minority restarts (one node of three).** No manual repair is normally needed. Do not restart another voter until the node has rejoined every group and caught up; two overlapping losses are a quorum loss even if the restarts were issued separately. For each group on the restarted node:
 
 - **It does not initialize the group again.** A per-group membership initializer (`raft.init_membership_per_group = true`, the chart default) runs `Initialize` only when every other configured voter answers that it holds nothing for the group either and no leader is seen; a fresh install still bootstraps this way. One voter holding entries or following a leader means the group exists, and the node waits to be replicated to. It waits for every voter, not a quorum, so a fresh install with a voter that never comes up stays uninitialized (it logs "waits for every voter before initializing").
-- **It does not vote until it has caught up.** Until the node holds the log that its leader had committed when it first heard from that leader, it refuses every vote for a candidate whose log is not empty and, once it has seen committed entries, every candidate. It can never help elect a leader that lacks entries committed with its lost copy.
+- **The repaired gate requires fresh recovery evidence.** In this source, the restarted process obtains a quorum-confirmed ReadIndex from the current leader and applies through that index before restoring voting or campaigning. Delayed inbound AppendEntries cannot open the gate; automatic elections, targeted leadership transfers and undrain cannot bypass it. Readiness answers `503` while a recovery gate remains closed. An open gate still does not prove full configured membership and cluster-wide catch-up; verify those before further maintenance. All voters must run the repaired gate before relying on its safety contract: unpatched 0.6.2's first-contact gate has a reproduced early-release defect. During rolling upgrade, proof from an older leader uses its existing linearizable HEAD and Vote RPCs.
 - **The leader rebuilds it.** The leader sees the node answer that it lacks entries it had acknowledged, and runs the same sequence as `ursulactl repair-restarted-voter`: commit a voter set without the node, add it back as a learner, wait until it has replicated the commit index, promote it. Each step is read off the current membership, so a leader change, another restart of the node, or `repair-restarted-voter` running at the same time all converge. Leadership handoffs (the balancer, the commit-stall watchdog) skip the node until then.
 
 `ursulactl verify-cluster` shows the node unready until every group has promoted it. The chart's graceful-rollout hook still runs `repair-restarted-voter` after a prepared restart; it finds nothing left to do. During a rolling upgrade from 0.6.0 or 0.6.1, a group whose leader still runs the earlier release is not rebuilt automatically; the hook rebuilds it, and the 0.6.2 node refuses to vote meanwhile.
 
-**A majority restarts at once (two nodes of three).** The group stops accepting writes and waits for an operator. The empty nodes refuse every candidate, and a surviving leader never removes a voter because the removal could not commit, so no leader with an incomplete log is ever elected and no acknowledged write is silently lost. Writes answer `503` with `Retry-After` while no leader exists; a surviving node that still believes it leads accepts writes it cannot commit, so they time out.
+**A majority restarts at once (two nodes of three).** The recovery path stops completing writes and waits for an operator instead of automatically adopting an incomplete log. This is a fail-closed recovery mechanism, not preservation of writes that existed only on the lost voters. Writes answer `503` with `Retry-After` while no leader exists; a surviving node that still believes it leads accepts writes it cannot commit, so they time out.
 
 To recover from a majority restart, pick the survivor whose log you keep: on each affected group, the voter with the highest `last_log_index` in `GET /__ursula/metrics`. Acknowledged writes that only the lost nodes held are gone; adopting the survivor accepts that. Then run, on every node of the group (through each node's admin listener, as below):
 

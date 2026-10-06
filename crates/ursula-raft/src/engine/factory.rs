@@ -12,6 +12,7 @@ use openraft::Raft;
 use openraft::RaftNetworkV2;
 use openraft::SnapshotPolicy;
 use openraft::network::RPCOption;
+use openraft::rt::WatchReceiver;
 use tokio::time::Instant;
 use tonic::transport::Endpoint;
 use ursula_runtime::ColdStoreHandle;
@@ -28,6 +29,7 @@ use ursula_shard::ShardPlacement;
 use super::RaftGroupEngine;
 use crate::grpc::GrpcRaftNetwork;
 use crate::grpc::GrpcRaftNetworkFactory;
+use crate::grpc::probe_rejoin_vote_barrier;
 use crate::log_store::CoreFileLogWriter;
 use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RaftGroupLogStore;
@@ -52,6 +54,70 @@ pub const GROUP_ELECTION_TIMEOUT_MIN_MS: u64 = 1500;
 /// How often a memory-WAL replica checks whether an unmarked group already
 /// holds writes (an upgraded 0.6.1 group) and must be marked.
 const INIT_MARKER_DRIVER_INTERVAL: Duration = Duration::from_secs(2);
+const REJOIN_VOTE_BARRIER_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn spawn_rejoin_vote_barrier(
+    placement: ShardPlacement,
+    raft: crate::registry::RaftGroupHandle,
+    rejoin: Arc<GroupRejoin>,
+    registry: RaftGroupHandleRegistry,
+    nodes: BTreeMap<u64, BasicNode>,
+) {
+    tokio::spawn(async move {
+        let mut last_barrier_leader = None;
+        loop {
+            registry.refresh_group_elections(placement.raft_group_id);
+            if rejoin.vote_gate_open() {
+                return;
+            }
+            let metrics = raft.metrics().borrow_watched().clone();
+            if metrics.running_state.is_err() {
+                return;
+            }
+            if let Some(leader_id) = metrics.current_leader
+                && last_barrier_leader != Some(metrics.vote)
+                && let Some(node) = nodes.get(&leader_id)
+            {
+                let outcome = crate::rt::time::timeout(
+                    REJOIN_VOTE_BARRIER_TIMEOUT,
+                    probe_rejoin_vote_barrier(
+                        placement,
+                        metrics.id,
+                        leader_id,
+                        &node.addr,
+                        REJOIN_VOTE_BARRIER_TIMEOUT,
+                    ),
+                )
+                .await;
+                let (leader, index) = match outcome {
+                    Ok(Ok(proof)) => proof,
+                    other => {
+                        tracing::debug!(
+                            raft_group_id = placement.raft_group_id.0,
+                            ?other,
+                            "recovery barrier probe failed"
+                        );
+                        crate::rt::time::sleep(REJOIN_HEAL_INTERVAL).await;
+                        continue;
+                    }
+                };
+                rejoin.confirm_barrier(leader, index);
+                last_barrier_leader = Some(leader);
+                registry.refresh_group_elections(placement.raft_group_id);
+                if rejoin.vote_gate_open() {
+                    tracing::info!(
+                        node_id = metrics.id,
+                        raft_group_id = placement.raft_group_id.0,
+                        barrier_index = index,
+                        "memory-WAL rejoin: fresh quorum barrier applied; participation restored"
+                    );
+                    return;
+                }
+            }
+            crate::rt::time::sleep(REJOIN_HEAL_INTERVAL).await;
+        }
+    });
+}
 
 #[cfg(test)]
 fn parse_positive_millis(raw: Option<&str>, default_ms: u64) -> u64 {
@@ -834,9 +900,16 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 tokio::spawn(run_rejoin_heal(
                     engine.raft_handle(),
                     rejoin.clone(),
-                    configured,
+                    configured.clone(),
                     REJOIN_HEAL_INTERVAL,
                 ));
+                spawn_rejoin_vote_barrier(
+                    placement,
+                    engine.raft_handle(),
+                    rejoin.clone(),
+                    self.registry.clone(),
+                    configured,
+                );
                 tokio::spawn(run_init_marker_driver(
                     engine.raft_handle(),
                     rejoin,
