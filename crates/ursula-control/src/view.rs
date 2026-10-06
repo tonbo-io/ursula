@@ -7,6 +7,7 @@ use ursula_shard::RaftGroupId;
 
 use crate::model::NodeId;
 use crate::model::NodeState;
+use crate::policy::GroupPlacementPolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementNode {
@@ -24,6 +25,8 @@ pub struct GroupPlacementView {
     pub draining: BTreeSet<NodeId>,
     pub epoch: u64,
     pub nodes: BTreeMap<NodeId, PlacementNode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<GroupPlacementPolicy>,
 }
 
 impl GroupPlacementView {
@@ -37,7 +40,7 @@ impl GroupPlacementView {
             && self
                 .nodes
                 .get(&node_id)
-                .is_some_and(|node| node.state == NodeState::Active)
+                .is_some_and(|node| matches!(node.state, NodeState::Active | NodeState::Draining))
     }
 
     pub fn cluster_endpoints(&self) -> BTreeMap<NodeId, String> {

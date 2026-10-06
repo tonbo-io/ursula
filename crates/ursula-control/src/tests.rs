@@ -29,6 +29,7 @@ fn placement_view_distinguishes_hosting_from_client_traffic() {
         learners: set([3]),
         draining: set([2]),
         epoch: 7,
+        policy: None,
         nodes: BTreeMap::from([
             (1, placement_node(1, NodeState::Active)),
             (2, placement_node(2, NodeState::Active)),
@@ -52,6 +53,7 @@ fn placement_view_selects_active_non_draining_voter_for_redirect() {
         learners: BTreeSet::new(),
         draining: set([2]),
         epoch: 1,
+        policy: None,
         nodes: BTreeMap::from([
             (1, placement_node(1, NodeState::Active)),
             (2, placement_node(2, NodeState::Active)),

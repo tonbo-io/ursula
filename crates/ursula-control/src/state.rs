@@ -15,6 +15,9 @@ use crate::model::MetaConfig;
 use crate::model::MigrationPhase;
 use crate::model::NodeId;
 use crate::model::NodeState;
+use crate::policy::GroupPlacementPolicy;
+use crate::policy::ManagedPlacement;
+use crate::policy::PlacementPolicy;
 use crate::view::GroupPlacementView;
 use crate::view::PlacementNode;
 
@@ -26,6 +29,10 @@ pub struct ControlPlaneState {
     pub active_migration: Option<u64>,
     pub next_migration_id: u64,
     pub config: MetaConfig,
+    /// Absent in legacy/static control snapshots. Enabling managed mode is an
+    /// explicit, validated adoption rather than a changed TOML default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_placement: Option<ManagedPlacement>,
 }
 
 impl Default for ControlPlaneState {
@@ -43,6 +50,7 @@ impl ControlPlaneState {
             active_migration: None,
             next_migration_id: 1,
             config,
+            managed_placement: None,
         }
     }
 
@@ -65,6 +73,11 @@ impl ControlPlaneState {
                 voters,
                 now_ms,
             } => self.seed_placement(raft_group_id, voters, now_ms),
+            ControlCommand::AdoptPlacementPolicy {
+                policy,
+                group_count,
+                now_ms: _,
+            } => self.adopt_placement_policy(policy, group_count),
             ControlCommand::CommitPlacement {
                 raft_group_id,
                 voters,
@@ -77,7 +90,20 @@ impl ControlPlaneState {
                 target_voters,
                 retain_removed,
                 now_ms,
-            } => self.begin_migration(raft_group_id, target_voters, retain_removed, now_ms),
+            } => self.begin_migration(raft_group_id, target_voters, None, retain_removed, now_ms),
+            ControlCommand::BeginPolicyMigration {
+                raft_group_id,
+                target_policy,
+                target_voters,
+                retain_removed,
+                now_ms,
+            } => self.begin_migration(
+                raft_group_id,
+                target_voters,
+                Some(target_policy),
+                retain_removed,
+                now_ms,
+            ),
             ControlCommand::AdvanceMigration {
                 migration_id,
                 phase,
@@ -139,6 +165,11 @@ impl ControlPlaneState {
             draining: placement.draining.clone(),
             epoch: placement.epoch,
             nodes,
+            policy: self
+                .managed_placement
+                .as_ref()
+                .and_then(|managed| managed.groups.get(&raft_group_id))
+                .cloned(),
         })
     }
 
@@ -157,6 +188,24 @@ impl ControlPlaneState {
         }
         if cluster_url.is_empty() {
             return reject("cluster_url must not be empty".to_owned());
+        }
+        if self.managed_placement.is_some() {
+            if node_id == 0 {
+                return reject("managed node_id must be non-zero".to_owned());
+            }
+            if let Some(existing) = self.nodes.get(&node_id) {
+                if existing.state == NodeState::Removed {
+                    return reject(format!("removed node {node_id} cannot be reused"));
+                }
+                if existing.client_url != client_url
+                    || existing.cluster_url != cluster_url
+                    || existing.labels != labels
+                {
+                    return reject(format!(
+                        "managed node {node_id} endpoints and labels are immutable"
+                    ));
+                }
+            }
         }
 
         let (registered_at_ms, state) =
@@ -188,6 +237,28 @@ impl ControlPlaneState {
         state: NodeState,
         now_ms: u64,
     ) -> ControlResponse {
+        if self.managed_placement.is_some() {
+            if self
+                .nodes
+                .get(&node_id)
+                .is_some_and(|node| node.state == NodeState::Removed)
+                && state != NodeState::Removed
+            {
+                return reject(format!("removed node {node_id} cannot be reused"));
+            }
+            if state == NodeState::Removed
+                && (self.config.initial_meta_voters.contains(&node_id)
+                    || self.placements.values().any(|placement| {
+                        placement.hosts(node_id) || placement.draining.contains(&node_id)
+                    })
+                    || self.active_migration().is_some_and(|migration| {
+                        migration.from_voters.contains(&node_id)
+                            || migration.target_voters.contains(&node_id)
+                    }))
+            {
+                return reject(format!("node {node_id} still has data or meta assignments"));
+            }
+        }
         let Some(node) = self.nodes.get_mut(&node_id) else {
             return reject(format!("node {node_id} is not registered"));
         };
@@ -202,6 +273,9 @@ impl ControlPlaneState {
         voters: BTreeSet<NodeId>,
         now_ms: u64,
     ) -> ControlResponse {
+        if self.managed_placement.is_some() {
+            return reject("managed placement cannot be reseeded".to_owned());
+        }
         if voters.is_empty() {
             return reject("placement voters must not be empty".to_owned());
         }
@@ -213,6 +287,83 @@ impl ControlPlaneState {
             draining: BTreeSet::new(),
             epoch: 0,
             updated_at_ms: now_ms,
+        });
+        ControlResponse::Ok
+    }
+
+    fn adopt_placement_policy(
+        &mut self,
+        mut policy: PlacementPolicy,
+        group_count: u32,
+    ) -> ControlResponse {
+        if let Err(reason) = policy.validate(group_count) {
+            return reject(reason);
+        }
+        policy
+            .group_overrides
+            .sort_by_key(|entry| entry.raft_group_id);
+        if let Some(managed) = &self.managed_placement {
+            return if managed.group_count == group_count && managed.bootstrap_policy == policy {
+                ControlResponse::Ok
+            } else {
+                reject(
+                    "managed bootstrap policy/group_count differs from persisted configuration"
+                        .to_owned(),
+                )
+            };
+        }
+        if self.active_migration.is_some() {
+            return reject("cannot adopt placement policy during a migration".to_owned());
+        }
+        if self.nodes.contains_key(&0) {
+            return reject("managed node_id must be non-zero".to_owned());
+        }
+        if self.placements.len() != group_count as usize {
+            return reject(
+                "adoption requires every configured group's existing placement".to_owned(),
+            );
+        }
+        let mut groups = BTreeMap::new();
+        for id in 0..group_count {
+            let id = RaftGroupId(id);
+            let Some(placement) = self.placements.get(&id) else {
+                return reject(format!("group {} has no existing placement", id.0));
+            };
+            if placement.raft_group_id != id
+                || !placement.learners.is_empty()
+                || !placement.draining.is_empty()
+            {
+                return reject(format!(
+                    "group {} needs a settled, uniform placement before adoption",
+                    id.0
+                ));
+            }
+            let resolved = policy.resolve(id);
+            if let Err(reason) = resolved.validate_voters(&placement.voters, &self.nodes) {
+                return reject(format!(
+                    "group {} adoption would change or violate policy: {reason}",
+                    id.0
+                ));
+            }
+            if placement.voters.contains(&0)
+                || placement.voters.iter().any(|id| {
+                    self.nodes
+                        .get(id)
+                        .is_some_and(|node| node.state == NodeState::Removed)
+                })
+            {
+                return reject(format!(
+                    "group {} includes an invalid or removed voter",
+                    id.0
+                ));
+            }
+            groups.insert(id, resolved);
+        }
+        self.config.default_replication_factor = policy.default_replication_factor.into();
+        self.managed_placement = Some(ManagedPlacement {
+            group_count,
+            bootstrap_policy: policy,
+            groups,
         });
         ControlResponse::Ok
     }
@@ -232,17 +383,57 @@ impl ControlPlaneState {
             return response;
         }
 
+        let target_policy = if self.managed_placement.is_some() {
+            let Some(migration) = self.active_migration() else {
+                return reject("managed placement commit requires an active migration".to_owned());
+            };
+            if migration.raft_group_id != raft_group_id
+                || migration.target_voters != voters
+                || migration.phase != MigrationPhase::CommittingPlacement
+            {
+                return reject(
+                    "managed placement commit does not match the active intent/phase".to_owned(),
+                );
+            }
+            let Some(policy) = &migration.target_policy else {
+                return reject("managed migration has no target policy".to_owned());
+            };
+            if let Err(reason) = policy.validate_voters(&voters, &self.nodes) {
+                return reject(reason);
+            }
+            if !draining.is_subset(&migration.removed_voters)
+                || !learners.is_subset(&migration.removed_voters)
+                || (!migration.retain_removed && !learners.is_empty())
+            {
+                return reject(
+                    "managed placement includes unauthorized learners/draining nodes".to_owned(),
+                );
+            }
+            Some(policy.clone())
+        } else {
+            None
+        };
+
+        let policy_changed = target_policy.as_ref().is_some_and(|policy| {
+            self.managed_placement
+                .as_ref()
+                .and_then(|managed| managed.groups.get(&raft_group_id))
+                != Some(policy)
+        });
         let placement = self
             .placements
             .entry(raft_group_id)
             .or_insert_with(|| DataGroupPlacement::empty(raft_group_id));
-        if placement.voters != voters {
+        if placement.voters != voters || policy_changed {
             placement.epoch = placement.epoch.saturating_add(1);
         }
         placement.voters = voters;
         placement.learners = learners;
         placement.draining = draining;
         placement.updated_at_ms = now_ms;
+        if let (Some(managed), Some(policy)) = (&mut self.managed_placement, target_policy) {
+            managed.groups.insert(raft_group_id, policy);
+        }
         ControlResponse::Ok
     }
 
@@ -257,8 +448,25 @@ impl ControlPlaneState {
                 "node {node_id} cannot be both voter and learner"
             )));
         }
-        if let Some(response) = self.validate_registered_nodes("voter", voters, true) {
+        if let Some(response) =
+            self.validate_registered_nodes("voter", voters, self.managed_placement.is_none())
+        {
             return Some(response);
+        }
+        if self.managed_placement.is_some() {
+            for id in voters {
+                let node = self.nodes.get(id)?;
+                let retained = self
+                    .active_migration()
+                    .is_some_and(|migration| migration.from_voters.contains(id));
+                if node.state != NodeState::Active
+                    && !(retained && node.state == NodeState::Draining)
+                {
+                    return Some(reject(format!(
+                        "voter node {id} is not eligible for this placement"
+                    )));
+                }
+            }
         }
         if let Some(response) = self.validate_registered_nodes("learner", learners, false) {
             return Some(response);
@@ -290,6 +498,7 @@ impl ControlPlaneState {
         &mut self,
         raft_group_id: RaftGroupId,
         target_voters: BTreeSet<NodeId>,
+        requested_policy: Option<GroupPlacementPolicy>,
         retain_removed: bool,
         now_ms: u64,
     ) -> ControlResponse {
@@ -299,11 +508,41 @@ impl ControlPlaneState {
         if target_voters.is_empty() {
             return reject("target voters must not be empty".to_owned());
         }
+        let Some(placement) = self.placements.get(&raft_group_id) else {
+            return reject(format!("group {} has no placement", raft_group_id.0));
+        };
+        let from_policy = self
+            .managed_placement
+            .as_ref()
+            .and_then(|managed| managed.groups.get(&raft_group_id))
+            .cloned();
+        if self.managed_placement.is_some() && from_policy.is_none() {
+            return reject("managed group has no persisted policy".to_owned());
+        }
+        if requested_policy.is_some() && from_policy.is_none() {
+            return reject("explicit policy migration requires managed placement".to_owned());
+        }
+        let target_policy = requested_policy.or_else(|| from_policy.clone());
+        if let Some(policy) = &from_policy
+            && let Err(reason) = policy.validate_voters(&placement.voters, &self.nodes)
+        {
+            return reject(format!(
+                "source placement violates its persisted policy: {reason}"
+            ));
+        }
+        if let Some(policy) = &target_policy
+            && let Err(reason) = policy.validate_voters(&target_voters, &self.nodes)
+        {
+            return reject(format!("target placement violates policy: {reason}"));
+        }
         for node_id in &target_voters {
             let Some(node) = self.nodes.get(node_id) else {
                 return reject(format!("node {node_id} is not registered"));
             };
-            if !node.state.is_migration_eligible() {
+            let retained_draining = from_policy.is_some()
+                && placement.voters.contains(node_id)
+                && node.state == NodeState::Draining;
+            if !node.state.is_migration_eligible() && !retained_draining {
                 return reject(format!(
                     "node {node_id} is not migration eligible: {:?}",
                     node.state
@@ -311,9 +550,6 @@ impl ControlPlaneState {
             }
         }
 
-        let Some(placement) = self.placements.get(&raft_group_id) else {
-            return reject(format!("group {} has no placement", raft_group_id.0));
-        };
         let from_voters = placement.voters.clone();
         let added_nodes = target_voters
             .difference(&from_voters)
@@ -336,6 +572,8 @@ impl ControlPlaneState {
             raft_group_id,
             from_voters,
             target_voters,
+            from_policy,
+            target_policy,
             added_nodes,
             removed_voters,
             retain_removed,
@@ -423,6 +661,27 @@ impl ControlPlaneState {
         success: bool,
         now_ms: u64,
     ) -> ControlResponse {
+        if self.managed_placement.is_some() {
+            let Some(migration) = self.migrations.get(&migration_id) else {
+                return reject(format!("migration {migration_id} does not exist"));
+            };
+            if success {
+                let placement = self.placements.get(&migration.raft_group_id);
+                let policy = self
+                    .managed_placement
+                    .as_ref()
+                    .and_then(|managed| managed.groups.get(&migration.raft_group_id));
+                if migration.phase != MigrationPhase::Finalizing
+                    || !placement
+                        .is_some_and(|placement| placement.voters == migration.target_voters)
+                    || policy != migration.target_policy.as_ref()
+                {
+                    return reject("managed migration cannot succeed before publishing its target placement/policy".to_owned());
+                }
+            } else if migration.phase >= MigrationPhase::PreparingLocalEngines {
+                return reject("managed migration with possible side effects requires reconciliation before unlocking".to_owned());
+            }
+        }
         let Some(migration) = self.migrations.get_mut(&migration_id) else {
             return reject(format!("migration {migration_id} does not exist"));
         };

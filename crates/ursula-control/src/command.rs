@@ -10,6 +10,8 @@ use crate::model::LearnerStatus;
 use crate::model::MigrationPhase;
 use crate::model::NodeId;
 use crate::model::NodeState;
+use crate::policy::GroupPlacementPolicy;
+use crate::policy::PlacementPolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlCommand {
@@ -31,8 +33,22 @@ pub enum ControlCommand {
         voters: BTreeSet<NodeId>,
         now_ms: u64,
     },
+    /// Adopt verified, uniform existing placements without altering voters.
+    AdoptPlacementPolicy {
+        policy: PlacementPolicy,
+        group_count: u32,
+        now_ms: u64,
+    },
     BeginMigration {
         raft_group_id: RaftGroupId,
+        target_voters: BTreeSet<NodeId>,
+        retain_removed: bool,
+        now_ms: u64,
+    },
+    /// Explicitly authorize a new steady-state RF/domain policy for one group.
+    BeginPolicyMigration {
+        raft_group_id: RaftGroupId,
+        target_policy: GroupPlacementPolicy,
         target_voters: BTreeSet<NodeId>,
         retain_removed: bool,
         now_ms: u64,
@@ -78,7 +94,9 @@ impl ControlCommand {
             Self::RegisterNode { now_ms, .. }
             | Self::SetNodeState { now_ms, .. }
             | Self::SeedPlacement { now_ms, .. }
+            | Self::AdoptPlacementPolicy { now_ms, .. }
             | Self::BeginMigration { now_ms, .. }
+            | Self::BeginPolicyMigration { now_ms, .. }
             | Self::AdvanceMigration { now_ms, .. }
             | Self::SetLearnerStatus { now_ms, .. }
             | Self::RecordMigrationError { now_ms, .. }
@@ -95,7 +113,9 @@ impl fmt::Display for ControlCommand {
             Self::RegisterNode { .. } => "register_node",
             Self::SetNodeState { .. } => "set_node_state",
             Self::SeedPlacement { .. } => "seed_placement",
+            Self::AdoptPlacementPolicy { .. } => "adopt_placement_policy",
             Self::BeginMigration { .. } => "begin_migration",
+            Self::BeginPolicyMigration { .. } => "begin_policy_migration",
             Self::AdvanceMigration { .. } => "advance_migration",
             Self::SetLearnerStatus { .. } => "set_learner_status",
             Self::RecordMigrationError { .. } => "record_migration_error",

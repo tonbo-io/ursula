@@ -248,6 +248,11 @@ mod tests {
     use ursula_control::ControlCommand;
     use ursula_control::ControlPlaneState;
     use ursula_control::ControlResponse;
+    use ursula_control::GroupPlacementPolicy;
+    use ursula_control::GroupPolicyOverride;
+    use ursula_control::MigrationPhase;
+    use ursula_control::PlacementPolicy;
+    use ursula_control::ReplicationFactor;
     use ursula_shard::RaftGroupId;
 
     use super::*;
@@ -511,95 +516,175 @@ mod tests {
     // Invoked by the parent with an isolated path. Exit deliberately skips
     // Raft shutdown and all Rust destructors, simulating process loss after
     // durable publication or compaction/unsnapshotted writes.
-    #[test]
-    fn durable_meta_crash_child() {
+    #[tokio::test]
+    async fn durable_meta_crash_child() {
         let Some(path) = std::env::var_os("URSULA_META_CRASH_TEST_PATH") else {
             return;
         };
         let after_purge = std::env::var_os("URSULA_META_CRASH_AFTER_PURGE").is_some();
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async move {
-                let handle = MetaRaftHandle::new_durable_node_with_network(
-                    1,
-                    crash_config(),
-                    SingleNodeRaftNetworkFactory,
-                    PathBuf::from(path),
-                )
-                .await
-                .unwrap();
+        let managed = std::env::var_os("URSULA_META_CRASH_MANAGED").is_some();
+        let handle = MetaRaftHandle::new_durable_node_with_network(
+            1,
+            crash_config(),
+            SingleNodeRaftNetworkFactory,
+            PathBuf::from(path),
+        )
+        .await
+        .unwrap();
+        handle
+            .initialize_membership(BTreeMap::from([(1, BasicNode::new("meta-local"))]))
+            .await
+            .unwrap();
+        handle
+            .wait_for_current_leader(1, Duration::from_secs(5))
+            .await
+            .unwrap();
+        for id in 1..=if managed { 5 } else { 4 } {
+            assert_eq!(
                 handle
-                    .initialize_membership(BTreeMap::from([(1, BasicNode::new("meta-local"))]))
+                    .register_node(
+                        crate::MetaNodeRegistration::new(
+                            id,
+                            format!("http://node{id}:4437"),
+                            format!("http://node{id}:4438")
+                        )
+                        .with_labels(if managed {
+                            BTreeMap::from([("zone".to_owned(), ((id - 1) % 3).to_string())])
+                        } else {
+                            BTreeMap::new()
+                        }),
+                        1
+                    )
                     .await
-                    .unwrap();
-                handle
-                    .wait_for_current_leader(1, Duration::from_secs(5))
-                    .await
-                    .unwrap();
-                for id in 1..=4 {
-                    assert_eq!(
-                        handle
-                            .register_node(
-                                crate::MetaNodeRegistration::new(
-                                    id,
-                                    format!("http://node{id}:4437"),
-                                    format!("http://node{id}:4438")
-                                ),
-                                1
-                            )
-                            .await
-                            .unwrap(),
-                        ControlResponse::Ok
-                    );
-                }
+                    .unwrap(),
+                ControlResponse::Ok
+            );
+        }
+        handle
+            .write(ControlCommand::SeedPlacement {
+                raft_group_id: RaftGroupId(0),
+                voters: BTreeSet::from([1, 2, 3]),
+                now_ms: 2,
+            })
+            .await
+            .unwrap();
+        if managed {
+            assert_eq!(
                 handle
                     .write(ControlCommand::SeedPlacement {
-                        raft_group_id: RaftGroupId(0),
-                        voters: BTreeSet::from([1, 2, 3]),
+                        raft_group_id: RaftGroupId(1),
+                        voters: BTreeSet::from([1, 2, 3, 4, 5]),
                         now_ms: 2,
                     })
                     .await
-                    .unwrap();
+                    .unwrap(),
+                ControlResponse::Ok
+            );
+            assert_eq!(
+                handle
+                    .write(ControlCommand::AdoptPlacementPolicy {
+                        group_count: 2,
+                        policy: PlacementPolicy {
+                            group_overrides: vec![GroupPolicyOverride {
+                                raft_group_id: RaftGroupId(1),
+                                replication_factor: ReplicationFactor::Five
+                            }],
+                            ..PlacementPolicy::default()
+                        },
+                        now_ms: 2,
+                    })
+                    .await
+                    .unwrap(),
+                ControlResponse::Ok
+            );
+        }
+        let begin = if managed {
+            ControlCommand::BeginPolicyMigration {
+                raft_group_id: RaftGroupId(0),
+                target_voters: BTreeSet::from([1, 2, 3, 4, 5]),
+                target_policy: GroupPlacementPolicy {
+                    replication_factor: ReplicationFactor::Five,
+                    ..GroupPlacementPolicy::default()
+                },
+                retain_removed: false,
+                now_ms: 3,
+            }
+        } else {
+            ControlCommand::BeginMigration {
+                raft_group_id: RaftGroupId(0),
+                target_voters: BTreeSet::from([1, 2, 4]),
+                retain_removed: false,
+                now_ms: 3,
+            }
+        };
+        assert_eq!(
+            handle.write(begin).await.unwrap(),
+            ControlResponse::MigrationStarted { migration_id: 1 }
+        );
+        let applied = handle
+            .with_state_machine(|sm| Box::pin(async move { sm.applied_log_id().unwrap() }))
+            .await
+            .unwrap();
+        let raft = handle.raft_handle();
+        raft.trigger().snapshot().await.unwrap();
+        raft.wait(Some(Duration::from_secs(5)))
+            .snapshot(applied, "crash checkpoint")
+            .await
+            .unwrap();
+        if after_purge {
+            raft.trigger().purge_log(applied.index).await.unwrap();
+            raft.wait(Some(Duration::from_secs(5)))
+                .purged(Some(applied), "crash compaction")
+                .await
+                .unwrap();
+            if managed {
                 assert_eq!(
                     handle
-                        .write(ControlCommand::BeginMigration {
-                            raft_group_id: RaftGroupId(0),
-                            target_voters: BTreeSet::from([1, 2, 4]),
-                            retain_removed: false,
-                            now_ms: 3,
+                        .write(ControlCommand::AdvanceMigration {
+                            migration_id: 1,
+                            phase: MigrationPhase::CommittingPlacement,
+                            now_ms: 4,
                         })
                         .await
                         .unwrap(),
-                    ControlResponse::MigrationStarted { migration_id: 1 }
+                    ControlResponse::Ok
                 );
-                let applied = handle
-                    .with_state_machine(|sm| Box::pin(async move { sm.applied_log_id().unwrap() }))
-                    .await
-                    .unwrap();
-                let raft = handle.raft_handle();
-                raft.trigger().snapshot().await.unwrap();
-                raft.wait(Some(Duration::from_secs(5)))
-                    .snapshot(applied, "crash checkpoint")
-                    .await
-                    .unwrap();
-                if after_purge {
-                    raft.trigger().purge_log(applied.index).await.unwrap();
-                    raft.wait(Some(Duration::from_secs(5)))
-                        .purged(Some(applied), "crash compaction")
+                assert_eq!(
+                    handle
+                        .write(ControlCommand::CommitPlacement {
+                            raft_group_id: RaftGroupId(0),
+                            voters: BTreeSet::from([1, 2, 3, 4, 5]),
+                            learners: BTreeSet::new(),
+                            draining: BTreeSet::new(),
+                            now_ms: 4,
+                        })
                         .await
-                        .unwrap();
-                    assert_eq!(
-                        handle.finish_migration(1, false, 4).await.unwrap(),
-                        ControlResponse::Ok
-                    );
-                }
-                std::process::exit(91);
-            });
+                        .unwrap(),
+                    ControlResponse::Ok
+                );
+                assert_eq!(
+                    handle
+                        .write(ControlCommand::AdvanceMigration {
+                            migration_id: 1,
+                            phase: MigrationPhase::Finalizing,
+                            now_ms: 4,
+                        })
+                        .await
+                        .unwrap(),
+                    ControlResponse::Ok
+                );
+            }
+            assert_eq!(
+                handle.finish_migration(1, managed, 4).await.unwrap(),
+                ControlResponse::Ok
+            );
+        }
+        std::process::exit(91);
     }
 
     #[tokio::test]
     async fn durable_meta_process_crash_recovers_intent_and_post_snapshot_log() {
-        for after_purge in [false, true] {
+        for (after_purge, managed) in [(false, false), (true, false), (false, true), (true, true)] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("meta.wal");
             let child_path = path.clone();
@@ -610,9 +695,13 @@ mod tests {
                     .arg("log_store::meta::tests::durable_meta_crash_child")
                     .arg("--nocapture")
                     .env("URSULA_META_CRASH_TEST_PATH", child_path)
-                    .env_remove("URSULA_META_CRASH_AFTER_PURGE");
+                    .env_remove("URSULA_META_CRASH_AFTER_PURGE")
+                    .env_remove("URSULA_META_CRASH_MANAGED");
                 if after_purge {
                     command.env("URSULA_META_CRASH_AFTER_PURGE", "1");
+                }
+                if managed {
+                    command.env("URSULA_META_CRASH_MANAGED", "1");
                 }
                 command.output().unwrap()
             })
@@ -638,7 +727,7 @@ mod tests {
                 .await
                 .unwrap();
             let state = handle.read_state(Clone::clone).await.unwrap();
-            assert_eq!(state.nodes.len(), 4);
+            assert_eq!(state.nodes.len(), if managed { 5 } else { 4 });
             assert_eq!(
                 state.active_migration,
                 if after_purge { None } else { Some(1) }
@@ -647,8 +736,42 @@ mod tests {
             assert_eq!(state.next_migration_id, 2);
             assert_eq!(
                 state.placements[&RaftGroupId(0)].voters,
-                BTreeSet::from([1, 2, 3])
+                if managed && after_purge {
+                    BTreeSet::from([1, 2, 3, 4, 5])
+                } else {
+                    BTreeSet::from([1, 2, 3])
+                }
             );
+            if managed {
+                let policies = state.managed_placement.as_ref().unwrap();
+                assert_eq!(
+                    policies.bootstrap_policy.default_replication_factor,
+                    ReplicationFactor::Three
+                );
+                assert_eq!(
+                    policies.groups[&RaftGroupId(0)].replication_factor,
+                    if after_purge {
+                        ReplicationFactor::Five
+                    } else {
+                        ReplicationFactor::Three
+                    }
+                );
+                assert_eq!(
+                    policies.groups[&RaftGroupId(1)].replication_factor,
+                    ReplicationFactor::Five
+                );
+                let intent = &state.migrations[&1];
+                assert_eq!(
+                    intent.from_policy.as_ref().unwrap().replication_factor,
+                    ReplicationFactor::Three
+                );
+                assert_eq!(
+                    intent.target_policy.as_ref().unwrap().replication_factor,
+                    ReplicationFactor::Five
+                );
+            } else {
+                assert!(state.managed_placement.is_none());
+            }
             handle.shutdown().await.unwrap();
         }
     }

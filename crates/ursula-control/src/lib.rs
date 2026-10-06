@@ -3,9 +3,18 @@
 //!
 //! The crate is intentionally pure data plus deterministic state transitions:
 //! no I/O, no async, and no wall-clock reads.
+//!
+//! Module map:
+//!
+//! - [`command`]: replicated control requests and responses.
+//! - [`model`]: nodes, placements and migration records.
+//! - [`policy`]: managed replication and failure-domain validation.
+//! - [`state`]: deterministic control state transitions.
+//! - [`view`]: routing projections consumed by data nodes and gateways.
 
 mod command;
 mod model;
+mod policy;
 mod state;
 mod view;
 
@@ -19,9 +28,17 @@ pub use model::MetaConfig;
 pub use model::MigrationPhase;
 pub use model::NodeId;
 pub use model::NodeState;
+pub use policy::GroupPlacementPolicy;
+pub use policy::GroupPolicyOverride;
+pub use policy::ManagedPlacement;
+pub use policy::PlacementPolicy;
+pub use policy::ReplicationFactor;
 pub use state::ControlPlaneState;
 pub use view::GroupPlacementView;
 pub use view::PlacementNode;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod policy_tests;

@@ -13,5 +13,10 @@ description = "Control-plane state for Ursula dynamic node registration, group p
 serde = { workspace = true }
 ursula-shard = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }
+toml = { workspace = true }
+
 [lints.clippy]
 wildcard_imports = "deny"

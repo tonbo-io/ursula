@@ -5,6 +5,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::RaftGroupId;
 
+use crate::policy::GroupPlacementPolicy;
+
 pub type NodeId = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +101,10 @@ pub struct GroupMigration {
     pub raft_group_id: RaftGroupId,
     pub from_voters: BTreeSet<NodeId>,
     pub target_voters: BTreeSet<NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_policy: Option<GroupPlacementPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_policy: Option<GroupPlacementPolicy>,
     pub added_nodes: BTreeSet<NodeId>,
     pub removed_voters: BTreeSet<NodeId>,
     pub retain_removed: bool,
