@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::fmt::Debug;
 use std::io;
 use std::ops::RangeBounds;
@@ -23,6 +19,7 @@ use openraft::storage::RaftLogStorage;
 use super::MemoryRaftLogStoreInner;
 use super::ensure_consecutive_entries;
 use super::ensure_log_append_boundary;
+use super::truncate_entries_after;
 use crate::meta::MetaRaftTypeConfig;
 use crate::types::UrsulaRaftTypeConfig;
 
@@ -165,9 +162,8 @@ macro_rules! impl_memory_log_store {
                 &mut self,
                 last_log_id: Option<LogIdOf<$config>>,
             ) -> Result<(), io::Error> {
-                let start_index = last_log_id.map_or(0, |log_id| log_id.index + 1);
                 let mut inner = self.lock_inner()?;
-                inner.entries.retain(|index, _| *index < start_index);
+                truncate_entries_after(&mut inner.entries, last_log_id.map(|log_id| log_id.index));
                 Ok(())
             }
 

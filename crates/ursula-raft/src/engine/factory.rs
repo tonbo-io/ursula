@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -154,7 +150,7 @@ impl From<&ursula_config::RaftConfig> for RaftEngineConfig {
 }
 
 fn quorum_size(voter_count: usize) -> usize {
-    (voter_count / 2) + 1
+    (voter_count / 2).saturating_add(1)
 }
 
 fn jittered_snapshot_logs_since_last(base: u64, placement: ShardPlacement, node_id: u64) -> u64 {
@@ -166,7 +162,8 @@ fn jittered_snapshot_logs_since_last(base: u64, placement: ShardPlacement, node_
     // value is operational scheduling only; it is not replicated state.
     let seed = u64::from(placement.raft_group_id.0).wrapping_mul(0x9e37_79b9_7f4a_7c15)
         ^ node_id.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    base.saturating_add(seed % base)
+    // `base` is at least 1, so the remainder always exists.
+    base.saturating_add(seed.checked_rem(base).unwrap_or(0))
 }
 
 async fn static_peer_reachable(address: &str, timeout: Duration) -> bool {
@@ -183,7 +180,7 @@ async fn wait_for_static_peer_quorum(
     engine_config: &RaftEngineConfig,
 ) {
     let quorum = quorum_size(nodes.len());
-    let mut next_warning = Instant::now() + engine_config.bootstrap_peer_probe;
+    let mut last_warning = Instant::now();
     let interval = engine_config.bootstrap_peer_probe_interval;
     let connect_timeout = engine_config.bootstrap_peer_connect;
 
@@ -194,7 +191,7 @@ async fn wait_for_static_peer_quorum(
                 continue;
             }
             if static_peer_reachable(&peer.addr, connect_timeout).await {
-                reachable += 1;
+                reachable = reachable.saturating_add(1);
             }
         }
 
@@ -202,13 +199,15 @@ async fn wait_for_static_peer_quorum(
             return;
         }
 
-        if Instant::now() >= next_warning {
+        if Instant::now().saturating_duration_since(last_warning)
+            >= engine_config.bootstrap_peer_probe
+        {
             tracing::warn!(
                 "raft bootstrap: node {node_id} group {} is waiting for static peer quorum; reachable {reachable}/{}, quorum {quorum}",
                 raft_group_id.0,
                 nodes.len()
             );
-            next_warning = Instant::now() + engine_config.bootstrap_peer_probe;
+            last_warning = Instant::now();
         }
 
         tokio::time::sleep(interval).await;
@@ -728,10 +727,10 @@ impl StaticGrpcRaftGroupEngineFactory {
         else {
             return false;
         };
-        let initializer_index = usize::try_from(raft_group_id.0).expect("raft group id fits usize")
-            % initializer_ids.len();
-        initializer_ids
-            .get(initializer_index)
+        usize::try_from(raft_group_id.0)
+            .expect("raft group id fits usize")
+            .checked_rem(initializer_ids.len())
+            .and_then(|initializer_index| initializer_ids.get(initializer_index))
             .is_some_and(|node_id| *node_id == self.node_id)
     }
 }

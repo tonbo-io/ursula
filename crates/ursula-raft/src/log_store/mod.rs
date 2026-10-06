@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 mod file;
 mod memory;
 
@@ -63,6 +59,14 @@ pub(crate) struct CoreJournalRecord {
     pub(crate) record: RaftGroupLogRecord,
 }
 
+/// Drops every entry after `last_index`, or all entries when it is `None`.
+pub(crate) fn truncate_entries_after<V>(entries: &mut BTreeMap<u64, V>, last_index: Option<u64>) {
+    match last_index {
+        Some(last_index) => entries.retain(|index, _| *index <= last_index),
+        None => entries.clear(),
+    }
+}
+
 pub(crate) fn ensure_consecutive_entries<C>(entries: &[EntryOf<C>]) -> Result<(), io::Error>
 where
     C: RaftTypeConfig,
@@ -99,7 +103,10 @@ where
     };
 
     let first_append_index = first_entry.log_id().index;
-    if first_append_index > last_existing_index + 1 {
+    if last_existing_index
+        .checked_add(1)
+        .is_some_and(|next_index| first_append_index > next_index)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("raft log store has a hole: {last_existing_index} then {first_append_index}"),
@@ -116,10 +123,10 @@ where
     C: RaftTypeConfig,
     C::Entry: Clone,
 {
-    let mut previous = None;
+    let mut previous: Option<u64> = None;
     for index in entries.keys().copied() {
         if let Some(previous) = previous
-            && index != previous + 1
+            && previous.checked_add(1) != Some(index)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

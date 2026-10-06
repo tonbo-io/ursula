@@ -5,10 +5,6 @@
 //! the read path and apply, and cold-index repair. The cold-path contracts
 //! themselves are pinned once, against the in-memory engine, by
 //! `ursula-runtime`'s cold-path tests.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::sync::Arc;
 
@@ -122,7 +118,9 @@ fn chunk(start_offset: u64, end_offset: u64, s3_path: &str) -> ColdChunkRef {
         start_offset,
         end_offset,
         s3_path: s3_path.to_owned(),
-        object_size: end_offset - start_offset,
+        object_size: end_offset
+            .checked_sub(start_offset)
+            .expect("chunk must not end before it starts"),
         ..Default::default()
     }
 }

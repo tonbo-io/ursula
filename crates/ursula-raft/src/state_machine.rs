@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io;
@@ -703,7 +699,7 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
                 EntryPayload::Blank => RaftGroupResponse::Blank,
                 EntryPayload::Normal(command) => {
                     let apply_started_at = Instant::now();
-                    applied_entries += 1;
+                    applied_entries = applied_entries.saturating_add(1);
                     let response = RaftGroupResponse::Write(
                         self.engine.apply_committed_write(command, self.placement),
                     );

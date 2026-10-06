@@ -12,10 +12,6 @@
 //! (`ursula_runtime::LinearizableReadBarrier`), and the engine calls it
 //! itself for reads that arrive without a confirmed index (forwarded gRPC
 //! reads, direct engine calls).
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -27,6 +23,7 @@ use futures_util::future::BoxFuture;
 use futures_util::future::Shared;
 use openraft::ReadPolicy;
 use openraft::error::LinearizableReadError;
+use openraft::rt::Instant;
 use openraft::rt::WatchReceiver;
 use openraft::type_config::TypeConfigExt;
 use ursula_runtime::GroupEngineError;
@@ -129,7 +126,7 @@ async fn confirm(raft: &RaftGroupHandle) -> Outcome {
     let config = raft.config();
     let budget = Duration::from_millis(config.election_timeout_min);
     let round = Duration::from_millis(config.heartbeat_interval);
-    let deadline = UrsulaRaftTypeConfig::now() + budget;
+    let began = UrsulaRaftTypeConfig::now();
     let self_id = || raft.metrics().borrow_watched().id;
     let linearizer = loop {
         let started = UrsulaRaftTypeConfig::now();
@@ -140,11 +137,14 @@ async fn confirm(raft: &RaftGroupHandle) -> Outcome {
                     err.api_error(),
                     Some(LinearizableReadError::QuorumNotEnough(_))
                 ) && raft.is_leader()
-                    && UrsulaRaftTypeConfig::now() < deadline =>
+                    && began.elapsed() < budget =>
             {
                 tracing::debug!("OpenRaft {OPERATION} retrying leadership confirmation: {err}");
-                let next_round = (started + round).min(deadline);
-                UrsulaRaftTypeConfig::sleep_until(next_round).await;
+                // Sleep out the rest of this heartbeat interval, but never past the budget.
+                let until_next_round = round
+                    .saturating_sub(started.elapsed())
+                    .min(budget.saturating_sub(began.elapsed()));
+                UrsulaRaftTypeConfig::sleep(until_next_round).await;
             }
             Err(err) => {
                 return Err(group_engine_linearizable_read_error(

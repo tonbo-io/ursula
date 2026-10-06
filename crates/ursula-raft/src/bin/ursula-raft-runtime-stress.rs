@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 // Stresses the production ThreadPerCore runtime; cfg(not(madsim))-only by
 // design (DoD #1). Under cfg(madsim) the bin is a no-op.
 
@@ -54,7 +50,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     create_streams(&runtime, &streams, args.setup_concurrency).await?;
 
     let total_appends = Arc::new(AtomicU64::new(0));
-    let deadline = Instant::now() + args.duration;
+    let deadline = Instant::now()
+        .checked_add(args.duration)
+        .ok_or("--duration-secs is too large")?;
     let started = Instant::now();
     let mut tasks = JoinSet::new();
     for producer_index in 0..args.producer_count {
@@ -64,16 +62,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let args = args.clone();
         tasks.spawn(async move {
             let payload = vec![0; args.payload_bytes];
-            let mut stream_index = producer_index % streams.len();
+            let stream_len = streams.len();
+            let mut stream_index = producer_index
+                .checked_rem(stream_len)
+                .ok_or("stream list is empty")?;
             while Instant::now() < deadline {
                 let stream = streams
                     .get(stream_index)
                     .expect("stream_index wraps below streams.len()")
                     .clone();
-                stream_index += args.producer_count;
-                if stream_index >= streams.len() {
-                    stream_index %= streams.len();
-                }
+                stream_index = stream_index
+                    .checked_add(args.producer_count)
+                    .and_then(|next| next.checked_rem(stream_len))
+                    .ok_or("stream index overflow")?;
 
                 let mut request = AppendRequest::from_bytes(stream, payload.clone());
                 request.content_type = DEFAULT_CONTENT_TYPE.to_owned();
@@ -144,15 +145,9 @@ async fn create_streams(
     setup_concurrency: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let setup_concurrency = setup_concurrency.max(1);
-    let mut next_stream = 0usize;
-    while next_stream < streams.len() {
+    for batch in streams.chunks(setup_concurrency) {
         let mut tasks = JoinSet::new();
-        for stream in streams
-            .iter()
-            .skip(next_stream)
-            .take(setup_concurrency)
-            .cloned()
-        {
+        for stream in batch.iter().cloned() {
             let runtime = runtime.clone();
             tasks.spawn(async move {
                 runtime
@@ -164,7 +159,6 @@ async fn create_streams(
         while let Some(result) = tasks.join_next().await {
             result??;
         }
-        next_stream += setup_concurrency;
     }
     Ok(())
 }

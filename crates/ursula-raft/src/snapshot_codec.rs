@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -59,7 +55,7 @@ pub(crate) fn decode_calls_on_this_thread() -> usize {
 /// Decodes the concatenated frames written by [`group_snapshot_frames`].
 pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStoreError> {
     #[cfg(test)]
-    DECODE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    DECODE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     let mut cursor = Cursor::new(bytes);
     let mut header = None;
     let mut streams = Vec::new();
@@ -259,14 +255,14 @@ impl Iterator for GroupSnapshotFrameIter {
             self.header = false;
             proto::snapshot_frame_v1::Frame::Header(Self::header_frame(snapshot))
         } else if let Some(stream) = snapshot.stream_snapshot.streams.get(self.next_stream) {
-            self.next_stream += 1;
+            self.next_stream = self.next_stream.saturating_add(1);
             match stream_to_proto(stream.clone()) {
                 Ok(stream) => proto::snapshot_frame_v1::Frame::Stream(Box::new(stream)),
                 Err(err) => return Some(Err(err)),
             }
         } else if let Some(append_count) = snapshot.stream_append_counts.get(self.next_append_count)
         {
-            self.next_append_count += 1;
+            self.next_append_count = self.next_append_count.saturating_add(1);
             proto::snapshot_frame_v1::Frame::AppendCount(append_count_to_proto(
                 append_count.clone(),
             ))
@@ -275,7 +271,7 @@ impl Iterator for GroupSnapshotFrameIter {
             .pending_cold_gc
             .get(self.next_cold_gc)
         {
-            self.next_cold_gc += 1;
+            self.next_cold_gc = self.next_cold_gc.saturating_add(1);
             proto::snapshot_frame_v1::Frame::ColdGc(cold_gc_to_proto(cold_gc.clone()))
         } else if self.footer {
             self.footer = false;

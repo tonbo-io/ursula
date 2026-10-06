@@ -15,10 +15,6 @@
 //! The policy is pure: the snapshot driver feeds it each group's
 //! [`GroupLogProgress`], read from the [`GroupLogGauge`] its state machine
 //! maintains, and the state probe feeds it simulated groups.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::cmp::Ordering;
 use std::sync::atomic::AtomicBool;
@@ -63,7 +59,10 @@ pub struct SnapshotCadence {
 impl SnapshotCadence {
     pub fn new(node_budget_bytes: u64, group_count: usize, backstop_entries: u64) -> Self {
         let groups = u64::try_from(group_count.max(1)).unwrap_or(u64::MAX);
-        let floor_bytes = (node_budget_bytes / groups.saturating_mul(2))
+        // `groups` is at least 1, so the divisor is at least 2 and the quotient always exists.
+        let floor_bytes = node_budget_bytes
+            .checked_div(groups.saturating_mul(2))
+            .unwrap_or(0)
             .clamp(MIN_SNAPSHOT_FLOOR_BYTES, MAX_SNAPSHOT_FLOOR_BYTES);
         Self {
             floor_bytes,
@@ -91,7 +90,8 @@ impl SnapshotCadence {
 
     /// Node log bytes at which the pressure pass starts.
     pub fn pressure_watermark_bytes(&self) -> u64 {
-        self.node_budget_bytes / 4 * 3
+        // `n / 4 * 3` is below `u64::MAX`, so this never saturates.
+        (self.node_budget_bytes / 4).saturating_mul(3)
     }
 
     /// Node log bytes the pressure pass aims to fall to.
@@ -157,7 +157,10 @@ impl SnapshotCadence {
 fn compare_yield(left: &GroupLogProgress, right: &GroupLogProgress) -> Ordering {
     let left_cost = u128::from(left.last_snapshot_bytes.max(1));
     let right_cost = u128::from(right.last_snapshot_bytes.max(1));
-    (u128::from(left.log_bytes) * right_cost).cmp(&(u128::from(right.log_bytes) * left_cost))
+    // Each factor is below 2^64, so the product fits `u128` and never saturates.
+    u128::from(left.log_bytes)
+        .saturating_mul(right_cost)
+        .cmp(&u128::from(right.log_bytes).saturating_mul(left_cost))
 }
 
 /// One planning decision of [`SnapshotCadence::plan`].
@@ -248,7 +251,7 @@ mod tests {
     fn progress(log_bytes: u64, last_snapshot_bytes: u64) -> GroupLogProgress {
         GroupLogProgress {
             log_bytes,
-            log_entries: log_bytes / 256 + 1,
+            log_entries: (log_bytes / 256).saturating_add(1),
             last_snapshot_bytes,
             has_snapshot: true,
         }
