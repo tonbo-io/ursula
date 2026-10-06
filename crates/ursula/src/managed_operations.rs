@@ -378,6 +378,9 @@ impl Coordinator {
                 )
                 .await?;
             let node = view.state.nodes.get(id).ok_or("participant is absent")?;
+            if inventory.protocol_version != crate::managed_receiver::RECEIVER_PROTOCOL_VERSION {
+                return Err("receiver protocol lacks required snapshot-pruning barriers".to_owned());
+            }
             if inventory.identity.cluster != view.identity
                 || inventory.identity.node.node_id != *id
                 || inventory.identity.node.cluster_url != node.cluster_url

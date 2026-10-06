@@ -1072,6 +1072,14 @@ impl RaftGroupHandleRegistry {
                 "group retirement requires managed revocation",
             ));
         }
+        // Detached pruning can outlive a cancelled snapshot builder. Drain
+        // its owned deletion lease before actor/reference retirement, too.
+        self.snapshot_store()
+            .configure_pruning(group.0, BTreeSet::new(), false)
+            .await
+            .map_err(|error| {
+                GroupEngineError::new(format!("drain retired snapshot pruning: {error}"))
+            })?;
         let raft = self
             .groups
             .lock()
@@ -1320,7 +1328,8 @@ impl RaftGroupHandleRegistry {
             snapshot_store.unwrap_or_else(default_snapshot_store);
     }
 
-    fn snapshot_store(&self) -> SharedSnapshotStore {
+    /// Shared store used by builders, installs and managed pruning barriers.
+    pub fn snapshot_store(&self) -> SharedSnapshotStore {
         self.snapshot_store
             .lock()
             .expect("raft group snapshot store mutex")

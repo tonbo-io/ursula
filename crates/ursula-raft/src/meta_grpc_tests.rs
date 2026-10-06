@@ -152,6 +152,7 @@ async fn bound_meta_transport_rejects_routing_drift_and_missing_binding_before_d
         (1, 1, 2, META_RAFT_PROTOCOL_VERSION),
         (0, 0, 0, META_RAFT_PROTOCOL_VERSION),
         (1, 1, 1, 1),
+        (1, 1, 1, 2),
     ] {
         let envelope = MetaRaftRpcEnvelopeV1 {
             cluster_id: CLUSTER.to_owned(),
@@ -724,6 +725,7 @@ async fn meta_transport_rejects_wrong_identity_and_version_before_payload_decode
         (CLUSTER, 8, META_RAFT_PROTOCOL_VERSION),
         (CLUSTER, 7, 0),
         (CLUSTER, 7, 1),
+        (CLUSTER, 7, 2),
     ] {
         let envelope = MetaRaftRpcEnvelopeV1 {
             cluster_id: cluster_id.to_owned(),

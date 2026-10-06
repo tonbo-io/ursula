@@ -167,12 +167,12 @@ async fn init_state_with_assignments(
     // Format epoch 2: refuse 0.5.x data and peers before anything is written.
     crate::bootstrap::check_and_stamp_format_epoch(config).await?;
 
-    let spawned = spawn_runtime_with_maintenance_drain(
-        config,
-        persistence,
-        topology,
-        start_maintenance_drained,
-    )?;
+    let spawn = if managed_groups.is_some() {
+        crate::bootstrap::spawn_managed_runtime
+    } else {
+        spawn_runtime_with_maintenance_drain
+    };
+    let spawned = spawn(config, persistence, topology, start_maintenance_drained)?;
     let runtime = spawned.runtime;
     if let (Some(registry), Some(groups)) = (&spawned.raft_registry, &managed_groups) {
         registry.set_managed_hosting(groups.clone());

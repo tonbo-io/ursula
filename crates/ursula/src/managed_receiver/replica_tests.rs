@@ -410,6 +410,233 @@ async fn native_server_executor_changes_rf3_to_rf5_to_rf3_and_hands_off_removed_
     fixture.stop().await;
 }
 
+#[derive(Debug, Default)]
+struct PruningProbe {
+    calls: std::sync::Mutex<Vec<(u32, BTreeSet<u64>, bool)>>,
+    block: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl ursula_runtime::SnapshotStore for PruningProbe {
+    fn upload<'a>(
+        &'a self,
+        key: ursula_runtime::SnapshotKey,
+        bytes: axum::body::Bytes,
+    ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::SnapshotLocation> {
+        Box::pin(async move {
+            ursula_runtime::default_snapshot_store()
+                .upload(key, bytes)
+                .await
+        })
+    }
+
+    fn download<'a>(
+        &'a self,
+        location: &'a ursula_runtime::SnapshotLocation,
+    ) -> ursula_runtime::SnapshotStoreFuture<'a, Vec<u8>> {
+        Box::pin(async move {
+            ursula_runtime::default_snapshot_store()
+                .download(location)
+                .await
+        })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        location: &'a ursula_runtime::SnapshotLocation,
+    ) -> ursula_runtime::SnapshotStoreFuture<'a, ()> {
+        Box::pin(async move {
+            ursula_runtime::default_snapshot_store()
+                .delete(location)
+                .await
+        })
+    }
+
+    fn configure_pruning<'a>(
+        &'a self,
+        group: u32,
+        voters: BTreeSet<u64>,
+        enabled: bool,
+    ) -> ursula_runtime::SnapshotStoreFuture<'a, ()> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push((group, voters, enabled));
+            if !enabled && self.block.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn native_receiver_pruning_barrier_survives_executor_takeover_rf3_rf5() {
+    for count in [3, 5] {
+        let fixture = Fixture::new(count).await;
+        let probe = Arc::new(PruningProbe::default());
+        probe.block.store(true, std::sync::atomic::Ordering::SeqCst);
+        fixture.states[0]
+            .raft_registry()
+            .unwrap()
+            .set_snapshot_store(Some(probe.clone()));
+        let target: BTreeSet<_> = (1..=count as u64 + 1).filter(|id| *id != 2).collect();
+        let request = crate::managed_operations::OperationRequest {
+            operation_key: format!("pruning-barrier-rf{count}"),
+            raft_group_id: GROUP,
+            expected_epoch: 0,
+            target_voters: target.clone(),
+            target_policy: None,
+        };
+        let id = submit_operation(&fixture, &request).await;
+        let executor = executors(&fixture);
+        tokio::time::timeout(Duration::from_secs(10), probe.entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.receivers[0]
+                .store
+                .snapshot()
+                .unwrap()
+                .fence
+                .unwrap()
+                .phase,
+            ursula_control::ReceiverFencePhase::Activating
+        );
+        let view = fixture.fresh_projection().await;
+        let managed = view.state.migrations[&id].managed.as_ref().unwrap();
+        assert!(
+            managed.receivers.is_empty(),
+            "GC drain must precede receiving-process certification"
+        );
+        assert!(managed.prepared.is_empty());
+        let old = managed.executor.as_ref().unwrap().token.clone();
+        stop_executors(executor).await;
+        let successor = if old.executor.node_id == 3 { 1 } else { 3 };
+        fixture.meta[old.executor.node_id as usize - 1]
+            .raft_handle()
+            .trigger()
+            .transfer_leader(successor)
+            .await
+            .unwrap();
+        fixture.meta[successor as usize - 1]
+            .raft_handle()
+            .wait(Some(Duration::from_secs(10)))
+            .current_leader(successor, "take over while source GC drain is blocked")
+            .await
+            .unwrap();
+        let executor = executors(&fixture);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if fixture.fresh_projection().await.state.migrations[&id]
+                    .managed
+                    .as_ref()
+                    .unwrap()
+                    .executor
+                    .as_ref()
+                    .unwrap()
+                    .token
+                    .generation
+                    > old.generation
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            fixture.receivers[0]
+                .store
+                .snapshot()
+                .unwrap()
+                .fence
+                .unwrap()
+                .phase,
+            ursula_control::ReceiverFencePhase::Activating
+        );
+        probe.release.notify_one();
+        wait_operation(&fixture, id).await;
+        stop_executors(executor).await;
+        assert_eq!(
+            fixture.fresh_projection().await.state.placements[&GROUP].voters,
+            target
+        );
+        {
+            let calls = probe.calls.lock().unwrap();
+            assert!(
+                calls
+                    .iter()
+                    .any(|(group, voters, enabled)| *group == GROUP.0
+                        && !enabled
+                        && voters.len() == count + 1)
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|(group, voters, enabled)| *group == GROUP.0
+                        && *enabled
+                        && voters == &target)
+            );
+        }
+        assert_eq!(
+            fixture.receivers[0]
+                .store
+                .snapshot()
+                .unwrap()
+                .fence
+                .unwrap()
+                .phase,
+            ursula_control::ReceiverFencePhase::Retired
+        );
+        probe.calls.lock().unwrap().clear();
+        let settled = fixture.fresh_projection().await;
+        fixture.receivers[0]
+            .sync_snapshot_pruning(&fixture.states[0], &settled)
+            .await
+            .unwrap();
+        {
+            let calls = probe.calls.lock().unwrap();
+            assert!(
+                calls
+                    .iter()
+                    .any(|(group, voters, enabled)| *group == GROUP.0
+                        && *enabled
+                        && voters == &target)
+            );
+            assert!(
+                calls.iter().any(|(group, voters, enabled)| *group == 1
+                    && *enabled
+                    && voters.len() == count)
+            );
+        }
+        probe.calls.lock().unwrap().clear();
+        fixture.receivers[0]
+            .sync_snapshot_pruning(&fixture.states[0], &view)
+            .await
+            .unwrap();
+        assert!(
+            probe.calls.lock().unwrap().is_empty(),
+            "an older complete view cannot roll pruning policy back"
+        );
+        let mut inventory = serde_json::to_value(crate::managed_receiver::ReceiverInventory {
+            protocol_version: crate::managed_receiver::RECEIVER_PROTOCOL_VERSION,
+            identity: fixture.receivers[0].store.identity().clone(),
+            process: fixture.states[0].process_incarnation.clone(),
+        })
+        .unwrap();
+        inventory
+            .as_object_mut()
+            .unwrap()
+            .remove("protocol_version");
+        let missing =
+            serde_json::from_value::<crate::managed_receiver::ReceiverInventory>(inventory)
+                .unwrap_err();
+        assert!(missing.to_string().contains("protocol_version"));
+    }
+}
+
 struct Fixture {
     root: tempfile::TempDir,
     recipe: ClusterBootstrap,

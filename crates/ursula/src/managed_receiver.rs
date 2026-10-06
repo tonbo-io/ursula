@@ -33,6 +33,9 @@ use ursula_raft::MetaRaftHandle;
 
 use crate::HttpState;
 
+// V3 requires activation to drain snapshot pruning before certification.
+pub(crate) const RECEIVER_PROTOCOL_VERSION: u32 = 3;
+
 mod membership;
 mod replica;
 use membership::applied_evidence;
@@ -197,13 +200,14 @@ impl ManagedReceiver {
         token: MigrationToken,
     ) -> Result<ReceiverLedger, String> {
         let _guard = self.gate.write().await;
-        self.fresh(state, &token, false).await?;
+        let view = self.fresh(state, &token, false).await?;
         let mut ledger = self.store.snapshot().map_err(|e| e.to_string())?;
         if ledger.fence.as_ref().is_some_and(|old| {
             old.token == token
                 && old.process == state.process_incarnation
                 && old.phase == ReceiverFencePhase::Active
         }) {
+            self.pause_snapshot_pruning(state, &view).await?;
             self.reconcile_replica(state, &token).await?;
             self.barrier(state).await?;
             return self.store.snapshot().map_err(|e| e.to_string());
@@ -221,6 +225,7 @@ impl ManagedReceiver {
             .persist(ledger.clone())
             .await
             .map_err(|e| e.to_string())?;
+        self.pause_snapshot_pruning(state, &view).await?;
         self.reconcile_replica(state, &token).await?;
         self.barrier(state).await?;
         // A generation can be replaced while this process waits for its queue.
@@ -270,6 +275,7 @@ impl ManagedReceiver {
             return Err("receiver token or process changed".to_owned());
         }
         if current.phase == ReceiverFencePhase::Retired {
+            self.resume_snapshot_pruning(state, &view).await?;
             return Ok(ledger);
         }
         current.phase = ReceiverFencePhase::Retiring;
@@ -286,7 +292,107 @@ impl ManagedReceiver {
             .persist(ledger.clone())
             .await
             .map_err(|e| e.to_string())?;
+        self.resume_snapshot_pruning(state, &view).await?;
         Ok(ledger)
+    }
+
+    async fn pause_snapshot_pruning(
+        &self,
+        state: &HttpState,
+        view: &ControlProjection,
+    ) -> Result<(), String> {
+        let migration = view.state.active_migration().ok_or("no active migration")?;
+        if let Some(registry) = state.raft_registry() {
+            registry
+                .snapshot_store()
+                .configure_pruning(
+                    migration.raft_group_id.0,
+                    migration
+                        .from_voters
+                        .union(&migration.target_voters)
+                        .copied()
+                        .collect(),
+                    false,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    async fn resume_snapshot_pruning(
+        &self,
+        state: &HttpState,
+        view: &ControlProjection,
+    ) -> Result<(), String> {
+        let migration = view.state.active_migration().ok_or("no active migration")?;
+        if let Some(registry) = state.raft_registry() {
+            registry
+                .snapshot_store()
+                .configure_pruning(
+                    migration.raft_group_id.0,
+                    migration.target_voters.clone(),
+                    true,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Only a fresh meta read may resume pruning after restart. Local cached
+    /// placement is enough for serving recovery, but not for object deletion.
+    pub(crate) async fn sync_snapshot_pruning(
+        &self,
+        state: &HttpState,
+        view: &ControlProjection,
+    ) -> Result<(), String> {
+        let _guard = self.gate.read().await;
+        view.validate()?;
+        if let Some(cursor) = &state.managed_projection {
+            let cursor = cursor
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cursor
+                .current()
+                .is_some_and(|current| current.applied_log_id.index > view.applied_log_id.index)
+            {
+                return Ok(());
+            }
+        }
+        let Some(registry) = state.raft_registry() else {
+            return Ok(());
+        };
+        let store = registry.snapshot_store();
+        let ledger = self.store.snapshot().map_err(|error| error.to_string())?;
+        let fence = ledger
+            .fence
+            .as_ref()
+            .filter(|fence| fence.phase != ReceiverFencePhase::Retired);
+        let fenced_group = fence
+            .and_then(|fence| view.state.migrations.get(&fence.token.migration_id))
+            .map(|migration| migration.raft_group_id);
+        let active_group = view
+            .state
+            .active_migration()
+            .map(|migration| migration.raft_group_id);
+        let own = self.store.identity().node.node_id;
+        let pause_all =
+            (fence.is_some() && fenced_group.is_none())
+                || !view.state.nodes.get(&own).is_some_and(|node| {
+                    matches!(node.state, NodeState::Active | NodeState::Draining)
+                });
+        for (group, placement) in &view.state.placements {
+            store
+                .configure_pruning(
+                    group.0,
+                    placement.voters.clone(),
+                    !pause_all && active_group != Some(*group) && fenced_group != Some(*group),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 }
 
@@ -309,6 +415,7 @@ pub(crate) fn router(state: HttpState) -> Router {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ReceiverInventory {
+    pub protocol_version: u32,
     pub identity: ursula_control::MetaLocalIdentity,
     pub process: ursula_proto::admin::ProcessIncarnation,
 }
@@ -316,6 +423,7 @@ pub(crate) struct ReceiverInventory {
 async fn process(State(state): State<HttpState>) -> Response {
     match &state.managed_receiver {
         Some(receiver) => Json(ReceiverInventory {
+            protocol_version: RECEIVER_PROTOCOL_VERSION,
             identity: receiver.store.identity().clone(),
             process: state.process_incarnation,
         })

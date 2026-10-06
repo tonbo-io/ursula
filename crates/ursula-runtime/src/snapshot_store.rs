@@ -187,6 +187,21 @@ pub type SnapshotStoreFuture<'a, T> =
 pub type SnapshotBytesIterator = Box<dyn Iterator<Item = Result<Bytes, SnapshotStoreError>> + Send>;
 
 pub trait SnapshotStore: Send + Sync + Debug {
+    /// Called before managed actors start. External pruning remains disabled
+    /// until the receiver supplies a fresh settled membership for each group.
+    fn enable_managed_pruning(&self, _group_count: u32) {}
+
+    /// Serialize policy changes with in-flight deletion. Disabling must drain
+    /// prior pruning before a receiver certifies transfer admission. Inline
+    /// and local stores have no external pruning and use the default no-op.
+    fn configure_pruning<'a>(
+        &'a self,
+        _group: u32,
+        _voters: BTreeSet<u64>,
+        _enabled: bool,
+    ) -> SnapshotStoreFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
     /// Persist a snapshot blob and return its location. Stores own naming and
     /// MAY ignore parts of `key` (Inline does).
     fn upload<'a>(
@@ -374,9 +389,13 @@ fn collect_snapshot_chunks(chunks: SnapshotBytesIterator) -> Result<Vec<u8>, Sna
 
 #[cfg(not(madsim))]
 mod s3 {
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
     use std::collections::HashSet;
     use std::io;
     use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::Mutex;
     use std::time::Duration;
     use std::time::SystemTime;
 
@@ -406,12 +425,31 @@ mod s3 {
         snapshot_key: Option<String>,
     }
 
+    #[derive(Debug, Default)]
+    struct PruningPolicy {
+        enabled: bool,
+        voters: BTreeSet<u64>,
+    }
+
+    type PruningPolicies = Arc<Mutex<BTreeMap<u32, Arc<tokio::sync::RwLock<PruningPolicy>>>>>;
+
+    #[cfg(test)]
+    struct PruneTestBarrier {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
     /// Bytes live in an opendal-managed S3 bucket under `{prefix}/group-{gid}/`.
+    #[derive(Clone)]
     pub struct S3SnapshotStore {
         operator: Operator,
         prefix: String,
-        references: Option<SnapshotReferenceConfig>,
+        references: Option<Arc<SnapshotReferenceConfig>>,
         gc_grace: Duration,
+        pruning: PruningPolicies,
+        #[cfg(test)]
+        prune_barrier: Option<Arc<PruneTestBarrier>>,
     }
 
     impl std::fmt::Debug for S3SnapshotStore {
@@ -435,17 +473,34 @@ mod s3 {
                 prefix,
                 references: None,
                 gc_grace: S3_SNAPSHOT_GC_GRACE,
+                pruning: Arc::default(),
+                #[cfg(test)]
+                prune_barrier: None,
             }
         }
 
         pub fn with_references(mut self, references: SnapshotReferenceConfig) -> Self {
-            self.references = Some(references);
+            self.references = Some(Arc::new(references));
             self
         }
 
         #[cfg(test)]
         pub(crate) fn with_gc_grace_for_tests(mut self, gc_grace: Duration) -> Self {
             self.gc_grace = gc_grace;
+            self
+        }
+
+        #[cfg(test)]
+        pub(crate) fn with_prune_barrier_for_tests(
+            mut self,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        ) -> Self {
+            self.prune_barrier = Some(Arc::new(PruneTestBarrier {
+                entered,
+                release,
+                armed: std::sync::atomic::AtomicBool::new(true),
+            }));
             self
         }
 
@@ -651,7 +706,188 @@ mod s3 {
         Ok((stored_bytes, size_bytes, digest))
     }
 
+    impl S3SnapshotStore {
+        async fn prune_candidates(
+            &self,
+            raft_group_id: u32,
+            current: &SnapshotLocation,
+            retain_latest: usize,
+            expected_voters: BTreeSet<u64>,
+        ) -> Result<(), SnapshotStoreError> {
+            let SnapshotLocation::S3 {
+                key: current_key, ..
+            } = current
+            else {
+                return Ok(());
+            };
+            if expected_voters.is_empty() {
+                return Ok(());
+            }
+            let group_prefix = self.group_prefix(raft_group_id);
+            let mut retained = HashSet::from([current_key.clone()]);
+            for node_id in &expected_voters {
+                let reference_key = self.reference_key(raft_group_id, *node_id);
+                let reference_bytes = match self.operator.read(&reference_key).await {
+                    Ok(bytes) => bytes,
+                    Err(error) if matches!(error.kind(), opendal::ErrorKind::NotFound) => {
+                        tracing::debug!(
+                            raft_group_id,
+                            node_id,
+                            "deferring S3 snapshot pruning until every voter publishes a reference"
+                        );
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        return Err(SnapshotStoreError::Backend(error.to_string()));
+                    }
+                };
+                let reference: SnapshotReference =
+                    serde_json::from_slice(&reference_bytes.to_vec())
+                        .map_err(|error| SnapshotStoreError::Deserialize(error.to_string()))?;
+                if reference.version != SNAPSHOT_REFERENCE_VERSION
+                    || reference.node_id != *node_id
+                    || reference.raft_group_id != raft_group_id
+                {
+                    return Err(SnapshotStoreError::Integrity(format!(
+                        "invalid S3 snapshot reference {reference_key}"
+                    )));
+                }
+                if let Some(key) = reference.snapshot_key {
+                    if !key.starts_with(&group_prefix) || !key.ends_with(".snap") {
+                        return Err(SnapshotStoreError::Integrity(format!(
+                            "S3 snapshot reference {reference_key} points outside group namespace"
+                        )));
+                    }
+                    retained.insert(key);
+                }
+            }
+            let cutoff = SystemTime::now()
+                .checked_sub(self.gc_grace)
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let entries = self
+                .operator
+                .list_with(&group_prefix)
+                .recursive(true)
+                .await
+                .map_err(|error| SnapshotStoreError::Backend(error.to_string()))?;
+            for entry in &entries {
+                if !entry.metadata().mode().is_file()
+                    || !entry
+                        .path()
+                        .starts_with(&format!("{group_prefix}references/"))
+                    || !entry.path().ends_with(".json")
+                {
+                    continue;
+                }
+                let bytes = self
+                    .operator
+                    .read(entry.path())
+                    .await
+                    .map_err(|error| SnapshotStoreError::Backend(error.to_string()))?;
+                let reference: SnapshotReference = serde_json::from_slice(&bytes.to_vec())
+                    .map_err(|error| SnapshotStoreError::Deserialize(error.to_string()))?;
+                if reference.version != SNAPSHOT_REFERENCE_VERSION
+                    || reference.raft_group_id != raft_group_id
+                {
+                    return Err(SnapshotStoreError::Integrity(format!(
+                        "invalid S3 snapshot reference {}",
+                        entry.path()
+                    )));
+                }
+                if let Some(key) = reference.snapshot_key {
+                    if !key.starts_with(&group_prefix) || !key.ends_with(".snap") {
+                        return Err(SnapshotStoreError::Integrity(format!(
+                            "S3 snapshot reference {} points outside group namespace",
+                            entry.path()
+                        )));
+                    }
+                    retained.insert(key);
+                }
+            }
+            let mut retired = Vec::new();
+            for entry in entries {
+                if !entry.metadata().mode().is_file()
+                    || !entry.path().ends_with(".snap")
+                    || retained.contains(entry.path())
+                {
+                    continue;
+                }
+                let modified = match entry.metadata().last_modified() {
+                    Some(modified) => Some(modified.into()),
+                    None => self
+                        .operator
+                        .stat(entry.path())
+                        .await
+                        .map_err(|error| SnapshotStoreError::Backend(error.to_string()))?
+                        .last_modified()
+                        .map(Into::into)
+                        .or_else(|| self.gc_grace.is_zero().then_some(SystemTime::UNIX_EPOCH)),
+                };
+                if let Some(modified) = modified
+                    && modified <= cutoff
+                {
+                    retired.push((modified, entry.path().to_owned()));
+                }
+            }
+            retired.sort_unstable_by(|left, right| right.cmp(left));
+            let mut deleted = 0_usize;
+            for (_modified, key) in retired.into_iter().skip(retain_latest) {
+                self.operator
+                    .delete(&key)
+                    .await
+                    .map_err(|error| SnapshotStoreError::Backend(error.to_string()))?;
+                deleted = deleted.saturating_add(1);
+            }
+            if deleted > 0 {
+                tracing::info!(
+                    raft_group_id,
+                    deleted,
+                    retained = retained.len(),
+                    "pruned unreachable S3 snapshot objects"
+                );
+            }
+            Ok(())
+        }
+    }
+
     impl SnapshotStore for S3SnapshotStore {
+        fn enable_managed_pruning(&self, group_count: u32) {
+            let mut policies = self
+                .pruning
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for group in 0..group_count {
+                policies.entry(group).or_default();
+            }
+        }
+
+        fn configure_pruning<'a>(
+            &'a self,
+            group: u32,
+            voters: BTreeSet<u64>,
+            enabled: bool,
+        ) -> SnapshotStoreFuture<'a, ()> {
+            Box::pin(async move {
+                if enabled && (voters.is_empty() || voters.contains(&0)) {
+                    return Err(SnapshotStoreError::Integrity(
+                        "snapshot pruning requires nonempty, nonzero voters".to_owned(),
+                    ));
+                }
+                let gate = {
+                    self.pruning
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .entry(group)
+                        .or_default()
+                        .clone()
+                };
+                let mut policy = gate.write().await;
+                policy.enabled = enabled;
+                policy.voters = voters;
+                Ok(())
+            })
+        }
+
         fn pin_reference<'a>(
             &'a self,
             raft_group_id: u32,
@@ -879,144 +1115,53 @@ mod s3 {
             current: &'a SnapshotLocation,
             retain_latest: usize,
         ) -> SnapshotStoreFuture<'a, ()> {
+            if !matches!(current, SnapshotLocation::S3 { .. }) || self.references.is_none() {
+                return Box::pin(async { Ok(()) });
+            }
+            let store = self.clone();
+            let current = current.clone();
             Box::pin(async move {
-                let SnapshotLocation::S3 {
-                    key: current_key, ..
-                } = current
-                else {
-                    return Ok(());
-                };
-                let Some(references) = &self.references else {
-                    return Ok(());
-                };
-                let expected_voters = references.voters_for(raft_group_id);
-                if expected_voters.is_empty() {
-                    return Ok(());
-                }
-                let group_prefix = self.group_prefix(raft_group_id);
-                let mut retained = HashSet::from([current_key.clone()]);
-                for node_id in expected_voters {
-                    let reference_key = self.reference_key(raft_group_id, *node_id);
-                    let reference_bytes = match self.operator.read(&reference_key).await {
-                        Ok(bytes) => bytes,
-                        Err(error) if matches!(error.kind(), opendal::ErrorKind::NotFound) => {
-                            tracing::debug!(
-                                raft_group_id,
-                                node_id,
-                                "deferring S3 snapshot pruning until every voter publishes a reference"
-                            );
-                            return Ok(());
-                        }
-                        Err(error) => {
-                            return Err(SnapshotStoreError::Backend(error.to_string()));
-                        }
-                    };
-                    let reference: SnapshotReference =
-                        serde_json::from_slice(&reference_bytes.to_vec())
-                            .map_err(|error| SnapshotStoreError::Deserialize(error.to_string()))?;
-                    if reference.version != SNAPSHOT_REFERENCE_VERSION
-                        || reference.node_id != *node_id
-                        || reference.raft_group_id != raft_group_id
+                // Keep the owned read lease through remote DELETE completion,
+                // even if the caller cancels its snapshot builder future.
+                tokio::spawn(async move {
+                    let gate = store
+                        .pruning
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .entry(raft_group_id)
+                        .or_insert_with(|| {
+                            Arc::new(tokio::sync::RwLock::new(PruningPolicy {
+                                enabled: true,
+                                voters: store
+                                    .references
+                                    .as_ref()
+                                    .map(|references| references.voters_for(raft_group_id).clone())
+                                    .unwrap_or_default(),
+                            }))
+                        })
+                        .clone();
+                    let policy = gate.read_owned().await;
+                    if !policy.enabled {
+                        return Ok(());
+                    }
+                    #[cfg(test)]
+                    if let Some(hook) = &store.prune_barrier
+                        && hook.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
                     {
-                        return Err(SnapshotStoreError::Integrity(format!(
-                            "invalid S3 snapshot reference {reference_key}"
-                        )));
+                        hook.entered.notify_one();
+                        hook.release.notified().await;
                     }
-                    if let Some(key) = reference.snapshot_key {
-                        if !key.starts_with(&group_prefix) || !key.ends_with(".snap") {
-                            return Err(SnapshotStoreError::Integrity(format!(
-                                "S3 snapshot reference {reference_key} points outside group namespace"
-                            )));
-                        }
-                        retained.insert(key);
-                    }
-                }
-                let cutoff = SystemTime::now()
-                    .checked_sub(self.gc_grace)
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                let entries = self
-                    .operator
-                    .list_with(&group_prefix)
-                    .recursive(true)
-                    .await
-                    .map_err(|error| SnapshotStoreError::Backend(error.to_string()))?;
-                for entry in &entries {
-                    if !entry.metadata().mode().is_file()
-                        || !entry
-                            .path()
-                            .starts_with(&format!("{group_prefix}references/"))
-                        || !entry.path().ends_with(".json")
-                    {
-                        continue;
-                    }
-                    let bytes = self
-                        .operator
-                        .read(entry.path())
-                        .await
-                        .map_err(|error| SnapshotStoreError::Backend(error.to_string()))?;
-                    let reference: SnapshotReference = serde_json::from_slice(&bytes.to_vec())
-                        .map_err(|error| SnapshotStoreError::Deserialize(error.to_string()))?;
-                    if reference.version != SNAPSHOT_REFERENCE_VERSION
-                        || reference.raft_group_id != raft_group_id
-                    {
-                        return Err(SnapshotStoreError::Integrity(format!(
-                            "invalid S3 snapshot reference {}",
-                            entry.path()
-                        )));
-                    }
-                    if let Some(key) = reference.snapshot_key {
-                        if !key.starts_with(&group_prefix) || !key.ends_with(".snap") {
-                            return Err(SnapshotStoreError::Integrity(format!(
-                                "S3 snapshot reference {} points outside group namespace",
-                                entry.path()
-                            )));
-                        }
-                        retained.insert(key);
-                    }
-                }
-                let mut retired = Vec::new();
-                for entry in entries {
-                    if !entry.metadata().mode().is_file()
-                        || !entry.path().ends_with(".snap")
-                        || retained.contains(entry.path())
-                    {
-                        continue;
-                    }
-                    let modified = match entry.metadata().last_modified() {
-                        Some(modified) => Some(modified.into()),
-                        None => self
-                            .operator
-                            .stat(entry.path())
-                            .await
-                            .map_err(|error| SnapshotStoreError::Backend(error.to_string()))?
-                            .last_modified()
-                            .map(Into::into)
-                            .or_else(|| self.gc_grace.is_zero().then_some(SystemTime::UNIX_EPOCH)),
-                    };
-                    if let Some(modified) = modified
-                        && modified <= cutoff
-                    {
-                        retired.push((modified, entry.path().to_owned()));
-                    }
-                }
-                retired.sort_unstable_by(|left, right| right.cmp(left));
-                let mut deleted = 0_usize;
-                for (_modified, key) in retired.into_iter().skip(retain_latest) {
-                    self.operator
-                        .delete(&key)
-                        .await
-                        .map_err(|error| SnapshotStoreError::Backend(error.to_string()))?;
-                    deleted = deleted.saturating_add(1);
-                }
-                if deleted > 0 {
-                    tracing::info!(
-                        raft_group_id,
-                        deleted,
-                        retained = retained.len(),
-                        "pruned unreachable S3 snapshot objects"
-                    );
-                }
-                Ok(())
+                    let voters = policy.voters.clone();
+                    let result = store
+                        .prune_candidates(raft_group_id, &current, retain_latest, voters)
+                        .await;
+                    drop(policy);
+                    result
+                })
+                .await
+                .map_err(|error| {
+                    SnapshotStoreError::Backend(format!("snapshot prune task: {error}"))
+                })?
             })
         }
 
@@ -1531,6 +1676,172 @@ mod tests {
             matches!(err, SnapshotStoreError::NotFound(_)),
             "expected NotFound after delete, got {err:?}"
         );
+    }
+
+    #[cfg(not(madsim))]
+    async fn publish_test_voters(
+        store: &S3SnapshotStore,
+        group: u32,
+        current: &SnapshotLocation,
+        voters: &[u64],
+    ) {
+        let SnapshotLocation::S3 { key, .. } = current else {
+            panic!("external location required");
+        };
+        for node in voters {
+            store
+                .write_raw_for_tests(
+                    &format!("snapshots/group-{group}/references/node-{node}.json"),
+                    serde_json::to_vec(&serde_json::json!({"version": ursula_stream::FORMAT_EPOCH,
+                    "node_id": node, "raft_group_id": group, "snapshot_key": key}))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    #[cfg(not(madsim))]
+    fn static_test_store() -> S3SnapshotStore {
+        S3SnapshotStore::memory_for_tests("snapshots")
+            .unwrap()
+            .with_references(SnapshotReferenceConfig {
+                node_id: 1,
+                default_voters: [1, 2, 3].into(),
+                per_group_voters: Default::default(),
+            })
+            .with_gc_grace_for_tests(std::time::Duration::ZERO)
+    }
+
+    #[cfg(not(madsim))]
+    fn managed_test_store() -> S3SnapshotStore {
+        let store = static_test_store();
+        store.enable_managed_pruning(9);
+        store
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn managed_pruning_restores_final_rf5_references_after_pause() {
+        let store = managed_test_store();
+        let current = store
+            .upload(test_key(7, "current"), b"current".to_vec().into())
+            .await
+            .unwrap();
+        let retired = store
+            .upload(test_key(7, "retired"), b"retired".to_vec().into())
+            .await
+            .unwrap();
+        publish_test_voters(&store, 7, &current, &[1, 2, 3]).await;
+        store.prune_retired(7, &current, 0).await.unwrap();
+        assert_eq!(store.download(&retired).await.unwrap(), b"retired");
+        // Source 3 has physically retired; its reference cannot be required.
+        store
+            .delete_raw_for_tests("snapshots/group-7/references/node-3.json")
+            .await
+            .unwrap();
+        store
+            .configure_pruning(7, [1, 2, 4, 5, 6].into(), true)
+            .await
+            .unwrap();
+        store.prune_retired(7, &current, 0).await.unwrap();
+        assert_eq!(
+            store.download(&retired).await.unwrap(),
+            b"retired",
+            "all final RF5 references are required"
+        );
+        publish_test_voters(&store, 7, &current, &[4, 5, 6]).await;
+        store.prune_retired(7, &current, 0).await.unwrap();
+        assert!(matches!(
+            store.download(&retired).await,
+            Err(SnapshotStoreError::NotFound(_))
+        ));
+        assert_eq!(store.download(&current).await.unwrap(), b"current");
+        store
+            .configure_pruning(7, [1, 2, 4, 5, 6].into(), false)
+            .await
+            .unwrap();
+        let later = store
+            .upload(test_key(7, "later"), b"later".to_vec().into())
+            .await
+            .unwrap();
+        store.prune_retired(7, &current, 0).await.unwrap();
+        assert_eq!(store.download(&later).await.unwrap(), b"later");
+        let _invalid = store
+            .configure_pruning(7, Default::default(), true)
+            .await
+            .unwrap_err();
+        store.prune_retired(7, &current, 0).await.unwrap();
+        assert_eq!(store.download(&later).await.unwrap(), b"later");
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn pruning_pause_drains_cancelled_pruner_and_keeps_neighbor_running() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let store = Arc::new(
+            static_test_store().with_prune_barrier_for_tests(entered.clone(), release.clone()),
+        );
+        let current = store
+            .upload(test_key(7, "current"), b"current".to_vec().into())
+            .await
+            .unwrap();
+        let retired = store
+            .upload(test_key(7, "retired"), b"retired".to_vec().into())
+            .await
+            .unwrap();
+        let neighbor = store
+            .upload(test_key(8, "current"), b"neighbor".to_vec().into())
+            .await
+            .unwrap();
+        let neighbor_retired = store
+            .upload(test_key(8, "retired"), b"neighbor-retired".to_vec().into())
+            .await
+            .unwrap();
+        for (group, snapshot) in [(7, &current), (8, &neighbor)] {
+            publish_test_voters(&store, group, snapshot, &[1, 2, 3]).await;
+        }
+        let owned = store.clone();
+        let snapshot = current.clone();
+        let caller = tokio::spawn(async move { owned.prune_retired(7, &snapshot, 0).await });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        let _cancelled = caller.await.unwrap_err();
+        let owned = store.clone();
+        let mut pause =
+            tokio::spawn(
+                async move { owned.configure_pruning(7, [1, 2, 3, 4].into(), false).await },
+            );
+        let _still_deleting = tokio::time::timeout(Duration::from_millis(30), &mut pause)
+            .await
+            .unwrap_err();
+        store.prune_retired(8, &neighbor, 0).await.unwrap();
+        assert!(matches!(
+            store.download(&neighbor_retired).await,
+            Err(SnapshotStoreError::NotFound(_))
+        ));
+        assert_eq!(store.download(&retired).await.unwrap(), b"retired");
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), pause)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            store.download(&retired).await,
+            Err(SnapshotStoreError::NotFound(_))
+        ));
+        let after = store
+            .upload(test_key(7, "after-pause"), b"after-pause".to_vec().into())
+            .await
+            .unwrap();
+        store.prune_retired(7, &current, 0).await.unwrap();
+        assert_eq!(store.download(&after).await.unwrap(), b"after-pause");
     }
 
     #[cfg(not(madsim))]

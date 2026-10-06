@@ -260,6 +260,7 @@ pub(super) async fn run(
         let refresh_recipe = recipe.clone();
         let refresh_cursor = cursor.clone();
         let refresh_meta = meta.clone();
+        let refresh_state = state.clone();
         let interval = control.refresh_interval.as_duration();
         let refresh = tokio::spawn(async move {
             loop {
@@ -267,12 +268,18 @@ pub(super) async fn run(
                 if let Ok(projection) = fetch_state(&refresh_recipe, true).await {
                     match refresh_meta.persist_projection(projection.clone()).await {
                         Ok(_) => {
-                            if let Err(error) = refresh_cursor
+                            let installed = refresh_cursor
                                 .write()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .install(projection)
-                            {
+                                .install(projection.clone());
+                            if let Err(error) = installed {
                                 tracing::error!(%error, "reject managed projection refresh");
+                            } else if let Some(receiver) = &refresh_state.managed_receiver
+                                && let Err(error) = receiver
+                                    .sync_snapshot_pruning(&refresh_state, &projection)
+                                    .await
+                            {
+                                tracing::warn!(%error, "managed snapshot pruning remains fenced");
                             }
                         }
                         Err(error) => {

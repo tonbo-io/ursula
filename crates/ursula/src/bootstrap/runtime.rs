@@ -52,6 +52,37 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
     topology: Topology,
     start_maintenance_drained: bool,
 ) -> Result<SpawnedRuntime, RuntimeError> {
+    spawn_runtime_internal(
+        config,
+        persistence,
+        topology,
+        start_maintenance_drained,
+        false,
+    )
+}
+
+pub(crate) fn spawn_managed_runtime(
+    config: &ursula_config::UrsulaConfig,
+    persistence: Persistence,
+    topology: Topology,
+    start_maintenance_drained: bool,
+) -> Result<SpawnedRuntime, RuntimeError> {
+    spawn_runtime_internal(
+        config,
+        persistence,
+        topology,
+        start_maintenance_drained,
+        true,
+    )
+}
+
+fn spawn_runtime_internal(
+    config: &ursula_config::UrsulaConfig,
+    persistence: Persistence,
+    topology: Topology,
+    start_maintenance_drained: bool,
+    managed_pruning: bool,
+) -> Result<SpawnedRuntime, RuntimeError> {
     let mut runtime_config =
         RuntimeConfig::from_ursula_config(&config.runtime, topology.raft_group_count());
     runtime_config.raft_max_uncommitted_bytes_per_group =
@@ -87,6 +118,14 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
     .map_err(|err| RuntimeError::ColdStoreConfig {
         message: err.to_string(),
     })?;
+    if managed_pruning && let Some(store) = &snapshot_store {
+        let count = u32::try_from(topology.raft_group_count()).map_err(|_| {
+            RuntimeError::ColdStoreConfig {
+                message: "managed snapshot group count exceeds u32".to_owned(),
+            }
+        })?;
+        store.enable_managed_pruning(count);
+    }
     let mut engine_config = RaftEngineConfig::from(&config.raft);
     let configured_snapshot_drive_interval_ms = config
         .storage

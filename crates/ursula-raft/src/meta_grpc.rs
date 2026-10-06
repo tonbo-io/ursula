@@ -55,9 +55,10 @@ use crate::raft_internal_proto::meta_raft_internal_client::MetaRaftInternalClien
 use crate::raft_internal_proto::meta_raft_internal_server::MetaRaftInternal;
 use crate::raft_internal_proto::meta_raft_internal_server::MetaRaftInternalServer;
 
-// Version 2 requires intent-bound managed transitions and durable executor
-// generations. Never mix its state-machine semantics with a version-1 peer.
-pub const META_RAFT_PROTOCOL_VERSION: u32 = 2;
+// Version 3 requires receiver snapshot-pruning barriers as well as durable
+// intent/executor semantics. Old controllers must not retain quorum authority
+// while new receivers depend on this prerequisite for external snapshot safety.
+pub const META_RAFT_PROTOCOL_VERSION: u32 = 3;
 pub const META_RAFT_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const META_RAFT_STATUS_PATH: &str = "/ursula.raft.v1.MetaRaftInternal/Status";
 pub const META_RAFT_WRITE_CONTROL_PATH: &str = "/ursula.raft.v1.MetaRaftInternal/WriteControl";
