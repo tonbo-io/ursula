@@ -2009,6 +2009,58 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
         }
     }
 
+    let manifest = peers
+        .iter()
+        .map(|(id, endpoint)| ursula_ctl::NodeInfo {
+            id: *id,
+            admin_url: endpoint.parse().unwrap(),
+            http_url: Some(endpoint.parse().unwrap()),
+            metrics_url: Some(endpoint.parse().unwrap()),
+            host: endpoint.clone(),
+        })
+        .collect::<Vec<_>>();
+    let client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
+    ursula_ctl::wait_cluster_ready(
+        "fresh quorum fixture startup",
+        &manifest,
+        &client,
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        16,
+    )
+    .await
+    .unwrap();
+    let mut options = ursula_ctl::quorum::QuorumVerificationOptions {
+        group_count: 6,
+        core_count: 1,
+        timeout: Duration::from_secs(5),
+        poll_interval: Duration::from_millis(10),
+        allow_legacy_eligibility: false,
+    };
+    let proof = ursula_ctl::quorum::verify_quorum(&manifest, &client, &options)
+        .await
+        .unwrap();
+    assert!(proof.participation_certified);
+    assert_eq!(proof.prefixes.len(), 6);
+    assert_eq!(proof.applied.len(), 3);
+    for (id, prefix) in proof.prefixes {
+        assert_eq!(prefix.leader_id, u64::from(id % 3) + 1);
+        assert!(
+            proof
+                .applied
+                .values()
+                .all(|groups| groups[&id] >= prefix.required_applied_index)
+        );
+    }
+    options.group_count = 7;
+    let missing = ursula_ctl::quorum::verify_quorum(&manifest, &client, &options)
+        .await
+        .unwrap_err();
+    assert!(
+        missing.to_string().contains("inventory differs"),
+        "{missing}"
+    );
+
     for node in nodes {
         node.shutdown().await;
     }

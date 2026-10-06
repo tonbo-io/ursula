@@ -114,6 +114,36 @@ pub(crate) const REJOIN_BARRIER_CAPABILITY: &str = "ursula-rejoin-barrier";
 
 pub(crate) type RaftClient = raft_internal_proto::raft_internal_client::RaftInternalClient<Channel>;
 
+/// One fresh, outbound ReadIndex confirmation bound to its committed leader.
+/// The legacy bridge returns the leader's last log as a conservative apply
+/// bound; callers must wait for every required replica to apply that prefix.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QuorumPrefix {
+    pub raft_group_id: u32,
+    pub leader_id: u64,
+    pub leader_term: u64,
+    pub required_applied_index: u64,
+}
+
+/// Confirm a group's current quorum without issuing an application write.
+/// This is a point-in-time observation, not a maintenance reservation or a
+/// promise that another participant cannot disrupt a voter immediately after.
+pub async fn confirm_quorum_prefix(
+    placement: ursula_shard::ShardPlacement,
+    leader_id: u64,
+    address: &str,
+    timeout: Duration,
+) -> Result<QuorumPrefix, String> {
+    let (vote, index) =
+        probe_rejoin_vote_barrier(placement, leader_id, leader_id, address, timeout).await?;
+    Ok(QuorumPrefix {
+        raft_group_id: placement.raft_group_id.0,
+        leader_id,
+        leader_term: vote.leader_id().term(),
+        required_applied_index: index,
+    })
+}
+
 /// Fresh recovery evidence. Negotiate the explicit barrier RPC through the
 /// existing Vote response before calling it: an unknown RPC on a 0.6.2
 /// HTTP/gRPC mux falls through to the HTTP append route. For a 0.6.2
@@ -154,6 +184,7 @@ pub(crate) async fn probe_rejoin_vote_barrier(
     if !response.vote.is_committed() || *response.vote.leader_id().node_id() != leader_id {
         return Err("recovery peer does not report itself as committed leader".to_owned());
     }
+    let observed_vote = response.vote;
     // Capability metadata is only a routing hint, never fresh quorum or
     // catch-up evidence. Do not cache it across peer replacements.
     if explicit_barrier {
@@ -171,6 +202,11 @@ pub(crate) async fn probe_rejoin_vote_barrier(
                 if !vote.is_committed() || *vote.leader_id().node_id() != leader_id {
                     return Err(
                         "recovery peer does not report itself as committed leader".to_owned()
+                    );
+                }
+                if vote != observed_vote {
+                    return Err(
+                        "recovery peer changed its vote across the ReadIndex proof".to_owned()
                     );
                 }
                 return Ok((vote, response.index));
@@ -223,6 +259,9 @@ pub(crate) async fn probe_rejoin_vote_barrier(
         .map_err(|err| format!("recovery vote probe: {err}"))?;
     if !response.vote.is_committed() || *response.vote.leader_id().node_id() != leader_id {
         return Err("recovery peer no longer reports itself as committed leader".to_owned());
+    }
+    if response.vote != observed_vote {
+        return Err("recovery peer changed its vote across the legacy ReadIndex proof".to_owned());
     }
     Ok((
         response.vote,
