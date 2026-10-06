@@ -153,16 +153,21 @@ unevacuated machine. Physical provisioning remains outside the Raft controller.
 | 2026-10-06 | HS-103 | Two transport tests reject wrong cluster/node/version on all four RPCs and exercise three/five meta voters with mixed RF3/RF5 control policies, explicit leader transfer, one/two stopped voters, successful majority writes, a new learner receiving the purged-prefix snapshot, and a complete shutdown/reopen without membership initialization | Reproduced real TCP/tonic traffic between durable replicas in one test process; this is not yet a multi-process Ursula CLI/bootstrap E2E |
 | 2026-10-06 | HS-103 | Workspace lib/bin tests: 902 passed, 1 ignored; workspace doc tests, format, workspace Clippy, seven tracked-source DST audits, madsim Raft lib check and existing smoke corpus passed. Raft suite alone: 152 passed, 1 ignored | Fixed a test race found under workspace concurrency: leader transfer can advance applied state before snapshot build, so await a covering snapshot/compacted prefix rather than exact log-ID equality. Existing smoke corpus proves compatibility, not new meta-transport fault coverage |
 
+
+| 2026-10-06 | HS-103 | Commit `3862daa` adds checksummed, immutable durable local identity; validates cluster token, group/core count and routing hash before all meta RPC decoding; persists a canonical trusted client/cluster/admin directory and an atomic bootstrap recipe with resolved policies. Rejects meta membership/endpoint drift, incompatible snapshot installation and changes to established identity | Identity and deterministic bootstrap component implemented; production startup remains pending |
+| 2026-10-06 | HS-103 | Five control tests and five bound-storage/transport tests cover RF3/RF5 meta bootstrap with mixed data policies, invalid directory/contracts/certificates, replay without resetting drained nodes, corrupt/torn/duplicate binding frames, missing journals, adoption of only empty unbound storage, and durable three-node restart after snapshot/purge | Real TCP actors in one process; data membership certificates are synthetic in these tests. Production bootstrap must collect them through data-group quorum read barriers |
+| 2026-10-06 | HS-103 | Workspace lib/bin tests: 912 passed, 1 ignored; workspace doc tests, format, workspace Clippy, all seven tracked-source DST audits, madsim Raft lib check and existing smoke corpus passed | Local checks passed; no new scaling fault schedule or CLI E2E is claimed |
+
 ## Current execution checkpoint
 
 Current implementation story: **HS-103**, concrete multi-node meta transport
 and one-time bootstrap. HS-101 is implemented and validated in `b7352ea`;
 HS-102's deterministic policy/adoption layer is implemented in `5c7e413`.
 The separate meta RPC service and durable three/five-node transport tests are
-implemented in `a5af881`. Next persist and validate the local cluster/node
-bootstrap identity before accepting RPCs; add opt-in server configuration,
-independent meta voters, the trusted client/cluster/admin directory, and
-bootstrap wiring that seeds policy from verified uniform data memberships.
+implemented in `a5af881`; durable identity, trusted directory and atomic
+bootstrap validation are implemented in `3862daa`. Next add opt-in server
+configuration and startup/routing for independent meta voters, and collect
+bootstrap evidence through actual data-group quorum read barriers.
 These must be wired before managed mode is usable. HS-104 then restores data
 assignments from ordered projections rather than stale TOML.
 

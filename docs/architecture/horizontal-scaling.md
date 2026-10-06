@@ -409,3 +409,25 @@ Acceptance uses real-process E2E plus DST fault schedules:
 Issue #2's supported manual-membership checklist can close only after slice 2
 passes; horizontal scale-out/in needs slice 3, and its autopilot item needs
 slice 4. Foundation tests or raw membership APIs alone do not close those gates.
+
+### Implementation checkpoint: durable identity and atomic adoption
+
+Commit `3862daa` binds the meta journal to a checksummed local identity before
+RPC service construction. The binding includes cluster ID, group/core counts,
+routing hash and canonical node registration (all three origins and labels).
+A bound journal cannot be opened through the unbound constructor or under a
+different identity. Missing journal files beside a binding are errors; only an
+empty, valid journal can be bound after an interrupted first creation.
+
+The replicated bootstrap command publishes the complete directory, initial
+meta voters, resolved placement policies and per-group membership evidence in
+one transition. Replay preserves live node/placement state. The meta state
+machine compares the declared initial meta voters and endpoints with its own
+committed uniform membership before first publication. Bound transport checks
+routing contracts before payload decoding, and snapshot installation rejects
+incompatible cluster identity before touching durable storage.
+
+These components are not yet connected to production startup. The bound TCP
+restart test uses synthetic data-membership certificates; production adoption
+must obtain uniform membership through an applied quorum read barrier. The
+complete milestone and its remaining exit criteria are tracked in the epic.
