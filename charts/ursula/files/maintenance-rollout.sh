@@ -239,6 +239,10 @@ maintenance_main() {
     --statefulset-object "${WORK}/statefulset.json" --group-count "${EXPECTED_GROUPS}" \
     --core-count "${CORE_COUNT}" >"${CELL}"
   maintenance_load
+  case "$(maintenance_read operation-kind)" in
+    idle | pod-replacement) ;;
+    *) log "a host recovery owns the reservation; planned Pod rollout cannot take it over"; return 1 ;;
+  esac
   wait_for_template
   if [ "$(maintenance_read stage)" != idle ]; then
     maintenance_takeover

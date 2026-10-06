@@ -82,7 +82,7 @@ impl<'de> Deserialize<'de> for PublishHostInventory {
     }
 }
 
-fn ready(object: &Value, kind: &str) -> Result<()> {
+pub(super) fn ready(object: &Value, kind: &str) -> Result<()> {
     if !object
         .pointer("/status/conditions")
         .and_then(Value::as_array)
@@ -133,7 +133,7 @@ impl HostVoter {
         Ok(host)
     }
 
-    fn validate(&self, cell: &CellIdentity) -> Result<()> {
+    pub(super) fn validate(&self, cell: &CellIdentity) -> Result<()> {
         self.source.validate(cell)?;
         identity(&self.node_name, "Node name")?;
         identity(&self.failure_domain, "failure domain")
@@ -259,18 +259,29 @@ impl HostInventory {
         plan: &[NodeInfo],
         observation: &PrefixObservation,
     ) -> Result<()> {
-        no_regression(&self.observation, observation)?;
-        let selected = self
-            .voters
-            .iter_mut()
-            .find(|voter| voter.source.node_id == replacement.node_id)
-            .context("replacement lost the catalogued source")?;
+        let mut selected = self.voter(replacement.node_id)?.clone();
         if selected.source.node_uid != replacement.node_uid
             || selected.source.provider_instance != replacement.provider_instance
         {
             bail!("Pod completion cannot overwrite the pre-fault physical host");
         }
         selected.source = replacement.clone();
+        self.complete_host_replacement(selected, plan, observation)
+    }
+
+    pub(super) fn complete_host_replacement(
+        &mut self,
+        replacement: HostVoter,
+        plan: &[NodeInfo],
+        observation: &PrefixObservation,
+    ) -> Result<()> {
+        no_regression(&self.observation, observation)?;
+        let selected = self
+            .voters
+            .iter_mut()
+            .find(|voter| voter.source.node_id == replacement.source.node_id)
+            .context("replacement lost the catalogued source")?;
+        *selected = replacement;
         self.process_plan = plan.to_vec();
         for node in &mut self.process_plan {
             node.expected_maintenance_fence = None;
@@ -355,7 +366,7 @@ impl Reservation {
             }
         }
         let mut next = self.clone();
-        next.version = 2;
+        next.version = self.version.max(2);
         next.hosts = Some(hosts);
         next.validate()?;
         Ok(next)

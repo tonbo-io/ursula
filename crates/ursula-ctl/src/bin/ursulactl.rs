@@ -150,6 +150,11 @@ enum ReservationSourceField {
 enum ReservationField {
     State,
     Hosts,
+    OperationKind,
+    HostRecovery,
+    SourceNodeUid,
+    SourceProviderInstance,
+    SourceNodeName,
     Manifest,
     Stage,
     SourceNodeId,
@@ -188,6 +193,37 @@ struct ReservationRequestArgs {
 
 #[derive(Subcommand, Debug)]
 enum ReservationRequestAction {
+    ReserveHostRecovery {
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        executor_id: String,
+        #[arg(long)]
+        node_id: u64,
+        #[arg(long)]
+        config: PathBuf,
+    },
+    AdmitHostTermination(ReservationObservationArgs),
+    RecordHostTermination(ReservationObservationArgs),
+    CompleteHostReplacement(ReservationObservationArgs),
+    AdmitFencedPodRetirement {
+        #[arg(long)]
+        fence: PathBuf,
+        #[arg(long)]
+        pod_object: Option<PathBuf>,
+        #[arg(long)]
+        node_object: Option<PathBuf>,
+    },
+    BindHostReplacement {
+        #[arg(long)]
+        fence: PathBuf,
+        #[arg(long)]
+        pod_object: PathBuf,
+        #[arg(long)]
+        node_object: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+    },
     PublishHostInventory {
         #[arg(long)]
         pods: PathBuf,
@@ -555,11 +591,24 @@ async fn main() -> Result<()> {
             if matches!(args.field, ReservationField::Stage) {
                 let stage = match state.operation() {
                     None => "idle",
+                    Some(operation) if operation.host.is_some() => operation
+                        .host
+                        .as_ref()
+                        .context("missing host recovery")?
+                        .stage(),
                     Some(operation) if operation.replacement.is_some() => "replacement-bound",
                     Some(operation) if operation.admission.is_some() => "deletion-admitted",
                     Some(_) => "reserved",
                 };
                 println!("{stage}");
+                return Ok(());
+            }
+            if matches!(args.field, ReservationField::OperationKind) {
+                println!("{}", match state.operation() {
+                    None => "idle",
+                    Some(operation) if operation.host.is_some() => "host-recovery",
+                    Some(_) => "pod-replacement",
+                });
                 return Ok(());
             }
             let operation = state.operation().context("no active source reservation")?;
@@ -573,6 +622,23 @@ async fn main() -> Result<()> {
                     println!("{}", serde_json::json!({"nodes": nodes}))
                 }
                 ReservationField::SourceNodeId => println!("{}", operation.source.node_id),
+                ReservationField::SourceNodeUid => println!("{}", operation.source.node_uid),
+                ReservationField::SourceProviderInstance => {
+                    println!("{}", operation.source.provider_instance)
+                }
+                ReservationField::SourceNodeName => println!(
+                    "{}",
+                    operation
+                        .host
+                        .as_ref()
+                        .context("not a host recovery")?
+                        .source_host
+                        .node_name
+                ),
+                ReservationField::HostRecovery => println!(
+                    "{}",
+                    serde_json::to_string(operation.host.as_ref().context("not a host recovery")?)?
+                ),
                 ReservationField::SourcePodUid => println!("{}", operation.source.pod_uid),
                 ReservationField::ReplacementPodUid => println!(
                     "{}",
@@ -584,7 +650,10 @@ async fn main() -> Result<()> {
                 ),
                 ReservationField::OperationId => println!("{}", operation.fence.reservation_id()),
                 ReservationField::Fence => println!("{}", serde_json::to_string(&operation.fence)?),
-                ReservationField::State | ReservationField::Stage | ReservationField::Hosts => {
+                ReservationField::State
+                | ReservationField::Stage
+                | ReservationField::Hosts
+                | ReservationField::OperationKind => {
                     bail!("unexpected reservation projection")
                 }
             }
@@ -767,11 +836,71 @@ fn read_reservation_json<T: serde::de::DeserializeOwned>(path: &std::path::Path)
 }
 
 async fn run_reservation_request(args: ReservationRequestArgs) -> Result<()> {
+    use ursula_ctl::reservation::HostRequest;
     use ursula_ctl::reservation::OwnershipRequest;
     use ursula_ctl::reservation::ProgressRequest;
     use ursula_ctl::reservation::ReservationRequest;
     let now_ms = wall_clock_unix_ms();
     let request = match args.action {
+        ReservationRequestAction::ReserveHostRecovery {
+            operation_id,
+            executor_id,
+            node_id,
+            config,
+        } => ReservationRequest::Host(HostRequest::ReserveHostRecovery {
+            operation_id,
+            executor_id,
+            node_id,
+            process_plan: load_nodes(&config).await?,
+            now_ms,
+        }),
+        ReservationRequestAction::AdmitHostTermination(args) => {
+            ReservationRequest::Host(HostRequest::AdmitHostTermination {
+                fence: read_reservation_json(&args.fence)?,
+                now_ms,
+                observation: read_reservation_json(&args.observation)?,
+            })
+        }
+        ReservationRequestAction::RecordHostTermination(args) => {
+            ReservationRequest::Host(HostRequest::RecordHostTermination {
+                fence: read_reservation_json(&args.fence)?,
+                now_ms,
+                observation: read_reservation_json(&args.observation)?,
+            })
+        }
+        ReservationRequestAction::CompleteHostReplacement(args) => {
+            ReservationRequest::Host(HostRequest::CompleteHostReplacement {
+                fence: read_reservation_json(&args.fence)?,
+                now_ms,
+                observation: read_reservation_json(&args.observation)?,
+            })
+        }
+        ReservationRequestAction::AdmitFencedPodRetirement {
+            fence,
+            pod_object,
+            node_object,
+        } => ReservationRequest::Host(HostRequest::AdmitFencedPodRetirement {
+            fence: read_reservation_json(&fence)?,
+            pod: pod_object
+                .as_deref()
+                .map(read_reservation_json)
+                .transpose()?,
+            node: node_object
+                .as_deref()
+                .map(read_reservation_json)
+                .transpose()?,
+        }),
+        ReservationRequestAction::BindHostReplacement {
+            fence,
+            pod_object,
+            node_object,
+            config,
+        } => ReservationRequest::Host(HostRequest::BindHostReplacement {
+            fence: read_reservation_json(&fence)?,
+            pod: read_reservation_json(&pod_object)?,
+            node: read_reservation_json(&node_object)?,
+            process_plan: load_nodes(&config).await?,
+        }),
         ReservationRequestAction::PublishHostInventory {
             pods,
             nodes,

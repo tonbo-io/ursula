@@ -11,16 +11,53 @@ use super::Reservation;
 use super::SourceIdentity;
 use crate::NodeInfo;
 
-fn live_metadata<'a>(object: &'a Value, kind: &str) -> Result<&'a Value> {
+fn object_metadata<'a>(object: &'a Value, kind: &str, allow_deleting: bool) -> Result<&'a Value> {
     if object.get("kind").and_then(Value::as_str) != Some(kind) {
         bail!("expected complete {kind} object");
     }
     let metadata = object.get("metadata").context("missing object metadata")?;
-    if metadata
-        .get("deletionTimestamp")
-        .is_some_and(|value| !value.is_null())
+    if !allow_deleting
+        && metadata
+            .get("deletionTimestamp")
+            .is_some_and(|value| !value.is_null())
     {
         bail!("{kind} is already deleting");
+    }
+    Ok(metadata)
+}
+
+fn live_metadata<'a>(object: &'a Value, kind: &str) -> Result<&'a Value> {
+    object_metadata(object, kind, false)
+}
+
+pub(super) fn selected_pod_metadata<'a>(
+    cell: &CellIdentity,
+    node_id: u64,
+    pod: &'a Value,
+    allow_deleting: bool,
+) -> Result<&'a Value> {
+    let metadata = object_metadata(pod, "Pod", allow_deleting)?;
+    let ordinal = node_id.checked_sub(1).context("invalid source voter")?;
+    let expected_name = format!("{}-{ordinal}", cell.statefulset);
+    let owned = metadata
+        .get("ownerReferences")
+        .and_then(Value::as_array)
+        .is_some_and(|owners| {
+            owners.iter().any(|owner| {
+                owner.get("uid").and_then(Value::as_str) == Some(cell.statefulset_uid.as_str())
+                    && owner.get("kind").and_then(Value::as_str) == Some("StatefulSet")
+                    && owner.get("controller").and_then(Value::as_bool) == Some(true)
+            })
+        });
+    if !owned
+        || metadata.get("namespace").and_then(Value::as_str) != Some(cell.namespace.as_str())
+        || metadata.get("name").and_then(Value::as_str) != Some(expected_name.as_str())
+        || pod
+            .pointer("/spec/nodeName")
+            .and_then(Value::as_str)
+            .is_none()
+    {
+        bail!("Pod identity does not belong to the selected voter and cell");
     }
     Ok(metadata)
 }
@@ -76,30 +113,25 @@ impl SourceIdentity {
         node: &Value,
         process_plan: &[NodeInfo],
     ) -> Result<Self> {
+        Self::capture_metadata(cell, node_id, pod, node, process_plan, false)
+    }
+
+    /// Only the host-recovery path may inspect already-deleting identities,
+    /// after recording irreversible termination of their exact physical host.
+    pub(super) fn capture_metadata(
+        cell: &CellIdentity,
+        node_id: u64,
+        pod: &Value,
+        node: &Value,
+        process_plan: &[NodeInfo],
+        allow_deleting: bool,
+    ) -> Result<Self> {
         Reservation::initial(cell.clone())?;
-        let metadata = live_metadata(pod, "Pod")?;
-        let node_metadata = live_metadata(node, "Node")?;
+        let metadata = selected_pod_metadata(cell, node_id, pod, allow_deleting)?;
+        let node_metadata = object_metadata(node, "Node", allow_deleting)?;
         let ordinal = node_id.checked_sub(1).context("invalid source voter")?;
         let expected_name = format!("{}-{ordinal}", cell.statefulset);
-        let owned = metadata
-            .get("ownerReferences")
-            .and_then(Value::as_array)
-            .is_some_and(|owners| {
-                owners.iter().any(|owner| {
-                    owner.get("uid").and_then(Value::as_str) == Some(cell.statefulset_uid.as_str())
-                        && owner.get("kind").and_then(Value::as_str) == Some("StatefulSet")
-                        && owner.get("controller").and_then(Value::as_bool) == Some(true)
-                })
-            });
-        if !owned
-            || metadata.get("namespace").and_then(Value::as_str) != Some(cell.namespace.as_str())
-            || metadata.get("name").and_then(Value::as_str) != Some(expected_name.as_str())
-            || pod
-                .pointer("/spec/nodeName")
-                .and_then(Value::as_str)
-                .is_none()
-            || pod.pointer("/spec/nodeName") != node_metadata.get("name")
-        {
+        if pod.pointer("/spec/nodeName") != node_metadata.get("name") {
             bail!("Pod/Node identity does not belong to the selected voter and cell");
         }
         let target = process_plan

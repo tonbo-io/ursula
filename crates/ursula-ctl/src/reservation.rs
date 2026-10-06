@@ -22,6 +22,7 @@ use crate::quorum::QuorumVerification;
 
 mod hosts;
 mod inventory;
+mod recovery;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -29,6 +30,10 @@ mod tests;
 pub use hosts::HostInventory;
 pub use hosts::HostVoter;
 pub use hosts::PublishHostInventory;
+pub use recovery::HostRecovery;
+pub use recovery::HostRequest;
+pub use recovery::HostTerminationObservation;
+pub use recovery::SurvivingPrefixObservation;
 pub use store::CasProposal;
 pub use store::ConfigMapSnapshot;
 
@@ -64,6 +69,8 @@ pub struct Operation {
     pub acquired_ms: u64,
     pub admission: Option<PrefixObservation>,
     pub replacement: Option<SourceIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostRecovery>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +101,8 @@ pub struct Completion {
     pub source: SourceIdentity,
     pub replacement: SourceIdentity,
     pub observation: PrefixObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostRecovery>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -140,6 +149,7 @@ pub enum ReservationRequest {
     Ownership(OwnershipRequest),
     Progress(ProgressRequest),
     Inventory(PublishHostInventory),
+    Host(HostRequest),
 }
 
 // Serde's buffered internally tagged/untagged deserializers cannot parse
@@ -224,6 +234,16 @@ impl<'de> Deserialize<'de> for ReservationRequest {
             Some("publish_host_inventory") => serde_json::from_value(value)
                 .map(Self::Inventory)
                 .map_err(parse_error),
+            Some(
+                "reserve_host_recovery"
+                | "admit_host_termination"
+                | "record_host_termination"
+                | "admit_fenced_pod_retirement"
+                | "bind_host_replacement"
+                | "complete_host_replacement",
+            ) => serde_json::from_value(value)
+                .map(Self::Host)
+                .map_err(parse_error),
             _ => Err(<D::Error as serde::de::Error>::custom(
                 "unsupported reservation action",
             )),
@@ -303,14 +323,14 @@ impl Reservation {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !matches!(self.version, 1 | 2)
+        if !matches!(self.version, 1..=3)
             || self.cell.group_count == 0
             || self.cell.core_count == 0
             || self.cell.voter_ids != BTreeSet::from([1, 2, 3])
         {
             bail!("unsupported reservation schema or three-voter inventory");
         }
-        if (self.version == 2) != self.hosts.is_some() {
+        if (self.version >= 2) != self.hosts.is_some() {
             bail!("host inventory requires an explicit schema-2 CAS migration");
         }
         if let Some(hosts) = &self.hosts {
@@ -365,6 +385,12 @@ impl Reservation {
             {
                 bail!("completion process or generation does not match its replacement");
             }
+            if let Some(host) = &receipt.host {
+                if self.version != 3 {
+                    bail!("host completion requires schema 3");
+                }
+                host.validate_completion(&self.cell, receipt)?;
+            }
         }
         if let Some(operation) = &self.operation {
             if operation.fence.generation() != self.generation
@@ -406,7 +432,18 @@ impl Reservation {
                     .context("missing original catalogued voter")?;
                 original.expected_process_incarnation =
                     Some(operation.source.process_incarnation.clone());
-                hosts.validate_source(&operation.source, &original_plan, operation.acquired_ms)?;
+                if let Some(host) = &operation.host {
+                    if self.version != 3 {
+                        bail!("host recovery requires schema 3");
+                    }
+                    host.validate_operation(self, operation)?;
+                } else {
+                    hosts.validate_source(
+                        &operation.source,
+                        &original_plan,
+                        operation.acquired_ms,
+                    )?;
+                }
             }
             if operation.replacement.as_ref().is_some_and(|replacement| {
                 replacement.node_id != operation.source.node_id
@@ -417,7 +454,13 @@ impl Reservation {
             {
                 bail!("invalid physical replacement or acquisition timestamp");
             }
-            if operation.replacement.is_some() && operation.admission.is_none() {
+            if operation.host.is_some() && operation.admission.is_some() {
+                bail!("host recovery cannot have planned Pod deletion admission");
+            }
+            if operation.host.is_none()
+                && operation.replacement.is_some()
+                && operation.admission.is_none()
+            {
                 bail!("replacement lacks persistent deletion admission");
             }
             if let Some(admission) = &operation.admission {
@@ -501,6 +544,7 @@ impl Reservation {
                     acquired_ms: now_ms,
                     admission: None,
                     replacement: None,
+                    host: None,
                 });
             }
             OwnershipRequest::Takeover {
@@ -611,10 +655,25 @@ fn validate_processes(plan: &[NodeInfo], observation: &PrefixObservation) -> Res
 }
 
 fn fresh(observation: &PrefixObservation, now_ms: u64, acquired_ms: u64) -> Result<()> {
-    if observation.started_ms < acquired_ms
-        || observation.completed_ms > now_ms
+    fresh_timestamps(
+        observation.started_ms,
+        observation.completed_ms,
+        now_ms,
+        acquired_ms,
+    )
+}
+
+fn fresh_timestamps(
+    started_ms: u64,
+    completed_ms: u64,
+    now_ms: u64,
+    acquired_ms: u64,
+) -> Result<()> {
+    if started_ms < acquired_ms
+        || completed_ms < started_ms
+        || completed_ms > now_ms
         || now_ms
-            .checked_sub(observation.started_ms)
+            .checked_sub(started_ms)
             .is_none_or(|elapsed| elapsed > 60_000)
     {
         bail!("prefix observation is stale, predates acquisition or is in the future");
@@ -643,6 +702,9 @@ impl Reservation {
         self.validate()?;
         let mut next = self.clone();
         let operation = next.operation.as_mut().context("no reserved operation")?;
+        if operation.host.is_some() {
+            bail!("planned Pod progress cannot mutate a host recovery");
+        }
         let supplied_fence = match &request {
             ProgressRequest::AdmitPodDeletion { fence, .. }
             | ProgressRequest::BindPodReplacement { fence, .. }
@@ -706,23 +768,6 @@ impl Reservation {
                         bail!("planned Pod replacement cannot change a catalogued physical host");
                     }
                 }
-                if process_plan.len() != operation.process_plan.len() {
-                    bail!("replacement changed inventory");
-                }
-                for old in &operation.process_plan {
-                    let new = process_plan
-                        .iter()
-                        .find(|node| node.id == old.id)
-                        .context("replacement lost a survivor")?;
-                    let mut permitted = old.clone();
-                    if old.id == replacement.node_id {
-                        permitted.expected_process_incarnation =
-                            Some(replacement.process_incarnation.clone());
-                    }
-                    if serde_json::to_value(&permitted)? != serde_json::to_value(new)? {
-                        bail!("only the selected replacement process may be rebound");
-                    }
-                }
                 for (value, label) in [
                     (&replacement.pod_uid, "replacement Pod UID"),
                     (&replacement.node_uid, "replacement Node UID"),
@@ -733,8 +778,7 @@ impl Reservation {
                 ] {
                     identity(value, label)?;
                 }
-                operation.process_plan = process_plan;
-                operation.replacement = Some(replacement);
+                bind_replacement(operation, replacement, process_plan)?;
             }
             ProgressRequest::CompletePodReplacement {
                 now_ms,
@@ -765,6 +809,7 @@ impl Reservation {
                     source: operation.source.clone(),
                     replacement: replacement.clone(),
                     observation,
+                    host: None,
                 });
                 next.operation = None;
             }
@@ -772,4 +817,30 @@ impl Reservation {
         next.validate()?;
         Ok(next)
     }
+}
+
+fn bind_replacement(
+    operation: &mut Operation,
+    replacement: SourceIdentity,
+    process_plan: Vec<NodeInfo>,
+) -> Result<()> {
+    if operation.replacement.is_some() || process_plan.len() != operation.process_plan.len() {
+        bail!("replacement is already bound or changed inventory");
+    }
+    for old in &operation.process_plan {
+        let new = process_plan
+            .iter()
+            .find(|node| node.id == old.id)
+            .context("replacement lost a survivor")?;
+        let mut permitted = old.clone();
+        if old.id == replacement.node_id {
+            permitted.expected_process_incarnation = Some(replacement.process_incarnation.clone());
+        }
+        if serde_json::to_value(&permitted)? != serde_json::to_value(new)? {
+            bail!("only the selected replacement process may be rebound");
+        }
+    }
+    operation.process_plan = process_plan;
+    operation.replacement = Some(replacement);
+    Ok(())
 }

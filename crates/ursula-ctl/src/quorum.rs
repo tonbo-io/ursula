@@ -85,7 +85,8 @@ fn certified_executor(snapshot: &ClusterSnapshot, retired: bool) -> Option<Maint
 
 /// Evidence from the two observed survivors, not restored three-voter
 /// redundancy or evidence that the excluded physical host is fenced.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SurvivingQuorumVerification {
     pub excluded_voter_id: u64,
     pub configured_voter_ids: BTreeSet<u64>,
