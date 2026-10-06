@@ -120,8 +120,10 @@ def shim(role):
                     result = {'kind': 'Namespace', 'metadata': {'name': 'test', 'uid': 'ns-uid'}}
                 elif kind == 'node':
                     node = int(name.split('-')[-1])
-                    result = {'kind': 'Node', 'metadata': {'name': name, 'uid': f'node-{node}'},
-                              'spec': {'providerID': f'instance-{node}'}}
+                    result = {'kind': 'Node', 'metadata': {'name': name, 'uid': f'node-{node}',
+                              'labels': {'topology.kubernetes.io/zone': f'zone-{node}'}},
+                              'spec': {'providerID': f'instance-{node}'},
+                              'status': {'conditions': [{'type': 'Ready', 'status': 'True'}]}}
                 elif kind == 'statefulset':
                     result = {'kind': 'StatefulSet', 'metadata': {'name': 'voters', 'namespace': 'test',
                               'uid': 'sts-uid', 'generation': 1}, 'spec': {'replicas': 3},
@@ -176,8 +178,10 @@ def shim(role):
                         plan[node - 1]['expected_process_incarnation'] = current['boot']
                         request = {'action': 'bind_pod_replacement', 'fence': operation['fence'],
                                    'pod': pod(db, node), 'node': {'kind': 'Node', 'metadata': {
-                                       'name': f'host-{node}', 'uid': f'node-{node}'},
-                                       'spec': {'providerID': f'instance-{node}'}},
+                                       'name': f'host-{node}', 'uid': f'node-{node}',
+                                       'labels': {'topology.kubernetes.io/zone': f'zone-{node}'}},
+                                       'spec': {'providerID': f'instance-{node}'},
+                                       'status': {'conditions': [{'type': 'Ready', 'status': 'True'}]}},
                                    'process_plan': plan}
                         cell_file = database.with_suffix('.cell.json')
                         snapshot_file = database.with_suffix('.snapshot.json')
@@ -188,7 +192,9 @@ def shim(role):
                         bound = subprocess.run([os.environ['URSULA_CTL_BINARY'], 'reservation-propose',
                                                 '--cell', str(cell_file), '--snapshot', str(snapshot_file),
                                                 '--request', str(request_file)], capture_output=True,
-                                               text=True, check=True)
+                                               text=True, check=False)
+                        if bound.returncode:
+                            raise RuntimeError(bound.stderr + bound.stdout)
                         offered = json.loads(bound.stdout)
                         offered['metadata']['resourceVersion'] = str(int(db['store']['metadata']['resourceVersion']) + 1)
                         db['store'] = offered
@@ -360,6 +366,45 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(len(self.deletions()), 1)
         self.assertTrue(self.deletions()[0]['startup_bound'])
         self.assertEqual(final['completion']['replacement']['process_incarnation'], self.db['nodes']['3']['boot'])
+
+    def test_native_catalog_accepts_hook_tunnels_and_same_executor_startup_binding(self):
+        plan = [{'id': n, 'host': f'10.0.0.{n}',
+                 'admin_url': f'http://10.0.0.{n}:4438/',
+                 'http_url': f'http://10.0.0.{n}:4437/',
+                 'expected_process_incarnation': self.db['nodes'][str(n)]['boot'],
+                 'expected_maintenance_fence': None} for n in (1, 2, 3)]
+        pods = [pod(self.db, n) for n in (1, 2, 3)]
+        for p in pods:
+            p['status'] = {'conditions': [{'type': 'Ready', 'status': 'True'}]}
+        nodes = [{'kind': 'Node', 'metadata': {'name': f'host-{n}', 'uid': f'node-{n}',
+                 'labels': {'topology.kubernetes.io/zone': f'zone-{n}'}},
+                 'spec': {'providerID': f'instance-{n}'},
+                 'status': {'conditions': [{'type': 'Ready', 'status': 'True'}]}}
+                 for n in (1, 2, 3)]
+        request = {'action': 'publish_host_inventory', 'pods': pods, 'nodes': nodes,
+                   'process_plan': plan, 'observation': proof(self.db, plan),
+                   'now_ms': time.time_ns() // 1_000_000}
+        request_path = self.directory / 'request.json'
+        snapshot_path = self.directory / 'snapshot.json'
+        request_path.write_text(json.dumps(request))
+        snapshot_path.write_text(json.dumps(self.db['store']))
+        result = subprocess.run([self.env['URSULA_CTL_BINARY'], 'reservation-propose',
+                                 '--cell', str(self.directory / 'cell.json'),
+                                 '--snapshot', str(snapshot_path), '--request', str(request_path)],
+                                capture_output=True, text=True, check=True)
+        self.db['store'] = json.loads(result.stdout)
+        self.db['store']['metadata']['resourceVersion'] = '2'
+        self.db['mode'] = 'startup-bind'
+        self.save()
+        run = self.run_shell()
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        final = self.refresh()
+        self.assertEqual(final['version'], 2)
+        self.assertEqual(final['generation'], 1)
+        self.assertIsNone(final['operation'])
+        self.assertEqual(len(self.deletions()), 1)
+        self.assertTrue(self.deletions()[0]['startup_bound'])
+        self.assertEqual(final['hosts']['voters'][2]['source']['pod_uid'], self.db['nodes']['3']['uid'])
 
     def test_legacy_consumer_cannot_bypass_an_existing_shared_reservation(self):
         run = self.run_shell('main')

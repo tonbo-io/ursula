@@ -15,6 +15,46 @@ use crate::reservation::Reservation;
 use crate::reservation::ReservationRequest;
 use crate::reservation::SurvivingPrefixObservation;
 
+#[test]
+fn host_acquisition_changes_only_locators_and_keeps_termination_unadmitted() {
+    let saved = Reservation::initial(cell())
+        .unwrap()
+        .publish_hosts(host_publication())
+        .unwrap();
+    let mut plan = saved.hosts().unwrap().process_plan.clone();
+    for node in &mut plan {
+        node.admin_url = format!("http://127.0.0.1:{}", 50000 + node.id)
+            .parse()
+            .unwrap();
+        node.host = "127.0.0.1".to_owned();
+        node.metrics_url = Some(node.admin_url.clone());
+    }
+    let action = HostRequest::ReserveHostRecovery {
+        operation_id: format!("{:032x}", 1),
+        executor_id: format!("{:032x}", 10),
+        node_id: 1,
+        process_plan: plan.clone(),
+        now_ms: 1600,
+    };
+    let mut changed_source = action.clone();
+    if let HostRequest::ReserveHostRecovery { process_plan, .. } = &mut changed_source {
+        process_plan[0].expected_process_incarnation = Some(ProcessIncarnation::from_bits(99));
+    }
+    assert!(saved.recover_host(changed_source).is_err());
+    let state = saved.recover_host(action).unwrap();
+    state.validate().unwrap();
+    let operation = state.operation().unwrap();
+    assert_eq!(
+        operation.source,
+        saved.hosts().unwrap().voter(1).unwrap().source
+    );
+    assert_eq!(operation.process_plan[0].admin_url, plan[0].admin_url);
+    let recovery = operation.host.as_ref().unwrap();
+    assert!(recovery.admission.is_none());
+    assert!(recovery.termination.is_none());
+    assert!(recovery.pod_retirement_intents.is_empty());
+}
+
 fn reserved() -> Reservation {
     let saved = Reservation::initial(cell())
         .unwrap()

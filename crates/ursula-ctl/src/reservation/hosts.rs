@@ -244,9 +244,10 @@ impl HostInventory {
                 .iter()
                 .find(|node| node.id == saved.id)
                 .context("maintenance lost a catalogued voter")?;
-            let mut candidate = candidate.clone();
-            candidate.expected_maintenance_fence = None;
-            if serde_json::to_value(saved)? != serde_json::to_value(candidate)? {
+            // A sampler may use direct Pod addresses while a maintenance executor
+            // uses UID-bound tunnels. Physical ownership and the fresh boot are
+            // identity; connection locators become fixed in the acquired plan.
+            if saved.expected_process_incarnation != candidate.expected_process_incarnation {
                 bail!("maintenance process plan differs from the healthy inventory");
             }
         }
