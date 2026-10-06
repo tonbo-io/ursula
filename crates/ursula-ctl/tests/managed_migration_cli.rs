@@ -1,0 +1,522 @@
+//! Real Ursula and ursulactl processes, independent meta/data Raft and disk WAL.
+//! Run after `cargo build -p ursula --bin ursula`; workspace integration builds
+//! already provide that binary. Inline/local snapshots do not establish S3.
+
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Child;
+use std::process::Command;
+use std::process::Stdio;
+use std::time::Duration;
+use std::time::Instant;
+
+use ursula_config::ControlConfig;
+use ursula_config::HumanDuration;
+use ursula_config::UrsulaConfig;
+use ursula_control::ControlProjection;
+use ursula_control::GroupPolicyOverride;
+use ursula_control::MigrationPhase;
+use ursula_control::NodeRegistration;
+use ursula_control::PlacementPolicy;
+use ursula_control::ReplicationFactor;
+use ursula_shard::BucketStreamId;
+use ursula_shard::RaftGroupId;
+use ursula_shard::StaticShardMap;
+
+struct Process {
+    child: Child,
+    log: PathBuf,
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+struct Cluster {
+    root: tempfile::TempDir,
+    binary: PathBuf,
+    nodes: BTreeMap<u64, NodeRegistration>,
+    configs: BTreeMap<u64, UrsulaConfig>,
+    processes: BTreeMap<u64, Process>,
+    client: reqwest::Client,
+    manifest: PathBuf,
+}
+
+fn port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+impl Cluster {
+    async fn new() -> Self {
+        let cli = Path::new(env!("CARGO_BIN_EXE_ursulactl"));
+        let binary = std::env::var_os("URSULA_BINARY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cli.parent().unwrap().join("ursula"));
+        assert!(
+            binary.is_file(),
+            "build the Ursula binary first: cargo build -p ursula --bin ursula"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let nodes: BTreeMap<_, _> = (1..=6)
+            .map(|id| {
+                (id, NodeRegistration {
+                    node_id: id,
+                    client_url: format!("http://127.0.0.1:{}", port()),
+                    cluster_url: format!("http://127.0.0.1:{}", port()),
+                    admin_url: format!("http://127.0.0.1:{}", port()),
+                    labels: BTreeMap::from([("zone".to_owned(), ((id - 1) % 3).to_string())]),
+                })
+            })
+            .collect();
+        let configs = nodes
+            .iter()
+            .map(|(id, node)| {
+                let mut config = UrsulaConfig::default();
+                config.runtime.core_count = 1;
+                config.server.listen = node.client_url.trim_start_matches("http://").to_owned();
+                config.server.cluster_listen =
+                    Some(node.cluster_url.trim_start_matches("http://").to_owned());
+                config.server.admin_listen =
+                    node.admin_url.trim_start_matches("http://").to_owned();
+                config.raft.node_id = *id;
+                config.raft.group_count = 2;
+                config.raft.init_membership = true;
+                config.raft.init_membership_per_group = true;
+                config.raft.wal.backend = ursula_config::WalBackend::Disk;
+                config.raft.wal.path = Some(root.path().join(format!("data-{id}")));
+                config.raft.peers = nodes
+                    .values()
+                    .map(|node| ursula_config::RaftPeerConfig {
+                        node_id: node.node_id,
+                        url: node.cluster_url.clone(),
+                    })
+                    .collect();
+                config.raft.groups = vec![
+                    ursula_config::RaftGroupConfig {
+                        raft_group_id: 0,
+                        voters: vec![1, 2, 3],
+                    },
+                    ursula_config::RaftGroupConfig {
+                        raft_group_id: 1,
+                        voters: vec![1, 2, 3, 4, 5],
+                    },
+                ];
+                config.validate().unwrap();
+                (*id, config)
+            })
+            .collect();
+        let manifest = root.path().join("cluster.json");
+        std::fs::write(
+            &manifest,
+            serde_json::to_vec(
+                &serde_json::json!({"nodes": nodes.values().map(|node| serde_json::json!({
+            "id": node.node_id, "admin_url": node.admin_url, "host": "127.0.0.1",
+        })).collect::<Vec<_>>()}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let mut cluster = Self {
+            root,
+            binary,
+            nodes,
+            configs,
+            processes: BTreeMap::new(),
+            client,
+            manifest,
+        };
+        for id in 1..=6 {
+            cluster.start(id, "static");
+        }
+        cluster.ready().await;
+        cluster.processes.clear();
+        for (id, config) in &mut cluster.configs {
+            config.raft.init_membership = false;
+            config.raft.init_membership_per_group = false;
+            config.control = Some(ControlConfig {
+                cluster_id: "managed-migration-cli".to_owned().try_into().unwrap(),
+                meta_journal_path: cluster.root.path().join(format!("meta-{id}/meta.wal")),
+                bootstrap_node_id: 1,
+                initialize_meta_membership: true,
+                initial_meta_voters: vec![1, 2, 3],
+                node: cluster.nodes[id].clone(),
+                bootstrap_nodes: cluster.nodes.values().cloned().collect(),
+                placement: PlacementPolicy {
+                    group_overrides: vec![GroupPolicyOverride {
+                        raft_group_id: RaftGroupId(1),
+                        replication_factor: ReplicationFactor::Five,
+                    }],
+                    ..Default::default()
+                },
+                meta_snapshot_logs_since_last: 1,
+                bootstrap_timeout: HumanDuration::sec(60),
+                refresh_interval: HumanDuration::milli(100),
+            });
+            config.validate().unwrap();
+        }
+        for id in 1..=6 {
+            cluster.start(id, "managed");
+        }
+        cluster.ready().await;
+        cluster
+    }
+
+    fn start(&mut self, id: u64, phase: &str) {
+        let path = self.root.path().join(format!("node-{id}.toml"));
+        std::fs::write(&path, toml::to_string_pretty(&self.configs[&id]).unwrap()).unwrap();
+        let log = self.root.path().join(format!("{phase}-{id}.log"));
+        let file = std::fs::File::create(&log).unwrap();
+        let child = Command::new(&self.binary)
+            .arg("--config")
+            .arg(path)
+            .env("RUST_LOG", "ursula=info,ursula_raft=info")
+            .stdout(Stdio::from(file.try_clone().unwrap()))
+            .stderr(Stdio::from(file))
+            .spawn()
+            .unwrap();
+        assert!(self.processes.insert(id, Process { child, log }).is_none());
+    }
+
+    fn alive(&mut self) {
+        for process in self.processes.values_mut() {
+            if let Some(status) = process.child.try_wait().unwrap() {
+                panic!(
+                    "server exited {status}: {}",
+                    std::fs::read_to_string(&process.log).unwrap()
+                );
+            }
+        }
+    }
+
+    async fn ready(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut diagnostics = Vec::new();
+        loop {
+            self.alive();
+            diagnostics.clear();
+            for id in self.processes.keys() {
+                // Static mode has no serving-role contract for a node owning
+                // zero configured replicas. Managed mode must certify it ready
+                // from explicit assignment inventory, including after evacuation.
+                if self.configs[id].control.is_none()
+                    && !self.configs[id]
+                        .raft
+                        .groups
+                        .iter()
+                        .any(|group| group.voters.contains(id))
+                {
+                    continue;
+                }
+                match self
+                    .client
+                    .get(format!("{}/__ursula/ready", self.nodes[id].client_url))
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.status().is_success() => {}
+                    Ok(response) => {
+                        diagnostics.push(format!("node {id}: {}", response.text().await.unwrap()))
+                    }
+                    Err(error) => diagnostics.push(format!("node {id}: {error}")),
+                }
+            }
+            if diagnostics.is_empty() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "readiness timeout: {diagnostics:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn cli_output(&self, arguments: &[&str]) -> std::process::Output {
+        tokio::time::timeout(
+            Duration::from_secs(50),
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_ursulactl"))
+                .args(["operation"])
+                .args(arguments)
+                .arg("--config")
+                .arg(&self.manifest)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("CLI deadline")
+        .unwrap()
+    }
+
+    async fn cli(&self, arguments: &[&str]) -> serde_json::Value {
+        let output = self.cli_output(arguments).await;
+        assert!(
+            output.status.success(),
+            "CLI {arguments:?}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    async fn view(&self) -> ControlProjection {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let output = self.cli_output(&["status"]).await;
+                if output.status.success() {
+                    return serde_json::from_slice(&output.stdout).unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("no fresh control projection through CLI")
+    }
+
+    async fn submit(&self, key: &str, epoch: u64, voters: &str, rf: Option<&str>) -> u64 {
+        let epoch = epoch.to_string();
+        let mut arguments = vec![
+            "submit",
+            "--operation-key",
+            key,
+            "--group",
+            "0",
+            "--expected-epoch",
+            &epoch,
+            "--voters",
+            voters,
+        ];
+        if let Some(rf) = rf {
+            arguments.extend(["--rf", rf]);
+        }
+        self.cli(&arguments).await["migration_id"].as_u64().unwrap()
+    }
+
+    async fn wait(&self, id: u64) {
+        let id = id.to_string();
+        let operation = self
+            .cli(&["resume", "--operation", &id, "--timeout-secs", "40"])
+            .await;
+        assert_eq!(operation["phase"], "Succeeded");
+    }
+
+    async fn write(&mut self, name: &str, body: &str) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            self.alive();
+            for id in self.processes.keys() {
+                if self
+                    .client
+                    .put(format!("{}/benchcmp/{name}", self.nodes[id].client_url))
+                    .body(body.to_owned())
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status().is_success())
+                {
+                    return;
+                }
+            }
+            assert!(Instant::now() < deadline, "HTTP write timeout");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn payloads(&mut self, name: &str, body: &str) {
+        let following = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        for id in self.processes.keys().copied().collect::<Vec<_>>() {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                self.alive();
+                if let Ok(response) = following
+                    .get(format!(
+                        "{}/benchcmp/{name}?offset=0&max_bytes=4096",
+                        self.nodes[&id].client_url
+                    ))
+                    .send()
+                    .await
+                    && response.status().is_success()
+                    && response.bytes().await.unwrap().as_ref() == body.as_bytes()
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "node {id} could not read acknowledged payload {name}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn binaries_resume_migration_after_controller_and_destination_restart_and_rf_changes() {
+    let mut cluster = Cluster::new().await;
+    let map = StaticShardMap::new(1, 2).unwrap();
+    let names = [0, 1].map(|group| {
+        (0..100)
+            .map(|n| format!("binary-group-{group}-{n}"))
+            .find(|name| {
+                map.locate(&BucketStreamId::new("benchcmp", name.clone()))
+                    .raft_group_id
+                    == RaftGroupId(group)
+            })
+            .unwrap()
+    });
+    cluster
+        .write(&names[0], "acknowledged-before-migration")
+        .await;
+    cluster
+        .write(&names[1], "neighbor-group-stays-readable")
+        .await;
+    cluster.processes.remove(&5);
+    let id = cluster.submit("binary-replacement", 0, "1,3,5", None).await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let owner = loop {
+        let view = cluster.view().await;
+        let migration = &view.state.migrations[&id];
+        assert!(migration.is_running());
+        if let Some(assignment) = &migration.managed.as_ref().unwrap().executor {
+            break assignment.token.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "executor did not claim accepted intent"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    cluster.processes.remove(&owner.executor.node_id);
+    // Keep both processes down until a new real meta leader takes ownership.
+    // RF3 retains two source voters; the RF5 neighbor retains three.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let view = cluster.view().await;
+        let current = view.state.migrations[&id]
+            .managed
+            .as_ref()
+            .unwrap()
+            .executor
+            .as_ref()
+            .unwrap();
+        if current.token.generation > owner.generation {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "executor generation did not advance after controller loss"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let during_names = [0, 1].map(|group| {
+        (0..100)
+            .map(|n| format!("fault-group-{group}-{n}"))
+            .find(|name| {
+                map.locate(&BucketStreamId::new("benchcmp", name.clone()))
+                    .raft_group_id
+                    == RaftGroupId(group)
+            })
+            .unwrap()
+    });
+    for name in &during_names {
+        cluster
+            .write(name, "acknowledged-during-controller-loss")
+            .await;
+    }
+    cluster.start(owner.executor.node_id, "controller-restart");
+    cluster.start(5, "destination-restart");
+    cluster.wait(id).await;
+    assert_eq!(
+        cluster.submit("binary-replacement", 0, "1,3,5", None).await,
+        id
+    );
+    let view = cluster.view().await;
+    assert_eq!(view.state.migrations[&id].phase, MigrationPhase::Succeeded);
+    let managed = view.state.migrations[&id].managed.as_ref().unwrap();
+    assert!(managed.executor.as_ref().unwrap().token.generation > owner.generation);
+    assert_ne!(
+        managed.receivers[&owner.executor.node_id],
+        owner.executor.incarnation
+    );
+    assert_eq!(
+        view.state.placements[&RaftGroupId(0)].voters,
+        BTreeSet::from([1, 3, 5])
+    );
+    cluster.ready().await;
+    cluster
+        .payloads(&names[0], "acknowledged-before-migration")
+        .await;
+    cluster
+        .payloads(&names[1], "neighbor-group-stays-readable")
+        .await;
+    for (epoch, rf, voters) in [(1, "5", "1,2,3,4,5"), (2, "3", "2,4,6")] {
+        let id = cluster
+            .submit(&format!("binary-policy-{epoch}"), epoch, voters, Some(rf))
+            .await;
+        cluster.wait(id).await;
+        cluster.ready().await;
+        cluster
+            .payloads(&names[0], "acknowledged-before-migration")
+            .await;
+        cluster
+            .payloads(&names[1], "neighbor-group-stays-readable")
+            .await;
+    }
+    let before = cluster.view().await;
+    for name in &during_names {
+        cluster
+            .payloads(name, "acknowledged-during-controller-loss")
+            .await;
+    }
+    assert_eq!(
+        before.state.placements[&RaftGroupId(0)].voters,
+        BTreeSet::from([2, 4, 6])
+    );
+    assert_eq!(before.state.placements[&RaftGroupId(0)].epoch, 3);
+    cluster.processes.clear();
+    for id in 1..=6 {
+        cluster.start(id, "settled-restart");
+    }
+    cluster.ready().await;
+    assert_eq!(cluster.view().await.state, before.state);
+    for name in &during_names {
+        cluster
+            .payloads(name, "acknowledged-during-controller-loss")
+            .await;
+    }
+    cluster
+        .payloads(&names[0], "acknowledged-before-migration")
+        .await;
+    cluster
+        .payloads(&names[1], "neighbor-group-stays-readable")
+        .await;
+    let new_name = (0..100)
+        .map(|n| format!("post-migration-{n}"))
+        .find(|name| {
+            map.locate(&BucketStreamId::new("benchcmp", name.clone()))
+                .raft_group_id
+                == RaftGroupId(0)
+        })
+        .unwrap();
+    cluster
+        .write(&new_name, "acknowledged-after-settled-restart")
+        .await;
+    cluster
+        .payloads(&new_name, "acknowledged-after-settled-restart")
+        .await;
+}

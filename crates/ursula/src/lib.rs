@@ -317,6 +317,22 @@ impl HttpState {
         let node_id = topology
             .node_id
             .or_else(|| snapshots.first().map(|group| group.node_id))?;
+        if let Some(cursor) = &self.managed_projection {
+            let cursor = cursor
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let view = cursor.current()?;
+            let expected = view
+                .state
+                .placements
+                .iter()
+                .filter(|(_, placement)| placement.voters.contains(&node_id))
+                .map(|(group, placement)| (group.0, placement.voters.clone()))
+                .collect();
+            return Some(ursula_raft::check_managed_raft_maintenance(
+                &snapshots, node_id, expected, 16,
+            ));
+        }
         let all_voters = topology.peers.keys().copied().collect::<BTreeSet<_>>();
         let expected = (0..self.runtime.raft_group_count())
             .filter_map(|id| {

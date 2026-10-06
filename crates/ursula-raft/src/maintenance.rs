@@ -1,8 +1,8 @@
 //! Local Raft eligibility for Kubernetes readiness and maintenance tooling.
 //!
-//! The expected inventory comes from configuration, never from the observed
-//! groups. This is a local eligibility check; cluster-wide disruption control
-//! must also observe every configured peer and serialize maintenance operations.
+//! Expected inventory comes from static configuration or a validated managed
+//! placement projection, never from observed groups. This local eligibility
+//! check does not reserve permission for cluster-wide disruption.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -44,8 +44,8 @@ pub struct RaftMaintenanceReport {
 
 impl RaftMaintenanceReport {
     pub fn ready(&self) -> bool {
-        self.version == 1
-            && !self.expected_groups.is_empty()
+        matches!(self.version, 1 | 2)
+            && (self.version == 2 || !self.expected_groups.is_empty())
             && self.node_issues.is_empty()
             && self.group_issues.is_empty()
     }
@@ -60,18 +60,44 @@ pub fn check_raft_maintenance(
     expected_groups: BTreeMap<u32, BTreeSet<u64>>,
     lag_tolerance: u64,
 ) -> RaftMaintenanceReport {
+    check_expected(groups, node_id, expected_groups, lag_tolerance, 1)
+}
+
+/// Managed inventory comes from a complete validated placement projection.
+/// An explicitly unassigned node may be locally ready with zero replicas;
+/// missing assigned replicas and unexpected resident replicas still fail closed.
+/// Version 2 distinguishes this contract from legacy static inventory.
+pub fn check_managed_raft_maintenance(
+    groups: &[RaftGroupMetricsSnapshot],
+    node_id: u64,
+    expected_groups: BTreeMap<u32, BTreeSet<u64>>,
+    lag_tolerance: u64,
+) -> RaftMaintenanceReport {
+    check_expected(groups, node_id, expected_groups, lag_tolerance, 2)
+}
+
+fn check_expected(
+    groups: &[RaftGroupMetricsSnapshot],
+    node_id: u64,
+    expected_groups: BTreeMap<u32, BTreeSet<u64>>,
+    lag_tolerance: u64,
+    version: u32,
+) -> RaftMaintenanceReport {
     use RaftMaintenanceIssue as Issue;
 
     let mut report = RaftMaintenanceReport {
-        version: 1,
+        version,
         node_id,
         lag_tolerance,
         expected_groups,
         node_issues: Vec::new(),
         group_issues: BTreeMap::new(),
     };
-    if report.expected_groups.is_empty() {
+    if version == 1 && report.expected_groups.is_empty() {
         report.node_issues.push(Issue::EmptyExpectedInventory);
+    }
+    if node_id == 0 {
+        report.node_issues.push(Issue::WrongNodeIdentity);
     }
     let mut seen = BTreeSet::new();
     for group in groups {
@@ -201,6 +227,41 @@ mod tests {
         ]);
         assert!(!report(&[]).ready());
         assert!(!check_raft_maintenance(&[], 1, BTreeMap::new(), 16).ready());
+    }
+
+    #[test]
+    fn managed_empty_assignment_is_ready_only_without_resident_replicas() {
+        let idle = check_managed_raft_maintenance(&[], 1, BTreeMap::new(), 16);
+        assert!(idle.ready());
+        assert_eq!(idle.version, 2);
+        assert!(
+            check_managed_raft_maintenance(&[], 0, BTreeMap::new(), 16)
+                .node_issues
+                .contains(&RaftMaintenanceIssue::WrongNodeIdentity)
+        );
+        let unexpected = check_managed_raft_maintenance(&[healthy(0)], 1, BTreeMap::new(), 16);
+        assert!(!unexpected.ready());
+        assert_eq!(unexpected.group_issues[&0], vec![
+            RaftMaintenanceIssue::UnexpectedGroup
+        ]);
+        let mut unknown = idle;
+        unknown.version = 3;
+        assert!(!unknown.ready());
+    }
+
+    #[test]
+    fn managed_inventory_requires_complete_rf5_membership_and_all_assigned_groups() {
+        let expected = BTreeMap::from([(0, BTreeSet::from([1, 2, 3, 4, 5]))]);
+        let incomplete = check_managed_raft_maintenance(&[healthy(0)], 1, expected.clone(), 16);
+        assert!(!incomplete.ready());
+        assert!(incomplete.group_issues[&0].contains(&RaftMaintenanceIssue::IncompleteVoterSet));
+        let mut group = healthy(0);
+        group.voter_ids = vec![1, 2, 3, 4, 5];
+        assert!(check_managed_raft_maintenance(&[group], 1, expected.clone(), 16).ready());
+        assert_eq!(
+            check_managed_raft_maintenance(&[], 1, expected, 16).group_issues[&0],
+            vec![RaftMaintenanceIssue::MissingGroup]
+        );
     }
 
     #[test]

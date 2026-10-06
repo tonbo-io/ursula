@@ -37,6 +37,7 @@ ursula-shard = { workspace = true }
 ursula-control = { workspace = true }
 
 [dev-dependencies]
+ursula-config = { workspace = true }
 axum = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["net", "sync"] }

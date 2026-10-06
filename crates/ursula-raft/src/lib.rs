@@ -104,6 +104,7 @@ pub use log_store::RaftGroupFileLogStore;
 pub use log_store::RaftGroupLogStore;
 pub use maintenance::RaftMaintenanceIssue;
 pub use maintenance::RaftMaintenanceReport;
+pub use maintenance::check_managed_raft_maintenance;
 pub use maintenance::check_raft_maintenance;
 pub use membership::QuorumGroupMembership;
 pub use membership::collect_bootstrap_memberships;
