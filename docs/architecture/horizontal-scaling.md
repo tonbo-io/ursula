@@ -50,7 +50,9 @@ overrides. Initially accept RF=3 and RF=5; other values are rejected rather than
 silently rounded or clamped. Existing static and single-node development modes
 keep their existing explicit membership semantics.
 
-The following is a proposed bootstrap configuration, not an available option:
+The placement section below is accepted by opt-in managed configuration as of
+`73f6970`; a complete `[control]` directory/bootstrap configuration is also
+required. This section alone does not enable a migration executor:
 
 ```toml
 [control.placement]
@@ -460,3 +462,41 @@ must freeze unmanaged/raw membership mutations on participating managed nodes
 before collecting evidence; no supported managed adoption API is exposed yet.
 The real TCP evidence fixture uses memory data WAL plus durable meta WAL, while
 persistent-data, separate-process server acceptance remains an M1 gate.
+
+
+### Implementation checkpoint: managed server adoption
+
+Commit `73f6970` connects the durable meta group to the server's separate private
+cluster listener. `[control]` requires a cluster token, absolute dedicated meta
+journal, local trusted registration, immutable initial directory/group layout,
+meta voters (3 or 5), one bootstrap coordinator, and persistent data WAL. Both
+data membership initialization flags must be false. Existing static/dev startup
+is unchanged. The private cluster transport currently uses HTTP; client/admin
+origins can be HTTPS through the deployment's proxy.
+
+First adoption uses a coordinated stop/restart of an already initialized static
+data cluster. The coordinator verifies every initial participant advertises the
+same bound recipe/coordinator with raw administration closed. Meta initialization
+requires all initial meta peers to be uninitialized; encountering established
+peer history waits for recovery rather than starting a competing cluster.
+A fresh quorum-confirmed empty control state permits restoring the original
+settled data actors without initialization. Actual data quorum certificates
+then seed one atomic metadata bootstrap. Client/admin listeners open after the
+complete projection is installed. This is an adoption implementation; it does
+not yet initialize a new managed data cluster or support rolling adoption.
+
+Subsequent startup gets complete metadata before constructing data actors and
+uses its current voters and trusted cluster origins, rather than TOML voters.
+Ordered refreshes update public redirects and node readiness; removed/disabled
+nodes cannot restore serving actors. Raw membership/recovery mutations and
+backup imports return a managed-mode conflict until fenced control operations
+are available. Probes live on the private cluster plane (and remain reachable
+in legacy single-listener mode through the merged router).
+
+Separate-process tests cover durable meta3/meta5 and mixed data RF3/RF5, metadata
+snapshot/purge and full restart, permitted meta-voter loss including its leader,
+new writes and acknowledged reads, and public-origin redirects from non-hosting
+nodes. Startup still needs meta quorum: durable local projection recovery is
+next. Refresh does not yet alter static runtime/background inventories or
+prepare/release groups. Those consumers and receiving-process fences must be
+integrated before managed migrations are exposed.
