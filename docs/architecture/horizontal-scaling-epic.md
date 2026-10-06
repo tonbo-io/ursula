@@ -65,7 +65,7 @@ blocked implementation milestone.
 | HS-101 | Persist and restore meta vote, log, committed/applied state and snapshots; recover correctly after compaction and crash/restart without resurrecting discarded intent | M0 | Complete: commit `b7352ea` |
 | HS-102 | Implement default/per-group RF=3/5 and one-domain-loss policy; infer/validate existing placements on adoption; reject invalid policies and bootstrap drift | M0 | Complete: commit `5c7e413` (deterministic policy/adoption layer) |
 | HS-103 | Concrete multi-node meta transport, independent meta voters, one-time bootstrap, cluster identity and trusted client/cluster/admin node directory | HS-101, HS-102 | Complete: commit `73f6970` (coordinated static-to-managed adoption) |
-| HS-104 | Ordered placement/policy projections with full-snapshot resync; data/node startup restores assignments without reinitializing from stale TOML | HS-103 | In progress: commits `d591c26`, `73f6970`, `a5e6740`, `064a1af`, `8b88822`, `d0d3bb9`, `82e1563`, `f5124a8` (ordered node/gateway recovery, outside-bootstrap startup and fresh snapshot-pruning consumer; intent-aware maintenance pending) |
+| HS-104 | Ordered placement/policy projections with full-snapshot resync; data/node startup restores assignments without reinitializing from stale TOML | HS-103 | In progress: commits `d591c26`, `73f6970`, `a5e6740`, `064a1af`, `8b88822`, `d0d3bb9`, `82e1563`, `f5124a8`, `43f48d8` (ordered node/gateway recovery, pruning and intent-aware inventory consumers; active-assignment binary recovery acceptance pending) |
 
 M1 acceptance includes multi-node meta leader turnover and a durable full
 restart after snapshot/log compaction. Test RF=3/quorum=2 and RF=5/quorum=3,
@@ -87,9 +87,9 @@ already accepts the meta type config.
 | HS-201 | Intent-bound state transitions, operation idempotency, epoch CAS, source/target policy and membership-step evidence; no successful finish without verified placement | M1 | In progress: commits `6530772`, `e877d48` (replicated intent and automatic physical execution; complete fault acceptance pending) |
 | HS-202 | Durable dynamic group prepare/release on the owning core; joining replicas never initialize themselves; revoked replicas cannot be recreated by traffic | HS-104, HS-201 | In progress: commits `064a1af`, `cf05e16`, `e7f12bf`, `dc54f53`, `8b88822`, `e877d48`, `d0d3bb9` (physical retirement, automatic execution and real outside-bootstrap joining/restart; install-boundary acceptance pending) |
 | HS-203 | Resumable learner catch-up, fixed-prefix applied verification, joint-membership reconciliation, leader handoff and final membership verification | HS-201, HS-202 | In progress: commits `3504fb5`, `e877d48` (fenced steps and autonomous executor, RF3/RF5 replacement and explicit 3→5→3; binary-restart/S3/fault acceptance pending) |
-| HS-204 | Durably allocated executor generations and process-incarnation fencing, receiving-process barriers and exclusion with maintenance; delayed old/raw requests cannot bypass authority | HS-201; required before managed mutations are exposed | In progress: commits `6530772`, `064a1af`, `8b88822`, `3504fb5`, `e877d48`, `f5124a8` (durable generations, process/pruning barriers, typed recovery and automatic leader takeover; maintenance integration and fault acceptance pending) |
-| HS-205 | Dynamic node/gateway routing, per-group readiness/quorum inventory, reference protection, actor/background-work retirement and safe per-core journal reclamation | HS-202, HS-203, HS-204 | In progress: commits `cf05e16`, `e7f12bf`, `dc54f53`, `8b88822`, `ebe8dd7`, `d0d3bb9`, `82e1563`, `f5124a8` (retirement, readiness, dynamic routing and membership-aware snapshot pruning; cluster-wide maintenance and real S3 acceptance pending) |
-| HS-206 | Supported operation API and CLI submit/status/wait/resume with admin authority and error semantics; real-process E2E plus DST at every migration boundary | HS-201 through HS-205 | In progress: commits `e877d48`, `ebe8dd7`, `d0d3bb9` (operation and registration API/CLI, real binary joining/migration/restart; install/joint faults, S3 and DST pending) |
+| HS-204 | Durably allocated executor generations and process-incarnation fencing, receiving-process barriers and exclusion with maintenance; delayed old/raw requests cannot bypass authority | HS-201; required before managed mutations are exposed | In progress: commits `6530772`, `064a1af`, `8b88822`, `3504fb5`, `e877d48`, `f5124a8`, `43f48d8` (durable generations, process/pruning barriers, takeover and intent-aware maintenance exclusion; supported disruption lifecycle and fault acceptance pending) |
+| HS-205 | Dynamic node/gateway routing, per-group readiness/quorum inventory, reference protection, actor/background-work retirement and safe per-core journal reclamation | HS-202, HS-203, HS-204 | In progress: commits `cf05e16`, `e7f12bf`, `dc54f53`, `8b88822`, `ebe8dd7`, `d0d3bb9`, `82e1563`, `f5124a8`, `43f48d8` (retirement, routing, pruning, assignment roles and per-group quorum verification; real S3/fault acceptance pending) |
+| HS-206 | Supported operation API and CLI submit/status/wait/resume with admin authority and error semantics; real-process E2E plus DST at every migration boundary | HS-201 through HS-205 | In progress: commits `e877d48`, `ebe8dd7`, `d0d3bb9`, `43f48d8` (operation/registration API/CLI, joining and mixed-RF quorum observations; install/joint faults, S3 and DST pending) |
 
 Start with one global active operation. M2 must move a group to a node that
 did not statically host it. Cover RF=3 and RF=5 replica replacements, and
@@ -209,6 +209,9 @@ unevacuated machine. Physical provisioning remains outside the Raft controller.
 | 2026-10-06 | HS-104 / HS-204 / HS-205 | Commit `f5124a8` starts managed external pruning disabled before actors, consumes only fresh ordered projections, and drains deletion leases before receiver activation and physical retirement. Pruners retain owned leases through remote I/O despite caller cancellation. Finalizing receivers resume with exact target voters only after published placement, removed-replica cleanup and durable receiver retirement; stale views cannot roll back policy | Two OpenDAL Memory kernel tests cover source-reference removal, all RF5 target references, pause/re-enable and cancelled deletion drain with an independent neighbor. One native RF3/RF5 test covers withheld certification, executor cancellation/meta-leader takeover, higher generation and final policy using a pruning probe; this is not real S3 migration |
 | 2026-10-06 | Compatibility | Meta RPC and required receiver inventory protocol are now v3. V2 meta envelopes fail before decoding and old receiver inventories cannot be certified. Disk state schemas and stream format epoch 2 are unchanged | Mixed meta RPC versions are unsupported; stop control activity for the protocol upgrade. No rolling mixed-version compatibility claim |
 | 2026-10-06 | Validation | Against `f5124a8`: workspace lib/bin tests 979 passed, 3 ignored; workspace doc tests, all-target Clippy with `-D warnings`, format, seven tracked-source DST audits, madsim Raft lib check and smoke corpus (1.59s) passed. Binary migration CLI fixtures passed in 26.61s; managed adoption/restart passed in 26.70s | Native `aarch64-apple-darwin` only; server verified arm64 Mach-O. An initial workspace build lost its generated `target/` directory before tests ran; a complete rebuild passed. Incremental compilation remains disabled. Existing madsim warnings remain; these CLI/DST regressions do not establish S3/install/joint migration acceptance |
+| 2026-10-06 | HS-104 / HS-204 / HS-205 | Commit `43f48d8` derives maintenance inventory v3 from placement plus durable assignment roles (voter, preparing learner, learner, retiring). Includes projection index and unresolved receiver/assignment state. Migration participants remain maintenance-ineligible; separate serving/registration eligibility uses local actual Raft membership, recovery and applied state under the allowed intent | RF3/RF5 native fixtures verify pre-core preparation, recognized learners, learner exclusion from quorum counts and HTTP serving readiness during learner/joint phases. Expected inventory never comes from observed handles. Native fixture refresh installs real fresh views explicitly; it has no production refresh task |
+| 2026-10-06 | HS-205 / HS-206 | Commit `43f48d8` adds `ursulactl operation verify-quorum`: discovers the complete live directory from fresh meta state, captures native uniform/joint configuration and fixed prefixes per group, pins process identities, preserves each constituent denominator, and rechecks data/meta state before reporting. Explicit exclusions do not rewrite membership. Maintenance eligibility and full redundancy are separate from quorum availability; output never grants disruption permission | Real seven-server binary fixture uses the original six-node admin-only manifest, discovers voter 7, verifies mixed RF3/RF5, stops RF5 voters 4/5, observes three survivors against the original five, rejects a two-survivor selection, then restarts both processes. This does not certify an AZ-loss schedule, evacuation or physical removal |
+| 2026-10-06 | Validation | Against `43f48d8`: workspace lib/bin tests 981 passed, 3 ignored; doc tests, all-target Clippy with `-D warnings`, format, seven DST audits, madsim Raft lib check and smoke (0.48s) passed. Final binary migration CLI fixtures passed in 30.21s; managed adoption/restart passed in 26.54s. Eight focused local inventory tests and RF3/RF5 joint tests passed | Native host only; no cross-compilation. Existing madsim warnings remain. Inline/local snapshots and native joint interruption do not prove install/joint OS-process failure, S3 or new migration-boundary DST |
 
 ## Current execution checkpoint
 
@@ -276,13 +279,28 @@ The control transport and mandatory receiver inventory are v3; mixed meta RPC
 versions are unsupported and require a quiesced control upgrade. Stream format
 epoch 2 and existing disk state schemas remain unchanged.
 
-Next integrate intent-aware maintenance. Verify interruption during
+Commit `43f48d8` supplies intent-aware maintenance inventory and a supported
+per-group observation command. Durable local roles distinguish preparing and
+resident learners from voters and retiring actors. Maintenance readiness stays
+closed for active participants or unresolved receiver work. Serving readiness
+uses actual allowed Raft membership/recovery/application independently, so the
+maintenance fence does not stop healthy data service. Learner existence is not
+voter evidence; actual applied promotion must occur before it counts in a quorum.
+The CLI captures every group's native configuration, including both joint sets,
+and fixed prefixes through trusted cluster origins. A complete fresh directory
+discovers outside-bootstrap nodes; pinned process metrics cover selected voters.
+Final data/meta reads refuse drift. RF5 three-survivor availability remains
+distinct from restored five-voter redundancy. This is read-only evidence,
+not a disruption reservation or physical-removal gate.
+
+Next verify interruption during
 replica preparation/snapshot install and joint membership, lost replies and
 delayed old receiver requests, S3 migration and migration-boundary DST.
 Established startup continues
 restoring assigned data from its bound checkpoint even under meta minority.
 
-M1 stays open for full intent-aware consumers. M2 stays open for install/joint
+M1 stays open for active-assignment binary startup/recovery acceptance; the
+intent-aware consumers are implemented. M2 stays open for install/joint
 binary restart, S3 and full fault acceptance. Ten native fixtures exercise endpoint
 and automatic execution with actual data/meta consensus, disk WAL and inline
 snapshots. HTTP identity replacement and executor interruption are in-process;

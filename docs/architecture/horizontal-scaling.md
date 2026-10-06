@@ -1296,3 +1296,75 @@ An initial build failed after the generated target directory disappeared;
 the complete rebuild and final checks pass. Real S3 migration, install/joint
 binary faults and migration-boundary DST remain open. Intent-aware maintenance
 is the next integration work; the entire epic remains active.
+
+### Implementation checkpoint: intent-aware maintenance and group quorums
+
+Commit `43f48d8` adds maintenance inventory v3. Expected groups come from the
+complete placement projection and durable local assignments. The report records
+the applied meta index, voter/preparing-learner/learner/retiring roles, local
+receiver fences, pending work and assignment drift. A prepared destination is
+recognized before placement publication and is not counted as a serving voter.
+An idle registered node remains eligible without inventing a data replica.
+Unknown versions, missing or unexpected replicas and assignment drift cannot
+certify maintenance readiness. Static v1 and legacy managed v2 reports retain
+their previous contract; the new managed verifier requires v3.
+
+Serving/registration readiness is separate from maintenance readiness. Active
+participants and unresolved receiver work exclude maintenance, while healthy
+data voters continue through native Raft. Local serving checks require an
+allowed source, target or joint configuration, applied membership, recovery,
+known in-configuration leadership and bounded apply lag. Joint/target shapes
+require committed intent authorization; learners are restricted to prepared
+destinations. A nonvoting learner does not establish voter participation.
+Preparing or retiring replicas do not certify serving votes. Requests still use
+the existing data-group quorum/read barriers; local readiness is not fresh
+control authority or a disruption lease.
+
+The supported observational command requires only trusted admin seeds:
+
+```sh
+ursulactl operation verify-quorum --config cluster.json
+ursulactl operation verify-quorum --config cluster.json --exclude 4,5
+```
+
+Group/core counts and cluster origins come from the fresh managed projection,
+including newly registered nodes outside the original manifest. One overall
+deadline covers directory discovery, native per-group configuration reads,
+pinned-process inventory and fixed-prefix application, and final data/meta
+rechecks. Stale inventory waits for projection refresh; conflicting membership,
+process replacement or changed control state requires a new observation.
+RF3 and RF5 groups retain their own denominators. Joint observations must cover
+both constituent majorities; native ReadIndex supplies the actual quorum
+authority. Learners do not contribute votes. Exclusions omit observation only
+and never narrow expected membership. Applied targets stay fixed while writes
+advance. Native membership endpoints must match trusted registered origins.
+
+Output includes each group's configuration, observed voters, required/counts
+for each constituent quorum, applied indices and full-redundancy observation.
+`maintenance_eligible` requires settled uniform groups, full voter observation
+and eligible local inventories. `disruption_authorized` remains false: draining,
+exclusive maintenance reservations, independent meta-voter lifecycle and physical
+removal remain separate requirements in the epic.
+
+Six existing RF3/RF5 native physical-move fixtures now inspect preparing and
+learner roles, exclude learners from quorum votes, and require HTTP serving
+readiness during learner catch-up. The two joint cases also obtain native joint
+quorum evidence and serving readiness while maintenance eligibility is false.
+These fixtures explicitly install actual fresh projections because they do not
+run the production refresher; they use disk WAL and inline snapshots. A new pure
+inventory test rejects transient/pending/fenced/drift eligibility, and a quorum
+arithmetic test rejects RF5 two-voter and joint single-constituent observations.
+
+The real outside-bootstrap seven-server fixture invokes the new command using
+its original six-node admin-only manifest. It observes RF3 `{1,2,7}` and RF5
+`{1,2,4,5,7}`, stops 4/5, confirms RF5 three-voter availability with unchanged
+five-voter membership and maintenance ineligibility, rejects an observation of
+only two RF5 voters, and restores both processes. This is a two-voter failure
+schedule, not AZ-loss, evacuation or scale-in acceptance.
+
+Final workspace lib/bin tests pass 981 with 3 ignored; doc tests, all-target
+Clippy with `-D warnings`, format, seven tracked-source DST audits, madsim Raft
+lib check and smoke (0.48s) pass. Both binary migration fixtures pass in 30.21s;
+managed adoption/restart passes in 26.54s. All use the native Mac host. Active
+assignment startup/recovery during install/joint OS-process faults, real S3
+migration and new migration-boundary DST are next; M3/M4 remain in scope.
