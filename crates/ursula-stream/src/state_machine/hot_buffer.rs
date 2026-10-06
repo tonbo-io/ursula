@@ -9,6 +9,10 @@
 //! whole blocks and trims at most one. Snapshots emit one hot segment per block and restore
 //! segments one-to-one, so every replica holds the same block layout after
 //! the same history.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use super::HotPayloadSegment;
 use super::StreamReadSegment;
@@ -38,11 +42,11 @@ impl HotBlock {
     }
 }
 
-fn len_u64(len: usize) -> u64 {
+pub(super) fn len_u64(len: usize) -> u64 {
     u64::try_from(len).unwrap_or(u64::MAX)
 }
 
-fn offset_delta(from: u64, to: u64) -> usize {
+pub(super) fn offset_delta(from: u64, to: u64) -> usize {
     usize::try_from(to.saturating_sub(from)).unwrap_or(usize::MAX)
 }
 

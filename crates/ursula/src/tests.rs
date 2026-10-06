@@ -1,3 +1,11 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
+#![expect(
+    clippy::assertions_on_result_states,
+    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
+)]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -418,14 +426,18 @@ impl StaticGrpcTestNode {
     async fn shutdown(mut self) {
         self.registry.shutdown_transport();
         if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
+            shutdown.send(()).expect("test server is still running");
         }
         if tokio::time::timeout(Duration::from_secs(5), &mut self.server)
             .await
             .is_err()
         {
             self.server.abort();
-            let _ = self.server.await;
+            if let Err(err) = self.server.await
+                && !err.is_cancelled()
+            {
+                panic!("test server failed: {err}");
+            }
         }
     }
 }
@@ -484,7 +496,10 @@ async fn spawn_static_grpc_test_node(
     let server = tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
+                // A dropped sender also means shut down.
+                if shutdown_rx.await.is_err() {
+                    tracing::debug!("test server shutdown sender dropped");
+                }
             })
             .await
             .expect("serve static raft node");
@@ -984,7 +999,12 @@ async fn json_depth_limit_applies_per_message_after_flattening() {
             Body::from(body.clone()),
         )
         .await;
-        assert_eq!(response.status(), status, "{}", &body[..16]);
+        assert_eq!(
+            response.status(),
+            status,
+            "{}",
+            body.get(..16).unwrap_or(&body)
+        );
     }
     let response = http_get(&app, "/benchcmp/json-depth?offset=-1").await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -1335,7 +1355,11 @@ async fn long_poll_returns_service_unavailable_when_live_waiters_are_full() {
     );
 
     first.abort();
-    let _ = first.await;
+    if let Err(err) = first.await
+        && !err.is_cancelled()
+    {
+        panic!("first waiter failed: {err}");
+    }
 
     let response = http_get(&app, "/__ursula/metrics").await;
     let body = body_bytes(response).await;
@@ -1554,7 +1578,7 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
             .expect("system time after unix epoch")
             .as_nanos()
     ));
-    let _ = std::fs::remove_dir_all(&raft_root);
+    remove_test_path(&raft_root);
 
     let app = router(
         spawn_runtime(
@@ -1652,7 +1676,7 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
             .expect("system time after unix epoch")
             .as_nanos()
     ));
-    let _ = std::fs::remove_dir_all(&raft_root);
+    remove_test_path(&raft_root);
 
     let spawned = spawn_runtime(
         &test_config(1, 1),
@@ -1743,7 +1767,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             .expect("system time after unix epoch")
             .as_nanos()
     ));
-    let _ = std::fs::remove_dir_all(&raft_root);
+    remove_test_path(&raft_root);
     let peers = [(1, "http://127.0.0.1:4477".to_owned())];
 
     {
@@ -1940,7 +1964,10 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
     let server = tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
+                // A dropped sender also means shut down.
+                if shutdown_rx.await.is_err() {
+                    tracing::debug!("test server shutdown sender dropped");
+                }
             })
             .await
             .expect("serve raft RPC router");
@@ -1977,7 +2004,7 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
         .expect_err("missing group should fail");
     assert!(err.to_string().contains("not registered"), "err={err}");
 
-    let _ = shutdown_tx.send(());
+    shutdown_tx.send(()).expect("server is still running");
     server.await.expect("server task");
 }
 
@@ -3243,7 +3270,7 @@ async fn static_grpc_raft_group_engine_replicates_with_core_journals() {
             .expect("system time after unix epoch")
             .as_nanos()
     ));
-    let _ = std::fs::remove_dir_all(&raft_root);
+    remove_test_path(&raft_root);
 
     let mut nodes = Vec::new();
     for (index, listener) in listeners.into_iter().enumerate() {
@@ -3390,7 +3417,7 @@ async fn static_grpc_raft_durable_cold_flush_replicates_manifest() {
             .expect("system time after unix epoch")
             .as_nanos()
     ));
-    let _ = std::fs::remove_dir_all(&raft_root);
+    remove_test_path(&raft_root);
     let cold_store = std::sync::Arc::new(ColdStore::memory().expect("memory cold store"));
 
     let mut nodes = Vec::new();
@@ -3575,7 +3602,7 @@ async fn static_grpc_raft_installs_snapshot_for_late_learner_with_core_journals(
             .expect("system time after unix epoch")
             .as_nanos()
     ));
-    let _ = std::fs::remove_dir_all(&raft_root);
+    remove_test_path(&raft_root);
 
     run_static_grpc_late_learner_snapshot_over_tcp(Some(raft_root.clone())).await;
 
@@ -8071,4 +8098,19 @@ async fn explicit_replacement_binding_preserves_token_and_rejects_another_execut
     let client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
     assert!(client.pin_nodes(&[node], Some(1), false).await.is_err());
     server.abort();
+}
+
+/// Remove a temporary test file or directory, tolerating its absence.
+pub(crate) fn remove_test_path(path: impl AsRef<std::path::Path>) {
+    let path = path.as_ref();
+    let removed = if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    if let Err(err) = removed
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        panic!("remove test path {}: {err}", path.display());
+    }
 }

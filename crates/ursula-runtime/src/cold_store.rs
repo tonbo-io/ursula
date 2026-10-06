@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt;
@@ -910,7 +914,7 @@ impl ColdStore {
         if len == 0 {
             return Ok(Vec::new());
         }
-        let len_u64 = u64::try_from(len).map_err(|_| {
+        let len_u64 = u64::try_from(len).map_err(|_overflow| {
             io::Error::new(io::ErrorKind::InvalidInput, "cold read length exceeds u64")
         })?;
         let read_end = read_start_offset.checked_add(len_u64).ok_or_else(|| {
@@ -1111,7 +1115,7 @@ impl ColdStore {
             .await
             .map_err(|err| cold_store_io_error(&path, err))?
             .to_bytes();
-        let expected_len = usize::try_from(block_end - block_start).map_err(|_| {
+        let expected_len = usize::try_from(block_end - block_start).map_err(|_overflow| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "cold cache block length exceeds usize",
@@ -1148,8 +1152,8 @@ impl ColdStore {
                 let block_end = block_start
                     .saturating_add(block_size)
                     .min(object.object_size);
-                if cache.get(&object.s3_path, block_index).is_none() {
-                    let _ = store
+                if cache.get(&object.s3_path, block_index).is_none()
+                    && let Err(err) = store
                         .read_cached_block(
                             &cache,
                             object.s3_path.clone(),
@@ -1158,7 +1162,9 @@ impl ColdStore {
                             block_start,
                             block_end,
                         )
-                        .await;
+                        .await
+                {
+                    tracing::debug!(%err, block_index, "cold block prefetch failed");
                 }
                 block_index += 1;
             }

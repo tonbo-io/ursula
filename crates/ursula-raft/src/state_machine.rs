@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io;
@@ -1120,7 +1124,7 @@ mod tests {
         };
         let directory =
             std::env::temp_dir().join(format!("ursula-persisted-snapshot-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
+        crate::tests::remove_test_path(&directory);
         std::fs::create_dir_all(&directory).expect("snapshot metadata directory");
         let metadata_path = directory.join("group-7.snapshot.json");
         let current_snapshot = Arc::new(Mutex::new(None));
@@ -1162,7 +1166,7 @@ mod tests {
                 .group_commit_index,
             42
         );
-        let _ = std::fs::remove_dir_all(directory);
+        crate::tests::remove_test_path(directory);
     }
 
     /// F12a: the persisted snapshot record and the pointer inside it use the
@@ -1184,7 +1188,7 @@ mod tests {
             "ursula-persisted-binary-snapshot-{}",
             std::process::id()
         ));
-        let _ = std::fs::remove_dir_all(&directory);
+        crate::tests::remove_test_path(&directory);
         std::fs::create_dir_all(&directory).expect("snapshot metadata directory");
         let metadata_path = directory.join("group-7.snapshot.json");
         let mut builder = RaftGroupSnapshotBuilder {
@@ -1229,7 +1233,7 @@ mod tests {
                 .group_commit_index,
             42
         );
-        let _ = std::fs::remove_dir_all(directory);
+        crate::tests::remove_test_path(directory);
     }
 
     #[cfg(not(madsim))]

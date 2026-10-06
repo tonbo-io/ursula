@@ -1,6 +1,10 @@
 //! Exact group-snapshot sizes from the production codec
 //! (`ursula_raft::group_snapshot_frames`), with a per-field and per-stream
 //! byte breakdown obtained by decoding each frame with prost.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::time::Instant;
 

@@ -1,5 +1,9 @@
 //! Result sink (JSON lines per workload), per-checkpoint measurement of a
 //! state machine, and the [`Outcome`] each workload hands to the gate.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -228,6 +232,10 @@ mod tests {
     use super::Outcome;
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the check stores an exact integer-valued metric"
+    )]
     fn repeated_checks_keep_the_worst_result() {
         let mut outcome = Outcome::default();
         outcome.check("c", "x <= 10", 3.0, 10.0);

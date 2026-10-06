@@ -30,5 +30,5 @@ ursula-shard = { workspace = true }
 ursula-stream = { workspace = true }
 zstd = { workspace = true }
 
-[lints.clippy]
-wildcard_imports = "deny"
+[lints]
+workspace = true

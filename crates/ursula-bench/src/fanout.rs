@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -122,7 +126,9 @@ pub async fn run(args: FanOutArgs) -> Result<FanOutResult> {
         writer_barrier.wait().await;
         let start = Instant::now();
         let dl = start + Duration::from_secs(writer_duration);
-        let _ = deadline_setter.set(dl);
+        if deadline_setter.set(dl).is_err() {
+            tracing::warn!("writer deadline was already set");
+        }
         run_writer(
             &writer_backend,
             &writer_stream,
@@ -138,7 +144,12 @@ pub async fn run(args: FanOutArgs) -> Result<FanOutResult> {
     let elapsed = start.elapsed();
 
     let drain_limit = Duration::from_secs(args.subscriber_idle_timeout_secs + 5);
-    let _ = tokio::time::timeout(drain_limit, futures::future::join_all(subs)).await;
+    if tokio::time::timeout(drain_limit, futures::future::join_all(subs))
+        .await
+        .is_err()
+    {
+        tracing::warn!("subscribers did not drain within {drain_limit:?}");
+    }
 
     let hist = hist.lock().await;
     let latency = summarize(&hist);
@@ -162,7 +173,6 @@ pub async fn run(args: FanOutArgs) -> Result<FanOutResult> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_subscriber(
     backend: &Backend,
     stream: &str,
@@ -226,7 +236,7 @@ async fn run_subscriber(
                     let us_u128 = lat_ns / 1000;
                     let us = us_u128.min(u128::from(local.high())) as u64;
                     if us > 0 {
-                        let _ = local.record(us);
+                        local.saturating_record(us);
                     }
                     recv.fetch_add(1, Ordering::Relaxed);
                     last_event_at = Instant::now();
@@ -300,7 +310,7 @@ fn build_payload(seq: u64, size: usize) -> Vec<u8> {
     let mut buf = Vec::with_capacity(size);
     let head_bytes = head.as_bytes();
     let take = head_bytes.len().min(size);
-    buf.extend_from_slice(&head_bytes[..take]);
+    buf.extend_from_slice(head_bytes.get(..take).unwrap_or_default());
     if size > take {
         buf.resize(size, b'.');
     }
@@ -322,7 +332,7 @@ fn extract_send_ns(payload: &[u8]) -> Option<u128> {
                 }
             };
             if i + 1 - start >= 48 {
-                let s = std::str::from_utf8(&payload[start + 16..start + 48]).ok()?;
+                let s = std::str::from_utf8(payload.get(start + 16..start + 48)?).ok()?;
                 return u128::from_str_radix(s, 16).ok();
             }
         } else {
@@ -346,13 +356,8 @@ fn find_event_end(buf: &[u8]) -> Option<usize> {
 fn parse_sse_data(raw: &[u8]) -> Option<Vec<u8>> {
     let mut payload = Vec::new();
     for line in raw.split(|b| *b == b'\n') {
-        if line.starts_with(b"data:") {
-            let rest = &line[5..];
-            let rest = if rest.starts_with(b" ") {
-                &rest[1..]
-            } else {
-                rest
-            };
+        if let Some(rest) = line.strip_prefix(b"data:") {
+            let rest = rest.strip_prefix(b" ").unwrap_or(rest);
             if !payload.is_empty() {
                 payload.push(b'\n');
             }

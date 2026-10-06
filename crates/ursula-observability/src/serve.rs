@@ -33,14 +33,24 @@ pub async fn shutdown_signal() {
             }
             Err(err) => {
                 tracing::error!("install SIGTERM handler: {err}; falling back to Ctrl-C only");
-                let _ = tokio::signal::ctrl_c().await;
+                if let Err(err) = tokio::signal::ctrl_c().await {
+                    // Without any signal handler, only process exit stops the server.
+                    tracing::error!(
+                        "install Ctrl-C handler: {err}; graceful shutdown is unavailable"
+                    );
+                    std::future::pending::<()>().await;
+                }
                 tracing::info!("received Ctrl+C, starting graceful shutdown");
             }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            // Without any signal handler, only process exit stops the server.
+            tracing::error!("install Ctrl-C handler: {err}; graceful shutdown is unavailable");
+            std::future::pending::<()>().await;
+        }
         tracing::info!("received Ctrl+C, starting graceful shutdown");
     }
 }

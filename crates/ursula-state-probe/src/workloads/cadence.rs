@@ -11,6 +11,10 @@
 //! groups) seen at a driver tick, against the node log budget. W1 is
 //! `--groups=1 --node-groups=128` (one heavy stream on a default node); the
 //! uniform workload is `--groups=128 --streams-per-group=4`.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use anyhow::Result;
 use clap::Args;

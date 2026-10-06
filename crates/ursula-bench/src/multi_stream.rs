@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::sync::Arc;
@@ -144,7 +148,9 @@ pub async fn run(args: MultiStreamArgs) -> Result<MultiStreamResult> {
     }
 
     for w in workers {
-        let _ = w.await;
+        if let Err(err) = w.await {
+            tracing::warn!("bench worker failed: {err}");
+        }
     }
 
     let elapsed = start.elapsed();
@@ -186,7 +192,10 @@ pub async fn run(args: MultiStreamArgs) -> Result<MultiStreamResult> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "benchmark writer receives each shared counter separately"
+)]
 async fn run_writer(
     backend: Backend,
     base_idx: usize,

@@ -831,7 +831,7 @@ mod s3 {
                     SnapshotCompression::None => stored_bytes,
                     SnapshotCompression::Zstd => zstd::bulk::decompress(
                         &stored_bytes,
-                        usize::try_from(*size_bytes).map_err(|_| {
+                        usize::try_from(*size_bytes).map_err(|_overflow| {
                             SnapshotStoreError::Integrity(format!(
                                 "s3 snapshot {key} logical size {size_bytes} does not fit usize"
                             ))
@@ -1158,6 +1158,10 @@ fn snapshot_namespace(cfg: &ursula_config::RaftSnapshotConfig) -> String {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::assertions_on_result_states,
+    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
+)]
 mod tests {
     use super::*;
 

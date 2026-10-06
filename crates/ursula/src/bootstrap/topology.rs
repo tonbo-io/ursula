@@ -66,10 +66,11 @@ impl Topology {
         }
 
         let peer_ids: BTreeSet<u64> = peers.iter().map(|(node_id, _)| *node_id).collect();
-        let raft_group_count_u32 =
-            u32::try_from(raft_group_count).map_err(|_| RuntimeError::StaticMembershipConfig {
+        let raft_group_count_u32 = u32::try_from(raft_group_count).map_err(|_overflow| {
+            RuntimeError::StaticMembershipConfig {
                 message: format!("raft_group_count {raft_group_count} exceeds u32::MAX"),
-            })?;
+            }
+        })?;
 
         for (raft_group_id, voters) in per_group_voters {
             if raft_group_id.0 >= raft_group_count_u32 {

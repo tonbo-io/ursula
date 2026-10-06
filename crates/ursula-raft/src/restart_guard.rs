@@ -25,6 +25,10 @@
 //!
 //! Without object storage nothing outlives a full restart, so it cannot be
 //! detected: the group initializes again, empty.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;

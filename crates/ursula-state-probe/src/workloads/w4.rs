@@ -6,6 +6,10 @@
 //! The producer cap (F3) answers `ProducerLimit` to producers beyond 4,096
 //! that find no producer idle for an hour; the workload counts those
 //! rejections and retries the producer's sequence 0 on its next turn.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::time::Instant;
 

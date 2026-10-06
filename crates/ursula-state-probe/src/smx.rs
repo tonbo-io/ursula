@@ -1,6 +1,10 @@
 //! L1 drivers: the real `StreamStateMachine` driven with exactly the commands
 //! the runtime issues (create, append, external append, flush and pack,
 //! compaction, checkpoint and retention).
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use anyhow::Result;
 use anyhow::bail;

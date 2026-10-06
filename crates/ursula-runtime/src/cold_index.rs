@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -199,7 +203,7 @@ fn decode_page(key: &ColdIndexPageKey, bytes: &[u8]) -> io::Result<ColdIndexPage
             format!("unsupported cold index page version {version}"),
         ));
     }
-    let body_len = usize::try_from(cursor.read_u32()?).expect("u32 fits usize");
+    let body_len = cursor.read_len()?;
     let body = cursor.read_exact(body_len)?;
     let expected_checksum = cursor.read_u64()?;
     if cursor.remaining() != 0 {
@@ -242,8 +246,7 @@ fn decode_page(key: &ColdIndexPageKey, bytes: &[u8]) -> io::Result<ColdIndexPage
     let start_offset = body.read_u64()?;
     let end_offset = body.read_u64()?;
     let cold_chunk_count = body.read_u32()?;
-    let mut cold_chunks =
-        Vec::with_capacity(usize::try_from(cold_chunk_count).expect("u32 fits usize"));
+    let mut cold_chunks = Vec::with_capacity(usize::try_from(cold_chunk_count).unwrap_or_default());
     for _ in 0..cold_chunk_count {
         let tag = body.read_u8()?;
         if tag != COLD_INDEX_ENTRY_COLD_CHUNK {
@@ -264,7 +267,7 @@ fn decode_page(key: &ColdIndexPageKey, bytes: &[u8]) -> io::Result<ColdIndexPage
     }
     let external_segment_count = body.read_u32()?;
     let mut external_segments =
-        Vec::with_capacity(usize::try_from(external_segment_count).expect("u32 fits usize"));
+        Vec::with_capacity(usize::try_from(external_segment_count).unwrap_or_default());
     for _ in 0..external_segment_count {
         let tag = body.read_u8()?;
         if tag != COLD_INDEX_ENTRY_EXTERNAL_SEGMENT {
@@ -349,41 +352,49 @@ impl<'a> Cursor<'a> {
                 "cold index page offset overflow",
             )
         })?;
-        if end > self.bytes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "cold index page ended early",
-            ));
-        }
-        let slice = &self.bytes[self.offset..end];
+        let slice = self.bytes.get(self.offset..end).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "cold index page ended early")
+        })?;
         self.offset = end;
         Ok(slice)
     }
 
+    fn read_array<const N: usize>(&mut self) -> io::Result<[u8; N]> {
+        let bytes = self.read_exact(N)?;
+        bytes.first_chunk::<N>().copied().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "cold index page ended early")
+        })
+    }
+
     fn read_u8(&mut self) -> io::Result<u8> {
-        Ok(self.read_exact(1)?[0])
+        let [byte] = self.read_array()?;
+        Ok(byte)
     }
 
     fn read_u16(&mut self) -> io::Result<u16> {
-        let mut bytes = [0; 2];
-        bytes.copy_from_slice(self.read_exact(2)?);
-        Ok(u16::from_le_bytes(bytes))
+        Ok(u16::from_le_bytes(self.read_array()?))
     }
 
     fn read_u32(&mut self) -> io::Result<u32> {
-        let mut bytes = [0; 4];
-        bytes.copy_from_slice(self.read_exact(4)?);
-        Ok(u32::from_le_bytes(bytes))
+        Ok(u32::from_le_bytes(self.read_array()?))
     }
 
     fn read_u64(&mut self) -> io::Result<u64> {
-        let mut bytes = [0; 8];
-        bytes.copy_from_slice(self.read_exact(8)?);
-        Ok(u64::from_le_bytes(bytes))
+        Ok(u64::from_le_bytes(self.read_array()?))
+    }
+
+    /// A `u32` length prefix.
+    fn read_len(&mut self) -> io::Result<usize> {
+        usize::try_from(self.read_u32()?).map_err(|_overflow| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cold index length exceeds usize",
+            )
+        })
     }
 
     fn read_string(&mut self) -> io::Result<String> {
-        let len = usize::try_from(self.read_u32()?).expect("u32 fits usize");
+        let len = self.read_len()?;
         let bytes = self.read_exact(len)?;
         String::from_utf8(bytes.to_vec()).map_err(|err| {
             io::Error::new(

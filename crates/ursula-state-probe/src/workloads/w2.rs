@@ -15,6 +15,10 @@
 //! worker does (discovery through `shared_ref_candidates`, then `CompactCold`
 //! of each planned run with the GC grace), and the GC worker acknowledges
 //! released packs once their grace has passed.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -106,6 +110,10 @@ fn percentile(sorted: &[u64], numerator: usize, denominator: usize) -> u64 {
     sorted.get(index).copied().unwrap_or(0)
 }
 
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "probe arguments are non-negative rates and durations; `as` saturates anything else to zero"
+)]
 pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
     let name = default_name(args);
     let flush_bytes = 8 * smx::MIB;

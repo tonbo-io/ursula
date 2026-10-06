@@ -3,6 +3,10 @@
 //! of streams holding hot bytes, plus the W2 starved-stream shape. Reports
 //! deterministic counters (candidates, bytes, whether the starved stream is
 //! included) next to wall time.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::time::Instant;
 

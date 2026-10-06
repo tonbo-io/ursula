@@ -437,12 +437,14 @@ pub(crate) struct RaftSnapshotBuildSample {
 impl RuntimeMetricsInner {
     pub(crate) fn record_routed_request(&self, core_id: CoreId, mailbox_send_wait_ns: u64) {
         let index = usize::from(core_id.0);
-        self.per_core_routed_requests[index].fetch_add_relaxed(1);
-        self.per_core_mailbox_send_wait_ns[index].fetch_add_relaxed(mailbox_send_wait_ns);
+        self.per_core_routed_requests.add_at(index, 1);
+        self.per_core_mailbox_send_wait_ns
+            .add_at(index, mailbox_send_wait_ns);
     }
 
     pub(crate) fn record_mailbox_full(&self, core_id: CoreId) {
-        self.per_core_mailbox_full_events[usize::from(core_id.0)].fetch_add_relaxed(1);
+        self.per_core_mailbox_full_events
+            .add_at(usize::from(core_id.0), 1);
     }
 
     pub(crate) fn cold_hot_bytes(&self) -> u64 {
@@ -459,9 +461,9 @@ impl RuntimeMetricsInner {
     }
 
     pub(crate) fn record_append(&self, core_id: CoreId, group_id: RaftGroupId) {
-        self.per_core_appends[usize::from(core_id.0)].fetch_add_relaxed(1);
-        self.per_group_appends[usize::try_from(group_id.0).expect("u32 fits usize")]
-            .fetch_add_relaxed(1);
+        self.per_core_appends.add_at(usize::from(core_id.0), 1);
+        self.per_group_appends
+            .add_at(usize::try_from(group_id.0).expect("u32 fits usize"), 1);
     }
 
     pub(crate) fn record_applied_mutation(
@@ -472,10 +474,11 @@ impl RuntimeMetricsInner {
     ) {
         let core_index = usize::from(core_id.0);
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
-        self.per_core_applied_mutations[core_index].fetch_add_relaxed(1);
-        self.per_group_applied_mutations[group_index].fetch_add_relaxed(1);
-        self.per_core_mutation_apply_ns[core_index].fetch_add_relaxed(apply_ns);
-        self.per_group_mutation_apply_ns[group_index].fetch_add_relaxed(apply_ns);
+        self.per_core_applied_mutations.add_at(core_index, 1);
+        self.per_group_applied_mutations.add_at(group_index, 1);
+        self.per_core_mutation_apply_ns.add_at(core_index, apply_ns);
+        self.per_group_mutation_apply_ns
+            .add_at(group_index, apply_ns);
     }
 
     pub(crate) fn record_group_engine_exec(
@@ -486,8 +489,10 @@ impl RuntimeMetricsInner {
     ) {
         let core_index = usize::from(core_id.0);
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
-        self.per_core_group_engine_exec_ns[core_index].fetch_add_relaxed(exec_ns);
-        self.per_group_group_engine_exec_ns[group_index].fetch_add_relaxed(exec_ns);
+        self.per_core_group_engine_exec_ns
+            .add_at(core_index, exec_ns);
+        self.per_group_group_engine_exec_ns
+            .add_at(group_index, exec_ns);
     }
 
     pub(crate) fn record_append_post_commit(
@@ -498,8 +503,10 @@ impl RuntimeMetricsInner {
     ) {
         let core_index = usize::from(core_id.0);
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
-        self.per_core_append_post_commit_ns[core_index].fetch_add_relaxed(elapsed_ns);
-        self.per_group_append_post_commit_ns[group_index].fetch_add_relaxed(elapsed_ns);
+        self.per_core_append_post_commit_ns
+            .add_at(core_index, elapsed_ns);
+        self.per_group_append_post_commit_ns
+            .add_at(group_index, elapsed_ns);
     }
 
     pub(crate) fn record_read_watcher_notify(
@@ -512,30 +519,39 @@ impl RuntimeMetricsInner {
         let core_index = usize::from(core_id.0);
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
         let replans = u64::try_from(replans).unwrap_or(u64::MAX);
-        self.per_core_read_watcher_notify_calls[core_index].fetch_add_relaxed(1);
-        self.per_group_read_watcher_notify_calls[group_index].fetch_add_relaxed(1);
-        self.per_core_read_watcher_notify_ns[core_index].fetch_add_relaxed(elapsed_ns);
-        self.per_group_read_watcher_notify_ns[group_index].fetch_add_relaxed(elapsed_ns);
-        self.per_core_read_watcher_replans[core_index].fetch_add_relaxed(replans);
-        self.per_group_read_watcher_replans[group_index].fetch_add_relaxed(replans);
+        self.per_core_read_watcher_notify_calls
+            .add_at(core_index, 1);
+        self.per_group_read_watcher_notify_calls
+            .add_at(group_index, 1);
+        self.per_core_read_watcher_notify_ns
+            .add_at(core_index, elapsed_ns);
+        self.per_group_read_watcher_notify_ns
+            .add_at(group_index, elapsed_ns);
+        self.per_core_read_watcher_replans
+            .add_at(core_index, replans);
+        self.per_group_read_watcher_replans
+            .add_at(group_index, replans);
     }
 
     pub(crate) fn record_group_mailbox_enqueued(&self, group_id: RaftGroupId) {
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
-        let depth = self.per_group_group_mailbox_depth[group_index]
-            .fetch_add_relaxed(1)
-            .saturating_add(1);
-        self.per_group_group_mailbox_max_depth[group_index].fetch_max_relaxed(depth);
+        if let Some(slot) = self.per_group_group_mailbox_depth.slot(group_index) {
+            let depth = slot.fetch_add_relaxed(1).saturating_add(1);
+            self.per_group_group_mailbox_max_depth
+                .max_at(group_index, depth);
+        }
     }
 
     pub(crate) fn record_group_mailbox_dequeued(&self, group_id: RaftGroupId) {
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
-        self.per_group_group_mailbox_depth[group_index].fetch_sub_saturating_relaxed(1);
+        self.per_group_group_mailbox_depth
+            .sub_saturating_at(group_index, 1);
     }
 
     pub(crate) fn record_group_mailbox_full(&self, group_id: RaftGroupId) {
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
-        self.per_group_group_mailbox_full_events[group_index].fetch_add_relaxed(1);
+        self.per_group_group_mailbox_full_events
+            .add_at(group_index, 1);
     }
 
     pub(crate) fn record_raft_apply_batch(
@@ -547,10 +563,12 @@ impl RuntimeMetricsInner {
     ) {
         let core_index = usize::from(core_id.0);
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
-        self.per_core_raft_apply_entries[core_index].fetch_add_relaxed(entry_count);
-        self.per_group_raft_apply_entries[group_index].fetch_add_relaxed(entry_count);
-        self.per_core_raft_apply_ns[core_index].fetch_add_relaxed(apply_ns);
-        self.per_group_raft_apply_ns[group_index].fetch_add_relaxed(apply_ns);
+        self.per_core_raft_apply_entries
+            .add_at(core_index, entry_count);
+        self.per_group_raft_apply_entries
+            .add_at(group_index, entry_count);
+        self.per_core_raft_apply_ns.add_at(core_index, apply_ns);
+        self.per_group_raft_apply_ns.add_at(group_index, apply_ns);
     }
 
     pub(crate) fn record_raft_snapshot_build(
@@ -559,16 +577,22 @@ impl RuntimeMetricsInner {
         sample: RaftSnapshotBuildSample,
     ) {
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
-        self.per_group_raft_snapshot_builds[group_index].fetch_add_relaxed(1);
-        self.per_group_raft_snapshot_build_ns[group_index].fetch_add_relaxed(sample.build_ns);
-        self.per_group_raft_snapshot_body_bytes[group_index].store_relaxed(sample.body_bytes);
-        self.per_group_raft_snapshot_pointer_bytes[group_index].store_relaxed(sample.pointer_bytes);
-        self.per_group_raft_snapshot_streams[group_index].store_relaxed(sample.streams);
+        self.per_group_raft_snapshot_builds.add_at(group_index, 1);
+        self.per_group_raft_snapshot_build_ns
+            .add_at(group_index, sample.build_ns);
+        self.per_group_raft_snapshot_body_bytes
+            .store_at(group_index, sample.body_bytes);
+        self.per_group_raft_snapshot_pointer_bytes
+            .store_at(group_index, sample.pointer_bytes);
+        self.per_group_raft_snapshot_streams
+            .store_at(group_index, sample.streams);
         if sample.external_upload {
-            self.per_group_raft_snapshot_external_uploads[group_index].fetch_add_relaxed(1);
+            self.per_group_raft_snapshot_external_uploads
+                .add_at(group_index, 1);
         }
         if sample.inline_fallback {
-            self.per_group_raft_snapshot_inline_fallbacks[group_index].fetch_add_relaxed(1);
+            self.per_group_raft_snapshot_inline_fallbacks
+                .add_at(group_index, 1);
         }
     }
 
@@ -582,14 +606,14 @@ impl RuntimeMetricsInner {
     ) {
         let core_index = usize::from(core_id.0);
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
-        self.per_core_wal_batches[core_index].fetch_add_relaxed(1);
-        self.per_group_wal_batches[group_index].fetch_add_relaxed(1);
-        self.per_core_wal_records[core_index].fetch_add_relaxed(record_count);
-        self.per_group_wal_records[group_index].fetch_add_relaxed(record_count);
-        self.per_core_wal_write_ns[core_index].fetch_add_relaxed(write_ns);
-        self.per_group_wal_write_ns[group_index].fetch_add_relaxed(write_ns);
-        self.per_core_wal_sync_ns[core_index].fetch_add_relaxed(sync_ns);
-        self.per_group_wal_sync_ns[group_index].fetch_add_relaxed(sync_ns);
+        self.per_core_wal_batches.add_at(core_index, 1);
+        self.per_group_wal_batches.add_at(group_index, 1);
+        self.per_core_wal_records.add_at(core_index, record_count);
+        self.per_group_wal_records.add_at(group_index, record_count);
+        self.per_core_wal_write_ns.add_at(core_index, write_ns);
+        self.per_group_wal_write_ns.add_at(group_index, write_ns);
+        self.per_core_wal_sync_ns.add_at(core_index, sync_ns);
+        self.per_group_wal_sync_ns.add_at(group_index, sync_ns);
     }
 
     pub(crate) fn record_wal_storage(
@@ -605,17 +629,23 @@ impl RuntimeMetricsInner {
     ) {
         let core_index = usize::from(core_id.0);
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
-        self.per_core_wal_fsyncs[core_index].fetch_add_relaxed(fsyncs);
-        self.per_group_wal_fsyncs[group_index].fetch_add_relaxed(fsyncs);
-        self.per_core_wal_fsync_records[core_index].fetch_add_relaxed(fsync_records);
-        self.per_group_wal_fsync_records[group_index].fetch_add_relaxed(fsync_records);
-        self.per_core_wal_reclaims[core_index].fetch_add_relaxed(reclaims);
-        self.per_group_wal_reclaims[group_index].fetch_add_relaxed(reclaims);
-        self.per_core_wal_reclaimed_bytes[core_index].fetch_add_relaxed(reclaimed_bytes);
-        self.per_group_wal_reclaimed_bytes[group_index].fetch_add_relaxed(reclaimed_bytes);
-        self.per_core_wal_reclaim_ns[core_index].fetch_add_relaxed(reclaim_ns);
-        self.per_group_wal_reclaim_ns[group_index].fetch_add_relaxed(reclaim_ns);
-        self.per_core_wal_physical_bytes[core_index].store_relaxed(physical_bytes);
+        self.per_core_wal_fsyncs.add_at(core_index, fsyncs);
+        self.per_group_wal_fsyncs.add_at(group_index, fsyncs);
+        self.per_core_wal_fsync_records
+            .add_at(core_index, fsync_records);
+        self.per_group_wal_fsync_records
+            .add_at(group_index, fsync_records);
+        self.per_core_wal_reclaims.add_at(core_index, reclaims);
+        self.per_group_wal_reclaims.add_at(group_index, reclaims);
+        self.per_core_wal_reclaimed_bytes
+            .add_at(core_index, reclaimed_bytes);
+        self.per_group_wal_reclaimed_bytes
+            .add_at(group_index, reclaimed_bytes);
+        self.per_core_wal_reclaim_ns.add_at(core_index, reclaim_ns);
+        self.per_group_wal_reclaim_ns
+            .add_at(group_index, reclaim_ns);
+        self.per_core_wal_physical_bytes
+            .store_at(core_index, physical_bytes);
     }
 
     pub(crate) fn record_wal_recovery(
@@ -627,10 +657,13 @@ impl RuntimeMetricsInner {
         live_entries: u64,
     ) {
         let core_index = usize::from(core_id.0);
-        self.per_core_wal_recovery_ns[core_index].fetch_add_relaxed(recovery_ns);
-        self.per_core_wal_recovery_records[core_index].fetch_add_relaxed(records);
-        self.per_core_wal_recovery_bytes[core_index].fetch_add_relaxed(bytes);
-        self.per_core_wal_recovery_live_entries[core_index].fetch_add_relaxed(live_entries);
+        self.per_core_wal_recovery_ns
+            .add_at(core_index, recovery_ns);
+        self.per_core_wal_recovery_records
+            .add_at(core_index, records);
+        self.per_core_wal_recovery_bytes.add_at(core_index, bytes);
+        self.per_core_wal_recovery_live_entries
+            .add_at(core_index, live_entries);
     }
 
     pub(crate) fn record_cold_upload(&self, bytes: u64, upload_ns: u64) {
@@ -693,9 +726,12 @@ impl RuntimeMetricsInner {
         group_hot_bytes: u64,
     ) {
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
-        self.per_group_cold_hot_bytes[group_index].store_relaxed(group_hot_bytes);
-        self.per_group_cold_hot_bytes_current_max[group_index].store_relaxed(group_hot_bytes);
-        self.per_group_cold_hot_bytes_max[group_index].fetch_max_relaxed(group_hot_bytes);
+        self.per_group_cold_hot_bytes
+            .store_at(group_index, group_hot_bytes);
+        self.per_group_cold_hot_bytes_current_max
+            .store_at(group_index, group_hot_bytes);
+        self.per_group_cold_hot_bytes_max
+            .max_at(group_index, group_hot_bytes);
         self.cold_hot_stream_bytes_max
             .fetch_max_relaxed(stream_hot_bytes);
     }
@@ -709,8 +745,9 @@ impl RuntimeMetricsInner {
     ) {
         let core_index = usize::from(core_id.0);
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
-        self.per_core_cold_backpressure_events[core_index].fetch_add_relaxed(1);
-        self.per_group_cold_backpressure_events[group_index].fetch_add_relaxed(1);
+        self.per_core_cold_backpressure_events.add_at(core_index, 1);
+        self.per_group_cold_backpressure_events
+            .add_at(group_index, 1);
         self.cold_backpressure_bytes
             .fetch_add_relaxed(incoming_bytes);
     }
@@ -720,17 +757,22 @@ impl RuntimeMetricsInner {
     }
 
     pub(crate) fn record_read_watchers_added(&self, core_id: CoreId, count: usize) {
-        self.per_core_live_read_waiters[usize::from(core_id.0)]
-            .fetch_add_relaxed(u64::try_from(count).expect("watcher count fits u64"));
+        self.per_core_live_read_waiters.add_at(
+            usize::from(core_id.0),
+            u64::try_from(count).expect("watcher count fits u64"),
+        );
     }
 
     pub(crate) fn record_read_watchers_removed(&self, core_id: CoreId, count: usize) {
-        self.per_core_live_read_waiters[usize::from(core_id.0)]
-            .fetch_sub_relaxed(u64::try_from(count).expect("watcher count fits u64"));
+        self.per_core_live_read_waiters.sub_at(
+            usize::from(core_id.0),
+            u64::try_from(count).expect("watcher count fits u64"),
+        );
     }
 
     pub(crate) fn record_live_read_backpressure(&self, core_id: CoreId) {
-        self.per_core_live_read_backpressure_events[usize::from(core_id.0)].fetch_add_relaxed(1);
+        self.per_core_live_read_backpressure_events
+            .add_at(usize::from(core_id.0), 1);
     }
 }
 
@@ -798,6 +840,55 @@ pub(crate) async fn record_cold_hot_backlog(
             backlog.stream_hot_bytes,
             backlog.group_hot_bytes,
         );
+    }
+}
+
+/// Per-core and per-group counters are indexed by ids that configuration
+/// validated. An out-of-range id is a routing bug: debug builds fail on it and
+/// release builds drop the sample instead of panicking the data path.
+pub(crate) trait CounterSlots {
+    fn slot(&self, index: usize) -> Option<&PaddedAtomicU64>;
+
+    fn add_at(&self, index: usize, value: u64) {
+        if let Some(slot) = self.slot(index) {
+            slot.fetch_add_relaxed(value);
+        }
+    }
+
+    fn sub_at(&self, index: usize, value: u64) {
+        if let Some(slot) = self.slot(index) {
+            slot.fetch_sub_relaxed(value);
+        }
+    }
+
+    fn sub_saturating_at(&self, index: usize, value: u64) {
+        if let Some(slot) = self.slot(index) {
+            slot.fetch_sub_saturating_relaxed(value);
+        }
+    }
+
+    fn store_at(&self, index: usize, value: u64) {
+        if let Some(slot) = self.slot(index) {
+            slot.store_relaxed(value);
+        }
+    }
+
+    fn max_at(&self, index: usize, value: u64) {
+        if let Some(slot) = self.slot(index) {
+            slot.fetch_max_relaxed(value);
+        }
+    }
+}
+
+impl CounterSlots for [PaddedAtomicU64] {
+    fn slot(&self, index: usize) -> Option<&PaddedAtomicU64> {
+        let slot = self.get(index);
+        debug_assert!(
+            slot.is_some(),
+            "metrics slot {index} is outside 0..{}",
+            self.len()
+        );
+        slot
     }
 }
 

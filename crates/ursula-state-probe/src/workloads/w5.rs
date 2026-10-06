@@ -7,6 +7,10 @@
 //! - `ttl-heap`: one long-lived stream, A appends, TTL none / sliding /
 //!   absolute: TTL heap growth per append.
 //! - `purge`: B buckets with one stream each, `PurgeBucket` each.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use anyhow::Result;
 use anyhow::bail;

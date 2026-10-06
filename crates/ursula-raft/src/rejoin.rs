@@ -38,6 +38,10 @@
 //! the survivor ([`GroupRejoin::adopt_survivor`]). A group whose every voter
 //! restarted empty is stopped by its "initialized" marker in object storage
 //! instead (`crate::restart_guard`).
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -308,7 +312,12 @@ impl GroupRejoin {
     /// it is reachable from the network.
     pub fn bind(&self, raft: &RaftGroupHandle) {
         raft.runtime_config().elect(false);
-        let _ = self.metrics.set(raft.metrics());
+        if self.metrics.set(raft.metrics()).is_err() {
+            tracing::warn!(
+                raft_group_id = self.raft_group_id.0,
+                "memory-WAL rejoin metrics were already bound"
+            );
+        }
     }
 
     fn metrics(&self) -> Option<RaftMetrics<UrsulaRaftTypeConfig>> {

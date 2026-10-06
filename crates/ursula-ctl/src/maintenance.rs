@@ -5,6 +5,10 @@
 //! process) belongs to the platform that owns it: Kubernetes and Helm for pod
 //! clusters, systemd for bare-metal hosts. A safe rolling restart runs these
 //! verbs around the platform's own restart, one node at a time.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -2199,6 +2203,10 @@ pub(crate) fn format_unready(report: &crate::plan::ReadinessReport) -> String {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::assertions_on_result_states,
+    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
+)]
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;

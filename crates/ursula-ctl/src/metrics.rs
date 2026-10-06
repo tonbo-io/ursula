@@ -72,7 +72,7 @@ impl MetricsClient {
         let mut pins = self
             .incarnations
             .lock()
-            .map_err(|_| anyhow!("process identity cache lock poisoned"))?;
+            .map_err(|_poisoned| anyhow!("process identity cache lock poisoned"))?;
         if let Some(pinned) = pins.get(&node.id) {
             if pinned != observed {
                 bail!(
@@ -90,7 +90,7 @@ impl MetricsClient {
         let existing = self
             .incarnations
             .lock()
-            .map_err(|_| anyhow!("process identity cache lock poisoned"))?
+            .map_err(|_poisoned| anyhow!("process identity cache lock poisoned"))?
             .get(&node.id)
             .cloned();
         if let Some(incarnation) = existing {
@@ -806,6 +806,10 @@ impl ClusterSnapshot {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::assertions_on_result_states,
+    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
+)]
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -1122,35 +1126,33 @@ mod tests {
     }
 
     #[test]
-    fn metrics_use_client_url_when_available() -> anyhow::Result<()> {
+    fn metrics_use_client_url_when_available() {
         let node = NodeInfo {
             expected_process_incarnation: None,
             expected_maintenance_fence: None,
             id: 1,
-            admin_url: Url::parse("http://127.0.0.1:4438")?,
+            admin_url: Url::parse("http://127.0.0.1:4438").expect("admin url"),
             host: "127.0.0.1".to_owned(),
-            http_url: Some(Url::parse("http://127.0.0.1:4437")?),
+            http_url: Some(Url::parse("http://127.0.0.1:4437").expect("client url")),
             metrics_url: None,
         };
 
         assert_eq!(metrics_base_url(&node).port(), Some(4437));
-        Ok(())
     }
 
     #[test]
-    fn metrics_fall_back_to_admin_url_for_legacy_manifests() -> anyhow::Result<()> {
+    fn metrics_fall_back_to_admin_url_for_legacy_manifests() {
         let node = NodeInfo {
             expected_process_incarnation: None,
             expected_maintenance_fence: None,
             id: 1,
-            admin_url: Url::parse("http://127.0.0.1:4438")?,
+            admin_url: Url::parse("http://127.0.0.1:4438").expect("admin url"),
             host: "127.0.0.1".to_owned(),
             http_url: None,
             metrics_url: None,
         };
 
         assert_eq!(metrics_base_url(&node).port(), Some(4438));
-        Ok(())
     }
 
     async fn quiesce_route() -> StatusCode {
@@ -1175,22 +1177,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_quiesce_probe_distinguishes_legacy_route_absence() -> anyhow::Result<()> {
-        let client = MetricsClient::new(Duration::from_secs(1))?;
+    async fn restart_quiesce_probe_distinguishes_legacy_route_absence() {
+        let client = MetricsClient::new(Duration::from_secs(1)).expect("metrics client");
         let supported = capability_node(
             Router::new().route("/__ursula/raft/quiesce-for-restart", post(quiesce_route)),
         )
-        .await?;
-        let legacy = capability_node(Router::new()).await?;
+        .await
+        .expect("supported node");
+        let legacy = capability_node(Router::new()).await.expect("legacy node");
 
         assert_eq!(
-            client.restart_quiesce_capability(&supported).await?,
+            client
+                .restart_quiesce_capability(&supported)
+                .await
+                .expect("probe supported node"),
             RestartQuiesceCapability::Supported
         );
         assert_eq!(
-            client.restart_quiesce_capability(&legacy).await?,
+            client
+                .restart_quiesce_capability(&legacy)
+                .await
+                .expect("probe legacy node"),
             RestartQuiesceCapability::LegacyUnavailable
         );
-        Ok(())
     }
 }

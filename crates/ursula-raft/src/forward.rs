@@ -88,7 +88,7 @@ pub(crate) fn read_stream_read_v1(
     request: &ReadStreamRequest,
 ) -> Result<raft_internal_proto::ReadStreamReadV1, GroupEngineError> {
     let max_len = u64::try_from(request.max_len)
-        .map_err(|_| GroupEngineError::new("read max_len does not fit u64"))?;
+        .map_err(|_overflow| GroupEngineError::new("read max_len does not fit u64"))?;
     Ok(raft_internal_proto::ReadStreamReadV1 {
         offset: request.offset,
         max_len,
@@ -214,7 +214,7 @@ pub(crate) async fn grpc_leader_channel(addr: &str) -> Result<Channel, GroupEngi
     let cache = GRPC_LEADER_CHANNELS.get_or_init(|| Mutex::new(BTreeMap::new()));
     if let Some(channel) = cache
         .lock()
-        .map_err(|_| GroupEngineError::new("gRPC leader channel cache mutex poisoned"))?
+        .map_err(|_poisoned| GroupEngineError::new("gRPC leader channel cache mutex poisoned"))?
         .get(addr)
         .cloned()
     {
@@ -228,7 +228,7 @@ pub(crate) async fn grpc_leader_channel(addr: &str) -> Result<Channel, GroupEngi
         .map_err(|err| GroupEngineError::new(format!("connect gRPC leader: {err}")))?;
     cache
         .lock()
-        .map_err(|_| GroupEngineError::new("gRPC leader channel cache mutex poisoned"))?
+        .map_err(|_poisoned| GroupEngineError::new("gRPC leader channel cache mutex poisoned"))?
         .insert(addr.to_owned(), channel.clone());
     Ok(channel)
 }

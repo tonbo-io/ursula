@@ -239,13 +239,7 @@ fn idle_producer_expires_at_its_own_next_write() {
     assert!(!deduplicated);
     assert_eq!(receipts(&machine, &stream_id, "p"), vec![0]);
     assert_eq!(window_items(&machine, &stream_id), 1);
-    let state = machine
-        .stream_slot(&stream_id)
-        .unwrap()
-        .producers
-        .get("p")
-        .unwrap()
-        .clone();
+    let state = machine.stream_slot(&stream_id).unwrap().producers["p"].clone();
     assert_eq!(state.last_seen_ms, idle_at);
 }
 

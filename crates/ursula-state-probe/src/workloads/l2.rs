@@ -7,6 +7,10 @@
 //! - `w1`: one stream, inline appends, a flush worker pass every tick.
 //! - `w2`: N trickle streams in one group, a flush worker pass every tick.
 //! - `compact`: `CompactCold` of shared pack slices on both engines.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -244,6 +248,10 @@ async fn w1(args: &L2Args, sink: &mut Sink) -> Result<Outcome> {
     Ok(outcome)
 }
 
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "probe arguments are non-negative rates and durations; `as` saturates anything else to zero"
+)]
 async fn w2(args: &L2Args, sink: &mut Sink) -> Result<Outcome> {
     let cold: ColdStoreHandle = Arc::new(ColdStore::memory().context("memory cold store")?);
     let rt = spawn(args.engine, cold, None)?;

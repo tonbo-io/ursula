@@ -6,6 +6,10 @@
 //! Each external append keeps its locator in state (F5). The workload models the
 //! leader's offload pass after every append, offloading a stream's staged refs
 //! once it holds more than T_ext = 16 or one is 10 s old.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::collections::HashMap;
 
@@ -64,6 +68,10 @@ pub fn default_name(args: &W3Args) -> String {
     })
 }
 
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "probe arguments are non-negative rates and durations; `as` saturates anything else to zero"
+)]
 pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
     let name = default_name(args);
     let payload_bytes = (args.payload_mib * smx::MIB as f64) as u64;

@@ -109,6 +109,10 @@ impl<C: RaftTypeConfig> raft_log::Callback for Callback<C> {
         match self {
             Self::IOFlushed(callback) => callback.io_completed(result),
             Self::Oneshot(tx) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the waiter may have given up; the flush result is then moot"
+                )]
                 let _ = tx.send(result);
             }
         }

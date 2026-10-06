@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::io;
@@ -14,7 +18,6 @@ use tokio::task::JoinSet;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
-use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 use ursula_shard::StaticShardMap;
 use ursula_stream::ColdChunkRef;
@@ -266,7 +269,7 @@ impl ShardRuntime {
         let shard_map = StaticShardMap::new(config.core_count, config.raft_group_count)?;
         let metrics = Arc::new(RuntimeMetricsInner::new(
             usize::from(shard_map.core_count()),
-            usize::try_from(shard_map.raft_group_count()).expect("u32 fits usize"),
+            config.raft_group_count,
         ));
         let cold_write_admission = ColdWriteAdmission {
             max_hot_bytes_per_group: config.cold_max_hot_bytes_per_group,
@@ -274,9 +277,8 @@ impl ShardRuntime {
         let raft_uncommitted_admission = RaftUncommittedAdmission {
             max_uncommitted_bytes_per_group: config.raft_max_uncommitted_bytes_per_group,
         };
-        let raft_uncommitted_bytes = Arc::new(RaftUncommittedBytesTracker::new(
-            usize::try_from(shard_map.raft_group_count()).expect("u32 fits usize"),
-        ));
+        let raft_uncommitted_bytes =
+            Arc::new(RaftUncommittedBytesTracker::new(config.raft_group_count));
         let engine_factory: Arc<dyn GroupEngineFactory> = Arc::new(engine_factory);
         let read_materialization = Arc::new(Semaphore::new(config.mailbox_capacity.max(1)));
         let read_barriers = ReadIndexBarriers::default();
@@ -400,7 +402,7 @@ impl ShardRuntime {
         incarnation: Option<u64>,
     ) -> Result<ReadStreamResponse, RuntimeError> {
         let placement = self.shard_map.locate(&request.stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
+        let mailbox = self.mailbox(placement.core_id)?;
         let waiter_id = self.next_waiter_id.fetch_add(1, Ordering::Relaxed);
         let stream_id = request.stream_id.clone();
         let (response_tx, response_rx) = oneshot::channel();
@@ -418,7 +420,7 @@ impl ShardRuntime {
         let mut cancel = WaitReadCancel::new(mailbox.tx.clone(), stream_id, placement, waiter_id);
         let response = response_rx
             .await
-            .map_err(|_| RuntimeError::ResponseDropped {
+            .map_err(|_dropped| RuntimeError::ResponseDropped {
                 core_id: mailbox.core_id,
             })?;
         cancel.disarm();
@@ -1146,13 +1148,14 @@ impl ShardRuntime {
                 .ok_or_else(|| RuntimeError::ColdStoreIo {
                     message: "cold compaction byte count overflow".to_owned(),
                 })?;
-            let capacity = usize::try_from(total_bytes).map_err(|_| RuntimeError::ColdStoreIo {
-                message: "cold compaction object exceeds addressable memory".to_owned(),
-            })?;
+            let capacity =
+                usize::try_from(total_bytes).map_err(|_overflow| RuntimeError::ColdStoreIo {
+                    message: "cold compaction object exceeds addressable memory".to_owned(),
+                })?;
             let mut payload = Vec::with_capacity(capacity);
             for chunk in &old_chunks {
                 let len = usize::try_from(chunk.end_offset.saturating_sub(chunk.start_offset))
-                    .map_err(|_| RuntimeError::ColdStoreIo {
+                    .map_err(|_overflow| RuntimeError::ColdStoreIo {
                         message: "cold chunk exceeds addressable memory".to_owned(),
                     })?;
                 let bytes = cold_store
@@ -1464,7 +1467,7 @@ impl ShardRuntime {
         let after = self
             .cold_index_repair
             .lock()
-            .map_err(|_| RuntimeError::ColdStoreConfig {
+            .map_err(|_poisoned| RuntimeError::ColdStoreConfig {
                 message: "cold-index repair cursor lock poisoned".to_owned(),
             })?
             .get(&raft_group_id)
@@ -1480,7 +1483,7 @@ impl ShardRuntime {
         let mut cursors =
             self.cold_index_repair
                 .lock()
-                .map_err(|_| RuntimeError::ColdStoreConfig {
+                .map_err(|_poisoned| RuntimeError::ColdStoreConfig {
                     message: "cold-index repair cursor lock poisoned".to_owned(),
                 })?;
         cursors.entry(raft_group_id).or_default().after = response.next_after;
@@ -1603,7 +1606,7 @@ impl ShardRuntime {
                 actual: placement,
             });
         }
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
+        let mailbox = self.mailbox(placement.core_id)?;
         let (response_tx, response_rx) = oneshot::channel();
         self.send_core_command(
             mailbox,
@@ -1637,7 +1640,7 @@ impl ShardRuntime {
                 actual: placement,
             });
         }
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
+        let mailbox = self.mailbox(placement.core_id)?;
         let (response_tx, response_rx) = oneshot::channel();
         self.send_core_command(
             mailbox,
@@ -1656,7 +1659,7 @@ impl ShardRuntime {
         raft_group_id: RaftGroupId,
     ) -> Result<ShardPlacement, RuntimeError> {
         let placement = self.placement_for_group(raft_group_id)?;
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
+        let mailbox = self.mailbox(placement.core_id)?;
         let (response_tx, response_rx) = oneshot::channel();
         self.send_core_command(
             mailbox,
@@ -1673,7 +1676,12 @@ impl ShardRuntime {
         let mut placements_by_core = vec![Vec::new(); self.mailboxes.len()];
         for raw_group_id in 0..self.shard_map.raft_group_count() {
             let placement = self.placement_for_group(RaftGroupId(raw_group_id))?;
-            placements_by_core[usize::from(placement.core_id.0)].push(placement);
+            placements_by_core
+                .get_mut(usize::from(placement.core_id.0))
+                .ok_or(RuntimeError::MailboxClosed {
+                    core_id: placement.core_id,
+                })?
+                .push(placement);
         }
         let mut responses = Vec::new();
         for (mailbox, placements) in self.mailboxes.iter().zip(placements_by_core) {
@@ -1688,30 +1696,29 @@ impl ShardRuntime {
         for (core_id, response_rx) in responses {
             response_rx
                 .await
-                .map_err(|_| RuntimeError::ResponseDropped { core_id })??;
+                .map_err(|_dropped| RuntimeError::ResponseDropped { core_id })??;
         }
         Ok(())
+    }
+
+    /// The mailbox of `core_id`. Placements come from the same shard map that
+    /// sized `mailboxes`, so a missing core means its worker is gone.
+    fn mailbox(&self, core_id: CoreId) -> Result<&CoreMailbox, RuntimeError> {
+        self.mailboxes
+            .get(usize::from(core_id.0))
+            .ok_or(RuntimeError::MailboxClosed { core_id })
     }
 
     fn placement_for_group(
         &self,
         raft_group_id: RaftGroupId,
     ) -> Result<ShardPlacement, RuntimeError> {
-        if raft_group_id.0 >= self.shard_map.raft_group_count() {
-            return Err(RuntimeError::InvalidRaftGroup {
+        self.shard_map
+            .placement(raft_group_id)
+            .ok_or(RuntimeError::InvalidRaftGroup {
                 raft_group_id,
                 raft_group_count: self.shard_map.raft_group_count(),
-            });
-        }
-        Ok(ShardPlacement {
-            core_id: CoreId(
-                (raft_group_id.0 % u32::from(self.shard_map.core_count()))
-                    .try_into()
-                    .expect("core id fits u16"),
-            ),
-            shard_id: ShardId(raft_group_id.0),
-            raft_group_id,
-        })
+            })
     }
 
     /// Routes a group command to its owning core and awaits the reply.
@@ -1725,7 +1732,7 @@ impl ShardRuntime {
         command: GroupCommand,
         response_rx: oneshot::Receiver<Result<T, RuntimeError>>,
     ) -> Result<T, RuntimeError> {
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
+        let mailbox = self.mailbox(placement.core_id)?;
         self.send_core_command(
             mailbox,
             CoreCommand::Group {
@@ -1747,7 +1754,7 @@ impl ShardRuntime {
         self.enqueue_core_command(mailbox, command).await?;
         response_rx
             .await
-            .map_err(|_| RuntimeError::ResponseDropped {
+            .map_err(|_dropped| RuntimeError::ResponseDropped {
                 core_id: mailbox.core_id,
             })?
     }
@@ -1765,7 +1772,7 @@ impl ShardRuntime {
             .tx
             .send(Traced::capture(command))
             .await
-            .map_err(|_| RuntimeError::MailboxClosed {
+            .map_err(|_closed| RuntimeError::MailboxClosed {
                 core_id: mailbox.core_id,
             })?;
         self.metrics

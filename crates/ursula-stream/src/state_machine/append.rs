@@ -1,4 +1,8 @@
 //! Append paths (inline/external) and idempotent producer bookkeeping.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use super::AppendExternalInput;
 use super::AppendStreamInput;

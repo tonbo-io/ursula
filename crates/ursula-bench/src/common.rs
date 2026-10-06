@@ -23,7 +23,7 @@ pub fn new_histogram() -> Histogram<u64> {
 pub fn record(hist: &mut Histogram<u64>, started_at: Instant) {
     let us = started_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
     let us = us.min(hist.high());
-    let _ = hist.record(us.max(hist.low()));
+    hist.saturating_record(us.max(hist.low()));
 }
 
 #[derive(Default, Clone, Debug, Serialize)]
@@ -64,8 +64,9 @@ pub fn fill_payload(size: usize, seed: u64) -> Vec<u8> {
         state = state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let bytes = state.to_le_bytes();
-        chunk.copy_from_slice(&bytes[..chunk.len()]);
+        for (dst, src) in chunk.iter_mut().zip(state.to_le_bytes()) {
+            *dst = src;
+        }
     }
     buf
 }

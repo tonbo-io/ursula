@@ -29,6 +29,10 @@
 //! not fit never stops the pass. The index and cursor are not replicated and
 //! are not part of snapshots; restore rebuilds the index from the restored
 //! hot buffers.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::cmp::Ordering;
 use std::collections::HashMap;

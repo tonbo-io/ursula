@@ -4,6 +4,10 @@
 //! appended: when the snapshot offset `S` is at or above the seal point and
 //! `[S, tail)` is all hot, one part per JSON message (split on LF) or one
 //! part in all for any other stream; an honest partial otherwise.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use super::*;
 

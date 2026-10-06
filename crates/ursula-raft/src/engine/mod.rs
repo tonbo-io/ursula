@@ -267,7 +267,6 @@ impl RaftGroupEngine {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new_single_node_with_log_store_metrics_and_snapshot_metadata<LS>(
         placement: ShardPlacement,
         node_id: u64,
@@ -345,7 +344,10 @@ impl RaftGroupEngine {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "pre-existing constructor shared by every engine variant; a builder should replace it"
+    )]
     pub async fn new_node_full<NF, LS>(
         placement: ShardPlacement,
         node_id: u64,

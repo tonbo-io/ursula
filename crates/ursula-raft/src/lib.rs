@@ -31,6 +31,11 @@
 //! - [`snapshot_codec`]: the group-snapshot frame codec; [`group_snapshot_frames`]
 //!   and [`decode_group_snapshot`] are re-exported for measurement tools.
 
+#[expect(
+    clippy::allow_attributes,
+    clippy::allow_attributes_without_reason,
+    reason = "tonic-build emits #[allow] attributes in generated code"
+)]
 pub mod raft_internal_proto {
     tonic::include_proto!("ursula.raft.v1");
 }

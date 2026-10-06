@@ -709,6 +709,10 @@ impl NodeMemoryMonitor {
                         .to_string();
                         tracing::error!("{breadcrumb}");
                         use std::io::Write as _;
+                        #[expect(
+                            clippy::let_underscore_must_use,
+                            reason = "best-effort flush immediately before abort; nothing can handle the error"
+                        )]
                         let _ = std::io::stderr().flush();
                         std::process::abort();
                     }
@@ -3613,8 +3617,9 @@ fn parse_snapshot_offset(raw: &str) -> Result<u64, BoxResponse> {
             (StatusCode::BAD_REQUEST, "invalid snapshot offset").into_response(),
         ));
     }
-    raw.parse::<u64>()
-        .map_err(|_| Box::new((StatusCode::BAD_REQUEST, "invalid snapshot offset").into_response()))
+    raw.parse::<u64>().map_err(|_invalid| {
+        Box::new((StatusCode::BAD_REQUEST, "invalid snapshot offset").into_response())
+    })
 }
 
 /// A catch-up read's start position. Its `offset=now` HEAD is linearizable
@@ -3655,9 +3660,9 @@ pub(crate) async fn read_offset(
 pub(crate) fn parse_read_offset(raw: Option<&str>) -> Result<u64, BoxResponse> {
     match raw {
         Some("-1") | None => Ok(0),
-        Some(raw) => raw
-            .parse::<u64>()
-            .map_err(|_| Box::new((StatusCode::BAD_REQUEST, "invalid offset").into_response())),
+        Some(raw) => raw.parse::<u64>().map_err(|_invalid| {
+            Box::new((StatusCode::BAD_REQUEST, "invalid offset").into_response())
+        }),
     }
 }
 
@@ -4003,14 +4008,14 @@ pub(crate) fn parse_stream_ttl(raw: &str) -> Result<u64, String> {
         return Err("stream-ttl must be a non-negative decimal integer".to_owned());
     }
     raw.parse::<u64>()
-        .map_err(|_| "stream-ttl is too large".to_owned())
+        .map_err(|_overflow| "stream-ttl is too large".to_owned())
 }
 
 pub(crate) fn parse_stream_expires_at(raw: &str) -> Result<u64, String> {
     let expires_at = DateTime::parse_from_rfc3339(raw)
-        .map_err(|_| "stream-expires-at must be an RFC3339 timestamp".to_owned())?;
+        .map_err(|_invalid| "stream-expires-at must be an RFC3339 timestamp".to_owned())?;
     u64::try_from(expires_at.timestamp_millis())
-        .map_err(|_| "stream-expires-at must not be before the Unix epoch".to_owned())
+        .map_err(|_before_epoch| "stream-expires-at must not be before the Unix epoch".to_owned())
 }
 
 /// The `Stream-Incarnation` request precondition (D12): `None` without the
@@ -4135,7 +4140,7 @@ pub(crate) fn parse_producer_integer(name: &str, raw: &str) -> Result<u64, Strin
     const MAX_JS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
     let value = raw
         .parse::<u64>()
-        .map_err(|_| format!("{name} must be a non-negative integer"))?;
+        .map_err(|_invalid| format!("{name} must be a non-negative integer"))?;
     if value > MAX_JS_SAFE_INTEGER {
         return Err(format!("{name} must be <= {MAX_JS_SAFE_INTEGER}"));
     }

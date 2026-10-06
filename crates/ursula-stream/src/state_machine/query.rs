@@ -1,4 +1,8 @@
 //! Read and query paths: heads, hot/cold accessors, read plans, snapshots, bootstrap.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use super::BOOTSTRAP_MAX_UPDATE_BYTES;
 use super::BucketStreamId;
@@ -19,6 +23,8 @@ use super::StreamResponse;
 use super::StreamStateMachine;
 use super::StreamStatus;
 use super::StreamVisibleSnapshot;
+use super::hot_buffer::len_u64;
+use super::hot_buffer::offset_delta;
 use super::stream_is_expired;
 use super::stream_ttl_renewal_due;
 use crate::json_records::is_json_record_content_type;
@@ -108,7 +114,7 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             ));
         };
-        Ok(u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64"))
+        Ok(len_u64(slot.hot_buffer.len()))
     }
 
     /// Whether the stream exists and has not expired at `now_ms`.
@@ -315,7 +321,7 @@ impl StreamStateMachine {
                     StreamReadSegment::Object(StreamReadObjectSegment {
                         object: ObjectPayloadRef::from(chunk),
                         read_start_offset: start,
-                        len: usize::try_from(end - start).expect("object read len fits usize"),
+                        len: offset_delta(start, end),
                     }),
                 ));
             }
@@ -329,7 +335,7 @@ impl StreamStateMachine {
                     StreamReadSegment::Object(StreamReadObjectSegment {
                         object: object.clone(),
                         read_start_offset: start,
-                        len: usize::try_from(end - start).expect("object read len fits usize"),
+                        len: offset_delta(start, end),
                     }),
                 ));
             }

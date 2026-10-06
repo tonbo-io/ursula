@@ -43,7 +43,10 @@ pub struct NodeInfo {
     pub expected_maintenance_fence: Option<MaintenanceFence>,
 }
 
-#[allow(async_fn_in_trait)]
+#[expect(
+    async_fn_in_trait,
+    reason = "ursulactl awaits providers on its own task; callers never need Send futures"
+)]
 pub trait NodeProvider {
     async fn list_nodes(&self) -> Result<Vec<NodeInfo>>;
 }
@@ -247,6 +250,10 @@ fn non_empty(value: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::assertions_on_result_states,
+    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
+)]
 mod tests {
     use super::*;
 
@@ -348,6 +355,10 @@ admin_url = "http://127.0.0.1:5442"
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::assertions_on_result_states,
+    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
+)]
 mod fence_tests {
     use serde_json::json;
 

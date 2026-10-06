@@ -17,6 +17,7 @@ use crate::command::GroupSnapshot;
 use crate::core_worker::CoreWorker;
 use crate::core_worker::ReadWatcher;
 use crate::core_worker::ReadWatchers;
+use crate::core_worker::reply;
 use crate::engine::GroupEngine;
 use crate::error::RuntimeError;
 use crate::metrics::RuntimeMetricsInner;
@@ -167,7 +168,7 @@ macro_rules! group_operations {
                 $($rejects)*
                 $(#[$attr])*
                 GroupCommand::$Variant { $tx, .. } => {
-                    let _ = $tx.send(Err($err));
+                    reply($tx, Err($err));
                 }
             }
             attach { $($attach)* }
@@ -177,7 +178,7 @@ macro_rules! group_operations {
                 GroupCommand::$Variant { $($field,)* $tx } => {
                     let response =
                         CoreWorker::$worker($(group_op_arg!($actor, $arg)),*).await;
-                    let _ = $tx.send(response);
+                    reply($tx, response);
                     ControlFlow::Continue(())
                 }
             }
@@ -220,7 +221,7 @@ macro_rules! group_operations {
                 $($rejects)*
                 $(#[$attr])*
                 GroupCommand::$Variant { $tx, .. } => {
-                    let _ = $tx.send(Err($err));
+                    reply($tx, Err($err));
                 }
             }
             attach {
@@ -239,7 +240,7 @@ macro_rules! group_operations {
                     let response =
                         CoreWorker::$worker($(group_op_arg!($actor, $arg)),*).await;
                     drop($g);
-                    let _ = $tx.send(response);
+                    reply($tx, response);
                     ControlFlow::Continue(())
                 }
             }
@@ -280,7 +281,7 @@ macro_rules! group_operations {
                 $($rejects)*
                 $(#[$attr])*
                 GroupCommand::$Variant { $tx, .. } => {
-                    let _ = $tx.send(Err($err));
+                    reply($tx, Err($err));
                 }
             }
             attach { $($attach)* }
@@ -377,7 +378,7 @@ macro_rules! group_operations {
                 $($rejects)*
                 $(#[$attr])*
                 GroupCommand::$Variant { $tx, .. } => {
-                    let _ = $tx.send(Err($err));
+                    reply($tx, Err($err));
                 }
             }
             attach { $($attach)* }
@@ -427,7 +428,7 @@ macro_rules! group_operations {
                 $($rejects)*
                 $(#[$attr])*
                 GroupCommand::$Variant { $tx, .. } => {
-                    let _ = $tx.send(Err($err));
+                    reply($tx, Err($err));
                 }
             }
             attach {
@@ -597,7 +598,7 @@ impl GroupActor {
                 // Durability is established when the group engine returns.
                 // Wake/materialize blocked readers afterwards so a large fanout
                 // cannot inflate the writer's acknowledgement latency.
-                let _ = response_tx.send(Ok(response));
+                reply(response_tx, Ok(response));
                 if !deduplicated {
                     CoreWorker::finish_append(
                         &mut self.engine,
@@ -611,7 +612,7 @@ impl GroupActor {
                 }
             }
             Err(err) => {
-                let _ = response_tx.send(Err(err));
+                reply(response_tx, Err(err));
             }
         }
         ControlFlow::Continue(())
@@ -626,7 +627,7 @@ impl GroupActor {
             .shutdown()
             .await
             .map_err(|err| RuntimeError::group_engine(self.placement, err));
-        let _ = response_tx.send(response);
+        reply(response_tx, response);
         ControlFlow::Break(())
     }
 

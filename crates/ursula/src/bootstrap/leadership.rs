@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -81,7 +85,7 @@ async fn leadership_balance_eligible_nodes(
 /// groups where it is currently leader). The result respects `max_per_tick`
 /// and produces a deterministic order (smallest group id first, smallest
 /// target id on ties) so retries on the same snapshot are stable.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn plan_leadership_balance(
     snaps: &[ursula_raft::RaftGroupMetricsSnapshot],
     my_id: u64,
@@ -317,10 +321,9 @@ pub fn spawn_leadership_balancer(
         loop {
             tokio::time::sleep(interval).await;
             let snaps = registry.metrics_snapshot();
-            if snaps.is_empty() {
+            let Some(my_id) = snaps.first().map(|snap| snap.node_id) else {
                 continue;
-            }
-            let my_id = snaps[0].node_id;
+            };
             let eligible_nodes =
                 leadership_balance_eligible_nodes(&registry, node_id, &peers, &client).await;
             let actions = plan_leadership_balance_with_eligible_nodes(

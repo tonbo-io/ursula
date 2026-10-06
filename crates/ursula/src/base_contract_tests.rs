@@ -13,6 +13,10 @@
 //! Offsets are opaque here: an offset is only ever echoed back or compared
 //! with another offset, never computed. A failing pin is a finding to
 //! triage; a later change may edit an assertion only with a named reason.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::sync::Arc;
 

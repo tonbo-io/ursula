@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::fmt::Debug;
 use std::io;
 use std::ops::RangeBounds;
@@ -64,7 +68,7 @@ where
     ) -> Result<MutexGuard<'_, MemoryRaftLogStoreInner<C>>, io::Error> {
         self.inner
             .lock()
-            .map_err(|_| io::Error::other("raft memory log store mutex poisoned"))
+            .map_err(|_poisoned| io::Error::other("raft memory log store mutex poisoned"))
     }
 }
 

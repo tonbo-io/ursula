@@ -92,11 +92,15 @@ pub fn init(options: InitOptions) -> ObservabilityGuard {
     #[cfg(feature = "otlp")]
     {
         if let Some((otel_layer, tracer_provider)) = otlp::build_layer(&options) {
-            let _ = tracing_subscriber::registry()
+            if let Err(err) = tracing_subscriber::registry()
                 .with(env_filter(options.default_directives))
                 .with(fmt_layer)
                 .with(otel_layer)
-                .try_init();
+                .try_init()
+            {
+                // An embedding binary or test already installed one; keep it.
+                tracing::debug!(%err, "global tracing subscriber already installed");
+            }
             // Metrics export is independent of the span layer; set the global
             // meter provider so the rest of the process can register
             // instruments via `opentelemetry::global::meter`.
@@ -111,10 +115,14 @@ pub fn init(options: InitOptions) -> ObservabilityGuard {
         }
     }
 
-    let _ = tracing_subscriber::registry()
+    if let Err(err) = tracing_subscriber::registry()
         .with(env_filter(options.default_directives))
         .with(fmt_layer)
-        .try_init();
+        .try_init()
+    {
+        // An embedding binary or test already installed one; keep it.
+        tracing::debug!(%err, "global tracing subscriber already installed");
+    }
 
     ObservabilityGuard {
         #[cfg(feature = "otlp")]

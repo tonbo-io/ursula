@@ -12,6 +12,10 @@
 //! (`ursula_runtime::LinearizableReadBarrier`), and the engine calls it
 //! itself for reads that arrive without a confirmed index (forwarded gRPC
 //! reads, direct engine calls).
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::sync::Arc;
 use std::sync::Mutex;

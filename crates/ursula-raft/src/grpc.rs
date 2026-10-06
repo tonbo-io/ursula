@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::future::Future;
@@ -67,6 +71,14 @@ use crate::types::UrsulaRaftTypeConfig;
 use crate::types::UrsulaVote;
 use crate::types::UrsulaVoteRequest;
 use crate::types::UrsulaVoteResponse;
+
+/// Reply to an append-stream caller that may have stopped waiting. A dropped
+/// receiver makes the reply moot.
+fn reply_to<T>(tx: oneshot::Sender<T>, value: T) {
+    if tx.send(value).is_err() {
+        tracing::trace!("append-stream caller stopped waiting before the reply");
+    }
+}
 
 pub(crate) static GRPC_LEADER_CHANNELS: OnceLock<Mutex<BTreeMap<String, Channel>>> =
     OnceLock::new();
@@ -735,10 +747,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 }
                 let request = tokio::select! {
                     biased;
-                    changed = shutdown.changed() => {
-                        let _ = changed;
-                        return None;
-                    }
+                    _ = shutdown.changed() => return None,
                     request = requests.next() => request?,
                 };
                 let buffered = match &request {
@@ -749,10 +758,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                         );
                         let permit = tokio::select! {
                             biased;
-                            changed = shutdown.changed() => {
-                                let _ = changed;
-                                return None;
-                            }
+                            _ = shutdown.changed() => return None,
                             permit = budget.clone().acquire_many_owned(charge) => permit.ok()?,
                         };
                         Some(QueuedAppendBytes::new(
@@ -1110,8 +1116,8 @@ pub(crate) fn read_stream_request_from_v1(
     now_ms: u64,
     read: raft_internal_proto::ReadStreamReadV1,
 ) -> Result<ReadStreamRequest, &'static str> {
-    let max_len =
-        usize::try_from(read.max_len).map_err(|_| "group_read.read_stream.max_len too large")?;
+    let max_len = usize::try_from(read.max_len)
+        .map_err(|_overflow| "group_read.read_stream.max_len too large")?;
     Ok(ReadStreamRequest {
         stream_id,
         offset: read.offset,
@@ -1443,7 +1449,7 @@ impl GrpcRaftNetwork {
                 response: response_sender,
                 queued,
             })
-            .map_err(|_| tonic::Status::unavailable("raft append stream is closed"))?;
+            .map_err(|_closed| tonic::Status::unavailable("raft append stream is closed"))?;
         match tokio::time::timeout_at(deadline, response_receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(tonic::Status::unavailable(
@@ -1709,7 +1715,7 @@ async fn run_append_session(
                                     "raft append stream response item is missing its result",
                                 )),
                             };
-                            let _ = reply.send(result);
+                            reply_to(reply, result);
                         }
                     }
                     Ok(None) => {
@@ -1743,9 +1749,12 @@ async fn run_append_session(
                 }
                 let Some(slot) = slot else {
                     for call in frame_calls {
-                        let _ = call.response.send(Err(tonic::Status::unavailable(
-                            "raft append stream request channel closed",
-                        )));
+                        reply_to(
+                            call.response,
+                            Err(tonic::Status::unavailable(
+                                "raft append stream request channel closed",
+                            )),
+                        );
                     }
                     accepting = false;
                     wire_sender.take();
@@ -1789,9 +1798,12 @@ async fn run_append_session(
     let abandoned = pending.len() as u64;
     GRPC_APPEND_STREAM_INFLIGHT.fetch_sub(abandoned, Ordering::Relaxed);
     for (_, response) in pending {
-        let _ = response.send(Err(tonic::Status::unavailable(
-            "raft append stream closed before the peer replied",
-        )));
+        reply_to(
+            response,
+            Err(tonic::Status::unavailable(
+                "raft append stream closed before the peer replied",
+            )),
+        );
     }
 }
 

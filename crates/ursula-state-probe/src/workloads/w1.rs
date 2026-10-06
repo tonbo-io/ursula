@@ -1,6 +1,10 @@
 //! W1: one JSON stream of ~200 B inline appends with cold flushes. With
 //! `--retain-every=K` (W6): every K records publish a tiny checkpoint and
 //! advance retention, keeping the last `--retain-keep` records.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::time::Instant;
 

@@ -288,7 +288,10 @@ fn spawn_singleton(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "static-cluster bootstrap wires every runtime dependency in one place"
+)]
 fn spawn_static_cluster(
     runtime_config: RuntimeConfig,
     cold_store: Option<ColdStoreHandle>,

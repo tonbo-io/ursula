@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
@@ -60,6 +64,10 @@ impl fmt::Display for HumanDuration {
 impl FromStr for HumanDuration {
     type Err = String;
 
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "the number is parsed from ASCII digits and '.', so it is finite and non-negative"
+    )]
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
         if s.is_empty() {
@@ -74,7 +82,7 @@ impl FromStr for HumanDuration {
         let (num_part, unit) = s.split_at(unit_start);
         let value: f64 = num_part
             .parse()
-            .map_err(|_| format!("invalid duration number '{num_part}'"))?;
+            .map_err(|err| format!("invalid duration number '{num_part}': {err}"))?;
         let duration = match unit {
             "ms" => {
                 if value.fract() != 0.0 {
@@ -83,13 +91,13 @@ impl FromStr for HumanDuration {
                 Duration::from_millis(value as u64)
             }
             "s" => Duration::try_from_secs_f64(value)
-                .map_err(|_| format!("duration '{s}' out of range"))?,
+                .map_err(|err| format!("duration '{s}' out of range: {err}"))?,
             "m" => Duration::try_from_secs_f64(value * 60.0)
-                .map_err(|_| format!("duration '{s}' out of range"))?,
+                .map_err(|err| format!("duration '{s}' out of range: {err}"))?,
             "h" => Duration::try_from_secs_f64(value * 3600.0)
-                .map_err(|_| format!("duration '{s}' out of range"))?,
+                .map_err(|err| format!("duration '{s}' out of range: {err}"))?,
             "d" => Duration::try_from_secs_f64(value * 86400.0)
-                .map_err(|_| format!("duration '{s}' out of range"))?,
+                .map_err(|err| format!("duration '{s}' out of range: {err}"))?,
             other => return Err(format!("unknown duration unit '{other}'")),
         };
         Ok(Self(duration))
@@ -114,10 +122,9 @@ impl<'de> Deserialize<'de> for HumanDuration {
                 )
             }
             fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
-                if v < 0 {
-                    return Err(E::custom("duration cannot be negative"));
-                }
-                Ok(HumanDuration(Duration::from_millis(v as u64)))
+                let millis = u64::try_from(v)
+                    .map_err(|_negative| E::custom("duration cannot be negative"))?;
+                Ok(HumanDuration(Duration::from_millis(millis)))
             }
             fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
                 Ok(HumanDuration(Duration::from_millis(v)))
@@ -174,6 +181,10 @@ impl fmt::Display for HumanSize {
 
 impl FromStr for HumanSize {
     type Err = String;
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "the number is parsed from ASCII digits and '.', so it is finite and non-negative"
+    )]
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
         if s.is_empty() {
@@ -188,7 +199,7 @@ impl FromStr for HumanSize {
         let (num_part, unit) = s.split_at(unit_start);
         let value: f64 = num_part
             .parse()
-            .map_err(|_| format!("invalid size number '{num_part}'"))?;
+            .map_err(|err| format!("invalid size number '{num_part}': {err}"))?;
         let multiplier: f64 = match unit {
             "B" | "b" => 1.0,
             "K" | "KB" | "k" | "kb" => 1000.0,
@@ -225,10 +236,9 @@ impl<'de> Deserialize<'de> for HumanSize {
                 )
             }
             fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
-                if v < 0 {
-                    return Err(E::custom("size cannot be negative"));
-                }
-                Ok(HumanSize(v as u64))
+                let bytes =
+                    u64::try_from(v).map_err(|_negative| E::custom("size cannot be negative"))?;
+                Ok(HumanSize(bytes))
             }
             fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
                 Ok(HumanSize(v))

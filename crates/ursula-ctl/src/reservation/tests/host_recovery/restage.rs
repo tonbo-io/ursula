@@ -1,3 +1,7 @@
+#![expect(
+    clippy::assertions_on_result_states,
+    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
+)]
 use serde_json::json;
 use ursula_proto::admin::ProcessIncarnation;
 
