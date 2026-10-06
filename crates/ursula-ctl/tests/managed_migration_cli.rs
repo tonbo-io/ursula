@@ -31,6 +31,8 @@ use ursula_shard::StaticShardMap;
 mod joint_fault;
 #[path = "managed_migration/snapshot_fault.rs"]
 mod snapshot_fault;
+#[path = "managed_migration/snapshot_reply.rs"]
+mod snapshot_reply;
 
 struct Process {
     child: Child,

@@ -51,7 +51,7 @@ pub(super) struct Gate {
 }
 
 impl Gate {
-    fn arm(&self, group: u32, target: BTreeSet<u64>) {
+    pub(super) fn arm(&self, group: u32, target: BTreeSet<u64>) {
         *self.state.lock().unwrap() = Some(Armed {
             group,
             target,
@@ -60,7 +60,7 @@ impl Gate {
         });
     }
 
-    fn resume(&self) {
+    pub(super) fn resume(&self) {
         *self.state.lock().unwrap() = None;
     }
 
@@ -122,6 +122,7 @@ impl Gate {
 struct DataProxy {
     channel: Channel,
     gate: Arc<Gate>,
+    snapshot_reply: Option<Arc<super::snapshot_reply::Gate>>,
 }
 
 #[derive(Clone)]
@@ -141,6 +142,29 @@ impl Drop for Proxy {
 
 impl Proxy {
     pub(super) async fn start(address: &str, backend: &str, gate: Arc<Gate>) -> Self {
+        Self::start_inner(address, backend, gate, None).await
+    }
+
+    pub(super) async fn start_snapshot(
+        address: &str,
+        backend: &str,
+        snapshot_reply: Arc<super::snapshot_reply::Gate>,
+    ) -> Self {
+        Self::start_inner(
+            address,
+            backend,
+            Arc::new(Gate::default()),
+            Some(snapshot_reply),
+        )
+        .await
+    }
+
+    async fn start_inner(
+        address: &str,
+        backend: &str,
+        gate: Arc<Gate>,
+        snapshot_reply: Option<Arc<super::snapshot_reply::Gate>>,
+    ) -> Self {
         let channel = Endpoint::from_shared(backend.to_owned())
             .unwrap()
             .connect_timeout(Duration::from_secs(2))
@@ -148,6 +172,7 @@ impl Proxy {
         let data = proto::raft_internal_server::RaftInternalServer::new(DataProxy {
             channel: channel.clone(),
             gate,
+            snapshot_reply,
         })
         .accept_compressed(CompressionEncoding::Zstd);
         let meta =
@@ -277,9 +302,15 @@ impl proto::raft_internal_server::RaftInternal for DataProxy {
         &self,
         request: Request<proto::RaftFullSnapshotRequestV1>,
     ) -> Result<Response<proto::RaftFullSnapshotAckV1>, Status> {
-        proto::raft_internal_client::RaftInternalClient::new(self.channel.clone())
+        let group = request.get_ref().raft_group_id;
+        let metadata = request.get_ref().snapshot_meta.clone();
+        let response = proto::raft_internal_client::RaftInternalClient::new(self.channel.clone())
             .full_snapshot(request)
-            .await
+            .await?;
+        if let Some(gate) = &self.snapshot_reply {
+            gate.hold_response(group, &metadata).await;
+        }
+        Ok(response)
     }
     async fn group_write(
         &self,

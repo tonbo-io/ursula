@@ -1504,3 +1504,26 @@ M2 remains open for complete migration-boundary DST and remaining snapshot,
 prepare/release and delayed-request fault acceptance. M3 capacity operations,
 performance acceptance and M4 autopilot remain in the active epic. M1 completion
 does not close those later milestones.
+
+### Implementation checkpoint: durable S3 snapshot response-loss fixture
+
+A fifth real-binary migration fixture is added for native Depot validation.
+The destination's Raft proxy forwards `full_snapshot` to the actual backend,
+then withholds its genuine successful response. This boundary follows native
+snapshot installation, fsynced local metadata and S3 reference publication;
+the proxy does not synthesize success. Verify the destination's applied prefix,
+decode its persisted snapshot metadata, and read its actual S3 reference and
+nonempty object before killing the destination process.
+
+Original voters also withhold final target-uniform membership appends so that
+placement cannot finish while the test inspects the installed pointer. A joint
+configuration may already be committed. Keep retained target voters alive so
+both RF3 and RF5 preserve their native source/target majorities during the
+destination outage; controller-loss-before-install is covered by the separate
+prefetch fixture. Acknowledge another write, reopen the same destination WAL,
+release the transport faults and require exact target membership, a new process
+identity, a higher executor generation, epoch 1 and all acknowledged payloads.
+Repeat S3 reference/pin cleanup and a complete seven-process restart.
+
+Validation is pending on Depot. This adds the post-application response-loss
+boundary, not a crash inside the atomic metadata write or complete executor DST.

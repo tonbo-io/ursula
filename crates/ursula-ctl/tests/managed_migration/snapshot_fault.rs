@@ -349,14 +349,62 @@ async fn references_settled(store: &opendal::Operator, group: u32, voters: &BTre
     }
 }
 
+async fn assert_download_pinned(proxy: &Proxy, store: &opendal::Operator, group: u32) {
+    tokio::time::timeout(Duration::from_secs(40), async {
+        loop {
+            let entered = proxy.gate.entered.notified();
+            if !proxy.gate.paths.lock().unwrap().is_empty() {
+                break;
+            }
+            entered.await;
+        }
+    })
+    .await
+    .expect("destination never downloaded a purged-prefix S3 snapshot");
+    assert!(!proxy.gate.paths.lock().unwrap().is_empty());
+    let download_paths = proxy.gate.paths.lock().unwrap().clone();
+    let pins = store
+        .list_with(&format!("snapshots/group-{group}/references/pins/7/"))
+        .recursive(true)
+        .await
+        .unwrap();
+    let mut protected = false;
+    for entry in pins
+        .into_iter()
+        .filter(|entry| entry.metadata().mode().is_file())
+    {
+        let pin: serde_json::Value =
+            serde_json::from_slice(&store.read(entry.path()).await.unwrap().to_vec()).unwrap();
+        let key = pin["snapshot_key"].as_str().unwrap();
+        if download_paths.iter().any(|path| path.ends_with(key)) {
+            assert!(store.stat(key).await.unwrap().content_length() > 0);
+            protected = true;
+        }
+    }
+    assert!(
+        protected,
+        "snapshot GET started without a durable target pin"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires native MinIO and AWS CLI; run explicitly with --ignored"]
 async fn binaries_resume_rf3_rf5_after_s3_snapshot_download_and_controller_crashes() {
+    snapshot_scenario(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires native MinIO and AWS CLI; run explicitly with --ignored"]
+async fn binaries_resume_rf3_rf5_after_durable_s3_snapshot_reply_loss_and_process_crashes() {
+    snapshot_scenario(true).await;
+}
+
+async fn snapshot_scenario(applied_reply: bool) {
     let mut minio = Minio::start().await;
-    let mut cluster = Cluster::new_with_s3(Some((
-        minio.storage.clone(),
-        "managed-snapshot-fault".to_owned(),
-    )))
+    let mut cluster = Cluster::new_with_transport(
+        Some((minio.storage.clone(), "managed-snapshot-fault".to_owned())),
+        applied_reply,
+    )
     .await;
     let proxy = Proxy::start(minio.storage.endpoint.clone().unwrap()).await;
     let store = minio.operator("managed-snapshot-fault");
@@ -387,7 +435,22 @@ async fn binaries_resume_rf3_rf5_after_s3_snapshot_download_and_controller_crash
         labels: BTreeMap::from([("zone".to_owned(), "2".to_owned())]),
     };
     assert!(cluster.register(&node).await.status.success());
+    let replies = Arc::new(super::snapshot_reply::Gate::default());
+    let backend = if applied_reply {
+        let backend = format!("http://127.0.0.1:{}", port());
+        cluster._proxies.push(
+            super::joint_fault::Proxy::start_snapshot(&node.cluster_url, &backend, replies.clone())
+                .await,
+        );
+        Some(backend)
+    } else {
+        None
+    };
     cluster.provision(node);
+    if let Some(backend) = backend {
+        cluster.configs.get_mut(&7).unwrap().server.cluster_listen =
+            Some(backend.trim_start_matches("http://").to_owned());
+    }
     cluster
         .configs
         .get_mut(&7)
@@ -401,45 +464,27 @@ async fn binaries_resume_rf3_rf5_after_s3_snapshot_download_and_controller_crash
     cluster.start(7, "snapshot-destination-join");
     cluster.ready().await;
     for (group, voters) in [(0, "1,2,7"), (1, "1,2,4,5,7")] {
-        proxy.gate.pause(group);
+        if applied_reply {
+            replies.arm(group);
+            // Keep publication uncommitted even if independent applied-prefix
+            // observations let the controller advance while this reply waits.
+            // All original native voters withhold the final uniform append.
+            cluster.fault.as_ref().unwrap().arm(
+                group,
+                voters.split(',').map(|id| id.parse().unwrap()).collect(),
+            );
+        } else {
+            proxy.gate.pause(group);
+        }
         let id = cluster
             .submit_group(group, &format!("snapshot-fault-{group}"), 0, voters, None)
             .await;
-        tokio::time::timeout(Duration::from_secs(40), async {
-            loop {
-                let entered = proxy.gate.entered.notified();
-                if !proxy.gate.paths.lock().unwrap().is_empty() {
-                    break;
-                }
-                entered.await;
-            }
-        })
-        .await
-        .expect("destination never downloaded a purged-prefix S3 snapshot");
-        assert!(!proxy.gate.paths.lock().unwrap().is_empty());
-        let download_paths = proxy.gate.paths.lock().unwrap().clone();
-        let pins = store
-            .list_with(&format!("snapshots/group-{group}/references/pins/7/"))
-            .recursive(true)
-            .await
-            .unwrap();
-        let mut protected = false;
-        for entry in pins
-            .into_iter()
-            .filter(|entry| entry.metadata().mode().is_file())
-        {
-            let pin: serde_json::Value =
-                serde_json::from_slice(&store.read(entry.path()).await.unwrap().to_vec()).unwrap();
-            let key = pin["snapshot_key"].as_str().unwrap();
-            if download_paths.iter().any(|path| path.ends_with(key)) {
-                assert!(store.stat(key).await.unwrap().content_length() > 0);
-                protected = true;
-            }
+        if applied_reply {
+            let installed = replies.boundary().await;
+            super::snapshot_reply::assert_installed(&cluster, &store, group, &installed).await;
+        } else {
+            assert_download_pinned(&proxy, &store, group).await;
         }
-        assert!(
-            protected,
-            "snapshot GET started without a durable target pin"
-        );
         let view = cluster.view().await;
         let migration = &view.state.migrations[&id];
         assert!(migration.is_running());
@@ -452,7 +497,11 @@ async fn binaries_resume_rf3_rf5_after_s3_snapshot_download_and_controller_crash
             ReplicaAssignmentPhase::Hosted
         );
         cluster.processes.remove(&7);
-        let controller = (group == 0).then_some(token.executor.node_id);
+        // After installation, joint consensus may already be committed. Keep
+        // retained target voters alive so this boundary tests reply loss plus
+        // destination replacement with a surviving native joint quorum. The
+        // prefetch variant separately kills the controller before joint commit.
+        let controller = (group == 0 && !applied_reply).then_some(token.executor.node_id);
         if let Some(controller) = controller {
             cluster.processes.remove(&controller);
         }
@@ -496,6 +545,10 @@ async fn binaries_resume_rf3_rf5_after_s3_snapshot_download_and_controller_crash
             cluster.start(controller, "snapshot-controller-restart");
         }
         proxy.gate.resume();
+        replies.resume();
+        if let Some(gate) = &cluster.fault {
+            gate.resume();
+        }
         cluster.wait(id).await;
         cluster.ready().await;
         let settled = cluster.view().await;
