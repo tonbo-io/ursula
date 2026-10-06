@@ -113,6 +113,11 @@ fn follower_forwards_stale_read_visibility_errors() {
     let missing = GroupEngineError::stream(StreamErrorCode::StreamNotFound, "missing");
     assert!(should_forward_stale_follower_read_error(false, &missing));
     assert!(!should_forward_stale_follower_read_error(true, &missing));
+    let beyond = GroupEngineError::stream(StreamErrorCode::OffsetOutOfRange, "beyond local tail");
+    assert!(should_forward_stale_follower_read_error(false, &beyond));
+    assert!(!should_forward_stale_follower_read_error(true, &beyond));
+    let gone = GroupEngineError::stream(StreamErrorCode::StreamGone, "retained prefix gone");
+    assert!(!should_forward_stale_follower_read_error(false, &gone));
 }
 
 #[test]

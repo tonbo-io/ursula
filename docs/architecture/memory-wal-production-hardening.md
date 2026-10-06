@@ -571,3 +571,33 @@ Local full-workspace library/binary tests passed (174 Ursula and 77 CLI tests), 
 The current `ursula-ctl` change supplies pure ownership/progress policy and offline whole-ConfigMap CAS proposal/acknowledgement commands. Planned Pod replacement requires a fresh all-active three-voter proof before admission, retirement of the original Pod UID, target-only process binding, and a fresh all-retired nonregressing proof before releasing the reservation. Takeover preserves the selected source and admitted write boundary, advances the executor generation and cannot choose another voter. Completed state retains the generation and replacement receipt. This is a foundation for the rollout consumer; it is not yet integrated into chart maintenance, qualified against a live Kubernetes CAS store, or sufficient for physical host recovery.
 
 Eleven policy regressions and the actual CLI process test cover competing CAS proposals, fixed-source takeover, stale/incomplete proofs, same-UID refusal, target-only binding, completion and persistent JSON round trips. The complete CLI path caught and fixed serde's buffered enum parsing failure for numeric JSON map keys. The synthetic proof fixture is explicitly not live Raft evidence. Consumer integration, two-survivor host-loss admission and exact physical fencing remain outstanding. See `maintenance-reservation.md` for the current interface and boundaries.
+
+## Shared-rollout qualification: stale follower cursor
+
+The first shared-reservation EKS run
+[37449534958](https://github.com/tonbo-io/cloud/actions/runs/37449534958),
+Ursula source `db5d13997391e2a556e4e7c6fd7f459ea2a90d85`, completed the actual
+three-voter Helm hook but failed its observer and did not complete final ACK
+verification. Its journal also records a distinct read-after-ACK failure:
+stream `qualification-recovery/stream-320`, acknowledged start offset 90112,
+then HTTP 416 reporting tail 81920. This run does not establish data preservation
+or qualification success. Namespace and exact S3 roots were independently read
+absent after cleanup. Cloud #3186 repairs the observer list/watch handshake and
+order-independent transition verification; it does not fix this read failure.
+
+A real TCP/gRPC regression on core baseline
+`14d89e378afe0e1cf4dd08eb9ae05b50e6f19223` pauses one follower's replication after
+all three apply a ten-byte prefix. The other two voters acknowledge two more
+appends through offset 18. Reading their acknowledged start offset 14 from the
+lagging follower reproduces `OffsetOutOfRange`, reporting local tail 10. This
+reproduces the stale-read mechanism without losing data; it does not prove that
+the failed EKS run had no additional recovery defect.
+
+Follower-local read-plan `OffsetOutOfRange` now joins the existing
+`StreamNotFound` forwarding path; these forwarded boundary checks use a
+quorum-confirmed leader read. Without a known leader, return the existing
+leader-unknown retryable refusal. Preserve truly invalid cursor errors and the
+owner-pinned live-read contract. The regression checks the exact acknowledged
+payload/offset, genuine out-of-range refusal, refusal when quorum confirmation
+fails, and the complete prefix on all three replicas after repair. Full reviewed
+artifact and production-scale qualification remain required.

@@ -553,3 +553,170 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         server.abort();
     }
 }
+
+/// ACKs are quorum-replicated, not necessarily applied on the third replica.
+/// A catch-up cursor ahead of that replica must be checked at the leader.
+#[tokio::test]
+async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
+    let config = Arc::new(
+        Config {
+            cluster_name: "stale-follower-cursor-grpc".to_owned(),
+            heartbeat_interval: 10,
+            election_timeout_min: 100,
+            election_timeout_max: 200,
+            enable_tick: false,
+            snapshot_policy: SnapshotPolicy::Never,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap(),
+    );
+    let mut endpoints = Vec::new();
+    let mut services = Vec::new();
+    let mut servers = Vec::new();
+    let mut engines = Vec::new();
+    let mut gates = Vec::new();
+    for id in 1..=3 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        endpoints.push(format!("http://{}", listener.local_addr().unwrap()));
+        let registry = RaftGroupHandleRegistry::default();
+        let service = RecoveryTestService {
+            inner: RaftGrpcService::new(registry.clone()),
+            pause_replication: Arc::new(AtomicBool::new(false)),
+            legacy: Arc::new(AtomicBool::new(false)),
+            unknown_rpc_requests: Arc::new(AtomicUsize::new(0)),
+            legacy_vote_change: Arc::new(AtomicUsize::new(0)),
+        };
+        let wire = pb::raft_internal_server::RaftInternalServer::new(service.clone())
+            .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
+        servers.push(tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new().fallback_service(wire))
+                .await
+                .unwrap();
+        }));
+        let (engine, _, gate) = new_recovery_engine(id, config.clone(), &registry).await;
+        services.push(service);
+        engines.push(engine);
+        gates.push(gate);
+    }
+    let nodes = endpoints
+        .iter()
+        .enumerate()
+        .map(|(index, endpoint)| (u64::try_from(index).unwrap() + 1, BasicNode::new(endpoint)))
+        .collect::<BTreeMap<_, _>>();
+    gates[1].allow_fresh_bootstrap();
+    engines[1].raft.runtime_config().elect(true);
+    engines[1].raft.initialize(nodes).await.unwrap();
+    engines[1]
+        .raft
+        .wait(Some(Duration::from_secs(5)))
+        .current_leader(2, "initial leader")
+        .await
+        .unwrap();
+    let stream_id = bsid("ack-cursor");
+    create_stream_via_raft(&engines[1], stream_id.clone()).await;
+    let initial = engines[1]
+        .raft
+        .client_write(append_command(stream_id.clone(), b"old-prefix"))
+        .await
+        .unwrap();
+    engines[1].raft.trigger().heartbeat().await.unwrap();
+    for engine in &engines {
+        engine
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index_at_least(Some(initial.log_id.index()), "initial prefix applied")
+            .await
+            .unwrap();
+    }
+    services[0].pause_replication.store(true, Ordering::SeqCst);
+    engines[1]
+        .raft
+        .client_write(append_command(stream_id.clone(), b"-gap"))
+        .await
+        .unwrap();
+    let acked = engines[1]
+        .raft
+        .client_write(append_command(stream_id.clone(), b"-ACK"))
+        .await
+        .unwrap();
+    match write_result_from_raft_response(acked.data).unwrap() {
+        Ok(GroupWriteResponse::Append(response)) => {
+            assert_eq!(response.start_offset, 14);
+            assert_eq!(response.next_offset, 18);
+        }
+        other => panic!("unexpected append response: {other:?}"),
+    }
+    assert_eq!(
+        engines[0]
+            .raft
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .as_ref()
+            .unwrap()
+            .index(),
+        initial.log_id.index()
+    );
+    let read = engines[0]
+        .read_stream(
+            ReadStreamRequest {
+                offset: 14,
+                ..read_req(stream_id.clone(), 4)
+            },
+            placement(),
+        )
+        .await
+        .expect("read acknowledged cursor through lagging follower");
+    assert_eq!(read.payload, b"-ACK");
+    assert_eq!(read.next_offset, 18);
+    let invalid = engines[0]
+        .read_stream(
+            ReadStreamRequest {
+                offset: 19,
+                ..read_req(stream_id.clone(), 4)
+            },
+            placement(),
+        )
+        .await
+        .expect_err("cursor beyond authoritative tail stays invalid");
+    assert_eq!(invalid.code(), Some(StreamErrorCode::OffsetOutOfRange));
+    // A remembered leader without a quorum cannot certify a permanent
+    // boundary, even when its own tail currently rejects the cursor.
+    services[2].pause_replication.store(true, Ordering::SeqCst);
+    let unconfirmed = engines[0]
+        .read_stream(
+            ReadStreamRequest {
+                offset: 19,
+                ..read_req(stream_id.clone(), 4)
+            },
+            placement(),
+        )
+        .await
+        .expect_err("boundary requires a current leader proof");
+    assert!(unconfirmed.leader_hint().is_some(), "{unconfirmed:?}");
+    assert_ne!(unconfirmed.code(), Some(StreamErrorCode::OffsetOutOfRange));
+    services[2].pause_replication.store(false, Ordering::SeqCst);
+    services[0].pause_replication.store(false, Ordering::SeqCst);
+    engines[1].raft.trigger().heartbeat().await.unwrap();
+    for engine in &engines {
+        engine
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index_at_least(Some(acked.log_id.index()), "complete ACK prefix repaired")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_stream_via_state_machine(engine, stream_id.clone(), 64)
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            b"old-prefix-gap-ACK"
+        );
+    }
+    shutdown_all(&engines).await;
+    for server in servers {
+        server.abort();
+    }
+}
