@@ -248,7 +248,9 @@ impl MetricsClient {
         raft_group_id: u64,
         current_term: u64,
     ) -> Result<()> {
-        if self.observed_incarnation(voter).await?.is_some() {
+        // Re-observe before selecting the legacy RPC: a cached legacy absence
+        // must never route an election to a newly guarded replacement.
+        if self.fetch_node(voter).await?.process_incarnation.is_some() {
             let url = voter
                 .admin_url
                 .join(&format!("/__ursula/raft/{raft_group_id}/self-election"))?;
@@ -858,6 +860,20 @@ mod tests {
                 .contains("metrics identity differs")
         );
         assert_eq!(applied.load(std::sync::atomic::Ordering::SeqCst), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_to_current_replacement_cannot_reuse_the_unbound_election_rpc() {
+        let (node, identity, _, task) = incarnation_node(1, None).await;
+        let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
+        client.fetch_node(&node).await.unwrap();
+        *identity.lock().unwrap() = Some(ProcessIncarnation::from_bits(1));
+        let error = client.request_self_election(&node, 0, 7).await.unwrap_err();
+        assert!(
+            error.to_string().contains("changed during"),
+            "cached legacy transport must stop before HTTP or consensus mutation: {error}"
+        );
         task.abort();
     }
 
