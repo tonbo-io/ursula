@@ -1471,7 +1471,10 @@ not model filesystem frame corruption or power-loss/fsync behavior.
 
 Four storage tests cover exclusive/isolated disks and identity rejection,
 commit-side recovery, durable prepare-receipt replay and pending work retained
-across a newer generation/process. They are queued for native Depot execution
-with `RUSTFLAGS='--cfg madsim'`. These are storage-seam checks, not complete
+across a newer generation/process. All four passed on native Depot ARM in
+[run 37534513860](https://github.com/tonbo-io/ursula/actions/runs/37534513860)
+at `e622256`, with `RUSTFLAGS='--cfg madsim'`. The existing smoke also passed;
+the full workflow failed on separate native fixture issues recorded in the
+epic tracker. These are storage-seam checks, not complete
 executor DST schedules. The bound meta persistence/transport harness and
 migration-boundary fault schedules remain the next integration work.
