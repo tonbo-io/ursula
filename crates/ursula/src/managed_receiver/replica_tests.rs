@@ -1040,6 +1040,29 @@ async fn mutate(
     )
 }
 
+async fn mutate_with_meta_retry(
+    state: &HttpState,
+    request_body: &ReplicaRequest,
+    action: &str,
+) -> (StatusCode, Vec<u8>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let result = mutate(state, request_body, action).await;
+        // A positive client request may land during native meta leader
+        // turnover under concurrent tests. Retry only the failed fresh read,
+        // which precedes mutation admission. Authority/CAS/process rejections
+        // and all other errors must still reach the existing strict assertions.
+        if result.0 != StatusCode::CONFLICT
+            || !String::from_utf8_lossy(&result.1)
+                .starts_with("read remote control projection: status: Unavailable")
+            || tokio::time::Instant::now() >= deadline
+        {
+            return result;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn applied(state: &HttpState) -> MembershipLogId {
     let raft = state.raft_registry().unwrap().get(GROUP).unwrap();
     let log = raft.metrics().borrow_watched().last_applied.unwrap();
@@ -1286,7 +1309,8 @@ async fn replica_scenario(replicas: usize, recover_release: bool, recover_member
             },
         },
     };
-    let (status, learner_reply) = mutate(&fixture.states[0], &learner, "membership").await;
+    let (status, learner_reply) =
+        mutate_with_meta_retry(&fixture.states[0], &learner, "membership").await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -1294,7 +1318,7 @@ async fn replica_scenario(replicas: usize, recover_release: bool, recover_member
         String::from_utf8_lossy(&learner_reply)
     );
     assert_eq!(
-        mutate(&fixture.states[0], &learner, "membership").await,
+        mutate_with_meta_retry(&fixture.states[0], &learner, "membership").await,
         (StatusCode::OK, learner_reply.clone())
     );
     let learner_receipt: CompletedMembershipMutation =
