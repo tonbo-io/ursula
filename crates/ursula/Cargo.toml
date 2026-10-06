@@ -57,6 +57,7 @@ ursula-config = { workspace = true }
 ursula-gateway = { workspace = true }
 ursula-index = { workspace = true }
 ursula-observability = { workspace = true, features = ["otlp"] }
+ursula-proto = { workspace = true }
 ursula-raft = { workspace = true }
 ursula-runtime = { workspace = true }
 ursula-shard = { workspace = true }

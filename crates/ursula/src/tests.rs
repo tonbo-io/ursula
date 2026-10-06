@@ -47,6 +47,33 @@ async fn send(
     body: Body,
 ) -> Response {
     let mut request = Request::builder().method(method).uri(uri);
+    if uri.starts_with("/__ursula/")
+        && !matches!(method, "GET" | "HEAD" | "OPTIONS")
+        && !headers
+            .iter()
+            .any(|(name, _)| *name == PROCESS_INCARNATION_HEADER)
+    {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/__ursula/metrics")
+                    .body(Body::empty())
+                    .expect("metrics request"),
+            )
+            .await
+            .expect("metrics response");
+        if response.status().is_success() {
+            let metrics: serde_json::Value =
+                serde_json::from_slice(&body_bytes(response).await).expect("metrics JSON");
+            request = request.header(
+                PROCESS_INCARNATION_HEADER,
+                metrics["process_incarnation"]
+                    .as_str()
+                    .expect("process identity"),
+            );
+        }
+    }
     for (name, value) in headers {
         request = request.header(*name, *value);
     }
@@ -2012,6 +2039,7 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
     let manifest = peers
         .iter()
         .map(|(id, endpoint)| ursula_ctl::NodeInfo {
+            expected_process_incarnation: None,
             id: *id,
             admin_url: endpoint.parse().unwrap(),
             http_url: Some(endpoint.parse().unwrap()),
@@ -2679,26 +2707,35 @@ async fn static_grpc_memory_node_rejoins_all_groups_through_membership_replaceme
         .await;
     }
 
-    let rejected_quiesce = client
-        .post(format!("{}/__ursula/raft/quiesce-for-restart", peers[2].1))
-        .send()
-        .await
-        .expect("attempt quiesce without drain");
+    let rejected_quiesce = admin_test_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/__ursula/raft/quiesce-for-restart", peers[2].1),
+    )
+    .await
+    .send()
+    .await
+    .expect("attempt quiesce without drain");
     assert_eq!(rejected_quiesce.status(), StatusCode::CONFLICT);
-    let mark_drain = client
-        .post(format!(
-            "{}/__ursula/leadership-shed/maintenance",
-            peers[2].1
-        ))
-        .send()
-        .await
-        .expect("mark stale replacement drained");
+    let mark_drain = admin_test_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/__ursula/leadership-shed/maintenance", peers[2].1),
+    )
+    .await
+    .send()
+    .await
+    .expect("mark stale replacement drained");
     assert_eq!(mark_drain.status(), StatusCode::OK);
-    let quiesce = client
-        .post(format!("{}/__ursula/raft/quiesce-for-restart", peers[2].1))
-        .send()
-        .await
-        .expect("quiesce stale replacement before restarting it");
+    let quiesce = admin_test_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/__ursula/raft/quiesce-for-restart", peers[2].1),
+    )
+    .await
+    .send()
+    .await
+    .expect("quiesce stale replacement before restarting it");
     assert_eq!(quiesce.status(), StatusCode::OK);
 
     stale_replacement.shutdown().await;
@@ -3703,13 +3740,15 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
         .await
         .expect("wait for late learner catch-up");
 
-    let promote = client
-        .post(format!(
-            "{leader_base}/__ursula/raft/0/membership?voters=1,2,3"
-        ))
-        .send()
-        .await
-        .expect("promote late learner");
+    let promote = admin_test_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{leader_base}/__ursula/raft/0/membership?voters=1,2,3"),
+    )
+    .await
+    .send()
+    .await
+    .expect("promote late learner");
     assert_eq!(promote.status(), StatusCode::OK);
     let promote_body = promote.text().await.expect("promote body");
     assert!(
@@ -6777,11 +6816,15 @@ async fn cluster_wide_purge_reaches_every_distributed_group_leader() {
         assert_eq!(response.status(), StatusCode::CREATED);
     }
 
-    let response = client
-        .delete(format!("{}/__ursula/purge/multi-leader-purge", peers[0].1))
-        .send()
-        .await
-        .expect("cluster-wide purge request");
+    let response = admin_test_request(
+        &client,
+        reqwest::Method::DELETE,
+        format!("{}/__ursula/purge/multi-leader-purge", peers[0].1),
+    )
+    .await
+    .send()
+    .await
+    .expect("cluster-wide purge request");
     assert_eq!(response.status(), StatusCode::OK);
     let report: serde_json::Value = response.json().await.expect("purge report JSON");
     assert_eq!(report["removed_streams"], 6);
@@ -7409,4 +7452,153 @@ async fn capped_and_uncapped_offset_reads_continue_exactly() {
             assert_eq!(seen, expected.as_bytes(), "{max_bytes}{live}");
         }
     }
+}
+
+/// Observe once before each independent test operation; restart races use explicit old pins.
+async fn admin_test_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: String,
+) -> reqwest::RequestBuilder {
+    let mut metrics_url = reqwest::Url::parse(&url).expect("admin URL");
+    metrics_url.set_path("/__ursula/metrics");
+    metrics_url.set_query(None);
+    let metrics: serde_json::Value = client
+        .get(metrics_url)
+        .send()
+        .await
+        .expect("metrics")
+        .json()
+        .await
+        .expect("JSON");
+    client.request(method, url).header(
+        PROCESS_INCARNATION_HEADER,
+        metrics["process_incarnation"].as_str().expect("identity"),
+    )
+}
+
+#[tokio::test]
+async fn stale_process_admin_requests_cannot_change_a_replacement_or_clear_its_drain() {
+    let runtime = spawn_runtime(
+        &test_config(1, 1),
+        Persistence::InMemory,
+        Topology::SingleNode {
+            raft_group_count: 1,
+        },
+    )
+    .expect("runtime")
+    .runtime;
+    let old = HttpState::with_raft_registry(runtime.clone(), RaftGroupHandleRegistry::default());
+    let registry = RaftGroupHandleRegistry::default();
+    let replacement = HttpState::with_raft_registry(runtime, registry.clone());
+    assert_ne!(old.process_incarnation, replacement.process_incarnation);
+    assert_eq!(
+        replacement.process_incarnation,
+        replacement.clone().process_incarnation
+    );
+    let app = admin_router(replacement.clone());
+    for (method, identity, status) in [
+        ("POST", None, StatusCode::PRECONDITION_REQUIRED),
+        ("POST", Some("malformed"), StatusCode::PRECONDITION_FAILED),
+        (
+            "POST",
+            Some(old.process_incarnation.as_str()),
+            StatusCode::PRECONDITION_FAILED,
+        ),
+    ] {
+        let mut request = Request::builder()
+            .method(method)
+            .uri("/__ursula/leadership-shed/maintenance");
+        if let Some(identity) = identity {
+            request = request.header(PROCESS_INCARNATION_HEADER, identity);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert!(
+            !registry.is_leadership_shed(),
+            "rejected request changed replacement state"
+        );
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/__ursula/leadership-shed/maintenance")
+                .header(
+                    PROCESS_INCARNATION_HEADER,
+                    replacement.process_incarnation.as_str(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(registry.is_leadership_shed());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/__ursula/leadership-shed/maintenance")
+                .header(PROCESS_INCARNATION_HEADER, old.process_incarnation.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert!(
+        registry.is_leadership_shed(),
+        "old executor cleared a replacement fence"
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/__ursula/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let metrics: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+    assert_eq!(
+        metrics["process_incarnation"],
+        replacement.process_incarnation.as_str()
+    );
+}
+
+#[tokio::test]
+async fn admin_mutation_without_observed_incarnation_is_rejected_before_drain() {
+    let registry = RaftGroupHandleRegistry::default();
+    let state = HttpState::with_raft_registry(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+        registry.clone(),
+    );
+    let response = admin_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/__ursula/leadership-shed/maintenance")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
+    assert!(!registry.is_leadership_shed());
 }

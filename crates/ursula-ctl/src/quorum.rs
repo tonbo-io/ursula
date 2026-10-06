@@ -13,6 +13,7 @@ use anyhow::bail;
 use futures_util::StreamExt;
 use serde::Serialize;
 use tokio::time::Instant;
+use ursula_proto::admin::ProcessIncarnation;
 use ursula_raft::QuorumPrefix;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
@@ -40,6 +41,8 @@ pub struct QuorumVerificationOptions {
 pub struct QuorumVerification {
     pub version: u32,
     pub participation_certified: bool,
+    pub process_incarnations_certified: bool,
+    pub process_incarnations: BTreeMap<u64, ProcessIncarnation>,
     pub prefixes: BTreeMap<u32, QuorumPrefix>,
     pub applied: BTreeMap<u64, BTreeMap<u32, u64>>,
 }
@@ -322,9 +325,20 @@ async fn verify_observed_quorum(
             )?;
             match apply_evidence(&snapshot, &prefixes)? {
                 Some(applied) => {
+                    let process_incarnations = snapshot
+                        .per_node
+                        .iter()
+                        .filter_map(|node| {
+                            node.process_incarnation
+                                .clone()
+                                .map(|incarnation| (node.node.id, incarnation))
+                        })
+                        .collect::<BTreeMap<_, _>>();
                     return Ok(QuorumVerification {
-                        version: 1,
+                        version: 2,
                         participation_certified,
+                        process_incarnations_certified: process_incarnations.len() == nodes.len(),
+                        process_incarnations,
                         prefixes,
                         applied,
                     });
@@ -349,7 +363,9 @@ mod tests {
         ClusterSnapshot {
             per_node: (1..=3)
                 .map(|id| NodeMetricsView {
+                    process_incarnation: None,
                     node: NodeInfo {
+                        expected_process_incarnation: None,
                         id,
                         admin_url: format!("http://node-{id}:4438").parse().unwrap(),
                         http_url: Some(format!("http://node-{id}:4437").parse().unwrap()),

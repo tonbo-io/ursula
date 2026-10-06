@@ -853,6 +853,30 @@ class ChaosAgent:
             return status, data, resp_headers
         return status, data, resp_headers
 
+    def admin_request(self, node: Node, method: str, path: str) -> tuple[int, bytes, dict[str, str]]:
+        """Bind one independent chaos operation before sending its mutation.
+
+        Deployed <=0.6.2 chaos sources have no process field; their existing
+        transport remains an uncertified migration consumer until retired.
+        Failed observation never falls back to an unbound mutation.
+        """
+        status, body, _ = self.request("GET", f"{node.admin_url}/__ursula/metrics")
+        if status != 200:
+            raise RuntimeError(f"admin identity observation returned {status}")
+        metrics = json.loads(body)
+        if not isinstance(metrics.get("raft_groups"), list):
+            raise RuntimeError("admin identity observation is not Ursula metrics")
+        identity = metrics.get("process_incarnation")
+        headers = {}
+        if identity is not None:
+            if not isinstance(identity, str) or re.fullmatch(r"[0-9a-f]{32}", identity) is None:
+                raise RuntimeError("invalid admin process identity")
+            expected_node = node_id_from_name(node.name)
+            if expected_node is not None and metrics.get("process_node_id") != expected_node:
+                raise RuntimeError("admin observation reached a different voter")
+            headers["x-ursula-process-incarnation"] = identity
+        return self.request(method, f"{node.admin_url}{path}", headers=headers)
+
     def kubernetes_request(self, method: str, path: str) -> tuple[int, bytes]:
         token_path = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
         ca_path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
@@ -1587,9 +1611,10 @@ class ChaosAgent:
         last_error = "no target nodes"
         for node in self.nodes:
             try:
-                status, body, _ = self.request(
+                status, body, _ = self.admin_request(
+                    node,
                     "POST",
-                    f"{node.admin_url}/__ursula/flush-cold/{BUCKET}/{sample.stream}?{query}",
+                    f"/__ursula/flush-cold/{BUCKET}/{sample.stream}?{query}",
                 )
             except Exception as exc:  # noqa: BLE001
                 last_error = f"{node.name}: {exc}"

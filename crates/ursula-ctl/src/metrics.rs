@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -7,8 +9,12 @@ use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 use reqwest::Client;
+use reqwest::Method;
+use reqwest::RequestBuilder;
 use reqwest::StatusCode;
 use serde::Deserialize;
+use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
+use ursula_proto::admin::ProcessIncarnation;
 
 use crate::provider::NodeInfo;
 
@@ -16,6 +22,7 @@ use crate::provider::NodeInfo;
 pub struct MetricsClient {
     client: Client,
     timeout: Duration,
+    incarnations: Arc<Mutex<HashMap<u64, Option<ProcessIncarnation>>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,11 +37,116 @@ impl MetricsClient {
             .timeout(timeout)
             .build()
             .context("build reqwest client")?;
-        Ok(Self { client, timeout })
+        Ok(Self {
+            client,
+            timeout,
+            incarnations: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     pub fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    pub(crate) fn http_client(&self) -> &Client {
+        &self.client
+    }
+
+    fn pin_incarnation(
+        &self,
+        node: &NodeInfo,
+        observed: &Option<ProcessIncarnation>,
+    ) -> Result<()> {
+        if node
+            .expected_process_incarnation
+            .as_ref()
+            .is_some_and(|expected| observed.as_ref() != Some(expected))
+        {
+            bail!(
+                "node {} process incarnation differs from its maintenance plan",
+                node.id
+            );
+        }
+        let mut pins = self
+            .incarnations
+            .lock()
+            .map_err(|_| anyhow!("process identity cache lock poisoned"))?;
+        if let Some(pinned) = pins.get(&node.id) {
+            if pinned != observed {
+                bail!(
+                    "node {} process incarnation changed during this operation; refusing to refresh its plan",
+                    node.id
+                );
+            }
+        } else {
+            pins.insert(node.id, observed.clone());
+        }
+        Ok(())
+    }
+
+    async fn observed_incarnation(&self, node: &NodeInfo) -> Result<Option<ProcessIncarnation>> {
+        let existing = self
+            .incarnations
+            .lock()
+            .map_err(|_| anyhow!("process identity cache lock poisoned"))?
+            .get(&node.id)
+            .cloned();
+        if let Some(incarnation) = existing {
+            self.pin_incarnation(node, &incarnation)?;
+            return Ok(incarnation);
+        }
+        Ok(self.fetch_node(node).await?.process_incarnation)
+    }
+
+    pub(crate) async fn admin_request(
+        &self,
+        node: &NodeInfo,
+        method: Method,
+        url: url::Url,
+    ) -> Result<RequestBuilder> {
+        let incarnation = self.observed_incarnation(node).await?;
+        let mut request = self.client.request(method, url);
+        if let Some(identity) = incarnation {
+            request = request.header(PROCESS_INCARNATION_HEADER, identity.as_str());
+        }
+        // Concrete migration consumers: deployed servers through 0.6.2 lack
+        // the identity field and cannot enforce this precondition. Preserve
+        // their existing transport only until those sources are retired.
+        Ok(request)
+    }
+
+    /// Return a manifest pinned to each observed server instance. Refreshing
+    /// one explicit replacement never refreshes another voter's authority.
+    pub async fn pin_nodes(
+        &self,
+        nodes: &[NodeInfo],
+        replacement: Option<u64>,
+        allow_legacy: bool,
+    ) -> Result<Vec<NodeInfo>> {
+        let ids = nodes.iter().map(|node| node.id).collect::<BTreeSet<_>>();
+        if ids.len() != nodes.len()
+            || nodes.is_empty()
+            || replacement.is_some_and(|id| !ids.contains(&id))
+        {
+            bail!("incarnation binding requires unique configured voters and a known replacement");
+        }
+        let mut pinned = Vec::with_capacity(nodes.len());
+        for configured in nodes {
+            let mut node = configured.clone();
+            if replacement == Some(node.id) {
+                node.expected_process_incarnation = None;
+            }
+            let view = self.fetch_node(&node).await?;
+            if view.process_incarnation.is_none() && !allow_legacy {
+                bail!(
+                    "node {} lacks process identity; only the deployed legacy migration may opt in",
+                    node.id
+                );
+            }
+            node.expected_process_incarnation = view.process_incarnation;
+            pinned.push(node);
+        }
+        Ok(pinned)
     }
 
     pub async fn fetch_node(&self, node: &NodeInfo) -> Result<NodeMetricsView> {
@@ -54,10 +166,11 @@ impl MetricsClient {
             .json()
             .await
             .with_context(|| format!("decode metrics from node {}", node.id))?;
-        if body
-            .raft_groups
-            .iter()
-            .any(|group| group.node_id != node.id)
+        if (body.process_incarnation.is_some() && body.process_node_id != Some(node.id))
+            || body
+                .raft_groups
+                .iter()
+                .any(|group| group.node_id != node.id)
             || body
                 .raft_maintenance
                 .as_ref()
@@ -68,6 +181,7 @@ impl MetricsClient {
                 node.id
             );
         }
+        self.pin_incarnation(node, &body.process_incarnation)?;
         Ok(NodeMetricsView::new(node.clone(), body))
     }
 
@@ -104,8 +218,8 @@ impl MetricsClient {
             .join(&path)
             .with_context(|| format!("compose transfer-leader url at node {}", leader.id))?;
         let resp = self
-            .client
-            .post(url.clone())
+            .admin_request(leader, Method::POST, url.clone())
+            .await?
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;
@@ -126,14 +240,36 @@ impl MetricsClient {
         }
     }
 
-    /// Trigger an election on a higher-term voter through the Raft
-    /// `TransferLeader` RPC shared with rolling-upgrade source versions.
+    /// Trigger a bound admin election on current instances. The deployed
+    /// 0.6.2 migration source retains its shared `TransferLeader` RPC.
     pub async fn request_self_election(
         &self,
         voter: &NodeInfo,
         raft_group_id: u64,
         current_term: u64,
     ) -> Result<()> {
+        if self.observed_incarnation(voter).await?.is_some() {
+            let url = voter
+                .admin_url
+                .join(&format!("/__ursula/raft/{raft_group_id}/self-election"))?;
+            let response = self
+                .admin_request(voter, Method::POST, url.clone())
+                .await?
+                .json(&serde_json::json!({"current_term": current_term}))
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                bail!(
+                    "self-election at node {} returned {}: {}",
+                    voter.id,
+                    response.status(),
+                    response.text().await?
+                );
+            }
+            return Ok(());
+        }
+        // The deployed 0.6.2 migration source has only the shared Raft RPC;
+        // current instances use the incarnation-bound admin route above.
         let endpoint = voter.http_url.as_ref().ok_or_else(|| {
             anyhow!(
                 "node {} has no public Raft/client address for survivor term handoff",
@@ -164,11 +300,17 @@ impl MetricsClient {
             .admin_url
             .join("/__ursula/leadership-shed/maintenance")
             .with_context(|| format!("compose maintenance-drain url for node {}", node.id))?;
-        let request = if enabled {
-            self.client.post(url.clone())
-        } else {
-            self.client.delete(url.clone())
-        };
+        let request = self
+            .admin_request(
+                node,
+                if enabled {
+                    Method::POST
+                } else {
+                    Method::DELETE
+                },
+                url.clone(),
+            )
+            .await?;
         let resp = request
             .send()
             .await
@@ -212,8 +354,8 @@ impl MetricsClient {
         // it into `%2C` and makes the old server reject every membership change.
         url.set_query(Some(&format!("voters={voter_list}")));
         let resp = self
-            .client
-            .post(url.clone())
+            .admin_request(leader, Method::POST, url.clone())
+            .await?
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;
@@ -263,8 +405,8 @@ impl MetricsClient {
         }
         url.set_query(Some(&format!("addr={address}&blocking=false")));
         let resp = self
-            .client
-            .post(url.clone())
+            .admin_request(leader, Method::POST, url.clone())
+            .await?
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;
@@ -290,8 +432,8 @@ impl MetricsClient {
             .join("/__ursula/raft/quiesce-for-restart")
             .with_context(|| format!("compose restart-quiesce url for node {}", node.id))?;
         let resp = self
-            .client
-            .post(url.clone())
+            .admin_request(node, Method::POST, url.clone())
+            .await?
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;
@@ -373,6 +515,10 @@ pub struct TransferLeaderResponse {
 #[derive(Debug, Clone, Deserialize)]
 struct RawMetrics {
     #[serde(default)]
+    process_incarnation: Option<ProcessIncarnation>,
+    #[serde(default)]
+    process_node_id: Option<u64>,
+    #[serde(default)]
     raft_groups: Vec<RawRaftGroup>,
     /// Raft WAL backend (`"memory"`/`"disk"`); absent on older servers.
     #[serde(default)]
@@ -409,6 +555,7 @@ pub struct NodeMetricsView {
     /// servers predating the field.
     pub wal_backend: Option<String>,
     pub raft_maintenance: Option<ursula_raft::RaftMaintenanceReport>,
+    pub process_incarnation: Option<ProcessIncarnation>,
 }
 
 impl NodeMetricsView {
@@ -433,6 +580,7 @@ impl NodeMetricsView {
             groups,
             wal_backend: raw.wal_backend,
             raft_maintenance: raw.raft_maintenance,
+            process_incarnation: raw.process_incarnation,
         }
     }
 
@@ -544,6 +692,222 @@ mod tests {
 
     use super::*;
 
+    async fn incarnation_node(
+        id: u64,
+        identity: Option<ProcessIncarnation>,
+    ) -> (
+        NodeInfo,
+        Arc<Mutex<Option<ProcessIncarnation>>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let current = Arc::new(Mutex::new(identity));
+        let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let metrics_identity = current.clone();
+        let mutation_identity = current.clone();
+        let mutation_count = applied.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/__ursula/metrics", axum::routing::get(move || {
+                let identity = metrics_identity.lock().unwrap().clone();
+                async move { axum::Json(serde_json::json!({"process_incarnation": identity, "process_node_id": id, "raft_groups": []})) }
+            }))
+            .route("/__ursula/leadership-shed/maintenance", post(move |headers: axum::http::HeaderMap| {
+                let identity = mutation_identity.lock().unwrap().clone();
+                let count = mutation_count.clone();
+                async move {
+                    if let Some(identity) = identity {
+                        let Some(observed) = headers.get(PROCESS_INCARNATION_HEADER) else { return StatusCode::PRECONDITION_REQUIRED; };
+                        if observed.to_str().ok() != Some(identity.as_str()) { return StatusCode::PRECONDITION_FAILED; }
+                    }
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    StatusCode::OK
+                }
+            }));
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (
+            NodeInfo {
+                id,
+                host: address.to_string(),
+                admin_url: Url::parse(&format!("http://{address}")).unwrap(),
+                http_url: None,
+                metrics_url: None,
+                expected_process_incarnation: None,
+            },
+            current,
+            applied,
+            task,
+        )
+    }
+
+    #[tokio::test]
+    async fn cached_incarnation_rejects_rebound_endpoint_and_cannot_be_refreshed() {
+        let (node, identity, applied, task) =
+            incarnation_node(1, Some(ProcessIncarnation::from_bits(1))).await;
+        let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
+        let pinned = client.fetch_node(&node).await.unwrap().process_incarnation;
+        *identity.lock().unwrap() = Some(ProcessIncarnation::from_bits(2));
+        let error = client
+            .clone()
+            .set_maintenance_drain(&node, true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("412"), "{error}");
+        assert_eq!(applied.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            client
+                .fetch_node(&node)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("changed during")
+        );
+        let mut refresh = node.clone();
+        refresh.expected_process_incarnation = Some(ProcessIncarnation::from_bits(2));
+        assert!(
+            client
+                .set_maintenance_drain(&refresh, true)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("maintenance plan")
+        );
+        assert_eq!(pinned, Some(ProcessIncarnation::from_bits(1)));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn saved_manifest_binds_survivors_and_only_explicit_replacement_can_change() {
+        let (a, a_identity, _, a_task) =
+            incarnation_node(1, Some(ProcessIncarnation::from_bits(1))).await;
+        let (b, b_identity, _, b_task) =
+            incarnation_node(2, Some(ProcessIncarnation::from_bits(2))).await;
+        let nodes = MetricsClient::new(Duration::from_secs(1))
+            .unwrap()
+            .pin_nodes(&[a, b], None, false)
+            .await
+            .unwrap();
+        *a_identity.lock().unwrap() = Some(ProcessIncarnation::from_bits(3));
+        let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
+        assert!(client.pin_nodes(&nodes, None, false).await.is_err());
+        let replaced = MetricsClient::new(Duration::from_secs(1))
+            .unwrap()
+            .pin_nodes(&nodes, Some(1), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            replaced[0].expected_process_incarnation,
+            Some(ProcessIncarnation::from_bits(3))
+        );
+        assert_eq!(
+            replaced[1].expected_process_incarnation,
+            nodes[1].expected_process_incarnation
+        );
+        *b_identity.lock().unwrap() = Some(ProcessIncarnation::from_bits(4));
+        assert!(
+            MetricsClient::new(Duration::from_secs(1))
+                .unwrap()
+                .pin_nodes(&nodes, Some(1), false)
+                .await
+                .is_err()
+        );
+        a_task.abort();
+        b_task.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_identity_requires_explicit_manifest_migration_and_never_matches_a_saved_pin() {
+        let (mut node, _, _, task) = incarnation_node(1, None).await;
+        assert!(
+            MetricsClient::new(Duration::from_secs(1))
+                .unwrap()
+                .pin_nodes(&[node.clone()], None, false)
+                .await
+                .is_err()
+        );
+        let migrated = MetricsClient::new(Duration::from_secs(1))
+            .unwrap()
+            .pin_nodes(&[node.clone()], None, true)
+            .await
+            .unwrap();
+        assert!(migrated[0].expected_process_incarnation.is_none());
+        node.expected_process_incarnation = Some(ProcessIncarnation::from_bits(1));
+        assert!(
+            MetricsClient::new(Duration::from_secs(1))
+                .unwrap()
+                .fetch_node(&node)
+                .await
+                .is_err()
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn identity_checks_apply_even_before_raft_groups_are_registered() {
+        let (mut node, _, applied, task) =
+            incarnation_node(1, Some(ProcessIncarnation::from_bits(1))).await;
+        node.id = 2;
+        let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
+        assert!(
+            client
+                .set_maintenance_drain(&node, true)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("metrics identity differs")
+        );
+        assert_eq!(applied.load(std::sync::atomic::Ordering::SeqCst), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn current_self_election_is_guarded_and_never_falls_back_after_identity_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/__ursula/metrics",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                "process_node_id":1,"process_incarnation":"00000000000000000000000000000001"}))
+                }),
+            )
+            .route(
+                "/__ursula/raft/0/self-election",
+                post(
+                    |headers: axum::http::HeaderMap,
+                     axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        assert_eq!(
+                            headers[PROCESS_INCARNATION_HEADER],
+                            "00000000000000000000000000000001"
+                        );
+                        assert_eq!(body["current_term"], 7);
+                        StatusCode::PRECONDITION_FAILED
+                    },
+                ),
+            );
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let node = NodeInfo {
+            id: 1,
+            host: address.to_string(),
+            admin_url: format!("http://{address}").parse().unwrap(),
+            http_url: None,
+            metrics_url: None,
+            expected_process_incarnation: None,
+        };
+        let error = MetricsClient::new(Duration::from_secs(1))
+            .unwrap()
+            .request_self_election(&node, 0, 7)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("412"),
+            "must report the guarded HTTP failure without using the absent legacy RPC endpoint: {error}"
+        );
+        task.abort();
+    }
+
     #[tokio::test]
     async fn tunneled_metrics_do_not_replace_the_advertised_learner_address() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -570,6 +934,7 @@ mod tests {
         let tunnel = Url::parse(&format!("http://{address}")).unwrap();
         let advertised = Url::parse("http://replacement.invalid:4437").unwrap();
         let node = NodeInfo {
+            expected_process_incarnation: None,
             id: 1,
             admin_url: tunnel.clone(),
             host: "replacement".to_owned(),
@@ -597,6 +962,7 @@ mod tests {
             }))).await.unwrap();
         });
         let node = NodeInfo {
+            expected_process_incarnation: None,
             id: 1,
             admin_url: Url::parse(&format!("http://{address}")).unwrap(),
             host: address.to_string(),
@@ -615,6 +981,7 @@ mod tests {
     #[test]
     fn metrics_use_client_url_when_available() -> anyhow::Result<()> {
         let node = NodeInfo {
+            expected_process_incarnation: None,
             id: 1,
             admin_url: Url::parse("http://127.0.0.1:4438")?,
             host: "127.0.0.1".to_owned(),
@@ -629,6 +996,7 @@ mod tests {
     #[test]
     fn metrics_fall_back_to_admin_url_for_legacy_manifests() -> anyhow::Result<()> {
         let node = NodeInfo {
+            expected_process_incarnation: None,
             id: 1,
             admin_url: Url::parse("http://127.0.0.1:4438")?,
             host: "127.0.0.1".to_owned(),
@@ -651,6 +1019,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         Ok(NodeInfo {
+            expected_process_incarnation: None,
             id: 1,
             admin_url: Url::parse(&format!("http://{address}"))?,
             host: address.to_string(),

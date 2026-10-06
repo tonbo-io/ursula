@@ -192,8 +192,9 @@ State-machine apply runs on the follower's owner core. If CPU is pinned, `last_a
 These are admin-plane endpoints (`server.admin_listen`, loopback `:4438` by default), reached over a tunnel (see [ursulactl's operation providers](/docs/cli#the-admin-plane)). The examples assume a forward from local `4438` to the node's admin plane.
 
 ```bash
-curl -X POST http://127.0.0.1:4438/__ursula/raft/{group_id}/snapshot
-curl -X POST http://127.0.0.1:4438/__ursula/raft/{group_id}/purge
+process_incarnation=$(curl --fail http://127.0.0.1:4438/__ursula/metrics | jq -er .process_incarnation)
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/{group_id}/snapshot
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/{group_id}/purge
 ```
 
 Purge only after the snapshot replicates. Otherwise a slow follower may need log entries you just dropped.

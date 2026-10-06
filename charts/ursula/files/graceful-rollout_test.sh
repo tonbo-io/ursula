@@ -21,6 +21,9 @@ original_wait_for_pod_started=$(declare -f wait_for_pod_started)
 wait_for_pod_started() { wait_for_pod_ready "$1"; }
 original_write_manifest=$(declare -f write_manifest)
 original_record_state=$(declare -f record_state)
+# Legacy state-machine fixtures below model ordering only. Instance-binding
+# regressions exercise the real function in their own source-only subshell.
+bind_replacement_incarnation() { :; }
 
 mocked_revision=ursula-stale
 mocked_uid=legacy-partial-uid
@@ -268,6 +271,7 @@ fi
   export NAMESPACE STATEFULSET REPLICAS EXPECTED_GROUPS TARGET_IMAGE ROLLOUT_SOURCE_ONLY
   # shellcheck source=graceful-rollout.sh
   . "${test_dir}/graceful-rollout.sh"
+  bind_replacement_incarnation() { :; }
 
   superseded_ctl=$(mktemp)
   superseded_ctl_calls=$(mktemp)
@@ -452,6 +456,7 @@ rm -f "${mock_ctl}" "${mock_ctl_calls}" "${MANIFEST}"
 # it, so reversing these two calls recreates the production deadlock.
 call_order=
 write_manifest() { :; }
+pin_manifest() { :; }
 wait_for_template() { :; }
 start_ready_forwards() { call_order="${call_order} ready"; }
 resume_if_needed() { call_order="${call_order} resume"; }
@@ -476,7 +481,7 @@ main
 rm -f "${healthy_ctl}"
 eval "${original_write_manifest}"
 
-# Every newly written state uses schema v2 and persists the source Pod UID.
+# Every newly written state uses schema v3 and persists the source Pod UID.
 eval "${original_record_state}"
 record_state_args=$(mktemp)
 kubectl() {
@@ -489,7 +494,7 @@ kubectl() {
 }
 export TARGET_REVISION=ursula-current
 record_state restarting 2 source-uid-2
-grep -q -- '--from-literal=state-schema-version=2' "${record_state_args}"
+grep -q -- '--from-literal=state-schema-version=3' "${record_state_args}"
 grep -q -- '--from-literal=source-pod-uid=source-uid-2' "${record_state_args}"
 rm -f "${record_state_args}" /tmp/rollout-state.yaml
 
@@ -506,6 +511,7 @@ rm -f "${record_state_args}" /tmp/rollout-state.yaml
   export NAMESPACE STATEFULSET REPLICAS EXPECTED_GROUPS TARGET_IMAGE ROLLOUT_SOURCE_ONLY
   # shellcheck source=graceful-rollout.sh
   . "${test_dir}/graceful-rollout.sh"
+  bind_replacement_incarnation() { :; }
 
   legacy_roll_calls=$(mktemp)
   legacy_probe_error=false
@@ -619,6 +625,7 @@ done
 (
   ROLLOUT_SOURCE_ONLY=1
   . "${test_dir}/graceful-rollout.sh"
+  bind_replacement_incarnation() { :; }
   recovery_order=
   repaired=0
   caught_up=0
@@ -668,6 +675,7 @@ done
 # API precondition is authoritative even when replacement races the request.
 (
   . "${test_dir}/graceful-rollout.sh"
+  bind_replacement_incarnation() { :; }
   NAMESPACE=ursula
   STATEFULSET=ursula
   source_uid=11111111-2222-3333-4444-555555555555
@@ -716,3 +724,57 @@ done
 )
 
 echo "graceful-rollout.sh: all checks passed"
+
+# Persist a single admitted replacement binding. Later Jobs must validate its
+# saved process even if a container restarts within the same Pod UID.
+(
+  . "${test_dir}/graceful-rollout.sh"
+  identity_dir=$(mktemp -d)
+  trap 'rm -rf "${identity_dir}"' EXIT
+  MANIFEST="${identity_dir}/manifest.json"
+  printf '{"nodes":[]}\n' >"${MANIFEST}"
+  CTL=identity_ctl
+  current_uid=new-pod
+  bound_uid=
+  deny_survivor=false
+  saved_count=0
+  kubectl() {
+    case "$*" in
+      *'{.data.source-pod-uid}') printf '%s' old-pod ;;
+      *'{.data.state-schema-version}') printf '%s' 3 ;;
+      *'{.data.replacement-pod-uid}') printf '%s' "${bound_uid}" ;;
+      *'{.metadata.uid}') printf '%s' "${current_uid}" ;;
+      *) return 1 ;;
+    esac
+  }
+  identity_ctl() {
+    printf '%s\n' "$*" >>"${identity_dir}/calls"
+    [ "${deny_survivor}" = false ] || return 1
+    printf '{"nodes":[],"pinned":true}\n'
+  }
+  record_state() {
+    [ "$1 $2 $3 $4" = 'restarting 3 old-pod new-pod' ]
+    saved_count=$((saved_count + 1))
+    bound_uid=$4
+  }
+  current_uid=old-pod
+  if bind_replacement_incarnation 3; then echo 'same source Pod must not refresh identity' >&2; exit 1; fi
+  [ ! -e "${identity_dir}/calls" ]
+  current_uid=new-pod
+  bind_replacement_incarnation 3
+  [ "${saved_count}" = 1 ]
+  grep -q -- '--replace-node 3' "${identity_dir}/calls"
+  : >"${identity_dir}/calls"
+  bind_replacement_incarnation 3
+  ! grep -q -- '--replace-node' "${identity_dir}/calls"
+  [ "${saved_count}" = 1 ]
+  deny_survivor=true
+  cp "${MANIFEST}" "${identity_dir}/before.json"
+  if bind_replacement_incarnation 3; then echo 'changed saved process must refuse resume' >&2; exit 1; fi
+  cmp "${MANIFEST}" "${identity_dir}/before.json"
+  [ ! -e "${MANIFEST}.next" ]
+  current_uid=unadmitted-second-pod
+  : >"${identity_dir}/calls"
+  if bind_replacement_incarnation 3; then echo 'second unadmitted Pod replacement must refuse resume' >&2; exit 1; fi
+  [ ! -s "${identity_dir}/calls" ]
+)
