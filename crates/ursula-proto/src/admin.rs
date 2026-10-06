@@ -83,6 +83,14 @@ impl MaintenanceFence {
         })
     }
 
+    pub fn reservation_id(&self) -> &str {
+        &self.reservation_id
+    }
+
+    pub fn executor_id(&self) -> &str {
+        &self.executor_id
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }

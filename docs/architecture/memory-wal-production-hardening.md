@@ -20,6 +20,14 @@ matches 0.6.2). Cloud review baseline:
 what is currently deployed. Initial fault probes are retained in the detached
 worktree `/private/tmp/ursula-mem-review-c61cb60`.
 
+## Updated continuity scope
+
+Owner clarification on 2026-10-06: qualify graceful Ursula upgrades using a general Durable Streams read/write workload. Agent Turn execution, Cloud session capture, billing settlement and Cloud application changes are not acceptance dependencies for this epic. Earlier Turn references below are retained as historical evidence, not outstanding release gates. Existing isolated test infrastructure and completed Cloud-hosted evidence remain reusable; they do not add Cloud product work to the scope.
+
+Owner priority clarification: temporary 502/503 responses during upgrade are acceptable, and callers may retry using the documented protocol. Fully transparent upgrade behavior, automatic client retries/reconnection and availability-oriented gateway optimization are independent low-priority follow-up, excluded from epic completion criteria. Qualification still uses sustained generic Durable Streams load and an independent acknowledgement journal: retain every acknowledged append, preserve offsets and ordering, and resolve ambiguous appends using unchanged producer coordinates without duplicate logical appends. Read/subscription clients may reconnect from confirmed offsets. Report raw errors, retry counts, write interruption and full-redundancy recovery separately; retrying test load validates integrity and recovery, not a zero-error availability promise.
+
+Single-voter local-state loss, exclusive maintenance/recovery gates, bounded memory, Raft telemetry and the correctness/resource-bound qualification matrix remain in scope. Throughput/latency optimization, faster rebuild tuning and same-topology memory/disk comparative benchmarks are independent low-priority follow-up, excluded from epic completion criteria. Existing performance observations remain evidence; no performance improvement or comparative benchmark is required to complete this epic.
+
 ## Milestones
 
 | Order | Work | Acceptance evidence | Status |
@@ -28,9 +36,26 @@ worktree `/private/tmp/ursula-mem-review-c61cb60`.
 | 2 | Make snapshot reference publication failures recoverable | Temporary reference PUT failure followed by successful retry without restarting the Raft group; retain snapshot GC protection | Merged in #370; local/remote CI and isolated EKS upgrade/restart passed at 4012d51; production qualification/deployment pending |
 | 3 | Raft-aware maintenance gates and automatic fenced replacement | Refuse a second planned disruption until every affected group regains healthy membership and catches up; replace dead-node voters without duplicate node identities | Local eligibility and fresh fixed-prefix verification merged in #370/#371; shared disruption serialization and fenced automatic replacement pending |
 | 4 | Node memory budget and backpressure | Bounded retained/uncommitted logs, hot data, request queues and concurrent rebuilds under production limits and S3 degradation; reject load before OOM | Pending |
-| 5 | Business retry and Raft observability | Invalidate dead leader routes; retry only replay-safe operations within a total budget; reviewed metrics and alerts for quorum risk, stopped groups and stalled recovery; synthetic append/read | Pending |
-| 6 | Production-scale qualification | Isolated fault injection with production topology/workload; measured write-recovery and full-redundancy RTO; RPO zero inside the failure model; ongoing Turn continuity; memory/disk comparison | Dedicated three-zone test hosts Ready; production-config measurement harness in Cloud #3177; actual baselines and RTO targets pending |
+| 5 | Raft observability | Metrics and alerts for quorum risk, stopped groups and stalled recovery; synthetic append/read; preserve clear retryable failure behavior | Pending |
+| 6 | Production-scale qualification | Isolated fault injection with production topology/workload; measured write-recovery and full-redundancy RTO; RPO zero inside the failure model; generic Durable Streams integrity and recovery during sequential upgrades with caller retries; record temporary failures and verify memory/queue bounds | Production-config normal-Pod baseline and #374 candidate qualified; abrupt-host, retained-volume and resource-stress qualification pending; numeric RTO targets remain unset |
 | Supporting | Accurate chart/config durability docs and bounded SIGTERM handoff | Chart rendering; config documentation matches abort behavior; real-process handoff and bounded no-quorum shutdown | Merged in #370; local/remote CI and isolated EKS upgrade/restart passed at 4012d51; production qualification/deployment pending |
+
+## Revised goal objective
+
+Complete Ursula memory-WAL production safety hardening for the fixed three-voter topology: tolerate one unrecovered voter losing all local state while preserving acknowledged data and protocol state; fix the reproduced recovery-barrier and snapshot-publication defects; implement exclusive Raft-aware maintenance admission and fenced automatic single-voter replacement; bound node memory, queues and rebuild concurrency with backpressure; provide necessary Raft metrics and recovery alerts; and qualify the reviewed release artifacts with generic Durable Streams workloads in an isolated production-scale environment. Preserve majority-loss fail-closed/manual data-loss acceptance, accurate durability documentation and bounded planned shutdown. Keep source, CI, artifact and live-qualification evidence distinct. Temporary 502/503 responses and protocol-safe caller retries are acceptable. Exclude performance optimization/comparative benchmarks, transparent zero-error upgrade behavior, Agent Turn tests and Cloud business integration from goal completion. Production remains read-only during qualification. The owner resumed the goal with this revised scope on 2026-10-06.
+
+This owner-revised objective supersedes older goal text mentioning business retries or Turn continuity. Historical tool metadata is not an additional completion requirement.
+
+## Epic completion criteria
+
+Complete the core correctness fixes; qualify acknowledged-write and protocol-state preservation after one unrecovered voter state loss; implement exclusive maintenance admission and fenced automatic replacement with full-group recovery before the next disruption; verify node memory/queue bounds and backpressure under sustained load and storage degradation; provide necessary Raft health metrics/alerts; and pass the corresponding isolated qualification at the declared production scale. Record write-recovery/full-redundancy timing and resource limits. Correctness, recovery completion and resource-bound tests remain required; making measured recovery faster or improving throughput/P99 does not.
+
+## Deferred outside epic completion
+
+- Performance optimization and comparative benchmarking: throughput/P99 improvements, rebuild acceleration and memory/disk WAL performance comparison.
+- Transparent upgrade availability: automatic client/subscription recovery, gateway availability/retry optimization and a zero-visible-error upgrade experience. Temporary 502/503 responses and protocol-safe caller retries are acceptable.
+
+Neither deferred item is a prerequisite for declaring this epic complete. Agent Turn and Cloud business integration also remain excluded.
 
 Keep implementation, CI, artifact publication, deployment, and live qualification
 as separate gates. Do not label any milestone complete because code merged or
@@ -339,7 +364,7 @@ Record separate targets and measured distributions for:
 
 - time until successful writes resume;
 - time until every group has a caught-up full voter set;
-- ongoing business-operation success and total retry time;
+- generic Durable Streams operation success, subscription recovery and total retry time;
 - survivor/replacement peak memory and queue depth during rebuild;
 - behavior under unavailable or delayed snapshot storage.
 
@@ -535,7 +560,14 @@ Final-source [CI 37428343421](https://github.com/tonbo-io/ursula/actions/runs/37
 
 ## M3 executor admission foundation
 
-The next change adds process-local executor tokens, ordered activation/retirement and immutable CLI propagation. Local checks passed; remote CI and isolated qualification of the integrated reservation consumer remain pending. The token comes from an external reviewed CAS reservation; the new protocol neither creates that reservation nor authorizes physical replacement. Activation must wait for admitted HTTP mutations and prior local Raft API messages. Cancelled callers must not release unfinished work, and cancelled or failed lifecycle transitions must retain their generation and close mutation admission. Retirement must never return to the uncertified unclaimed state. Submission ordering does not prove asynchronous replication or provider operations finished; fresh all-replica certification and exact physical lifecycle reconciliation remain required. Chart/Cloud shared CAS integration, automatic fenced host recovery, abrupt-host fault qualification and M4–M6 remain pending.
+The next change adds process-local executor tokens, ordered activation/retirement and immutable CLI propagation. PR #375 merged as `c066d14823fc90dfa6c50e0f3d7d9e4af5c33466`; its tree `2d1bdc4e40875d7eefc42fe566d8bd9dfbae9ea0` exactly matches qualified source `19732a42e1e354b4063813fe22d4d1e6973538fc`. [CI](https://github.com/tonbo-io/ursula/actions/runs/37432113224), [real-S3 integration](https://github.com/tonbo-io/ursula/actions/runs/37432113361) and [both 128-owner WAL soaks](https://github.com/tonbo-io/ursula/actions/runs/37432113357) passed. The integrated shared reservation consumer remains unimplemented and unqualified; no serving deployment is claimed. The token comes from an external reviewed CAS reservation; the new protocol neither creates that reservation nor authorizes physical replacement. Activation must wait for admitted HTTP mutations and prior local Raft API messages. Cancelled callers must not release unfinished work, and cancelled or failed lifecycle transitions must retain their generation and close mutation admission. Retirement must never return to the uncertified unclaimed state. Submission ordering does not prove asynchronous replication or provider operations finished; fresh all-replica certification and exact physical lifecycle reconciliation remain required. Chart/Cloud shared CAS integration, automatic fenced host recovery, abrupt-host fault qualification and M4–M6 remain pending.
 
 
 Local full-workspace library/binary tests passed (174 Ursula and 77 CLI tests), as did all-target Clippy, formatting, documentation tests, the documentation-site build, seven DST audits and the madsim smoke corpus. The eight native process integration cases passed; the S3 restart case is environment-gated locally. The memory-voter restart now retains its immutable token, rebinds only the replacement process, reads back six acknowledged payloads and obtains fresh six-group proofs before and after all processes retire the token. A separate three-node TCP fixture rejects certification of mixed active/retired executors. Cancellation tests cover an unfinished HTTP mutation, pending activation/retirement, unresolved-handler poisoning and the actual Raft API queue. None of these results establishes a shared reservation, provider-host fencing, production recovery time, or active-Turn continuity.
+
+
+## Shared reservation policy implementation
+
+The current `ursula-ctl` change supplies pure ownership/progress policy and offline whole-ConfigMap CAS proposal/acknowledgement commands. Planned Pod replacement requires a fresh all-active three-voter proof before admission, retirement of the original Pod UID, target-only process binding, and a fresh all-retired nonregressing proof before releasing the reservation. Takeover preserves the selected source and admitted write boundary, advances the executor generation and cannot choose another voter. Completed state retains the generation and replacement receipt. This is a foundation for the rollout consumer; it is not yet integrated into chart maintenance, qualified against a live Kubernetes CAS store, or sufficient for physical host recovery.
+
+Eleven policy regressions and the actual CLI process test cover competing CAS proposals, fixed-source takeover, stale/incomplete proofs, same-UID refusal, target-only binding, completion and persistent JSON round trips. The complete CLI path caught and fixed serde's buffered enum parsing failure for numeric JSON map keys. The synthetic proof fixture is explicitly not live Raft evidence. Consumer integration, two-survivor host-loss admission and exact physical fencing remain outstanding. See `maintenance-reservation.md` for the current interface and boundaries.
