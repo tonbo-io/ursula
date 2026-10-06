@@ -571,3 +571,67 @@ Local full-workspace library/binary tests passed (174 Ursula and 77 CLI tests), 
 The current `ursula-ctl` change supplies pure ownership/progress policy and offline whole-ConfigMap CAS proposal/acknowledgement commands. Planned Pod replacement requires a fresh all-active three-voter proof before admission, retirement of the original Pod UID, target-only process binding, and a fresh all-retired nonregressing proof before releasing the reservation. Takeover preserves the selected source and admitted write boundary, advances the executor generation and cannot choose another voter. Completed state retains the generation and replacement receipt. This is a foundation for the rollout consumer; it is not yet integrated into chart maintenance, qualified against a live Kubernetes CAS store, or sufficient for physical host recovery.
 
 Eleven policy regressions and the actual CLI process test cover competing CAS proposals, fixed-source takeover, stale/incomplete proofs, same-UID refusal, target-only binding, completion and persistent JSON round trips. The complete CLI path caught and fixed serde's buffered enum parsing failure for numeric JSON map keys. The synthetic proof fixture is explicitly not live Raft evidence. Consumer integration, two-survivor host-loss admission and exact physical fencing remain outstanding. See `maintenance-reservation.md` for the current interface and boundaries.
+
+## Shared-rollout qualification: stale follower cursor
+
+The first shared-reservation EKS run
+[37449534958](https://github.com/tonbo-io/cloud/actions/runs/37449534958),
+Ursula source `db5d13997391e2a556e4e7c6fd7f459ea2a90d85`, completed the actual
+three-voter Helm hook but failed its observer and did not complete final ACK
+verification. Its journal also records a distinct read-after-ACK failure:
+stream `qualification-recovery/stream-320`, acknowledged start offset 90112,
+then HTTP 416 reporting tail 81920. This run does not establish data preservation
+or qualification success. Namespace and exact S3 roots were independently read
+absent after cleanup. Cloud #3186 repairs the observer list/watch handshake and
+order-independent transition verification; it does not fix this read failure.
+
+A real TCP/gRPC regression on core baseline
+`14d89e378afe0e1cf4dd08eb9ae05b50e6f19223` pauses one follower's replication after
+all three apply a ten-byte prefix. The other two voters acknowledge two more
+appends through offset 18. Reading their acknowledged start offset 14 from the
+lagging follower reproduces `OffsetOutOfRange`, reporting local tail 10. This
+reproduces the stale-read mechanism without losing data; it does not prove that
+the failed EKS run had no additional recovery defect.
+
+Follower-local read-plan `OffsetOutOfRange` now joins the existing
+`StreamNotFound` forwarding path; these forwarded boundary checks use a
+quorum-confirmed leader read. Without a known leader, return the existing
+leader-unknown retryable refusal. Preserve truly invalid cursor errors and the
+owner-pinned live-read contract. The regression checks the exact acknowledged
+payload/offset, genuine out-of-range refusal, refusal when quorum confirmation
+fails, and the complete prefix on all three replicas after repair. Full reviewed
+artifact and production-scale qualification remain required.
+
+
+## Follow-up: survivor eligibility after restart leader pinning
+
+Core candidate `9590730dc057100eaf8923d955baa669e2850811` passed every scheduled
+remote check and both WAL resource soaks. Publication
+[37451918285](https://github.com/tonbo-io/ursula/actions/runs/37451918285) produced
+version `0.0.0-pr.9590730dc057`, image
+`sha256:cec3b84abfa3c5b1a5e2bbb162f8b1100cbf0d3727368ecdc8430d503bacd578`
+and chart
+`sha256:32158a2c461ada6acf2f964bb71f6ed0cae84bc5d2c7a2cbc0dccb38154ffc48`.
+[Isolated EKS 37452468568](https://github.com/tonbo-io/cloud/actions/runs/37452468568)
+completed its 0.6.2 upgrade and independently verified all 1024 acknowledged
+payloads/offsets, hash
+`48314800c159329e0d6747e9504de6c5dcdae1719b8e73794b26795dd89dadf0`.
+The same-version restart failed during the last selected voter's repair: after
+successfully pinning leaders, a one-shot survivor check reported voter 3 not
+complete/caught up. No final readback ran. Namespace absence was independently
+verified. The old aggregate diagnostic does not establish which group or
+eligibility condition failed; do not claim an exact live root cause or full
+qualification. Initial dispatch 37452374099 supplied mutually exclusive PR and
+version inputs and was refused before credentials/test resource creation.
+
+A synthetic HTTP regression against the same CLI baseline reproduces the
+one-shot failure when a survivor briefly reports joint membership immediately
+after successful leader pinning. Recovery now waits read-only, within the
+existing drain timeout, for unchanged survivor eligibility checks to pass before
+planning repair or advancing after detach. Metrics I/O and polling share that
+absolute stage deadline; process-pin and transport errors remain terminal.
+Persistent unsafe state still refuses membership changes, and its bounded
+diagnostic includes blocked groups and maintenance reasons. This regression is
+sequencing evidence, not reproduction of the unknown EKS rejection reason.
+The updated source needs new CI, publication and complete EKS/shared-rollout
+qualification before merge.

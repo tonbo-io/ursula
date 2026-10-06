@@ -141,7 +141,11 @@ pub(crate) fn should_forward_stale_follower_read_error(
     is_leader: bool,
     error: &GroupEngineError,
 ) -> bool {
-    !is_leader && matches!(error.code(), Some(StreamErrorCode::StreamNotFound))
+    !is_leader
+        && matches!(
+            error.code(),
+            Some(StreamErrorCode::StreamNotFound | StreamErrorCode::OffsetOutOfRange)
+        )
 }
 
 impl RaftGroupEngine {
@@ -955,15 +959,20 @@ impl GroupEngine for RaftGroupEngine {
                         ) =>
                 {
                     if let Some(leader_node) = self.current_leader_node().await {
+                        // A stale local boundary is not authoritative. Confirm
+                        // the leader and its applied prefix before deciding
+                        // whether this stream/cursor actually exists.
+                        let mut authoritative_request = original_request;
+                        authoritative_request.leader_only = true;
                         let response = forward_read_stream_to_leader(
                             placement,
                             &leader_node,
-                            original_request,
+                            authoritative_request,
                         )
                         .await?;
                         return Ok(GroupReadStreamParts::from_response(response));
                     }
-                    return Err(error);
+                    return Err(self.not_leader_for_read("read_stream boundary").await);
                 }
                 Err(error) => return Err(error),
             };
