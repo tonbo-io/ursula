@@ -44,19 +44,44 @@ pub struct QuorumVerification {
     pub applied: BTreeMap<u64, BTreeMap<u32, u64>>,
 }
 
+/// Evidence from the two observed survivors, not restored three-voter
+/// redundancy or evidence that the excluded physical host is fenced.
+#[derive(Debug, Clone, Serialize)]
+pub struct SurvivingQuorumVerification {
+    pub excluded_voter_id: u64,
+    pub configured_voter_ids: BTreeSet<u64>,
+    pub surviving_voter_ids: BTreeSet<u64>,
+    pub full_redundancy_restored: bool,
+    pub verification: QuorumVerification,
+}
+
+#[cfg(test)]
 fn validate_inventory(
     snapshot: &ClusterSnapshot,
     voters: &BTreeSet<u64>,
     group_count: u32,
     allow_legacy: bool,
 ) -> Result<bool> {
+    validate_observed_inventory(snapshot, voters, voters, group_count, allow_legacy)
+}
+
+fn validate_observed_inventory(
+    snapshot: &ClusterSnapshot,
+    voters: &BTreeSet<u64>,
+    observed_voters: &BTreeSet<u64>,
+    group_count: u32,
+    allow_legacy: bool,
+) -> Result<bool> {
+    if !observed_voters.is_subset(voters) || observed_voters.len() <= voters.len() / 2 {
+        bail!("observed configured voters cannot form a quorum");
+    }
     let reported = snapshot
         .per_node
         .iter()
         .map(|node| node.node.id)
         .collect::<BTreeSet<_>>();
-    if &reported != voters || snapshot.per_node.len() != voters.len() {
-        bail!("quorum verification requires every configured voter exactly once");
+    if &reported != observed_voters || snapshot.per_node.len() != observed_voters.len() {
+        bail!("quorum verification requires every selected voter exactly once");
     }
     let expected = (0..u64::from(group_count)).collect::<BTreeSet<_>>();
     let mut participation_certified = true;
@@ -162,9 +187,58 @@ pub async fn verify_quorum(
     client: &MetricsClient,
     options: &QuorumVerificationOptions,
 ) -> Result<QuorumVerification> {
-    let voters = nodes.iter().map(|node| node.id).collect::<BTreeSet<_>>();
+    verify_observed_quorum(nodes, nodes, client, options).await
+}
+
+/// Confirm fresh prefixes on both survivors after excluding exactly one of
+/// three configured voters. Full membership still names the original three;
+/// narrowing the observed set must never narrow the expected membership.
+pub async fn verify_surviving_quorum(
+    configured_nodes: &[NodeInfo],
+    excluded_voter_id: u64,
+    client: &MetricsClient,
+    options: &QuorumVerificationOptions,
+) -> Result<SurvivingQuorumVerification> {
+    let configured_voter_ids = configured_nodes
+        .iter()
+        .map(|node| node.id)
+        .collect::<BTreeSet<_>>();
+    if configured_nodes.len() != 3
+        || configured_voter_ids.len() != 3
+        || !configured_voter_ids.contains(&excluded_voter_id)
+    {
+        bail!("survivor observation requires three configured voters and one known exclusion");
+    }
+    let survivors = configured_nodes
+        .iter()
+        .filter(|node| node.id != excluded_voter_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let verification =
+        verify_observed_quorum(configured_nodes, &survivors, client, options).await?;
+    Ok(SurvivingQuorumVerification {
+        excluded_voter_id,
+        configured_voter_ids,
+        surviving_voter_ids: survivors.iter().map(|node| node.id).collect(),
+        full_redundancy_restored: false,
+        verification,
+    })
+}
+
+async fn verify_observed_quorum(
+    configured_nodes: &[NodeInfo],
+    nodes: &[NodeInfo],
+    client: &MetricsClient,
+    options: &QuorumVerificationOptions,
+) -> Result<QuorumVerification> {
+    let voters = configured_nodes
+        .iter()
+        .map(|node| node.id)
+        .collect::<BTreeSet<_>>();
+    let observed_voters = nodes.iter().map(|node| node.id).collect::<BTreeSet<_>>();
     if nodes.is_empty()
-        || voters.len() != nodes.len()
+        || voters.len() != configured_nodes.len()
+        || observed_voters.len() != nodes.len()
         || options.group_count == 0
         || options.core_count == 0
     {
@@ -173,9 +247,10 @@ pub async fn verify_quorum(
     let deadline = Instant::now() + options.timeout;
     let observe = async {
         let initial = client.fetch_cluster(nodes).await?;
-        validate_inventory(
+        validate_observed_inventory(
             &initial,
             &voters,
+            &observed_voters,
             options.group_count,
             options.allow_legacy_eligibility,
         )?;
@@ -238,9 +313,10 @@ pub async fn verify_quorum(
             .collect::<Result<BTreeMap<_, _>>>()?;
         loop {
             let snapshot = client.fetch_cluster(nodes).await?;
-            let participation_certified = validate_inventory(
+            let participation_certified = validate_observed_inventory(
                 &snapshot,
                 &voters,
+                &observed_voters,
                 options.group_count,
                 options.allow_legacy_eligibility,
             )?;
@@ -335,6 +411,91 @@ mod tests {
         assert!(validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, false).unwrap());
         assert!(apply_evidence(&sample, &prefixes(20)).unwrap().is_some());
         assert!(apply_evidence(&sample, &prefixes(21)).unwrap().is_none());
+    }
+
+    #[test]
+    fn survivor_observation_preserves_the_full_configured_membership() {
+        let mut sample = snapshot();
+        sample.per_node.retain(|node| node.node.id != 3);
+        let voters = BTreeSet::from([1, 2, 3]);
+        let survivors = BTreeSet::from([1, 2]);
+        assert!(validate_observed_inventory(&sample, &voters, &survivors, 2, false).unwrap());
+        assert!(validate_inventory(&sample, &voters, 2, false).is_err());
+        assert_eq!(
+            apply_evidence(&sample, &prefixes(20))
+                .unwrap()
+                .unwrap()
+                .len(),
+            2
+        );
+        for node in &mut sample.per_node {
+            for group in &mut node.groups {
+                group.voter_ids = vec![1, 2];
+            }
+        }
+        assert!(validate_observed_inventory(&sample, &voters, &survivors, 2, false).is_err());
+    }
+
+    #[test]
+    fn survivor_observation_cannot_exclude_a_second_required_replica() {
+        let mut sample = snapshot();
+        sample.per_node.retain(|node| node.node.id == 1);
+        assert!(
+            validate_observed_inventory(
+                &sample,
+                &BTreeSet::from([1, 2, 3]),
+                &BTreeSet::from([1]),
+                2,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            validate_observed_inventory(
+                &sample,
+                &BTreeSet::from([1, 2, 3]),
+                &BTreeSet::from([1, 2]),
+                2,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            validate_observed_inventory(
+                &sample,
+                &BTreeSet::from([1, 2, 3]),
+                &BTreeSet::from([1, 4]),
+                2,
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn survivor_api_refuses_unknown_exclusions_or_a_changed_topology() {
+        let nodes = snapshot()
+            .per_node
+            .into_iter()
+            .map(|node| node.node)
+            .collect::<Vec<_>>();
+        let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
+        let options = QuorumVerificationOptions {
+            group_count: 2,
+            core_count: 1,
+            timeout: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(10),
+            allow_legacy_eligibility: false,
+        };
+        for (manifest, excluded) in [(&nodes[..], 4), (&nodes[..2], 1)] {
+            let error = verify_surviving_quorum(manifest, excluded, &client, &options)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("three configured voters"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

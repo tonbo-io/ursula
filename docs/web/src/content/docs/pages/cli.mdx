@@ -40,6 +40,7 @@ The naive procedure of "restart followers, then leader" does **not** wait for `a
 | `wait-ready` | Block until every node reports the expected group count and every group has a leader |
 | `verify-cluster` | Require every configured voter to be present and caught up in two consecutive samples before the next rollout step |
 | `verify-quorum` | Confirm every configured group with a fresh ReadIndex round and require every replica to apply its fixed prefix under the same leader term |
+| `verify-survivors` | Confirm fresh prefixes on two observed survivors while preserving the three-voter configuration; does not certify full redundancy or physical fencing |
 
 Mutating verbs exit `0` on success and `2` on an abort (drain timeout, no safe transfer target, catch-up stall). Anything else is a configuration or transport error with a single-line, machine-greppable message.
 
@@ -175,3 +176,15 @@ The command requires each configured voter exactly once, every configured group 
 The pinned 0.6.2 baseline predates participation reports. `--allow-legacy-eligibility` is an explicit diagnostic option for measuring that baseline and returns `verification.participation_certified=false`. It does not certify the repaired process participation guarantee. The probe uses the existing Vote and linearizable HEAD RPCs for old leaders; it never sends an unknown barrier RPC to their HTTP/gRPC mux.
 
 A successful observation is not a maintenance reservation, a continuously refreshed health claim or physical fencing permission. Independent maintenance workflows still need to serialize disruptions and bind replacement to the actual Pod/process/host incarnation.
+
+## `verify-survivors`
+
+After one voter becomes unavailable, this source can separately observe the two survivors. Keep all three voters in the manifest and explicitly exclude exactly one known node:
+
+```bash
+ursulactl verify-survivors --config cluster.json --excluded-node-id 3 --expected-groups 256 --core-count 2 --timeout-secs 120
+```
+
+Every group must still have the complete uniform three-voter membership, no learners and open participation gates on both observed replicas. Both survivors must agree on a reachable leader and apply each newly confirmed fixed prefix. The command rejects a second missing replica, an unknown exclusion or a changed topology; it never shrinks the configured membership to fit observations. Legacy diagnostics retain the explicit opt-in and do not certify participation.
+
+The output is scoped as `surviving_quorum`, records the configured and observed voter sets, and always reports `full_redundancy_restored=false`. Excluding a voter from observation does not prove its old process or host is stopped. Hard fencing and an exclusive maintenance reservation remain prerequisites for physical replacement, and the complete `verify-quorum` check is required before any subsequent disruption.
