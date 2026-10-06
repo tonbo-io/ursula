@@ -1,0 +1,61 @@
+{{- if .Values.server.startupOwnership.enabled -}}
+{{- $sts := include "ursula.fullname" . -}}
+{{- $name := printf "%s-startup" $sts | trunc 63 | trimSuffix "-" -}}
+{{- $cluster := printf "%s-%s" ($name | trunc 54 | trimSuffix "-") (printf "%s/%s" .Release.Namespace $sts | sha256sum | trunc 8) -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: [{{ printf "%s-maintenance" $sts | quote }}]
+    verbs: ["get", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    resourceNames: [{{ printf "%s-0" $sts | quote }}, {{ printf "%s-1" $sts | quote }}, {{ printf "%s-2" $sts | quote }}]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    resourceNames: [{{ $sts | quote }}]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "ursula.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $cluster }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    resourceNames: [{{ .Release.Namespace | quote }}]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $cluster }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $cluster }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "ursula.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

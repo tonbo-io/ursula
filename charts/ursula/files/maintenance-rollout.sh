@@ -192,21 +192,32 @@ maintenance_recover_operation() {
     fi
     wait_for_pod_started "${maintenance_ordinal}"
     start_forward "${maintenance_ordinal}"
-    maintenance_capture_pod
-    "${CTL}" pin-incarnations --config "${MANIFEST}" --replace-node "${maintenance_node}" \
-      --http-timeout-secs 30 >"${WORK}/replacement.json"
-    maintenance_bound_uid=$("${CTL}" reservation-source --cell "${CELL}" \
-      --pod-object "${WORK}/pod.json" --node-object "${WORK}/node.json" \
-      --config "${WORK}/replacement.json" --node-id "${maintenance_node}" --field pod-uid)
-    [ -n "${maintenance_bound_uid}" ] && [ "${maintenance_bound_uid}" != "${maintenance_source_uid}" ]
-    # The native policy checks the complete Pod's UID/owner, Node/provider
-    # identity and target-only process change. A surrounding UID read prevents
-    # pinning a process across another Pod replacement.
-    [ "$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-${maintenance_ordinal}" -o jsonpath='{.metadata.uid}')" = "${maintenance_bound_uid}" ]
-    "${CTL}" reservation-request bind-pod-replacement --fence "${FENCE}" \
-      --pod-object "${WORK}/pod.json" --node-object "${WORK}/node.json" \
-      --config "${WORK}/replacement.json" >"${REQUEST}"
-    maintenance_cas
+    # A startup-guarded server may have bound its fresh boot before listening.
+    # Reload that exact operation; never adopt a new executor through this read.
+    maintenance_load
+    maintenance_read fence >"${WORK}/observed-fence.json"
+    [ "$(cat "${FENCE}")" = "$(cat "${WORK}/observed-fence.json")" ]
+    [ "$(maintenance_read source-pod-uid)" = "${maintenance_source_uid}" ]
+    if [ "$(maintenance_read stage)" = replacement-bound ]; then
+      [ "$(maintenance_target_uid)" = "$(maintenance_read replacement-pod-uid)" ]
+    else
+      [ "$(maintenance_read stage)" = deletion-admitted ]
+      maintenance_capture_pod
+      "${CTL}" pin-incarnations --config "${MANIFEST}" --replace-node "${maintenance_node}" \
+        --http-timeout-secs 30 >"${WORK}/replacement.json"
+      maintenance_bound_uid=$("${CTL}" reservation-source --cell "${CELL}" \
+        --pod-object "${WORK}/pod.json" --node-object "${WORK}/node.json" \
+        --config "${WORK}/replacement.json" --node-id "${maintenance_node}" --field pod-uid)
+      [ -n "${maintenance_bound_uid}" ] && [ "${maintenance_bound_uid}" != "${maintenance_source_uid}" ]
+      # The native policy checks the complete Pod's UID/owner, Node/provider
+      # identity and target-only process change. A surrounding UID read prevents
+      # pinning a process across another Pod replacement.
+      [ "$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-${maintenance_ordinal}" -o jsonpath='{.metadata.uid}')" = "${maintenance_bound_uid}" ]
+      "${CTL}" reservation-request bind-pod-replacement --fence "${FENCE}" \
+        --pod-object "${WORK}/pod.json" --node-object "${WORK}/node.json" \
+        --config "${WORK}/replacement.json" >"${REQUEST}"
+      maintenance_cas
+    fi
     maintenance_plan
   else
     [ "${maintenance_stage}" = replacement-bound ]

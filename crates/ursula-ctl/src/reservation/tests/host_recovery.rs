@@ -15,6 +15,46 @@ use crate::reservation::Reservation;
 use crate::reservation::ReservationRequest;
 use crate::reservation::SurvivingPrefixObservation;
 
+#[test]
+fn host_acquisition_changes_only_locators_and_keeps_termination_unadmitted() {
+    let saved = Reservation::initial(cell())
+        .unwrap()
+        .publish_hosts(host_publication())
+        .unwrap();
+    let mut plan = saved.hosts().unwrap().process_plan.clone();
+    for node in &mut plan {
+        node.admin_url = format!("http://127.0.0.1:{}", 50000 + node.id)
+            .parse()
+            .unwrap();
+        node.host = "127.0.0.1".to_owned();
+        node.metrics_url = Some(node.admin_url.clone());
+    }
+    let action = HostRequest::ReserveHostRecovery {
+        operation_id: format!("{:032x}", 1),
+        executor_id: format!("{:032x}", 10),
+        node_id: 1,
+        process_plan: plan.clone(),
+        now_ms: 1600,
+    };
+    let mut changed_source = action.clone();
+    if let HostRequest::ReserveHostRecovery { process_plan, .. } = &mut changed_source {
+        process_plan[0].expected_process_incarnation = Some(ProcessIncarnation::from_bits(99));
+    }
+    assert!(saved.recover_host(changed_source).is_err());
+    let state = saved.recover_host(action).unwrap();
+    state.validate().unwrap();
+    let operation = state.operation().unwrap();
+    assert_eq!(
+        operation.source,
+        saved.hosts().unwrap().voter(1).unwrap().source
+    );
+    assert_eq!(operation.process_plan[0].admin_url, plan[0].admin_url);
+    let recovery = operation.host.as_ref().unwrap();
+    assert!(recovery.admission.is_none());
+    assert!(recovery.termination.is_none());
+    assert!(recovery.pod_retirement_intents.is_empty());
+}
+
 fn reserved() -> Reservation {
     let saved = Reservation::initial(cell())
         .unwrap()
@@ -58,7 +98,7 @@ fn admit(state: &Reservation) -> Reservation {
         .unwrap()
 }
 
-fn terminated() -> Reservation {
+pub(super) fn terminated() -> Reservation {
     let state = admit(&reserved());
     state
         .recover_host(HostRequest::RecordHostTermination {
@@ -74,7 +114,7 @@ fn terminated() -> Reservation {
         .unwrap()
 }
 
-fn original_intent(state: &Reservation) -> Reservation {
+pub(super) fn original_intent(state: &Reservation) -> Reservation {
     state
         .recover_host(HostRequest::AdmitFencedPodRetirement {
             fence: state.operation().unwrap().fence.clone(),
@@ -113,6 +153,22 @@ fn complete(state: &Reservation) -> HostRequest {
         now_ms: 3000,
         observation: observation(state, true, 2800, 70),
     }
+}
+
+pub(super) fn completed_startup_fixture() -> (Reservation, super::super::PublishHostInventory) {
+    let mut state = original_intent(&terminated());
+    let mut request = binding(&state, "replacement");
+    if let HostRequest::BindHostReplacement { node, .. } = &mut request {
+        node["spec"]["providerID"] = json!("aws:///zone-1/i-123");
+    }
+    state = state.recover_host(request).unwrap();
+    state = state.recover_host(complete(&state)).unwrap();
+    let mut captured = host_publication();
+    let source = &state.hosts().unwrap().voter(1).unwrap().source;
+    captured.pods[0]["metadata"]["uid"] = json!(source.pod_uid);
+    captured.nodes[0]["metadata"]["uid"] = json!(source.node_uid);
+    captured.nodes[0]["spec"]["providerID"] = json!(source.provider_instance);
+    (state, captured)
 }
 
 #[test]

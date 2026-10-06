@@ -297,6 +297,33 @@ class HelmTemplateConfigTest(unittest.TestCase):
                                       "--set", invalid], text=True, capture_output=True)
                 self.assertNotEqual(run.returncode, 0)
 
+    def test_startup_ownership_is_explicit_and_has_only_exact_store_mutation(self) -> None:
+        values = ("--namespace", "test", "--set", "s3.bucket=bkt", "--set",
+                  "server.updateStrategy=OnDelete", "--set", "server.gracefulRollout.enabled=true",
+                  "--set", "server.gracefulRollout.maintenanceReservation=true",
+                  "--set", "server.startupOwnership.enabled=true")
+        rendered = render_chart(*values)
+        self.assertIn('name: URSULA_STARTUP_RESERVATION\n              value: "true"', rendered)
+        self.assertIn('fieldPath: metadata.uid', rendered)
+        self.assertIn('mountPath: /var/run/ursula-startup\n              readOnly: true', rendered)
+        self.assertIn('expirationSeconds: 600', rendered)
+        self.assertIn('name: kube-root-ca.crt', rendered)
+        self.assertIn('path: /sys/devices/virtual/dmi/id/board_asset_tag\n            type: File', rendered)
+        self.assertIn('mountPath: /var/run/ursula-physical-instance\n              readOnly: true', rendered)
+        startup_role = re.search(r'kind: Role\nmetadata:\n  name: test-ursula-startup\n(?P<body>.*?)(?=\n---)', rendered, re.S).group('body')
+        self.assertIn('resourceNames: ["test-ursula-maintenance"]\n    verbs: ["get", "update"]', startup_role)
+        self.assertNotIn('"delete"', startup_role)
+        self.assertNotIn('"create"', startup_role)
+        self.assertNotIn('"patch"', startup_role)
+        self.assertNotIn('URSULA_STARTUP_RESERVATION', render_chart("--set", "s3.bucket=bkt"))
+        for invalid in ("server.replicaCount=2", "server.updateStrategy=RollingUpdate",
+                        "server.gracefulRollout.maintenanceReservation=false",
+                        "serviceAccount.create=false,serviceAccount.name=default",
+                        "server.extraEnv[0].name=URSULA_STARTUP_RESERVATION,server.extraEnv[0].value=false"):
+            with self.subTest(invalid=invalid):
+                result = subprocess.run(["helm", "template", "test", "charts/ursula", *values, "--set", invalid], text=True, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+
     def test_every_deployment_role_uses_the_unified_ursula_binary(self) -> None:
         rendered = render_chart(
             *indexer_values(),

@@ -67,6 +67,13 @@ impl FenceRejection {
 }
 
 impl AdminMutationFence {
+    pub(crate) fn from_startup(current: MaintenanceFenceState) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(current)),
+            uncertain: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     pub(crate) async fn snapshot(&self) -> MaintenanceFenceState {
         self.current.read().await.clone()
     }
@@ -150,7 +157,9 @@ impl AdminMutationFence {
             // and retirement never returns to this permissive state.
             MaintenanceFenceState::Unclaimed if header.is_none() => {}
             MaintenanceFenceState::Unclaimed => return Err(FenceRejection::Changed),
-            MaintenanceFenceState::Activating { .. } | MaintenanceFenceState::Retiring { .. } => {
+            MaintenanceFenceState::AwaitingReservation
+            | MaintenanceFenceState::Activating { .. }
+            | MaintenanceFenceState::Retiring { .. } => {
                 return Err(FenceRejection::Uncertain);
             }
             MaintenanceFenceState::Retired { .. } => return Err(FenceRejection::Retired),
@@ -211,6 +220,50 @@ mod tests {
             generation,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn startup_retains_closed_authority_and_generation_before_first_request() {
+        let pending =
+            AdminMutationFence::from_startup(MaintenanceFenceState::Activating { fence: token(7) });
+        assert!(pending.admit_mutation(None).await.is_err());
+        assert!(
+            pending
+                .admit_mutation(Some(&token(7).header_value()))
+                .await
+                .is_err()
+        );
+        assert!(pending.activate(token(6), async { Ok(()) }).await.is_err());
+        let changed_executor =
+            MaintenanceFence::new(format!("{:032x}", 1), format!("{:032x}", 8), 7).unwrap();
+        assert!(
+            pending
+                .activate(changed_executor, async { Ok(()) })
+                .await
+                .is_err()
+        );
+        assert!(pending.activate(token(7), async { Ok(()) }).await.is_ok());
+        pending
+            .admit_mutation(Some(&token(7).header_value()))
+            .await
+            .unwrap()
+            .complete();
+
+        let idle =
+            AdminMutationFence::from_startup(MaintenanceFenceState::Retired { fence: token(7) });
+        assert!(idle.admit_mutation(None).await.is_err());
+        for generation in [6, 7] {
+            assert!(
+                idle.activate(token(generation), async { Ok(()) })
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(idle.activate(token(8), async { Ok(()) }).await.is_ok());
+
+        let initial = AdminMutationFence::from_startup(MaintenanceFenceState::AwaitingReservation);
+        assert!(initial.admit_mutation(None).await.is_err());
+        assert!(initial.activate(token(1), async { Ok(()) }).await.is_ok());
     }
 
     #[tokio::test]

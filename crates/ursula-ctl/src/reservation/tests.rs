@@ -10,6 +10,7 @@ use super::Value;
 use crate::NodeInfo;
 
 mod host_recovery;
+mod startup;
 
 fn cell() -> CellIdentity {
     CellIdentity {
@@ -529,6 +530,88 @@ fn incomplete_or_uncertified_healthy_inventory_cannot_anchor_host_recovery() {
 }
 
 #[test]
+fn planned_reservation_accepts_new_locators_but_keeps_identity_and_binding_fixed() {
+    let saved = Reservation::initial(cell())
+        .unwrap()
+        .publish_hosts(host_publication())
+        .unwrap();
+    let mut action = request(1, 10, 1);
+    if let OwnershipRequest::Reserve {
+        process_plan,
+        now_ms,
+        ..
+    } = &mut action
+    {
+        *now_ms = 1600;
+        for node in process_plan {
+            node.host = "127.0.0.1".to_owned();
+            node.admin_url = format!("http://127.0.0.1:{}", 50000 + node.id)
+                .parse()
+                .unwrap();
+            node.metrics_url = Some(node.admin_url.clone());
+            node.http_url = Some(
+                format!(
+                    "http://voter-{}.headless.ns.svc.cluster.local:4437",
+                    node.id
+                )
+                .parse()
+                .unwrap(),
+            );
+        }
+    }
+    for case in 0..3 {
+        let mut invalid = action.clone();
+        if let OwnershipRequest::Reserve {
+            source,
+            process_plan,
+            ..
+        } = &mut invalid
+        {
+            match case {
+                0 => {
+                    process_plan[1].expected_process_incarnation =
+                        Some(ProcessIncarnation::from_bits(99))
+                }
+                1 => source.node_uid = "new-node".to_owned(),
+                _ => source.provider_instance = "new-instance".to_owned(),
+            }
+        }
+        assert!(saved.propose(invalid).is_err(), "case {case}");
+    }
+    let reserved = saved.propose(action).unwrap();
+    reserved.validate().unwrap();
+    assert_eq!(
+        reserved.operation().unwrap().process_plan[0].host,
+        "127.0.0.1"
+    );
+    assert_eq!(saved.hosts().unwrap().process_plan[0].host, "voter-1");
+    let admitted = reserved
+        .progress(super::ProgressRequest::AdmitPodDeletion {
+            fence: reserved.operation().unwrap().fence.clone(),
+            now_ms: 1900,
+            observation: observation(&reserved, false, 1700, 60),
+        })
+        .unwrap();
+    let mut bind = binding(&admitted);
+    if let super::ProgressRequest::BindPodReplacement { node, .. } = &mut bind {
+        node["metadata"]["labels"] = json!({"topology.kubernetes.io/zone":"zone-1"});
+    }
+    for case in 0..4 {
+        let mut changed = bind.clone();
+        if let super::ProgressRequest::BindPodReplacement { process_plan, .. } = &mut changed {
+            match case {
+                0 => process_plan[0].admin_url = "http://another:4438".parse().unwrap(),
+                1 => process_plan[1].metrics_url = None,
+                2 => process_plan[1].host = "another-host".to_owned(),
+                _ => process_plan[1].http_url = Some("http://another:4437".parse().unwrap()),
+            }
+        }
+        assert!(admitted.progress(changed).is_err(), "case {case}");
+    }
+    admitted.progress(bind).unwrap();
+}
+
+#[test]
 fn healthy_refresh_cannot_forget_a_changed_or_reused_physical_host() {
     let saved = Reservation::initial(cell())
         .unwrap()
@@ -965,4 +1048,18 @@ fn captured_api_identity_rejects_misdirected_or_deleting_objects() {
                 .is_err()
         );
     }
+}
+
+/// Shared fixture for the actual HTTP startup adapter tests.
+pub(crate) fn startup_fixture() -> (Reservation, super::PublishHostInventory, Value) {
+    (
+        host_recovery::original_intent(&host_recovery::terminated()),
+        host_publication(),
+        document(),
+    )
+}
+
+pub(crate) fn completed_startup_fixture() -> (Reservation, super::PublishHostInventory, Value) {
+    let (state, captured) = host_recovery::completed_startup_fixture();
+    (state, captured, document())
 }

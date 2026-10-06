@@ -23,9 +23,10 @@ use crate::quorum::QuorumVerification;
 mod hosts;
 mod inventory;
 mod recovery;
+mod startup;
 mod store;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use hosts::HostInventory;
 pub use hosts::HostVoter;

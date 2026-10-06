@@ -35,6 +35,217 @@ impl Drop for ChildGuard {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_startup_admission_precedes_transport_and_publishes_its_fresh_boot() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = static_cluster_cli_test_guard().await;
+    let directory = tempfile::tempdir().unwrap();
+    let server = directory.path().join("ursula");
+    std::fs::copy(env!("CARGO_BIN_EXE_ursula"), &server).unwrap();
+    let helper = directory.path().join("ursulactl");
+    std::fs::write(
+        &helper,
+        r#"#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --process-incarnation ]; then
+    printf '%s' "$2" > "$CAPTURE_BOOT"
+    boot="$2"
+    break
+  fi
+  shift
+done
+if [ "$STARTUP_REFUSE" = true ]; then
+  echo 'fixture admission refused' >&2
+  exit 9
+fi
+printf '{"process_incarnation":"%s","maintenance_fence":%s}\n' "${STARTUP_RETURN_BOOT:-$boot}" "$STARTUP_FENCE"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ports = [free_port(), free_port(), free_port()];
+    let port = ports[0];
+    let url = format!("http://127.0.0.1:{port}");
+    let peers: Vec<_> = ports
+        .iter()
+        .enumerate()
+        .map(|(index, port)| (index as u64 + 1, format!("http://127.0.0.1:{port}")))
+        .collect();
+    let config = directory.path().join("cluster.toml");
+    let logs = directory.path().join("raft-log");
+    let admin_port = write_cluster_config(&config, port, 1, 1, &peers, true, &logs);
+    let admin_url = format!("http://127.0.0.1:{admin_port}");
+    let captured = directory.path().join("boot");
+    let fence = |generation| {
+        ursula_proto::admin::MaintenanceFence::new(
+            format!("{:032x}", 1),
+            format!("{generation:032x}"),
+            generation,
+        )
+        .unwrap()
+    };
+    let retired = serde_json::to_string(&ursula_proto::admin::MaintenanceFenceState::Retired {
+        fence: fence(7),
+    })
+    .unwrap();
+    let start = |refuse: bool, authority: &str, returned_boot: &str| {
+        let mut command = Command::new(&server);
+        command
+            .args(["server", "--config"])
+            .arg(&config)
+            .env("URSULA_STARTUP_RESERVATION", "true")
+            .env("CAPTURE_BOOT", &captured)
+            .env("STARTUP_REFUSE", refuse.to_string())
+            .env("STARTUP_FENCE", authority)
+            .env("STARTUP_RETURN_BOOT", returned_boot);
+        spawn_child(command, format!("startup-admission-{port}-{refuse}"))
+    };
+    let mut rejected = start(true, &retired, "");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(exit) = rejected.child.try_wait().unwrap() {
+            assert!(!exit.success());
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !logs.exists(),
+        "no format stamp or Raft log may precede admission"
+    );
+    assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+    assert!(std::net::TcpStream::connect(("127.0.0.1", admin_port)).is_err());
+    let rejected_boot = std::fs::read_to_string(&captured).unwrap();
+    assert_eq!(rejected_boot.len(), 32);
+    drop(rejected);
+    for (authority, returned_boot) in [
+        ("{\"state\":\"unclaimed\"}".to_owned(), ""),
+        (
+            serde_json::to_string(&ursula_proto::admin::MaintenanceFenceState::Active {
+                fence: fence(7),
+            })
+            .unwrap(),
+            "",
+        ),
+        (retired.clone(), "00000000000000000000000000000000"),
+    ] {
+        let mut rejected = start(false, &authority, returned_boot);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(exit) = rejected.child.try_wait().unwrap() {
+                assert!(!exit.success());
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!logs.exists());
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+        assert!(std::net::TcpStream::connect(("127.0.0.1", admin_port)).is_err());
+    }
+    let mut survivors = Vec::new();
+    for (index, (node_id, _)) in peers.iter().enumerate().skip(1) {
+        let survivor_config = directory.path().join(format!("node-{node_id}.toml"));
+        write_cluster_config(
+            &survivor_config,
+            ports[index],
+            *node_id,
+            1,
+            &peers,
+            false,
+            &directory.path().join(format!("node-{node_id}-log")),
+        );
+        survivors.push(spawn_node_with_cluster_config(
+            server.to_str().unwrap(),
+            &survivor_config,
+        ));
+    }
+    let mut accepted = start(false, &retired, "");
+    let client = reqwest::Client::new();
+    wait_until_ready(&client, &url, std::slice::from_mut(&mut accepted)).await;
+    for (_, survivor_url) in peers.iter().skip(1) {
+        wait_until_ready(&client, survivor_url, &mut survivors).await;
+    }
+    let metrics: serde_json::Value = client
+        .get(format!("{url}/__ursula/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let admitted_boot = std::fs::read_to_string(&captured).unwrap();
+    assert_ne!(admitted_boot, rejected_boot);
+    assert_eq!(
+        metrics["process_incarnation"].as_str(),
+        Some(admitted_boot.as_str())
+    );
+    assert_eq!(
+        metrics["maintenance_fence"],
+        serde_json::from_str::<serde_json::Value>(&retired).unwrap()
+    );
+    let mutate = |token: Option<String>| {
+        let mut request = client
+            .delete(format!("{admin_url}/__ursula/leadership-shed/maintenance"))
+            .header(
+                ursula_proto::admin::PROCESS_INCARNATION_HEADER,
+                &admitted_boot,
+            );
+        if let Some(token) = token {
+            request = request.header(ursula_proto::admin::MAINTENANCE_FENCE_HEADER, token);
+        }
+        request
+    };
+    assert_eq!(
+        mutate(None).send().await.unwrap().status(),
+        reqwest::StatusCode::PRECONDITION_FAILED
+    );
+    for generation in [6, 7, 8] {
+        let response = client
+            .post(format!("{admin_url}/__ursula/maintenance/fence/activate"))
+            .header(
+                ursula_proto::admin::PROCESS_INCARNATION_HEADER,
+                &admitted_boot,
+            )
+            .json(&fence(generation))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if generation == 8 {
+                reqwest::StatusCode::OK
+            } else {
+                reqwest::StatusCode::PRECONDITION_FAILED
+            }
+        );
+    }
+    assert_eq!(
+        mutate(None).send().await.unwrap().status(),
+        reqwest::StatusCode::PRECONDITION_REQUIRED
+    );
+    assert_eq!(
+        mutate(Some(fence(7).header_value()))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::PRECONDITION_FAILED
+    );
+    assert_eq!(
+        mutate(Some(fence(8).header_value()))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    drop(accepted);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_sigterm_drains_listeners_and_exits_cleanly() {
     let _guard = static_cluster_cli_test_guard().await;
