@@ -70,6 +70,9 @@ enum Command {
     /// Strictly verify that every configured node is a voter in every group,
     /// caught up, and observes a usable leader.
     VerifyCluster(VerifyClusterArgs),
+    /// Capture fresh quorum prefixes and verify every configured replica.
+    /// This observation does not reserve permission to disrupt a voter.
+    VerifyQuorum(VerifyQuorumArgs),
     /// Create a verifiable backup of every raft group into a local directory
     /// or `s3://bucket/prefix`.
     #[command(name = "backup-create")]
@@ -242,6 +245,26 @@ struct VerifyClusterArgs {
     lag_tolerance: u64,
 }
 
+#[derive(Args, Debug)]
+struct VerifyQuorumArgs {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long)]
+    expected_groups: u32,
+    #[arg(long)]
+    core_count: u16,
+    #[arg(long, default_value_t = 120)]
+    timeout_secs: u64,
+    #[arg(long, default_value_t = 1)]
+    poll_interval_secs: u64,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+    /// Only for diagnostic measurements of the pinned 0.6.2 baseline;
+    /// output explicitly reports participation_certified=false.
+    #[arg(long)]
+    allow_legacy_eligibility: bool,
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     let _telemetry =
@@ -269,6 +292,32 @@ async fn main() -> Result<()> {
         }
         Command::ClassifyAmnesiac(args) => run_classify_amnesiac_subcommand(args).await,
         Command::VerifyCluster(args) => run_verify_cluster_subcommand(args).await,
+        Command::VerifyQuorum(args) => {
+            let started_ms = wall_clock_unix_ms();
+            let nodes = load_nodes(&args.config).await?;
+            let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+            let report = ursula_ctl::quorum::verify_quorum(
+                &nodes,
+                &client,
+                &ursula_ctl::quorum::QuorumVerificationOptions {
+                    group_count: args.expected_groups,
+                    core_count: args.core_count,
+                    timeout: Duration::from_secs(args.timeout_secs),
+                    poll_interval: Duration::from_secs(args.poll_interval_secs),
+                    allow_legacy_eligibility: args.allow_legacy_eligibility,
+                },
+            )
+            .await?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "started_ms": started_ms,
+                    "completed_ms": wall_clock_unix_ms(),
+                    "verification": report,
+                })
+            );
+            Ok(())
+        }
         Command::BackupCreate(args) => run_backup_create_subcommand(args).await,
         Command::BackupVerify(args) => run_backup_verify_subcommand(args).await,
         Command::Restore(args) => run_restore_subcommand(args).await,

@@ -16,6 +16,7 @@
 //! - [`backup`]: verifiable cluster backup, verification, and restore.
 //! - [`maintenance`]: node-maintenance verbs (drain, restart repair, catch-up).
 //! - [`provider`]: cluster manifest loading and node addressing.
+//! - [`quorum`]: fresh fixed-prefix verification with explicit configured inventory.
 
 pub mod backup;
 pub mod maintenance;
@@ -23,6 +24,7 @@ pub mod metrics;
 pub mod observe;
 pub mod plan;
 pub mod provider;
+pub mod quorum;
 
 pub use maintenance::CatchUpOptions;
 pub use maintenance::CatchUpOutcome;

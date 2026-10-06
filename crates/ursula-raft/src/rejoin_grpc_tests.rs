@@ -23,6 +23,9 @@ struct RecoveryTestService {
     pause_replication: Arc<AtomicBool>,
     legacy: Arc<AtomicBool>,
     unknown_rpc_requests: Arc<AtomicUsize>,
+    // 1 arms a term change after the legacy HEAD; 2 corrupts only its
+    // following Vote response, without changing the actual Raft handlers.
+    legacy_vote_change: Arc<AtomicUsize>,
 }
 
 #[tonic::async_trait]
@@ -91,6 +94,19 @@ impl RaftInternal for RecoveryTestService {
                 .metadata_mut()
                 .remove(crate::grpc::REJOIN_BARRIER_CAPABILITY);
         }
+        if self
+            .legacy_vote_change
+            .compare_exchange(2, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let mut vote: UrsulaVoteResponse =
+                decode_wire(&response.get_ref().payload, "test vote").unwrap();
+            vote.vote = UrsulaVote::new_committed(
+                vote.vote.leader_id().term().saturating_add(1),
+                *vote.vote.leader_id().node_id(),
+            );
+            response.get_mut().payload = encode_wire(&vote);
+        }
         Ok(response)
     }
 
@@ -112,7 +128,11 @@ impl RaftInternal for RecoveryTestService {
         &self,
         request: Request<pb::GroupReadRequestV1>,
     ) -> Result<Response<pb::GroupReadResponseV1>, Status> {
-        self.inner.group_read(request).await
+        let response = self.inner.group_read(request).await;
+        let _armed =
+            self.legacy_vote_change
+                .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst);
+        response
     }
 
     async fn rejoin_barrier(
@@ -189,6 +209,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             pause_replication: Arc::new(AtomicBool::new(false)),
             legacy: Arc::new(AtomicBool::new(false)),
             unknown_rpc_requests: Arc::new(AtomicUsize::new(0)),
+            legacy_vote_change: Arc::new(AtomicUsize::new(0)),
         };
         let wire_service = pb::raft_internal_server::RaftInternalServer::new(service.clone())
             .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
@@ -364,6 +385,11 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             "capability and low-term Vote cannot replace a fresh quorum proof"
         );
         assert_eq!(services[1].unknown_rpc_requests.load(Ordering::SeqCst), 0);
+        assert!(
+            crate::confirm_quorum_prefix(placement(), 2, &endpoints[1], Duration::from_millis(150))
+                .await
+                .is_err()
+        );
     }
     // Reconnect healthy C first. B still owns the ACKed suffix; A still only
     // has the old prefix, so a successful fresh proof alone cannot open A.
@@ -376,6 +402,13 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         .applied_index_at_least(Some(acked.log_id.index()), "C repaired suffix")
         .await
         .unwrap();
+    services[1].legacy.store(true, Ordering::SeqCst);
+    services[1].legacy_vote_change.store(1, Ordering::SeqCst);
+    let changed_vote =
+        crate::confirm_quorum_prefix(placement(), 2, &endpoints[1], Duration::from_secs(1))
+            .await
+            .unwrap_err();
+    assert!(changed_vote.contains("changed its vote"), "{changed_vote}");
     for legacy in [false, true, false] {
         services[1].legacy.store(legacy, Ordering::SeqCst);
         if legacy {
@@ -405,6 +438,13 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
                 .await
                 .expect("fresh recovery proof, including legacy bridge");
         assert!(proof.1 >= acked.log_id.index());
+        let observed =
+            crate::confirm_quorum_prefix(placement(), 2, &endpoints[1], Duration::from_secs(1))
+                .await
+                .expect("fresh maintenance observation through the same probe");
+        assert_eq!(observed.leader_id, 2);
+        assert_eq!(observed.raft_group_id, placement().raft_group_id.0);
+        assert!(observed.required_applied_index >= acked.log_id.index());
         gates[0].confirm_barrier(proof.0, proof.1);
         assert!(!gates[0].vote_gate_open(), "proof must also be applied");
         assert_eq!(services[1].unknown_rpc_requests.load(Ordering::SeqCst), 0);

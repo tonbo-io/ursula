@@ -24,13 +24,13 @@ worktree `/private/tmp/ursula-mem-review-c61cb60`.
 
 | Order | Work | Acceptance evidence | Status |
 | --- | --- | --- | --- |
-| 1 | Fix early vote eligibility after memory-WAL state loss | Regression reproducing stale AppendEntries plus one state loss; acknowledged tail survives; real gRPC coverage; explanation of the recovery barrier | Implemented; local and remote CI passed at 874c3a4; EKS qualification/deployment pending |
-| 2 | Make snapshot reference publication failures recoverable | Temporary reference PUT failure followed by successful retry without restarting the Raft group; retain snapshot GC protection | Implemented; local and remote CI passed at 874c3a4; EKS qualification/deployment pending |
+| 1 | Fix early vote eligibility after memory-WAL state loss | Regression reproducing stale AppendEntries plus one state loss; acknowledged tail survives; real gRPC coverage; explanation of the recovery barrier | Merged in #370; local/remote CI and isolated EKS upgrade/restart passed at 4012d51; production qualification/deployment pending |
+| 2 | Make snapshot reference publication failures recoverable | Temporary reference PUT failure followed by successful retry without restarting the Raft group; retain snapshot GC protection | Merged in #370; local/remote CI and isolated EKS upgrade/restart passed at 4012d51; production qualification/deployment pending |
 | 3 | Raft-aware maintenance gates and automatic fenced replacement | Refuse a second planned disruption until every affected group regains healthy membership and catches up; replace dead-node voters without duplicate node identities | Configuration-backed local eligibility and CLI gates implemented; serialized disruption, fresh cluster proof and fenced replacement pending |
 | 4 | Node memory budget and backpressure | Bounded retained/uncommitted logs, hot data, request queues and concurrent rebuilds under production limits and S3 degradation; reject load before OOM | Pending |
 | 5 | Business retry and Raft observability | Invalidate dead leader routes; retry only replay-safe operations within a total budget; reviewed metrics and alerts for quorum risk, stopped groups and stalled recovery; synthetic append/read | Pending |
 | 6 | Production-scale qualification | Isolated fault injection with production topology/workload; measured write-recovery and full-redundancy RTO; RPO zero inside the failure model; ongoing Turn continuity; memory/disk comparison | Dedicated test cell selected; measure baselines before proposing numeric RTO targets |
-| Supporting | Accurate chart/config durability docs and bounded SIGTERM handoff | Chart rendering; config documentation matches abort behavior; real-process handoff and bounded no-quorum shutdown | Implemented; local and remote CI passed at 874c3a4; EKS qualification/deployment pending |
+| Supporting | Accurate chart/config durability docs and bounded SIGTERM handoff | Chart rendering; config documentation matches abort behavior; real-process handoff and bounded no-quorum shutdown | Merged in #370; local/remote CI and isolated EKS upgrade/restart passed at 4012d51; production qualification/deployment pending |
 
 Keep implementation, CI, artifact publication, deployment, and live qualification
 as separate gates. Do not label any milestone complete because code merged or
@@ -312,10 +312,27 @@ and startup-probe shell regressions, shellcheck and strict Helm lint passed.
 
 ## Qualification parameters
 
+The core follow-up at `4012d5171a134beacb0d3a941019adb25252a5eb` passed all
+scheduled remote checks, including both 128-owner WAL soaks (opt-in nightly
+skipped). Candidate publication [run 37407902210](https://github.com/tonbo-io/ursula/actions/runs/37407902210)
+recorded image `sha256:2f3fa52cf1510c6feedaed7edff7c3c51910f5302c46ebb3c711c637ca82b0a0`
+and chart `sha256:4af5d1269d6420ede55dc8842c7b23a3bf46a540536a45e8584b8ca0e4a4468d`.
+Same-epoch EKS [run 37408145007](https://github.com/tonbo-io/cloud/actions/runs/37408145007)
+passed the 0.6.2-to-candidate upgrade and a complete sequential same-version
+restart. The independent journal verified the same 1,024 ACKed payload hashes
+and offsets after both passes; every replacement passed strict 256-group
+readiness. The summary records exit status 0 and namespace deletion, confirmed
+by a separate read-only query. Evidence is retained under
+`/private/tmp/ursula-hardening-eks-37408145007-evidence`. PR #370 merged as
+`60c8d82bd2fbe9ea7785f283e764ed197c432b2f`; its Git tree exactly matches the
+qualified source tree. This accepts the core and upgrade regression milestone,
+not production-config recovery times, S3 fault recovery at production volume,
+Turn continuity or production deployment.
+
 Use a dedicated test cell reusing production configuration for fault injection
 (user selected). Existing production cells are read-only sampling targets until a concrete
 reviewed test procedure authorizes disruptions. Reuse the production three-voter,
-256-group, 3-GiB-per-voter configuration as a starting point; confirm actual cold
+256-group configuration and freeze its current memory/placement settings; confirm actual cold
 storage, placement, data volume, write rate and workload before treating it as equivalent.
 
 Record separate targets and measured distributions for:
@@ -340,6 +357,23 @@ contract, current Raft health, RPO or either recovery-time baseline. The generic
 local `canary` context was stale; the confirmed context was
 `tonbo-canary-cilium-1-eks`. Raw read-only captures are under
 `/private/tmp/ursula-hardening-live-*.json`.
+
+Cloud main then advanced to `fe9bbe1c74dbfa7de55df6850a90229ab3318632` through
+[PR #3170](https://github.com/tonbo-io/cloud/pull/3170), declaring dedicated
+ARM64 voter placement and matching 16-GiB requests/limits. Read-only canary
+sampling during migration confirmed the StatefulSet's new desired settings,
+two actual 16-GiB voters and one remaining 3-GiB voter, all still on 0.6.2.
+The raw capture is `/private/tmp/ursula-hardening-prod-placement-20261006.json`.
+Subsequent read-only inspection confirmed the graceful-rollout Job terminally
+failed with `BackoffLimitExceeded` at `2026-10-06T03:04:31Z`. Its log records
+the old hook's metrics DNS lookup failure after replacing node 2; this is the
+known tunnel-selection defect repaired in PR #370, not an ongoing migration.
+Evidence: `/private/tmp/ursula-hardening-prod-baseline-freeze-status.json` and
+`/private/tmp/ursula-hardening-prod-migration-failure.log`. Freeze the declared
+16-GiB target as the qualification configuration and record this mixed live
+state separately; it is not a steady-state recovery baseline.
+Capacity changes do not establish bounded memory, exclusive replacement
+identity, automatic dead-node recovery or either RTO baseline.
 
 The existing Cloud artifact workflow provides a disposable namespace and cleanup evidence, but its candidate fixture uses 2 GiB, inline snapshots, disabled cold storage, and no gateway or indexer. It is suitable for its upgrade regression, not the selected production-config recovery baseline. Extend reviewed test automation with a separate production-config fixture, isolated S3 prefixes, concurrent append/read measurement and full-group redundancy sampling before reporting qualification results. Do not relabel the current local six-group tests or that candidate fixture as production-scale measurements.
 
@@ -390,3 +424,50 @@ target. Pod Ready, a union of observed group IDs, or an aggregate leader count
 alone cannot establish recovery. Keep per-group evidence and sampling intervals
 with both measurements; no numeric RTO acceptance limit is set before these
 baselines are available.
+
+## Qualification infrastructure and fresh-prefix preparation
+
+Cloud [PR #3175](https://github.com/tonbo-io/cloud/pull/3175) merged at
+`8e1f017df49ebc0449238c7e683a016bcd887501` after its PR and merge-queue checks.
+It declares a canary-only three-zone qualification pool derived from production
+voter instance types and zones, a separate namespace and exact IRSA subjects,
+and disjoint server/index test S3 prefixes. Reviewed-main IAM
+[plan 37412094352](https://github.com/tonbo-io/cloud/actions/runs/37412094352) and
+[apply 37412248380](https://github.com/tonbo-io/cloud/actions/runs/37412248380)
+succeeded: four resources added, none changed or destroyed. Serving roles,
+storage and voters were untouched.
+
+The first targeted compute
+[plan 37412362067](https://github.com/tonbo-io/cloud/actions/runs/37412362067)
+failed before apply: the qualification contract supplied the AWS spelling
+`NO_SCHEDULE`, while the reused managed pool expects Kubernetes `NoSchedule`
+and maps it to the AWS enum at the resource boundary. Cloud
+[PR #3176](https://github.com/tonbo-io/cloud/pull/3176) corrects that contract and
+adds a regression and merged as `d90a8fbaebde934a958055fd526b926bd55edc59`;
+its reviewed-main compute plans still need to be inspected before capacity creation. No qualification node has been created by this failed
+plan.
+
+Local `ursulactl verify-quorum` implementation captures a fresh outbound
+ReadIndex prefix for every explicitly configured group and waits for every
+configured replica to apply that fixed prefix under the same leader term.
+It reuses the memory-WAL recovery probe, validates complete uniform membership
+and local participation reports, and bounds metrics requests, RPCs and waits by
+one absolute deadline. An explicit 0.6.2 diagnostic option returns
+`participation_certified=false`; missing old fields cannot certify the repaired
+participation guarantee. The shared probe now also refuses a vote/term change
+between its routing probe and ReadIndex result. Local validation passed 846
+workspace unit/bin tests, workspace doc tests and all-target Clippy, all seven
+DST audits and the smoke corpus, and all eight real-process static-cluster
+integration tests. The focused real TCP/gRPC fixture checks six groups on all
+three replicas and rejects a configured seventh missing group. This is observation evidence,
+not a maintenance reservation or physical fencing authorization. Full M3 still
+requires cross-workflow serialization and incarnation-aware replacement.
+
+The production-config value derivation and continuous append/read probe are
+also implemented locally in Cloud, with immutable server image pins, run-scoped
+roots, preserved producer identity/sequence/body across ambiguous retries, an
+independent ACK event journal, full acknowledged-prefix verification and
+replay deduplication. Native Helm rendering of the pinned 0.6.2 baseline passed
+the isolation guard. Their reviewed EKS orchestration, fault boundaries and
+final run evidence remain pending; no production-scale RTO or Turn result is
+claimed by these preparation steps.

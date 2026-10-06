@@ -4431,6 +4431,7 @@ dependencies = [
  "url",
  "ursula-observability",
  "ursula-raft",
+ "ursula-shard",
  "ursula-stream",
  "yaml_serde",
 ]
