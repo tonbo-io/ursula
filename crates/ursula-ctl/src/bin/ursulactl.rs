@@ -1402,22 +1402,17 @@ mod tests {
                 leader_term: 7,
                 required_applied_index: 20,
             })]),
-            applied: (2..=3)
-                .map(|id| (id, BTreeMap::from([(0, 20)])))
-                .collect(),
+            applied: (2..=3).map(|id| (id, BTreeMap::from([(0, 20)]))).collect(),
         };
-        let encoded = survivor_observation_json(
-            100,
-            101,
-            ursula_ctl::quorum::SurvivingQuorumVerification {
+        let encoded =
+            survivor_observation_json(100, 101, ursula_ctl::quorum::SurvivingQuorumVerification {
                 excluded_voter_id: 1,
                 configured_voter_ids: [1, 2, 3].into_iter().collect(),
                 surviving_voter_ids: [2, 3].into_iter().collect(),
                 full_redundancy_restored: false,
                 verification,
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         let output: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(output["verification"]["excluded_voter_id"], 1);
         assert_eq!(
