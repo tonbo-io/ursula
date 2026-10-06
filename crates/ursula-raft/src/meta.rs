@@ -496,6 +496,18 @@ impl MetaRaftHandle {
         &self,
         timeout: Duration,
     ) -> Result<ControlProjection, MetaRaftError> {
+        let projection = self.read_bootstrap_state(timeout).await?;
+        projection
+            .validate()
+            .map_err(|reason| MetaRaftError::new("read control projection", reason))?;
+        Ok(projection)
+    }
+
+    /// Quorum-confirmed applied state, including the empty pre-adoption phase.
+    pub async fn read_bootstrap_state(
+        &self,
+        timeout: Duration,
+    ) -> Result<ControlProjection, MetaRaftError> {
         let identity = self
             .local_identity
             .as_ref()
@@ -562,7 +574,7 @@ impl MetaRaftHandle {
                 ));
             }
             projection
-                .validate()
+                .validate_bootstrap_state()
                 .map_err(|reason| MetaRaftError::new("read control projection", reason))?;
             Ok(projection)
         })

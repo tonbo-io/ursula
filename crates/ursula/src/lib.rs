@@ -273,6 +273,7 @@ pub struct HttpState {
     process_incarnation: ProcessIncarnation,
     admin_fence: admin_fence::AdminMutationFence,
     configured_node_id: Option<u64>,
+    managed_projection: Option<Arc<std::sync::RwLock<ursula_control::ProjectionCursor>>>,
     runtime: ShardRuntime,
     raft_registry: Option<RaftGroupHandleRegistry>,
     client_write_router: Option<ClientWriteLeaderRouter>,
@@ -323,6 +324,17 @@ impl HttpState {
         otel_metrics::register(&self.runtime.metrics());
     }
 
+    pub(crate) fn with_managed_projection(
+        mut self,
+        cursor: Arc<std::sync::RwLock<ursula_control::ProjectionCursor>>,
+    ) -> Self {
+        if let Some(router) = &mut self.client_write_router {
+            router.managed_projection = Some(cursor.clone());
+        }
+        self.managed_projection = Some(cursor);
+        self
+    }
+
     pub(crate) fn with_configured_node_id(mut self, node_id: u64) -> Self {
         self.configured_node_id = Some(node_id);
         self
@@ -333,6 +345,7 @@ impl HttpState {
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
             admin_fence: admin_fence::AdminMutationFence::default(),
             configured_node_id: None,
+            managed_projection: None,
             runtime,
             raft_registry: None,
             client_write_router: None,
@@ -356,6 +369,7 @@ impl HttpState {
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
             admin_fence: admin_fence::AdminMutationFence::default(),
             configured_node_id: None,
+            managed_projection: None,
             runtime,
             raft_registry: Some(raft_registry),
             client_write_router: None,
@@ -403,6 +417,7 @@ impl HttpState {
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
             admin_fence: admin_fence::AdminMutationFence::default(),
             configured_node_id: None,
+            managed_projection: None,
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
             node_memory: NodeMemoryMonitor::default(),
@@ -537,6 +552,7 @@ pub struct ClientWriteLeaderRouter {
     peers: Arc<BTreeMap<u64, String>>,
     node_id: Option<u64>,
     per_group_voters: Arc<BTreeMap<RaftGroupId, BTreeSet<u64>>>,
+    managed_projection: Option<Arc<std::sync::RwLock<ursula_control::ProjectionCursor>>>,
 }
 
 impl ClientWriteLeaderRouter {
@@ -558,6 +574,7 @@ impl ClientWriteLeaderRouter {
             ),
             node_id: node_id.into(),
             per_group_voters: Arc::new(per_group_voters),
+            managed_projection: None,
         }
     }
 
@@ -570,6 +587,17 @@ impl ClientWriteLeaderRouter {
         if Some(leader_id) == self.node_id {
             return None;
         }
+        if let Some(cursor) = &self.managed_projection {
+            let cursor = cursor
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let node = cursor.current()?.state.nodes.get(&leader_id)?;
+            return matches!(
+                node.state,
+                ursula_control::NodeState::Active | ursula_control::NodeState::Draining
+            )
+            .then(|| (leader_id, node.client_url.clone()));
+        }
         let leader_base = self
             .peers
             .get(&leader_id)
@@ -581,6 +609,16 @@ impl ClientWriteLeaderRouter {
         let RuntimeError::GroupNotHosted { raft_group_id, .. } = err else {
             return None;
         };
+        if let Some(cursor) = &self.managed_projection {
+            let cursor = cursor
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            return cursor
+                .current()?
+                .state
+                .placement_view(*raft_group_id)?
+                .active_voter_client_url(self.node_id);
+        }
         let voters = self.per_group_voters.get(raft_group_id)?;
         voters
             .iter()
@@ -985,6 +1023,21 @@ async fn require_admin_incarnation(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    let path = request.uri().path();
+    if state.managed_projection.is_some()
+        && !matches!(
+            *request.method(),
+            Method::GET | Method::HEAD | Method::OPTIONS
+        )
+        && (path.starts_with("/__ursula/raft/")
+            || (path.starts_with("/__ursula/backup/") && path.ends_with("/import")))
+    {
+        return (
+            StatusCode::CONFLICT,
+            "managed mode requires the fenced control operation API",
+        )
+            .into_response();
+    }
     if !matches!(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
@@ -1118,6 +1171,7 @@ pub fn cluster_router_from_state(state: HttpState) -> Router {
             raft_grpc_service(state.clone(), raft_registry),
         )
         .route(LEADERSHIP_SHED_PATH, get(leadership_shed_status))
+        .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state)
 }
@@ -1304,7 +1358,25 @@ async fn readiness(State(state): State<HttpState>) -> Response {
         || raft_maintenance
             .as_ref()
             .is_some_and(ursula_raft::RaftMaintenanceReport::ready);
-    let ready = !disk.pressure && !format_epoch_mismatch && recovery_ready && raft_ready;
+    let control_ready = state.managed_projection.as_ref().is_none_or(|cursor| {
+        cursor
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current()
+            .is_some_and(|view| {
+                state
+                    .configured_node_id
+                    .and_then(|id| view.state.nodes.get(&id))
+                    .is_some_and(|node| {
+                        matches!(
+                            node.state,
+                            ursula_control::NodeState::Active | ursula_control::NodeState::Draining
+                        )
+                    })
+            })
+    });
+    let ready =
+        !disk.pressure && !format_epoch_mismatch && recovery_ready && raft_ready && control_ready;
     // Memory-WAL groups whose voters all restarted empty after holding
     // writes: they refuse writes until an operator re-initializes them. Not
     // a serving guarantee for the affected groups. Their recovery gates stay
@@ -1328,6 +1400,8 @@ async fn readiness(State(state): State<HttpState>) -> Response {
                 Some("wal_disk_pressure")
             } else if !recovery_ready {
                 Some("memory_wal_recovery_barrier")
+            } else if !control_ready {
+                Some("managed_control_unready")
             } else if !raft_ready {
                 Some("raft_maintenance_unready")
             } else {
@@ -1475,7 +1549,6 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         .route("/__ursula/metrics", get(metrics))
         .route(READINESS_PATH, get(readiness))
         .route("/__ursula/usage", get(bucket_usage))
-        .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .route("/{bucket}", put(create_bucket))
         // The bare path (the removed latest-snapshot redirect and the removed
         // record-addressed publish) answers 405 to every method, not a 404

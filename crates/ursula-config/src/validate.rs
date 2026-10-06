@@ -85,6 +85,9 @@ impl UrsulaConfig {
             ));
         }
         self.validate_cold_health_watermarks()?;
+        if let Some(control) = &self.control {
+            control.bootstrap(self).map_err(ValidationError::Other)?;
+        }
         Ok(())
     }
 

@@ -209,4 +209,6 @@ service MetaRaftInternal {
   rpc TransferLeader(MetaRaftRpcEnvelopeV1) returns (RaftTransferLeaderAckV1);
   // Fresh ReadIndex + complete applied control projection. No mutation.
   rpc ReadProjection(MetaRaftRpcEnvelopeV1) returns (RaftRpcAckV1);
+  rpc ReadBootstrapState(MetaRaftRpcEnvelopeV1) returns (RaftRpcAckV1);
+  rpc Status(MetaRaftRpcEnvelopeV1) returns (RaftRpcAckV1);
 }

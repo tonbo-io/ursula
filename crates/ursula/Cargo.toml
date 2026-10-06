@@ -54,6 +54,7 @@ tower-http = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 ursula-config = { workspace = true }
+ursula-control = { workspace = true }
 ursula-gateway = { workspace = true }
 ursula-index = { workspace = true }
 ursula-observability = { workspace = true, features = ["otlp"] }

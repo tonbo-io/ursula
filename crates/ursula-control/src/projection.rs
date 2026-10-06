@@ -18,6 +18,26 @@ pub struct ControlProjection {
 }
 
 impl ControlProjection {
+    /// A quorum-confirmed state may precede adoption. Only a completely empty
+    /// control state is valid in that phase; established states need a full view.
+    pub fn validate_bootstrap_state(&self) -> Result<(), String> {
+        if self.state.cluster_bootstrap.is_some() {
+            return self.validate();
+        }
+        self.identity.validate()?;
+        if self.applied_log_id.node_id == 0
+            || !self.state.nodes.is_empty()
+            || !self.state.placements.is_empty()
+            || !self.state.migrations.is_empty()
+            || self.state.active_migration.is_some()
+            || self.state.managed_placement.is_some()
+            || self.state.next_migration_id != 1
+        {
+            return Err("pre-adoption state must be completely empty".to_owned());
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.identity.validate()?;
         if self.applied_log_id.node_id == 0 {

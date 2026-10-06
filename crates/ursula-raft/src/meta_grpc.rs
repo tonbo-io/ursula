@@ -26,13 +26,16 @@ use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use openraft::rt::WatchReceiver;
 use prost::Message;
+use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
+use ursula_control::ClusterBootstrap;
 use ursula_control::ClusterId;
 use ursula_control::ClusterIdentity;
 use ursula_control::ControlProjection;
+use ursula_control::MetaLocalIdentity;
 
 use crate::codec::encode_wire;
 use crate::grpc::GrpcRpcError;
@@ -52,6 +55,9 @@ use crate::raft_internal_proto::meta_raft_internal_server::MetaRaftInternalServe
 
 pub const META_RAFT_PROTOCOL_VERSION: u32 = 1;
 pub const META_RAFT_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+pub const META_RAFT_STATUS_PATH: &str = "/ursula.raft.v1.MetaRaftInternal/Status";
+pub const META_RAFT_READ_BOOTSTRAP_STATE_PATH: &str =
+    "/ursula.raft.v1.MetaRaftInternal/ReadBootstrapState";
 pub const META_RAFT_READ_PROJECTION_PATH: &str = "/ursula.raft.v1.MetaRaftInternal/ReadProjection";
 pub const META_RAFT_APPEND_PATH: &str = "/ursula.raft.v1.MetaRaftInternal/Append";
 pub const META_RAFT_VOTE_PATH: &str = "/ursula.raft.v1.MetaRaftInternal/Vote";
@@ -64,12 +70,27 @@ fn cluster_identity(value: impl Into<String>) -> Result<Arc<str>, MetaRaftError>
     Ok(Arc::from(id.as_str()))
 }
 
+/// Local observation, not quorum evidence. A server advertises its immutable
+/// recipe only after it has disabled raw membership administration locally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetaReplicaStatus {
+    pub identity: MetaLocalIdentity,
+    pub initialized: bool,
+    pub current_leader: Option<u64>,
+    pub snapshot_index: Option<u64>,
+    pub purged_log_index: Option<u64>,
+    pub bootstrap_recipe: Option<ClusterBootstrap>,
+    pub bootstrap_node_id: Option<u64>,
+}
+
 #[derive(Clone)]
 pub struct MetaRaftGrpcService {
     cluster_id: Arc<str>,
     node_id: u64,
     raft: MetaRaft,
     handle: MetaRaftHandle,
+    bootstrap_recipe: Option<ClusterBootstrap>,
+    bootstrap_node_id: Option<u64>,
     routing_identity: Option<ClusterIdentity>,
 }
 
@@ -113,10 +134,40 @@ impl MetaRaftGrpcService {
             node_id,
             raft,
             handle: handle.clone(),
+            bootstrap_recipe: None,
+            bootstrap_node_id: None,
             routing_identity: handle
                 .local_identity()
                 .map(|identity| identity.cluster.clone()),
         })
+    }
+
+    pub fn with_managed_bootstrap(
+        mut self,
+        recipe: ClusterBootstrap,
+        bootstrap_node_id: u64,
+    ) -> Result<Self, MetaRaftError> {
+        let recipe = recipe
+            .normalize()
+            .map_err(|reason| MetaRaftError::new("declare managed bootstrap", reason))?;
+        let identity = self.handle.local_identity().ok_or_else(|| {
+            MetaRaftError::new("declare managed bootstrap", "durable binding required")
+        })?;
+        if !recipe.initial_meta_voters.contains(&bootstrap_node_id)
+            || recipe.identity != identity.cluster
+            || recipe
+                .nodes
+                .get(&identity.node.node_id)
+                .is_some_and(|node| node != &identity.node)
+        {
+            return Err(MetaRaftError::new(
+                "declare managed bootstrap",
+                "recipe differs from local identity",
+            ));
+        }
+        self.bootstrap_recipe = Some(recipe);
+        self.bootstrap_node_id = Some(bootstrap_node_id);
+        Ok(self)
     }
 
     fn validate(
@@ -178,6 +229,74 @@ fn decode<T: DeserializeOwned>(payload: &[u8]) -> Result<T, GrpcRpcError> {
 
 #[tonic::async_trait]
 impl MetaRaftInternal for MetaRaftGrpcService {
+    async fn status(
+        &self,
+        request: tonic::Request<MetaRaftRpcEnvelopeV1>,
+    ) -> Result<tonic::Response<RaftRpcAckV1>, tonic::Status> {
+        let envelope = request.into_inner();
+        self.validate(
+            &envelope.cluster_id,
+            envelope.target_node_id,
+            envelope.protocol_version,
+            envelope.group_count,
+            envelope.core_count,
+            envelope.routing_hash_version,
+        )?;
+        if !envelope.payload.is_empty() {
+            return Err(tonic::Status::invalid_argument("status takes no payload"));
+        }
+        let identity = self
+            .handle
+            .local_identity()
+            .ok_or_else(|| tonic::Status::failed_precondition("bound identity required"))?
+            .clone();
+        let initialized = self
+            .raft
+            .is_initialized()
+            .await
+            .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        Ok(tonic::Response::new(RaftRpcAckV1 {
+            payload: encode_wire(&MetaReplicaStatus {
+                identity,
+                initialized,
+                current_leader: metrics.current_leader,
+                snapshot_index: metrics.snapshot.map(|id| id.index()),
+                purged_log_index: metrics.purged.map(|id| id.index()),
+                bootstrap_recipe: self.bootstrap_recipe.clone(),
+                bootstrap_node_id: self.bootstrap_node_id,
+            }),
+        }))
+    }
+
+    async fn read_bootstrap_state(
+        &self,
+        request: tonic::Request<MetaRaftRpcEnvelopeV1>,
+    ) -> Result<tonic::Response<RaftRpcAckV1>, tonic::Status> {
+        let envelope = request.into_inner();
+        self.validate(
+            &envelope.cluster_id,
+            envelope.target_node_id,
+            envelope.protocol_version,
+            envelope.group_count,
+            envelope.core_count,
+            envelope.routing_hash_version,
+        )?;
+        if !envelope.payload.is_empty() {
+            return Err(tonic::Status::invalid_argument(
+                "bootstrap state read takes no payload",
+            ));
+        }
+        let state = self
+            .handle
+            .read_bootstrap_state(Duration::from_secs(5))
+            .await
+            .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+        Ok(tonic::Response::new(RaftRpcAckV1 {
+            payload: encode_wire(&state),
+        }))
+    }
+
     async fn read_projection(
         &self,
         request: tonic::Request<MetaRaftRpcEnvelopeV1>,
@@ -517,6 +636,25 @@ pub async fn read_control_projection(
     address: &str,
     timeout: Duration,
 ) -> Result<ControlProjection, MetaRaftError> {
+    read_remote_state(identity, target_node_id, address, timeout, false).await
+}
+
+pub async fn read_bootstrap_control_state(
+    identity: &ClusterIdentity,
+    target_node_id: u64,
+    address: &str,
+    timeout: Duration,
+) -> Result<ControlProjection, MetaRaftError> {
+    read_remote_state(identity, target_node_id, address, timeout, true).await
+}
+
+async fn read_remote_state(
+    identity: &ClusterIdentity,
+    target_node_id: u64,
+    address: &str,
+    timeout: Duration,
+    allow_empty: bool,
+) -> Result<ControlProjection, MetaRaftError> {
     identity
         .validate()
         .map_err(|reason| MetaRaftError::new("read remote control projection", reason))?;
@@ -543,11 +681,13 @@ pub async fn read_control_projection(
         routing_hash_version: identity.routing_hash.wire_version(),
     });
     request.set_timeout(timeout);
-    let response = client
-        .read_projection(request)
-        .await
-        .map_err(|error| MetaRaftError::with_source("read remote control projection", error))?
-        .into_inner();
+    let response = if allow_empty {
+        client.read_bootstrap_state(request).await
+    } else {
+        client.read_projection(request).await
+    }
+    .map_err(|error| MetaRaftError::with_source("read remote control projection", error))?
+    .into_inner();
     let projection: ControlProjection = rmp_serde::from_slice(&response.payload)
         .map_err(|error| MetaRaftError::with_source("decode control projection", error))?;
     if projection.identity != *identity {
@@ -556,8 +696,60 @@ pub async fn read_control_projection(
             "remote routing identity differs",
         ));
     }
-    projection
-        .validate()
-        .map_err(|reason| MetaRaftError::new("validate control projection", reason))?;
+    if allow_empty {
+        projection.validate_bootstrap_state()
+    } else {
+        projection.validate()
+    }
+    .map_err(|reason| MetaRaftError::new("validate control projection", reason))?;
     Ok(projection)
+}
+
+/// Local bound replica status, used solely for first bootstrap identity/empty
+/// checks. Initialized status never proves fresh quorum or current placement.
+pub async fn read_meta_replica_status(
+    identity: &ClusterIdentity,
+    target_node_id: u64,
+    address: &str,
+    timeout: Duration,
+) -> Result<MetaReplicaStatus, MetaRaftError> {
+    identity
+        .validate()
+        .map_err(|reason| MetaRaftError::new("read meta status", reason))?;
+    if target_node_id == 0 || timeout.is_zero() {
+        return Err(MetaRaftError::new(
+            "read meta status",
+            "non-zero target and timeout required",
+        ));
+    }
+    let endpoint = Endpoint::from_shared(normalize_grpc_endpoint(address.to_owned()))
+        .map_err(|error| MetaRaftError::with_source("create meta status endpoint", error))?
+        .connect_timeout(timeout)
+        .timeout(timeout);
+    let mut client = MetaRaftInternalClient::new(endpoint.connect_lazy())
+        .max_decoding_message_size(META_RAFT_MAX_MESSAGE_BYTES);
+    let mut request = tonic::Request::new(MetaRaftRpcEnvelopeV1 {
+        cluster_id: identity.cluster_id.as_str().to_owned(),
+        target_node_id,
+        protocol_version: META_RAFT_PROTOCOL_VERSION,
+        payload: bytes::Bytes::new(),
+        group_count: identity.group_count,
+        core_count: u32::from(identity.core_count),
+        routing_hash_version: identity.routing_hash.wire_version(),
+    });
+    request.set_timeout(timeout);
+    let response = client
+        .status(request)
+        .await
+        .map_err(|error| MetaRaftError::with_source("read meta status", error))?
+        .into_inner();
+    let status: MetaReplicaStatus = rmp_serde::from_slice(&response.payload)
+        .map_err(|error| MetaRaftError::with_source("decode meta status", error))?;
+    if status.identity.cluster != *identity || status.identity.node.node_id != target_node_id {
+        return Err(MetaRaftError::new(
+            "validate meta status",
+            "remote identity differs",
+        ));
+    }
+    Ok(status)
 }

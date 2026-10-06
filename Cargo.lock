@@ -4362,6 +4362,7 @@ dependencies = [
  "tracing",
  "url",
  "ursula-config",
+ "ursula-control",
  "ursula-ctl",
  "ursula-gateway",
  "ursula-index",
@@ -4400,6 +4401,8 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "toml",
+ "ursula-control",
+ "ursula-shard",
 ]
 
 [[package]]

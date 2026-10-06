@@ -1,3 +1,5 @@
+mod managed;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -79,6 +81,9 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     let start_maintenance_drained = parse_start_maintenance_drained(
         std::env::var_os("URSULA_START_MAINTENANCE_DRAINED").as_deref(),
     )?;
+    if config.control.is_some() {
+        return managed::run(&config, start_maintenance_drained).await;
+    }
     let state = init_state(&config, preset, start_maintenance_drained).await?;
     state.register_otel_metrics();
     serve(state, &config).await

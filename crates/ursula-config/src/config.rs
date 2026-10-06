@@ -58,6 +58,8 @@ impl RaftSnapshotBackend {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UrsulaConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control: Option<crate::control::ControlConfig>,
     pub server: ServerConfig,
     pub runtime: RuntimeConfig,
     pub raft: RaftConfig,

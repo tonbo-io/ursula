@@ -173,7 +173,23 @@ async fn bound_meta_transport_rejects_routing_drift_and_missing_binding_before_d
             tonic::Code::FailedPrecondition
         );
         assert_eq!(
-            client.read_projection(envelope).await.unwrap_err().code(),
+            client.status(envelope.clone()).await.unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            client
+                .read_bootstrap_state(envelope.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            client
+                .read_projection(envelope.clone())
+                .await
+                .unwrap_err()
+                .code(),
             tonic::Code::FailedPrecondition
         );
         assert_eq!(
@@ -195,6 +211,17 @@ async fn bound_meta_transport_rejects_routing_drift_and_missing_binding_before_d
             tonic::Code::FailedPrecondition
         );
     }
+    let status = crate::read_meta_replica_status(
+        &bound_identity(7, String::new()).cluster,
+        7,
+        &node.handle.local_identity().unwrap().node.cluster_url,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert!(!status.initialized);
+    assert!(status.bootstrap_recipe.is_none());
+    assert!(status.bootstrap_node_id.is_none());
     assert!(!node.handle.raft_handle().is_initialized().await.unwrap());
     assert!(
         node.handle
@@ -822,6 +849,18 @@ async fn complete_projection_rpc_requires_bootstrap_and_a_live_meta_quorum() {
             .is_err(),
             "pre-bootstrap state is not a usable managed projection"
         );
+        let pending = crate::read_bootstrap_control_state(
+            &identity.cluster,
+            identity.node.node_id,
+            &identity.node.cluster_url,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(pending.state.cluster_bootstrap.is_none());
+        assert!(pending.state.placements.is_empty());
+        pending.validate_bootstrap_state().unwrap();
+        assert!(pending.validate().is_err());
         let bootstrap = ClusterBootstrap {
             identity: identity.cluster.clone(),
             initial_meta_voters: (1..=count).collect(),
