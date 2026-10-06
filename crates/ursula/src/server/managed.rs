@@ -106,43 +106,49 @@ pub(super) async fn run(
     )));
     let result: Result<(), Box<dyn std::error::Error>> = async {
         let timeout = control.bootstrap_timeout.as_duration();
-        let initial = tokio::time::timeout(timeout, async {
-            loop {
-                if cluster_task.0.is_finished() {
-                    return Err(invalid("managed cluster listener stopped during bootstrap"));
+        // Recovery hints restore established data only. They never authorize
+        // meta initialization or new control actions; those need fresh quorums.
+        let initial = if let Some(cached) = meta.cached_projection()? {
+            cached
+        } else {
+            tokio::time::timeout(timeout, async {
+                loop {
+                    if cluster_task.0.is_finished() {
+                        return Err(invalid("managed cluster listener stopped during bootstrap"));
+                    }
+                    if config.raft.node_id == control.bootstrap_node_id
+                        && control.initialize_meta_membership
+                        && !meta
+                            .raft_handle()
+                            .is_initialized()
+                            .await
+                            .map_err(|error| invalid(error.to_string()))?
+                        && verify_bootstrap_peers(&recipe, control.bootstrap_node_id, true)
+                            .await
+                            .is_ok()
+                    {
+                        let voters = recipe
+                            .initial_meta_voters
+                            .iter()
+                            .filter_map(|id| {
+                                recipe
+                                    .nodes
+                                    .get(id)
+                                    .map(|node| (*id, BasicNode::new(&node.cluster_url)))
+                            })
+                            .collect();
+                        meta.initialize_membership(voters)
+                            .await
+                            .map_err(|error| invalid(error.to_string()))?;
+                    }
+                    if let Ok(state) = fetch_state(&recipe, false).await {
+                        break Ok(state);
+                    }
+                    tokio::time::sleep(control.refresh_interval.as_duration()).await;
                 }
-                if config.raft.node_id == control.bootstrap_node_id
-                    && control.initialize_meta_membership
-                    && !meta
-                        .raft_handle()
-                        .is_initialized()
-                        .await
-                        .map_err(|error| invalid(error.to_string()))?
-                    && verify_bootstrap_peers(&recipe, control.bootstrap_node_id, true)
-                        .await
-                        .is_ok()
-                {
-                    let voters = recipe
-                        .initial_meta_voters
-                        .iter()
-                        .filter_map(|id| {
-                            recipe
-                                .nodes
-                                .get(id)
-                                .map(|node| (*id, BasicNode::new(&node.cluster_url)))
-                        })
-                        .collect();
-                    meta.initialize_membership(voters)
-                        .await
-                        .map_err(|error| invalid(error.to_string()))?;
-                }
-                if let Ok(state) = fetch_state(&recipe, false).await {
-                    break Ok(state);
-                }
-                tokio::time::sleep(control.refresh_interval.as_duration()).await;
-            }
-        })
-        .await??;
+            })
+            .await??
+        };
         if let Some(record) = &initial.state.cluster_bootstrap
             && record.recipe != recipe
         {
@@ -200,6 +206,7 @@ pub(super) async fn run(
             })
             .await??
         };
+        meta.persist_projection(projection.clone()).await?;
         cursor
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -210,17 +217,26 @@ pub(super) async fn run(
         let admin_listener = tokio::net::TcpListener::bind(&config.server.admin_listen).await?;
         let refresh_recipe = recipe.clone();
         let refresh_cursor = cursor.clone();
+        let refresh_meta = meta.clone();
         let interval = control.refresh_interval.as_duration();
         let refresh = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                if let Ok(projection) = fetch_state(&refresh_recipe, true).await
-                    && let Err(error) = refresh_cursor
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .install(projection)
-                {
-                    tracing::error!(%error, "reject managed projection refresh");
+                if let Ok(projection) = fetch_state(&refresh_recipe, true).await {
+                    match refresh_meta.persist_projection(projection.clone()).await {
+                        Ok(_) => {
+                            if let Err(error) = refresh_cursor
+                                .write()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .install(projection)
+                            {
+                                tracing::error!(%error, "reject managed projection refresh");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "reject non-durable projection refresh")
+                        }
+                    }
                 }
             }
         });

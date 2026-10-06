@@ -187,7 +187,11 @@ async fn managed_cli_adopts_mixed_disk_groups_with_three_and_five_meta_voters_an
                     client_url: format!("http://127.0.0.1:{}", port()),
                     cluster_url: format!("http://127.0.0.1:{}", port()),
                     admin_url: format!("http://127.0.0.1:{}", port()),
-                    labels: BTreeMap::from([("zone".to_owned(), ((id - 1) % 3).to_string())]),
+                    labels: BTreeMap::from([("zone".to_owned(), match id {
+                        4 => "1".to_owned(),
+                        5 => "2".to_owned(),
+                        _ => (id - 1).to_string(),
+                    })]),
                 })
             })
             .collect::<BTreeMap<_, _>>();
@@ -260,7 +264,11 @@ async fn managed_cli_adopts_mixed_disk_groups_with_three_and_five_meta_voters_an
                     .join(format!("meta-{}/meta.wal", config.raft.node_id)),
                 bootstrap_node_id: 1,
                 initialize_meta_membership: true,
-                initial_meta_voters: (1..=meta_count as u64).collect(),
+                initial_meta_voters: if meta_count == 3 {
+                    vec![1, 4, 5]
+                } else {
+                    vec![1, 2, 3, 4, 5]
+                },
                 node: nodes[&config.raft.node_id].clone(),
                 bootstrap_nodes: nodes.values().cloned().collect(),
                 placement: if meta_count == 5 {
@@ -359,7 +367,7 @@ async fn managed_cli_adopts_mixed_disk_groups_with_three_and_five_meta_voters_an
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let mut compacted = true;
-            for id in 1..=meta_count as u64 {
+            for &id in &configs[0].control.as_ref().unwrap().initial_meta_voters {
                 let status = ursula_raft::read_meta_replica_status(
                     &identity,
                     id,
@@ -494,5 +502,70 @@ async fn managed_cli_adopts_mixed_disk_groups_with_three_and_five_meta_voters_an
             "acknowledged-after-adoption",
         )
         .await;
+        if meta_count == 3 {
+            // Meta voters {1,4,5} have no quorum, but nodes {1,2,3} retain
+            // both data groups' majorities. Restart those data processes using
+            // only their durable projection checkpoints; initialization stays
+            // requested in TOML to prove it cannot reset existing meta state.
+            drop(processes);
+            let survivors = nodes
+                .iter()
+                .filter(|(id, _)| **id <= 3)
+                .map(|(id, node)| (*id, node.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let mut processes = paths
+                .iter()
+                .take(3)
+                .enumerate()
+                .map(|(index, path)| {
+                    spawn(
+                        binary,
+                        path,
+                        &root.path().join(format!("meta-offline-{}.log", index + 1)),
+                    )
+                })
+                .collect::<Vec<_>>();
+            ready(&client, &survivors, &mut processes).await;
+            assert!(
+                ursula_raft::read_control_projection(
+                    &identity,
+                    1,
+                    &nodes[&1].cluster_url,
+                    Duration::from_millis(500),
+                )
+                .await
+                .is_err(),
+                "a local recovery hint must not manufacture a fresh meta quorum"
+            );
+            let offline_name = (0..100)
+                .map(|i| format!("managed-meta-offline-{i}"))
+                .find(|name| {
+                    map.locate(&ursula_shard::BucketStreamId::new("benchcmp", name.clone()))
+                        .raft_group_id
+                        == RaftGroupId(0)
+                })
+                .unwrap();
+            create(
+                &client,
+                &survivors,
+                &offline_name,
+                "acknowledged-without-meta-quorum",
+            )
+            .await;
+            payload(
+                &following,
+                &nodes[&1],
+                &offline_name,
+                "acknowledged-without-meta-quorum",
+            )
+            .await;
+            payload(
+                &following,
+                &nodes[&1],
+                "managed-before",
+                "acknowledged-before-adoption",
+            )
+            .await;
+        }
     }
 }

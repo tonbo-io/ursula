@@ -25,7 +25,10 @@ use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use serde::Deserialize;
 use serde::Serialize;
+use ursula_control::ControlProjection;
 use ursula_control::MetaLocalIdentity;
+use ursula_control::ProjectionCursor;
+use ursula_control::ProjectionInstall;
 use ursula_runtime::journal;
 
 use super::JournalLock;
@@ -42,6 +45,13 @@ use crate::meta::MetaRaftTypeConfig;
 type MetaLog = MemoryRaftLogStoreInner<MetaRaftTypeConfig>;
 #[cfg(not(madsim))]
 const MAX_IDENTITY_FILE_BYTES: u64 = 128 * 1024;
+const MAX_PROJECTION_FILE_BYTES: u64 = 16 * 1024 * 1024 + 128 * 1024 + 64;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProjectionCheckpoint {
+    identity: MetaLocalIdentity,
+    projection: ControlProjection,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum MetaLogRecord {
@@ -56,6 +66,7 @@ struct MetaFileInner {
     log: MetaLog,
     writer: journal::JournalWriter,
     snapshot: Option<MetaCurrentSnapshot>,
+    projection: Option<ProjectionCursor>,
     failed: bool,
 }
 
@@ -64,6 +75,7 @@ struct MetaFileInner {
 pub struct MetaRaftFileLogStore {
     path: PathBuf,
     snapshot_path: PathBuf,
+    projection_path: PathBuf,
     identity: Option<MetaLocalIdentity>,
     inner: Mutex<MetaFileInner>,
     _lock: JournalLock,
@@ -131,6 +143,47 @@ impl MetaRaftFileLogStore {
         identity_name.push(".identity");
         let identity_path = PathBuf::from(identity_name);
         let binding_exists = identity_path.exists();
+        let mut projection_name = path.as_os_str().to_owned();
+        projection_name.push(".projection");
+        let projection_path = PathBuf::from(projection_name);
+        let mut projection = identity
+            .as_ref()
+            .map(|identity| ProjectionCursor::new(identity.cluster.clone()))
+            .transpose()
+            .map_err(|reason| invalid(&reason))?;
+        if projection_path.exists() {
+            let identity = identity
+                .as_ref()
+                .ok_or_else(|| invalid("projection requires bound storage"))?;
+            if !binding_exists || !path.exists() {
+                return Err(invalid(
+                    "projection is missing its durable identity or journal",
+                ));
+            }
+            if fs::metadata(&projection_path)?.len() > MAX_PROJECTION_FILE_BYTES {
+                return Err(invalid("projection exceeds the bounded transport size"));
+            }
+            let bytes = fs::read(&projection_path)?;
+            let (records, valid_len) =
+                journal::decode_frames::<WireCodec<ProjectionCheckpoint>>(&bytes)?;
+            if valid_len != bytes.len() || records.len() != 1 {
+                return Err(invalid(
+                    "projection is not one complete checksummed checkpoint",
+                ));
+            }
+            let checkpoint = records
+                .into_iter()
+                .next()
+                .ok_or_else(|| invalid("missing projection checkpoint"))?;
+            if &checkpoint.identity != identity {
+                return Err(invalid("projection local identity differs"));
+            }
+            projection
+                .as_mut()
+                .ok_or_else(|| invalid("projection requires bound cursor"))?
+                .install(checkpoint.projection)
+                .map_err(|reason| invalid(&reason))?;
+        }
         if binding_exists {
             if fs::metadata(&identity_path)?.len() > MAX_IDENTITY_FILE_BYTES {
                 return Err(invalid(
@@ -234,11 +287,13 @@ impl MetaRaftFileLogStore {
         Ok(Arc::new(Self {
             path,
             snapshot_path,
+            projection_path,
             identity,
             inner: Mutex::new(MetaFileInner {
                 log,
                 writer,
                 snapshot,
+                projection,
                 failed: false,
             }),
             _lock: lock,
@@ -260,6 +315,58 @@ impl MetaRaftFileLogStore {
 
     pub(crate) fn snapshot(&self) -> io::Result<Option<MetaCurrentSnapshot>> {
         Ok(self.lock()?.snapshot.clone())
+    }
+
+    /// Local recovery hint only; loading this checkpoint never grants control
+    /// authority or constitutes a fresh meta quorum read.
+    pub(crate) fn cached_projection(&self) -> io::Result<Option<ControlProjection>> {
+        Ok(self
+            .lock()?
+            .projection
+            .as_ref()
+            .and_then(ProjectionCursor::current)
+            .cloned())
+    }
+
+    /// Commit ordering and the checksummed checkpoint before publishing a view.
+    /// The journal's exclusive lock also owns this local recovery file.
+    pub(crate) async fn persist_projection(
+        self: &Arc<Self>,
+        projection: ControlProjection,
+    ) -> io::Result<ProjectionInstall> {
+        let store = self.clone();
+        spawn_log_store_blocking(None, move || {
+            let identity = store
+                .identity
+                .clone()
+                .ok_or_else(|| invalid("projection requires bound storage"))?;
+            let mut inner = store.lock()?;
+            let mut cursor = inner
+                .projection
+                .clone()
+                .ok_or_else(|| invalid("projection requires bound cursor"))?;
+            let result = cursor
+                .install(projection.clone())
+                .map_err(|reason| invalid(&reason))?;
+            if result == ProjectionInstall::Advanced {
+                let checkpoint = ProjectionCheckpoint {
+                    identity,
+                    projection,
+                };
+                let bytes = crate::codec::encode_wire(&checkpoint);
+                if bytes.len() as u64 > MAX_PROJECTION_FILE_BYTES.saturating_sub(64) {
+                    return Err(invalid("projection exceeds the bounded checkpoint size"));
+                }
+                let write = replace_journal(&store.projection_path, std::iter::once(checkpoint));
+                if write.is_err() {
+                    inner.failed = true;
+                }
+                write?;
+                inner.projection = Some(cursor);
+            }
+            Ok(result)
+        })
+        .await
     }
 
     pub(crate) async fn persist_snapshot(
@@ -402,6 +509,155 @@ mod tests {
                 labels: BTreeMap::from([("zone".to_owned(), "a".to_owned())]),
             },
         }
+    }
+
+    fn projection_fixture() -> (MetaLocalIdentity, ControlProjection) {
+        let mut identity = local_identity();
+        identity.cluster.group_count = 1;
+        let nodes = (1..=3)
+            .map(|id| {
+                let mut node = identity.node.clone();
+                node.node_id = id;
+                node.client_url = format!("http://node{id}:4437");
+                node.cluster_url = format!("http://node{id}:4439");
+                node.admin_url = format!("http://node{id}:4438");
+                node.labels.insert(
+                    "zone".to_owned(),
+                    char::from(b'a' + (id - 1) as u8).to_string(),
+                );
+                (id, node)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut state = ControlPlaneState::default();
+        assert_eq!(
+            state.apply(ControlCommand::BootstrapCluster {
+                bootstrap: ursula_control::ClusterBootstrap {
+                    identity: identity.cluster.clone(),
+                    nodes,
+                    initial_meta_voters: [1, 2, 3].into(),
+                    voters: BTreeMap::from([(RaftGroupId(0), [1, 2, 3].into())]),
+                    placement: Default::default(),
+                },
+                memberships: BTreeMap::from([(
+                    RaftGroupId(0),
+                    ursula_control::VerifiedGroupMembership {
+                        voters: [1, 2, 3].into(),
+                        learners: Default::default(),
+                        log_id: ursula_control::MembershipLogId {
+                            term: 1,
+                            node_id: 1,
+                            index: 1
+                        },
+                    }
+                )]),
+                now_ms: 1,
+            }),
+            ControlResponse::Ok
+        );
+        let projection = ControlProjection {
+            identity: identity.cluster.clone(),
+            applied_log_id: ursula_control::MembershipLogId {
+                term: 2,
+                node_id: 1,
+                index: 5,
+            },
+            state,
+        };
+        projection.validate().unwrap();
+        (identity, projection)
+    }
+
+    #[tokio::test]
+    async fn cached_projection_is_bound_durable_and_never_regresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.wal");
+        let (identity, old) = projection_fixture();
+        let store = MetaRaftFileLogStore::open_bound(&path, identity.clone()).unwrap();
+        assert!(store.cached_projection().unwrap().is_none());
+        assert_eq!(
+            store.persist_projection(old.clone()).await.unwrap(),
+            ProjectionInstall::Advanced
+        );
+        assert_eq!(
+            store.persist_projection(old.clone()).await.unwrap(),
+            ProjectionInstall::Unchanged
+        );
+        let mut newer = old.clone();
+        newer.applied_log_id.index = 10;
+        newer.applied_log_id.term = 3;
+        assert_eq!(
+            store.persist_projection(newer.clone()).await.unwrap(),
+            ProjectionInstall::Advanced
+        );
+        assert_eq!(
+            store.persist_projection(old).await.unwrap(),
+            ProjectionInstall::Stale
+        );
+        let bytes = fs::read(dir.path().join("meta.wal.projection")).unwrap();
+        let mut conflict = newer.clone();
+        conflict.applied_log_id.node_id = 2;
+        assert!(store.persist_projection(conflict).await.is_err());
+        assert_eq!(
+            fs::read(dir.path().join("meta.wal.projection")).unwrap(),
+            bytes
+        );
+        drop(store);
+        let store = MetaRaftFileLogStore::open_bound(&path, identity).unwrap();
+        assert_eq!(store.cached_projection().unwrap(), Some(newer));
+    }
+
+    #[tokio::test]
+    async fn cached_projection_rejects_torn_corrupt_or_foreign_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.wal");
+        let cache = dir.path().join("meta.wal.projection");
+        let (identity, projection) = projection_fixture();
+        let store = MetaRaftFileLogStore::open_bound(&path, identity.clone()).unwrap();
+        store.persist_projection(projection.clone()).await.unwrap();
+        drop(store);
+        let bytes = fs::read(&cache).unwrap();
+        for end in [0, bytes.len() / 2, bytes.len() - 1] {
+            fs::write(&cache, &bytes[..end]).unwrap();
+            assert!(MetaRaftFileLogStore::open_bound(&path, identity.clone()).is_err());
+        }
+        let mut corrupt = bytes;
+        let middle = corrupt.len() / 2;
+        corrupt[middle] ^= 1;
+        fs::write(&cache, corrupt).unwrap();
+        assert!(MetaRaftFileLogStore::open_bound(&path, identity.clone()).is_err());
+        let mut foreign = identity.clone();
+        foreign.node.node_id = 2;
+        replace_journal(&cache, [ProjectionCheckpoint {
+            identity: foreign,
+            projection,
+        }])
+        .unwrap();
+        assert!(MetaRaftFileLogStore::open_bound(&path, identity).is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_projection_publication_closes_storage_and_preserves_old_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.wal");
+        let (identity, old) = projection_fixture();
+        let mut store = MetaRaftFileLogStore::open_bound(&path, identity.clone()).unwrap();
+        store.persist_projection(old.clone()).await.unwrap();
+        let temporary = dir.path().join("meta.wal.projection.tmp");
+        fs::create_dir(&temporary).unwrap();
+        let mut newer = old.clone();
+        newer.applied_log_id.index += 1;
+        assert!(store.persist_projection(newer).await.is_err());
+        assert!(store.cached_projection().is_err());
+        assert!(
+            store
+                .save_vote(&openraft::Vote::new_committed(3, 1))
+                .await
+                .is_err()
+        );
+        drop(store);
+        fs::remove_dir(temporary).unwrap();
+        let store = MetaRaftFileLogStore::open_bound(&path, identity).unwrap();
+        assert_eq!(store.cached_projection().unwrap(), Some(old));
     }
 
     #[tokio::test]

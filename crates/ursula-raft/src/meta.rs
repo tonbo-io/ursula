@@ -134,6 +134,7 @@ impl MetaNodeRegistration {
 pub struct MetaRaftHandle {
     raft: MetaRaft,
     local_identity: Option<MetaLocalIdentity>,
+    durable_store: Option<Arc<MetaRaftFileLogStore>>,
 }
 
 impl MetaRaftHandle {
@@ -208,6 +209,30 @@ impl MetaRaftHandle {
         self.local_identity.as_ref()
     }
 
+    pub fn cached_projection(&self) -> Result<Option<ControlProjection>, MetaRaftError> {
+        self.durable_store
+            .as_ref()
+            .ok_or_else(|| {
+                MetaRaftError::new("load cached projection", "durable bound storage required")
+            })?
+            .cached_projection()
+            .map_err(|error| MetaRaftError::with_source("load cached projection", error))
+    }
+
+    pub async fn persist_projection(
+        &self,
+        projection: ControlProjection,
+    ) -> Result<ursula_control::ProjectionInstall, MetaRaftError> {
+        self.durable_store
+            .as_ref()
+            .ok_or_else(|| {
+                MetaRaftError::new("persist projection", "durable bound storage required")
+            })?
+            .persist_projection(projection)
+            .await
+            .map_err(|error| MetaRaftError::with_source("persist projection", error))
+    }
+
     async fn new_node_with_state_machine<NF, LS>(
         node_id: u64,
         config: Arc<Config>,
@@ -224,6 +249,7 @@ impl MetaRaftHandle {
             .as_ref()
             .and_then(|store| store.identity())
             .cloned();
+        let durable_store = state_machine.durable_store.clone();
         if let (Some(identity), Some(bootstrap)) =
             (&local_identity, &state_machine.state.cluster_bootstrap)
             && identity.cluster != bootstrap.recipe.identity
@@ -240,6 +266,7 @@ impl MetaRaftHandle {
         Ok(Self {
             raft,
             local_identity,
+            durable_store,
         })
     }
 
