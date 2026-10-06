@@ -1,6 +1,6 @@
 //! Native HTTP receiver tests with actual RF3/RF5 data and meta consensus. Each test
-//! drives membership directly; the supported fenced membership executor is a
-//! separate acceptance gate. HTTP-state replacement is not a binary restart.
+//! uses fenced membership endpoints; the joint fault injects a stopped native
+//! future. The server executor is separate; HTTP-state replacement is not restart.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -22,11 +22,14 @@ use tower::ServiceExt;
 use ursula_control::ClusterBootstrap;
 use ursula_control::ClusterId;
 use ursula_control::ClusterIdentity;
+use ursula_control::CompletedMembershipMutation;
 use ursula_control::CompletedReceiverMutation;
 use ursula_control::ControlCommand;
 use ursula_control::ControlResponse;
 use ursula_control::FinalMembershipEvidence;
 use ursula_control::MembershipLogId;
+use ursula_control::MembershipOutcome;
+use ursula_control::MembershipStep;
 use ursula_control::MetaLocalIdentity;
 use ursula_control::MigrationRequest;
 use ursula_control::MigrationToken;
@@ -404,25 +407,36 @@ fn applied(state: &HttpState) -> MembershipLogId {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replica_http_recovers_pre_core_prepare_and_replays_actual_rf3_release_after_cancellation()
 {
-    replica_scenario(3, false).await;
+    replica_scenario(3, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replica_http_reconciles_release_after_new_generation_and_replaced_process() {
-    replica_scenario(3, true).await;
+    replica_scenario(3, true, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rf5_replica_http_preserves_acked_prefix_and_replays_release_after_cancellation() {
-    replica_scenario(5, false).await;
+    replica_scenario(5, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rf5_replica_http_reconciles_release_across_generation_and_process_replacement() {
-    replica_scenario(5, true).await;
+    replica_scenario(5, true, false).await;
 }
 
-async fn replica_scenario(replicas: usize, recover_release: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn membership_http_recovers_an_actual_committed_joint_configuration_without_reverting_source()
+{
+    replica_scenario(3, false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rf5_membership_http_recovers_committed_joint_configuration() {
+    replica_scenario(5, false, true).await;
+}
+
+async fn replica_scenario(replicas: usize, recover_release: bool, recover_membership: bool) {
     let mut fixture = Fixture::new(replicas).await;
     let added = replicas;
     let added_id = added as u64 + 1;
@@ -587,14 +601,33 @@ async fn replica_scenario(replicas: usize, recover_release: bool) {
         .unwrap()
         .get(GROUP)
         .unwrap();
-    leader
-        .add_learner(
-            added_id,
-            BasicNode::new(&fixture.recipe.nodes[&added_id].cluster_url),
-            true,
-        )
-        .await
-        .unwrap();
+    let learner = ReplicaRequest {
+        token: token.clone(),
+        raft_group_id: GROUP,
+        request_id: "add-learner".to_owned(),
+        operation: ReceiverMutationKind::ManagedMembership {
+            step: MembershipStep::AddLearner {
+                epoch: 0,
+                node_id: added_id,
+                prefix: prefix.clone(),
+            },
+        },
+    };
+    let (status, learner_reply) = mutate(&fixture.states[0], &learner, "membership").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&learner_reply)
+    );
+    assert_eq!(
+        mutate(&fixture.states[0], &learner, "membership").await,
+        (StatusCode::OK, learner_reply.clone())
+    );
+    let learner_receipt: CompletedMembershipMutation =
+        serde_json::from_slice(&learner_reply).unwrap();
+    assert_eq!(learner_receipt.outcome, MembershipOutcome::Applied);
+    assert!(learner_receipt.configuration.learners.contains(&added_id));
     new_replica
         .wait(Some(Duration::from_secs(10)))
         .applied_index_at_least(Some(prefix.index), "learner prefix")
@@ -602,21 +635,150 @@ async fn replica_scenario(replicas: usize, recover_release: bool) {
         .unwrap();
     fixture
         .update(&token, MigrationUpdate::RecordLearner {
-            evidence: ReplicaAppliedEvidence {
-                process: fixture.process(added),
-                applied_log_id: applied(&fixture.states[added]),
-            },
+            evidence: applied_http(&fixture.states[added], &token, &prefix).await,
         })
         .await;
     fixture
         .update(&token, MigrationUpdate::AuthorizeMembership)
         .await;
-    // Direct native membership drive is fixture setup, not the supported fenced
-    // receiver membership endpoint/executor, which remains pending.
-    leader
-        .change_membership(target_voters, false)
+    let mut change = ReplicaRequest {
+        token: token.clone(),
+        raft_group_id: GROUP,
+        request_id: "change-voters".to_owned(),
+        operation: ReceiverMutationKind::ManagedMembership {
+            step: MembershipStep::ChangeVoters {
+                epoch: 0,
+                target_voters: target_voters.clone(),
+            },
+        },
+    };
+    if recover_membership {
+        // Fault boundary: checkpoint before queueing; stop polling the public
+        // OpenRaft future after its first submission, so the joint configuration
+        // commits but its second uniform submission never runs.
+        let mut ledger = fixture.receivers[0].store.snapshot().unwrap();
+        ledger.pending = Some(PendingReceiverMutation {
+            token: token.clone(),
+            raft_group_id: GROUP,
+            request_id: change.request_id.clone(),
+            process: fixture.states[0].process_incarnation.clone(),
+            operation: change.operation.clone(),
+        });
+        fixture.receivers[0].store.persist(ledger).await.unwrap();
+        let mut interrupted = Box::pin(leader.change_membership(target_voters.clone(), false));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(interrupted.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        leader
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |metrics| {
+                    metrics
+                        .membership_config
+                        .membership()
+                        .get_joint_config()
+                        .len()
+                        == 2
+                        && metrics.last_applied.map(|log| log.index())
+                            >= metrics.membership_config.log_id().map(|log| log.index())
+                },
+                "actual committed joint",
+            )
+            .await
+            .unwrap();
+        drop(interrupted);
+        let joint = ursula_raft::confirm_group_configuration(
+            GROUP,
+            1,
+            &fixture.recipe.nodes[&1].cluster_url,
+            Duration::from_secs(5),
+        )
         .await
         .unwrap();
+        assert_eq!(joint.voter_sets, vec![
+            fixture.recipe.voters[&GROUP].clone(),
+            target_voters.clone()
+        ]);
+        assert!(joint.uniform_membership().is_err());
+        assert!(
+            ursula_raft::confirm_group_membership(
+                GROUP,
+                1,
+                &fixture.recipe.nodes[&1].cluster_url,
+                Duration::from_secs(5)
+            )
+            .await
+            .is_err()
+        );
+        let previous = fixture.states[0].clone();
+        fixture.states[0] = HttpState::with_raft_registry(
+            previous.runtime.clone(),
+            previous.raft_registry().unwrap().clone(),
+        )
+        .with_configured_node_id(1)
+        .with_managed_projection(previous.managed_projection.clone().unwrap())
+        .with_managed_receiver(fixture.receivers[0].clone());
+        token = fixture.claim(token.generation).await;
+        fixture.certify(&token).await;
+        let restored = fixture.receivers[0].store.snapshot().unwrap();
+        let receipt = &restored.membership_completed[&change.request_id];
+        assert_eq!(receipt.outcome, MembershipOutcome::Reconciled);
+        assert_eq!(receipt.configuration.voter_sets, joint.voter_sets);
+        assert_eq!(receipt.request.token, token);
+        let mut prepared = prepare.clone();
+        prepared.token = token.clone();
+        assert_eq!(
+            mutate(&fixture.states[added], &prepared, "prepare").await.0,
+            StatusCode::OK
+        );
+        fixture
+            .update(&token, MigrationUpdate::RecordPrepared {
+                process: fixture.process(added),
+            })
+            .await;
+        fixture
+            .update(&token, MigrationUpdate::RecordLearner {
+                evidence: applied_http(&fixture.states[added], &token, &prefix).await,
+            })
+            .await;
+        fixture
+            .update(&token, MigrationUpdate::AuthorizeMembership)
+            .await;
+        change.token = token.clone();
+        let (status, recovered) = mutate(&fixture.states[0], &change, "membership").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&recovered)
+        );
+        assert_eq!(
+            serde_json::from_slice::<CompletedMembershipMutation>(&recovered)
+                .unwrap()
+                .outcome,
+            MembershipOutcome::Reconciled
+        );
+        change.request_id = "change-voters-resume".to_owned();
+    }
+    let (status, membership_reply) = mutate(&fixture.states[0], &change, "membership").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&membership_reply)
+    );
+    assert_eq!(
+        mutate(&fixture.states[0], &change, "membership").await,
+        (StatusCode::OK, membership_reply.clone())
+    );
+    let changed: CompletedMembershipMutation = serde_json::from_slice(&membership_reply).unwrap();
+    assert_eq!(changed.outcome, MembershipOutcome::Applied);
+    assert_eq!(
+        changed.configuration.uniform_membership().unwrap().voters,
+        target_voters
+    );
     let target = ursula_raft::confirm_group_membership(
         GROUP,
         1,
@@ -637,21 +799,17 @@ async fn replica_scenario(replicas: usize, recover_release: bool) {
             .await
             .unwrap();
     }
+    let mut replicas = BTreeMap::new();
+    for index in target_indices.iter().copied() {
+        let evidence = applied_http(&fixture.states[index], &token, &committed_prefix).await;
+        replicas.insert(index as u64 + 1, evidence);
+    }
     fixture
         .update(&token, MigrationUpdate::VerifyMembership {
             evidence: FinalMembershipEvidence {
                 membership: target.membership.clone(),
                 committed_prefix,
-                replicas: target_indices
-                    .iter()
-                    .copied()
-                    .map(|index| {
-                        (index as u64 + 1, ReplicaAppliedEvidence {
-                            process: fixture.process(index),
-                            applied_log_id: applied(&fixture.states[index]),
-                        })
-                    })
-                    .collect(),
+                replicas,
             },
         })
         .await;
@@ -934,4 +1092,123 @@ async fn replica_scenario(replicas: usize, recover_release: bool) {
         );
     }
     fixture.stop().await;
+}
+
+async fn applied_http(
+    state: &HttpState,
+    token: &MigrationToken,
+    prefix: &MembershipLogId,
+) -> ReplicaAppliedEvidence {
+    let response = crate::admin_router(state.clone())
+        .oneshot(request(
+            state,
+            "applied",
+            &super::super::membership::AppliedRequest {
+                token: token.clone(),
+                raft_group_id: GROUP,
+                prefix: prefix.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn membership_http_handoff_uses_fresh_data_quorum_and_replays_the_same_receipt() {
+    for count in [3, 5] {
+        let fixture = Fixture::new(count).await;
+        let source = ursula_raft::confirm_group_membership(
+            GROUP,
+            1,
+            &fixture.recipe.nodes[&1].cluster_url,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let target: BTreeSet<_> = (1..=count as u64 + 1).filter(|id| *id != 2).collect();
+        assert_eq!(
+            fixture.meta[0]
+                .write(ControlCommand::SubmitMigration {
+                    request: MigrationRequest {
+                        operation_key: "handoff-step".to_owned(),
+                        raft_group_id: GROUP,
+                        expected_epoch: 0,
+                        source_membership: source.membership,
+                        target_voters: target,
+                        target_policy: None,
+                    },
+                    now_ms: 2,
+                })
+                .await
+                .unwrap(),
+            ControlResponse::MigrationStarted { migration_id: 1 }
+        );
+        let token = fixture.claim(0).await;
+        fixture
+            .update(&token, MigrationUpdate::AuthorizeReceivers)
+            .await;
+        fixture.certify(&token).await;
+        let mut handoff = ReplicaRequest {
+            token: token.clone(),
+            raft_group_id: GROUP,
+            request_id: "handoff-to-retained-voter".to_owned(),
+            operation: ReceiverMutationKind::ManagedMembership {
+                step: MembershipStep::TransferLeader {
+                    epoch: 0,
+                    node_id: 3,
+                },
+            },
+        };
+        let mut wrong = handoff.clone();
+        wrong.operation = ReceiverMutationKind::ManagedMembership {
+            step: MembershipStep::TransferLeader {
+                epoch: 0,
+                node_id: count as u64 + 1,
+            },
+        };
+        assert_eq!(
+            mutate(&fixture.states[0], &wrong, "membership").await.0,
+            StatusCode::CONFLICT
+        );
+        assert!(
+            fixture.receivers[0]
+                .store
+                .snapshot()
+                .unwrap()
+                .pending
+                .is_none()
+        );
+        let (status, reply) = mutate(&fixture.states[0], &handoff, "membership").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        let receipt: CompletedMembershipMutation = serde_json::from_slice(&reply).unwrap();
+        assert_eq!(receipt.outcome, MembershipOutcome::Applied);
+        assert_eq!(receipt.configuration.leader_id, 3);
+        assert_eq!(receipt.configuration.voter_sets, vec![
+            fixture.recipe.voters[&GROUP].clone()
+        ]);
+        assert_eq!(
+            mutate(&fixture.states[0], &handoff, "membership").await,
+            (StatusCode::OK, reply)
+        );
+        handoff.operation = ReceiverMutationKind::ManagedMembership {
+            step: MembershipStep::TransferLeader {
+                epoch: 0,
+                node_id: 1,
+            },
+        };
+        assert_eq!(
+            mutate(&fixture.states[0], &handoff, "membership").await.0,
+            StatusCode::CONFLICT
+        );
+        fixture.stop().await;
+    }
 }

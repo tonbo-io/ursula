@@ -107,6 +107,7 @@ pub use maintenance::RaftMaintenanceReport;
 pub use maintenance::check_raft_maintenance;
 pub use membership::QuorumGroupMembership;
 pub use membership::collect_bootstrap_memberships;
+pub use membership::confirm_group_configuration;
 pub use membership::confirm_group_membership;
 pub use meta::MetaNodeRegistration;
 pub use meta::MetaRaft;

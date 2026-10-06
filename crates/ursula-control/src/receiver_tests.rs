@@ -220,3 +220,129 @@ fn replica_release_receipt_requires_matching_witness_and_complete_retirement() {
     rehosted.assignments.get_mut(&RaftGroupId(0)).unwrap().phase = ReplicaAssignmentPhase::Hosted;
     assert!(retired.validate_successor(&rehosted, 2).is_err());
 }
+
+fn membership_pending(id: &str, ledger: &ReceiverLedger) -> ReceiverLedger {
+    let mut pending = ledger.clone();
+    pending.pending = Some(PendingReceiverMutation {
+        token: token(7),
+        raft_group_id: RaftGroupId(0),
+        request_id: id.to_owned(),
+        process: ProcessIncarnation::from_bits(10),
+        operation: super::ReceiverMutationKind::ManagedMembership {
+            step: super::MembershipStep::ChangeVoters {
+                epoch: 0,
+                target_voters: [1, 3, 4].into(),
+            },
+        },
+    });
+    pending
+}
+
+fn membership_complete(pending: &ReceiverLedger, joint: bool) -> ReceiverLedger {
+    let mut ready = pending.clone();
+    let request = ready.pending.take().unwrap();
+    ready.membership_completed.insert(
+        request.request_id.clone(),
+        super::CompletedMembershipMutation {
+            request,
+            process: ReceiverProcess {
+                node_id: 2,
+                incarnation: ProcessIncarnation::from_bits(10),
+            },
+            configuration: crate::CommittedGroupConfiguration {
+                raft_group_id: RaftGroupId(0),
+                leader_id: 1,
+                leader_term: 2,
+                membership_log_id: MembershipLogId {
+                    term: 2,
+                    node_id: 1,
+                    index: 17,
+                },
+                applied_log_id: MembershipLogId {
+                    term: 2,
+                    node_id: 1,
+                    index: 18,
+                },
+                voter_sets: if joint {
+                    vec![[1, 2, 3].into(), [1, 3, 4].into()]
+                } else {
+                    vec![[1, 3, 4].into()]
+                },
+                learners: Default::default(),
+                nodes: if joint {
+                    (1..=4)
+                        .map(|id| (id, format!("http://node{id}:4440")))
+                        .collect()
+                } else {
+                    [1, 3, 4]
+                        .map(|id| (id, format!("http://node{id}:4440")))
+                        .into()
+                },
+            },
+            outcome: if joint {
+                super::MembershipOutcome::Reconciled
+            } else {
+                super::MembershipOutcome::Applied
+            },
+        },
+    );
+    ready
+}
+
+#[test]
+fn membership_receipts_preserve_keys_and_bound_generation_state_without_rewriting_replies() {
+    let mut ledger = active();
+    for index in 0..super::MAX_MEMBERSHIP_RECEIPTS {
+        let pending = membership_pending(&format!("membership-{index}"), &ledger);
+        assert!(ledger.validate_successor(&pending, 2).is_ok());
+        let ready = membership_complete(&pending, false);
+        assert!(pending.validate_successor(&ready, 2).is_ok());
+        ledger = ready;
+    }
+    assert!(
+        ledger
+            .validate_successor(&membership_pending("overflow", &ledger), 2)
+            .is_err()
+    );
+    let mut forgotten = ledger.clone();
+    forgotten.membership_completed.clear();
+    assert!(ledger.validate_successor(&forgotten, 2).is_err());
+    let mut rewritten = ledger.clone();
+    rewritten
+        .membership_completed
+        .get_mut("membership-0")
+        .unwrap()
+        .outcome = super::MembershipOutcome::Reconciled;
+    assert!(ledger.validate_successor(&rewritten, 2).is_err());
+    let mut next_generation = forgotten;
+    next_generation.high_water_generation = 8;
+    next_generation.fence.as_mut().unwrap().token = token(8);
+    next_generation.fence.as_mut().unwrap().phase = ReceiverFencePhase::Activating;
+    next_generation.fence.as_mut().unwrap().process = ProcessIncarnation::from_bits(11);
+    assert!(ledger.validate_successor(&next_generation, 2).is_ok());
+}
+
+#[test]
+fn membership_reconciliation_reports_joint_state_without_claiming_the_voter_change_applied() {
+    let pending = membership_pending("interrupted-joint", &active());
+    let reconciled = membership_complete(&pending, true);
+    assert!(pending.validate_successor(&reconciled, 2).is_ok());
+    let mut false_success = reconciled.clone();
+    false_success
+        .membership_completed
+        .get_mut("interrupted-joint")
+        .unwrap()
+        .outcome = super::MembershipOutcome::Applied;
+    assert!(pending.validate_successor(&false_success, 2).is_err());
+    let mut forged = reconciled.clone();
+    forged
+        .membership_completed
+        .get_mut("interrupted-joint")
+        .unwrap()
+        .request
+        .request_id = "other-key".to_owned();
+    assert!(pending.validate_successor(&forged, 2).is_err());
+    let mut cleared = pending.clone();
+    cleared.pending = None;
+    assert!(pending.validate_successor(&cleared, 2).is_err());
+}

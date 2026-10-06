@@ -124,7 +124,7 @@ impl ManagedReceiver {
                 self.confirm_release_membership(&view, request, recovering)
                     .await?;
             }
-            ReceiverMutationKind::Membership => {
+            ReceiverMutationKind::Membership | ReceiverMutationKind::ManagedMembership { .. } => {
                 return Err("membership work requires its own reconciliation protocol".to_owned());
             }
         }
@@ -241,7 +241,7 @@ impl ManagedReceiver {
                     },
                 }
             }
-            ReceiverMutationKind::Membership => {
+            ReceiverMutationKind::Membership | ReceiverMutationKind::ManagedMembership { .. } => {
                 return Err("unsupported membership operation".to_owned());
             }
         };
@@ -279,6 +279,12 @@ impl ManagedReceiver {
         let Some(mut pending) = ledger.pending.clone() else {
             return Ok(());
         };
+        if matches!(
+            pending.operation,
+            ReceiverMutationKind::ManagedMembership { .. }
+        ) {
+            return self.reconcile_membership(state, token).await;
+        }
         if matches!(pending.operation, ReceiverMutationKind::Membership) {
             return Err("pending membership needs actual membership reconciliation".to_owned());
         }
@@ -321,6 +327,12 @@ impl ManagedReceiver {
             return Err("invalid replica request id".to_owned());
         }
         let mut ledger = self.store.snapshot().map_err(|e| e.to_string())?;
+        if ledger
+            .membership_completed
+            .contains_key(&pending.request_id)
+        {
+            return Err("request id belongs to a membership action".to_owned());
+        }
         if let Some(completed) = &ledger.completed
             && completed.request.token == pending.token
         {
@@ -342,7 +354,10 @@ impl ManagedReceiver {
                 ReceiverMutationKind::ReleaseReplica { epoch, .. } => {
                     (epoch, ReplicaAssignmentPhase::Retiring)
                 }
-                ReceiverMutationKind::Membership => return Err("unsupported operation".to_owned()),
+                ReceiverMutationKind::Membership
+                | ReceiverMutationKind::ManagedMembership { .. } => {
+                    return Err("unsupported operation".to_owned());
+                }
             };
             let old_phase = ledger
                 .assignments

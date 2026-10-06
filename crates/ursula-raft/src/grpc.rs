@@ -935,6 +935,11 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             request.protocol_version,
             request.raft_group_id,
         )?;
+        if request.include_membership && request.include_configuration {
+            return Err(tonic::Status::invalid_argument(
+                "select either uniform membership or full configuration",
+            ));
+        }
         let raft = self
             .registry
             .get(group)
@@ -949,7 +954,9 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .read_barrier(group)
             .ok_or_else(|| tonic::Status::not_found("read barrier is not registered"))?;
         let before = raft.metrics().borrow_watched().clone();
-        if request.include_membership && request.target_node_id != before.id {
+        if (request.include_membership || request.include_configuration)
+            && request.target_node_id != before.id
+        {
             return Err(tonic::Status::failed_precondition(
                 "membership recipient node identity mismatch",
             ));
@@ -979,11 +986,24 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         } else {
             bytes::Bytes::new()
         };
+        let configuration = if request.include_configuration {
+            let observation =
+                crate::membership::read_applied_configuration(&self.registry, group, index).await?;
+            if observation.leader_term != metrics.vote.leader_id().term() {
+                return Err(tonic::Status::failed_precondition(
+                    "configuration barrier lost leadership",
+                ));
+            }
+            encode_wire(&observation)
+        } else {
+            bytes::Bytes::new()
+        };
         Ok(tonic::Response::new(
             raft_internal_proto::RejoinBarrierResponseV1 {
                 vote: encode_wire(&metrics.vote),
                 index,
                 membership,
+                configuration,
             },
         ))
     }

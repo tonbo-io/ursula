@@ -157,6 +157,9 @@ message RejoinBarrierRequestV1 {
   // Managed adoption needs applied uniform membership, rather than metrics.
   bool include_membership = 3;
   uint64 target_node_id = 4;
+  // Migration recovery needs both constituent voter sets of a committed joint
+  // configuration. This does not relax include_membership's uniform contract.
+  bool include_configuration = 5;
 }
 
 message RejoinBarrierResponseV1 {
@@ -164,6 +167,8 @@ message RejoinBarrierResponseV1 {
   uint64 index = 2;
   // MessagePack QuorumGroupMembership, present only when requested.
   bytes membership = 3;
+  // MessagePack CommittedGroupConfiguration, present only when requested.
+  bytes configuration = 4;
 }
 
 service RaftInternal {

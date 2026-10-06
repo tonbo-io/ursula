@@ -4,8 +4,12 @@ use std::process::Command;
 
 use ursula_control::ClusterId;
 use ursula_control::ClusterIdentity;
+use ursula_control::CommittedGroupConfiguration;
+use ursula_control::CompletedMembershipMutation;
 use ursula_control::CompletedReceiverMutation;
 use ursula_control::MembershipLogId;
+use ursula_control::MembershipOutcome;
+use ursula_control::MembershipStep;
 use ursula_control::MetaLocalIdentity;
 use ursula_control::MigrationToken;
 use ursula_control::NodeRegistration;
@@ -208,6 +212,71 @@ async fn receiver_crash_child() {
             operation: ursula_control::ReceiverMutationKind::Membership,
         });
         store.persist(ledger).await.unwrap();
+    } else if mode.starts_with("membership-") {
+        let target = [1, 3, 4].into();
+        ledger.pending = Some(PendingReceiverMutation {
+            token: token(7),
+            raft_group_id: RaftGroupId(0),
+            request_id: "lost-membership-step".to_owned(),
+            process: ProcessIncarnation::from_bits(10),
+            operation: ReceiverMutationKind::ManagedMembership {
+                step: MembershipStep::ChangeVoters {
+                    epoch: 0,
+                    target_voters: target,
+                },
+            },
+        });
+        let mut ledger = store.persist(ledger).await.unwrap();
+        if mode != "membership-pending" {
+            let joint = mode == "membership-reconciled";
+            let request = ledger.pending.take().unwrap();
+            ledger.membership_completed.insert(
+                request.request_id.clone(),
+                CompletedMembershipMutation {
+                    request,
+                    process: ReceiverProcess {
+                        node_id: 1,
+                        incarnation: ProcessIncarnation::from_bits(10),
+                    },
+                    configuration: CommittedGroupConfiguration {
+                        raft_group_id: RaftGroupId(0),
+                        leader_id: 1,
+                        leader_term: 2,
+                        membership_log_id: MembershipLogId {
+                            term: 2,
+                            node_id: 1,
+                            index: 17,
+                        },
+                        applied_log_id: MembershipLogId {
+                            term: 2,
+                            node_id: 1,
+                            index: 18,
+                        },
+                        voter_sets: if joint {
+                            vec![[1, 2, 3].into(), [1, 3, 4].into()]
+                        } else {
+                            vec![[1, 3, 4].into()]
+                        },
+                        learners: Default::default(),
+                        nodes: if joint {
+                            (1..=4)
+                                .map(|id| (id, format!("http://node{id}:4440")))
+                                .collect()
+                        } else {
+                            [1, 3, 4]
+                                .map(|id| (id, format!("http://node{id}:4440")))
+                                .into()
+                        },
+                    },
+                    outcome: if joint {
+                        MembershipOutcome::Reconciled
+                    } else {
+                        MembershipOutcome::Applied
+                    },
+                },
+            );
+            store.persist(ledger).await.unwrap();
+        }
     } else if mode.starts_with("replica-") {
         let prepare = mode.starts_with("replica-prepare-");
         let group = RaftGroupId(u32::from(prepare));
@@ -269,7 +338,8 @@ async fn receiver_crash_child() {
                         local_records_reclaimed: true,
                     },
                 },
-                ReceiverMutationKind::Membership => unreachable!(),
+                ReceiverMutationKind::Membership
+                | ReceiverMutationKind::ManagedMembership { .. } => unreachable!(),
             };
             ledger.completed = Some(CompletedReceiverMutation { request, result });
             store.persist(ledger).await.unwrap();
@@ -400,11 +470,68 @@ async fn receiver_replica_checkpoints_survive_process_exit_without_forgetting_wo
                         local_records_reclaimed: true,
                     },
                 },
-                ReceiverMutationKind::Membership => unreachable!(),
+                ReceiverMutationKind::Membership
+                | ReceiverMutationKind::ManagedMembership { .. } => unreachable!(),
             };
             foreign.completed = Some(CompletedReceiverMutation { request, result });
             assert!(foreign.validate(2).is_ok());
             assert!(store.persist(foreign).await.is_err());
+        }
+        assert_eq!(store.snapshot().unwrap(), ledger);
+    }
+}
+
+// Configuration facts below are storage fixtures. Native receiver tests obtain
+// their actual data-quorum observations over TCP before issuing a receipt.
+#[tokio::test]
+async fn receiver_membership_pending_and_bounded_replies_survive_os_process_exit() {
+    for mode in [
+        "membership-pending",
+        "membership-applied",
+        "membership-reconciled",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("receiver");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "log_store::receiver::tests::receiver_crash_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("URSULA_RECEIVER_CRASH_PATH", &path)
+            .env("URSULA_RECEIVER_CRASH_MODE", mode)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let store = ManagedReceiverStore::open(path, identity()).await.unwrap();
+        let ledger = store.snapshot().unwrap();
+        assert_eq!(ledger.pending.is_some(), mode == "membership-pending");
+        assert_eq!(
+            ledger.membership_completed.len(),
+            usize::from(mode != "membership-pending")
+        );
+        if mode == "membership-pending" {
+            assert!(matches!(
+                ledger.pending.as_ref().unwrap().operation,
+                ReceiverMutationKind::ManagedMembership { .. }
+            ));
+            let mut forgotten = ledger.clone();
+            forgotten.pending = None;
+            assert!(store.persist(forgotten).await.is_err());
+        } else {
+            let receipt = &ledger.membership_completed["lost-membership-step"];
+            assert_eq!(
+                receipt.outcome,
+                if mode == "membership-reconciled" {
+                    MembershipOutcome::Reconciled
+                } else {
+                    MembershipOutcome::Applied
+                }
+            );
+            let mut forgotten = ledger.clone();
+            forgotten.membership_completed.clear();
+            assert!(store.persist(forgotten).await.is_err());
         }
         assert_eq!(store.snapshot().unwrap(), ledger);
     }

@@ -1,23 +1,29 @@
 //! Durable node-local control authority and replica retirement tombstones.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use serde::Deserialize;
 use serde::Serialize;
 use ursula_proto::admin::ProcessIncarnation;
 use ursula_shard::RaftGroupId;
 
+use crate::CommittedGroupConfiguration;
 use crate::MembershipLogId;
 use crate::MigrationToken;
 use crate::ReceiverProcess;
 use crate::ReplicaRetirementEvidence;
 
-/// Immutable description of possibly admitted work. Membership remains opaque
-/// until its dedicated reconciliation protocol is implemented; activation must
-/// not infer completion from a queue barrier.
+/// Immutable description of possibly admitted work. Legacy opaque membership
+/// remains fail-closed; typed steps reconcile actual committed configuration
+/// rather than inferring completion from a queue barrier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ReceiverMutationKind {
     Membership,
+    ManagedMembership {
+        step: MembershipStep,
+    },
     PrepareReplica {
         epoch: u64,
     },
@@ -26,6 +32,46 @@ pub enum ReceiverMutationKind {
         membership_log_id: MembershipLogId,
     },
 }
+
+/// Exact logical membership action authorized by the immutable meta intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum MembershipStep {
+    TransferLeader {
+        epoch: u64,
+        node_id: u64,
+    },
+    AddLearner {
+        epoch: u64,
+        node_id: u64,
+        prefix: MembershipLogId,
+    },
+    ChangeVoters {
+        epoch: u64,
+        target_voters: BTreeSet<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MembershipOutcome {
+    Applied,
+    /// A takeover observed committed state but did not resubmit the old action.
+    /// The executor must continue from this configuration after recertification.
+    Reconciled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletedMembershipMutation {
+    pub request: PendingReceiverMutation,
+    pub process: ReceiverProcess,
+    pub configuration: CommittedGroupConfiguration,
+    pub outcome: MembershipOutcome,
+}
+
+/// RF<=5 needs at most five learner actions, one voter change and a handoff.
+/// Repeated failed/reconciled attempts consume this bounded generation budget;
+/// the executor can obtain a new generation rather than discard old request IDs.
+pub const MAX_MEMBERSHIP_RECEIPTS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReceiverFencePhase {
@@ -93,6 +139,8 @@ pub struct ReceiverLedger {
     /// A lost response to the current operation replays the exact durable result.
     #[serde(default)]
     pub completed: Option<CompletedReceiverMutation>,
+    #[serde(default)]
+    pub membership_completed: BTreeMap<String, CompletedMembershipMutation>,
 }
 
 impl ReceiverLedger {
@@ -180,6 +228,61 @@ impl ReceiverLedger {
                 self.validate_replica_assignment(&completed.request, true)?;
             }
         }
+        if self.membership_completed.len() > MAX_MEMBERSHIP_RECEIPTS {
+            return Err("membership receipt generation budget exhausted".to_owned());
+        }
+        for (key, receipt) in &self.membership_completed {
+            self.validate_request(&receipt.request, group_count)?;
+            receipt.configuration.validate()?;
+            let ReceiverMutationKind::ManagedMembership { step } = &receipt.request.operation
+            else {
+                return Err("membership receipt has no typed membership action".to_owned());
+            };
+            if key != &receipt.request.request_id
+                || receipt.request.token.generation != self.high_water_generation
+                || receipt.process.node_id == 0
+                || receipt.process.incarnation != receipt.request.process
+                || receipt.configuration.raft_group_id != receipt.request.raft_group_id
+                || self.completed.as_ref().is_some_and(|replica| {
+                    replica.request.token == receipt.request.token
+                        && replica.request.request_id == *key
+                })
+            {
+                return Err(
+                    "membership receipt differs from receiving-process authority".to_owned(),
+                );
+            }
+            if receipt.outcome == MembershipOutcome::Applied {
+                let voters: BTreeSet<_> = receipt
+                    .configuration
+                    .voter_sets
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect();
+                let valid = match step {
+                    MembershipStep::TransferLeader { node_id, .. } => {
+                        receipt.configuration.leader_id == *node_id
+                    }
+                    MembershipStep::AddLearner {
+                        node_id, prefix, ..
+                    } => {
+                        (voters.contains(node_id)
+                            || receipt.configuration.learners.contains(node_id))
+                            && covers(&receipt.configuration.applied_log_id, prefix)
+                    }
+                    MembershipStep::ChangeVoters { target_voters, .. } => {
+                        receipt.configuration.voter_sets.as_slice() == [target_voters.clone()]
+                            && receipt.configuration.learners.is_empty()
+                    }
+                };
+                if !valid {
+                    return Err(
+                        "membership action lacks its applied configuration result".to_owned()
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -202,6 +305,20 @@ impl ReceiverLedger {
         {
             return Err("release witness has no membership leader".to_owned());
         }
+        if let ReceiverMutationKind::ManagedMembership { step } = &request.operation {
+            let valid = match step {
+                MembershipStep::TransferLeader { node_id, .. } => *node_id != 0,
+                MembershipStep::AddLearner {
+                    node_id, prefix, ..
+                } => *node_id != 0 && prefix.node_id != 0,
+                MembershipStep::ChangeVoters { target_voters, .. } => {
+                    matches!(target_voters.len(), 3 | 5) && !target_voters.contains(&0)
+                }
+            };
+            if !valid {
+                return Err("invalid typed membership action".to_owned());
+            }
+        }
         if request.token.generation == self.high_water_generation
             && !self
                 .fence
@@ -219,7 +336,10 @@ impl ReceiverLedger {
         complete: bool,
     ) -> Result<(), String> {
         let phases = match (&request.operation, complete) {
-            (ReceiverMutationKind::Membership, _) => return Ok(()),
+            (
+                ReceiverMutationKind::Membership | ReceiverMutationKind::ManagedMembership { .. },
+                _,
+            ) => return Ok(()),
             (ReceiverMutationKind::PrepareReplica { .. }, false) => &[
                 ReplicaAssignmentPhase::Preparing,
                 ReplicaAssignmentPhase::Hosted,
@@ -238,7 +358,9 @@ impl ReceiverLedger {
         let epoch = match request.operation {
             ReceiverMutationKind::PrepareReplica { epoch }
             | ReceiverMutationKind::ReleaseReplica { epoch, .. } => epoch,
-            ReceiverMutationKind::Membership => return Ok(()),
+            ReceiverMutationKind::Membership | ReceiverMutationKind::ManagedMembership { .. } => {
+                return Ok(());
+            }
         };
         if !self
             .assignments
@@ -290,20 +412,42 @@ impl ReceiverLedger {
                 }
             }
             (Some(old), None) => {
-                if !next
-                    .completed
-                    .as_ref()
-                    .is_some_and(|done| &done.request == old)
-                {
+                let complete = match &old.operation {
+                    ReceiverMutationKind::ManagedMembership { .. } => next
+                        .membership_completed
+                        .get(&old.request_id)
+                        .is_some_and(|done| &done.request == old),
+                    _ => next
+                        .completed
+                        .as_ref()
+                        .is_some_and(|done| &done.request == old),
+                };
+                if !complete {
                     return Err("pending work cannot clear without its durable receipt".to_owned());
                 }
                 next.validate_replica_assignment(old, true)?;
             }
             (None, Some(new)) => {
-                if self
-                    .completed
-                    .as_ref()
-                    .is_some_and(|done| done.request.token == new.token && done.request != *new)
+                if matches!(
+                    new.operation,
+                    ReceiverMutationKind::ManagedMembership { .. }
+                ) && (self.membership_completed.len() >= MAX_MEMBERSHIP_RECEIPTS
+                    || self.membership_completed.contains_key(&new.request_id))
+                {
+                    return Err("membership receipt budget/key already consumed".to_owned());
+                }
+                if self.completed.as_ref().is_some_and(|done| {
+                    done.request.token == new.token
+                        && (done.request.request_id == new.request_id
+                            || !matches!(
+                                new.operation,
+                                ReceiverMutationKind::ManagedMembership { .. }
+                            ))
+                        && done.request != *new
+                }) || self
+                    .membership_completed
+                    .get(&new.request_id)
+                    .is_some_and(|done| done.request != *new)
                 {
                     return Err(
                         "one replica action per receiver generation; retry the original request"
@@ -330,6 +474,35 @@ impl ReceiverLedger {
             })
         {
             return Err("receipt can change only when completing its pending operation".to_owned());
+        }
+        if next.high_water_generation == self.high_water_generation {
+            for (key, old) in &self.membership_completed {
+                if next.membership_completed.get(key) != Some(old) {
+                    return Err(
+                        "membership receipts cannot be forgotten or rewritten within a generation"
+                            .to_owned(),
+                    );
+                }
+            }
+            for (key, new) in &next.membership_completed {
+                if !self.membership_completed.contains_key(key)
+                    && !(next.pending.is_none()
+                        && self
+                            .pending
+                            .as_ref()
+                            .is_some_and(|pending| &new.request == pending))
+                {
+                    return Err(
+                        "membership receipt requires completion of its exact pending action"
+                            .to_owned(),
+                    );
+                }
+            }
+        } else if !next.membership_completed.is_empty() {
+            return Err(
+                "new receiver generation must discard only its old-generation membership replies"
+                    .to_owned(),
+            );
         }
         if next.high_water_generation == self.high_water_generation {
             match (&self.fence, &next.fence) {
@@ -431,3 +604,7 @@ impl ReceiverLedger {
 #[cfg(test)]
 #[path = "receiver_tests.rs"]
 mod tests;
+
+fn covers(applied: &MembershipLogId, prefix: &MembershipLogId) -> bool {
+    applied == prefix || (applied.index > prefix.index && applied.term >= prefix.term)
+}

@@ -20,7 +20,11 @@ mod otel_metrics;
 pub mod server;
 mod http_time {
     #[cfg(madsim)]
+    pub use madsim::time::sleep;
+    #[cfg(madsim)]
     pub use madsim::time::timeout;
+    #[cfg(not(madsim))]
+    pub use tokio::time::sleep;
     #[cfg(not(madsim))]
     pub use tokio::time::timeout;
 }

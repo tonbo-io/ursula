@@ -7,6 +7,7 @@
 //! Module map:
 //!
 //! - [`command`]: replicated control requests and responses.
+//! - [`configuration`]: quorum-observed applied uniform/joint data configurations.
 //! - [`cluster`]: immutable routing identity and trusted bootstrap inventory.
 //! - [`model`]: nodes, placements and migration records.
 //! - [`migration`]: intent-bound managed migrations and executor/evidence ordering.
@@ -18,12 +19,18 @@
 
 mod cluster;
 mod command;
+mod configuration;
+pub use configuration::CommittedGroupConfiguration;
 mod migration;
 mod model;
 mod policy;
 mod projection;
 mod receiver;
+pub use receiver::CompletedMembershipMutation;
 pub use receiver::CompletedReceiverMutation;
+pub use receiver::MAX_MEMBERSHIP_RECEIPTS;
+pub use receiver::MembershipOutcome;
+pub use receiver::MembershipStep;
 pub use receiver::PendingReceiverMutation;
 pub use receiver::ReceiverFencePhase;
 pub use receiver::ReceiverFenceRecord;

@@ -184,6 +184,15 @@ fn validate_receipt_node(ledger: &ReceiverLedger, node_id: u64) -> io::Result<()
             return Err(invalid("receiver receipt differs from its bound node"));
         }
     }
+    if ledger
+        .membership_completed
+        .values()
+        .any(|receipt| receipt.process.node_id != node_id)
+    {
+        return Err(invalid(
+            "membership receipt differs from its bound receiver node",
+        ));
+    }
     Ok(())
 }
 

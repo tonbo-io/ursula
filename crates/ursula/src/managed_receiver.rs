@@ -33,7 +33,10 @@ use ursula_raft::MetaRaftHandle;
 
 use crate::HttpState;
 
+mod membership;
 mod replica;
+use membership::applied_evidence;
+use membership::membership_mutation;
 use replica::replica_prepare;
 use replica::replica_release;
 
@@ -205,6 +208,9 @@ impl ManagedReceiver {
             self.barrier(state).await?;
             return self.store.snapshot().map_err(|e| e.to_string());
         }
+        if ledger.high_water_generation < token.generation {
+            ledger.membership_completed.clear();
+        }
         ledger.high_water_generation = token.generation;
         ledger.fence = Some(ReceiverFenceRecord {
             token: token.clone(),
@@ -291,6 +297,11 @@ pub(crate) fn router(state: HttpState) -> Router {
         .route("/__ursula/control/receiver/retire", post(retire))
         .route("/__ursula/control/receiver/prepare", post(replica_prepare))
         .route("/__ursula/control/receiver/release", post(replica_release))
+        .route(
+            "/__ursula/control/receiver/membership",
+            post(membership_mutation),
+        )
+        .route("/__ursula/control/receiver/applied", post(applied_evidence))
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024))
         .with_state(state)
 }

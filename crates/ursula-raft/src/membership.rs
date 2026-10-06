@@ -7,6 +7,7 @@ use openraft::rt::WatchReceiver;
 use openraft::vote::RaftLeaderId;
 use serde::Deserialize;
 use serde::Serialize;
+use ursula_control::CommittedGroupConfiguration;
 use ursula_control::MembershipLogId;
 use ursula_control::VerifiedGroupMembership;
 use ursula_shard::RaftGroupId;
@@ -47,6 +48,7 @@ pub async fn confirm_group_membership(
         raft_group_id: group.0,
         protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
         include_membership: true,
+        include_configuration: false,
         target_node_id: leader_id,
     });
     request.set_timeout(timeout);
@@ -96,6 +98,26 @@ pub(crate) async fn read_applied_membership(
     group: RaftGroupId,
     read_index: u64,
 ) -> Result<QuorumGroupMembership, tonic::Status> {
+    let observation = read_applied_configuration(registry, group, read_index).await?;
+    let membership = observation
+        .uniform_membership()
+        .map_err(tonic::Status::failed_precondition)?;
+    // Keep the original uniform-only response and contract unchanged.
+    Ok(QuorumGroupMembership {
+        raft_group_id: group,
+        leader_id: observation.leader_id,
+        leader_term: observation.leader_term,
+        applied_index: observation.applied_log_id.index,
+        membership,
+        nodes: observation.nodes,
+    })
+}
+
+pub(crate) async fn read_applied_configuration(
+    registry: &RaftGroupHandleRegistry,
+    group: RaftGroupId,
+    read_index: u64,
+) -> Result<CommittedGroupConfiguration, tonic::Status> {
     let raft = registry
         .get(group)
         .ok_or_else(|| tonic::Status::not_found("raft group is not registered"))?;
@@ -108,45 +130,90 @@ pub(crate) async fn read_applied_membership(
         .await
         .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
     let after = raft.metrics().borrow_watched().clone();
-    let applied =
-        applied.ok_or_else(|| tonic::Status::failed_precondition("membership is not applied"))?;
-    let log_id =
-        committed.log_id().as_ref().copied().ok_or_else(|| {
-            tonic::Status::failed_precondition("membership has no committed log id")
-        })?;
-    let membership = committed.membership();
+    let applied = applied
+        .ok_or_else(|| tonic::Status::failed_precondition("configuration is not applied"))?;
+    let log_id = committed.log_id().as_ref().copied().ok_or_else(|| {
+        tonic::Status::failed_precondition("configuration has no committed log id")
+    })?;
     if before.current_leader != Some(before.id)
         || after.current_leader != Some(after.id)
         || before.vote != after.vote
         || !after.vote.is_committed()
         || before.membership_config.as_ref() != &committed
         || after.membership_config.as_ref() != &committed
-        || membership.get_joint_config().len() != 1
         || applied.index() < read_index
     {
         return Err(tonic::Status::failed_precondition(
-            "membership observation requires stable leadership and applied uniform membership",
+            "configuration observation requires stable leadership and applied effective membership",
         ));
     }
-    Ok(QuorumGroupMembership {
+    let convert = |log: openraft::alias::LogIdOf<crate::UrsulaRaftTypeConfig>| MembershipLogId {
+        term: log.committed_leader_id().term(),
+        node_id: *log.committed_leader_id().node_id(),
+        index: log.index(),
+    };
+    let membership = committed.membership();
+    let observation = CommittedGroupConfiguration {
         raft_group_id: group,
         leader_id: after.id,
         leader_term: after.vote.leader_id().term(),
-        applied_index: applied.index(),
-        membership: VerifiedGroupMembership {
-            voters: membership.voter_ids().collect(),
-            learners: membership.learner_ids().collect(),
-            log_id: MembershipLogId {
-                term: log_id.committed_leader_id().term(),
-                node_id: *log_id.committed_leader_id().node_id(),
-                index: log_id.index(),
-            },
-        },
+        applied_log_id: convert(applied),
+        membership_log_id: convert(log_id),
+        voter_sets: membership.get_joint_config().clone(),
+        learners: membership.learner_ids().collect(),
         nodes: membership
             .nodes()
             .map(|(id, node)| (*id, node.addr.clone()))
             .collect(),
-    })
+    };
+    observation
+        .validate()
+        .map_err(tonic::Status::failed_precondition)?;
+    Ok(observation)
+}
+
+/// Observe applied uniform or joint configuration through its actual leader.
+/// Older peers that omit the capability fail closed; there is no metrics fallback.
+pub async fn confirm_group_configuration(
+    group: RaftGroupId,
+    leader_id: u64,
+    address: &str,
+    timeout: Duration,
+) -> Result<CommittedGroupConfiguration, String> {
+    if leader_id == 0 || timeout.is_zero() {
+        return Err("configuration observation requires a non-zero leader and timeout".to_owned());
+    }
+    let network = GrpcRaftNetwork::new(group, leader_id, address);
+    let mut client = network.client().map_err(|error| error.to_string())?;
+    let mut request = tonic::Request::new(RejoinBarrierRequestV1 {
+        raft_group_id: group.0,
+        protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
+        include_configuration: true,
+        target_node_id: leader_id,
+        ..Default::default()
+    });
+    request.set_timeout(timeout);
+    let response = client
+        .rejoin_barrier(request)
+        .await
+        .map_err(|error| format!("confirm data configuration: {error}"))?
+        .into_inner();
+    let vote: UrsulaVote = decode_wire(&response.vote, "configuration barrier vote")
+        .map_err(|error| error.to_string())?;
+    let observation: CommittedGroupConfiguration =
+        decode_wire(&response.configuration, "configuration barrier certificate")
+            .map_err(|error| error.to_string())?;
+    observation.validate()?;
+    if !vote.is_committed()
+        || *vote.leader_id().node_id() != leader_id
+        || observation.raft_group_id != group
+        || observation.leader_id != leader_id
+        || observation.leader_term != vote.leader_id().term()
+        || observation.applied_log_id.index < response.index
+    {
+        return Err("inconsistent data configuration certificate".to_owned());
+    }
+    Ok(observation)
 }
 
 /// Collect real quorum evidence for every declared bootstrap group under one
