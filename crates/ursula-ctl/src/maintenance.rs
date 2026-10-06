@@ -610,6 +610,8 @@ pub async fn prepare_amnesiac_restart(
 /// a blocking learner and promoted only after it has caught up. The operation
 /// is idempotent across a mixture of full-voter, detached, and learner states,
 /// so a later rollout Job can resume a partially completed 256-group repair.
+/// If the leader's concurrent heal driver completes that repair first, accept
+/// its converged membership only after observing target catch-up and readiness.
 pub async fn repair_restarted_voter(
     nodes: &[NodeInfo],
     target: &NodeInfo,
@@ -914,6 +916,31 @@ where
                         }
                         return Ok(());
                     }
+                    if let Some(ready) =
+                        observed_full_repair(&snapshot, nodes, target_node_id, group_id)
+                    {
+                        if ready {
+                            tracing::info!(
+                                leader_node_id = leader.id,
+                                raft_group_id = group_id,
+                                operation = operation_name,
+                                "leader heal driver completed voter repair before the requested intermediate state was observed"
+                            );
+                            return Ok(());
+                        }
+                        // The complete voter set has already converged and the
+                        // target covers the observed committed prefix. Give its
+                        // fresh recovery proof time to finish; detaching again
+                        // would race the leader's heal driver indefinitely.
+                        last_error = anyhow!(
+                            "full membership and catch-up observed; waiting for participation readiness"
+                        );
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        tokio::time::sleep(options.poll_interval).await;
+                        continue;
+                    }
                     leader
                 }
                 Err(error) => {
@@ -978,6 +1005,40 @@ where
         "{operation_name} did not converge for group {group_id} within {:?}",
         options.operation_reconcile_timeout
     ))
+}
+
+/// A complete, caught-up repair observed on every configured node. `None`
+/// means a membership rebuild may still be necessary; `Some(false)` means
+/// only the participation gate remains pending. Full membership alone never
+/// certifies recovery of a memory-WAL target.
+fn observed_full_repair(
+    snapshot: &ClusterSnapshot,
+    nodes: &[NodeInfo],
+    target_node_id: u64,
+    group_id: u64,
+) -> Option<bool> {
+    let expected = nodes.iter().map(|node| node.id).collect::<BTreeSet<_>>();
+    let groups = nodes
+        .iter()
+        .map(|node| snapshot.node(node.id)?.group(group_id))
+        .collect::<Option<Vec<_>>>()?;
+    if groups.iter().any(|group| {
+        group.voter_ids.iter().copied().collect::<BTreeSet<_>>() != expected
+            || !group.learner_ids.is_empty()
+    }) {
+        return None;
+    }
+    let committed = groups
+        .iter()
+        .filter_map(|group| group.committed_index)
+        .max()?;
+    let target = groups
+        .iter()
+        .find(|group| group.node_id == target_node_id)?;
+    if target.last_applied_index? < committed {
+        return None;
+    }
+    Some(groups.iter().all(|group| group.participation_ready()))
 }
 
 async fn wait_repair_learners_caught_up(
@@ -2065,6 +2126,7 @@ mod tests {
         transient_dual_leader_reports: AtomicUsize,
         survivor_fenced: AtomicBool,
         recovery_gate_ready: AtomicBool,
+        heal_after_operation: AtomicUsize,
         drained_nodes: Mutex<Vec<u64>>,
         undrained_nodes: Mutex<Vec<u64>>,
         quiesced_nodes: Mutex<Vec<u64>>,
@@ -2158,7 +2220,15 @@ mod tests {
                     "committed_index": 100,
                     "last_applied_index": applied,
                     "voter_ids": voters,
-                    "learner_ids": learners
+                    "learner_ids": learners,
+                    "maintenance": {
+                        "running": true,
+                        "recovery_ready": state.cluster.recovery_gate_ready.load(Ordering::SeqCst),
+                        "accepting_transfers": true,
+                        "membership_joint": false,
+                        "membership_log_index": 0,
+                        "stopped_for_operator": false
+                    }
                 }]
             }));
         }
@@ -2324,6 +2394,11 @@ mod tests {
             .cluster
             .membership_phase
             .store(phase, Ordering::SeqCst);
+        if voters == "1,2" && state.cluster.heal_after_operation.load(Ordering::SeqCst) == 1 {
+            // The old leader completes detach/attach/promote before the CLI
+            // next samples metrics. The intermediate postcondition is gone.
+            state.cluster.membership_phase.store(3, Ordering::SeqCst);
+        }
         state
             .cluster
             .operations
@@ -2350,6 +2425,9 @@ mod tests {
             return StatusCode::BAD_REQUEST;
         }
         state.cluster.membership_phase.store(2, Ordering::SeqCst);
+        if state.cluster.heal_after_operation.load(Ordering::SeqCst) == 2 {
+            state.cluster.membership_phase.store(3, Ordering::SeqCst);
+        }
         state
             .cluster
             .operations
@@ -2370,6 +2448,7 @@ mod tests {
             transient_dual_leader_reports: AtomicUsize::new(0),
             survivor_fenced: AtomicBool::new(false),
             recovery_gate_ready: AtomicBool::new(true),
+            heal_after_operation: AtomicUsize::new(0),
             drained_nodes: Mutex::new(Vec::new()),
             undrained_nodes: Mutex::new(Vec::new()),
             quiesced_nodes: Mutex::new(Vec::new()),
@@ -2465,6 +2544,104 @@ mod tests {
             "learner:1:3",
             "membership:1:1,2,3"
         ]);
+    }
+
+    #[tokio::test]
+    async fn membership_repair_accepts_concurrent_heal_after_detach_or_attach() {
+        for heal_after in [1, 2] {
+            let (nodes, cluster) = mock_cluster(LeaderScenario::RepairableTarget).await;
+            cluster
+                .heal_after_operation
+                .store(heal_after, Ordering::SeqCst);
+            repair_restarted_voter(
+                &nodes,
+                &nodes[2],
+                &MetricsClient::new(Duration::from_secs(1)).unwrap(),
+                &DrainOptions {
+                    drain_timeout: Duration::from_secs(1),
+                    poll_interval: Duration::from_millis(1),
+                    ..DrainOptions::default()
+                },
+                &MembershipRepairOptions {
+                    operation_reconcile_timeout: Duration::from_secs(1),
+                    poll_interval: Duration::from_millis(1),
+                    ..MembershipRepairOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            let operations = cluster.operations.lock().unwrap();
+            let membership = operations
+                .iter()
+                .filter(|op| op.starts_with("membership:"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                membership,
+                vec![&"membership:1:1,2".to_owned()],
+                "must not undo a completed heal"
+            );
+            let learners = operations
+                .iter()
+                .filter(|op| op.starts_with("learner:"))
+                .count();
+            assert_eq!(learners, usize::from(heal_after == 2));
+        }
+    }
+
+    #[tokio::test]
+    async fn full_membership_with_closed_recovery_gate_waits_without_detaching_again() {
+        let (nodes, cluster) = mock_cluster(LeaderScenario::RepairableTarget).await;
+        cluster.membership_phase.store(3, Ordering::SeqCst);
+        cluster.recovery_gate_ready.store(false, Ordering::SeqCst);
+        let survivors = BTreeSet::from([1, 2]);
+        let error = reconcile_group_operation(
+            &nodes,
+            3,
+            &MetricsClient::new(Duration::from_secs(1)).unwrap(),
+            7,
+            &MembershipRepairOptions {
+                operation_reconcile_timeout: Duration::from_millis(20),
+                poll_interval: Duration::from_millis(1),
+                ..MembershipRepairOptions::default()
+            },
+            "detach restarted voter",
+            |group| group.voter_ids == vec![1, 2],
+            GroupOperation::ChangeMembership(&survivors),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("waiting for participation readiness"));
+        assert!(cluster.operations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_membership_without_target_catchup_is_not_a_completed_heal() {
+        let (nodes, cluster) = mock_cluster(LeaderScenario::RepairableTarget).await;
+        cluster.membership_phase.store(3, Ordering::SeqCst);
+        let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
+        let mut snapshot = client.fetch_cluster(&nodes).await.unwrap();
+        assert_eq!(observed_full_repair(&snapshot, &nodes, 3, 7), Some(true));
+        // The two 0.6.2 survivors do not emit the additive maintenance report;
+        // the upgraded target's actual gate must still be checked.
+        snapshot.per_node[0].groups[0].maintenance = None;
+        snapshot.per_node[1].groups[0].maintenance = None;
+        assert_eq!(observed_full_repair(&snapshot, &nodes, 3, 7), Some(true));
+        snapshot.per_node[2].groups[0]
+            .maintenance
+            .as_mut()
+            .unwrap()
+            .recovery_ready = false;
+        assert_eq!(observed_full_repair(&snapshot, &nodes, 3, 7), Some(false));
+        snapshot.per_node[2].groups[0]
+            .maintenance
+            .as_mut()
+            .unwrap()
+            .recovery_ready = true;
+        snapshot.per_node[2].groups[0].last_applied_index = Some(99);
+        assert_eq!(observed_full_repair(&snapshot, &nodes, 3, 7), None);
+        snapshot.per_node[2].groups[0].last_applied_index = Some(100);
+        snapshot.per_node[1].groups[0].voter_ids = vec![1, 2];
+        assert_eq!(observed_full_repair(&snapshot, &nodes, 3, 7), None);
     }
 
     #[tokio::test]

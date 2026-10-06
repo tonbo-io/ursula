@@ -46,6 +46,7 @@ rand = { workspace = true, features = ["std", "std_rng", "thread_rng"] }
 sim-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
+axum = { workspace = true }
 blake3 = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
 raft-log = "0.4.5"

@@ -110,10 +110,13 @@ use crate::registry::LeadershipShedState;
 use crate::registry::RaftGroupHandleRegistry;
 
 const APPEND_STREAM_BACKLOG_FULL: &str = "raft append stream backlog full";
+pub(crate) const REJOIN_BARRIER_CAPABILITY: &str = "ursula-rejoin-barrier";
 
 pub(crate) type RaftClient = raft_internal_proto::raft_internal_client::RaftInternalClient<Channel>;
 
-/// Fresh recovery evidence. Prefer the explicit barrier RPC. For a 0.6.2
+/// Fresh recovery evidence. Negotiate the explicit barrier RPC through the
+/// existing Vote response before calling it: an unknown RPC on a 0.6.2
+/// HTTP/gRPC mux falls through to the HTTP append route. For a 0.6.2
 /// leader during rolling upgrade, a linearizable HEAD of an impossible HTTP
 /// name confirms leadership before validating the name. A subsequent low-term
 /// vote probe supplies a conservative catch-up bound (the leader's last log,
@@ -131,23 +134,50 @@ pub(crate) async fn probe_rejoin_vote_barrier(
 ) -> Result<(UrsulaVote, u64), String> {
     let mut network = GrpcRaftNetwork::new(placement.raft_group_id, leader_id, address);
     let mut client = network.client().map_err(|err| err.to_string())?;
-    let mut barrier_request = tonic::Request::new(raft_internal_proto::RejoinBarrierRequestV1 {
-        raft_group_id: placement.raft_group_id.0,
-        protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
-    });
-    barrier_request.set_timeout(timeout);
-    match client.rejoin_barrier(barrier_request).await {
-        Ok(response) => {
-            let response = response.into_inner();
-            let vote: UrsulaVote = decode_wire(&response.vote, "rejoin barrier vote")
-                .map_err(|err| err.to_string())?;
-            if !vote.is_committed() || *vote.leader_id().node_id() != leader_id {
-                return Err("recovery peer does not report itself as committed leader".to_owned());
+    let envelope = network.vote_envelope(crate::rejoin::bootstrap_probe_vote(node_id));
+    GRPC_VOTE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    GRPC_VOTE_REQUEST_BYTES.fetch_add(envelope.encoded_len() as u64, Ordering::Relaxed);
+    let mut capability_request = tonic::Request::new(envelope);
+    capability_request.set_timeout(timeout);
+    let capability_response = client
+        .vote(capability_request)
+        .await
+        .map_err(|err| format!("recovery capability probe: {err}"))?;
+    let explicit_barrier = capability_response
+        .metadata()
+        .get(REJOIN_BARRIER_CAPABILITY)
+        .is_some_and(|value| value == "1");
+    let ack = capability_response.into_inner();
+    GRPC_VOTE_RESPONSE_BYTES.fetch_add(ack.encoded_len() as u64, Ordering::Relaxed);
+    let response: UrsulaVoteResponse =
+        decode_wire(&ack.payload, "rejoin capability vote").map_err(|err| err.to_string())?;
+    if !response.vote.is_committed() || *response.vote.leader_id().node_id() != leader_id {
+        return Err("recovery peer does not report itself as committed leader".to_owned());
+    }
+    // Capability metadata is only a routing hint, never fresh quorum or
+    // catch-up evidence. Do not cache it across peer replacements.
+    if explicit_barrier {
+        let mut barrier_request =
+            tonic::Request::new(raft_internal_proto::RejoinBarrierRequestV1 {
+                raft_group_id: placement.raft_group_id.0,
+                protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+            });
+        barrier_request.set_timeout(timeout);
+        match client.rejoin_barrier(barrier_request).await {
+            Ok(response) => {
+                let response = response.into_inner();
+                let vote: UrsulaVote = decode_wire(&response.vote, "rejoin barrier vote")
+                    .map_err(|err| err.to_string())?;
+                if !vote.is_committed() || *vote.leader_id().node_id() != leader_id {
+                    return Err(
+                        "recovery peer does not report itself as committed leader".to_owned()
+                    );
+                }
+                return Ok((vote, response.index));
             }
-            return Ok((vote, response.index));
+            Err(status) if status.code() == tonic::Code::Unimplemented => {}
+            Err(status) => return Err(format!("recovery barrier: {status}")),
         }
-        Err(status) if status.code() == tonic::Code::Unimplemented => {}
-        Err(status) => return Err(format!("recovery barrier: {status}")),
     }
     let mut request = tonic::Request::new(raft_internal_proto::GroupReadRequestV1 {
         raft_group_id: placement.raft_group_id.0,
@@ -736,9 +766,14 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .vote(raft_group_id, request)
             .await
             .map_err(|err| tonic::Status::internal(err.to_string()))?;
-        Ok(tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
+        let mut response = tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
             payload: encode_wire(&response),
-        }))
+        });
+        response.metadata_mut().insert(
+            REJOIN_BARRIER_CAPABILITY,
+            tonic::metadata::MetadataValue::from_static("1"),
+        );
+        Ok(response)
     }
 
     async fn full_snapshot(

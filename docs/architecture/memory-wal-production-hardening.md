@@ -255,6 +255,53 @@ regressions check the tunnel/peer separation for every supported replica count.
 These changes require new CI, immutable candidate publication and another EKS
 upgrade run before merge or deployment.
 
+At `9918c391a2a3c5aa61fedda74c28ad71a4f28888`, all scheduled remote checks,
+including both 128-owner WAL soaks, passed (the opt-in nightly check was skipped).
+Candidate publication [run 37406301991](https://github.com/tonbo-io/ursula/actions/runs/37406301991)
+recorded image `sha256:93af1063d0aee1d0bbd5def06d83dead489c4a6579c77e8391a850dcea12148b`
+and chart `sha256:9c5d0c71b11749982cb1e777bb21c8cff129cb346061740c507ceffcd1659e7c`.
+The same-epoch EKS upgrade [run 37406598319](https://github.com/tonbo-io/cloud/actions/runs/37406598319)
+passed the former metrics/DNS failure point but failed during the first voter's
+repair. The independent journal again recorded 1,024 ACKed streams, but no
+post-upgrade verification ran; cleanup read back the namespace absent.
+
+Two mixed-version defects were identified. First, the old HTTP/gRPC mux routes
+an unknown `RejoinBarrier` POST to the HTTP append handler and returns HTTP 400
+`InvalidBucketId`, which tonic maps to `Internal`, not `Unimplemented`. The
+new voter's fresh recovery gate therefore remained closed. Second, the old
+leader's automatic detach/attach/promote repair can complete between CLI polls,
+so the CLI repeatedly undid that repair while waiting to observe the detached
+intermediate membership. Live group 15 metrics showed all three voters at the
+same committed/applied index with the new target's recovery gate still closed;
+the hook repeatedly issued successful detach operations until its deadline.
+Evidence is retained under `/private/tmp/ursula-hardening-eks-37406598319-evidence`
+and the corresponding `node-*-metrics.json` and legacy RPC response captures.
+
+The follow-up negotiates barrier support through additive metadata on the
+existing low-term Vote RPC, before sending any new method. Missing metadata
+selects the legacy linearizable HEAD plus subsequent Vote proof; capability
+metadata alone cannot open the gate and is not cached across replacements.
+The real TCP regression models the legacy mux's HTTP 400 response and checks
+that recovery never sends the unknown method, rejects missing fresh quorum
+proof and still requires applying the proven prefix. CLI reconciliation accepts
+a concurrent completed heal only after every configured node reports the full
+uniform voter set, no learners, target apply through the observed committed
+prefix, and participation readiness. A caught-up full set with a closed gate
+waits without repeatedly detaching. New regressions cover automatic promotion
+after both detach and attach, an unopened gate, and full membership without
+target catch-up. This follow-up needs its own CI and immutable EKS candidate;
+neither failed upgrade establishes an RPO pass or a recovery-time baseline.
+
+The mux/concurrent-heal follow-up passed 839 workspace library/binary tests
+with one pre-existing ignored stress test, workspace documentation tests,
+all-targets Clippy, formatting, all seven DST audits and the madsim smoke
+corpus. All eight real-process cluster entries passed (the real-S3 opt-in entry
+skipped locally). The unchanged stronger rollout/Helm regressions passed on
+the previous head. The new CLI regression also checks the supported 0.6.2
+survivors' absent maintenance fields while retaining the upgraded target's
+actual recovery-gate check. Remote and EKS validation of this follow-up remain
+pending until its exact source and artifacts are recorded.
+
 The transport follow-up passed 836 workspace library/binary tests with one
 pre-existing ignored stress test, workspace doc tests, all-targets Clippy,
 formatting and all seven DST audits. All eight static-cluster entries passed

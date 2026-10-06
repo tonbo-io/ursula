@@ -1,10 +1,10 @@
 //! Recovery fault schedules over real TCP/gRPC, retaining the actual Raft handlers.
 
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use openraft::rt::WatchReceiver;
-use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -22,6 +22,7 @@ struct RecoveryTestService {
     inner: RaftGrpcService,
     pause_replication: Arc<AtomicBool>,
     legacy: Arc<AtomicBool>,
+    unknown_rpc_requests: Arc<AtomicUsize>,
 }
 
 #[tonic::async_trait]
@@ -84,7 +85,13 @@ impl RaftInternal for RecoveryTestService {
         &self,
         request: Request<pb::RaftRpcEnvelopeV1>,
     ) -> Result<Response<pb::RaftRpcAckV1>, Status> {
-        self.inner.vote(request).await
+        let mut response = self.inner.vote(request).await?;
+        if self.legacy.load(Ordering::SeqCst) {
+            response
+                .metadata_mut()
+                .remove(crate::grpc::REJOIN_BARRIER_CAPABILITY);
+        }
+        Ok(response)
     }
 
     async fn full_snapshot(
@@ -181,15 +188,37 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             inner: RaftGrpcService::new(registry.clone()),
             pause_replication: Arc::new(AtomicBool::new(false)),
             legacy: Arc::new(AtomicBool::new(false)),
+            unknown_rpc_requests: Arc::new(AtomicUsize::new(0)),
         };
         let wire_service = pb::raft_internal_server::RaftInternalServer::new(service.clone())
             .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
+        let mux_state = service.clone();
+        let app =
+            axum::Router::new()
+                .fallback_service(wire_service)
+                .layer(axum::middleware::from_fn(
+                    move |request: axum::extract::Request, next: axum::middleware::Next| {
+                        let state = mux_state.clone();
+                        async move {
+                            use axum::response::IntoResponse;
+                            // Model the 0.6.2 production mux: an unknown method reaches
+                            // the /{bucket}/{stream} HTTP append handler, not tonic's
+                            // Unimplemented handler. A successful recovery must never
+                            // send this potentially mutating request to that version.
+                            if state.legacy.load(Ordering::SeqCst)
+                                && request.uri().path()
+                                    == "/ursula.raft.v1.RaftInternal/RejoinBarrier"
+                            {
+                                state.unknown_rpc_requests.fetch_add(1, Ordering::SeqCst);
+                                return (axum::http::StatusCode::BAD_REQUEST, "InvalidBucketId")
+                                    .into_response();
+                            }
+                            next.run(request).await
+                        }
+                    },
+                ));
         servers.push(tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(wire_service)
-                .serve_with_incoming(TcpListenerStream::new(listener))
-                .await
-                .unwrap();
+            axum::serve(listener, app).await.unwrap();
         }));
         let (engine, store, gate) = new_recovery_engine(id, config.clone(), &registry).await;
         registries.push(registry);
@@ -326,12 +355,16 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         Some(3),
         "lagging C cannot win using restarted A"
     );
-    assert!(
-        probe_rejoin_vote_barrier(placement(), 1, 2, &endpoints[1], Duration::from_millis(150))
-            .await
-            .is_err(),
-        "no fresh quorum proof while both replication paths are held"
-    );
+    for legacy in [false, true] {
+        services[1].legacy.store(legacy, Ordering::SeqCst);
+        assert!(
+            probe_rejoin_vote_barrier(placement(), 1, 2, &endpoints[1], Duration::from_millis(150))
+                .await
+                .is_err(),
+            "capability and low-term Vote cannot replace a fresh quorum proof"
+        );
+        assert_eq!(services[1].unknown_rpc_requests.load(Ordering::SeqCst), 0);
+    }
     // Reconnect healthy C first. B still owns the ACKed suffix; A still only
     // has the old prefix, so a successful fresh proof alone cannot open A.
     services[2].pause_replication.store(false, Ordering::SeqCst);
@@ -343,8 +376,30 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         .applied_index_at_least(Some(acked.log_id.index()), "C repaired suffix")
         .await
         .unwrap();
-    for legacy in [false, true] {
+    for legacy in [false, true, false] {
         services[1].legacy.store(legacy, Ordering::SeqCst);
+        if legacy {
+            let mut raw =
+                pb::raft_internal_client::RaftInternalClient::connect(endpoints[1].clone())
+                    .await
+                    .unwrap();
+            let error = raw
+                .rejoin_barrier(pb::RejoinBarrierRequestV1 {
+                    raft_group_id: placement().raft_group_id.0,
+                    protocol_version: ursula_stream::FORMAT_EPOCH,
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.code(),
+                tonic::Code::Internal,
+                "legacy mux HTTP 400 is not gRPC Unimplemented"
+            );
+            assert_eq!(
+                services[1].unknown_rpc_requests.swap(0, Ordering::SeqCst),
+                1
+            );
+        }
         let proof =
             probe_rejoin_vote_barrier(placement(), 1, 2, &endpoints[1], Duration::from_secs(1))
                 .await
@@ -352,6 +407,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         assert!(proof.1 >= acked.log_id.index());
         gates[0].confirm_barrier(proof.0, proof.1);
         assert!(!gates[0].vote_gate_open(), "proof must also be applied");
+        assert_eq!(services[1].unknown_rpc_requests.load(Ordering::SeqCst), 0);
     }
     services[0].pause_replication.store(false, Ordering::SeqCst);
     engines[1].raft.trigger().heartbeat().await.unwrap();

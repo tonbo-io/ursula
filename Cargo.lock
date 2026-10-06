@@ -4517,6 +4517,7 @@ dependencies = [
 name = "ursula-raft"
 version = "0.6.2"
 dependencies = [
+ "axum 0.8.9",
  "bitflags",
  "blake3",
  "bytes",
