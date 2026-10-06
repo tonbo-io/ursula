@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::atomic::AtomicU16;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -55,11 +57,22 @@ struct Cluster {
 }
 
 fn port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    static NEXT: AtomicU16 = AtomicU16::new(20000);
+    loop {
+        // Unique across concurrent fixtures and below the native runners'
+        // default ephemeral range. An outbound probe from an early process
+        // cannot claim another process's not-yet-bound listener port.
+        let candidate = NEXT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |port| {
+                port.checked_add(1).filter(|next| *next <= 30000)
+            })
+            .expect("fixture listener port range exhausted");
+        match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, candidate)) {
+            Ok(_) => return candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(error) => panic!("reserve migration fixture port: {error}"),
+        }
+    }
 }
 
 impl Cluster {
