@@ -7,10 +7,6 @@
 //! How a record turns into a payload is entirely the [`FrameCodec`]'s business, so
 //! the Raft log store can frame protobuf while the WAL engine frames JSON over the
 //! exact same code.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::fs;
 use std::fs::File;
@@ -215,6 +211,7 @@ pub fn replay_each<C: FrameCodec>(
         if remaining < FRAME_HEADER_LEN_U64 {
             break;
         }
+        let frame_number = frame_index.saturating_add(1);
 
         let mut len_bytes = [0_u8; 4];
         file.read_exact(&mut len_bytes)?;
@@ -228,7 +225,7 @@ pub fn replay_each<C: FrameCodec>(
                 format!(
                     "journal '{}' frame {} declares {} bytes, exceeding the {} byte limit",
                     path.display(),
-                    frame_index + 1,
+                    frame_number,
                     payload_len,
                     MAX_FRAME_PAYLOAD_BYTES
                 ),
@@ -252,7 +249,7 @@ pub fn replay_each<C: FrameCodec>(
                 format!(
                     "journal '{}' frame {} checksum mismatch: expected {expected_checksum:#010x}, got {actual_checksum:#010x}",
                     path.display(),
-                    frame_index + 1
+                    frame_number
                 ),
             ));
         }
@@ -262,7 +259,7 @@ pub fn replay_each<C: FrameCodec>(
                 format!(
                     "journal '{}' frame {} decode failed: {err}",
                     path.display(),
-                    frame_index + 1
+                    frame_number
                 ),
             )
         })?;
@@ -315,7 +312,7 @@ pub fn decode_frames<C: FrameCodec>(bytes: &[u8]) -> io::Result<(Vec<C::Record>,
                 io::ErrorKind::InvalidData,
                 format!(
                     "in-memory journal frame {} declares {len} bytes, exceeding the {MAX_FRAME_PAYLOAD_BYTES} byte limit",
-                    frame_index + 1
+                    frame_index.saturating_add(1)
                 ),
             ));
         }
@@ -333,7 +330,7 @@ pub fn decode_frames<C: FrameCodec>(bytes: &[u8]) -> io::Result<(Vec<C::Record>,
                 io::ErrorKind::InvalidData,
                 format!(
                     "in-memory journal frame {} checksum mismatch: expected {expected_checksum:#010x}, got {actual_checksum:#010x}",
-                    frame_index + 1
+                    frame_index.saturating_add(1)
                 ),
             ));
         }

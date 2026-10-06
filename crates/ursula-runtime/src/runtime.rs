@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::io;
@@ -1007,7 +1003,7 @@ impl ShardRuntime {
         }
         #[cfg(not(madsim))]
         {
-            let mut flushed = 0;
+            let mut flushed = 0_usize;
             let mut next_group_id = 0;
             let group_count = self.shard_map.raft_group_count();
             let mut tasks = JoinSet::new();
@@ -1017,7 +1013,7 @@ impl ShardRuntime {
                     let runtime = self.clone();
                     let request = request.clone();
                     let group_id = RaftGroupId(next_group_id);
-                    next_group_id += 1;
+                    next_group_id = next_group_id.saturating_add(1);
                     tasks.spawn(async move {
                         runtime
                             .flush_cold_group_batch_once(
@@ -1031,7 +1027,7 @@ impl ShardRuntime {
                 }
                 if let Some(result) = tasks.join_next().await {
                     match result {
-                        Ok(Ok(count)) => flushed += count,
+                        Ok(Ok(count)) => flushed = flushed.saturating_add(count),
                         Ok(Err(err)) => return Err(err),
                         Err(err) => {
                             return Err(RuntimeError::ColdStoreIo {
@@ -1049,9 +1045,9 @@ impl ShardRuntime {
         &self,
         request: PlanGroupColdFlushRequest,
     ) -> Result<usize, RuntimeError> {
-        let mut flushed = 0;
+        let mut flushed = 0_usize;
         for group_id in 0..self.shard_map.raft_group_count() {
-            flushed += self
+            let group_flushed = self
                 .flush_cold_group_batch_once(
                     RaftGroupId(group_id),
                     request.clone(),
@@ -1059,6 +1055,7 @@ impl ShardRuntime {
                 )
                 .await?
                 .len();
+            flushed = flushed.saturating_add(group_flushed);
         }
         Ok(flushed)
     }
@@ -1120,7 +1117,7 @@ impl ShardRuntime {
         gc_grace_ms: u64,
     ) -> Result<usize, RuntimeError> {
         let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-        let mut compacted = 0;
+        let mut compacted = 0_usize;
         while compacted < max_streams {
             let Some(((stream_id, generation), stream_pages)) = pages_by_stream.next() else {
                 break;
@@ -1237,7 +1234,7 @@ impl ShardRuntime {
                 replacement_range.1,
                 replacement_range.2,
             );
-            compacted += 1;
+            compacted = compacted.saturating_add(1);
         }
         Ok(compacted)
     }
@@ -1299,7 +1296,7 @@ impl ShardRuntime {
             match result {
                 Ok(()) => {
                     acked_seq = Some(entry.seq);
-                    reclaimed += 1;
+                    reclaimed = reclaimed.saturating_add(1);
                 }
                 Err(err) => {
                     self.metrics.record_cold_gc_error();
@@ -1319,7 +1316,7 @@ impl ShardRuntime {
                                 error = %err,
                                 "cold GC entry failed; deferred to the tail of the queue"
                             );
-                            deferred += 1;
+                            deferred = deferred.saturating_add(1);
                             first_error.get_or_insert(error);
                             continue;
                         }
@@ -1539,14 +1536,16 @@ impl ShardRuntime {
         // F14b: one group's failure must not stall reclamation in the groups
         // after it. Every group runs; the first error is reported once all
         // have had their pass.
-        let mut reclaimed = 0;
+        let mut reclaimed = 0_usize;
         let mut first_error = None;
         for group_id in 0..self.shard_map.raft_group_count() {
             match self
                 .run_cold_gc_group_once(RaftGroupId(group_id), max_entries_per_group)
                 .await
             {
-                Ok(group_reclaimed) => reclaimed += group_reclaimed,
+                Ok(group_reclaimed) => {
+                    reclaimed = reclaimed.saturating_add(group_reclaimed);
+                }
                 Err(err) => {
                     tracing::warn!(
                         raft_group_id = group_id,

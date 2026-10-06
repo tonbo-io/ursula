@@ -275,10 +275,6 @@ async fn collect_stream(
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 mod tests {
     use std::sync::Arc;
 
@@ -302,7 +298,7 @@ mod tests {
             start_offset,
             end_offset,
             s3_path: s3_path.to_owned(),
-            object_size: end_offset - start_offset,
+            object_size: end_offset.checked_sub(start_offset).unwrap(),
             ..Default::default()
         }
     }

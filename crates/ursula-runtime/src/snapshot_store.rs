@@ -1158,10 +1158,6 @@ fn snapshot_namespace(cfg: &ursula_config::RaftSnapshotConfig) -> String {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 mod tests {
     use super::*;
 
@@ -1344,8 +1340,16 @@ mod tests {
         };
         let binary = inline.encode_binary().unwrap().len();
         assert!(binary < 4096 + 64, "binary inline bytes are not amplified");
-        assert!(SnapshotPointer::decode(b"\x00garbage").is_err());
-        assert!(SnapshotPointer::decode(b" \n{\"snapshot_id\":1}").is_err());
+        let garbage = SnapshotPointer::decode(b"\x00garbage");
+        assert!(
+            matches!(garbage, Err(SnapshotStoreError::Deserialize(_))),
+            "{garbage:?}"
+        );
+        let json_like = SnapshotPointer::decode(b" \n{\"snapshot_id\":1}");
+        assert!(
+            matches!(json_like, Err(SnapshotStoreError::Deserialize(_))),
+            "{json_like:?}"
+        );
     }
 
     #[test]

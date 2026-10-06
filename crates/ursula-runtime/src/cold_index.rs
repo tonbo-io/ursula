@@ -1,12 +1,9 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
+use std::ops::RangeInclusive;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -104,6 +101,20 @@ fn ranges_overlap(start: u64, end: u64, other_start: u64, other_end: u64) -> boo
     start < other_end && other_start < end
 }
 
+/// Inclusive page ids touched by the half-open offset range
+/// `[start_offset, end_offset)`, or `None` when the range is empty.
+pub(crate) fn page_ids_for_range(
+    start_offset: u64,
+    end_offset: u64,
+) -> Option<RangeInclusive<u64>> {
+    let last_offset = end_offset.checked_sub(1)?;
+    if last_offset < start_offset {
+        return None;
+    }
+    let span = ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
+    Some(start_offset / span..=last_offset / span)
+}
+
 /// F19 step 1, the clip rule: removes every entry other than `chunk` that
 /// overlaps `chunk`'s range. Only call it for a range whose bytes state
 /// proves: a flush of hot bytes, or a replacement of state-held refs. Such a
@@ -175,7 +186,12 @@ fn encode_page(key: &ColdIndexPageKey, page: &ColdIndexPage) -> Vec<u8> {
         put_string(&mut body, &object.s3_path);
     }
 
-    let mut bytes = Vec::with_capacity(COLD_INDEX_PAGE_MAGIC.len() + 2 + 4 + body.len() + 8);
+    let mut bytes = Vec::with_capacity(
+        COLD_INDEX_PAGE_MAGIC
+            .len()
+            .saturating_add(2 + 4 + 8)
+            .saturating_add(body.len()),
+    );
     bytes.extend_from_slice(COLD_INDEX_PAGE_MAGIC);
     put_u16(&mut bytes, COLD_INDEX_PAGE_VERSION);
     put_u32(
@@ -443,13 +459,11 @@ pub async fn write_cold_chunk_index_pages_with_rollback_in_generation<
     generation: u64,
     chunk: &ColdChunkRef,
 ) -> io::Result<Vec<ColdIndexPageRollback>> {
-    if chunk.end_offset <= chunk.start_offset {
+    let Some(page_ids) = page_ids_for_range(chunk.start_offset, chunk.end_offset) else {
         return Ok(Vec::new());
-    }
-    let first_page_id = chunk.start_offset / ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
-    let last_page_id = (chunk.end_offset - 1) / ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
+    };
     let mut rollback = Vec::new();
-    for page_id in first_page_id..=last_page_id {
+    for page_id in page_ids {
         let key = ColdIndexPageKey {
             stream_id: stream_id.clone(),
             generation,
@@ -526,13 +540,11 @@ pub async fn write_proven_external_index_pages<S: ColdIndexPageStore + ?Sized>(
     generation: u64,
     object: &ObjectPayloadRef,
 ) -> io::Result<u64> {
-    if object.end_offset <= object.start_offset {
+    let Some(page_ids) = page_ids_for_range(object.start_offset, object.end_offset) else {
         return Ok(0);
-    }
-    let first_page_id = object.start_offset / ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
-    let last_page_id = (object.end_offset - 1) / ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
+    };
     let mut clipped = 0_u64;
-    for page_id in first_page_id..=last_page_id {
+    for page_id in page_ids {
         let key = ColdIndexPageKey {
             stream_id: stream_id.clone(),
             generation,
@@ -837,16 +849,13 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
         start_offset: u64,
         end_offset: u64,
     ) {
-        if end_offset <= start_offset {
+        let Some(page_ids) = page_ids_for_range(start_offset, end_offset) else {
             return;
-        }
-        let span = ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
-        let first_page = start_offset / span;
-        let last_page = (end_offset - 1) / span;
+        };
         let covered = |key: &ColdIndexPageKey| {
             &key.stream_id == stream_id
                 && key.generation == generation
-                && (first_page..=last_page).contains(&key.page_id)
+                && page_ids.contains(&key.page_id)
         };
         let mut inner = self.inner.lock().expect("cold index cache mutex poisoned");
         inner.bump_invalidation_epoch(stream_id);
@@ -1139,18 +1148,20 @@ pub async fn replace_cold_chunk_index_pages_with_rollback_in_generation<
     old_chunks: &[ColdChunkRef],
     replacement: &ColdChunkRef,
 ) -> io::Result<Option<Vec<ColdIndexPageRollback>>> {
-    if old_chunks.len() < 2 || replacement.end_offset <= replacement.start_offset {
+    if old_chunks.len() < 2 {
         return Ok(None);
     }
-    let first_page_id = replacement.start_offset / ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
-    let last_page_id = (replacement.end_offset - 1) / ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
+    let Some(page_ids) = page_ids_for_range(replacement.start_offset, replacement.end_offset)
+    else {
+        return Ok(None);
+    };
     let old_identities = old_chunks
         .iter()
         .map(|chunk| (chunk.start_offset, chunk.end_offset, chunk.s3_path.as_str()))
         .collect::<HashSet<_>>();
     let mut pages = Vec::new();
     let mut found = HashSet::new();
-    for page_id in first_page_id..=last_page_id {
+    for page_id in page_ids {
         let key = ColdIndexPageKey {
             stream_id: stream_id.clone(),
             generation,
@@ -1564,7 +1575,7 @@ mod tests {
                 start_offset,
                 end_offset,
                 s3_path: format!("benchcmp/cold-index/chunks/{start_offset:020}.bin"),
-                object_size: end_offset - start_offset,
+                object_size: end_offset.checked_sub(start_offset).unwrap(),
                 ..Default::default()
             }],
             external_segments: Vec::new(),
@@ -2093,7 +2104,7 @@ mod tests {
             start_offset,
             end_offset,
             s3_path: s3_path.to_owned(),
-            object_size: end_offset - start_offset,
+            object_size: end_offset.checked_sub(start_offset).unwrap(),
             object_offset: 0,
         }
     }

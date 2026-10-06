@@ -4,14 +4,6 @@
 //! committed refs, clipping whatever overlapped them (Invariant 11); state
 //! keeps at most T_ext staged refs per stream (W3); and the orphan sweep
 //! never deletes a staged object that state or pages reference.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
-#![expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -155,7 +147,7 @@ async fn assert_no_page_entry_overlaps_differing_bytes(
         let start = usize::try_from(entry.start_offset).expect("offset fits usize");
         let end = usize::try_from(entry.end_offset).expect("offset fits usize");
         let object = cold_store
-            .read_object_range(&entry, entry.start_offset, end - start)
+            .read_object_range(&entry, entry.start_offset, end.checked_sub(start).unwrap())
             .await
             .expect("page entry names a readable object");
         assert_eq!(
@@ -283,7 +275,10 @@ async fn orphan_sweep_keeps_state_and_page_referenced_staged_objects() {
         .await
         .expect("sweep");
     assert_eq!(swept.orphans_deleted, 1);
-    assert!(cold_store.object_size(&orphan).await.is_err());
+    cold_store
+        .object_size(&orphan)
+        .await
+        .expect_err("the sweep deletes the orphaned object");
     for kept in [&offloaded, &staged] {
         assert!(cold_store.object_size(kept).await.is_ok(), "{kept} is kept");
     }

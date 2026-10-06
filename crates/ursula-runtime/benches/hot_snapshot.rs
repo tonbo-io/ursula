@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use criterion::BatchSize;
 use criterion::BenchmarkId;
 use criterion::Criterion;
@@ -90,7 +86,9 @@ impl SnapshotScenario {
     }
 
     fn hot_bytes(self) -> usize {
-        self.stream_count() * self.hot_chunks_per_stream() * CHUNK_BYTES
+        self.stream_count()
+            .saturating_mul(self.hot_chunks_per_stream())
+            .saturating_mul(CHUNK_BYTES)
     }
 }
 

@@ -1,10 +1,6 @@
 //! Cold-tier background workers.
 //!
 //! Started by the bootstrap layer after the runtime is constructed.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use ursula_stream::ColdFlushPressure;
 
@@ -22,7 +18,7 @@ fn pass_pressure(observed_hot_bytes: u64, pressure_hot_bytes: u64) -> Option<Col
     (pressure_hot_bytes > 0 && observed_hot_bytes >= pressure_hot_bytes).then(|| {
         ColdFlushPressure {
             node_hot_bytes: observed_hot_bytes,
-            node_target_bytes: pressure_hot_bytes / 4 * 3,
+            node_target_bytes: (pressure_hot_bytes / 4).saturating_mul(3),
         }
     })
 }

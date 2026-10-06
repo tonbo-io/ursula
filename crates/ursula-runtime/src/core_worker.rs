@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -89,7 +85,7 @@ pub(crate) struct CoreMailbox {
 
 impl CoreMailbox {
     pub(crate) fn depth(&self) -> usize {
-        self.tx.max_capacity() - self.tx.capacity()
+        self.tx.max_capacity().saturating_sub(self.tx.capacity())
     }
 
     pub(crate) fn capacity(&self) -> usize {
@@ -846,7 +842,7 @@ impl CoreWorker {
         };
         let before = watchers.len();
         watchers.retain(|watcher| watcher.waiter_id != waiter_id);
-        let removed = before - watchers.len();
+        let removed = before.saturating_sub(watchers.len());
         let is_empty = watchers.is_empty();
         if removed > 0 {
             metrics.record_read_watchers_removed(core_id, removed);

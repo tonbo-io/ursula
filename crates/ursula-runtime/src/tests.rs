@@ -1,11 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
-#![expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -1299,7 +1291,17 @@ async fn snapshot_group_routes_to_owner_core_and_captures_only_group_state() {
         .expect("read restored snapshot");
     assert_eq!(read.payload, b"first");
     assert_eq!(read.next_offset, 5);
-    assert!(restored.read(&second_stream, 0, 16).is_err());
+    let missing = restored.read(&second_stream, 0, 16);
+    assert!(
+        matches!(
+            missing,
+            Err(ursula_stream::StreamResponse::Error {
+                code: StreamErrorCode::StreamNotFound,
+                ..
+            })
+        ),
+        "{missing:?}"
+    );
 
     let metrics = runtime.metrics().snapshot();
     assert_eq!(metrics.routed_requests, 5);
@@ -1883,12 +1885,10 @@ async fn packed_cold_object_survives_until_last_stream_is_deleted() {
         .run_cold_gc_all_groups_once(256)
         .await
         .expect("gc final packed stream");
-    assert!(
-        cold_store
-            .read_chunk_range(&chunks[1], chunks[1].start_offset, 4)
-            .await
-            .is_err()
-    );
+    cold_store
+        .read_chunk_range(&chunks[1], chunks[1].start_offset, 4)
+        .await
+        .expect_err("the reclaimed cold chunk is no longer readable");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1968,12 +1968,10 @@ async fn cold_packs_are_bucket_scoped_erasure_domains_within_one_raft_group() {
         .await
         .expect("prove first bucket absence");
     assert_eq!(proof.pending_cold_gc_entries, 0);
-    assert!(
-        cold_store
-            .read_chunk_range(&a_chunks[0], a_chunks[0].start_offset, 4)
-            .await
-            .is_err()
-    );
+    cold_store
+        .read_chunk_range(&a_chunks[0], a_chunks[0].start_offset, 4)
+        .await
+        .expect_err("the reclaimed cold chunk is no longer readable");
     assert_eq!(
         cold_store
             .read_chunk_range(&b_chunks[0], b_chunks[0].start_offset, 4)
@@ -1990,12 +1988,14 @@ async fn node_hot_bytes(runtime: &ShardRuntime, group_count: u32) -> u64 {
             .snapshot_group(RaftGroupId(group_id))
             .await
             .expect("snapshot group");
-        total += snapshot
-            .stream_snapshot
-            .streams
-            .iter()
-            .map(|entry| u64::try_from(entry.payload.len()).expect("len fits u64"))
-            .sum::<u64>();
+        total = total.saturating_add(
+            snapshot
+                .stream_snapshot
+                .streams
+                .iter()
+                .map(|entry| u64::try_from(entry.payload.len()).expect("len fits u64"))
+                .sum::<u64>(),
+        );
     }
     total
 }
@@ -2257,12 +2257,10 @@ async fn purge_report_proves_cold_gc_queue_is_empty_only_after_reclamation() {
         .expect("prove purge");
     assert_eq!(proof.removed_streams, 0);
     assert_eq!(proof.pending_cold_gc_entries, 0);
-    assert!(
-        cold_store
-            .read_chunk_range(&chunk, chunk.start_offset, 4)
-            .await
-            .is_err()
-    );
+    cold_store
+        .read_chunk_range(&chunk, chunk.start_offset, 4)
+        .await
+        .expect_err("the reclaimed cold chunk is no longer readable");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2352,12 +2350,10 @@ async fn cold_compaction_preserves_reads_and_reclaims_inputs_after_grace() {
             object_size: 4,
             ..Default::default()
         };
-        assert!(
-            cold_store
-                .read_chunk_range(&old, old.start_offset, 4)
-                .await
-                .is_err()
-        );
+        cold_store
+            .read_chunk_range(&old, old.start_offset, 4)
+            .await
+            .expect_err("the compacted input chunk is reclaimed");
     }
 }
 
@@ -3743,8 +3739,9 @@ impl GroupEngine for BlockingReadEngine {
                 return Ok(GroupReadStreamParts {
                     placement,
                     offset: request.offset,
-                    next_offset: request.offset
-                        + u64::try_from(b"ready".len()).expect("payload len fits u64"),
+                    next_offset: request.offset.saturating_add(
+                        u64::try_from(b"ready".len()).expect("payload len fits u64"),
+                    ),
                     content_type: DEFAULT_CONTENT_TYPE.to_owned(),
                     up_to_date: true,
                     closed: false,
@@ -3852,7 +3849,7 @@ impl GroupEngine for RecordingEngine {
     ) -> GroupCreateStreamFuture<'a> {
         Box::pin(async move {
             assert_eq!(placement, self.placement);
-            self.commit_index += 1;
+            self.commit_index = self.commit_index.saturating_add(1);
             Ok(CreateStreamResponse {
                 placement,
                 next_offset: u64::try_from(request.initial_payload.len())
@@ -3934,7 +3931,7 @@ impl GroupEngine for RecordingEngine {
     ) -> GroupCloseStreamFuture<'a> {
         Box::pin(async move {
             assert_eq!(placement, self.placement);
-            self.commit_index += 1;
+            self.commit_index = self.commit_index.saturating_add(1);
             Ok(CloseStreamResponse {
                 placement,
                 next_offset: self.commit_index,
@@ -3952,7 +3949,7 @@ impl GroupEngine for RecordingEngine {
     ) -> GroupDeleteStreamFuture<'a> {
         Box::pin(async move {
             assert_eq!(placement, self.placement);
-            self.commit_index += 1;
+            self.commit_index = self.commit_index.saturating_add(1);
             Ok(DeleteStreamResponse {
                 placement,
                 group_commit_index: self.commit_index,
@@ -3970,8 +3967,8 @@ impl GroupEngine for RecordingEngine {
         Box::pin(async move {
             assert_eq!(placement, self.placement);
             let start_offset = self.commit_index;
-            let next_offset = start_offset + request.payload_len();
-            self.commit_index += 1;
+            let next_offset = start_offset.saturating_add(request.payload_len());
+            self.commit_index = self.commit_index.saturating_add(1);
             Ok(AppendResponse {
                 placement,
                 start_offset,

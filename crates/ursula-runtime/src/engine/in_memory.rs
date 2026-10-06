@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::sync::Arc;
 
 use ursula_shard::BucketStreamId;
@@ -170,6 +166,12 @@ impl InMemoryGroupEngine {
         self.cold_index_cache.clone()
     }
 
+    /// Advances the in-memory commit counter. It is a monotonic gauge of
+    /// applied writes, so it saturates instead of wrapping.
+    fn advance_commit_index(&mut self) {
+        self.commit_index = self.commit_index.saturating_add(1);
+    }
+
     pub(crate) fn set_cold_store(&mut self, cold_store: Option<ColdStoreHandle>) {
         self.cold_index_cache = cold_store.as_ref().map(|cold_store| {
             Arc::new(ColdIndexPageCache::new(
@@ -314,7 +316,7 @@ impl InMemoryGroupEngine {
                 ..
             } => {
                 let stream_id = require_response_stream_id(stream_id, "created")?;
-                self.commit_index += 1;
+                self.advance_commit_index();
                 Ok(GroupWriteResponse::CreateStream(CreateStreamResponse {
                     placement,
                     next_offset,
@@ -350,7 +352,7 @@ impl InMemoryGroupEngine {
                 let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
                 let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
                 if !deduplicated {
-                    self.commit_index += 1;
+                    self.advance_commit_index();
                     self.state_machine.add_stream_append_count(&stream_id, 1);
                 }
                 let stream_append_count = self.state_machine.stream_append_count(&stream_id);
@@ -373,7 +375,7 @@ impl InMemoryGroupEngine {
                 snapshot_offset,
                 snapshot_digest,
             } => {
-                self.commit_index += 1;
+                self.advance_commit_index();
                 Ok(GroupWriteResponse::PublishSnapshot(
                     PublishSnapshotResponse {
                         placement,
@@ -387,7 +389,7 @@ impl InMemoryGroupEngine {
             }
             StreamResponse::StreamTidied { debt_remaining } => {
                 require_response_stream_id(stream_id, "tidied")?;
-                self.commit_index += 1;
+                self.advance_commit_index();
                 Ok(GroupWriteResponse::TidyStream(
                     crate::request::TidyStreamResponse {
                         placement,
@@ -397,7 +399,7 @@ impl InMemoryGroupEngine {
                 ))
             }
             StreamResponse::RetentionAdvanced { retained_offset } => {
-                self.commit_index += 1;
+                self.advance_commit_index();
                 Ok(GroupWriteResponse::AdvanceRetention(
                     AdvanceRetentionResponse {
                         placement,
@@ -410,7 +412,7 @@ impl InMemoryGroupEngine {
             }
             StreamResponse::Accessed { changed, expired } => {
                 if changed || expired {
-                    self.commit_index += 1;
+                    self.advance_commit_index();
                 }
                 Ok(GroupWriteResponse::TouchStreamAccess(
                     TouchStreamAccessResponse {
@@ -422,7 +424,7 @@ impl InMemoryGroupEngine {
                 ))
             }
             StreamResponse::SnapshotImported { buckets, streams } => {
-                self.commit_index += 1;
+                self.advance_commit_index();
                 Ok(GroupWriteResponse::ImportGroupState(
                     ImportGroupStateResponse {
                         placement,
@@ -433,7 +435,7 @@ impl InMemoryGroupEngine {
                 ))
             }
             StreamResponse::ColdFlushed { hot_start_offset } => {
-                self.commit_index += 1;
+                self.advance_commit_index();
                 Ok(GroupWriteResponse::FlushCold(FlushColdResponse {
                     placement,
                     hot_start_offset,
@@ -445,7 +447,7 @@ impl InMemoryGroupEngine {
                 compacted_chunks,
                 compacted_bytes,
             } => {
-                self.commit_index += 1;
+                self.advance_commit_index();
                 Ok(GroupWriteResponse::CompactCold(CompactColdResponse {
                     placement,
                     compacted_chunks,
@@ -460,7 +462,7 @@ impl InMemoryGroupEngine {
             } => {
                 let stream_id = require_response_stream_id(stream_id, "closed")?;
                 if !deduplicated {
-                    self.commit_index += 1;
+                    self.advance_commit_index();
                 }
                 Ok(GroupWriteResponse::CloseStream(CloseStreamResponse {
                     placement,
@@ -472,7 +474,7 @@ impl InMemoryGroupEngine {
             }
             StreamResponse::Deleted => {
                 let stream_id = require_response_stream_id(stream_id, "deleted")?;
-                self.commit_index += 1;
+                self.advance_commit_index();
                 Ok(GroupWriteResponse::DeleteStream(DeleteStreamResponse {
                     placement,
                     group_commit_index: self.commit_index,
@@ -480,7 +482,7 @@ impl InMemoryGroupEngine {
                 }))
             }
             StreamResponse::ColdGcAcked { removed } => {
-                self.commit_index += 1;
+                self.advance_commit_index();
                 Ok(GroupWriteResponse::AckColdGc(AckColdGcResponse {
                     placement,
                     removed,
@@ -489,7 +491,7 @@ impl InMemoryGroupEngine {
             }
             StreamResponse::ColdRefsOffloaded { removed, remaining } => {
                 require_response_stream_id(stream_id, "cold refs offloaded")?;
-                self.commit_index += 1;
+                self.advance_commit_index();
                 Ok(GroupWriteResponse::OffloadColdRefs(
                     crate::cold_refs::OffloadStreamColdRefsResponse {
                         placement,
@@ -500,7 +502,7 @@ impl InMemoryGroupEngine {
                 ))
             }
             StreamResponse::ColdGcDeferred { new_seq } => {
-                self.commit_index += 1;
+                self.advance_commit_index();
                 Ok(GroupWriteResponse::DeferColdGc(DeferColdGcResponse {
                     placement,
                     new_seq,
@@ -512,7 +514,7 @@ impl InMemoryGroupEngine {
                 removed_streams,
                 pending_cold_gc_entries,
             } => {
-                self.commit_index += 1;
+                self.advance_commit_index();
                 Ok(GroupWriteResponse::PurgeBucket(PurgeBucketResponse {
                     placement,
                     removed_streams,
@@ -742,7 +744,7 @@ impl InMemoryGroupEngine {
                 let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
                 let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
                 if !deduplicated {
-                    self.commit_index += 1;
+                    self.advance_commit_index();
                     self.state_machine.add_stream_append_count(&stream_id, 1);
                 }
                 let stream_append_count = self.state_machine.stream_append_count(&stream_id);
@@ -888,15 +890,15 @@ impl InMemoryGroupEngine {
                 .max(segment.read_start_offset)
                 .max(cursor);
             let end = object.end_offset.min(segment_end);
-            if start >= end {
+            let Some(read_len) = end.checked_sub(start).filter(|len| *len > 0) else {
                 continue;
-            }
+            };
             let bytes = cold_store
                 .read_object_range_for_stream(
                     stream_id,
                     &object,
                     start,
-                    usize::try_from(end - start).expect("object read len fits usize"),
+                    usize::try_from(read_len).expect("object read len fits usize"),
                 )
                 .await?;
             payload.extend_from_slice(&bytes);
