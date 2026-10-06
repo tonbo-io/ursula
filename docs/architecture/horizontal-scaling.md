@@ -500,3 +500,28 @@ nodes. Startup still needs meta quorum: durable local projection recovery is
 next. Refresh does not yet alter static runtime/background inventories or
 prepare/release groups. Those consumers and receiving-process fences must be
 integrated before managed migrations are exposed.
+
+
+### Implementation checkpoint: local projection recovery
+
+Commit `a5e6740` stores complete projections in `<meta_journal_path>.projection`.
+The meta journal's exclusive lock owns the file; each bounded, checksummed
+checkpoint binds the full local node/cluster identity and the complete ordered
+projection. A new view is validated, fsynced and atomically renamed before the
+server publishes it. Stale versions are ignored; equal-index conflicts and
+corrupt/torn/foreign checkpoints are rejected. A publication I/O failure poisons
+storage instead of publishing an undurable view.
+
+An established server may restore settled data assignments from this checkpoint
+while meta quorum is unavailable. It skips meta initialization and does not
+manufacture ReadIndex or control authority. Periodic fresh complete reads resume
+ordered updates when quorum returns. New adoption, planning and control mutations
+continue to need real quorum evidence. The process test uses meta3 voters
+{1,4,5} in distinct zones and restarts only nodes {1,2,3}: both data groups retain
+quorum, fresh meta projection reads fail, and old/new payload reads and writes
+succeed. This proves independent established data recovery, not migration safety.
+
+Projection-driven dynamic prepare/release and learner/intent startup remain
+pending. Before enabling them, add durable intent/epoch evidence and receiver
+fences, including local retirement authority that overrides a stale checkpoint.
+A cache alone must never allow traffic or restart to recreate a revoked actor.

@@ -59,7 +59,7 @@ blocked implementation milestone.
 | HS-101 | Persist and restore meta vote, log, committed/applied state and snapshots; recover correctly after compaction and crash/restart without resurrecting discarded intent | M0 | Complete: commit `b7352ea` |
 | HS-102 | Implement default/per-group RF=3/5 and one-domain-loss policy; infer/validate existing placements on adoption; reject invalid policies and bootstrap drift | M0 | Complete: commit `5c7e413` (deterministic policy/adoption layer) |
 | HS-103 | Concrete multi-node meta transport, independent meta voters, one-time bootstrap, cluster identity and trusted client/cluster/admin node directory | HS-101, HS-102 | Complete: commit `73f6970` (coordinated static-to-managed adoption) |
-| HS-104 | Ordered placement/policy projections with full-snapshot resync; data/node startup restores assignments without reinitializing from stale TOML | HS-103 | In progress: commit `d591c26` (projection transport/ordering component) |
+| HS-104 | Ordered placement/policy projections with full-snapshot resync; data/node startup restores assignments without reinitializing from stale TOML | HS-103 | In progress: commits `d591c26`, `73f6970`, `a5e6740` (ordered transport, settled assignment consumers and durable local recovery) |
 
 M1 acceptance includes multi-node meta leader turnover and a durable full
 restart after snapshot/log compaction. Test RF=3/quorum=2 and RF=5/quorum=3,
@@ -169,10 +169,14 @@ unevacuated machine. Physical provisioning remains outside the Raft controller.
 | 2026-10-06 | M1 | Real Ursula CLI processes with disk WAL: meta3/meta5, mixed RF3/RF5, default RF3/default RF5 plus override, pre/post-adoption payloads, raw-admin rejection with valid incarnation, private 64 KiB probe, per-voter metadata snapshot/purge, full restart and exact control-state preservation, non-hosting redirect to public origin, meta leader plus permitted voter loss followed by fresh control reads and new write/read | Passed in 23.74s; coordinated adoption and fixed settled layouts only; no migration/S3/performance claim |
 | 2026-10-06 | M1 | Workspace lib/bin tests: 919 passed, 1 ignored; workspace doc tests, workspace Clippy with `-D warnings`, format, seven tracked-source DST audits, madsim Raft check and existing smoke corpus passed. Existing static CLI follower-forwarding test passed (1 test, 4.01s) | Corrected a private-plane probe routing gap exposed by the turnover test and a duplicate-route merge exposed by full tests; final checks passed. Existing smoke proves compatibility, not new scaling boundary fault coverage |
 
+| 2026-10-06 | HS-104 | Commit `a5e6740` persists complete projections in a bounded checksummed checkpoint owned by the meta journal lock and bound to full local identity. Validate and order before atomic/fsynced publication; stale/conflicting views cannot roll back the recovery file. Corrupt/torn/foreign files fail startup. Publication failure closes storage and preserves the previous checkpoint | Durable recovery implemented for established settled layouts; cached state is a recovery hint, never fresh control authority |
+| 2026-10-06 | HS-104 | Three storage tests cover monotonic reopen, unchanged/stale/conflicting versions, torn/corrupt/foreign checkpoints, failed publication and storage poisoning. Extended real CLI test selects meta voters {1,4,5} in distinct zones, stops all processes and restarts only data nodes {1,2,3}: fresh meta quorum read fails, both data majorities remain ready, acknowledged pre-adoption data survives and a new write/read succeeds | Reproduced independent meta/data quorum-loss recovery; CLI fixture passed in 26.61s. RF5 layout remains 2/2/1; no migration or snapshot-retirement acceptance is claimed |
+| 2026-10-06 | HS-104 | Workspace lib/bin tests: 922 passed, 1 ignored; workspace doc tests, final workspace Clippy with `-D warnings`, format, all seven tracked-source DST audits, madsim Raft check and existing smoke corpus passed | Local final checks passed. A first fixture variant was rejected by the meta failure-domain constraint; corrected zones before the passing process run |
+
 ## Current execution checkpoint
 
-Current implementation story: **HS-104**, durable local projection recovery and
-assignment consumers. HS-103 is implemented in `73f6970`: opt-in `[control]`
+Current implementation story: **HS-104**, learner/intent-aware hosting and live
+assignment consumers. Durable local recovery is implemented in `a5e6740`. HS-103 is implemented in `73f6970`: opt-in `[control]`
 configuration, independently selected meta3/meta5 voters, bound private RPCs,
 cohort-checked one-time meta bootstrap and adoption using actual data quorum
 certificates. Raw data-membership and backup-import mutations are rejected
@@ -188,11 +192,15 @@ reads, new data writes, acknowledged-payload reads and non-hosting public
 redirects succeed. This proves the coordinated adoption route; a fresh managed
 data cluster initializer and a rolling adoption protocol are not implemented.
 
-M1 remains incomplete: startup currently requires a fresh meta quorum even for
-established data groups. Durable local projection caching, learner/intent-aware
-hosting restoration and live runtime/maintenance/snapshot inventory consumers
-remain HS-104. The current refresh updates the ordered cursor and public routing;
-it does not create or retire actors. No actual data-group migration, CI,
+M1 remains incomplete: learner/intent-aware hosting restoration and live
+runtime/maintenance/snapshot inventory consumers remain HS-104. Established
+settled data groups now recover from the identity-bound projection checkpoint
+without meta quorum; first adoption still requires fresh meta/data quorums.
+The current refresh updates the durable ordered cursor and public routing;
+it does not create or retire actors. Before wiring those mutations, implement
+the prerequisite HS-201 intent/epoch evidence and HS-204 receiver fencing
+foundations. This starts M2 dependencies while M1 remains open; milestone
+completion still requires the stated full acceptance, not only a partial cache. No actual data-group migration, CI,
 deployment or scaling-performance acceptance is claimed. M2 receiver fences
 must precede exposing managed mutations. No external blocker is recorded.
 
