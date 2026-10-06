@@ -6,13 +6,10 @@
 //! The producer cap (F3) answers `ProducerLimit` to producers beyond 4,096
 //! that find no producer idle for an hour; the workload counts those
 //! rejections and retries the producer's sequence 0 on its next turn.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::time::Instant;
 
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use clap::Args;
@@ -114,14 +111,17 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
     let flush_bytes = 8 * smx::MIB;
     for cp in points {
         while n < cp {
-            let p = usize::try_from(n % producers as u64)?;
+            let p = usize::try_from(
+                n.checked_rem(producers as u64)
+                    .context("producer count must be nonzero")?,
+            )?;
             let (Some(s), Some(e), Some(producer_id)) =
                 (seq.get_mut(p), epoch.get_mut(p), ids.get(p))
             else {
                 bail!("producer index out of range");
             };
             if args.epoch_every > 0 && *s == args.epoch_every {
-                *e += 1;
+                *e = e.saturating_add(1);
                 *s = 0;
             }
             let producer = ProducerRequest {
@@ -129,7 +129,7 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
                 producer_epoch: *e,
                 producer_seq: *s,
             };
-            let now = smx::T0 + n * 10;
+            let now = smx::T0.saturating_add(n.saturating_mul(10));
             let record = payload::json_record(&mut rng, n, args.rec_bytes);
             starts.push(n, smx::tail(&m, &id));
             let response = smx::append(&mut m, &id, record, Some(producer), now);
@@ -144,24 +144,24 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
                 ..
             } = response
             {
-                producer_limit_rejections += 1;
-                n += 1;
+                producer_limit_rejections = producer_limit_rejections.saturating_add(1);
+                n = n.saturating_add(1);
                 continue;
             }
             smx::ok(response, "producer append")?;
-            *s += 1;
-            n += 1;
+            *s = s.saturating_add(1);
+            n = n.saturating_add(1);
             if m.total_hot_payload_bytes() >= flush_bytes as u64 {
                 smx::flush_pass(&mut m, flush_bytes, flush_bytes, &mut packs, &mut stats)?;
             }
             if args.retain_every > 0
                 && n.is_multiple_of(args.retain_every)
                 && n > args.retain_keep
-                && let Some((_, offset)) = starts.at_or_below(n - args.retain_keep)
+                && let Some((_, offset)) = starts.at_or_below(n.saturating_sub(args.retain_keep))
                 && offset > m.retained_offset(&id)
             {
                 smx::checkpoint_and_retain(&mut m, &id, offset, checkpoint_payload, now)?;
-                retentions += 1;
+                retentions = retentions.saturating_add(1);
             }
         }
         let mut timing = Vec::new();
@@ -183,7 +183,7 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
                             producer_epoch: *e0,
                             producer_seq: retry_seq,
                         }),
-                        smx::T0 + n * 10,
+                        smx::T0.saturating_add(n.saturating_mul(10)),
                     );
                     deduplicated = matches!(response, StreamResponse::Appended {
                         deduplicated: true,

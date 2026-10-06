@@ -7,10 +7,6 @@
 //! - `w1`: one stream, inline appends, a flush worker pass every tick.
 //! - `w2`: N trickle streams in one group, a flush worker pass every tick.
 //! - `compact`: `CompactCold` of shared pack slices on both engines.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -219,15 +215,16 @@ async fn w1(args: &L2Args, sink: &mut Sink) -> Result<Outcome> {
                 &rt,
                 &id,
                 payload::json_record(&mut rng, n, args.rec_bytes),
-                T0 + n * 10,
+                T0.saturating_add(n.saturating_mul(10)),
             )
             .await?;
-            n += 1;
+            n = n.saturating_add(1);
             if n.is_multiple_of(args.per_tick.max(1)) {
-                flushed += rt
+                let flushed_now = rt
                     .flush_cold_all_groups_once_bounded(flush_request(8 * MIB, 8 * MIB), 4)
                     .await
                     .map_err(|err| anyhow::anyhow!("flush pass: {err}"))?;
+                flushed = flushed.saturating_add(flushed_now);
             }
         }
         let (snapshot, stats) = snap(&rt).await?;
@@ -274,8 +271,13 @@ async fn w2(args: &L2Args, sink: &mut Sink) -> Result<Outcome> {
     let mut max_hot_seen = 0u64;
     let started = Instant::now();
     let mut outcome = Outcome::default();
-    for sec in 1..=args.minutes * 60 {
-        let now = T0 + sec * 1000;
+    let max_flush_bytes = args
+        .max_flush_mib
+        .checked_mul(MIB)
+        .context("--max-flush-mib overflows usize")?;
+    let measure_every_secs = args.measure_every_min.max(1).saturating_mul(60);
+    for sec in 1..=args.minutes.saturating_mul(60) {
+        let now = T0.saturating_add(sec.saturating_mul(1000));
         for (id, s) in ids.iter().zip(seq.iter_mut()) {
             if rng.below(1_000_000) < threshold {
                 append(
@@ -285,18 +287,18 @@ async fn w2(args: &L2Args, sink: &mut Sink) -> Result<Outcome> {
                     now,
                 )
                 .await?;
-                *s += 1;
+                *s = s.saturating_add(1);
             }
         }
         let flushed = rt
-            .flush_cold_all_groups_once_bounded(flush_request(8 * MIB, args.max_flush_mib * MIB), 4)
+            .flush_cold_all_groups_once_bounded(flush_request(8 * MIB, max_flush_bytes), 4)
             .await
             .map_err(|err| anyhow::anyhow!("flush pass: {err}"))?;
         if flushed > 0 {
-            passes_with_flush += 1;
-            slices += flushed;
+            passes_with_flush = passes_with_flush.saturating_add(1);
+            slices = slices.saturating_add(flushed);
         }
-        if sec % (args.measure_every_min.max(1) * 60) == 0 {
+        if sec.checked_rem(measure_every_secs) == Some(0) {
             let (_, stats) = snap(&rt).await?;
             let max_refs = stats
                 .streams
@@ -336,28 +338,19 @@ async fn compact_on(engine: Engine) -> Result<(Value, bool)> {
     create(&rt, &a).await?;
     create(&rt, &b).await?;
     let mut rng = payload::Rng::new(3);
-    let mut flushed = 0;
+    let mut flushed = 0usize;
     for round in 0..3u64 {
         for i in 0..10u64 {
-            append(
-                &rt,
-                &a,
-                payload::json_record(&mut rng, round * 10 + i, 200),
-                T0 + i,
-            )
-            .await?;
-            append(
-                &rt,
-                &b,
-                payload::json_record(&mut rng, round * 10 + i, 200),
-                T0 + i,
-            )
-            .await?;
+            let seq = round.saturating_mul(10).saturating_add(i);
+            let now = T0.saturating_add(i);
+            append(&rt, &a, payload::json_record(&mut rng, seq, 200), now).await?;
+            append(&rt, &b, payload::json_record(&mut rng, seq, 200), now).await?;
         }
-        flushed += rt
+        let flushed_now = rt
             .flush_cold_all_groups_once_bounded(flush_request(1, 8 * MIB), 1)
             .await
             .map_err(|err| anyhow::anyhow!("flush: {err}"))?;
+        flushed = flushed.saturating_add(flushed_now);
     }
     let (snapshot, _) = snap(&rt).await?;
     let (generation, old): (u64, Vec<ColdChunkRef>) = snapshot
@@ -372,7 +365,12 @@ async fn compact_on(engine: Engine) -> Result<(Value, bool)> {
     let end = old.last().map_or(0, |c| c.end_offset);
     let mut body = Vec::new();
     for chunk in &old {
-        let len = usize::try_from(chunk.end_offset - chunk.start_offset)?;
+        let len = usize::try_from(
+            chunk
+                .end_offset
+                .checked_sub(chunk.start_offset)
+                .context("cold chunk ends before it starts")?,
+        )?;
         body.extend_from_slice(
             &cold
                 .read_chunk_range(chunk, chunk.start_offset, len)

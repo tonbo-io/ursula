@@ -1,13 +1,10 @@
 //! W1: one JSON stream of ~200 B inline appends with cold flushes. With
 //! `--retain-every=K` (W6): every K records publish a tiny checkpoint and
 //! advance retention, keeping the last `--retain-keep` records.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::time::Instant;
 
+use anyhow::Context;
 use anyhow::Result;
 use clap::Args;
 use serde_json::json;
@@ -100,7 +97,12 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
     let per_append = args.recs_per_append.max(1);
     // Allocated before the heap baseline, so it does not count as state.
     let mut starts = smx::RecordStarts::new(if args.retain_every > 0 {
-        usize::try_from(args.retain_keep / per_append)? + 2
+        usize::try_from(
+            args.retain_keep
+                .checked_div(per_append)
+                .context("records per append must be nonzero")?,
+        )?
+        .saturating_add(2)
     } else {
         0
     });
@@ -110,7 +112,10 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
     let id = smx::sid("bkt1", "h0001", "log");
     smx::create_stream(&mut m, &id, None, None, smx::T0)?;
 
-    let flush_bytes = args.flush_mib * smx::MIB;
+    let flush_bytes = args
+        .flush_mib
+        .checked_mul(smx::MIB)
+        .context("--flush-mib overflows usize")?;
     let mut packs = smx::PackPaths::default();
     let mut stats = smx::FlushStats::default();
     let mut outcome = Outcome::default();
@@ -125,28 +130,29 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
     let mut last = None;
     for cp in checkpoints(&args.checkpoints, args.records) {
         while n < cp {
-            let now = smx::T0 + n * 10;
-            let k = per_append.min(cp - n);
+            let now = smx::T0.saturating_add(n.saturating_mul(10));
+            let k = per_append.min(cp.saturating_sub(n));
             let body = payload::json_records(&mut rng, n, usize::try_from(k)?, args.rec_bytes);
             starts.push(n, smx::tail(&m, &id));
             let started = Instant::now();
             let response = smx::append(&mut m, &id, body, None, now);
-            apply_ns += started.elapsed().as_nanos();
+            apply_ns = apply_ns.saturating_add(started.elapsed().as_nanos());
             smx::ok(response, "append")?;
-            appends += 1;
-            n += k;
+            appends = appends.saturating_add(1);
+            n = n.saturating_add(k);
             if m.total_hot_payload_bytes() >= flush_bytes as u64 {
                 smx::flush_pass(&mut m, flush_bytes, flush_bytes, &mut packs, &mut stats)?;
             }
             if args.retain_every > 0 && n >= next_retain {
-                next_retain += args.retain_every;
+                next_retain = next_retain.saturating_add(args.retain_every);
                 if n > args.retain_keep
-                    && let Some((record, offset)) = starts.at_or_below(n - args.retain_keep)
+                    && let Some((record, offset)) =
+                        starts.at_or_below(n.saturating_sub(args.retain_keep))
                     && record > retained_from
                 {
                     smx::checkpoint_and_retain(&mut m, &id, offset, checkpoint_payload, now)?;
                     retained_from = record;
-                    retentions += 1;
+                    retentions = retentions.saturating_add(1);
                 }
             }
         }
@@ -167,7 +173,7 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
         }
         let residual = formula::residual(&measured);
         residuals.push((n, residual));
-        let retained = n - retained_from;
+        let retained = n.saturating_sub(retained_from);
         sink.row(&json!({
             "workload": name,
             "records": n,
@@ -192,12 +198,14 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
 
     // Residual growth between N and 4N (§7.2), when both were measured.
     if let Some(&(n_last, r_last)) = residuals.last()
-        && let Some(&(_, r_quarter)) = residuals.iter().find(|(k, _)| k * 4 == n_last)
+        && let Some(&(_, r_quarter)) = residuals
+            .iter()
+            .find(|(k, _)| k.checked_mul(4) == Some(n_last))
     {
         outcome.check(
             "residual_growth_n_to_4n",
             "residual state grows <= 1 KiB between N and 4N records",
-            (r_last - r_quarter) as f64,
+            r_last.saturating_sub(r_quarter) as f64,
             1024.0,
         );
     }
@@ -229,7 +237,7 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
             "workload": name,
             "restore_from_snapshot": {
                 "snapshot_bytes": bytes.len(),
-                "restored_heap_bytes": (after - before).bytes,
+                "restored_heap_bytes": after.saturating_sub(before).bytes,
                 "decode_and_restore_ms": round3(restore_ms),
                 "restored_tail": smx::tail(&restored, &id),
             }

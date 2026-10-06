@@ -1,8 +1,4 @@
 //! Deterministic payload generators (minified JSON, one record per line).
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 /// xorshift64 generator; deterministic for a seed.
 pub struct Rng(u64);
@@ -23,7 +19,7 @@ impl Rng {
 
     /// Uniform-ish value in `[0, n)`.
     pub fn below(&mut self, n: u64) -> u64 {
-        self.next_u64() % n.max(1)
+        self.next_u64().checked_rem(n.max(1)).unwrap_or(0)
     }
 }
 
@@ -38,10 +34,11 @@ pub fn json_record(rng: &mut Rng, seq: u64, len: usize) -> Vec<u8> {
         1_759_300_000_000u64.wrapping_add(seq.wrapping_mul(7))
     );
     let tail = b"\"}\n";
-    let mut v = Vec::with_capacity(len.max(head.len() + tail.len()));
+    let mut v = Vec::with_capacity(len.max(head.len().saturating_add(tail.len())));
     v.extend_from_slice(head.as_bytes());
     let alphabet = ALPHA.len() as u64;
-    while v.len() + tail.len() < len {
+    let body_len = len.saturating_sub(tail.len());
+    while v.len() < body_len {
         let index = usize::try_from(rng.below(alphabet)).unwrap_or(0);
         v.push(ALPHA.get(index).copied().unwrap_or(b'a'));
     }
@@ -54,7 +51,7 @@ pub fn json_record(rng: &mut Rng, seq: u64, len: usize) -> Vec<u8> {
 pub fn json_records(rng: &mut Rng, first_seq: u64, n: usize, len: usize) -> Vec<u8> {
     let mut payload = Vec::with_capacity(n.saturating_mul(len));
     for i in 0..n {
-        payload.extend_from_slice(&json_record(rng, first_seq + i as u64, len));
+        payload.extend_from_slice(&json_record(rng, first_seq.saturating_add(i as u64), len));
     }
     payload
 }

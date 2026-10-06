@@ -3,13 +3,10 @@
 //! of streams holding hot bytes, plus the W2 starved-stream shape. Reports
 //! deterministic counters (candidates, bytes, whether the starved stream is
 //! included) next to wall time.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::time::Instant;
 
+use anyhow::Context;
 use anyhow::Result;
 use clap::Args;
 use serde_json::json;
@@ -56,7 +53,7 @@ fn build(
         let mut held = 0;
         while held < starved_bytes {
             let record = payload::json_record(&mut rng, held as u64, 300);
-            held += record.len();
+            held = held.saturating_add(record.len());
             smx::ok(smx::append(&mut m, &id, record, None, smx::T0), "append")?;
         }
     }
@@ -100,7 +97,10 @@ pub fn run(args: &PlannerArgs, sink: &mut Sink) -> Result<Outcome> {
         outcome.metric_u64(&format!("drain_{streams}.candidates"), count as u64);
         outcome.metric_u64(&format!("drain_{streams}.candidate_bytes"), bytes);
     }
-    let starved = args.starved_mib * smx::MIB;
+    let starved = args
+        .starved_mib
+        .checked_mul(smx::MIB)
+        .context("--starved-mib overflows usize")?;
     let m = build(200, 1, 300, starved)?;
     let (ms, count, bytes) = time_plan(&m, 8 * smx::MIB, 8 * smx::MIB, 5)?;
     let included = bytes as usize > starved;

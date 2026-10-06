@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -89,7 +85,11 @@ pub async fn run(args: FanOutArgs) -> Result<FanOutResult> {
     backend.ensure_namespace().await?;
     backend.create_stream(&stream, "text/plain").await?;
 
-    let ready_barrier = Arc::new(Barrier::new(args.subscribers + 1));
+    let ready_barrier = Arc::new(Barrier::new(
+        args.subscribers
+            .checked_add(1)
+            .context("--subscribers overflows usize")?,
+    ));
     let events_received = Arc::new(AtomicU64::new(0));
     let subscriber_errors = Arc::new(AtomicU64::new(0));
     let hist = Arc::new(Mutex::new(new_histogram()));
@@ -125,7 +125,9 @@ pub async fn run(args: FanOutArgs) -> Result<FanOutResult> {
     let writer = tokio::spawn(async move {
         writer_barrier.wait().await;
         let start = Instant::now();
-        let dl = start + Duration::from_secs(writer_duration);
+        let dl = start
+            .checked_add(Duration::from_secs(writer_duration))
+            .context("--duration-secs overflows Instant")?;
         if deadline_setter.set(dl).is_err() {
             tracing::warn!("writer deadline was already set");
         }
@@ -143,7 +145,7 @@ pub async fn run(args: FanOutArgs) -> Result<FanOutResult> {
     let (events_sent, append_counts) = writer.await??;
     let elapsed = start.elapsed();
 
-    let drain_limit = Duration::from_secs(args.subscriber_idle_timeout_secs + 5);
+    let drain_limit = Duration::from_secs(args.subscriber_idle_timeout_secs.saturating_add(5));
     if tokio::time::timeout(drain_limit, futures::future::join_all(subs))
         .await
         .is_err()
@@ -205,12 +207,16 @@ async fn run_subscriber(
         loop {
             let dl = deadline.get().copied();
             if let Some(end) = dl
-                && Instant::now() >= end + Duration::from_secs(2)
+                && end
+                    .checked_add(Duration::from_secs(2))
+                    .is_some_and(|limit| Instant::now() >= limit)
             {
                 break;
             }
             let to = match dl {
-                Some(end) => end.saturating_duration_since(Instant::now()) + Duration::from_secs(2),
+                Some(end) => end
+                    .saturating_duration_since(Instant::now())
+                    .saturating_add(Duration::from_secs(2)),
                 None => idle,
             }
             .min(idle);
@@ -227,7 +233,7 @@ async fn run_subscriber(
             };
             buf.extend_from_slice(&chunk);
             while let Some(idx) = find_event_end(&buf) {
-                let raw = buf.split_to(idx + 2).freeze();
+                let raw = buf.split_to(idx.saturating_add(2)).freeze();
                 if let Some(payload) = parse_sse_data(&raw)
                     && let Some(sent_ns) = extract_send_ns(&payload)
                 {
@@ -259,7 +265,8 @@ async fn run_writer(
     payload_size: usize,
     deadline: Instant,
 ) -> Result<(u64, Counts)> {
-    let interval = Duration::from_micros(1_000_000 / rate.max(1));
+    // A zero rate counts as one append per second.
+    let interval = Duration::from_micros(1_000_000u64.checked_div(rate).unwrap_or(1_000_000));
     let mut next_at = Instant::now();
     let mut sent: u64 = 0;
     let mut ok: u64 = 0;
@@ -269,29 +276,29 @@ async fn run_writer(
     while Instant::now() < deadline {
         let now = Instant::now();
         if now < next_at {
-            tokio::time::sleep(next_at - now).await;
+            tokio::time::sleep(next_at.saturating_duration_since(now)).await;
         }
-        next_at += interval;
+        next_at = next_at.checked_add(interval).unwrap_or(deadline);
         let payload = build_payload(seq, payload_size);
         let resp = backend
             .append_request(0, stream, &payload, None, "text/plain")
             .send()
             .await;
-        sent += 1;
+        sent = sent.saturating_add(1);
         match resp {
             Ok(r) => {
                 let s = r.status();
                 if s.is_success() {
-                    ok += 1;
+                    ok = ok.saturating_add(1);
                 } else if s.as_u16() == 503 || s.as_u16() == 429 {
-                    bp += 1;
+                    bp = bp.saturating_add(1);
                 } else {
-                    err += 1;
+                    err = err.saturating_add(1);
                 }
             }
-            Err(_) => err += 1,
+            Err(_) => err = err.saturating_add(1),
         }
-        seq += 1;
+        seq = seq.saturating_add(1);
     }
     Ok((sent, Counts {
         ok,
@@ -331,8 +338,12 @@ fn extract_send_ns(payload: &[u8]) -> Option<u128> {
                     i
                 }
             };
-            if i + 1 - start >= 48 {
-                let s = std::str::from_utf8(payload.get(start + 16..start + 48)?).ok()?;
+            let run_len = i.saturating_sub(start).saturating_add(1);
+            if run_len >= 48 {
+                let s = std::str::from_utf8(
+                    payload.get(start.checked_add(16)?..start.checked_add(48)?)?,
+                )
+                .ok()?;
                 return u128::from_str_radix(s, 16).ok();
             }
         } else {
@@ -346,7 +357,7 @@ fn find_event_end(buf: &[u8]) -> Option<usize> {
     let mut prev = b'\0';
     for (i, b) in buf.iter().enumerate() {
         if prev == b'\n' && *b == b'\n' {
-            return Some(i - 1);
+            return i.checked_sub(1);
         }
         prev = *b;
     }

@@ -7,10 +7,6 @@
 //! - `ttl-heap`: one long-lived stream, A appends, TTL none / sliding /
 //!   absolute: TTL heap growth per append.
 //! - `purge`: B buckets with one stream each, `PurgeBucket` each.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use anyhow::Result;
 use anyhow::bail;
@@ -118,7 +114,7 @@ fn delete(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
                 )
             })
             .collect();
-        let now = smx::T0 + cycle as u64 * 60_000;
+        let now = smx::T0.saturating_add((cycle as u64).saturating_mul(60_000));
         for id in &ids {
             smx::create_stream(&mut m, id, None, None, now)?;
             for k in 0..args.appends_per_stream {
@@ -136,7 +132,7 @@ fn delete(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
                 "delete",
             )?;
         }
-        created_total += args.streams;
+        created_total = created_total.saturating_add(args.streams);
         let pending = m.pending_cold_gc_len();
         smx::ack_all_cold_gc(&mut m)?;
         let after_gc = measure_sm(&m, &base, Vec::new(), false)?;
@@ -147,7 +143,7 @@ fn delete(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
             "live": {"heap": live.heap.bytes, "snapshot": live.snap.total_bytes},
             "after_gc_ack": after_gc.to_json(),
         }))?;
-        if cycle + 1 == args.cycles {
+        if args.cycles.checked_sub(1) == Some(cycle) {
             outcome.metric_i64("heap_after_churn_bytes", after_gc.heap.bytes);
             outcome.metric_i64("heap_slack_after_churn_bytes", after_gc.slack_bytes());
             outcome.metric_u64("snapshot_after_churn_bytes", after_gc.snap.total_bytes);
@@ -175,12 +171,12 @@ fn ttl_expire(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
         .map(|i| smx::sid("bkt1", &format!("t{i:07}"), &format!("log{i:07}")))
         .collect();
     for (i, id) in ids.iter().enumerate() {
-        let now = smx::T0 + i as u64;
+        let now = smx::T0.saturating_add(i as u64);
         smx::create_stream(&mut m, id, Some(ttl), None, now)?;
         for k in 0..args.appends_per_stream {
             let record = payload::json_record(&mut rng, k as u64, 200);
             smx::ok(
-                smx::append(&mut m, id, record, None, now + k as u64),
+                smx::append(&mut m, id, record, None, now.saturating_add(k as u64)),
                 "append",
             )?;
         }
@@ -191,16 +187,20 @@ fn ttl_expire(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
     outcome.metric_u64("ttl_heap_entries_live", live.gauges.ttl_heap_entries);
     sink.row(&json!({"phase": "all TTL streams live", "m": live.to_json()}))?;
     drop(live);
-    let later = smx::T0 + streams as u64 + args.appends_per_stream as u64 + ttl * 1000 + 1;
+    let later = smx::T0
+        .saturating_add(streams as u64)
+        .saturating_add(args.appends_per_stream as u64)
+        .saturating_add(ttl.saturating_mul(1000))
+        .saturating_add(1);
     let mut writes = 0u64;
-    let limit = (streams as u64 / 200 + 100) * 2;
+    let limit = (streams as u64 / 200).saturating_add(100).saturating_mul(2);
     while writes <= limit && ids.iter().any(|id| m.head(id).is_some()) {
         let record = payload::json_record(&mut rng, writes, 200);
         smx::ok(
-            smx::append(&mut m, &keep, record, None, later + writes),
+            smx::append(&mut m, &keep, record, None, later.saturating_add(writes)),
             "keepalive",
         )?;
-        writes += 1;
+        writes = writes.saturating_add(1);
     }
     let left = ids.iter().filter(|id| m.head(id).is_some()).count();
     let pending = m.pending_cold_gc_len();
@@ -225,6 +225,7 @@ fn ttl_expire(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
 /// Runs the identical workload with TTL none / sliding / absolute and reports
 /// the heap difference, which is the node-local TTL index.
 fn ttl_heap(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
+    const HOT_FLUSH_BYTES: usize = 8 * smx::MIB;
     let appends = args.appends;
     let ttl = args.ttl_heap_seconds;
     sink.row(
@@ -250,7 +251,7 @@ fn ttl_heap(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
         let id = smx::sid("bkt1", "h0001", "log");
         let (ttl_seconds, expires_at) = match variant {
             "sliding" => (Some(ttl), None),
-            "absolute" => (None, Some(smx::T0 + ttl * 1000)),
+            "absolute" => (None, Some(smx::T0.saturating_add(ttl.saturating_mul(1000)))),
             _ => (None, None),
         };
         smx::create_stream(&mut m, &id, ttl_seconds, expires_at, smx::T0)?;
@@ -259,31 +260,37 @@ fn ttl_heap(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
         let mut n = 0u64;
         for cp in &points {
             while n < *cp {
-                let now = smx::T0 + n * 10;
+                let now = smx::T0.saturating_add(n.saturating_mul(10));
                 let record = payload::json_record(&mut rng, n, 200);
                 starts.push(n, smx::tail(&m, &id));
                 smx::ok(smx::append(&mut m, &id, record, None, now), "append")?;
-                n += 1;
-                if m.total_hot_payload_bytes() >= 8 * smx::MIB as u64 {
-                    smx::flush_pass(&mut m, 8 * smx::MIB, 8 * smx::MIB, &mut packs, &mut stats)?;
+                n = n.saturating_add(1);
+                if m.total_hot_payload_bytes() >= HOT_FLUSH_BYTES as u64 {
+                    smx::flush_pass(
+                        &mut m,
+                        HOT_FLUSH_BYTES,
+                        HOT_FLUSH_BYTES,
+                        &mut packs,
+                        &mut stats,
+                    )?;
                 }
                 if args.retain_every > 0
                     && n.is_multiple_of(args.retain_every)
                     && n > 1000
-                    && let Some((_, offset)) = starts.at_or_below(n - 1000)
+                    && let Some((_, offset)) = starts.at_or_below(n.saturating_sub(1000))
                     && offset > m.retained_offset(&id)
                 {
                     smx::checkpoint_and_retain(&mut m, &id, offset, br#"{"c":1}"#, now)?;
                 }
             }
-            let heap = alloc::heap() - base.heap;
+            let heap = alloc::heap().saturating_sub(base.heap);
             let tight = alloc::tight_size(&m);
             let gauges = m.state_gauges();
             outcome.check(
                 "f8_ttl_heap_entries",
                 "TTL heap entries <= 2 x live TTL streams (F8)",
                 gauges.ttl_heap_entries as f64,
-                (2 * gauges.ttl_streams) as f64,
+                gauges.ttl_streams.saturating_mul(2) as f64,
             );
             sink.row(
                 &json!({"variant": variant, "appends": n, "heap_actual_bytes": heap.bytes,
@@ -301,7 +308,7 @@ fn ttl_heap(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
             "delete",
         )?;
         smx::ack_all_cold_gc(&mut m)?;
-        let after_delete = alloc::heap() - base.heap;
+        let after_delete = alloc::heap().saturating_sub(base.heap);
         let gauges = m.state_gauges();
         sink.row(&json!({"variant": variant, "appends": n,
             "heap_after_delete_stream_bytes": after_delete.bytes,
@@ -319,11 +326,11 @@ fn ttl_heap(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
         if *variant == "none" {
             continue;
         }
-        let per_append = round3((bytes - none_bytes) as f64 / appends.max(1) as f64);
+        let per_append = round3(bytes.saturating_sub(none_bytes) as f64 / appends.max(1) as f64);
         outcome.metric(&format!("{variant}.ttl_index_bytes_per_append"), per_append);
         sink.row(&json!({"variant": variant, "appends": appends,
             "ttl_index_bytes_per_append": per_append,
-            "ttl_index_blocks_per_append": round3((blocks - none_blocks) as f64 / appends.max(1) as f64)}))?;
+            "ttl_index_blocks_per_append": round3(blocks.saturating_sub(none_blocks) as f64 / appends.max(1) as f64)}))?;
     }
     Ok(outcome)
 }

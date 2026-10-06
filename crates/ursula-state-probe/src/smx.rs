@@ -1,10 +1,6 @@
 //! L1 drivers: the real `StreamStateMachine` driven with exactly the commands
 //! the runtime issues (create, append, external append, flush and pack,
 //! compaction, checkpoint and retention).
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use anyhow::Result;
 use anyhow::bail;
@@ -124,7 +120,9 @@ impl PackPaths {
     pub fn next(&mut self, bucket_id: &str, raft_group_id: u32) -> String {
         self.next = self.next.saturating_add(1);
         let sequence = self.next.saturating_add(1 << 40);
-        let pseudo_nanos = u128::from(T0).saturating_mul(1_000_000) + u128::from(self.next);
+        let pseudo_nanos = u128::from(T0)
+            .saturating_mul(1_000_000)
+            .saturating_add(u128::from(self.next));
         format!("{bucket_id}/_packs/{raft_group_id:08x}/{pseudo_nanos:032x}-{sequence:016x}.bin")
     }
 }
@@ -156,7 +154,7 @@ pub fn flush_pass(
     if candidates.is_empty() {
         return Ok(published);
     }
-    stats.passes += 1;
+    stats.passes = stats.passes.saturating_add(1);
     let mut batches: Vec<Vec<ColdFlushCandidate>> = Vec::new();
     for candidate in candidates {
         let bucket = candidate.stream_id.bucket_id.clone();
@@ -182,7 +180,7 @@ pub fn flush_pass(
                 .map(|c| c.stream_id.bucket_id.clone())
                 .unwrap_or_default();
             let path = packs.next(&bucket, 0);
-            stats.packs += 1;
+            stats.packs = stats.packs.saturating_add(1);
             let mut object_offset = 0u64;
             for candidate in batch {
                 let len = candidate.payload.len() as u64;
@@ -204,9 +202,9 @@ pub fn flush_pass(
                     "flush packed",
                 )?;
                 published.push((candidate.stream_id, chunk));
-                object_offset += len;
-                stats.pack_slices += 1;
-                stats.bytes += len;
+                object_offset = object_offset.saturating_add(len);
+                stats.pack_slices = stats.pack_slices.saturating_add(1);
+                stats.bytes = stats.bytes.saturating_add(len);
             }
         } else {
             for candidate in batch {
@@ -234,8 +232,8 @@ pub fn flush_pass(
                     "flush exclusive",
                 )?;
                 published.push((candidate.stream_id, chunk));
-                stats.exclusive += 1;
-                stats.bytes += len;
+                stats.exclusive = stats.exclusive.saturating_add(1);
+                stats.bytes = stats.bytes.saturating_add(len);
             }
         }
     }

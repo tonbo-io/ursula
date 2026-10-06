@@ -6,10 +6,6 @@
 //! Each external append keeps its locator in state (F5). The workload models the
 //! leader's offload pass after every append, offloading a stream's staged refs
 //! once it holds more than T_ext = 16 or one is 10 s old.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::collections::HashMap;
 
@@ -90,7 +86,13 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
     if points.last() != Some(&args.appends) {
         points.push(args.appends);
     }
-    let ends: Vec<u64> = (1..=recs).map(|k| k * payload_bytes / recs).collect();
+    let ends: Vec<u64> = (1..=recs)
+        .map(|k| {
+            k.saturating_mul(payload_bytes)
+                .checked_div(recs)
+                .unwrap_or(0)
+        })
+        .collect();
     let mut rng = payload::Rng::new(5);
     // Allocated before the heap baseline, so it does not count as state.
     let mut starts = smx::RecordStarts::new(if args.retain_every > 0 {
@@ -116,7 +118,7 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
     let checkpoint_payload = br#"{"checkpoint":1}"#;
     for cp in points {
         while n < cp {
-            let now = smx::T0 + n * 1000;
+            let now = smx::T0.saturating_add(n.saturating_mul(1000));
             starts.push(records, smx::tail(&m, &id));
             smx::ok(
                 smx::append_external(&mut m, &id, payload_bytes, ends.clone(), now),
@@ -126,28 +128,29 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
                 staged_at.entry(object.s3_path.clone()).or_insert(now);
             }
             max_staged = max_staged.max(m.external_segments(&id).len() as u64);
-            offloads += offload_pass(&mut m, &mut staged_at, now)?;
-            n += 1;
-            records += recs;
+            offloads = offloads.saturating_add(offload_pass(&mut m, &mut staged_at, now)?);
+            n = n.saturating_add(1);
+            records = records.saturating_add(recs);
             if args.inline_every > 0 && n.is_multiple_of(args.inline_every) {
                 let record = payload::json_record(&mut rng, records, 200);
                 starts.push(records, smx::tail(&m, &id));
                 smx::ok(smx::append(&mut m, &id, record, None, now), "inline append")?;
-                inline_appends += 1;
-                records += 1;
+                inline_appends = inline_appends.saturating_add(1);
+                records = records.saturating_add(1);
                 smx::flush_pass(&mut m, 1, 8 * smx::MIB, &mut packs, &mut stats)?;
             }
             if args.retain_every > 0
                 && n.is_multiple_of(args.retain_every)
                 && records > args.retain_keep
-                && let Some((_, offset)) = starts.at_or_below(records - args.retain_keep)
+                && let Some((_, offset)) =
+                    starts.at_or_below(records.saturating_sub(args.retain_keep))
                 && offset > m.retained_offset(&id)
             {
                 smx::checkpoint_and_retain(&mut m, &id, offset, checkpoint_payload, now)?;
-                retentions += 1;
+                retentions = retentions.saturating_add(1);
             }
         }
-        let total_appends = n + inline_appends;
+        let total_appends = n.saturating_add(inline_appends);
         let measured = measure_sm(
             &m,
             &base,
@@ -203,7 +206,7 @@ fn offload_pass(
         },
         64,
     );
-    let mut applied = 0;
+    let mut applied = 0u64;
     for candidate in candidates {
         for object in &candidate.refs {
             staged_at.remove(&object.s3_path);
@@ -215,7 +218,7 @@ fn offload_pass(
             }),
             "offload cold refs",
         )?;
-        applied += 1;
+        applied = applied.saturating_add(1);
     }
     Ok(applied)
 }

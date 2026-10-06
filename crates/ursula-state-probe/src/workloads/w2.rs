@@ -15,14 +15,11 @@
 //! worker does (discovery through `shared_ref_candidates`, then `CompactCold`
 //! of each planned run with the GC grace), and the GC worker acknowledges
 //! released packs once their grace has passed.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
+use anyhow::Context;
 use anyhow::Result;
 use clap::Args;
 use serde_json::json;
@@ -52,6 +49,12 @@ const DRIVER_MAX_RUN_BYTES: u64 = 16 * 1024 * 1024;
 const DRIVER_GC_GRACE_MS: u64 = 300_000;
 /// `compaction_max_streams_per_pass` (16).
 const DRIVER_MAX_STREAMS: usize = 16;
+/// Group hot size at which the flush pass runs (default config: 8 MiB).
+const FLUSH_BYTES: usize = 8 * smx::MIB;
+/// Node pressure flush threshold shared by `--pressure-groups` groups.
+const PRESSURE_BYTES: u64 = 128 * smx::MIB as u64;
+/// Hot bytes above which one stream counts as starved (2 x flush size, F10).
+const STARVED_HOT_BYTES: u64 = 2 * FLUSH_BYTES as u64;
 
 #[derive(Debug, Clone, Args)]
 pub struct W2Args {
@@ -106,7 +109,12 @@ fn percentile(sorted: &[u64], numerator: usize, denominator: usize) -> u64 {
     if sorted.is_empty() {
         return 0;
     }
-    let index = (sorted.len() - 1) * numerator / denominator.max(1);
+    let index = sorted
+        .len()
+        .saturating_sub(1)
+        .saturating_mul(numerator)
+        .checked_div(denominator.max(1))
+        .unwrap_or(0);
     sorted.get(index).copied().unwrap_or(0)
 }
 
@@ -116,9 +124,11 @@ fn percentile(sorted: &[u64], numerator: usize, denominator: usize) -> u64 {
 )]
 pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
     let name = default_name(args);
-    let flush_bytes = 8 * smx::MIB;
-    let max_flush_bytes = args.max_flush_mib * smx::MIB;
-    let pressure_bytes = 128 * smx::MIB as u64;
+    let flush_bytes = FLUSH_BYTES;
+    let max_flush_bytes = args
+        .max_flush_mib
+        .checked_mul(smx::MIB)
+        .context("--max-flush-mib overflows usize")?;
     sink.row(
         &json!({"workload": name, "streams": args.streams, "hours": args.hours,
         "rate_per_stream_per_s": args.rate, "rec_bytes": args.rec_bytes,
@@ -183,7 +193,7 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
         DRIVER_INTERVAL_REFS
     };
     for sec in 1..=total_secs {
-        let now = smx::T0 + sec * 1000;
+        let now = smx::T0.saturating_add(sec.saturating_mul(1000));
         for (i, id) in ids.iter().enumerate() {
             if rng.below(1_000_000) < threshold {
                 let seq = appends.get(i).copied().unwrap_or(0);
@@ -193,13 +203,13 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
                 }
                 smx::ok(smx::append(&mut m, id, record, None, now), "append")?;
                 if let Some(count) = appends.get_mut(i) {
-                    *count += 1;
+                    *count = count.saturating_add(1);
                 }
             }
         }
         let group_hot = m.total_hot_payload_bytes();
         let min_hot = if args.pressure_groups > 0
-            && group_hot * args.pressure_groups as u64 >= pressure_bytes
+            && group_hot.saturating_mul(args.pressure_groups as u64) >= PRESSURE_BYTES
         {
             1
         } else {
@@ -207,10 +217,11 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
         };
         let started = std::time::Instant::now();
         let published = smx::flush_pass(&mut m, min_hot, max_flush_bytes, &mut packs, &mut stats)?;
-        flush_ns_interval += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        flush_ns_interval = flush_ns_interval
+            .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         for (stream_id, chunk) in published {
             if chunk.shared_object {
-                refs_added_interval += 1;
+                refs_added_interval = refs_added_interval.saturating_add(1);
                 if let Some(index) = index_of.get(&stream_id) {
                     refs.entry(*index).or_default().push(chunk);
                 }
@@ -224,7 +235,7 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
                 .max()
                 .unwrap_or(0);
             max_refs_seen = max_refs_seen.max(max_refs);
-            if sec % args.driver_interval_sec.max(1) == 0 {
+            if sec.checked_rem(args.driver_interval_sec.max(1)) == Some(0) {
                 for (id, after) in ids.iter().zip(&refs_after_pass) {
                     let added = (m.cold_chunks(id).len() as u64).saturating_sub(*after);
                     max_refs_added_between_passes = max_refs_added_between_passes.max(added);
@@ -235,17 +246,17 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
                 }
             }
         }
-        if args.retain_every_sec > 0 && sec % args.retain_every_sec == 0 {
+        if sec.checked_rem(args.retain_every_sec) == Some(0) {
             for (i, id) in ids.iter().enumerate() {
                 let next = appends.get(i).copied().unwrap_or(0);
                 if next > args.retain_keep
-                    && let Some((_, offset)) = starts
-                        .get(i)
-                        .and_then(|starts| starts.at_or_below(next - args.retain_keep))
+                    && let Some((_, offset)) = starts.get(i).and_then(|starts| {
+                        starts.at_or_below(next.saturating_sub(args.retain_keep))
+                    })
                     && offset > m.retained_offset(id)
                 {
                     smx::checkpoint_and_retain(&mut m, id, offset, checkpoint_payload, now)?;
-                    retentions += 1;
+                    retentions = retentions.saturating_add(1);
                 }
                 let live = m.cold_chunks(id).len();
                 if let Some(mirror) = refs.get_mut(&i) {
@@ -265,10 +276,10 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
                 .unwrap_or(0)
         };
         max_stream_hot_seen = max_stream_hot_seen.max(max_hot);
-        if first_starved_sec.is_none() && max_hot > 2 * flush_bytes as u64 {
+        if first_starved_sec.is_none() && max_hot > STARVED_HOT_BYTES {
             first_starved_sec = Some(sec);
         }
-        if sec % measure_every == 0 || sec == total_secs {
+        if sec.checked_rem(measure_every) == Some(0) || sec == total_secs {
             let measured = measure_sm(&m, &base, smx::append_counts(&ids, &appends), args.zstd)?;
             formula::per_stream_checks(&mut outcome, &measured, shared_refs_interval);
             let mut ref_counts: Vec<u64> = measured
@@ -325,7 +336,7 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
         "f10_max_stream_hot",
         "max stream hot bytes <= 2 x flush_size (F10, starvation)",
         max_stream_hot_seen as f64,
-        (2 * flush_bytes) as f64,
+        STARVED_HOT_BYTES as f64,
     );
 
     if args.driver {
@@ -337,7 +348,7 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
             "f2_driver_shared_refs_per_stream",
             "shared refs per stream <= 64 + the most refs one stream gained between two driver passes, at every second (F2 driver)",
             max_refs_seen as f64,
-            (formula::MAX_SHARED_REFS + max_refs_added_between_passes) as f64,
+            formula::MAX_SHARED_REFS.saturating_add(max_refs_added_between_passes) as f64,
         );
         outcome.check(
             "f2_driver_packs_reclaimed",
@@ -373,14 +384,17 @@ fn compact_all(
     sink: &mut Sink,
 ) -> Result<()> {
     let before: usize = refs.values().map(Vec::len).sum();
-    let mut ok_count = 0;
-    let mut err_count = 0;
+    let mut ok_count = 0u64;
+    let mut err_count = 0u64;
     let mut first_err = None;
     for (index, old) in std::mem::take(refs) {
         let (Some(first), Some(last), Some(id)) = (old.first(), old.last(), ids.get(index)) else {
             continue;
         };
         let (start, end) = (first.start_offset, last.end_offset);
+        let object_size = end
+            .checked_sub(start)
+            .context("shared run ends before it starts")?;
         let replacement = ColdChunkRef {
             start_offset: start,
             end_offset: end,
@@ -390,7 +404,7 @@ fn compact_all(
                 start,
                 end,
             ),
-            object_size: end - start,
+            object_size,
             object_offset: 0,
             shared_object: false,
             payload_digest: String::new(),
@@ -399,11 +413,13 @@ fn compact_all(
             stream_id: id.clone(),
             old_chunks: old,
             replacement,
-            gc_not_before_ms: smx::T0 + total_secs * 1000 + 300_000,
+            gc_not_before_ms: smx::T0
+                .saturating_add(total_secs.saturating_mul(1000))
+                .saturating_add(300_000),
         }) {
-            StreamResponse::ColdCompacted { .. } => ok_count += 1,
+            StreamResponse::ColdCompacted { .. } => ok_count = ok_count.saturating_add(1),
             other => {
-                err_count += 1;
+                err_count = err_count.saturating_add(1);
                 if first_err.is_none() {
                     first_err = Some(format!("{other:?}"));
                 }
@@ -452,7 +468,7 @@ fn driver_pass(
     now_ms: u64,
     stats: &mut DriverStats,
 ) -> Result<()> {
-    stats.passes += 1;
+    stats.passes = stats.passes.saturating_add(1);
     let request = SharedRefCompactionRequest::new(now_ms, DRIVER_MAX_RUN_BYTES, DRIVER_MAX_STREAMS);
     for candidate in m.shared_ref_candidates(&request, tracker) {
         let (Some(first), Some(last)) = (candidate.run.first(), candidate.run.last()) else {
@@ -460,6 +476,9 @@ fn driver_pass(
         };
         let (start, end) = (first.start_offset, last.end_offset);
         let slices = candidate.run.len() as u64;
+        let object_size = end
+            .checked_sub(start)
+            .context("shared run ends before it starts")?;
         let replacement = ColdChunkRef {
             start_offset: start,
             end_offset: end,
@@ -470,7 +489,7 @@ fn driver_pass(
                 start,
                 end,
             ),
-            object_size: end - start,
+            object_size,
             object_offset: 0,
             shared_object: false,
             payload_digest: String::new(),
@@ -480,12 +499,12 @@ fn driver_pass(
                 stream_id: candidate.stream_id,
                 old_chunks: candidate.run,
                 replacement,
-                gc_not_before_ms: now_ms + DRIVER_GC_GRACE_MS,
+                gc_not_before_ms: now_ms.saturating_add(DRIVER_GC_GRACE_MS),
             }),
             "driver compact cold",
         )?;
-        stats.compactions += 1;
-        stats.compacted_slices += slices;
+        stats.compactions = stats.compactions.saturating_add(1);
+        stats.compacted_slices = stats.compacted_slices.saturating_add(slices);
     }
     let due = m
         .pending_cold_gc_batch(usize::MAX)
@@ -493,10 +512,11 @@ fn driver_pass(
         .take_while(|entry| entry.not_before_ms <= now_ms)
         .collect::<Vec<_>>();
     if let Some(last) = due.last() {
-        stats.packs_reclaimed += due
+        let reclaimed_packs = due
             .iter()
             .filter(|entry| matches!(&entry.target, ColdGcTarget::Paths(paths) if paths.iter().any(|path| path.contains("/_packs/"))))
             .count() as u64;
+        stats.packs_reclaimed = stats.packs_reclaimed.saturating_add(reclaimed_packs);
         smx::ok(
             m.apply(StreamCommand::AckColdGc {
                 up_to_seq: last.seq,

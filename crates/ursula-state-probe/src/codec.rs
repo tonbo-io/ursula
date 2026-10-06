@@ -1,10 +1,6 @@
 //! Exact group-snapshot sizes from the production codec
 //! (`ursula_raft::group_snapshot_frames`), with a per-field and per-stream
 //! byte breakdown obtained by decoding each frame with prost.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::time::Instant;
 
@@ -116,6 +112,11 @@ fn n(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+/// Saturating `*counter += by`.
+fn bump(counter: &mut u64, by: u64) {
+    *counter = counter.saturating_add(by);
+}
+
 fn delta<F: FnOnce(&mut proto::StreamSnapshotEntryV1)>(
     entry: &proto::StreamSnapshotEntryV1,
     full: usize,
@@ -146,8 +147,8 @@ fn stream_name(entry: &proto::StreamSnapshotEntryV1) -> String {
 }
 
 fn add_stream(st: &mut SnapStats, entry: proto::StreamSnapshotEntryV1, frame_bytes: u64) {
-    st.stream_frames += 1;
-    st.stream_bytes += frame_bytes;
+    bump(&mut st.stream_frames, 1);
+    bump(&mut st.stream_bytes, frame_bytes);
     let full = entry.encoded_len();
     let cc = delta(&entry, full, |x| x.cold_chunks.clear());
     let es = delta(&entry, full, |x| x.external_segments.clear());
@@ -160,18 +161,27 @@ fn add_stream(st: &mut SnapStats, entry: proto::StreamSnapshotEntryV1, frame_byt
         .iter()
         .map(|p| n(p.receipts.len()))
         .sum();
-    st.cold_chunks_bytes += cc;
-    st.cold_chunks_count += n(entry.cold_chunks.len());
-    st.external_segments_bytes += es;
-    st.external_segments_count += n(entry.external_segments.len());
-    st.hot_payload_bytes += hp;
-    st.hot_segments_bytes += hs;
-    st.hot_segments_count += n(entry.hot_segments.len());
-    st.producer_bytes += pr;
-    st.producer_count += n(entry.producer_states.len());
-    st.receipt_count += receipts;
-    st.visible_snapshot_bytes += vs;
-    st.stream_fixed_bytes += frame_bytes.saturating_sub(cc + es + hp + hs + pr + vs);
+    bump(&mut st.cold_chunks_bytes, cc);
+    bump(&mut st.cold_chunks_count, n(entry.cold_chunks.len()));
+    bump(&mut st.external_segments_bytes, es);
+    bump(
+        &mut st.external_segments_count,
+        n(entry.external_segments.len()),
+    );
+    bump(&mut st.hot_payload_bytes, hp);
+    bump(&mut st.hot_segments_bytes, hs);
+    bump(&mut st.hot_segments_count, n(entry.hot_segments.len()));
+    bump(&mut st.producer_bytes, pr);
+    bump(&mut st.producer_count, n(entry.producer_states.len()));
+    bump(&mut st.receipt_count, receipts);
+    bump(&mut st.visible_snapshot_bytes, vs);
+    let attributed = [cc, es, hp, hs, pr, vs]
+        .into_iter()
+        .fold(0u64, u64::saturating_add);
+    bump(
+        &mut st.stream_fixed_bytes,
+        frame_bytes.saturating_sub(attributed),
+    );
 
     let hot_bytes = n(entry.payload.len());
     st.streams.push(StreamFrameStats {
@@ -199,28 +209,36 @@ pub fn measure(snapshot: GroupSnapshot, with_zstd: bool) -> Result<SnapStats> {
     };
     for frame_bytes in &frames {
         let len = n(frame_bytes.len());
-        st.total_bytes += len;
+        bump(&mut st.total_bytes, len);
         let mut cursor = std::io::Cursor::new(frame_bytes.as_ref());
         let frame = proto::SnapshotFrameV1::decode_length_delimited(&mut cursor)
             .context("decode snapshot frame")?;
         match frame.frame.context("empty snapshot frame")? {
             proto::snapshot_frame_v1::Frame::Header(h) => {
-                st.header_bytes += len;
+                bump(&mut st.header_bytes, len);
                 let full = h.encoded_len();
-                st.header_bucket_usage_bytes += header_delta(&h, full, |x| x.bucket_usage.clear());
-                st.header_erased_bucket_bytes +=
-                    header_delta(&h, full, |x| x.erased_buckets.clear());
-                st.header_bucket_usage_count += n(h.bucket_usage.len());
-                st.header_erased_bucket_count += n(h.erased_buckets.len());
+                bump(
+                    &mut st.header_bucket_usage_bytes,
+                    header_delta(&h, full, |x| x.bucket_usage.clear()),
+                );
+                bump(
+                    &mut st.header_erased_bucket_bytes,
+                    header_delta(&h, full, |x| x.erased_buckets.clear()),
+                );
+                bump(&mut st.header_bucket_usage_count, n(h.bucket_usage.len()));
+                bump(
+                    &mut st.header_erased_bucket_count,
+                    n(h.erased_buckets.len()),
+                );
             }
             proto::snapshot_frame_v1::Frame::Stream(entry) => add_stream(&mut st, *entry, len),
             proto::snapshot_frame_v1::Frame::AppendCount(_) => {
-                st.append_count_frames += 1;
-                st.append_count_bytes += len;
+                bump(&mut st.append_count_frames, 1);
+                bump(&mut st.append_count_bytes, len);
             }
             proto::snapshot_frame_v1::Frame::ColdGc(_) => {
-                st.cold_gc_frames += 1;
-                st.cold_gc_bytes += len;
+                bump(&mut st.cold_gc_frames, 1);
+                bump(&mut st.cold_gc_bytes, len);
             }
             proto::snapshot_frame_v1::Frame::FormatEpoch(_)
             | proto::snapshot_frame_v1::Frame::Footer(_) => {}

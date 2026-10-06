@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::sync::Arc;
@@ -10,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use anyhow::Context;
 use anyhow::Result;
 use clap::Args;
 use futures::stream::FuturesUnordered;
@@ -113,7 +110,9 @@ pub async fn run(args: MultiStreamArgs) -> Result<MultiStreamResult> {
     let errors = Arc::new(Mutex::new(BTreeMap::<String, u64>::new()));
     let hist = Arc::new(Mutex::new(new_histogram()));
 
-    let deadline = Instant::now() + Duration::from_secs(args.duration_secs);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(args.duration_secs))
+        .context("--duration-secs overflows Instant")?;
     let start = Instant::now();
 
     let mut workers = Vec::with_capacity(args.streams);
@@ -212,20 +211,19 @@ async fn run_writer(
 ) {
     let epoch: u64 = 0;
     let mut seq: u64 = 0;
-    let interval = if rate_per_stream > 0 {
-        Some(Duration::from_micros(1_000_000 / rate_per_stream.max(1)))
-    } else {
-        None
-    };
+    // A zero rate means as fast as possible: no pacing interval.
+    let interval = 1_000_000u64
+        .checked_div(rate_per_stream)
+        .map(Duration::from_micros);
     let mut next_at = Instant::now();
     let mut local = new_histogram();
     while Instant::now() < deadline {
         if let Some(iv) = interval {
             let now = Instant::now();
             if now < next_at {
-                tokio::time::sleep(next_at - now).await;
+                tokio::time::sleep(next_at.saturating_duration_since(now)).await;
             }
-            next_at += iv;
+            next_at = next_at.checked_add(iv).unwrap_or(deadline);
         }
         let started = Instant::now();
         let producer = Some(Producer {
@@ -249,7 +247,7 @@ async fn run_writer(
                 if status.is_success() {
                     ok.fetch_add(1, Ordering::Relaxed);
                     record(&mut local, started);
-                    seq += 1;
+                    seq = seq.saturating_add(1);
                 } else if status.as_u16() == 503 || status.as_u16() == 429 {
                     bp.fetch_add(1, Ordering::Relaxed);
                     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -270,7 +268,8 @@ async fn run_writer(
 
 async fn record_error(errors: &Mutex<BTreeMap<String, u64>>, error: String) {
     let mut errors = errors.lock().await;
-    *errors.entry(error).or_default() += 1;
+    let count = errors.entry(error).or_default();
+    *count = count.saturating_add(1);
 }
 
 fn reqwest_error_chain(error: &reqwest::Error) -> String {
@@ -302,13 +301,13 @@ async fn create_streams(backend: &Backend, count: usize, concurrency: usize) -> 
     };
     while next < count && pending.len() < max {
         push_one(next, &mut pending);
-        next += 1;
+        next = next.saturating_add(1);
     }
     while let Some(joined) = pending.next().await {
         joined??;
         if next < count {
             push_one(next, &mut pending);
-            next += 1;
+            next = next.saturating_add(1);
         }
     }
     Ok(())
