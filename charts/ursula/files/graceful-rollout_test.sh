@@ -80,6 +80,7 @@ desired_revision() {
 
 replace_pod() {
   [ "$1" = "1" ]
+  [ "$2" = "${mocked_uid}" ]
   replacement_count=$((replacement_count + 1))
   mocked_uid="replacement-${replacement_count}"
   mocked_revision=ursula-current
@@ -336,6 +337,7 @@ CTL
   }
   replace_pod() {
     [ "$1" = 2 ]
+    [ "$2" = "${superseded_uid}" ]
     printf '%s\n' replace-pod >>"${superseded_order}"
     superseded_uid=current-target-uid
     superseded_revision=ursula-new-target
@@ -416,7 +418,7 @@ chmod +x "${mock_ctl}"
 CTL=${mock_ctl}
 REPLICAS=3
 desired_revision() { printf '%s' ursula-recovered; }
-replace_pod() { [ "$1" = "2" ]; recovered_replaced=1; }
+replace_pod() { [ "$1" = "2" ] && [ "$2" = amnesiac-source-uid ]; recovered_replaced=1; }
 wait_for_pod_ready() { [ "$1" = "2" ]; }
 wait_for_pod_started() { wait_for_pod_ready "$1"; }
 pod_matches_target() { [ "$1" = "2" ] && [ "$2" = "ursula-recovered" ]; }
@@ -660,6 +662,57 @@ done
     [ "$*" = '-n ursula wait --for=jsonpath={.status.containerStatuses[?(@.name=="ursula")].started}=true pod/ursula-2 --timeout=15m' ]
   }
   wait_for_pod_started 2
+)
+
+# A stale caller cannot delete the new Pod that reused its admitted name. The
+# API precondition is authoritative even when replacement races the request.
+(
+  . "${test_dir}/graceful-rollout.sh"
+  NAMESPACE=ursula
+  STATEFULSET=ursula
+  source_uid=11111111-2222-3333-4444-555555555555
+  replacement_uid=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+  identity_dir=$(mktemp -d)
+  trap 'rm -rf "${identity_dir}"' EXIT
+  reject_stale=false
+  stop_forward() { [ "$1" = 2 ]; }
+  kubectl() {
+    case "$*" in
+      'delete --raw=/api/v1/namespaces/ursula/pods/ursula-2 -f -')
+        cat >"${identity_dir}/body.json"
+        python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d == {"apiVersion":"v1", "kind":"DeleteOptions", "preconditions":{"uid":sys.argv[2]}}' \
+          "${identity_dir}/body.json" "${source_uid}"
+        if [ "${reject_stale}" = true ]; then
+          printf 'Conflict: UID precondition does not match\n' >&2
+          return 1
+        fi
+        touch "${identity_dir}/deleted-source"
+        ;;
+      '-n ursula get pod ursula-2 -o jsonpath={.metadata.uid}')
+        # The replacement is already observable when the old caller wakes.
+        printf '%s' "${replacement_uid}"
+        ;;
+      *)
+        printf 'unexpected incarnation operation: %s\n' "$*" >&2
+        return 1
+        ;;
+    esac
+  }
+  replace_pod 2 "${source_uid}"
+  [ -f "${identity_dir}/deleted-source" ]
+  rm "${identity_dir}/deleted-source"
+  reject_stale=true
+  if replace_pod 2 "${source_uid}"; then
+    echo "stale UID conflict must stop replacement" >&2
+    exit 1
+  fi
+  [ ! -f "${identity_dir}/deleted-source" ]
+  rm "${identity_dir}/body.json"
+  if replace_pod 2 'invalid"uid'; then
+    echo "invalid identity must fail before any deletion" >&2
+    exit 1
+  fi
+  [ ! -f "${identity_dir}/body.json" ]
 )
 
 echo "graceful-rollout.sh: all checks passed"

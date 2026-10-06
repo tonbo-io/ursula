@@ -66,4 +66,28 @@ helm upgrade "${release}" "${chart}" \
   --set server.updateStrategy=OnDelete \
   --timeout 3m >/dev/null
 
+# Real API regression: the stale source UID must not delete a second Pod that
+# the StatefulSet created under the same name. This Pod is unscheduled, so the
+# test does not start a process or bypass its configured termination grace.
+(
+  NAMESPACE=${namespace}
+  STATEFULSET=${release}
+  REPLICAS=1
+  EXPECTED_GROUPS=1
+  TARGET_IMAGE=unused
+  ROLLOUT_SOURCE_ONLY=1
+  export NAMESPACE STATEFULSET REPLICAS EXPECTED_GROUPS TARGET_IMAGE ROLLOUT_SOURCE_ONLY
+  . "${chart}/files/graceful-rollout.sh"
+  source_uid=$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-0" -o jsonpath='{.metadata.uid}')
+  replace_pod 0 "${source_uid}"
+  replacement_uid=$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-0" -o jsonpath='{.metadata.uid}')
+  test "${source_uid}" != "${replacement_uid}"
+  if replace_pod 0 "${source_uid}"; then
+    echo "stale source UID deleted a replacement Pod" >&2
+    exit 1
+  fi
+  test "$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-0" -o jsonpath='{.metadata.uid}')" = "${replacement_uid}"
+  test -z "$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-0" -o jsonpath='{.metadata.deletionTimestamp}')"
+)
+
 echo "Helm cleared stale rollingUpdate state, switched to OnDelete, and repeated cleanly"
