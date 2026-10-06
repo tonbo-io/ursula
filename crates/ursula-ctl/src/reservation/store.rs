@@ -106,6 +106,9 @@ impl ConfigMapSnapshot {
         match request {
             ReservationRequest::Ownership(request) => self.propose(request),
             ReservationRequest::Progress(request) => self.progress(request),
+            ReservationRequest::Inventory(request) => {
+                self.propose_state(self.state.publish_hosts(request)?)
+            }
         }
     }
 

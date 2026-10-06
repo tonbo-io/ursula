@@ -13,6 +13,172 @@ use ursula_ctl::reservation::SourceIdentity;
 use ursula_proto::admin::ProcessIncarnation;
 
 #[test]
+fn healthy_host_capture_round_trips_through_actual_cli_without_acquiring_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let cell = CellIdentity {
+        namespace: "test".into(),
+        namespace_uid: "namespace-uid".into(),
+        statefulset: "voters".into(),
+        statefulset_uid: "statefulset-uid".into(),
+        group_count: 2,
+        core_count: 1,
+        voter_ids: [1, 2, 3].into_iter().collect(),
+    };
+    let now = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let plan = (1_u64..=3)
+        .map(|id| NodeInfo {
+            id,
+            host: format!("voters-{id}"),
+            admin_url: format!("http://127.0.0.1:{}", 1000 + id).parse().unwrap(),
+            http_url: None,
+            metrics_url: None,
+            expected_process_incarnation: Some(ProcessIncarnation::from_bits(u128::from(id))),
+            expected_maintenance_fence: None,
+        })
+        .collect::<Vec<_>>();
+    let proof = PrefixObservation {
+        started_ms: now,
+        completed_ms: now,
+        verification: ursula_ctl::quorum::QuorumVerification {
+            version: 3,
+            participation_certified: true,
+            process_incarnations_certified: true,
+            process_incarnations: plan
+                .iter()
+                .map(|node| (node.id, node.expected_process_incarnation.clone().unwrap()))
+                .collect(),
+            maintenance_executor_certified: false,
+            maintenance_executor_retired_certified: false,
+            maintenance_fence: None,
+            prefixes: (0..2)
+                .map(|group| {
+                    (group, ursula_raft::QuorumPrefix {
+                        raft_group_id: group,
+                        leader_id: 2,
+                        leader_term: 1,
+                        required_applied_index: 50,
+                    })
+                })
+                .collect(),
+            applied: (1..=3)
+                .map(|id| (id, [(0, 50), (1, 50)].into_iter().collect()))
+                .collect(),
+        },
+    };
+    let pods = json!({"kind":"PodList", "items":(1..=3).map(|id|json!({"kind":"Pod", "metadata":{
+        "namespace":"test", "name":format!("voters-{}",id-1), "uid":format!("pod-{id}"),
+        "ownerReferences":[{"kind":"StatefulSet", "uid":"statefulset-uid", "controller":true}]},
+        "spec":{"nodeName":format!("host-{id}")}, "status":{"conditions":[{"type":"Ready", "status":"True"}]}})).collect::<Vec<_>>()});
+    let nodes = json!({"kind":"NodeList", "items":(1..=3).map(|id|json!({"kind":"Node", "metadata":{
+        "name":format!("host-{id}"), "uid":format!("node-{id}"), "labels":{"topology.kubernetes.io/zone":format!("zone-{id}")}},
+        "spec":{"providerID":format!("instance-{id}")}, "status":{"conditions":[{"type":"Ready", "status":"True"}]}})).collect::<Vec<_>>()});
+    let snapshot = json!({"apiVersion":"v1", "kind":"ConfigMap", "metadata":{"namespace":"test", "name":"voters-maintenance", "uid":"store-uid", "resourceVersion":"first"}, "data":{"reservation":serde_json::to_string(&Reservation::initial(cell.clone()).unwrap()).unwrap()}});
+    for (name, value) in [
+        ("cell", serde_json::to_value(&cell).unwrap()),
+        ("snapshot", snapshot),
+        ("pods", pods),
+        ("nodes", nodes),
+        ("config", json!({"nodes":plan})),
+        ("observation", serde_json::to_value(proof).unwrap()),
+    ] {
+        std::fs::write(
+            directory.path().join(name),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+    }
+    let builder = Command::new(env!("CARGO_BIN_EXE_ursulactl"))
+        .args(["reservation-request", "publish-host-inventory"])
+        .arg("--pods")
+        .arg(directory.path().join("pods"))
+        .arg("--nodes")
+        .arg(directory.path().join("nodes"))
+        .arg("--config")
+        .arg(directory.path().join("config"))
+        .arg("--observation")
+        .arg(directory.path().join("observation"))
+        .output()
+        .unwrap();
+    assert!(
+        builder.status.success(),
+        "{}",
+        String::from_utf8_lossy(&builder.stderr)
+    );
+    std::fs::write(directory.path().join("request"), builder.stdout).unwrap();
+    let propose = Command::new(env!("CARGO_BIN_EXE_ursulactl"))
+        .arg("reservation-propose")
+        .arg("--cell")
+        .arg(directory.path().join("cell"))
+        .arg("--snapshot")
+        .arg(directory.path().join("snapshot"))
+        .arg("--request")
+        .arg(directory.path().join("request"))
+        .output()
+        .unwrap();
+    assert!(
+        propose.status.success(),
+        "{}",
+        String::from_utf8_lossy(&propose.stderr)
+    );
+    let mut response: Value = serde_json::from_slice(&propose.stdout).unwrap();
+    response["metadata"]["resourceVersion"] = json!("second");
+    std::fs::write(
+        directory.path().join("response"),
+        serde_json::to_vec(&response).unwrap(),
+    )
+    .unwrap();
+    let acknowledge = Command::new(env!("CARGO_BIN_EXE_ursulactl"))
+        .arg("reservation-acknowledge")
+        .arg("--cell")
+        .arg(directory.path().join("cell"))
+        .arg("--snapshot")
+        .arg(directory.path().join("snapshot"))
+        .arg("--request")
+        .arg(directory.path().join("request"))
+        .arg("--response")
+        .arg(directory.path().join("response"))
+        .output()
+        .unwrap();
+    assert!(
+        acknowledge.status.success(),
+        "{}",
+        String::from_utf8_lossy(&acknowledge.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&acknowledge.stdout).unwrap();
+    assert_eq!(receipt["disruption_authorized"], false);
+    assert_eq!(receipt["physical_hosts_fenced"], false);
+    assert_eq!(receipt["reservation"]["generation"], 0);
+    assert!(receipt["reservation"]["operation"].is_null());
+    let read = Command::new(env!("CARGO_BIN_EXE_ursulactl"))
+        .arg("reservation-read")
+        .arg("--cell")
+        .arg(directory.path().join("cell"))
+        .arg("--snapshot")
+        .arg(directory.path().join("response"))
+        .args(["--field", "hosts"])
+        .output()
+        .unwrap();
+    assert!(
+        read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&read.stdout).unwrap()["voters"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[test]
 fn proposal_is_not_a_receipt_and_conflicting_committed_state_cannot_be_adopted() {
     let directory = tempfile::tempdir().unwrap();
     let cell = CellIdentity {

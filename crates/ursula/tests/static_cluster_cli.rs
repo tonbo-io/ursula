@@ -787,6 +787,28 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
     // Real Raft observations must also satisfy the shared reservation policy.
     // Physical identities below describe this native fixture, not Kubernetes
     // or provider fencing. ChildGuard waits for the original process to exit.
+    let options = ursula_ctl::quorum::QuorumVerificationOptions {
+        group_count: 6,
+        core_count: 1,
+        timeout: Duration::from_secs(15),
+        poll_interval: Duration::from_millis(100),
+        allow_legacy_eligibility: false,
+    };
+    ursula_ctl::wait_cluster_ready(
+        "pre-fault host inventory",
+        &nodes,
+        &ctl,
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+        16,
+    )
+    .await
+    .expect("capture requires full startup recovery, not listener readiness");
+    let inventory_started = now_ms();
+    let inventory_proof = ursula_ctl::quorum::verify_quorum(&nodes, &ctl, &options)
+        .await
+        .expect("fresh pre-fault host inventory proof");
+    let inventory_observation = observation(inventory_started, inventory_proof);
     let mut reservation =
         ursula_ctl::reservation::Reservation::initial(ursula_ctl::reservation::CellIdentity {
             namespace: "native".into(),
@@ -798,6 +820,23 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
             voter_ids: [1, 2, 3].into_iter().collect(),
         })
         .unwrap()
+        .publish_hosts(ursula_ctl::reservation::PublishHostInventory {
+            now_ms: now_ms(),
+            process_plan: nodes.clone(),
+            observation: inventory_observation,
+            pods: (1..=3).map(|id| serde_json::json!({"kind":"Pod", "metadata":{
+                "namespace":"native", "name":format!("voters-{}", id-1),
+                "uid":if id == 3 { "native-original".to_owned() } else { format!("native-pod-{id}") },
+                "ownerReferences":[{"kind":"StatefulSet", "uid":"native-sts", "controller":true}]},
+                "spec":{"nodeName":format!("native-host-{id}")},
+                "status":{"conditions":[{"type":"Ready", "status":"True"}]}})).collect(),
+            nodes: (1..=3).map(|id| serde_json::json!({"kind":"Node", "metadata":{
+                "name":format!("native-host-{id}"), "uid":format!("native-node-{id}"),
+                "labels":{"topology.kubernetes.io/zone":format!("native-zone-{id}")}},
+                "spec":{"providerID":format!("native-instance-{id}")},
+                "status":{"conditions":[{"type":"Ready", "status":"True"}]}})).collect(),
+        })
+        .expect("capture all original host identities in the maintenance store")
         .propose(ursula_ctl::reservation::OwnershipRequest::Reserve {
             operation_id: format!("{:032x}", 1),
             executor_id: format!("{:032x}", 2),
@@ -814,13 +853,6 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
         })
         .unwrap();
     let executor = reservation.operation().unwrap().fence.clone();
-    let options = ursula_ctl::quorum::QuorumVerificationOptions {
-        group_count: 6,
-        core_count: 1,
-        timeout: Duration::from_secs(15),
-        poll_interval: Duration::from_millis(100),
-        allow_legacy_eligibility: false,
-    };
     for node in &mut nodes {
         node.expected_maintenance_fence = Some(executor.clone());
     }
@@ -952,7 +984,7 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
                 "kind":"StatefulSet", "uid":"native-sts", "controller":true}]},
             "spec":{"nodeName":"native-host-3"}}),
                 node: serde_json::json!({"kind":"Node", "metadata":{"name":"native-host-3",
-            "uid":"native-node-3"}, "spec":{"providerID":"native-instance-3"}}),
+            "uid":"native-node-3", "labels":{"topology.kubernetes.io/zone":"native-zone-3"}}, "spec":{"providerID":"native-instance-3"}}),
             },
         )
         .expect("only the irreversibly retired target process may bind");
@@ -1056,6 +1088,26 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
         .expect("live all-retired prefixes release only the bound replacement");
     assert!(reservation.operation().is_none());
     assert_eq!(reservation.generation(), 1);
+    assert_eq!(
+        reservation
+            .hosts()
+            .unwrap()
+            .voter(3)
+            .unwrap()
+            .source
+            .pod_uid,
+        "native-replacement"
+    );
+    assert_eq!(
+        reservation
+            .hosts()
+            .unwrap()
+            .voter(3)
+            .unwrap()
+            .source
+            .provider_instance,
+        "native-instance-3"
+    );
     assert_eq!(
         reservation.completion().unwrap().replacement.pod_uid,
         "native-replacement"

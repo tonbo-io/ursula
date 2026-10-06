@@ -381,6 +381,343 @@ fn binding(state: &Reservation) -> super::ProgressRequest {
     }
 }
 
+fn host_publication() -> super::PublishHostInventory {
+    let state = Reservation::initial(cell())
+        .unwrap()
+        .propose(request(1, 10, 1))
+        .unwrap();
+    let mut proof = observation(&state, false, 1200, 50);
+    proof.verification.maintenance_fence = None;
+    proof.verification.maintenance_executor_certified = false;
+    let mut plan = state.operation().unwrap().process_plan.clone();
+    for node in &mut plan {
+        node.expected_maintenance_fence = None;
+    }
+    super::PublishHostInventory {
+        now_ms: 1500,
+        process_plan: plan,
+        observation: proof,
+        pods: (1..=3)
+            .map(|id| {
+                json!({"kind":"Pod", "metadata":{
+            "namespace":"ursula", "name":format!("voters-{}", id-1), "uid":format!("pod-{id}"),
+            "ownerReferences":[{"kind":"StatefulSet", "uid":"statefulset-uid", "controller":true}]},
+            "spec":{"nodeName":format!("host-{id}")},
+            "status":{"conditions":[{"type":"Ready", "status":"True"}]}})
+            })
+            .collect(),
+        nodes: (1..=3)
+            .map(|id| {
+                json!({"kind":"Node", "metadata":{
+            "name":format!("host-{id}"), "uid":format!("node-{id}"),
+            "labels":{"topology.kubernetes.io/zone":format!("zone-{id}")}},
+            "spec":{"providerID":format!("instance-{id}")},
+            "status":{"conditions":[{"type":"Ready", "status":"True"}]}})
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn host_inventory_migration_is_whole_store_cas_and_serializes_with_ownership() {
+    let before = ConfigMapSnapshot::parse(document(), &cell()).unwrap();
+    let inventory_request = super::ReservationRequest::Inventory(host_publication());
+    // The actual JSON path, including string-encoded integer proof map keys.
+    let encoded = serde_json::to_string(&inventory_request).unwrap();
+    assert!(encoded.contains("publish_host_inventory"));
+    let parsed: super::ReservationRequest = serde_json::from_str(&encoded).unwrap();
+    let capture = before.transition(parsed).unwrap();
+    let owner = before.propose(request(1, 10, 1)).unwrap();
+    let mut response = capture.document().clone();
+    response["metadata"]["resourceVersion"] = json!("rv-two");
+    let acknowledged = before.acknowledge(&capture, response.clone()).unwrap();
+    assert!(before.acknowledge(&owner, response).is_err());
+    assert_eq!(acknowledged.state().version, 2);
+    assert_eq!(acknowledged.state().generation(), 0);
+    assert!(acknowledged.state().operation().is_none());
+    assert_eq!(
+        acknowledged
+            .state()
+            .hosts()
+            .unwrap()
+            .voter(2)
+            .unwrap()
+            .source
+            .provider_instance,
+        "instance-2"
+    );
+    assert_eq!(capture.document()["metadata"]["uid"], "store-uid");
+    assert_eq!(capture.document()["data"]["other"], "preserved");
+    let mut action = request(1, 10, 1);
+    if let OwnershipRequest::Reserve { now_ms, .. } = &mut action {
+        *now_ms = 1600;
+    }
+    let owned = acknowledged.state().propose(action).unwrap();
+    assert!(owned.publish_hosts(host_publication()).is_err());
+    let takeover = owned
+        .propose(OwnershipRequest::Takeover {
+            operation_id: format!("{:032x}", 1),
+            executor_id: format!("{:032x}", 20),
+            now_ms: 2000,
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(owned.hosts()).unwrap(),
+        serde_json::to_value(takeover.hosts()).unwrap()
+    );
+}
+
+#[test]
+fn incomplete_or_uncertified_healthy_inventory_cannot_anchor_host_recovery() {
+    for case in 0..16 {
+        let mut request = host_publication();
+        match case {
+            0 => {
+                request.pods.pop();
+            }
+            1 => {
+                request.nodes.pop();
+            }
+            2 => request.pods[0]["status"]["conditions"][0]["status"] = json!("False"),
+            3 => request.nodes[0]["status"]["conditions"][0]["status"] = json!("Unknown"),
+            4 => request.nodes[0]["metadata"]["deletionTimestamp"] = json!("now"),
+            5 => request.pods[0]["metadata"]["deletionTimestamp"] = json!("now"),
+            6 => request.nodes[1]["spec"]["providerID"] = json!("instance-1"),
+            7 => {
+                request.nodes[1]["metadata"]["labels"]["topology.kubernetes.io/zone"] =
+                    json!("zone-1")
+            }
+            8 => {
+                request.nodes[0]["metadata"]["labels"] = json!({});
+            }
+            9 => {
+                request.observation.verification.applied.remove(&3);
+            }
+            10 => request.observation.verification.participation_certified = false,
+            11 => {
+                request
+                    .observation
+                    .verification
+                    .process_incarnations_certified = false
+            }
+            12 => {
+                request
+                    .observation
+                    .verification
+                    .maintenance_executor_certified = true
+            }
+            13 => request
+                .observation
+                .verification
+                .process_incarnations
+                .insert(1, ProcessIncarnation::from_bits(99))
+                .map(|_| ())
+                .unwrap(),
+            14 => request.now_ms = 1000,
+            _ => request.now_ms = 100_000,
+        }
+        assert!(
+            Reservation::initial(cell())
+                .unwrap()
+                .publish_hosts(request)
+                .is_err(),
+            "case {case}"
+        );
+    }
+}
+
+#[test]
+fn healthy_refresh_cannot_forget_a_changed_or_reused_physical_host() {
+    let saved = Reservation::initial(cell())
+        .unwrap()
+        .publish_hosts(host_publication())
+        .unwrap();
+    for case in 0..5 {
+        let mut refresh = host_publication();
+        refresh.observation.started_ms = 1600;
+        refresh.observation.completed_ms = 1700;
+        refresh.now_ms = 1800;
+        match case {
+            0 => refresh.nodes[0]["metadata"]["uid"] = json!("new-node-same-name"),
+            1 => refresh.nodes[0]["spec"]["providerID"] = json!("new-instance"),
+            2 => {
+                refresh.nodes[0]["metadata"]["labels"]["topology.kubernetes.io/zone"] =
+                    json!("new-zone")
+            }
+            3 => {
+                refresh.nodes[0]["metadata"]["name"] = json!("new-host");
+                refresh.pods[0]["spec"]["nodeName"] = json!("new-host");
+            }
+            _ => {
+                for prefix in refresh.observation.verification.prefixes.values_mut() {
+                    prefix.required_applied_index = 49;
+                }
+            }
+        }
+        assert!(saved.publish_hosts(refresh).is_err(), "case {case}");
+    }
+    assert!(saved.publish_hosts(host_publication()).is_err()); // Older sampler cannot overwrite newer evidence.
+}
+
+#[test]
+fn recovered_process_can_refresh_only_after_full_nonregressing_proof() {
+    let saved = Reservation::initial(cell())
+        .unwrap()
+        .publish_hosts(host_publication())
+        .unwrap();
+    let mut refresh = host_publication();
+    refresh.observation.started_ms = 1600;
+    refresh.observation.completed_ms = 1700;
+    refresh.now_ms = 1800;
+    refresh.process_plan[0].expected_process_incarnation = Some(ProcessIncarnation::from_bits(100));
+    refresh
+        .observation
+        .verification
+        .process_incarnations
+        .insert(1, ProcessIncarnation::from_bits(100));
+    refresh.pods[0]["metadata"]["uid"] = json!("recovered-pod");
+    let repaired = saved.publish_hosts(refresh).unwrap();
+    assert_eq!(
+        repaired
+            .hosts()
+            .unwrap()
+            .voter(1)
+            .unwrap()
+            .source
+            .provider_instance,
+        "instance-1"
+    );
+    let mut action = request(2, 20, 1);
+    if let OwnershipRequest::Reserve { now_ms, .. } = &mut action {
+        *now_ms = 1900;
+    }
+    assert!(repaired.propose(action.clone()).is_err());
+    if let OwnershipRequest::Reserve {
+        source,
+        process_plan,
+        now_ms,
+        ..
+    } = &mut action
+    {
+        *now_ms = 1900;
+        *source = repaired.hosts().unwrap().voter(1).unwrap().source.clone();
+        *process_plan = repaired.hosts().unwrap().process_plan.clone();
+    }
+    repaired.propose(action).unwrap();
+}
+
+#[test]
+fn planned_completion_advances_host_catalog_without_discarding_old_physical_identity() {
+    let saved = Reservation::initial(cell())
+        .unwrap()
+        .publish_hosts(host_publication())
+        .unwrap();
+    let mut action = request(1, 10, 1);
+    if let OwnershipRequest::Reserve { now_ms, .. } = &mut action {
+        *now_ms = 1600;
+    }
+    let reserved = saved.propose(action).unwrap();
+    assert!(
+        reserved
+            .progress(super::ProgressRequest::AdmitPodDeletion {
+                fence: reserved.operation().unwrap().fence.clone(),
+                now_ms: 1900,
+                observation: observation(&reserved, false, 1700, 49),
+            })
+            .is_err()
+    );
+    let admitted = reserved
+        .progress(super::ProgressRequest::AdmitPodDeletion {
+            fence: reserved.operation().unwrap().fence.clone(),
+            now_ms: 1900,
+            observation: observation(&reserved, false, 1700, 60),
+        })
+        .unwrap();
+    let mut bind = binding(&admitted);
+    let mut regressed = admitted.clone();
+    for prefix in regressed
+        .operation
+        .as_mut()
+        .unwrap()
+        .admission
+        .as_mut()
+        .unwrap()
+        .verification
+        .prefixes
+        .values_mut()
+    {
+        prefix.required_applied_index = 49;
+    }
+    assert!(regressed.validate().is_err());
+    if let super::ProgressRequest::BindPodReplacement { node, .. } = &mut bind {
+        node["metadata"]["labels"] = json!({"topology.kubernetes.io/zone":"zone-1"});
+    }
+    let mut wrong_host = bind.clone();
+    if let super::ProgressRequest::BindPodReplacement { node, .. } = &mut wrong_host {
+        node["spec"]["providerID"] = json!("new-instance");
+    }
+    assert!(admitted.progress(wrong_host).is_err());
+    let rebound = admitted.progress(bind).unwrap();
+    let completed = rebound
+        .progress(super::ProgressRequest::CompletePodReplacement {
+            fence: rebound.operation().unwrap().fence.clone(),
+            now_ms: 2300,
+            observation: observation(&rebound, true, 2100, 70),
+        })
+        .unwrap();
+    assert!(completed.operation().is_none());
+    let hosts = completed.hosts().unwrap();
+    assert_eq!(hosts.voter(1).unwrap().source.pod_uid, "replacement-pod");
+    assert_eq!(hosts.voter(1).unwrap().source.node_uid, "node-1");
+    assert_eq!(
+        hosts.observation.verification.prefixes[&0].required_applied_index,
+        70
+    );
+    let mut next_action = request(2, 20, 2);
+    if let OwnershipRequest::Reserve {
+        process_plan,
+        now_ms,
+        ..
+    } = &mut next_action
+    {
+        *process_plan = hosts.process_plan.clone();
+        *now_ms = 2400;
+    }
+    completed.propose(next_action).unwrap();
+    let mut refresh = host_publication();
+    refresh.process_plan = hosts.process_plan.clone();
+    refresh.process_plan[0].expected_process_incarnation = Some(ProcessIncarnation::from_bits(200));
+    refresh.pods[0]["metadata"]["uid"] = json!("replacement-pod");
+    refresh.observation = hosts.observation.clone();
+    refresh.observation.started_ms = 2500;
+    refresh.observation.completed_ms = 2600;
+    refresh
+        .observation
+        .verification
+        .process_incarnations
+        .insert(1, ProcessIncarnation::from_bits(200));
+    refresh.observation.verification.maintenance_fence = None;
+    refresh
+        .observation
+        .verification
+        .maintenance_executor_retired_certified = false;
+    refresh.now_ms = 2700;
+    let refreshed = completed.publish_hosts(refresh).unwrap();
+    let mut next_action = request(3, 30, 1);
+    if let OwnershipRequest::Reserve {
+        source,
+        process_plan,
+        now_ms,
+        ..
+    } = &mut next_action
+    {
+        *source = refreshed.hosts().unwrap().voter(1).unwrap().source.clone();
+        *process_plan = refreshed.hosts().unwrap().process_plan.clone();
+        *now_ms = 2800;
+    }
+    refreshed.propose(next_action).unwrap();
+}
+
 #[test]
 fn release_requires_retired_original_uid_and_all_retired_current_prefixes() {
     let active = admitted();
