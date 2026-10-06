@@ -93,6 +93,22 @@ and transport in `ursula-raft`, and server wiring in `ursula`. Reuse durable
 storage mechanisms where suitable without assuming data-group file storage
 already accepts the meta type config.
 
+### M1 completion audit
+
+The audit below maps the original M1 contract to executable checks. It does
+not make M2's remaining migration fault matrix a new M1 prerequisite.
+
+| Gate | Evidence and boundary |
+| --- | --- |
+| HS-101: durable consensus/state recovery, compaction and crash | `ursula-raft` meta log-store tests cover OS-process exit before/after purge, post-snapshot intent logs, torn/corrupt history and failed publication. `bound_meta_bootstrap_records_replicate_and_survive_compaction_and_full_restart` restores the bound bootstrap and active executor state over actual TCP replicas. |
+| HS-102: RF3/RF5, mixed policies, invalid placements and immutable adoption | `ursula-control/src/policy_tests.rs` covers both quorum sizes, all three-domain assignments, insufficient voters/nodes, missing labels, RF drift and legacy snapshots; `ursula-config/src/control.rs` covers opt-in configuration and rejected reinitialization. Domain-policy enumeration proves the policy arithmetic; it is not the M3 physical AZ-loss experiment. |
+| HS-103: independent meta3/meta5, turnover, trusted identity and one-time bootstrap | `meta_transport_three_and_five_voters_survive_failures_and_full_restart`, bound transport/bootstrap checks, and `managed_cli_adopts_mixed_disk_groups_with_three_and_five_meta_voters_and_restarts`. The latter uses independent meta voters, compacts snapshots, restarts all server processes and preserves the complete recipe/policies/placement. |
+| HS-104: ordered full projections and startup from persisted assignments | `complete_projection_rpc_requires_bootstrap_and_a_live_meta_quorum` verifies full-view resync after compaction and stale-view rejection. Bound cache tests reject regression, conflicting indexes and corrupt/foreign checkpoints. The managed adoption binary test restarts data voters under meta minority from cached projections without inventing fresh control authority. The outside-bootstrap migration fixture verifies settled node-7 assignment recovery with unchanged old TOML; S3-prefetch and committed-joint binary faults additionally cover active-assignment recovery. |
+| Static/dev compatibility | Managed mode is opt-in. Workspace unit/bin checks include existing static/dev configuration and routing behavior; the historical focused static follower-forwarding regression passed against the implementation before the move to Depot. M1 does not claim new static-mode scaling behavior. |
+
+The current remote run validates the implementation SHA separately from this
+documentation audit. Record its terminal results before advancing the scoreboard.
+
 ## M2 — one complete migration
 
 | Story | Deliverable and exit criteria | Dependencies | Status |
@@ -232,6 +248,8 @@ unevacuated machine. Physical provisioning remains outside the Raft controller.
 | 2026-10-06 | Validation | Against `bb7a9cd` including `be6900a`: workspace lib/bin 981 passed, 3 ignored; all four binary migration CLI tests, explicitly including MinIO, passed in 92.74s. Managed adoption/restart with independent three/five meta voters passed in 25.82s. All-target Clippy with `-D warnings`, doc tests, format, seven tracked-source DST audits, madsim Raft lib check and existing smoke (0.40s) passed | Native Mac host only; rebuilt server verified arm64 Mach-O. The strengthened joint fixture alone passed in 17.71s before the final combined regression. Existing madsim warnings remain. No new migration DST, CI, deployment or scaling-performance acceptance is claimed |
 | 2026-10-06 | Execution constraint / remote verification | User moved all build/test work to GitHub Actions Depot because the local device is on battery. Added branch-triggered `horizontal-scaling.yml`: native ARM Rust checks, real-process migration/adoption and explicit MinIO faults, plus existing DST audits/smoke, with acceptance-log artifacts | Local compute-intensive validation is stopped. Remote results must be attached by exact SHA/run URL after completion; workflow configuration is not passing CI evidence |
 | 2026-10-06 | Remote execution started | Pushed dedicated branch at `700e871b6537853efbdb434b25c0062837bd183e`; [Horizontal scaling run 37533668030](https://github.com/tonbo-io/ursula/actions/runs/37533668030) started all three Depot Ubuntu ARM jobs. Toolchain installation and seven DST audits completed successfully; native compilation/checking is running | Pending remote acceptance. Track this exact run to terminal status and fix actual failures on Depot. The workflow runs no provisioning, publication or deployment step |
+| 2026-10-06 | Remote result audit | Run `37533668030` at `700e871` finished with a misleading green workflow: full logs prove 981 unit/bin passes (3 ignored), doc/format/Clippy passes, seven DST audits and existing smoke passes, and all four native migration fixtures including MinIO pass in 90.55s. The managed-adoption test actually failed immediately with `Address already in use`; its piped `tee` hid Cargo's exit status | Partial passing evidence only; the run does not satisfy the complete acceptance gate. Commit `be5c5a0` explicitly selects Bash with pipefail for every run step and reserves distinct adoption listener ports below the native runners' default ephemeral range. Revalidate on Depot before advancing M1 |
+| 2026-10-06 | HS-206 simulation prerequisite | Commit `853155d` introduces explicit harness-owned restartable receiver disks under `cfg(madsim)`, reusing production CAS/authority validation with atomic before/after-commit faults. Four storage checks cover identity/exclusivity/isolation, commit-side recovery, lost prepare-receipt replay and pending work across newer generation/process | Remote validation pending. This supplies a storage seam; it is not a complete executor migration DST schedule. Bound meta persistence/transport and fault-schedule integration remain pending |
 
 ## Current execution checkpoint
 
@@ -354,12 +372,14 @@ CARGO_INCREMENTAL=0 cargo test -p ursula-ctl --test managed_migration_cli \
   joint_fault -- --nocapture
 ```
 
-Next audit M1 against its exact exit criteria and add migration-boundary DST,
+The M1 completion audit above maps its exact exit criteria to existing checks;
+its final scoreboard update awaits corrected remote adoption validation.
+Next add migration-boundary DST,
 remaining snapshot/prepare/release process faults, lost replies and delayed old
-receiver requests. The current receiver checkpoint deliberately rejects file
-storage under madsim; exercising the supported receiver/executor there requires
-a controlled simulated persistent backend rather than host files or a separate
-protocol model.
+receiver requests. File-backed receiver open still rejects madsim; commit
+`853155d` provides explicit simulated disks with shared production validation.
+Integrate bound meta persistence/transport and the supported receiver/executor
+into the harness without host files or a separate protocol model.
 Established startup continues
 restoring assigned data from its bound checkpoint even under meta minority.
 
@@ -376,7 +396,9 @@ outside-bootstrap joining with mixed-RF migrations, gateway discovery, meta
 minority data continuity and full restart. Existing DST
 smoke checks compatibility, not the new executor's fault boundaries.
 M3 manual scaling/batches and M4 autopilot remain in the active goal's scope.
-No CI, deployment or scaling-performance acceptance is claimed. No external
+Partial native Depot CI evidence is recorded above. The first run's masked
+adoption failure is fixed in source and awaits corrected remote validation;
+deployment and scaling-performance acceptance are still open. No external
 blocker is recorded.
 
 For each implementation increment, update the relevant story and this
