@@ -738,10 +738,11 @@ echo "graceful-rollout.sh: all checks passed"
   bound_uid=
   deny_survivor=false
   saved_count=0
+  observation_failure=false
   kubectl() {
     case "$*" in
       *'{.data.source-pod-uid}') printf '%s' old-pod ;;
-      *'{.data.state-schema-version}') printf '%s' 3 ;;
+      *'{.data.state-schema-version}') [ "${observation_failure}" = false ] || return 1; printf '%s' 3 ;;
       *'{.data.replacement-pod-uid}') printf '%s' "${bound_uid}" ;;
       *'{.metadata.uid}') printf '%s' "${current_uid}" ;;
       *) return 1 ;;
@@ -757,6 +758,11 @@ echo "graceful-rollout.sh: all checks passed"
     saved_count=$((saved_count + 1))
     bound_uid=$4
   }
+  current_uid=old-pod
+  observation_failure=true
+  if bind_replacement_incarnation 3; then echo 'failed state observation must refuse identity refresh' >&2; exit 1; fi
+  [ ! -e "${identity_dir}/calls" ]
+  observation_failure=false
   current_uid=old-pod
   if bind_replacement_incarnation 3; then echo 'same source Pod must not refresh identity' >&2; exit 1; fi
   [ ! -e "${identity_dir}/calls" ]

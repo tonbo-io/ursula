@@ -58,19 +58,23 @@ pin_manifest() {
     rm -f "${MANIFEST}.next"
     return 1
   fi
-  mv "${MANIFEST}.next" "${MANIFEST}"
+  mv "${MANIFEST}.next" "${MANIFEST}" || return 1
 }
 
 bind_replacement_incarnation() {
   node_id=$1
   saved_uid=$(kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
-    -o jsonpath='{.data.source-pod-uid}')
+    -o jsonpath='{.data.source-pod-uid}') || return 1
   saved_schema=$(kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
-    -o jsonpath='{.data.state-schema-version}')
+    -o jsonpath='{.data.state-schema-version}') || return 1
   bound_uid=$(kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
-    -o jsonpath='{.data.replacement-pod-uid}')
+    -o jsonpath='{.data.replacement-pod-uid}') || return 1
   current_uid=$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-$((node_id - 1))" \
-    -o jsonpath='{.metadata.uid}')
+    -o jsonpath='{.metadata.uid}') || return 1
+  case "${saved_schema:-1}" in
+    1|2|3) ;;
+    *) log "unsupported replacement state schema: ${saved_schema}"; return 1 ;;
+  esac
   if [ "${saved_schema}" = 3 ] && { [ -z "${saved_uid}" ] || [ "${saved_uid}" = "${current_uid}" ]; }; then
     log "refusing to refresh node ${node_id} process without an admitted Pod replacement"
     return 1
@@ -91,7 +95,7 @@ bind_replacement_incarnation() {
     rm -f "${MANIFEST}.next"
     return 1
   fi
-  mv "${MANIFEST}.next" "${MANIFEST}"
+  mv "${MANIFEST}.next" "${MANIFEST}" || return 1
   # Schema 1/2 are interrupted legacy rollouts without a saved instance plan.
   # Preserve their admitted UID when present. Do not create a schema-3 state
   # without a source UID; the old schema-1 path finishes only this migration.
@@ -367,8 +371,8 @@ record_state() {
     --from-literal=source-pod-uid="${source_pod_uid}" \
     --from-file=process-manifest="${MANIFEST}" \
     --from-literal=replacement-pod-uid="${replacement_pod_uid}" \
-    --dry-run=client -o yaml >"${state_file}"
-  kubectl -n "${NAMESPACE}" apply -f "${state_file}"
+    --dry-run=client -o yaml >"${state_file}" || return 1
+  kubectl -n "${NAMESPACE}" apply -f "${state_file}" || return 1
 }
 
 replacement_attempt_was_superseded() {
