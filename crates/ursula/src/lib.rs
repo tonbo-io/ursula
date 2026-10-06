@@ -308,20 +308,32 @@ pub struct HttpState {
 }
 
 impl HttpState {
-    /// The static topology is the expected inventory. Observed metrics cannot
-    /// establish which groups or voters are missing after a restart.
+    /// Configuration or managed placement plus durable assignments define the
+    /// inventory. Observations cannot establish what is missing after restart.
     fn raft_maintenance_report(&self) -> Option<ursula_raft::RaftMaintenanceReport> {
         let registry = self.raft_registry()?;
-        let topology = self.client_write_router.as_ref()?;
         let snapshots = registry.metrics_snapshot();
-        let node_id = topology
-            .node_id
+        let node_id = self
+            .configured_node_id
+            .or_else(|| {
+                self.client_write_router
+                    .as_ref()
+                    .and_then(|router| router.node_id)
+            })
             .or_else(|| snapshots.first().map(|group| group.node_id))?;
         if let Some(cursor) = &self.managed_projection {
             let cursor = cursor
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let view = cursor.current()?;
+            if let Some(receiver) = &self.managed_receiver {
+                return Some(receiver.maintenance_report(
+                    view,
+                    node_id,
+                    &snapshots,
+                    self.admin_fence.is_uncertain(),
+                ));
+            }
             let expected = view
                 .state
                 .placements
@@ -333,6 +345,7 @@ impl HttpState {
                 &snapshots, node_id, expected, 16,
             ));
         }
+        let topology = self.client_write_router.as_ref()?;
         let all_voters = topology.peers.keys().copied().collect::<BTreeSet<_>>();
         let expected = (0..self.runtime.raft_group_count())
             .filter_map(|id| {
@@ -1429,7 +1442,7 @@ async fn readiness(State(state): State<HttpState>) -> Response {
     let raft_ready = state.raft_registry().is_none()
         || raft_maintenance
             .as_ref()
-            .is_some_and(ursula_raft::RaftMaintenanceReport::ready);
+            .is_some_and(ursula_raft::RaftMaintenanceReport::serving_ready);
     let control_ready = state.managed_projection.as_ref().is_none_or(|cursor| {
         cursor
             .read()

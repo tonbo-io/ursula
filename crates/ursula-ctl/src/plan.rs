@@ -521,6 +521,7 @@ mod tests {
                 .collect(),
         };
         snapshot.per_node[0].raft_maintenance = Some(ursula_raft::RaftMaintenanceReport {
+            managed_inventory: None,
             version: 1,
             node_id: 1,
             lag_tolerance: 16,

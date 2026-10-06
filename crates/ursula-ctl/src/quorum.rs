@@ -436,6 +436,7 @@ mod tests {
                         .collect(),
                     wal_backend: Some("memory".to_owned()),
                     raft_maintenance: Some(ursula_raft::RaftMaintenanceReport {
+                        managed_inventory: None,
                         version: 1,
                         node_id: id,
                         lag_tolerance: 16,

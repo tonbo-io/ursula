@@ -106,6 +106,8 @@ struct OperationArgs {
 
 #[derive(Subcommand, Debug)]
 enum OperationCommand {
+    /// Observe each managed group's native quorum and fixed applied prefix.
+    VerifyQuorum(ManagedQuorumArgs),
     /// Register immutable node origins/labels before starting its process.
     RegisterNode(NodeRegisterArgs),
     /// Submit an immutable intent; reuse the same key and arguments on retry.
@@ -115,6 +117,19 @@ enum OperationCommand {
     /// Wait for an existing ID. Resume restarts observation of server-owned work.
     #[command(alias = "resume")]
     Wait(OperationWaitArgs),
+}
+
+#[derive(Args, Debug)]
+struct ManagedQuorumArgs {
+    #[command(flatten)]
+    observe: ObserveArgs,
+    #[arg(long, default_value_t = 30)]
+    timeout_secs: u64,
+    #[arg(long, default_value_t = 100)]
+    poll_interval_ms: u64,
+    /// Omit observations of these nodes; expected memberships stay unchanged.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    exclude: Vec<u64>,
 }
 
 #[derive(Args, Debug)]
@@ -818,6 +833,21 @@ async fn run_operation(args: OperationArgs) -> Result<()> {
     use ursula_ctl::operations::OperationClient;
 
     match args.command {
+        OperationCommand::VerifyQuorum(args) => {
+            let nodes = load_nodes(&args.observe.config).await?;
+            let client = MetricsClient::new(Duration::from_secs(args.observe.http_timeout_secs))?;
+            let evidence = ursula_ctl::managed_quorum::verify_managed_quorum(
+                &nodes,
+                &client,
+                &ursula_ctl::managed_quorum::ManagedQuorumOptions {
+                    timeout: Duration::from_secs(args.timeout_secs),
+                    poll_interval: Duration::from_millis(args.poll_interval_ms),
+                    excluded_nodes: args.exclude.into_iter().collect(),
+                },
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&evidence)?);
+        }
         OperationCommand::RegisterNode(args) => {
             let nodes = load_nodes(&args.observe.config).await?;
             let client = OperationClient::new(Duration::from_secs(args.observe.http_timeout_secs))?;

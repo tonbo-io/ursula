@@ -30,6 +30,31 @@ pub enum RaftMaintenanceIssue {
     LeaderOutsideVoters,
     NotApplied,
     ApplyLag,
+    ManagedMigration,
+    ReceiverUncertain,
+    AssignmentDrift,
+}
+
+/// Local assignment role, including actors which exist before placement publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedReplicaRole {
+    Voter,
+    PreparingLearner,
+    Learner,
+    Retiring,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedRaftInventory {
+    pub applied_meta_index: u64,
+    pub active_migration_id: Option<u64>,
+    pub replica_roles: BTreeMap<u32, ManagedReplicaRole>,
+    pub receiver_fenced: bool,
+    pub receiver_pending: bool,
+    pub assignment_drift: bool,
+    /// Local serving/registration eligibility, separate from disruption gates.
+    pub serving_ready: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,13 +65,41 @@ pub struct RaftMaintenanceReport {
     pub expected_groups: BTreeMap<u32, BTreeSet<u64>>,
     pub node_issues: Vec<RaftMaintenanceIssue>,
     pub group_issues: BTreeMap<u32, Vec<RaftMaintenanceIssue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_inventory: Option<ManagedRaftInventory>,
 }
 
 impl RaftMaintenanceReport {
+    pub fn serving_ready(&self) -> bool {
+        if self.version == 3 {
+            return self
+                .managed_inventory
+                .as_ref()
+                .is_some_and(|inventory| inventory.serving_ready && !inventory.assignment_drift);
+        }
+        self.ready()
+    }
+
     pub fn ready(&self) -> bool {
-        matches!(self.version, 1 | 2)
-            && (self.version == 2 || !self.expected_groups.is_empty())
-            && self.node_issues.is_empty()
+        (match self.version {
+            1 => !self.expected_groups.is_empty() && self.managed_inventory.is_none(),
+            2 => self.managed_inventory.is_none(),
+            3 => self.managed_inventory.as_ref().is_some_and(|inventory| {
+                inventory.active_migration_id.is_none()
+                    && !inventory.receiver_fenced
+                    && !inventory.receiver_pending
+                    && !inventory.assignment_drift
+                    && inventory
+                        .replica_roles
+                        .keys()
+                        .eq(self.expected_groups.keys())
+                    && inventory
+                        .replica_roles
+                        .values()
+                        .all(|role| *role == ManagedReplicaRole::Voter)
+            }),
+            _ => false,
+        }) && self.node_issues.is_empty()
             && self.group_issues.is_empty()
     }
 }
@@ -76,6 +129,36 @@ pub fn check_managed_raft_maintenance(
     check_expected(groups, node_id, expected_groups, lag_tolerance, 2)
 }
 
+/// Version 3 distinguishes transient learner/retiring assignments from voters.
+/// Participation during an active operation is diagnostic, never disruption
+/// permission or a substitute for a group's native quorum read.
+pub fn check_managed_raft_inventory(
+    groups: &[RaftGroupMetricsSnapshot],
+    node_id: u64,
+    expected_groups: BTreeMap<u32, BTreeSet<u64>>,
+    lag_tolerance: u64,
+    inventory: ManagedRaftInventory,
+) -> RaftMaintenanceReport {
+    let mut report = check_expected(groups, node_id, expected_groups, lag_tolerance, 3);
+    if inventory.active_migration_id.is_some() {
+        report
+            .node_issues
+            .push(RaftMaintenanceIssue::ManagedMigration);
+    }
+    if inventory.receiver_fenced || inventory.receiver_pending {
+        report
+            .node_issues
+            .push(RaftMaintenanceIssue::ReceiverUncertain);
+    }
+    if inventory.assignment_drift {
+        report
+            .node_issues
+            .push(RaftMaintenanceIssue::AssignmentDrift);
+    }
+    report.managed_inventory = Some(inventory);
+    report
+}
+
 fn check_expected(
     groups: &[RaftGroupMetricsSnapshot],
     node_id: u64,
@@ -92,6 +175,7 @@ fn check_expected(
         expected_groups,
         node_issues: Vec::new(),
         group_issues: BTreeMap::new(),
+        managed_inventory: None,
     };
     if version == 1 && report.expected_groups.is_empty() {
         report.node_issues.push(Issue::EmptyExpectedInventory);
@@ -262,6 +346,57 @@ mod tests {
             check_managed_raft_maintenance(&[], 1, expected, 16).group_issues[&0],
             vec![RaftMaintenanceIssue::MissingGroup]
         );
+    }
+
+    #[test]
+    fn managed_v3_transient_roles_and_unresolved_receivers_never_certify_readiness() {
+        let expected = BTreeMap::from([(0, BTreeSet::from([1, 2, 3]))]);
+        let settled = ManagedRaftInventory {
+            applied_meta_index: 7,
+            active_migration_id: None,
+            replica_roles: BTreeMap::from([(0, ManagedReplicaRole::Voter)]),
+            receiver_fenced: false,
+            receiver_pending: false,
+            assignment_drift: false,
+            serving_ready: true,
+        };
+        assert!(
+            check_managed_raft_inventory(&[healthy(0)], 1, expected.clone(), 16, settled.clone())
+                .ready()
+        );
+        for role in [
+            ManagedReplicaRole::PreparingLearner,
+            ManagedReplicaRole::Learner,
+            ManagedReplicaRole::Retiring,
+        ] {
+            let mut transient = settled.clone();
+            transient.replica_roles.insert(0, role);
+            assert!(
+                !check_managed_raft_inventory(&[healthy(0)], 1, expected.clone(), 16, transient)
+                    .ready()
+            );
+        }
+        for reason in ["migration", "pending", "fenced", "drift"] {
+            let mut blocked = settled.clone();
+            match reason {
+                "migration" => blocked.active_migration_id = Some(1),
+                "pending" => blocked.receiver_pending = true,
+                "fenced" => blocked.receiver_fenced = true,
+                "drift" => blocked.assignment_drift = true,
+                _ => unreachable!(),
+            }
+            assert!(
+                !check_managed_raft_inventory(&[healthy(0)], 1, expected.clone(), 16, blocked)
+                    .ready()
+            );
+        }
+        let mut idle = settled;
+        idle.replica_roles.clear();
+        let idle = check_managed_raft_inventory(&[], 1, BTreeMap::new(), 16, idle);
+        assert!(idle.ready());
+        let mut unknown = idle;
+        unknown.version = 4;
+        assert!(!unknown.ready());
     }
 
     #[test]

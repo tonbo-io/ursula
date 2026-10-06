@@ -598,6 +598,41 @@ async fn binaries_join_outside_bootstrap_directory_and_restore_rf3_rf5() {
                 .await;
         }
     }
+    // The manifest still lists the original six nodes and no client origins.
+    // Managed verification discovers node 7 and each group's own replica set.
+    let verified = cluster.cli(&["verify-quorum"]).await;
+    assert_eq!(
+        verified["groups"]["0"]["required_majorities"],
+        serde_json::json!([2])
+    );
+    assert_eq!(
+        verified["groups"]["1"]["required_majorities"],
+        serde_json::json!([3])
+    );
+    assert_eq!(verified["maintenance_eligible"], true);
+    assert_eq!(verified["disruption_authorized"], false);
+    assert!(verified["process_incarnations"].get("7").is_some());
+    cluster.processes.remove(&4);
+    cluster.processes.remove(&5);
+    let survivors = cluster.cli(&["verify-quorum", "--exclude", "4,5"]).await;
+    assert_eq!(
+        survivors["groups"]["1"]["observed_per_set"],
+        serde_json::json!([3])
+    );
+    assert_eq!(
+        survivors["groups"]["1"]["configuration"]["voter_sets"],
+        serde_json::json!([[1, 2, 4, 5, 7]])
+    );
+    assert_eq!(survivors["groups"]["1"]["full_redundancy_observed"], false);
+    assert_eq!(survivors["maintenance_eligible"], false);
+    let insufficient = cluster
+        .cli_output(&["verify-quorum", "--exclude", "2,4,5"])
+        .await;
+    assert!(!insufficient.status.success());
+    assert!(String::from_utf8_lossy(&insufficient.stderr).contains("constituent group quorum"));
+    cluster.start(4, "rf5-survivor-return");
+    cluster.start(5, "rf5-survivor-return");
+    cluster.ready().await;
     // Both possible old leaders (1 and 2) are removed. Node 7 is the only
     // retained voter, so the supported executor hands leadership to it.
     let id = cluster

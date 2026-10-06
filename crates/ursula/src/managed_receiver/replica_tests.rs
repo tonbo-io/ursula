@@ -647,6 +647,53 @@ struct Fixture {
 }
 
 impl Fixture {
+    // This native fixture has no production refresh task. Install the actual
+    // fresh view before exercising the consumer and observational CLI client.
+    async fn refresh_inventory(&self) {
+        let view = self.fresh_projection().await;
+        for state in &self.states {
+            state
+                .managed_projection
+                .as_ref()
+                .unwrap()
+                .write()
+                .unwrap()
+                .install(view.clone())
+                .unwrap();
+        }
+    }
+
+    async fn observe_quorums(
+        &self,
+        excluded: BTreeSet<u64>,
+    ) -> anyhow::Result<ursula_ctl::managed_quorum::ManagedQuorumVerification> {
+        self.refresh_inventory().await;
+        let seeds: Vec<_> = self
+            .recipe
+            .nodes
+            .values()
+            .map(|node| ursula_ctl::NodeInfo {
+                id: node.node_id,
+                admin_url: node.admin_url.parse().unwrap(),
+                host: "127.0.0.1".to_owned(),
+                http_url: None,
+                metrics_url: None,
+                expected_process_incarnation: None,
+                expected_maintenance_fence: None,
+            })
+            .collect();
+        ursula_ctl::managed_quorum::verify_managed_quorum(
+            &seeds,
+            &ursula_ctl::MetricsClient::new(Duration::from_secs(2))?,
+            &ursula_ctl::managed_quorum::ManagedQuorumOptions {
+                timeout: Duration::from_secs(10),
+                poll_interval: Duration::from_millis(20),
+                excluded_nodes: excluded,
+            },
+        )
+        .await
+    }
+
     async fn fresh_projection(&self) -> ursula_control::ControlProjection {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -1103,6 +1150,19 @@ async fn replica_scenario(replicas: usize, recover_release: bool, recover_member
         .persist(ledger)
         .await
         .unwrap();
+    fixture.refresh_inventory().await;
+    let preparing = fixture.states[added].raft_maintenance_report().unwrap();
+    assert!(!preparing.ready());
+    assert!(
+        preparing.serving_ready(),
+        "an unassigned node remains registration eligible; preparation is not voter evidence"
+    );
+    assert_eq!(preparing.version, 3);
+    assert_eq!(
+        preparing.managed_inventory.unwrap().replica_roles[&0],
+        ursula_raft::ManagedReplicaRole::PreparingLearner
+    );
+    assert!(preparing.group_issues[&0].contains(&ursula_raft::RaftMaintenanceIssue::MissingGroup));
     let old_state = fixture.states[added].clone();
     fixture.states[added] = HttpState::with_raft_registry(
         old_state.runtime.clone(),
@@ -1173,6 +1233,20 @@ async fn replica_scenario(replicas: usize, recover_release: bool, recover_member
         .get(GROUP)
         .unwrap();
     assert!(!new_replica.is_initialized().await.unwrap());
+    fixture.refresh_inventory().await;
+    let prepared = fixture.states[added].raft_maintenance_report().unwrap();
+    assert!(!prepared.ready());
+    assert!(
+        prepared.serving_ready(),
+        "learner readiness is separate from front-door/registration eligibility"
+    );
+    assert_eq!(
+        prepared.managed_inventory.unwrap().replica_roles[&0],
+        ursula_raft::ManagedReplicaRole::Learner
+    );
+    assert!(
+        !prepared.group_issues[&0].contains(&ursula_raft::RaftMaintenanceIssue::UnexpectedGroup)
+    );
     fixture
         .update(&token, MigrationUpdate::RecordPrepared {
             process: fixture.process(added),
@@ -1237,6 +1311,33 @@ async fn replica_scenario(replicas: usize, recover_release: bool, recover_member
             evidence: applied_http(&fixture.states[added], &token, &prefix).await,
         })
         .await;
+    let learner_evidence = fixture.observe_quorums(BTreeSet::new()).await.unwrap();
+    assert!(
+        learner_evidence.groups[&0]
+            .configuration
+            .learners
+            .contains(&added_id)
+    );
+    assert!(
+        !learner_evidence.groups[&0]
+            .observed_voters
+            .contains(&added_id)
+    );
+    assert!(!learner_evidence.maintenance_eligible);
+    let serving = crate::router_with_http_state(fixture.states[0].clone())
+        .oneshot(
+            Request::builder()
+                .uri(crate::READINESS_PATH)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serving.status(),
+        StatusCode::OK,
+        "serving remains available while the learner catches up"
+    );
     fixture
         .update(&token, MigrationUpdate::AuthorizeMembership)
         .await;
@@ -1301,6 +1402,33 @@ async fn replica_scenario(replicas: usize, recover_release: bool, recover_member
             target_voters.clone()
         ]);
         assert!(joint.uniform_membership().is_err());
+        let evidence = fixture.observe_quorums(BTreeSet::new()).await.unwrap();
+        let serving = fixture.states[0].raft_maintenance_report().unwrap();
+        assert!(!serving.ready());
+        assert!(
+            serving.serving_ready(),
+            "native joint consensus remains the data authority during fenced maintenance exclusion"
+        );
+        let readiness = crate::router_with_http_state(fixture.states[0].clone())
+            .oneshot(
+                Request::builder()
+                    .uri(crate::READINESS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(readiness.status(), StatusCode::OK);
+        assert_eq!(
+            evidence.groups[&0].configuration.voter_sets,
+            joint.voter_sets
+        );
+        assert_eq!(evidence.groups[&0].required_majorities, vec![
+            replicas / 2 + 1,
+            replicas / 2 + 1
+        ]);
+        assert!(!evidence.maintenance_eligible);
+        assert!(!evidence.disruption_authorized);
         assert!(
             ursula_raft::confirm_group_membership(
                 GROUP,

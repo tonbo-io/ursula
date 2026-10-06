@@ -394,6 +394,227 @@ impl ManagedReceiver {
         }
         Ok(())
     }
+
+    /// Inventory is derived from placement plus the durable assignment ledger,
+    /// never from handles observed in metrics. Transitional roles do not count
+    /// as serving voters or grant disruption permission.
+    pub(crate) fn maintenance_report(
+        &self,
+        view: &ControlProjection,
+        node_id: u64,
+        groups: &[ursula_raft::RaftGroupMetricsSnapshot],
+        admin_uncertain: bool,
+    ) -> ursula_raft::RaftMaintenanceReport {
+        use ursula_raft::ManagedRaftInventory;
+        use ursula_raft::ManagedReplicaRole;
+
+        let active = view.state.active_migration().filter(|migration| {
+            migration.from_voters.contains(&node_id) || migration.target_voters.contains(&node_id)
+        });
+        let mut expected: std::collections::BTreeMap<_, _> = view
+            .state
+            .placements
+            .iter()
+            .filter(|(_, placement)| placement.voters.contains(&node_id))
+            .map(|(group, placement)| (group.0, placement.voters.clone()))
+            .collect();
+        let mut inventory = ManagedRaftInventory {
+            applied_meta_index: view.applied_log_id.index,
+            active_migration_id: active.map(|migration| migration.migration_id),
+            replica_roles: expected
+                .keys()
+                .map(|group| (*group, ManagedReplicaRole::Voter))
+                .collect(),
+            receiver_fenced: admin_uncertain,
+            receiver_pending: false,
+            serving_ready: false,
+            assignment_drift: node_id != self.store.identity().node.node_id
+                || !view.state.nodes.get(&node_id).is_some_and(|node| {
+                    matches!(node.state, NodeState::Active | NodeState::Draining)
+                }),
+        };
+        match self.store.snapshot() {
+            Err(_) => inventory.assignment_drift = true,
+            Ok(ledger) => {
+                inventory.receiver_fenced |= ledger
+                    .fence
+                    .as_ref()
+                    .is_some_and(|fence| fence.phase != ReceiverFencePhase::Retired);
+                inventory.receiver_pending = ledger.pending.is_some();
+                inventory.assignment_drift |= !ledger.assignments_seeded;
+                for (group, placement) in &view.state.placements {
+                    if placement.voters.contains(&node_id)
+                        && !ledger.assignments.get(group).is_some_and(|assignment| {
+                            assignment.phase == ReplicaAssignmentPhase::Hosted
+                                && (assignment.epoch == placement.epoch
+                                    || active
+                                        .filter(|migration| migration.raft_group_id == *group)
+                                        .and_then(|migration| migration.managed.as_ref())
+                                        .is_some_and(|managed| {
+                                            assignment.epoch == managed.request.expected_epoch
+                                        }))
+                        })
+                    {
+                        inventory.assignment_drift = true;
+                    }
+                }
+                for (group, assignment) in &ledger.assignments {
+                    if assignment.phase == ReplicaAssignmentPhase::Retired {
+                        continue;
+                    }
+                    let Some(placement) = view.state.placements.get(group) else {
+                        inventory.assignment_drift = true;
+                        continue;
+                    };
+                    let intent = active.filter(|migration| migration.raft_group_id == *group);
+                    let role = match assignment.phase {
+                        ReplicaAssignmentPhase::Hosted if placement.voters.contains(&node_id) => {
+                            ManagedReplicaRole::Voter
+                        }
+                        ReplicaAssignmentPhase::Preparing | ReplicaAssignmentPhase::Hosted
+                            if intent.is_some_and(|migration| {
+                                migration.added_nodes.contains(&node_id)
+                                    && assignment.migration_id == migration.migration_id
+                            }) =>
+                        {
+                            if assignment.phase == ReplicaAssignmentPhase::Preparing {
+                                ManagedReplicaRole::PreparingLearner
+                            } else {
+                                ManagedReplicaRole::Learner
+                            }
+                        }
+                        ReplicaAssignmentPhase::Retiring | ReplicaAssignmentPhase::Hosted
+                            if intent.is_some_and(|migration| {
+                                migration.removed_voters.contains(&node_id)
+                            }) =>
+                        {
+                            ManagedReplicaRole::Retiring
+                        }
+                        _ => {
+                            inventory.assignment_drift = true;
+                            ManagedReplicaRole::Retiring
+                        }
+                    };
+                    expected.insert(group.0, placement.voters.clone());
+                    inventory.replica_roles.insert(group.0, role);
+                }
+            }
+        }
+        inventory.serving_ready = managed_serving_ready(view, node_id, groups, &inventory);
+        ursula_raft::check_managed_raft_inventory(groups, node_id, expected, 16, inventory)
+    }
+}
+
+fn managed_serving_ready(
+    view: &ControlProjection,
+    node_id: u64,
+    groups: &[ursula_raft::RaftGroupMetricsSnapshot],
+    inventory: &ursula_raft::ManagedRaftInventory,
+) -> bool {
+    use ursula_raft::ManagedReplicaRole;
+    if inventory.assignment_drift {
+        return false;
+    }
+    let resident: std::collections::BTreeMap<_, _> = groups
+        .iter()
+        .map(|group| (group.raft_group_id, group))
+        .collect();
+    if resident.len() != groups.len()
+        || groups.iter().any(|group| {
+            group.node_id != node_id || !inventory.replica_roles.contains_key(&group.raft_group_id)
+        })
+    {
+        return false;
+    }
+    for (id, role) in &inventory.replica_roles {
+        let Some(group) = resident.get(id) else {
+            if *role == ManagedReplicaRole::Voter {
+                return false;
+            }
+            continue;
+        };
+        if *role == ManagedReplicaRole::Retiring {
+            continue;
+        }
+        let voters: std::collections::BTreeSet<_> = group.voter_ids.iter().copied().collect();
+        let learners: std::collections::BTreeSet<_> = group.learner_ids.iter().copied().collect();
+        if voters.len() != group.voter_ids.len() || learners.len() != group.learner_ids.len() {
+            return false;
+        }
+        let intent = view
+            .state
+            .active_migration()
+            .filter(|migration| migration.raft_group_id.0 == *id);
+        // A prepared destination may have no membership before AddLearner.
+        // Neither missing learner progress nor its existence makes it a voter.
+        if !voters.contains(&node_id)
+            && matches!(
+                role,
+                ManagedReplicaRole::PreparingLearner | ManagedReplicaRole::Learner
+            )
+        {
+            continue;
+        }
+        let allowed = if let Some(migration) = intent {
+            let Some(managed) = &migration.managed else {
+                return false;
+            };
+            let shape = if group.maintenance.membership_joint {
+                managed.membership_may_have_changed
+                    && voters
+                        == migration
+                            .from_voters
+                            .union(&migration.target_voters)
+                            .copied()
+                            .collect()
+            } else {
+                voters == migration.from_voters
+                    || (managed.membership_may_have_changed && voters == migration.target_voters)
+            };
+            shape
+                && learners.is_subset(&migration.added_nodes)
+                && learners.is_subset(&managed.prepared)
+        } else {
+            view.state
+                .placements
+                .get(&ursula_shard::RaftGroupId(*id))
+                .is_some_and(|placement| voters == placement.voters)
+                && learners.is_empty()
+                && !group.maintenance.membership_joint
+        };
+        if !allowed {
+            return false;
+        }
+        if !voters.contains(&node_id) {
+            // A removed source stops counting before placement publication;
+            // it still routes requests through the actual current data leader.
+            if intent.is_some_and(|migration| migration.removed_voters.contains(&node_id)) {
+                continue;
+            }
+            return false;
+        }
+        if *role == ManagedReplicaRole::PreparingLearner
+            || !group.maintenance.running
+            || !group.maintenance.recovery_ready
+            || group.maintenance.stopped_for_operator
+            || !group
+                .current_leader
+                .is_some_and(|leader| voters.contains(&leader))
+        {
+            return false;
+        }
+        let (Some(committed), Some(applied), Some(membership)) = (
+            group.committed,
+            group.last_applied,
+            group.maintenance.membership_log_index,
+        ) else {
+            return false;
+        };
+        if applied.index < membership || committed.index.saturating_sub(applied.index) > 16 {
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) fn router(state: HttpState) -> Router {
