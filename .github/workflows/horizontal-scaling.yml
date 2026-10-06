@@ -1,0 +1,107 @@
+name: Horizontal scaling
+
+on:
+  push:
+    branches: [docs/horizontal-scaling-epic]
+    paths:
+      - '.github/workflows/horizontal-scaling.yml'
+      - 'Cargo.*'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - 'scripts/dst/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: horizontal-scaling-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  rust:
+    name: Native Rust checks
+    runs-on: depot-ubuntu-24.04-arm-8
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+        with:
+          rustflags: ''
+      - name: Formatting and Clippy
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Unit and documentation tests
+        run: |
+          cargo test --locked --workspace --lib --bins
+          cargo test --locked --workspace --doc
+
+  migration:
+    name: Native migration and MinIO faults
+    runs-on: depot-ubuntu-24.04-arm-8
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+        with:
+          rustflags: ''
+      - name: Build native server
+        run: cargo build --locked -p ursula --bin ursula
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.3'
+          cache: false
+      - name: Install native MinIO
+        run: |
+          # Pin the same source commit as the previously verified local fixture.
+          # The fixture starts its own loopback server with dummy credentials.
+          git init "$RUNNER_TEMP/minio-source"
+          git -C "$RUNNER_TEMP/minio-source" remote add origin https://github.com/minio/minio.git
+          git -C "$RUNNER_TEMP/minio-source" fetch --depth=1 origin 9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a
+          git -C "$RUNNER_TEMP/minio-source" checkout --detach FETCH_HEAD
+          mkdir -p "$RUNNER_TEMP/minio-bin"
+          (cd "$RUNNER_TEMP/minio-source" && go build -trimpath -o "$RUNNER_TEMP/minio-bin/minio" .)
+          echo "URSULA_MINIO_BINARY=$RUNNER_TEMP/minio-bin/minio" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/minio-bin/minio" --version
+          aws --version
+      - name: Migration CLI, snapshot and committed-joint faults
+        env:
+          URSULA_BINARY: ${{ github.workspace }}/target/debug/ursula
+        run: |
+          mkdir -p evidence
+          cargo test --locked -p ursula-ctl --test managed_migration_cli -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee evidence/migration.log
+      - name: Managed adoption and restart
+        env:
+          URSULA_BINARY: ${{ github.workspace }}/target/debug/ursula
+        run: cargo test --locked -p ursula --test managed_cluster_cli -- --nocapture 2>&1 | tee evidence/adoption.log
+      - name: Preserve acceptance logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: horizontal-scaling-native-acceptance
+          path: evidence/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  simulation:
+    name: Native deterministic simulation compatibility
+    runs-on: depot-ubuntu-24.04-arm-8
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+        with:
+          rustflags: ''
+      - name: Audit DST guards
+        run: python3 -m scripts.dst all
+      - name: Check and replay existing smoke corpus
+        env:
+          RUSTFLAGS: --cfg madsim
+        run: |
+          cargo check --locked -p ursula-raft --lib
+          cargo test --locked -p ursula-sim smoke_corpus_replays -- --nocapture

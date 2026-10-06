@@ -391,6 +391,12 @@ Local device builds and tests must use the native host target only, per the
 cross-compile locally. Simulation via `--cfg madsim` still uses this host
 target. Native validation on other platforms is separate evidence.
 
+Later that day the user moved all builds and tests to GitHub Actions Depot
+runners because the local device is on battery. Until that instruction changes,
+perform only editing, review and remote-CI orchestration locally. The dedicated
+`horizontal-scaling.yml` workflow builds/tests natively on Depot Ubuntu ARM;
+its run evidence is separate from the earlier Mac acceptance results.
+
 - Move a group in a configured subset layout onto a node that did not host it.
   Then expand 3 to 6 nodes and shrink 6 to 3 with RF=3 and stable stream/group
   identities. Repeat 5 to 10 to 5 with RF=5, plus a mixed-RF layout and explicit
@@ -1408,3 +1414,41 @@ madsim Raft lib check and existing smoke (0.43s) pass. MinIO and AWS CLI report
 native `darwin/arm64` / `exe/arm64`; the server is arm64 Mach-O. Remaining
 install-apply/joint process faults and migration DST keep M1/M2 open; M3/M4
 remain in the epic's scope.
+
+### Implementation checkpoint: committed-joint process crashes and CLI output
+
+Commit `bb7a9cd` adds a native six-server fixture for both RF3 and RF5. Per-node
+gRPC proxies forward actual data/meta RPCs and reject delivery of final uniform
+membership appends for the selected group. AppendStream items are forwarded
+through native unary Append RPCs with their original correlation IDs; this is a
+fault fixture, not a performance measurement. No successful Raft response is
+fabricated. Exact joint source/target sets are captured from native log entries;
+the data leader's committed/applied indices cover that joint entry and remain
+below the withheld uniform entry. Placement must still be epoch 0.
+
+The unaffected neighbor group acknowledges a write while that boundary remains
+held. Kill all six data/meta processes without graceful shutdown, then reopen
+the same WAL/checkpoint files under the unchanged TOML recipe. The supported
+`ursulactl operation resume` runs across the outage; automatic execution must
+roll forward to RF3 `{1,2,6}` / RF5 `{1,2,4,5,6}`, exact uniform membership with
+no learners, epoch 1 and a higher executor generation. Process identities must
+change. All front doors must read every pre-crash and neighbor-window ACK, and a
+further settled restart must preserve complete meta state and payloads.
+
+This reproduction also exposed stdout contamination: temporary control-plane
+unavailability warnings preceded the otherwise successful resume JSON. Commit
+`be6900a` directs the shared tracing formatter to stderr, matching its existing
+documented contract. The fixture now starts the CLI before restarting any
+server, requires a real outage warning from stderr, drains diagnostics and
+parses successful stdout strictly as JSON. It never strips logs to accept a
+malformed response.
+
+Final workspace lib/bin tests pass 981 with 3 ignored. All four binary migration
+CLI fixtures, explicitly including the opt-in MinIO test, pass in 92.74s;
+managed adoption/restart with independent three/five meta voters passes in
+25.82s. All-target Clippy with `-D warnings`, doc tests, format, seven
+tracked-source DST audits, madsim Raft lib check and existing smoke (0.40s) pass.
+The rebuilt server is native arm64 Mach-O. This joint fixture uses inline
+snapshots; it does not certify the joint/S3 combination or new migration DST.
+M1 completion audit and remaining M2 fault/DST boundaries are next, followed by
+the unchanged M3 capacity operations and M4 autopilot scope.

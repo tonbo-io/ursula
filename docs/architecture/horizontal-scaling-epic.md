@@ -23,6 +23,13 @@ device. `--cfg madsim` selects the simulation implementation on that same
 host; it does not select a different target. Other-platform validation requires
 its own native environment and remains separate evidence.
 
+Later on 2026-10-06 the user reported that this device is on battery and
+instructed all builds/tests to run on GitHub Actions Depot runners instead.
+Local build/test work is suspended until the user changes that instruction;
+local work is editing, review and remote-CI orchestration only. The epic's
+`horizontal-scaling.yml` workflow uses native Depot Ubuntu ARM runners without
+cross-target compilation. Earlier Mac results remain historical local evidence.
+
 ## Outcome and accepted direction
 
 An operator can add data nodes, rebalance group replicas and leaders, and
@@ -71,7 +78,7 @@ follow-up items outside the initial contract above are not completion gates.
 | HS-101 | Persist and restore meta vote, log, committed/applied state and snapshots; recover correctly after compaction and crash/restart without resurrecting discarded intent | M0 | Complete: commit `b7352ea` |
 | HS-102 | Implement default/per-group RF=3/5 and one-domain-loss policy; infer/validate existing placements on adoption; reject invalid policies and bootstrap drift | M0 | Complete: commit `5c7e413` (deterministic policy/adoption layer) |
 | HS-103 | Concrete multi-node meta transport, independent meta voters, one-time bootstrap, cluster identity and trusted client/cluster/admin node directory | HS-101, HS-102 | Complete: commit `73f6970` (coordinated static-to-managed adoption) |
-| HS-104 | Ordered placement/policy projections with full-snapshot resync; data/node startup restores assignments without reinitializing from stale TOML | HS-103 | In progress: commits `d591c26`, `73f6970`, `a5e6740`, `064a1af`, `8b88822`, `d0d3bb9`, `82e1563`, `f5124a8`, `43f48d8`, `db45b1a` (ordered consumers and binary learner recovery during external S3 snapshot prefetch; remaining active-assignment recovery phases pending) |
+| HS-104 | Ordered placement/policy projections with full-snapshot resync; data/node startup restores assignments without reinitializing from stale TOML | HS-103 | In progress: commits `d591c26`, `73f6970`, `a5e6740`, `064a1af`, `8b88822`, `d0d3bb9`, `82e1563`, `f5124a8`, `43f48d8`, `db45b1a`, `bb7a9cd` (ordered consumers and binary assignment recovery during S3 prefetch and committed joint; M1 completion audit pending) |
 
 M1 acceptance includes multi-node meta leader turnover and a durable full
 restart after snapshot/log compaction. Test RF=3/quorum=2 and RF=5/quorum=3,
@@ -92,10 +99,10 @@ already accepts the meta type config.
 | --- | --- | --- | --- |
 | HS-201 | Intent-bound state transitions, operation idempotency, epoch CAS, source/target policy and membership-step evidence; no successful finish without verified placement | M1 | In progress: commits `6530772`, `e877d48` (replicated intent and automatic physical execution; complete fault acceptance pending) |
 | HS-202 | Durable dynamic group prepare/release on the owning core; joining replicas never initialize themselves; revoked replicas cannot be recreated by traffic | HS-104, HS-201 | In progress: commits `064a1af`, `cf05e16`, `e7f12bf`, `dc54f53`, `8b88822`, `e877d48`, `d0d3bb9` (physical retirement, automatic execution and real outside-bootstrap joining/restart; install-boundary acceptance pending) |
-| HS-203 | Resumable learner catch-up, fixed-prefix applied verification, joint-membership reconciliation, leader handoff and final membership verification | HS-201, HS-202 | In progress: commits `3504fb5`, `e877d48`, `db45b1a` (fenced execution, RF3/RF5 replacement, explicit 3→5→3 and MinIO snapshot-prefetch process recovery; joint/install-apply fault acceptance pending) |
-| HS-204 | Durably allocated executor generations and process-incarnation fencing, receiving-process barriers and exclusion with maintenance; delayed old/raw requests cannot bypass authority | HS-201; required before managed mutations are exposed | In progress: commits `6530772`, `064a1af`, `8b88822`, `3504fb5`, `e877d48`, `f5124a8`, `43f48d8` (durable generations, process/pruning barriers, takeover and intent-aware maintenance exclusion; supported disruption lifecycle and fault acceptance pending) |
+| HS-203 | Resumable learner catch-up, fixed-prefix applied verification, joint-membership reconciliation, leader handoff and final membership verification | HS-201, HS-202 | In progress: commits `3504fb5`, `e877d48`, `db45b1a`, `bb7a9cd` (RF3/RF5 replacement, explicit 3→5→3, MinIO prefetch faults and full-process committed-joint recovery; remaining snapshot/fault acceptance pending) |
+| HS-204 | Durably allocated executor generations and process-incarnation fencing, receiving-process barriers and exclusion with maintenance; delayed old/raw requests cannot bypass authority | HS-201; required before managed mutations are exposed | In progress: commits `6530772`, `064a1af`, `8b88822`, `3504fb5`, `e877d48`, `f5124a8`, `43f48d8`, `bb7a9cd` (durable generations, process/pruning barriers, joint-boundary process replacement and maintenance exclusion; supported disruption lifecycle and complete delayed-request/fault acceptance pending) |
 | HS-205 | Dynamic node/gateway routing, per-group readiness/quorum inventory, reference protection, actor/background-work retirement and safe per-core journal reclamation | HS-202, HS-203, HS-204 | In progress: commits `cf05e16`, `e7f12bf`, `dc54f53`, `8b88822`, `ebe8dd7`, `d0d3bb9`, `82e1563`, `f5124a8`, `43f48d8`, `db45b1a` (retirement, routing, inventory/quorum and real S3 snapshot pins/reference cleanup; complete fault acceptance pending) |
-| HS-206 | Supported operation API and CLI submit/status/wait/resume with admin authority and error semantics; real-process E2E plus DST at every migration boundary | HS-201 through HS-205 | In progress: commits `e877d48`, `ebe8dd7`, `d0d3bb9`, `43f48d8`, `db45b1a` (operation/registration API/CLI, joining, quorum observations and MinIO snapshot-prefetch process faults; install-apply/joint faults and new DST pending) |
+| HS-206 | Supported operation API and CLI submit/status/wait/resume with admin authority and error semantics; real-process E2E plus DST at every migration boundary | HS-201 through HS-205 | In progress: commits `e877d48`, `ebe8dd7`, `d0d3bb9`, `43f48d8`, `db45b1a`, `be6900a`, `bb7a9cd` (operation/registration API/CLI, joining, quorum observations, MinIO prefetch/joint process faults and clean CLI JSON during outages; remaining fault phases and new DST pending) |
 
 Start with one global active operation. M2 must move a group to a node that
 did not statically host it. Cover RF=3 and RF=5 replica replacements, and
@@ -220,6 +227,10 @@ unevacuated machine. Physical provisioning remains outside the Raft controller.
 | 2026-10-06 | Validation | Against `43f48d8`: workspace lib/bin tests 981 passed, 3 ignored; doc tests, all-target Clippy with `-D warnings`, format, seven DST audits, madsim Raft lib check and smoke (0.48s) passed. Final binary migration CLI fixtures passed in 30.21s; managed adoption/restart passed in 26.54s. Eight focused local inventory tests and RF3/RF5 joint tests passed | Native host only; no cross-compilation. Existing madsim warnings remain. Inline/local snapshots and native joint interruption do not prove install/joint OS-process failure, S3 or new migration-boundary DST |
 | 2026-10-06 | HS-104 / HS-203 / HS-205 / HS-206 | Commit `db45b1a` adds an opt-in native MinIO fixture with real seven-server binaries, data disk WAL, independent meta Raft and S3 snapshots. A destination-only HTTP proxy blocks an actual `.snap` GET after the target publishes its durable S3 pin. RF3 kills both destination and controller and observes controller takeover; RF5 kills the destination. Both restore the original local journals, claim higher executor generations, publish exact target membership/epoch and preserve writes acknowledged before and during the fault | Verify every final voter's reference points at a readable S3 object, removed replicas have no external pointer/pins, and obsolete retained-node pins converge to at most the current pointer. Repeat after full seven-node restart; original bootstrap manifest verifies both group quorums and maintenance eligibility. Fault is external prefetch before pointer application, not a kill during durable snapshot application or joint membership |
 | 2026-10-06 | Validation | Against `db45b1a`: workspace lib/bin 981 passed, 3 ignored; all three binary migration CLI tests explicitly including the opt-in test passed in 74.02s. Doc tests, all-target Clippy with `-D warnings`, format, seven tracked-source DST audits, madsim Raft lib check and existing smoke (0.43s) passed | Native `aarch64-apple-darwin` only. MinIO `RELEASE.2025-10-15T17-29-55Z` (`go1.26.3 darwin/arm64`), AWS CLI `2.33.19` (`exe/arm64`), dummy credentials and an isolated local bucket. No AWS behavior, one-hour object GC cutoff/deletion, cold-manifest replay, new migration DST, CI or deployment evidence is claimed |
+| 2026-10-06 | HS-104 / HS-203 / HS-204 / HS-206 | Commit `bb7a9cd` adds a native six-process RF3/RF5 joint crash fixture. A gRPC proxy forwards native data/meta RPCs and withholds only final target-uniform membership appends. Captured joint entries contain exact source/target voter sets; the actual leader reports joint committed/applied and uniform uncommitted, while placement remains epoch 0. A neighbor group acknowledges another write at that boundary. SIGKILL all six data/meta processes, reopen the same journals, and resume through the supported CLI | Both policies reach exact uniform target membership without learners, epoch 1, higher executor generation and changed process identity. Every acknowledged payload survives, including neighbor-window writes, and another settled full restart preserves complete meta state. Inline snapshots; this does not establish the joint/S3 cross-product or a new deterministic simulation schedule. The proxy forwards AppendStream items through native unary Append RPCs, preserving correlation; it never fabricates successful Raft responses |
+| 2026-10-06 | HS-206 / regression fix | Native joint crash reproduction found successful `ursulactl operation resume` stdout prefixed with temporary-unavailability WARN lines, causing strict JSON parsing to fail. Commit `be6900a` explicitly sends the shared tracing formatter to stderr, matching its documented contract | The joint fixture starts the CLI while all servers remain down, requires the actual outage warning on stderr before restarting any server, then parses the successful stdout as pure JSON. Diagnostics are drained while waiting; warnings are not filtered from stdout to make the test pass |
+| 2026-10-06 | Validation | Against `bb7a9cd` including `be6900a`: workspace lib/bin 981 passed, 3 ignored; all four binary migration CLI tests, explicitly including MinIO, passed in 92.74s. Managed adoption/restart with independent three/five meta voters passed in 25.82s. All-target Clippy with `-D warnings`, doc tests, format, seven tracked-source DST audits, madsim Raft lib check and existing smoke (0.40s) passed | Native Mac host only; rebuilt server verified arm64 Mach-O. The strengthened joint fixture alone passed in 17.71s before the final combined regression. Existing madsim warnings remain. No new migration DST, CI, deployment or scaling-performance acceptance is claimed |
+| 2026-10-06 | Execution constraint / remote verification | User moved all build/test work to GitHub Actions Depot because the local device is on battery. Added branch-triggered `horizontal-scaling.yml`: native ARM Rust checks, real-process migration/adoption and explicit MinIO faults, plus existing DST audits/smoke, with acceptance-log artifacts | Local compute-intensive validation is stopped. Remote results must be attached by exact SHA/run URL after completion; workflow configuration is not passing CI evidence |
 
 ## Current execution checkpoint
 
@@ -325,16 +336,36 @@ native executables; `URSULA_BINARY` can select the native server executable.
 Default test runs intentionally skip this external-tool fixture; the final
 validation above explicitly included it.
 
-Next verify interruption during durable snapshot application and joint
-membership, remaining prepare/release recovery phases, lost replies, delayed
-old receiver requests and migration-boundary DST.
+Commits `be6900a` / `bb7a9cd` close the RF3/RF5 committed-joint OS-process crash
+slice. The test observes actual committed/applied joint log positions while the
+final uniform append cannot reach followers and placement remains unpublished.
+All six data/meta processes stop without graceful completion, then recover the
+same journals through a live `resume` CLI. Exact target membership, epoch,
+process/generation replacement, acknowledged neighbor writes and a further full
+restart pass. Outage warnings are now on stderr; strict JSON stdout remains
+machine-readable even when the CLI begins before servers restart.
+
+Reproduce this inline-snapshot native fixture with:
+
+```bash
+CARGO_INCREMENTAL=0 cargo build -p ursula --bin ursula
+CARGO_INCREMENTAL=0 cargo test -p ursula-ctl --test managed_migration_cli \
+  joint_fault -- --nocapture
+```
+
+Next audit M1 against its exact exit criteria and add migration-boundary DST,
+remaining snapshot/prepare/release process faults, lost replies and delayed old
+receiver requests. The current receiver checkpoint deliberately rejects file
+storage under madsim; exercising the supported receiver/executor there requires
+a controlled simulated persistent backend rather than host files or a separate
+protocol model.
 Established startup continues
 restoring assigned data from its bound checkpoint even under meta minority.
 
-M1 stays open for the remaining active-assignment binary startup/recovery
-acceptance; intent-aware consumers and the snapshot-prefetch restart slice are
-verified. M2 stays open for install-apply/joint binary restart and full fault
-acceptance. Ten native fixtures exercise endpoint
+M1 stays open pending its completion audit; ordered consumers, settled recovery,
+meta-minority startup, S3 prefetch and committed-joint active-assignment restart
+now have native evidence. M2 stays open for the remaining snapshot/recovery
+boundaries, delayed requests and migration DST. Ten native fixtures exercise endpoint
 and automatic execution with actual data/meta consensus, disk WAL and inline
 snapshots. HTTP identity replacement and executor interruption are in-process;
 separate subprocess tests cover receiver-ledger recovery independently. The
