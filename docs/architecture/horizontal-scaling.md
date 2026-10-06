@@ -922,3 +922,112 @@ a native fault fixture, and snapshots here are inline/local WAL. The resumable
 server executor/operation API/CLI, explicit 3→5→3, real receiver binary restarts,
 S3 migration, live routing/inventory integration and migration-boundary DST
 remain required. These endpoint tests do not complete M2 or the full epic.
+
+### Implementation checkpoint: automatic executor and operation API
+
+Commit `e877d48` supplies the resumable server executor, bound managed-command
+transport, operation HTTP API and `ursulactl operation` commands. It supersedes
+the preceding checkpoint's pending executor/API/CLI and native RF-change work;
+binary restart, S3 and scaling acceptance remain outstanding.
+
+Only a fresh local meta-leader projection lets a server claim execution. Claims
+allocate durable monotonic generations and bind the owner to its process
+incarnation. A different meta leader or changed receiving-process inventory
+claims a new generation. The shared metadata revision CAS prevents an old
+iteration from publishing its observations after takeover. Fresh receiver-side
+authority, queue reconciliation and process headers continue to fence native
+effects even if the executor loses its request or stops while it is in flight.
+
+The executor reads durable progress on every iteration and performs one state
+transition or native membership action. It authorizes and activates every
+participant, certifies their actual processes, prepares added replicas and
+captures the immutable catch-up prefix. It adds learners through the fenced
+endpoint and polls each learner's actual applied state. After durable membership
+authorization, it observes source uniform, intended joint or target uniform
+configuration, hands a removed leader to a retained voter when available and
+continues OpenRaft's voter-change protocol. Publication requires exact uniform
+target voters with no learners and every target process applied through the
+same observed post-membership prefix. The executor holds that prefix fixed
+during its bounded verification attempt; restart discards the observations and
+captures a fresh prefix, without using them to publish.
+
+After publication it releases every removed replica with the verified membership
+log ID, records physical retirement evidence, retires every participant's fence
+and only then finishes the operation. Pending work on a former data leader is
+reconciled through activation before another mutation is attempted. Historical
+`Applied` or `Reconciled` receipts cannot stand in for the newly observed desired
+state: a further necessary membership attempt uses a new request ID. Receipt
+capacity exhaustion claims a new generation and recertifies processes rather
+than evicting replies. Distinct execution errors remain in durable operation
+status; retries back off to two seconds (or the configured refresh interval
+when larger) and keep the operation lock.
+
+`WriteControl` is an additive private meta RPC under protocol version 2. It
+checks bound cluster/node/routing/version identity before decoding, caps command
+payloads at 1 MiB, requires fresh adopted meta state, rejects followers and
+legacy/bootstrap transitions, and submits allowed managed commands through
+OpenRaft quorum replication. Clients try trusted meta-voter origins rather than
+following arbitrary remote hints. A lost deadline reply is ambiguous: keyed
+submission or generation/revision CAS replay and a fresh projection resolve it.
+The existing data-group and static administrative paths remain independent.
+
+The managed admin listener exposes:
+
+| Endpoint | Behavior |
+| --- | --- |
+| `POST /__ursula/control/operations` | Accept an immutable keyed group/epoch/target/policy intent; return `202` and its migration ID |
+| `GET /__ursula/control/operations` | Return a fresh complete control projection, including operation history and placement policies |
+| `GET /__ursula/control/operations/{migration_id}` | Return fresh durable operation status, or `404` for an unknown ID |
+| `GET /__ursula/control/receiver/process` | Discover bound local identity and current receiving process; this is admission information, not quorum proof |
+
+Operator submission contains `operation_key`, `raft_group_id`, `expected_epoch`,
+`target_voters` and optional `target_policy`. The server obtains its source
+membership certificate through an actual data quorum. Omitting target policy
+preserves the resolved RF/domain policy; an RF change is explicit. Replaying an
+existing key checks these operator fields and reuses the original source
+certificate, including after completion. Epoch/key/policy conflicts return
+`409`; missing fresh control or source-data quorum returns `503`. HTTP
+submission is detached from request cancellation, and receiver lifecycle/native
+work retains its own durable checkpoint and cancellation-independent execution.
+
+For an existing cluster manifest, the supported CLI is:
+
+```sh
+ursulactl operation status --config cluster.toml
+ursulactl operation submit --config cluster.toml \
+  --operation-key move-group-0 --group 0 --expected-epoch 0 --voters 1,3,4
+ursulactl operation submit --config cluster.toml \
+  --operation-key grow-group-0 --group 0 --expected-epoch 1 \
+  --voters 1,2,3,4,5 --rf 5 --failure-domain zone
+ursulactl operation status --config cluster.toml --operation 1
+ursulactl operation wait --config cluster.toml --operation 1
+ursulactl operation resume --config cluster.toml --operation 1
+```
+
+These are separate example intents; use the epoch from fresh status for the
+actual requested target. Wait/resume observes the same durable ID and does not
+own, cancel or recreate execution. A CLI timeout leaves server work active;
+unknown IDs/conflicts are terminal, while temporary server/transport failures
+can be observed again. Physical process provisioning remains the operator's
+responsibility.
+
+Two new native fixtures use real admin listeners, independent meta/data TCP
+Raft, disk WAL and inline snapshots. They cover RF3/RF5 automatic replacement
+with acknowledged-payload preservation; submission through a follower; executor
+task interruption, actual meta-leader transfer and higher-generation takeover;
+immutable-key replay/conflict; CLI-client timeout/status/wait/replay; and actual
+3→5→3 publication, removed-data-leader handoff and old-replica retirement. A CLI
+argument test checks RF preservation, explicit RF5 and resume of an existing ID.
+The bound meta transport test checks remote submit/replay, follower refusal,
+legacy-command rejection and full durable reopen. Native fixture observations
+follow actual fresh quorum/leadership rather than assuming node 1 stays leader.
+
+Final checks: 967 workspace lib/bin tests passed, 3 ignored; workspace doc tests,
+Clippy with `-D warnings`, format, seven DST audits, madsim Raft check and existing
+smoke (0.40s) passed. Static forwarding and mixed-RF/meta3/meta5 adoption/restart
+CLI regressions passed (4.30s / 25.44s). The new executor faults are native task
+interruption and leadership transfer; the binary CLI fixtures remain fixed-layout
+adoption/recovery. Dynamic registration/joining beyond the bootstrap directory,
+complete live routing/inventory/maintenance/snapshot consumers, migration-time
+binary/S3 restart, joint-boundary DST and full scale/performance/autopilot gates
+remain open. M1/M2 and the complete epic are still active.

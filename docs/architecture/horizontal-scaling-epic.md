@@ -1,6 +1,6 @@
 # Horizontal Scaling Epic
 
-Status: active; M1 consumers and M2 fencing foundations in progress under a persistent goal.
+Status: active; M1 consumers and M2 automatic migration acceptance in progress under a persistent goal.
 Last updated: 2026-10-06.
 
 - Tracking issue: [#2: dynamic group membership](https://github.com/tonbo-io/ursula/issues/2).
@@ -78,12 +78,12 @@ already accepts the meta type config.
 
 | Story | Deliverable and exit criteria | Dependencies | Status |
 | --- | --- | --- | --- |
-| HS-201 | Intent-bound state transitions, operation idempotency, epoch CAS, source/target policy and membership-step evidence; no successful finish without verified placement | M1 | In progress: commit `6530772` (replicated metadata protocol; physical executor integration pending) |
-| HS-202 | Durable dynamic group prepare/release on the owning core; joining replicas never initialize themselves; revoked replicas cannot be recreated by traffic | HS-104, HS-201 | In progress: commits `064a1af`, `cf05e16`, `e7f12bf`, `dc54f53`, `8b88822` (durable receiver prepare/release and retirement kernel; supported membership and binary-restart acceptance pending) |
-| HS-203 | Resumable learner catch-up, fixed-prefix applied verification, joint-membership reconciliation, leader handoff and final membership verification | HS-201, HS-202 | In progress: commit `3504fb5` (fenced steps, applied-state evidence, actual joint reconciliation and quorum-confirmed handoff; autonomous executor and binary-restart acceptance pending) |
-| HS-204 | Durably allocated executor generations and process-incarnation fencing, receiving-process barriers and exclusion with maintenance; delayed old/raw requests cannot bypass authority | HS-201; required before managed mutations are exposed | In progress: commits `6530772`, `064a1af`, `8b88822`, `3504fb5` (durable generations, process barriers and typed replica/membership recovery; full executor and maintenance integration pending) |
+| HS-201 | Intent-bound state transitions, operation idempotency, epoch CAS, source/target policy and membership-step evidence; no successful finish without verified placement | M1 | In progress: commits `6530772`, `e877d48` (replicated intent and automatic physical execution; complete fault acceptance pending) |
+| HS-202 | Durable dynamic group prepare/release on the owning core; joining replicas never initialize themselves; revoked replicas cannot be recreated by traffic | HS-104, HS-201 | In progress: commits `064a1af`, `cf05e16`, `e7f12bf`, `dc54f53`, `8b88822`, `e877d48` (durable receiver prepare/release, retirement kernel and automatic execution; dynamic joining/binary-restart acceptance pending) |
+| HS-203 | Resumable learner catch-up, fixed-prefix applied verification, joint-membership reconciliation, leader handoff and final membership verification | HS-201, HS-202 | In progress: commits `3504fb5`, `e877d48` (fenced steps and autonomous executor, RF3/RF5 replacement and explicit 3→5→3; binary-restart/S3/fault acceptance pending) |
+| HS-204 | Durably allocated executor generations and process-incarnation fencing, receiving-process barriers and exclusion with maintenance; delayed old/raw requests cannot bypass authority | HS-201; required before managed mutations are exposed | In progress: commits `6530772`, `064a1af`, `8b88822`, `3504fb5`, `e877d48` (durable generations, process barriers, typed recovery and automatic leader takeover; maintenance integration and fault acceptance pending) |
 | HS-205 | Dynamic node/gateway routing, per-group readiness/quorum inventory, reference protection, actor/background-work retirement and safe per-core journal reclamation | HS-202, HS-203, HS-204 | In progress: commits `cf05e16`, `e7f12bf`, `dc54f53`, `8b88822` (WAL/actor/snapshot/cold-work retirement and receiver integration; dynamic inventory pending) |
-| HS-206 | Supported operation API and CLI submit/status/wait/resume with admin authority and error semantics; real-process E2E plus DST at every migration boundary | HS-201 through HS-205 | Planned |
+| HS-206 | Supported operation API and CLI submit/status/wait/resume with admin authority and error semantics; real-process E2E plus DST at every migration boundary | HS-201 through HS-205 | In progress: commit `e877d48` (operation API and CLI client, automatic server execution and native TCP takeover; binary migration and boundary DST pending) |
 
 Start with one global active operation. M2 must move a group to a node that
 did not statically host it. Cover RF=3 and RF=5 replica replacements, and
@@ -189,47 +189,50 @@ unevacuated machine. Physical provisioning remains outside the Raft controller.
 | 2026-10-06 | HS-203 / HS-204 | Commit `3504fb5` adds durable process-fenced learner/voter/handoff steps, a separate quorum-confirmed joint configuration capability, and per-replica applied-state evidence. Activation observes and reconciles pending work before certification without resubmitting it; exact step replies remain bounded and immutable within their generation | Membership endpoint integration implemented; resumable server executor/API/CLI and full migration acceptance pending |
 | 2026-10-06 | HS-203 / HS-204 | Four existing RF3/RF5 physical-move fixtures now use fenced membership endpoints and actual applied evidence. Two new RF3/RF5 cases commit a real joint entry, interrupt before the uniform submission, replace HTTP process/generation, recover joint state and roll forward. A handoff test covers RF3/RF5 actual leader quorum, nonvoter refusal and exact replay. Three configuration, two bounded-ledger and one OS-exit checkpoint parent test pass | Data/meta are actual TCP Raft with local WAL/inline snapshots; HTTP replacement is in-process, joint interruption is native injection, and store facts are synthetic. No binary-restart/S3/operator scaling acceptance claim |
 | 2026-10-06 | M1/M2 | Final workspace lib/bin tests: 964 passed, 3 ignored; doc tests, workspace Clippy, format, seven DST audits, madsim Raft check and existing smoke passed (0.37s). Static follower forwarding and mixed-RF/meta3/meta5 adoption/restart CLI regressions passed (5.86s / 28.04s) | Compatibility and endpoint checks passed; explicit RF changes, migration-boundary DST and complete scale/performance gates remain open |
+| 2026-10-06 | HS-201 / HS-203 / HS-204 / HS-206 | Commit `e877d48` adds a bound managed-command WriteControl RPC, fresh leader routing, source-certificate capture, keyed operation API and CLI submit/status/wait/resume. The current meta leader claims a durable executor token and automatically certifies processes, prepares replicas, captures/polls fixed prefixes, performs fenced learner/handoff/voter steps, verifies/publishes placement, releases removed replicas and retires all receiver authority | Accepted intent is server-owned; cached projections and process inventory are not authority. RPC refuses legacy/bootstrap commands and followers; HTTP conflicts are 409, unavailable fresh quorums are 503 |
+| 2026-10-06 | HS-203 / HS-204 / HS-206 | Two native TCP fixtures cover RF3/RF5 automatic replacements with acknowledged payload preservation, follower API submission, stopped/restarted executor tasks, actual meta leader transfer and higher generation takeover, replay/conflicting keys, CLI-client timeout/status/wait/replay, and explicit 3→5→3 policy changes with removed-data-leader handoff and physical retirement | Real meta/data Raft, disk WAL, inline snapshots and admin listeners in one process. Task interruption and meta leadership transfer do not establish OS/binary restart or S3 migration acceptance |
+| 2026-10-06 | M1/M2 | Final workspace lib/bin tests: 967 passed, 3 ignored; doc tests, workspace Clippy with `-D warnings`, format, seven tracked-source DST audits, madsim Raft check and existing smoke passed (0.40s). Static follower forwarding and mixed-RF/meta3/meta5 adoption/restart CLI regressions passed (4.30s / 25.44s) | Resolved two single-step loop lint issues, released a retained test gRPC channel before WAL reopen, and made executor fixtures follow actual meta leadership/fresh quorum instead of assuming node 1 stays leader. Native compatibility checks passed; binary CLI fixtures remain fixed-layout adoption/recovery |
 
 ## Current execution checkpoint
 
-Current implementation stories: **HS-201/HS-203/HS-204/HS-206** resumable
-server executor and supported operation API/CLI, alongside **HS-104/HS-205**
-intent-aware inventory/routing/readiness and maintenance/snapshot consumers.
-Commit `3504fb5` connects durable receiver authority to typed learner, voter-change
-and leader-handoff steps. Actual fresh data-quorum observations distinguish
-source uniform, intended joint and target uniform state; replacement activation
-reconciles pending submissions without inventing action success. Separate
-applied-state evidence binds a replica's actual applied prefix to its current
-process. Membership replies are retained in a bounded per-generation map;
-opaque legacy pending work still fails closed.
+Current implementation stories: **HS-104/HS-205/HS-206** dynamic live inventory,
+routing/readiness, maintenance/snapshot consumers and real-process migration
+acceptance, alongside **HS-203/HS-204** migration-boundary fault/restart coverage.
+Commit `e877d48` connects the durable intent and receiver protocols to an automatic
+meta-leader-owned executor and supported operation API/CLI. RF3/RF5 replacement,
+executor task interruption plus actual meta leadership takeover, and explicit
+3→5→3 now pass through real admin HTTP and data/meta TCP Raft fixtures. Current
+process discovery is a header/admission binding, never quorum authority. Fresh
+meta tokens authorize every native receiver step; actual data configurations and
+applied prefixes authorize publication and cleanup. Retry budgets retain bounded
+receipts; further membership attempts claim a new generation instead of evicting
+replies. Pending work on former leaders is reconciled before unrelated mutation.
 
 Commit `8b88822` supplies durable replica prepare/release, physical receipts,
 process/generation recovery and settled assignment epochs. `dc54f53`, `e7f12bf`
 and `cf05e16` connect cold/background/reference, actor and shared-core WAL cleanup;
 `064a1af` supplies receiving-process fences and `6530772` supplies meta intent,
-generation and evidence ordering. Receiver endpoints now implement physical and
-membership steps, but an accepted intent is not yet autonomously executed by a
-server controller. Meta writes need supported leader routing, and the operation
-API/CLI must submit/status/wait/resume the durable global operation. Raw managed
-membership/recovery, backup import and external maintenance-fence APIs stay closed.
+generation and evidence ordering. `3504fb5` supplies fenced membership steps and
+actual joint reconciliation; `e877d48` supplies their autonomous orchestration.
+Raw managed membership/recovery, backup import and external maintenance-fence
+APIs stay closed. CLI wait/resume observes the same durable ID; stopping it or
+timing out does not cancel server execution. Distinct executor errors are
+persisted while the operation remains active, with bounded retry backoff.
 
-Next wire a resumable server executor to these endpoints: claim/certify receiving
-processes, prepare replicas, capture and verify the fixed prefix, continue actual
-joint state and hand off a removed leader, certify/publish final placement, release
-removed replicas and retire receiver authority. Controller failure cannot lose an
-accepted intent; restart/lost-reply recovery must use actual membership rather
-than replay an assumed source layout. Complete explicit 3→5→3 and real receiver
-binary-restart acceptance, then finish dynamic live inventory/routing/maintenance/
-snapshot consumers and migration-boundary DST. Established startup continues
+Next reproduce supported migrations using Ursula/ursulactl binaries, including
+destination/controller restart during migration, lost replies and joint recovery.
+Finish dynamic registration/joining outside the initial bootstrap directory,
+intent-aware live inventory/routing/maintenance/snapshot consumers, S3 migration
+and migration-boundary DST. Established startup continues
 restoring assigned data from its bound checkpoint even under meta minority.
 
-M1 stays open for full intent-aware consumers. M2 stays open for autonomous
-supported migration, RF-change and fault acceptance. Seven native endpoint tests
-exercise RF3/RF5 physical movement, generation recovery, committed joint recovery
-and leader handoff; they use actual TCP data/meta consensus, disk WAL and inline
-snapshots. HTTP replacement is in-process, and separate subprocess tests cover
-receiver-ledger recovery independently. The tests do not establish a complete
-operator workflow, receiver binary-restart/S3 migration or joint-boundary DST.
+M1 stays open for full intent-aware consumers. M2 stays open for complete binary
+migration, restart/S3 and fault acceptance. Nine native fixtures exercise endpoint
+and automatic execution with actual data/meta consensus, disk WAL and inline
+snapshots. HTTP identity replacement and executor interruption are in-process;
+separate subprocess tests cover receiver-ledger recovery independently. The
+binary CLI regressions still exercise fixed-layout adoption/recovery. Existing
+DST smoke checks compatibility, not the new executor's fault boundaries.
 M3 manual scaling/batches and M4 autopilot remain in the active goal's scope.
 No CI, deployment or scaling-performance acceptance is claimed. No external
 blocker is recorded.
