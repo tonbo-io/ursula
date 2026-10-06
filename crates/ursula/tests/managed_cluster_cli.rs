@@ -44,12 +44,37 @@ fn spawn(binary: &str, config: &Path, log: &Path) -> Process {
         log: log.to_owned(),
     }
 }
-fn port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+struct Ports {
+    next: u16,
+    reserved: Vec<std::net::TcpListener>,
+}
+
+impl Ports {
+    fn new() -> Self {
+        Self {
+            next: 15000,
+            reserved: Vec::new(),
+        }
+    }
+
+    fn port(&mut self) -> u16 {
+        // Keep all fixture ports distinct while planning. Avoid the default
+        // Linux/macOS ephemeral range: an early node's outbound connection
+        // must not occupy a later node's not-yet-bound listener address.
+        while self.next < 30000 {
+            let candidate = self.next;
+            self.next += 1;
+            match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, candidate)) {
+                Ok(listener) => {
+                    self.reserved.push(listener);
+                    return candidate;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(error) => panic!("reserve fixture port: {error}"),
+            }
+        }
+        panic!("no available listener ports below the ephemeral range");
+    }
 }
 fn check_alive(processes: &mut [Process]) {
     for process in processes {
@@ -180,13 +205,14 @@ async fn managed_cli_adopts_mixed_disk_groups_with_three_and_five_meta_voters_an
     let binary = env!("CARGO_BIN_EXE_ursula");
     for meta_count in [3_usize, 5] {
         let root = tempfile::tempdir().unwrap();
+        let mut ports = Ports::new();
         let nodes = (1..=5)
             .map(|id| {
                 (id, NodeRegistration {
                     node_id: id,
-                    client_url: format!("http://127.0.0.1:{}", port()),
-                    cluster_url: format!("http://127.0.0.1:{}", port()),
-                    admin_url: format!("http://127.0.0.1:{}", port()),
+                    client_url: format!("http://127.0.0.1:{}", ports.port()),
+                    cluster_url: format!("http://127.0.0.1:{}", ports.port()),
+                    admin_url: format!("http://127.0.0.1:{}", ports.port()),
                     labels: BTreeMap::from([("zone".to_owned(), match id {
                         4 => "1".to_owned(),
                         5 => "2".to_owned(),
@@ -195,6 +221,7 @@ async fn managed_cli_adopts_mixed_disk_groups_with_three_and_five_meta_voters_an
                 })
             })
             .collect::<BTreeMap<_, _>>();
+        drop(ports);
         let mut configs = Vec::new();
         let mut paths = Vec::new();
         let mut processes = Vec::new();
