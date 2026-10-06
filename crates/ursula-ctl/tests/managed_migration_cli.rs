@@ -25,6 +25,9 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::StaticShardMap;
 
+#[path = "managed_migration/snapshot_fault.rs"]
+mod snapshot_fault;
+
 struct Process {
     child: Child,
     log: PathBuf,
@@ -57,6 +60,10 @@ fn port() -> u16 {
 
 impl Cluster {
     async fn new() -> Self {
+        Self::new_with_s3(None).await
+    }
+
+    async fn new_with_s3(storage: Option<(ursula_config::S3Config, String)>) -> Self {
         let cli = Path::new(env!("CARGO_BIN_EXE_ursulactl"));
         let binary = std::env::var_os("URSULA_BINARY")
             .map(PathBuf::from)
@@ -110,6 +117,15 @@ impl Cluster {
                         voters: vec![1, 2, 3, 4, 5],
                     },
                 ];
+                if let Some((s3, prefix)) = &storage {
+                    config.storage.cold.backend = ursula_config::ColdBackend::S3;
+                    config.storage.cold.root = Some(prefix.clone());
+                    config.storage.cold.s3 = Some(s3.clone());
+                    config.storage.snapshot.backend = ursula_config::RaftSnapshotBackend::S3;
+                    config.storage.snapshot.drive_interval = Some(HumanDuration::milli(0));
+                    config.raft.snapshot_logs_since_last = 1;
+                    config.raft.max_in_snapshot_log_to_keep = 0;
+                }
                 config.validate().unwrap();
                 (*id, config)
             })
