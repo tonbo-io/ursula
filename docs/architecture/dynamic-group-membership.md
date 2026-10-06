@@ -5,6 +5,12 @@ membership and the foundation merged in the first phase. It is not an operator
 runbook yet: the public HTTP admin API, `ursulactl` workflow, bootstrap wiring,
 and durable meta log store are intentionally left for follow-up work.
 
+The follow-up [horizontal scaling design](horizontal-scaling.md) describes
+configurable replica sets (default RF=3, initially supporting RF=3 and RF=5),
+recoverable group migration, routing and maintenance integration, and the
+scale-out/scale-in acceptance gates. The [epic tracker](horizontal-scaling-epic.md)
+records milestones, implementation stories, dependencies and validation progress.
+
 The design target is not "every node hosts every group". A cluster can have
 more data-capable nodes than any single data group needs:
 
