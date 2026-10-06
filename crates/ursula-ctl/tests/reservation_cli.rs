@@ -102,6 +102,121 @@ fn proposal_is_not_a_receipt_and_conflicting_committed_state_cannot_be_adopted()
     assert_eq!(receipt["disruption_authorized"], false);
     assert_eq!(receipt["physical_hosts_fenced"], false);
     assert_eq!(receipt["nodes"].as_array().unwrap().len(), 3);
+    let view_path = directory.path().join("view-snapshot");
+    std::fs::write(&view_path, serde_json::to_vec(&accepted).unwrap()).unwrap();
+    let read_field = |field: &str| {
+        Command::new(env!("CARGO_BIN_EXE_ursulactl"))
+            .arg("reservation-read")
+            .arg("--cell")
+            .arg(directory.path().join("cell"))
+            .arg("--snapshot")
+            .arg(&view_path)
+            .arg("--field")
+            .arg(field)
+            .output()
+            .unwrap()
+    };
+    for (field, expected) in [
+        ("stage", "reserved"),
+        ("source-node-id", "1"),
+        ("source-pod-uid", "pod-1"),
+    ] {
+        let read = read_field(field);
+        assert!(
+            read.status.success(),
+            "{}",
+            String::from_utf8_lossy(&read.stderr)
+        );
+        assert_eq!(String::from_utf8(read.stdout).unwrap().trim(), expected);
+    }
+    let read = read_field("manifest");
+    assert!(read.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&read.stdout).unwrap()["nodes"],
+        receipt["nodes"]
+    );
+    assert!(!read_field("replacement-pod-uid").status.success());
+    let initial: Value =
+        serde_json::from_slice(&std::fs::read(directory.path().join("snapshot")).unwrap()).unwrap();
+    std::fs::write(&view_path, serde_json::to_vec(&initial).unwrap()).unwrap();
+    assert_eq!(
+        String::from_utf8(read_field("stage").stdout)
+            .unwrap()
+            .trim(),
+        "idle"
+    );
+    assert!(!read_field("manifest").status.success());
+    // Real CLI identity capture from synthetic full API objects.
+    let namespace_path = directory.path().join("namespace");
+    let sts_path = directory.path().join("statefulset");
+    let pod_path = directory.path().join("pod");
+    let node_path = directory.path().join("node");
+    let plan_path = directory.path().join("plan");
+    let namespace = json!({"kind":"Namespace", "metadata":{"name":"test", "uid":"namespace-uid"}});
+    let mut sts = json!({"kind":"StatefulSet", "metadata":{"namespace":"test", "name":"voters", "uid":"statefulset-uid"}, "spec":{"replicas":3}});
+    let pod = json!({"kind":"Pod", "metadata":{"namespace":"test", "name":"voters-0", "uid":"pod-1", "ownerReferences":[{"kind":"StatefulSet", "uid":"statefulset-uid", "controller":true}]}, "spec":{"nodeName":"host-1"}});
+    let node = json!({"kind":"Node", "metadata":{"name":"host-1", "uid":"node-1"}, "spec":{"providerID":"instance-1"}});
+    for (path, value) in [
+        (&namespace_path, &namespace),
+        (&sts_path, &sts),
+        (&pod_path, &pod),
+        (&node_path, &node),
+    ] {
+        std::fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
+    }
+    std::fs::write(
+        &plan_path,
+        serde_json::to_vec(&json!({"nodes":receipt["nodes"]})).unwrap(),
+    )
+    .unwrap();
+    let capture_cell = || {
+        Command::new(env!("CARGO_BIN_EXE_ursulactl"))
+            .arg("reservation-cell")
+            .arg("--namespace-object")
+            .arg(&namespace_path)
+            .arg("--statefulset-object")
+            .arg(&sts_path)
+            .args(["--group-count", "256", "--core-count", "2"])
+            .output()
+            .unwrap()
+    };
+    let result = capture_cell();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let captured_cell: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        captured_cell,
+        serde_json::from_slice::<Value>(&std::fs::read(directory.path().join("cell")).unwrap())
+            .unwrap()
+    );
+    let result = Command::new(env!("CARGO_BIN_EXE_ursulactl"))
+        .arg("reservation-source")
+        .arg("--cell")
+        .arg(directory.path().join("cell"))
+        .arg("--pod-object")
+        .arg(&pod_path)
+        .arg("--node-object")
+        .arg(&node_path)
+        .arg("--config")
+        .arg(&plan_path)
+        .args(["--node-id", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&result.stdout).unwrap(),
+        receipt["reservation"]["operation"]["source"]
+    );
+    sts["spec"]["replicas"] = json!(2);
+    std::fs::write(&sts_path, serde_json::to_vec(&sts).unwrap()).unwrap();
+    assert!(!capture_cell().status.success());
     let mut other_state: Value =
         serde_json::from_str(accepted["data"]["reservation"].as_str().unwrap()).unwrap();
     other_state["operation"]["source"]["pod_uid"] = json!("different-source");

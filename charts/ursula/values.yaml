@@ -82,6 +82,12 @@ server:
     # Off by default: it is only meaningful with updateStrategy=OnDelete, and
     # it needs RBAC to delete pods and forward ports.
     enabled: false
+    # Shared CAS/process fencing requires all voters to support maintenance
+    # tokens and an explicitly bootstrapped persistent <StatefulSet>-maintenance
+    # ConfigMap. A missing store fails closed; this hook never initializes it.
+    # false retains only the uncertified legacy upgrade migration. Enable this
+    # after migration before claiming production-safe shared maintenance.
+    maintenanceReservation: false
     # Groups `ursulactl verify-cluster` should find. Defaults to raft.groupCount.
     expectedGroups: null
     # Ceiling for the whole rollout, not one node. Draining and catching up a

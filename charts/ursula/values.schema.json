@@ -588,6 +588,10 @@
             },
             "resources": {
               "type": "object"
+            },
+            "maintenanceReservation": {
+              "type": "boolean",
+              "description": "Use shared persistent reservation CAS and process fencing for planned Pod rollouts. Requires explicit new-cell store bootstrap and token-capable voters; missing stores fail closed. False is the uncertified legacy migration."
             }
           },
           "required": [

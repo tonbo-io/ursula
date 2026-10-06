@@ -455,6 +455,7 @@ rm -f "${mock_ctl}" "${mock_ctl_calls}" "${MANIFEST}"
 # stale replacement in the fixture cannot become Ready until resume replaces
 # it, so reversing these two calls recreates the production deadlock.
 call_order=
+legacy_shared_store_guard() { :; }
 write_manifest() { :; }
 pin_manifest() { :; }
 wait_for_template() { :; }
@@ -783,4 +784,22 @@ echo "graceful-rollout.sh: all checks passed"
   : >"${identity_dir}/calls"
   if bind_replacement_incarnation 3; then echo 'second unadmitted Pod replacement must refuse resume' >&2; exit 1; fi
   [ ! -s "${identity_dir}/calls" ]
+)
+
+# Disabling the new value cannot reopen the legacy writer after adoption.
+(
+  . "${test_dir}/graceful-rollout.sh"
+  guard_mode=present
+  kubectl() {
+    case "${guard_mode}" in
+      present) printf '%s\n' configmap/ursula-maintenance ;;
+      missing) return 0 ;;
+      failed) return 1 ;;
+    esac
+  }
+  if legacy_shared_store_guard; then echo 'shared store reopened legacy writer' >&2; exit 1; fi
+  guard_mode=failed
+  if legacy_shared_store_guard; then echo 'failed GET reopened legacy writer' >&2; exit 1; fi
+  guard_mode=missing
+  legacy_shared_store_guard
 )
