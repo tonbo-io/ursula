@@ -277,3 +277,105 @@ fn trusted_directory_rejects_endpoint_aliases_and_non_origin_urls() {
         serde_json::from_str::<RoutingHashVersion>("\"fnv1a64_bucket_slash_stream_v2\"").is_err()
     );
 }
+
+#[test]
+fn complete_projections_resync_without_rollback_or_conflicting_versions() {
+    use crate::ControlProjection;
+    use crate::ProjectionCursor;
+    use crate::ProjectionInstall;
+
+    let bootstrap = recipe(3);
+    let mut state = ControlPlaneState::default();
+    assert_eq!(state.apply(command(bootstrap.clone())), ControlResponse::Ok);
+    let first = ControlProjection {
+        identity: bootstrap.identity.clone(),
+        applied_log_id: MembershipLogId {
+            term: 2,
+            node_id: 1,
+            index: 10,
+        },
+        state,
+    };
+    first.validate().unwrap();
+    let bytes = rmp_serde::to_vec_named(&first).unwrap();
+    assert_eq!(
+        rmp_serde::from_slice::<ControlProjection>(&bytes).unwrap(),
+        first
+    );
+    let mut cursor = ProjectionCursor::new(bootstrap.identity).unwrap();
+    assert_eq!(
+        cursor.install(first.clone()).unwrap(),
+        ProjectionInstall::Advanced
+    );
+    assert_eq!(
+        cursor.install(first.clone()).unwrap(),
+        ProjectionInstall::Unchanged
+    );
+    // A complete later snapshot repairs any number of missing updates.
+    let mut later = first.clone();
+    later.applied_log_id = MembershipLogId {
+        term: 3,
+        node_id: 2,
+        index: 100,
+    };
+    assert_eq!(
+        later.state.apply(ControlCommand::SetNodeState {
+            node_id: 3,
+            state: NodeState::Draining,
+            now_ms: 7,
+        }),
+        ControlResponse::Ok
+    );
+    assert_eq!(
+        cursor.install(later.clone()).unwrap(),
+        ProjectionInstall::Advanced
+    );
+    assert_eq!(
+        cursor.install(first.clone()).unwrap(),
+        ProjectionInstall::Stale
+    );
+    assert_eq!(cursor.current(), Some(&later));
+    let mut conflict = later.clone();
+    conflict.state.nodes.get_mut(&3).unwrap().updated_at_ms += 1;
+    assert!(cursor.install(conflict).is_err());
+    assert_eq!(cursor.current(), Some(&later));
+    let mut wrong_term = later.clone();
+    wrong_term.applied_log_id.term = 1;
+    wrong_term.applied_log_id.index = 101;
+    let mut wrong_identity = later.clone();
+    wrong_identity.identity.core_count = 3;
+    let mut partial = later.clone();
+    partial.applied_log_id.index = 102;
+    partial.state.placements.remove(&RaftGroupId(0));
+    let mut wrong_rf = later.clone();
+    wrong_rf.applied_log_id.index = 103;
+    wrong_rf
+        .state
+        .placements
+        .get_mut(&RaftGroupId(1))
+        .unwrap()
+        .voters
+        .remove(&5);
+    let mut wrong_group = later.clone();
+    wrong_group.applied_log_id.index = 104;
+    wrong_group
+        .state
+        .placements
+        .get_mut(&RaftGroupId(0))
+        .unwrap()
+        .raft_group_id = RaftGroupId(1);
+    let mut missing_bootstrap = later.clone();
+    missing_bootstrap.applied_log_id.index = 105;
+    missing_bootstrap.state.cluster_bootstrap = None;
+    for invalid in [
+        wrong_term,
+        wrong_identity,
+        partial,
+        wrong_rf,
+        wrong_group,
+        missing_bootstrap,
+    ] {
+        assert!(cursor.install(invalid).is_err());
+        assert_eq!(cursor.current(), Some(&later));
+    }
+}

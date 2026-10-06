@@ -10,6 +10,7 @@
 //! - [`cluster`]: immutable routing identity and trusted bootstrap inventory.
 //! - [`model`]: nodes, placements and migration records.
 //! - [`policy`]: managed replication and failure-domain validation.
+//! - [`projection`]: complete ordered control snapshots and identity/rollback guards.
 //! - [`state`]: deterministic control state transitions.
 //! - [`view`]: routing projections consumed by data nodes and gateways.
 
@@ -17,6 +18,7 @@ mod cluster;
 mod command;
 mod model;
 mod policy;
+mod projection;
 mod state;
 mod view;
 
@@ -56,3 +58,7 @@ mod policy_tests;
 
 #[cfg(test)]
 mod cluster_tests;
+
+pub use projection::ControlProjection;
+pub use projection::ProjectionCursor;
+pub use projection::ProjectionInstall;

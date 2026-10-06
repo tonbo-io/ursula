@@ -165,7 +165,15 @@ async fn bound_meta_transport_rejects_routing_drift_and_missing_binding_before_d
             tonic::Code::FailedPrecondition
         );
         assert_eq!(
-            client.transfer_leader(envelope).await.unwrap_err().code(),
+            client
+                .transfer_leader(envelope.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            client.read_projection(envelope).await.unwrap_err().code(),
             tonic::Code::FailedPrecondition
         );
         assert_eq!(
@@ -522,7 +530,11 @@ async fn meta_transport_rejects_wrong_identity_and_version_before_payload_decode
             tonic::Code::FailedPrecondition
         );
         assert_eq!(
-            client.transfer_leader(envelope).await.unwrap_err().code(),
+            client
+                .transfer_leader(envelope.clone())
+                .await
+                .unwrap_err()
+                .code(),
             tonic::Code::FailedPrecondition
         );
         assert_eq!(
@@ -756,6 +768,194 @@ async fn meta_transport_three_and_five_voters_survive_failures_and_full_restart(
                 count as usize
             );
         }
+        for node in nodes.into_iter().flatten() {
+            stop(node).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn complete_projection_rpc_requires_bootstrap_and_a_live_meta_quorum() {
+    for count in [3_u64, 5] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut identities = Vec::new();
+        let mut nodes = Vec::new();
+        for id in 1..=count {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let identity = bound_identity(id, format!("http://{}", listener.local_addr().unwrap()));
+            nodes.push(Some(
+                start_bound(
+                    identity.clone(),
+                    listener,
+                    &dir.path().join(format!("meta-{id}.wal")),
+                )
+                .await,
+            ));
+            identities.push(identity);
+        }
+        let membership = identities
+            .iter()
+            .map(|identity| {
+                (
+                    identity.node.node_id,
+                    BasicNode::new(&identity.node.cluster_url),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        nodes[0]
+            .as_ref()
+            .unwrap()
+            .handle
+            .initialize_membership(membership)
+            .await
+            .unwrap();
+        let leader_index = leader(&nodes).await;
+        let identity = &identities[leader_index];
+        assert!(
+            crate::read_control_projection(
+                &identity.cluster,
+                identity.node.node_id,
+                &identity.node.cluster_url,
+                Duration::from_secs(1)
+            )
+            .await
+            .is_err(),
+            "pre-bootstrap state is not a usable managed projection"
+        );
+        let bootstrap = ClusterBootstrap {
+            identity: identity.cluster.clone(),
+            initial_meta_voters: (1..=count).collect(),
+            nodes: identities
+                .iter()
+                .map(|id| (id.node.node_id, id.node.clone()))
+                .collect(),
+            voters: BTreeMap::from([(RaftGroupId(0), (1..=count).collect())]),
+            placement: PlacementPolicy {
+                default_replication_factor: ReplicationFactor::try_from(count as u32).unwrap(),
+                ..Default::default()
+            },
+        };
+        // Data-plane certificate collection is covered by the real data RPC test;
+        // this test focuses on the independent meta projection transport.
+        let certificates = BTreeMap::from([(RaftGroupId(0), VerifiedGroupMembership {
+            voters: (1..=count).collect(),
+            learners: BTreeSet::new(),
+            log_id: MembershipLogId {
+                term: 1,
+                node_id: 1,
+                index: 1,
+            },
+        })]);
+        let handle = &nodes[leader_index].as_ref().unwrap().handle;
+        assert_eq!(
+            handle
+                .write(ControlCommand::BootstrapCluster {
+                    bootstrap,
+                    memberships: certificates,
+                    now_ms: 1
+                })
+                .await
+                .unwrap(),
+            ControlResponse::Ok
+        );
+        let first = crate::read_control_projection(
+            &identity.cluster,
+            identity.node.node_id,
+            &identity.node.cluster_url,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let mut cursor = ursula_control::ProjectionCursor::new(identity.cluster.clone()).unwrap();
+        assert_eq!(
+            cursor.install(first.clone()).unwrap(),
+            ursula_control::ProjectionInstall::Advanced
+        );
+        assert_eq!(
+            handle
+                .write(ControlCommand::SetNodeState {
+                    node_id: count,
+                    state: NodeState::Draining,
+                    now_ms: 2
+                })
+                .await
+                .unwrap(),
+            ControlResponse::Ok
+        );
+        let second = crate::read_control_projection(
+            &identity.cluster,
+            identity.node.node_id,
+            &identity.node.cluster_url,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(second.applied_log_id.index > first.applied_log_id.index);
+        assert_eq!(second.state.nodes[&count].state, NodeState::Draining);
+        assert_eq!(
+            cursor.install(second.clone()).unwrap(),
+            ursula_control::ProjectionInstall::Advanced
+        );
+        assert_eq!(
+            cursor.install(first).unwrap(),
+            ursula_control::ProjectionInstall::Stale
+        );
+        let follower_index = (leader_index + 1) % nodes.len();
+        let follower = &identities[follower_index];
+        assert!(
+            crate::read_control_projection(
+                &follower.cluster,
+                follower.node.node_id,
+                &follower.node.cluster_url,
+                Duration::from_secs(1)
+            )
+            .await
+            .is_err()
+        );
+        let mut wrong_contract = identity.cluster.clone();
+        wrong_contract.group_count += 1;
+        assert!(
+            crate::read_control_projection(
+                &wrong_contract,
+                identity.node.node_id,
+                &identity.node.cluster_url,
+                Duration::from_secs(1)
+            )
+            .await
+            .is_err()
+        );
+        let prefix = applied(handle).await;
+        wait_state(&nodes, prefix).await;
+        snapshot_and_purge(handle).await;
+        let after_compaction = crate::read_control_projection(
+            &identity.cluster,
+            identity.node.node_id,
+            &identity.node.cluster_url,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after_compaction.state, second.state);
+        // Keep the sampled leader alive while removing its quorum. Cached state
+        // remains usable to existing consumers, but cannot certify a fresh read.
+        let remove_count = count / 2 + 1;
+        for index in (0..nodes.len())
+            .filter(|index| *index != leader_index)
+            .take(remove_count as usize)
+        {
+            stop(nodes[index].take().unwrap()).await;
+        }
+        assert!(
+            crate::read_control_projection(
+                &identity.cluster,
+                identity.node.node_id,
+                &identity.node.cluster_url,
+                Duration::from_millis(500)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(cursor.current(), Some(&second));
         for node in nodes.into_iter().flatten() {
             stop(node).await;
         }

@@ -154,11 +154,16 @@ message GroupReadResponseV1 {
 message RejoinBarrierRequestV1 {
   uint32 raft_group_id = 1;
   uint32 protocol_version = 2;
+  // Managed adoption needs applied uniform membership, rather than metrics.
+  bool include_membership = 3;
+  uint64 target_node_id = 4;
 }
 
 message RejoinBarrierResponseV1 {
   bytes vote = 1;
   uint64 index = 2;
+  // MessagePack QuorumGroupMembership, present only when requested.
+  bytes membership = 3;
 }
 
 service RaftInternal {
@@ -202,4 +207,6 @@ service MetaRaftInternal {
   rpc Vote(MetaRaftRpcEnvelopeV1) returns (RaftRpcAckV1);
   rpc FullSnapshot(MetaRaftSnapshotRequestV1) returns (RaftFullSnapshotAckV1);
   rpc TransferLeader(MetaRaftRpcEnvelopeV1) returns (RaftTransferLeaderAckV1);
+  // Fresh ReadIndex + complete applied control projection. No mutation.
+  rpc ReadProjection(MetaRaftRpcEnvelopeV1) returns (RaftRpcAckV1);
 }

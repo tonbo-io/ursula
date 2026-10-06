@@ -14,6 +14,7 @@
 //! - [`registry`]: [`RaftGroupHandleRegistry`] and the single-node test network.
 //! - [`maintenance`]: configuration-backed local Raft maintenance eligibility.
 //! - [`state_machine`]: per-group [`RaftGroupStateMachine`] and snapshot builder.
+//! - [`membership`]: quorum-confirmed applied membership certificates for control adoption.
 //! - [`meta`]: meta-group OpenRaft type config and control-plane state machine.
 //! - [`meta_grpc`]: concrete meta consensus RPC service and network factory.
 //! - `log_store::meta`: durable meta journal, snapshots, and recovery guards.
@@ -44,6 +45,7 @@ mod forward;
 mod grpc;
 mod log_store;
 mod maintenance;
+mod membership;
 mod meta;
 mod meta_grpc;
 #[cfg(all(test, not(madsim)))]
@@ -100,6 +102,9 @@ pub use log_store::RaftGroupLogStore;
 pub use maintenance::RaftMaintenanceIssue;
 pub use maintenance::RaftMaintenanceReport;
 pub use maintenance::check_raft_maintenance;
+pub use membership::QuorumGroupMembership;
+pub use membership::collect_bootstrap_memberships;
+pub use membership::confirm_group_membership;
 pub use meta::MetaNodeRegistration;
 pub use meta::MetaRaft;
 pub use meta::MetaRaftError;
@@ -111,12 +116,14 @@ pub use meta_grpc::META_RAFT_APPEND_PATH;
 pub use meta_grpc::META_RAFT_FULL_SNAPSHOT_PATH;
 pub use meta_grpc::META_RAFT_MAX_MESSAGE_BYTES;
 pub use meta_grpc::META_RAFT_PROTOCOL_VERSION;
+pub use meta_grpc::META_RAFT_READ_PROJECTION_PATH;
 pub use meta_grpc::META_RAFT_TRANSFER_LEADER_PATH;
 pub use meta_grpc::META_RAFT_VOTE_PATH;
 pub use meta_grpc::MetaGrpcRaftNetwork;
 pub use meta_grpc::MetaGrpcRaftNetworkFactory;
 pub use meta_grpc::MetaRaftGrpcService;
 pub use meta_grpc::meta_raft_grpc_service;
+pub use meta_grpc::read_control_projection;
 pub use registry::InProcessRaftFaultAction;
 pub use registry::InProcessRaftFaultScript;
 pub use registry::InProcessRaftFaultStep;

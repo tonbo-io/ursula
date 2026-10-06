@@ -192,6 +192,7 @@ pub(crate) async fn probe_rejoin_vote_barrier(
             tonic::Request::new(raft_internal_proto::RejoinBarrierRequestV1 {
                 raft_group_id: placement.raft_group_id.0,
                 protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+                ..Default::default()
             });
         barrier_request.set_timeout(timeout);
         match client.rejoin_barrier(barrier_request).await {
@@ -947,6 +948,12 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .registry
             .read_barrier(group)
             .ok_or_else(|| tonic::Status::not_found("read barrier is not registered"))?;
+        let before = raft.metrics().borrow_watched().clone();
+        if request.include_membership && request.target_node_id != before.id {
+            return Err(tonic::Status::failed_precondition(
+                "membership recipient node identity mismatch",
+            ));
+        }
         let index = barrier
             .round()
             .await
@@ -960,10 +967,23 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 "recovery barrier lost leadership",
             ));
         }
+        let membership = if request.include_membership {
+            let observation =
+                crate::membership::read_applied_membership(&self.registry, group, index).await?;
+            if observation.leader_term != metrics.vote.leader_id().term() {
+                return Err(tonic::Status::failed_precondition(
+                    "membership barrier lost leadership",
+                ));
+            }
+            encode_wire(&observation)
+        } else {
+            bytes::Bytes::new()
+        };
         Ok(tonic::Response::new(
             raft_internal_proto::RejoinBarrierResponseV1 {
                 vote: encode_wire(&metrics.vote),
                 index,
+                membership,
             },
         ))
     }

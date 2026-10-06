@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::Duration;
 
 use openraft::BasicNode;
 use openraft::OptionalSend;
@@ -31,6 +32,7 @@ use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 use ursula_control::ClusterId;
 use ursula_control::ClusterIdentity;
+use ursula_control::ControlProjection;
 
 use crate::codec::encode_wire;
 use crate::grpc::GrpcRpcError;
@@ -50,6 +52,7 @@ use crate::raft_internal_proto::meta_raft_internal_server::MetaRaftInternalServe
 
 pub const META_RAFT_PROTOCOL_VERSION: u32 = 1;
 pub const META_RAFT_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+pub const META_RAFT_READ_PROJECTION_PATH: &str = "/ursula.raft.v1.MetaRaftInternal/ReadProjection";
 pub const META_RAFT_APPEND_PATH: &str = "/ursula.raft.v1.MetaRaftInternal/Append";
 pub const META_RAFT_VOTE_PATH: &str = "/ursula.raft.v1.MetaRaftInternal/Vote";
 pub const META_RAFT_FULL_SNAPSHOT_PATH: &str = "/ursula.raft.v1.MetaRaftInternal/FullSnapshot";
@@ -66,6 +69,7 @@ pub struct MetaRaftGrpcService {
     cluster_id: Arc<str>,
     node_id: u64,
     raft: MetaRaft,
+    handle: MetaRaftHandle,
     routing_identity: Option<ClusterIdentity>,
 }
 
@@ -108,6 +112,7 @@ impl MetaRaftGrpcService {
             cluster_id,
             node_id,
             raft,
+            handle: handle.clone(),
             routing_identity: handle
                 .local_identity()
                 .map(|identity| identity.cluster.clone()),
@@ -173,6 +178,34 @@ fn decode<T: DeserializeOwned>(payload: &[u8]) -> Result<T, GrpcRpcError> {
 
 #[tonic::async_trait]
 impl MetaRaftInternal for MetaRaftGrpcService {
+    async fn read_projection(
+        &self,
+        request: tonic::Request<MetaRaftRpcEnvelopeV1>,
+    ) -> Result<tonic::Response<RaftRpcAckV1>, tonic::Status> {
+        let envelope = request.into_inner();
+        self.validate(
+            &envelope.cluster_id,
+            envelope.target_node_id,
+            envelope.protocol_version,
+            envelope.group_count,
+            envelope.core_count,
+            envelope.routing_hash_version,
+        )?;
+        if !envelope.payload.is_empty() {
+            return Err(tonic::Status::invalid_argument(
+                "projection read takes no payload",
+            ));
+        }
+        let projection = self
+            .handle
+            .read_projection(Duration::from_secs(5))
+            .await
+            .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+        Ok(tonic::Response::new(RaftRpcAckV1 {
+            payload: encode_wire(&projection),
+        }))
+    }
+
     async fn append(
         &self,
         request: tonic::Request<MetaRaftRpcEnvelopeV1>,
@@ -474,4 +507,57 @@ impl RaftNetworkV2<MetaRaftTypeConfig> for MetaGrpcRaftNetwork {
         .await
         .map(|_| ())
     }
+}
+
+/// Read a complete placement projection from a bound meta leader. The caller
+/// supplies a trusted endpoint from its bootstrap/discovery directory.
+pub async fn read_control_projection(
+    identity: &ClusterIdentity,
+    target_node_id: u64,
+    address: &str,
+    timeout: Duration,
+) -> Result<ControlProjection, MetaRaftError> {
+    identity
+        .validate()
+        .map_err(|reason| MetaRaftError::new("read remote control projection", reason))?;
+    if target_node_id == 0 || timeout.is_zero() {
+        return Err(MetaRaftError::new(
+            "read remote control projection",
+            "non-zero node and timeout required",
+        ));
+    }
+    let endpoint = Endpoint::from_shared(normalize_grpc_endpoint(address.to_owned()))
+        .map_err(|error| MetaRaftError::with_source("create projection endpoint", error))?
+        .connect_timeout(timeout)
+        .timeout(timeout);
+    let mut client = MetaRaftInternalClient::new(endpoint.connect_lazy())
+        .max_decoding_message_size(META_RAFT_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(META_RAFT_MAX_MESSAGE_BYTES);
+    let mut request = tonic::Request::new(MetaRaftRpcEnvelopeV1 {
+        cluster_id: identity.cluster_id.as_str().to_owned(),
+        target_node_id,
+        protocol_version: META_RAFT_PROTOCOL_VERSION,
+        payload: bytes::Bytes::new(),
+        group_count: identity.group_count,
+        core_count: u32::from(identity.core_count),
+        routing_hash_version: identity.routing_hash.wire_version(),
+    });
+    request.set_timeout(timeout);
+    let response = client
+        .read_projection(request)
+        .await
+        .map_err(|error| MetaRaftError::with_source("read remote control projection", error))?
+        .into_inner();
+    let projection: ControlProjection = rmp_serde::from_slice(&response.payload)
+        .map_err(|error| MetaRaftError::with_source("decode control projection", error))?;
+    if projection.identity != *identity {
+        return Err(MetaRaftError::new(
+            "validate control projection",
+            "remote routing identity differs",
+        ));
+    }
+    projection
+        .validate()
+        .map_err(|reason| MetaRaftError::new("validate control projection", reason))?;
+    Ok(projection)
 }

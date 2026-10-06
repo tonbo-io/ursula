@@ -420,6 +420,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
                 .rejoin_barrier(pb::RejoinBarrierRequestV1 {
                     raft_group_id: placement().raft_group_id.0,
                     protocol_version: ursula_stream::FORMAT_EPOCH,
+                    ..Default::default()
                 })
                 .await
                 .unwrap_err();
@@ -551,5 +552,309 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     shutdown_all(&engines).await;
     for server in servers {
         server.abort();
+    }
+}
+
+#[tokio::test]
+async fn applied_membership_certificates_require_a_fresh_quorum_and_uniform_commit() {
+    for count in [3_u64, 5] {
+        let config = Arc::new(
+            Config {
+                cluster_name: format!("membership-certificate-{count}"),
+                heartbeat_interval: 20,
+                election_timeout_min: 150,
+                election_timeout_max: 300,
+                enable_tick: false,
+                snapshot_policy: SnapshotPolicy::Never,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let identity = ursula_control::ClusterIdentity {
+            cluster_id: ursula_control::ClusterId::try_from(format!("certified-bootstrap-{count}"))
+                .unwrap(),
+            group_count: 1,
+            core_count: 1,
+            routing_hash: ursula_control::RoutingHashVersion::Fnv1a64BucketSlashStreamV1,
+        };
+        let mut meta_handles = Vec::new();
+        let mut directory = BTreeMap::new();
+        let mut registries = Vec::new();
+        let mut endpoints = BTreeMap::new();
+        let mut services = Vec::new();
+        let mut servers = Vec::new();
+        let mut engines = Vec::new();
+        for id in 1..=count {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            endpoints.insert(id, format!("http://{}", listener.local_addr().unwrap()));
+            let registry = RaftGroupHandleRegistry::default();
+            let service = RecoveryTestService {
+                inner: RaftGrpcService::new(registry.clone()),
+                pause_replication: Arc::new(AtomicBool::new(false)),
+                legacy: Arc::new(AtomicBool::new(false)),
+                unknown_rpc_requests: Arc::new(AtomicUsize::new(0)),
+                legacy_vote_change: Arc::new(AtomicUsize::new(0)),
+            };
+            let registration = ursula_control::NodeRegistration {
+                node_id: id,
+                client_url: format!("http://client{id}:4437"),
+                cluster_url: endpoints[&id].clone(),
+                admin_url: format!("http://admin{id}:4438"),
+                labels: BTreeMap::from([("zone".to_owned(), ((id - 1) % 3).to_string())]),
+            };
+            let meta = crate::MetaRaftHandle::new_bound_durable_node_with_network(
+                ursula_control::MetaLocalIdentity {
+                    cluster: identity.clone(),
+                    node: registration.clone(),
+                },
+                config.clone(),
+                crate::MetaGrpcRaftNetworkFactory::new_bound(identity.clone()).unwrap(),
+                dir.path().join(format!("meta-{id}.wal")),
+            )
+            .await
+            .unwrap();
+            let meta_service = crate::meta_raft_grpc_service(
+                crate::MetaRaftGrpcService::new_bound(&meta).unwrap(),
+            );
+            meta_handles.push(meta);
+            directory.insert(id, registration);
+            let wire = pb::raft_internal_server::RaftInternalServer::new(service.clone())
+                .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
+            servers.push(tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(wire)
+                    .add_service(meta_service)
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                    .await
+                    .unwrap();
+            }));
+            let (engine, _, gate) = new_recovery_engine(id, config.clone(), &registry).await;
+            gate.allow_fresh_bootstrap();
+            registry.refresh_group_elections(placement().raft_group_id);
+            registries.push(registry);
+            engines.push(engine);
+            services.push(service);
+        }
+        let nodes = endpoints
+            .iter()
+            .map(|(id, url)| (*id, BasicNode::new(url)))
+            .collect::<BTreeMap<_, _>>();
+        engines[0].raft.initialize(nodes).await.unwrap();
+        engines[0]
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .current_leader(1, "certificate leader")
+            .await
+            .unwrap();
+        let write = engines[0]
+            .raft
+            .client_write(create_command(bsid("certificate")))
+            .await
+            .unwrap();
+        let proof = crate::confirm_group_membership(
+            placement().raft_group_id,
+            1,
+            &endpoints[&1],
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(proof.membership.voters, (1..=count).collect());
+        assert!(proof.membership.learners.is_empty());
+        assert_eq!(proof.nodes, endpoints);
+        assert!(proof.applied_index >= write.log_id.index());
+        assert!(proof.membership.log_id.index < proof.applied_index);
+        let bootstrap = ursula_control::ClusterBootstrap {
+            identity: identity.clone(),
+            initial_meta_voters: BTreeSet::from([1, 2, 3]),
+            nodes: directory,
+            voters: BTreeMap::from([(placement().raft_group_id, (1..=count).collect())]),
+            placement: ursula_control::PlacementPolicy {
+                default_replication_factor: ursula_control::ReplicationFactor::try_from(
+                    count as u32,
+                )
+                .unwrap(),
+                ..Default::default()
+            },
+        };
+        let evidence = crate::collect_bootstrap_memberships(&bootstrap, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(evidence[&placement().raft_group_id], proof.membership);
+        let mut wrong_directory = bootstrap.clone();
+        wrong_directory.nodes.get_mut(&count).unwrap().cluster_url =
+            "http://wrong-origin:4439".to_owned();
+        let error = crate::collect_bootstrap_memberships(&wrong_directory, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(error.contains("committed endpoint differs"), "{error}");
+        if count == 5 {
+            let mut wrong_voters = bootstrap.clone();
+            wrong_voters
+                .voters
+                .insert(placement().raft_group_id, BTreeSet::from([1, 2, 3]));
+            wrong_voters.placement.default_replication_factor =
+                ursula_control::ReplicationFactor::Three;
+            let error = crate::collect_bootstrap_memberships(&wrong_voters, Duration::from_secs(2))
+                .await
+                .unwrap_err();
+            assert!(error.contains("committed membership differs"), "{error}");
+        }
+        meta_handles[0]
+            .initialize_membership(
+                endpoints
+                    .iter()
+                    .filter(|(id, _)| **id <= 3)
+                    .map(|(id, url)| (*id, BasicNode::new(url)))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        meta_handles[0]
+            .wait_for_current_leader(1, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            meta_handles[0]
+                .bootstrap_cluster_from_quorums(bootstrap.clone(), Duration::from_secs(2), 1)
+                .await
+                .unwrap(),
+            ursula_control::ControlResponse::Ok
+        );
+        let projection =
+            crate::read_control_projection(&identity, 1, &endpoints[&1], Duration::from_secs(2))
+                .await
+                .unwrap();
+        assert_eq!(
+            projection
+                .state
+                .cluster_bootstrap
+                .as_ref()
+                .unwrap()
+                .memberships,
+            evidence
+        );
+        assert_eq!(projection.state.config.initial_meta_voters.len(), 3);
+        assert_eq!(
+            projection.state.placements[&placement().raft_group_id]
+                .voters
+                .len(),
+            count as usize
+        );
+        // A follower cannot manufacture a quorum certificate from its metrics.
+        assert!(
+            crate::confirm_group_membership(
+                placement().raft_group_id,
+                2,
+                &endpoints[&2],
+                Duration::from_secs(1)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            crate::confirm_group_membership(
+                placement().raft_group_id,
+                2,
+                &endpoints[&1],
+                Duration::from_secs(1)
+            )
+            .await
+            .is_err()
+        );
+        services[0].legacy.store(true, Ordering::SeqCst);
+        assert!(
+            crate::confirm_group_membership(
+                placement().raft_group_id,
+                1,
+                &endpoints[&1],
+                Duration::from_secs(1)
+            )
+            .await
+            .is_err()
+        );
+        services[0].legacy.store(false, Ordering::SeqCst);
+        // Freeze replication while keeping this process's stale leader metrics.
+        for service in services.iter().skip(1) {
+            service.pause_replication.store(true, Ordering::SeqCst);
+        }
+        let mutation_raft = engines[0].raft.clone();
+        let mutation = tokio::spawn(async move {
+            mutation_raft
+                .change_membership(BTreeSet::from([1, 2]), false)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if engines[0]
+                    .raft
+                    .metrics()
+                    .borrow_watched()
+                    .membership_config
+                    .membership()
+                    .get_joint_config()
+                    .len()
+                    == 2
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let error = crate::membership::read_applied_membership(
+            &registries[0],
+            placement().raft_group_id,
+            write.log_id.index(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            tonic::Code::FailedPrecondition,
+            "uncommitted effective membership cannot certify applied membership"
+        );
+        assert!(engines[0].raft.is_leader());
+        assert!(
+            crate::confirm_group_membership(
+                placement().raft_group_id,
+                1,
+                &endpoints[&1],
+                Duration::from_secs(1)
+            )
+            .await
+            .is_err(),
+            "quorum loss must invalidate a new certificate"
+        );
+        // Reopening/retrying the bootstrap recipe preserves established policy
+        // even when data no longer has the original membership or a quorum.
+        assert_eq!(
+            meta_handles[0]
+                .bootstrap_cluster_from_quorums(bootstrap, Duration::from_millis(1), 2)
+                .await
+                .unwrap(),
+            ursula_control::ControlResponse::Ok
+        );
+        assert_eq!(
+            meta_handles[0]
+                .read_projection(Duration::from_secs(2))
+                .await
+                .unwrap()
+                .state,
+            projection.state
+        );
+        mutation.abort();
+        for meta in meta_handles {
+            meta.shutdown().await.unwrap();
+        }
+        for engine in engines {
+            engine.raft.shutdown().await.unwrap();
+        }
+        for server in servers {
+            server.abort();
+        }
     }
 }

@@ -16,20 +16,25 @@ use openraft::EntryPayload;
 use openraft::OptionalSend;
 use openraft::Raft;
 use openraft::RaftNetworkFactory;
+use openraft::ReadPolicy;
 use openraft::alias::LogIdOf;
 use openraft::alias::SnapshotDataOf;
 use openraft::alias::SnapshotMetaOf;
 use openraft::alias::SnapshotOf;
 use openraft::alias::StoredMembershipOf;
+use openraft::rt::WatchReceiver;
 use openraft::storage::EntryResponder;
 use openraft::storage::RaftLogStorage;
 use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
+use openraft::vote::RaftLeaderId;
 use serde::Deserialize;
 use serde::Serialize;
 use ursula_control::ControlCommand;
 use ursula_control::ControlPlaneState;
+use ursula_control::ControlProjection;
 use ursula_control::ControlResponse;
+use ursula_control::MembershipLogId;
 use ursula_control::MetaLocalIdentity;
 use ursula_control::NodeId;
 use ursula_shard::RaftGroupId;
@@ -429,6 +434,140 @@ impl MetaRaftHandle {
             Box::pin(async move { value })
         })
         .await
+    }
+
+    /// Adopt the declared settled data groups only after observing each one's
+    /// actual applied membership through a fresh data-quorum barrier. A replay
+    /// of an established recipe never re-reads or resets later live placements.
+    pub async fn bootstrap_cluster_from_quorums(
+        &self,
+        bootstrap: ursula_control::ClusterBootstrap,
+        timeout: Duration,
+        now_ms: u64,
+    ) -> Result<ControlResponse, MetaRaftError> {
+        let bootstrap = bootstrap
+            .normalize()
+            .map_err(|reason| MetaRaftError::new("validate managed bootstrap", reason))?;
+        let local = self.local_identity.as_ref().ok_or_else(|| {
+            MetaRaftError::new(
+                "bootstrap managed cluster",
+                "durable local identity required",
+            )
+        })?;
+        if local.cluster != bootstrap.identity {
+            return Err(MetaRaftError::new(
+                "bootstrap managed cluster",
+                "routing identity differs from local binding",
+            ));
+        }
+        let replay = self
+            .read_state(|state| {
+                state
+                    .cluster_bootstrap
+                    .as_ref()
+                    .map(|record| record.recipe.clone())
+            })
+            .await?;
+        let memberships = match replay {
+            Some(recipe) if recipe == bootstrap => BTreeMap::new(),
+            Some(_) => {
+                return Err(MetaRaftError::new(
+                    "bootstrap managed cluster",
+                    "bootstrap recipe drift",
+                ));
+            }
+            None => crate::membership::collect_bootstrap_memberships(&bootstrap, timeout)
+                .await
+                .map_err(|reason| {
+                    MetaRaftError::new("collect bootstrap data memberships", reason)
+                })?,
+        };
+        self.write(ControlCommand::BootstrapCluster {
+            bootstrap,
+            memberships,
+            now_ms,
+        })
+        .await
+    }
+
+    /// A fresh ReadIndex, followed by the complete applied state. Intended for
+    /// startup/projection refresh, never an ordinary stream request's hot path.
+    pub async fn read_projection(
+        &self,
+        timeout: Duration,
+    ) -> Result<ControlProjection, MetaRaftError> {
+        let identity = self
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| {
+                MetaRaftError::new(
+                    "read control projection",
+                    "durable local identity is required",
+                )
+            })?
+            .cluster
+            .clone();
+        if timeout.is_zero() {
+            return Err(MetaRaftError::new(
+                "read control projection",
+                "timeout must be non-zero",
+            ));
+        }
+        crate::rt::time::timeout(timeout, async {
+            let before = self.raft.metrics().borrow_watched().clone();
+            let linearizer = self
+                .raft
+                .get_read_linearizer(ReadPolicy::ReadIndex)
+                .await
+                .map_err(|error| {
+                    MetaRaftError::with_source("confirm meta projection quorum", error)
+                })?;
+            let read_index = linearizer.read_log_id().index();
+            linearizer
+                .try_await_ready(&self.raft, Some(timeout))
+                .await
+                .map_err(|error| {
+                    MetaRaftError::with_source("await meta projection application", error)
+                })?
+                .map_err(|error| {
+                    MetaRaftError::new("await meta projection application", format!("{error:?}"))
+                })?;
+            let projection = self
+                .with_state_machine(move |machine| {
+                    let result = machine.applied_log_id().map(|id| ControlProjection {
+                        identity,
+                        applied_log_id: MembershipLogId {
+                            term: id.committed_leader_id().term(),
+                            node_id: *id.committed_leader_id().node_id(),
+                            index: id.index(),
+                        },
+                        state: machine.state().clone(),
+                    });
+                    Box::pin(async move { result })
+                })
+                .await?
+                .ok_or_else(|| {
+                    MetaRaftError::new("read control projection", "no applied meta log")
+                })?;
+            let after = self.raft.metrics().borrow_watched().clone();
+            if before.current_leader != Some(before.id)
+                || after.current_leader != Some(after.id)
+                || before.vote != after.vote
+                || !after.vote.is_committed()
+                || projection.applied_log_id.index < read_index
+            {
+                return Err(MetaRaftError::new(
+                    "read control projection",
+                    "leadership changed during projection read",
+                ));
+            }
+            projection
+                .validate()
+                .map_err(|reason| MetaRaftError::new("read control projection", reason))?;
+            Ok(projection)
+        })
+        .await
+        .map_err(|error| MetaRaftError::with_source("read control projection deadline", error))?
     }
 
     pub async fn shutdown(&self) -> Result<(), MetaRaftError> {

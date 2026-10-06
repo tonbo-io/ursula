@@ -213,7 +213,64 @@ impl ClusterBootstrap {
                 }
             }
         }
+        self.validate_layout()?;
         Ok(self)
+    }
+
+    /// Validate complete, settled data placement and the independently sized
+    /// meta quorum before any bootstrap RPCs or persistent writes are attempted.
+    pub fn validate_layout(&self) -> Result<(), String> {
+        use crate::ClusterNode;
+        use crate::GroupPlacementPolicy;
+        use crate::NodeState;
+        use crate::ReplicationFactor;
+
+        self.identity.validate()?;
+        self.placement.validate(self.identity.group_count)?;
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|(id, node)| {
+                (*id, ClusterNode {
+                    node_id: *id,
+                    client_url: node.client_url.clone(),
+                    cluster_url: node.cluster_url.clone(),
+                    admin_url: Some(node.admin_url.clone()),
+                    labels: node.labels.clone(),
+                    state: NodeState::Active,
+                    registered_at_ms: 0,
+                    updated_at_ms: 0,
+                })
+            })
+            .collect();
+        let meta_rf = u32::try_from(self.initial_meta_voters.len())
+            .ok()
+            .and_then(|count| ReplicationFactor::try_from(count).ok())
+            .ok_or_else(|| "initial meta voter count must be 3 or 5".to_owned())?;
+        GroupPlacementPolicy {
+            replication_factor: meta_rf,
+            failure_domain: self.placement.failure_domain.clone(),
+            survive_failure_domains: self.placement.survive_failure_domains,
+        }
+        .validate_voters(&self.initial_meta_voters, &nodes)
+        .map_err(|reason| format!("meta bootstrap placement violates policy: {reason}"))?;
+        if self.voters.len() != self.identity.group_count as usize {
+            return Err("bootstrap must specify every data group's voters".to_owned());
+        }
+        for raw_group in 0..self.identity.group_count {
+            let group = RaftGroupId(raw_group);
+            let voters = self
+                .voters
+                .get(&group)
+                .ok_or_else(|| format!("bootstrap lacks group {raw_group}"))?;
+            self.placement
+                .resolve(group)
+                .validate_voters(voters, &nodes)
+                .map_err(|reason| {
+                    format!("group {raw_group} violates bootstrap policy: {reason}")
+                })?;
+        }
+        Ok(())
     }
 }
 
