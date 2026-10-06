@@ -87,7 +87,9 @@ fn env_filter(default_directives: &str) -> EnvFilter {
 /// a global subscriber is already registered (matching the previous
 /// `fmt().try_init()` behavior).
 pub fn init(options: InitOptions) -> ObservabilityGuard {
-    let fmt_layer = tracing_subscriber::fmt::layer().with_target(true);
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(true)
+        .with_writer(std::io::stderr);
 
     #[cfg(feature = "otlp")]
     {
