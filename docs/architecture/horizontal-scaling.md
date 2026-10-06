@@ -63,6 +63,16 @@ raft_group_id = 42
 replication_factor = 5
 ```
 
+Local epic implementation checkpoint (`5c7e413`): the deterministic
+`ursula-control` policy layer now accepts this placement structure, validates
+RF3/RF5 and one-domain-loss constraints, and persists cluster bootstrap plus
+resolved per-group policies through meta snapshots/logs. Adoption validates
+all recorded uniform placements atomically and rejects RF/bootstrap drift.
+Ordinary migration intents preserve RF; explicit policy intents retain both
+source and target policy. The server's `[control]` configuration, actual
+membership discovery, multi-node transport and supported migration executor
+are still subsequent stories; editing server TOML does not yet enable scaling.
+
 Persist the default and each group's resolved policy in meta Raft. Configuration
 seeds policy only on initial bootstrap; editing TOML after bootstrap must not
 silently change live memberships. API/CLI policy updates are explicit, durable

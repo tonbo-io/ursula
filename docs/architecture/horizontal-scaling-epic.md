@@ -57,8 +57,8 @@ blocked implementation milestone.
 | Story | Deliverable and exit criteria | Dependencies | Status |
 | --- | --- | --- | --- |
 | HS-101 | Persist and restore meta vote, log, committed/applied state and snapshots; recover correctly after compaction and crash/restart without resurrecting discarded intent | M0 | Complete: commit `b7352ea` |
-| HS-102 | Implement default/per-group RF=3/5 and one-domain-loss policy; infer/validate existing placements on adoption; reject invalid policies and bootstrap drift | M0 | In progress |
-| HS-103 | Concrete multi-node meta transport, independent meta voters, one-time bootstrap, cluster identity and trusted client/cluster/admin node directory | HS-101, HS-102 | Planned |
+| HS-102 | Implement default/per-group RF=3/5 and one-domain-loss policy; infer/validate existing placements on adoption; reject invalid policies and bootstrap drift | M0 | Complete: commit `5c7e413` (deterministic policy/adoption layer) |
+| HS-103 | Concrete multi-node meta transport, independent meta voters, one-time bootstrap, cluster identity and trusted client/cluster/admin node directory | HS-101, HS-102 | In progress |
 | HS-104 | Ordered placement/policy projections with full-snapshot resync; data/node startup restores assignments without reinitializing from stale TOML | HS-103 | Planned |
 
 M1 acceptance includes multi-node meta leader turnover and a durable full
@@ -146,16 +146,25 @@ unevacuated machine. Physical provisioning remains outside the Raft controller.
 | 2026-10-06 | M0 | Committed design/tracker baseline in `4fe583d` | Local committed documents |
 | 2026-10-06 | HS-101 | Commit `b7352ea` adds durable meta journal, atomic checksummed snapshots, guarded purge/compaction and recoverable constructors; 8 focused tests cover process exit before/after purge and post-snapshot intent logs, torn tail, corruption, failed snapshot publication and lock exclusivity | Local implementation and reproduced process/storage tests; multi-node transport/bootstrap remain HS-103 |
 | 2026-10-06 | HS-101 | `cargo fmt --all -- --check`; workspace Clippy with `-D warnings`; workspace lib/bin tests (888 passed, 1 ignored); workspace doc tests; seven DST audits; `RUSTFLAGS='--cfg madsim'` Raft lib check and `smoke_corpus_replays` | Passed; madsim has existing warnings in runtime/data-log modules; no new meta-storage warning |
+| 2026-10-06 | HS-102 | Commit `5c7e413` adds numeric RF3/RF5 types, default/per-group one-domain-loss policy, atomic validated adoption of complete settled placements, immutable bootstrap configuration and persisted resolved/source/target policies. Ordinary moves preserve RF; explicit policy intents publish policy together with matching voters. Draining nodes continue serving retained groups and cannot receive new assignments | Deterministic control layer implemented; no supported data-membership mutation API exposed yet |
+| 2026-10-06 | HS-102 | 12 new policy tests cover JSON/MessagePack/TOML RF validation, mixed RF, all 27 RF3 and 243 RF5 three-domain assignments, missing labels/nodes, insufficient voters, RF drift, rejected-operation atomicity, node identity/domain immutability, legacy snapshot compatibility, and explicit 3→5→3 policy publication | Reproduced control transitions; actual data-group Raft membership verification/execution remains M2 |
+| 2026-10-06 | HS-102 | Extended real meta process-exit recovery to four checkpoints (legacy/managed, snapshot/purged prefix plus later logs), preserving mixed policies and source/target RF. Workspace lib/bin tests: 900 passed, 1 ignored; workspace doc tests, format, workspace Clippy, all seven DST audits and madsim smoke corpus passed | Local checks passed. Converted the crash child to the standard Tokio test entrypoint after the tracked-source DST scan flagged manual runtime construction; final audit includes staged new files |
 
 ## Current execution checkpoint
 
-Current implementation story: **HS-102**, configurable replication and
-failure-domain policy. HS-101 is implemented and validated in `b7352ea`.
-Persist default and resolved per-group policies with deterministic validation,
-then validate adoption from actual memberships and explicit RF changes.
+Current implementation story: **HS-103**, concrete multi-node meta transport
+and one-time bootstrap. HS-101 is implemented and validated in `b7352ea`;
+HS-102's deterministic policy/adoption layer is implemented in `5c7e413`.
+Add a separate meta RPC service with cluster/node identity checks, durable
+multi-node restart/leader-turnover tests, and bootstrap wiring that seeds
+policy from verified uniform data memberships. The server configuration and
+trusted admin/node directory must be wired before managed mode is usable.
 
-M1 remains incomplete: durable storage is present, but policy, multi-node
-transport/bootstrap and projection distribution are not yet integrated. No CI,
+M1 remains incomplete: durable storage and deterministic policy are present,
+but multi-node transport/bootstrap and projection distribution are not yet
+integrated. Policy tests and meta recovery do not verify an actual data-group
+RF migration; intent evidence, epoch CAS and receiver-side fencing remain M2.
+No CI,
 deployment or scaling-performance acceptance is claimed.
 There is no current external blocker recorded; pending implementation is not
 a blocker.
