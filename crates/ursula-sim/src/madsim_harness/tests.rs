@@ -3154,7 +3154,8 @@ fn memory_wal_barrier_exit_refreshes_elections_after_apply() {
                 participation.register_rejoin(placement().raft_group_id, rejoin.clone());
                 participation.register(placement(), raft.clone());
                 if drained {
-                    participation.mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
+                    participation
+                        .mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
                 }
                 // Only the tested follower may campaign after the leader fails.
                 for (&id, engine) in &cluster.engines {
@@ -3163,7 +3164,17 @@ fn memory_wal_barrier_exit_refreshes_elections_after_apply() {
                     }
                 }
                 isolate(&cluster.policy, follower);
-                cluster.append(leader, &stream, b"barrier-target;").await.expect("commit target");
+                let previous = cluster.applied(leader).expect("leader applied");
+                cluster
+                    .append(leader, &stream, b"barrier-target;")
+                    .await
+                    .expect("commit target");
+                cluster.engines[&leader]
+                    .raft_handle()
+                    .wait(Some(Duration::from_secs(2)))
+                    .applied_index_at_least(Some(previous + 1), "publish target apply metrics")
+                    .await
+                    .expect("leader metrics include the acknowledged append");
                 let metrics = cluster.metrics(leader);
                 let target = metrics.last_applied.expect("applied target").index;
                 assert!(cluster.applied(follower).expect("follower applied") < target);
@@ -3178,26 +3189,36 @@ fn memory_wal_barrier_exit_refreshes_elections_after_apply() {
                     Duration::from_millis(10),
                 ));
                 madsim::time::timeout(Duration::from_secs(2), entered.notified())
-                    .await.expect("driver paused after writing elect(false)");
+                    .await
+                    .expect("driver paused after writing elect(false)");
                 assert!(!rejoin.vote_gate_open(), "apply has not reached the target");
                 cluster.policy.clear();
                 raft.wait(Some(Duration::from_secs(2)))
                     .applied_index_at_least(Some(target), "apply between the two observations")
-                    .await.expect("real state machine applies target");
+                    .await
+                    .expect("real state machine applies target");
                 resume.notify_one();
                 madsim::time::timeout(Duration::from_secs(2), driver)
-                    .await.expect("barrier driver exits").expect("driver task");
+                    .await
+                    .expect("barrier driver exits")
+                    .expect("driver task");
                 assert!(rejoin.vote_gate_open());
                 isolate(&cluster.policy, leader);
                 if drained {
                     madsim::time::sleep(Duration::from_secs(1)).await;
-                    assert_eq!(cluster.metrics(follower).vote, metrics.vote,
-                        "an open recovery gate must not override maintenance drain");
+                    assert_eq!(
+                        cluster.metrics(follower).vote,
+                        metrics.vote,
+                        "an open recovery gate must not override maintenance drain"
+                    );
                 } else {
                     raft.wait(Some(Duration::from_secs(5)))
-                        .metrics(|m| m.state == openraft::ServerState::Leader,
-                            "the recovered follower automatically campaigns")
-                        .await.expect("election enabled without drain/undrain");
+                        .metrics(
+                            |m| m.state == openraft::ServerState::Leader,
+                            "the recovered follower automatically campaigns",
+                        )
+                        .await
+                        .expect("election enabled without drain/undrain");
                 }
                 for (_, drivers) in cluster.drivers {
                     for driver in drivers {

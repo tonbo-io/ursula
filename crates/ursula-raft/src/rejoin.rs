@@ -321,7 +321,11 @@ impl GroupRejoin {
         let has_target = self.gate.lock().expect("vote gate").catch_up.is_some();
         let checkpoint = {
             let mut slot = self.barrier_checkpoint.lock().expect("barrier checkpoint");
-            if has_target && slot.as_ref().is_some_and(|hook| hook.after_probe == after_probe) {
+            if has_target
+                && slot
+                    .as_ref()
+                    .is_some_and(|hook| hook.after_probe == after_probe)
+            {
                 slot.take()
             } else {
                 None
