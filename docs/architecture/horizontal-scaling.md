@@ -1088,6 +1088,75 @@ cargo build -p ursula --bin ursula
 cargo test -p ursula-ctl --test managed_migration_cli -- --nocapture
 ```
 
+### Implementation checkpoint: joining outside the bootstrap directory
+
+Commit `d0d3bb9` exposes `POST /__ursula/control/nodes` and
+`ursulactl operation register-node`. Registration commits through the fresh
+meta leader and the existing `RegisterManagedNode` state-machine command.
+An unreachable meta quorum returns 503; invalid or conflicting immutable
+identity returns 409. The detached submission survives cancellation of the HTTP
+caller. Repeating a normalized identity preserves the node's current serving
+state and original registration time; its update timestamp may advance.
+Registering a data node does not add a meta voter or change any group's voters.
+
+The registration JSON supplies a new, nonzero `node_id`, distinct trusted
+`client_url`, `cluster_url`, `admin_url` origins and immutable placement labels:
+
+```json
+{
+  "node_id": 7,
+  "client_url": "http://node7:4437",
+  "cluster_url": "http://node7:4440",
+  "admin_url": "http://node7:4438",
+  "labels": { "zone": "c" }
+}
+```
+
+```sh
+ursulactl operation register-node --config cluster.toml --registration node7.json
+ursulactl operation status --config cluster.toml
+```
+
+Registration validates origin syntax, alias collisions, bounded labels and
+immutable IDs/endpoints/labels. Managed cluster RPC currently requires HTTP;
+TLS transport is not configured, so registering an HTTPS cluster origin is
+rejected. The admin registration body limit is 128 KiB, sufficient for the
+bounded labels. This endpoint shares the managed admin trust model; provision it
+on the same protected admin network as operation submission.
+
+After registration, provision the new node with its own `control.node`,
+matching listen addresses, data WAL and meta journal paths, and
+`raft.init_membership = false` / `init_membership_per_group = false`.
+Keep the original `control.bootstrap_nodes`, `initial_meta_voters`, source
+`raft.groups`, group/core counts, routing hash and cluster ID intact. The new
+node's static `raft.peers` includes the original recipe and its own cluster
+origin; old nodes' startup files need no extension. Startup fetches the current
+complete projection and requires its local identity to match the registered
+node before creating data actors. Unknown IDs and mismatched role origins,
+labels or cluster identity fail. An unassigned registered node starts without
+data membership initialization and becomes ready for a subsequent migration.
+
+The new `binaries_join_outside_bootstrap_directory_and_restore_rf3_rf5` fixture
+starts the original six-process meta3/mixed-RF cluster, acknowledges payloads,
+registers node 7 through the real CLI, accepts canonical replay and rejects
+changed labels. It verifies node 7 is absent from the immutable bootstrap
+recipe, has no initial data assignment and does not change meta voters. The
+seventh binary joins using that original recipe. Supported migrations replace
+the RF3 voters with `{1,2,7}` and RF5 voters with `{1,2,4,5,7}`. Fresh native
+data-quorum configuration observations require exact uniform voters and zero
+learners. Every front door reads the pre-join acknowledged payloads. A complete
+seven-process restart preserves exact control state, actual RF3/RF5 membership
+and acknowledged payloads, then accepts and serves a new write.
+
+The focused run passed in 23.68s; both migration fixtures together passed in
+27.71s. Workspace lib/bin tests passed 970 with 3 ignored; workspace doc tests,
+Clippy with `-D warnings`, format, seven DST audits, madsim Raft lib check and
+smoke corpus passed. The fixed-layout managed adoption fixture also passed.
+The new fixture uses disk WAL and inline/local snapshots. Gateway discovery,
+maintenance/snapshot consumers, interruption during install/joint consensus,
+real S3 migration, new migration-boundary DST and full capacity/autopilot
+acceptance remain open.
+
 Workspace integration builds provide both binaries automatically; a custom
 server binary may be selected with `URSULA_BINARY`. Final fixture run passed in
 26.33s. Two pure inventory tests cover managed idle/unknown/wrong identity,

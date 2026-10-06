@@ -59,7 +59,7 @@ blocked implementation milestone.
 | HS-101 | Persist and restore meta vote, log, committed/applied state and snapshots; recover correctly after compaction and crash/restart without resurrecting discarded intent | M0 | Complete: commit `b7352ea` |
 | HS-102 | Implement default/per-group RF=3/5 and one-domain-loss policy; infer/validate existing placements on adoption; reject invalid policies and bootstrap drift | M0 | Complete: commit `5c7e413` (deterministic policy/adoption layer) |
 | HS-103 | Concrete multi-node meta transport, independent meta voters, one-time bootstrap, cluster identity and trusted client/cluster/admin node directory | HS-101, HS-102 | Complete: commit `73f6970` (coordinated static-to-managed adoption) |
-| HS-104 | Ordered placement/policy projections with full-snapshot resync; data/node startup restores assignments without reinitializing from stale TOML | HS-103 | In progress: commits `d591c26`, `73f6970`, `a5e6740`, `064a1af`, `8b88822` (ordered projection/assignment recovery, hosting authority and pending prepare/release recovery) |
+| HS-104 | Ordered placement/policy projections with full-snapshot resync; data/node startup restores assignments without reinitializing from stale TOML | HS-103 | In progress: commits `d591c26`, `73f6970`, `a5e6740`, `064a1af`, `8b88822`, `d0d3bb9` (ordered recovery and outside-bootstrap node startup; full consumer integration pending) |
 
 M1 acceptance includes multi-node meta leader turnover and a durable full
 restart after snapshot/log compaction. Test RF=3/quorum=2 and RF=5/quorum=3,
@@ -79,11 +79,11 @@ already accepts the meta type config.
 | Story | Deliverable and exit criteria | Dependencies | Status |
 | --- | --- | --- | --- |
 | HS-201 | Intent-bound state transitions, operation idempotency, epoch CAS, source/target policy and membership-step evidence; no successful finish without verified placement | M1 | In progress: commits `6530772`, `e877d48` (replicated intent and automatic physical execution; complete fault acceptance pending) |
-| HS-202 | Durable dynamic group prepare/release on the owning core; joining replicas never initialize themselves; revoked replicas cannot be recreated by traffic | HS-104, HS-201 | In progress: commits `064a1af`, `cf05e16`, `e7f12bf`, `dc54f53`, `8b88822`, `e877d48` (durable receiver prepare/release, retirement kernel and automatic execution; dynamic joining/binary-restart acceptance pending) |
+| HS-202 | Durable dynamic group prepare/release on the owning core; joining replicas never initialize themselves; revoked replicas cannot be recreated by traffic | HS-104, HS-201 | In progress: commits `064a1af`, `cf05e16`, `e7f12bf`, `dc54f53`, `8b88822`, `e877d48`, `d0d3bb9` (physical retirement, automatic execution and real outside-bootstrap joining/restart; install-boundary acceptance pending) |
 | HS-203 | Resumable learner catch-up, fixed-prefix applied verification, joint-membership reconciliation, leader handoff and final membership verification | HS-201, HS-202 | In progress: commits `3504fb5`, `e877d48` (fenced steps and autonomous executor, RF3/RF5 replacement and explicit 3→5→3; binary-restart/S3/fault acceptance pending) |
 | HS-204 | Durably allocated executor generations and process-incarnation fencing, receiving-process barriers and exclusion with maintenance; delayed old/raw requests cannot bypass authority | HS-201; required before managed mutations are exposed | In progress: commits `6530772`, `064a1af`, `8b88822`, `3504fb5`, `e877d48` (durable generations, process barriers, typed recovery and automatic leader takeover; maintenance integration and fault acceptance pending) |
-| HS-205 | Dynamic node/gateway routing, per-group readiness/quorum inventory, reference protection, actor/background-work retirement and safe per-core journal reclamation | HS-202, HS-203, HS-204 | In progress: commits `cf05e16`, `e7f12bf`, `dc54f53`, `8b88822`, `ebe8dd7` (retirement and dynamic local readiness; cluster-wide quorum/maintenance/snapshot consumers and new-node joining pending) |
-| HS-206 | Supported operation API and CLI submit/status/wait/resume with admin authority and error semantics; real-process E2E plus DST at every migration boundary | HS-201 through HS-205 | In progress: commits `e877d48`, `ebe8dd7` (API/CLI, native takeover and real binary migration/restart/RF changes; install/joint boundary faults, S3 and DST pending) |
+| HS-205 | Dynamic node/gateway routing, per-group readiness/quorum inventory, reference protection, actor/background-work retirement and safe per-core journal reclamation | HS-202, HS-203, HS-204 | In progress: commits `cf05e16`, `e7f12bf`, `dc54f53`, `8b88822`, `ebe8dd7`, `d0d3bb9` (retirement, readiness and new-node front-door routing; gateway and cluster-wide maintenance/snapshot consumers pending) |
+| HS-206 | Supported operation API and CLI submit/status/wait/resume with admin authority and error semantics; real-process E2E plus DST at every migration boundary | HS-201 through HS-205 | In progress: commits `e877d48`, `ebe8dd7`, `d0d3bb9` (operation and registration API/CLI, real binary joining/migration/restart; install/joint faults, S3 and DST pending) |
 
 Start with one global active operation. M2 must move a group to a node that
 did not statically host it. Cover RF=3 and RF=5 replica replacements, and
@@ -196,6 +196,9 @@ unevacuated machine. Physical provisioning remains outside the Raft controller.
 | 2026-10-06 | HS-203 / HS-204 / HS-206 | New `ursula-ctl/tests/managed_migration_cli.rs` runs six real Ursula processes and real ursulactl submit/status/resume commands with meta3, mixed RF3/RF5 and disk WAL. With destination 5 down, accept an RF3 move, kill the allocated controller, require higher-generation takeover, and acknowledge new writes in RF3/RF5 while both processes remain down. Restart both, finish/replay, change RF 3→5→3, read pre-fault/during-fault payloads through all front doors, fully restart and compare exact control state, then acknowledge/read new data | Passed in 26.33s. Controller/destination restart happens before receiver activation because destination discovery is blocked. Inline/local snapshots; no install/joint interruption, S3, outside-bootstrap joining, scale/performance or DST claim |
 | 2026-10-06 | M1/M2 | Workspace lib/bin tests: 969 passed, 3 ignored; doc tests, final Clippy with `-D warnings`, format, seven tracked-source DST audits, madsim Raft check and existing smoke (0.39s) passed. Existing mixed-RF/meta3/meta5 adoption/restart CLI passed (28.27s). Binary migration fixture uses explicitly configured static roles during pre-adoption setup; zero-role managed nodes must pass dynamic readiness | Final checks passed against `ebe8dd7`; M1/M2 cross-cutting consumers and fault acceptance remain open |
 
+| 2026-10-06 | HS-104 / HS-202 / HS-205 / HS-206 | Commit `d0d3bb9` adds durable node registration API/CLI and immutable local identity checks before managed data startup. A seventh binary joins outside the original six-node bootstrap directory, becomes ready without data initialization, receives RF3/RF5 migrations, exposes exact native uniform membership and serves acknowledged payloads through every front door before/after full seven-process restart | Focused E2E passed in 23.68s; registration replay canonicalizes origins and refuses changed labels; bootstrap recipe and meta3 remain unchanged. Disk WAL/inline snapshots; gateway, install/joint faults, S3, capacity and DST acceptance remain open |
+| 2026-10-06 | Validation | Workspace lib/bin tests: 970 passed, 3 ignored; workspace doc tests, workspace Clippy all targets with `-D warnings`, format, seven DST audits, madsim Raft lib check and smoke corpus passed. Both migration CLI fixtures passed together in 27.71s; existing managed adoption E2E passed | Local checks only. Existing madsim warnings remain; smoke corpus establishes compatibility rather than new migration fault coverage |
+
 ## Current execution checkpoint
 
 Current implementation stories: **HS-104/HS-205/HS-206** dynamic live inventory,
@@ -231,11 +234,18 @@ prefixes after RF changes and full restart, and exact durable control state
 survives that settled restart. These faults occur before receiver activation;
 they do not establish interruption safety at snapshot install or joint consensus.
 
-Next verify binary interruption during replica preparation/snapshot install and
-joint membership, plus lost replies and delayed old receiver requests.
-Finish dynamic registration/joining outside the initial bootstrap directory,
-intent-aware live inventory/routing/maintenance/snapshot consumers, S3 migration
-and migration-boundary DST. Established startup continues
+Commit `d0d3bb9` adds supported durable registration and actual joining beyond
+the bootstrap directory. A new seventh process starts from the original recipe,
+receives both RF3/RF5 replacements and survives full cluster restart without
+extending old TOML files or changing meta voters. Registered identity must match
+before data actor startup. Native quorum observations and all front-door payload
+reads pass. This completes the new-node joining slice, not M1/M2 exit criteria.
+
+Next integrate gateway discovery with the trusted managed directory, then
+intent-aware maintenance/snapshot consumers. Verify binary interruption during
+replica preparation/snapshot install and joint membership, lost replies and
+delayed old receiver requests, S3 migration and migration-boundary DST.
+Established startup continues
 restoring assigned data from its bound checkpoint even under meta minority.
 
 M1 stays open for full intent-aware consumers. M2 stays open for install/joint
@@ -243,8 +253,9 @@ binary restart, S3 and full fault acceptance. Nine native fixtures exercise endp
 and automatic execution with actual data/meta consensus, disk WAL and inline
 snapshots. HTTP identity replacement and executor interruption are in-process;
 separate subprocess tests cover receiver-ledger recovery independently. The
-binary CLI evidence includes both fixed-layout adoption/recovery and complete
-single-group moves/RF changes with controller/destination recovery. Existing DST
+binary CLI evidence includes fixed-layout adoption/recovery, complete
+single-group moves/RF changes with controller/destination recovery, and
+outside-bootstrap joining with mixed-RF migrations and full restart. Existing DST
 smoke checks compatibility, not the new executor's fault boundaries.
 M3 manual scaling/batches and M4 autopilot remain in the active goal's scope.
 No CI, deployment or scaling-performance acceptance is claimed. No external
