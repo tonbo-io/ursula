@@ -775,9 +775,71 @@ seven DST audits, madsim Raft check and existing smoke. Static/managed CLI
 regressions passed (0.14s / 28.71s) before the final simulation-runtime/SSE-test
 correction; SSE now compares metrics against actual delivered control frames.
 
-The next receiver increment must persist prepare/release descriptions before
-side effects, recover them on process replacement, update local hosting under
-the receiving-process gate, and produce/replay actual physical cleanup receipts.
-Real RF3/RF5 moves, joint-membership reconciliation, dynamic readiness/maintenance/
-snapshot-reference inventories and migration-boundary fault acceptance remain
-open. The runtime kernel tests do not satisfy those exit criteria.
+The next checkpoint integrates durable prepare/release descriptions and actual
+physical receipts with this kernel. Supported membership execution, dynamic
+readiness/maintenance/snapshot-reference inventories and migration-boundary fault
+acceptance remain open. The runtime kernel tests do not satisfy those exit criteria.
+
+### Implementation checkpoint: recoverable replica prepare/release
+
+Commit `8b88822` adds managed receiver POST endpoints
+`/__ursula/control/receiver/prepare` and `/release`. Requests bind the current
+executor token, group, process-incarnation header and stable request ID to a typed
+operation: prepare uses the immutable source epoch; release uses the published
+placement epoch and verified uniform-membership log ID. Each receiving process
+has one pending operation and one bounded current replica receipt slot. At this
+increment, one replica action is admitted per receiver generation; its exact
+request replays the durable receipt, and different keys or payloads are rejected.
+Opaque membership work still fails closed pending its dedicated reconciliation
+protocol.
+
+Admission holds the receiving-process gate and reads fresh independent meta
+quorum authority. The durable `Preparing`/`Retiring` assignment and complete
+pending action are published before changing local hosting or submitting core
+work. Prepare warms only its explicitly authorized replica, preserves an existing
+hosted replica and never initializes membership. Release additionally obtains an
+actual target data-quorum ReadIndex/application certificate: target voters must
+be exact, uniform and learner-free, exclude this node and use registered origins.
+A matching metadata certificate alone cannot authorize physical deletion.
+
+Release revokes local hosting before invoking the owning-core drain/reference/
+WAL cleanup. HTTP cancellation does not cancel admitted work. Successful work
+rechecks fresh authority and atomically stores the hosted/retired assignment,
+clears pending and publishes a process-bound prepared/physical-cleanup receipt.
+Publication failures or a replaced metadata generation retain pending work.
+Receipt validation also binds its reported node to the checkpoint's local identity.
+Target fence retirement settles the local assignment to the published epoch.
+
+Activation reconciles typed pending work before its queue barrier and before
+certifying the current process. A strictly newer generation can rebind the same
+intent, action, epoch and request ID to the replacement process; same-generation
+process changes and action replacement are rejected. A previously authorized
+release may recover against the same published target membership at its original
+log ID or a later covering committed log ID; equal-index conflicting IDs and term
+regression are rejected. Actual quorum and cleanup remain mandatory. This allows
+cleanup completed under an old generation to roll forward without reopening the
+replica or inventing a successful old-generation reply.
+
+Three deterministic ledger tests cover immutable pending descriptions, takeover,
+receipt/assignment coupling and retirement evidence. One storage parent test
+exits independent child processes without destructors after prepare/release
+pending and completed checkpoint publication, then reopens and verifies retained
+work/receipts and bound-node checks. Its receipts are synthetic storage fixtures.
+Four native receiver-router tests exercise actual RF3/RF5 meta/data Raft over TCP,
+local disk data WAL and inline snapshots. They move one replica to a node outside
+the source voters, preserve an acknowledged stream prefix, recover pre-core
+prepare on HTTP-state replacement, cancel release while an allocated snapshot
+builder blocks drain, keep a neighbor group reading/writing, and verify physical
+cleanup plus byte-identical receipt replay. The takeover variants replace the
+removed HTTP process and executor generation during cleanup, reconcile pending
+release before activation, recertify target applied membership and finish the
+metadata intent.
+
+These tests drive data membership directly through native OpenRaft; they do not
+establish a supported fenced membership executor or binary-restart migration
+workflow. HTTP-state replacement is in-process, and the checkpoint child tests
+cover durable ledger recovery independently. Real S3 migration, explicit 3→5→3,
+joint-boundary fault DST, live inventories and full operator scaling remain open.
+Final workspace lib/bin tests passed (955 passed, 3 ignored), with doc tests,
+Clippy, format and seven tracked-source DST audits. Madsim/CLI results and the next
+implementation checkpoint are recorded in the epic tracker.
