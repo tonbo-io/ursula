@@ -3,12 +3,14 @@
 //!
 //! Module map:
 //!
+//! - [`admin_fence`]: process-local executor ordering for administrative mutations.
 //! - [`json_text`]: JSON Message Text (P1): validation, flattening and lexical
 //!   minification of `application/json` write bodies.
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
 //! - [`bootstrap`]: typed-config `spawn_*_runtime` constructors and cold-flush worker.
 //! - [`server`]: command arguments and the long-running server service entrypoint.
 
+mod admin_fence;
 mod bootstrap;
 mod cold_snapshot;
 pub mod json_text;
@@ -37,6 +39,7 @@ use std::time::SystemTime;
 #[cfg(not(madsim))]
 use std::time::UNIX_EPOCH;
 
+use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
@@ -77,6 +80,8 @@ use tower_http::compression::CompressionLayer;
 use tower_http::compression::CompressionLevel;
 use tower_http::compression::predicate::Predicate;
 use tower_http::compression::predicate::SizeAbove;
+use ursula_proto::admin::MAINTENANCE_FENCE_HEADER;
+use ursula_proto::admin::MaintenanceFence;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
 use ursula_proto::admin::ProcessIncarnation;
 use ursula_raft::LeadershipShedFlag;
@@ -266,6 +271,7 @@ impl WallClock for SystemWallClock {
 #[derive(Clone)]
 pub struct HttpState {
     process_incarnation: ProcessIncarnation,
+    admin_fence: admin_fence::AdminMutationFence,
     configured_node_id: Option<u64>,
     runtime: ShardRuntime,
     raft_registry: Option<RaftGroupHandleRegistry>,
@@ -325,6 +331,7 @@ impl HttpState {
     pub fn new(runtime: ShardRuntime) -> Self {
         Self {
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
+            admin_fence: admin_fence::AdminMutationFence::default(),
             configured_node_id: None,
             runtime,
             raft_registry: None,
@@ -347,6 +354,7 @@ impl HttpState {
         let leadership_shed = raft_registry.leadership_shed_flag();
         Self {
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
+            admin_fence: admin_fence::AdminMutationFence::default(),
             configured_node_id: None,
             runtime,
             raft_registry: Some(raft_registry),
@@ -393,6 +401,7 @@ impl HttpState {
                 per_group_voters,
             )),
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
+            admin_fence: admin_fence::AdminMutationFence::default(),
             configured_node_id: None,
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
@@ -896,6 +905,14 @@ pub fn admin_router(state: HttpState) -> Router {
 fn admin_ops_router(state: HttpState) -> Router {
     let router = Router::new()
         .route(
+            "/__ursula/maintenance/fence/activate",
+            post(activate_admin_fence),
+        )
+        .route(
+            "/__ursula/maintenance/fence/retire",
+            post(retire_admin_fence),
+        )
+        .route(
             "/__ursula/flush-cold/{bucket}/{stream}",
             post(flush_cold_stream),
         )
@@ -986,8 +1003,79 @@ async fn require_admin_incarnation(
             )
                 .into_response();
         }
+        // Lifecycle handlers take the write guard themselves. They remain
+        // process-bound and validate the supplied immutable executor token.
+        if *request.method() == Method::POST
+            && matches!(
+                request.uri().path(),
+                "/__ursula/maintenance/fence/activate" | "/__ursula/maintenance/fence/retire"
+            )
+        {
+            return next.run(request).await;
+        }
+        let fence_header = match request.headers().get(MAINTENANCE_FENCE_HEADER) {
+            Some(header) => match header.to_str() {
+                Ok(value) => Some(value),
+                Err(_) => return admin_fence::FenceRejection::Changed.response(),
+            },
+            None => None,
+        };
+        let guard = match state.admin_fence.admit_mutation(fence_header).await {
+            Ok(guard) => guard,
+            Err(rejection) => return rejection.response(),
+        };
+        // Dropping the caller's response future must not cancel an admitted
+        // actor/Core mutation and release its guard before its reply arrives.
+        return match tokio::spawn(async move {
+            let response = next.run(request).await;
+            guard.complete();
+            response
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::error!(%error, "admitted admin mutation task failed");
+                admin_fence::FenceRejection::Uncertain.response()
+            }
+        };
     }
     next.run(request).await
+}
+
+async fn confirm_admin_command_submission(state: &HttpState) -> Result<(), String> {
+    if let Some(registry) = &state.raft_registry {
+        registry.confirm_admin_command_submission().await?;
+    }
+    Ok(())
+}
+
+async fn activate_admin_fence(
+    State(state): State<HttpState>,
+    Json(fence): Json<MaintenanceFence>,
+) -> Response {
+    match state
+        .admin_fence
+        .activate(fence, confirm_admin_command_submission(&state))
+        .await
+    {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(rejection) => rejection.response(),
+    }
+}
+
+async fn retire_admin_fence(
+    State(state): State<HttpState>,
+    Json(fence): Json<MaintenanceFence>,
+) -> Response {
+    match state
+        .admin_fence
+        .retire(fence, confirm_admin_command_submission(&state))
+        .await
+    {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(rejection) => rejection.response(),
+    }
 }
 
 /// Cluster-plane routes: inter-node gRPC carrying Raft RPCs, snapshot
@@ -1719,10 +1807,19 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
     let rss = state.node_memory.last_rss_bytes();
     let cap = state.node_memory.abort_cap_bytes().unwrap_or_default();
     let group_state_gauges = group_state_gauges_json(&state).await;
+    let maintenance_fence = state.admin_fence.snapshot().await;
     if let Some(object) = body.as_object_mut() {
         object.insert(
             "process_incarnation".to_owned(),
             serde_json::json!(state.process_incarnation),
+        );
+        object.insert(
+            "maintenance_fence".to_owned(),
+            serde_json::json!(maintenance_fence),
+        );
+        object.insert(
+            "maintenance_fence_uncertain".to_owned(),
+            serde_json::json!(state.admin_fence.is_uncertain()),
         );
         object.insert(
             "process_node_id".to_owned(),

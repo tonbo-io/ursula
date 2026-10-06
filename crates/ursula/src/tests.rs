@@ -2040,6 +2040,7 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
         .iter()
         .map(|(id, endpoint)| ursula_ctl::NodeInfo {
             expected_process_incarnation: None,
+            expected_maintenance_fence: None,
             id: *id,
             admin_url: endpoint.parse().unwrap(),
             http_url: Some(endpoint.parse().unwrap()),
@@ -2080,6 +2081,39 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
                 .all(|groups| groups[&id] >= prefix.required_applied_index)
         );
     }
+    let mut admitted = client.pin_nodes(&manifest, None, false).await.unwrap();
+    for node in &mut admitted {
+        node.expected_maintenance_fence = Some(executor_token(1));
+    }
+    for node in &admitted {
+        client.set_maintenance_fence(node, false).await.unwrap();
+    }
+    let admitted_proof = ursula_ctl::quorum::verify_quorum(&admitted, &client, &options)
+        .await
+        .unwrap();
+    assert!(admitted_proof.maintenance_executor_certified);
+    assert!(!admitted_proof.maintenance_executor_retired_certified);
+    assert_eq!(admitted_proof.maintenance_fence, Some(executor_token(1)));
+    client
+        .set_maintenance_fence(&admitted[0], true)
+        .await
+        .unwrap();
+    let mixed = ursula_ctl::quorum::verify_quorum(&admitted, &client, &options)
+        .await
+        .unwrap();
+    assert!(!mixed.maintenance_executor_certified);
+    assert!(!mixed.maintenance_executor_retired_certified);
+    assert!(mixed.maintenance_fence.is_none());
+    for node in &admitted {
+        client.set_maintenance_fence(node, true).await.unwrap();
+    }
+    let retired_proof = ursula_ctl::quorum::verify_quorum(&admitted, &client, &options)
+        .await
+        .unwrap();
+    assert!(!retired_proof.maintenance_executor_certified);
+    assert!(retired_proof.maintenance_executor_retired_certified);
+    assert_eq!(retired_proof.prefixes.len(), 6);
+    assert_eq!(retired_proof.applied.len(), 3);
     options.group_count = 7;
     let missing = ursula_ctl::quorum::verify_quorum(&manifest, &client, &options)
         .await
@@ -7625,4 +7659,416 @@ async fn admin_mutation_without_observed_incarnation_is_rejected_before_drain() 
         .unwrap();
     assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
     assert!(!registry.is_leadership_shed());
+}
+
+fn executor_fence_test_state() -> HttpState {
+    let mut state = HttpState::with_raft_registry(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+        RaftGroupHandleRegistry::default(),
+    );
+    state.configured_node_id = Some(1);
+    state
+}
+
+fn executor_token(generation: u64) -> MaintenanceFence {
+    MaintenanceFence::new(
+        format!("{:032x}", 1),
+        format!("{generation:032x}"),
+        generation,
+    )
+    .unwrap()
+}
+
+async fn executor_lifecycle(
+    app: &Router,
+    state: &HttpState,
+    operation: &str,
+    token: &MaintenanceFence,
+) -> Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/__ursula/maintenance/fence/{operation}"))
+                .header(
+                    PROCESS_INCARNATION_HEADER,
+                    state.process_incarnation.as_str(),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(token).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn admin_executor_takeover_and_retirement_protect_real_drain_mutations() {
+    let state = executor_fence_test_state();
+    let registry = state.raft_registry.as_ref().unwrap();
+    let app = admin_router(state.clone());
+    let old = executor_token(1);
+    let new = executor_token(2);
+    assert_eq!(
+        executor_lifecycle(&app, &state, "activate", &old)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        executor_lifecycle(&app, &state, "activate", &new)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    for (header, expected) in [
+        (None, StatusCode::PRECONDITION_REQUIRED),
+        (Some(old.header_value()), StatusCode::PRECONDITION_FAILED),
+        (
+            Some("malformed".to_owned()),
+            StatusCode::PRECONDITION_FAILED,
+        ),
+        (Some(new.header_value()), StatusCode::OK),
+    ] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/__ursula/leadership-shed/maintenance")
+            .header(
+                PROCESS_INCARNATION_HEADER,
+                state.process_incarnation.as_str(),
+            );
+        if let Some(header) = header {
+            request = request.header(MAINTENANCE_FENCE_HEADER, header);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+        assert_eq!(registry.is_leadership_shed(), expected == StatusCode::OK);
+    }
+    assert_eq!(
+        executor_lifecycle(&app, &state, "retire", &new)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        executor_lifecycle(&app, &state, "activate", &new)
+            .await
+            .status(),
+        StatusCode::PRECONDITION_FAILED
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/__ursula/leadership-shed/maintenance")
+                .header(
+                    PROCESS_INCARNATION_HEADER,
+                    state.process_incarnation.as_str(),
+                )
+                .header(MAINTENANCE_FENCE_HEADER, new.header_value())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert!(registry.is_leadership_shed());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/__ursula/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+    assert_eq!(body["maintenance_fence"]["state"], "retired");
+    assert_eq!(body["maintenance_fence_uncertain"], false);
+}
+
+#[tokio::test]
+async fn malformed_present_executor_header_cannot_fall_back_to_uncertified_mode() {
+    let state = executor_fence_test_state();
+    let registry = state.raft_registry.as_ref().unwrap();
+    let response = admin_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/__ursula/leadership-shed/maintenance")
+                .header(
+                    PROCESS_INCARNATION_HEADER,
+                    state.process_incarnation.as_str(),
+                )
+                .header(
+                    MAINTENANCE_FENCE_HEADER,
+                    axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert!(!registry.is_leadership_shed());
+}
+
+#[tokio::test]
+async fn cancelled_http_caller_cannot_release_an_unfinished_executor_mutation() {
+    let state = executor_fence_test_state();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::new(tokio::sync::Notify::new());
+    let executed = Arc::new(AtomicU64::new(0));
+    let handler_entered = entered.clone();
+    let handler_finish = finish.clone();
+    let handler_executed = executed.clone();
+    let app = Router::new()
+        .route(
+            "/test-mutation",
+            post(move || {
+                let entered = handler_entered.clone();
+                let finish = handler_finish.clone();
+                let executed = handler_executed.clone();
+                async move {
+                    entered.notify_one();
+                    finish.notified().await;
+                    executed.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::OK
+                }
+            }),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_incarnation,
+        ));
+    let identity = state.process_incarnation.clone();
+    let caller = tokio::spawn(async move {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/test-mutation")
+                .header(PROCESS_INCARNATION_HEADER, identity.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    });
+    entered.notified().await;
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    let takeover_state = state.clone();
+    let mut takeover = tokio::spawn(async move {
+        takeover_state
+            .admin_fence
+            .activate(executor_token(1), async { Ok(()) })
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut takeover)
+            .await
+            .is_err()
+    );
+    finish.notify_one();
+    assert!(takeover.await.unwrap().is_ok());
+    assert_eq!(executed.load(Ordering::SeqCst), 1);
+    assert!(!state.admin_fence.is_uncertain());
+}
+
+#[test]
+fn executor_json_requires_canonical_ids_and_nonzero_generation() {
+    for body in [
+        json!({"reservation_id": "bad", "executor_id": format!("{:032x}", 1), "generation": 1}),
+        json!({"reservation_id": format!("{:032x}", 1), "executor_id": format!("{:032x}", 1), "generation": 0}),
+        json!({"reservation_id": format!("{:032x}", 1), "executor_id": format!("{:032x}", 1), "generation": 1, "extra": true}),
+    ] {
+        assert!(serde_json::from_value::<MaintenanceFence>(body).is_err());
+    }
+    let fence = executor_token(1);
+    assert_eq!(
+        serde_json::from_value::<MaintenanceFence>(serde_json::to_value(&fence).unwrap()).unwrap(),
+        fence
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_activation_waits_for_the_actual_raft_api_queue() {
+    let registry = RaftGroupHandleRegistry::default();
+    let mut config = RuntimeConfig::new(1, 1);
+    config.threading = ursula_runtime::RuntimeThreading::HostedTokio;
+    let runtime = ShardRuntime::spawn_with_engine_factory(
+        config,
+        ursula_raft::RegisteredRaftGroupEngineFactory::new(registry.clone()),
+    )
+    .expect("runtime");
+    runtime
+        .warm_group(RaftGroupId(0))
+        .await
+        .expect("warm group");
+    let raft = registry.get(RaftGroupId(0)).unwrap();
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let (release, hold) = std::sync::mpsc::channel();
+    raft.external_request(move |_| {
+        entered.send(()).unwrap();
+        hold.recv().unwrap();
+    })
+    .await
+    .unwrap();
+    observed.await.unwrap();
+    let state = HttpState::with_raft_registry(runtime, registry.clone());
+    let app = admin_router(state.clone());
+    let activation_state = state.clone();
+    let activation_app = app.clone();
+    let mut activation = tokio::spawn(async move {
+        executor_lifecycle(
+            &activation_app,
+            &activation_state,
+            "activate",
+            &executor_token(1),
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut activation)
+            .await
+            .is_err()
+    );
+    release.send(()).unwrap();
+    assert_eq!(activation.await.unwrap().status(), StatusCode::OK);
+    registry.quiesce_for_restart().await.unwrap();
+    assert_eq!(
+        executor_lifecycle(&app, &state, "retire", &executor_token(1))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn cli_uses_saved_executor_identity_and_never_refreshes_after_takeover() {
+    let state = executor_fence_test_state();
+    let registry = state.raft_registry.as_ref().unwrap().clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = admin_router(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut node = ursula_ctl::NodeInfo {
+        id: 1,
+        host: address.to_string(),
+        admin_url: format!("http://{address}").parse().unwrap(),
+        http_url: None,
+        metrics_url: None,
+        expected_process_incarnation: Some(state.process_incarnation.clone()),
+        expected_maintenance_fence: Some(executor_token(1)),
+    };
+    let old_client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
+    old_client
+        .set_maintenance_fence(&node, false)
+        .await
+        .unwrap();
+    old_client.set_maintenance_drain(&node, true).await.unwrap();
+    assert!(registry.is_leadership_shed());
+    let old_node = node.clone();
+    node.expected_maintenance_fence = Some(executor_token(2));
+    let new_client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
+    new_client
+        .set_maintenance_fence(&node, false)
+        .await
+        .unwrap();
+    assert!(
+        old_client
+            .set_maintenance_drain(&old_node, false)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("412")
+    );
+    assert!(old_client.fetch_node(&old_node).await.is_err());
+    assert!(
+        old_client
+            .pin_nodes(std::slice::from_ref(&old_node), None, false)
+            .await
+            .is_err()
+    );
+    assert!(registry.is_leadership_shed());
+    new_client
+        .set_maintenance_drain(&node, false)
+        .await
+        .unwrap();
+    assert!(!registry.is_leadership_shed());
+    new_client.set_maintenance_fence(&node, true).await.unwrap();
+    // A fresh invocation may retry retirement; it must never activate the
+    // retired token or discover a new authority from reported server state.
+    let resumed = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
+    resumed.set_maintenance_fence(&node, true).await.unwrap();
+    assert!(resumed.set_maintenance_fence(&node, false).await.is_err());
+    assert!(
+        old_client
+            .set_maintenance_fence(&old_node, false)
+            .await
+            .is_err()
+    );
+    assert!(resumed.set_maintenance_drain(&node, true).await.is_err());
+    server.abort();
+}
+
+#[tokio::test]
+async fn explicit_replacement_binding_preserves_token_and_rejects_another_executor() {
+    let state = executor_fence_test_state();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = admin_router(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let node = ursula_ctl::NodeInfo {
+        id: 1,
+        host: address.to_string(),
+        admin_url: format!("http://{address}").parse().unwrap(),
+        http_url: None,
+        metrics_url: None,
+        expected_process_incarnation: Some(ProcessIncarnation::from_bits(0)),
+        expected_maintenance_fence: Some(executor_token(1)),
+    };
+    let client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
+    assert!(
+        client
+            .pin_nodes(std::slice::from_ref(&node), None, false)
+            .await
+            .is_err()
+    );
+    let client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
+    let pinned = client
+        .pin_nodes(std::slice::from_ref(&node), Some(1), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        pinned[0].expected_process_incarnation,
+        Some(state.process_incarnation.clone())
+    );
+    assert_eq!(
+        pinned[0].expected_maintenance_fence,
+        node.expected_maintenance_fence
+    );
+    let mut other = pinned[0].clone();
+    other.expected_maintenance_fence = Some(executor_token(2));
+    client.set_maintenance_fence(&other, false).await.unwrap();
+    let client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
+    assert!(client.pin_nodes(&[node], Some(1), false).await.is_err());
+    server.abort();
 }

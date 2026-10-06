@@ -189,6 +189,7 @@ mod tests {
     fn node(id: u64) -> NodeInfo {
         NodeInfo {
             expected_process_incarnation: None,
+            expected_maintenance_fence: None,
             id,
             admin_url: Url::parse(&format!("http://10.0.0.{id}:4438")).unwrap(),
             host: format!("10.0.0.{id}"),
@@ -231,6 +232,8 @@ mod tests {
             per_node: vec![
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: node(1),
                     groups: vec![group(7, Some(1)), group(8, Some(2))],
                     wal_backend: None,
@@ -238,6 +241,8 @@ mod tests {
                 },
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: node(2),
                     groups: vec![group(7, Some(1)), group(8, Some(2))],
                     wal_backend: None,
@@ -254,6 +259,8 @@ mod tests {
         let snapshot = ClusterSnapshot {
             per_node: vec![NodeMetricsView {
                 process_incarnation: None,
+                maintenance_fence: None,
+                maintenance_fence_uncertain: false,
                 node: node(1),
                 groups: vec![group(7, None)],
                 wal_backend: None,
@@ -270,6 +277,8 @@ mod tests {
         let snapshot = ClusterSnapshot {
             per_node: vec![NodeMetricsView {
                 process_incarnation: None,
+                maintenance_fence: None,
+                maintenance_fence_uncertain: false,
                 node: node(1),
                 groups: vec![group(7, Some(1)), empty_group(8)],
                 wal_backend: None,

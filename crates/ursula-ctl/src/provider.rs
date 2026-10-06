@@ -6,6 +6,7 @@ use anyhow::bail;
 use serde::Deserialize;
 use serde::Serialize;
 use url::Url;
+use ursula_proto::admin::MaintenanceFence;
 use ursula_proto::admin::ProcessIncarnation;
 
 /// Default admin-plane port; must match `server.admin_listen`'s default.
@@ -36,6 +37,10 @@ pub struct NodeInfo {
     /// mismatch is terminal; callers must not refresh it after failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_process_incarnation: Option<ProcessIncarnation>,
+    /// Immutable token from the admitted cell reservation; never refreshed
+    /// from server metrics or after a precondition failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_maintenance_fence: Option<MaintenanceFence>,
 }
 
 #[allow(async_fn_in_trait)]
@@ -117,15 +122,35 @@ impl NodeProvider for StaticNodeProvider {
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
+    #[serde(default)]
+    maintenance_fence: Option<MaintenanceFence>,
     nodes: Vec<RawNode>,
 }
 
 impl RawConfig {
     fn into_nodes(self) -> Result<Vec<NodeInfo>> {
-        self.nodes
+        let mut nodes = self
+            .nodes
             .into_iter()
             .map(RawNode::into_node)
-            .collect::<Result<_>>()
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(fence) = self.maintenance_fence {
+            for node in &mut nodes {
+                if node
+                    .expected_maintenance_fence
+                    .as_ref()
+                    .is_some_and(|expected| expected != &fence)
+                {
+                    bail!(
+                        "node {} executor token disagrees with the cell token",
+                        node.id
+                    );
+                }
+                node.expected_maintenance_fence = Some(fence.clone());
+            }
+        }
+        validate_maintenance_fences(&nodes)?;
+        Ok(nodes)
     }
 }
 
@@ -142,6 +167,8 @@ struct RawNode {
     metrics_url: Option<String>,
     #[serde(default)]
     expected_process_incarnation: Option<ProcessIncarnation>,
+    #[serde(default)]
+    expected_maintenance_fence: Option<MaintenanceFence>,
     #[serde(default)]
     host: Option<String>,
 }
@@ -195,8 +222,23 @@ impl RawNode {
             http_url,
             metrics_url,
             expected_process_incarnation: self.expected_process_incarnation,
+            expected_maintenance_fence: self.expected_maintenance_fence,
         })
     }
+}
+
+/// Saved node lists and programmatic consumers must describe one cell token.
+pub(crate) fn validate_maintenance_fences(nodes: &[NodeInfo]) -> Result<()> {
+    let expected = nodes
+        .first()
+        .and_then(|node| node.expected_maintenance_fence.as_ref());
+    if nodes
+        .iter()
+        .any(|node| node.expected_maintenance_fence.as_ref() != expected)
+    {
+        bail!("configured voters must share one immutable maintenance executor token");
+    }
+    Ok(())
 }
 
 fn non_empty(value: &str) -> Option<&str> {
@@ -302,5 +344,49 @@ admin_url = "http://127.0.0.1:5442"
         assert_eq!(nodes[0].admin_url.as_str(), "http://127.0.0.1:5441/");
         // host falls back to the admin URL's host when not given.
         assert_eq!(nodes[1].host, "127.0.0.1");
+    }
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use serde_json::json;
+
+    use super::StaticNodeProvider;
+
+    #[test]
+    fn cell_token_survives_saved_nodes_and_rejects_inconsistent_plans() {
+        let token = json!({"reservation_id": format!("{:032x}", 1), "executor_id": format!("{:032x}", 2), "generation": 3});
+        let manifest = json!({"maintenance_fence": token, "nodes": [{"id": 1, "host": "a"}, {"id": 2, "host": "b"}]});
+        let provider =
+            StaticNodeProvider::from_bytes(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(
+            provider
+                .nodes
+                .iter()
+                .all(|node| node.expected_maintenance_fence.is_some())
+        );
+        let saved = json!({"nodes": provider.nodes});
+        let resumed = StaticNodeProvider::from_bytes(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(
+            resumed.nodes[0].expected_maintenance_fence,
+            resumed.nodes[1].expected_maintenance_fence
+        );
+        let mut inconsistent = saved.clone();
+        inconsistent["nodes"][1]["expected_maintenance_fence"]["generation"] = json!(4);
+        assert!(
+            StaticNodeProvider::from_bytes(&serde_json::to_vec(&inconsistent).unwrap()).is_err()
+        );
+        inconsistent = saved;
+        inconsistent["nodes"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_maintenance_fence");
+        assert!(
+            StaticNodeProvider::from_bytes(&serde_json::to_vec(&inconsistent).unwrap()).is_err()
+        );
+        let mut conflict = manifest;
+        conflict["nodes"][0]["expected_maintenance_fence"] = token;
+        conflict["nodes"][0]["expected_maintenance_fence"]["generation"] = json!(4);
+        assert!(StaticNodeProvider::from_bytes(&serde_json::to_vec(&conflict).unwrap()).is_err());
     }
 }

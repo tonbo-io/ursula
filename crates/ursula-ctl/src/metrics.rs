@@ -13,6 +13,8 @@ use reqwest::Method;
 use reqwest::RequestBuilder;
 use reqwest::StatusCode;
 use serde::Deserialize;
+use ursula_proto::admin::MAINTENANCE_FENCE_HEADER;
+use ursula_proto::admin::MaintenanceFenceState;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
 use ursula_proto::admin::ProcessIncarnation;
 
@@ -106,13 +108,78 @@ impl MetricsClient {
     ) -> Result<RequestBuilder> {
         let incarnation = self.observed_incarnation(node).await?;
         let mut request = self.client.request(method, url);
-        if let Some(identity) = incarnation {
+        if let Some(identity) = &incarnation {
             request = request.header(PROCESS_INCARNATION_HEADER, identity.as_str());
+        }
+        if let Some(fence) = &node.expected_maintenance_fence {
+            if incarnation.is_none() {
+                bail!(
+                    "executor fencing requires process identity at node {}",
+                    node.id
+                );
+            }
+            request = request.header(MAINTENANCE_FENCE_HEADER, fence.header_value());
         }
         // Concrete migration consumers: deployed servers through 0.6.2 lack
         // the identity field and cannot enforce this precondition. Preserve
         // their existing transport only until those sources are retired.
         Ok(request)
+    }
+
+    /// Install/retire the caller's already-admitted token on one fixed process.
+    /// This does not acquire a cell reservation or refresh either identity.
+    pub async fn set_maintenance_fence(
+        &self,
+        node: &NodeInfo,
+        retire: bool,
+    ) -> Result<MaintenanceFenceState> {
+        let fence = node
+            .expected_maintenance_fence
+            .as_ref()
+            .context("maintenance lifecycle requires a saved executor token")?;
+        node.expected_process_incarnation
+            .as_ref()
+            .context("maintenance lifecycle requires a saved process identity")?;
+        let mut observed = node.clone();
+        // Lifecycle admission intentionally handles Unclaimed/pending/Retired
+        // metrics, but must preserve the immutable process pin.
+        observed.expected_maintenance_fence = None;
+        self.fetch_node(&observed).await?;
+        let operation = if retire { "retire" } else { "activate" };
+        let url = node
+            .admin_url
+            .join(&format!("/__ursula/maintenance/fence/{operation}"))?;
+        let response = self
+            .admin_request(&observed, Method::POST, url)
+            .await?
+            .json(fence)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            bail!(
+                "maintenance {operation} at node {} returned {status}: {body}; stop without refreshing authority",
+                node.id
+            );
+        }
+        let reported: MaintenanceFenceState = serde_json::from_str(&body)?;
+        let expected = if retire {
+            MaintenanceFenceState::Retired {
+                fence: fence.clone(),
+            }
+        } else {
+            MaintenanceFenceState::Active {
+                fence: fence.clone(),
+            }
+        };
+        if reported != expected {
+            bail!(
+                "node {} acknowledged a different maintenance executor state",
+                node.id
+            );
+        }
+        Ok(reported)
     }
 
     /// Return a manifest pinned to each observed server instance. Refreshing
@@ -123,6 +190,7 @@ impl MetricsClient {
         replacement: Option<u64>,
         allow_legacy: bool,
     ) -> Result<Vec<NodeInfo>> {
+        crate::provider::validate_maintenance_fences(nodes)?;
         let ids = nodes.iter().map(|node| node.id).collect::<BTreeSet<_>>();
         if ids.len() != nodes.len()
             || nodes.is_empty()
@@ -136,7 +204,43 @@ impl MetricsClient {
             if replacement == Some(node.id) {
                 node.expected_process_incarnation = None;
             }
-            let view = self.fetch_node(&node).await?;
+            let mut observed = node.clone();
+            if replacement == Some(node.id) {
+                observed.expected_maintenance_fence = None;
+            }
+            let view = self.fetch_node(&observed).await?;
+            if replacement == Some(node.id)
+                && let Some(expected) = &node.expected_maintenance_fence
+            {
+                let unclaimed =
+                    view.maintenance_fence.as_ref() == Some(&MaintenanceFenceState::Unclaimed);
+                let same = view.maintenance_fence.as_ref()
+                    == Some(&MaintenanceFenceState::Active {
+                        fence: expected.clone(),
+                    });
+                if (!unclaimed && !same)
+                    || view.maintenance_fence_uncertain
+                    || view.process_incarnation.is_none()
+                {
+                    bail!(
+                        "replacement node {} has another or unresolved maintenance authority",
+                        node.id
+                    );
+                }
+            }
+            if replacement.is_some()
+                && replacement != Some(node.id)
+                && let Some(expected) = &node.expected_maintenance_fence
+                && view.maintenance_fence.as_ref()
+                    != Some(&MaintenanceFenceState::Active {
+                        fence: expected.clone(),
+                    })
+            {
+                bail!(
+                    "surviving node {} lacks the saved active maintenance authority",
+                    node.id
+                );
+            }
             if view.process_incarnation.is_none() && !allow_legacy {
                 bail!(
                     "node {} lacks process identity; only the deployed legacy migration may opt in",
@@ -182,10 +286,21 @@ impl MetricsClient {
             );
         }
         self.pin_incarnation(node, &body.process_incarnation)?;
+        if let Some(expected) = &node.expected_maintenance_fence {
+            let bound = matches!(body.maintenance_fence.as_ref(),
+                Some(MaintenanceFenceState::Active { fence } | MaintenanceFenceState::Retired { fence }) if fence == expected);
+            if !bound || body.maintenance_fence_uncertain {
+                bail!(
+                    "node {} maintenance executor differs from the saved plan or has unresolved work",
+                    node.id
+                );
+            }
+        }
         Ok(NodeMetricsView::new(node.clone(), body))
     }
 
     pub async fn fetch_cluster(&self, nodes: &[NodeInfo]) -> Result<ClusterSnapshot> {
+        crate::provider::validate_maintenance_fences(nodes)?;
         let mut per_node = Vec::with_capacity(nodes.len());
         for node in nodes {
             per_node.push(self.fetch_node(node).await?);
@@ -521,6 +636,10 @@ struct RawMetrics {
     #[serde(default)]
     process_node_id: Option<u64>,
     #[serde(default)]
+    maintenance_fence: Option<MaintenanceFenceState>,
+    #[serde(default)]
+    maintenance_fence_uncertain: bool,
+    #[serde(default)]
     raft_groups: Vec<RawRaftGroup>,
     /// Raft WAL backend (`"memory"`/`"disk"`); absent on older servers.
     #[serde(default)]
@@ -558,6 +677,8 @@ pub struct NodeMetricsView {
     pub wal_backend: Option<String>,
     pub raft_maintenance: Option<ursula_raft::RaftMaintenanceReport>,
     pub process_incarnation: Option<ProcessIncarnation>,
+    pub maintenance_fence: Option<MaintenanceFenceState>,
+    pub maintenance_fence_uncertain: bool,
 }
 
 impl NodeMetricsView {
@@ -583,6 +704,8 @@ impl NodeMetricsView {
             wal_backend: raw.wal_backend,
             raft_maintenance: raw.raft_maintenance,
             process_incarnation: raw.process_incarnation,
+            maintenance_fence: raw.maintenance_fence,
+            maintenance_fence_uncertain: raw.maintenance_fence_uncertain,
         }
     }
 
@@ -736,6 +859,7 @@ mod tests {
                 http_url: None,
                 metrics_url: None,
                 expected_process_incarnation: None,
+                expected_maintenance_fence: None,
             },
             current,
             applied,
@@ -911,6 +1035,7 @@ mod tests {
             http_url: None,
             metrics_url: None,
             expected_process_incarnation: None,
+            expected_maintenance_fence: None,
         };
         let error = MetricsClient::new(Duration::from_secs(1))
             .unwrap()
@@ -951,6 +1076,7 @@ mod tests {
         let advertised = Url::parse("http://replacement.invalid:4437").unwrap();
         let node = NodeInfo {
             expected_process_incarnation: None,
+            expected_maintenance_fence: None,
             id: 1,
             admin_url: tunnel.clone(),
             host: "replacement".to_owned(),
@@ -979,6 +1105,7 @@ mod tests {
         });
         let node = NodeInfo {
             expected_process_incarnation: None,
+            expected_maintenance_fence: None,
             id: 1,
             admin_url: Url::parse(&format!("http://{address}")).unwrap(),
             host: address.to_string(),
@@ -998,6 +1125,7 @@ mod tests {
     fn metrics_use_client_url_when_available() -> anyhow::Result<()> {
         let node = NodeInfo {
             expected_process_incarnation: None,
+            expected_maintenance_fence: None,
             id: 1,
             admin_url: Url::parse("http://127.0.0.1:4438")?,
             host: "127.0.0.1".to_owned(),
@@ -1013,6 +1141,7 @@ mod tests {
     fn metrics_fall_back_to_admin_url_for_legacy_manifests() -> anyhow::Result<()> {
         let node = NodeInfo {
             expected_process_incarnation: None,
+            expected_maintenance_fence: None,
             id: 1,
             admin_url: Url::parse("http://127.0.0.1:4438")?,
             host: "127.0.0.1".to_owned(),
@@ -1036,6 +1165,7 @@ mod tests {
         });
         Ok(NodeInfo {
             expected_process_incarnation: None,
+            expected_maintenance_fence: None,
             id: 1,
             admin_url: Url::parse(&format!("http://{address}"))?,
             host: address.to_string(),

@@ -2577,6 +2577,7 @@ mod tests {
             let url = url::Url::parse(&format!("http://{address}")).unwrap();
             nodes.push(NodeInfo {
                 expected_process_incarnation: None,
+                expected_maintenance_fence: None,
                 id: node_id,
                 admin_url: url.clone(),
                 host: address.to_string(),
@@ -2590,6 +2591,7 @@ mod tests {
     fn n(id: u64, host: &str) -> NodeInfo {
         NodeInfo {
             expected_process_incarnation: None,
+            expected_maintenance_fence: None,
             id,
             admin_url: url::Url::parse(&format!("http://{host}:4438")).unwrap(),
             host: host.to_owned(),
@@ -3130,6 +3132,8 @@ mod tests {
             per_node: vec![
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: n(1, "10.0.0.1"),
                     groups: vec![group(7, 1, Some(1), 50, 50)],
                     wal_backend: None,
@@ -3137,6 +3141,8 @@ mod tests {
                 },
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(1), 100, 100)],
                     wal_backend: None,
@@ -3144,6 +3150,8 @@ mod tests {
                 },
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: n(3, "10.0.0.3"),
                     groups: vec![group(7, 3, Some(1), 95, 100)],
                     wal_backend: None,
@@ -3164,6 +3172,8 @@ mod tests {
         let snapshot = ClusterSnapshot {
             per_node: vec![NodeMetricsView {
                 process_incarnation: None,
+                maintenance_fence: None,
+                maintenance_fence_uncertain: false,
                 node: n(2, "10.0.0.2"),
                 groups: vec![group(7, 2, Some(2), 100, 100)],
                 wal_backend: None,
@@ -3271,6 +3281,8 @@ mod tests {
             per_node: vec![
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(2), 100, 100)],
                     wal_backend: Some("memory".into()),
@@ -3278,6 +3290,8 @@ mod tests {
                 },
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: n(3, "10.0.0.3"),
                     groups: vec![group(7, 3, Some(2), 100, 100)],
                     wal_backend: Some("memory".into()),
@@ -3291,6 +3305,8 @@ mod tests {
             per_node: vec![
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(2), 100, 100)],
                     wal_backend: Some("memory".into()),
@@ -3298,6 +3314,8 @@ mod tests {
                 },
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: n(3, "10.0.0.3"),
                     groups: vec![group(7, 3, Some(3), 100, 100)],
                     wal_backend: Some("memory".into()),
@@ -3386,6 +3404,8 @@ mod tests {
             per_node: vec![
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: n(1, "10.0.0.1"),
                     groups: vec![group(7, 1, Some(2), 50, 50)],
                     wal_backend: None,
@@ -3393,6 +3413,8 @@ mod tests {
                 },
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(2), 100, 100)],
                     wal_backend: None,
@@ -3411,6 +3433,8 @@ mod tests {
             per_node: vec![
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: n(1, "10.0.0.1"),
                     groups: vec![group(7, 1, Some(2), 100, 100)],
                     wal_backend: None,
@@ -3418,6 +3442,8 @@ mod tests {
                 },
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(2), 100, 100)],
                     wal_backend: None,
@@ -3425,6 +3451,8 @@ mod tests {
                 },
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: n(3, "10.0.0.3"),
                     groups: vec![group(7, 3, Some(1), 100, 100)],
                     wal_backend: None,
@@ -3448,6 +3476,8 @@ mod tests {
             per_node: vec![
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: n(1, "10.0.0.1"),
                     groups: vec![group(159, 1, Some(1), 100, 100)],
                     wal_backend: Some("memory".into()),
@@ -3455,6 +3485,8 @@ mod tests {
                 },
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(159, 2, Some(3), 100, 100)],
                     wal_backend: Some("memory".into()),
@@ -3462,6 +3494,8 @@ mod tests {
                 },
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: n(3, "10.0.0.3"),
                     groups: vec![group(159, 3, Some(1), 100, 100)],
                     wal_backend: Some("memory".into()),
@@ -3483,6 +3517,8 @@ mod tests {
             per_node: vec![
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: n(1, "10.0.0.1"),
                     groups: vec![empty_target_group],
                     wal_backend: Some("memory".into()),
@@ -3490,6 +3526,8 @@ mod tests {
                 },
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(2), 100, 100)],
                     wal_backend: Some("memory".into()),
@@ -3497,6 +3535,8 @@ mod tests {
                 },
                 NodeMetricsView {
                     process_incarnation: None,
+                    maintenance_fence: None,
+                    maintenance_fence_uncertain: false,
                     node: n(3, "10.0.0.3"),
                     groups: vec![group(7, 3, Some(2), 100, 100)],
                     wal_backend: Some("memory".into()),

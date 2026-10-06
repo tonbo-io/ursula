@@ -58,6 +58,24 @@ The saved nodes carry `expected_process_incarnation`. After an admitted Pod repl
 
 `--allow-legacy-incarnation` is the deployed through-0.6.2 migration option: those servers have no identity precondition and the output reports `process_incarnations_certified=false`. Retire the option when those upgrade sources and retained legacy rollout states are gone. `verify-quorum` records the observed process identities and their certification separately from Raft participation. Instance identity does not serialize concurrent executors or prove a failed host is physically fenced.
 
+## Maintenance executor admission
+
+A reviewed cell reservation consumer can add one immutable `maintenance_fence` object at the manifest root: `reservation_id` and `executor_id` are 32 lowercase hexadecimal characters, and `generation` is a nonzero cell-wide monotonically increasing integer. Every saved node carries that same token as `expected_maintenance_fence`; inconsistent or partially populated plans are rejected. The lifecycle commands require saved process identities for every configured voter:
+
+```bash
+ursulactl activate-maintenance-fence --config admitted-cluster.json
+ursulactl drain --config admitted-cluster.json --node 3
+# After replacement and reconciliation of its physical lifecycle:
+ursulactl retire-maintenance-fence --config admitted-cluster.json
+ursulactl verify-quorum --config admitted-cluster.json --expected-groups 256 --core-count 2
+```
+
+These commands install or retire the supplied token; they do not acquire a shared reservation, choose generations, authorize Pod deletion, or establish provider-host fencing. A multi-node command may stop after partial acknowledgement. Keep the external operation reserved, resume its same identities, and require all relevant acknowledgements before advancing. Expiry is not authority to select another voter. A new executor uses the higher generation admitted by the external CAS operation; CLI never adopts a token discovered in metrics or refreshes it after 412/428.
+
+Activation waits for admitted mutation handlers and then confirms prior messages were processed by each captured local Raft API queue. Caller cancellation leaves its admitted handler running; abnormal handler termination latches that process closed. Failed or cancelled activation/retirement stays closed until the same pending lifecycle completes or an externally admitted higher generation activates. Retirement retains its generation and cannot be reopened by the same token. This confirms submission ordering, not completion of asynchronous replication, snapshot work, or physical operations. Fresh all-replica prefix certification and external lifecycle reconciliation remain required before releasing the reservation.
+
+New processes start `unclaimed`, explicitly uncertified until admission. An explicit `pin-incarnations --replace-node` can bind only that selected unclaimed replacement while preserving the token; other voters must still match the active saved authority. Once activated, all mutating admin requests require `x-ursula-maintenance-fence` as `reservation_id:generation:executor_id` in addition to the process-incarnation header. Metrics report `maintenance_fence` and `maintenance_fence_uncertain`; `verify-quorum` schema 3 records `maintenance_executor_certified` only when every observed process matches the same caller-supplied active token. A subsequent proof can inspect the same retired token and reports `maintenance_executor_retired_certified` only when all observed processes have retired it; a mix of active and retired nodes certifies neither state. These flags certify process-local admission or retirement, not the external reservation or physical fencing. Existing chart and Cloud consumers are uncertified until their shared reservation integration is complete.
+
 ## The admin plane
 
 Nodes carry **no cluster-mutation surface on the network**. The mutating operator endpoints (raft snapshot/purge/membership/learners/leader-transfer, maintenance drain, cold-flush trigger, bucket purge) plus metrics and usage are served on a separate **admin plane** bound to `server.admin_listen`, which defaults to loopback (`127.0.0.1:4438`). The public client plane (`:4437`) serves only stream traffic and read-only metrics and usage.

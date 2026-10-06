@@ -1003,6 +1003,35 @@ impl RaftGroupHandleRegistry {
         }
     }
 
+    /// Confirm that API messages submitted before this observation have been
+    /// processed by each captured local core. This is not a committed-prefix,
+    /// state-machine completion or cluster-wide redundancy certificate.
+    pub async fn confirm_admin_command_submission(&self) -> Result<(), String> {
+        let groups = self
+            .groups
+            .lock()
+            .expect("raft group handle registry mutex")
+            .iter()
+            .map(|(id, raft)| (*id, raft.clone()))
+            .collect::<Vec<_>>();
+        let results = join_all(groups.into_iter().map(|(id, raft)| async move {
+            match raft.with_raft_state(|_| ()).await {
+                Ok(()) | Err(openraft::error::Fatal::Stopped) => Ok(()),
+                Err(error) => Err(format!("group {id}: {error}")),
+            }
+        }))
+        .await;
+        let failures = results
+            .into_iter()
+            .filter_map(Result::err)
+            .collect::<Vec<_>>();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
     pub(crate) fn subscribe_transport_shutdown(&self) -> watch::Receiver<bool> {
         self.transport_shutdown.subscribe()
     }

@@ -770,6 +770,26 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
         .pin_nodes(&nodes, None, false)
         .await
         .expect("save original process plan");
+    let executor =
+        ursula_proto::admin::MaintenanceFence::new(format!("{:032x}", 1), format!("{:032x}", 2), 1)
+            .unwrap();
+    for node in &mut nodes {
+        node.expected_maintenance_fence = Some(executor.clone());
+    }
+    for node in &nodes {
+        ctl.set_maintenance_fence(node, false)
+            .await
+            .expect("activate executor");
+    }
+    for index in 0..6 {
+        post_until_no_content(
+            &client,
+            &format!("{}/benchcmp/restart-repair-{index}", public(1)),
+            "executor-fence-tail",
+        )
+        .await;
+    }
+
     let drain_options = ursula_ctl::DrainOptions {
         drain_timeout: Duration::from_secs(60),
         ready_timeout: Duration::from_secs(60),
@@ -800,6 +820,7 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
     let retired_identity = nodes[2].expected_process_incarnation.clone();
     nodes[2] = ctl_node(3, admin_port, &public(3));
     nodes[2].expected_process_incarnation = retired_identity.clone();
+    nodes[2].expected_maintenance_fence = Some(executor.clone());
     wait_until_ready(&client, &public(3), &mut children).await;
 
     let stale_clear = ctl
@@ -827,6 +848,16 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
         .await
         .expect("bind only admitted replacement");
     assert_ne!(nodes[2].expected_process_incarnation, retired_identity);
+    assert!(
+        nodes
+            .iter()
+            .all(|node| node.expected_maintenance_fence.as_ref() == Some(&executor))
+    );
+    for node in &nodes {
+        ctl.set_maintenance_fence(node, false)
+            .await
+            .expect("activate only the new process; survivors stay fixed");
+    }
 
     // Node 3 heals by itself; it is never an empty voter on the way.
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -882,6 +913,41 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+
+    for index in 0..6 {
+        read_until_matches(
+            &client,
+            &format!(
+                "{}/benchcmp/restart-repair-{index}?offset=0&max_bytes=64",
+                public(3)
+            ),
+            b"executor-fence-tail",
+        )
+        .await;
+    }
+    let options = ursula_ctl::quorum::QuorumVerificationOptions {
+        group_count: 6,
+        core_count: 1,
+        timeout: Duration::from_secs(15),
+        poll_interval: Duration::from_millis(100),
+        allow_legacy_eligibility: false,
+    };
+    let proof = ursula_ctl::quorum::verify_quorum(&nodes, &ctl, &options)
+        .await
+        .expect("current process full prefix proof");
+    assert!(proof.maintenance_executor_certified);
+    assert!(proof.process_incarnations_certified);
+    for node in &nodes {
+        ctl.set_maintenance_fence(node, true)
+            .await
+            .expect("retire executor");
+    }
+    let proof = ursula_ctl::quorum::verify_quorum(&nodes, &ctl, &options)
+        .await
+        .expect("fresh proof after all executors retired");
+    assert!(proof.maintenance_executor_retired_certified);
+    assert!(!proof.maintenance_executor_certified);
+    assert!(ctl.set_maintenance_drain(&nodes[2], false).await.is_err());
     drop(children);
 }
 
@@ -1077,6 +1143,7 @@ async fn sigterm_and_wait_for_clean_exit(child: &mut ChildGuard) {
 fn ctl_node(node_id: u64, admin_port: u16, public_url: &str) -> ursula_ctl::NodeInfo {
     ursula_ctl::NodeInfo {
         expected_process_incarnation: None,
+        expected_maintenance_fence: None,
         id: node_id,
         admin_url: url::Url::parse(&format!("http://127.0.0.1:{admin_port}")).expect("admin url"),
         host: "127.0.0.1".to_owned(),
