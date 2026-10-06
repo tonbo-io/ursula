@@ -733,6 +733,9 @@ impl StaticGrpcRaftGroupEngineFactory {
 
 impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
     fn hosts_group(&self, placement: ShardPlacement) -> bool {
+        if let Some(allowed) = self.registry.managed_group_hosting(placement.raft_group_id) {
+            return allowed;
+        }
         if self.per_group_voters.is_empty() {
             return true;
         }

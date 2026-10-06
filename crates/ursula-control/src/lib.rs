@@ -12,6 +12,7 @@
 //! - [`migration`]: intent-bound managed migrations and executor/evidence ordering.
 //! - [`policy`]: managed replication and failure-domain validation.
 //! - [`projection`]: complete ordered control snapshots and identity/rollback guards.
+//! - [`receiver`]: durable node-local fencing and replica retirement state.
 //! - [`state`]: deterministic control state transitions.
 //! - [`view`]: routing projections consumed by data nodes and gateways.
 
@@ -21,6 +22,13 @@ mod migration;
 mod model;
 mod policy;
 mod projection;
+mod receiver;
+pub use receiver::PendingReceiverMutation;
+pub use receiver::ReceiverFencePhase;
+pub use receiver::ReceiverFenceRecord;
+pub use receiver::ReceiverLedger;
+pub use receiver::ReplicaAssignment;
+pub use receiver::ReplicaAssignmentPhase;
 mod state;
 mod view;
 

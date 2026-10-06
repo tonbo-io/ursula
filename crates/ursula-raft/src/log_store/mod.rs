@@ -1,7 +1,7 @@
 mod file;
 mod memory;
 mod meta;
-
+mod receiver;
 use std::collections::BTreeMap;
 use std::io;
 
@@ -22,6 +22,7 @@ use openraft::alias::EntryOf;
 use openraft::alias::LogIdOf;
 use openraft::alias::VoteOf;
 use openraft::entry::RaftEntry;
+pub use receiver::ManagedReceiverStore;
 use serde::Deserialize;
 use serde::Serialize;
 

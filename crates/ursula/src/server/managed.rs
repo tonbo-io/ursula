@@ -52,6 +52,10 @@ pub(super) async fn run(
             .ok_or_else(|| invalid("cluster listener is absent"))?,
     )
     .await?;
+    let mut receiver_name = control.meta_journal_path.as_os_str().to_owned();
+    receiver_name.push(".receiver");
+    let receiver_store =
+        ursula_raft::ManagedReceiverStore::open(receiver_name.into(), identity.clone()).await?;
     crate::bootstrap::check_and_stamp_format_epoch(config).await?;
     let raft_config = Arc::new(
         Config {
@@ -160,9 +164,47 @@ pub(super) async fn run(
         // Data construction receives live placement if one exists. Neither a
         // restored nor a joining managed replica may initialize membership.
         let runtime_config = runtime_config(config, &initial)?;
-        let state = super::init_state(&runtime_config, None, maintenance_drained)
-            .await?
-            .with_managed_projection(cursor.clone());
+        let mut ledger = receiver_store.snapshot()?;
+        if !ledger.assignments_seeded {
+            // A fresh empty meta quorum permits initial static adoption; an
+            // established snapshot permits upgrade of the pre-ledger server.
+            // Thereafter only explicit prepare/release may change assignments.
+            ledger.assignments_seeded = true;
+            for group in &runtime_config.raft.groups {
+                if group.voters.contains(&config.raft.node_id) {
+                    let id = ursula_shard::RaftGroupId(group.raft_group_id);
+                    ledger
+                        .assignments
+                        .insert(id, ursula_control::ReplicaAssignment {
+                            epoch: initial.state.placements.get(&id).map_or(0, |p| p.epoch),
+                            migration_id: 0,
+                            generation: 0,
+                            phase: ursula_control::ReplicaAssignmentPhase::Hosted,
+                        });
+                }
+            }
+            receiver_store.persist(ledger.clone()).await?;
+        }
+        let groups = ledger
+            .assignments
+            .keys()
+            .filter(|group| ledger.may_restore(**group))
+            .copied()
+            .collect();
+        let receiver = Arc::new(crate::managed_receiver::ManagedReceiver::new(
+            receiver_store.clone(),
+            recipe.clone(),
+            meta.clone(),
+        ));
+        let state = super::init_state_with_assignments(
+            &runtime_config,
+            None,
+            maintenance_drained,
+            Some(groups),
+        )
+        .await?
+        .with_managed_projection(cursor.clone())
+        .with_managed_receiver(receiver);
         *slot.write().await = Some(crate::cluster_router_from_state(state.clone()));
         let projection = if initial.state.cluster_bootstrap.is_some() {
             initial
@@ -555,5 +597,149 @@ mod tests {
         assert_eq!(restored.raft.peers[0].url, nodes[&1].cluster_url);
         view.state.nodes.get_mut(&1).unwrap().state = ursula_control::NodeState::Removed;
         assert!(runtime_config(&config, &view).is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_assignment_restores_nonvoter_without_initializing_membership() {
+        let root = tempfile::tempdir().unwrap();
+        let recipe = bootstrap_recipe();
+        let mut config = UrsulaConfig::default();
+        config.runtime.core_count = 1;
+        config.raft.node_id = 4;
+        config.raft.group_count = 1;
+        config.raft.init_membership = false;
+        config.raft.init_membership_per_group = false;
+        config.raft.wal.backend = ursula_config::WalBackend::Disk;
+        config.raft.wal.path = Some(root.path().join("data"));
+        config.raft.peers = recipe
+            .nodes
+            .values()
+            .map(|node| ursula_config::RaftPeerConfig {
+                node_id: node.node_id,
+                url: node.cluster_url.clone(),
+            })
+            .collect();
+        config.raft.groups = vec![ursula_config::RaftGroupConfig {
+            raft_group_id: 0,
+            voters: vec![1, 2, 3],
+        }];
+        let state = super::super::init_state_with_assignments(
+            &config,
+            None,
+            false,
+            Some([RaftGroupId(0)].into()),
+        )
+        .await
+        .unwrap();
+        let registry = state.raft_registry().unwrap();
+        let raft = registry.get(RaftGroupId(0)).unwrap();
+        assert!(
+            !raft.is_initialized().await.unwrap(),
+            "assignment restoration must never invent a data membership"
+        );
+        registry.quiesce_for_restart().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_retirement_overrides_stale_voters_before_warmup_and_lazy_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let recipe = bootstrap_recipe();
+        let identity = ursula_control::MetaLocalIdentity {
+            cluster: recipe.identity.clone(),
+            node: recipe.nodes[&1].clone(),
+        };
+        let path = root.path().join("receiver");
+        let store = ursula_raft::ManagedReceiverStore::open(path.clone(), identity.clone())
+            .await
+            .unwrap();
+        let mut ledger = store.snapshot().unwrap();
+        ledger.assignments_seeded = true;
+        ledger
+            .assignments
+            .insert(RaftGroupId(0), ursula_control::ReplicaAssignment {
+                epoch: 0,
+                generation: 0,
+                migration_id: 0,
+                phase: ursula_control::ReplicaAssignmentPhase::Hosted,
+            });
+        let mut ledger = store.persist(ledger).await.unwrap();
+        ledger.high_water_generation = 1;
+        ledger.fence = Some(ursula_control::ReceiverFenceRecord {
+            token: ursula_control::MigrationToken {
+                migration_id: 1,
+                generation: 1,
+                executor: ursula_control::ReceiverProcess {
+                    node_id: 2,
+                    incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(2),
+                },
+            },
+            process: ursula_proto::admin::ProcessIncarnation::from_bits(1),
+            phase: ursula_control::ReceiverFencePhase::Activating,
+        });
+        let mut ledger = store.persist(ledger).await.unwrap();
+        ledger.fence.as_mut().unwrap().phase = ursula_control::ReceiverFencePhase::Active;
+        ledger.assignments.get_mut(&RaftGroupId(0)).unwrap().phase =
+            ursula_control::ReplicaAssignmentPhase::Retiring;
+        let mut ledger = store.persist(ledger).await.unwrap();
+        let assignment = ledger.assignments.get_mut(&RaftGroupId(0)).unwrap();
+        assignment.phase = ursula_control::ReplicaAssignmentPhase::Retired;
+        assignment.epoch = 1;
+        assignment.generation = 1;
+        assignment.migration_id = 1;
+        store.persist(ledger).await.unwrap();
+        drop(store);
+        let store = ursula_raft::ManagedReceiverStore::open(path, identity)
+            .await
+            .unwrap();
+        let ledger = store.snapshot().unwrap();
+        let allowed = ledger
+            .assignments
+            .keys()
+            .filter(|group| ledger.may_restore(**group))
+            .copied()
+            .collect();
+        let mut config = UrsulaConfig::default();
+        config.runtime.core_count = 1;
+        config.raft.node_id = 1;
+        config.raft.group_count = 1;
+        config.raft.wal.backend = ursula_config::WalBackend::Disk;
+        config.raft.wal.path = Some(root.path().join("data"));
+        config.raft.peers = recipe
+            .nodes
+            .values()
+            .map(|node| ursula_config::RaftPeerConfig {
+                node_id: node.node_id,
+                url: node.cluster_url.clone(),
+            })
+            .collect();
+        // These stale voters deliberately still include this retired node.
+        config.raft.groups = vec![ursula_config::RaftGroupConfig {
+            raft_group_id: 0,
+            voters: vec![1, 2, 3],
+        }];
+        let state = super::super::init_state_with_assignments(&config, None, false, Some(allowed))
+            .await
+            .unwrap();
+        assert!(
+            !state
+                .raft_registry()
+                .unwrap()
+                .contains_group(RaftGroupId(0))
+        );
+        state
+            .raft_registry()
+            .unwrap()
+            .allow_dynamic_group_hosting(RaftGroupId(0));
+        assert!(matches!(
+            state.runtime.warm_group(RaftGroupId(0)).await,
+            Err(ursula_runtime::RuntimeError::GroupNotHosted { .. })
+        ));
+        assert!(
+            !state
+                .raft_registry()
+                .unwrap()
+                .contains_group(RaftGroupId(0)),
+            "neither stale voters nor a legacy allowlist may recreate the retired engine"
+        );
     }
 }

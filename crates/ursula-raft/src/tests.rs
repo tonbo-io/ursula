@@ -1080,6 +1080,13 @@ fn dynamic_group_hosting_allows_non_voter_warmup() {
     assert!(!factory.hosts_group(placement));
     registry.allow_dynamic_group_hosting(RaftGroupId(2));
     assert!(factory.hosts_group(placement));
+    registry.set_managed_hosting(BTreeSet::new());
+    assert!(
+        !factory.hosts_group(placement),
+        "managed tombstone overrides legacy hosting"
+    );
+    registry.set_managed_hosting(BTreeSet::from([RaftGroupId(2)]));
+    assert!(factory.hosts_group(placement));
 }
 
 #[tokio::test]

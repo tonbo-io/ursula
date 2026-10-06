@@ -18,6 +18,7 @@
 //! - [`meta`]: meta-group OpenRaft type config and control-plane state machine.
 //! - [`meta_grpc`]: concrete meta consensus RPC service and network factory.
 //! - `log_store::meta`: durable meta journal, snapshots, and recovery guards.
+//! - `log_store::receiver`: bound receiver fences and local replica assignments.
 //! - [`engine`]: [`RaftGroupEngine`] + `GroupEngine` impl, with the engine
 //!   factories under `engine::factory`.
 //! - [`format_epoch`]: the Raft protocol (format-epoch) peer probe and the
@@ -94,6 +95,7 @@ pub use grpc::confirm_quorum_prefix;
 pub use grpc::raft_grpc_metrics_snapshot;
 pub use grpc::raft_grpc_service;
 pub use grpc::request_self_election_via_transfer;
+pub use log_store::ManagedReceiverStore;
 pub use log_store::MemoryRaftLogStore;
 pub use log_store::MetaRaftFileLogStore;
 pub use log_store::MetaRaftLogStore;

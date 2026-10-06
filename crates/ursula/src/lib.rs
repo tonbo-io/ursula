@@ -4,6 +4,7 @@
 //! Module map:
 //!
 //! - [`admin_fence`]: process-local executor ordering for administrative mutations.
+//! - [`managed_receiver`]: durable, quorum-authorized managed receiver lifecycle.
 //! - [`json_text`]: JSON Message Text (P1): validation, flattening and lexical
 //!   minification of `application/json` write bodies.
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
@@ -14,6 +15,7 @@ mod admin_fence;
 mod bootstrap;
 mod cold_snapshot;
 pub mod json_text;
+mod managed_receiver;
 mod otel_metrics;
 pub mod server;
 mod http_time {
@@ -274,6 +276,7 @@ pub struct HttpState {
     admin_fence: admin_fence::AdminMutationFence,
     configured_node_id: Option<u64>,
     managed_projection: Option<Arc<std::sync::RwLock<ursula_control::ProjectionCursor>>>,
+    managed_receiver: Option<Arc<managed_receiver::ManagedReceiver>>,
     runtime: ShardRuntime,
     raft_registry: Option<RaftGroupHandleRegistry>,
     client_write_router: Option<ClientWriteLeaderRouter>,
@@ -335,6 +338,14 @@ impl HttpState {
         self
     }
 
+    pub(crate) fn with_managed_receiver(
+        mut self,
+        receiver: Arc<managed_receiver::ManagedReceiver>,
+    ) -> Self {
+        self.managed_receiver = Some(receiver);
+        self
+    }
+
     pub(crate) fn with_configured_node_id(mut self, node_id: u64) -> Self {
         self.configured_node_id = Some(node_id);
         self
@@ -346,6 +357,7 @@ impl HttpState {
             admin_fence: admin_fence::AdminMutationFence::default(),
             configured_node_id: None,
             managed_projection: None,
+            managed_receiver: None,
             runtime,
             raft_registry: None,
             client_write_router: None,
@@ -370,6 +382,7 @@ impl HttpState {
             admin_fence: admin_fence::AdminMutationFence::default(),
             configured_node_id: None,
             managed_projection: None,
+            managed_receiver: None,
             runtime,
             raft_registry: Some(raft_registry),
             client_write_router: None,
@@ -418,6 +431,7 @@ impl HttpState {
             admin_fence: admin_fence::AdminMutationFence::default(),
             configured_node_id: None,
             managed_projection: None,
+            managed_receiver: None,
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
             node_memory: NodeMemoryMonitor::default(),
@@ -929,12 +943,17 @@ pub fn router_with_http_state(state: HttpState) -> Router {
 /// `server.admin_listen` (loopback by default) — nodes expose no
 /// cluster-mutation endpoints on the client or cluster planes.
 pub fn admin_router(state: HttpState) -> Router {
-    admin_ops_router(state.clone()).merge(
+    let router = admin_ops_router(state.clone()).merge(
         Router::new()
             .route("/__ursula/metrics", get(metrics))
             .route("/__ursula/usage", get(bucket_usage))
-            .with_state(state),
-    )
+            .with_state(state.clone()),
+    );
+    if state.managed_receiver.is_some() {
+        router.merge(managed_receiver::router(state))
+    } else {
+        router
+    }
 }
 
 /// The mutating admin routes without the metrics and usage aliases. The
@@ -1030,6 +1049,7 @@ async fn require_admin_incarnation(
             Method::GET | Method::HEAD | Method::OPTIONS
         )
         && (path.starts_with("/__ursula/raft/")
+            || path.starts_with("/__ursula/maintenance/fence/")
             || (path.starts_with("/__ursula/backup/") && path.ends_with("/import")))
     {
         return (
@@ -1056,6 +1076,14 @@ async fn require_admin_incarnation(
             )
                 .into_response();
         }
+        let managed_guard = if let Some(receiver) = &state.managed_receiver {
+            match receiver.admit_unmanaged().await {
+                Ok(guard) => Some(guard),
+                Err(reason) => return (StatusCode::CONFLICT, reason).into_response(),
+            }
+        } else {
+            None
+        };
         // Lifecycle handlers take the write guard themselves. They remain
         // process-bound and validate the supplied immutable executor token.
         if *request.method() == Method::POST
@@ -1080,6 +1108,7 @@ async fn require_admin_incarnation(
         // Dropping the caller's response future must not cancel an admitted
         // actor/Core mutation and release its guard before its reply arrives.
         return match tokio::spawn(async move {
+            let _managed_guard = managed_guard;
             let response = next.run(request).await;
             guard.complete();
             response

@@ -102,6 +102,15 @@ async fn init_state(
     preset: Option<Preset>,
     start_maintenance_drained: bool,
 ) -> Result<HttpState, Box<dyn std::error::Error>> {
+    init_state_with_assignments(config, preset, start_maintenance_drained, None).await
+}
+
+async fn init_state_with_assignments(
+    config: &ursula_config::UrsulaConfig,
+    preset: Option<Preset>,
+    start_maintenance_drained: bool,
+    managed_groups: Option<BTreeSet<RaftGroupId>>,
+) -> Result<HttpState, Box<dyn std::error::Error>> {
     let raft_peers: Vec<(u64, String)> = config
         .raft
         .peers
@@ -165,9 +174,18 @@ async fn init_state(
         start_maintenance_drained,
     )?;
     let runtime = spawned.runtime;
+    if let (Some(registry), Some(groups)) = (&spawned.raft_registry, &managed_groups) {
+        registry.set_managed_hosting(groups.clone());
+    }
 
     if !raft_peers.is_empty() {
-        if per_group_voters.is_empty() {
+        if let Some(groups) = &managed_groups {
+            // Preparing replicas may not be voters in the cached projection.
+            // The durable local assignment, not that cache, owns restoration.
+            for group in groups {
+                runtime.warm_group(*group).await?;
+            }
+        } else if per_group_voters.is_empty() {
             runtime.warm_all_groups().await?;
         } else {
             for raw_group_id in 0..config.raft.group_count {

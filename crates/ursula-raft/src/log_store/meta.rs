@@ -1414,7 +1414,7 @@ fn compact_records(log: &MetaLog) -> Vec<MetaLogRecord> {
     records
 }
 
-fn replace_journal<T: Serialize + serde::de::DeserializeOwned>(
+pub(super) fn replace_journal<T: Serialize + serde::de::DeserializeOwned>(
     path: &Path,
     records: impl IntoIterator<Item = T>,
 ) -> io::Result<()> {

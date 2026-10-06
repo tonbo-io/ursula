@@ -917,6 +917,7 @@ pub struct RaftGroupHandleRegistry {
     /// leader saw lose their log.
     rejoins: Arc<Mutex<BTreeMap<u32, Arc<GroupRejoin>>>>,
     dynamic_hosted_groups: Arc<Mutex<BTreeSet<RaftGroupId>>>,
+    managed_hosted_groups: Arc<Mutex<Option<BTreeSet<RaftGroupId>>>>,
     leadership_shed: LeadershipShedFlag,
     transport_shutdown: watch::Sender<bool>,
     snapshot_store: Arc<Mutex<SharedSnapshotStore>>,
@@ -933,6 +934,7 @@ impl Default for RaftGroupHandleRegistry {
             read_barriers: Arc::new(Mutex::new(BTreeMap::new())),
             rejoins: Arc::new(Mutex::new(BTreeMap::new())),
             dynamic_hosted_groups: Arc::new(Mutex::new(BTreeSet::new())),
+            managed_hosted_groups: Arc::new(Mutex::new(None)),
             leadership_shed: Arc::new(AtomicU8::new(0)),
             transport_shutdown,
             snapshot_store: Arc::new(Mutex::new(default_snapshot_store())),
@@ -1199,6 +1201,24 @@ impl RaftGroupHandleRegistry {
             .lock()
             .expect("raft dynamic hosted groups mutex")
             .insert(raft_group_id)
+    }
+
+    /// Managed assignment authority overrides static voters and the legacy
+    /// dynamic allowlist. Install before warming; update only after durable
+    /// receiver assignment publication. Existing actor teardown is separate.
+    pub fn set_managed_hosting(&self, groups: BTreeSet<RaftGroupId>) {
+        *self
+            .managed_hosted_groups
+            .lock()
+            .expect("managed hosting mutex") = Some(groups);
+    }
+
+    pub fn managed_group_hosting(&self, group: RaftGroupId) -> Option<bool> {
+        self.managed_hosted_groups
+            .lock()
+            .expect("managed hosting mutex")
+            .as_ref()
+            .map(|groups| groups.contains(&group))
     }
 
     pub fn dynamic_group_hosting_allowed(&self, raft_group_id: RaftGroupId) -> bool {
