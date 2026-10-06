@@ -309,7 +309,10 @@ replace_pod() {
       return 0
     fi
     attempts=$((attempts + 1))
-    [ "${attempts}" -lt 300 ]
+    if [ "${attempts}" -ge 300 ]; then
+      log "timed out waiting for replacement Pod ${pod} after 300 observations"
+      return 1
+    fi
     sleep 1
   done
 }
