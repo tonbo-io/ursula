@@ -3,6 +3,16 @@
 {{- $sts := include "ursula.fullname" . -}}
 {{- $adminPort := (splitList ":" .Values.server.adminListen) | last -}}
 {{- $expectedGroups := default .Values.raft.groupCount .Values.server.gracefulRollout.expectedGroups -}}
+{{- $reserved := .Values.server.gracefulRollout.maintenanceReservation -}}
+{{- $clusterRole := printf "%s-%s" ($name | trunc 54 | trimSuffix "-") (printf "%s/%s" .Release.Namespace $sts | sha256sum | trunc 8) -}}
+{{- if $reserved -}}
+{{- if ne (int .Values.server.replicaCount) 3 -}}
+{{- fail "shared maintenance requires exactly three voters" -}}
+{{- end -}}
+{{- if ne (int $expectedGroups) (int .Values.raft.groupCount) -}}
+{{- fail "shared maintenance expectedGroups must equal raft.groupCount" -}}
+{{- end -}}
+{{- end -}}
 {{/*
 Graceful voter rollout.
 
@@ -73,7 +83,12 @@ rules:
   # than draining one that was already done.
   - apiGroups: [""]
     resources: ["configmaps"]
+{{- if $reserved }}
+    resourceNames: [{{ printf "%s-maintenance" $sts | quote }}]
+    verbs: ["get", "update"]
+{{- else }}
     verbs: ["get", "create", "update", "patch"]
+{{- end }}
   - apiGroups: ["apps"]
     resources: ["statefulsets"]
     verbs: ["get", "list", "watch"]
@@ -107,6 +122,49 @@ subjects:
   - kind: ServiceAccount
     name: {{ $name }}
     namespace: {{ .Release.Namespace }}
+{{- if $reserved }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $clusterRole }}
+  annotations:
+    "helm.sh/hook": post-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
+    "argocd.argoproj.io/hook": Sync
+    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded,HookFailed
+    "argocd.argoproj.io/sync-wave": "-1"
+rules:
+  # Read immutable placement identities; no provider/Node mutation privilege.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    resourceNames: [{{ .Release.Namespace | quote }}]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $clusterRole }}
+  annotations:
+    "helm.sh/hook": post-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
+    "argocd.argoproj.io/hook": Sync
+    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded,HookFailed
+    "argocd.argoproj.io/sync-wave": "-1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $clusterRole }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -125,6 +183,10 @@ metadata:
 data:
   graceful-rollout.sh: |
 {{ .Files.Get "files/graceful-rollout.sh" | indent 4 }}
+{{- if $reserved }}
+  maintenance-rollout.sh: |
+{{ .Files.Get "files/maintenance-rollout.sh" | indent 4 }}
+{{- end }}
 ---
 apiVersion: batch/v1
 kind: Job
@@ -177,7 +239,11 @@ spec:
             - -ec
             - |
               export PATH="/tools:${PATH}"
+{{- if $reserved }}
+              exec /bin/sh /opt/rollout/maintenance-rollout.sh
+{{- else }}
               exec /bin/sh /opt/rollout/graceful-rollout.sh
+{{- end }}
           env:
             - name: NAMESPACE
               valueFrom:
@@ -191,6 +257,9 @@ spec:
             # every verification either passes vacuously or never passes.
             - name: EXPECTED_GROUPS
               value: {{ $expectedGroups | quote }}
+            # Same deterministic core inventory as the server configuration.
+            - name: CORE_COUNT
+              value: {{ .Values.server.coreCount | quote }}
             # Templated rather than derived from `ursulactl --version` at run
             # time. The chart knows the tag it is deploying; the binary only
             # knows what it was built as, and the two are not the same fact.

@@ -267,6 +267,36 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertNotIn("app.kubernetes.io/name:", pod_labels)
         self.assertNotIn("app.kubernetes.io/instance:", pod_labels)
 
+    def test_shared_maintenance_job_rbac_and_inventory(self) -> None:
+        values = (
+            "--namespace", "test", "--set", "s3.bucket=bkt", "--set",
+            "server.updateStrategy=OnDelete", "--set", "server.gracefulRollout.enabled=true",
+            "--set", "server.gracefulRollout.maintenanceReservation=true",
+            "--set", "server.coreCount=2", "--set", "raft.groupCount=256",
+        )
+        rendered = render_chart(*values)
+        self.assertIn("exec /bin/sh /opt/rollout/maintenance-rollout.sh", rendered)
+        self.assertIn('name: CORE_COUNT\n              value: "2"', rendered)
+        self.assertIn('name: EXPECTED_GROUPS\n              value: "256"', rendered)
+        self.assertIn('resourceNames: ["test-ursula-maintenance"]\n    verbs: ["get", "update"]', rendered)
+        cluster_role = re.search(r"kind: ClusterRole\n.*?(?=\n---)", rendered, re.S).group(0)
+        self.assertIn('resources: ["nodes"]\n    verbs: ["get"]', cluster_role)
+        self.assertIn('resourceNames: ["test"]', cluster_role)
+        self.assertNotIn('"delete"', cluster_role)
+        # Only the script ConfigMap is rendered: persistent state is deliberately
+        # not a disposable hook or an ordinary Helm resource that resets data.
+        names = re.findall(r"kind: ConfigMap\nmetadata:\n  name: ([^\n]+)", rendered)
+        self.assertNotIn("test-ursula-maintenance", names)
+        other = render_chart(*values, "--namespace", "other")
+        other_role = re.search(r"kind: ClusterRole\nmetadata:\n  name: ([^\n]+)", other).group(1)
+        this_role = re.search(r"kind: ClusterRole\nmetadata:\n  name: ([^\n]+)", rendered).group(1)
+        self.assertNotEqual(this_role, other_role)
+        for invalid in ("server.replicaCount=2", "server.gracefulRollout.expectedGroups=1"):
+            with self.subTest(invalid=invalid):
+                run = subprocess.run(["helm", "template", "test", "charts/ursula", *values,
+                                      "--set", invalid], text=True, capture_output=True)
+                self.assertNotEqual(run.returncode, 0)
+
     def test_every_deployment_role_uses_the_unified_ursula_binary(self) -> None:
         rendered = render_chart(
             *indexer_values(),

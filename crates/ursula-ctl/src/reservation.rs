@@ -20,6 +20,7 @@ use ursula_proto::admin::ProcessIncarnation;
 use crate::NodeInfo;
 use crate::quorum::QuorumVerification;
 
+mod inventory;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -615,71 +616,13 @@ impl Reservation {
                 if operation.replacement.is_some() {
                     bail!("replacement identity is already pinned; cannot refresh it");
                 }
-                let metadata = pod
-                    .get("metadata")
-                    .context("missing replacement Pod metadata")?;
-                let node_metadata = node
-                    .get("metadata")
-                    .context("missing replacement Node metadata")?;
-                let owned = metadata
-                    .get("ownerReferences")
-                    .and_then(Value::as_array)
-                    .is_some_and(|owners| {
-                        owners.iter().any(|owner| {
-                            owner.get("uid").and_then(Value::as_str)
-                                == Some(self.cell.statefulset_uid.as_str())
-                                && owner.get("kind").and_then(Value::as_str) == Some("StatefulSet")
-                                && owner.get("controller").and_then(Value::as_bool) == Some(true)
-                        })
-                    });
-                if pod.get("kind").and_then(Value::as_str) != Some("Pod")
-                    || node.get("kind").and_then(Value::as_str) != Some("Node")
-                    || !owned
-                    || metadata.get("namespace").and_then(Value::as_str)
-                        != Some(self.cell.namespace.as_str())
-                    || metadata.get("name").and_then(Value::as_str)
-                        != Some(operation.source.pod_name.as_str())
-                    || metadata
-                        .get("deletionTimestamp")
-                        .is_some_and(|timestamp| !timestamp.is_null())
-                    || node_metadata
-                        .get("deletionTimestamp")
-                        .is_some_and(|timestamp| !timestamp.is_null())
-                    || pod
-                        .pointer("/spec/nodeName")
-                        .and_then(Value::as_str)
-                        .is_none()
-                    || pod.pointer("/spec/nodeName") != node_metadata.get("name")
-                {
-                    bail!("replacement Pod/Node does not belong to the selected cell");
-                }
-                let target = process_plan
-                    .iter()
-                    .find(|node| node.id == operation.source.node_id)
-                    .context("missing replacement process")?;
-                let replacement = SourceIdentity {
-                    node_id: operation.source.node_id,
-                    pod_name: operation.source.pod_name.clone(),
-                    pod_uid: metadata
-                        .get("uid")
-                        .and_then(Value::as_str)
-                        .context("missing replacement Pod UID")?
-                        .to_owned(),
-                    node_uid: node_metadata
-                        .get("uid")
-                        .and_then(Value::as_str)
-                        .context("missing replacement Node UID")?
-                        .to_owned(),
-                    provider_instance: node
-                        .pointer("/spec/providerID")
-                        .and_then(Value::as_str)
-                        .context("missing replacement provider identity")?
-                        .to_owned(),
-                    process_incarnation: target
-                        .expected_process_incarnation
-                        .clone()
-                        .context("missing replacement process pin")?,
-                };
+                let replacement = SourceIdentity::capture(
+                    &self.cell,
+                    operation.source.node_id,
+                    &pod,
+                    &node,
+                    &process_plan,
+                )?;
                 if replacement.pod_uid == operation.source.pod_uid
                     || replacement.process_incarnation == operation.source.process_incarnation
                 {

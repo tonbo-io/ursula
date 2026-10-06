@@ -732,7 +732,23 @@ roll_node() {
   log "node ${node_id} verified"
 }
 
+legacy_shared_store_guard() {
+  # Once a reviewed shared reservation exists, a later values/default regression
+  # must not re-enable this independent writer, even when the store is idle.
+  # Bootstrap itself requires no legacy executor still running.
+  if ! shared_store=$(kubectl -n "${NAMESPACE}" get configmap "${STATEFULSET}-maintenance" \
+      --ignore-not-found=true -o name); then
+    log "cannot establish whether shared maintenance is enabled; refusing legacy rollout"
+    return 1
+  fi
+  if [ -n "${shared_store}" ]; then
+    log "persistent maintenance store exists; enable gracefulRollout.maintenanceReservation"
+    return 1
+  fi
+}
+
 main() {
+  legacy_shared_store_guard || return 1
   write_manifest
   wait_for_template
 

@@ -571,3 +571,59 @@ fn oversized_declared_inventory_cannot_allocate_missing_group_evidence() {
             .is_err()
     );
 }
+
+#[test]
+fn captured_api_identity_rejects_misdirected_or_deleting_objects() {
+    let namespace =
+        json!({"kind":"Namespace", "metadata":{"name":"ursula", "uid":"namespace-uid"}});
+    let sts = json!({"kind":"StatefulSet", "metadata":{"namespace":"ursula", "name":"voters", "uid":"statefulset-uid"}, "spec":{"replicas":3}});
+    assert_eq!(
+        CellIdentity::capture(&namespace, &sts, 256, 2).unwrap(),
+        cell()
+    );
+    for (path, value) in [
+        ("/spec/replicas", json!(2)),
+        ("/metadata/namespace", json!("other")),
+        ("/metadata/uid", json!("")),
+    ] {
+        let mut invalid = sts.clone();
+        *invalid.pointer_mut(path).unwrap() = value;
+        assert!(CellIdentity::capture(&namespace, &invalid, 256, 2).is_err());
+    }
+    let active = admitted();
+    let super::ProgressRequest::BindPodReplacement {
+        pod,
+        node,
+        process_plan,
+        ..
+    } = binding(&active)
+    else {
+        unreachable!()
+    };
+    let captured = SourceIdentity::capture(&active.cell, 1, &pod, &node, &process_plan).unwrap();
+    assert_eq!(captured.node_uid, "node-1");
+    assert_eq!(
+        captured.process_incarnation,
+        ProcessIncarnation::from_bits(100)
+    );
+    for case in 0..6 {
+        let mut invalid_pod = pod.clone();
+        let mut invalid_node = node.clone();
+        let mut invalid_plan = process_plan.clone();
+        match case {
+            0 => {
+                invalid_pod["metadata"]["ownerReferences"][0]["uid"] =
+                    json!("recreated-statefulset")
+            }
+            1 => invalid_pod["metadata"]["deletionTimestamp"] = json!("now"),
+            2 => invalid_node["metadata"]["deletionTimestamp"] = json!("now"),
+            3 => invalid_node["metadata"]["name"] = json!("other-host"),
+            4 => invalid_node["spec"]["providerID"] = json!(""),
+            _ => invalid_plan[0].expected_process_incarnation = None,
+        }
+        assert!(
+            SourceIdentity::capture(&active.cell, 1, &invalid_pod, &invalid_node, &invalid_plan)
+                .is_err()
+        );
+    }
+}

@@ -770,9 +770,57 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
         .pin_nodes(&nodes, None, false)
         .await
         .expect("save original process plan");
-    let executor =
-        ursula_proto::admin::MaintenanceFence::new(format!("{:032x}", 1), format!("{:032x}", 2), 1)
-            .unwrap();
+    let now_ms = || {
+        u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
+    };
+    let observation = |started_ms, verification| ursula_ctl::reservation::PrefixObservation {
+        started_ms,
+        completed_ms: now_ms(),
+        verification,
+    };
+    // Real Raft observations must also satisfy the shared reservation policy.
+    // Physical identities below describe this native fixture, not Kubernetes
+    // or provider fencing. ChildGuard waits for the original process to exit.
+    let mut reservation =
+        ursula_ctl::reservation::Reservation::initial(ursula_ctl::reservation::CellIdentity {
+            namespace: "native".into(),
+            namespace_uid: "native-namespace".into(),
+            statefulset: "voters".into(),
+            statefulset_uid: "native-sts".into(),
+            group_count: 6,
+            core_count: 1,
+            voter_ids: [1, 2, 3].into_iter().collect(),
+        })
+        .unwrap()
+        .propose(ursula_ctl::reservation::OwnershipRequest::Reserve {
+            operation_id: format!("{:032x}", 1),
+            executor_id: format!("{:032x}", 2),
+            now_ms: now_ms(),
+            process_plan: nodes.clone(),
+            source: ursula_ctl::reservation::SourceIdentity {
+                node_id: 3,
+                pod_name: "voters-2".into(),
+                pod_uid: "native-original".into(),
+                node_uid: "native-node-3".into(),
+                provider_instance: "native-instance-3".into(),
+                process_incarnation: nodes[2].expected_process_incarnation.clone().unwrap(),
+            },
+        })
+        .unwrap();
+    let executor = reservation.operation().unwrap().fence.clone();
+    let options = ursula_ctl::quorum::QuorumVerificationOptions {
+        group_count: 6,
+        core_count: 1,
+        timeout: Duration::from_secs(15),
+        poll_interval: Duration::from_millis(100),
+        allow_legacy_eligibility: false,
+    };
     for node in &mut nodes {
         node.expected_maintenance_fence = Some(executor.clone());
     }
@@ -789,6 +837,31 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
         )
         .await;
     }
+
+    ursula_ctl::wait_cluster_ready(
+        "reservation admission",
+        &nodes,
+        &ctl,
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+        16,
+    )
+    .await
+    .expect("listener startup alone is not Raft eligibility");
+    let started_ms = now_ms();
+    let admitted = observation(
+        started_ms,
+        ursula_ctl::quorum::verify_quorum(&nodes, &ctl, &options)
+            .await
+            .unwrap(),
+    );
+    reservation = reservation
+        .progress(ursula_ctl::reservation::ProgressRequest::AdmitPodDeletion {
+            fence: executor.clone(),
+            now_ms: now_ms(),
+            observation: admitted,
+        })
+        .expect("live all-active admission accepted by shared policy");
 
     let drain_options = ursula_ctl::DrainOptions {
         drain_timeout: Duration::from_secs(60),
@@ -814,13 +887,29 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
         .await
         .expect("prepare node 3 restart");
 
+    let survivors = ursula_ctl::quorum::verify_surviving_quorum(&nodes, 3, &ctl, &options)
+        .await
+        .expect("prepared source leaves both pinned survivors eligible");
+    assert!(survivors.verification.maintenance_executor_certified);
+    assert!(!survivors.full_redundancy_restored);
+
+    // The chart reuses its Pod-bound tunnel addresses. Preserve the same
+    // native listening configuration too: shared binding permits only a boot
+    // change, never refreshing a target URL alongside its incarnation.
+    let replacement_config = children[2].config_path.clone().unwrap();
+    let replacement_text = std::fs::read_to_string(&replacement_config).unwrap();
     drop(children.pop());
-    let (child, admin_port) = spawn_per_group_memory_node(binary, 3, ports[2], &peers, true);
+    std::fs::write(&replacement_config, replacement_text).unwrap();
+    let mut command = Command::new(binary);
+    command
+        .arg("server")
+        .arg("--config")
+        .arg(&replacement_config)
+        .env("URSULA_START_MAINTENANCE_DRAINED", "true");
+    let mut child = spawn_child(command, format!("replacement-node-3-{}", ports[2]));
+    child.config_path = Some(replacement_config);
     children.push(child);
     let retired_identity = nodes[2].expected_process_incarnation.clone();
-    nodes[2] = ctl_node(3, admin_port, &public(3));
-    nodes[2].expected_process_incarnation = retired_identity.clone();
-    nodes[2].expected_maintenance_fence = Some(executor.clone());
     wait_until_ready(&client, &public(3), &mut children).await;
 
     let stale_clear = ctl
@@ -853,6 +942,20 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
             .iter()
             .all(|node| node.expected_maintenance_fence.as_ref() == Some(&executor))
     );
+    reservation = reservation
+        .progress(
+            ursula_ctl::reservation::ProgressRequest::BindPodReplacement {
+                fence: executor.clone(),
+                process_plan: nodes.clone(),
+                pod: serde_json::json!({"kind":"Pod", "metadata":{"namespace":"native",
+            "name":"voters-2", "uid":"native-replacement", "ownerReferences":[{
+                "kind":"StatefulSet", "uid":"native-sts", "controller":true}]},
+            "spec":{"nodeName":"native-host-3"}}),
+                node: serde_json::json!({"kind":"Node", "metadata":{"name":"native-host-3",
+            "uid":"native-node-3"}, "spec":{"providerID":"native-instance-3"}}),
+            },
+        )
+        .expect("only the irreversibly retired target process may bind");
     for node in &nodes {
         ctl.set_maintenance_fence(node, false)
             .await
@@ -925,13 +1028,7 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
         )
         .await;
     }
-    let options = ursula_ctl::quorum::QuorumVerificationOptions {
-        group_count: 6,
-        core_count: 1,
-        timeout: Duration::from_secs(15),
-        poll_interval: Duration::from_millis(100),
-        allow_legacy_eligibility: false,
-    };
+
     let proof = ursula_ctl::quorum::verify_quorum(&nodes, &ctl, &options)
         .await
         .expect("current process full prefix proof");
@@ -942,11 +1039,27 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
             .await
             .expect("retire executor");
     }
+    let started_ms = now_ms();
     let proof = ursula_ctl::quorum::verify_quorum(&nodes, &ctl, &options)
         .await
         .expect("fresh proof after all executors retired");
     assert!(proof.maintenance_executor_retired_certified);
     assert!(!proof.maintenance_executor_certified);
+    reservation = reservation
+        .progress(
+            ursula_ctl::reservation::ProgressRequest::CompletePodReplacement {
+                fence: executor,
+                now_ms: now_ms(),
+                observation: observation(started_ms, proof),
+            },
+        )
+        .expect("live all-retired prefixes release only the bound replacement");
+    assert!(reservation.operation().is_none());
+    assert_eq!(reservation.generation(), 1);
+    assert_eq!(
+        reservation.completion().unwrap().replacement.pod_uid,
+        "native-replacement"
+    );
     assert!(ctl.set_maintenance_drain(&nodes[2], false).await.is_err());
     drop(children);
 }

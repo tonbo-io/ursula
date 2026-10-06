@@ -40,6 +40,17 @@ enum Command {
     RetireMaintenanceFence(ObserveArgs),
     /// Produce a whole-object reservation CAS proposal without contacting Kubernetes.
     ReservationPropose(ReservationProposeArgs),
+    /// Capture immutable three-voter cell identity from complete API objects.
+    ReservationCell(ReservationCellArgs),
+    /// Capture a selected Pod/Node identity using its pinned process plan.
+    ReservationSource(ReservationSourceArgs),
+    /// Read one validated reservation snapshot without acquiring authority.
+    ReservationRead(ReservationReadArgs),
+    /// Emit an explicit new-cell store for reviewed create-only bootstrap.
+    /// Never use this to recover a missing/deleted store for an existing cell.
+    ReservationBootstrap(ReservationBootstrapArgs),
+    /// Build a typed request from bounded JSON files, without acquiring authority.
+    ReservationRequest(ReservationRequestArgs),
     /// Verify the exact original proposal's API receipt and emit its persistent state.
     /// Ownership alone never grants disruption or release.
     ReservationAcknowledge(ReservationAcknowledgeArgs),
@@ -99,6 +110,119 @@ enum Command {
     /// Restore a verified backup into a fresh, empty cluster with the same
     /// raft group count.
     Restore(BackupCreateArgs),
+}
+
+#[derive(Args, Debug)]
+struct ReservationCellArgs {
+    #[arg(long)]
+    namespace_object: PathBuf,
+    #[arg(long)]
+    statefulset_object: PathBuf,
+    #[arg(long)]
+    group_count: u32,
+    #[arg(long)]
+    core_count: u16,
+}
+
+#[derive(Args, Debug)]
+struct ReservationSourceArgs {
+    #[arg(long)]
+    cell: PathBuf,
+    #[arg(long)]
+    pod_object: PathBuf,
+    #[arg(long)]
+    node_object: PathBuf,
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    node_id: u64,
+    #[arg(long, value_enum, default_value = "source")]
+    field: ReservationSourceField,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum ReservationSourceField {
+    Source,
+    PodUid,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum ReservationField {
+    State,
+    Manifest,
+    Stage,
+    SourceNodeId,
+    SourcePodUid,
+    ReplacementPodUid,
+    OperationId,
+    Fence,
+}
+
+#[derive(Args, Debug)]
+struct ReservationReadArgs {
+    #[arg(long)]
+    cell: PathBuf,
+    #[arg(long)]
+    snapshot: PathBuf,
+    #[arg(long, value_enum, default_value = "state")]
+    field: ReservationField,
+    /// Project the two saved survivors only; valid exclusively for manifest.
+    #[arg(long)]
+    exclude_source: bool,
+}
+
+#[derive(Args, Debug)]
+struct ReservationBootstrapArgs {
+    #[arg(long)]
+    cell: PathBuf,
+    #[arg(long, required = true)]
+    confirm_new_cell: bool,
+}
+
+#[derive(Args, Debug)]
+struct ReservationRequestArgs {
+    #[command(subcommand)]
+    action: ReservationRequestAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum ReservationRequestAction {
+    Reserve {
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        executor_id: String,
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+    },
+    Takeover {
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        executor_id: String,
+    },
+    AdmitPodDeletion(ReservationObservationArgs),
+    CompletePodReplacement(ReservationObservationArgs),
+    BindPodReplacement {
+        #[arg(long)]
+        fence: PathBuf,
+        #[arg(long)]
+        pod_object: PathBuf,
+        #[arg(long)]
+        node_object: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+    },
+}
+
+#[derive(Args, Debug)]
+struct ReservationObservationArgs {
+    #[arg(long)]
+    fence: PathBuf,
+    #[arg(long)]
+    observation: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -364,6 +488,104 @@ async fn main() -> Result<()> {
             run_maintenance_fence_subcommand(args, false).await
         }
         Command::RetireMaintenanceFence(args) => run_maintenance_fence_subcommand(args, true).await,
+        Command::ReservationCell(args) => {
+            let namespace = read_reservation_json(&args.namespace_object)?;
+            let statefulset = read_reservation_json(&args.statefulset_object)?;
+            let cell = ursula_ctl::reservation::CellIdentity::capture(
+                &namespace,
+                &statefulset,
+                args.group_count,
+                args.core_count,
+            )?;
+            println!("{}", serde_json::to_string(&cell)?);
+            Ok(())
+        }
+        Command::ReservationSource(args) => {
+            let cell = read_reservation_json(&args.cell)?;
+            let pod = read_reservation_json(&args.pod_object)?;
+            let node = read_reservation_json(&args.node_object)?;
+            let plan = load_nodes(&args.config).await?;
+            let source = ursula_ctl::reservation::SourceIdentity::capture(
+                &cell,
+                args.node_id,
+                &pod,
+                &node,
+                &plan,
+            )?;
+            match args.field {
+                ReservationSourceField::Source => println!("{}", serde_json::to_string(&source)?),
+                ReservationSourceField::PodUid => println!("{}", source.pod_uid),
+            }
+            Ok(())
+        }
+        Command::ReservationRead(args) => {
+            if args.exclude_source && !matches!(args.field, ReservationField::Manifest) {
+                bail!("exclude-source is only valid for the manifest projection");
+            }
+            let cell = read_reservation_json(&args.cell)?;
+            let document = read_reservation_json(&args.snapshot)?;
+            let snapshot = ursula_ctl::reservation::ConfigMapSnapshot::parse(document, &cell)?;
+            let state = snapshot.state();
+            if matches!(args.field, ReservationField::State) {
+                println!("{}", serde_json::to_string(state)?);
+                return Ok(());
+            }
+            if matches!(args.field, ReservationField::Stage) {
+                let stage = match state.operation() {
+                    None => "idle",
+                    Some(operation) if operation.replacement.is_some() => "replacement-bound",
+                    Some(operation) if operation.admission.is_some() => "deletion-admitted",
+                    Some(_) => "reserved",
+                };
+                println!("{stage}");
+                return Ok(());
+            }
+            let operation = state.operation().context("no active source reservation")?;
+            match args.field {
+                ReservationField::Manifest => {
+                    let nodes = operation
+                        .process_plan
+                        .iter()
+                        .filter(|node| !args.exclude_source || node.id != operation.source.node_id)
+                        .collect::<Vec<_>>();
+                    println!("{}", serde_json::json!({"nodes": nodes}))
+                }
+                ReservationField::SourceNodeId => println!("{}", operation.source.node_id),
+                ReservationField::SourcePodUid => println!("{}", operation.source.pod_uid),
+                ReservationField::ReplacementPodUid => println!(
+                    "{}",
+                    operation
+                        .replacement
+                        .as_ref()
+                        .context("replacement not bound")?
+                        .pod_uid
+                ),
+                ReservationField::OperationId => println!("{}", operation.fence.reservation_id()),
+                ReservationField::Fence => println!("{}", serde_json::to_string(&operation.fence)?),
+                ReservationField::State | ReservationField::Stage => {
+                    bail!("unexpected reservation projection")
+                }
+            }
+            Ok(())
+        }
+        Command::ReservationBootstrap(args) => {
+            if !args.confirm_new_cell {
+                bail!("new-cell bootstrap requires explicit confirmation");
+            }
+            let cell: ursula_ctl::reservation::CellIdentity = read_reservation_json(&args.cell)?;
+            let state = ursula_ctl::reservation::Reservation::initial(cell.clone())?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "apiVersion": "v1", "kind": "ConfigMap",
+                    "metadata": {"namespace": cell.namespace,
+                        "name": format!("{}-maintenance", cell.statefulset)},
+                    "data": {"reservation": serde_json::to_string(&state)?},
+                })
+            );
+            Ok(())
+        }
+        Command::ReservationRequest(args) => run_reservation_request(args).await,
         Command::ReservationPropose(args) => {
             let (_, proposal) = reservation_proposal(&args)?;
             println!("{}", serde_json::to_string(proposal.document())?);
@@ -520,6 +742,62 @@ fn read_reservation_json<T: serde::de::DeserializeOwned>(path: &std::path::Path)
     }
     serde_json::from_slice(&bytes)
         .with_context(|| format!("parse reservation JSON {}", path.display()))
+}
+
+async fn run_reservation_request(args: ReservationRequestArgs) -> Result<()> {
+    use ursula_ctl::reservation::OwnershipRequest;
+    use ursula_ctl::reservation::ProgressRequest;
+    use ursula_ctl::reservation::ReservationRequest;
+    let now_ms = wall_clock_unix_ms();
+    let request = match args.action {
+        ReservationRequestAction::Reserve {
+            operation_id,
+            executor_id,
+            source,
+            config,
+        } => ReservationRequest::Ownership(OwnershipRequest::Reserve {
+            operation_id,
+            executor_id,
+            source: read_reservation_json(&source)?,
+            process_plan: load_nodes(&config).await?,
+            now_ms,
+        }),
+        ReservationRequestAction::Takeover {
+            operation_id,
+            executor_id,
+        } => ReservationRequest::Ownership(OwnershipRequest::Takeover {
+            operation_id,
+            executor_id,
+            now_ms,
+        }),
+        ReservationRequestAction::AdmitPodDeletion(args) => {
+            ReservationRequest::Progress(ProgressRequest::AdmitPodDeletion {
+                fence: read_reservation_json(&args.fence)?,
+                now_ms,
+                observation: read_reservation_json(&args.observation)?,
+            })
+        }
+        ReservationRequestAction::CompletePodReplacement(args) => {
+            ReservationRequest::Progress(ProgressRequest::CompletePodReplacement {
+                fence: read_reservation_json(&args.fence)?,
+                now_ms,
+                observation: read_reservation_json(&args.observation)?,
+            })
+        }
+        ReservationRequestAction::BindPodReplacement {
+            fence,
+            pod_object,
+            node_object,
+            config,
+        } => ReservationRequest::Progress(ProgressRequest::BindPodReplacement {
+            fence: read_reservation_json(&fence)?,
+            pod: read_reservation_json(&pod_object)?,
+            node: read_reservation_json(&node_object)?,
+            process_plan: load_nodes(&config).await?,
+        }),
+    };
+    println!("{}", serde_json::to_string(&request)?);
+    Ok(())
 }
 
 fn reservation_proposal(

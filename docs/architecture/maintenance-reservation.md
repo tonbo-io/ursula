@@ -3,8 +3,9 @@
 The `ursula-ctl::reservation` policy and the offline `reservation-propose` /
 `reservation-acknowledge` commands provide a common, fail-closed state machine
 for **planned, UID-bound Pod replacement**. They perform no Kubernetes writes,
-provider calls or Raft mutations. They are not yet wired into the chart or Cloud
-workflow and do not make those existing consumers certified.
+provider calls or Raft mutations. The opt-in chart consumer described below uses
+this policy for planned Pod rollouts. Managed-node writers and abrupt host recovery
+are not yet integrated, and serving cells are not yet qualified.
 
 ## Store and ownership
 
@@ -97,12 +98,64 @@ The acknowledgement output includes the complete reservation and its fixed node
 plan when active. `disruption_authorized` and `physical_hosts_fenced` remain false:
 the command validates a persisted transition, not the subsequent physical action.
 
-## Outstanding consumer and host work
+## Chart consumer and explicit bootstrap
 
-The chart's existing rollout state still uses unconditional apply and is explicitly
-uncertified. Both it and Cloud must use the common reservation before their
-writers can share one exclusion boundary. Legacy voters without executor admission
-need a separate, explicitly uncertified migration before strong takeover is used.
+Set `server.updateStrategy=OnDelete`, `server.gracefulRollout.enabled=true` and
+`server.gracefulRollout.maintenanceReservation=true` after all three voters
+support executor admission. This selects `files/maintenance-rollout.sh` instead
+of the legacy adapter. `expectedGroups` must match `raft.groupCount`, and
+`server.coreCount` supplies the same core inventory as the generated server
+configuration. The Job has read-only Node/namespace access for immutable identity
+capture (`Node.spec.providerID` must be present), and get/update access to its
+exact reservation ConfigMap; it cannot
+create/reset that store or mutate Node objects.
+
+Create the persistent store once as a separate, reviewed new-cell bootstrap:
+
+```sh
+kubectl get namespace "$namespace" -o json > namespace.json
+kubectl -n "$namespace" get statefulset "$statefulset" -o json > statefulset.json
+ursulactl reservation-cell --namespace-object namespace.json \
+  --statefulset-object statefulset.json --group-count 256 --core-count 2 > cell.json
+ursulactl reservation-bootstrap --cell cell.json --confirm-new-cell > initial.json
+kubectl create -f initial.json
+```
+
+Use the actual cell group/core counts. The generated document has no UID,
+resourceVersion, owner or hook; create obtains the platform identities. An
+existing store makes create fail. Never run this procedure to recover a deleted
+reservation for an existing cell: it discards the persisted generation and any
+unfinished operation. Ordinary hook execution has no bootstrap branch.
+
+The consumer submits whole-object replace and validates the returned API receipt
+before activating process tokens. It uses all-active fresh prefix evidence after waiting for fixed-plan Raft eligibility before
+recording deletion admission, a UID-bound normal Pod delete, target-only process
+binding, catch-up, and all-active then all-retired fresh evidence before completion.
+An already-staged image alone cannot pass a no-op rollout without complete group
+health. No legacy identity/eligibility allowance is used in the reserved path.
+
+A failed or cancelled hook stops its tunnels and leaves the reservation intact.
+A new executor takes over the same operation at a higher generation. After an
+accepted but ambiguously observed delete, it resumes that original target and
+retains both survivor boots and the admission prefix floor. Binding an already
+retired source is observation only: repair validates the fixed surviving pair
+before membership changes, without demanding a complete three-voter membership
+during the selected target's remove/learner/promote interval. Once the replacement
+is bound, another container restart or Pod UID change refuses advancement. Partial
+token retirement is reconciled by a higher-generation takeover before release.
+Another source cannot be reserved before completion preserves a full-group receipt.
+
+## Outstanding host work
+
+`maintenanceReservation=false` retains the existing unconditional-apply adapter
+only for explicitly uncertified legacy migration. Legacy voters without executor
+admission need this controlled migration before strong takeover is enabled. Once
+the persistent store exists, the legacy Job refuses to run even if a later values
+change disables the reserved path; a failed store GET also fails closed. Bootstrap
+requires that every legacy executor has already stopped.
+Both planned rollouts and managed-node writers must eventually use the common
+reservation before they can share one exclusion boundary. External uncoordinated
+force deletion or Node/provider mutation is not qualified by this Pod-only path.
 
 Abrupt host recovery requires irreversible termination of the exact old provider
 instance before force-removing Kubernetes identities. EKS managed-node updates
@@ -120,5 +173,12 @@ recreated/ephemeral stores, fixed-source takeover, stale/future and incomplete
 prefixes, same-UID refusal, target-only rebinding, retired-token completion, prefix
 nonregression and retained generation. An actual `ursulactl` subprocess verifies
 proposal/receipt separation and refusal to adopt another committed state. These
-are not live Kubernetes CAS, chart integration, host-fencing or production RTO
-evidence.
+are not live Kubernetes CAS, host-fencing or production RTO evidence. The
+chart shell/native CLI sequencing suite uses atomic synthetic platform transport
+and covers concurrent actual consumers, missing/conflicting stores, incomplete
+proofs, serial source replacement, ambiguous deletion, fixed replacement boots,
+partial retirement takeover, SIGTERM cancellation and no-op health checks. Raft proofs in that suite
+are synthetic. A separate native three-node restart feeds live all-active and
+all-retired prefix observations through the policy and verifies six acknowledged
+payloads; its physical metadata is a native fixture, not a provider receipt.
+Real Kubernetes consumer and production-scale fault qualification remain required.
