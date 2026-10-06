@@ -500,8 +500,8 @@ in legacy single-listener mode through the merged router).
 Separate-process tests cover durable meta3/meta5 and mixed data RF3/RF5, metadata
 snapshot/purge and full restart, permitted meta-voter loss including its leader,
 new writes and acknowledged reads, and public-origin redirects from non-hosting
-nodes. Startup still needs meta quorum: durable local projection recovery is
-next. Refresh does not yet alter static runtime/background inventories or
+nodes. At that increment startup required meta quorum; durable local projection
+recovery is recorded below. Refresh does not yet alter runtime/background inventories or
 prepare/release groups. Those consumers and receiving-process fences must be
 integrated before managed migrations are exposed.
 
@@ -589,3 +589,67 @@ Tests cover pure RF3/RF5 replacement and RF cycles, plus actual three-replica
 meta consensus, compaction, a later error log and full restart/takeover. Those
 migration tests use synthetic data/receiver certificates; actual data migration
 and receiving-process fence fault coverage remain M2 acceptance work.
+
+
+### Implementation checkpoint: receiving-process admission and assignments
+
+Commit `064a1af` adds an identity-bound node-local receiver checkpoint at
+`<meta_journal_path>.receiver`, with its own immutable `.identity` binding and
+exclusive filesystem lock. One complete checksummed record, bounded to 16 MiB,
+is fsynced and atomically replaced before publishing memory state. Revision CAS,
+monotonic generations/epochs and phase checks reject rollback or reopening a
+retired generation. Missing, corrupt, torn or foreign history fails closed;
+publication I/O failure poisons the store until recovery.
+
+Managed admin listeners expose receiver status, activation and retirement at
+`/__ursula/control/receiver`, `/activate` and `/retire`. Lifecycle requests bind
+the observed HTTP process incarnation and the full meta executor token. Each
+activation requires fresh independent meta-quorum authorization, excludes
+unrelated admin mutations, persists `Activating`, confirms previously submitted
+local admin queue work, rereads fresh authority and persists `Active`. Detached
+lifecycle tasks survive cancellation of the HTTP response future. Replacement
+processes need a newly allocated meta generation; the previous process's token
+cannot authorize them. A cached projection never substitutes for fresh control
+quorum, including an otherwise idempotent activation retry.
+
+Receiver retirement requires published placement, complete removed-replica
+cleanup metadata and the current participant incarnation. A removed receiver
+also requires its own durable `Retired` assignment at the matching intent,
+generation and placement epoch. Retirement persists `Retiring` before its queue
+barrier and `Retired` afterward. The same generation cannot reopen. Raw Raft
+mutations, backup imports and external maintenance-fence lifecycle mutations
+remain closed in managed mode; other mutating administration holds the receiver
+read gate through detached completion. Pending managed submissions and uncertain
+legacy admin work prevent admission/retirement from claiming a drained barrier.
+
+The queue observation confirms command processing, not an applied/committed Raft
+prefix or physical cleanup. The pending-submission record is a storage/admission
+foundation; managed membership submission and reconciliation are not exposed yet.
+Before enabling them, persist each submission, reconcile actual Raft membership
+and applied state after lost replies/restarts, and produce physical receipts.
+
+Initial adoption seeds settled local assignments once. Thereafter explicit local
+assignments override cached voters and the legacy dynamic allowlist before warmup
+or lazy creation. `Preparing` and `Hosted` may restore; absent, `Retiring` and
+`Retired` entries cannot create an actor. Explicit assignments can restore a
+nonvoter engine without initializing membership. Tombstones cannot be deleted;
+reuse requires a new prepare intent/generation. Actual prepare/release handlers,
+live actor/background teardown, snapshot-reference retirement and per-core WAL
+reclamation remain required. The tests construct assignments; they do not claim
+that the current server has physically migrated or released a replica.
+
+Validation includes three store tests (with a separately invoked ignored child
+entry point), independent OS-process exit/reopen at active/pending/retired
+checkpoints, identity/history corruption and publication failure, and a real
+three-voter meta TCP/receiver HTTP test. The HTTP test reproduces cancelled
+activation, old process/generation rejection, cleanup/tombstone retirement gates,
+retired-generation rejection and meta-quorum loss. Data membership/cleanup
+receipts are synthetic, and HTTP process replacement uses a new in-process
+`HttpState`; receiver binary-restart migration tests remain pending. Runtime tests
+prove stale voters/allowlists cannot recreate a retired engine and an explicitly
+assigned nonvoter restores without self-initialization. Workspace lib/bin tests
+passed (936 passed, 2 ignored), alongside doc tests, Clippy, format, seven DST
+audits, madsim Raft check and the existing smoke corpus. Static follower forwarding
+and the existing mixed-RF/meta3/meta5 adoption/restart CLI fixture passed (4.74s
+and 29.17s). Existing smoke remains compatibility coverage, not migration-boundary
+DST acceptance.

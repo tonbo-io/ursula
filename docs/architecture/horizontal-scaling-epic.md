@@ -59,7 +59,7 @@ blocked implementation milestone.
 | HS-101 | Persist and restore meta vote, log, committed/applied state and snapshots; recover correctly after compaction and crash/restart without resurrecting discarded intent | M0 | Complete: commit `b7352ea` |
 | HS-102 | Implement default/per-group RF=3/5 and one-domain-loss policy; infer/validate existing placements on adoption; reject invalid policies and bootstrap drift | M0 | Complete: commit `5c7e413` (deterministic policy/adoption layer) |
 | HS-103 | Concrete multi-node meta transport, independent meta voters, one-time bootstrap, cluster identity and trusted client/cluster/admin node directory | HS-101, HS-102 | Complete: commit `73f6970` (coordinated static-to-managed adoption) |
-| HS-104 | Ordered placement/policy projections with full-snapshot resync; data/node startup restores assignments without reinitializing from stale TOML | HS-103 | In progress: commits `d591c26`, `73f6970`, `a5e6740` (ordered transport, settled assignment consumers and durable local recovery) |
+| HS-104 | Ordered placement/policy projections with full-snapshot resync; data/node startup restores assignments without reinitializing from stale TOML | HS-103 | In progress: commits `d591c26`, `73f6970`, `a5e6740`, `064a1af` (ordered transport, durable projection/assignment recovery and hosting authority) |
 
 M1 acceptance includes multi-node meta leader turnover and a durable full
 restart after snapshot/log compaction. Test RF=3/quorum=2 and RF=5/quorum=3,
@@ -79,9 +79,9 @@ already accepts the meta type config.
 | Story | Deliverable and exit criteria | Dependencies | Status |
 | --- | --- | --- | --- |
 | HS-201 | Intent-bound state transitions, operation idempotency, epoch CAS, source/target policy and membership-step evidence; no successful finish without verified placement | M1 | In progress: commit `6530772` (replicated metadata protocol; physical executor integration pending) |
-| HS-202 | Durable dynamic group prepare/release on the owning core; joining replicas never initialize themselves; revoked replicas cannot be recreated by traffic | HS-104, HS-201 | Planned |
+| HS-202 | Durable dynamic group prepare/release on the owning core; joining replicas never initialize themselves; revoked replicas cannot be recreated by traffic | HS-104, HS-201 | In progress: commit `064a1af` (assignment/tombstone storage and startup authority; physical prepare/release pending) |
 | HS-203 | Resumable learner catch-up, fixed-prefix applied verification, joint-membership reconciliation, leader handoff and final membership verification | HS-201, HS-202 | Planned |
-| HS-204 | Durably allocated executor generations and process-incarnation fencing, receiving-process barriers and exclusion with maintenance; delayed old/raw requests cannot bypass authority | HS-201; required before managed mutations are exposed | In progress: commit `6530772` (durable generation/receipt model; receiving-process admission pending) |
+| HS-204 | Durably allocated executor generations and process-incarnation fencing, receiving-process barriers and exclusion with maintenance; delayed old/raw requests cannot bypass authority | HS-201; required before managed mutations are exposed | In progress: commits `6530772`, `064a1af` (durable generations and receiver lifecycle admission; managed submission/reconciliation and full maintenance integration pending) |
 | HS-205 | Dynamic node/gateway routing, per-group readiness/quorum inventory, reference protection, actor/background-work retirement and safe per-core journal reclamation | HS-202, HS-203, HS-204 | Planned |
 | HS-206 | Supported operation API and CLI submit/status/wait/resume with admin authority and error semantics; real-process E2E plus DST at every migration boundary | HS-201 through HS-205 | Planned |
 
@@ -178,44 +178,48 @@ unevacuated machine. Physical provisioning remains outside the Raft controller.
 | 2026-10-06 | HS-201/HS-204 | Eight control tests cover RF3/RF5 replacement, explicit 3→5→3 policy publication, replay/conflicting keys, stale source/epoch/revision/process evidence, incomplete/joint/unapplied target proof, generation takeover before/after publication, cleanup gates, cancellation after lost activation replies, serialization, invalid recovery records and exhausted counters | Pure tests use synthetic certificates/receipts; they prove deterministic enforcement, not actual membership movement or physical reclamation |
 | 2026-10-06 | HS-201/HS-204 | Extended three-node durable meta TCP test persists an intent and receiver-activation authorization, snapshots/purges every replica, appends a lost-activation error afterward, fully restarts and verifies exact recovered control state, same-key replay, higher replacement generation and refusal of the old token without unlocking | Real meta consensus/storage/restart; synthetic data/receiver evidence. The existing combined server process fixture remains a fixed-layout adoption/recovery regression |
 | 2026-10-06 | M1/M2 | Workspace lib/bin tests: 930 passed, 1 ignored; workspace doc tests, workspace Clippy with `-D warnings`, format, seven tracked-source DST audits, madsim Raft check and existing smoke corpus passed. Meta protocol v2 rejects v1 peers before decode; after that change all five meta transport tests passed (4.56s), managed CLI regression passed (32.17s), final Clippy/audits/format and madsim Raft check passed | New managed state semantics are separated from v1 peers. Existing smoke is compatibility evidence; migration-boundary DST and actual group/RF migration E2E remain pending |
+| 2026-10-06 | HS-204 / HS-202 / HS-104 | Commit `064a1af` adds bound checksummed receiver checkpoints, revision CAS, persistent generation/process fences and replica assignment/tombstone FSM. Managed HTTP activation/retirement require fresh meta quorum and current process/token, survive response cancellation, exclude unrelated admin mutation and reject pending/uncertain work. Removed receivers need their own matching retired assignment before fence retirement; same-generation reopening is rejected | Receiver lifecycle admission implemented; queue processing is not a committed-prefix certificate. Actual membership submission and pending-work reconciliation remain pending |
+| 2026-10-06 | HS-202 / HS-104 | Managed startup seeds settled assignments once, installs local hosting authority before warmup, restores explicitly assigned nonvoters without membership initialization, and rejects absent/retiring/retired assignments despite stale voters or the legacy dynamic allowlist | Reproduced storage/runtime foundation; no physical prepare/release, actor teardown or WAL reclamation claim |
+| 2026-10-06 | HS-204 | Store tests pass across independent OS-process exit/reopen at active/pending/retired checkpoints, missing/corrupt/foreign history, stale CAS and publication I/O failure. Actual meta3 TCP/receiver HTTP test covers cancellation, replaced HTTP process identity, old generations, cleanup/tombstone gates, retirement and quorum loss | Three store tests plus one HTTP test; child entry point is ignored in the default runner and invoked explicitly. Data/other-receiver cleanup certificates are synthetic; HTTP replacement is a new in-process state |
+| 2026-10-06 | M1/M2 | Workspace lib/bin tests: 936 passed, 2 ignored; workspace doc tests, Clippy with `-D warnings`, format, all seven DST audits, madsim Raft check and existing smoke passed. Static follower forwarding passed (4.74s); managed mixed-RF/meta3/meta5 CLI adoption/restart regression passed (29.17s) | Final increment checks passed. Existing smoke/CLI prove compatibility and fixed-layout recovery; migration-boundary DST, receiver binary-restart migration E2E and scale acceptance remain pending |
 
 ## Current execution checkpoint
 
-Current implementation story: **HS-204**, receiving-process admission and durable
-fence/assignment ledger, followed by **HS-202/HS-104** dynamic prepare/release and
-intent-aware startup. Commit `6530772` supplies the HS-201 replicated intent,
-epoch/revision and evidence protocol plus HS-204 durable executor generations.
-Physical data/receiver evidence is not yet produced or consumed by a server
-migration executor. Durable local projection recovery is in `a5e6740`. HS-103 is implemented in `73f6970`: opt-in `[control]`
-configuration, independently selected meta3/meta5 voters, bound private RPCs,
-cohort-checked one-time meta bootstrap and adoption using actual data quorum
-certificates. Raw data-membership and backup-import mutations are rejected
-before adoption and after startup. Established startup derives group voters
-and trusted cluster origins from complete metadata, with both data membership
-initialization flags disabled. Public redirects use the metadata client origin.
+Current implementation stories: **HS-202/HS-104** explicit prepare/release and
+intent-aware startup, alongside **HS-204/HS-203** managed submission and actual
+membership reconciliation. Commit `064a1af` supplies durable receiving-process
+lifecycle admission, monotonic local assignments and retirement tombstones;
+`6530772` supplies replicated intent, epoch/revision, executor generations and
+evidence ordering. The supported server migration executor does not yet produce
+physical data/cleanup receipts. Receiver activation/retirement is available on
+the managed admin plane; raw membership/recovery, backup-import and external
+maintenance-fence mutations remain closed.
 
-The real-process M1 fixture starts a persistent static cluster with two mixed
-RF3/RF5 groups, coordinates shutdown and managed adoption, confirms meta
-snapshot/purge on every meta voter, fully restarts without reinitialization,
-and stops the current meta leader (plus a second voter for meta5). Fresh meta
-reads, new data writes, acknowledged-payload reads and non-hosting public
-redirects succeed. This proves the coordinated adoption route; a fresh managed
-data cluster initializer and a rolling adoption protocol are not implemented.
+Established startup restores settled data from the bound projection checkpoint
+(`a5e6740`) even without meta quorum. Local assignments now override stale cached
+voters and legacy hosting before actor construction; explicitly assigned
+nonvoters restore without membership initialization. Dynamic prepare/release
+handlers, live inventory/maintenance/snapshot consumers, actor/background teardown
+and safe per-core journal reclamation remain required. Queue barriers alone
+cannot resolve possibly committed membership changes. Next persist each managed
+submission, reconcile actual data Raft membership/applied state and lost replies,
+then wire those receipts to the resumable executor.
 
-M1 remains incomplete: learner/intent-aware hosting restoration and live
-runtime/maintenance/snapshot inventory consumers remain HS-104. Established
-settled data groups now recover from the identity-bound projection checkpoint
-without meta quorum; first adoption still requires fresh meta/data quorums.
-The current refresh updates the durable ordered cursor and public routing;
-it does not create or retire actors. The HS-201 metadata prerequisites now
-exist; next persist and enforce receiving-process authority, drain/reconcile
-previous submissions, and exclude maintenance before any managed mutation.
-The local assignment/retirement ledger must override stale cached projections
-and prevent traffic/restart from recreating revoked actors. These M2 foundations
-start while M1 stays open; milestone completion still requires full acceptance.
-No actual data-group migration, CI,
-deployment or scaling-performance acceptance is claimed. M2 receiver fences
-must precede exposing managed mutations. No external blocker is recorded.
+HS-103 remains implemented in `73f6970`: opt-in configuration, independent meta3/
+meta5 voters, cohort-checked one-time bootstrap and coordinated static-to-managed
+adoption using actual data quorum certificates. The real-process fixture uses
+mixed RF3/RF5 disk groups, confirms meta snapshot/purge, fully restarts, survives
+meta-voter/leader loss and verifies reads/new writes/public-origin redirects. It
+also restarts a data quorum with only a meta minority using the local checkpoint.
+A fresh managed data initializer and rolling adoption are not implemented.
+
+M1 stays open for full intent-aware consumers; M2 stays open for actual RF3/RF5
+replica moves, explicit 3→5→3 and boundary fault acceptance. M3 manual scaling/
+batches and M4 autopilot remain in the active goal's scope. The new receiver HTTP
+test uses actual meta consensus but synthetic data/cleanup receipts and an
+in-process HTTP-state replacement; it is not a physical migration or receiver
+binary-restart E2E. No actual group migration, CI, deployment or scaling-performance
+acceptance is claimed. No external blocker is recorded.
 
 For each implementation increment, update the relevant story and this
 checkpoint with the exact commit/PR, commands or CI run, reproduced results,
