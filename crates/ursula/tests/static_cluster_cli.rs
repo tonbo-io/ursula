@@ -766,6 +766,10 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
     }
 
     let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client");
+    nodes = ctl
+        .pin_nodes(&nodes, None, false)
+        .await
+        .expect("save original process plan");
     let drain_options = ursula_ctl::DrainOptions {
         drain_timeout: Duration::from_secs(60),
         ready_timeout: Duration::from_secs(60),
@@ -793,8 +797,36 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
     drop(children.pop());
     let (child, admin_port) = spawn_per_group_memory_node(binary, 3, ports[2], &peers, true);
     children.push(child);
+    let retired_identity = nodes[2].expected_process_incarnation.clone();
     nodes[2] = ctl_node(3, admin_port, &public(3));
+    nodes[2].expected_process_incarnation = retired_identity.clone();
     wait_until_ready(&client, &public(3), &mut children).await;
+
+    let stale_clear = ctl
+        .set_maintenance_drain(&nodes[2], false)
+        .await
+        .expect_err("old process must not clear replacement drain");
+    assert!(stale_clear.to_string().contains("412"), "{stale_clear}");
+    let replacement_shed: serde_json::Value = client
+        .get(format!("{}/__ursula/leadership-shed", public(3)))
+        .send()
+        .await
+        .expect("replacement policy")
+        .json()
+        .await
+        .expect("policy JSON");
+    assert_eq!(replacement_shed["state"], "maintenance-drain");
+    assert!(
+        ctl.fetch_node(&nodes[2]).await.is_err(),
+        "old operation must not refresh its identity"
+    );
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5))
+        .expect("new admitted repair operation");
+    nodes = ctl
+        .pin_nodes(&nodes, Some(3), false)
+        .await
+        .expect("bind only admitted replacement");
+    assert_ne!(nodes[2].expected_process_incarnation, retired_identity);
 
     // Node 3 heals by itself; it is never an empty voter on the way.
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
