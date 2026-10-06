@@ -73,6 +73,14 @@ source and target policy. The server's `[control]` configuration, actual
 membership discovery, multi-node transport and supported migration executor
 are still subsequent stories; editing server TOML does not yet enable scaling.
 
+Transport checkpoint (`a5af881`): meta append/vote/snapshot/leader-transfer
+RPCs now use a separate service with cluster-token, recipient and protocol
+checks. Real TCP tests cover three/five durable meta voters, leader handoff,
+one/two unavailable voters, snapshot installation into an empty learner, and
+full replica shutdown/reopen. Persisted identity, production bootstrap and
+server routing remain in HS-103; these tests do not establish a supported
+data-group migration or CLI scaling workflow.
+
 Persist the default and each group's resolved policy in meta Raft. Configuration
 seeds policy only on initial bootstrap; editing TOML after bootstrap must not
 silently change live memberships. API/CLI policy updates are explicit, durable

@@ -149,20 +149,26 @@ unevacuated machine. Physical provisioning remains outside the Raft controller.
 | 2026-10-06 | HS-102 | Commit `5c7e413` adds numeric RF3/RF5 types, default/per-group one-domain-loss policy, atomic validated adoption of complete settled placements, immutable bootstrap configuration and persisted resolved/source/target policies. Ordinary moves preserve RF; explicit policy intents publish policy together with matching voters. Draining nodes continue serving retained groups and cannot receive new assignments | Deterministic control layer implemented; no supported data-membership mutation API exposed yet |
 | 2026-10-06 | HS-102 | 12 new policy tests cover JSON/MessagePack/TOML RF validation, mixed RF, all 27 RF3 and 243 RF5 three-domain assignments, missing labels/nodes, insufficient voters, RF drift, rejected-operation atomicity, node identity/domain immutability, legacy snapshot compatibility, and explicit 3→5→3 policy publication | Reproduced control transitions; actual data-group Raft membership verification/execution remains M2 |
 | 2026-10-06 | HS-102 | Extended real meta process-exit recovery to four checkpoints (legacy/managed, snapshot/purged prefix plus later logs), preserving mixed policies and source/target RF. Workspace lib/bin tests: 900 passed, 1 ignored; workspace doc tests, format, workspace Clippy, all seven DST audits and madsim smoke corpus passed | Local checks passed. Converted the crash child to the standard Tokio test entrypoint after the tracked-source DST scan flagged manual runtime construction; final audit includes staged new files |
+| 2026-10-06 | HS-103 | Commit `a5af881` adds a separate `MetaRaftInternal` service and concrete network factory for append, vote, full snapshot and leader transfer. Validate protocol version, cluster token and recipient before decoding; cap messages at 16 MiB, propagate deadlines/cancellation and rebuild failed peer channels | Transport component implemented; persisted identity/bootstrap/configuration/server routing are still pending |
+| 2026-10-06 | HS-103 | Two transport tests reject wrong cluster/node/version on all four RPCs and exercise three/five meta voters with mixed RF3/RF5 control policies, explicit leader transfer, one/two stopped voters, successful majority writes, a new learner receiving the purged-prefix snapshot, and a complete shutdown/reopen without membership initialization | Reproduced real TCP/tonic traffic between durable replicas in one test process; this is not yet a multi-process Ursula CLI/bootstrap E2E |
+| 2026-10-06 | HS-103 | Workspace lib/bin tests: 902 passed, 1 ignored; workspace doc tests, format, workspace Clippy, seven tracked-source DST audits, madsim Raft lib check and existing smoke corpus passed. Raft suite alone: 152 passed, 1 ignored | Fixed a test race found under workspace concurrency: leader transfer can advance applied state before snapshot build, so await a covering snapshot/compacted prefix rather than exact log-ID equality. Existing smoke corpus proves compatibility, not new meta-transport fault coverage |
 
 ## Current execution checkpoint
 
 Current implementation story: **HS-103**, concrete multi-node meta transport
 and one-time bootstrap. HS-101 is implemented and validated in `b7352ea`;
 HS-102's deterministic policy/adoption layer is implemented in `5c7e413`.
-Add a separate meta RPC service with cluster/node identity checks, durable
-multi-node restart/leader-turnover tests, and bootstrap wiring that seeds
-policy from verified uniform data memberships. The server configuration and
-trusted admin/node directory must be wired before managed mode is usable.
+The separate meta RPC service and durable three/five-node transport tests are
+implemented in `a5af881`. Next persist and validate the local cluster/node
+bootstrap identity before accepting RPCs; add opt-in server configuration,
+independent meta voters, the trusted client/cluster/admin directory, and
+bootstrap wiring that seeds policy from verified uniform data memberships.
+These must be wired before managed mode is usable. HS-104 then restores data
+assignments from ordered projections rather than stale TOML.
 
 M1 remains incomplete: durable storage and deterministic policy are present,
-but multi-node transport/bootstrap and projection distribution are not yet
-integrated. Policy tests and meta recovery do not verify an actual data-group
+but transport has not been connected to production bootstrap/server routing,
+and projection distribution is absent. Policy tests and meta recovery do not verify an actual data-group
 RF migration; intent evidence, epoch CAS and receiver-side fencing remain M2.
 No CI,
 deployment or scaling-performance acceptance is claimed.
