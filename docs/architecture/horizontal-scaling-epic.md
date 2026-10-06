@@ -79,10 +79,10 @@ already accepts the meta type config.
 | Story | Deliverable and exit criteria | Dependencies | Status |
 | --- | --- | --- | --- |
 | HS-201 | Intent-bound state transitions, operation idempotency, epoch CAS, source/target policy and membership-step evidence; no successful finish without verified placement | M1 | In progress: commit `6530772` (replicated metadata protocol; physical executor integration pending) |
-| HS-202 | Durable dynamic group prepare/release on the owning core; joining replicas never initialize themselves; revoked replicas cannot be recreated by traffic | HS-104, HS-201 | In progress: commits `064a1af`, `cf05e16`, `e7f12bf` (durable hosting, WAL reclamation and owning-core retirement; complete prepare/release pending) |
+| HS-202 | Durable dynamic group prepare/release on the owning core; joining replicas never initialize themselves; revoked replicas cannot be recreated by traffic | HS-104, HS-201 | In progress: commits `064a1af`, `cf05e16`, `e7f12bf`, `dc54f53` (durable hosting and retirement kernel; complete prepare/release pending) |
 | HS-203 | Resumable learner catch-up, fixed-prefix applied verification, joint-membership reconciliation, leader handoff and final membership verification | HS-201, HS-202 | Planned |
 | HS-204 | Durably allocated executor generations and process-incarnation fencing, receiving-process barriers and exclusion with maintenance; delayed old/raw requests cannot bypass authority | HS-201; required before managed mutations are exposed | In progress: commits `6530772`, `064a1af` (durable generations and receiver lifecycle admission; managed submission/reconciliation and full maintenance integration pending) |
-| HS-205 | Dynamic node/gateway routing, per-group readiness/quorum inventory, reference protection, actor/background-work retirement and safe per-core journal reclamation | HS-202, HS-203, HS-204 | In progress: commits `cf05e16`, `e7f12bf` (WAL, actor and snapshot retirement; cold-work barriers and dynamic inventory pending) |
+| HS-205 | Dynamic node/gateway routing, per-group readiness/quorum inventory, reference protection, actor/background-work retirement and safe per-core journal reclamation | HS-202, HS-203, HS-204 | In progress: commits `cf05e16`, `e7f12bf`, `dc54f53` (WAL, actor, snapshot and detached cold-work retirement; dynamic inventory and receiver integration pending) |
 | HS-206 | Supported operation API and CLI submit/status/wait/resume with admin authority and error semantics; real-process E2E plus DST at every migration boundary | HS-201 through HS-205 | Planned |
 
 Start with one global active operation. M2 must move a group to a node that
@@ -190,11 +190,18 @@ unevacuated machine. Physical provisioning remains outside the Raft controller.
 | 2026-10-06 | HS-202 / HS-205 | Four new tests reproduce live pin drain and failure/retry, same-pointer prefetch owner isolation, and actual disk/OpenRaft cleanup while a queued builder delays retirement, the original caller is cancelled and a neighbor group continues. Reopening is uninitialized and old handles/builders remain fenced | The native kernel fixture uses RF1; S3 reference tests use mock stores. This is not RF3/RF5 migration or receiver binary-restart acceptance |
 | 2026-10-06 | M1/M2 | Workspace lib/bin tests: 943 passed, 3 ignored; doc tests, workspace Clippy, format, seven DST audits, madsim Raft check and existing smoke passed. Static follower forwarding passed (0.13s), mixed-RF/meta3/meta5 adoption/restart CLI passed (30.86s) | Existing CLI/DST remain fixed-layout compatibility evidence; full migration and scaling exit criteria remain open |
 
+| 2026-10-06 | HS-202 / HS-205 | Commit `dc54f53` shares the permanently closeable group lifecycle across snapshot work, cold flush/GC/compaction/repair/orphan sweep, detached read materialization and external payload/snapshot publication. Admission precedes planning; detached tasks keep guards through I/O, publication and cleanup despite caller cancellation. Successful retirement also removes cold cursors/debt; revoked work cannot refill debt | Physical cleanup kernel implemented; durable assignment transitions, supported prepare/release receipts and live inventory integration remain pending |
+| 2026-10-06 | HS-202 / HS-205 | Three native disk/OpenRaft tests pause actual cold flush, GC and read materialization after planning, cancel their callers, and reproduce retirement waiting while a neighbor writes. A fourth test proves cancelled HTTP writes retain their ingress byte reservation until completion | RF1 kernel fixtures with memory cold backend, not RF3/RF5 migration or real S3 acceptance. Streaming snapshot/external-payload wiring has existing protocol regression coverage; dedicated migration-fault tests remain required |
+| 2026-10-06 | M1/M2 | Final workspace lib/bin tests: 947 passed, 3 ignored; doc tests, Clippy, format and seven DST audits passed. Madsim Raft check passed; after using the simulation task runtime in ingress, existing smoke passed (0.39s). SSE metrics now check actual delivered control frames across valid scheduling orders. Static forwarding and managed adoption/restart CLI passed (0.14s / 28.71s) before the ingress runtime-alias/SSE-test correction | Regressions resolved and final checks passed. CLI fixtures remain fixed-layout compatibility evidence; migration/scale/DST/performance exit criteria remain open |
+
 ## Current execution checkpoint
 
 Current implementation stories: **HS-202/HS-104** explicit prepare/release and
 intent-aware startup, alongside **HS-204/HS-203** managed submission and actual
-membership reconciliation. Commit `e7f12bf` adds cancellation-independent,
+membership reconciliation. Commit `dc54f53` extends close/drain and cancellation
+isolation to detached cold work, read materialization and external payload/
+snapshot publication, and retains ingress byte credit until write completion.
+Commit `e7f12bf` adds cancellation-independent,
 coalesced owning-core actor retirement, registry/cache/read-barrier removal,
 snapshot work/pin draining and reference/metadata cleanup. Commit `cf05e16` supplies physical shared-core WAL
 reclamation and permanent old log-store owner invalidation. Commit `064a1af`
@@ -211,11 +218,12 @@ Established startup restores settled data from the bound projection checkpoint
 voters and legacy hosting before actor construction; explicitly assigned
 nonvoters restore without membership initialization. Dynamic prepare/release
 handlers and live inventory/maintenance/snapshot consumers remain required.
-Actor, snapshot and WAL cleanup are integrated in the runtime kernel, but cold
-flush/GC/orphan work outside the actor still needs a per-group close/drain barrier
-before a complete receiver release can be certified. Queue barriers alone
-cannot resolve possibly committed membership changes. Next close that cold-work
-gap, then wire durable prepare/release to the cleanup kernel. Persist every managed submission,
+Actor, snapshot, WAL and detached cold-work cleanup are integrated in the runtime
+kernel. The supported receiver still needs durable prepare/release transitions,
+recoverable pending-operation descriptions and physical receipts before complete
+release can be certified. Queue barriers alone cannot resolve possibly committed
+membership changes. Next wire durable prepare/release to this kernel, including
+process-replacement recovery and exact receipt replay. Persist every managed submission,
 reconcile actual data Raft membership/applied state and lost replies, and wire
 physical receipts to the resumable executor.
 

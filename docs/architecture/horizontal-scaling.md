@@ -633,9 +633,9 @@ assignments override cached voters and the legacy dynamic allowlist before warmu
 or lazy creation. `Preparing` and `Hosted` may restore; absent, `Retiring` and
 `Retired` entries cannot create an actor. Explicit assignments can restore a
 nonvoter engine without initializing membership. Tombstones cannot be deleted;
-reuse requires a new prepare intent/generation. Actual prepare/release handlers,
-live actor/background teardown, snapshot-reference retirement and per-core WAL
-reclamation remain required. The tests construct assignments; they do not claim
+reuse requires a new prepare intent/generation. Actual prepare/release handlers
+and physical receipt production remain required; the retirement kernels below
+implement actor/snapshot/background and WAL cleanup. The tests construct assignments; they do not claim
 that the current server has physically migrated or released a replica.
 
 Validation includes three store tests (with a separately invoked ignored child
@@ -732,8 +732,52 @@ tests use mock S3 stores. All 943 workspace lib/bin tests passed (3 ignored),
 with doc tests, Clippy, format, seven DST audits, madsim Raft check, existing smoke
 and static/managed CLI regressions. This does not prove an RF3/RF5 move.
 
-Cold flush, GC, compaction and orphan sweep can execute S3 work outside the actor
-after obtaining a plan. They still need the group lifecycle barrier; actor and
-snapshot draining alone cannot certify a complete release. The receiver release
-endpoint is not exposed until that boundary and durable assignment/receipt
-integration are implemented.
+At that checkpoint, cold flush, GC, compaction and orphan sweep still executed
+external work outside the snapshot drain. The following increment closes that
+boundary. Durable receiver assignment/receipt integration remains required
+before exposing a complete release endpoint.
+
+### Implementation checkpoint: detached cold-work retirement
+
+Commit `dc54f53` moves the close/drain lifecycle into `ursula-runtime` and shares
+it with the disk factory's snapshot coordinator. Managed work admission checks
+hosting and captures the current replica lifecycle before planning or external
+I/O. Flush, GC, orphan sweep, shared-ref compaction and cold-index repair execute
+as detached admitted group tasks; same-stream compaction detaches one stream at
+a time, without retaining unrelated groups' lifecycles. Cancellation drops the
+response waiter while the task keeps its guard through I/O, publication and any
+rejection cleanup. Closing the lifecycle rejects new work and retirement waits
+for existing tasks. Actor-bound work remains drained by the shutdown queue.
+
+Raft read plans carry a lifecycle guard into detached materialization, including
+time waiting for a node read permit; local cache references are dropped before
+that guard. External create/append payload staging and stream snapshot uploads
+also run under detached group guards through commit/cleanup. Admitted HTTP write
+tasks retain their ingress body-byte reservation despite response cancellation,
+so retries cannot reuse credit while old uploads remain. Simulation ingress uses
+the madsim task runtime. Ordinary data writes retain their existing Raft commit
+semantics; a lost HTTP response still requires protocol idempotency on retry.
+
+After successful physical retirement, detached runtime completion removes that
+group's repair/orphan cursors and compaction debt before acknowledging cleanup.
+Debt recording checks current hosting/lifecycle, preventing a late pass from
+refilling retired state. Permanent old lifecycle objects stay closed across a
+new engine incarnation. This process-local barrier supplements the durable
+receiver generation and does not authorize a new assignment or prove membership.
+
+Three native disk/OpenRaft tests pause a flush, GC and read after planning, cancel
+the caller, verify retirement remains pending and a neighbor still writes, then
+allow I/O to finish and verify cleanup completes. These use RF1 kernel fixtures
+and a memory cold backend. A fourth test verifies the HTTP body budget stays
+reserved after cancellation and is returned only on task completion. Final
+workspace lib/bin tests passed (947 passed, 3 ignored), with docs, Clippy, format,
+seven DST audits, madsim Raft check and existing smoke. Static/managed CLI
+regressions passed (0.14s / 28.71s) before the final simulation-runtime/SSE-test
+correction; SSE now compares metrics against actual delivered control frames.
+
+The next receiver increment must persist prepare/release descriptions before
+side effects, recover them on process replacement, update local hosting under
+the receiving-process gate, and produce/replay actual physical cleanup receipts.
+Real RF3/RF5 moves, joint-membership reconciliation, dynamic readiness/maintenance/
+snapshot-reference inventories and migration-boundary fault acceptance remain
+open. The runtime kernel tests do not satisfy those exit criteria.
