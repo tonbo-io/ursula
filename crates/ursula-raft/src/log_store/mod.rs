@@ -23,6 +23,10 @@ use openraft::alias::LogIdOf;
 use openraft::alias::VoteOf;
 use openraft::entry::RaftEntry;
 pub use receiver::ManagedReceiverStore;
+#[cfg(madsim)]
+pub use receiver::SimulatedReceiverDisk;
+#[cfg(madsim)]
+pub use receiver::SimulatedReceiverWriteFault;
 use serde::Deserialize;
 use serde::Serialize;
 

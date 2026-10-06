@@ -1452,3 +1452,26 @@ The rebuilt server is native arm64 Mach-O. This joint fixture uses inline
 snapshots; it does not certify the joint/S3 combination or new migration DST.
 M1 completion audit and remaining M2 fault/DST boundaries are next, followed by
 the unchanged M3 capacity operations and M4 autopilot scope.
+
+### Implementation checkpoint: receiver storage seam for simulation
+
+Under `cfg(madsim)`, `ManagedReceiverStore::open_simulated` opens an explicit
+harness-owned `SimulatedReceiverDisk`. The disk survives dropping/recreating
+node tasks, enforces one open store and the normalized immutable identity, and
+has one-shot failures before or after atomic checkpoint publication. A lost
+commit reply poisons the old store; reopening recovers the committed checkpoint.
+The existing file constructor still rejects simulation. No host file, blocking
+task, wall-clock dependency or process-global disk map is introduced.
+
+Both backends use the same production checkpoint validation: revision CAS,
+bounded size, generation/assignment succession and local-node receipt binding.
+Native persistence retains its detached blocking task and checksummed atomic
+file replacement. Simulation changes only the publication mechanism; it does
+not model filesystem frame corruption or power-loss/fsync behavior.
+
+Four storage tests cover exclusive/isolated disks and identity rejection,
+commit-side recovery, durable prepare-receipt replay and pending work retained
+across a newer generation/process. They are queued for native Depot execution
+with `RUSTFLAGS='--cfg madsim'`. These are storage-seam checks, not complete
+executor DST schedules. The bound meta persistence/transport harness and
+migration-boundary fault schedules remain the next integration work.

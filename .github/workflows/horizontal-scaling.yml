@@ -104,4 +104,5 @@ jobs:
           RUSTFLAGS: --cfg madsim
         run: |
           cargo check --locked -p ursula-raft --lib
+          cargo test --locked -p ursula-raft simulated_receiver -- --test-threads=1
           cargo test --locked -p ursula-sim smoke_corpus_replays -- --nocapture

@@ -15,11 +15,21 @@ use ursula_control::ReceiverLedger;
 #[cfg(not(madsim))]
 use ursula_runtime::journal;
 
+#[cfg(not(madsim))]
 use super::JournalLock;
 #[cfg(not(madsim))]
 use super::WireCodec;
+#[cfg(not(madsim))]
 use super::meta::replace_journal;
+#[cfg(not(madsim))]
 use super::spawn_log_store_blocking;
+
+#[cfg(madsim)]
+mod simulated;
+#[cfg(madsim)]
+pub use simulated::SimulatedReceiverDisk;
+#[cfg(madsim)]
+pub use simulated::SimulatedReceiverWriteFault;
 
 const MAX_CHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -36,9 +46,13 @@ struct Inner {
 
 pub struct ManagedReceiverStore {
     identity: MetaLocalIdentity,
+    #[cfg(not(madsim))]
     path: PathBuf,
     inner: Mutex<Inner>,
+    #[cfg(not(madsim))]
     _lock: JournalLock,
+    #[cfg(madsim)]
+    disk: SimulatedReceiverDisk,
 }
 
 impl ManagedReceiverStore {
@@ -123,52 +137,62 @@ impl ManagedReceiverStore {
         Ok(inner.ledger.clone())
     }
 
-    pub async fn persist(
-        self: &Arc<Self>,
-        mut ledger: ReceiverLedger,
-    ) -> io::Result<ReceiverLedger> {
-        let store = self.clone();
-        spawn_log_store_blocking(None, move || {
-            let mut inner = store
-                .inner
-                .lock()
-                .map_err(|_| invalid("receiver store mutex poisoned"))?;
-            if inner.failed {
-                return Err(invalid("receiver storage failed; reopen to recover"));
-            }
-            if inner.ledger == ledger {
-                return Ok(ledger);
-            }
-            if inner.ledger.revision != ledger.revision {
-                return Err(invalid("receiver checkpoint revision CAS failed"));
-            }
-            ledger.revision = ledger
-                .revision
-                .checked_add(1)
-                .ok_or_else(|| invalid("receiver checkpoint revision exhausted"))?;
-            inner
-                .ledger
-                .validate_successor(&ledger, store.identity.cluster.group_count)
-                .map_err(invalid)?;
-            validate_receipt_node(&ledger, store.identity.node.node_id)?;
-            let checkpoint = Checkpoint {
-                identity: store.identity.clone(),
-                ledger: ledger.clone(),
-            };
-            if crate::codec::encode_wire(&checkpoint).len() as u64
-                > MAX_CHECKPOINT_BYTES.saturating_sub(64)
-            {
-                return Err(invalid("receiver checkpoint exceeds its bounded size"));
-            }
-            let result = replace_journal(&store.path, [checkpoint]);
-            if result.is_err() {
-                inner.failed = true;
-            }
-            result?;
-            inner.ledger = ledger.clone();
-            Ok(ledger)
-        })
-        .await
+    pub async fn persist(self: &Arc<Self>, ledger: ReceiverLedger) -> io::Result<ReceiverLedger> {
+        #[cfg(madsim)]
+        {
+            self.persist_checkpoint(ledger)
+        }
+        #[cfg(not(madsim))]
+        {
+            let store = self.clone();
+            spawn_log_store_blocking(None, move || store.persist_checkpoint(ledger)).await
+        }
+    }
+
+    // Both backends use the production revision/authority validation. Only the
+    // atomic publication changes under simulation; no host files are opened.
+    fn persist_checkpoint(&self, mut ledger: ReceiverLedger) -> io::Result<ReceiverLedger> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| invalid("receiver store mutex poisoned"))?;
+        if inner.failed {
+            return Err(invalid("receiver storage failed; reopen to recover"));
+        }
+        if inner.ledger == ledger {
+            return Ok(ledger);
+        }
+        if inner.ledger.revision != ledger.revision {
+            return Err(invalid("receiver checkpoint revision CAS failed"));
+        }
+        ledger.revision = ledger
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| invalid("receiver checkpoint revision exhausted"))?;
+        inner
+            .ledger
+            .validate_successor(&ledger, self.identity.cluster.group_count)
+            .map_err(invalid)?;
+        validate_receipt_node(&ledger, self.identity.node.node_id)?;
+        let checkpoint = Checkpoint {
+            identity: self.identity.clone(),
+            ledger: ledger.clone(),
+        };
+        if crate::codec::encode_wire(&checkpoint).len() as u64
+            > MAX_CHECKPOINT_BYTES.saturating_sub(64)
+        {
+            return Err(invalid("receiver checkpoint exceeds its bounded size"));
+        }
+        #[cfg(not(madsim))]
+        let result = replace_journal(&self.path, [checkpoint]);
+        #[cfg(madsim)]
+        let result = self.disk.publish(checkpoint);
+        if result.is_err() {
+            inner.failed = true;
+        }
+        result?;
+        inner.ledger = ledger.clone();
+        Ok(ledger)
     }
 }
 

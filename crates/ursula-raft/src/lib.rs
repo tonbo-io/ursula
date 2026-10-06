@@ -102,6 +102,10 @@ pub use log_store::MetaRaftFileLogStore;
 pub use log_store::MetaRaftLogStore;
 pub use log_store::RaftGroupFileLogStore;
 pub use log_store::RaftGroupLogStore;
+#[cfg(madsim)]
+pub use log_store::SimulatedReceiverDisk;
+#[cfg(madsim)]
+pub use log_store::SimulatedReceiverWriteFault;
 pub use maintenance::ManagedRaftInventory;
 pub use maintenance::ManagedReplicaRole;
 pub use maintenance::RaftMaintenanceIssue;
