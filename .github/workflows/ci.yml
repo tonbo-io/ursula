@@ -126,6 +126,37 @@ jobs:
       - name: Audit DST guards (all 7 audits)
         run: python3 -m scripts.dst all
 
+      - name: Verify both election-refresh regression controls
+        run: |
+          source_file=crates/ursula-raft/src/rejoin.rs
+          cp "$source_file" "$RUNNER_TEMP/rejoin-fixed.rs"
+          trap 'cp "$RUNNER_TEMP/rejoin-fixed.rs" "$source_file"' EXIT
+          for branch in loop probe; do
+            cp "$RUNNER_TEMP/rejoin-fixed.rs" "$source_file"
+            BRANCH="$branch" python3 - <<'PYCONTROL'
+          import os
+          from pathlib import Path
+          p = Path("crates/ursula-raft/src/rejoin.rs")
+          s = p.read_text()
+          if os.environ["BRANCH"] == "loop":
+              needle = "            registry.refresh_group_elections(raft_group_id);\n            return;"
+              replacement = "            return;"
+          else:
+              needle = "            if rejoin.vote_gate_open() {\n                registry.refresh_group_elections(raft_group_id);"
+              replacement = "            if rejoin.vote_gate_open() {"
+          assert s.count(needle) == 1
+          p.write_text(s.replace(needle, replacement, 1))
+          PYCONTROL
+            if RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim memory_wal_barrier_exit_refreshes_elections_after_apply -- --nocapture >"$RUNNER_TEMP/rejoin-control-$branch.log" 2>&1; then
+              cat "$RUNNER_TEMP/rejoin-control-$branch.log"
+              echo "regression failed to detect missing $branch refresh" >&2
+              exit 1
+            fi
+            cat "$RUNNER_TEMP/rejoin-control-$branch.log"
+            grep -q 'election enabled without drain/undrain' "$RUNNER_TEMP/rejoin-control-$branch.log"
+          done
+          cp "$RUNNER_TEMP/rejoin-fixed.rs" "$source_file"
+
       - name: Run madsim smoke corpus and PR seed set
         run: |
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim memory_wal_barrier_exit_refreshes_elections_after_apply -- --nocapture
