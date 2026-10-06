@@ -219,7 +219,7 @@ ursulactl verify-survivors --config cluster.json --excluded-node-id 3 --expected
 
 Every group must still have the complete uniform three-voter membership, no learners and open participation gates on both observed replicas. Both survivors must agree on a reachable leader and apply each newly confirmed fixed prefix. The command rejects a second missing replica, an unknown exclusion or a changed topology; it never shrinks the configured membership to fit observations. Legacy diagnostics retain the explicit opt-in and do not certify participation.
 
-The output is scoped as `surviving_quorum`, records the configured and observed voter sets, and always reports `full_redundancy_restored=false`. Excluding a voter from observation does not prove its old process or host is stopped. Hard fencing and an exclusive maintenance reservation remain prerequisites for physical replacement, and the complete `verify-quorum` check is required before any subsequent disruption.
+The timestamped output uses the native survivor-observation format: `verification` contains the configured and observed voter sets, the excluded voter and `full_redundancy_restored=false`, with its quorum-prefix proof in the nested `verification` field. Save this output directly as the `--observation` input to `reservation-request admit-host-termination` or `admit-replacement-termination`; proposal, persistent CAS acknowledgement and physical fencing remain separate required steps. Excluding a voter from observation does not prove its old process or host is stopped. Hard fencing and an exclusive maintenance reservation remain prerequisites for physical replacement, and the complete `verify-quorum` check is required before any subsequent disruption.
 
 ### Shared reservation proposals
 

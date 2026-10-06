@@ -793,11 +793,7 @@ async fn main() -> Result<()> {
             .await?;
             println!(
                 "{}",
-                serde_json::json!({
-                    "started_ms": started_ms,
-                    "completed_ms": wall_clock_unix_ms(),
-                    "surviving_quorum": report,
-                })
+                survivor_observation_json(started_ms, wall_clock_unix_ms(), report)?
             );
             Ok(())
         }
@@ -805,6 +801,20 @@ async fn main() -> Result<()> {
         Command::BackupVerify(args) => run_backup_verify_subcommand(args).await,
         Command::Restore(args) => run_restore_subcommand(args).await,
     }
+}
+
+fn survivor_observation_json(
+    started_ms: u64,
+    completed_ms: u64,
+    verification: ursula_ctl::quorum::SurvivingQuorumVerification,
+) -> Result<String> {
+    Ok(serde_json::to_string(
+        &ursula_ctl::reservation::SurvivingPrefixObservation {
+            started_ms,
+            completed_ms,
+            verification,
+        },
+    )?)
 }
 
 fn backup_client(nodes: &[NodeInfo], http_timeout_secs: u64) -> Result<backup::BackupClient> {
@@ -1349,4 +1359,110 @@ async fn run_verify_cluster_subcommand(args: VerifyClusterArgs) -> Result<()> {
     .await?;
     println!("cluster verified: {} node(s) fully ready", nodes.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use clap::Parser;
+
+    use super::Cli;
+    use super::Command;
+    use super::run_reservation_request;
+    use super::survivor_observation_json;
+
+    #[tokio::test]
+    async fn survivor_output_feeds_both_native_admission_builders_without_rewriting() {
+        let directory = tempfile::tempdir().unwrap();
+        let fence = ursula_proto::admin::MaintenanceFence::new(
+            format!("{:032x}", 1),
+            format!("{:032x}", 2),
+            1,
+        )
+        .unwrap();
+        let verification = ursula_ctl::quorum::QuorumVerification {
+            version: 3,
+            participation_certified: true,
+            process_incarnations_certified: true,
+            process_incarnations: (2..=3)
+                .map(|id| {
+                    (
+                        id,
+                        ursula_proto::admin::ProcessIncarnation::from_bits(u128::from(id)),
+                    )
+                })
+                .collect(),
+            maintenance_executor_certified: true,
+            maintenance_executor_retired_certified: false,
+            maintenance_fence: Some(fence.clone()),
+            prefixes: BTreeMap::from([(0, ursula_raft::QuorumPrefix {
+                raft_group_id: 0,
+                leader_id: 2,
+                leader_term: 7,
+                required_applied_index: 20,
+            })]),
+            applied: (2..=3)
+                .map(|id| (id, BTreeMap::from([(0, 20)])))
+                .collect(),
+        };
+        let encoded = survivor_observation_json(
+            100,
+            101,
+            ursula_ctl::quorum::SurvivingQuorumVerification {
+                excluded_voter_id: 1,
+                configured_voter_ids: [1, 2, 3].into_iter().collect(),
+                surviving_voter_ids: [2, 3].into_iter().collect(),
+                full_redundancy_restored: false,
+                verification,
+            },
+        )
+        .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(output["verification"]["excluded_voter_id"], 1);
+        assert_eq!(
+            output["verification"]["surviving_voter_ids"],
+            serde_json::json!([2, 3])
+        );
+        assert_eq!(output["verification"]["full_redundancy_restored"], false);
+        assert!(
+            serde_json::from_value::<ursula_ctl::reservation::PrefixObservation>(output).is_err()
+        );
+        let observation_path = directory.path().join("observation.json");
+        std::fs::write(&observation_path, encoded).unwrap();
+        let fence_path = directory.path().join("fence.json");
+        std::fs::write(&fence_path, serde_json::to_vec(&fence).unwrap()).unwrap();
+        let candidate_path = directory.path().join("candidate.json");
+        let candidate = ursula_ctl::reservation::SourceIdentity {
+            node_id: 1,
+            pod_name: "voters-0".into(),
+            pod_uid: "candidate-pod".into(),
+            node_uid: "candidate-node".into(),
+            provider_instance: "candidate-provider".into(),
+            process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(11),
+        };
+        std::fs::write(&candidate_path, serde_json::to_vec(&candidate).unwrap()).unwrap();
+        for action in ["admit-host-termination", "admit-replacement-termination"] {
+            let mut arguments = vec![
+                "ursulactl".to_owned(),
+                "reservation-request".to_owned(),
+                action.to_owned(),
+                "--fence".to_owned(),
+                fence_path.display().to_string(),
+                "--observation".to_owned(),
+                observation_path.display().to_string(),
+            ];
+            if action == "admit-replacement-termination" {
+                arguments.extend([
+                    "--candidate".to_owned(),
+                    candidate_path.display().to_string(),
+                ]);
+            }
+            let Command::ReservationRequest(args) = Cli::try_parse_from(arguments).unwrap().command
+            else {
+                panic!("expected native reservation builder");
+            };
+            run_reservation_request(args).await.unwrap();
+        }
+    }
 }
