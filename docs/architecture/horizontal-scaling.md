@@ -431,3 +431,32 @@ These components are not yet connected to production startup. The bound TCP
 restart test uses synthetic data-membership certificates; production adoption
 must obtain uniform membership through an applied quorum read barrier. The
 complete milestone and its remaining exit criteria are tracked in the epic.
+
+### Implementation checkpoint: quorum evidence and complete projections
+
+Commit `d591c26` adds the production-facing evidence collector and adoption
+helper. The data recovery-barrier RPC can return applied uniform membership,
+its membership log ID, the sampled applied prefix and node addresses after a
+fresh ReadIndex. Before answering, compare committed state-machine membership
+with effective Raft membership and stable leader/vote observations. Reject joint
+or unapplied configurations. The collector checks exact voter sets, absence of
+learners and canonical endpoint equality against the immutable recipe, under a
+total deadline with at most RF concurrent candidate requests. Bootstrap replay
+uses the persisted recipe and does not re-read or reset later data membership.
+
+The bound meta ReadProjection RPC confirms a fresh ReadIndex, awaits application
+and returns the entire control state with its applied meta log ID. A pure cursor
+replaces full snapshots atomically: later complete snapshots repair missed
+updates, older indices are ignored, and conflicts at the same index, routing
+contract changes, term regression, missing groups and invalid resolved policies
+are rejected. Initial placement epoch zero is valid; projection ordering uses
+the applied meta log, not a fabricated non-zero placement epoch requirement.
+This read is for startup/control refresh and is not part of the stream hot path.
+
+These components still need production server wiring, ordered local consumers
+and durable assignment recovery. Quorum certificates are observations, not
+reservations against subsequent membership changes. A bootstrap coordinator
+must freeze unmanaged/raw membership mutations on participating managed nodes
+before collecting evidence; no supported managed adoption API is exposed yet.
+The real TCP evidence fixture uses memory data WAL plus durable meta WAL, while
+persistent-data, separate-process server acceptance remains an M1 gate.

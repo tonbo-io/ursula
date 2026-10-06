@@ -59,7 +59,7 @@ blocked implementation milestone.
 | HS-101 | Persist and restore meta vote, log, committed/applied state and snapshots; recover correctly after compaction and crash/restart without resurrecting discarded intent | M0 | Complete: commit `b7352ea` |
 | HS-102 | Implement default/per-group RF=3/5 and one-domain-loss policy; infer/validate existing placements on adoption; reject invalid policies and bootstrap drift | M0 | Complete: commit `5c7e413` (deterministic policy/adoption layer) |
 | HS-103 | Concrete multi-node meta transport, independent meta voters, one-time bootstrap, cluster identity and trusted client/cluster/admin node directory | HS-101, HS-102 | In progress |
-| HS-104 | Ordered placement/policy projections with full-snapshot resync; data/node startup restores assignments without reinitializing from stale TOML | HS-103 | Planned |
+| HS-104 | Ordered placement/policy projections with full-snapshot resync; data/node startup restores assignments without reinitializing from stale TOML | HS-103 | In progress: commit `d591c26` (projection transport/ordering component) |
 
 M1 acceptance includes multi-node meta leader turnover and a durable full
 restart after snapshot/log compaction. Test RF=3/quorum=2 and RF=5/quorum=3,
@@ -158,27 +158,45 @@ unevacuated machine. Physical provisioning remains outside the Raft controller.
 | 2026-10-06 | HS-103 | Five control tests and five bound-storage/transport tests cover RF3/RF5 meta bootstrap with mixed data policies, invalid directory/contracts/certificates, replay without resetting drained nodes, corrupt/torn/duplicate binding frames, missing journals, adoption of only empty unbound storage, and durable three-node restart after snapshot/purge | Real TCP actors in one process; data membership certificates are synthetic in these tests. Production bootstrap must collect them through data-group quorum read barriers |
 | 2026-10-06 | HS-103 | Workspace lib/bin tests: 912 passed, 1 ignored; workspace doc tests, format, workspace Clippy, all seven tracked-source DST audits, madsim Raft lib check and existing smoke corpus passed | Local checks passed; no new scaling fault schedule or CLI E2E is claimed |
 
+
+| 2026-10-06 | HS-103 | Commit `d591c26` extends the existing recovery barrier with opt-in uniform-membership certificates. A fresh ReadIndex must be applied; sample committed state-machine membership and reject divergence from effective membership, joint configurations, recipient/leader drift and missing capability. Bootstrap collection validates actual voter sets and canonical Raft endpoints against the complete trusted recipe under one total deadline | Quorum evidence collection and adoption helper implemented; certificates are observations, not membership-mutation reservations |
+| 2026-10-06 | HS-103 | A real TCP fixture combines three durable meta voters with respectively three/five data voters, obtains actual data certificates, publishes bootstrap through meta Raft and reads it through the projection RPC. Rejects wrong committed endpoint/voter declarations, follower/legacy responses, unapplied joint membership and quorum loss; replay succeeds through independent meta quorum without resetting policy or requiring the old data layout | Real meta/data RPCs in one process; this fixture uses memory data WAL and durable meta WAL. It is not the persistent-data Ursula CLI acceptance gate |
+| 2026-10-06 | HS-104 | Commit `d591c26` adds complete control projections versioned by applied meta log ID, a bound ReadProjection RPC with fresh ReadIndex/application/deadline checks, and an atomic pure cursor that rejects conflicting versions/contracts and term regression. Complete snapshots resync across arbitrarily many missed updates; stale snapshots preserve the current view | Projection transport/ordering foundation; server consumers, local cache and assignment restoration remain pending |
+| 2026-10-06 | HS-104 | RF3/RF5 bound meta RPC tests cover pre-bootstrap refusal, later applied node-state visibility, compaction, follower refusal and fresh-read failure after quorum loss. Pure cursor tests cover serialization, full resync, stale/conflicting logs, missing groups/bootstrap, policy mismatch and wrong group/routing identity. Workspace lib/bin tests: 915 passed, 1 ignored; workspace doc tests, format, workspace Clippy, seven tracked-source DST audits, madsim Raft lib check and existing smoke corpus passed | Local reproduced checks; existing smoke proves compatibility, not new control-projection fault schedules |
+
 ## Current execution checkpoint
 
-Current implementation story: **HS-103**, concrete multi-node meta transport
-and one-time bootstrap. HS-101 is implemented and validated in `b7352ea`;
-HS-102's deterministic policy/adoption layer is implemented in `5c7e413`.
-The separate meta RPC service and durable three/five-node transport tests are
-implemented in `a5af881`; durable identity, trusted directory and atomic
-bootstrap validation are implemented in `3862daa`. Next add opt-in server
-configuration and startup/routing for independent meta voters, and collect
-bootstrap evidence through actual data-group quorum read barriers.
-These must be wired before managed mode is usable. HS-104 then restores data
-assignments from ordered projections rather than stale TOML.
+Current implementation story: **HS-103**, production configuration and safe
+one-time bootstrap; **HS-104** projection transport/ordering foundation is also
+implemented. HS-101 is implemented and validated in `b7352ea`; HS-102's
+deterministic policy/adoption layer is implemented in `5c7e413`. Meta RPCs and
+three/five-voter durable transport are in `a5af881`; immutable local identity,
+trusted directory and atomic recipe validation are in `3862daa`.
 
-M1 remains incomplete: durable storage and deterministic policy are present,
-but transport has not been connected to production bootstrap/server routing,
-and projection distribution is absent. Policy tests and meta recovery do not verify an actual data-group
-RF migration; intent evidence, epoch CAS and receiver-side fencing remain M2.
-No CI,
-deployment or scaling-performance acceptance is claimed.
-There is no current external blocker recorded; pending implementation is not
-a blocker.
+Commit `d591c26` replaces synthetic data evidence at the adoption-helper boundary
+with actual applied quorum-membership certificates and exposes complete ordered
+control projections. Its combined test publishes data evidence through a
+three-voter durable meta quorum with RF3/RF5 data quorums. The standalone RF3/RF5
+meta projection test still uses synthetic data certificates to isolate that
+transport component; neither fixture is a multi-process server E2E.
+
+Next connect opt-in configuration and the separate meta RPCs to the production
+cluster listener. Coordinate first bootstrap and restart before allowing data
+actors to warm groups: require trusted peer identity, distinguish an empty
+control plane from an established projection, disable unmanaged/raw membership
+mutations during managed adoption, and never initialize a joining/restarted
+group from stale TOML. Wire full projections into assignment/routing/readiness
+consumers and durable local recovery, then run the persistent-data, real-process
+M1 acceptance gate. Membership certificates alone cannot reserve a configuration
+against concurrent raw administration; production bootstrap must close that
+race before managed adoption is exposed.
+
+M1 remains incomplete: storage, transport, policy, identity and quorum evidence
+components are present, but production configuration/bootstrap/routing and
+projection consumers are absent. No actual data-group RF migration, CI,
+deployment or scaling-performance acceptance is claimed. Intent evidence, epoch
+CAS and receiver-side executor fences remain M2. There is no current external
+blocker recorded; pending implementation is not a blocker.
 
 For each implementation increment, update the relevant story and this
 checkpoint with the exact commit/PR, commands or CI run, reproduced results,
