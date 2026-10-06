@@ -4,10 +4,11 @@
 //! - cold path full (hot_bytes_per_group, existing [`crate::request::ColdWriteAdmission`])
 //! - raft replication lagging ([`RaftUncommittedAdmission`], uncommitted_bytes_per_group)
 //! - forward queue piling on a remote peer (inflight_forward_bytes_per_peer, lives in `ursula::lib`)
-//! - process memory near OOM (rss vs soft_cap, lives in `ursula::lib`)
 //!
 //! Each admission can be independently configured (`None` = disabled).
 //! Call sites consult the relevant subset; errors surface as HTTP 503.
+//! The process RSS abort cap is a separate last-resort fail-stop, not a
+//! write-admission gate.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
