@@ -10,6 +10,7 @@ use super::Value;
 use crate::NodeInfo;
 
 mod host_recovery;
+mod startup;
 
 fn cell() -> CellIdentity {
     CellIdentity {
@@ -965,4 +966,18 @@ fn captured_api_identity_rejects_misdirected_or_deleting_objects() {
                 .is_err()
         );
     }
+}
+
+/// Shared fixture for the actual HTTP startup adapter tests.
+pub(crate) fn startup_fixture() -> (Reservation, super::PublishHostInventory, Value) {
+    (
+        host_recovery::original_intent(&host_recovery::terminated()),
+        host_publication(),
+        document(),
+    )
+}
+
+pub(crate) fn completed_startup_fixture() -> (Reservation, super::PublishHostInventory, Value) {
+    let (state, captured) = host_recovery::completed_startup_fixture();
+    (state, captured, document())
 }

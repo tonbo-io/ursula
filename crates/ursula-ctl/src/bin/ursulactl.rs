@@ -31,6 +31,8 @@ struct Cli {
 enum Command {
     /// Print per-node raft group count and leadership distribution from /__ursula/metrics.
     Status(ObserveArgs),
+    /// Admit one fresh server boot against its live Kubernetes identities.
+    StartupAdmit(StartupAdmitArgs),
     /// Produce a read-only manifest with fixed server-instance identities.
     PinIncarnations(PinIncarnationsArgs),
     /// Activate an already-admitted reservation token on every pinned process.
@@ -110,6 +112,18 @@ enum Command {
     /// Restore a verified backup into a fresh, empty cluster with the same
     /// raft group count.
     Restore(BackupCreateArgs),
+}
+
+#[derive(Args, Debug)]
+struct StartupAdmitArgs {
+    #[arg(long)]
+    node_id: u64,
+    #[arg(long)]
+    group_count: u32,
+    #[arg(long)]
+    core_count: u16,
+    #[arg(long)]
+    process_incarnation: String,
 }
 
 #[derive(Args, Debug)]
@@ -518,6 +532,21 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Command::StartupAdmit(args) => {
+            let boot = ursula_proto::admin::ProcessIncarnation::try_from(args.process_incarnation)
+                .map_err(anyhow::Error::msg)?;
+            let identity = ursula_ctl::startup::StartupIdentity::from_environment(
+                args.node_id,
+                args.group_count,
+                args.core_count,
+                boot,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string(&ursula_ctl::startup::admit_in_cluster(identity).await?)?
+            );
+            Ok(())
+        }
         Command::Status(args) => run_status_subcommand(args).await,
         Command::PinIncarnations(args) => {
             let nodes = load_nodes(&args.config).await?;

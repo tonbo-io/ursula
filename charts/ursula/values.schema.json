@@ -600,6 +600,26 @@
             "kubectlImage",
             "resources"
           ]
+        },
+        "startupOwnership": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Require a settled host catalog and pre-transport boot admission through the shared maintenance CAS."
+            },
+            "provider": {
+              "type": "string",
+              "enum": [
+                "aws-nitro"
+              ]
+            }
+          },
+          "required": [
+            "enabled",
+            "provider"
+          ]
         }
       },
       "required": [

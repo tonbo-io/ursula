@@ -76,10 +76,67 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         preset.unwrap_or(Preset::Default)
     );
 
-    let start_maintenance_drained = parse_start_maintenance_drained(
+    let mut start_maintenance_drained = parse_start_maintenance_drained(
         std::env::var_os("URSULA_START_MAINTENANCE_DRAINED").as_deref(),
     )?;
-    let state = init_state(&config, preset, start_maintenance_drained).await?;
+    let boot = ursula_proto::admin::ProcessIncarnation::from_bits(rand::random());
+    let mut startup_admission = None;
+    match std::env::var("URSULA_STARTUP_RESERVATION") {
+        Ok(value) if value == "true" => {
+            let helper = std::env::current_exe()?.with_file_name("ursulactl");
+            let mut helper_command = tokio::process::Command::new(helper);
+            helper_command
+                .args([
+                    "startup-admit",
+                    "--node-id",
+                    &config.raft.node_id.to_string(),
+                    "--group-count",
+                    &config.raft.group_count.to_string(),
+                    "--core-count",
+                    &config.runtime.core_count.to_string(),
+                    "--process-incarnation",
+                    boot.as_str(),
+                ])
+                .kill_on_drop(true);
+            let output =
+                tokio::time::timeout(Duration::from_secs(65), helper_command.output()).await??;
+            if !output.status.success() {
+                return Err(std::io::Error::other(format!(
+                    "startup reservation refused: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ))
+                .into());
+            }
+            let admission: ursula_proto::admin::StartupAdmission =
+                serde_json::from_slice(&output.stdout)?;
+            admission.validate().map_err(std::io::Error::other)?;
+            if admission.process_incarnation != boot {
+                return Err(std::io::Error::other(
+                    "startup helper changed the fresh process incarnation",
+                )
+                .into());
+            }
+            start_maintenance_drained |= admission.start_maintenance_drained();
+            startup_admission = Some(admission);
+        }
+        Ok(value) if value == "false" => (),
+        Err(std::env::VarError::NotPresent) => (),
+        _ => {
+            return Err(std::io::Error::other(
+                "URSULA_STARTUP_RESERVATION must be exactly true or false",
+            )
+            .into());
+        }
+    }
+    // No format stamps, Raft actors, transport or listeners exist before admission.
+    let mut state = init_state(&config, preset, start_maintenance_drained)
+        .await?
+        .with_process_incarnation(boot);
+    if let Some(admission) = startup_admission {
+        // No admin requests can enter the Raft API queue before this gate is
+        // installed: all listeners are opened by serve.
+        state = state.with_startup_maintenance_fence(admission.maintenance_fence);
+    }
     state.register_otel_metrics();
     serve(state, &config).await
 }

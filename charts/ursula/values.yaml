@@ -78,6 +78,12 @@ server:
   # cannot know which voter is safe to lose; this drains one node, replaces it,
   # waits for it to rejoin and catch up, verifies the cluster, and only then
   # moves on. Without it an OnDelete upgrade never reaches the new image.
+  # Enable only after a settled pre-fault host catalog exists in the shared store.
+  # Every server launch claims its fresh boot before opening Raft transport.
+  startupOwnership:
+    enabled: false
+    # Read-only Nitro kernel instance identity must match the scheduled Node.
+    provider: aws-nitro
   gracefulRollout:
     # Off by default: it is only meaningful with updateStrategy=OnDelete, and
     # it needs RBAC to delete pods and forward ports.

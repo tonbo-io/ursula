@@ -35,7 +35,7 @@ spec:
         {{- end }}
     spec:
       serviceAccountName: {{ include "ursula.serviceAccountName" . }}
-      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      automountServiceAccountToken: {{ if .Values.server.startupOwnership.enabled }}false{{ else }}{{ .Values.serviceAccount.automountServiceAccountToken }}{{ end }}
       enableServiceLinks: false
       terminationGracePeriodSeconds: {{ .Values.server.terminationGracePeriodSeconds }}
       {{- with .Values.global.imagePullSecrets }}
@@ -62,6 +62,26 @@ spec:
               containerPort: {{ .Values.server.ports.client }}
               protocol: TCP
           env:
+            {{- if .Values.server.startupOwnership.enabled }}
+            - name: URSULA_STARTUP_PROVIDER
+              value: {{ .Values.server.startupOwnership.provider | quote }}
+            - name: URSULA_STARTUP_RESERVATION
+              value: "true"
+            - name: URSULA_STARTUP_STATEFULSET
+              value: {{ include "ursula.fullname" . | quote }}
+            - name: URSULA_STARTUP_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: URSULA_STARTUP_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: URSULA_STARTUP_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            {{- end }}
             - name: RUST_LOG
               value: {{ .Values.server.rustLog | quote }}
             {{- if $hasS3Credentials }}
@@ -122,6 +142,14 @@ spec:
             timeoutSeconds: {{ .Values.server.probes.liveness.timeoutSeconds }}
           {{- end }}
           volumeMounts:
+            {{- if .Values.server.startupOwnership.enabled }}
+            - name: physical-instance
+              mountPath: /var/run/ursula-physical-instance
+              readOnly: true
+            - name: startup-api
+              mountPath: /var/run/ursula-startup
+              readOnly: true
+            {{- end }}
             - name: entrypoint
               mountPath: /opt/ursula/entrypoint
               readOnly: true
@@ -135,6 +163,24 @@ spec:
             - name: raft-data
               mountPath: {{ .Values.raft.logDir }}
       volumes:
+        {{- if .Values.server.startupOwnership.enabled }}
+        - name: physical-instance
+          hostPath:
+            path: /sys/devices/virtual/dmi/id/board_asset_tag
+            type: File
+        - name: startup-api
+          projected:
+            defaultMode: 0440
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+        {{- end }}
         - name: entrypoint
           configMap:
             name: {{ include "ursula.fullname" . }}

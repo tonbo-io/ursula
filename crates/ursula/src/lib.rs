@@ -323,6 +323,19 @@ impl HttpState {
         otel_metrics::register(&self.runtime.metrics());
     }
 
+    pub(crate) fn with_process_incarnation(mut self, boot: ProcessIncarnation) -> Self {
+        self.process_incarnation = boot;
+        self
+    }
+
+    pub(crate) fn with_startup_maintenance_fence(
+        mut self,
+        fence: ursula_proto::admin::MaintenanceFenceState,
+    ) -> Self {
+        self.admin_fence = admin_fence::AdminMutationFence::from_startup(fence);
+        self
+    }
+
     pub(crate) fn with_configured_node_id(mut self, node_id: u64) -> Self {
         self.configured_node_id = Some(node_id);
         self

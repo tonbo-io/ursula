@@ -169,6 +169,31 @@ def shim(role):
                     event['deleted_node'] = node
                     event['generation'] = operation['fence']['generation']
                     event['admission'] = operation['admission']
+                    if db['mode'] == 'startup-bind':
+                        # A separately admitted server commits its boot before
+                        # listening, while this hook still holds the old snapshot.
+                        plan = operation['process_plan']
+                        plan[node - 1]['expected_process_incarnation'] = current['boot']
+                        request = {'action': 'bind_pod_replacement', 'fence': operation['fence'],
+                                   'pod': pod(db, node), 'node': {'kind': 'Node', 'metadata': {
+                                       'name': f'host-{node}', 'uid': f'node-{node}'},
+                                       'spec': {'providerID': f'instance-{node}'}},
+                                   'process_plan': plan}
+                        cell_file = database.with_suffix('.cell.json')
+                        snapshot_file = database.with_suffix('.snapshot.json')
+                        request_file = database.with_suffix('.request.json')
+                        cell_file.write_text(json.dumps(state(db)['cell']))
+                        snapshot_file.write_text(json.dumps(db['store']))
+                        request_file.write_text(json.dumps(request))
+                        bound = subprocess.run([os.environ['URSULA_CTL_BINARY'], 'reservation-propose',
+                                                '--cell', str(cell_file), '--snapshot', str(snapshot_file),
+                                                '--request', str(request_file)], capture_output=True,
+                                               text=True, check=True)
+                        offered = json.loads(bound.stdout)
+                        offered['metadata']['resourceVersion'] = str(int(db['store']['metadata']['resourceVersion']) + 1)
+                        db['store'] = offered
+                        current.update(phase='activating', token=operation['fence'])
+                        event['startup_bound'] = True
                     if db['mode'] == 'after-delete':
                         db['mode'] = 'normal'
                         failure = 'transport lost after API accepted UID deletion'
@@ -323,6 +348,18 @@ class RolloutTests(unittest.TestCase):
         for deletion in self.deletions():
             self.assertEqual(len(deletion['admission']['verification']['prefixes']), 4)
             self.assertEqual(len(deletion['admission']['verification']['applied']), 3)
+
+    def test_hook_accepts_exact_same_executor_pretransport_startup_binding(self):
+        self.db['mode'] = 'startup-bind'
+        self.save()
+        run = self.run_shell()
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        final = self.refresh()
+        self.assertIsNone(final['operation'])
+        self.assertEqual(final['generation'], 1)
+        self.assertEqual(len(self.deletions()), 1)
+        self.assertTrue(self.deletions()[0]['startup_bound'])
+        self.assertEqual(final['completion']['replacement']['process_incarnation'], self.db['nodes']['3']['boot'])
 
     def test_legacy_consumer_cannot_bypass_an_existing_shared_reservation(self):
         run = self.run_shell('main')

@@ -137,6 +137,9 @@ pub enum MaintenanceFenceState {
     /// No reservation protocol has been installed; this is uncertified.
     #[default]
     Unclaimed,
+    /// The persistent ownership protocol is installed, with no completed
+    /// reservation yet. Mutations remain closed until an executor activates.
+    AwaitingReservation,
     Active {
         fence: MaintenanceFence,
     },
@@ -154,12 +157,40 @@ pub enum MaintenanceFenceState {
 impl MaintenanceFenceState {
     pub fn fence(&self) -> Option<&MaintenanceFence> {
         match self {
-            Self::Unclaimed => None,
+            Self::Unclaimed | Self::AwaitingReservation => None,
             Self::Active { fence }
             | Self::Activating { fence }
             | Self::Retiring { fence }
             | Self::Retired { fence } => Some(fence),
         }
+    }
+}
+
+/// A trusted startup helper's acknowledged ownership, loaded before listeners.
+/// The server generates the incarnation; the helper must return it unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupAdmission {
+    pub process_incarnation: ProcessIncarnation,
+    pub maintenance_fence: MaintenanceFenceState,
+}
+
+impl StartupAdmission {
+    /// Startup never grants active mutation authority or uncertified admission.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self.maintenance_fence {
+            MaintenanceFenceState::AwaitingReservation
+            | MaintenanceFenceState::Activating { .. }
+            | MaintenanceFenceState::Retired { .. } => Ok(()),
+            _ => Err("startup admission must retain closed maintenance authority"),
+        }
+    }
+
+    pub fn start_maintenance_drained(&self) -> bool {
+        matches!(
+            self.maintenance_fence,
+            MaintenanceFenceState::Activating { .. }
+        )
     }
 }
 

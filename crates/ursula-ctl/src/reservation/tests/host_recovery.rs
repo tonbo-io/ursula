@@ -58,7 +58,7 @@ fn admit(state: &Reservation) -> Reservation {
         .unwrap()
 }
 
-fn terminated() -> Reservation {
+pub(super) fn terminated() -> Reservation {
     let state = admit(&reserved());
     state
         .recover_host(HostRequest::RecordHostTermination {
@@ -74,7 +74,7 @@ fn terminated() -> Reservation {
         .unwrap()
 }
 
-fn original_intent(state: &Reservation) -> Reservation {
+pub(super) fn original_intent(state: &Reservation) -> Reservation {
     state
         .recover_host(HostRequest::AdmitFencedPodRetirement {
             fence: state.operation().unwrap().fence.clone(),
@@ -113,6 +113,22 @@ fn complete(state: &Reservation) -> HostRequest {
         now_ms: 3000,
         observation: observation(state, true, 2800, 70),
     }
+}
+
+pub(super) fn completed_startup_fixture() -> (Reservation, super::super::PublishHostInventory) {
+    let mut state = original_intent(&terminated());
+    let mut request = binding(&state, "replacement");
+    if let HostRequest::BindHostReplacement { node, .. } = &mut request {
+        node["spec"]["providerID"] = json!("aws:///zone-1/i-123");
+    }
+    state = state.recover_host(request).unwrap();
+    state = state.recover_host(complete(&state)).unwrap();
+    let mut captured = host_publication();
+    let source = &state.hosts().unwrap().voter(1).unwrap().source;
+    captured.pods[0]["metadata"]["uid"] = json!(source.pod_uid);
+    captured.nodes[0]["metadata"]["uid"] = json!(source.node_uid);
+    captured.nodes[0]["spec"]["providerID"] = json!(source.provider_instance);
+    (state, captured)
 }
 
 #[test]
