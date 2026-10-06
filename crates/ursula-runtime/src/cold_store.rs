@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt;
@@ -929,9 +925,9 @@ impl ColdStore {
                 ),
             ));
         }
-        let object_start = object
-            .object_offset
-            .checked_add(read_start_offset - object.start_offset)
+        let object_start = read_start_offset
+            .checked_sub(object.start_offset)
+            .and_then(|within_segment| object.object_offset.checked_add(within_segment))
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "cold read range overflow")
             })?;
@@ -1056,12 +1052,25 @@ impl ColdStore {
         object_end: u64,
         len: usize,
     ) -> io::Result<Vec<u8>> {
+        let range_error = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cold cache block range is out of bounds",
+            )
+        };
         let mut payload = Vec::with_capacity(len);
         let block_size = cache.block_size();
-        let first_block = object_start / block_size;
-        let last_block = (object_end - 1) / block_size;
+        let last_offset = object_end.checked_sub(1).ok_or_else(range_error)?;
+        let first_block = object_start
+            .checked_div(block_size)
+            .ok_or_else(range_error)?;
+        let last_block = last_offset
+            .checked_div(block_size)
+            .ok_or_else(range_error)?;
         for block_index in first_block..=last_block {
-            let block_start = block_index * block_size;
+            let block_start = block_index
+                .checked_mul(block_size)
+                .ok_or_else(range_error)?;
             let block_end = block_start
                 .saturating_add(block_size)
                 .min(object.object_size);
@@ -1075,10 +1084,14 @@ impl ColdStore {
                     block_end,
                 )
                 .await?;
-            let slice_start = usize::try_from(object_start.max(block_start) - block_start)
+            // `max(object_start, block_start) - block_start` never underflows.
+            let slice_start = usize::try_from(object_start.saturating_sub(block_start))
                 .expect("cache slice start fits usize");
-            let slice_end = usize::try_from(object_end.min(block_end) - block_start)
-                .expect("cache slice end fits usize");
+            let slice_end = object_end
+                .min(block_end)
+                .checked_sub(block_start)
+                .ok_or_else(range_error)?;
+            let slice_end = usize::try_from(slice_end).expect("cache slice end fits usize");
             payload.extend_from_slice(&block.slice(slice_start..slice_end));
         }
         if payload.len() != len {
@@ -1108,6 +1121,12 @@ impl ColdStore {
         if let Some(bytes) = cache.get(&path, block_index) {
             return Ok(bytes);
         }
+        let block_len = block_end.checked_sub(block_start).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cold cache block range is out of bounds",
+            )
+        })?;
         let bytes = self
             .operator
             .read_with(&path)
@@ -1115,7 +1134,7 @@ impl ColdStore {
             .await
             .map_err(|err| cold_store_io_error(&path, err))?
             .to_bytes();
-        let expected_len = usize::try_from(block_end - block_start).map_err(|_overflow| {
+        let expected_len = usize::try_from(block_len).map_err(|_overflow| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "cold cache block length exceeds usize",
@@ -1145,7 +1164,10 @@ impl ColdStore {
         let store = self.clone();
         crate::rt::spawn(async move {
             for _ in 0..readahead_blocks {
-                let block_start = block_index * block_size;
+                // An overflowing block start is past the end of the object.
+                let Some(block_start) = block_index.checked_mul(block_size) else {
+                    break;
+                };
                 if block_start >= object.object_size {
                     break;
                 }
@@ -1166,7 +1188,7 @@ impl ColdStore {
                 {
                     tracing::debug!(%err, block_index, "cold block prefetch failed");
                 }
-                block_index += 1;
+                block_index = block_index.saturating_add(1);
             }
         });
     }
@@ -1398,7 +1420,11 @@ impl ColdReadCache {
     /// read half once the map is full. Amortized O(1) per new reader. A
     /// pruned stream only loses its readahead score.
     fn prune_readers_if_needed(&self, inner: &mut ColdReadCacheInner) {
-        let capacity_blocks = self.config.max_bytes / self.config.block_bytes.max(1);
+        let capacity_blocks = self
+            .config
+            .max_bytes
+            .checked_div(self.config.block_bytes.max(1))
+            .unwrap_or_default();
         let limit = capacity_blocks.saturating_mul(4).max(MIN_TRACKED_READERS);
         if inner.readers.len() < limit {
             return;
@@ -1410,10 +1436,10 @@ impl ColdReadCache {
             .map(|state| state.last_read)
             .collect::<Vec<_>>();
         let drop_count = generations.len().saturating_sub(keep);
-        if drop_count == 0 {
+        let Some(threshold_index) = drop_count.checked_sub(1) else {
             return;
-        }
-        let (_, threshold, _) = generations.select_nth_unstable(drop_count - 1);
+        };
+        let (_, threshold, _) = generations.select_nth_unstable(threshold_index);
         let threshold = *threshold;
         inner.readers.retain(|_, state| state.last_read > threshold);
         inner.readers.shrink_to(limit);
@@ -1481,7 +1507,7 @@ impl ColdReadCache {
         // from the live blocks once it bloats past 2x the live entry count —
         // amortized O(1) per touch, since each rebuild shrinks it back to
         // `blocks.len()` so the next rebuild is `blocks.len()` touches away.
-        if inner.lru.len() <= inner.blocks.len() * 2 + 16 {
+        if inner.lru.len() <= inner.blocks.len().saturating_mul(2).saturating_add(16) {
             return;
         }
         let mut live: Vec<(u64, ColdCacheKey)> = inner

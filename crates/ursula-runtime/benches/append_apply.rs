@@ -2,10 +2,6 @@
     clippy::panic,
     reason = "a benchmark aborts on an unexpected engine response"
 )]
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use criterion::BatchSize;
 use criterion::BenchmarkId;
 use criterion::Criterion;
@@ -257,8 +253,8 @@ fn snapshot_compaction(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 
             None,
         );
     }
-    let snapshot_offset =
-        u64::try_from(APPENDS_PER_ITER / 2 * payload.len()).expect("snapshot offset fits u64");
+    let snapshot_offset = u64::try_from((APPENDS_PER_ITER / 2).saturating_mul(payload.len()))
+        .expect("snapshot offset fits u64");
     match machine.apply(StreamCommand::PublishSnapshot {
         stream_id: stream_id.clone(),
         snapshot_offset,

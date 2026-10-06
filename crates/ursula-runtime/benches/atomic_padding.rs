@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -31,7 +27,7 @@ fn run_packed(thread_count: usize) -> u64 {
     };
     std::thread::scope(|scope| {
         for thread_index in 0..thread_count {
-            let counter = if thread_index % 2 == 0 {
+            let counter = if thread_index.is_multiple_of(2) {
                 &counters.left
             } else {
                 &counters.right
@@ -43,7 +39,10 @@ fn run_packed(thread_count: usize) -> u64 {
             });
         }
     });
-    counters.left.load(Ordering::Relaxed) + counters.right.load(Ordering::Relaxed)
+    counters
+        .left
+        .load(Ordering::Relaxed)
+        .saturating_add(counters.right.load(Ordering::Relaxed))
 }
 
 fn run_padded(thread_count: usize) -> u64 {
@@ -53,7 +52,7 @@ fn run_padded(thread_count: usize) -> u64 {
     };
     std::thread::scope(|scope| {
         for thread_index in 0..thread_count {
-            let counter = if thread_index % 2 == 0 {
+            let counter = if thread_index.is_multiple_of(2) {
                 &counters.left
             } else {
                 &counters.right
@@ -65,7 +64,10 @@ fn run_padded(thread_count: usize) -> u64 {
             });
         }
     });
-    counters.left.load(Ordering::Relaxed) + counters.right.load(Ordering::Relaxed)
+    counters
+        .left
+        .load(Ordering::Relaxed)
+        .saturating_add(counters.right.load(Ordering::Relaxed))
 }
 
 fn atomic_padding_benches(c: &mut Criterion) {

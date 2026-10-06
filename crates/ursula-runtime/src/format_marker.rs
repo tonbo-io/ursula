@@ -398,10 +398,6 @@ impl FormatEpochNamespace {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 mod tests {
     use opendal::Scheme;
 
@@ -521,12 +517,10 @@ mod tests {
         let ns = memory_namespace(&operator, "snapshots/");
         assert_eq!(ns.classify().await.unwrap(), MarkerState::Fresh);
         ns.write_marker().await.unwrap();
-        assert!(
-            operator
-                .stat(&format!("snapshots/{OBJECT_MARKER}"))
-                .await
-                .is_ok()
-        );
+        operator
+            .stat(&format!("snapshots/{OBJECT_MARKER}"))
+            .await
+            .expect("write_marker stores the object marker");
         assert_eq!(ns.classify().await.unwrap(), MarkerState::Current);
 
         let unmarked = memory_operator();
@@ -552,12 +546,10 @@ mod tests {
         ns.write_group_marker(3).await.unwrap();
         assert!(ns.group_marker_exists(3).await.unwrap());
         assert!(!ns.group_marker_exists(4).await.unwrap());
-        assert!(
-            operator
-                .stat(&format!("snapshots/{GROUP_INIT_MARKER_DIR}/group-3"))
-                .await
-                .is_ok()
-        );
+        operator
+            .stat(&format!("snapshots/{GROUP_INIT_MARKER_DIR}/group-3"))
+            .await
+            .expect("write_group_marker stores the group marker");
         assert_eq!(ns.classify().await.unwrap(), MarkerState::Current);
     }
 

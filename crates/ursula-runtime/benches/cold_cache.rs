@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use criterion::BenchmarkId;
 use criterion::Criterion;
 use criterion::Throughput;
@@ -209,7 +205,8 @@ async fn scan_once(
     let mut offset = 0u64;
     let mut checksum = 0u64;
     while offset < object.end_offset {
-        let remaining = usize::try_from(object.end_offset - offset).expect("remaining fits usize");
+        let remaining = usize::try_from(object.end_offset.saturating_sub(offset))
+            .expect("remaining fits usize");
         let len = remaining.min(READ_BYTES);
         let bytes = store
             .read_object_range_for_stream(stream_id, object, offset, len)
@@ -229,7 +226,8 @@ async fn interleaved_scan_once(stores: &[(BucketStreamId, BenchStore)]) -> u64 {
         .map(|(_, store)| store.object.end_offset)
         .unwrap_or(0);
     while offset < end_offset {
-        let remaining = usize::try_from(end_offset - offset).expect("remaining fits usize");
+        let remaining =
+            usize::try_from(end_offset.saturating_sub(offset)).expect("remaining fits usize");
         let len = remaining.min(READ_BYTES);
         for (stream_id, bench_store) in stores {
             let bytes = bench_store
@@ -263,14 +261,24 @@ async fn read_offsets(
 }
 
 fn random_offsets(object_bytes: usize, read_bytes: usize, count: usize) -> Vec<u64> {
-    let block_count = (object_bytes - read_bytes) / read_bytes;
+    let block_count = object_bytes
+        .checked_sub(read_bytes)
+        .and_then(|span| span.checked_div(read_bytes))
+        .expect("object is at least one read long and reads are non-empty");
     let mut state = 0x1234_5678_9abc_def0u64;
     (0..count)
         .map(|_| {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let block_index =
-                usize::try_from(state).expect("random state fits usize") % block_count;
-            u64::try_from(block_index * read_bytes).expect("offset fits u64")
+            let block_index = usize::try_from(state)
+                .expect("random state fits usize")
+                .checked_rem(block_count)
+                .expect("object holds at least one read block");
+            u64::try_from(
+                block_index
+                    .checked_mul(read_bytes)
+                    .expect("offset fits usize"),
+            )
+            .expect("offset fits u64")
         })
         .collect()
 }

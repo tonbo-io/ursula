@@ -9,10 +9,6 @@
 //! cold-index repair cursor, which reads every page of every stream of the
 //! group it leads, records the pages that still hold small chunks, so idle
 //! streams are found too.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -20,6 +16,7 @@ use std::collections::VecDeque;
 use ursula_shard::BucketStreamId;
 
 use crate::cold_index::ColdIndexPageKey;
+use crate::cold_index::page_ids_for_range;
 
 /// Most pages held as debt; further pages are dropped until the compactor
 /// drains some, and the repair cursor finds them again later.
@@ -51,11 +48,10 @@ impl CompactionDebt {
         start_offset: u64,
         end_offset: u64,
     ) {
-        if end_offset <= start_offset {
+        let Some(page_ids) = page_ids_for_range(start_offset, end_offset) else {
             return;
-        }
-        let span = ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
-        for page_id in start_offset / span..=(end_offset - 1) / span {
+        };
+        for page_id in page_ids {
             self.record_page(ColdIndexPageKey {
                 stream_id: stream_id.clone(),
                 generation,

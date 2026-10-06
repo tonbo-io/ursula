@@ -1,10 +1,6 @@
 //! Regression tests for the bounded-state cold-path correctness defects
 //! (D1 regressed cold frontier, D3 stale page entries, F14b GC isolation,
 //! F14e stale flushes, F19 page repair).
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::sync::Arc;
 
@@ -303,7 +299,7 @@ fn object(start_offset: u64, end_offset: u64, s3_path: &str) -> ObjectPayloadRef
         start_offset,
         end_offset,
         s3_path: s3_path.to_owned(),
-        object_size: end_offset - start_offset,
+        object_size: end_offset.checked_sub(start_offset).unwrap(),
         object_offset: 0,
     }
 }
