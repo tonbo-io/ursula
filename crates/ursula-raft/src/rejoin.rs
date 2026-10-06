@@ -263,6 +263,16 @@ pub struct GroupRejoin {
     gate: Mutex<VoteGate>,
     reverted: Mutex<RevertedFollowers>,
     restart_guard: RestartGuard,
+    #[cfg(madsim)]
+    barrier_checkpoint: Mutex<Option<BarrierCheckpoint>>,
+}
+
+/// One-shot scheduling boundary for the production barrier driver in DST.
+#[cfg(madsim)]
+struct BarrierCheckpoint {
+    after_probe: bool,
+    entered: Arc<crate::rt::sync::Notify>,
+    resume: Arc<crate::rt::sync::Notify>,
 }
 
 impl fmt::Debug for GroupRejoin {
@@ -284,6 +294,42 @@ impl GroupRejoin {
             gate: Mutex::new(VoteGate::default()),
             reverted: Mutex::new(RevertedFollowers::default()),
             restart_guard: RestartGuard::new(raft_group_id, None),
+            #[cfg(madsim)]
+            barrier_checkpoint: Mutex::new(None),
+        }
+    }
+
+    /// Pause once after election refresh with a known barrier, before the
+    /// second gate read. Only compiled into deterministic simulations.
+    #[cfg(madsim)]
+    pub fn pause_barrier_after_refresh(
+        &self,
+        after_probe: bool,
+    ) -> (Arc<crate::rt::sync::Notify>, Arc<crate::rt::sync::Notify>) {
+        let entered = Arc::new(crate::rt::sync::Notify::new());
+        let resume = Arc::new(crate::rt::sync::Notify::new());
+        *self.barrier_checkpoint.lock().expect("barrier checkpoint") = Some(BarrierCheckpoint {
+            after_probe,
+            entered: entered.clone(),
+            resume: resume.clone(),
+        });
+        (entered, resume)
+    }
+
+    #[cfg(madsim)]
+    async fn barrier_refresh_checkpoint(&self, after_probe: bool) {
+        let has_target = self.gate.lock().expect("vote gate").catch_up.is_some();
+        let checkpoint = {
+            let mut slot = self.barrier_checkpoint.lock().expect("barrier checkpoint");
+            if has_target && slot.as_ref().is_some_and(|hook| hook.after_probe == after_probe) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(checkpoint) = checkpoint {
+            checkpoint.entered.notify_one();
+            checkpoint.resume.notified().await;
         }
     }
 
@@ -869,7 +915,12 @@ pub async fn run_rejoin_vote_barrier<P, F>(
     let mut last_barrier_leader = None;
     loop {
         registry.refresh_group_elections(raft_group_id);
+        #[cfg(madsim)]
+        rejoin.barrier_refresh_checkpoint(false).await;
         if rejoin.vote_gate_open() {
+            // Apply can advance between refresh and this sticky gate read.
+            // Publish the open gate to election policy before the driver exits.
+            registry.refresh_group_elections(raft_group_id);
             return;
         }
         let metrics = raft.metrics().borrow_watched().clone();
@@ -897,7 +948,10 @@ pub async fn run_rejoin_vote_barrier<P, F>(
             rejoin.confirm_barrier(leader, index);
             last_barrier_leader = Some(leader);
             registry.refresh_group_elections(raft_group_id);
+            #[cfg(madsim)]
+            rejoin.barrier_refresh_checkpoint(true).await;
             if rejoin.vote_gate_open() {
+                registry.refresh_group_elections(raft_group_id);
                 tracing::info!(
                     node_id = metrics.id,
                     raft_group_id = raft_group_id.0,

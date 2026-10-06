@@ -3126,6 +3126,93 @@ async fn rejoin_cluster_with_records(stream: &BucketStreamId) -> (RejoinCluster,
     (cluster, acknowledged)
 }
 
+/// Apply advances after election refresh but before the driver's final gate
+/// read. Both exit paths must restore automatic campaigning without undrain.
+#[test]
+fn memory_wal_barrier_exit_refreshes_elections_after_apply() {
+    let _guard = sim_test_guard();
+    for after_probe in [false, true] {
+        for drained in [false, true] {
+            run_with_madsim(1, async move {
+                let stream = BucketStreamId::new("simulated", "barrier-election-race");
+                let (mut cluster, _) = rejoin_cluster_with_records(&stream).await;
+                let leader = cluster.wait_leader(Duration::from_secs(5)).await;
+                let follower = (1..=3).find(|id| *id != leader).expect("follower");
+                // Stop the old process drivers before attaching a closed gate.
+                for driver in cluster.drivers.remove(&follower).expect("drivers") {
+                    driver.abort();
+                    let _ = driver.await;
+                }
+                let raft = cluster.engines[&follower].raft_handle();
+                let rejoin = Arc::new(ursula_raft::GroupRejoin::new(
+                    follower,
+                    placement().raft_group_id,
+                ));
+                rejoin.bind(&raft);
+                cluster.registry.register_rejoin(follower, rejoin.clone());
+                let participation = ursula_raft::RaftGroupHandleRegistry::default();
+                participation.register_rejoin(placement().raft_group_id, rejoin.clone());
+                participation.register(placement(), raft.clone());
+                if drained {
+                    participation.mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
+                }
+                // Only the tested follower may campaign after the leader fails.
+                for (&id, engine) in &cluster.engines {
+                    if id != follower {
+                        engine.raft_handle().runtime_config().elect(false);
+                    }
+                }
+                isolate(&cluster.policy, follower);
+                cluster.append(leader, &stream, b"barrier-target;").await.expect("commit target");
+                let metrics = cluster.metrics(leader);
+                let target = metrics.last_applied.expect("applied target").index;
+                assert!(cluster.applied(follower).expect("follower applied") < target);
+                let (entered, resume) = rejoin.pause_barrier_after_refresh(after_probe);
+                let driver = madsim::task::spawn(ursula_raft::run_rejoin_vote_barrier(
+                    raft.clone(),
+                    rejoin.clone(),
+                    participation,
+                    rejoin_configured_voters(),
+                    move |_, _| async move { Ok((metrics.vote, target)) },
+                    Duration::from_secs(1),
+                    Duration::from_millis(10),
+                ));
+                madsim::time::timeout(Duration::from_secs(2), entered.notified())
+                    .await.expect("driver paused after writing elect(false)");
+                assert!(!rejoin.vote_gate_open(), "apply has not reached the target");
+                cluster.policy.clear();
+                raft.wait(Some(Duration::from_secs(2)))
+                    .applied_index_at_least(Some(target), "apply between the two observations")
+                    .await.expect("real state machine applies target");
+                resume.notify_one();
+                madsim::time::timeout(Duration::from_secs(2), driver)
+                    .await.expect("barrier driver exits").expect("driver task");
+                assert!(rejoin.vote_gate_open());
+                isolate(&cluster.policy, leader);
+                if drained {
+                    madsim::time::sleep(Duration::from_secs(1)).await;
+                    assert_eq!(cluster.metrics(follower).vote, metrics.vote,
+                        "an open recovery gate must not override maintenance drain");
+                } else {
+                    raft.wait(Some(Duration::from_secs(5)))
+                        .metrics(|m| m.state == openraft::ServerState::Leader,
+                            "the recovered follower automatically campaigns")
+                        .await.expect("election enabled without drain/undrain");
+                }
+                for (_, drivers) in cluster.drivers {
+                    for driver in drivers {
+                        driver.abort();
+                        let _ = driver.await;
+                    }
+                }
+                for (_, engine) in cluster.engines {
+                    engine.shutdown().await.expect("shutdown");
+                }
+            });
+        }
+    }
+}
+
 /// A minority (one follower) restarts with an empty memory log while writes
 /// continue. It must not count as a voter with an empty log: the leader sees
 /// it lost acknowledged entries and rebuilds it through remove, learner,

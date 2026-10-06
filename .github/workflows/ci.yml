@@ -128,6 +128,7 @@ jobs:
 
       - name: Run madsim smoke corpus and PR seed set
         run: |
+          RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim memory_wal_barrier_exit_refreshes_elections_after_apply -- --nocapture
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim smoke_corpus_replays -- --nocapture
           RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --failure-dir target/ursula-sim-failures \
