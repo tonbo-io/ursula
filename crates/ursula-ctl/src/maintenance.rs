@@ -660,13 +660,10 @@ pub async fn repair_restarted_voter(
         .context("stabilize surviving voter terms before membership repair")?;
     let fence =
         pin_restart_leaders(nodes, target, client, drain_options, &configured_node_ids).await?;
-    let initial = client.fetch_cluster(nodes).await?;
-    validate_surviving_voters(
-        &initial,
-        &configured_node_ids,
-        target.id,
-        drain_options.lag_tolerance,
-    )?;
+    let initial =
+        wait_for_recovery_survivors(nodes, target, client, drain_options, &configured_node_ids)
+            .await
+            .context("wait for survivors after pinning restart leaders")?;
     let anchor_view = initial.node(fence.leader_anchor).ok_or_else(|| {
         anyhow!(
             "restart anchor {} did not report metrics",
@@ -751,13 +748,10 @@ pub async fn repair_restarted_voter(
     .await
     .context("detach restarted voter from unready groups")?;
 
-    let detached = client.fetch_cluster(nodes).await?;
-    validate_surviving_voters(
-        &detached,
-        &configured_node_ids,
-        target.id,
-        drain_options.lag_tolerance,
-    )?;
+    let detached =
+        wait_for_recovery_survivors(nodes, target, client, drain_options, &configured_node_ids)
+            .await
+            .context("wait for survivors after restarted voter detach")?;
     let anchor_view = detached.node(fence.leader_anchor).ok_or_else(|| {
         anyhow!(
             "restart anchor {} disappeared after voter detach",
@@ -1254,6 +1248,42 @@ async fn drain_recovery_target(
     }
 }
 
+/// Re-sample without changing membership while concurrent healing applies its
+/// transitions. The timeout bounds both metrics requests and polling sleeps;
+/// process-pin/transport errors remain terminal and every eligibility check is
+/// unchanged. A previous successful sample cannot certify a later transition.
+async fn wait_for_recovery_survivors(
+    nodes: &[NodeInfo],
+    target: &NodeInfo,
+    client: &MetricsClient,
+    options: &DrainOptions,
+    configured_node_ids: &BTreeSet<u64>,
+) -> Result<ClusterSnapshot> {
+    let mut last_error = anyhow!("surviving voters have not been observed");
+    let outcome = tokio::time::timeout(options.drain_timeout, async {
+        loop {
+            let snapshot = client.fetch_cluster(nodes).await?;
+            match validate_surviving_voters(
+                &snapshot,
+                configured_node_ids,
+                target.id,
+                options.lag_tolerance,
+            ) {
+                Ok(()) => return Ok(snapshot),
+                Err(error) => last_error = error,
+            }
+            tracing::debug!(%last_error, "waiting for recovery survivor eligibility");
+            tokio::time::sleep(options.poll_interval).await;
+        }
+    })
+    .await;
+    match outcome {
+        Ok(result) => result,
+        Err(_) => Err(last_error)
+            .context("recovery survivor eligibility did not converge before the drain deadline"),
+    }
+}
+
 fn validate_surviving_voters(
     snapshot: &ClusterSnapshot,
     configured_node_ids: &BTreeSet<u64>,
@@ -1330,8 +1360,23 @@ fn validate_surviving_voters(
         }
     }
     for node_id in &survivors {
-        if !check_readiness(&eligible, *node_id, lag_tolerance).all_ready {
-            bail!("surviving voter {node_id} is not complete and caught up");
+        let readiness = check_readiness(&eligible, *node_id, lag_tolerance);
+        if !readiness.all_ready {
+            let blocked = readiness
+                .per_group
+                .values()
+                .filter(|group| !group.ready)
+                .take(8)
+                .collect::<Vec<_>>();
+            let issues = readiness
+                .maintenance_issues
+                .iter()
+                .take(8)
+                .collect::<Vec<_>>();
+            bail!(
+                "surviving voter {node_id} is not complete and caught up: groups={}, blocked={blocked:?}, maintenance_issues={issues:?}",
+                readiness.per_group.len()
+            );
         }
     }
     Ok(())
@@ -2196,6 +2241,9 @@ mod tests {
         recovery_gate_ready: AtomicBool,
         strict_maintenance_report: AtomicBool,
         joint_survivor_samples: AtomicUsize,
+        fenced_metric_samples: AtomicUsize,
+        post_fence_joint_samples: AtomicUsize,
+        stall_metrics: AtomicUsize,
         heal_after_operation: AtomicUsize,
         drained_nodes: Mutex<Vec<u64>>,
         undrained_nodes: Mutex<Vec<u64>>,
@@ -2221,6 +2269,10 @@ mod tests {
     }
 
     async fn mock_metrics(State(state): State<MockNode>) -> Json<serde_json::Value> {
+        if state.cluster.stall_metrics.load(Ordering::SeqCst) != 0 {
+            state.cluster.stall_metrics.store(2, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
         let leader = mock_current_leader(&state.cluster);
         if matches!(state.cluster.scenario, LeaderScenario::TargetMissing) && state.node_id == 3 {
             return Json(json!({
@@ -2280,14 +2332,41 @@ mod tests {
                 } else {
                     (100, Some(leader))
                 };
-            let joint = state.node_id == 1
+            let post_fence_joint = state.node_id == 1
+                && state.cluster.survivor_fenced.load(Ordering::SeqCst)
                 && state
                     .cluster
-                    .joint_survivor_samples
+                    .fenced_metric_samples
+                    .fetch_add(1, Ordering::SeqCst)
+                    > 0
+                && state
+                    .cluster
+                    .post_fence_joint_samples
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                         remaining.checked_sub(1)
                     })
                     .is_ok();
+            if post_fence_joint {
+                assert!(
+                    state
+                        .cluster
+                        .operations
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|operation| !operation.starts_with("membership:")
+                            && !operation.starts_with("learner:"))
+                );
+            }
+            let joint = post_fence_joint
+                || state.node_id == 1
+                    && state
+                        .cluster
+                        .joint_survivor_samples
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                            remaining.checked_sub(1)
+                        })
+                        .is_ok();
             let report = state.cluster.strict_maintenance_report.load(Ordering::SeqCst).then(|| {
                 let mut issues = Vec::new();
                 if voters != vec![1, 2, 3] || !learners.is_empty() { issues.push("incomplete_voter_set"); }
@@ -2537,6 +2616,9 @@ mod tests {
             recovery_gate_ready: AtomicBool::new(true),
             strict_maintenance_report: AtomicBool::new(false),
             joint_survivor_samples: AtomicUsize::new(0),
+            fenced_metric_samples: AtomicUsize::new(0),
+            post_fence_joint_samples: AtomicUsize::new(0),
+            stall_metrics: AtomicUsize::new(0),
             heal_after_operation: AtomicUsize::new(0),
             drained_nodes: Mutex::new(Vec::new()),
             undrained_nodes: Mutex::new(Vec::new()),
@@ -2675,6 +2757,95 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(cluster.membership_phase.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn repair_waits_for_survivor_eligibility_after_pinning_leaders() {
+        let (nodes, cluster) = mock_cluster(LeaderScenario::RepairableTarget).await;
+        cluster
+            .strict_maintenance_report
+            .store(true, Ordering::SeqCst);
+        cluster.post_fence_joint_samples.store(1, Ordering::SeqCst);
+        repair_restarted_voter(
+            &nodes,
+            &nodes[2],
+            &MetricsClient::new(Duration::from_secs(1)).unwrap(),
+            &DrainOptions {
+                drain_timeout: Duration::from_secs(1),
+                poll_interval: Duration::from_millis(1),
+                ..DrainOptions::default()
+            },
+            &MembershipRepairOptions {
+                poll_interval: Duration::from_millis(1),
+                ..MembershipRepairOptions::default()
+            },
+        )
+        .await
+        .expect("transient survivor state after a successful pin must converge");
+        assert_eq!(cluster.membership_phase.load(Ordering::SeqCst), 3);
+        assert_eq!(cluster.post_fence_joint_samples.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_survivor_deadline_bounds_a_stalled_metrics_request() {
+        let (nodes, cluster) = mock_cluster(LeaderScenario::RepairableTarget).await;
+        cluster.stall_metrics.store(1, Ordering::SeqCst);
+        let started = Instant::now();
+        let error = wait_for_recovery_survivors(
+            &nodes,
+            &nodes[2],
+            &MetricsClient::new(Duration::from_secs(2)).unwrap(),
+            &DrainOptions {
+                drain_timeout: Duration::from_millis(50),
+                ..DrainOptions::default()
+            },
+            &BTreeSet::from([1, 2, 3]),
+        )
+        .await
+        .expect_err("metrics I/O must not exceed the recovery stage budget");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(cluster.stall_metrics.load(Ordering::SeqCst), 2);
+        assert!(format!("{error:#}").contains("deadline"));
+        assert!(cluster.operations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn repair_refuses_persistent_survivor_issues_after_pinning_without_membership_mutations()
+    {
+        let (nodes, cluster) = mock_cluster(LeaderScenario::RepairableTarget).await;
+        cluster
+            .strict_maintenance_report
+            .store(true, Ordering::SeqCst);
+        cluster
+            .post_fence_joint_samples
+            .store(usize::MAX, Ordering::SeqCst);
+        let error = repair_restarted_voter(
+            &nodes,
+            &nodes[2],
+            &MetricsClient::new(Duration::from_secs(1)).unwrap(),
+            &DrainOptions {
+                drain_timeout: Duration::from_millis(50),
+                poll_interval: Duration::from_millis(1),
+                ..DrainOptions::default()
+            },
+            &MembershipRepairOptions::default(),
+        )
+        .await
+        .expect_err("an unready survivor cannot admit membership repair");
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("deadline"), "{diagnostic}");
+        assert!(diagnostic.contains("surviving voter 1"), "{diagnostic}");
+        assert!(diagnostic.contains("raft_group_id: 7"), "{diagnostic}");
+        assert_eq!(cluster.membership_phase.load(Ordering::SeqCst), 0);
+        assert!(
+            cluster
+                .operations
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|operation| !operation.starts_with("membership:")
+                    && !operation.starts_with("learner:"))
+        );
     }
 
     #[tokio::test]

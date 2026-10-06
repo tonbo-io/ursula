@@ -601,3 +601,37 @@ owner-pinned live-read contract. The regression checks the exact acknowledged
 payload/offset, genuine out-of-range refusal, refusal when quorum confirmation
 fails, and the complete prefix on all three replicas after repair. Full reviewed
 artifact and production-scale qualification remain required.
+
+
+## Follow-up: survivor eligibility after restart leader pinning
+
+Core candidate `9590730dc057100eaf8923d955baa669e2850811` passed every scheduled
+remote check and both WAL resource soaks. Publication
+[37451918285](https://github.com/tonbo-io/ursula/actions/runs/37451918285) produced
+version `0.0.0-pr.9590730dc057`, image
+`sha256:cec3b84abfa3c5b1a5e2bbb162f8b1100cbf0d3727368ecdc8430d503bacd578`
+and chart
+`sha256:32158a2c461ada6acf2f964bb71f6ed0cae84bc5d2c7a2cbc0dccb38154ffc48`.
+[Isolated EKS 37452468568](https://github.com/tonbo-io/cloud/actions/runs/37452468568)
+completed its 0.6.2 upgrade and independently verified all 1024 acknowledged
+payloads/offsets, hash
+`48314800c159329e0d6747e9504de6c5dcdae1719b8e73794b26795dd89dadf0`.
+The same-version restart failed during the last selected voter's repair: after
+successfully pinning leaders, a one-shot survivor check reported voter 3 not
+complete/caught up. No final readback ran. Namespace absence was independently
+verified. The old aggregate diagnostic does not establish which group or
+eligibility condition failed; do not claim an exact live root cause or full
+qualification. Initial dispatch 37452374099 supplied mutually exclusive PR and
+version inputs and was refused before credentials/test resource creation.
+
+A synthetic HTTP regression against the same CLI baseline reproduces the
+one-shot failure when a survivor briefly reports joint membership immediately
+after successful leader pinning. Recovery now waits read-only, within the
+existing drain timeout, for unchanged survivor eligibility checks to pass before
+planning repair or advancing after detach. Metrics I/O and polling share that
+absolute stage deadline; process-pin and transport errors remain terminal.
+Persistent unsafe state still refuses membership changes, and its bounded
+diagnostic includes blocked groups and maintenance reasons. This regression is
+sequencing evidence, not reproduction of the unknown EKS rejection reason.
+The updated source needs new CI, publication and complete EKS/shared-rollout
+qualification before merge.
