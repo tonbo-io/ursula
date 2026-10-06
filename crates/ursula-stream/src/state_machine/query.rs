@@ -1,8 +1,4 @@
 //! Read and query paths: heads, hot/cold accessors, read plans, snapshots, bootstrap.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use super::BOOTSTRAP_MAX_UPDATE_BYTES;
 use super::BucketStreamId;
@@ -519,7 +515,7 @@ fn push_cold_index_segments(
                 generation,
                 page_id,
                 read_start_offset: cursor,
-                len: usize::try_from(segment_end - cursor).expect("cold index read len fits usize"),
+                len: offset_delta(cursor, segment_end),
             }),
         ));
         cursor = segment_end;

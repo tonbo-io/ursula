@@ -29,10 +29,6 @@
 //! not fit never stops the pass. The index and cursor are not replicated and
 //! are not part of snapshots; restore rebuilds the index from the restored
 //! hot buffers.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -96,7 +92,8 @@ impl ColdFlushPressure {
         if excess == 0 || self.node_hot_bytes == 0 {
             return 0;
         }
-        let share = u128::from(group_hot_bytes) * u128::from(excess);
+        // The product of two `u64` values always fits in `u128`.
+        let share = u128::from(group_hot_bytes).saturating_mul(u128::from(excess));
         let node = u128::from(self.node_hot_bytes);
         let drain = share.div_ceil(node);
         u64::try_from(drain)
@@ -245,7 +242,7 @@ impl StreamStateMachine {
 
         let mut hot = Vec::with_capacity(self.flush_planner.hot_streams.len());
         for stream_id in &self.flush_planner.hot_streams {
-            stats.streams_visited += 1;
+            stats.streams_visited = stats.streams_visited.saturating_add(1);
             let Some(slot) = self.stream_slot(stream_id) else {
                 continue;
             };
@@ -258,7 +255,7 @@ impl StreamStateMachine {
         if mode == PassMode::AgedOnly && !hot.iter().any(|(_, _, aged)| *aged) {
             return Ok((ColdFlushPass { candidates, stats }, None));
         }
-        stats.sorts += 1;
+        stats.sorts = stats.sorts.saturating_add(1);
         // Aged tails first, then largest first.
         hot.sort_by(|left, right| {
             right
@@ -309,7 +306,7 @@ impl StreamStateMachine {
                     Err(err) => return Err(err),
                 };
                 let len = candidate.payload.len();
-                stats.bytes_copied += len;
+                stats.bytes_copied = stats.bytes_copied.saturating_add(len);
                 planned_for_stream = planned_for_stream.saturating_add(len);
                 planned_total =
                     planned_total.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));

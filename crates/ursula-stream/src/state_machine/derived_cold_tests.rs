@@ -1,10 +1,6 @@
 //! Bounded-state cold hygiene: F18 step 2 derived cold coverage, F14b
 //! `DeferColdGc`, F14i retention grace, and the incarnation check on
 //! `FlushCold`.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use super::*;
 
@@ -94,7 +90,7 @@ fn flush(
             start_offset,
             end_offset,
             s3_path: path.to_owned(),
-            object_size: end_offset - start_offset,
+            object_size: end_offset.checked_sub(start_offset).unwrap(),
             object_offset: 0,
             shared_object: false,
             payload_digest: String::new(),
@@ -288,8 +284,8 @@ fn f14i_retention_keeps_dropped_pack_slices_for_the_grace() {
 
 fn gc_queue_with_two_entries() -> StreamStateMachine {
     let mut machine = fresh_machine();
-    for (index, id) in ["gc-a", "gc-b"].into_iter().enumerate() {
-        create(&mut machine, id, 10 + index as u64);
+    for (id, now_ms) in ["gc-a", "gc-b"].into_iter().zip(10u64..) {
+        create(&mut machine, id, now_ms);
         append(&mut machine, id, b"abcd");
         assert!(matches!(
             flush(&mut machine, id, 0, 4, &format!("derived/chunks/{id}.bin")),

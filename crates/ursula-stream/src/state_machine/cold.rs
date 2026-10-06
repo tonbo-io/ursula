@@ -1,8 +1,4 @@
 //! Cold-tier flush planning, GC queue, retention compaction, and snapshot publishing.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use super::BucketStreamId;
 use super::ColdChunkRef;
@@ -685,13 +681,16 @@ impl StreamStateMachine {
         };
         let stream = &slot.metadata;
         if !is_json_record_content_type(&stream.content_type)
-            || offset == 0
             || offset == floor
             || offset == stream.tail_offset
         {
             return Ok(());
         }
-        match slot.hot_buffer.byte_at(offset - 1) {
+        // Offset 0 is always a message boundary and has no preceding byte.
+        let Some(preceding_offset) = offset.checked_sub(1) else {
+            return Ok(());
+        };
+        match slot.hot_buffer.byte_at(preceding_offset) {
             Some(b'\n') => Ok(()),
             Some(_) => Err(StreamResponse::error_with_next_offset(
                 StreamErrorCode::InvalidSnapshot,

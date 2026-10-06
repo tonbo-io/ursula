@@ -4,10 +4,6 @@
 //! appended: when the snapshot offset `S` is at or above the seal point and
 //! `[S, tail)` is all hot, one part per JSON message (split on LF) or one
 //! part in all for any other stream; an honest partial otherwise.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use super::*;
 
@@ -96,7 +92,7 @@ fn flush(machine: &mut StreamStateMachine, id: &str, start: u64, end: u64, path:
             start_offset: start,
             end_offset: end,
             s3_path: path.to_owned(),
-            object_size: end - start,
+            object_size: end.checked_sub(start).unwrap(),
             object_offset: 0,
             shared_object: false,
             payload_digest: String::new(),
@@ -188,8 +184,10 @@ fn hot_covers(entry: &StreamSnapshotEntry, start: u64, end: u64) -> bool {
 
 fn json_records(count: usize, seed: u64) -> Vec<u8> {
     let mut payload = Vec::new();
+    let base = seed.checked_mul(10).unwrap();
     for index in 0..count {
-        payload.extend_from_slice(format!("{{\"r\":{}}}\n", seed * 10 + index as u64).as_bytes());
+        let record = base.checked_add(u64::try_from(index).unwrap()).unwrap();
+        payload.extend_from_slice(format!("{{\"r\":{record}}}\n").as_bytes());
     }
     payload
 }
@@ -211,7 +209,10 @@ impl Oracle {
         let mut record_start = start;
         for (index, byte) in payload.iter().enumerate() {
             if *byte == b'\n' {
-                let end = start + index as u64 + 1;
+                let end = start
+                    .checked_add(u64::try_from(index).unwrap())
+                    .and_then(|at| at.checked_add(1))
+                    .unwrap();
                 self.push(record_start, end);
                 record_start = end;
             }

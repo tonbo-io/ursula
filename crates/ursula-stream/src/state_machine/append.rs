@@ -1,8 +1,4 @@
 //! Append paths (inline/external) and idempotent producer bookkeeping.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use super::AppendExternalInput;
 use super::AppendStreamInput;
@@ -527,19 +523,21 @@ impl StreamStateMachine {
                 },
             });
         }
-        if producer.producer_seq == state.producer_seq + 1 {
+        // The duplicate branch above returned for `producer_seq <=
+        // state.producer_seq`, so `state.producer_seq < u64::MAX` here and the
+        // saturating add never clamps.
+        let expected_seq = state.producer_seq.saturating_add(1);
+        if producer.producer_seq == expected_seq {
             return Ok(ProducerDecision::Accept);
         }
         Err(StreamResponse::error_with_context(
             StreamErrorCode::ProducerSeqConflict,
             format!(
-                "producer '{}' expected sequence {}, received {}",
-                producer.producer_id,
-                state.producer_seq + 1,
-                producer.producer_seq
+                "producer '{}' expected sequence {expected_seq}, received {}",
+                producer.producer_id, producer.producer_seq
             ),
             vec![StreamErrorContext::ProducerSeqConflict {
-                expected_seq: state.producer_seq + 1,
+                expected_seq,
                 received_seq: producer.producer_seq,
             }],
         ))

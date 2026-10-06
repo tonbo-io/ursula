@@ -9,10 +9,6 @@
 //! whole blocks and trims at most one. Snapshots emit one hot segment per block and restore
 //! segments one-to-one, so every replica holds the same block layout after
 //! the same history.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use super::HotPayloadSegment;
 use super::StreamReadSegment;
@@ -172,7 +168,10 @@ impl HotBuffer {
             && last.end_offset() == offset
             && last.bytes.len() < HOT_BLOCK_BYTES
         {
-            let take = payload.len().min(HOT_BLOCK_BYTES - last.bytes.len());
+            // The branch condition keeps `last.bytes.len() < HOT_BLOCK_BYTES`.
+            let take = payload
+                .len()
+                .min(HOT_BLOCK_BYTES.saturating_sub(last.bytes.len()));
             let (head, rest) = payload.split_at(take);
             reserve_in_block(&mut last.bytes, head.len());
             last.bytes.extend_from_slice(head);
@@ -220,13 +219,18 @@ impl HotBuffer {
                 break;
             }
             let skip = offset_delta(block.start_offset, from_offset).min(block.bytes.len());
-            let available = block.bytes.len() - skip;
-            let take = available.min(max_flush_bytes - payload.len());
-            let Some(bytes) = block.bytes.get(skip..skip + take) else {
+            let Some(available) = block.bytes.get(skip..) else {
+                break;
+            };
+            // `payload.len() < max_flush_bytes` was checked above.
+            let take = available
+                .len()
+                .min(max_flush_bytes.saturating_sub(payload.len()));
+            let Some(bytes) = available.get(..take) else {
                 break;
             };
             payload.extend_from_slice(bytes);
-            if take < available {
+            if take < available.len() {
                 break;
             }
         }
@@ -411,8 +415,11 @@ mod tests {
         let mut hot = HotBuffer::default();
         let payload = vec![7u8; bytes];
         let width = u64::try_from(bytes).unwrap();
-        for index in 0..appends {
-            hot.push(index * width, (index + 1) * width, &payload);
+        let mut start = 0u64;
+        for _ in 0..appends {
+            let end = start.checked_add(width).unwrap();
+            hot.push(start, end, &payload);
+            start = end;
         }
         hot
     }
@@ -526,7 +533,7 @@ mod tests {
             let mut out = Vec::new();
             for (offset, bytes) in &self.appends {
                 for (index, byte) in bytes.iter().enumerate() {
-                    let at = offset + index as u64;
+                    let at = offset.checked_add(len_u64(index)).unwrap();
                     if at >= start && at < end {
                         out.push((at, *byte));
                     }
@@ -538,12 +545,12 @@ mod tests {
         fn flush_prefix(&mut self, end: u64) {
             let mut kept = Vec::new();
             for (offset, bytes) in self.appends.drain(..) {
-                let finish = offset + bytes.len() as u64;
+                let finish = offset.checked_add(len_u64(bytes.len())).unwrap();
                 if finish <= end {
                     continue;
                 }
                 if offset < end {
-                    let skip = (end - offset) as usize;
+                    let skip = offset_delta(offset, end);
                     kept.push((end, bytes[skip..].to_vec()));
                 } else {
                     kept.push((offset, bytes));
@@ -564,7 +571,7 @@ mod tests {
                 panic!("hot buffer returned a non-hot segment");
             };
             for (index, byte) in bytes.into_iter().enumerate() {
-                out.push((start + index as u64, byte));
+                out.push((start.checked_add(len_u64(index)).unwrap(), byte));
             }
         }
         out
@@ -576,14 +583,14 @@ mod tests {
 
     impl Rng {
         fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
+            self.0 ^= self.0.wrapping_shl(13);
             self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
+            self.0 ^= self.0.wrapping_shl(17);
             self.0
         }
 
         fn below(&mut self, bound: u64) -> u64 {
-            self.next() % bound.max(1)
+            self.next().checked_rem(bound.max(1)).unwrap()
         }
     }
 

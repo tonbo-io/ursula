@@ -5,12 +5,11 @@
 //! - [`content_type`]: content-type normalization, used by the node.
 //! - crate root: shard and Raft group identifiers, [`BucketStreamId`], the
 //!   reserved subresource names and the static shard map.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::fmt;
+use std::num::NonZeroU16;
+use std::num::NonZeroU32;
+use std::num::NonZeroU64;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -118,8 +117,8 @@ pub enum ShardMapError {
 
 #[derive(Debug, Clone)]
 pub struct StaticShardMap {
-    core_count: u16,
-    raft_group_count: u32,
+    core_count: NonZeroU16,
+    raft_group_count: NonZeroU32,
 }
 
 impl StaticShardMap {
@@ -132,8 +131,11 @@ impl StaticShardMap {
         }
         let core_count = u16::try_from(core_count)
             .map_err(|_overflow| ShardMapError::TooManyCores(core_count))?;
+        let core_count = NonZeroU16::new(core_count).ok_or(ShardMapError::ZeroCores)?;
         let raft_group_count = u32::try_from(raft_group_count)
             .map_err(|_overflow| ShardMapError::TooManyRaftGroups(raft_group_count))?;
+        let raft_group_count =
+            NonZeroU32::new(raft_group_count).ok_or(ShardMapError::ZeroRaftGroups)?;
         Ok(Self {
             core_count,
             raft_group_count,
@@ -141,19 +143,19 @@ impl StaticShardMap {
     }
 
     pub fn core_count(&self) -> u16 {
-        self.core_count
+        self.core_count.get()
     }
 
     pub fn raft_group_count(&self) -> u32 {
-        self.raft_group_count
+        self.raft_group_count.get()
     }
 
     /// Placement of `raft_group_id`, or `None` when the group is outside this map.
     pub fn placement(&self, raft_group_id: RaftGroupId) -> Option<ShardPlacement> {
-        if raft_group_id.0 >= self.raft_group_count {
+        if raft_group_id.0 >= self.raft_group_count.get() {
             return None;
         }
-        let core = raft_group_id.0.checked_rem(u32::from(self.core_count))?;
+        let core = raft_group_id.0 % NonZeroU32::from(self.core_count);
         Some(ShardPlacement {
             core_id: CoreId(u16::try_from(core).ok()?),
             shard_id: ShardId(raft_group_id.0),
@@ -163,8 +165,8 @@ impl StaticShardMap {
 
     pub fn locate(&self, stream_id: &BucketStreamId) -> ShardPlacement {
         let hash = fnv1a64_routing_key(stream_id);
-        let raft_group = (hash % u64::from(self.raft_group_count)) as u32;
-        let core = (u64::from(raft_group) % u64::from(self.core_count)) as u16;
+        let raft_group = (hash % NonZeroU64::from(self.raft_group_count)) as u32;
+        let core = (u64::from(raft_group) % NonZeroU64::from(self.core_count)) as u16;
         ShardPlacement {
             core_id: CoreId(core),
             shard_id: ShardId(raft_group),

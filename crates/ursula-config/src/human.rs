@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
@@ -14,6 +10,8 @@ use serde::Serializer;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct HumanDuration(Duration);
 
+// The unit constructors clamp to the largest representable value instead of
+// wrapping, so an oversized argument stays a very large limit.
 impl HumanDuration {
     pub const fn as_duration(&self) -> Duration {
         self.0
@@ -25,13 +23,13 @@ impl HumanDuration {
         Self(Duration::from_secs(n))
     }
     pub const fn min(n: u64) -> Self {
-        Self(Duration::from_secs(n * 60))
+        Self(Duration::from_secs(n.saturating_mul(60)))
     }
     pub const fn hour(n: u64) -> Self {
-        Self(Duration::from_secs(n * 3600))
+        Self(Duration::from_secs(n.saturating_mul(3600)))
     }
     pub const fn day(n: u64) -> Self {
-        Self(Duration::from_secs(n * 86400))
+        Self(Duration::from_secs(n.saturating_mul(86400)))
     }
 }
 
@@ -140,6 +138,8 @@ impl<'de> Deserialize<'de> for HumanDuration {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct HumanSize(u64);
 
+// The unit constructors clamp to the largest representable value instead of
+// wrapping, so an oversized argument stays a very large limit.
 impl HumanSize {
     pub const fn as_bytes(&self) -> u64 {
         self.0
@@ -148,13 +148,13 @@ impl HumanSize {
         Self(n)
     }
     pub const fn kib(n: u64) -> Self {
-        Self(n * 1024)
+        Self(n.saturating_mul(1024))
     }
     pub const fn mib(n: u64) -> Self {
-        Self(n * 1024 * 1024)
+        Self(n.saturating_mul(1024 * 1024))
     }
     pub const fn gib(n: u64) -> Self {
-        Self(n * 1024 * 1024 * 1024)
+        Self(n.saturating_mul(1024 * 1024 * 1024))
     }
 }
 

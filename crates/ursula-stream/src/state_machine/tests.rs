@@ -1,11 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
-#![expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 use std::collections::HashMap;
 
 use proptest::collection::vec;
@@ -2483,7 +2475,7 @@ fn snapshot_restore_rejects_invalid_entries() {
             ..StreamSnapshot::default()
         })
     };
-    assert!(restore_gc("benchcmp", Some(1)).is_ok());
+    restore_gc("benchcmp", Some(1)).expect("an attributed gc entry restores");
     assert_eq!(
         restore_gc("", Some(1)).expect_err("unattributed entry"),
         StreamSnapshotError::UnattributedColdGc { seq: 4 }
@@ -2753,7 +2745,9 @@ fn stream_ttl_uses_sliding_access_window() {
         }
     );
 
-    assert!(machine.read_plan_at(&stream_id, 2, 16, 2_149).is_ok());
+    machine
+        .read_plan_at(&stream_id, 2, 16, 2_149)
+        .expect("the stream is readable inside its renewed ttl window");
     assert_eq!(
         machine.apply(append_cmd(stream_id.clone(), b"!", Append {
             now_ms: 2_149,
@@ -2904,7 +2898,9 @@ fn stream_expires_at_is_absolute_and_recreate_after_expiry() {
         })),
         StreamResponse::Appended { .. }
     ));
-    assert!(machine.read_plan_at(&stream_id, 0, 16, 1_999).is_ok());
+    machine
+        .read_plan_at(&stream_id, 0, 16, 1_999)
+        .expect("the stream is readable until its ttl expires");
     assert_err_code(
         machine.read_plan_at(&stream_id, 0, 16, 2_000),
         StreamErrorCode::StreamNotFound,
@@ -3185,11 +3181,12 @@ proptest! {
         let mut expected_tail = u64::try_from(expected.len()).unwrap();
         for payload in payloads {
             let payload_len = u64::try_from(payload.len()).unwrap();
+            let next_tail = expected_tail.checked_add(payload_len).unwrap();
             prop_assert_eq!(
                 append_payload(&mut machine, "prop-offsets", payload.clone(), false, None),
-                appended(expected_tail, expected_tail + payload_len)
+                appended(expected_tail, next_tail)
             );
-            expected_tail += payload_len;
+            expected_tail = next_tail;
             expected.extend_from_slice(&payload);
 
             let head = machine.head(&stream_id).expect("stream head");
@@ -3256,6 +3253,7 @@ proptest! {
         );
 
         let next_len = u64::try_from(next_payload.len()).unwrap();
+        let combined_len = first_len.checked_add(next_len).unwrap();
         prop_assert_eq!(
             append_payload(
                 &mut machine,
@@ -3264,7 +3262,7 @@ proptest! {
                 false,
                 Some(producer("writer-1", 1, 0)),
             ),
-            appended_by(producer("writer-1", 1, 0), first_len, first_len + next_len, false, false)
+            appended_by(producer("writer-1", 1, 0), first_len, combined_len, false, false)
         );
         let stale_response = append_payload(
             &mut machine,
@@ -3286,7 +3284,7 @@ proptest! {
         );
         prop_assert_eq!(
             machine.head(&stream_id).expect("head").tail_offset,
-            first_len + next_len
+            combined_len
         );
     }
 
@@ -3299,9 +3297,12 @@ proptest! {
     ) {
         let mut machine = machine();
         let stream_id = stream("prop-ttl");
-        let ttl_ms = ttl_seconds * 1_000;
-        let touch_ms = start_ms + touch_delta_ms.min(ttl_ms - 1);
-        let expire_ms = touch_ms + ttl_ms;
+        let ttl_ms = ttl_seconds.checked_mul(1_000).unwrap();
+        let touch_ms = start_ms
+            .checked_add(touch_delta_ms.min(ttl_ms.checked_sub(1).unwrap()))
+            .unwrap();
+        let expire_ms = touch_ms.checked_add(ttl_ms).unwrap();
+        let last_live_ms = expire_ms.checked_sub(1).unwrap();
 
         let create_response = machine.apply(create_cmd(stream_id.clone(), Create {
             payload,
@@ -3322,7 +3323,7 @@ proptest! {
                 expired: false,
             }
         );
-        prop_assert!(machine.read_plan_at(&stream_id, 0, 16, expire_ms - 1).is_ok());
+        prop_assert!(machine.read_plan_at(&stream_id, 0, 16, last_live_ms).is_ok());
         let expired_read = machine.read_plan_at(&stream_id, 0, 16, expire_ms);
         prop_assert!(
             matches!(
@@ -3450,8 +3451,10 @@ proptest! {
             });
         }
 
-        let snapshot_message_count = 1 + (snapshot_index_seed % (payloads.len() - 1));
-        let snapshot_offset = boundaries[snapshot_message_count - 1].end_offset;
+        let snapshot_message_index = snapshot_index_seed
+            .checked_rem(payloads.len().checked_sub(1).unwrap())
+            .unwrap();
+        let snapshot_offset = boundaries[snapshot_message_index].end_offset;
         let publish_response = machine.apply(publish_snapshot_cmd(
             stream_id.clone(),
             snapshot_offset,
@@ -3524,7 +3527,8 @@ proptest! {
             .read_plan(
                 &stream_id,
                 snapshot_offset,
-                usize::try_from(tail_offset - snapshot_offset).expect("read len fits usize"),
+                usize::try_from(tail_offset.checked_sub(snapshot_offset).unwrap())
+                    .expect("read len fits usize"),
             )
             .expect("retained read plan");
         prop_assert_eq!(retained_plan.next_offset, tail_offset);
@@ -4069,7 +4073,9 @@ proptest! {
             let response = append_payload(&mut machine, "prop-boot", payload.clone(), false, None);
             let appended = matches!(response, StreamResponse::Appended { .. });
             prop_assert!(appended);
-            let end = tail + u64::try_from(payload.len()).expect("len fits u64");
+            let end = tail
+                .checked_add(u64::try_from(payload.len()).expect("len fits u64"))
+                .unwrap();
             messages.push(StreamMessageRecord { start_offset: tail, end_offset: end });
             tail = end;
         }
@@ -4086,8 +4092,12 @@ proptest! {
         }
         let mut snapshot_offset = 0;
         if publish_snapshot {
-            let index = snapshot_index_seed % (messages.len() + 1);
-            snapshot_offset = if index == 0 { 0 } else { messages[index - 1].end_offset };
+            let index = snapshot_index_seed
+                .checked_rem(messages.len().checked_add(1).unwrap())
+                .unwrap();
+            snapshot_offset = index
+                .checked_sub(1)
+                .map_or(0, |previous| messages[previous].end_offset);
             let published = matches!(
                 machine.apply(publish_snapshot_cmd(stream_id.clone(), snapshot_offset, OCTET, b"s", 0)),
                 StreamResponse::SnapshotPublished { .. }
