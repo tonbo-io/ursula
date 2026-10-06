@@ -28,5 +28,5 @@ tokio-stream = { workspace = true }
 tracing = { workspace = true }
 ursula-observability = { workspace = true }
 
-[lints.clippy]
-wildcard_imports = "deny"
+[lints]
+workspace = true

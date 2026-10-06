@@ -39,7 +39,7 @@ fn plan_next_cold_flush_benches(c: &mut Criterion) {
                             usize::MAX,
                             MAX_CANDIDATES,
                         );
-                        let _ = black_box(result);
+                        black_box(&result);
                     },
                     BatchSize::LargeInput,
                 );

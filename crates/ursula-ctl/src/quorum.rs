@@ -2,6 +2,10 @@
 //!
 //! This evidence is scoped to one observation. Physical disruption still needs
 //! an exclusive reservation and incarnation-aware lifecycle fencing.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -396,6 +400,10 @@ async fn verify_observed_quorum(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::assertions_on_result_states,
+    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
+)]
 mod tests {
     use super::*;
     use crate::metrics::NodeMetricsView;

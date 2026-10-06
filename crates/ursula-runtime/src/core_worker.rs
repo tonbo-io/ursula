@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -93,7 +97,15 @@ impl CoreMailbox {
     }
 }
 
-#[allow(
+/// Reply to a caller that may have stopped waiting (cancelled or timed out).
+/// A dropped receiver makes the reply moot.
+pub(crate) fn reply<T>(tx: oneshot::Sender<T>, value: T) {
+    if tx.send(value).is_err() {
+        tracing::trace!("caller stopped waiting before the reply");
+    }
+}
+
+#[expect(
     clippy::large_enum_variant,
     reason = "Group is the hot-path variant moved through the core mailbox; boxing it would add \
               a per-operation allocation to every append"
@@ -204,14 +216,22 @@ impl Drop for WaitReadCancel {
             // Drop cannot await. If the owner mailbox is full, the stale
             // waiter is still removed when the next stream notification
             // consumes the closed oneshot sender.
-            let _ = self.tx.try_send(Traced::capture(CoreCommand::Group {
-                placement: self.placement,
-                admission: None,
-                command: GroupCommand::CancelWaitRead {
-                    stream_id,
-                    waiter_id: self.waiter_id,
-                },
-            }));
+            if self
+                .tx
+                .try_send(Traced::capture(CoreCommand::Group {
+                    placement: self.placement,
+                    admission: None,
+                    command: GroupCommand::CancelWaitRead {
+                        stream_id,
+                        waiter_id: self.waiter_id,
+                    },
+                }))
+                .is_err()
+            {
+                tracing::trace!(
+                    "owner mailbox full; the stale waiter is removed on the next notification"
+                );
+            }
         }
     }
 }
@@ -259,14 +279,14 @@ impl CoreWorker {
             } => {
                 debug_assert_eq!(placement.core_id, self.core_id);
                 let response = self.group(placement).await.map(|_| placement);
-                let _ = response_tx.send(response);
+                reply(response_tx, response);
             }
             CoreCommand::WarmGroups {
                 placements,
                 response_tx,
             } => {
                 let response = self.warm_groups(placements).await;
-                let _ = response_tx.send(response);
+                reply(response_tx, response);
             }
             CoreCommand::ShutdownGroupEngine {
                 placement,
@@ -283,7 +303,7 @@ impl CoreWorker {
             } => {
                 debug_assert_eq!(placement.core_id, self.core_id);
                 let response = self.install_group_engine(placement, engine).await;
-                let _ = response_tx.send(response);
+                reply(response_tx, response);
             }
         }
     }
@@ -394,7 +414,7 @@ impl CoreWorker {
         response_tx: oneshot::Sender<Result<(), RuntimeError>>,
     ) {
         let Some(group) = self.groups.remove(&placement.raft_group_id) else {
-            let _ = response_tx.send(Ok(()));
+            reply(response_tx, Ok(()));
             return;
         };
         self.read_barriers.remove(placement.raft_group_id);
@@ -511,7 +531,7 @@ impl CoreWorker {
                 Self::send_read_parts_response(placement, read_materialization, parts, response_tx);
             }
             Err(err) => {
-                let _ = response_tx.send(Err(err));
+                reply(response_tx, Err(err));
             }
         }
     }
@@ -532,7 +552,7 @@ impl CoreWorker {
                     core_id: placement.core_id,
                 }),
             };
-            let _ = response_tx.send(response);
+            reply(response_tx, response);
         });
     }
 
@@ -553,7 +573,7 @@ impl CoreWorker {
                 }),
             };
             for watcher in watchers {
-                let _ = watcher.response_tx.send(response.clone());
+                reply(watcher.response_tx, response.clone());
             }
         });
     }
@@ -757,13 +777,14 @@ impl CoreWorker {
                     && current_waiters >= limit
                 {
                     metrics.record_live_read_backpressure(placement.core_id);
-                    let _ = watcher
-                        .response_tx
-                        .send(Err(RuntimeError::LiveReadBackpressure {
+                    reply(
+                        watcher.response_tx,
+                        Err(RuntimeError::LiveReadBackpressure {
                             core_id: placement.core_id,
                             current_waiters,
                             limit,
-                        }));
+                        }),
+                    );
                     return;
                 }
                 metrics.record_read_watcher_added(placement.core_id);
@@ -781,7 +802,7 @@ impl CoreWorker {
                 );
             }
             Err(err) => {
-                let _ = watcher.response_tx.send(Err(err));
+                reply(watcher.response_tx, Err(err));
             }
         }
     }
@@ -1666,7 +1687,7 @@ impl CoreWorker {
                 }
                 Err(err) => {
                     for watcher in watchers {
-                        let _ = watcher.response_tx.send(Err(err.clone()));
+                        reply(watcher.response_tx, Err(err.clone()));
                     }
                 }
             }

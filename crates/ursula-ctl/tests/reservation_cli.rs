@@ -1,4 +1,13 @@
 //! Actual offline CLI process checks. No Kubernetes or provider operation.
+#![expect(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "integration tests assert by panicking, as clippy.toml allows for unit tests"
+)]
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::process::Command;
 
 use serde_json::Value;

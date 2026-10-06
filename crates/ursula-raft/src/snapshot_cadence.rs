@@ -15,6 +15,10 @@
 //! The policy is pure: the snapshot driver feeds it each group's
 //! [`GroupLogProgress`], read from the [`GroupLogGauge`] its state machine
 //! maintains, and the state probe feeds it simulated groups.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::cmp::Ordering;
 use std::sync::atomic::AtomicBool;

@@ -4,6 +4,10 @@
 //! compacted) their reclamation is deferred to a background worker on the
 //! leader. This queue stamps each batch with a monotonically increasing
 //! sequence number so draining can be confirmed by a replicated `AckColdGc`.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::collections::VecDeque;
 

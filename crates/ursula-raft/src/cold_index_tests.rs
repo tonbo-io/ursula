@@ -5,6 +5,10 @@
 //! the read path and apply, and cold-index repair. The cold-path contracts
 //! themselves are pinned once, against the in-memory engine, by
 //! `ursula-runtime`'s cold-path tests.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::sync::Arc;
 

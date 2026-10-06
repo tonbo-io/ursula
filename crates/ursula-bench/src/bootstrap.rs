@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -98,7 +102,9 @@ pub async fn run(args: BootstrapArgs) -> Result<BootstrapResult> {
     let pending = Arc::new(tokio::sync::Semaphore::new(args.setup_concurrency.max(1)));
 
     for stream in &stream_names {
-        let _ = backend.delete_stream(stream).await;
+        if let Err(err) = backend.delete_stream(stream).await {
+            tracing::debug!("delete stale stream {stream}: {err:#}");
+        }
         backend
             .create_stream(stream, "application/octet-stream")
             .await
@@ -108,21 +114,30 @@ pub async fn run(args: BootstrapArgs) -> Result<BootstrapResult> {
     let mut joins = Vec::new();
     for stream in &stream_names {
         for _ in 0..event_count {
-            let permit = pending.clone().acquire_owned().await.unwrap();
+            let permit = pending
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("the setup semaphore is never closed");
             let backend = backend.clone();
             let stream = stream.clone();
             let payload = payload.clone();
             joins.push(tokio::spawn(async move {
                 let _permit = permit;
-                let _ = backend
+                if let Err(err) = backend
                     .append_request(0, &stream, &payload, None, "application/octet-stream")
                     .send()
-                    .await;
+                    .await
+                {
+                    tracing::warn!("bootstrap append to {stream} failed: {err}");
+                }
             }));
         }
     }
     for j in joins {
-        let _ = j.await;
+        if let Err(err) = j.await {
+            tracing::warn!("bootstrap append task failed: {err}");
+        }
     }
 
     if args.snapshot_bytes > 0 {
@@ -146,11 +161,11 @@ pub async fn run(args: BootstrapArgs) -> Result<BootstrapResult> {
     let mut handles = Vec::with_capacity(args.clients);
     for idx in 0..args.clients {
         let backend = backend.clone();
-        let stream = if args.per_client_stream {
-            stream_names[idx].clone()
-        } else {
-            stream_names[0].clone()
-        };
+        let stream_index = if args.per_client_stream { idx } else { 0 };
+        let stream = stream_names
+            .get(stream_index)
+            .expect("one stream per client, or one shared stream")
+            .clone();
         let barrier = barrier.clone();
         let ok = ok.clone();
         let bp = bp.clone();
@@ -165,7 +180,9 @@ pub async fn run(args: BootstrapArgs) -> Result<BootstrapResult> {
 
     let stampede_start = Instant::now();
     for h in handles {
-        let _ = h.await;
+        if let Err(err) = h.await {
+            tracing::warn!("stampede client failed: {err}");
+        }
     }
     let stampede_elapsed = stampede_start.elapsed();
 
@@ -195,7 +212,6 @@ pub async fn run(args: BootstrapArgs) -> Result<BootstrapResult> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_client(
     backend: &Backend,
     base_idx: usize,
@@ -239,7 +255,7 @@ async fn run_client(
     let us = elapsed.as_micros().min(u64::MAX as u128) as u64;
     let mut h = hist.lock().await;
     let us = us.min(h.high()).max(h.low());
-    let _ = h.record(us);
+    h.saturating_record(us);
     drop(h);
     bytes_total.fetch_add(bytes, Ordering::Relaxed);
     ok.fetch_add(1, Ordering::Relaxed);

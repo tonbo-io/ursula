@@ -97,7 +97,7 @@ impl ShardRuntime {
         let after = self
             .cold_orphan_sweep
             .lock()
-            .map_err(|_| RuntimeError::ColdStoreConfig {
+            .map_err(|_poisoned| RuntimeError::ColdStoreConfig {
                 message: "cold orphan sweep cursor lock poisoned".to_owned(),
             })?
             .get(&raft_group_id)
@@ -316,7 +316,7 @@ impl ShardRuntime {
     ) -> Result<(), RuntimeError> {
         self.cold_orphan_sweep
             .lock()
-            .map_err(|_| RuntimeError::ColdStoreConfig {
+            .map_err(|_poisoned| RuntimeError::ColdStoreConfig {
                 message: "cold orphan sweep cursor lock poisoned".to_owned(),
             })?
             .insert(raft_group_id, after);

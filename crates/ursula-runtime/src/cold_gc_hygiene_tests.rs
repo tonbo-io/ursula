@@ -331,7 +331,10 @@ async fn retain_past_last_pack_reference() -> (Arc<ColdStore>, String) {
         .await
         .expect("advance retention");
     // The deleted stream's own entry needs no pack; reclaim what is due.
-    let _ = runtime.run_cold_gc_group_once(group, 16).await;
+    runtime
+        .run_cold_gc_group_once(group, 16)
+        .await
+        .expect("cold gc pass");
     (cold_store, pack_path)
 }
 

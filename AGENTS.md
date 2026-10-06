@@ -124,7 +124,16 @@ Run `cargo fmt --all -- --check` before committing. Formatting is controlled by 
 
 ### Linting
 
-The workspace enforces an extensive clippy lint configuration in `Cargo.toml` under `[workspace.lints.clippy]`:
+Every crate inherits the workspace lint configuration:
+
+```toml
+[lints]
+workspace = true
+```
+
+Do not add crate-level `[lints.*]` tables. Cargo ignores the workspace lints for a crate that declares its own, which silently disables everything below. Add new lints to `[workspace.lints]` in the root `Cargo.toml` instead.
+
+The workspace configuration in `Cargo.toml` under `[workspace.lints.clippy]`:
 
 **Panic Prevention**: `string_slice`, `indexing_slicing`, `unwrap_used`, `panic`, `todo`, `unimplemented`, `get_unwrap`, `unwrap_in_result`, `unchecked_time_subtraction`, `panic_in_result_fn`, `arithmetic_side_effects` are all warned.
 
@@ -138,11 +147,39 @@ The workspace enforces an extensive clippy lint configuration in `Cargo.toml` un
 
 **Attribute Discipline**: `allow_attributes`, `allow_attributes_without_reason`.
 
-**Note**: Tests are allowed to use `unwrap`, `panic`, `expect`, `dbg`, and indexing/slicing (configured in `clippy.toml`).
+**Note**: Tests are allowed to use `unwrap`, `panic`, `expect`, `dbg`, and indexing/slicing (configured in `clippy.toml`). Those allowances cover only `#[test]` functions and `#[cfg(test)]` modules, so integration test crates (`tests/*.rs`) and benchmarks state the same exemptions with a crate-level `#![expect(..., reason = "...")]`.
+
+**Suppressions**: Suppress a lint only with `#[expect(lint, reason = "...")]` on the narrowest item. Do not use `#[allow]`. An unfulfilled `expect` fails the build, so a suppression disappears once the code no longer needs it.
+
+**Known debt**: `arithmetic_side_effects` and `assertions_on_result_states` predate lint enforcement in many modules. Those modules carry a module-level `#![expect(..., reason = "pre-existing ... debt")]`. Do not add these markers to new modules. When you change a marked module, fix its sites and delete the marker.
 
 ### Unsafe Code
 
-`unsafe_code = "deny"` is set at the workspace level. Any unsafe code requires an explicit override with strong justification.
+`unsafe_code = "deny"` is set at the workspace level. Any unsafe code requires an explicit `#[expect(unsafe_code, reason = "...")]` with strong justification and a `// SAFETY:` comment on every unsafe block. The only current uses are the counting `GlobalAlloc` implementations used for allocation measurement. Build scripts pass the vendored `protoc` through `prost_build::Config::protoc_executable` rather than `std::env::set_var`.
+
+### Error Handling
+
+Follow the typed-error style of the early crates: `ursula-runtime`'s `RuntimeError`, `ursula-stream`'s `StreamSnapshotError` and `ursula-raft`'s `GrpcRpcError`.
+
+- Library code returns a `thiserror` enum defined at the module or crate boundary. Variants carry structured fields (identifiers as newtypes such as `RaftGroupId`), not pre-formatted strings.
+- Do not return `Result<_, String>`, `Box<dyn Error>` or `anyhow::Result` from library APIs. `anyhow` is for binary `main`/CLI glue and tests. Do not wrap failures that are not I/O in `io::Error::other`.
+- Keep the source error with `#[from]` or `#[source]` instead of `to_string()`. Discard it only when it carries no information (an integer conversion overflow, a poisoned lock, a closed channel), and then name the binding (`|_overflow|`, `|_poisoned|`, `|_closed|`) so the discard is deliberate. Never write `map_err(|_| ...)`.
+- Make every distinction a caller acts on a variant: retryable or permanent, not leader or protocol mismatch, outcome unknown or failed. Expose classification through methods such as `RuntimeError::leader_hint()`, never by matching message text.
+- Convert to transport errors in one place per transport (`impl From<GrpcRpcError> for tonic::Status`, `impl IntoResponse`) and choose the precise status code.
+- Tests assert the variant, for example `assert!(matches!(err, Error::StaleFence { .. }))`, not `is_err()` or a message substring.
+
+### Code Idioms
+
+Follow the conventions of the early crates (`ursula-stream`, `ursula-shard`, `ursula-runtime`) instead of introducing new patterns:
+
+- Model state with enums so that invalid combinations cannot be represented. Do not encode stages as a set of `Option` and `bool` fields checked by a `validate()` method.
+- Drive a state machine through one dispatcher with one method per command, as `StreamStateMachine::apply(StreamCommand) -> StreamResponse` does. Keep decision logic pure: no I/O, with time passed in (as `now_ms` in `StreamCommand`). Keep the async drivers around it thin.
+- Use newtypes for identifiers (`CoreId`, `ShardId`, `RaftGroupId`, `BucketStreamId`) and parse at the boundary with `TryFrom` or `#[serde(try_from)]` rather than validating afterwards.
+- Both sides of a protocol (server and `ursulactl`) share typed request and response structs. Do not build JSON with `json!` or `object.insert`, and do not match string literals across Rust and shell.
+- Keep one implementation of each policy check. When two call sites need the same predicate, call a shared function.
+- Wait on `watch` channels instead of sleep-polling, keep the `JoinHandle` of every long-lived task, and do not perform blocking I/O while holding a `std::sync::Mutex`.
+- Cover state machines with many transitions with `proptest`, as `ursula-stream/src/state_machine/tests.rs` does.
+- Tests go through production entry points. Put test-only APIs behind `#[cfg(test)]`.
 
 ### Logging
 

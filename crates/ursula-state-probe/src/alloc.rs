@@ -7,6 +7,10 @@
 //! with `#[global_allocator]`; library users (tests) may install it too.
 //!
 //! Figures are requested bytes; real RSS is somewhat higher.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
@@ -63,6 +67,10 @@ fn on_dealloc(ptr: *mut u8, size: usize) {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "a counting global allocator must implement the unsafe GlobalAlloc trait"
+)]
 // SAFETY: every method forwards to `System` with the caller's layout and only
 // updates atomic counters around the call, so `System`'s contract carries over.
 unsafe impl GlobalAlloc for Counting {

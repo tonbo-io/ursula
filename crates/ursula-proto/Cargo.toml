@@ -17,5 +17,5 @@ serde = { workspace = true }
 prost-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
 
-[lints.clippy]
-wildcard_imports = "deny"
+[lints]
+workspace = true

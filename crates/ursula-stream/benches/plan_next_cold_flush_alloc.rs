@@ -1,5 +1,3 @@
-#![allow(unsafe_code)]
-
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
 use std::alloc::System;
@@ -26,6 +24,12 @@ struct TrackAlloc;
 static ALLOC_TOTAL: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+#[expect(
+    unsafe_code,
+    reason = "an allocation-counting global allocator must implement the unsafe GlobalAlloc trait"
+)]
+// SAFETY: every method delegates to `System` with the caller's layout and only
+// updates atomic counters around the call.
 unsafe impl GlobalAlloc for TrackAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: delegated to the system allocator with the same layout.

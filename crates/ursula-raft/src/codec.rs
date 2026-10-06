@@ -44,7 +44,7 @@ pub(crate) fn placement_from_parts(
     field: &str,
 ) -> Result<ShardPlacement, GroupEngineError> {
     let core_id = u16::try_from(core_id)
-        .map_err(|_| GroupEngineError::new(format!("{field}.core_id does not fit u16")))?;
+        .map_err(|_overflow| GroupEngineError::new(format!("{field}.core_id does not fit u16")))?;
     Ok(ShardPlacement {
         core_id: CoreId(core_id),
         shard_id: ShardId(shard_id),

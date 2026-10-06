@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -391,7 +395,7 @@ fn status_to_proto(status: StreamStatus) -> proto::StreamStatusV1 {
 }
 
 fn status_from_proto(status: i32) -> Result<StreamStatus, SnapshotStoreError> {
-    match proto::StreamStatusV1::try_from(status).map_err(|_| {
+    match proto::StreamStatusV1::try_from(status).map_err(|_unknown| {
         SnapshotStoreError::Deserialize(format!("invalid stream status value {status}"))
     })? {
         proto::StreamStatusV1::StreamStatusOpen => Ok(StreamStatus::Open),
@@ -414,13 +418,13 @@ fn hot_segment_from_proto(
     Ok(HotPayloadSegment {
         start_offset: segment.start_offset,
         end_offset: segment.end_offset,
-        payload_start: usize::try_from(segment.payload_start).map_err(|_| {
+        payload_start: usize::try_from(segment.payload_start).map_err(|_overflow| {
             SnapshotStoreError::Deserialize(format!(
                 "hot segment payload_start {} does not fit usize",
                 segment.payload_start
             ))
         })?,
-        payload_end: usize::try_from(segment.payload_end).map_err(|_| {
+        payload_end: usize::try_from(segment.payload_end).map_err(|_overflow| {
             SnapshotStoreError::Deserialize(format!(
                 "hot segment payload_end {} does not fit usize",
                 segment.payload_end

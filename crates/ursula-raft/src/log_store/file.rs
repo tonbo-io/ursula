@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::fs;
@@ -100,7 +104,9 @@ impl JournalLock {
         if !file.try_lock_exclusive()? {
             let mut owner = String::new();
             file.rewind()?;
-            let _ = file.read_to_string(&mut owner);
+            if let Err(err) = file.read_to_string(&mut owner) {
+                tracing::debug!(%err, "read journal lock owner");
+            }
             let owner = owner.trim();
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -238,13 +244,13 @@ impl RaftGroupFileLogStore {
     pub(crate) fn lock_inner(&self) -> Result<MutexGuard<'_, RaftGroupLogStoreInner>, io::Error> {
         self.inner
             .lock()
-            .map_err(|_| io::Error::other("raft group file log store mutex poisoned"))
+            .map_err(|_poisoned| io::Error::other("raft group file log store mutex poisoned"))
     }
 
     pub(crate) fn lock_file(&self) -> Result<MutexGuard<'_, RaftGroupFileLogHandle>, io::Error> {
         self.file
             .lock()
-            .map_err(|_| io::Error::other("raft group file log store file mutex poisoned"))
+            .map_err(|_poisoned| io::Error::other("raft group file log store file mutex poisoned"))
     }
 
     pub(crate) fn append_record_locked(
@@ -371,7 +377,8 @@ impl CoreFileLogWriter {
         *writer
             .thread
             .lock()
-            .map_err(|_| io::Error::other("core file log thread mutex poisoned"))? = Some(thread);
+            .map_err(|_poisoned| io::Error::other("core file log thread mutex poisoned"))? =
+            Some(thread);
         Ok(writer)
     }
 
@@ -392,7 +399,7 @@ impl CoreFileLogWriter {
     fn take_recovered(&self, group_id: u32) -> Result<RaftGroupLogStoreInner, io::Error> {
         self.recovered
             .lock()
-            .map_err(|_| io::Error::other("core file log recovery mutex poisoned"))
+            .map_err(|_poisoned| io::Error::other("core file log recovery mutex poisoned"))
             .map(|mut recovered| recovered.remove(&group_id).unwrap_or_default())
     }
 
@@ -414,10 +421,10 @@ impl CoreFileLogWriter {
                 record,
                 response_tx,
             })
-            .map_err(|_| io::Error::other("core file log writer closed"))?;
+            .map_err(|_closed| io::Error::other("core file log writer closed"))?;
         let timing = response_rx
             .recv()
-            .map_err(|_| io::Error::other("core file log writer dropped response"))?
+            .map_err(|_dropped| io::Error::other("core file log writer dropped response"))?
             .map_err(io::Error::other)?;
         Ok(timing)
     }
@@ -489,13 +496,17 @@ pub(crate) fn run_core_file_log_writer(
                         },
                         physical_bytes: timing.physical_bytes,
                     };
-                    let _ = request.response_tx.send(Ok(per_request));
+                    if request.response_tx.send(Ok(per_request)).is_err() {
+                        tracing::trace!("raft log append caller stopped waiting");
+                    }
                 }
             }
             Err(err) => {
                 let message = err.to_string();
                 for request in batch {
-                    let _ = request.response_tx.send(Err(message.clone()));
+                    if request.response_tx.send(Err(message.clone())).is_err() {
+                        tracing::trace!("raft log append caller stopped waiting");
+                    }
                 }
             }
         }
@@ -746,15 +757,13 @@ pub(crate) async fn spawn_log_store_blocking<T>(
 where
     T: Send + 'static,
 {
-    let permit = match blocking {
-        Some(blocking) => Some(
-            blocking
-                .acquire_owned()
-                .await
-                .map_err(|_| io::Error::other("OpenRaft file log blocking limiter closed"))?,
-        ),
-        None => None,
-    };
+    let permit =
+        match blocking {
+            Some(blocking) => Some(blocking.acquire_owned().await.map_err(|_closed| {
+                io::Error::other("OpenRaft file log blocking limiter closed")
+            })?),
+            None => None,
+        };
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         f()
@@ -1079,7 +1088,7 @@ mod tests {
         let path = std::env::temp_dir()
             .join("ursula-raft-file-log-tests")
             .join(format!("{name}-{}-{nonce}.bin", std::process::id()));
-        let _ = fs::remove_file(&path);
+        crate::tests::remove_test_path(&path);
         path
     }
 
@@ -1170,7 +1179,7 @@ mod tests {
             valid_len
         );
 
-        let _ = fs::remove_file(&path);
+        crate::tests::remove_test_path(&path);
     }
 
     #[test]
@@ -1210,7 +1219,7 @@ mod tests {
             valid_len
         );
 
-        let _ = fs::remove_file(&path);
+        crate::tests::remove_test_path(&path);
     }
 
     #[test]
@@ -1241,7 +1250,7 @@ mod tests {
             Some(second_vote)
         );
 
-        let _ = fs::remove_file(&path);
+        crate::tests::remove_test_path(&path);
     }
 
     #[cfg(not(madsim))]
@@ -1289,7 +1298,7 @@ mod tests {
         assert_eq!(recovered.last_purged_log_id, Some(test_log_id(2)));
         assert_eq!(recovered.committed, Some(test_log_id(3)));
         assert_eq!(recovered.entries.keys().copied().collect::<Vec<_>>(), [3]);
-        let _ = fs::remove_file(&path);
+        crate::tests::remove_test_path(&path);
     }
 
     #[cfg(not(madsim))]
@@ -1333,7 +1342,7 @@ mod tests {
         assert_eq!(group.entries.keys().copied().collect::<Vec<_>>(), [
             256, 257
         ]);
-        let _ = fs::remove_file(&path);
+        crate::tests::remove_test_path(&path);
     }
 
     #[cfg(not(madsim))]
@@ -1377,7 +1386,7 @@ mod tests {
         let group = recovered.get(&7).expect("recovered group");
         assert_eq!(group.last_purged_log_id, Some(test_log_id(1)));
         assert!(group.entries.is_empty());
-        let _ = fs::remove_file(&path);
+        crate::tests::remove_test_path(&path);
     }
 
     #[test]
@@ -1391,8 +1400,8 @@ mod tests {
         drop(first);
         let reopened = RaftGroupFileLogStore::shared(&path).expect("lock releases on drop");
         drop(reopened);
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(format!("{}.lock", path.display()));
+        crate::tests::remove_test_path(&path);
+        crate::tests::remove_test_path(format!("{}.lock", path.display()));
     }
 
     #[cfg(not(madsim))]
@@ -1406,7 +1415,7 @@ mod tests {
         drop(first);
         let reopened = CoreFileLogWriter::shared(&path).expect("core lock releases on drop");
         drop(reopened);
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(format!("{}.lock", path.display()));
+        crate::tests::remove_test_path(&path);
+        crate::tests::remove_test_path(format!("{}.lock", path.display()));
     }
 }

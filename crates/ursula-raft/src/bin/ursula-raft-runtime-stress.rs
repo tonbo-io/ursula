@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 // Stresses the production ThreadPerCore runtime; cfg(not(madsim))-only by
 // design (DoD #1). Under cfg(madsim) the bin is a no-op.
 
@@ -62,7 +66,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let payload = vec![0; args.payload_bytes];
             let mut stream_index = producer_index % streams.len();
             while Instant::now() < deadline {
-                let stream = streams[stream_index].clone();
+                let stream = streams
+                    .get(stream_index)
+                    .expect("stream_index wraps below streams.len()")
+                    .clone();
                 stream_index += args.producer_count;
                 if stream_index >= streams.len() {
                     stream_index %= streams.len();

@@ -275,6 +275,10 @@ async fn collect_stream(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 mod tests {
     use std::sync::Arc;
 

@@ -1,4 +1,8 @@
 //! Snapshot / restore serialization for the Raft state machine.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use super::BucketStreamId;
 use super::ColdChunkRef;

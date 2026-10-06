@@ -1,3 +1,11 @@
+#![expect(
+    clippy::panic,
+    reason = "a benchmark aborts on an unexpected engine response"
+)]
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use criterion::BatchSize;
 use criterion::BenchmarkId;
 use criterion::Criterion;

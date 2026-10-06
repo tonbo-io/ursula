@@ -4,6 +4,10 @@
 //! Each check records whether today's code meets the design's target. Most do
 //! not yet; the gate's ratchet file records which, so a regression (a met
 //! target lost) fails and an improvement is reported for tightening.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use crate::out::Measured;
 use crate::out::Outcome;

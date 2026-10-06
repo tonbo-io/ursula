@@ -1,6 +1,10 @@
 //! Cold-tier background workers.
 //!
 //! Started by the bootstrap layer after the runtime is constructed.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use ursula_stream::ColdFlushPressure;
 

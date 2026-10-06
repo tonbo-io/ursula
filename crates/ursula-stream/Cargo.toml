@@ -33,5 +33,5 @@ harness = false
 name = "plan_next_cold_flush_alloc"
 harness = false
 
-[lints.clippy]
-wildcard_imports = "deny"
+[lints]
+workspace = true

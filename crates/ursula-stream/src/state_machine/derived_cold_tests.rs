@@ -1,6 +1,10 @@
 //! Bounded-state cold hygiene: F18 step 2 derived cold coverage, F14b
 //! `DeferColdGc`, F14i retention grace, and the incarnation check on
 //! `FlushCold`.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use super::*;
 

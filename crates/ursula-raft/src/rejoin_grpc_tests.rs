@@ -1,4 +1,8 @@
 //! Recovery fault schedules over real TCP/gRPC, retaining the actual Raft handlers.
+#![expect(
+    clippy::assertions_on_result_states,
+    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
+)]
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;

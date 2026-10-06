@@ -28,10 +28,18 @@ thread_local! {
     static ALLOCATED: Cell<usize> = const { Cell::new(0) };
 }
 
+#[expect(
+    unsafe_code,
+    reason = "a counting global allocator must implement the unsafe GlobalAlloc trait"
+)]
 // SAFETY: every call forwards to `System` unchanged; the thread-local counter
 // is const-initialized and never allocates.
 unsafe impl GlobalAlloc for ThreadCountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the allocator cannot report a thread-local torn down at thread exit"
+        )]
         let _ = ALLOCATED.try_with(|bytes| bytes.set(bytes.get().wrapping_add(layout.size())));
         // SAFETY: forwarded verbatim.
         unsafe { System.alloc(layout) }
@@ -43,6 +51,10 @@ unsafe impl GlobalAlloc for ThreadCountingAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the allocator cannot report a thread-local torn down at thread exit"
+        )]
         let _ = ALLOCATED.try_with(|bytes| bytes.set(bytes.get().wrapping_add(new_size)));
         // SAFETY: forwarded verbatim.
         unsafe { System.realloc(ptr, layout, new_size) }

@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
@@ -193,8 +197,7 @@ pub fn classify_amnesiac_voter(
     }
 
     let mut candidates = Vec::new();
-    for target_id in &expected {
-        let target = &reports[target_id];
+    for (target_id, target) in &reports {
         let missing_group_ids = target
             .per_group
             .values()

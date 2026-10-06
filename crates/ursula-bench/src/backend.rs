@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use anyhow::Context;
 use anyhow::Result;
 use bytes::Bytes;
@@ -63,11 +67,15 @@ impl Backend {
     }
 
     pub fn base_for(&self, idx: usize) -> &str {
-        &self.bases[idx % self.bases.len()]
+        self.bases
+            .get(idx % self.bases.len())
+            .expect("Backend::new keeps at least one base URL")
     }
 
     pub fn first_base(&self) -> &str {
-        &self.bases[0]
+        self.bases
+            .first()
+            .expect("Backend::new keeps at least one base URL")
     }
 
     pub async fn ensure_namespace(&self) -> Result<()> {
@@ -187,7 +195,7 @@ impl Backend {
             ApiStyle::Ursula => format!("{base}/{}/{}", self.bucket, stream),
             ApiStyle::Durable => format!("{base}/v1/stream/{stream}"),
         };
-        let _ = self.client.delete(&url).send().await;
+        self.client.delete(&url).send().await?;
         Ok(())
     }
 

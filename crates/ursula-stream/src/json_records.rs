@@ -48,7 +48,9 @@ pub(crate) fn record_ends_valid(json: bool, payload_len: u64, record_ends: &[u64
     }
     record_ends.last() == Some(&payload_len)
         && record_ends.first().is_some_and(|first| *first > 0)
-        && record_ends.windows(2).all(|pair| pair[0] < pair[1])
+        && record_ends
+            .windows(2)
+            .all(|pair| matches!(pair, [earlier, later] if earlier < later))
 }
 
 #[cfg(test)]

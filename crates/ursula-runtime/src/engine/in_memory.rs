@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::sync::Arc;
 
 use ursula_shard::BucketStreamId;
@@ -591,7 +595,7 @@ impl InMemoryGroupEngine {
             self.check_cold_write_admission(
                 &request.stream_id,
                 admission,
-                u64::try_from(request.initial_payload.len()).expect("payload len fits u64"),
+                u64::try_from(request.initial_payload.len()).unwrap_or(u64::MAX),
             )?;
         }
         let response =
@@ -624,7 +628,7 @@ impl InMemoryGroupEngine {
             self.check_cold_write_admission(
                 &request.stream_id,
                 admission,
-                u64::try_from(request.payload.len()).expect("payload len fits u64"),
+                u64::try_from(request.payload.len()).unwrap_or(u64::MAX),
             )?;
         }
         let response =

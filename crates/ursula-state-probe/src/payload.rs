@@ -1,4 +1,8 @@
 //! Deterministic payload generators (minified JSON, one record per line).
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 /// xorshift64 generator; deterministic for a seed.
 pub struct Rng(u64);

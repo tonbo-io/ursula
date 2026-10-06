@@ -1,6 +1,10 @@
 //! Capacity hygiene (F7) measured through the state machine: after a
 //! flush or retention, retained containers hold at most
 //! `2 * len + 64` elements of capacity.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use super::*;
 

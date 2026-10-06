@@ -1,5 +1,9 @@
 //! Bounded-state F5: external payload locators committed in state at apply
 //! and removed by `OffloadColdRefs`.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use super::*;
 

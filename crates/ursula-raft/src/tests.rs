@@ -764,7 +764,7 @@ async fn raft_file_log_store_recovers_vote_committed_and_entries() {
     assert_eq!(entries[0].log_id, log_id(1));
     assert_eq!(entries[1].log_id, log_id(2));
 
-    let _ = fs::remove_file(&path);
+    remove_test_path(&path);
 }
 
 #[tokio::test]
@@ -794,7 +794,7 @@ async fn raft_file_log_store_skips_duplicate_vote_and_committed_records() {
         Some(log_id(2))
     );
 
-    let _ = fs::remove_file(&path);
+    remove_test_path(&path);
 }
 
 #[tokio::test]
@@ -845,7 +845,7 @@ async fn raft_file_log_store_recovers_truncate_and_purge() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].log_id, log_id(3));
 
-    let _ = fs::remove_file(&path);
+    remove_test_path(&path);
 }
 
 #[tokio::test]
@@ -910,7 +910,7 @@ async fn raft_file_log_restart_rebuilds_only_through_the_committed_marker() {
 
     drop(reader);
     drop(reopened);
-    let _ = fs::remove_file(&path);
+    remove_test_path(&path);
 }
 
 #[tokio::test]
@@ -2230,7 +2230,7 @@ async fn raft_group_engine_recovers_client_writes_from_file_log() {
         .await
         .expect("shutdown recovered engine");
 
-    let _ = fs::remove_file(&path);
+    remove_test_path(&path);
 }
 
 #[tokio::test]
@@ -2290,7 +2290,7 @@ async fn warm_group_registers_runtime_owned_raft_handle() {
 #[tokio::test]
 async fn durable_raft_group_engine_records_file_log_metrics() {
     let root = temp_log_path("raft-file-log-metrics-root").with_extension("");
-    let _ = fs::remove_dir_all(&root);
+    remove_test_path(&root);
 
     let config = hosted_config(1, 1);
     let runtime =
@@ -2332,13 +2332,13 @@ async fn durable_raft_group_engine_records_file_log_metrics() {
     assert!(metrics.wal_physical_bytes > 0);
 
     drop(runtime);
-    let _ = fs::remove_dir_all(&root);
+    remove_test_path(&root);
 }
 
 #[tokio::test]
 async fn durable_raft_group_engine_recovers_from_core_journal() {
     let root = temp_log_path("raft-core-journal-recover-root").with_extension("");
-    let _ = fs::remove_dir_all(&root);
+    remove_test_path(&root);
     let stream_id = bsid("raft-core-journal-recover");
 
     {
@@ -2389,7 +2389,7 @@ async fn durable_raft_group_engine_recovers_from_core_journal() {
         assert_eq!(read.payload, b"journal-payload");
     }
 
-    let _ = fs::remove_dir_all(&root);
+    remove_test_path(&root);
 }
 
 #[tokio::test]
@@ -2490,5 +2490,20 @@ fn forwarded_reads_carry_linearizability_over_grpc() {
             .expect("decode head");
         let served = crate::grpc::head_stream_request_from_v1(head.stream_id.clone(), 77, decoded);
         assert_eq!(served, head);
+    }
+}
+
+/// Remove a temporary test file or directory, tolerating its absence.
+pub(crate) fn remove_test_path(path: impl AsRef<std::path::Path>) {
+    let path = path.as_ref();
+    let removed = if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    if let Err(err) = removed
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        panic!("remove test path {}: {err}", path.display());
     }
 }

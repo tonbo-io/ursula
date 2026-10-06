@@ -18,8 +18,5 @@ dirs = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)', 'cfg(tokio_unstable)'] }
-
-[lints.clippy]
-wildcard_imports = "deny"
+[lints]
+workspace = true

@@ -7,6 +7,10 @@
 //! How a record turns into a payload is entirely the [`FrameCodec`]'s business, so
 //! the Raft log store can frame protobuf while the WAL engine frames JSON over the
 //! exact same code.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::fs;
 use std::fs::File;
@@ -24,24 +28,23 @@ const JOURNAL_MAGIC: [u8; 8] = *b"URSJWAL\0";
 const JOURNAL_VERSION: u16 = ursula_stream::FORMAT_EPOCH as u16;
 const _: () = assert!(ursula_stream::FORMAT_EPOCH <= u16::MAX as u32);
 const JOURNAL_HEADER_LEN: usize = 16;
+const JOURNAL_HEADER_LEN_U16: u16 = JOURNAL_HEADER_LEN as u16;
+const JOURNAL_HEADER_LEN_U64: u64 = JOURNAL_HEADER_LEN as u64;
 const FRAME_HEADER_LEN: usize = 8;
+const FRAME_HEADER_LEN_U64: u64 = FRAME_HEADER_LEN as u64;
 
 /// Maximum encoded payload accepted from disk or written as one journal frame.
 ///
 /// This is intentionally above Ursula's 256 MiB Raft RPC limit while still
 /// preventing a corrupted length field from requesting an unbounded allocation.
 pub const MAX_FRAME_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
+const MAX_FRAME_PAYLOAD_BYTES_U64: u64 = MAX_FRAME_PAYLOAD_BYTES as u64;
 
 fn journal_header() -> [u8; JOURNAL_HEADER_LEN] {
-    let mut header = [0_u8; JOURNAL_HEADER_LEN];
-    header[..JOURNAL_MAGIC.len()].copy_from_slice(&JOURNAL_MAGIC);
-    header[8..10].copy_from_slice(&JOURNAL_VERSION.to_le_bytes());
-    header[10..12].copy_from_slice(
-        &u16::try_from(JOURNAL_HEADER_LEN)
-            .expect("journal header length fits u16")
-            .to_le_bytes(),
-    );
-    header
+    let [m0, m1, m2, m3, m4, m5, m6, m7] = JOURNAL_MAGIC;
+    let [v0, v1] = JOURNAL_VERSION.to_le_bytes();
+    let [l0, l1] = JOURNAL_HEADER_LEN_U16.to_le_bytes();
+    [m0, m1, m2, m3, m4, m5, m6, m7, v0, v1, l0, l1, 0, 0, 0, 0]
 }
 
 /// Serialization seam: how one record becomes a frame payload and back.
@@ -119,8 +122,9 @@ impl JournalWriter {
                 ),
             ));
         }
-        let len = u32::try_from(payload.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "journal record too large"))?;
+        let len = u32::try_from(payload.len()).map_err(|_overflow| {
+            io::Error::new(io::ErrorKind::InvalidData, "journal record too large")
+        })?;
         let checksum = crc32fast::hash(&payload);
         let file = self.file_mut(path)?;
         file.write_all(&len.to_le_bytes())?;
@@ -192,7 +196,7 @@ pub fn replay_each<C: FrameCodec>(
     if file_len == 0 {
         return Ok(());
     }
-    if file_len < u64::try_from(JOURNAL_HEADER_LEN).expect("header length fits u64") {
+    if file_len < JOURNAL_HEADER_LEN_U64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -204,11 +208,11 @@ pub fn replay_each<C: FrameCodec>(
         ));
     }
     validate_file_header(&mut file, path, file_len)?;
-    let mut valid_len = u64::try_from(JOURNAL_HEADER_LEN).expect("header length fits u64");
+    let mut valid_len = JOURNAL_HEADER_LEN_U64;
     let mut frame_index = 0_u64;
     while valid_len < file_len {
         let remaining = file_len.saturating_sub(valid_len);
-        if remaining < u64::try_from(FRAME_HEADER_LEN).expect("frame header length fits u64") {
+        if remaining < FRAME_HEADER_LEN_U64 {
             break;
         }
 
@@ -218,7 +222,7 @@ pub fn replay_each<C: FrameCodec>(
         let mut checksum_bytes = [0_u8; 4];
         file.read_exact(&mut checksum_bytes)?;
         let expected_checksum = u32::from_le_bytes(checksum_bytes);
-        if payload_len > u64::try_from(MAX_FRAME_PAYLOAD_BYTES).expect("frame limit fits u64") {
+        if payload_len > MAX_FRAME_PAYLOAD_BYTES_U64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -230,15 +234,16 @@ pub fn replay_each<C: FrameCodec>(
                 ),
             ));
         }
-        if remaining
-            .saturating_sub(u64::try_from(FRAME_HEADER_LEN).expect("frame header length fits u64"))
-            < payload_len
-        {
+        if remaining.saturating_sub(FRAME_HEADER_LEN_U64) < payload_len {
             break;
         }
 
-        let payload_len = usize::try_from(payload_len).expect("u32 fits usize");
-        let mut payload = vec![0_u8; payload_len];
+        let mut payload = vec![
+            0_u8;
+            usize::try_from(payload_len).map_err(|_overflow| {
+                io::Error::new(io::ErrorKind::InvalidData, "journal frame exceeds usize")
+            })?
+        ];
         file.read_exact(&mut payload)?;
         let actual_checksum = crc32fast::hash(&payload);
         if actual_checksum != expected_checksum {
@@ -263,11 +268,7 @@ pub fn replay_each<C: FrameCodec>(
         })?;
         visit(record)?;
         valid_len = valid_len
-            .checked_add(
-                u64::try_from(FRAME_HEADER_LEN)
-                    .expect("frame header length fits u64")
-                    .saturating_add(u64::try_from(payload_len).expect("usize fits u64")),
-            )
+            .checked_add(FRAME_HEADER_LEN_U64.saturating_add(payload_len))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "journal offset overflow"))?;
         frame_index = frame_index.saturating_add(1);
     }
@@ -275,7 +276,7 @@ pub fn replay_each<C: FrameCodec>(
     if valid_len < file_len {
         truncate_to(
             path,
-            usize::try_from(valid_len).map_err(|_| {
+            usize::try_from(valid_len).map_err(|_overflow| {
                 io::Error::new(io::ErrorKind::InvalidData, "journal offset exceeds usize")
             })?,
         )?;
@@ -290,25 +291,25 @@ pub fn decode_frames<C: FrameCodec>(bytes: &[u8]) -> io::Result<(Vec<C::Record>,
     if bytes.is_empty() {
         return Ok((records, 0));
     }
-    if bytes.len() < JOURNAL_HEADER_LEN {
+    let Some(header) = bytes.first_chunk::<JOURNAL_HEADER_LEN>() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "in-memory journal has no complete Ursula WAL header",
         ));
-    }
-    validate_header_bytes(&bytes[..JOURNAL_HEADER_LEN], "in-memory journal")?;
+    };
+    validate_header_bytes(header, "in-memory journal")?;
     let mut offset = JOURNAL_HEADER_LEN;
     let mut frame_index = 0_usize;
     while offset < bytes.len() {
-        let Some(frame_header) = bytes.get(offset..offset.saturating_add(FRAME_HEADER_LEN)) else {
+        let Some(&[l0, l1, l2, l3, c0, c1, c2, c3]) = bytes
+            .get(offset..)
+            .and_then(<[u8]>::first_chunk::<FRAME_HEADER_LEN>)
+        else {
             return Ok((records, offset)); // torn length prefix
         };
-        let len = usize::try_from(u32::from_le_bytes(
-            frame_header[..4]
-                .try_into()
-                .expect("slice is exactly four bytes"),
-        ))
-        .expect("u32 fits usize");
+        let len = usize::try_from(u32::from_le_bytes([l0, l1, l2, l3])).map_err(|_overflow| {
+            io::Error::new(io::ErrorKind::InvalidData, "journal frame exceeds usize")
+        })?;
         if len > MAX_FRAME_PAYLOAD_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -318,11 +319,7 @@ pub fn decode_frames<C: FrameCodec>(bytes: &[u8]) -> io::Result<(Vec<C::Record>,
                 ),
             ));
         }
-        let expected_checksum = u32::from_le_bytes(
-            frame_header[4..8]
-                .try_into()
-                .expect("slice is exactly four bytes"),
-        );
+        let expected_checksum = u32::from_le_bytes([c0, c1, c2, c3]);
         let start = offset.saturating_add(FRAME_HEADER_LEN);
         let end = start.checked_add(len).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "journal frame length overflow")
@@ -348,7 +345,7 @@ pub fn decode_frames<C: FrameCodec>(bytes: &[u8]) -> io::Result<(Vec<C::Record>,
 }
 
 fn validate_file_header(file: &mut File, path: &Path, file_len: u64) -> io::Result<()> {
-    if file_len < u64::try_from(JOURNAL_HEADER_LEN).expect("header length fits u64") {
+    if file_len < JOURNAL_HEADER_LEN_U64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("journal '{}' has a torn file header", path.display()),
@@ -360,8 +357,9 @@ fn validate_file_header(file: &mut File, path: &Path, file_len: u64) -> io::Resu
     validate_header_bytes(&header, &format!("journal '{}'", path.display()))
 }
 
-fn validate_header_bytes(header: &[u8], description: &str) -> io::Result<()> {
-    if header.get(..JOURNAL_MAGIC.len()) != Some(JOURNAL_MAGIC.as_slice()) {
+fn validate_header_bytes(header: &[u8; JOURNAL_HEADER_LEN], description: &str) -> io::Result<()> {
+    let [magic @ .., v0, v1, l0, l1, r0, r1, r2, r3] = *header;
+    if magic != JOURNAL_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -371,11 +369,7 @@ fn validate_header_bytes(header: &[u8], description: &str) -> io::Result<()> {
             ),
         ));
     }
-    let version = u16::from_le_bytes(
-        header[8..10]
-            .try_into()
-            .expect("validated journal header has version bytes"),
-    );
+    let version = u16::from_le_bytes([v0, v1]);
     if version != JOURNAL_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -387,11 +381,7 @@ fn validate_header_bytes(header: &[u8], description: &str) -> io::Result<()> {
             ),
         ));
     }
-    let header_len = usize::from(u16::from_le_bytes(
-        header[10..12]
-            .try_into()
-            .expect("validated journal header has length bytes"),
-    ));
+    let header_len = usize::from(u16::from_le_bytes([l0, l1]));
     if header_len != JOURNAL_HEADER_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -400,7 +390,7 @@ fn validate_header_bytes(header: &[u8], description: &str) -> io::Result<()> {
             ),
         ));
     }
-    if header[12..].iter().any(|byte| *byte != 0) {
+    if [r0, r1, r2, r3] != [0; 4] {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{description} has non-zero reserved header bytes"),
@@ -412,7 +402,9 @@ fn validate_header_bytes(header: &[u8], description: &str) -> io::Result<()> {
 /// Truncate `path` to `valid_len` bytes, dropping a torn trailing frame, then `fsync`.
 pub fn truncate_to(path: &Path, valid_len: usize) -> io::Result<()> {
     let file = OpenOptions::new().write(true).open(path)?;
-    file.set_len(u64::try_from(valid_len).expect("valid frame offset fits u64"))?;
+    file.set_len(u64::try_from(valid_len).map_err(|_overflow| {
+        io::Error::new(io::ErrorKind::InvalidData, "journal offset exceeds u64")
+    })?)?;
     file.sync_data()
 }
 

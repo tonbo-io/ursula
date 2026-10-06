@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -145,10 +149,9 @@ pub fn spawn_commit_stall_watchdog(
         loop {
             tokio::time::sleep(interval).await;
             let snaps = registry.metrics_snapshot();
-            if snaps.is_empty() {
+            let Some(my_id) = snaps.first().map(|snap| snap.node_id) else {
                 continue;
-            }
-            let my_id = snaps[0].node_id;
+            };
             let actions = tracker.evaluate(&snaps, my_id, Instant::now(), threshold);
             for action in actions {
                 let Some(raft) = registry.get(RaftGroupId(action.group_id)) else {

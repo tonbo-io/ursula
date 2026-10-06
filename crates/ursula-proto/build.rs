@@ -3,11 +3,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for proto in protos {
         println!("cargo:rerun-if-changed={proto}");
     }
-    unsafe {
-        std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path()?);
-    }
-
     prost_build::Config::new()
+        .protoc_executable(protoc_bin_vendored::protoc_bin_path()?)
         // Generate `bytes` fields as `Bytes` instead of `Vec<u8>` so decoding
         // payload-heavy commands slices the receive buffer instead of copying.
         .bytes(["."])

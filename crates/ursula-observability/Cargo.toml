@@ -41,5 +41,5 @@ criterion = { workspace = true }
 name = "span_overhead"
 harness = false
 
-[lints.clippy]
-wildcard_imports = "deny"
+[lints]
+workspace = true

@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -467,7 +471,7 @@ impl DurableRaftLogStoreFactory {
         let mut writers = self
             .core_writers
             .lock()
-            .map_err(|_| GroupEngineError::new("core file log writer mutex poisoned"))?;
+            .map_err(|_poisoned| GroupEngineError::new("core file log writer mutex poisoned"))?;
         if let Some(writer) = writers.get(&placement.core_id.0).and_then(Weak::upgrade) {
             return Ok(writer);
         }
@@ -718,11 +722,12 @@ impl StaticGrpcRaftGroupEngineFactory {
         if !self.initialize_membership_per_group {
             return true;
         }
-        let initializer_ids = self.membership_initializer_ids(raft_group_id);
-        if initializer_ids.as_ref().is_none_or(|i| i.is_empty()) {
+        let Some(initializer_ids) = self
+            .membership_initializer_ids(raft_group_id)
+            .filter(|ids| !ids.is_empty())
+        else {
             return false;
-        }
-        let initializer_ids = initializer_ids.unwrap();
+        };
         let initializer_index = usize::try_from(raft_group_id.0).expect("raft group id fits usize")
             % initializer_ids.len();
         initializer_ids
@@ -1023,7 +1028,7 @@ mod tests {
         assert!(!durable_factory.uses_memory_log_store());
         assert!(!durable_factory.raft_memory_bootstrap_seen(RaftGroupId(0)));
 
-        let _ = std::fs::remove_dir_all(dir);
+        crate::tests::remove_test_path(dir);
     }
 
     #[test]

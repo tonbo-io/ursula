@@ -1,3 +1,11 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
+#![expect(
+    clippy::assertions_on_result_states,
+    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
+)]
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -2822,7 +2830,11 @@ async fn canceled_wait_read_stream_removes_owner_waiter() {
     };
     wait_for_live_waiters(&runtime, 1).await;
     wait.abort();
-    let _ = wait.await;
+    if let Err(err) = wait.await
+        && !err.is_cancelled()
+    {
+        panic!("waiter failed: {err}");
+    }
     wait_for_live_waiters(&runtime, 0).await;
 }
 
@@ -2856,7 +2868,11 @@ async fn live_read_waiter_limit_rejects_excess_waiters_on_owner_core() {
     assert_eq!(snapshot.per_core_live_read_backpressure_events, vec![1]);
 
     first.abort();
-    let _ = first.await;
+    if let Err(err) = first.await
+        && !err.is_cancelled()
+    {
+        panic!("first waiter failed: {err}");
+    }
     wait_for_live_waiters(&runtime, 0).await;
 }
 

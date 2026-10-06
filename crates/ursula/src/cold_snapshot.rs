@@ -6,6 +6,10 @@
 //! replicated state never holds the body. Reads and `/bootstrap` stream the
 //! object back in bounded pieces. Without a cold store, or for bodies under
 //! the staging threshold, publish keeps the inline path and its 32 MiB cap.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::io;
 
@@ -209,7 +213,8 @@ async fn read_piece(
     start: u64,
     len: u64,
 ) -> io::Result<Bytes> {
-    let len = usize::try_from(len).map_err(|_| io::Error::other("piece length exceeds usize"))?;
+    let len =
+        usize::try_from(len).map_err(|_overflow| io::Error::other("piece length exceeds usize"))?;
     cold_store
         .read_whole_object_range(&object.s3_path, object.payload_len, start, len)
         .await

@@ -1,4 +1,8 @@
 //! Cold-tier flush planning, GC queue, retention compaction, and snapshot publishing.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use super::BucketStreamId;
 use super::ColdChunkRef;

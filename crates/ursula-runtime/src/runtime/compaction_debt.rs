@@ -9,6 +9,10 @@
 //! cold-index repair cursor, which reads every page of every stream of the
 //! group it leads, records the pages that still hold small chunks, so idle
 //! streams are found too.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::collections::HashSet;
 use std::collections::VecDeque;

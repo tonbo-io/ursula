@@ -25,13 +25,14 @@ pub(crate) use leadership::handoff_shutdown_leadership;
 pub use runtime::SpawnedRuntime;
 pub use runtime::spawn_runtime;
 pub(crate) use runtime::spawn_runtime_with_maintenance_drain;
+// Internals the crate's unit tests exercise directly.
+#[cfg(test)]
+pub(crate) use test_reexports::*;
 pub use topology::Persistence;
 pub use topology::Topology;
 pub(crate) use wal_disk::initialize_wal_disk_monitor;
 pub(crate) use wal_disk::spawn_wal_disk_gate;
-
-// Re-export test-visible internals so existing tests don't break.
-#[allow(unused_imports)]
+#[cfg(test)]
 mod test_reexports {
     pub(crate) use super::cold_health::ColdHealthDecision;
     pub(crate) use super::cold_health::ColdHealthSample;
@@ -43,7 +44,6 @@ mod test_reexports {
     pub(crate) use super::egress::cluster_egress_probe_groups;
     pub(crate) use super::egress::plan_cluster_egress_shed;
     pub(crate) use super::egress::spawn_egress_gate;
-    pub(crate) use super::leadership::LeadershipBalanceAction;
     pub(crate) use super::leadership::handoff_target_caught_up;
     pub(crate) use super::leadership::plan_leadership_balance;
     pub(crate) use super::leadership::plan_leadership_balance_with_eligible_nodes;
@@ -53,5 +53,3 @@ mod test_reexports {
     pub(crate) use super::util::leader_counts;
     pub(crate) use super::util::prioritized_transfer_targets;
 }
-#[allow(unused_imports)]
-pub(crate) use test_reexports::*;

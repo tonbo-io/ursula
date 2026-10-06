@@ -4,6 +4,14 @@
 //! committed refs, clipping whatever overlapped them (Invariant 11); state
 //! keeps at most T_ext staged refs per stream (W3); and the orphan sweep
 //! never deletes a staged object that state or pages reference.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
+#![expect(
+    clippy::assertions_on_result_states,
+    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
+)]
 
 use std::sync::Arc;
 use std::time::Duration;

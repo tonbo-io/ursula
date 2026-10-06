@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 mod file;
 mod memory;
 
@@ -65,9 +69,11 @@ where
     C::Entry: Clone,
 {
     for pair in entries.windows(2) {
-        let current = pair[0].log_id().index;
-        let next = pair[1].log_id().index;
-        if next != current + 1 {
+        let [current, next] = pair else {
+            continue;
+        };
+        let (current, next) = (current.log_id().index, next.log_id().index);
+        if current.checked_add(1) != Some(next) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("raft log entries are not consecutive: {current} then {next}"),

@@ -22,10 +22,11 @@ fn install_default_subscriber() {
     // Mirror the server's default deployment: fmt + EnvFilter at `info`, no
     // OpenTelemetry layer. Discard formatted output so we measure span cost,
     // not formatting/IO.
-    let _ = tracing_subscriber::registry()
+    tracing_subscriber::registry()
         .with(EnvFilter::new("info"))
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink))
-        .try_init();
+        .try_init()
+        .expect("the benchmark installs the only global subscriber");
 }
 
 fn bench_spans(c: &mut Criterion) {

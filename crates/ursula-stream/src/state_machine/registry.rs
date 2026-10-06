@@ -225,6 +225,10 @@ impl StreamRegistry {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 mod tests {
     use std::collections::BinaryHeap;
 

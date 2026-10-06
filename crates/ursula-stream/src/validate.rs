@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use ursula_shard::BucketStreamId;
 
 pub fn validate_bucket_id(bucket_id: &str) -> Result<(), String> {

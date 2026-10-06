@@ -1,5 +1,10 @@
 //! End-to-end smoke test: tiny versions of each workload run against the real
 //! state machine and runtime and produce the gate's metrics and checks.
+#![expect(
+    clippy::panic,
+    clippy::float_cmp,
+    reason = "integration tests assert by panicking and compare exact probe outputs"
+)]
 
 use clap::Args;
 use clap::FromArgMatches;
@@ -92,5 +97,5 @@ fn tiny_workloads_produce_metrics_and_checks() {
         .expect("l2 compact");
     assert!(check_met(&compact, "f2_shared_compact_cold_memory"));
 
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).expect("remove probe output directory");
 }

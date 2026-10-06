@@ -47,17 +47,22 @@ impl RaftUncommittedBytesTracker {
     }
 
     pub(crate) fn load(&self, group_id: RaftGroupId) -> u64 {
-        self.slot(group_id).load(Ordering::Relaxed)
+        self.slot(group_id)
+            .map_or(0, |slot| slot.load(Ordering::Relaxed))
     }
 
     pub(crate) fn add(&self, group_id: RaftGroupId, bytes: u64) {
-        self.slot(group_id).fetch_add(bytes, Ordering::Relaxed);
+        if let Some(slot) = self.slot(group_id) {
+            slot.fetch_add(bytes, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn sub(&self, group_id: RaftGroupId, bytes: u64) {
         // Use saturating subtract to avoid wrap if a request is double-credited
         // (defense-in-depth; the call sites pair add/sub one-for-one).
-        let slot = self.slot(group_id);
+        let Some(slot) = self.slot(group_id) else {
+            return;
+        };
         let mut current = slot.load(Ordering::Relaxed);
         loop {
             let next = current.saturating_sub(bytes);
@@ -68,9 +73,18 @@ impl RaftUncommittedBytesTracker {
         }
     }
 
-    fn slot(&self, group_id: RaftGroupId) -> &AtomicU64 {
-        let index = usize::try_from(group_id.0).expect("u32 fits usize");
-        &self.per_group[index]
+    /// Group ids come from the shard map that sized `per_group`. An
+    /// out-of-range id fails debug builds and is ignored in release builds.
+    fn slot(&self, group_id: RaftGroupId) -> Option<&AtomicU64> {
+        let slot = usize::try_from(group_id.0)
+            .ok()
+            .and_then(|index| self.per_group.get(index));
+        debug_assert!(
+            slot.is_some(),
+            "raft group {} is outside the uncommitted-bytes tracker",
+            group_id.0
+        );
+        slot
     }
 }
 
@@ -83,7 +97,6 @@ pub(crate) struct UncommittedBytesGuard {
     tracker: SharedRaftUncommittedBytes,
     group_id: RaftGroupId,
     bytes: u64,
-    armed: bool,
 }
 
 impl UncommittedBytesGuard {
@@ -97,24 +110,13 @@ impl UncommittedBytesGuard {
             tracker,
             group_id,
             bytes,
-            armed: true,
         }
-    }
-
-    /// Disarm without releasing; useful when something else has taken over
-    /// the credit (we currently always release on drop, so this is reserved
-    /// for future use).
-    #[allow(dead_code)]
-    pub(crate) fn disarm(mut self) {
-        self.armed = false;
     }
 }
 
 impl Drop for UncommittedBytesGuard {
     fn drop(&mut self) {
-        if self.armed {
-            self.tracker.sub(self.group_id, self.bytes);
-        }
+        self.tracker.sub(self.group_id, self.bytes);
     }
 }
 

@@ -153,13 +153,14 @@ impl ShardRuntime {
         };
         let (start_offset, end_offset) = (first.start_offset, last.end_offset);
         let total_bytes = end_offset.saturating_sub(start_offset);
-        let capacity = usize::try_from(total_bytes).map_err(|_| RuntimeError::ColdStoreIo {
-            message: "shared-ref compaction run exceeds addressable memory".to_owned(),
-        })?;
+        let capacity =
+            usize::try_from(total_bytes).map_err(|_overflow| RuntimeError::ColdStoreIo {
+                message: "shared-ref compaction run exceeds addressable memory".to_owned(),
+            })?;
         let mut payload = Vec::with_capacity(capacity);
         for slice in &run {
             let len = usize::try_from(slice.end_offset.saturating_sub(slice.start_offset))
-                .map_err(|_| RuntimeError::ColdStoreIo {
+                .map_err(|_overflow| RuntimeError::ColdStoreIo {
                     message: "shared slice exceeds addressable memory".to_owned(),
                 })?;
             let bytes = cold_store

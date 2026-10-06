@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -1587,6 +1591,10 @@ pub(crate) fn log_progress_snapshot(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::assertions_on_result_states,
+    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
+)]
 mod tests {
     use bytes::Bytes;
     use ursula_runtime::GroupSnapshot;

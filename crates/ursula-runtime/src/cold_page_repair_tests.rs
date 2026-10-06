@@ -1,6 +1,10 @@
 //! Regression tests for the bounded-state cold-path correctness defects
 //! (D1 regressed cold frontier, D3 stale page entries, F14b GC isolation,
 //! F14e stale flushes, F19 page repair).
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::sync::Arc;
 

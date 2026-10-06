@@ -62,7 +62,7 @@ impl UrsulaConfig {
                 .s3
                 .as_ref()
                 .and_then(|s3| s3.bucket.as_ref());
-            if bucket.is_none() || bucket.unwrap().trim().is_empty() {
+            if bucket.is_none_or(|bucket| bucket.trim().is_empty()) {
                 return Err(ValidationError::ColdS3BucketRequired);
             }
         }
@@ -172,7 +172,7 @@ impl UrsulaConfig {
             ));
         }
 
-        let group_count = u32::try_from(self.raft.group_count).map_err(|_| {
+        let group_count = u32::try_from(self.raft.group_count).map_err(|_overflow| {
             ValidationError::Other(format!(
                 "raft.group_count {} exceeds u32::MAX",
                 self.raft.group_count

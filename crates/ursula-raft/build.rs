@@ -1,11 +1,8 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto = "proto/raft_internal.proto";
     println!("cargo:rerun-if-changed={proto}");
-    // Build scripts run single-threaded for this crate, so setting PROTOC is scoped to
-    // the current process and safe for tonic/prost code generation.
-    unsafe {
-        std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path()?);
-    }
+    let mut config = tonic_build::Config::new();
+    config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
 
     tonic_build::configure()
         .build_server(true)
@@ -13,7 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Generate `bytes` fields as `Bytes` instead of `Vec<u8>` so decoding
         // payload-heavy RPCs slices the receive buffer instead of copying.
         .bytes(["."])
-        .compile_protos(&[proto], &["proto"])?;
+        .compile_protos_with_config(config, &[proto], &["proto"])?;
 
     Ok(())
 }

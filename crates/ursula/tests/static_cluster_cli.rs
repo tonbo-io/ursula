@@ -1,3 +1,18 @@
+#![expect(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    reason = "integration tests assert by panicking, as clippy.toml allows for unit tests"
+)]
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
+#![expect(
+    clippy::assertions_on_result_states,
+    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
+)]
 use std::collections::HashSet;
 use std::fs::File;
 use std::net::TcpListener;
@@ -23,13 +38,17 @@ struct ChildGuard {
 }
 
 impl Drop for ChildGuard {
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "Drop must not panic, and the child may already have exited"
+    )]
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
         if !std::thread::panicking() {
-            let _ = std::fs::remove_file(&self.stderr_path);
+            remove_test_path(&self.stderr_path);
             if let Some(config) = &self.config_path {
-                let _ = std::fs::remove_file(config);
+                remove_test_path(config);
             }
         }
     }
@@ -263,7 +282,7 @@ async fn cli_sigterm_drains_listeners_and_exits_cleanly() {
             .expect("system time after unix epoch")
             .as_nanos()
     ));
-    let _ = std::fs::remove_dir_all(&root);
+    remove_test_path(&root);
     std::fs::create_dir_all(&root).expect("create temp root");
     let config_path = root.join("cluster.toml");
     let log_dir = root.join("raft-log");
@@ -410,7 +429,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_with_bootstrap_enabled_after_rest
             .expect("system time after unix epoch")
             .as_nanos()
     ));
-    let _ = std::fs::remove_dir_all(&root);
+    remove_test_path(&root);
     std::fs::create_dir_all(&root).expect("create temp root");
     let config_path = root.join("cluster.toml");
     let log_dir = root.join("raft-log");
@@ -502,7 +521,7 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
             .expect("system time after unix epoch")
             .as_nanos()
     ));
-    let _ = std::fs::remove_dir_all(&root);
+    remove_test_path(&root);
     std::fs::create_dir_all(&root).expect("create temp root");
 
     let mut configs = Vec::new();
@@ -645,7 +664,7 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
             .expect("system time after unix epoch")
             .as_nanos()
     ));
-    let _ = std::fs::remove_dir_all(&root);
+    remove_test_path(&root);
     std::fs::create_dir_all(&root).expect("create temp root");
 
     let node1_config = root.join("node-1.toml");
@@ -815,7 +834,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
         "ursula-cli-s3-cold-cluster-restart-{}-{suffix}",
         std::process::id()
     ));
-    let _ = std::fs::remove_dir_all(&root);
+    remove_test_path(&root);
     std::fs::create_dir_all(&root).expect("create temp root");
 
     let mut configs = Vec::new();
@@ -2613,4 +2632,19 @@ async fn admin_test_post(client: &reqwest::Client, url: String) -> reqwest::Requ
         ursula_proto::admin::PROCESS_INCARNATION_HEADER,
         metrics["process_incarnation"].as_str().expect("identity"),
     )
+}
+
+/// Remove a temporary test file or directory, tolerating its absence.
+fn remove_test_path(path: impl AsRef<std::path::Path>) {
+    let path = path.as_ref();
+    let removed = if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    if let Err(err) = removed
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        panic!("remove test path {}: {err}", path.display());
+    }
 }

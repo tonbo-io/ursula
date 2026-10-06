@@ -1,3 +1,7 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -228,8 +232,11 @@ async fn append_waves(
             .enumerate()
             .map(|(group_index, store)| {
                 let mut store = store.clone();
-                let index = next_indexes[group_index];
-                next_indexes[group_index] = index.saturating_add(1);
+                let slot = next_indexes
+                    .get_mut(group_index)
+                    .expect("one next index per store in the wave");
+                let index = *slot;
+                *slot = index.saturating_add(1);
                 async move {
                     let entry = entry(
                         index,

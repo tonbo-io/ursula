@@ -1,9 +1,12 @@
 //! Read-only verbs that operate on `/__ursula/metrics`. These are direct ports
 //! of the retired `ursula_ec2.py` `status` / `wait-ready` — same metrics surface, no SSH
 //! dependency.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
+)]
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::io::Write;
 use std::time::Duration;
 use std::time::Instant;
@@ -84,18 +87,11 @@ pub fn write_status<W: Write>(out: &mut W, report: &StatusReport) -> std::io::Re
 }
 
 fn format_leaders(counts: &BTreeMap<u64, usize>) -> String {
-    if counts.is_empty() {
-        return "{}".to_owned();
-    }
-    let mut out = String::from("{");
-    for (i, (id, count)) in counts.iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        let _ = write!(out, "{id}: {count}");
-    }
-    out.push('}');
-    out
+    let entries: Vec<String> = counts
+        .iter()
+        .map(|(id, count)| format!("{id}: {count}"))
+        .collect();
+    format!("{{{}}}", entries.join(", "))
 }
 
 /// Block until every node reports `expected_groups` raft groups and every group
