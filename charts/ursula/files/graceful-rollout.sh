@@ -231,12 +231,19 @@ start_ready_forwards() {
 
 replace_pod() {
   ordinal=$1
+  old_uid=${2:?replacement requires the admitted source Pod UID}
   pod="${STATEFULSET}-${ordinal}"
-  old_uid=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
-    -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+  # Never refresh the admitted identity by name here: another actor may have
+  # already replaced it. The API's UID precondition rejects that race without
+  # deleting the new voter. Preserve the Pod's configured termination grace.
+  case "${old_uid}" in
+    *[!0-9a-f-]*) log "invalid source Pod UID"; return 1 ;;
+  esac
+  [ "${#old_uid}" -eq 36 ] || return 1
   stop_forward "${ordinal}"
-  if [ -n "${old_uid}" ]; then
-    kubectl -n "${NAMESPACE}" delete pod "${pod}" --wait=false
+  if ! printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s"}}\n' "${old_uid}" \
+    | kubectl delete --raw="/api/v1/namespaces/${NAMESPACE}/pods/${pod}" -f - >/dev/null; then
+    return 1
   fi
   attempts=0
   while :; do
@@ -400,7 +407,7 @@ resume_quiesce_upgrade() {
   if [ -n "${current_pod_uid}" ]; then
     if [ "${current_pod_uid}" = "${source_pod_uid}" ]; then
       log "replacing drained legacy node ${node_id} with a restart-quiesce-capable binary"
-      replace_pod "${ordinal}"
+      replace_pod "${ordinal}" "${source_pod_uid}" || return 1
     elif ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
       # The durable handoff owns every replacement after source_pod_uid. A
       # failed Helm attempt may have created a Ready non-target replacement
@@ -408,7 +415,7 @@ resume_quiesce_upgrade() {
       # with the current target before membership repair so it cannot keep
       # advancing terms while the surviving voters converge.
       log "replacing superseded non-target node ${node_id} before durable membership repair"
-      replace_pod "${ordinal}"
+      replace_pod "${ordinal}" "${current_pod_uid}" || return 1
     fi
   fi
   wait_for_pod_started "${ordinal}"
@@ -511,7 +518,7 @@ resume_if_needed() {
     -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
   if [ -n "${current_pod_uid}" ] && [ "${current_pod_uid}" = "${source_pod_uid}" ]; then
     log "recreating recorded restart source at node ${node_id}"
-    replace_pod "${ordinal}"
+    replace_pod "${ordinal}" "${source_pod_uid}" || return 1
   fi
   finish_recovery_restart "${ordinal}" "${node_id}"
 }
@@ -546,7 +553,7 @@ recover_amnesiac_if_needed() {
     --drain-timeout-secs 300 \
     --http-timeout-secs 60 \
     --lag-tolerance 16
-  replace_pod "${ordinal}"
+  replace_pod "${ordinal}" "${source_pod_uid}" || return 1
   wait_for_pod_started "${ordinal}"
   if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
     log "recovered node ${node_id} did not start at ${TARGET_IMAGE}@${TARGET_REVISION}"
@@ -620,7 +627,7 @@ roll_node() {
     --node "${node_id}" \
     --http-timeout-secs 60
 
-  replace_pod "${ordinal}"
+  replace_pod "${ordinal}" "${source_pod_uid}" || return 1
 
   wait_for_pod_started "${ordinal}"
   start_forward "${ordinal}"
