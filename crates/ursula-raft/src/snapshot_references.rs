@@ -9,12 +9,12 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 
+use ursula_runtime::GroupActivity;
+use ursula_runtime::GroupActivityGuard;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::SnapshotLocation;
 use ursula_runtime::SnapshotStoreError;
 
-use crate::group_lifecycle::GroupActivity;
-use crate::group_lifecycle::GroupActivityGuard;
 use crate::rt::sync::Mutex as AsyncMutex;
 
 #[derive(Debug, Default)]

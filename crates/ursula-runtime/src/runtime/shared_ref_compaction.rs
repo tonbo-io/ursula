@@ -53,6 +53,20 @@ impl ShardRuntime {
         raft_group_id: RaftGroupId,
         config: &SharedRefCompactionConfig,
     ) -> Result<SharedRefCompactionReport, RuntimeError> {
+        let config = config.clone();
+        self.run_group_work(raft_group_id, move |runtime| async move {
+            runtime
+                .compact_shared_refs_group_once_admitted(raft_group_id, &config)
+                .await
+        })
+        .await?
+    }
+
+    async fn compact_shared_refs_group_once_admitted(
+        &self,
+        raft_group_id: RaftGroupId,
+        config: &SharedRefCompactionConfig,
+    ) -> Result<SharedRefCompactionReport, RuntimeError> {
         let mut report = SharedRefCompactionReport::default();
         let Some(cold_store) = self.cold_store.as_ref() else {
             return Ok(report);

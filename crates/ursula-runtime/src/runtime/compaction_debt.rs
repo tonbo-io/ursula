@@ -79,6 +79,11 @@ impl CompactionDebt {
     pub(crate) fn len(&self) -> usize {
         self.order.len()
     }
+
+    pub(crate) fn remove_where(&mut self, discard: impl Fn(&ColdIndexPageKey) -> bool) {
+        self.order.retain(|key| !discard(key));
+        self.pages.retain(|key| !discard(key));
+    }
 }
 
 #[cfg(test)]

@@ -24,6 +24,12 @@ mod http_time {
     #[cfg(not(madsim))]
     pub use tokio::time::timeout;
 }
+mod http_task {
+    #[cfg(madsim)]
+    pub use madsim::task::spawn;
+    #[cfg(not(madsim))]
+    pub use tokio::spawn;
+}
 mod removed_surface;
 mod render;
 mod wal_disk;
@@ -1298,7 +1304,7 @@ async fn ingress_admission_middleware(
     let body_bytes =
         body_bytes.min(u64::try_from(MAX_HTTP_BODY_BYTES).expect("max body bytes fits u64"));
 
-    let _body_permits = if body_bytes > 0 {
+    let body_permits = if body_bytes > 0 {
         let Ok(permits) = u32::try_from(body_bytes) else {
             return (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large").into_response();
         };
@@ -1310,7 +1316,20 @@ async fn ingress_admission_middleware(
         None
     };
 
-    next.run(request).await
+    // Detached write work keeps the reservation after response cancellation.
+    // Otherwise retries could refill the byte budget while old uploads remain.
+    match http_task::spawn(async move {
+        let _body_permits = body_permits;
+        next.run(request).await
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(%error, "admitted write task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 fn request_write_body_bytes(request: &Request<Body>) -> Option<u64> {
@@ -2916,6 +2935,27 @@ pub(crate) async fn create_stream_by_id(
 pub(crate) async fn create_stream_external_by_id(
     state: HttpState,
     request_target: String,
+    request: CreateStreamRequest,
+    producer: Option<ProducerRequest>,
+) -> Response {
+    let group = state.runtime.locate(&request.stream_id).raft_group_id;
+    let error_state = state.clone();
+    let error_target = request_target.clone();
+    match error_state
+        .runtime
+        .run_group_work(group, move |_| async move {
+            create_stream_external_by_id_admitted(state, request_target, request, producer).await
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => runtime_error_or_leader_redirect_async(&error_state, err, &error_target).await,
+    }
+}
+
+async fn create_stream_external_by_id_admitted(
+    state: HttpState,
+    request_target: String,
     mut request: CreateStreamRequest,
     producer: Option<ProducerRequest>,
 ) -> Response {
@@ -3059,6 +3099,26 @@ pub(crate) async fn append_stream_by_id(
 }
 
 pub(crate) async fn append_stream_external_by_id(
+    state: HttpState,
+    request_target: String,
+    request: AppendRequest,
+) -> Response {
+    let group = state.runtime.locate(&request.stream_id).raft_group_id;
+    let error_state = state.clone();
+    let error_target = request_target.clone();
+    match error_state
+        .runtime
+        .run_group_work(group, move |_| async move {
+            append_stream_external_by_id_admitted(state, request_target, request).await
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => runtime_error_or_leader_redirect_async(&error_state, err, &error_target).await,
+    }
+}
+
+async fn append_stream_external_by_id_admitted(
     state: HttpState,
     request_target: String,
     mut request: AppendRequest,
@@ -3479,6 +3539,37 @@ async fn verify_json_boundary(
 }
 
 async fn publish_snapshot_by_offset(
+    state: HttpState,
+    request_target: String,
+    stream_id: BucketStreamId,
+    snapshot_offset: u64,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let group = state.runtime.locate(&stream_id).raft_group_id;
+    let error_state = state.clone();
+    let error_target = request_target.clone();
+    match error_state
+        .runtime
+        .run_group_work(group, move |_| async move {
+            publish_snapshot_by_offset_admitted(
+                state,
+                request_target,
+                stream_id,
+                snapshot_offset,
+                headers,
+                body,
+            )
+            .await
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => runtime_error_or_leader_redirect_async(&error_state, err, &error_target).await,
+    }
+}
+
+async fn publish_snapshot_by_offset_admitted(
     state: HttpState,
     request_target: String,
     stream_id: BucketStreamId,

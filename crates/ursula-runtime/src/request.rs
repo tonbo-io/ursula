@@ -252,6 +252,7 @@ pub struct GroupReadStreamParts {
     pub up_to_date: bool,
     pub closed: bool,
     pub body: GroupReadStreamBody,
+    pub(crate) _activity: Option<crate::GroupActivityGuard>,
 }
 
 impl GroupReadStreamParts {
@@ -265,6 +266,7 @@ impl GroupReadStreamParts {
             up_to_date: response.up_to_date,
             closed: response.closed,
             body: GroupReadStreamBody::Materialized(response.payload),
+            _activity: None,
         }
     }
 
@@ -289,7 +291,15 @@ impl GroupReadStreamParts {
                 cold_store,
                 cold_index_cache,
             },
+            _activity: None,
         }
+    }
+
+    /// Carry admitted read work into detached materialization, including time
+    /// waiting for a node read permit. Retirement waits until the parts drop.
+    pub fn with_activity(mut self, activity: crate::GroupActivityGuard) -> Self {
+        self._activity = Some(activity);
+        self
     }
 
     pub async fn into_response(self) -> Result<ReadStreamResponse, GroupEngineError> {

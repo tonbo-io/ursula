@@ -582,6 +582,15 @@ pub trait GroupEngine: Send + 'static {
 }
 
 pub trait GroupEngineFactory: Send + Sync + 'static {
+    /// Admit detached work before planning or external I/O. Managed factories
+    /// bind the guard to this replica incarnation and reject revoked hosting.
+    fn enter_group_work(
+        &self,
+        _placement: ShardPlacement,
+    ) -> Result<Option<crate::GroupActivityGuard>, GroupEngineError> {
+        Ok(None)
+    }
+
     /// Reclaim a revoked, stopped replica's durable local resources. Ordinary
     /// shutdown preserves state; retirement requires explicit factory support.
     fn retire<'a>(

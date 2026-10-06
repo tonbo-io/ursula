@@ -91,6 +91,20 @@ impl ShardRuntime {
         max_streams: usize,
         grace_ms: u64,
     ) -> Result<ColdOrphanSweepReport, RuntimeError> {
+        self.run_group_work(raft_group_id, move |runtime| async move {
+            runtime
+                .sweep_cold_orphans_group_once_admitted(raft_group_id, max_streams, grace_ms)
+                .await
+        })
+        .await?
+    }
+
+    async fn sweep_cold_orphans_group_once_admitted(
+        &self,
+        raft_group_id: RaftGroupId,
+        max_streams: usize,
+        grace_ms: u64,
+    ) -> Result<ColdOrphanSweepReport, RuntimeError> {
         let Some(cold_store) = self.cold_store.as_ref() else {
             return Ok(ColdOrphanSweepReport::default());
         };

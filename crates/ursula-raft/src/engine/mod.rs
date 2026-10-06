@@ -880,6 +880,18 @@ impl GroupEngine for RaftGroupEngine {
         placement: ShardPlacement,
     ) -> GroupReadStreamPartsFuture<'a> {
         Box::pin(async move {
+            let activity = self
+                .with_state_machine(|state_machine| {
+                    Box::pin(async move {
+                        state_machine
+                            .snapshot_install
+                            .references(state_machine.placement.raft_group_id.0)
+                            .activity
+                            .enter()
+                            .map_err(GroupEngineError::new)
+                    })
+                })
+                .await??;
             let original_request = request.clone();
             // A live read pinned to its owner's confirmed read index is
             // served only here, while this replica leads and has applied
@@ -988,7 +1000,7 @@ impl GroupEngine for RaftGroupEngine {
                 }
                 parts.up_to_date = false;
             }
-            Ok(parts)
+            Ok(parts.with_activity(activity))
         })
     }
 

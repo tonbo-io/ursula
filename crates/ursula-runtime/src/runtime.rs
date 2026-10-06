@@ -222,6 +222,16 @@ pub struct ShardRuntime {
     compaction_debt_chunk_bytes: Arc<AtomicU64>,
     /// Each started group's ReadIndex barrier, installed by its core worker.
     read_barriers: ReadIndexBarriers,
+    group_work: GroupWorkAdmission,
+}
+
+#[derive(Clone)]
+struct GroupWorkAdmission(Arc<dyn GroupEngineFactory>);
+
+impl std::fmt::Debug for GroupWorkAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupWorkAdmission").finish_non_exhaustive()
+    }
 }
 
 /// Node-local position of one group's cold-index repair cursor.
@@ -315,6 +325,7 @@ impl ShardRuntime {
                 DEFAULT_COMPACTION_DEBT_CHUNK_BYTES,
             )),
             read_barriers,
+            group_work: GroupWorkAdmission(engine_factory),
         })
     }
 
@@ -340,6 +351,9 @@ impl ShardRuntime {
         end_offset: u64,
         object_bytes: u64,
     ) {
+        let Ok(_work) = self.enter_group_work(self.locate(stream_id).raft_group_id) else {
+            return;
+        };
         if object_bytes >= self.compaction_debt_chunk_bytes.load(Ordering::Relaxed) {
             return;
         }
@@ -352,8 +366,11 @@ impl ShardRuntime {
         if pages.is_empty() {
             return;
         }
-        if let Ok(mut debt) = self.compaction_debt.lock() {
-            for key in pages {
+        for key in pages {
+            let Ok(_work) = self.enter_group_work(self.locate(&key.stream_id).raft_group_id) else {
+                continue;
+            };
+            if let Ok(mut debt) = self.compaction_debt.lock() {
                 debt.record_page(key);
             }
         }
@@ -367,6 +384,52 @@ impl ShardRuntime {
 
     pub fn locate(&self, stream_id: &BucketStreamId) -> ShardPlacement {
         self.shard_map.locate(stream_id)
+    }
+
+    /// Admit detached work before obtaining a plan or starting external I/O.
+    /// Hold the returned guard through publication and any rejection cleanup.
+    /// Managed retirement waits for this replica's admitted work to finish.
+    pub fn enter_group_work(
+        &self,
+        group: RaftGroupId,
+    ) -> Result<Option<crate::GroupActivityGuard>, RuntimeError> {
+        let placement = self.placement_for_group(group)?;
+        if !self.group_work.0.hosts_group(placement) {
+            return Err(RuntimeError::GroupNotHosted {
+                core_id: placement.core_id,
+                raft_group_id: group,
+            });
+        }
+        self.group_work
+            .0
+            .enter_group_work(placement)
+            .map_err(|error| RuntimeError::group_engine(placement, error))
+    }
+
+    /// Run admitted replica work independently of response cancellation. The
+    /// lifecycle guard remains with the task through external I/O and cleanup.
+    pub async fn run_group_work<T, F, Fut>(
+        &self,
+        group: RaftGroupId,
+        work: F,
+    ) -> Result<T, RuntimeError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Self) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+    {
+        let guard = self.enter_group_work(group)?;
+        let placement = self.placement_for_group(group)?;
+        let runtime = self.clone();
+        let (response, completion) = oneshot::channel();
+        crate::rt::spawn(async move {
+            let _work = guard;
+            let result = work(runtime).await;
+            let _ = response.send(result);
+        });
+        completion.await.map_err(|_| RuntimeError::ResponseDropped {
+            core_id: placement.core_id,
+        })
     }
 
     pub fn has_cold_store(&self) -> bool {
@@ -534,6 +597,17 @@ impl ShardRuntime {
         &self,
         request: PlanColdFlushRequest,
     ) -> Result<Option<FlushColdResponse>, RuntimeError> {
+        self.run_group_work(
+            self.locate(&request.stream_id).raft_group_id,
+            move |runtime| async move { runtime.flush_cold_once_admitted(request).await },
+        )
+        .await?
+    }
+
+    async fn flush_cold_once_admitted(
+        &self,
+        request: PlanColdFlushRequest,
+    ) -> Result<Option<FlushColdResponse>, RuntimeError> {
         let Some(candidate) = self.plan_cold_flush(request).await? else {
             return Ok(None);
         };
@@ -541,6 +615,19 @@ impl ShardRuntime {
     }
 
     pub async fn flush_cold_group_once(
+        &self,
+        raft_group_id: RaftGroupId,
+        request: PlanGroupColdFlushRequest,
+    ) -> Result<Option<FlushColdResponse>, RuntimeError> {
+        self.run_group_work(raft_group_id, move |runtime| async move {
+            runtime
+                .flush_cold_group_once_admitted(raft_group_id, request)
+                .await
+        })
+        .await?
+    }
+
+    async fn flush_cold_group_once_admitted(
         &self,
         raft_group_id: RaftGroupId,
         request: PlanGroupColdFlushRequest,
@@ -559,6 +646,20 @@ impl ShardRuntime {
     }
 
     pub async fn flush_cold_group_batch_once(
+        &self,
+        raft_group_id: RaftGroupId,
+        request: PlanGroupColdFlushRequest,
+        max_candidates: usize,
+    ) -> Result<Vec<FlushColdResponse>, RuntimeError> {
+        self.run_group_work(raft_group_id, move |runtime| async move {
+            runtime
+                .flush_cold_group_batch_once_admitted(raft_group_id, request, max_candidates)
+                .await
+        })
+        .await?
+    }
+
+    async fn flush_cold_group_batch_once_admitted(
         &self,
         raft_group_id: RaftGroupId,
         request: PlanGroupColdFlushRequest,
@@ -815,6 +916,14 @@ impl ShardRuntime {
         &self,
         candidates: Vec<ColdFlushCandidate>,
     ) -> Result<Vec<FlushColdResponse>, RuntimeError> {
+        let groups: BTreeSet<_> = candidates
+            .iter()
+            .map(|candidate| self.locate(&candidate.stream_id).raft_group_id)
+            .collect();
+        let _work: Vec<_> = groups
+            .into_iter()
+            .map(|group| self.enter_group_work(group))
+            .collect::<Result<_, _>>()?;
         self.flush_cold_candidates_batch(candidates).await
     }
 
@@ -1118,126 +1227,157 @@ impl ShardRuntime {
         max_streams: usize,
         gc_grace_ms: u64,
     ) -> Result<usize, RuntimeError> {
-        let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
         let mut compacted = 0;
         while compacted < max_streams {
             let Some(((stream_id, generation), stream_pages)) = pages_by_stream.next() else {
                 break;
             };
-            // Only the local Raft leader may publish a replacement. A plain
-            // leadership check: compaction gains no quorum round trip, and the
-            // replacement's own commit is what proves leadership.
-            if !self.accepts_local_writes(&stream_id).await.unwrap_or(false) {
-                continue;
-            }
-            let chunks = load_cold_chunks_from_pages(&store, &stream_pages)
-                .await
-                .map_err(|err| RuntimeError::ColdStoreIo {
-                    message: err.to_string(),
-                })?;
-            let Some(old_chunks) = select_cold_chunk_compaction(&chunks, target_bytes, max_bytes)
-            else {
-                continue;
-            };
-            let total_bytes = old_chunks
-                .iter()
-                .try_fold(0_u64, |total, chunk| {
-                    total.checked_add(chunk.end_offset.saturating_sub(chunk.start_offset))
-                })
-                .ok_or_else(|| RuntimeError::ColdStoreIo {
-                    message: "cold compaction byte count overflow".to_owned(),
-                })?;
-            let capacity = usize::try_from(total_bytes).map_err(|_| RuntimeError::ColdStoreIo {
-                message: "cold compaction object exceeds addressable memory".to_owned(),
-            })?;
-            let mut payload = Vec::with_capacity(capacity);
-            for chunk in &old_chunks {
-                let len = usize::try_from(chunk.end_offset.saturating_sub(chunk.start_offset))
-                    .map_err(|_| RuntimeError::ColdStoreIo {
-                        message: "cold chunk exceeds addressable memory".to_owned(),
-                    })?;
-                let bytes = cold_store
-                    .read_chunk_range(chunk, chunk.start_offset, len)
-                    .await
-                    .map_err(|err| RuntimeError::ColdStoreIo {
-                        message: err.to_string(),
-                    })?;
-                payload.extend_from_slice(&bytes);
-            }
-            let first = old_chunks
-                .first()
-                .expect("candidate contains at least two chunks");
-            let last = old_chunks
-                .last()
-                .expect("candidate contains at least two chunks");
-            let path = new_cold_chunk_path_in_generation(
-                &stream_id,
-                generation,
-                first.start_offset,
-                last.end_offset,
-            );
-            let object_size = cold_store
-                .write_chunk(&path, &payload)
-                .await
-                .map_err(|err| RuntimeError::ColdStoreIo {
-                    message: err.to_string(),
-                })?;
-            let replacement = ColdChunkRef {
-                start_offset: first.start_offset,
-                end_offset: last.end_offset,
-                object_size,
-                s3_path: path,
-                object_offset: 0,
-                shared_object: false,
-                payload_digest: blake3::hash(&payload).to_hex().to_string(),
-            };
-            let replacement_path = replacement.s3_path.clone();
-            let replacement_range = (
-                replacement.start_offset,
-                replacement.end_offset,
-                replacement.object_size,
-            );
-            let gc_not_before_ms = unix_time_ms().saturating_add(gc_grace_ms);
-            let compact_result = self
-                .compact_cold(CompactColdRequest {
-                    stream_id: stream_id.clone(),
-                    old_chunks,
-                    replacement,
-                    gc_not_before_ms,
+            let group = self.locate(&stream_id).raft_group_id;
+            let cold_store = cold_store.clone();
+            let result = self
+                .run_group_work(group, move |runtime| async move {
+                    runtime
+                        .compact_cold_stream(
+                            &cold_store,
+                            ((stream_id, generation), stream_pages),
+                            target_bytes,
+                            max_bytes,
+                            gc_grace_ms,
+                        )
+                        .await
                 })
                 .await;
-            if let Err(err) = compact_result {
-                let rollback_safe =
-                    err.is_forward_before_proposal() || err.stream_error_code().is_some();
-                if !rollback_safe {
-                    return Err(err);
-                }
-                if let Err(cleanup_err) = cold_store.delete_chunk(&replacement_path).await {
-                    tracing::warn!(
-                        stream = %stream_id,
-                        path = %replacement_path,
-                        error = %cleanup_err,
-                        "failed to remove unpublished cold compaction replacement"
-                    );
-                }
-                tracing::warn!(
-                    stream = %stream_id,
-                    error = %err,
-                    "cold compaction publish failed; continuing with remaining streams"
-                );
-                continue;
+            match result {
+                Ok(result) => compacted += result?,
+                Err(RuntimeError::GroupNotHosted { .. }) => {}
+                Err(err) => return Err(err),
             }
-            // A replacement still below the debt size may merge further.
-            self.record_compaction_debt(
-                &stream_id,
-                generation,
-                replacement_range.0,
-                replacement_range.1,
-                replacement_range.2,
-            );
-            compacted += 1;
         }
         Ok(compacted)
+    }
+
+    async fn compact_cold_stream(
+        &self,
+        cold_store: &ColdStoreHandle,
+        stream: ((BucketStreamId, u64), Vec<ColdIndexPageKey>),
+        target_bytes: u64,
+        max_bytes: u64,
+        gc_grace_ms: u64,
+    ) -> Result<usize, RuntimeError> {
+        let ((stream_id, generation), stream_pages) = stream;
+        let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+        // Only the local Raft leader may publish a replacement. A plain
+        // leadership check: compaction gains no quorum round trip, and the
+        // replacement's own commit is what proves leadership.
+        if !self.accepts_local_writes(&stream_id).await.unwrap_or(false) {
+            return Ok(0);
+        }
+        let chunks = load_cold_chunks_from_pages(&store, &stream_pages)
+            .await
+            .map_err(|err| RuntimeError::ColdStoreIo {
+                message: err.to_string(),
+            })?;
+        let Some(old_chunks) = select_cold_chunk_compaction(&chunks, target_bytes, max_bytes)
+        else {
+            return Ok(0);
+        };
+        let total_bytes = old_chunks
+            .iter()
+            .try_fold(0_u64, |total, chunk| {
+                total.checked_add(chunk.end_offset.saturating_sub(chunk.start_offset))
+            })
+            .ok_or_else(|| RuntimeError::ColdStoreIo {
+                message: "cold compaction byte count overflow".to_owned(),
+            })?;
+        let capacity = usize::try_from(total_bytes).map_err(|_| RuntimeError::ColdStoreIo {
+            message: "cold compaction object exceeds addressable memory".to_owned(),
+        })?;
+        let mut payload = Vec::with_capacity(capacity);
+        for chunk in &old_chunks {
+            let len = usize::try_from(chunk.end_offset.saturating_sub(chunk.start_offset))
+                .map_err(|_| RuntimeError::ColdStoreIo {
+                    message: "cold chunk exceeds addressable memory".to_owned(),
+                })?;
+            let bytes = cold_store
+                .read_chunk_range(chunk, chunk.start_offset, len)
+                .await
+                .map_err(|err| RuntimeError::ColdStoreIo {
+                    message: err.to_string(),
+                })?;
+            payload.extend_from_slice(&bytes);
+        }
+        let first = old_chunks
+            .first()
+            .expect("candidate contains at least two chunks");
+        let last = old_chunks
+            .last()
+            .expect("candidate contains at least two chunks");
+        let path = new_cold_chunk_path_in_generation(
+            &stream_id,
+            generation,
+            first.start_offset,
+            last.end_offset,
+        );
+        let object_size = cold_store
+            .write_chunk(&path, &payload)
+            .await
+            .map_err(|err| RuntimeError::ColdStoreIo {
+                message: err.to_string(),
+            })?;
+        let replacement = ColdChunkRef {
+            start_offset: first.start_offset,
+            end_offset: last.end_offset,
+            object_size,
+            s3_path: path,
+            object_offset: 0,
+            shared_object: false,
+            payload_digest: blake3::hash(&payload).to_hex().to_string(),
+        };
+        let replacement_path = replacement.s3_path.clone();
+        let replacement_range = (
+            replacement.start_offset,
+            replacement.end_offset,
+            replacement.object_size,
+        );
+        let gc_not_before_ms = unix_time_ms().saturating_add(gc_grace_ms);
+        let compact_result = self
+            .compact_cold(CompactColdRequest {
+                stream_id: stream_id.clone(),
+                old_chunks,
+                replacement,
+                gc_not_before_ms,
+            })
+            .await;
+        if let Err(err) = compact_result {
+            let rollback_safe =
+                err.is_forward_before_proposal() || err.stream_error_code().is_some();
+            if !rollback_safe {
+                return Err(err);
+            }
+            if let Err(cleanup_err) = cold_store.delete_chunk(&replacement_path).await {
+                tracing::warn!(
+                    stream = %stream_id,
+                    path = %replacement_path,
+                    error = %cleanup_err,
+                    "failed to remove unpublished cold compaction replacement"
+                );
+            }
+            tracing::warn!(
+                stream = %stream_id,
+                error = %err,
+                "cold compaction publish failed; continuing with remaining streams"
+            );
+            return Ok(0);
+        }
+        // A replacement still below the debt size may merge further.
+        self.record_compaction_debt(
+            &stream_id,
+            generation,
+            replacement_range.0,
+            replacement_range.1,
+            replacement_range.2,
+        );
+        Ok(1)
     }
 
     /// Drains the leader-side cold-GC queue for one group: physically reclaims
@@ -1245,6 +1385,19 @@ impl ShardRuntime {
     /// the reclaimed entries. Deletions are idempotent, so a crash or leader
     /// change between reclaim and ack simply re-runs them next tick.
     pub async fn run_cold_gc_group_once(
+        &self,
+        raft_group_id: RaftGroupId,
+        max_entries: usize,
+    ) -> Result<usize, RuntimeError> {
+        self.run_group_work(raft_group_id, move |runtime| async move {
+            runtime
+                .run_cold_gc_group_once_admitted(raft_group_id, max_entries)
+                .await
+        })
+        .await?
+    }
+
+    async fn run_cold_gc_group_once_admitted(
         &self,
         raft_group_id: RaftGroupId,
         max_entries: usize,
@@ -1459,6 +1612,19 @@ impl ShardRuntime {
         raft_group_id: RaftGroupId,
         max_streams: usize,
     ) -> Result<ColdIndexRepairStep, RuntimeError> {
+        self.run_group_work(raft_group_id, move |runtime| async move {
+            runtime
+                .repair_cold_index_group_once_admitted(raft_group_id, max_streams)
+                .await
+        })
+        .await?
+    }
+
+    async fn repair_cold_index_group_once_admitted(
+        &self,
+        raft_group_id: RaftGroupId,
+        max_streams: usize,
+    ) -> Result<ColdIndexRepairStep, RuntimeError> {
         if self.cold_store.is_none() {
             return Ok(ColdIndexRepairStep::default());
         }
@@ -1622,17 +1788,46 @@ impl ShardRuntime {
     /// Caller cancellation does not cancel admitted core cleanup work.
     pub async fn retire_group_engine(&self, group: RaftGroupId) -> Result<(), RuntimeError> {
         let placement = self.placement_for_group(group)?;
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::RetireGroupEngine {
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
+        let runtime = self.clone();
+        let (completion_tx, completion_rx) = oneshot::channel();
+        crate::rt::spawn(async move {
+            let mailbox = &runtime.mailboxes[usize::from(placement.core_id.0)];
+            let (response_tx, response_rx) = oneshot::channel();
+            let result = runtime
+                .send_core_command(
+                    mailbox,
+                    CoreCommand::RetireGroupEngine {
+                        placement,
+                        response_tx,
+                    },
+                    response_rx,
+                )
+                .await;
+            if result.is_ok() {
+                runtime.forget_retired_cold_state(group);
+            }
+            let _ = completion_tx.send(result);
+        });
+        completion_rx
+            .await
+            .map_err(|_| RuntimeError::ResponseDropped {
+                core_id: placement.core_id,
+            })?
+    }
+
+    fn forget_retired_cold_state(&self, group: RaftGroupId) {
+        self.cold_index_repair
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&group);
+        self.cold_orphan_sweep
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&group);
+        self.compaction_debt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove_where(|key| self.locate(&key.stream_id).raft_group_id == group);
     }
 
     #[cfg(madsim)]

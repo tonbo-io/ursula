@@ -1440,6 +1440,11 @@ async fn sse_live_tail_delivers_appended_text_and_closed_control() {
     assert!(body.contains("\"streamNextOffset\":\"00000000000000000009\""));
     assert!(body.contains("\"streamClosed\":true"));
 
+    // Scheduling may send an empty tail control before the closing append.
+    // Metrics count the control frames actually delivered to the client.
+    let control_events = body.matches("event: control\n").count();
+    assert!(control_events >= 1);
+
     let response = http_get(&app, "/__ursula/metrics").await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_bytes(response).await;
@@ -1447,7 +1452,7 @@ async fn sse_live_tail_delivers_appended_text_and_closed_control() {
     assert!(body.contains("\"sse_streams_opened\":1"));
     assert!(body.contains("\"sse_read_iterations\":"));
     assert!(body.contains("\"sse_data_events\":1"));
-    assert!(body.contains("\"sse_control_events\":1"));
+    assert!(body.contains(&format!("\"sse_control_events\":{control_events},")));
     assert!(body.contains("\"sse_error_events\":0"));
 }
 
@@ -5116,8 +5121,18 @@ async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {
 
 #[tokio::test]
 async fn ingress_body_budget_holds_credit_until_response_finishes() {
+    ingress_body_budget_completion(false).await;
+}
+
+#[tokio::test]
+async fn ingress_body_budget_holds_credit_after_response_cancellation() {
+    ingress_body_budget_completion(true).await;
+}
+
+async fn ingress_body_budget_completion(cancel: bool) {
     let entered = Arc::new(tokio::sync::Barrier::new(2));
     let release = Arc::new(tokio::sync::Notify::new());
+    let body_budget = Arc::new(tokio::sync::Semaphore::new(4));
     let app = Router::new()
         .route(
             "/write",
@@ -5137,7 +5152,7 @@ async fn ingress_body_budget_holds_credit_until_response_finishes() {
         )
         .layer(middleware::from_fn_with_state(
             IngressAdmission {
-                body_bytes: Arc::new(tokio::sync::Semaphore::new(4)),
+                body_bytes: body_budget.clone(),
                 wal_disk: WalDiskMonitor::default(),
                 raft_log: None,
             },
@@ -5157,6 +5172,9 @@ async fn ingress_body_budget_holds_credit_until_response_finishes() {
         }
     });
     entered.wait().await;
+    if cancel {
+        first.abort();
+    }
 
     let second = http_post(
         &app,
@@ -5168,10 +5186,21 @@ async fn ingress_body_budget_holds_credit_until_response_finishes() {
     assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     release.notify_one();
-    assert_eq!(
-        first.await.expect("first join").status(),
-        StatusCode::NO_CONTENT
-    );
+    if cancel {
+        assert!(first.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while body_budget.available_permits() != 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    } else {
+        assert_eq!(
+            first.await.expect("first join").status(),
+            StatusCode::NO_CONTENT
+        );
+    }
 }
 
 #[tokio::test]

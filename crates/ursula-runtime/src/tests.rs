@@ -3739,6 +3739,7 @@ impl GroupEngine for BlockingReadEngine {
                         payload: b"ready".to_vec(),
                     },
                     incarnation: 0,
+                    _activity: None,
                 });
             }
             let response = ReadStreamResponse {

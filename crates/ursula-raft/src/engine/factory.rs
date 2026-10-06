@@ -750,6 +750,22 @@ impl StaticGrpcRaftGroupEngineFactory {
 }
 
 impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
+    fn enter_group_work(
+        &self,
+        placement: ShardPlacement,
+    ) -> Result<Option<ursula_runtime::GroupActivityGuard>, GroupEngineError> {
+        if !self.hosts_group(placement) {
+            return Err(GroupEngineError::new("group work requires local hosting"));
+        }
+        self.registry
+            .snapshot_install_coordinator()
+            .references(placement.raft_group_id.0)
+            .activity
+            .enter()
+            .map(Some)
+            .map_err(GroupEngineError::new)
+    }
+
     fn retire<'a>(
         &'a self,
         placement: ShardPlacement,

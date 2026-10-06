@@ -14,7 +14,9 @@ struct State {
 }
 
 #[derive(Debug)]
-pub(crate) struct GroupActivity {
+/// A process-local, permanently closeable lifecycle for detached replica work.
+/// It supplements durable receiver authorization; it does not grant hosting.
+pub struct GroupActivity {
     state: Mutex<State>,
     changes: watch::Sender<usize>,
 }
@@ -30,15 +32,16 @@ impl Default for GroupActivity {
 }
 
 #[derive(Debug)]
-pub(crate) struct GroupActivityGuard {
+/// Keeps admitted replica work in the retirement drain until dropped.
+pub struct GroupActivityGuard {
     activity: Arc<GroupActivity>,
 }
 
 impl GroupActivity {
-    pub(crate) fn enter(self: &Arc<Self>) -> Result<GroupActivityGuard, String> {
+    pub fn enter(self: &Arc<Self>) -> Result<GroupActivityGuard, String> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.closed {
-            return Err("group snapshot lifecycle is retired".to_owned());
+            return Err("group lifecycle is retired".to_owned());
         }
         state.active = state
             .active
@@ -50,21 +53,22 @@ impl GroupActivity {
         })
     }
 
-    pub(crate) fn is_closed(&self) -> bool {
+    pub fn is_closed(&self) -> bool {
         self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .closed
     }
 
-    pub(crate) fn close(&self) {
+    pub fn close(&self) {
         self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .closed = true;
     }
 
-    pub(crate) async fn drain(&self) {
+    /// Wait after `close`; callers cannot reopen this lifecycle.
+    pub async fn drain(&self) {
         let mut changes = self.changes.subscribe();
         loop {
             if *changes.borrow_and_update() == 0 {

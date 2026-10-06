@@ -21,6 +21,7 @@
 //! - [`runtime`]: `ShardRuntime`, `RuntimeConfig`, and per-core worker spawn.
 //! - [`core_worker`]: single-thread actor that owns groups for one core.
 //! - [`group_actor`]: per-group mailbox actor running inside a core worker.
+//! - [`group_lifecycle`]: close/drain barriers for detached replica work.
 //! - [`ops`]: declarative manifest of the uniform runtime operations; expands
 //!   into the per-operation actor and client plumbing.
 //! - [`metrics`]: runtime metrics shared across cores; lock-free counters.
@@ -40,6 +41,7 @@ mod engine;
 mod error;
 pub mod format_marker;
 mod group_actor;
+mod group_lifecycle;
 pub mod journal;
 mod metrics;
 mod ops;
@@ -159,6 +161,8 @@ pub use engine::in_memory::next_repair_cursor;
 pub use engine::in_memory::repair_cold_index_response;
 pub use error::ErrorStatus;
 pub use error::RuntimeError;
+pub use group_lifecycle::GroupActivity;
+pub use group_lifecycle::GroupActivityGuard;
 pub use metrics::RuntimeMailboxSnapshot;
 pub use metrics::RuntimeMetrics;
 pub use metrics::RuntimeMetricsSnapshot;
