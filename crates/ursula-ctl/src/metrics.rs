@@ -54,6 +54,20 @@ impl MetricsClient {
             .json()
             .await
             .with_context(|| format!("decode metrics from node {}", node.id))?;
+        if body
+            .raft_groups
+            .iter()
+            .any(|group| group.node_id != node.id)
+            || body
+                .raft_maintenance
+                .as_ref()
+                .is_some_and(|report| report.node_id != node.id)
+        {
+            bail!(
+                "metrics identity differs from configured node {}; refusing to operate through a misdirected endpoint",
+                node.id
+            );
+        }
         Ok(NodeMetricsView::new(node.clone(), body))
     }
 
@@ -336,7 +350,10 @@ impl MetricsClient {
 }
 
 fn metrics_base_url(node: &NodeInfo) -> &url::Url {
-    node.http_url.as_ref().unwrap_or(&node.admin_url)
+    node.metrics_url
+        .as_ref()
+        .or(node.http_url.as_ref())
+        .unwrap_or(&node.admin_url)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -360,6 +377,8 @@ struct RawMetrics {
     /// Raft WAL backend (`"memory"`/`"disk"`); absent on older servers.
     #[serde(default)]
     wal_backend: Option<String>,
+    #[serde(default)]
+    raft_maintenance: Option<ursula_raft::RaftMaintenanceReport>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -378,6 +397,8 @@ struct RawRaftGroup {
     voter_ids: Vec<u64>,
     #[serde(default)]
     learner_ids: Vec<u64>,
+    #[serde(default)]
+    maintenance: Option<ursula_raft::RaftGroupMaintenanceState>,
 }
 
 #[derive(Debug, Clone)]
@@ -387,6 +408,7 @@ pub struct NodeMetricsView {
     /// Raft WAL backend this node reports (`"memory"`/`"disk"`); `None` on
     /// servers predating the field.
     pub wal_backend: Option<String>,
+    pub raft_maintenance: Option<ursula_raft::RaftMaintenanceReport>,
 }
 
 impl NodeMetricsView {
@@ -403,12 +425,14 @@ impl NodeMetricsView {
                 last_applied_index: g.last_applied_index,
                 voter_ids: g.voter_ids,
                 learner_ids: g.learner_ids,
+                maintenance: g.maintenance,
             })
             .collect();
         Self {
             node,
             groups,
             wal_backend: raw.wal_backend,
+            raft_maintenance: raw.raft_maintenance,
         }
     }
 
@@ -436,6 +460,24 @@ pub struct RaftGroupView {
     pub last_applied_index: Option<u64>,
     pub voter_ids: Vec<u64>,
     pub learner_ids: Vec<u64>,
+    /// Absent on the supported 0.6.2 upgrade source. Such sources retain
+    /// their legacy checks until replaced; they cannot certify the repaired
+    /// memory-WAL participation guarantee. Remove when no retained upgrade
+    /// source predates this metrics contract.
+    pub maintenance: Option<ursula_raft::RaftGroupMaintenanceState>,
+}
+
+impl RaftGroupView {
+    pub fn participation_ready(&self) -> bool {
+        self.maintenance.as_ref().is_none_or(|health| {
+            health.running
+                && health.recovery_ready
+                && !health.membership_joint
+                && !health.stopped_for_operator
+                && health.membership_log_index.is_some()
+                && self.last_applied_index >= health.membership_log_index
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -492,12 +534,83 @@ impl ClusterSnapshot {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
     use axum::Router;
     use axum::http::StatusCode;
     use axum::routing::post;
     use url::Url;
 
     use super::*;
+
+    #[tokio::test]
+    async fn tunneled_metrics_do_not_replace_the_advertised_learner_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let query = Arc::new(Mutex::new(None));
+        let received = query.clone();
+        let app = Router::new()
+            .route(
+                "/__ursula/metrics",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "raft_groups": [{"raft_group_id": 0, "node_id": 1}]
+                    }))
+                }),
+            )
+            .route(
+                "/__ursula/raft/0/learners/1",
+                post(move |axum::extract::RawQuery(value)| async move {
+                    *received.lock().unwrap() = value;
+                    StatusCode::OK
+                }),
+            );
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let tunnel = Url::parse(&format!("http://{address}")).unwrap();
+        let advertised = Url::parse("http://replacement.invalid:4437").unwrap();
+        let node = NodeInfo {
+            id: 1,
+            admin_url: tunnel.clone(),
+            host: "replacement".to_owned(),
+            http_url: Some(advertised.clone()),
+            metrics_url: Some(tunnel),
+        };
+        let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
+        let view = client.fetch_node(&node).await.unwrap();
+        assert_eq!(view.node.http_url, Some(advertised.clone()));
+        client.add_learner(&node, 0, &node).await.unwrap();
+        assert_eq!(
+            query.lock().unwrap().as_deref(),
+            Some(format!("addr={advertised}&blocking=false").as_str())
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn metrics_refuse_an_admin_tunnel_that_reaches_a_different_voter() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/__ursula/metrics", axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"raft_groups": [{"raft_group_id": 0, "node_id": 2}]}))
+            }))).await.unwrap();
+        });
+        let node = NodeInfo {
+            id: 1,
+            admin_url: Url::parse(&format!("http://{address}")).unwrap(),
+            host: address.to_string(),
+            http_url: None,
+            metrics_url: None,
+        };
+        let error = MetricsClient::new(Duration::from_secs(1))
+            .unwrap()
+            .fetch_node(&node)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("metrics identity differs"));
+        task.abort();
+    }
 
     #[test]
     fn metrics_use_client_url_when_available() -> anyhow::Result<()> {
@@ -506,6 +619,7 @@ mod tests {
             admin_url: Url::parse("http://127.0.0.1:4438")?,
             host: "127.0.0.1".to_owned(),
             http_url: Some(Url::parse("http://127.0.0.1:4437")?),
+            metrics_url: None,
         };
 
         assert_eq!(metrics_base_url(&node).port(), Some(4437));
@@ -519,6 +633,7 @@ mod tests {
             admin_url: Url::parse("http://127.0.0.1:4438")?,
             host: "127.0.0.1".to_owned(),
             http_url: None,
+            metrics_url: None,
         };
 
         assert_eq!(metrics_base_url(&node).port(), Some(4438));
@@ -540,6 +655,7 @@ mod tests {
             admin_url: Url::parse(&format!("http://{address}"))?,
             host: address.to_string(),
             http_url: None,
+            metrics_url: None,
         })
     }
 

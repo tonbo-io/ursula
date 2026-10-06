@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::body::to_bytes;
@@ -2432,6 +2433,18 @@ async fn static_grpc_memory_node_rejoins_all_groups_through_membership_replaceme
         .await;
     }
 
+    // Full redundancy includes the fresh recovery barrier, not just matching
+    // payload bytes. Do not inject the next loss during initial recovery.
+    let recovery_deadline = Instant::now() + Duration::from_secs(10);
+    for node in &nodes {
+        while !node.registry.recovery_barriers_ready() {
+            assert!(
+                Instant::now() < recovery_deadline,
+                "initial recovery barriers not applied"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
     let stopped_node = nodes.remove(2);
     stopped_node.shutdown().await;
 
@@ -4983,6 +4996,75 @@ async fn ingress_body_budget_holds_credit_until_response_finishes() {
 }
 
 #[tokio::test]
+async fn an_unproven_memory_recovery_cannot_count_as_ready_after_undrain() {
+    let registry = RaftGroupHandleRegistry::default();
+    registry.register_rejoin(
+        RaftGroupId(0),
+        Arc::new(ursula_raft::GroupRejoin::new(1, RaftGroupId(0))),
+    );
+    let runtime = spawn_runtime(
+        &test_config(1, 1),
+        Persistence::InMemory,
+        Topology::SingleNode {
+            raft_group_count: 1,
+        },
+    )
+    .expect("runtime")
+    .runtime;
+    let app = client_router_with_admission(
+        HttpState::with_raft_registry(runtime, registry.clone()),
+        IngressAdmission::default(),
+    );
+    registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
+    registry.clear_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
+    let ready = http_get(&app, READINESS_PATH).await;
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes(ready).await).unwrap();
+    assert_eq!(body["reason"], json!("memory_wal_recovery_barrier"));
+    assert_eq!(body["recovery_barriers_ready"], json!(false));
+}
+
+#[tokio::test]
+async fn raft_readiness_uses_the_configured_inventory_even_when_every_group_is_missing() {
+    let runtime = spawn_runtime(
+        &test_config(1, 2),
+        Persistence::InMemory,
+        Topology::SingleNode {
+            raft_group_count: 2,
+        },
+    )
+    .expect("runtime")
+    .runtime;
+    let state = HttpState::with_static_raft_cluster_topology(
+        runtime,
+        RaftGroupHandleRegistry::default(),
+        1,
+        [
+            (1, "http://localhost:4437".to_owned()),
+            (2, "http://localhost:4438".to_owned()),
+            (3, "http://localhost:4439".to_owned()),
+        ],
+        BTreeMap::new(),
+    );
+    let app = client_router_with_admission(state, IngressAdmission::default());
+    let ready = http_get(&app, READINESS_PATH).await;
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes(ready).await).unwrap();
+    assert_eq!(body["reason"], json!("raft_maintenance_unready"));
+    assert_eq!(
+        body["raft_maintenance"]["expected_groups"],
+        json!({"0": [1, 2, 3], "1": [1, 2, 3]})
+    );
+    assert_eq!(
+        body["raft_maintenance"]["group_issues"],
+        json!({"0": ["missing_group"], "1": ["missing_group"]})
+    );
+    let response = http_get(&app, "/__ursula/metrics").await;
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+    assert_eq!(body["configured_raft_group_count"], 2);
+}
+
+#[tokio::test]
 async fn wal_disk_pressure_rejects_writes_and_marks_readiness_unavailable() {
     let monitor = WalDiskMonitor::new(100, 200);
     assert_eq!(
@@ -5154,6 +5236,7 @@ fn raft_metrics_snapshot(
         purged: None,
         voter_ids: voters,
         learner_ids: vec![],
+        maintenance: ursula_raft::RaftGroupMaintenanceState::default(),
         log: Default::default(),
     }
 }

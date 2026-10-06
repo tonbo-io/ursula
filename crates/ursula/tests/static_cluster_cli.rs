@@ -774,7 +774,13 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
         .expect("drain node 3");
     assert!(
         matches!(outcome, ursula_ctl::DrainOutcome::Drained),
-        "{outcome:?}"
+        "{outcome:?}; metrics={:?}; children={}",
+        ctl.try_fetch_cluster(&nodes).await,
+        children
+            .iter()
+            .map(child_report)
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     ursula_ctl::prepare_restart(&nodes, &nodes[2], &ctl, &drain_options)
         .await
@@ -880,6 +886,7 @@ fn spawn_per_group_memory_node(
     .expect("enable per-group membership initialization");
     let mut command = Command::new(binary);
     command.arg("server").arg("--config").arg(&config_path);
+    command.env("RUST_LOG", "info");
     if start_drained {
         command.env("URSULA_START_MAINTENANCE_DRAINED", "true");
     }
@@ -888,12 +895,156 @@ fn spawn_per_group_memory_node(
     (guard, admin_port)
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_sigterm_hands_off_memory_leaders_and_bounds_quorum_loss() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let binary = env!("CARGO_BIN_EXE_ursula");
+    let ports = [free_port(), free_port(), free_port()];
+    let peers = ports
+        .iter()
+        .enumerate()
+        .map(|(index, port)| ((index + 1) as u64, format!("http://127.0.0.1:{port}")))
+        .collect::<Vec<_>>();
+    let mut children = Vec::new();
+    let mut nodes = Vec::new();
+    for (node_id, url) in &peers {
+        let (child, admin_port) = spawn_per_group_memory_node(
+            binary,
+            *node_id,
+            ports[(*node_id - 1) as usize],
+            &peers,
+            false,
+        );
+        children.push(child);
+        nodes.push(ctl_node(*node_id, admin_port, url));
+    }
+    let client = reqwest::Client::new();
+    for (_, url) in &peers {
+        wait_until_ready(&client, url, &mut children).await;
+    }
+    for index in 0..6 {
+        put_with_body_until_created(
+            &client,
+            &format!("{}/benchcmp/sigterm-{index}", peers[0].1),
+            "acknowledged-before-sigterm",
+        )
+        .await;
+    }
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(2)).expect("ctl client");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let snapshot = loop {
+        let snapshot = ctl.fetch_cluster(&nodes).await.expect("fetch cluster");
+        if nodes.iter().all(|node| {
+            snapshot.node(node.id).is_some_and(|view| {
+                view.groups.len() == 6
+                    && view
+                        .groups
+                        .iter()
+                        .all(|group| group.current_leader.is_some())
+            }) && ursula_ctl::plan::check_readiness(&snapshot, node.id, 0).all_ready
+        }) {
+            break snapshot;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cluster not caught up: {snapshot:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let leader_count = |node_id| {
+        snapshot
+            .node(node_id)
+            .unwrap()
+            .groups
+            .iter()
+            .filter(|group| group.current_leader == Some(node_id))
+            .count()
+    };
+    let index = (0..nodes.len())
+        .max_by_key(|index| leader_count(nodes[*index].id))
+        .unwrap();
+    assert!(leader_count(nodes[index].id) > 0);
+    let mut outgoing = children.remove(index);
+    nodes.remove(index);
+    sigterm_and_wait_for_clean_exit(&mut outgoing).await;
+    let log = std::fs::read_to_string(&outgoing.stderr_path).expect("shutdown log");
+    // This event is emitted only after the outgoing process has observed zero
+    // local leaders, before it shuts down its Raft transport. A normal election
+    // after an abrupt exit cannot satisfy this assertion.
+    assert!(
+        log.contains("shutdown leadership handoff complete"),
+        "{log}"
+    );
+    for node in &nodes {
+        for index in 0..6 {
+            let payload = read_until_replicated(
+                &client,
+                &format!(
+                    "{}/benchcmp/sigterm-{index}?offset=0&max_bytes=64",
+                    node.http_url
+                        .as_ref()
+                        .unwrap()
+                        .as_str()
+                        .trim_end_matches('/')
+                ),
+            )
+            .await;
+            assert_eq!(payload, b"acknowledged-before-sigterm");
+        }
+    }
+
+    // With the terminated voter gone, kill another voter without a handoff.
+    // The last process cannot transfer leadership, but must still exit promptly.
+    let snapshot = ctl.fetch_cluster(&nodes).await.expect("fetch survivors");
+    let leader_index = (0..nodes.len())
+        .max_by_key(|index| {
+            let node_id = nodes[*index].id;
+            snapshot
+                .node(node_id)
+                .unwrap()
+                .groups
+                .iter()
+                .filter(|group| group.current_leader == Some(node_id))
+                .count()
+        })
+        .unwrap();
+    drop(children.remove(1 - leader_index));
+    sigterm_and_wait_for_clean_exit(&mut children[0]).await;
+}
+
+async fn sigterm_and_wait_for_clean_exit(child: &mut ChildGuard) {
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(child.child.id().to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(status.success());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.child.try_wait().expect("poll child") {
+            assert!(
+                status.success(),
+                "unclean shutdown: {status}; {}",
+                child_report(child)
+            );
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shutdown exceeded handoff budget: {}",
+            child_report(child)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn ctl_node(node_id: u64, admin_port: u16, public_url: &str) -> ursula_ctl::NodeInfo {
     ursula_ctl::NodeInfo {
         id: node_id,
         admin_url: url::Url::parse(&format!("http://127.0.0.1:{admin_port}")).expect("admin url"),
         host: "127.0.0.1".to_owned(),
         http_url: Some(url::Url::parse(public_url).expect("public url")),
+        metrics_url: None,
     }
 }
 
@@ -1115,7 +1266,12 @@ fn spawn_child(mut command: Command, label: String) -> ChildGuard {
             stderr_path.display()
         )
     });
-    command.stdout(Stdio::null()).stderr(Stdio::from(stderr));
+    // Tracing's formatter writes to stdout; retain it alongside stderr so
+    // shutdown ordering and child startup failures are observable in tests.
+    let stdout = stderr.try_clone().expect("clone child log handle");
+    command
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
     let child = command.spawn().unwrap_or_else(|err| {
         panic!(
             "spawn {label} failed; stderr log {}: {err}",

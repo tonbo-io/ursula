@@ -36,6 +36,9 @@ write_manifest() {
       printf '    {\n'
       printf '      "id": %s,\n' "$((ordinal + 1))"
       printf '      "admin_url": "http://127.0.0.1:%s",\n' "$((FORWARD_PORT_BASE + ordinal))"
+      # Metrics use the same Pod-bound tunnel. Keep http_url as the real peer
+      # address: learner attachment persists it in Raft membership.
+      printf '      "metrics_url": "http://127.0.0.1:%s",\n' "$((FORWARD_PORT_BASE + ordinal))"
       printf '      "host": "%s-%s",\n' "${STATEFULSET}" "${ordinal}"
       printf '      "http_url": "http://%s-%s.%s-headless.%s.svc.cluster.local:%s"\n' \
         "${STATEFULSET}" "${ordinal}" "${STATEFULSET}" "${NAMESPACE}" "${CLIENT_PORT}"
@@ -203,6 +206,16 @@ wait_for_pod_ready() {
   kubectl -n "${NAMESPACE}" wait --for=condition=Ready "pod/${pod}" --timeout=15m
 }
 
+wait_for_pod_started() {
+  ordinal=$1
+  pod="${STATEFULSET}-${ordinal}"
+  # Ready certifies repaired Raft membership. Wait for the TCP startup probe
+  # here so manual membership repair remains reachable while Ready is false.
+  kubectl -n "${NAMESPACE}" wait \
+    --for='jsonpath={.status.containerStatuses[?(@.name=="ursula")].started}=true' \
+    "pod/${pod}" --timeout=15m
+}
+
 start_ready_forwards() {
   ordinal=0
   while [ "${ordinal}" -lt "${REPLICAS}" ]; do
@@ -340,7 +353,7 @@ replacement_attempt_was_superseded() {
 finish_recovery_restart() {
   ordinal=$1
   node_id=$2
-  wait_for_pod_ready "${ordinal}"
+  wait_for_pod_started "${ordinal}"
   if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
     log "recovered node ${node_id} did not start at ${TARGET_IMAGE}@${TARGET_REVISION}"
     return 1
@@ -354,6 +367,7 @@ finish_recovery_restart() {
     --ready-timeout-secs 1800 \
     --lag-tolerance 16
   finish_prepared_restart "${node_id}"
+  wait_for_pod_ready "${ordinal}"
   strict_verify
   record_state complete "${node_id}"
 }
@@ -361,7 +375,7 @@ finish_recovery_restart() {
 finish_superseded_replacement() {
   ordinal=$1
   node_id=$2
-  wait_for_pod_ready "${ordinal}"
+  wait_for_pod_started "${ordinal}"
   start_forward "${ordinal}"
   repair_restarted_voter "${node_id}"
   "${CTL}" wait \
@@ -371,6 +385,7 @@ finish_superseded_replacement() {
     --ready-timeout-secs 1800 \
     --lag-tolerance 16
   finish_prepared_restart "${node_id}"
+  wait_for_pod_ready "${ordinal}"
   strict_verify
   record_state complete "${node_id}"
 }
@@ -396,7 +411,7 @@ resume_quiesce_upgrade() {
       replace_pod "${ordinal}"
     fi
   fi
-  wait_for_pod_ready "${ordinal}"
+  wait_for_pod_started "${ordinal}"
   if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
     log "legacy recovery handoff at node ${node_id} produced a non-target Pod"
     return 1
@@ -532,7 +547,7 @@ recover_amnesiac_if_needed() {
     --http-timeout-secs 60 \
     --lag-tolerance 16
   replace_pod "${ordinal}"
-  wait_for_pod_ready "${ordinal}"
+  wait_for_pod_started "${ordinal}"
   if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
     log "recovered node ${node_id} did not start at ${TARGET_IMAGE}@${TARGET_REVISION}"
     return 1
@@ -546,6 +561,7 @@ recover_amnesiac_if_needed() {
     --ready-timeout-secs 1800 \
     --lag-tolerance 16
   finish_prepared_restart "${node_id}"
+  wait_for_pod_ready "${ordinal}"
   strict_verify
   record_state complete "${node_id}"
   log "amnesiac voter ${node_id} recovered and verified"
@@ -606,7 +622,7 @@ roll_node() {
 
   replace_pod "${ordinal}"
 
-  wait_for_pod_ready "${ordinal}"
+  wait_for_pod_started "${ordinal}"
   start_forward "${ordinal}"
   image=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
     -o jsonpath='{.spec.containers[?(@.name=="ursula")].image}')
@@ -629,6 +645,7 @@ roll_node() {
     --ready-timeout-secs 1800 \
     --lag-tolerance 16
   finish_prepared_restart "${node_id}"
+  wait_for_pod_ready "${ordinal}"
   strict_verify
   TARGET_REVISION=${current_revision}
   record_state complete "${node_id}"

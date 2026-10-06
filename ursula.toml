@@ -48,8 +48,9 @@ listen = "127.0.0.1:4437"
 # Defaults to the machine's available parallelism when omitted.
 core_count = 4
 
-# Soft RSS cap.  When the process RSS exceeds this value, new writes are
-# rejected with HTTP 503.  Omit to disable the monitor.
+# Emergency RSS abort threshold. Exceeding it aborts the process, without
+# returning HTTP 503 or gracefully handing off leadership. With memory WAL,
+# this loses all local Raft logs. Omit to disable the monitor.
 # node_memory_abort_cap_size = "8GiB"
 
 # Minimum payload size that triggers external cold-store staging instead

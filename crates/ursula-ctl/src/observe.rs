@@ -192,6 +192,7 @@ mod tests {
             admin_url: Url::parse(&format!("http://10.0.0.{id}:4438")).unwrap(),
             host: format!("10.0.0.{id}"),
             http_url: Some(Url::parse(&format!("http://10.0.0.{id}/")).unwrap()),
+            metrics_url: None,
         }
     }
 
@@ -205,6 +206,7 @@ mod tests {
             last_applied_index: Some(1),
             voter_ids: vec![1, 2, 3],
             learner_ids: vec![],
+            maintenance: None,
         }
     }
 
@@ -218,6 +220,7 @@ mod tests {
             last_applied_index: None,
             voter_ids: vec![],
             learner_ids: vec![],
+            maintenance: None,
         }
     }
 
@@ -229,11 +232,13 @@ mod tests {
                     node: node(1),
                     groups: vec![group(7, Some(1)), group(8, Some(2))],
                     wal_backend: None,
+                    raft_maintenance: None,
                 },
                 NodeMetricsView {
                     node: node(2),
                     groups: vec![group(7, Some(1)), group(8, Some(2))],
                     wal_backend: None,
+                    raft_maintenance: None,
                 },
             ],
         };
@@ -248,6 +253,7 @@ mod tests {
                 node: node(1),
                 groups: vec![group(7, None)],
                 wal_backend: None,
+                raft_maintenance: None,
             }],
         };
         let mut summary = String::new();
@@ -262,6 +268,7 @@ mod tests {
                 node: node(1),
                 groups: vec![group(7, Some(1)), empty_group(8)],
                 wal_backend: None,
+                raft_maintenance: None,
             }],
         };
         let mut summary = String::new();

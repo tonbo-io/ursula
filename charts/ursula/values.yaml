@@ -50,6 +50,9 @@ server:
   replicaCount: 3
   # StatefulSet pod management policy. Parallel avoids readiness-gated bootstrap serialization.
   podManagementPolicy: Parallel
+  # Allow the voter's overall 20-second shutdown budget, which includes up to
+  # 5 seconds of leadership handoff, plus Kubernetes termination overhead.
+  terminationGracePeriodSeconds: 30
   # RollingUpdate lets Kubernetes replace pods automatically. OnDelete stages
   # new templates without restarting voters so an external graceful-rollout
   # controller can drain and replace exactly one pod at a time.
@@ -180,10 +183,11 @@ raft:
   # Fresh-cluster bootstrap flag. Set to false after the first successful ready.
   initMembership: false
   # Idempotent per-group bootstrap flag. Persistent groups may keep this enabled across restarts.
-  # With storageMode=memory a restarted pod initializes a group again only when every voter
-  # reports it empty; otherwise the group leaders rebuild it (see README, Bootstrap Behavior).
+  # With storageMode=memory leaders rebuild a restarted minority of voters. All-empty
+  # groups initialize only if no S3 initialized marker exists (see README, Bootstrap Behavior).
   initMembershipPerGroup: true
-  # Storage mode: logDir for durable Raft logs, memory for ephemeral tests.
+  # Storage mode: logDir for persistent Raft logs, memory for volatile quorum-replicated logs.
+  # Memory WAL loses local state on every restart; restore redundancy before another restart.
   storageMode: logDir
   # Raft log directory used when storageMode=logDir.
   logDir: /var/lib/ursula/raft
@@ -191,7 +195,10 @@ raft:
   minAvailableBytes: 536870912
   # Resume only above this watermark to avoid readiness flapping.
   resumeAvailableBytes: 1073741824
-  # Required opt-in for multi-pod memory WAL clusters. Never enable in production.
+  # Explicit acceptance of the memory-WAL durability contract for multi-pod clusters:
+  # a minority restart heals automatically; quorum loss stops writes and may lose confirmed data.
+  # With shared S3, initialized markers block silent reinitialization after all voters restart;
+  # continuing requires an operator to explicitly accept data loss. See README for prerequisites.
   allowVolatileMultiPeer: false
   # Optional cap for uncommitted payload bytes per group.
   maxUncommittedBytesPerGroup: null

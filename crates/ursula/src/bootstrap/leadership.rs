@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use openraft::rt::WatchReceiver;
+use ursula_raft::LeadershipShedReason;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_shard::RaftGroupId;
 
@@ -42,7 +43,7 @@ async fn leadership_balance_eligible_nodes(
     client: &reqwest::Client,
 ) -> HashSet<u64> {
     let mut eligible = HashSet::new();
-    if registry.leadership_shed_state().should_campaign() {
+    if registry.leadership_shed_state().should_campaign() && registry.recovery_barriers_ready() {
         eligible.insert(node_id);
     }
 
@@ -179,6 +180,109 @@ pub(crate) fn handoff_target_caught_up(
     leader_last_log_index
         .zip(target_matched_index)
         .is_some_and(|(last, matched)| matched >= last)
+}
+
+/// Best-effort shutdown handoff while Raft transport is still available.
+/// The caller bounds the whole operation, including peer discovery and waiting
+/// for observed leadership changes. Enqueuing a transfer is not completion.
+pub(crate) async fn handoff_shutdown_leadership(
+    registry: &RaftGroupHandleRegistry,
+    node_id: u64,
+    peers: &[(u64, String)],
+) -> usize {
+    registry.mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
+    let led_groups: HashSet<_> = registry
+        .metrics_snapshot()
+        .iter()
+        .filter(|snapshot| snapshot.current_leader == Some(node_id))
+        .map(|snapshot| snapshot.raft_group_id)
+        .collect();
+    let remaining_leaders = || {
+        registry
+            .metrics_snapshot()
+            .iter()
+            .filter(|snapshot| {
+                snapshot.current_leader == Some(node_id)
+                    || (led_groups.contains(&snapshot.raft_group_id)
+                        && snapshot.current_leader.is_none())
+            })
+            .count()
+    };
+    if remaining_leaders() == 0 {
+        return 0;
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::warn!(%err, "shutdown: cannot discover eligible leadership targets");
+            return remaining_leaders();
+        }
+    };
+    let mut submitted = HashSet::new();
+    loop {
+        let snapshots = registry.metrics_snapshot();
+        let remaining = snapshots
+            .iter()
+            .filter(|snapshot| {
+                snapshot.current_leader == Some(node_id)
+                    || (led_groups.contains(&snapshot.raft_group_id)
+                        && snapshot.current_leader.is_none())
+            })
+            .count();
+        if remaining == 0 {
+            return 0;
+        }
+        let eligible = leadership_balance_eligible_nodes(registry, node_id, peers, &client).await;
+        let counts = crate::bootstrap::util::leader_counts(&snapshots);
+        for snapshot in snapshots {
+            if snapshot.current_leader != Some(node_id)
+                || submitted.contains(&snapshot.raft_group_id)
+            {
+                continue;
+            }
+            let group = RaftGroupId(snapshot.raft_group_id);
+            let Some(raft) = registry.get(group) else {
+                continue;
+            };
+            for target in
+                crate::bootstrap::util::prioritized_transfer_targets(&snapshot, node_id, &counts)
+            {
+                if !eligible.contains(&target) || registry.is_reverted_follower(group, target) {
+                    continue;
+                }
+                let caught_up = {
+                    let metrics_rx = raft.metrics();
+                    let metrics = metrics_rx.borrow_watched();
+                    let matched = metrics
+                        .replication
+                        .as_ref()
+                        .and_then(|replication| replication.get(&target))
+                        .and_then(|matched| matched.as_ref())
+                        .map(|log_id| log_id.index());
+                    handoff_target_caught_up(metrics.last_log_index, matched)
+                };
+                if !caught_up {
+                    continue;
+                }
+                match raft.trigger().transfer_leader(target).await {
+                    Ok(()) => {
+                        submitted.insert(snapshot.raft_group_id);
+                        break;
+                    }
+                    Err(err) => tracing::warn!(
+                        raft_group_id = snapshot.raft_group_id,
+                        target,
+                        %err,
+                        "shutdown: leadership transfer request failed"
+                    ),
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Config-driven leadership balancer.

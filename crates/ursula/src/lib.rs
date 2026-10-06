@@ -85,6 +85,7 @@ use ursula_raft::RAFT_GRPC_FULL_SNAPSHOT_PATH;
 use ursula_raft::RAFT_GRPC_GROUP_READ_PATH;
 use ursula_raft::RAFT_GRPC_GROUP_WRITE_PATH;
 use ursula_raft::RAFT_GRPC_MAX_MESSAGE_BYTES;
+use ursula_raft::RAFT_GRPC_REJOIN_BARRIER_PATH;
 use ursula_raft::RAFT_GRPC_TRANSFER_LEADER_PATH;
 use ursula_raft::RAFT_GRPC_VOTE_PATH;
 use ursula_raft::RaftGroupHandle;
@@ -281,6 +282,30 @@ pub struct HttpState {
 }
 
 impl HttpState {
+    /// The static topology is the expected inventory. Observed metrics cannot
+    /// establish which groups or voters are missing after a restart.
+    fn raft_maintenance_report(&self) -> Option<ursula_raft::RaftMaintenanceReport> {
+        let registry = self.raft_registry()?;
+        let topology = self.client_write_router.as_ref()?;
+        let snapshots = registry.metrics_snapshot();
+        let node_id = topology
+            .node_id
+            .or_else(|| snapshots.first().map(|group| group.node_id))?;
+        let all_voters = topology.peers.keys().copied().collect::<BTreeSet<_>>();
+        let expected = (0..self.runtime.raft_group_count())
+            .filter_map(|id| {
+                let voters = topology
+                    .per_group_voters
+                    .get(&RaftGroupId(id))
+                    .unwrap_or(&all_voters);
+                voters.contains(&node_id).then(|| (id, voters.clone()))
+            })
+            .collect();
+        Some(ursula_raft::check_raft_maintenance(
+            &snapshots, node_id, expected, 16,
+        ))
+    }
+
     /// Bridge the runtime's metrics to the global OTLP meter (export-time
     /// observable instruments; no hot-path cost). Inert when no OTLP meter
     /// provider is installed.
@@ -738,6 +763,14 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for HttpRaftGrpcSer
             .await
     }
 
+    async fn rejoin_barrier(
+        &self,
+        request: tonic::Request<raft_internal_proto::RejoinBarrierRequestV1>,
+    ) -> Result<tonic::Response<raft_internal_proto::RejoinBarrierResponseV1>, tonic::Status> {
+        raft_internal_proto::raft_internal_server::RaftInternal::rejoin_barrier(&self.raft, request)
+            .await
+    }
+
     async fn transfer_leader(
         &self,
         request: tonic::Request<raft_internal_proto::RaftTransferLeaderRequestV1>,
@@ -939,6 +972,10 @@ pub fn cluster_router_from_state(state: HttpState) -> Router {
             raft_grpc_service(state.clone(), raft_registry.clone()),
         )
         .route_service(
+            RAFT_GRPC_REJOIN_BARRIER_PATH,
+            raft_grpc_service(state.clone(), raft_registry.clone()),
+        )
+        .route_service(
             RAFT_GRPC_TRANSFER_LEADER_PATH,
             raft_grpc_service(state.clone(), raft_registry),
         )
@@ -1119,10 +1156,21 @@ async fn readiness(State(state): State<HttpState>) -> Response {
     // A node that saw a peer on another format epoch never becomes Ready
     // again, so a rolling update stops at it (format epoch 2, E8).
     let format_epoch_mismatch = state.format_epoch_mismatch.recorded();
-    let ready = !disk.pressure && !format_epoch_mismatch;
+    let recovery_ready = state
+        .raft_registry()
+        .is_none_or(RaftGroupHandleRegistry::recovery_barriers_ready);
+    let raft_maintenance = state.raft_maintenance_report();
+    // Non-Raft dev mode has no static voter role. A registry without its
+    // topology cannot certify a complete maintenance inventory.
+    let raft_ready = state.raft_registry().is_none()
+        || raft_maintenance
+            .as_ref()
+            .is_some_and(ursula_raft::RaftMaintenanceReport::ready);
+    let ready = !disk.pressure && !format_epoch_mismatch && recovery_ready && raft_ready;
     // Memory-WAL groups whose voters all restarted empty after holding
     // writes: they refuse writes until an operator re-initializes them. Not
-    // a readiness failure (the node serves its other groups).
+    // a serving guarantee for the affected groups. Their recovery gates stay
+    // closed, so the node must not count toward a planned-disruption budget.
     let full_restart_groups = state
         .raft_registry()
         .map(RaftGroupHandleRegistry::full_restart_stopped_groups)
@@ -1140,10 +1188,16 @@ async fn readiness(State(state): State<HttpState>) -> Response {
                 Some("format_epoch_mismatch")
             } else if disk.pressure {
                 Some("wal_disk_pressure")
+            } else if !recovery_ready {
+                Some("memory_wal_recovery_barrier")
+            } else if !raft_ready {
+                Some("raft_maintenance_unready")
             } else {
                 None
             },
             "format_epoch_mismatch": format_epoch_mismatch,
+            "recovery_barriers_ready": recovery_ready,
+            "raft_maintenance": raft_maintenance,
             "memory_wal_full_restart_groups": full_restart_groups,
             "wal_disk_pressure": disk.pressure,
             "wal_available_bytes": disk.available_bytes,
@@ -1156,6 +1210,9 @@ async fn readiness(State(state): State<HttpState>) -> Response {
 }
 
 async fn leadership_shed_status(State(state): State<HttpState>) -> Response {
+    let recovery_ready = state
+        .raft_registry()
+        .is_none_or(RaftGroupHandleRegistry::recovery_barriers_ready);
     let shed_state = state
         .raft_registry()
         .map(RaftGroupHandleRegistry::leadership_shed_state)
@@ -1163,8 +1220,9 @@ async fn leadership_shed_status(State(state): State<HttpState>) -> Response {
     let body = serde_json::json!({
         "bits": shed_state.bits(),
         "state": shed_state.to_string(),
-        "should_accept_transfer": shed_state.should_accept_transfer(),
-        "should_campaign": shed_state.should_campaign(),
+        "should_accept_transfer": shed_state.should_accept_transfer() && recovery_ready,
+        "should_campaign": shed_state.should_campaign() && recovery_ready,
+        "recovery_barriers_ready": recovery_ready,
         "should_shed_current_leaders": shed_state.should_shed_current_leaders(),
     })
     .to_string();
@@ -1612,6 +1670,14 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
     let cap = state.node_memory.abort_cap_bytes().unwrap_or_default();
     let group_state_gauges = group_state_gauges_json(&state).await;
     if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "configured_raft_group_count".to_owned(),
+            serde_json::json!(state.runtime.raft_group_count()),
+        );
+        object.insert(
+            "raft_maintenance".to_owned(),
+            serde_json::json!(state.raft_maintenance_report()),
+        );
         object.insert("group_state_gauges".to_owned(), group_state_gauges);
         object.insert("process_rss_bytes".to_owned(), serde_json::json!(rss));
         object.insert(

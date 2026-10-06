@@ -345,6 +345,7 @@ where
                         "raft bootstrap: memory-WAL node {node_id} group {group} initializes again empty: the operator accepted the loss of its writes"
                     );
                 }
+                rejoin.allow_fresh_bootstrap();
                 if let Err(err) = raft.initialize(nodes).await {
                     tracing::error!(
                         "raft bootstrap: node {node_id} group {group} failed to initialize membership: {err}"

@@ -69,6 +69,10 @@ use crate::types::*;
 type CommittedLeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
 type MetaLeaderId = <MetaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
 
+#[cfg(not(madsim))]
+#[path = "rejoin_grpc_tests.rs"]
+mod rejoin_grpc_tests;
+
 struct FileLogStoreBuilder;
 
 impl

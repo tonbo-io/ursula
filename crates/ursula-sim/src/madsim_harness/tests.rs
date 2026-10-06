@@ -2780,6 +2780,10 @@ struct RejoinCluster {
     config: Arc<Config>,
     engines: BTreeMap<u64, RaftGroupEngine>,
     rejoins: BTreeMap<u64, Arc<ursula_raft::GroupRejoin>>,
+    /// Process-owned background tasks must die with that process. Otherwise
+    /// an old recovery probe can issue RPCs through an already stopped Raft
+    /// handle into the next incarnation of another node.
+    drivers: BTreeMap<u64, Vec<madsim::task::JoinHandle<()>>>,
     /// Object storage for the "initialized" markers. With it, node 1 is the
     /// group's initializer and bootstraps it the way a memory-WAL node does
     /// (probe, marker, `Initialize`) on every start.
@@ -2805,6 +2809,7 @@ impl RejoinCluster {
             config,
             engines: BTreeMap::new(),
             rejoins: BTreeMap::new(),
+            drivers: BTreeMap::new(),
             markers: None,
         };
         for node_id in 1..=3 {
@@ -2838,6 +2843,7 @@ impl RejoinCluster {
             config,
             engines: BTreeMap::new(),
             rejoins: BTreeMap::new(),
+            drivers: BTreeMap::new(),
             markers: Some(Arc::new(ursula_raft::MemoryInitMarkers::default())),
         };
         for node_id in 1..=3 {
@@ -2872,36 +2878,87 @@ impl RejoinCluster {
         rejoin.bind(&engine.raft_handle());
         self.registry.register_rejoin(node_id, rejoin.clone());
         self.registry.register(node_id, engine.raft_handle());
-        madsim::task::spawn(ursula_raft::run_rejoin_heal(
+        let participation = ursula_raft::RaftGroupHandleRegistry::default();
+        participation.register_rejoin(placement().raft_group_id, rejoin.clone());
+        participation.register(placement(), engine.raft_handle());
+        let probe_registry = self.registry.clone();
+        let mut drivers = Vec::new();
+        drivers.push(madsim::task::spawn(ursula_raft::run_rejoin_vote_barrier(
+            engine.raft_handle(),
+            rejoin.clone(),
+            participation,
+            rejoin_configured_voters(),
+            move |leader_id, _address| {
+                let registry = probe_registry.clone();
+                async move {
+                    let leader = registry.get(leader_id).ok_or("leader is absent")?;
+                    let linearizer = leader
+                        .get_read_linearizer(openraft::ReadPolicy::ReadIndex)
+                        .await
+                        .map_err(|err| err.to_string())?;
+                    let index = linearizer.read_log_id().index();
+                    linearizer
+                        .try_await_ready(&leader, Some(Duration::from_secs(1)))
+                        .await
+                        .map_err(|err| err.to_string())?
+                        .map_err(|err| format!("leader apply timeout: {err:?}"))?;
+                    let metrics =
+                        openraft::rt::WatchReceiver::borrow_watched(&leader.metrics()).clone();
+                    if metrics.current_leader != Some(leader_id) || !metrics.vote.is_committed() {
+                        return Err("probe target lost leadership".to_owned());
+                    }
+                    Ok((metrics.vote, index))
+                }
+            },
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+        )));
+        drivers.push(madsim::task::spawn(ursula_raft::run_rejoin_heal(
             engine.raft_handle(),
             rejoin.clone(),
             rejoin_configured_voters(),
             Duration::from_millis(50),
-        ));
+        )));
         if self.markers.is_some() {
             engine.set_rejoin(rejoin.clone());
             if node_id == 1 {
                 let registry = self.registry.clone();
-                madsim::task::spawn(ursula_raft::run_memory_wal_bootstrap(
-                    node_id,
-                    engine.raft_handle(),
-                    rejoin.clone(),
-                    rejoin_configured_voters(),
-                    move |peer_id, _address| {
-                        let registry = registry.clone();
-                        async move { in_process_probe(&registry, node_id, peer_id).await }
-                    },
-                    Duration::from_millis(50),
-                    Duration::from_secs(5),
-                ));
+                let raft = engine.raft_handle();
+                let bootstrap_rejoin = rejoin.clone();
+                drivers.push(madsim::task::spawn(async move {
+                    ursula_raft::run_memory_wal_bootstrap(
+                        node_id,
+                        raft,
+                        bootstrap_rejoin,
+                        rejoin_configured_voters(),
+                        move |peer_id, _address| {
+                            let registry = registry.clone();
+                            async move { in_process_probe(&registry, node_id, peer_id).await }
+                        },
+                        Duration::from_millis(50),
+                        Duration::from_secs(5),
+                    )
+                    .await;
+                }));
             }
         }
         self.engines.insert(node_id, engine);
         self.rejoins.insert(node_id, rejoin);
+        self.drivers.insert(node_id, drivers);
     }
 
     /// Crash `node_ids` at once and start them again with empty logs.
     async fn restart_empty(&mut self, node_ids: &[u64]) {
+        for node_id in node_ids {
+            for driver in self
+                .drivers
+                .remove(node_id)
+                .expect("running process drivers")
+            {
+                driver.abort();
+                let _ = driver.await;
+            }
+        }
         for node_id in node_ids {
             self.registry.unregister(*node_id);
             let engine = self.engines.remove(node_id).expect("running node");
@@ -3057,6 +3114,14 @@ async fn rejoin_cluster_with_records(stream: &BucketStreamId) -> (RejoinCluster,
             .applied_index_at_least(Some(committed), "every replica applied the records")
             .await
             .expect("replicas caught up before the restart");
+        let deadline = madsim::time::Instant::now() + Duration::from_secs(5);
+        while !cluster.rejoins[&node_id].vote_gate_open() {
+            assert!(
+                madsim::time::Instant::now() < deadline,
+                "initial recovery proof did not complete"
+            );
+            madsim::time::sleep(Duration::from_millis(10)).await;
+        }
     }
     (cluster, acknowledged)
 }
@@ -3215,6 +3280,39 @@ fn memory_wal_majority_restart_stops_writes_until_the_operator_adopts_the_surviv
             acknowledged = read.payload.to_vec();
             rejoin_write(&mut cluster, &stream, &mut acknowledged, 100, 4).await;
             cluster.read_everywhere(&stream, &acknowledged).await;
+            let deadline = madsim::time::Instant::now() + Duration::from_secs(5);
+            while cluster
+                .rejoins
+                .values()
+                .any(|rejoin| !rejoin.vote_gate_open())
+            {
+                assert!(
+                    madsim::time::Instant::now() < deadline,
+                    "recovery proofs did not finish"
+                );
+                madsim::time::sleep(Duration::from_millis(50)).await;
+            }
+            // Operator authorization covered that loss only. A subsequent
+            // single restart must use the ordinary remove/learner repair,
+            // rather than inherit a stale log-rewind permission.
+            let again = *restarted.iter().next().expect("restarted follower");
+            cluster.restart_empty(&[again]).await;
+            let deadline = madsim::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(leader) = cluster.leader()
+                    && cluster.healed(leader, again)
+                    && cluster.rejoins[&again].vote_gate_open()
+                {
+                    break;
+                }
+                assert!(
+                    madsim::time::Instant::now() < deadline,
+                    "seed {seed}: later single loss did not heal"
+                );
+                madsim::time::sleep(Duration::from_millis(50)).await;
+            }
+            rejoin_write(&mut cluster, &stream, &mut acknowledged, 200, 4).await;
+            cluster.read_everywhere(&stream, &acknowledged).await;
         });
     }
 }
@@ -3277,7 +3375,8 @@ fn memory_wal_full_restart_stops_writes_until_the_operator_accepts_the_loss() {
             while !cluster.rejoins[&1].restart_guard().stopped_for_operator() {
                 assert!(
                     madsim::time::Instant::now() < deadline,
-                    "seed {seed}: the initializer never stopped for the operator"
+                    "seed {seed}: the initializer never stopped for the operator: {:?}",
+                    (1..=3).map(|id| cluster.metrics(id)).collect::<Vec<_>>()
                 );
                 madsim::time::sleep(Duration::from_millis(50)).await;
             }
