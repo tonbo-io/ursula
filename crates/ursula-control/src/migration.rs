@@ -26,6 +26,18 @@ pub struct ReceiverProcess {
     pub incarnation: ProcessIncarnation,
 }
 
+/// Operator intent. The server captures the source membership through a data
+/// quorum; an operator never supplies or fabricates the source certificate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationOperationRequest {
+    pub operation_key: String,
+    pub raft_group_id: RaftGroupId,
+    pub expected_epoch: u64,
+    pub target_voters: BTreeSet<u64>,
+    pub target_policy: Option<GroupPlacementPolicy>,
+}
+
 /// Immutable request. Retrying the same key and payload returns the same ID,
 /// including after completion; reusing the key for another payload is rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

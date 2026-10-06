@@ -34,6 +34,7 @@ ursula-observability = { workspace = true }
 ursula-proto = { workspace = true }
 ursula-raft = { workspace = true }
 ursula-shard = { workspace = true }
+ursula-control = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

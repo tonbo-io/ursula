@@ -56,6 +56,7 @@ pub use command::ControlResponse;
 pub use migration::ExecutorAssignment;
 pub use migration::FinalMembershipEvidence;
 pub use migration::ManagedMigration;
+pub use migration::MigrationOperationRequest;
 pub use migration::MigrationRequest;
 pub use migration::MigrationToken;
 pub use migration::MigrationUpdate;

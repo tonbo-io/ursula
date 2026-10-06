@@ -29,6 +29,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Submit and observe durable migrations executed by the server.
+    Operation(OperationArgs),
     /// Print per-node raft group count and leadership distribution from /__ursula/metrics.
     Status(ObserveArgs),
     /// Produce a read-only manifest with fixed server-instance identities.
@@ -94,6 +96,64 @@ enum Command {
     /// Restore a verified backup into a fresh, empty cluster with the same
     /// raft group count.
     Restore(BackupCreateArgs),
+}
+
+#[derive(Args, Debug)]
+struct OperationArgs {
+    #[command(subcommand)]
+    command: OperationCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum OperationCommand {
+    /// Submit an immutable intent; reuse the same key and arguments on retry.
+    Submit(OperationSubmitArgs),
+    /// Print fresh control state, or one operation when --operation is set.
+    Status(OperationStatusArgs),
+    /// Wait for an existing ID. Resume restarts observation of server-owned work.
+    #[command(alias = "resume")]
+    Wait(OperationWaitArgs),
+}
+
+#[derive(Args, Debug)]
+struct OperationSubmitArgs {
+    #[command(flatten)]
+    observe: ObserveArgs,
+    #[arg(long)]
+    operation_key: String,
+    #[arg(long)]
+    group: u32,
+    #[arg(long)]
+    expected_epoch: u64,
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    voters: Vec<u64>,
+    /// Explicit policy change; omitting this preserves the group's current RF.
+    #[arg(long, value_parser = ["3", "5"])]
+    rf: Option<String>,
+    #[arg(long, default_value = "zone", requires = "rf")]
+    failure_domain: String,
+    #[arg(long, default_value_t = 1, requires = "rf")]
+    survive_failure_domains: u32,
+}
+
+#[derive(Args, Debug)]
+struct OperationStatusArgs {
+    #[command(flatten)]
+    observe: ObserveArgs,
+    #[arg(long)]
+    operation: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+struct OperationWaitArgs {
+    #[command(flatten)]
+    observe: ObserveArgs,
+    #[arg(long)]
+    operation: u64,
+    #[arg(long, default_value_t = 300)]
+    timeout_secs: u64,
+    #[arg(long, default_value_t = 1)]
+    poll_interval_secs: u64,
 }
 
 #[derive(Args, Debug)]
@@ -320,6 +380,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Command::Operation(args) => run_operation(args).await,
         Command::Status(args) => run_status_subcommand(args).await,
         Command::PinIncarnations(args) => {
             let nodes = load_nodes(&args.config).await?;
@@ -739,6 +800,66 @@ async fn run_classify_amnesiac_subcommand(args: AmnesiacClassifyArgs) -> Result<
     Ok(())
 }
 
+async fn run_operation(args: OperationArgs) -> Result<()> {
+    use ursula_control::GroupPlacementPolicy;
+    use ursula_control::MigrationOperationRequest;
+    use ursula_control::ReplicationFactor;
+    use ursula_ctl::operations::OperationClient;
+
+    match args.command {
+        OperationCommand::Submit(args) => {
+            let nodes = load_nodes(&args.observe.config).await?;
+            let client = OperationClient::new(Duration::from_secs(args.observe.http_timeout_secs))?;
+            let target_policy = args
+                .rf
+                .map(|rf| -> Result<GroupPlacementPolicy> {
+                    Ok(GroupPlacementPolicy {
+                        replication_factor: ReplicationFactor::try_from(rf.parse::<u32>()?)
+                            .map_err(anyhow::Error::msg)?,
+                        failure_domain: args.failure_domain,
+                        survive_failure_domains: args.survive_failure_domains,
+                    })
+                })
+                .transpose()?;
+            let request = MigrationOperationRequest {
+                operation_key: args.operation_key,
+                raft_group_id: ursula_shard::RaftGroupId(args.group),
+                expected_epoch: args.expected_epoch,
+                target_voters: args.voters.into_iter().collect(),
+                target_policy,
+            };
+            println!(
+                "{}",
+                serde_json::json!({"migration_id": client.submit(&nodes, &request).await?})
+            );
+        }
+        OperationCommand::Status(args) => {
+            let nodes = load_nodes(&args.observe.config).await?;
+            let client = OperationClient::new(Duration::from_secs(args.observe.http_timeout_secs))?;
+            let status = if let Some(id) = args.operation {
+                serde_json::to_value(client.status(&nodes, id).await?)?
+            } else {
+                serde_json::to_value(client.list(&nodes).await?)?
+            };
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        OperationCommand::Wait(args) => {
+            let nodes = load_nodes(&args.observe.config).await?;
+            let client = OperationClient::new(Duration::from_secs(args.observe.http_timeout_secs))?;
+            let operation = client
+                .wait(
+                    &nodes,
+                    args.operation,
+                    Duration::from_secs(args.timeout_secs),
+                    Duration::from_secs(args.poll_interval_secs),
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&operation)?);
+        }
+    }
+    Ok(())
+}
+
 async fn run_verify_cluster_subcommand(args: VerifyClusterArgs) -> Result<()> {
     let nodes = load_nodes(&args.config).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
@@ -753,4 +874,78 @@ async fn run_verify_cluster_subcommand(args: VerifyClusterArgs) -> Result<()> {
     .await?;
     println!("cluster verified: {} node(s) fully ready", nodes.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Cli;
+    use super::Command;
+    use super::OperationCommand;
+
+    #[test]
+    fn operation_arguments_preserve_rf_and_resume_existing_ids() {
+        let cli = Cli::try_parse_from([
+            "ursulactl",
+            "operation",
+            "submit",
+            "--config",
+            "cluster.toml",
+            "--operation-key",
+            "move-0",
+            "--group",
+            "0",
+            "--expected-epoch",
+            "0",
+            "--voters",
+            "1,3,4",
+        ])
+        .unwrap();
+        let Command::Operation(args) = cli.command else {
+            panic!("missing operation")
+        };
+        let OperationCommand::Submit(args) = args.command else {
+            panic!("missing submit")
+        };
+        assert_eq!(args.voters, vec![1, 3, 4]);
+        assert!(args.rf.is_none());
+        assert!(
+            Cli::try_parse_from([
+                "ursulactl",
+                "operation",
+                "submit",
+                "--config",
+                "cluster.toml",
+                "--operation-key",
+                "grow",
+                "--group",
+                "0",
+                "--expected-epoch",
+                "0",
+                "--voters",
+                "1,2,3,4,5",
+                "--rf",
+                "5"
+            ])
+            .is_ok()
+        );
+        let cli = Cli::try_parse_from([
+            "ursulactl",
+            "operation",
+            "resume",
+            "--config",
+            "cluster.toml",
+            "--operation",
+            "7",
+        ])
+        .unwrap();
+        let Command::Operation(args) = cli.command else {
+            panic!("missing operation")
+        };
+        let OperationCommand::Wait(args) = args.command else {
+            panic!("missing wait")
+        };
+        assert_eq!(args.operation, 7);
+    }
 }

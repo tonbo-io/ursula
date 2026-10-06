@@ -5,6 +5,7 @@
 //!
 //! - [`admin_fence`]: process-local executor ordering for administrative mutations.
 //! - [`managed_receiver`]: durable, quorum-authorized managed receiver lifecycle.
+//! - [`managed_operations`]: durable operation API and resumable server executor.
 //! - [`json_text`]: JSON Message Text (P1): validation, flattening and lexical
 //!   minification of `application/json` write bodies.
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
@@ -15,6 +16,7 @@ mod admin_fence;
 mod bootstrap;
 mod cold_snapshot;
 pub mod json_text;
+mod managed_operations;
 mod managed_receiver;
 mod otel_metrics;
 pub mod server;
@@ -960,7 +962,9 @@ pub fn admin_router(state: HttpState) -> Router {
             .with_state(state.clone()),
     );
     if state.managed_receiver.is_some() {
-        router.merge(managed_receiver::router(state))
+        router
+            .merge(managed_receiver::router(state.clone()))
+            .merge(managed_operations::router(state))
     } else {
         router
     }

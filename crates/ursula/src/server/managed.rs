@@ -312,12 +312,15 @@ pub(super) async fn run(
         );
         let admin = super::serve_until_shutdown(
             admin_listener,
-            crate::admin_router(state),
+            crate::admin_router(state.clone()),
             super::notified(shutdown.clone()),
             None,
         );
+        let executor = tokio::spawn(crate::managed_operations::run(state, interval));
         let cluster = async { (&mut cluster_task.0).await.map_err(std::io::Error::other)? };
         let result = tokio::try_join!(client, admin, cluster);
+        executor.abort();
+        let _ = executor.await;
         refresh.abort();
         result?;
         Ok::<_, Box<dyn std::error::Error>>(())
@@ -341,6 +344,7 @@ fn meta_router(service: MetaRaftGrpcService) -> Router {
         ursula_raft::META_RAFT_READ_PROJECTION_PATH,
         ursula_raft::META_RAFT_READ_BOOTSTRAP_STATE_PATH,
         ursula_raft::META_RAFT_STATUS_PATH,
+        ursula_raft::META_RAFT_WRITE_CONTROL_PATH,
     ] {
         router = router.route_service(path, meta_raft_grpc_service(service.clone()));
     }

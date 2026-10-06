@@ -4438,6 +4438,7 @@ dependencies = [
  "toml",
  "tracing",
  "url",
+ "ursula-control",
  "ursula-observability",
  "ursula-proto",
  "ursula-raft",

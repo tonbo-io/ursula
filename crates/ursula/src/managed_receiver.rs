@@ -42,8 +42,8 @@ use replica::replica_release;
 
 pub(crate) struct ManagedReceiver {
     pub(crate) store: Arc<ManagedReceiverStore>,
-    recipe: ClusterBootstrap,
-    meta: MetaRaftHandle,
+    pub(crate) recipe: ClusterBootstrap,
+    pub(crate) meta: MetaRaftHandle,
     gate: Arc<RwLock<()>>,
 }
 
@@ -293,6 +293,7 @@ impl ManagedReceiver {
 pub(crate) fn router(state: HttpState) -> Router {
     Router::new()
         .route("/__ursula/control/receiver", get(status))
+        .route("/__ursula/control/receiver/process", get(process))
         .route("/__ursula/control/receiver/activate", post(activate))
         .route("/__ursula/control/receiver/retire", post(retire))
         .route("/__ursula/control/receiver/prepare", post(replica_prepare))
@@ -304,6 +305,23 @@ pub(crate) fn router(state: HttpState) -> Router {
         .route("/__ursula/control/receiver/applied", post(applied_evidence))
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024))
         .with_state(state)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ReceiverInventory {
+    pub identity: ursula_control::MetaLocalIdentity,
+    pub process: ursula_proto::admin::ProcessIncarnation,
+}
+
+async fn process(State(state): State<HttpState>) -> Response {
+    match &state.managed_receiver {
+        Some(receiver) => Json(ReceiverInventory {
+            identity: receiver.store.identity().clone(),
+            process: state.process_incarnation,
+        })
+        .into_response(),
+        None => (StatusCode::CONFLICT, "managed receiver is unavailable").into_response(),
+    }
 }
 
 #[cfg(all(test, not(madsim)))]

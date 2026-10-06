@@ -184,6 +184,14 @@ async fn bound_meta_transport_rejects_routing_drift_and_missing_binding_before_d
         );
         assert_eq!(
             client
+                .write_control(envelope.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            client
                 .read_bootstrap_state(envelope.clone())
                 .await
                 .unwrap_err()
@@ -393,6 +401,57 @@ async fn bound_meta_bootstrap_records_replicate_and_survive_compaction_and_full_
         target_voters: [2, 3, 4].into(),
         target_policy: None,
     };
+    let command = ControlCommand::SubmitMigration {
+        request: request.clone(),
+        now_ms: 3,
+    };
+    let remote = crate::write_control_command(
+        &identities[elected].cluster,
+        identities[elected].node.node_id,
+        &identities[elected].node.cluster_url,
+        &command,
+        DEADLINE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(remote, ControlResponse::MigrationStarted {
+        migration_id: 1
+    });
+    let follower = (elected + 1) % 3;
+    assert!(
+        crate::write_control_command(
+            &identities[follower].cluster,
+            identities[follower].node.node_id,
+            &identities[follower].node.cluster_url,
+            &command,
+            DEADLINE,
+        )
+        .await
+        .is_err()
+    );
+    // The private managed endpoint must never open a legacy membership path.
+    let mut client = MetaRaftInternalClient::connect(identities[elected].node.cluster_url.clone())
+        .await
+        .unwrap();
+    let envelope = MetaRaftRpcEnvelopeV1 {
+        cluster_id: CLUSTER.to_owned(),
+        target_node_id: identities[elected].node.node_id,
+        protocol_version: META_RAFT_PROTOCOL_VERSION,
+        group_count: 1,
+        core_count: 1,
+        routing_hash_version: 1,
+        payload: crate::codec::encode_wire(&ControlCommand::SeedPlacement {
+            raft_group_id: RaftGroupId(0),
+            voters: [1, 2, 3].into(),
+            now_ms: 3,
+        }),
+    };
+    assert_eq!(
+        client.write_control(envelope).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+    // Close this test connection before the subsequent full storage reopen.
+    drop(client);
     assert_eq!(
         handle
             .write(ControlCommand::SubmitMigration {

@@ -34,7 +34,9 @@ use tonic::transport::Endpoint;
 use ursula_control::ClusterBootstrap;
 use ursula_control::ClusterId;
 use ursula_control::ClusterIdentity;
+use ursula_control::ControlCommand;
 use ursula_control::ControlProjection;
+use ursula_control::ControlResponse;
 use ursula_control::MetaLocalIdentity;
 
 use crate::codec::encode_wire;
@@ -58,6 +60,8 @@ use crate::raft_internal_proto::meta_raft_internal_server::MetaRaftInternalServe
 pub const META_RAFT_PROTOCOL_VERSION: u32 = 2;
 pub const META_RAFT_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const META_RAFT_STATUS_PATH: &str = "/ursula.raft.v1.MetaRaftInternal/Status";
+pub const META_RAFT_WRITE_CONTROL_PATH: &str = "/ursula.raft.v1.MetaRaftInternal/WriteControl";
+const MAX_CONTROL_COMMAND_BYTES: usize = 1024 * 1024;
 pub const META_RAFT_READ_BOOTSTRAP_STATE_PATH: &str =
     "/ursula.raft.v1.MetaRaftInternal/ReadBootstrapState";
 pub const META_RAFT_READ_PROJECTION_PATH: &str = "/ursula.raft.v1.MetaRaftInternal/ReadProjection";
@@ -231,6 +235,46 @@ fn decode<T: DeserializeOwned>(payload: &[u8]) -> Result<T, GrpcRpcError> {
 
 #[tonic::async_trait]
 impl MetaRaftInternal for MetaRaftGrpcService {
+    async fn write_control(
+        &self,
+        request: tonic::Request<MetaRaftRpcEnvelopeV1>,
+    ) -> Result<tonic::Response<RaftRpcAckV1>, tonic::Status> {
+        let envelope = request.into_inner();
+        self.validate(
+            &envelope.cluster_id,
+            envelope.target_node_id,
+            envelope.protocol_version,
+            envelope.group_count,
+            envelope.core_count,
+            envelope.routing_hash_version,
+        )?;
+        if self.routing_identity.is_none() {
+            return Err(tonic::Status::failed_precondition(
+                "bound identity required",
+            ));
+        }
+        if envelope.payload.len() > MAX_CONTROL_COMMAND_BYTES {
+            return Err(tonic::Status::resource_exhausted(
+                "control command exceeds 1 MiB",
+            ));
+        }
+        let command: ControlCommand = decode(&envelope.payload)?;
+        validate_remote_command(&command).map_err(tonic::Status::invalid_argument)?;
+        // Requiring adoption also prevents a private RPC caller from using
+        // legacy transitions or initiating membership/bootstrap remotely.
+        self.handle
+            .read_projection(Duration::from_secs(5))
+            .await
+            .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+        let response = crate::rt::time::timeout(Duration::from_secs(5), self.handle.write(command))
+            .await
+            .map_err(|_| tonic::Status::deadline_exceeded("control write deadline"))?
+            .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+        Ok(tonic::Response::new(RaftRpcAckV1 {
+            payload: encode_wire(&response),
+        }))
+    }
+
     async fn status(
         &self,
         request: tonic::Request<MetaRaftRpcEnvelopeV1>,
@@ -424,6 +468,74 @@ impl MetaRaftInternal for MetaRaftGrpcService {
             .map_err(|error| tonic::Status::internal(error.to_string()))?;
         Ok(tonic::Response::new(RaftTransferLeaderAckV1 {}))
     }
+}
+
+fn validate_remote_command(command: &ControlCommand) -> Result<(), &'static str> {
+    match command {
+        ControlCommand::SubmitMigration { .. }
+        | ControlCommand::ClaimMigrationExecutor { .. }
+        | ControlCommand::UpdateMigration { .. }
+        | ControlCommand::RegisterManagedNode { .. }
+        | ControlCommand::SetNodeState { .. } => Ok(()),
+        _ => Err(
+            "only managed intent, executor, node registration and node state commands are accepted",
+        ),
+    }
+}
+
+/// Submit one managed command to a trusted bound meta voter. This never
+/// forwards internally and never turns status/metrics into write authority.
+/// A deadline can lose a committed reply: retry the identical operation key or
+/// CAS command, then read a fresh projection to reconcile its durable result.
+pub async fn write_control_command(
+    identity: &ClusterIdentity,
+    target_node_id: u64,
+    address: &str,
+    command: &ControlCommand,
+    timeout: Duration,
+) -> Result<ControlResponse, MetaRaftError> {
+    identity
+        .validate()
+        .map_err(|reason| MetaRaftError::new("write remote control", reason))?;
+    validate_remote_command(command)
+        .map_err(|reason| MetaRaftError::new("write remote control", reason))?;
+    if target_node_id == 0 || timeout.is_zero() {
+        return Err(MetaRaftError::new(
+            "write remote control",
+            "non-zero target and timeout required",
+        ));
+    }
+    let payload = encode_wire(command);
+    if payload.len() > MAX_CONTROL_COMMAND_BYTES {
+        return Err(MetaRaftError::new(
+            "write remote control",
+            "control command exceeds 1 MiB",
+        ));
+    }
+    let endpoint = Endpoint::from_shared(normalize_grpc_endpoint(address.to_owned()))
+        .map_err(|error| MetaRaftError::with_source("create control write endpoint", error))?
+        .connect_timeout(timeout)
+        .timeout(timeout);
+    let mut client = MetaRaftInternalClient::new(endpoint.connect_lazy())
+        .max_decoding_message_size(META_RAFT_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(META_RAFT_MAX_MESSAGE_BYTES);
+    let mut request = tonic::Request::new(MetaRaftRpcEnvelopeV1 {
+        cluster_id: identity.cluster_id.as_str().to_owned(),
+        target_node_id,
+        protocol_version: META_RAFT_PROTOCOL_VERSION,
+        payload,
+        group_count: identity.group_count,
+        core_count: u32::from(identity.core_count),
+        routing_hash_version: identity.routing_hash.wire_version(),
+    });
+    request.set_timeout(timeout);
+    let response = client
+        .write_control(request)
+        .await
+        .map_err(|error| MetaRaftError::with_source("write remote control", error))?
+        .into_inner();
+    rmp_serde::from_slice(&response.payload)
+        .map_err(|error| MetaRaftError::with_source("decode control write response", error))
 }
 
 #[derive(Debug, Clone)]

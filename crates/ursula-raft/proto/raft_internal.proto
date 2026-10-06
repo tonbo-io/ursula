@@ -216,4 +216,7 @@ service MetaRaftInternal {
   rpc ReadProjection(MetaRaftRpcEnvelopeV1) returns (RaftRpcAckV1);
   rpc ReadBootstrapState(MetaRaftRpcEnvelopeV1) returns (RaftRpcAckV1);
   rpc Status(MetaRaftRpcEnvelopeV1) returns (RaftRpcAckV1);
+  // Bound managed commands only. Followers reject; callers retry immutable
+  // intent keys / generation and revision CAS against another trusted voter.
+  rpc WriteControl(MetaRaftRpcEnvelopeV1) returns (RaftRpcAckV1);
 }

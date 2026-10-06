@@ -1,6 +1,6 @@
 //! Native HTTP receiver tests with actual RF3/RF5 data and meta consensus. Each test
-//! uses fenced membership endpoints; the joint fault injects a stopped native
-//! future. The server executor is separate; HTTP-state replacement is not restart.
+//! uses fenced membership endpoints; executor cases use actual admin listeners.
+//! Joint faults stop a native future; HTTP-state replacement is not OS restart.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -67,6 +67,349 @@ use crate::managed_receiver::ReceiverRequest;
 
 const GROUP: RaftGroupId = RaftGroupId(0);
 
+async fn submit_operation(
+    fixture: &Fixture,
+    request: &crate::managed_operations::OperationRequest,
+) -> u64 {
+    // Submit through a follower's actual admin listener, then drop the caller.
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/__ursula/control/operations",
+            fixture.recipe.nodes[&2].admin_url
+        ))
+        .json(request)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.bytes().await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let ControlResponse::MigrationStarted { migration_id } =
+        serde_json::from_slice(&bytes).unwrap()
+    else {
+        panic!("missing operation ID")
+    };
+    migration_id
+}
+
+async fn wait_operation(fixture: &Fixture, id: u64) {
+    tokio::time::timeout(Duration::from_secs(40), async {
+        loop {
+            let view = fixture.fresh_projection().await;
+            if !view.state.migrations[&id].is_running() {
+                assert_eq!(
+                    view.state.migrations[&id].phase,
+                    ursula_control::MigrationPhase::Succeeded
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "executor timed out: {:?}",
+            fixture
+                .receivers
+                .iter()
+                .map(|r| r.store.snapshot().unwrap())
+                .collect::<Vec<_>>()
+        )
+    });
+}
+
+fn executors(fixture: &Fixture) -> Vec<tokio::task::JoinHandle<()>> {
+    fixture
+        .recipe
+        .initial_meta_voters
+        .iter()
+        .map(|id| {
+            tokio::spawn(crate::managed_operations::run(
+                fixture.states[*id as usize - 1].clone(),
+                Duration::from_millis(20),
+            ))
+        })
+        .collect()
+}
+
+async fn stop_executors(tasks: Vec<tokio::task::JoinHandle<()>>) {
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_operation_api_and_server_executor_resume_rf3_rf5_replacement() {
+    for count in [3, 5] {
+        let fixture = Fixture::new(count).await;
+        let target: BTreeSet<_> = (1..=count as u64 + 1).filter(|id| *id != 2).collect();
+        let request = crate::managed_operations::OperationRequest {
+            operation_key: format!("automatic-rf{count}"),
+            raft_group_id: GROUP,
+            expected_epoch: 0,
+            target_voters: target.clone(),
+            target_policy: None,
+        };
+        let stream = (0..100)
+            .map(|n| BucketStreamId::new("automatic", format!("s{n}")))
+            .find(|stream| fixture.states[0].runtime.locate(stream).raft_group_id == GROUP)
+            .unwrap();
+        let mut create = CreateStreamRequest::new(stream.clone(), "text/plain");
+        create.initial_payload = b"acknowledged-before-automatic-move".to_vec().into();
+        fixture.states[0]
+            .runtime
+            .create_stream(create)
+            .await
+            .unwrap();
+        let id = submit_operation(&fixture, &request).await;
+        let operation_nodes = fixture
+            .recipe
+            .nodes
+            .values()
+            .map(|node| ursula_ctl::NodeInfo {
+                id: node.node_id,
+                admin_url: node.admin_url.parse().unwrap(),
+                host: "127.0.0.1".to_owned(),
+                http_url: None,
+                metrics_url: None,
+                expected_process_incarnation: None,
+                expected_maintenance_fence: None,
+            })
+            .collect::<Vec<_>>();
+        let operation_client =
+            ursula_ctl::operations::OperationClient::new(Duration::from_secs(2)).unwrap();
+        // The CLI client observes accepted intent before any server task starts.
+        assert!(
+            operation_client
+                .wait(
+                    &operation_nodes,
+                    id,
+                    Duration::from_millis(30),
+                    Duration::from_millis(5)
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            operation_client
+                .status(&operation_nodes, id)
+                .await
+                .unwrap()
+                .is_running()
+        );
+        assert!(
+            operation_client
+                .wait(
+                    &operation_nodes,
+                    999,
+                    Duration::from_secs(10),
+                    Duration::from_millis(5)
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("404")
+        );
+        let executor = executors(&fixture);
+        // Lose the executor after receiver activation has become durable.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let view = fixture.fresh_projection().await;
+                if view.state.migrations[&id]
+                    .managed
+                    .as_ref()
+                    .unwrap()
+                    .receiver_activation_authorized
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        stop_executors(executor).await;
+        let before_takeover = fixture.fresh_projection().await;
+        let old_token = before_takeover.state.migrations[&id]
+            .managed
+            .as_ref()
+            .unwrap()
+            .executor
+            .as_ref()
+            .unwrap()
+            .token
+            .clone();
+        let successor = if old_token.executor.node_id == 3 {
+            1
+        } else {
+            3
+        };
+        fixture.meta[old_token.executor.node_id as usize - 1]
+            .raft_handle()
+            .trigger()
+            .transfer_leader(successor)
+            .await
+            .unwrap();
+        fixture.meta[successor as usize - 1]
+            .raft_handle()
+            .wait(Some(Duration::from_secs(10)))
+            .current_leader(
+                successor,
+                "executor takeover follows actual meta leadership",
+            )
+            .await
+            .unwrap();
+        assert_eq!(submit_operation(&fixture, &request).await, id);
+        let executor = executors(&fixture);
+        wait_operation(&fixture, id).await;
+        stop_executors(executor).await;
+        assert_eq!(
+            operation_client
+                .wait(
+                    &operation_nodes,
+                    id,
+                    Duration::from_secs(2),
+                    Duration::from_millis(10)
+                )
+                .await
+                .unwrap()
+                .phase,
+            ursula_control::MigrationPhase::Succeeded
+        );
+        assert_eq!(
+            operation_client
+                .submit(&operation_nodes, &request)
+                .await
+                .unwrap(),
+            id
+        );
+        operation_client.list(&operation_nodes).await.unwrap();
+        assert_eq!(submit_operation(&fixture, &request).await, id);
+        let view = fixture.fresh_projection().await;
+        assert!(
+            view.state.migrations[&id]
+                .managed
+                .as_ref()
+                .unwrap()
+                .executor
+                .as_ref()
+                .unwrap()
+                .token
+                .generation
+                > old_token.generation
+        );
+        assert_eq!(view.state.placements[&GROUP].voters, target);
+        assert_eq!(view.state.placements[&GROUP].epoch, 1);
+        assert!(view.state.placements[&GROUP].draining.is_empty());
+        assert!(
+            fixture.states[1]
+                .raft_registry()
+                .unwrap()
+                .get(GROUP)
+                .is_none()
+        );
+        assert!(
+            fixture.states[1]
+                .raft_registry()
+                .unwrap()
+                .get(RaftGroupId(1))
+                .is_some()
+        );
+        let moved = fixture.states[count]
+            .runtime
+            .read_stream(ursula_runtime::ReadStreamRequest {
+                stream_id: stream,
+                offset: 0,
+                max_len: 100,
+                now_ms: 0,
+                leader_only: false,
+                read_index: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(moved.payload, b"acknowledged-before-automatic-move");
+        let mut conflicting = request.clone();
+        conflicting.expected_epoch = 1;
+        assert_eq!(
+            reqwest::Client::new()
+                .post(format!(
+                    "{}/__ursula/control/operations",
+                    fixture.recipe.nodes[&1].admin_url
+                ))
+                .json(&conflicting)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        fixture.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_server_executor_changes_rf3_to_rf5_to_rf3_and_hands_off_removed_leader() {
+    let fixture = Fixture::new_with_nodes(3, 6).await;
+    let executor = executors(&fixture);
+    for (index, (rf, target)) in [
+        (5, BTreeSet::from([1, 2, 3, 4, 5])),
+        (3, BTreeSet::from([2, 4, 6])),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request = crate::managed_operations::OperationRequest {
+            operation_key: format!("automatic-policy-{index}"),
+            raft_group_id: GROUP,
+            expected_epoch: index as u64,
+            target_voters: target.clone(),
+            target_policy: Some(ursula_control::GroupPlacementPolicy {
+                replication_factor: ursula_control::ReplicationFactor::try_from(rf).unwrap(),
+                ..Default::default()
+            }),
+        };
+        let id = submit_operation(&fixture, &request).await;
+        wait_operation(&fixture, id).await;
+        let view = fixture.fresh_projection().await;
+        assert_eq!(view.state.placements[&GROUP].voters, target);
+        assert_eq!(
+            view.state.managed_placement.as_ref().unwrap().groups[&GROUP].replication_factor,
+            ursula_control::ReplicationFactor::try_from(rf).unwrap()
+        );
+        let leader = *target.first().unwrap();
+        let configuration = ursula_raft::confirm_group_configuration(
+            GROUP,
+            leader,
+            &fixture.recipe.nodes[&leader].cluster_url,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(configuration.voter_sets, vec![target]);
+        assert!(configuration.learners.is_empty());
+    }
+    stop_executors(executor).await;
+    for id in [1, 3, 5] {
+        assert!(
+            fixture.states[id - 1]
+                .raft_registry()
+                .unwrap()
+                .get(GROUP)
+                .is_none()
+        );
+    }
+    fixture.stop().await;
+}
+
 struct Fixture {
     root: tempfile::TempDir,
     recipe: ClusterBootstrap,
@@ -77,7 +420,25 @@ struct Fixture {
 }
 
 impl Fixture {
+    async fn fresh_projection(&self) -> ursula_control::ControlProjection {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                for handle in &self.meta {
+                    if let Ok(view) = handle.read_projection(Duration::from_secs(1)).await {
+                        return view;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fixture has no fresh meta quorum")
+    }
     async fn new(replicas: usize) -> Self {
+        Self::new_with_nodes(replicas, replicas + 1).await
+    }
+
+    async fn new_with_nodes(replicas: usize, total: usize) -> Self {
         let root = tempfile::tempdir().unwrap();
         let identity = ClusterIdentity {
             cluster_id: ClusterId::try_from("replica-http".to_owned()).unwrap(),
@@ -86,17 +447,21 @@ impl Fixture {
             routing_hash: RoutingHashVersion::Fnv1a64BucketSlashStreamV1,
         };
         let mut listeners = Vec::new();
+        let mut admin_listeners = Vec::new();
         let mut nodes = BTreeMap::new();
-        for id in 1..=replicas as u64 + 1 {
+        for id in 1..=total as u64 {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let admin = TcpListener::bind("127.0.0.1:0").await.unwrap();
             nodes.insert(id, NodeRegistration {
                 node_id: id,
                 client_url: format!("http://node{id}:4437"),
-                admin_url: format!("http://node{id}:4438"),
+                admin_url: format!("http://{}", admin.local_addr().unwrap()),
                 cluster_url: format!("http://{}", listener.local_addr().unwrap()),
                 labels: BTreeMap::from([(
                     "zone".to_owned(),
-                    if id == replicas as u64 + 1 {
+                    if total > replicas + 1 {
+                        ((id - 1) % 3 + 1).to_string()
+                    } else if id == replicas as u64 + 1 {
                         "2".to_owned()
                     } else {
                         match id {
@@ -110,6 +475,7 @@ impl Fixture {
                 )]),
             });
             listeners.push(listener);
+            admin_listeners.push(admin);
         }
         let source: BTreeSet<_> = (1..=replicas as u64).collect();
         let recipe = ClusterBootstrap {
@@ -140,8 +506,8 @@ impl Fixture {
                 Arc::new(
                     Config {
                         heartbeat_interval: 50,
-                        election_timeout_min: 150,
-                        election_timeout_max: 300,
+                        election_timeout_min: 500,
+                        election_timeout_max: 1000,
                         ..Default::default()
                     }
                     .validate()
@@ -198,11 +564,17 @@ impl Fixture {
                 ursula_raft::META_RAFT_FULL_SNAPSHOT_PATH,
                 ursula_raft::META_RAFT_TRANSFER_LEADER_PATH,
                 ursula_raft::META_RAFT_READ_PROJECTION_PATH,
+                ursula_raft::META_RAFT_WRITE_CONTROL_PATH,
             ] {
                 router = router.route_service(path, meta_raft_grpc_service(service.clone()));
             }
             servers.push(tokio::spawn(async move {
                 axum::serve(listener, router).await.unwrap();
+            }));
+            let admin = admin_listeners.remove(0);
+            let admin_router = crate::admin_router(state.clone());
+            servers.push(tokio::spawn(async move {
+                axum::serve(admin, admin_router).await.unwrap();
             }));
             states.push(state);
             receivers.push(receiver);
