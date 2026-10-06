@@ -1372,6 +1372,15 @@ async fn append_idempotent_until_acked(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_host_recovery_keeps_ack_tail_across_abrupt_memory_voter_loss() {
+    run_cli_host_recovery(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_host_recovery_restages_a_bound_candidate_without_losing_acks() {
+    run_cli_host_recovery(true).await;
+}
+
+async fn run_cli_host_recovery(interrupt_candidate: bool) {
     use ursula_ctl::reservation::HostRequest;
     use ursula_ctl::reservation::HostTerminationObservation;
     use ursula_ctl::reservation::OwnershipRequest;
@@ -1571,6 +1580,133 @@ async fn cli_host_recovery_keeps_ack_tail_across_abrupt_memory_voter_loss() {
     for node in &nodes {
         ctl.set_maintenance_fence(node, false).await.unwrap();
     }
+    let mut last_sequence = 1;
+    let mut last_payload = "during-recovery";
+    let mut expected_payload = b"before-faultduring-recovery".to_vec();
+    let ctl = if interrupt_candidate {
+        let candidate = state.operation().unwrap().replacement.clone().unwrap();
+        let config = children[2].config_path.clone().unwrap();
+        let text = std::fs::read_to_string(&config).unwrap();
+        // A second real SIGKILL, in the same unrecovered voter slot, after
+        // persistent binding. Never clear that binding merely on timeout.
+        children[2].child.kill().unwrap();
+        children[2].child.wait().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let survivor_observation = loop {
+            let started_ms = native_epoch_ms();
+            match ursula_ctl::quorum::verify_surviving_quorum(&nodes, 3, &ctl, &options).await {
+                Ok(verification) => {
+                    break SurvivingPrefixObservation {
+                        started_ms,
+                        completed_ms: native_epoch_ms(),
+                        verification,
+                    };
+                }
+                Err(error) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "candidate-loss proof: {error}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        };
+        state = state
+            .recover_host(HostRequest::AdmitReplacementTermination {
+                fence: state.operation().unwrap().fence.clone(),
+                candidate: candidate.clone(),
+                now_ms: native_epoch_ms(),
+                observation: survivor_observation,
+            })
+            .unwrap();
+        assert!(
+            state
+                .recover_host(HostRequest::RestageHostReplacement {
+                    fence: state.operation().unwrap().fence.clone(),
+                    candidate: candidate.clone(),
+                    now_ms: native_epoch_ms()
+                })
+                .is_err()
+        );
+        let started_ms = native_epoch_ms();
+        assert!(children[2].child.try_wait().unwrap().is_some());
+        state = state
+            .recover_host(HostRequest::RecordReplacementTermination {
+                fence: state.operation().unwrap().fence.clone(),
+                candidate: candidate.clone(),
+                now_ms: native_epoch_ms(),
+                observation: HostTerminationObservation {
+                    started_ms,
+                    completed_ms: native_epoch_ms(),
+                    provider_instance: candidate.provider_instance.clone(),
+                    terminal_state: "terminated".into(),
+                },
+            })
+            .unwrap();
+        state = state
+            .recover_host(HostRequest::RestageHostReplacement {
+                fence: state.operation().unwrap().fence.clone(),
+                candidate,
+                now_ms: native_epoch_ms(),
+            })
+            .unwrap();
+        assert!(state.operation().unwrap().replacement.is_none());
+        assert!(
+            state
+                .operation()
+                .unwrap()
+                .host
+                .as_ref()
+                .unwrap()
+                .pod_retirement_intents
+                .contains("native-host-replacement")
+        );
+        // Both original and post-fault ACKs remain on the same two survivors.
+        last_sequence = 2;
+        last_payload = "after-candidate-loss";
+        expected_payload.extend_from_slice(last_payload.as_bytes());
+        for (index, offset) in offsets.iter_mut().enumerate() {
+            let previous: u64 = offset.parse().unwrap();
+            *offset = append_idempotent_until_acked(
+                &client,
+                &format!("{}/benchcmp/host-recovery-{index}", public(1)),
+                last_sequence,
+                last_payload,
+            )
+            .await;
+            assert_eq!(
+                offset.parse::<u64>().unwrap(),
+                previous + u64::try_from(last_payload.len()).unwrap()
+            );
+        }
+        drop(children.pop());
+        std::fs::write(&config, text).unwrap();
+        let mut command = Command::new(binary);
+        command
+            .arg("server")
+            .arg("--config")
+            .arg(&config)
+            .env("URSULA_START_MAINTENANCE_DRAINED", "true");
+        let mut child = spawn_child(command, format!("host-restaged-{}", ports[2]));
+        child.config_path = Some(config);
+        children.push(child);
+        wait_until_ready(&client, &public(3), &mut children).await;
+        let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).unwrap();
+        nodes = ctl
+            .pin_nodes(&state.operation().unwrap().process_plan, Some(3), false)
+            .await
+            .unwrap();
+        state = state.recover_host(HostRequest::BindHostReplacement { fence: state.operation().unwrap().fence.clone(), process_plan: nodes.clone(),
+            pod: serde_json::json!({"kind":"Pod","metadata":{"namespace":"native","name":"voters-2","uid":"native-host-restaged","ownerReferences":[{"kind":"StatefulSet","uid":"native-sts","controller":true}]},"spec":{"nodeName":"native-host-3-restaged"}}),
+            node: serde_json::json!({"kind":"Node","metadata":{"name":"native-host-3-restaged","uid":"native-node-3-restaged","labels":{"topology.kubernetes.io/zone":"native-zone-3"}},"spec":{"providerID":"native-instance-3-restaged"},"status":{"conditions":[{"type":"Ready","status":"True"}]}})
+        }).unwrap();
+        for node in &nodes {
+            ctl.set_maintenance_fence(node, false).await.unwrap();
+        }
+        ctl
+    } else {
+        ctl
+    };
     ursula_ctl::repair_restarted_voter(
         &nodes,
         &nodes[2],
@@ -1608,7 +1744,7 @@ async fn cli_host_recovery_keeps_ack_tail_across_abrupt_memory_voter_loss() {
     for (index, offset) in offsets.iter().enumerate() {
         let url = format!("{}/benchcmp/host-recovery-{index}", public(3));
         assert_eq!(
-            append_idempotent_until_acked(&client, &url, 1, "during-recovery").await,
+            append_idempotent_until_acked(&client, &url, last_sequence, last_payload).await,
             *offset,
             "replayed ACK offset must survive"
         );
@@ -1619,7 +1755,7 @@ async fn cli_host_recovery_keeps_ack_tail_across_abrupt_memory_voter_loss() {
                     "{}/benchcmp/host-recovery-{index}?offset=0&max_bytes=64",
                     public(id)
                 ),
-                b"before-faultduring-recovery",
+                &expected_payload,
             )
             .await;
         }
@@ -1663,7 +1799,11 @@ async fn cli_host_recovery_keeps_ack_tail_across_abrupt_memory_voter_loss() {
             .unwrap()
             .source
             .provider_instance,
-        "native-instance-3-replacement"
+        if interrupt_candidate {
+            "native-instance-3-restaged"
+        } else {
+            "native-instance-3-replacement"
+        }
     );
     assert!(
         state

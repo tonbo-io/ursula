@@ -140,6 +140,15 @@ fn commit_host_request(directory: &std::path::Path, snapshot: &Value, request: &
 
 #[test]
 fn healthy_inventory_and_host_recovery_round_trip_through_actual_cli_without_physical_authority() {
+    run_host_cli(false);
+}
+
+#[test]
+fn interrupted_candidate_round_trips_through_actual_cli_and_exact_cas_receipts() {
+    run_host_cli(true);
+}
+
+fn run_host_cli(interrupt_candidate: bool) {
     let directory = tempfile::tempdir().unwrap();
     let cell = CellIdentity {
         namespace: "test".into(),
@@ -377,13 +386,91 @@ fn healthy_inventory_and_host_recovery_round_trip_through_actual_cli_without_phy
         ("config", dir.join("host-config").display().to_string()),
     ]);
     committed = commit_host_request(dir, &committed, &request);
+    let mut final_boot = ProcessIncarnation::from_bits(100);
+    if interrupt_candidate {
+        let bound: Reservation =
+            serde_json::from_str(committed["data"]["reservation"].as_str().unwrap()).unwrap();
+        let candidate = file(
+            dir,
+            "candidate",
+            bound.operation().unwrap().replacement.as_ref().unwrap(),
+        )
+        .display()
+        .to_string();
+        let mut fresh = survivors.clone();
+        fresh.started_ms = epoch_ms();
+        fresh.completed_ms = fresh.started_ms;
+        file(dir, "host-observation", &fresh);
+        let request = build_host_request(dir, "admit-replacement-termination", &[
+            ("fence", fence.clone()),
+            ("candidate", candidate.clone()),
+            ("observation", observation.clone()),
+        ]);
+        committed = commit_host_request(dir, &committed, &request);
+        let now = epoch_ms();
+        file(
+            dir,
+            "host-observation",
+            &ursula_ctl::reservation::HostTerminationObservation {
+                started_ms: now,
+                completed_ms: now,
+                provider_instance: "replacement-instance".into(),
+                terminal_state: "terminated".into(),
+            },
+        );
+        let request = build_host_request(dir, "record-replacement-termination", &[
+            ("fence", fence.clone()),
+            ("candidate", candidate.clone()),
+            ("observation", observation.clone()),
+        ]);
+        committed = commit_host_request(dir, &committed, &request);
+        let request = build_host_request(dir, "restage-host-replacement", &[
+            ("fence", fence.clone()),
+            ("candidate", candidate),
+        ]);
+        committed = commit_host_request(dir, &committed, &request);
+        let restaged: Reservation =
+            serde_json::from_str(committed["data"]["reservation"].as_str().unwrap()).unwrap();
+        assert!(restaged.operation().unwrap().replacement.is_none());
+        assert!(
+            restaged
+                .operation()
+                .unwrap()
+                .host
+                .as_ref()
+                .unwrap()
+                .pod_retirement_intents
+                .contains("replacement-pod")
+        );
+        let mut plan = restaged.operation().unwrap().process_plan.clone();
+        final_boot = ProcessIncarnation::from_bits(101);
+        plan[0].expected_process_incarnation = Some(final_boot.clone());
+        file(dir, "host-config", &json!({"nodes":plan}));
+        file(
+            dir,
+            "host-pod",
+            &json!({"kind":"Pod","metadata":{"namespace":"test","name":"voters-0","uid":"restaged-pod","ownerReferences":[{"kind":"StatefulSet","uid":"statefulset-uid","controller":true}]},"spec":{"nodeName":"restaged-host"}}),
+        );
+        file(
+            dir,
+            "host-node",
+            &json!({"kind":"Node","metadata":{"name":"restaged-host","uid":"restaged-node","labels":{"topology.kubernetes.io/zone":"zone-1"}},"spec":{"providerID":"restaged-instance"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}),
+        );
+        let request = build_host_request(dir, "bind-host-replacement", &[
+            ("fence", fence.clone()),
+            ("pod-object", dir.join("host-pod").display().to_string()),
+            ("node-object", dir.join("host-node").display().to_string()),
+            ("config", dir.join("host-config").display().to_string()),
+        ]);
+        committed = commit_host_request(dir, &committed, &request);
+    }
     let mut finished = proof;
     finished.started_ms = epoch_ms();
     finished.completed_ms = finished.started_ms;
     finished
         .verification
         .process_incarnations
-        .insert(1, ProcessIncarnation::from_bits(100));
+        .insert(1, final_boot);
     finished.verification.maintenance_fence = Some(operation.fence.clone());
     finished.verification.maintenance_executor_retired_certified = true;
     file(dir, "host-observation", &finished);
@@ -401,7 +488,11 @@ fn healthy_inventory_and_host_recovery_round_trip_through_actual_cli_without_phy
         final_state.hosts().unwrap().voters[0]
             .source
             .provider_instance,
-        "replacement-instance"
+        if interrupt_candidate {
+            "restaged-instance"
+        } else {
+            "replacement-instance"
+        }
     );
     assert!(
         final_state
