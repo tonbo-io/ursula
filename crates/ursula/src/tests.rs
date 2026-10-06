@@ -2061,6 +2061,36 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
         "{missing}"
     );
 
+    options.group_count = 6;
+    nodes.pop().unwrap().shutdown().await;
+    assert!(
+        ursula_ctl::quorum::verify_quorum(&manifest, &client, &options)
+            .await
+            .is_err()
+    );
+    let survivor = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match ursula_ctl::quorum::verify_surviving_quorum(&manifest, 3, &client, &options).await
+            {
+                Ok(proof) => break proof,
+                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(survivor.configured_voter_ids, BTreeSet::from([1, 2, 3]));
+    assert_eq!(survivor.surviving_voter_ids, BTreeSet::from([1, 2]));
+    assert!(!survivor.full_redundancy_restored);
+    assert_eq!(survivor.verification.prefixes.len(), 6);
+    assert_eq!(survivor.verification.applied.len(), 2);
+    nodes.pop().unwrap().shutdown().await;
+    assert!(
+        ursula_ctl::quorum::verify_surviving_quorum(&manifest, 3, &client, &options)
+            .await
+            .is_err()
+    );
+
     for node in nodes {
         node.shutdown().await;
     }

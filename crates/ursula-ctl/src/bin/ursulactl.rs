@@ -73,6 +73,9 @@ enum Command {
     /// Capture fresh quorum prefixes and verify every configured replica.
     /// This observation does not reserve permission to disrupt a voter.
     VerifyQuorum(VerifyQuorumArgs),
+    /// Verify fresh prefixes on two survivors without claiming restored
+    /// redundancy or authorizing an unfenced physical replacement.
+    VerifySurvivors(VerifySurvivorsArgs),
     /// Create a verifiable backup of every raft group into a local directory
     /// or `s3://bucket/prefix`.
     #[command(name = "backup-create")]
@@ -265,6 +268,28 @@ struct VerifyQuorumArgs {
     allow_legacy_eligibility: bool,
 }
 
+impl VerifyQuorumArgs {
+    fn options(&self) -> ursula_ctl::quorum::QuorumVerificationOptions {
+        ursula_ctl::quorum::QuorumVerificationOptions {
+            group_count: self.expected_groups,
+            core_count: self.core_count,
+            timeout: Duration::from_secs(self.timeout_secs),
+            poll_interval: Duration::from_secs(self.poll_interval_secs),
+            allow_legacy_eligibility: self.allow_legacy_eligibility,
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+struct VerifySurvivorsArgs {
+    #[command(flatten)]
+    quorum: VerifyQuorumArgs,
+    /// Exactly one configured voter to omit from observation. This option
+    /// does not establish that its old process or host cannot return.
+    #[arg(long)]
+    excluded_node_id: u64,
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     let _telemetry =
@@ -296,16 +321,27 @@ async fn main() -> Result<()> {
             let started_ms = wall_clock_unix_ms();
             let nodes = load_nodes(&args.config).await?;
             let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
-            let report = ursula_ctl::quorum::verify_quorum(
+            let report =
+                ursula_ctl::quorum::verify_quorum(&nodes, &client, &args.options()).await?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "started_ms": started_ms,
+                    "completed_ms": wall_clock_unix_ms(),
+                    "verification": report,
+                })
+            );
+            Ok(())
+        }
+        Command::VerifySurvivors(args) => {
+            let started_ms = wall_clock_unix_ms();
+            let nodes = load_nodes(&args.quorum.config).await?;
+            let client = MetricsClient::new(Duration::from_secs(args.quorum.http_timeout_secs))?;
+            let report = ursula_ctl::quorum::verify_surviving_quorum(
                 &nodes,
+                args.excluded_node_id,
                 &client,
-                &ursula_ctl::quorum::QuorumVerificationOptions {
-                    group_count: args.expected_groups,
-                    core_count: args.core_count,
-                    timeout: Duration::from_secs(args.timeout_secs),
-                    poll_interval: Duration::from_secs(args.poll_interval_secs),
-                    allow_legacy_eligibility: args.allow_legacy_eligibility,
-                },
+                &args.quorum.options(),
             )
             .await?;
             println!(
@@ -313,7 +349,7 @@ async fn main() -> Result<()> {
                 serde_json::json!({
                     "started_ms": started_ms,
                     "completed_ms": wall_clock_unix_ms(),
-                    "verification": report,
+                    "surviving_quorum": report,
                 })
             );
             Ok(())
