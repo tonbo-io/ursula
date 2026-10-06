@@ -180,6 +180,9 @@ message MetaRaftRpcEnvelopeV1 {
   uint64 target_node_id = 2;
   uint32 protocol_version = 3;
   bytes payload = 4;
+  uint32 group_count = 5;
+  uint32 core_count = 6;
+  uint32 routing_hash_version = 7;
 }
 
 message MetaRaftSnapshotRequestV1 {
@@ -189,6 +192,9 @@ message MetaRaftSnapshotRequestV1 {
   bytes vote = 4;
   bytes snapshot_meta = 5;
   bytes snapshot_payload = 6;
+  uint32 group_count = 7;
+  uint32 core_count = 8;
+  uint32 routing_hash_version = 9;
 }
 
 service MetaRaftInternal {

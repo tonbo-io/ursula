@@ -17,6 +17,7 @@ fn placement_node(node_id: u64, state: NodeState) -> PlacementNode {
         node_id,
         client_url: format!("http://node{node_id}:4491"),
         cluster_url: format!("http://node{node_id}:4492"),
+        admin_url: None,
         state,
     }
 }
@@ -77,6 +78,7 @@ fn cluster_node_active_state_is_migration_eligible() {
         node_id: 5,
         client_url: "http://node5:4491".to_owned(),
         cluster_url: "http://node5:4492".to_owned(),
+        admin_url: None,
         state: NodeState::Active,
         registered_at_ms: 10,
         updated_at_ms: 10,

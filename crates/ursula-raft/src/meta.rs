@@ -30,6 +30,7 @@ use serde::Serialize;
 use ursula_control::ControlCommand;
 use ursula_control::ControlPlaneState;
 use ursula_control::ControlResponse;
+use ursula_control::MetaLocalIdentity;
 use ursula_control::NodeId;
 use ursula_shard::RaftGroupId;
 
@@ -127,6 +128,7 @@ impl MetaNodeRegistration {
 #[derive(Clone)]
 pub struct MetaRaftHandle {
     raft: MetaRaft,
+    local_identity: Option<MetaLocalIdentity>,
 }
 
 impl MetaRaftHandle {
@@ -173,6 +175,34 @@ impl MetaRaftHandle {
             .await
     }
 
+    /// Managed-mode startup: reject storage/node/cluster/routing drift before
+    /// constructing Raft or accepting any consensus traffic.
+    pub async fn new_bound_durable_node_with_network<NF>(
+        identity: MetaLocalIdentity,
+        config: Arc<Config>,
+        network_factory: NF,
+        journal_path: impl Into<PathBuf>,
+    ) -> Result<Self, MetaRaftError>
+    where
+        NF: RaftNetworkFactory<MetaRaftTypeConfig>,
+    {
+        let path = journal_path.into();
+        let node_id = identity.node.node_id;
+        let (store, state_machine) = crate::log_store::spawn_log_store_blocking(None, move || {
+            let store = MetaRaftFileLogStore::open_bound(path, identity)?;
+            let state_machine = MetaRaftStateMachine::open_durable(store.clone())?;
+            Ok((store, state_machine))
+        })
+        .await
+        .map_err(|error| MetaRaftError::with_source("recover bound durable meta storage", error))?;
+        Self::new_node_with_state_machine(node_id, config, network_factory, store, state_machine)
+            .await
+    }
+
+    pub fn local_identity(&self) -> Option<&MetaLocalIdentity> {
+        self.local_identity.as_ref()
+    }
+
     async fn new_node_with_state_machine<NF, LS>(
         node_id: u64,
         config: Arc<Config>,
@@ -184,11 +214,28 @@ impl MetaRaftHandle {
         NF: RaftNetworkFactory<MetaRaftTypeConfig>,
         LS: RaftLogStorage<MetaRaftTypeConfig>,
     {
+        let local_identity = state_machine
+            .durable_store
+            .as_ref()
+            .and_then(|store| store.identity())
+            .cloned();
+        if let (Some(identity), Some(bootstrap)) =
+            (&local_identity, &state_machine.state.cluster_bootstrap)
+            && identity.cluster != bootstrap.recipe.identity
+        {
+            return Err(MetaRaftError::new(
+                "recover meta bootstrap identity",
+                "control snapshot differs from local storage identity",
+            ));
+        }
         let raft = MetaRaft::new(node_id, config, network_factory, log_store, state_machine)
             .await
             .map_err(|err| MetaRaftError::with_source("create meta OpenRaft group", err))?;
 
-        Ok(Self { raft })
+        Ok(Self {
+            raft,
+            local_identity,
+        })
     }
 
     pub async fn new_single_node_with_log_store<LS>(
@@ -257,6 +304,15 @@ impl MetaRaftHandle {
     }
 
     pub async fn write(&self, command: ControlCommand) -> Result<ControlResponse, MetaRaftError> {
+        if let (Some(identity), ControlCommand::BootstrapCluster { bootstrap, .. }) =
+            (&self.local_identity, &command)
+            && identity.cluster != bootstrap.identity
+        {
+            return Err(MetaRaftError::new(
+                "write meta bootstrap",
+                "bootstrap differs from bound cluster/routing identity",
+            ));
+        }
         self.raft
             .client_write(command)
             .await
@@ -432,6 +488,52 @@ impl MetaRaftStateMachine {
         self.last_response.as_ref()
     }
 
+    fn apply_control_command(&mut self, command: ControlCommand) -> ControlResponse {
+        if let ControlCommand::BootstrapCluster { bootstrap, .. } = &command {
+            let bootstrap = match bootstrap.clone().normalize() {
+                Ok(bootstrap) => bootstrap,
+                Err(reason) => return ControlResponse::Rejected { reason },
+            };
+            // Bound peers must share the routing contract: RPC preambles reject
+            // a different binding before Raft. This also guards raw in-process
+            // callers that bypass MetaRaftHandle::write.
+            if self
+                .durable_store
+                .as_ref()
+                .and_then(|store| store.identity())
+                .is_some_and(|identity| identity.cluster != bootstrap.identity)
+            {
+                return ControlResponse::Rejected {
+                    reason: "bootstrap differs from bound cluster/routing identity".to_owned(),
+                };
+            }
+            if self.state.cluster_bootstrap.is_none() {
+                let membership = self.last_membership.membership();
+                if membership.get_joint_config().as_slice()
+                    != [bootstrap.initial_meta_voters.clone()]
+                {
+                    return ControlResponse::Rejected { reason: "bootstrap meta voters differ from the committed uniform meta membership".to_owned() };
+                }
+                for voter in &bootstrap.initial_meta_voters {
+                    let matches = bootstrap.nodes.get(voter).is_some_and(|node| {
+                        membership.get_node(voter).is_some_and(|actual| {
+                            crate::grpc::normalize_grpc_endpoint(actual.addr.clone())
+                                == node.cluster_url.trim_end_matches('/')
+                        })
+                    });
+                    if !matches {
+                        return ControlResponse::Rejected {
+                            reason: format!(
+                                "bootstrap meta voter {voter} endpoint differs from its committed membership"
+                            ),
+                        };
+                    }
+                }
+            }
+        }
+        self.state.apply(command)
+    }
+
     fn snapshot_meta(&self) -> SnapshotMetaOf<MetaRaftTypeConfig> {
         SnapshotMetaOf::<MetaRaftTypeConfig> {
             last_log_id: self.last_applied_log_id,
@@ -467,7 +569,7 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
             self.last_applied_log_id = Some(entry.log_id);
             let response = match entry.payload {
                 EntryPayload::Blank => ControlResponse::Ok,
-                EntryPayload::Normal(command) => self.state.apply(command),
+                EntryPayload::Normal(command) => self.apply_control_command(command),
                 EntryPayload::Membership(membership) => {
                     self.last_membership = StoredMembershipOf::<MetaRaftTypeConfig>::new(
                         Some(entry.log_id),
@@ -517,7 +619,21 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
                 "meta snapshot membership exceeds its applied log",
             ));
         }
-        let state = serde_json::from_slice(&bytes).map_err(invalid_snapshot)?;
+        let state: ControlPlaneState = serde_json::from_slice(&bytes).map_err(invalid_snapshot)?;
+        if let Some(identity) = self
+            .durable_store
+            .as_ref()
+            .and_then(|store| store.identity())
+            && state
+                .cluster_bootstrap
+                .as_ref()
+                .is_some_and(|bootstrap| bootstrap.recipe.identity != identity.cluster)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incoming control snapshot differs from local cluster/routing identity",
+            ));
+        }
         let current = MetaCurrentSnapshot {
             meta: meta.clone(),
             bytes,

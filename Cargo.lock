@@ -4410,6 +4410,7 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "url",
  "ursula-shard",
 ]
 

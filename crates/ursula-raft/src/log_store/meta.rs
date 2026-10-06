@@ -25,6 +25,7 @@ use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use serde::Deserialize;
 use serde::Serialize;
+use ursula_control::MetaLocalIdentity;
 use ursula_runtime::journal;
 
 use super::JournalLock;
@@ -39,6 +40,8 @@ use crate::meta::MetaCurrentSnapshot;
 use crate::meta::MetaRaftTypeConfig;
 
 type MetaLog = MemoryRaftLogStoreInner<MetaRaftTypeConfig>;
+#[cfg(not(madsim))]
+const MAX_IDENTITY_FILE_BYTES: u64 = 128 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum MetaLogRecord {
@@ -61,6 +64,7 @@ struct MetaFileInner {
 pub struct MetaRaftFileLogStore {
     path: PathBuf,
     snapshot_path: PathBuf,
+    identity: Option<MetaLocalIdentity>,
     inner: Mutex<MetaFileInner>,
     _lock: JournalLock,
 }
@@ -82,15 +86,91 @@ impl MetaRaftFileLogStore {
         ))
     }
 
+    #[cfg(madsim)]
+    pub fn open_bound(
+        _path: impl Into<PathBuf>,
+        _identity: MetaLocalIdentity,
+    ) -> io::Result<Arc<Self>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable meta identity binding is unavailable in simulation",
+        ))
+    }
+
     #[cfg(not(madsim))]
     pub fn open(path: impl Into<PathBuf>) -> io::Result<Arc<Self>> {
-        let path = path.into();
+        Self::open_inner(path.into(), None)
+    }
+
+    /// Bind storage before starting Raft. Reopen requires exactly the same
+    /// normalized node endpoints and immutable cluster/routing identity.
+    #[cfg(not(madsim))]
+    pub fn open_bound(
+        path: impl Into<PathBuf>,
+        identity: MetaLocalIdentity,
+    ) -> io::Result<Arc<Self>> {
+        let identity = identity
+            .normalize()
+            .map_err(|reason| io::Error::new(io::ErrorKind::InvalidInput, reason))?;
+        Self::open_inner(path.into(), Some(identity))
+    }
+
+    pub fn identity(&self) -> Option<&MetaLocalIdentity> {
+        self.identity.as_ref()
+    }
+
+    #[cfg(not(madsim))]
+    fn open_inner(path: PathBuf, identity: Option<MetaLocalIdentity>) -> io::Result<Arc<Self>> {
         let path = if path.is_absolute() {
             path
         } else {
             std::env::current_dir()?.join(path)
         };
         let lock = JournalLock::acquire(&path)?;
+        let mut identity_name = path.as_os_str().to_owned();
+        identity_name.push(".identity");
+        let identity_path = PathBuf::from(identity_name);
+        let binding_exists = identity_path.exists();
+        if binding_exists {
+            if fs::metadata(&identity_path)?.len() > MAX_IDENTITY_FILE_BYTES {
+                return Err(invalid(
+                    "meta identity file exceeds the bounded node-registration size",
+                ));
+            }
+            let bytes = fs::read(&identity_path)?;
+            let (records, valid_len) =
+                journal::decode_frames::<WireCodec<MetaLocalIdentity>>(&bytes)?;
+            if valid_len != bytes.len() || records.len() != 1 {
+                return Err(invalid(
+                    "meta identity file is not one complete checksummed binding",
+                ));
+            }
+            if identity.as_ref() != records.first() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "meta storage identity differs or requires a bound constructor",
+                ));
+            }
+            if !path.exists() {
+                return Err(invalid(
+                    "meta journal is missing beside its identity binding",
+                ));
+            }
+        }
+        if identity.is_some() && !binding_exists && path.exists() {
+            // Inspect without journal recovery/truncation. Binding a legacy
+            // consensus history must fail without modifying that history.
+            if fs::metadata(&path)?.len() > MAX_IDENTITY_FILE_BYTES {
+                return Err(invalid("cannot bind an existing unbound meta journal"));
+            }
+            let bytes = fs::read(&path)?;
+            let (records, valid_len) = journal::decode_frames::<WireCodec<MetaLogRecord>>(&bytes)?;
+            if !records.is_empty() || valid_len != bytes.len() {
+                return Err(invalid(
+                    "cannot bind an existing unbound meta consensus history; explicit adoption is required",
+                ));
+            }
+        }
         let mut snapshot_name = path.as_os_str().to_owned();
         snapshot_name.push(".snapshot");
         let snapshot_path = PathBuf::from(snapshot_name);
@@ -127,15 +207,34 @@ impl MetaRaftFileLogStore {
                 "purged meta log is not covered by a durable snapshot",
             ));
         }
+        if identity.is_some()
+            && !binding_exists
+            && (snapshot.is_some()
+                || log.vote.is_some()
+                || log.committed.is_some()
+                || log.last_purged_log_id.is_some()
+                || !log.entries.is_empty())
+        {
+            return Err(invalid(
+                "cannot bind an existing unbound meta consensus history; explicit adoption is required",
+            ));
+        }
         let mut writer = journal::JournalWriter::new(!path.exists());
         writer.ensure_created(&path)?;
         writer.sync(&path)?;
         if let Some(parent) = path.parent() {
             fs::File::open(parent)?.sync_all()?;
         }
+        if !binding_exists && let Some(identity) = &identity {
+            // The durable empty journal precedes the binding. A crash before
+            // the atomic binding rename is retryable because no Raft process
+            // has started; a missing journal after binding is never recreated.
+            replace_journal(&identity_path, std::iter::once(identity.clone()))?;
+        }
         Ok(Arc::new(Self {
             path,
             snapshot_path,
+            identity,
             inner: Mutex::new(MetaFileInner {
                 log,
                 writer,
@@ -245,14 +344,19 @@ mod tests {
     use openraft::storage::RaftStateMachine;
     use openraft::type_config::TypeConfigExt;
     use openraft::vote::RaftLeaderId;
+    use ursula_control::ClusterId;
+    use ursula_control::ClusterIdentity;
     use ursula_control::ControlCommand;
     use ursula_control::ControlPlaneState;
     use ursula_control::ControlResponse;
     use ursula_control::GroupPlacementPolicy;
     use ursula_control::GroupPolicyOverride;
+    use ursula_control::MetaLocalIdentity;
     use ursula_control::MigrationPhase;
+    use ursula_control::NodeRegistration;
     use ursula_control::PlacementPolicy;
     use ursula_control::ReplicationFactor;
+    use ursula_control::RoutingHashVersion;
     use ursula_shard::RaftGroupId;
 
     use super::*;
@@ -280,6 +384,132 @@ mod tests {
             },
             bytes: serde_json::to_vec(&ControlPlaneState::default()).unwrap(),
         }
+    }
+
+    fn local_identity() -> MetaLocalIdentity {
+        MetaLocalIdentity {
+            cluster: ClusterIdentity {
+                cluster_id: ClusterId::try_from("bound-test".to_owned()).unwrap(),
+                group_count: 16,
+                core_count: 2,
+                routing_hash: RoutingHashVersion::Fnv1a64BucketSlashStreamV1,
+            },
+            node: NodeRegistration {
+                node_id: 1,
+                client_url: "http://node1:4437".to_owned(),
+                cluster_url: "http://node1:4439".to_owned(),
+                admin_url: "http://node1:4438".to_owned(),
+                labels: BTreeMap::from([("zone".to_owned(), "a".to_owned())]),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_meta_storage_rejects_identity_drift_without_modifying_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.wal");
+        let identity_path = dir.path().join("meta.wal.identity");
+        let identity = local_identity();
+        let mut store = MetaRaftFileLogStore::open_bound(&path, identity.clone()).unwrap();
+        assert_eq!(store.identity(), Some(&identity));
+        store
+            .save_vote(&openraft::Vote::new_committed(2, 1))
+            .await
+            .unwrap();
+        drop(store);
+        let original_journal = fs::read(&path).unwrap();
+        let original_identity = fs::read(&identity_path).unwrap();
+        assert!(MetaRaftFileLogStore::open(&path).is_err());
+        for mutation in 0..6 {
+            let mut changed = identity.clone();
+            match mutation {
+                0 => changed.node.node_id = 2,
+                1 => changed.cluster.cluster_id = ClusterId::try_from("other".to_owned()).unwrap(),
+                2 => changed.cluster.group_count += 1,
+                3 => changed.cluster.core_count += 1,
+                4 => changed.node.admin_url = "http://other:4438".to_owned(),
+                _ => {
+                    changed
+                        .node
+                        .labels
+                        .insert("zone".to_owned(), "b".to_owned());
+                }
+            }
+            assert!(MetaRaftFileLogStore::open_bound(&path, changed).is_err());
+            assert_eq!(fs::read(&path).unwrap(), original_journal);
+            assert_eq!(fs::read(&identity_path).unwrap(), original_identity);
+        }
+        let mut equivalent = identity;
+        equivalent.node.client_url = "HTTP://NODE1:4437/".to_owned();
+        let mut store = MetaRaftFileLogStore::open_bound(&path, equivalent).unwrap();
+        assert_eq!(
+            store.read_vote().await.unwrap(),
+            Some(openraft::Vote::new_committed(2, 1))
+        );
+        drop(store);
+        fs::remove_file(&path).unwrap();
+        assert!(MetaRaftFileLogStore::open_bound(&path, local_identity()).is_err());
+        assert!(
+            !path.exists(),
+            "a missing bound journal is never silently recreated"
+        );
+    }
+
+    #[test]
+    fn bound_meta_identity_rejects_corruption_torn_tail_and_multiple_records() {
+        for mode in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("meta.wal");
+            let identity_path = dir.path().join("meta.wal.identity");
+            let identity = local_identity();
+            drop(MetaRaftFileLogStore::open_bound(&path, identity.clone()).unwrap());
+            match mode {
+                0 => {
+                    let mut bytes = fs::read(&identity_path).unwrap();
+                    bytes[24] ^= 1;
+                    fs::write(&identity_path, bytes).unwrap();
+                }
+                1 => {
+                    let mut file = OpenOptions::new()
+                        .append(true)
+                        .open(&identity_path)
+                        .unwrap();
+                    file.write_all(&[1]).unwrap();
+                    file.sync_all().unwrap();
+                }
+                _ => replace_journal(&identity_path, [identity.clone(), identity.clone()]).unwrap(),
+            }
+            assert!(MetaRaftFileLogStore::open_bound(&path, identity).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_meta_retries_empty_binding_publication_but_refuses_unbound_consensus_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.wal");
+        let store = MetaRaftFileLogStore::open(&path).unwrap();
+        drop(store); // Empty durable header, before initial binding publication.
+        let store = MetaRaftFileLogStore::open_bound(&path, local_identity()).unwrap();
+        drop(store);
+        let path = dir.path().join("existing-meta.wal");
+        let mut store = MetaRaftFileLogStore::open(&path).unwrap();
+        store
+            .save_vote(&openraft::Vote::new_committed(2, 1))
+            .await
+            .unwrap();
+        drop(store);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[1]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let before = fs::read(&path).unwrap();
+        assert!(MetaRaftFileLogStore::open_bound(&path, local_identity()).is_err());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "rejected binding must not recover/truncate legacy history"
+        );
+        assert!(!dir.path().join("existing-meta.wal.identity").exists());
     }
 
     #[tokio::test]

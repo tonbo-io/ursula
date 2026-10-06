@@ -11,6 +11,7 @@ description = "Control-plane state for Ursula dynamic node registration, group p
 
 [dependencies]
 serde = { workspace = true }
+url = { workspace = true }
 ursula-shard = { workspace = true }
 
 [dev-dependencies]

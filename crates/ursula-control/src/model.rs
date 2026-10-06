@@ -28,6 +28,8 @@ pub struct ClusterNode {
     pub node_id: NodeId,
     pub client_url: String,
     pub cluster_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_url: Option<String>,
     pub state: NodeState,
     pub registered_at_ms: u64,
     pub updated_at_ms: u64,

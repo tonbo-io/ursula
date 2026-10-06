@@ -10,15 +10,25 @@ use openraft::ReadPolicy;
 use openraft::ServerState;
 use openraft::alias::LogIdOf;
 use openraft::rt::WatchReceiver;
+use openraft::storage::RaftStateMachine;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
+use ursula_control::ClusterBootstrap;
+use ursula_control::ClusterId;
+use ursula_control::ClusterIdentity;
 use ursula_control::ControlCommand;
 use ursula_control::ControlPlaneState;
 use ursula_control::ControlResponse;
 use ursula_control::GroupPolicyOverride;
+use ursula_control::MembershipLogId;
+use ursula_control::MetaLocalIdentity;
+use ursula_control::NodeRegistration;
+use ursula_control::NodeState;
 use ursula_control::PlacementPolicy;
 use ursula_control::ReplicationFactor;
+use ursula_control::RoutingHashVersion;
+use ursula_control::VerifiedGroupMembership;
 use ursula_shard::RaftGroupId;
 
 use crate::meta::MetaRaftHandle;
@@ -75,6 +85,332 @@ async fn stop(node: TestNode) {
     node.server.abort();
     let _ = node.server.await;
     drop(node.handle);
+}
+
+fn bound_identity(id: u64, endpoint: String) -> MetaLocalIdentity {
+    MetaLocalIdentity {
+        cluster: ClusterIdentity {
+            cluster_id: ClusterId::try_from(CLUSTER.to_owned()).unwrap(),
+            group_count: 1,
+            core_count: 1,
+            routing_hash: RoutingHashVersion::Fnv1a64BucketSlashStreamV1,
+        },
+        node: NodeRegistration {
+            node_id: id,
+            client_url: format!("http://client{id}:4437"),
+            cluster_url: endpoint,
+            admin_url: format!("http://admin{id}:4438"),
+            labels: BTreeMap::from([("zone".to_owned(), ((id - 1) % 3).to_string())]),
+        },
+    }
+}
+
+async fn start_bound(identity: MetaLocalIdentity, listener: TcpListener, path: &Path) -> TestNode {
+    let config = Arc::new(
+        Config {
+            heartbeat_interval: 50,
+            election_timeout_min: 300,
+            election_timeout_max: 600,
+            max_in_snapshot_log_to_keep: 0,
+            ..Config::default()
+        }
+        .validate()
+        .unwrap(),
+    );
+    let factory = MetaGrpcRaftNetworkFactory::new_bound(identity.cluster.clone()).unwrap();
+    let handle =
+        MetaRaftHandle::new_bound_durable_node_with_network(identity, config, factory, path)
+            .await
+            .unwrap();
+    let service = MetaRaftGrpcService::new_bound(&handle).unwrap();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(meta_raft_grpc_service(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    TestNode { handle, server }
+}
+
+#[tokio::test]
+async fn bound_meta_transport_rejects_routing_drift_and_missing_binding_before_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let node = start_bound(
+        bound_identity(7, endpoint.clone()),
+        listener,
+        &dir.path().join("meta.wal"),
+    )
+    .await;
+    assert!(MetaRaftGrpcService::new("other-cluster", &node.handle).is_err());
+    let mut client = MetaRaftInternalClient::connect(endpoint).await.unwrap();
+    for (groups, cores, hash) in [(2, 1, 1), (1, 2, 1), (1, 1, 2), (0, 0, 0)] {
+        let envelope = MetaRaftRpcEnvelopeV1 {
+            cluster_id: CLUSTER.to_owned(),
+            target_node_id: 7,
+            protocol_version: META_RAFT_PROTOCOL_VERSION,
+            group_count: groups,
+            core_count: cores,
+            routing_hash_version: hash,
+            payload: vec![0xc1].into(),
+        };
+        assert_eq!(
+            client.append(envelope.clone()).await.unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            client.vote(envelope.clone()).await.unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            client.transfer_leader(envelope).await.unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            client
+                .full_snapshot(MetaRaftSnapshotRequestV1 {
+                    cluster_id: CLUSTER.to_owned(),
+                    target_node_id: 7,
+                    protocol_version: META_RAFT_PROTOCOL_VERSION,
+                    group_count: groups,
+                    core_count: cores,
+                    routing_hash_version: hash,
+                    vote: vec![0xc1].into(),
+                    snapshot_meta: vec![0xc1].into(),
+                    snapshot_payload: vec![0xc1].into()
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+    assert!(!node.handle.raft_handle().is_initialized().await.unwrap());
+    assert!(
+        node.handle
+            .read_state(|state| state.cluster_bootstrap.is_none())
+            .await
+            .unwrap()
+    );
+    stop(node).await;
+}
+
+#[tokio::test]
+async fn bound_meta_bootstrap_records_replicate_and_survive_compaction_and_full_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut identities = Vec::new();
+    let mut addresses = Vec::new();
+    let mut nodes = Vec::new();
+    for id in 1..=3 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let identity = bound_identity(id, format!("http://{address}"));
+        nodes.push(Some(
+            start_bound(
+                identity.clone(),
+                listener,
+                &dir.path().join(format!("node{id}.wal")),
+            )
+            .await,
+        ));
+        identities.push(identity);
+        addresses.push(address);
+    }
+    let meta_membership = identities
+        .iter()
+        .map(|identity| {
+            (
+                identity.node.node_id,
+                BasicNode::new(&identity.node.cluster_url),
+            )
+        })
+        .collect();
+    nodes[0]
+        .as_ref()
+        .unwrap()
+        .handle
+        .initialize_membership(meta_membership)
+        .await
+        .unwrap();
+    let elected = leader(&nodes).await;
+    let handle = &nodes[elected].as_ref().unwrap().handle;
+    let bootstrap = ClusterBootstrap {
+        identity: identities[0].cluster.clone(),
+        initial_meta_voters: BTreeSet::from([1, 2, 3]),
+        nodes: identities
+            .iter()
+            .map(|identity| (identity.node.node_id, identity.node.clone()))
+            .collect(),
+        voters: BTreeMap::from([(RaftGroupId(0), BTreeSet::from([1, 2, 3]))]),
+        placement: PlacementPolicy::default(),
+    };
+    // Synthetic data-membership certificate: this test exercises consensus,
+    // persistence and bootstrap guards, not data-group discovery or execution.
+    let memberships = BTreeMap::from([(RaftGroupId(0), VerifiedGroupMembership {
+        voters: BTreeSet::from([1, 2, 3]),
+        learners: BTreeSet::new(),
+        log_id: MembershipLogId {
+            term: 1,
+            node_id: 1,
+            index: 0,
+        },
+    })]);
+    let mut wrong_meta = bootstrap.clone();
+    wrong_meta.initial_meta_voters.insert(4);
+    assert!(
+        handle
+            .write(ControlCommand::BootstrapCluster {
+                bootstrap: wrong_meta,
+                memberships: memberships.clone(),
+                now_ms: 1
+            })
+            .await
+            .unwrap()
+            .is_rejected()
+    );
+    let mut wrong_endpoint = bootstrap.clone();
+    wrong_endpoint.nodes.get_mut(&1).unwrap().cluster_url = "http://other-meta:4439".to_owned();
+    assert!(
+        handle
+            .write(ControlCommand::BootstrapCluster {
+                bootstrap: wrong_endpoint,
+                memberships: memberships.clone(),
+                now_ms: 1
+            })
+            .await
+            .unwrap()
+            .is_rejected()
+    );
+    let mut wrong_contract = bootstrap.clone();
+    wrong_contract.identity.core_count = 2;
+    assert!(
+        handle
+            .raft_handle()
+            .client_write(ControlCommand::BootstrapCluster {
+                bootstrap: wrong_contract,
+                memberships: memberships.clone(),
+                now_ms: 1
+            })
+            .await
+            .unwrap()
+            .data
+            .is_rejected()
+    );
+    assert_eq!(
+        handle
+            .write(ControlCommand::BootstrapCluster {
+                bootstrap: bootstrap.clone(),
+                memberships: memberships.clone(),
+                now_ms: 1
+            })
+            .await
+            .unwrap(),
+        ControlResponse::Ok
+    );
+    assert_eq!(
+        handle
+            .write(ControlCommand::SetNodeState {
+                node_id: 3,
+                state: NodeState::Draining,
+                now_ms: 2
+            })
+            .await
+            .unwrap(),
+        ControlResponse::Ok
+    );
+    let mut wrong_identity = bootstrap.clone();
+    wrong_identity.identity.core_count = 2;
+    assert!(
+        handle
+            .write(ControlCommand::BootstrapCluster {
+                bootstrap: wrong_identity,
+                memberships: memberships.clone(),
+                now_ms: 3
+            })
+            .await
+            .is_err()
+    );
+    let prefix = applied(handle).await;
+    wait_state(&nodes, prefix).await;
+    let expected = handle.read_state(Clone::clone).await.unwrap();
+    for node in nodes.iter().flatten() {
+        snapshot_and_purge(&node.handle).await;
+    }
+    let source = handle.raft_handle().get_snapshot().await.unwrap().unwrap();
+    let mut incompatible = expected.clone();
+    incompatible
+        .cluster_bootstrap
+        .as_mut()
+        .unwrap()
+        .recipe
+        .identity
+        .core_count = 2;
+    let bytes = serde_json::to_vec(&incompatible).unwrap();
+    let mut meta = source.meta;
+    let snapshot_path = dir.path().join(format!("node{}.wal.snapshot", elected + 1));
+    let before = std::fs::read(&snapshot_path).unwrap();
+    let result = handle
+        .with_state_machine(move |machine| {
+            Box::pin(async move {
+                meta.last_log_id = machine.applied_log_id();
+                machine
+                    .install_snapshot(&meta, std::io::Cursor::new(bytes))
+                    .await
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        std::fs::read(&snapshot_path).unwrap(),
+        before,
+        "incompatible snapshot is rejected before durable publication"
+    );
+    assert_eq!(handle.read_state(Clone::clone).await.unwrap(), expected);
+    for node in nodes.iter_mut() {
+        stop(node.take().unwrap()).await;
+    }
+    for (index, identity) in identities.iter().enumerate() {
+        let listener = TcpListener::bind(addresses[index]).await.unwrap();
+        let node = start_bound(
+            identity.clone(),
+            listener,
+            &dir.path()
+                .join(format!("node{}.wal", identity.node.node_id)),
+        )
+        .await;
+        assert!(node.handle.raft_handle().is_initialized().await.unwrap());
+        nodes[index] = Some(node);
+    }
+    let elected = leader(&nodes).await;
+    let handle = &nodes[elected].as_ref().unwrap().handle;
+    assert_eq!(
+        handle
+            .write(ControlCommand::BootstrapCluster {
+                bootstrap,
+                memberships,
+                now_ms: 4
+            })
+            .await
+            .unwrap(),
+        ControlResponse::Ok
+    );
+    wait_state(&nodes, applied(handle).await).await;
+    for node in nodes.iter().flatten() {
+        assert_eq!(
+            node.handle.read_state(Clone::clone).await.unwrap(),
+            expected
+        );
+        assert_eq!(
+            node.handle.local_identity().unwrap().cluster,
+            identities[0].cluster
+        );
+    }
+    for node in nodes.into_iter().flatten() {
+        stop(node).await;
+    }
 }
 
 async fn leader(nodes: &[Option<TestNode>]) -> usize {
@@ -175,6 +511,7 @@ async fn meta_transport_rejects_wrong_identity_and_version_before_payload_decode
             target_node_id: target,
             protocol_version: version,
             payload: vec![0xc1].into(),
+            ..Default::default()
         };
         assert_eq!(
             client.append(envelope.clone()).await.unwrap_err().code(),
@@ -197,6 +534,7 @@ async fn meta_transport_rejects_wrong_identity_and_version_before_payload_decode
                     vote: vec![0xc1].into(),
                     snapshot_meta: vec![0xc1].into(),
                     snapshot_payload: vec![0xc1].into(),
+                    ..Default::default()
                 })
                 .await
                 .unwrap_err()
@@ -211,6 +549,7 @@ async fn meta_transport_rejects_wrong_identity_and_version_before_payload_decode
                 target_node_id: 7,
                 protocol_version: META_RAFT_PROTOCOL_VERSION,
                 payload: vec![0xc1].into(),
+                ..Default::default()
             })
             .await
             .unwrap_err()

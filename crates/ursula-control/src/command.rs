@@ -6,6 +6,9 @@ use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::RaftGroupId;
 
+use crate::cluster::ClusterBootstrap;
+use crate::cluster::NodeRegistration;
+use crate::cluster::VerifiedGroupMembership;
 use crate::model::LearnerStatus;
 use crate::model::MigrationPhase;
 use crate::model::NodeId;
@@ -15,6 +18,15 @@ use crate::policy::PlacementPolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlCommand {
+    BootstrapCluster {
+        bootstrap: ClusterBootstrap,
+        memberships: BTreeMap<RaftGroupId, VerifiedGroupMembership>,
+        now_ms: u64,
+    },
+    RegisterManagedNode {
+        node: NodeRegistration,
+        now_ms: u64,
+    },
     RegisterNode {
         node_id: NodeId,
         client_url: String,
@@ -91,7 +103,9 @@ pub enum ControlCommand {
 impl ControlCommand {
     pub fn now_ms(&self) -> u64 {
         match self {
-            Self::RegisterNode { now_ms, .. }
+            Self::BootstrapCluster { now_ms, .. }
+            | Self::RegisterManagedNode { now_ms, .. }
+            | Self::RegisterNode { now_ms, .. }
             | Self::SetNodeState { now_ms, .. }
             | Self::SeedPlacement { now_ms, .. }
             | Self::AdoptPlacementPolicy { now_ms, .. }
@@ -110,6 +124,8 @@ impl ControlCommand {
 impl fmt::Display for ControlCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::BootstrapCluster { .. } => "bootstrap_cluster",
+            Self::RegisterManagedNode { .. } => "register_managed_node",
             Self::RegisterNode { .. } => "register_node",
             Self::SetNodeState { .. } => "set_node_state",
             Self::SeedPlacement { .. } => "seed_placement",

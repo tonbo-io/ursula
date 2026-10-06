@@ -5,6 +5,10 @@ use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::RaftGroupId;
 
+use crate::cluster::ClusterBootstrap;
+use crate::cluster::ClusterBootstrapRecord;
+use crate::cluster::NodeRegistration;
+use crate::cluster::VerifiedGroupMembership;
 use crate::command::ControlCommand;
 use crate::command::ControlResponse;
 use crate::model::ClusterNode;
@@ -18,6 +22,7 @@ use crate::model::NodeState;
 use crate::policy::GroupPlacementPolicy;
 use crate::policy::ManagedPlacement;
 use crate::policy::PlacementPolicy;
+use crate::policy::ReplicationFactor;
 use crate::view::GroupPlacementView;
 use crate::view::PlacementNode;
 
@@ -33,6 +38,8 @@ pub struct ControlPlaneState {
     /// explicit, validated adoption rather than a changed TOML default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_placement: Option<ManagedPlacement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_bootstrap: Option<ClusterBootstrapRecord>,
 }
 
 impl Default for ControlPlaneState {
@@ -51,18 +58,33 @@ impl ControlPlaneState {
             next_migration_id: 1,
             config,
             managed_placement: None,
+            cluster_bootstrap: None,
         }
     }
 
     pub fn apply(&mut self, command: ControlCommand) -> ControlResponse {
         match command {
+            ControlCommand::BootstrapCluster {
+                bootstrap,
+                memberships,
+                now_ms,
+            } => self.bootstrap_cluster(bootstrap, memberships, now_ms),
+            ControlCommand::RegisterManagedNode { node, now_ms } => {
+                self.register_managed_node(node, now_ms)
+            }
             ControlCommand::RegisterNode {
                 node_id,
                 client_url,
                 cluster_url,
                 labels,
                 now_ms,
-            } => self.register_node(node_id, client_url, cluster_url, labels, now_ms),
+            } => {
+                if self.cluster_bootstrap.is_some() {
+                    reject("bootstrapped clusters require RegisterManagedNode with a trusted admin endpoint".to_owned())
+                } else {
+                    self.register_node(node_id, client_url, cluster_url, None, labels, now_ms)
+                }
+            }
             ControlCommand::SetNodeState {
                 node_id,
                 state,
@@ -152,6 +174,7 @@ impl ControlPlaneState {
                         node_id: *node_id,
                         client_url: node.client_url.clone(),
                         cluster_url: node.cluster_url.clone(),
+                        admin_url: node.admin_url.clone(),
                         state: node.state,
                     })
                 })
@@ -178,6 +201,7 @@ impl ControlPlaneState {
         node_id: NodeId,
         client_url: String,
         cluster_url: String,
+        admin_url: Option<String>,
         labels: BTreeMap<String, String>,
         now_ms: u64,
     ) -> ControlResponse {
@@ -200,6 +224,7 @@ impl ControlPlaneState {
                 if existing.client_url != client_url
                     || existing.cluster_url != cluster_url
                     || existing.labels != labels
+                    || existing.admin_url != admin_url
                 {
                     return reject(format!(
                         "managed node {node_id} endpoints and labels are immutable"
@@ -223,11 +248,151 @@ impl ControlPlaneState {
             node_id,
             client_url,
             cluster_url,
+            admin_url,
             state,
             registered_at_ms,
             updated_at_ms: now_ms,
             labels,
         });
+        ControlResponse::Ok
+    }
+
+    fn register_managed_node(&mut self, node: NodeRegistration, now_ms: u64) -> ControlResponse {
+        if self.cluster_bootstrap.is_none() {
+            return reject("managed node registration requires cluster bootstrap".to_owned());
+        }
+        let node = match node.normalize() {
+            Ok(node) => node,
+            Err(reason) => return reject(reason),
+        };
+        for existing in self
+            .nodes
+            .values()
+            .filter(|existing| existing.node_id != node.node_id)
+        {
+            for origin in [&node.client_url, &node.cluster_url, &node.admin_url] {
+                if origin == &existing.client_url
+                    || origin == &existing.cluster_url
+                    || existing.admin_url.as_ref() == Some(origin)
+                {
+                    return reject(format!(
+                        "endpoint {origin} is already owned by node {}",
+                        existing.node_id
+                    ));
+                }
+            }
+        }
+        self.register_node(
+            node.node_id,
+            node.client_url,
+            node.cluster_url,
+            Some(node.admin_url),
+            node.labels,
+            now_ms,
+        )
+    }
+
+    fn bootstrap_cluster(
+        &mut self,
+        bootstrap: ClusterBootstrap,
+        memberships: BTreeMap<RaftGroupId, VerifiedGroupMembership>,
+        now_ms: u64,
+    ) -> ControlResponse {
+        let bootstrap = match bootstrap.normalize() {
+            Ok(bootstrap) => bootstrap,
+            Err(reason) => return reject(reason),
+        };
+        if let Some(existing) = &self.cluster_bootstrap {
+            return if existing.recipe == bootstrap {
+                ControlResponse::Ok
+            } else {
+                reject("cluster bootstrap differs from its immutable persisted recipe".to_owned())
+            };
+        }
+        if !self.nodes.is_empty()
+            || !self.placements.is_empty()
+            || !self.migrations.is_empty()
+            || self.active_migration.is_some()
+            || self.managed_placement.is_some()
+            || self.next_migration_id != 1
+        {
+            return reject("cluster bootstrap requires an empty control state; existing control state needs explicit adoption".to_owned());
+        }
+        let meta_rf = match u32::try_from(bootstrap.initial_meta_voters.len())
+            .ok()
+            .and_then(|count| ReplicationFactor::try_from(count).ok())
+        {
+            Some(rf) => rf,
+            None => {
+                return reject(
+                    "initial meta voter count must be independently configured as 3 or 5"
+                        .to_owned(),
+                );
+            }
+        };
+        let mut candidate = Self::new(MetaConfig {
+            initial_meta_voters: bootstrap.initial_meta_voters.clone(),
+            ..self.config.clone()
+        });
+        for node in bootstrap.nodes.values() {
+            candidate.nodes.insert(node.node_id, ClusterNode {
+                node_id: node.node_id,
+                client_url: node.client_url.clone(),
+                cluster_url: node.cluster_url.clone(),
+                admin_url: Some(node.admin_url.clone()),
+                state: NodeState::Active,
+                registered_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                labels: node.labels.clone(),
+            });
+        }
+        let meta_policy = GroupPlacementPolicy {
+            replication_factor: meta_rf,
+            failure_domain: bootstrap.placement.failure_domain.clone(),
+            survive_failure_domains: bootstrap.placement.survive_failure_domains,
+        };
+        if let Err(reason) =
+            meta_policy.validate_voters(&bootstrap.initial_meta_voters, &candidate.nodes)
+        {
+            return reject(format!(
+                "meta bootstrap placement violates policy: {reason}"
+            ));
+        }
+        if memberships.len() != bootstrap.identity.group_count as usize
+            || bootstrap.voters.len() != memberships.len()
+        {
+            return reject(
+                "bootstrap requires verified memberships for every configured group".to_owned(),
+            );
+        }
+        for (group, expected) in &bootstrap.voters {
+            let Some(observed) = memberships.get(group) else {
+                return reject(format!("group {} has no verified membership", group.0));
+            };
+            if observed.voters != *expected
+                || !observed.learners.is_empty()
+                || observed.log_id.node_id == 0
+            {
+                return reject(format!(
+                    "group {} verified membership differs from settled bootstrap voters",
+                    group.0
+                ));
+            }
+            let response = candidate.seed_placement(*group, observed.voters.clone(), now_ms);
+            if response.is_rejected() {
+                return response;
+            }
+        }
+        let response = candidate
+            .adopt_placement_policy(bootstrap.placement.clone(), bootstrap.identity.group_count);
+        if response.is_rejected() {
+            return response;
+        }
+        candidate.cluster_bootstrap = Some(ClusterBootstrapRecord {
+            recipe: bootstrap,
+            memberships,
+        });
+        *self = candidate;
         ControlResponse::Ok
     }
 

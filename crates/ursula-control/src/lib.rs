@@ -7,17 +7,28 @@
 //! Module map:
 //!
 //! - [`command`]: replicated control requests and responses.
+//! - [`cluster`]: immutable routing identity and trusted bootstrap inventory.
 //! - [`model`]: nodes, placements and migration records.
 //! - [`policy`]: managed replication and failure-domain validation.
 //! - [`state`]: deterministic control state transitions.
 //! - [`view`]: routing projections consumed by data nodes and gateways.
 
+mod cluster;
 mod command;
 mod model;
 mod policy;
 mod state;
 mod view;
 
+pub use cluster::ClusterBootstrap;
+pub use cluster::ClusterBootstrapRecord;
+pub use cluster::ClusterId;
+pub use cluster::ClusterIdentity;
+pub use cluster::MembershipLogId;
+pub use cluster::MetaLocalIdentity;
+pub use cluster::NodeRegistration;
+pub use cluster::RoutingHashVersion;
+pub use cluster::VerifiedGroupMembership;
 pub use command::ControlCommand;
 pub use command::ControlResponse;
 pub use model::ClusterNode;
@@ -42,3 +53,6 @@ mod tests;
 
 #[cfg(test)]
 mod policy_tests;
+
+#[cfg(test)]
+mod cluster_tests;

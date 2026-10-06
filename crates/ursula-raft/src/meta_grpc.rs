@@ -29,6 +29,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
+use ursula_control::ClusterId;
+use ursula_control::ClusterIdentity;
 
 use crate::codec::encode_wire;
 use crate::grpc::GrpcRpcError;
@@ -54,19 +56,9 @@ pub const META_RAFT_FULL_SNAPSHOT_PATH: &str = "/ursula.raft.v1.MetaRaftInternal
 pub const META_RAFT_TRANSFER_LEADER_PATH: &str = "/ursula.raft.v1.MetaRaftInternal/TransferLeader";
 
 fn cluster_identity(value: impl Into<String>) -> Result<Arc<str>, MetaRaftError> {
-    let value = value.into();
-    if value.is_empty()
-        || value.len() > 128
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        return Err(MetaRaftError::new(
-            "validate meta cluster identity",
-            "cluster_id must be 1..=128 ASCII letters, digits, '-', '_' or '.'",
-        ));
-    }
-    Ok(value.into())
+    let id = ClusterId::try_from(value.into())
+        .map_err(|reason| MetaRaftError::new("validate meta cluster identity", reason))?;
+    Ok(Arc::from(id.as_str()))
 }
 
 #[derive(Clone)]
@@ -74,9 +66,19 @@ pub struct MetaRaftGrpcService {
     cluster_id: Arc<str>,
     node_id: u64,
     raft: MetaRaft,
+    routing_identity: Option<ClusterIdentity>,
 }
 
 impl MetaRaftGrpcService {
+    pub fn new_bound(handle: &MetaRaftHandle) -> Result<Self, MetaRaftError> {
+        let identity = handle.local_identity().ok_or_else(|| {
+            MetaRaftError::new(
+                "create bound meta RPC service",
+                "local durable identity is required",
+            )
+        })?;
+        Self::new(identity.cluster.cluster_id.as_str(), handle)
+    }
     /// The caller must supply the replica's persisted bootstrap identity.
     /// This precondition prevents accidental cross-cluster routing; the private
     /// cluster listener still requires the deployment's network access controls.
@@ -92,14 +94,35 @@ impl MetaRaftGrpcService {
                 "node_id must be non-zero",
             ));
         }
+        let cluster_id = cluster_identity(cluster_id)?;
+        if handle.local_identity().is_some_and(|identity| {
+            identity.cluster.cluster_id.as_str() != cluster_id.as_ref()
+                || identity.node.node_id != node_id
+        }) {
+            return Err(MetaRaftError::new(
+                "create meta RPC service",
+                "RPC identity differs from durable local binding",
+            ));
+        }
         Ok(Self {
-            cluster_id: cluster_identity(cluster_id)?,
+            cluster_id,
             node_id,
             raft,
+            routing_identity: handle
+                .local_identity()
+                .map(|identity| identity.cluster.clone()),
         })
     }
 
-    fn validate(&self, cluster_id: &str, target: u64, version: u32) -> Result<(), GrpcRpcError> {
+    fn validate(
+        &self,
+        cluster_id: &str,
+        target: u64,
+        version: u32,
+        group_count: u32,
+        core_count: u32,
+        hash_version: u32,
+    ) -> Result<(), GrpcRpcError> {
         if version != META_RAFT_PROTOCOL_VERSION {
             return Err(GrpcRpcError::failed_precondition(
                 "meta protocol version mismatch",
@@ -113,6 +136,21 @@ impl MetaRaftGrpcService {
         if target != self.node_id {
             return Err(GrpcRpcError::failed_precondition(
                 "meta recipient node identity mismatch",
+            ));
+        }
+        let expected = self
+            .routing_identity
+            .as_ref()
+            .map_or((0, 0, 0), |identity| {
+                (
+                    identity.group_count,
+                    u32::from(identity.core_count),
+                    identity.routing_hash.wire_version(),
+                )
+            });
+        if (group_count, core_count, hash_version) != expected {
+            return Err(GrpcRpcError::failed_precondition(
+                "meta immutable routing identity mismatch",
             ));
         }
         Ok(())
@@ -144,6 +182,9 @@ impl MetaRaftInternal for MetaRaftGrpcService {
             &envelope.cluster_id,
             envelope.target_node_id,
             envelope.protocol_version,
+            envelope.group_count,
+            envelope.core_count,
+            envelope.routing_hash_version,
         )?;
         let rpc: AppendEntriesRequest<MetaRaftTypeConfig> = decode(&envelope.payload)?;
         let response = self
@@ -165,6 +206,9 @@ impl MetaRaftInternal for MetaRaftGrpcService {
             &envelope.cluster_id,
             envelope.target_node_id,
             envelope.protocol_version,
+            envelope.group_count,
+            envelope.core_count,
+            envelope.routing_hash_version,
         )?;
         let rpc: VoteRequest<MetaRaftTypeConfig> = decode(&envelope.payload)?;
         let response = self
@@ -186,6 +230,9 @@ impl MetaRaftInternal for MetaRaftGrpcService {
             &request.cluster_id,
             request.target_node_id,
             request.protocol_version,
+            request.group_count,
+            request.core_count,
+            request.routing_hash_version,
         )?;
         let vote: VoteOf<MetaRaftTypeConfig> = decode(&request.vote)?;
         let meta: SnapshotMetaOf<MetaRaftTypeConfig> = decode(&request.snapshot_meta)?;
@@ -212,6 +259,9 @@ impl MetaRaftInternal for MetaRaftGrpcService {
             &envelope.cluster_id,
             envelope.target_node_id,
             envelope.protocol_version,
+            envelope.group_count,
+            envelope.core_count,
+            envelope.routing_hash_version,
         )?;
         let rpc: TransferLeaderRequest<MetaRaftTypeConfig> = decode(&envelope.payload)?;
         self.raft
@@ -225,12 +275,24 @@ impl MetaRaftInternal for MetaRaftGrpcService {
 #[derive(Debug, Clone)]
 pub struct MetaGrpcRaftNetworkFactory {
     cluster_id: Arc<str>,
+    routing_identity: Option<ClusterIdentity>,
 }
 
 impl MetaGrpcRaftNetworkFactory {
     pub fn new(cluster_id: impl Into<String>) -> Result<Self, MetaRaftError> {
         Ok(Self {
             cluster_id: cluster_identity(cluster_id)?,
+            routing_identity: None,
+        })
+    }
+
+    pub fn new_bound(identity: ClusterIdentity) -> Result<Self, MetaRaftError> {
+        identity
+            .validate()
+            .map_err(|reason| MetaRaftError::new("validate meta routing identity", reason))?;
+        Ok(Self {
+            cluster_id: Arc::from(identity.cluster_id.as_str()),
+            routing_identity: Some(identity),
         })
     }
 }
@@ -244,6 +306,7 @@ impl RaftNetworkFactory<MetaRaftTypeConfig> for MetaGrpcRaftNetworkFactory {
             target,
             endpoint: normalize_grpc_endpoint(node.addr.clone()),
             client: None,
+            routing_identity: self.routing_identity.clone(),
         }
     }
 }
@@ -254,6 +317,7 @@ pub struct MetaGrpcRaftNetwork {
     target: u64,
     endpoint: String,
     client: Option<MetaRaftInternalClient<Channel>>,
+    routing_identity: Option<ClusterIdentity>,
 }
 
 fn network_error(message: impl ToString) -> RPCError<MetaRaftTypeConfig> {
@@ -267,6 +331,18 @@ impl MetaGrpcRaftNetwork {
             target_node_id: self.target,
             protocol_version: META_RAFT_PROTOCOL_VERSION,
             payload: encode_wire(rpc),
+            group_count: self
+                .routing_identity
+                .as_ref()
+                .map_or(0, |identity| identity.group_count),
+            core_count: self
+                .routing_identity
+                .as_ref()
+                .map_or(0, |identity| u32::from(identity.core_count)),
+            routing_hash_version: self
+                .routing_identity
+                .as_ref()
+                .map_or(0, |identity| identity.routing_hash.wire_version()),
         }
     }
 
@@ -362,6 +438,18 @@ impl RaftNetworkV2<MetaRaftTypeConfig> for MetaGrpcRaftNetwork {
             vote: encode_wire(&vote),
             snapshot_meta: encode_wire(&snapshot.meta),
             snapshot_payload: snapshot.snapshot.into_inner().into(),
+            group_count: self
+                .routing_identity
+                .as_ref()
+                .map_or(0, |identity| identity.group_count),
+            core_count: self
+                .routing_identity
+                .as_ref()
+                .map_or(0, |identity| u32::from(identity.core_count)),
+            routing_hash_version: self
+                .routing_identity
+                .as_ref()
+                .map_or(0, |identity| identity.routing_hash.wire_version()),
         };
         let response = tokio::select! {
             biased;
