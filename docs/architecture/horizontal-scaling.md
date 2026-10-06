@@ -1166,3 +1166,71 @@ tests passed (969 passed, 3 ignored), along with workspace doc tests, Clippy wit
 (0.39s). Existing mixed-RF/meta3/meta5 adoption/restart CLI passed (28.27s).
 M1/M2 remain open for the outstanding cross-cutting and fault gates; M3/M4 remain
 in the active epic.
+
+### Implementation checkpoint: managed gateway discovery
+
+Commit `82e1563` adds managed routing to the current deployment command,
+`ursula gateway`. Supply the original `ClusterBootstrap` JSON instead of static
+`--upstream` flags. The recipe includes the fixed routing identity, original
+node directory and independent initial meta voters; it is never extended when
+data nodes register. For example, export it from a fresh operation status:
+
+```sh
+ursulactl operation status --config cluster.toml \
+  | jq '.state.cluster_bootstrap.recipe' > managed-bootstrap.json
+ursula gateway --managed-bootstrap managed-bootstrap.json \
+  --listen 0.0.0.0:4437 --managed-refresh-ms 1000
+```
+
+Managed and static upstream arguments are mutually exclusive. The group count
+comes from the recipe; a conflicting explicit `--raft-group-count` fails.
+The refresh interval must be nonzero and defaults to one second. Initial startup
+requires a complete fresh projection before binding the public listener.
+This stateless gateway does not persist a directory for startup under meta
+minority. Already running gateways retain their last installed hints when the
+meta quorum is unavailable; actual serving permission remains with data Raft.
+
+Each refresh reads the bound `ReadProjection` RPC through trusted initial meta
+origins, with two-second RPC/connect timeouts per voter and no untrusted leader-URL
+forwarding. Validate the cluster/routing identity, exact immutable recipe and
+complete projection, then install through `ProjectionCursor`. Older views do
+not roll back routing and conflicting equal-index views fail. Advanced views
+invalidate affinity hints. Pick initial upstreams from the resolved group's
+voters, filtering disabled/removed nodes; active/draining nodes remain usable.
+
+A marked leader redirect must match the exact registered client origin and
+node ID. An unknown origin triggers a serialized refresh with a 100 ms cooldown
+covering successes and failures. A failed refresh leaves the installed view
+intact. If the origin remains unknown, return 503 with `Retry-After: 1` rather
+than a self-directed redirect. Never learn a new origin solely from `Location`.
+Static redirect resolution also compares exact origins. Transport failures
+evict only the corresponding affinity entry for the client's next retry; an
+ambiguous write is not automatically replayed. The periodic refresh task stops
+when the serving task exits or is cancelled.
+
+Six new tests cover complete ordering, rollback/conflict/bootstrap drift,
+empty-directory cooldown, unknown-origin refusal after actual failed RPCs,
+exact static origin matching, cache eviction after connection failure and CLI
+mode selection (several boundaries share one test). Final gateway lib tests
+passed 87; workspace lib/bin tests passed 976 with 3 ignored. Clippy, workspace
+doc tests, format, seven DST audits, madsim Raft check and existing smoke passed.
+
+The existing outside-bootstrap binary fixture now starts a gateway before
+registering node 7, with a ten-minute refresh interval to require redirect-driven
+discovery. After RF3/RF5 joining, a supported RF3 move from `{1,2,7}` to
+`{4,5,7}` transfers leadership to the only retained voter, 7. A fresh native data
+configuration confirms leader 7 and uniform target voters. The gateway reads
+pre-join RF3/RF5 payloads and acknowledges a write through the new leader.
+A second gateway refreshes every 100 ms. Stopping meta voters 1 and 2 leaves
+data majorities at both RFs; a bound RPC fails and the second gateway logs a
+failed refresh, then reads existing data and acknowledges a new RF3 write.
+Both gateway writes survive full seven-server restart, and the same gateway
+processes continue reading them. Both migration fixtures pass together in
+24.95s; fixed-layout adoption/restart passes in 28.21s.
+
+This uses real gateway/server/CLI processes, TCP data/meta Raft, disk WAL and
+inline/local snapshots. It does not prove install/joint interruption, SSE offset
+recovery through migration, S3 migration, fresh gateway restart during meta
+minority, migration-boundary DST or capacity/autopilot acceptance. Intent-aware
+maintenance and snapshot consumers are the next integration work; the complete
+epic remains active.
