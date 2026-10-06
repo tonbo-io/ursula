@@ -171,3 +171,29 @@ service RaftInternal {
   rpc RejoinBarrier(RejoinBarrierRequestV1) returns (RejoinBarrierResponseV1);
   rpc TransferLeader(RaftTransferLeaderRequestV1) returns (RaftTransferLeaderAckV1);
 }
+
+// Meta consensus has a separate service and preamble. No data-group ID (in
+// particular group zero) can address it. Cluster identity and recipient are
+// validated before decoding an opaque OpenRaft payload.
+message MetaRaftRpcEnvelopeV1 {
+  string cluster_id = 1;
+  uint64 target_node_id = 2;
+  uint32 protocol_version = 3;
+  bytes payload = 4;
+}
+
+message MetaRaftSnapshotRequestV1 {
+  string cluster_id = 1;
+  uint64 target_node_id = 2;
+  uint32 protocol_version = 3;
+  bytes vote = 4;
+  bytes snapshot_meta = 5;
+  bytes snapshot_payload = 6;
+}
+
+service MetaRaftInternal {
+  rpc Append(MetaRaftRpcEnvelopeV1) returns (RaftRpcAckV1);
+  rpc Vote(MetaRaftRpcEnvelopeV1) returns (RaftRpcAckV1);
+  rpc FullSnapshot(MetaRaftSnapshotRequestV1) returns (RaftFullSnapshotAckV1);
+  rpc TransferLeader(MetaRaftRpcEnvelopeV1) returns (RaftTransferLeaderAckV1);
+}
