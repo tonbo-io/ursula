@@ -77,6 +77,8 @@ use tower_http::compression::CompressionLayer;
 use tower_http::compression::CompressionLevel;
 use tower_http::compression::predicate::Predicate;
 use tower_http::compression::predicate::SizeAbove;
+use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
+use ursula_proto::admin::ProcessIncarnation;
 use ursula_raft::LeadershipShedFlag;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::RAFT_GRPC_APPEND_PATH;
@@ -263,6 +265,8 @@ impl WallClock for SystemWallClock {
 
 #[derive(Clone)]
 pub struct HttpState {
+    process_incarnation: ProcessIncarnation,
+    configured_node_id: Option<u64>,
     runtime: ShardRuntime,
     raft_registry: Option<RaftGroupHandleRegistry>,
     client_write_router: Option<ClientWriteLeaderRouter>,
@@ -313,8 +317,15 @@ impl HttpState {
         otel_metrics::register(&self.runtime.metrics());
     }
 
+    pub(crate) fn with_configured_node_id(mut self, node_id: u64) -> Self {
+        self.configured_node_id = Some(node_id);
+        self
+    }
+
     pub fn new(runtime: ShardRuntime) -> Self {
         Self {
+            process_incarnation: ProcessIncarnation::from_bits(rand::random()),
+            configured_node_id: None,
             runtime,
             raft_registry: None,
             client_write_router: None,
@@ -335,6 +346,8 @@ impl HttpState {
     ) -> Self {
         let leadership_shed = raft_registry.leadership_shed_flag();
         Self {
+            process_incarnation: ProcessIncarnation::from_bits(rand::random()),
+            configured_node_id: None,
             runtime,
             raft_registry: Some(raft_registry),
             client_write_router: None,
@@ -379,6 +392,8 @@ impl HttpState {
                 peers,
                 per_group_voters,
             )),
+            process_incarnation: ProcessIncarnation::from_bits(rand::random()),
+            configured_node_id: None,
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
             node_memory: NodeMemoryMonitor::default(),
@@ -922,6 +937,10 @@ fn admin_ops_router(state: HttpState) -> Router {
             post(transfer_raft_leader),
         )
         .route(
+            "/__ursula/raft/{raft_group_id}/self-election",
+            post(request_raft_self_election),
+        )
+        .route(
             "/__ursula/raft/{raft_group_id}/rejoin/adopt-survivor/{node_id}",
             post(adopt_rejoin_survivor),
         )
@@ -936,8 +955,39 @@ fn admin_ops_router(state: HttpState) -> Router {
     #[cfg(feature = "jemalloc-prof")]
     let router = router.route("/__ursula/debug/heap-profile", get(heap_profile));
     router
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_incarnation,
+        ))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state)
+}
+
+async fn require_admin_incarnation(
+    State(state): State<HttpState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) {
+        let Some(identity) = request.headers().get(PROCESS_INCARNATION_HEADER) else {
+            return (
+                StatusCode::PRECONDITION_REQUIRED,
+                "admin mutation requires its observed process incarnation",
+            )
+                .into_response();
+        };
+        if identity.to_str().ok() != Some(state.process_incarnation.as_str()) {
+            return (
+                StatusCode::PRECONDITION_FAILED,
+                "admin target process incarnation changed; stop the current maintenance plan",
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
 }
 
 /// Cluster-plane routes: inter-node gRPC carrying Raft RPCs, snapshot
@@ -1670,6 +1720,22 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
     let cap = state.node_memory.abort_cap_bytes().unwrap_or_default();
     let group_state_gauges = group_state_gauges_json(&state).await;
     if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "process_incarnation".to_owned(),
+            serde_json::json!(state.process_incarnation),
+        );
+        object.insert(
+            "process_node_id".to_owned(),
+            serde_json::json!(
+                state
+                    .configured_node_id
+                    .or_else(|| state
+                        .client_write_router
+                        .as_ref()
+                        .and_then(|topology| topology.node_id))
+                    .or_else(|| raft_groups.first().map(|group| group.node_id))
+            ),
+        );
         object.insert(
             "configured_raft_group_count".to_owned(),
             serde_json::json!(state.runtime.raft_group_count()),
@@ -2407,6 +2473,46 @@ pub(crate) async fn transfer_raft_leader(
         })
         .to_string(),
     )
+}
+
+#[derive(serde::Deserialize)]
+struct SelfElectionRequest {
+    current_term: u64,
+}
+
+async fn request_raft_self_election(
+    State(state): State<HttpState>,
+    Path(group_id): Path<u64>,
+    axum::Json(request): axum::Json<SelfElectionRequest>,
+) -> Response {
+    let (group_id, raft) = match resolve_raft_group(&state, group_id) {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
+    };
+    let observed = raft.metrics().borrow_watched().clone();
+    if observed.current_term != request.current_term {
+        return (
+            StatusCode::CONFLICT,
+            "self-election term changed; observe again",
+        )
+            .into_response();
+    }
+    let Some(registry) = state.raft_registry() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let transfer = openraft::raft::TransferLeaderRequest::new(
+        openraft::Vote::new(request.current_term, observed.id),
+        observed.id,
+        None,
+    );
+    match registry.handle_transfer_leader(group_id, transfer).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            format!("self-election refused: {error}"),
+        )
+            .into_response(),
+    }
 }
 
 pub(crate) fn parse_raft_group_id(raw: u64) -> Result<RaftGroupId, std::num::TryFromIntError> {

@@ -198,6 +198,7 @@ async fn init_state(
         ursula_config::WalBackend::Disk => "disk",
     };
     let mut state = state
+        .with_configured_node_id(config.raft.node_id)
         .with_runtime_config(&config.runtime)
         .with_wal_backend(wal_backend);
     if let Some(wal_path) = config.raft.wal.resolved_path() {
@@ -407,6 +408,35 @@ mod tests {
         assert!(parse_start_maintenance_drained(Some(OsStr::new("true"))).unwrap());
         assert!(!parse_start_maintenance_drained(Some(OsStr::new("false"))).unwrap());
         assert!(parse_start_maintenance_drained(Some(OsStr::new("1"))).is_err());
+    }
+
+    #[tokio::test]
+    async fn standalone_boot_publishes_configured_node_identity_before_groups_exist() {
+        use axum::body::Body;
+        use axum::body::to_bytes;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let mut config = ursula_config::UrsulaConfig::default();
+        config.runtime.core_count = 1;
+        config.raft.group_count = 1;
+        config.raft.node_id = 7;
+        assert!(config.raft.peers.is_empty());
+        let state = super::init_state(&config, None, false).await.unwrap();
+        let response = crate::admin_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/__ursula/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let metrics: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(metrics["process_node_id"], 7);
+        assert_eq!(metrics["process_incarnation"].as_str().unwrap().len(), 32);
     }
 
     #[test]

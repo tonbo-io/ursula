@@ -6,6 +6,7 @@ use anyhow::bail;
 use serde::Deserialize;
 use serde::Serialize;
 use url::Url;
+use ursula_proto::admin::ProcessIncarnation;
 
 /// Default admin-plane port; must match `server.admin_listen`'s default.
 const DEFAULT_ADMIN_PORT: u16 = 4438;
@@ -31,6 +32,10 @@ pub struct NodeInfo {
     /// can be inspected before its cluster DNS record becomes reachable.
     #[serde(default)]
     pub metrics_url: Option<Url>,
+    /// Identity retained by a maintenance plan across CLI invocations. A
+    /// mismatch is terminal; callers must not refresh it after failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_process_incarnation: Option<ProcessIncarnation>,
 }
 
 #[allow(async_fn_in_trait)]
@@ -136,6 +141,8 @@ struct RawNode {
     #[serde(default)]
     metrics_url: Option<String>,
     #[serde(default)]
+    expected_process_incarnation: Option<ProcessIncarnation>,
+    #[serde(default)]
     host: Option<String>,
 }
 
@@ -187,6 +194,7 @@ impl RawNode {
             host,
             http_url,
             metrics_url,
+            expected_process_incarnation: self.expected_process_incarnation,
         })
     }
 }
@@ -199,6 +207,28 @@ fn non_empty(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifests_round_trip_pinned_incarnations_and_refuse_malformed_identity() {
+        let json = br#"{"nodes":[{"id":1,"host":"node","expected_process_incarnation":"00000000000000000000000000000001"}]}"#;
+        let provider = StaticNodeProvider::from_bytes(json).unwrap();
+        let serialized = serde_json::to_vec(&serde_json::json!({"nodes":provider.nodes})).unwrap();
+        let restored = StaticNodeProvider::from_bytes(&serialized).unwrap();
+        assert_eq!(
+            restored.nodes[0]
+                .expected_process_incarnation
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "00000000000000000000000000000001"
+        );
+        assert!(
+            StaticNodeProvider::from_bytes(
+                br#"{"nodes":[{"id":1,"host":"node","expected_process_incarnation":"invalid"}]}"#
+            )
+            .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn json_manifest_defaults_admin_url_from_host() {

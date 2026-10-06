@@ -31,28 +31,33 @@ leadership-related fields across the whole cluster.
 
 These are the primitives `ursulactl` and any custom operator tooling builds on. They live on the **admin plane** (`server.admin_listen`, loopback `127.0.0.1:4438` by default), not the public client plane. Nodes expose no cluster-mutation surface on the network. Reach them over a tunnel to the admin port (see [ursulactl's operation providers](/docs/cli#the-admin-plane)). The examples below assume a forward from local `4438` to the node's admin plane. Each call is local to one node. To act on every group, loop over the IDs in metrics.
 
+Every admin mutation requires `x-ursula-process-incarnation`, pinned from `GET /__ursula/metrics` before the operation. Missing identity returns `428`; a restarted target returns `412` before the handler changes state. Keep the same identity for the entire plan and stop on either response. This precondition is public instance identity, not authentication or an exclusive maintenance reservation. Updated `ursulactl` attaches it automatically and refuses to refresh it during an operation.
+
 ```bash
+# Observe once for this operation; do not refresh after a 412.
+process_incarnation=$(curl --fail http://127.0.0.1:4438/__ursula/metrics | jq -er .process_incarnation)
+
 # Force a cold flush for one stream (skip the timer)
-curl -X POST http://127.0.0.1:4438/__ursula/flush-cold/demo/hello
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/flush-cold/demo/hello
 
 # Trigger a Raft snapshot for one group
-curl -X POST http://127.0.0.1:4438/__ursula/raft/42/snapshot
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/42/snapshot
 
 # Purge log entries below the last snapshot index for one group
-curl -X POST http://127.0.0.1:4438/__ursula/raft/42/purge
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/42/purge
 
 # Add a learner (non-voting replica) to one group without blocking on catch-up
-curl -X POST "http://127.0.0.1:4438/__ursula/raft/42/learners/4?addr=http://node-4:4437&blocking=false"
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST "http://127.0.0.1:4438/__ursula/raft/42/learners/4?addr=http://node-4:4437&blocking=false"
 
 # Hand leadership of one group to another voter (used by `ursulactl drain`)
-curl -X POST http://127.0.0.1:4438/__ursula/raft/42/leader/transfer/2
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/42/leader/transfer/2
 
 # Replace the voter set of one group (call on the group's current leader)
-curl -X POST "http://127.0.0.1:4438/__ursula/raft/42/membership?voters=1,2,3"
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST "http://127.0.0.1:4438/__ursula/raft/42/membership?voters=1,2,3"
 
 # Put this node into maintenance drain / lift it again
-curl -X POST   http://127.0.0.1:4438/__ursula/leadership-shed/maintenance
-curl -X DELETE http://127.0.0.1:4438/__ursula/leadership-shed/maintenance
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/leadership-shed/maintenance
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X DELETE http://127.0.0.1:4438/__ursula/leadership-shed/maintenance
 
 ```
 
@@ -114,7 +119,9 @@ To recover from a majority restart, pick the survivor whose log you keep: on eac
 
 ```bash
 # group 42, survivor node 1
-curl -X POST http://127.0.0.1:4438/__ursula/raft/42/rejoin/adopt-survivor/1
+# Pin this node before accepting the recovery plan.
+process_incarnation=$(curl --fail http://127.0.0.1:4438/__ursula/metrics | jq -er .process_incarnation)
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/42/rejoin/adopt-survivor/1
 ```
 
 On an empty node this lets it vote for the survivor (and only the survivor) while it is behind (`"action": "vote_released"`). On the survivor, if it still leads, it lets it replicate the emptied nodes from the start (`"followers_reset"`); if it does not lead (`"survivor_not_leader"`), it wins the next election once the others released their vote. The group then heals as after a minority restart. This is the only use of OpenRaft's one-shot log-reversion reset; it is process-local, so repeat the call if the survivor restarts or loses leadership before the emptied nodes caught up.
@@ -129,7 +136,8 @@ The writes are gone; only the operator can accept that. On the node that lists t
 
 ```bash
 # group 42: initialize it again, empty, accepting the loss of its writes
-curl -X POST 'http://127.0.0.1:4438/__ursula/raft/42/rejoin/reinitialize?accept_data_loss=true'
+process_incarnation=$(curl --fail http://127.0.0.1:4438/__ursula/metrics | jq -er .process_incarnation)
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST 'http://127.0.0.1:4438/__ursula/raft/42/rejoin/reinitialize?accept_data_loss=true'
 ```
 
 It answers `{"action": "reinitialize_accepted"}`, and the group initializes on the next probe. Without `accept_data_loss=true` it answers `400`; on a node where the group has not stopped, `409`. Cold objects the group wrote before the restart stay in object storage, unreferenced. To start such a cluster over instead, install it on a new object-storage prefix (as for any fresh install).
@@ -175,7 +183,7 @@ Counters are monotonic and survive snapshots, stream deletion, and bucket purge.
 The response is a completion report an operator can attest to:
 
 ```bash
-curl -X DELETE http://127.0.0.1:4438/__ursula/purge/tenant-a
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X DELETE http://127.0.0.1:4438/__ursula/purge/tenant-a
 # {"bucket":"tenant-a","removed_streams":12,"groups_with_streams":[0,3,5],"cold_gc_entries_reclaimed":12,"cold_gc_pending_entries":0,"cold_gc_complete":true,"cold_gc_error":null,"bucket_prefix_absent":true}
 ```
 

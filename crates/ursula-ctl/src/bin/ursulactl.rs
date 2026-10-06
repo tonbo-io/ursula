@@ -31,6 +31,8 @@ struct Cli {
 enum Command {
     /// Print per-node raft group count and leadership distribution from /__ursula/metrics.
     Status(ObserveArgs),
+    /// Produce a read-only manifest with fixed server-instance identities.
+    PinIncarnations(PinIncarnationsArgs),
     /// Block until every node reports the expected number of raft groups and initialized groups have leaders.
     WaitReady(WaitReadyArgs),
     /// Mark one node as draining and transfer away every leadership it holds.
@@ -117,6 +119,22 @@ struct ObserveArgs {
     /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
+struct PinIncarnationsArgs {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    /// Bind only this explicitly admitted replacement to its new identity;
+    /// every other voter must still match the saved manifest.
+    #[arg(long)]
+    replace_node: Option<u64>,
+    /// Migration diagnostic for deployed 0.6.2 and earlier sources only.
+    /// Missing identities remain explicitly uncertified in the output.
+    #[arg(long)]
+    allow_legacy_incarnation: bool,
     #[arg(long, default_value_t = 10)]
     http_timeout_secs: u64,
 }
@@ -298,6 +316,18 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Status(args) => run_status_subcommand(args).await,
+        Command::PinIncarnations(args) => {
+            let nodes = load_nodes(&args.config).await?;
+            let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+            let pinned = client
+                .pin_nodes(&nodes, args.replace_node, args.allow_legacy_incarnation)
+                .await?;
+            println!(
+                "{}",
+                serde_json::json!({"process_incarnations_certified": pinned.iter().all(|node| node.expected_process_incarnation.is_some()), "nodes": pinned})
+            );
+            Ok(())
+        }
         Command::WaitReady(args) => run_wait_ready_subcommand(args).await,
         Command::Drain(args) => run_drain_subcommand(args).await,
         Command::Undrain(args) => run_undrain_subcommand(args).await,
@@ -361,15 +391,10 @@ async fn main() -> Result<()> {
 }
 
 fn backup_client(nodes: &[NodeInfo], http_timeout_secs: u64) -> Result<backup::BackupClient> {
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(http_timeout_secs))
-        .build()
-        .context("build backup HTTP client")?;
-    let urls = nodes
-        .iter()
-        .map(|node| node.admin_url.as_str().trim_end_matches('/').to_owned())
-        .collect::<Vec<_>>();
-    backup::BackupClient::new(http, urls)
+    backup::BackupClient::new(
+        MetricsClient::new(Duration::from_secs(http_timeout_secs))?,
+        nodes.to_vec(),
+    )
 }
 
 fn wall_clock_unix_ms() -> u64 {

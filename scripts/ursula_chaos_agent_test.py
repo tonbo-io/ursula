@@ -559,6 +559,9 @@ class ChaosAgentStateTest(unittest.TestCase):
         def request(method, url, **kwargs):
             if method == "HEAD":
                 return 200, b"", {"stream-cold-hot-start-offset": "0"}
+            if method == "GET":
+                return 200, b'{"raft_groups":[],"process_node_id":1,"process_incarnation":"00000000000000000000000000000001"}', {}
+            self.assertEqual(kwargs["headers"], {"x-ursula-process-incarnation":"00000000000000000000000000000001"})
             posts.append(url)
             return 200, b'{"hot_start_offset": 50}', {}
 

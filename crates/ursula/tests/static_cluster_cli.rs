@@ -498,8 +498,8 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
     .await;
     assert_eq!(follower_payload, b"cli-late-learner-payload");
 
-    let snapshot = client
-        .post(format!("{node1_admin}/__ursula/raft/0/snapshot"))
+    let snapshot = admin_test_post(&client, format!("{node1_admin}/__ursula/raft/0/snapshot"))
+        .await
         .send()
         .await
         .expect("trigger leader snapshot");
@@ -512,26 +512,30 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
         .and_then(serde_json::Value::as_u64)
         .expect("snapshot index");
 
-    let purge = client
-        .post(format!(
-            "{node1_admin}/__ursula/raft/0/purge?upto={snapshot_index}"
-        ))
-        .send()
-        .await
-        .expect("trigger leader purge");
+    let purge = admin_test_post(
+        &client,
+        format!("{node1_admin}/__ursula/raft/0/purge?upto={snapshot_index}"),
+    )
+    .await
+    .send()
+    .await
+    .expect("trigger leader purge");
     assert_eq!(purge.status(), reqwest::StatusCode::OK);
 
     children.push(spawn_node_with_cluster_config(binary, &node3_config));
     wait_until_ready(&client, &peers[2].1, &mut children).await;
 
-    let add_learner = client
-        .post(format!(
+    let add_learner = admin_test_post(
+        &client,
+        format!(
             "{node1_admin}/__ursula/raft/0/learners/3?addr={}",
             peers[2].1
-        ))
-        .send()
-        .await
-        .expect("add late learner");
+        ),
+    )
+    .await
+    .send()
+    .await
+    .expect("add late learner");
     assert_eq!(add_learner.status(), reqwest::StatusCode::OK);
 
     wait_metrics_contains(
@@ -762,6 +766,10 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
     }
 
     let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client");
+    nodes = ctl
+        .pin_nodes(&nodes, None, false)
+        .await
+        .expect("save original process plan");
     let drain_options = ursula_ctl::DrainOptions {
         drain_timeout: Duration::from_secs(60),
         ready_timeout: Duration::from_secs(60),
@@ -789,8 +797,36 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
     drop(children.pop());
     let (child, admin_port) = spawn_per_group_memory_node(binary, 3, ports[2], &peers, true);
     children.push(child);
+    let retired_identity = nodes[2].expected_process_incarnation.clone();
     nodes[2] = ctl_node(3, admin_port, &public(3));
+    nodes[2].expected_process_incarnation = retired_identity.clone();
     wait_until_ready(&client, &public(3), &mut children).await;
+
+    let stale_clear = ctl
+        .set_maintenance_drain(&nodes[2], false)
+        .await
+        .expect_err("old process must not clear replacement drain");
+    assert!(stale_clear.to_string().contains("412"), "{stale_clear}");
+    let replacement_shed: serde_json::Value = client
+        .get(format!("{}/__ursula/leadership-shed", public(3)))
+        .send()
+        .await
+        .expect("replacement policy")
+        .json()
+        .await
+        .expect("policy JSON");
+    assert_eq!(replacement_shed["state"], "maintenance-drain");
+    assert!(
+        ctl.fetch_node(&nodes[2]).await.is_err(),
+        "old operation must not refresh its identity"
+    );
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5))
+        .expect("new admitted repair operation");
+    nodes = ctl
+        .pin_nodes(&nodes, Some(3), false)
+        .await
+        .expect("bind only admitted replacement");
+    assert_ne!(nodes[2].expected_process_incarnation, retired_identity);
 
     // Node 3 heals by itself; it is never an empty voter on the way.
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -1040,6 +1076,7 @@ async fn sigterm_and_wait_for_clean_exit(child: &mut ChildGuard) {
 
 fn ctl_node(node_id: u64, admin_port: u16, public_url: &str) -> ursula_ctl::NodeInfo {
     ursula_ctl::NodeInfo {
+        expected_process_incarnation: None,
         id: node_id,
         admin_url: url::Url::parse(&format!("http://127.0.0.1:{admin_port}")).expect("admin url"),
         host: "127.0.0.1".to_owned(),
@@ -1588,13 +1625,14 @@ async fn flush_stream_until_cold_hot_bytes_zero(
     stream: &str,
 ) {
     for _ in 0..100 {
-        let flush = client
-            .post(format!(
-                "{base_url}/__ursula/flush-cold/{bucket}/{stream}?min_hot_bytes=1&max_bytes=4"
-            ))
-            .send()
-            .await
-            .expect("send cold flush request");
+        let flush = admin_test_post(
+            client,
+            format!("{base_url}/__ursula/flush-cold/{bucket}/{stream}?min_hot_bytes=1&max_bytes=4"),
+        )
+        .await
+        .send()
+        .await
+        .expect("send cold flush request");
         assert!(
             flush.status() == reqwest::StatusCode::OK
                 || flush.status() == reqwest::StatusCode::NO_CONTENT,
@@ -1623,4 +1661,22 @@ async fn flush_stream_until_cold_hot_bytes_zero(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("cold hot bytes did not drain for {bucket}/{stream}");
+}
+
+async fn admin_test_post(client: &reqwest::Client, url: String) -> reqwest::RequestBuilder {
+    let mut metrics_url = reqwest::Url::parse(&url).expect("admin URL");
+    metrics_url.set_path("/__ursula/metrics");
+    metrics_url.set_query(None);
+    let metrics: serde_json::Value = client
+        .get(metrics_url)
+        .send()
+        .await
+        .expect("metrics")
+        .json()
+        .await
+        .expect("JSON");
+    client.post(url).header(
+        ursula_proto::admin::PROCESS_INCARNATION_HEADER,
+        metrics["process_incarnation"].as_str().expect("identity"),
+    )
 }

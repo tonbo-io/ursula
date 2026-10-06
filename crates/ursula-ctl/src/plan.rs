@@ -375,6 +375,7 @@ mod tests {
 
     fn node(id: u64) -> NodeInfo {
         NodeInfo {
+            expected_process_incarnation: None,
             id,
             admin_url: Url::parse(&format!("http://10.0.0.{id}:4438")).unwrap(),
             host: format!("10.0.0.{id}"),
@@ -385,6 +386,7 @@ mod tests {
 
     fn view(node_id: u64, groups: Vec<RaftGroupView>) -> NodeMetricsView {
         NodeMetricsView {
+            process_incarnation: None,
             node: node(node_id),
             groups,
             wal_backend: None,

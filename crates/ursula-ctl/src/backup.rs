@@ -33,6 +33,9 @@ use serde::Serialize;
 use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamStateMachine;
 
+use crate::MetricsClient;
+use crate::NodeInfo;
+
 /// The backup format is the format epoch. A 0.5.x ursulactl refuses this
 /// version through its own check; this tool refuses 0.5.x backups and
 /// clusters (E9).
@@ -144,22 +147,27 @@ struct BackupInfo {
 
 pub struct BackupClient {
     http: reqwest::Client,
-    nodes: Vec<String>,
+    metrics: MetricsClient,
+    nodes: Vec<NodeInfo>,
 }
 
 impl BackupClient {
-    pub fn new(http: reqwest::Client, nodes: Vec<String>) -> Result<Self> {
+    pub fn new(metrics: MetricsClient, nodes: Vec<NodeInfo>) -> Result<Self> {
         if nodes.is_empty() {
             bail!("at least one node URL is required");
         }
-        Ok(Self { http, nodes })
+        Ok(Self {
+            http: metrics.http_client().clone(),
+            metrics,
+            nodes,
+        })
     }
 
     async fn info(&self) -> Result<BackupInfo> {
         let mut last_error = None;
         for node in &self.nodes {
-            let url = format!("{}/__ursula/backup/info", node.trim_end_matches('/'));
-            match self.http.get(&url).send().await {
+            let url = node.admin_url.join("/__ursula/backup/info")?;
+            match self.http.get(url.clone()).send().await {
                 Ok(response) if response.status().is_success() => {
                     return response.json::<BackupInfo>().await.context("decode info");
                 }
@@ -178,11 +186,10 @@ impl BackupClient {
         let mut best: Option<(Vec<u8>, u64)> = None;
         let mut last_error = None;
         for node in &self.nodes {
-            let url = format!(
-                "{}/__ursula/backup/group/{raft_group_id}",
-                node.trim_end_matches('/')
-            );
-            let response = match self.http.get(&url).send().await {
+            let url = node
+                .admin_url
+                .join(&format!("/__ursula/backup/group/{raft_group_id}"))?;
+            let response = match self.http.get(url.clone()).send().await {
                 Ok(response) if response.status().is_success() => response,
                 Ok(response) => {
                     last_error = Some(anyhow::anyhow!("{url}: HTTP {}", response.status()));
@@ -229,13 +236,13 @@ impl BackupClient {
     async fn import_group(&self, raft_group_id: u32, body: Vec<u8>) -> Result<()> {
         let mut last_error = None;
         for node in &self.nodes {
-            let url = format!(
-                "{}/__ursula/backup/group/{raft_group_id}/import",
-                node.trim_end_matches('/')
-            );
+            let url = node
+                .admin_url
+                .join(&format!("/__ursula/backup/group/{raft_group_id}/import"))?;
             match self
-                .http
-                .post(&url)
+                .metrics
+                .admin_request(node, reqwest::Method::POST, url.clone())
+                .await?
                 .header("content-type", "application/x-msgpack")
                 .body(body.clone())
                 .send()
@@ -248,6 +255,13 @@ impl BackupClient {
                     // 409 means the target is not empty: retrying another
                     // node cannot help, and the operator must not be told a
                     // half-restore is retryable.
+                    if status == reqwest::StatusCode::PRECONDITION_FAILED
+                        || status == reqwest::StatusCode::PRECONDITION_REQUIRED
+                    {
+                        bail!(
+                            "group {raft_group_id}: target process identity is not the pinned restore target: {detail}"
+                        );
+                    }
                     if status == reqwest::StatusCode::CONFLICT {
                         bail!("group {raft_group_id}: target not empty: {detail}");
                     }
@@ -559,8 +573,18 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let client =
-            BackupClient::new(reqwest::Client::new(), vec![format!("http://{address}")]).unwrap();
+        let client = BackupClient::new(
+            MetricsClient::new(std::time::Duration::from_secs(1)).unwrap(),
+            vec![NodeInfo {
+                id: 1,
+                admin_url: format!("http://{address}").parse().unwrap(),
+                host: address.to_string(),
+                http_url: None,
+                metrics_url: None,
+                expected_process_incarnation: None,
+            }],
+        )
+        .unwrap();
 
         let err = restore(&client, &store)
             .await
@@ -571,5 +595,63 @@ mod tests {
             "{err}"
         );
         assert_eq!(imports.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn import_identity_failure_never_hops_to_another_restore_target() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        use axum::routing::post;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let received = attempts.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/__ursula/metrics",
+                        get(|| async {
+                            axum::Json(serde_json::json!({
+                    "process_node_id":1, "process_incarnation":"00000000000000000000000000000001"}))
+                        }),
+                    )
+                    .route(
+                        "/__ursula/backup/group/0/import",
+                        post(move |headers: axum::http::HeaderMap| {
+                            let received = received.clone();
+                            async move {
+                                assert_eq!(
+                                    headers[ursula_proto::admin::PROCESS_INCARNATION_HEADER],
+                                    "00000000000000000000000000000001"
+                                );
+                                received.fetch_add(1, Ordering::SeqCst);
+                                StatusCode::PRECONDITION_FAILED
+                            }
+                        }),
+                    ),
+            )
+            .await
+            .unwrap();
+        });
+        let node = NodeInfo {
+            id: 1,
+            admin_url: format!("http://{address}").parse().unwrap(),
+            host: address.to_string(),
+            http_url: None,
+            metrics_url: None,
+            expected_process_incarnation: None,
+        };
+        let metrics = MetricsClient::new(std::time::Duration::from_secs(1)).unwrap();
+        let client = BackupClient::new(metrics, vec![node.clone(), node]).unwrap();
+        let error = client.import_group(0, vec![]).await.unwrap_err();
+        assert!(error.to_string().contains("target process identity"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        task.abort();
     }
 }

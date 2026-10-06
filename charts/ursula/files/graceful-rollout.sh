@@ -49,6 +49,61 @@ write_manifest() {
   } >"${MANIFEST}"
 }
 
+# Pin across separate CLI invocations and persist the plan before a mutation.
+# --allow-legacy-incarnation is only the deployed <=0.6.2 upgrade consumer;
+# those entries remain explicitly uncertified until each voter is replaced.
+pin_manifest() {
+  if ! "${CTL}" pin-incarnations --config "${MANIFEST}" \
+      --allow-legacy-incarnation --http-timeout-secs 60 >"${MANIFEST}.next"; then
+    rm -f "${MANIFEST}.next"
+    return 1
+  fi
+  mv "${MANIFEST}.next" "${MANIFEST}" || return 1
+}
+
+bind_replacement_incarnation() {
+  node_id=$1
+  saved_uid=$(kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
+    -o jsonpath='{.data.source-pod-uid}') || return 1
+  saved_schema=$(kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
+    -o jsonpath='{.data.state-schema-version}') || return 1
+  bound_uid=$(kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
+    -o jsonpath='{.data.replacement-pod-uid}') || return 1
+  current_uid=$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-$((node_id - 1))" \
+    -o jsonpath='{.metadata.uid}') || return 1
+  case "${saved_schema:-1}" in
+    1|2|3) ;;
+    *) log "unsupported replacement state schema: ${saved_schema}"; return 1 ;;
+  esac
+  if [ "${saved_schema}" = 3 ] && { [ -z "${saved_uid}" ] || [ "${saved_uid}" = "${current_uid}" ]; }; then
+    log "refusing to refresh node ${node_id} process without an admitted Pod replacement"
+    return 1
+  fi
+  [ -n "${current_uid}" ] || return 1
+  if [ -n "${bound_uid}" ]; then
+    if [ "${bound_uid}" != "${current_uid}" ]; then
+      log "replacement Pod changed after its process plan was saved; refusing another identity refresh"
+      return 1
+    fi
+    # Same Pod with a restarted container must retain the old process pin and
+    # fail closed. A resumed Job cannot turn that restart into new authority.
+    pin_manifest
+    return
+  fi
+  if ! "${CTL}" pin-incarnations --config "${MANIFEST}" --replace-node "${node_id}" \
+      --allow-legacy-incarnation --http-timeout-secs 60 >"${MANIFEST}.next"; then
+    rm -f "${MANIFEST}.next"
+    return 1
+  fi
+  mv "${MANIFEST}.next" "${MANIFEST}" || return 1
+  # Schema 1/2 are interrupted legacy rollouts without a saved instance plan.
+  # Preserve their admitted UID when present. Do not create a schema-3 state
+  # without a source UID; the old schema-1 path finishes only this migration.
+  if [ -n "${saved_uid}" ]; then
+    record_state restarting "${node_id}" "${saved_uid}" "${current_uid}"
+  fi
+}
+
 forward_pid() {
   eval "printf '%s' \"\${PF_$1_PID:-}\""
 }
@@ -127,6 +182,7 @@ finish_prepared_restart() {
 
 repair_restarted_voter() {
   node_id=$1
+  bind_replacement_incarnation "${node_id}" || return 1
   PREPARED_RESTART_NODE=${node_id}
   # The first replacement can be repaired through 0.4.8 survivors, whose
   # learner endpoint ignores blocking=false and waits for catch-up. The CLI
@@ -304,16 +360,19 @@ record_state() {
   phase=$1
   node_id=$2
   source_pod_uid=${3:-}
+  replacement_pod_uid=${4:-}
   state_file=/tmp/rollout-state.yaml
   kubectl -n "${NAMESPACE}" create configmap "${STATE_CONFIGMAP}" \
-    --from-literal=state-schema-version="2" \
+    --from-literal=state-schema-version="3" \
     --from-literal=target-image="${TARGET_IMAGE}" \
     --from-literal=target-revision="${TARGET_REVISION}" \
     --from-literal=phase="${phase}" \
     --from-literal=node-id="${node_id}" \
     --from-literal=source-pod-uid="${source_pod_uid}" \
-    --dry-run=client -o yaml >"${state_file}"
-  kubectl -n "${NAMESPACE}" apply -f "${state_file}"
+    --from-file=process-manifest="${MANIFEST}" \
+    --from-literal=replacement-pod-uid="${replacement_pod_uid}" \
+    --dry-run=client -o yaml >"${state_file}" || return 1
+  kubectl -n "${NAMESPACE}" apply -f "${state_file}" || return 1
 }
 
 replacement_attempt_was_superseded() {
@@ -458,6 +517,20 @@ resume_if_needed() {
     1)
       if [ "${phase}" != "restarting" ]; then
         log "rollout state schema 1 cannot represent phase ${phase}"
+        return 1
+      fi
+      ;;
+    3)
+      if [ -z "${source_pod_uid}" ]; then
+        log "rollout state schema 3 is missing source-pod-uid"
+        return 1
+      fi
+      # Read the durable plan before any state-changing CLI operation. Parsing
+      # and all surviving instance matches are checked by pin-incarnations.
+      kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
+        -o jsonpath='{.data.process-manifest}' >"${MANIFEST}"
+      if [ ! -s "${MANIFEST}" ]; then
+        log "rollout state schema 3 is missing process-manifest"
         return 1
       fi
       ;;
@@ -677,6 +750,7 @@ main() {
     ordinal=$((ordinal + 1))
   done
 
+  pin_manifest || return 1
   recover_amnesiac_if_needed
   strict_verify
 
