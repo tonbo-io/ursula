@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
@@ -45,6 +47,10 @@ use crate::types::CORE_LOG_GROUP_COMMIT_DELAY;
 use crate::types::CORE_LOG_GROUP_COMMIT_MAX_BATCH;
 use crate::types::UrsulaRaftTypeConfig;
 
+#[path = "core_lifecycle.rs"]
+mod lifecycle;
+use lifecycle::CoreFileLogCommand;
+
 const CORE_LOG_BLOCKING_MAX_CONCURRENCY: usize = 8;
 const CORE_LOG_ONLINE_RECLAIM_MIN_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -55,6 +61,7 @@ pub struct RaftGroupFileLogStore {
     file: Mutex<RaftGroupFileLogHandle>,
     metrics: Option<RaftGroupFileLogStoreMetrics>,
     core_writer: Option<Arc<CoreFileLogWriter>>,
+    core_lease: Option<Arc<AtomicBool>>,
     _lock: Option<JournalLock>,
 }
 
@@ -70,8 +77,9 @@ type RaftGroupFileLogHandle = journal::JournalWriter;
 
 #[derive(Debug)]
 pub(crate) struct CoreFileLogWriter {
-    tx: Option<mpsc::Sender<CoreFileLogWrite>>,
+    tx: Option<mpsc::Sender<CoreFileLogCommand>>,
     recovered: Mutex<BTreeMap<u32, RaftGroupLogStoreInner>>,
+    leases: Mutex<BTreeMap<u32, Arc<AtomicBool>>>,
     blocking: Arc<Semaphore>,
     _lock: JournalLock,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -141,6 +149,7 @@ impl Drop for JournalLock {
 #[derive(Debug)]
 pub(crate) struct CoreFileLogWrite {
     group_id: u32,
+    lease: Arc<AtomicBool>,
     record: RaftGroupLogRecord,
     response_tx: mpsc::Sender<Result<CoreFileLogWriteTiming, String>>,
 }
@@ -198,11 +207,12 @@ impl RaftGroupFileLogStore {
             None
         };
         let parent_needs_sync = !path.exists();
-        let inner = match (&core_writer, &metrics) {
+        let (inner, core_lease) = match (&core_writer, &metrics) {
             (Some(writer), Some(metrics)) => {
-                writer.take_recovered(metrics.placement.raft_group_id.0)?
+                let (inner, lease) = writer.open_group(metrics.placement.raft_group_id.0)?;
+                (inner, Some(lease))
             }
-            _ => load_log_store_inner(&path)?,
+            _ => (load_log_store_inner(&path)?, None),
         };
         Ok(Self {
             path,
@@ -210,6 +220,7 @@ impl RaftGroupFileLogStore {
             file: Mutex::new(RaftGroupFileLogHandle::new(parent_needs_sync)),
             metrics,
             core_writer,
+            core_lease,
             _lock: lock,
         })
     }
@@ -236,6 +247,13 @@ impl RaftGroupFileLogStore {
     }
 
     pub(crate) fn lock_inner(&self) -> Result<MutexGuard<'_, RaftGroupLogStoreInner>, io::Error> {
+        if self
+            .core_lease
+            .as_ref()
+            .is_some_and(|lease| !lease.load(Ordering::Acquire))
+        {
+            return Err(io::Error::other("core WAL group owner was retired"));
+        }
         self.inner
             .lock()
             .map_err(|_| io::Error::other("raft group file log store mutex poisoned"))
@@ -256,7 +274,14 @@ impl RaftGroupFileLogStore {
                 .metrics
                 .as_ref()
                 .expect("core journal writer requires placement metrics");
-            core_writer.append(metrics.placement.raft_group_id.0, record.clone())?
+            core_writer.append(
+                metrics.placement.raft_group_id.0,
+                self.core_lease
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("missing core WAL lease"))?
+                    .clone(),
+                record.clone(),
+            )?
         } else {
             let mut file = self.lock_file()?;
             let (write_ns, sync_ns) = append_log_store_record(&self.path, &mut file, record)?;
@@ -360,6 +385,7 @@ impl CoreFileLogWriter {
         let writer = Arc::new(Self {
             tx: Some(tx),
             recovered: Mutex::new(recovered),
+            leases: Mutex::new(BTreeMap::new()),
             blocking: Arc::new(Semaphore::new(CORE_LOG_BLOCKING_MAX_CONCURRENCY)),
             _lock: lock,
             thread: Mutex::new(None),
@@ -396,24 +422,29 @@ impl CoreFileLogWriter {
             .map(|mut recovered| recovered.remove(&group_id).unwrap_or_default())
     }
 
-    fn blocking_semaphore(&self) -> Arc<Semaphore> {
+    pub(crate) fn blocking_semaphore(&self) -> Arc<Semaphore> {
         Arc::clone(&self.blocking)
     }
 
     pub(crate) fn append(
         &self,
         group_id: u32,
+        lease: Arc<AtomicBool>,
         record: RaftGroupLogRecord,
     ) -> Result<CoreFileLogWriteTiming, io::Error> {
+        if !lease.load(Ordering::Acquire) {
+            return Err(io::Error::other("core WAL group owner was retired"));
+        }
         let (response_tx, response_rx) = mpsc::channel();
         self.tx
             .as_ref()
             .ok_or_else(|| io::Error::other("core file log writer is shutting down"))?
-            .send(CoreFileLogWrite {
+            .send(CoreFileLogCommand::Append(CoreFileLogWrite {
                 group_id,
+                lease,
                 record,
                 response_tx,
-            })
+            }))
             .map_err(|_| io::Error::other("core file log writer closed"))?;
         let timing = response_rx
             .recv()
@@ -442,23 +473,60 @@ impl Drop for CoreFileLogWriter {
 }
 
 #[cfg_attr(madsim, allow(dead_code))]
-pub(crate) fn run_core_file_log_writer(
-    journal_path: PathBuf,
-    rx: mpsc::Receiver<CoreFileLogWrite>,
-) {
+fn run_core_file_log_writer(journal_path: PathBuf, rx: mpsc::Receiver<CoreFileLogCommand>) {
     let mut journal_handle = RaftGroupFileLogHandle::new(!journal_path.exists());
 
-    while let Ok(first) = rx.recv() {
+    let mut pending = None;
+    let mut failed: Option<String> = None;
+    loop {
+        let command = match pending.take().map(Ok).unwrap_or_else(|| rx.recv()) {
+            Ok(command) => command,
+            Err(_) => break,
+        };
+        if let Some(reason) = &failed {
+            command.reject(reason);
+            continue;
+        }
+        let first = match command {
+            CoreFileLogCommand::Append(request) => request,
+            command => {
+                if let Err(reason) =
+                    lifecycle::execute_control(command, &journal_path, &mut journal_handle)
+                {
+                    failed = Some(reason);
+                }
+                continue;
+            }
+        };
         let mut batch = vec![first];
         if let Ok(next) = rx.recv_timeout(CORE_LOG_GROUP_COMMIT_DELAY) {
-            batch.push(next);
-        }
-        while batch.len() < CORE_LOG_GROUP_COMMIT_MAX_BATCH {
-            match rx.try_recv() {
-                Ok(next) => batch.push(next),
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => break,
+            match next {
+                CoreFileLogCommand::Append(request) => batch.push(request),
+                command => pending = Some(command),
             }
+        }
+        while pending.is_none() && batch.len() < CORE_LOG_GROUP_COMMIT_MAX_BATCH {
+            match rx.try_recv() {
+                Ok(CoreFileLogCommand::Append(request)) => batch.push(request),
+                Ok(command) => {
+                    pending = Some(command);
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        batch.retain(|request| {
+            if request.lease.load(Ordering::Acquire) {
+                true
+            } else {
+                let _ = request
+                    .response_tx
+                    .send(Err("core WAL group owner was retired".to_owned()));
+                false
+            }
+        });
+        if batch.is_empty() {
+            continue;
         }
 
         let result = write_core_log_batch(&journal_path, &mut journal_handle, &batch);
@@ -494,6 +562,7 @@ pub(crate) fn run_core_file_log_writer(
             }
             Err(err) => {
                 let message = err.to_string();
+                failed = Some(message.clone());
                 for request in batch {
                     let _ = request.response_tx.send(Err(message.clone()));
                 }
@@ -830,6 +899,15 @@ fn compact_core_journal(
     journal_path: &Path,
     inners: &BTreeMap<u32, RaftGroupLogStoreInner>,
 ) -> Result<Option<(u64, u64)>, io::Error> {
+    rewrite_core_journal(journal_path, inners, false)
+}
+
+#[cfg(not(madsim))]
+fn rewrite_core_journal(
+    journal_path: &Path,
+    inners: &BTreeMap<u32, RaftGroupLogStoreInner>,
+    force: bool,
+) -> Result<Option<(u64, u64)>, io::Error> {
     if !journal_path.exists() {
         return Ok(None);
     }
@@ -873,7 +951,7 @@ fn compact_core_journal(
     drop(handle);
 
     let after = fs::metadata(&compact_path)?.len();
-    if after >= before {
+    if !force && after >= before {
         fs::remove_file(&compact_path)?;
         return Ok(None);
     }

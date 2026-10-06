@@ -17,6 +17,7 @@
 //! - [`membership`]: quorum-confirmed applied membership certificates for control adoption.
 //! - [`meta`]: meta-group OpenRaft type config and control-plane state machine.
 //! - [`meta_grpc`]: concrete meta consensus RPC service and network factory.
+//! - `log_store::file`: shared data journals, owner leases and per-group WAL reclamation.
 //! - `log_store::meta`: durable meta journal, snapshots, and recovery guards.
 //! - `log_store::receiver`: bound receiver fences and local replica assignments.
 //! - [`engine`]: [`RaftGroupEngine`] + `GroupEngine` impl, with the engine

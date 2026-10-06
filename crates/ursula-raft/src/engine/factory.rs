@@ -496,6 +496,24 @@ impl DurableRaftLogStoreFactory {
         )
         .map_err(|err| GroupEngineError::new(format!("open OpenRaft file log: {err}")))
     }
+
+    /// Remove only this stopped group's WAL records, serialized with other
+    /// groups' writes. The caller must durably revoke hosting and drain/stop
+    /// the engine first. This does not retire snapshots or certify membership.
+    /// Returns physical core-journal bytes before and after replacement.
+    pub async fn reclaim_stopped_group_wal(
+        &self,
+        placement: ShardPlacement,
+        metrics: GroupEngineMetrics,
+    ) -> Result<(u64, u64), GroupEngineError> {
+        let writer = self.core_writer(placement, metrics)?;
+        let blocking = writer.blocking_semaphore();
+        crate::log_store::spawn_log_store_blocking(Some(blocking), move || {
+            writer.reclaim_stopped_group(placement.raft_group_id.0)
+        })
+        .await
+        .map_err(|error| GroupEngineError::new(format!("reclaim stopped group WAL: {error}")))
+    }
 }
 
 #[derive(Debug, Clone)]
