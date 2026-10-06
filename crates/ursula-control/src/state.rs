@@ -311,6 +311,12 @@ impl ControlPlaneState {
             Ok(node) => node,
             Err(reason) => return reject(reason),
         };
+        if !node.cluster_url.starts_with("http://") {
+            return reject(
+                "managed cluster RPC requires HTTP origins; TLS transport is not configured"
+                    .to_owned(),
+            );
+        }
         for existing in self
             .nodes
             .values()

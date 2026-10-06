@@ -12,6 +12,7 @@ use ursula_control::ControlResponse;
 use ursula_control::GroupMigration;
 use ursula_control::MigrationOperationRequest;
 use ursula_control::MigrationPhase;
+use ursula_control::NodeRegistration;
 
 use crate::NodeInfo;
 
@@ -40,12 +41,12 @@ impl OperationClient {
         &self,
         nodes: &[NodeInfo],
         path: &str,
-        body: Option<&MigrationOperationRequest>,
+        body: Option<serde_json::Value>,
     ) -> Result<T> {
         let mut last = anyhow!("no reachable managed admin endpoint");
         for node in nodes {
             let url = node.admin_url.join(path)?;
-            let request = if let Some(body) = body {
+            let request = if let Some(body) = &body {
                 self.client.post(url).json(body)
             } else {
                 self.client.get(url)
@@ -87,12 +88,33 @@ impl OperationClient {
         request: &MigrationOperationRequest,
     ) -> Result<u64> {
         match self
-            .request(nodes, "/__ursula/control/operations", Some(request))
+            .request(
+                nodes,
+                "/__ursula/control/operations",
+                Some(serde_json::to_value(request)?),
+            )
             .await?
         {
             ControlResponse::MigrationStarted { migration_id } => Ok(migration_id),
             ControlResponse::Rejected { reason } => bail!("{reason}"),
             _ => bail!("unexpected operation submission response"),
+        }
+    }
+
+    /// Register immutable origins/labels before provisioning the new process.
+    /// Repeating the same node identity preserves its existing serving state.
+    pub async fn register_node(&self, nodes: &[NodeInfo], node: &NodeRegistration) -> Result<()> {
+        match self
+            .request(
+                nodes,
+                "/__ursula/control/nodes",
+                Some(serde_json::to_value(node)?),
+            )
+            .await?
+        {
+            ControlResponse::Ok => Ok(()),
+            ControlResponse::Rejected { reason } => bail!("{reason}"),
+            _ => bail!("unexpected node registration response"),
         }
     }
 

@@ -247,6 +247,12 @@ fn managed_registration_requires_trusted_origins_and_preserves_node_identity() {
         node: collision,
         now_ms: 2,
     });
+    let mut unsupported = node(7);
+    unsupported.cluster_url = "https://node7:4439".to_owned();
+    reject_without_changes(&mut state, ControlCommand::RegisterManagedNode {
+        node: unsupported,
+        now_ms: 2,
+    });
 }
 
 #[test]

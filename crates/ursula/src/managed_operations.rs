@@ -30,6 +30,7 @@ use ursula_control::MembershipStep;
 use ursula_control::MigrationRequest;
 use ursula_control::MigrationToken;
 use ursula_control::MigrationUpdate;
+use ursula_control::NodeRegistration;
 use ursula_control::ReceiverFencePhase;
 use ursula_control::ReceiverLedger;
 use ursula_control::ReceiverMutationKind;
@@ -59,6 +60,14 @@ pub(crate) fn router(state: HttpState) -> Router {
         .route("/__ursula/control/operations", get(list).post(submit))
         .route("/__ursula/control/operations/{migration_id}", get(status))
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024))
+        .merge(
+            Router::new()
+                .route(
+                    "/__ursula/control/nodes",
+                    axum::routing::post(register_node),
+                )
+                .layer(axum::extract::DefaultBodyLimit::max(128 * 1024)),
+        )
         .with_state(state)
 }
 
@@ -109,14 +118,46 @@ async fn submit(State(state): State<HttpState>, Json(request): Json<OperationReq
     };
     // Losing the HTTP response cannot cancel the durable submit. The request
     // key remains discoverable via the fresh operation list after reconnection.
-    match crate::http_task::spawn(async move { control.submit(request).await }).await {
-        Ok(Ok(response)) => (StatusCode::ACCEPTED, Json(response)).into_response(),
-        Ok(Err(OperationError::Conflict(error))) => (StatusCode::CONFLICT, error).into_response(),
-        Ok(Err(OperationError::Unavailable(error))) => {
+    let result = crate::http_task::spawn(async move { control.submit(request).await })
+        .await
+        .unwrap_or_else(|error| Err(OperationError::Unavailable(error.to_string())));
+    render_result(result, StatusCode::ACCEPTED)
+}
+
+fn render_result(result: Result<ControlResponse, OperationError>, status: StatusCode) -> Response {
+    match result {
+        Ok(response) => (status, Json(response)).into_response(),
+        Err(OperationError::Conflict(error)) => (StatusCode::CONFLICT, error).into_response(),
+        Err(OperationError::Unavailable(error)) => {
             (StatusCode::SERVICE_UNAVAILABLE, error).into_response()
         }
-        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
     }
+}
+
+async fn register_node(
+    State(state): State<HttpState>,
+    Json(node): Json<NodeRegistration>,
+) -> Response {
+    let control = match coordinator(state) {
+        Ok(control) => control,
+        Err(error) => return (StatusCode::CONFLICT, error).into_response(),
+    };
+    let result = crate::http_task::spawn(async move {
+        match control
+            .send(ControlCommand::RegisterManagedNode {
+                node,
+                now_ms: control.state.unix_time_ms(),
+            })
+            .await
+            .map_err(OperationError::Unavailable)?
+        {
+            ControlResponse::Rejected { reason } => Err(OperationError::Conflict(reason)),
+            response => Ok(response),
+        }
+    })
+    .await
+    .unwrap_or_else(|error| Err(OperationError::Unavailable(error.to_string())));
+    render_result(result, StatusCode::OK)
 }
 
 pub(crate) struct Coordinator {

@@ -287,13 +287,25 @@ impl Cluster {
     }
 
     async fn submit(&self, key: &str, epoch: u64, voters: &str, rf: Option<&str>) -> u64 {
+        self.submit_group(0, key, epoch, voters, rf).await
+    }
+
+    async fn submit_group(
+        &self,
+        group: u32,
+        key: &str,
+        epoch: u64,
+        voters: &str,
+        rf: Option<&str>,
+    ) -> u64 {
         let epoch = epoch.to_string();
+        let group = group.to_string();
         let mut arguments = vec![
             "submit",
             "--operation-key",
             key,
             "--group",
-            "0",
+            &group,
             "--expected-epoch",
             &epoch,
             "--voters",
@@ -303,6 +315,67 @@ impl Cluster {
             arguments.extend(["--rf", rf]);
         }
         self.cli(&arguments).await["migration_id"].as_u64().unwrap()
+    }
+
+    async fn register(&self, node: &NodeRegistration) -> std::process::Output {
+        let path = self.root.path().join("registration.json");
+        std::fs::write(&path, serde_json::to_vec(node).unwrap()).unwrap();
+        self.cli_output(&["register-node", "--registration", path.to_str().unwrap()])
+            .await
+    }
+
+    fn provision(&mut self, node: NodeRegistration) {
+        let id = node.node_id;
+        assert!(!self.nodes.contains_key(&id));
+        let mut config = self.configs[&6].clone();
+        config.raft.node_id = id;
+        config.raft.wal.path = Some(self.root.path().join(format!("data-{id}")));
+        config.server.listen = node.client_url.trim_start_matches("http://").to_owned();
+        config.server.cluster_listen =
+            Some(node.cluster_url.trim_start_matches("http://").to_owned());
+        config.server.admin_listen = node.admin_url.trim_start_matches("http://").to_owned();
+        config.raft.peers.push(ursula_config::RaftPeerConfig {
+            node_id: id,
+            url: node.cluster_url.clone(),
+        });
+        let control = config.control.as_mut().unwrap();
+        control.node = node.clone();
+        control.meta_journal_path = self.root.path().join(format!("meta-{id}/meta.wal"));
+        // Neither the original recipe nor old nodes' startup files are extended.
+        assert!(
+            !control
+                .bootstrap_nodes
+                .iter()
+                .any(|node| node.node_id == id)
+        );
+        config.validate().unwrap();
+        self.configs.insert(id, config);
+        self.nodes.insert(id, node);
+    }
+
+    async fn configuration(&self, group: u32, voters: BTreeSet<u64>) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            for id in &voters {
+                if let Ok(actual) = ursula_raft::confirm_group_configuration(
+                    RaftGroupId(group),
+                    *id,
+                    &self.nodes[id].cluster_url,
+                    Duration::from_secs(2),
+                )
+                .await
+                {
+                    assert_eq!(actual.voter_sets, vec![voters.clone()]);
+                    assert!(actual.learners.is_empty());
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no actual uniform group configuration"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     async fn wait(&self, id: u64) {
@@ -363,6 +436,117 @@ impl Cluster {
             }
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn binaries_join_outside_bootstrap_directory_and_restore_rf3_rf5() {
+    let mut cluster = Cluster::new().await;
+    let map = StaticShardMap::new(1, 2).unwrap();
+    let names = [0, 1].map(|group| {
+        (0..100)
+            .map(|n| format!("join-group-{group}-{n}"))
+            .find(|name| {
+                map.locate(&BucketStreamId::new("benchcmp", name.clone()))
+                    .raft_group_id
+                    == RaftGroupId(group)
+            })
+            .unwrap()
+    });
+    for name in &names {
+        cluster.write(name, "acknowledged-before-node-join").await;
+    }
+    let node = NodeRegistration {
+        node_id: 7,
+        client_url: format!("http://127.0.0.1:{}", port()),
+        cluster_url: format!("http://127.0.0.1:{}", port()),
+        admin_url: format!("http://127.0.0.1:{}", port()),
+        labels: BTreeMap::from([("zone".to_owned(), "2".to_owned())]),
+    };
+    let registered = cluster.register(&node).await;
+    assert!(
+        registered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered.stderr)
+    );
+    let mut replay = node.clone();
+    replay.admin_url.push('/');
+    assert!(cluster.register(&replay).await.status.success());
+    let mut conflict = node.clone();
+    conflict
+        .labels
+        .insert("zone".to_owned(), "other".to_owned());
+    assert!(!cluster.register(&conflict).await.status.success());
+    let view = cluster.view().await;
+    assert_eq!(view.state.nodes[&7].labels, node.labels);
+    assert_eq!(
+        view.state.config.initial_meta_voters,
+        BTreeSet::from([1, 2, 3])
+    );
+    assert!(
+        !view
+            .state
+            .cluster_bootstrap
+            .as_ref()
+            .unwrap()
+            .recipe
+            .nodes
+            .contains_key(&7)
+    );
+    assert!(
+        view.state
+            .placements
+            .values()
+            .all(|placement| !placement.voters.contains(&7))
+    );
+    cluster.provision(node);
+    cluster.start(7, "outside-directory-join");
+    cluster.ready().await;
+    for (group, voters) in [(0, "1,2,7"), (1, "1,2,4,5,7")] {
+        let id = cluster
+            .submit_group(
+                group,
+                &format!("outside-directory-{group}"),
+                0,
+                voters,
+                None,
+            )
+            .await;
+        cluster.wait(id).await;
+        cluster
+            .configuration(
+                group,
+                voters.split(',').map(|id| id.parse().unwrap()).collect(),
+            )
+            .await;
+        cluster.ready().await;
+        for name in &names {
+            cluster
+                .payloads(name, "acknowledged-before-node-join")
+                .await;
+        }
+    }
+    let before = cluster.view().await;
+    cluster.processes.clear();
+    for id in 1..=7 {
+        cluster.start(id, "joined-cluster-restart");
+    }
+    cluster.ready().await;
+    assert_eq!(cluster.view().await.state, before.state);
+    cluster.configuration(0, BTreeSet::from([1, 2, 7])).await;
+    cluster
+        .configuration(1, BTreeSet::from([1, 2, 4, 5, 7]))
+        .await;
+    for name in &names {
+        cluster
+            .payloads(name, "acknowledged-before-node-join")
+            .await;
+    }
+    cluster
+        .write("after-new-node-restart", "acknowledged-after-node-join")
+        .await;
+    cluster
+        .payloads("after-new-node-restart", "acknowledged-after-node-join")
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -433,6 +433,25 @@ fn runtime_config(
     runtime.raft.init_membership_per_group = false;
     if projection.state.cluster_bootstrap.is_some() {
         projection.validate().map_err(invalid)?;
+        let node = projection
+            .state
+            .nodes
+            .get(&config.raft.node_id)
+            .ok_or_else(|| invalid("managed node must be registered before startup"))?;
+        if let Some(control) = &config.control {
+            let local = control.local_identity(config).map_err(invalid)?;
+            if local.node.node_id != config.raft.node_id
+                || local.cluster != projection.identity
+                || local.node.client_url != node.client_url
+                || local.node.cluster_url != node.cluster_url
+                || Some(&local.node.admin_url) != node.admin_url.as_ref()
+                || local.node.labels != node.labels
+            {
+                return Err(invalid(
+                    "local node identity differs from its immutable managed registration",
+                ));
+            }
+        }
         if projection
             .state
             .nodes
@@ -642,6 +661,104 @@ mod tests {
             "assignment restoration must never invent a data membership"
         );
         registry.quiesce_for_restart().await.unwrap();
+    }
+
+    #[test]
+    fn joining_runtime_requires_registered_immutable_identity() {
+        let recipe = bootstrap_recipe();
+        let mut state = ControlPlaneState::default();
+        assert_eq!(
+            state.apply(ControlCommand::BootstrapCluster {
+                bootstrap: recipe.clone(),
+                memberships: BTreeMap::from([(RaftGroupId(0), VerifiedGroupMembership {
+                    voters: [1, 2, 3].into(),
+                    learners: Default::default(),
+                    log_id: MembershipLogId {
+                        term: 1,
+                        node_id: 1,
+                        index: 1
+                    },
+                })]),
+                now_ms: 1,
+            }),
+            ControlResponse::Ok
+        );
+        let node = ursula_control::NodeRegistration {
+            node_id: 6,
+            client_url: "http://node6:4437".to_owned(),
+            cluster_url: "http://node6:4440".to_owned(),
+            admin_url: "http://node6:4438".to_owned(),
+            labels: BTreeMap::from([("zone".to_owned(), "2".to_owned())]),
+        };
+        let mut config = UrsulaConfig::default();
+        config.runtime.core_count = 1;
+        config.raft.node_id = 6;
+        config.raft.group_count = 1;
+        config.control = Some(ursula_config::ControlConfig {
+            cluster_id: recipe.identity.cluster_id.clone(),
+            meta_journal_path: "unused-meta".into(),
+            bootstrap_node_id: 1,
+            initialize_meta_membership: false,
+            initial_meta_voters: vec![1, 2, 3],
+            node: node.clone(),
+            bootstrap_nodes: recipe.nodes.values().cloned().collect(),
+            placement: Default::default(),
+            meta_snapshot_logs_since_last: 1,
+            bootstrap_timeout: ursula_config::HumanDuration::sec(60),
+            refresh_interval: ursula_config::HumanDuration::milli(100),
+        });
+        let mut view = ControlProjection {
+            identity: recipe.identity.clone(),
+            applied_log_id: MembershipLogId {
+                term: 1,
+                node_id: 1,
+                index: 2,
+            },
+            state,
+        };
+        assert!(runtime_config(&config, &view).is_err());
+        assert_eq!(
+            view.state.apply(ControlCommand::RegisterManagedNode {
+                node: node.clone(),
+                now_ms: 2
+            }),
+            ControlResponse::Ok
+        );
+        let restored = runtime_config(&config, &view).unwrap();
+        assert!(!restored.raft.init_membership);
+        assert!(!restored.raft.init_membership_per_group);
+        assert!(
+            restored
+                .raft
+                .groups
+                .iter()
+                .all(|group| !group.voters.contains(&6))
+        );
+        assert!(
+            restored
+                .raft
+                .peers
+                .iter()
+                .any(|peer| peer.node_id == 6 && peer.url == node.cluster_url)
+        );
+        for field in 0..6 {
+            let mut mismatched = config.clone();
+            let control = mismatched.control.as_mut().unwrap();
+            match field {
+                0 => control.node.node_id = 7,
+                1 => control.node.client_url = "http://other:4437".to_owned(),
+                2 => control.node.cluster_url = "http://other:4440".to_owned(),
+                3 => control.node.admin_url = "http://other:4438".to_owned(),
+                4 => {
+                    control
+                        .node
+                        .labels
+                        .insert("zone".to_owned(), "other".to_owned());
+                }
+                _ => control.cluster_id = "other-cluster".to_owned().try_into().unwrap(),
+            }
+            assert!(runtime_config(&mismatched, &view).is_err());
+        }
     }
 
     #[tokio::test]

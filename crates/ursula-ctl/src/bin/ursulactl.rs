@@ -106,6 +106,8 @@ struct OperationArgs {
 
 #[derive(Subcommand, Debug)]
 enum OperationCommand {
+    /// Register immutable node origins/labels before starting its process.
+    RegisterNode(NodeRegisterArgs),
     /// Submit an immutable intent; reuse the same key and arguments on retry.
     Submit(OperationSubmitArgs),
     /// Print fresh control state, or one operation when --operation is set.
@@ -113,6 +115,15 @@ enum OperationCommand {
     /// Wait for an existing ID. Resume restarts observation of server-owned work.
     #[command(alias = "resume")]
     Wait(OperationWaitArgs),
+}
+
+#[derive(Args, Debug)]
+struct NodeRegisterArgs {
+    #[command(flatten)]
+    observe: ObserveArgs,
+    /// JSON NodeRegistration containing node_id, client/cluster/admin URLs and labels.
+    #[arg(long)]
+    registration: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -807,6 +818,19 @@ async fn run_operation(args: OperationArgs) -> Result<()> {
     use ursula_ctl::operations::OperationClient;
 
     match args.command {
+        OperationCommand::RegisterNode(args) => {
+            let nodes = load_nodes(&args.observe.config).await?;
+            let client = OperationClient::new(Duration::from_secs(args.observe.http_timeout_secs))?;
+            let node: ursula_control::NodeRegistration =
+                serde_json::from_slice(&std::fs::read(&args.registration).with_context(|| {
+                    format!("read registration {}", args.registration.display())
+                })?)?;
+            client.register_node(&nodes, &node).await?;
+            println!(
+                "{}",
+                serde_json::json!({"node_id": node.node_id, "registered": true})
+            );
+        }
         OperationCommand::Submit(args) => {
             let nodes = load_nodes(&args.observe.config).await?;
             let client = OperationClient::new(Duration::from_secs(args.observe.http_timeout_secs))?;
