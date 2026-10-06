@@ -65,11 +65,17 @@ printf '{"process_incarnation":"%s","maintenance_fence":%s}\n' "${STARTUP_RETURN
     )
     .unwrap();
     std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let port = free_port();
+    let ports = [free_port(), free_port(), free_port()];
+    let port = ports[0];
     let url = format!("http://127.0.0.1:{port}");
+    let peers: Vec<_> = ports
+        .iter()
+        .enumerate()
+        .map(|(index, port)| (index as u64 + 1, format!("http://127.0.0.1:{port}")))
+        .collect();
     let config = directory.path().join("cluster.toml");
     let logs = directory.path().join("raft-log");
-    let admin_port = write_single_node_cluster_config(&config, port, 1, 1, &url, true, &logs);
+    let admin_port = write_cluster_config(&config, port, 1, 1, &peers, true, &logs);
     let admin_url = format!("http://127.0.0.1:{admin_port}");
     let captured = directory.path().join("boot");
     let fence = |generation| {
@@ -140,9 +146,29 @@ printf '{"process_incarnation":"%s","maintenance_fence":%s}\n' "${STARTUP_RETURN
         assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
         assert!(std::net::TcpStream::connect(("127.0.0.1", admin_port)).is_err());
     }
+    let mut survivors = Vec::new();
+    for (index, (node_id, _)) in peers.iter().enumerate().skip(1) {
+        let survivor_config = directory.path().join(format!("node-{node_id}.toml"));
+        write_cluster_config(
+            &survivor_config,
+            ports[index],
+            *node_id,
+            1,
+            &peers,
+            false,
+            &directory.path().join(format!("node-{node_id}-log")),
+        );
+        survivors.push(spawn_node_with_cluster_config(
+            server.to_str().unwrap(),
+            &survivor_config,
+        ));
+    }
     let mut accepted = start(false, &retired, "");
     let client = reqwest::Client::new();
     wait_until_ready(&client, &url, std::slice::from_mut(&mut accepted)).await;
+    for (_, survivor_url) in peers.iter().skip(1) {
+        wait_until_ready(&client, survivor_url, &mut survivors).await;
+    }
     let metrics: serde_json::Value = client
         .get(format!("{url}/__ursula/metrics"))
         .send()

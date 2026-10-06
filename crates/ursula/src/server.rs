@@ -83,6 +83,7 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut startup_admission = None;
     match std::env::var("URSULA_STARTUP_RESERVATION") {
         Ok(value) if value == "true" => {
+            validate_startup_topology(&config)?;
             let helper = std::env::current_exe()?.with_file_name("ursulactl");
             let mut helper_command = tokio::process::Command::new(helper);
             helper_command
@@ -287,6 +288,30 @@ fn parse_start_maintenance_drained(value: Option<&OsStr>) -> Result<bool, std::i
     }
 }
 
+fn validate_startup_topology(config: &ursula_config::UrsulaConfig) -> Result<(), std::io::Error> {
+    let voters = BTreeSet::from([1, 2, 3]);
+    if config.raft.peers.len() != 3
+        || config
+            .raft
+            .peers
+            .iter()
+            .map(|peer| peer.node_id)
+            .collect::<BTreeSet<_>>()
+            != voters
+        || !voters.contains(&config.raft.node_id)
+        || config.raft.groups.iter().any(|group| {
+            group.voters.iter().copied().collect::<BTreeSet<_>>() != voters
+                || group.voters.len() != 3
+        })
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "startup ownership requires the fixed three-voter topology on every group",
+        ));
+    }
+    Ok(())
+}
+
 fn static_grpc_node_hosts_group(
     node_id: u64,
     raft_group_id: u32,
@@ -465,6 +490,42 @@ mod tests {
         assert!(parse_start_maintenance_drained(Some(OsStr::new("true"))).unwrap());
         assert!(!parse_start_maintenance_drained(Some(OsStr::new("false"))).unwrap());
         assert!(parse_start_maintenance_drained(Some(OsStr::new("1"))).is_err());
+    }
+
+    #[test]
+    fn startup_ownership_refuses_topologies_outside_the_catalogued_cell() {
+        use ursula_config::RaftGroupConfig;
+        use ursula_config::RaftPeerConfig;
+        use ursula_config::UrsulaConfig;
+
+        let mut config = UrsulaConfig::default();
+        config.raft.node_id = 1;
+        config.raft.group_count = 1;
+        assert!(super::validate_startup_topology(&config).is_err());
+        config.raft.peers = (1..=3)
+            .map(|node_id| RaftPeerConfig {
+                node_id,
+                url: format!("http://node-{node_id}:50051"),
+            })
+            .collect();
+        assert!(super::validate_startup_topology(&config).is_ok());
+        config.raft.groups = vec![RaftGroupConfig {
+            raft_group_id: 0,
+            voters: vec![1, 2, 3],
+        }];
+        assert!(super::validate_startup_topology(&config).is_ok());
+        for voters in [vec![1], vec![1, 2], vec![1, 2, 4], vec![1, 2, 2, 3]] {
+            config.raft.groups[0].voters = voters;
+            assert!(super::validate_startup_topology(&config).is_err());
+        }
+        config.raft.groups.clear();
+        config.raft.node_id = 4;
+        assert!(super::validate_startup_topology(&config).is_err());
+        config.raft.node_id = 1;
+        config.raft.peers[2].node_id = 2;
+        assert!(super::validate_startup_topology(&config).is_err());
+        config.raft.peers.truncate(1);
+        assert!(super::validate_startup_topology(&config).is_err());
     }
 
     #[tokio::test]
