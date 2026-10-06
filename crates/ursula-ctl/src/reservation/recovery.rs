@@ -33,6 +33,11 @@ use super::validate_processes;
 use crate::NodeInfo;
 use crate::quorum::SurvivingQuorumVerification;
 
+mod restage;
+
+pub use restage::ReplacementRetirement;
+pub use restage::RetiredHostReplacement;
+
 const MAX_POD_RETIREMENTS: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,9 +105,13 @@ pub struct HostTerminationObservation {
 
 impl HostTerminationObservation {
     fn validate(&self, source: &HostVoter, admission: &SurvivingPrefixObservation) -> Result<()> {
+        self.validate_since(source, admission.completed_ms)
+    }
+
+    fn validate_since(&self, source: &HostVoter, admission_completed_ms: u64) -> Result<()> {
         if self.provider_instance != source.source.provider_instance
             || self.terminal_state != "terminated"
-            || self.started_ms < admission.completed_ms
+            || self.started_ms < admission_completed_ms
             || self.completed_ms < self.started_ms
         {
             bail!("no irreversible terminal observation of the exact admitted provider instance");
@@ -121,6 +130,12 @@ pub struct HostRecovery {
     /// Persist before any force delete; none may subsequently bind as replacement.
     pub pod_retirement_intents: BTreeSet<String>,
     pub replacement_host: Option<HostVoter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_retirement: Option<ReplacementRetirement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_replacements: Vec<RetiredHostReplacement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_replacement_prefix: Option<SurvivingPrefixObservation>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -154,6 +169,23 @@ pub enum HostRequest {
         pod: Value,
         node: Value,
         process_plan: Vec<NodeInfo>,
+    },
+    AdmitReplacementTermination {
+        fence: MaintenanceFence,
+        candidate: SourceIdentity,
+        now_ms: u64,
+        observation: SurvivingPrefixObservation,
+    },
+    RecordReplacementTermination {
+        fence: MaintenanceFence,
+        candidate: SourceIdentity,
+        now_ms: u64,
+        observation: HostTerminationObservation,
+    },
+    RestageHostReplacement {
+        fence: MaintenanceFence,
+        candidate: SourceIdentity,
+        now_ms: u64,
     },
     CompleteHostReplacement {
         fence: MaintenanceFence,
@@ -211,6 +243,21 @@ impl<'de> Deserialize<'de> for HostRequest {
             now_ms: u64,
             observation: PrefixObservation,
         }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Restage {
+            fence: MaintenanceFence,
+            candidate: SourceIdentity,
+            now_ms: u64,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CandidateObservation<T> {
+            fence: MaintenanceFence,
+            candidate: SourceIdentity,
+            now_ms: u64,
+            observation: T,
+        }
         let mut value = Value::deserialize(deserializer)?;
         let action = value
             .as_object_mut()
@@ -260,6 +307,34 @@ impl<'de> Deserialize<'de> for HostRequest {
                     pod: fields.pod,
                     node: fields.node,
                     process_plan: fields.process_plan,
+                })
+            }
+            "admit_replacement_termination" => {
+                let fields: CandidateObservation<SurvivingPrefixObservation> =
+                    serde_json::from_value(value).map_err(parse_error)?;
+                Ok(Self::AdmitReplacementTermination {
+                    fence: fields.fence,
+                    candidate: fields.candidate,
+                    now_ms: fields.now_ms,
+                    observation: fields.observation,
+                })
+            }
+            "record_replacement_termination" => {
+                let fields: CandidateObservation<HostTerminationObservation> =
+                    serde_json::from_value(value).map_err(parse_error)?;
+                Ok(Self::RecordReplacementTermination {
+                    fence: fields.fence,
+                    candidate: fields.candidate,
+                    now_ms: fields.now_ms,
+                    observation: fields.observation,
+                })
+            }
+            "restage_host_replacement" => {
+                let fields: Restage = serde_json::from_value(value).map_err(parse_error)?;
+                Ok(Self::RestageHostReplacement {
+                    fence: fields.fence,
+                    candidate: fields.candidate,
+                    now_ms: fields.now_ms,
                 })
             }
             "complete_host_replacement" => {
@@ -312,6 +387,7 @@ fn original_host_plan(
 impl HostRecovery {
     fn validate_common(&self, cell: &CellIdentity, fence: &MaintenanceFence) -> Result<()> {
         self.source_host.validate(cell)?;
+        self.validate_restage_history(cell, fence)?;
         if self.pod_retirement_intents.len() > MAX_POD_RETIREMENTS {
             bail!("fenced Pod retirement history exceeds its bound");
         }
@@ -334,6 +410,7 @@ impl HostRecovery {
         }
         if let Some(replacement) = &self.replacement_host {
             replacement.validate(cell)?;
+            self.check_retired_host_reuse(replacement)?;
             if self.termination.is_none()
                 || !self
                     .pod_retirement_intents
@@ -391,6 +468,7 @@ impl HostRecovery {
                 no_regression(&receipt.observation, &admission.prefix())?;
             }
         }
+        self.validate_restage_operation(state, operation)?;
         if let Some(replacement) = &self.replacement_host {
             for host in &hosts.voters {
                 if host.source.node_id != operation.source.node_id
@@ -422,6 +500,7 @@ impl HostRecovery {
         if self.source_host.source != receipt.source || replacement.source != receipt.replacement {
             bail!("host receipt changed its source or replacement");
         }
+        self.validate_restage_completion(receipt)?;
         let admitted = admission.prefix();
         no_regression(&admitted, &receipt.observation)?;
         if receipt.observation.started_ms
@@ -448,7 +527,13 @@ impl HostRecovery {
     }
 
     pub fn stage(&self) -> &'static str {
-        if self.replacement_host.is_some() {
+        if let Some(retirement) = &self.replacement_retirement {
+            if retirement.termination.is_some() {
+                "host-replacement-terminated"
+            } else {
+                "host-replacement-termination-admitted"
+            }
+        } else if self.replacement_host.is_some() {
             "host-replacement-bound"
         } else if self.termination.is_some() {
             "host-terminated"
@@ -481,7 +566,7 @@ impl Reservation {
             let source_host = hosts.voter(node_id)?.clone();
             original_host_plan(hosts, &source_host.source, &process_plan, now_ms)?;
             let mut next = self.clone();
-            next.version = 3;
+            next.version = self.version.max(3);
             next.generation = self
                 .generation
                 .checked_add(1)
@@ -504,6 +589,9 @@ impl Reservation {
                     termination: None,
                     pod_retirement_intents: BTreeSet::new(),
                     replacement_host: None,
+                    replacement_retirement: None,
+                    retired_replacements: Vec::new(),
+                    retained_replacement_prefix: None,
                 }),
             });
             next.validate()?;
@@ -523,7 +611,10 @@ impl Reservation {
             | HostRequest::RecordHostTermination { fence, .. }
             | HostRequest::AdmitFencedPodRetirement { fence, .. }
             | HostRequest::BindHostReplacement { fence, .. }
-            | HostRequest::CompleteHostReplacement { fence, .. } => fence,
+            | HostRequest::CompleteHostReplacement { fence, .. }
+            | HostRequest::AdmitReplacementTermination { fence, .. }
+            | HostRequest::RecordReplacementTermination { fence, .. }
+            | HostRequest::RestageHostReplacement { fence, .. } => fence,
             HostRequest::ReserveHostRecovery { .. } => bail!("unexpected ownership request"),
         };
         if fence != &operation.fence {
@@ -602,35 +693,34 @@ impl Reservation {
                 let uid = if let Some(pod) = pod {
                     let metadata =
                         selected_pod_metadata(&self.cell, operation.source.node_id, &pod, true)?;
-                    if pod.pointer("/spec/nodeName").and_then(Value::as_str)
-                        != Some(host.source_host.node_name.as_str())
-                    {
-                        bail!("Pod is not on the fenced source host");
-                    }
                     let uid = metadata
                         .get("uid")
                         .and_then(Value::as_str)
                         .context("missing fenced Pod UID")?
                         .to_owned();
-                    {
-                        // A same-name Node can be recreated, even while the old
-                        // Pod UID remains. UID alone never proves physical ownership.
-                        let node = node.as_ref().context(
-                            "observed Pod retirement requires the original full Node observation",
-                        )?;
-                        let captured = SourceIdentity::capture_metadata(
-                            &self.cell,
-                            operation.source.node_id,
-                            &pod,
-                            node,
-                            &operation.process_plan,
-                            true,
-                        )?;
-                        if captured.node_uid != operation.source.node_uid
-                            || captured.provider_instance != operation.source.provider_instance
-                        {
-                            bail!("Pod is not owned by the irreversibly fenced instance");
-                        }
+                    let node = node
+                        .as_ref()
+                        .context("observed Pod retirement requires the full Node observation")?;
+                    let captured = SourceIdentity::capture_metadata(
+                        &self.cell,
+                        operation.source.node_id,
+                        &pod,
+                        node,
+                        &operation.process_plan,
+                        true,
+                    )?;
+                    let physical = std::iter::once(&host.source_host).chain(
+                        host.retired_replacements
+                            .iter()
+                            .map(|retired| &retired.host),
+                    );
+                    if !physical.into_iter().any(|fenced| {
+                        captured.node_uid == fenced.source.node_uid
+                            && captured.provider_instance == fenced.source.provider_instance
+                            && pod.pointer("/spec/nodeName").and_then(Value::as_str)
+                                == Some(fenced.node_name.as_str())
+                    }) {
+                        bail!("Pod is not owned by an irreversibly fenced instance");
                     }
                     uid
                 } else {
@@ -668,6 +758,46 @@ impl Reservation {
                 let replacement = HostVoter::capture(&self.cell, source.clone(), &node)?;
                 host.replacement_host = Some(replacement);
                 bind_replacement(operation, source, process_plan)?;
+            }
+            HostRequest::AdmitReplacementTermination {
+                candidate,
+                now_ms,
+                observation,
+                ..
+            } => {
+                host.require_candidate(&candidate)?;
+                host.admit_replacement_termination(
+                    &self.cell,
+                    &operation.fence,
+                    &operation.process_plan,
+                    operation.acquired_ms,
+                    now_ms,
+                    observation,
+                )?;
+                next.version = 4;
+            }
+            HostRequest::RecordReplacementTermination {
+                candidate,
+                now_ms,
+                observation,
+                ..
+            } => {
+                host.require_candidate(&candidate)?;
+                host.record_replacement_termination(operation.acquired_ms, now_ms, observation)?;
+            }
+            HostRequest::RestageHostReplacement {
+                candidate, now_ms, ..
+            } => {
+                host.require_candidate(&candidate)?;
+                host.restage_replacement(now_ms)?;
+                operation.replacement = None;
+                operation
+                    .process_plan
+                    .iter_mut()
+                    .find(|node| node.id == operation.source.node_id)
+                    .context("missing selected target")?
+                    .expected_process_incarnation =
+                    Some(operation.source.process_incarnation.clone());
             }
             HostRequest::CompleteHostReplacement {
                 now_ms,

@@ -34,6 +34,8 @@ pub use hosts::PublishHostInventory;
 pub use recovery::HostRecovery;
 pub use recovery::HostRequest;
 pub use recovery::HostTerminationObservation;
+pub use recovery::ReplacementRetirement;
+pub use recovery::RetiredHostReplacement;
 pub use recovery::SurvivingPrefixObservation;
 pub use store::CasProposal;
 pub use store::ConfigMapSnapshot;
@@ -241,7 +243,10 @@ impl<'de> Deserialize<'de> for ReservationRequest {
                 | "record_host_termination"
                 | "admit_fenced_pod_retirement"
                 | "bind_host_replacement"
-                | "complete_host_replacement",
+                | "complete_host_replacement"
+                | "admit_replacement_termination"
+                | "record_replacement_termination"
+                | "restage_host_replacement",
             ) => serde_json::from_value(value)
                 .map(Self::Host)
                 .map_err(parse_error),
@@ -324,7 +329,7 @@ impl Reservation {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !matches!(self.version, 1..=3)
+        if !matches!(self.version, 1..=4)
             || self.cell.group_count == 0
             || self.cell.core_count == 0
             || self.cell.voter_ids != BTreeSet::from([1, 2, 3])
@@ -387,10 +392,13 @@ impl Reservation {
                 bail!("completion process or generation does not match its replacement");
             }
             if let Some(host) = &receipt.host {
-                if self.version != 3 {
-                    bail!("host completion requires schema 3");
+                if self.version < 3 || (host.uses_restage_schema() && self.version != 4) {
+                    bail!("host completion requires schema 3, restaging requires schema 4");
                 }
                 host.validate_completion(&self.cell, receipt)?;
+                host.validate_retired_host_placement(
+                    self.hosts.as_ref().context("no host inventory")?,
+                )?;
             }
         }
         if let Some(operation) = &self.operation {
@@ -434,8 +442,8 @@ impl Reservation {
                 original.expected_process_incarnation =
                     Some(operation.source.process_incarnation.clone());
                 if let Some(host) = &operation.host {
-                    if self.version != 3 {
-                        bail!("host recovery requires schema 3");
+                    if self.version < 3 || (host.uses_restage_schema() && self.version != 4) {
+                        bail!("host recovery requires schema 3, restaging requires schema 4");
                     }
                     host.validate_operation(self, operation)?;
                 } else {

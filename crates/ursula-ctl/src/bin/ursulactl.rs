@@ -219,6 +219,14 @@ enum ReservationRequestAction {
     },
     AdmitHostTermination(ReservationObservationArgs),
     RecordHostTermination(ReservationObservationArgs),
+    AdmitReplacementTermination(ReplacementObservationArgs),
+    RecordReplacementTermination(ReplacementObservationArgs),
+    RestageHostReplacement {
+        #[arg(long)]
+        fence: PathBuf,
+        #[arg(long)]
+        candidate: PathBuf,
+    },
     CompleteHostReplacement(ReservationObservationArgs),
     AdmitFencedPodRetirement {
         #[arg(long)]
@@ -276,6 +284,14 @@ enum ReservationRequestAction {
         #[arg(long)]
         config: PathBuf,
     },
+}
+
+#[derive(Args, Debug)]
+struct ReplacementObservationArgs {
+    #[command(flatten)]
+    observation: ReservationObservationArgs,
+    #[arg(long)]
+    candidate: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -895,6 +911,29 @@ async fn run_reservation_request(args: ReservationRequestArgs) -> Result<()> {
                 fence: read_reservation_json(&args.fence)?,
                 now_ms,
                 observation: read_reservation_json(&args.observation)?,
+            })
+        }
+        ReservationRequestAction::AdmitReplacementTermination(args) => {
+            ReservationRequest::Host(HostRequest::AdmitReplacementTermination {
+                fence: read_reservation_json(&args.observation.fence)?,
+                candidate: read_reservation_json(&args.candidate)?,
+                now_ms,
+                observation: read_reservation_json(&args.observation.observation)?,
+            })
+        }
+        ReservationRequestAction::RecordReplacementTermination(args) => {
+            ReservationRequest::Host(HostRequest::RecordReplacementTermination {
+                fence: read_reservation_json(&args.observation.fence)?,
+                candidate: read_reservation_json(&args.candidate)?,
+                now_ms,
+                observation: read_reservation_json(&args.observation.observation)?,
+            })
+        }
+        ReservationRequestAction::RestageHostReplacement { fence, candidate } => {
+            ReservationRequest::Host(HostRequest::RestageHostReplacement {
+                fence: read_reservation_json(&fence)?,
+                candidate: read_reservation_json(&candidate)?,
+                now_ms,
             })
         }
         ReservationRequestAction::CompleteHostReplacement(args) => {
