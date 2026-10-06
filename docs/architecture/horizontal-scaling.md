@@ -843,3 +843,82 @@ joint-boundary fault DST, live inventories and full operator scaling remain open
 Final workspace lib/bin tests passed (955 passed, 3 ignored), with doc tests,
 Clippy, format and seven tracked-source DST audits. Madsim/CLI results and the next
 implementation checkpoint are recorded in the epic tracker.
+
+
+### Implementation checkpoint: fenced membership steps and joint recovery
+
+Commit `3504fb5` adds managed receiver POST endpoints `/membership` and `/applied`
+under `/__ursula/control/receiver`. Membership actions carry the same token,
+group, receiving process and immutable request ID as replica actions, with typed
+`AddLearner`, `ChangeVoters` and `TransferLeader` descriptions. Their epoch,
+learner ID/fixed prefix, target voter set or handoff target must match fresh meta
+intent authority. New membership submissions require an active, certified
+receiving process and the appropriate prepared/applied authorization. Arbitrary
+raw membership/recovery administration remains closed in managed mode.
+
+The receiver publishes pending work before submitting OpenRaft work. Existing
+configuration is observed through a fresh data quorum, with exact registered
+origins and only source-uniform, intended source/target joint, or target-uniform
+voter sets permitted. Existing learners must belong to the intent. After placement
+publication, only the settled target uniform membership is accepted. A follower
+cannot start a missing action; an already applied action can produce its receipt
+without submitting another native mutation. Learner addition commits a learner
+but does not certify that learner's applied prefix. `/applied` reports the target
+process's actual state-machine applied log ID through its own hosting/activity
+admission and captured-prefix authority; the executor records that separate proof.
+
+`ChangeVoters` uses OpenRaft's actual joint-to-uniform protocol and never writes
+the old source configuration to escape a joint state. `TransferLeader` requires
+an actual voter in the intended target and waits for a fresh quorum observation
+of that leader; queue acceptance alone is not handoff success. Native submission
+and result observation use bounded waits. Timeouts, authority replacement and
+lost replies retain pending work. HTTP cancellation cannot cancel the admitted
+membership task. A result observation can retry transient leadership changes,
+while metadata authority is checked on each iteration.
+
+The data RejoinBarrier RPC gains a separate opt-in configuration capability,
+returning applied log identity, membership log identity, leader term/ID, the one
+or two constituent voter sets, learners and origins. The original uniform-only
+membership certificate remains uniform-only; a joint observation cannot convert
+to a placement publication certificate. The flags are mutually exclusive.
+Missing capability, wrong recipient/vote, unapplied effective membership,
+leadership change and unavailable quorum fail closed, without metrics fallback.
+This additive observation does not change the stream format epoch.
+
+Activation first processes prior local API submissions, then obtains actual
+committed configuration through the data quorum. It can rebind the identical
+pending action to a newer generation/process and persist a `Reconciled` result
+without resubmitting old work before all receivers are certified. This outcome
+is an observation, not a claim that the logical action finished: a committed
+joint configuration remains joint. After recertification, the executor continues
+from that state with a new request ID; `Applied` voter-change receipts require
+exact uniform target voters and no learners. Leadership changes can be reconciled
+through a different real leader, including after the old submitter loses leadership.
+
+Receiver storage retains one current replica receipt and up to eight membership
+receipts per generation, plus one pending action. Replies cannot be deleted or
+rewritten within that generation, and IDs cannot cross replica/membership action
+namespaces. New generations discard old membership replies while preserving and
+reconciling pending work. The cap covers RF<=5 learner/voter/handoff steps; extra
+attempts require a new generation rather than silently forgetting old keys.
+
+Three configuration tests validate joint versus uniform certificates and log/
+node/quorum shape. Two ledger tests exercise bounded receipt retention and ensure
+joint reconciliation cannot claim an applied voter change. A subprocess parent
+reopens typed pending, applied and reconciled checkpoints after OS process exit;
+its configuration facts are synthetic storage fixtures. The four existing RF3/
+RF5 physical-move fixtures now use fenced membership and applied-state endpoints.
+Two new native cases commit an actual joint entry by polling the first OpenRaft
+submission once and then stopping its caller before the uniform submission.
+Replacement HTTP identity and executor generation recover that exact joint state,
+then complete uniform membership through the endpoint. Another native test hands
+off leadership at RF3 and RF5, rejects a nonvoter target and replays the same receipt.
+
+Final workspace lib/bin tests passed (964 passed, 3 ignored), alongside docs,
+Clippy, format, seven DST audits, madsim Raft check and existing smoke (0.37s).
+Static forwarding and mixed-RF/meta3/meta5 adoption/restart CLI regressions passed
+(5.86s / 28.04s). HTTP replacement remains in-process, the joint interruption is
+a native fault fixture, and snapshots here are inline/local WAL. The resumable
+server executor/operation API/CLI, explicit 3→5→3, real receiver binary restarts,
+S3 migration, live routing/inventory integration and migration-boundary DST
+remain required. These endpoint tests do not complete M2 or the full epic.
