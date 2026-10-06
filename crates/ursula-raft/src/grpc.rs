@@ -1746,7 +1746,13 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
         GRPC_APPEND_RESPONSE_BYTES.fetch_add(ack.encoded_len() as u64, Ordering::Relaxed);
         let response: UrsulaAppendEntriesResponse = self.decode_rpc_ack("Append", &ack.payload)?;
         if let Some(rejoin) = &self.rejoin
-            && rejoin.follower_lost_log(self.target, &rpc.vote, rpc.prev_log_id.as_ref(), &response)
+            && rejoin.follower_lost_log(
+                self.target,
+                &rpc.vote,
+                rpc.prev_log_id.as_ref(),
+                rpc.entries.last().map(|entry| &entry.log_id),
+                &response,
+            )
         {
             return Err(raft_rpc_network_error(format!(
                 "node {} at {} lost Raft log entries it had acknowledged",

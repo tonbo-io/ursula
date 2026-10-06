@@ -21,6 +21,8 @@
 //! - [`forward`]: leader-forwarding helpers used by the engine when a node is a follower.
 //! - [`snapshot_cadence`]: the byte-based snapshot cadence policy (F12e) and
 //!   the per-group log gauges the snapshot driver reads.
+//! - [`snapshot_references`]: prepared external-pointer pins and recoverable
+//!   current-reference publication outside RaftCore.
 //! - [`rejoin`]: memory-WAL rejoin: the bootstrap probe, the vote gate of an
 //!   emptied replica, and the leader-side heal driver.
 //! - [`restart_guard`]: memory-WAL full-restart guard: the per-group
@@ -48,6 +50,7 @@ mod rt;
 mod sim_runtime;
 pub mod snapshot_cadence;
 mod snapshot_codec;
+mod snapshot_references;
 mod state_machine;
 mod telemetry;
 mod types;
@@ -113,6 +116,7 @@ pub use rejoin::GroupRejoin;
 pub use rejoin::PeerGroupLog;
 pub use rejoin::bootstrap_probe_vote;
 pub use rejoin::run_rejoin_heal;
+pub use rejoin::run_rejoin_vote_barrier;
 pub use restart_guard::InitMarkerStore;
 pub use restart_guard::MemoryInitMarkers;
 pub use restart_guard::MemoryWalBootstrap;

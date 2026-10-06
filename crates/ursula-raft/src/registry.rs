@@ -619,6 +619,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
         }
         let leader = rpc.vote;
         let prev_log_id = rpc.prev_log_id;
+        let sent_last_log_id = rpc.entries.last().map(|entry| entry.log_id);
         let response = target.append_entries(rpc).await.map_err(|err| {
             RPCError::Network(NetworkError::from_string(format!(
                 "remote AppendEntries on node {}: {err}",
@@ -626,7 +627,13 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             )))
         })?;
         if let Some(rejoin) = &self.rejoin
-            && rejoin.follower_lost_log(self.target, &leader, prev_log_id.as_ref(), &response)
+            && rejoin.follower_lost_log(
+                self.target,
+                &leader,
+                prev_log_id.as_ref(),
+                sent_last_log_id.as_ref(),
+                &response,
+            )
         {
             return Err(RPCError::Network(NetworkError::from_string(format!(
                 "node {} lost Raft log entries it had acknowledged",
@@ -1378,16 +1385,32 @@ impl RaftGroupHandleRegistry {
     ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, GroupEngineError> {
         let raft = self.require_group(raft_group_id)?;
         let _install_permit = self.snapshot_install.acquire().await?;
-        let prefetched = self.prefetch_snapshot_for_install(snapshot).await?;
+        let prefetched = self
+            .prefetch_snapshot_for_install(raft_group_id, snapshot)
+            .await?;
         let snapshot = prefetched.snapshot;
         let _prefetch_guard = prefetched.guard;
-        raft.install_full_snapshot(vote, snapshot)
+        let result = raft
+            .install_full_snapshot(vote, snapshot)
             .await
-            .map_err(|err| GroupEngineError::new(format!("OpenRaft install snapshot: {err}")))
+            .map_err(|err| GroupEngineError::new(format!("OpenRaft install snapshot: {err}")));
+        drop(_prefetch_guard);
+        let publication = self
+            .snapshot_install
+            .references(raft_group_id.0)
+            .publish_current(&self.snapshot_store(), raft_group_id.0)
+            .await
+            .map_err(|err| {
+                GroupEngineError::new(format!("publish installed snapshot reference: {err}"))
+            });
+        // Publication errors remain ordinary transport errors. The accepted
+        // pointer stays pinned, and a repeated install retries publication.
+        result.and_then(|response| publication.map(|()| response))
     }
 
     async fn prefetch_snapshot_for_install(
         &self,
+        raft_group_id: RaftGroupId,
         snapshot: TypeConfigSnapshotOf<UrsulaRaftTypeConfig>,
     ) -> Result<PrefetchedInstallSnapshot, GroupEngineError> {
         let pointer_bytes = snapshot.snapshot.into_inner();
@@ -1409,6 +1432,14 @@ impl RaftGroupHandleRegistry {
         }
 
         let snapshot_store = self.snapshot_store();
+        let reference = self
+            .snapshot_install
+            .references(raft_group_id.0)
+            .prepare(&snapshot_store, raft_group_id.0, &location)
+            .await
+            .map_err(|err| {
+                GroupEngineError::new(format!("pin incoming snapshot before install: {err}"))
+            })?;
         let snapshot_bytes = snapshot_store.download(&location).await.map_err(|err| {
             GroupEngineError::new(format!(
                 "prefetch OpenRaft snapshot {snapshot_id} before install: {err}"
@@ -1432,6 +1463,7 @@ impl RaftGroupHandleRegistry {
             &pointer.snapshot_id,
             &pointer.location,
             group_snapshot,
+            reference,
         );
         let guard = PrefetchedSnapshotGuard {
             snapshot_install: self.snapshot_install.clone(),
@@ -1546,6 +1578,300 @@ mod tests {
         bytes: Option<Vec<u8>>,
     }
 
+    #[derive(Debug, Default)]
+    struct FailingReferenceStore {
+        fail_pin: std::sync::atomic::AtomicBool,
+        fail_current: std::sync::atomic::AtomicBool,
+        pins: Mutex<BTreeSet<String>>,
+        current: Mutex<Option<String>>,
+        pause_current: std::sync::atomic::AtomicBool,
+        entered_current: crate::rt::sync::Notify,
+        release_current: crate::rt::sync::Notify,
+    }
+
+    impl SnapshotStore for FailingReferenceStore {
+        fn upload<'a>(
+            &'a self,
+            _key: ursula_runtime::SnapshotKey,
+            bytes: Bytes,
+        ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+            Box::pin(async move {
+                Ok(SnapshotLocation::Inline {
+                    bytes: bytes.to_vec(),
+                })
+            })
+        }
+        fn download<'a>(
+            &'a self,
+            _location: &'a SnapshotLocation,
+        ) -> SnapshotStoreFuture<'a, Vec<u8>> {
+            Box::pin(async { Ok(group_snapshot_bytes()) })
+        }
+        fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn pin_reference<'a>(
+            &'a self,
+            _group: u32,
+            location: &'a SnapshotLocation,
+        ) -> SnapshotStoreFuture<'a, ()> {
+            Box::pin(async move {
+                if self.fail_pin.load(Ordering::SeqCst) {
+                    return Err(SnapshotStoreError::Backend(
+                        "temporary pin PUT outage".to_owned(),
+                    ));
+                }
+                if let SnapshotLocation::S3 { key, .. } = location {
+                    self.pins.lock().unwrap().insert(key.clone());
+                }
+                Ok(())
+            })
+        }
+        fn publish_reference<'a>(
+            &'a self,
+            _group: u32,
+            location: &'a SnapshotLocation,
+        ) -> SnapshotStoreFuture<'a, ()> {
+            Box::pin(async move {
+                if self.fail_current.load(Ordering::SeqCst) {
+                    return Err(SnapshotStoreError::Backend(
+                        "temporary current-reference PUT outage".to_owned(),
+                    ));
+                }
+                if self.pause_current.load(Ordering::SeqCst) {
+                    self.entered_current.notify_one();
+                    self.release_current.notified().await;
+                }
+                *self.current.lock().unwrap() = match location {
+                    SnapshotLocation::S3 { key, .. } => Some(key.clone()),
+                    _ => None,
+                };
+                Ok(())
+            })
+        }
+        fn reconcile_reference_pins<'a>(
+            &'a self,
+            _group: u32,
+            retained: &'a [SnapshotLocation],
+        ) -> SnapshotStoreFuture<'a, ()> {
+            Box::pin(async move {
+                let keys: BTreeSet<_> = retained
+                    .iter()
+                    .filter_map(|location| match location {
+                        SnapshotLocation::S3 { key, .. } => Some(key.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                self.pins.lock().unwrap().retain(|key| keys.contains(key));
+                Ok(())
+            })
+        }
+    }
+
+    async fn reference_failure_group(
+        store: Arc<FailingReferenceStore>,
+    ) -> (RaftGroupHandleRegistry, RaftGroupHandle) {
+        let registry = RaftGroupHandleRegistry::default();
+        registry.set_snapshot_store(Some(store.clone()));
+        let placement = ShardPlacement {
+            core_id: ursula_shard::CoreId(0),
+            shard_id: ursula_shard::ShardId(0),
+            raft_group_id: RaftGroupId(7),
+        };
+        let state_machine = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+            placement,
+            None,
+            None,
+            store,
+            SnapshotBuildCoordinator::default(),
+            registry.snapshot_install_coordinator(),
+            None,
+        );
+        let config = Arc::new(
+            openraft::Config {
+                enable_tick: false,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap(),
+        );
+        let raft = RaftGroupHandle::new(
+            1,
+            config,
+            SingleNodeRaftNetworkFactory,
+            crate::log_store::RaftGroupLogStore::shared(),
+            state_machine,
+        )
+        .await
+        .unwrap();
+        registry.register(placement, raft.clone());
+        (registry, raft)
+    }
+
+    fn reference_failure_snapshot() -> TypeConfigSnapshotOf<UrsulaRaftTypeConfig> {
+        let mut snapshot = external_snapshot("reference-fault");
+        let id = openraft::LogId::new(openraft::vote::RaftLeaderId::new(1, 2), 1);
+        snapshot.meta.last_log_id = Some(id);
+        snapshot.meta.last_membership =
+            openraft::alias::StoredMembershipOf::<UrsulaRaftTypeConfig>::new(
+                Some(id),
+                openraft::Membership::new(
+                    vec![BTreeSet::from([1])],
+                    BTreeMap::from([(1, openraft::BasicNode::new("local"))]),
+                )
+                .unwrap(),
+            );
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn snapshot_reference_put_failures_retry_without_restarting_raft() {
+        for fail_pin in [true, false] {
+            let store = Arc::new(FailingReferenceStore::default());
+            store.fail_pin.store(fail_pin, Ordering::SeqCst);
+            store.fail_current.store(!fail_pin, Ordering::SeqCst);
+            let (registry, raft) = reference_failure_group(store.clone()).await;
+            let first = registry
+                .install_full_snapshot(
+                    RaftGroupId(7),
+                    crate::types::UrsulaVote::new_committed(1, 2),
+                    reference_failure_snapshot(),
+                )
+                .await;
+            assert!(first.is_err());
+            let metrics = raft.metrics().borrow_watched().clone();
+            assert!(
+                metrics.running_state.is_ok(),
+                "transient object-store failure must not kill RaftCore"
+            );
+            if fail_pin {
+                assert!(
+                    metrics.last_applied.is_none(),
+                    "pin failure must precede installation"
+                );
+                assert!(store.pins.lock().unwrap().is_empty());
+            } else {
+                assert_eq!(metrics.last_applied.unwrap().index(), 1);
+                assert!(store.pins.lock().unwrap().contains("reference-fault.snap"));
+                let snapshot = raft.get_snapshot().await.unwrap().unwrap();
+                let pointer = SnapshotPointer::decode(snapshot.snapshot.get_ref()).unwrap();
+                assert!(
+                    matches!(pointer.location, SnapshotLocation::S3 { .. }),
+                    "temporary reference failure must not retain a full inline snapshot"
+                );
+            }
+            store.fail_pin.store(false, Ordering::SeqCst);
+            store.fail_current.store(false, Ordering::SeqCst);
+            registry
+                .install_full_snapshot(
+                    RaftGroupId(7),
+                    crate::types::UrsulaVote::new_committed(1, 2),
+                    reference_failure_snapshot(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                store.current.lock().unwrap().as_deref(),
+                Some("reference-fault.snap")
+            );
+            assert_eq!(store.pins.lock().unwrap().len(), 1);
+            // Same Raft handle resumes an election and committed application.
+            raft.trigger().elect().await.unwrap();
+            raft.wait(Some(Duration::from_secs(2)))
+                .current_leader(1, "recovered group elects")
+                .await
+                .unwrap();
+            raft.client_write(ursula_runtime::GroupWriteCommand::Stream(
+                ursula_stream::StreamCommand::CreateBucket {
+                    bucket_id: "after-retry".to_owned(),
+                },
+            ))
+            .await
+            .unwrap();
+            assert!(raft.metrics().borrow_watched().running_state.is_ok());
+            raft.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_snapshot_releases_its_pin_without_publishing_a_current_pointer() {
+        let store = Arc::new(FailingReferenceStore::default());
+        let (registry, raft) = reference_failure_group(store.clone()).await;
+        raft.vote(crate::types::UrsulaVoteRequest::new(
+            crate::types::UrsulaVote::new(5, 1),
+            None,
+        ))
+        .await
+        .unwrap();
+        registry
+            .install_full_snapshot(
+                RaftGroupId(7),
+                crate::types::UrsulaVote::new_committed(1, 2),
+                reference_failure_snapshot(),
+            )
+            .await
+            .unwrap();
+        assert!(raft.metrics().borrow_watched().last_applied.is_none());
+        assert!(store.current.lock().unwrap().is_none());
+        assert!(store.pins.lock().unwrap().is_empty());
+        raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lagging_reference_put_keeps_the_new_current_and_every_prepared_pointer_pinned() {
+        let store = Arc::new(FailingReferenceStore::default());
+        let shared: SharedSnapshotStore = store.clone();
+        let references = Arc::new(crate::snapshot_references::SnapshotReferences::default());
+        let location = |id: &str| {
+            SnapshotPointer::decode(external_snapshot(id).snapshot.get_ref())
+                .unwrap()
+                .location
+        };
+        let old = location("old-current");
+        let incoming = location("new-current");
+        let pending = location("pending-build");
+        let old_lease = references.prepare(&shared, 7, &old).await.unwrap();
+        references.commit_current(&old);
+        drop(old_lease);
+        let new_lease = references.prepare(&shared, 7, &incoming).await.unwrap();
+        let pending_lease = references.prepare(&shared, 7, &pending).await.unwrap();
+        store.pause_current.store(true, Ordering::SeqCst);
+        let publication = crate::rt::spawn({
+            let references = references.clone();
+            let shared = shared.clone();
+            async move { references.publish_current(&shared, 7).await }
+        });
+        store.entered_current.notified().await;
+        // Installation performs no reference I/O and can finish while the
+        // old reference PUT is still blocked outside RaftCore.
+        references.commit_current(&incoming);
+        drop(new_lease);
+        store.release_current.notify_one();
+        publication.await.unwrap().unwrap();
+        assert_eq!(
+            store.current.lock().unwrap().as_deref(),
+            Some("old-current.snap")
+        );
+        assert_eq!(
+            *store.pins.lock().unwrap(),
+            BTreeSet::from([
+                "new-current.snap".to_owned(),
+                "pending-build.snap".to_owned(),
+            ])
+        );
+        store.pause_current.store(false, Ordering::SeqCst);
+        drop(pending_lease);
+        references.publish_current(&shared, 7).await.unwrap();
+        assert_eq!(
+            store.current.lock().unwrap().as_deref(),
+            Some("new-current.snap")
+        );
+        assert_eq!(
+            *store.pins.lock().unwrap(),
+            BTreeSet::from(["new-current.snap".to_owned()])
+        );
+    }
+
     impl SnapshotStore for StaticSnapshotStore {
         fn upload<'a>(
             &'a self,
@@ -1625,7 +1951,7 @@ mod tests {
         })));
 
         let prefetched = registry
-            .prefetch_snapshot_for_install(external_snapshot("snapshot-a"))
+            .prefetch_snapshot_for_install(RaftGroupId(7), external_snapshot("snapshot-a"))
             .await
             .expect("prefetch external snapshot");
 
@@ -1636,7 +1962,7 @@ mod tests {
             .snapshot_install_coordinator()
             .take_prefetched(&pointer)
             .expect("external snapshot is cached for install");
-        assert_eq!(cached.group_commit_index, 0);
+        assert_eq!(cached.snapshot.group_commit_index, 0);
     }
 
     #[tokio::test]
@@ -1651,7 +1977,7 @@ mod tests {
         })));
 
         let prefetched = registry
-            .prefetch_snapshot_for_install(external_snapshot("snapshot-drop"))
+            .prefetch_snapshot_for_install(RaftGroupId(7), external_snapshot("snapshot-drop"))
             .await
             .expect("prefetch external snapshot");
         let coordinator = registry.snapshot_install_coordinator();
@@ -1690,7 +2016,7 @@ mod tests {
         })));
 
         let prefetched = registry
-            .prefetch_snapshot_for_install(external_snapshot("snapshot-unconsumed"))
+            .prefetch_snapshot_for_install(RaftGroupId(7), external_snapshot("snapshot-unconsumed"))
             .await
             .expect("prefetch external snapshot");
         let pointer = SnapshotPointer::decode(prefetched.snapshot.snapshot.get_ref()).unwrap();
@@ -1711,7 +2037,7 @@ mod tests {
         registry.set_snapshot_store(Some(Arc::new(StaticSnapshotStore { bytes: None })));
 
         let err = registry
-            .prefetch_snapshot_for_install(external_snapshot("missing"))
+            .prefetch_snapshot_for_install(RaftGroupId(7), external_snapshot("missing"))
             .await
             .expect_err("missing snapshot should fail before OpenRaft install");
 
@@ -1735,7 +2061,7 @@ mod tests {
         };
 
         let prefetched = registry
-            .prefetch_snapshot_for_install(snapshot)
+            .prefetch_snapshot_for_install(RaftGroupId(7), snapshot)
             .await
             .expect("inline snapshot does not touch snapshot store");
         let pointer = SnapshotPointer::decode(&prefetched.snapshot.snapshot.into_inner()).unwrap();

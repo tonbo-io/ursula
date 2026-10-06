@@ -63,60 +63,25 @@ fn spawn_rejoin_vote_barrier(
     registry: RaftGroupHandleRegistry,
     nodes: BTreeMap<u64, BasicNode>,
 ) {
-    tokio::spawn(async move {
-        let mut last_barrier_leader = None;
-        loop {
-            registry.refresh_group_elections(placement.raft_group_id);
-            if rejoin.vote_gate_open() {
-                return;
-            }
-            let metrics = raft.metrics().borrow_watched().clone();
-            if metrics.running_state.is_err() {
-                return;
-            }
-            if let Some(leader_id) = metrics.current_leader
-                && last_barrier_leader != Some(metrics.vote)
-                && let Some(node) = nodes.get(&leader_id)
-            {
-                let outcome = crate::rt::time::timeout(
-                    REJOIN_VOTE_BARRIER_TIMEOUT,
-                    probe_rejoin_vote_barrier(
-                        placement,
-                        metrics.id,
-                        leader_id,
-                        &node.addr,
-                        REJOIN_VOTE_BARRIER_TIMEOUT,
-                    ),
-                )
-                .await;
-                let (leader, index) = match outcome {
-                    Ok(Ok(proof)) => proof,
-                    other => {
-                        tracing::debug!(
-                            raft_group_id = placement.raft_group_id.0,
-                            ?other,
-                            "recovery barrier probe failed"
-                        );
-                        crate::rt::time::sleep(REJOIN_HEAL_INTERVAL).await;
-                        continue;
-                    }
-                };
-                rejoin.confirm_barrier(leader, index);
-                last_barrier_leader = Some(leader);
-                registry.refresh_group_elections(placement.raft_group_id);
-                if rejoin.vote_gate_open() {
-                    tracing::info!(
-                        node_id = metrics.id,
-                        raft_group_id = placement.raft_group_id.0,
-                        barrier_index = index,
-                        "memory-WAL rejoin: fresh quorum barrier applied; participation restored"
-                    );
-                    return;
-                }
-            }
-            crate::rt::time::sleep(REJOIN_HEAL_INTERVAL).await;
-        }
-    });
+    let node_id = raft.metrics().borrow_watched().id;
+    tokio::spawn(crate::rejoin::run_rejoin_vote_barrier(
+        raft,
+        rejoin,
+        registry,
+        nodes,
+        move |leader_id, address| async move {
+            probe_rejoin_vote_barrier(
+                placement,
+                node_id,
+                leader_id,
+                &address,
+                REJOIN_VOTE_BARRIER_TIMEOUT,
+            )
+            .await
+        },
+        REJOIN_VOTE_BARRIER_TIMEOUT,
+        REJOIN_HEAL_INTERVAL,
+    ));
 }
 
 #[cfg(test)]

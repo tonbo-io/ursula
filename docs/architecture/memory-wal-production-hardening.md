@@ -25,7 +25,7 @@ worktree `/private/tmp/ursula-mem-review-c61cb60`.
 | Order | Work | Acceptance evidence | Status |
 | --- | --- | --- | --- |
 | 1 | Fix early vote eligibility after memory-WAL state loss | Regression reproducing stale AppendEntries plus one state loss; acknowledged tail survives; real gRPC coverage; explanation of the recovery barrier | Implemented; real-gRPC regression and local cluster checks passed; CI/deployment pending |
-| 2 | Make snapshot reference publication failures recoverable | Temporary reference PUT failure followed by successful retry without restarting the Raft group; retain snapshot GC protection | Reproduced; fix pending |
+| 2 | Make snapshot reference publication failures recoverable | Temporary reference PUT failure followed by successful retry without restarting the Raft group; retain snapshot GC protection | Implemented; local fault, GC and concurrent-pointer tests passed; new CI/deployment pending |
 | 3 | Raft-aware maintenance gates and automatic fenced replacement | Refuse a second planned disruption until every affected group regains healthy membership and catches up; replace dead-node voters without duplicate node identities | Recovery-proof readiness added; full membership/count/disruption gates and fenced replacement pending |
 | 4 | Node memory budget and backpressure | Bounded retained/uncommitted logs, hot data, request queues and concurrent rebuilds under production limits and S3 degradation; reject load before OOM | Pending |
 | 5 | Business retry and Raft observability | Invalidate dead leader routes; retry only replay-safe operations within a total budget; reviewed metrics and alerts for quorum risk, stopped groups and stalled recovery; synthetic append/read | Pending |
@@ -72,6 +72,75 @@ The additive RejoinBarrier RPC returns a quorum-confirmed ReadIndex and committe
 The real TCP/gRPC regression delivers the captured old Append through the production handler while delaying newer replication, allowing Vote traffic, and losing only A's state. It verifies that lagging C cannot win, automatic elections and TransferLeader cannot bypass A's closed gate, absent quorum cannot produce proof, and proof alone cannot open the gate before application. It repeats A's restart after repair, changes the healthy leader, rejects proof from a forwarded legacy HEAD, and verifies the acknowledged payload on all replicas. The original unpatched reproduction remains an in-process probe; the new gRPC result is validation of the repair under the equivalent schedule, not a claim of having reproduced the old binary over gRPC.
 
 Local validation: the workspace library/binary suites passed 816 tests with one pre-existing ignored stress test, including 131 Raft tests and the real-gRPC fault schedule. The full real-process static-cluster CLI suite passed (8 entries, with real S3 opt-in absent). Workspace/all-targets Clippy, workspace doc tests, formatting, all seven DST audits and the madsim smoke corpus passed. CI, real S3 and dedicated-cell qualification remain separate gates.
+
+## Snapshot reference recovery
+
+The reproduced reference PUT failure was inside OpenRaft's state-machine worker,
+where an I/O error permanently stops the group. Prepare and pin an incoming S3
+pointer before downloading or entering Raft installation. The state-machine
+worker installs the already decoded snapshot and commits the local pointer;
+publish its current reference after leaving that worker. A temporary publication
+failure returns a retryable install RPC error while the accepted pointer stays
+pinned and Raft remains live. Retrying on the same group publishes the reference,
+including when Raft ignores an already installed snapshot.
+
+Pins use the existing version-2 reference JSON under each group's recursive
+`references/` prefix. The 0.6.2 collector already scans that prefix, so no snapshot
+or reference format migration is needed. Retain the current pointer and every
+prepared build/install pointer; retire only this node identity's obsolete pins.
+Keep the current pin after publication because a newer pointer can become current
+while an older PUT is in flight. Serialize reference I/O without holding that
+lock across a Raft call. Reconcile abandoned pins on the next preparation or
+publication, including fenced durable restart; no unbounded process-local history
+of retired pointers is retained. This assumes one live owner of a node identity;
+fencing replacement owners remains milestone 3. Snapshot object upload and pin
+creation remain separate operations subject to the existing GC grace contract.
+
+Snapshot builders and installers commit metadata and current pointers under the
+same lock. A builder captured before a newer installation returns the newer
+snapshot rather than overwriting its pointer or durable metadata. A pin failure
+happens before installation; a builder may use its existing inline fallback.
+Failure to publish an already pinned external pointer does not force a potentially
+large inline copy. Restored durable pointers also keep their pin if publication
+temporarily fails. Permanent pin/download or local metadata failures retain their
+existing failure behavior.
+
+Fault regressions cover pre-install pin failure, post-install current-reference
+PUT failure, retry without restarting Raft, and a new committed command on the
+same handle. Additional tests cover rejected installs releasing their pins,
+concurrent older PUT/new current pointer transitions, an old builder racing a
+new installation, and zero-grace collection with the actual S3 snapshot-store
+implementation over an OpenDAL memory backend. These are not live AWS fault tests
+or production-scale measurements.
+
+## CI and simulation follow-up
+
+Draft PR [#370](https://github.com/tonbo-io/ursula/pull/370) at
+`89e7536cd00ab1df69d957c4e15aa86a11c21a58` passed the Rust, lint, Helm, documentation,
+protocol, real-S3 integration, three-node SQLite VFS E2E, memory/disk soak,
+state-growth and candidate-artifact checks. Its DST job failed: the rejoin fixture
+had not driven the new outbound recovery proof. Simulation now shares the
+production proof driver and cancels process-owned background tasks when a simulated
+process dies, before starting its replacement.
+
+That coverage also exposed a manual majority-loss recovery interaction: ReadIndex
+uses AppendEntries, but its Conflict response does not rewind replication progress.
+Do not consume the network's operator override on that probe. End the override
+when replication metrics reset, or a successful response proves restoration of
+the former prefix even if a fast rebuild occurred between metrics samples. Clear
+it on a leader change. Unit tests and the majority-loss scenario cover a subsequent
+single loss after operator recovery so authorization cannot carry into that loss.
+This preserves the existing explicit data-loss-acceptance path; it does not add
+a quorum-loss data preservation guarantee.
+
+The updated workspace library/binary suites passed 823 tests with one pre-existing
+ignored stress test. Reference/GC/race regressions, workspace doc tests and all
+seven DST audits passed locally. Workspace/all-targets Clippy, formatting and all
+eight static-cluster CLI entries passed (the real-S3 entry skipped without opt-in).
+The unchanged CI scripts for smoke corpus/PR seeds, bounded-state seed families,
+and memory-WAL scenarios passed locally. All three memory-WAL families also passed
+seeds 1–32, including the subsequent single loss. Remote checks must run again on
+the updated head before their results apply to the snapshot-reference changes.
 
 ## Qualification parameters
 

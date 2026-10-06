@@ -42,6 +42,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -59,6 +60,7 @@ use openraft::vote::RaftLeaderId;
 use ursula_shard::RaftGroupId;
 
 use crate::registry::RaftGroupHandle;
+use crate::registry::RaftGroupHandleRegistry;
 use crate::restart_guard::InitMarkerStore;
 use crate::restart_guard::RestartGuard;
 use crate::types::UrsulaAppendEntriesRequest;
@@ -216,9 +218,40 @@ impl VoteGate {
 struct RevertedFollowers {
     leader: Option<UrsulaVote>,
     targets: BTreeSet<u64>,
-    /// Targets whose next conflict goes to OpenRaft (operator recovery after
-    /// `allow_next_revert`).
-    pass_next: BTreeSet<u64>,
+    /// Operator-authorized rewinds, until Raft replication metrics show the
+    /// old matched point was reset. ReadIndex also sends Append RPCs; its
+    /// Conflict confirms leadership but does not reset replication progress.
+    /// Consuming permission on that response would strand operator recovery.
+    allowed_reverts: BTreeMap<u64, u64>,
+}
+
+impl RevertedFollowers {
+    fn operator_reset_pending(
+        &mut self,
+        target: u64,
+        leader: &UrsulaVote,
+        matched: Option<u64>,
+        confirmed: Option<u64>,
+    ) -> bool {
+        if self.leader.as_ref() != Some(leader) {
+            self.allowed_reverts.clear();
+            return false;
+        }
+        let Some(previous) = self.allowed_reverts.get(&target).copied() else {
+            return false;
+        };
+        // A fast rebuild can reset and advance metrics between our samples.
+        // A successful RPC through the former matched point also ends the
+        // authorization, so a second loss never inherits this override.
+        if matched.is_none_or(|matched| matched < previous)
+            || confirmed.is_some_and(|confirmed| confirmed >= previous)
+        {
+            self.allowed_reverts.remove(&target);
+            false
+        } else {
+            true
+        }
+    }
 }
 
 /// One memory-WAL replica's rejoin state for one group: the inbound vote
@@ -370,14 +403,9 @@ impl GroupRejoin {
         target: u64,
         leader: &UrsulaVote,
         prev_log_id: Option<&LogIdOf<UrsulaRaftTypeConfig>>,
+        sent_last_log_id: Option<&LogIdOf<UrsulaRaftTypeConfig>>,
         response: &UrsulaAppendEntriesResponse,
     ) -> bool {
-        if !matches!(response, UrsulaAppendEntriesResponse::Conflict) {
-            return false;
-        }
-        let Some(prev) = log_index(prev_log_id) else {
-            return false;
-        };
         let Some(metrics) = self.metrics() else {
             return false;
         };
@@ -389,11 +417,26 @@ impl GroupRejoin {
             .as_ref()
             .and_then(|replication| replication.get(&target))
             .and_then(|matched| log_index(matched.as_ref()));
+        let mut reverted = self.reverted.lock().unwrap_or_else(PoisonError::into_inner);
+        let confirmed = match response {
+            UrsulaAppendEntriesResponse::Success => log_index(sent_last_log_id.or(prev_log_id)),
+            UrsulaAppendEntriesResponse::PartialSuccess(matching) => log_index(matching.as_ref()),
+            UrsulaAppendEntriesResponse::Conflict | UrsulaAppendEntriesResponse::HigherVote(_) => {
+                None
+            }
+        };
+        let operator_reset_pending =
+            reverted.operator_reset_pending(target, leader, matched, confirmed);
+        if !matches!(response, UrsulaAppendEntriesResponse::Conflict) {
+            return false;
+        }
+        let Some(prev) = log_index(prev_log_id) else {
+            return false;
+        };
         if !matched.is_some_and(|matched| prev <= matched) {
             return false;
         }
-        let mut reverted = self.reverted.lock().unwrap_or_else(PoisonError::into_inner);
-        if reverted.pass_next.remove(&target) {
+        if operator_reset_pending {
             return false;
         }
         if reverted.leader.as_ref() != Some(leader) {
@@ -489,7 +532,14 @@ impl GroupRejoin {
             let mut reverted = self.reverted.lock().unwrap_or_else(PoisonError::into_inner);
             for target in &targets {
                 reverted.targets.remove(target);
-                reverted.pass_next.insert(*target);
+                if let Some(matched) = metrics
+                    .replication
+                    .as_ref()
+                    .and_then(|replication| replication.get(target))
+                    .and_then(|matched| log_index(matched.as_ref()))
+                {
+                    reverted.allowed_reverts.insert(*target, matched);
+                }
             }
         }
         tracing::warn!(
@@ -799,6 +849,68 @@ pub async fn run_rejoin_heal(
     }
 }
 
+/// Drive memory-WAL participation from fresh outbound leader proofs. The
+/// supplied probe must confirm a new post-call ReadIndex with a quorum and
+/// return that leader's committed vote and required local applied index.
+/// Transport-independent so simulation exercises the production gate driver.
+pub async fn run_rejoin_vote_barrier<P, F>(
+    raft: RaftGroupHandle,
+    rejoin: Arc<GroupRejoin>,
+    registry: RaftGroupHandleRegistry,
+    nodes: BTreeMap<u64, BasicNode>,
+    probe: P,
+    probe_timeout: Duration,
+    interval: Duration,
+) where
+    P: Fn(u64, String) -> F,
+    F: Future<Output = Result<(UrsulaVote, u64), String>>,
+{
+    let raft_group_id = rejoin.raft_group_id;
+    let mut last_barrier_leader = None;
+    loop {
+        registry.refresh_group_elections(raft_group_id);
+        if rejoin.vote_gate_open() {
+            return;
+        }
+        let metrics = raft.metrics().borrow_watched().clone();
+        if metrics.running_state.is_err() {
+            return;
+        }
+        if let Some(leader_id) = metrics.current_leader
+            && last_barrier_leader != Some(metrics.vote)
+            && let Some(node) = nodes.get(&leader_id)
+        {
+            let outcome =
+                crate::rt::time::timeout(probe_timeout, probe(leader_id, node.addr.clone())).await;
+            let (leader, index) = match outcome {
+                Ok(Ok(proof)) => proof,
+                other => {
+                    tracing::debug!(
+                        raft_group_id = raft_group_id.0,
+                        ?other,
+                        "recovery barrier probe failed"
+                    );
+                    crate::rt::time::sleep(interval).await;
+                    continue;
+                }
+            };
+            rejoin.confirm_barrier(leader, index);
+            last_barrier_leader = Some(leader);
+            registry.refresh_group_elections(raft_group_id);
+            if rejoin.vote_gate_open() {
+                tracing::info!(
+                    node_id = metrics.id,
+                    raft_group_id = raft_group_id.0,
+                    barrier_index = index,
+                    "memory-WAL rejoin: fresh quorum barrier applied; participation restored"
+                );
+                return;
+            }
+        }
+        crate::rt::time::sleep(interval).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -818,6 +930,39 @@ mod tests {
 
     fn follower(last_applied: Option<u64>) -> LocalReplica {
         LocalReplica { last_applied }
+    }
+
+    #[test]
+    fn operator_rewind_survives_read_index_conflicts_but_ends_after_repair() {
+        let leader = leader(3, 1);
+        let mut reverted = RevertedFollowers {
+            leader: Some(leader),
+            allowed_reverts: BTreeMap::from([(2, 20), (3, 20)]),
+            ..Default::default()
+        };
+        // ReadIndex conflicts leave Raft's replication progress untouched.
+        assert!(reverted.operator_reset_pending(2, &leader, Some(20), None));
+        assert!(reverted.operator_reset_pending(2, &leader, Some(20), None));
+        // A real rewind resets the progress; permission cannot cover another
+        // loss even after this follower has caught up again.
+        assert!(!reverted.operator_reset_pending(2, &leader, None, None));
+        assert!(!reverted.operator_reset_pending(2, &leader, Some(30), None));
+        // A fast catch-up can happen between metrics samples. Its successful
+        // Append still proves that the prior prefix has been restored.
+        assert!(reverted.operator_reset_pending(3, &leader, Some(20), Some(19)));
+        assert!(!reverted.operator_reset_pending(3, &leader, Some(30), Some(20)));
+        assert!(!reverted.operator_reset_pending(3, &leader, Some(30), None));
+    }
+
+    #[test]
+    fn operator_rewind_permission_does_not_cross_a_leader_change() {
+        let mut reverted = RevertedFollowers {
+            leader: Some(leader(3, 1)),
+            allowed_reverts: BTreeMap::from([(2, 20)]),
+            ..Default::default()
+        };
+        assert!(!reverted.operator_reset_pending(2, &leader(4, 3), Some(20), None));
+        assert!(reverted.allowed_reverts.is_empty());
     }
 
     #[test]

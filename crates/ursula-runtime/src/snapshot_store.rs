@@ -231,12 +231,38 @@ pub trait SnapshotStore: Send + Sync + Debug {
 
     /// Publish this node's current durable pointer. External stores use these
     /// references to prove that an object is unreachable before deleting it;
-    /// callers persist local metadata first and rely on the GC grace period
-    /// while publishing the corresponding external reference.
+    /// callers pin an incoming pointer before changing local metadata and
+    /// publish the current reference after that transition. The current pin
+    /// remains protected if this PUT fails or briefly lags another transition.
     fn publish_reference<'a>(
         &'a self,
         _raft_group_id: u32,
         _location: &'a SnapshotLocation,
+    ) -> SnapshotStoreFuture<'a, ()> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    /// Protect an incoming external pointer without replacing this node's
+    /// current reference. Complete before installing or publishing the pointer.
+    /// Pins use the existing reference record format so older pruners retain them.
+    /// A backend enabling external snapshot GC must implement this operation
+    /// and pin reconciliation; the no-op default is for stores without GC.
+    fn pin_reference<'a>(
+        &'a self,
+        _raft_group_id: u32,
+        _location: &'a SnapshotLocation,
+    ) -> SnapshotStoreFuture<'a, ()> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    /// Remove this node's obsolete pins, keeping both its current external
+    /// pointer and every prepared operation that could still publish a pointer.
+    /// Callers serialize this with pin creation. Startup reconciliation must
+    /// include the durable restored pointer before removing abandoned pins.
+    fn reconcile_reference_pins<'a>(
+        &'a self,
+        _raft_group_id: u32,
+        _retained: &'a [SnapshotLocation],
     ) -> SnapshotStoreFuture<'a, ()> {
         Box::pin(async move { Ok(()) })
     }
@@ -626,6 +652,103 @@ mod s3 {
     }
 
     impl SnapshotStore for S3SnapshotStore {
+        fn pin_reference<'a>(
+            &'a self,
+            raft_group_id: u32,
+            location: &'a SnapshotLocation,
+        ) -> SnapshotStoreFuture<'a, ()> {
+            Box::pin(async move {
+                let (Some(references), SnapshotLocation::S3 { key, .. }) =
+                    (&self.references, location)
+                else {
+                    return Ok(());
+                };
+                if !key.starts_with(&self.group_prefix(raft_group_id)) || !key.ends_with(".snap") {
+                    return Err(SnapshotStoreError::Integrity(
+                        "snapshot pin points outside group namespace".to_owned(),
+                    ));
+                }
+                let pin_key = format!(
+                    "{}references/pins/{}/{}.json",
+                    self.group_prefix(raft_group_id),
+                    references.node_id,
+                    blake3::hash(key.as_bytes()).to_hex(),
+                );
+                let record = serde_json::to_vec(&SnapshotReference {
+                    version: SNAPSHOT_REFERENCE_VERSION,
+                    node_id: references.node_id,
+                    raft_group_id,
+                    snapshot_key: Some(key.clone()),
+                })
+                .map_err(|err| SnapshotStoreError::Serialize(err.to_string()))?;
+                self.operator
+                    .write(&pin_key, record)
+                    .await
+                    .map_err(|err| SnapshotStoreError::Backend(err.to_string()))
+            })
+        }
+
+        fn reconcile_reference_pins<'a>(
+            &'a self,
+            raft_group_id: u32,
+            retained: &'a [SnapshotLocation],
+        ) -> SnapshotStoreFuture<'a, ()> {
+            Box::pin(async move {
+                let Some(references) = &self.references else {
+                    return Ok(());
+                };
+                let prefix = format!(
+                    "{}references/pins/{}/",
+                    self.group_prefix(raft_group_id),
+                    references.node_id
+                );
+                let retained: HashSet<_> = retained
+                    .iter()
+                    .filter_map(|location| match location {
+                        SnapshotLocation::S3 { key, .. } => Some(key.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let entries = self
+                    .operator
+                    .list_with(&prefix)
+                    .recursive(true)
+                    .await
+                    .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?;
+                for entry in entries {
+                    if !entry.metadata().mode().is_file() || !entry.path().ends_with(".json") {
+                        continue;
+                    }
+                    let bytes = self
+                        .operator
+                        .read(entry.path())
+                        .await
+                        .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?;
+                    let reference: SnapshotReference = serde_json::from_slice(&bytes.to_vec())
+                        .map_err(|err| SnapshotStoreError::Deserialize(err.to_string()))?;
+                    if reference.version != SNAPSHOT_REFERENCE_VERSION
+                        || reference.node_id != references.node_id
+                        || reference.raft_group_id != raft_group_id
+                    {
+                        return Err(SnapshotStoreError::Integrity(
+                            "invalid snapshot pin".to_owned(),
+                        ));
+                    }
+                    if reference
+                        .snapshot_key
+                        .as_deref()
+                        .is_none_or(|key| !retained.contains(key))
+                    {
+                        self.operator
+                            .delete(entry.path())
+                            .await
+                            .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?;
+                    }
+                }
+                Ok(())
+            })
+        }
+
         fn upload<'a>(
             &'a self,
             key: SnapshotKey,
@@ -1266,6 +1389,73 @@ mod tests {
         store.delete(&loc).await.unwrap();
         assert_eq!(store.download(&loc).await.unwrap(), payload);
         store.delete(&loc).await.unwrap();
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_pending_pins_protect_install_and_only_retire_this_nodes_obsolete_pins() {
+        let operator = opendal::Operator::via_iter(opendal::Scheme::Memory, []).unwrap();
+        let store = S3SnapshotStore::new(operator.clone(), "snapshot-pin-gc")
+            .with_references(SnapshotReferenceConfig {
+                node_id: 1,
+                default_voters: BTreeSet::from([1]),
+                per_group_voters: BTreeMap::new(),
+            })
+            .with_gc_grace_for_tests(std::time::Duration::ZERO);
+        let other = S3SnapshotStore::new(operator, "snapshot-pin-gc").with_references(
+            SnapshotReferenceConfig {
+                node_id: 2,
+                default_voters: BTreeSet::from([1]),
+                per_group_voters: BTreeMap::new(),
+            },
+        );
+        let old = store
+            .upload(test_key(7, "old"), b"old".to_vec().into())
+            .await
+            .unwrap();
+        let incoming = store
+            .upload(test_key(7, "incoming"), b"incoming".to_vec().into())
+            .await
+            .unwrap();
+        let abandoned = store
+            .upload(test_key(7, "abandoned"), b"abandoned".to_vec().into())
+            .await
+            .unwrap();
+        let other_pin = store
+            .upload(test_key(7, "other"), b"other".to_vec().into())
+            .await
+            .unwrap();
+        store.publish_reference(7, &old).await.unwrap();
+        store.pin_reference(7, &incoming).await.unwrap();
+        store.pin_reference(7, &abandoned).await.unwrap();
+        other.pin_reference(7, &other_pin).await.unwrap();
+        // The unchanged GC reader understands these version-two records,
+        // while the primary still names the old pointer during installation
+        // or after a failed primary PUT. Zero grace makes protection explicit.
+        store.prune_retired(7, &old, 0).await.unwrap();
+        assert_eq!(store.download(&old).await.unwrap(), b"old");
+        assert_eq!(store.download(&incoming).await.unwrap(), b"incoming");
+        assert_eq!(store.download(&abandoned).await.unwrap(), b"abandoned");
+        assert_eq!(store.download(&other_pin).await.unwrap(), b"other");
+        store
+            .reconcile_reference_pins(7, std::slice::from_ref(&incoming))
+            .await
+            .unwrap();
+        store.prune_retired(7, &old, 0).await.unwrap();
+        assert!(matches!(
+            store.download(&abandoned).await,
+            Err(SnapshotStoreError::NotFound(_))
+        ));
+        assert_eq!(store.download(&incoming).await.unwrap(), b"incoming");
+        assert_eq!(store.download(&other_pin).await.unwrap(), b"other");
+        store.publish_reference(7, &incoming).await.unwrap();
+        store.prune_retired(7, &incoming, 0).await.unwrap();
+        assert!(matches!(
+            store.download(&old).await,
+            Err(SnapshotStoreError::NotFound(_))
+        ));
+        assert_eq!(store.download(&incoming).await.unwrap(), b"incoming");
+        assert_eq!(store.download(&other_pin).await.unwrap(), b"other");
     }
 
     #[cfg(not(madsim))]

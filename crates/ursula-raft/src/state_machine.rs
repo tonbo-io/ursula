@@ -65,6 +65,8 @@ use crate::snapshot_cadence::GroupLogMark;
 use crate::snapshot_cadence::GroupLogProgress;
 use crate::snapshot_codec::decode_group_snapshot;
 use crate::snapshot_codec::group_snapshot_frames;
+use crate::snapshot_references::SnapshotReferenceLease;
+use crate::snapshot_references::SnapshotReferences;
 use crate::types::RaftGroupResponse;
 use crate::types::UrsulaRaftTypeConfig;
 
@@ -230,7 +232,14 @@ struct SnapshotInstallCoordinatorInner {
     semaphore: Arc<Semaphore>,
     /// Snapshots downloaded and decoded before OpenRaft's install, keyed by
     /// pointer. Install consumes the decoded group, so it decodes once.
-    prefetched: Mutex<BTreeMap<String, GroupSnapshot>>,
+    prefetched: Mutex<BTreeMap<String, PrefetchedGroupSnapshot>>,
+    references: Mutex<BTreeMap<u32, Arc<SnapshotReferences>>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PrefetchedGroupSnapshot {
+    pub(crate) snapshot: GroupSnapshot,
+    reference: Option<SnapshotReferenceLease>,
 }
 
 impl Default for SnapshotInstallCoordinator {
@@ -245,6 +254,7 @@ impl SnapshotInstallCoordinator {
             inner: Arc::new(SnapshotInstallCoordinatorInner {
                 semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
                 prefetched: Mutex::new(BTreeMap::new()),
+                references: Mutex::new(BTreeMap::new()),
             }),
         }
     }
@@ -278,27 +288,44 @@ impl SnapshotInstallCoordinator {
         }
     }
 
-    pub fn cache_prefetched(
+    pub(crate) fn references(&self, group: u32) -> Arc<SnapshotReferences> {
+        self.inner
+            .references
+            .lock()
+            .expect("snapshot references mutex")
+            .entry(group)
+            .or_default()
+            .clone()
+    }
+
+    pub(crate) fn cache_prefetched(
         &self,
         snapshot_id: &str,
         location: &SnapshotLocation,
         snapshot: GroupSnapshot,
+        reference: Option<SnapshotReferenceLease>,
     ) -> String {
         let key = Self::cache_key(snapshot_id, location);
         self.inner
             .prefetched
             .lock()
             .expect("snapshot install prefetch cache mutex")
-            .insert(key.clone(), snapshot);
+            .insert(key.clone(), PrefetchedGroupSnapshot {
+                snapshot,
+                reference,
+            });
         key
     }
 
-    pub fn take_prefetched(&self, pointer: &SnapshotPointer) -> Option<GroupSnapshot> {
+    pub(crate) fn take_prefetched(
+        &self,
+        pointer: &SnapshotPointer,
+    ) -> Option<PrefetchedGroupSnapshot> {
         let key = Self::cache_key(&pointer.snapshot_id, &pointer.location);
         self.clear_prefetched_key(&key)
     }
 
-    pub fn clear_prefetched_key(&self, key: &str) -> Option<GroupSnapshot> {
+    pub(crate) fn clear_prefetched_key(&self, key: &str) -> Option<PrefetchedGroupSnapshot> {
         self.inner
             .prefetched
             .lock()
@@ -424,6 +451,17 @@ impl RaftGroupStateMachine {
             .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
         let pointer = SnapshotPointer::decode(&persisted.pointer_bytes)
             .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
+        let references = self
+            .snapshot_install
+            .references(self.placement.raft_group_id.0);
+        let reference = references
+            .prepare(
+                &self.snapshot_store,
+                self.placement.raft_group_id.0,
+                &pointer.location,
+            )
+            .await
+            .map_err(|err| err.into_io())?;
         let snapshot_bytes = match &pointer.location {
             SnapshotLocation::Inline { bytes } => bytes.clone(),
             location => self
@@ -433,12 +471,6 @@ impl RaftGroupStateMachine {
                 .map_err(|err| err.into_io())?,
         };
         let group_snapshot = decode_group_snapshot(&snapshot_bytes).map_err(|err| err.into_io())?;
-        if matches!(pointer.location, SnapshotLocation::S3 { .. }) {
-            self.snapshot_store
-                .publish_reference(self.placement.raft_group_id.0, &pointer.location)
-                .await
-                .map_err(|err| err.into_io())?;
-        }
         self.engine
             .install_snapshot(group_snapshot)
             .await
@@ -451,6 +483,14 @@ impl RaftGroupStateMachine {
             meta: persisted.meta,
             pointer_bytes: persisted.pointer_bytes,
         });
+        references.commit_current(&pointer.location);
+        drop(reference);
+        if let Err(err) = references
+            .publish_current(&self.snapshot_store, self.placement.raft_group_id.0)
+            .await
+        {
+            tracing::warn!(%err, "restored snapshot remains pinned while current-reference publication is unavailable");
+        }
         Ok(())
     }
 
@@ -599,6 +639,9 @@ impl RaftGroupStateMachine {
             snapshot_metadata_path: self.snapshot_metadata_path.clone(),
             log_gauge: Arc::clone(&self.log_gauge),
             log_mark: self.log_gauge.mark(),
+            references: self
+                .snapshot_install
+                .references(self.placement.raft_group_id.0),
         }
     }
 
@@ -742,13 +785,22 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         // Decode exactly once (bounded-stream-state F12c): inline bytes are
         // decoded in place, and a prefetched external snapshot arrives
         // already decoded.
+        let mut reference = None;
         let group_snapshot = match &pointer.location {
             SnapshotLocation::Inline { bytes } => {
                 decode_group_snapshot(bytes).map_err(|err| err.into_io())?
             }
             location => match self.snapshot_install.take_prefetched(&pointer) {
-                Some(group_snapshot) => group_snapshot,
+                Some(prefetched) => {
+                    reference = prefetched.reference;
+                    prefetched.snapshot
+                }
                 None => {
+                    if matches!(location, SnapshotLocation::S3 { .. }) {
+                        return Err(io::Error::other(
+                            "external S3 snapshots must be pinned and prefetched before Raft installation",
+                        ));
+                    }
                     let bytes = self
                         .snapshot_store
                         .download(location)
@@ -762,21 +814,26 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             .install_snapshot(group_snapshot)
             .await
             .map_err(group_engine_io_error)?;
-        persist_snapshot_metadata(self.snapshot_metadata_path.as_deref(), meta, &pointer_bytes)?;
-        if matches!(pointer.location, SnapshotLocation::S3 { .. }) {
-            self.snapshot_store
-                .publish_reference(self.placement.raft_group_id.0, &pointer.location)
-                .await
-                .map_err(|err| err.into_io())?;
-        }
         self.last_applied_log_id = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
         self.log_gauge
             .record_snapshot(self.log_gauge.mark(), pointer.location.size_hint());
-        *self.current_snapshot.lock().expect("snapshot mutex") = Some(CurrentSnapshot {
-            meta: meta.clone(),
-            pointer_bytes,
-        });
+        {
+            let mut current = self.current_snapshot.lock().expect("snapshot mutex");
+            persist_snapshot_metadata(
+                self.snapshot_metadata_path.as_deref(),
+                meta,
+                &pointer_bytes,
+            )?;
+            *current = Some(CurrentSnapshot {
+                meta: meta.clone(),
+                pointer_bytes,
+            });
+            self.snapshot_install
+                .references(self.placement.raft_group_id.0)
+                .commit_current(&pointer.location);
+        }
+        drop(reference);
         Ok(())
     }
 
@@ -809,6 +866,7 @@ pub struct RaftGroupSnapshotBuilder {
     log_gauge: Arc<GroupLogGauge>,
     /// The applied log this snapshot covers (F12e).
     log_mark: GroupLogMark,
+    references: Arc<SnapshotReferences>,
 }
 
 impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
@@ -870,45 +928,30 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             snapshot_id: snapshot_id.clone(),
             location,
         };
-        let mut pointer_bytes = pointer.encode_binary().map_err(|err| err.into_io())?;
-        persist_snapshot_metadata(
-            self.snapshot_metadata_path.as_deref(),
-            &self.meta,
-            &pointer_bytes,
-        )?;
-        if matches!(pointer.location, SnapshotLocation::S3 { .. })
-            && let Err(err) = self
-                .snapshot_store
-                .publish_reference(self.placement.raft_group_id.0, &pointer.location)
-                .await
+        let reference = match self
+            .references
+            .prepare(
+                &self.snapshot_store,
+                self.placement.raft_group_id.0,
+                &pointer.location,
+            )
+            .await
         {
-            tracing::warn!(
-                snapshot_id,
-                error = %err,
-                "falling back to inline OpenRaft snapshot after external reference publication failed"
-            );
-            if let Err(delete_error) = self.snapshot_store.delete(&pointer.location).await {
-                tracing::warn!(
-                    snapshot_id,
-                    error = %delete_error,
-                    "failed to delete unreferenced external snapshot after reference publication failure"
-                );
+            Ok(reference) => reference,
+            Err(err) => {
+                tracing::warn!(snapshot_id, %err, "falling back to inline snapshot after external pin failure");
+                pointer.location = SnapshotLocation::Inline {
+                    bytes: group_snapshot_frames(Arc::clone(&self.snapshot))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|err| err.into_io())?
+                        .into_iter()
+                        .flat_map(|chunk| chunk.to_vec())
+                        .collect(),
+                };
+                None
             }
-            pointer.location = SnapshotLocation::Inline {
-                bytes: group_snapshot_frames(Arc::clone(&self.snapshot))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|err| err.into_io())?
-                    .into_iter()
-                    .flat_map(|chunk| chunk.to_vec())
-                    .collect(),
-            };
-            pointer_bytes = pointer.encode_binary().map_err(|err| err.into_io())?;
-            persist_snapshot_metadata(
-                self.snapshot_metadata_path.as_deref(),
-                &self.meta,
-                &pointer_bytes,
-            )?;
-        }
+        };
+        let pointer_bytes = pointer.encode_binary().map_err(|err| err.into_io())?;
         let external_upload = !matches!(pointer.location, SnapshotLocation::Inline { .. });
         let inline_fallback = !external_upload;
         if let Some(metrics) = &self.metrics {
@@ -922,20 +965,46 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                 inline_fallback,
             );
         }
-        {
+        let chosen = {
             let mut guard = self.current_snapshot.lock().expect("snapshot mutex");
-            guard.replace(CurrentSnapshot {
-                meta: self.meta.clone(),
-                pointer_bytes: pointer_bytes.clone(),
-            });
+            // A build captured before a newer install must not overwrite its
+            // durable metadata, reference or pointer when the upload finishes.
+            if let Some(current) = guard.as_ref()
+                && current.meta.last_log_id > self.meta.last_log_id
+            {
+                current.clone()
+            } else {
+                persist_snapshot_metadata(
+                    self.snapshot_metadata_path.as_deref(),
+                    &self.meta,
+                    &pointer_bytes,
+                )?;
+                let current = CurrentSnapshot {
+                    meta: self.meta.clone(),
+                    pointer_bytes,
+                };
+                guard.replace(current.clone());
+                self.references.commit_current(&pointer.location);
+                self.log_gauge
+                    .record_snapshot(self.log_mark, pointer.location.size_hint());
+                current
+            }
+        };
+        drop(reference);
+        if let Err(err) = self
+            .references
+            .publish_current(&self.snapshot_store, self.placement.raft_group_id.0)
+            .await
+        {
+            tracing::warn!(snapshot_id, %err, "snapshot remains pinned while current-reference publication is unavailable");
         }
-        self.log_gauge
-            .record_snapshot(self.log_mark, pointer.location.size_hint());
+        let chosen_pointer =
+            SnapshotPointer::decode(&chosen.pointer_bytes).map_err(|err| err.into_io())?;
         if let Err(err) = self
             .snapshot_store
             .prune_retired(
                 self.placement.raft_group_id.0,
-                &pointer.location,
+                &chosen_pointer.location,
                 RETAINED_RETIRED_EXTERNAL_SNAPSHOTS,
             )
             .await
@@ -947,8 +1016,8 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             );
         }
         Ok(SnapshotOf::<UrsulaRaftTypeConfig> {
-            meta: self.meta.clone(),
-            snapshot: Cursor::new(pointer_bytes),
+            meta: chosen.meta,
+            snapshot: Cursor::new(chosen.pointer_bytes),
         })
     }
 }
@@ -1065,6 +1134,7 @@ mod tests {
             _build_permit: test_build_permit().await,
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
+            references: Arc::default(),
             snapshot_metadata_path: Some(metadata_path.clone()),
         };
         builder.build_snapshot().await.expect("persist snapshot");
@@ -1127,6 +1197,7 @@ mod tests {
             _build_permit: test_build_permit().await,
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
+            references: Arc::default(),
             snapshot_metadata_path: Some(metadata_path.clone()),
         };
         builder.build_snapshot().await.expect("persist snapshot");
@@ -1159,6 +1230,73 @@ mod tests {
             42
         );
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn older_snapshot_build_cannot_overwrite_a_newer_installed_pointer_or_metadata() {
+        let placement = ShardPlacement {
+            core_id: ursula_shard::CoreId(0),
+            shard_id: ursula_shard::ShardId(0),
+            raft_group_id: ursula_shard::RaftGroupId(7),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let metadata = directory.path().join("group-7.snapshot.json");
+        let store: SharedSnapshotStore =
+            Arc::new(ursula_runtime::S3SnapshotStore::memory_for_tests("stale-build").unwrap());
+        let mut state = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+            placement,
+            None,
+            None,
+            store.clone(),
+            SnapshotBuildCoordinator::default(),
+            SnapshotInstallCoordinator::default(),
+            Some(metadata.clone()),
+        );
+        state
+            .engine
+            .install_snapshot(test_group_snapshot(placement, 1))
+            .await
+            .unwrap();
+        state.last_applied_log_id = Some(test_log_id(1));
+        let mut old_builder = state.get_snapshot_builder().await;
+        let bytes = group_snapshot_frames(Arc::new(test_group_snapshot(placement, 2)))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .flat_map(|chunk| chunk.to_vec())
+            .collect();
+        let pointer = SnapshotPointer {
+            snapshot_id: "newer-install".to_owned(),
+            location: SnapshotLocation::Inline { bytes },
+        };
+        state
+            .install_snapshot(
+                &test_snapshot_meta(2),
+                Cursor::new(pointer.encode_binary().unwrap()),
+            )
+            .await
+            .unwrap();
+        // Complete the upload captured at index 1 only after installing index 2.
+        let returned = old_builder.build_snapshot().await.unwrap();
+        assert_eq!(returned.meta.last_log_id, Some(test_log_id(2)));
+        let pointer = SnapshotPointer::decode(returned.snapshot.get_ref()).unwrap();
+        assert_eq!(pointer.snapshot_id, "newer-install");
+        let mut restored = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+            placement,
+            None,
+            None,
+            store,
+            SnapshotBuildCoordinator::default(),
+            SnapshotInstallCoordinator::default(),
+            Some(metadata),
+        );
+        restored.restore_persisted_snapshot().await.unwrap();
+        assert_eq!(restored.last_applied_log_id, Some(test_log_id(2)));
+        assert_eq!(
+            restored.group_snapshot().await.unwrap().group_commit_index,
+            2
+        );
     }
 
     #[cfg(not(madsim))]
@@ -1197,6 +1335,7 @@ mod tests {
             _build_permit: test_build_permit().await,
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
+            references: Arc::default(),
             snapshot_metadata_path: None,
         };
         let first_snapshot = first.build_snapshot().await.expect("first snapshot");
@@ -1213,6 +1352,7 @@ mod tests {
             _build_permit: test_build_permit().await,
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
+            references: Arc::default(),
             snapshot_metadata_path: None,
         };
         let second_snapshot = second.build_snapshot().await.expect("second snapshot");
@@ -1246,6 +1386,7 @@ mod tests {
             _build_permit: test_build_permit().await,
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
+            references: Arc::default(),
             snapshot_metadata_path: None,
         };
         let third_snapshot = third.build_snapshot().await.expect("third snapshot");
@@ -1327,6 +1468,7 @@ mod tests {
             _build_permit: test_build_permit().await,
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
+            references: Arc::default(),
             snapshot_metadata_path: None,
         };
 
