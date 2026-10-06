@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -261,7 +257,7 @@ async fn append_waves(
                 }
             });
         try_join_all(writes).await.expect("append benchmark wave");
-        remaining -= wave;
+        remaining = remaining.saturating_sub(wave);
     }
     black_box(stores);
 }

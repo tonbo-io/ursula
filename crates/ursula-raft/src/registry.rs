@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -217,12 +213,12 @@ impl InProcessRaftRegistry {
     }
 
     fn record_full_snapshot(&self, node_id: u64) {
-        *self
+        let mut calls = self
             .full_snapshot_calls
             .lock()
-            .expect("in-process raft full snapshot calls mutex")
-            .entry(node_id)
-            .or_insert(0) += 1;
+            .expect("in-process raft full snapshot calls mutex");
+        let count = calls.entry(node_id).or_insert(0);
+        *count = count.saturating_add(1);
     }
 }
 
@@ -1591,10 +1587,6 @@ pub(crate) fn log_progress_snapshot(
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 mod tests {
     use bytes::Bytes;
     use ursula_runtime::GroupSnapshot;
@@ -1788,7 +1780,7 @@ mod tests {
                     reference_failure_snapshot(),
                 )
                 .await;
-            assert!(first.is_err());
+            first.expect_err("a failing reference store must reject the snapshot install");
             let metrics = raft.metrics().borrow_watched().clone();
             assert!(
                 metrics.running_state.is_ok(),
@@ -1838,7 +1830,11 @@ mod tests {
             ))
             .await
             .unwrap();
-            assert!(raft.metrics().borrow_watched().running_state.is_ok());
+            raft.metrics()
+                .borrow_watched()
+                .running_state
+                .as_ref()
+                .expect("raft core must keep running after the snapshot retry");
             raft.shutdown().await.unwrap();
         }
     }

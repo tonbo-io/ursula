@@ -1,8 +1,4 @@
 //! Recovery fault schedules over real TCP/gRPC, retaining the actual Raft handlers.
-#![expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
@@ -389,11 +385,9 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             "capability and low-term Vote cannot replace a fresh quorum proof"
         );
         assert_eq!(services[1].unknown_rpc_requests.load(Ordering::SeqCst), 0);
-        assert!(
-            crate::confirm_quorum_prefix(placement(), 2, &endpoints[1], Duration::from_millis(150))
-                .await
-                .is_err()
-        );
+        crate::confirm_quorum_prefix(placement(), 2, &endpoints[1], Duration::from_millis(150))
+            .await
+            .expect_err("a stale or legacy peer cannot confirm a quorum prefix");
     }
     // Reconnect healthy C first. B still owns the ACKed suffix; A still only
     // has the old prefix, so a successful fresh proof alone cannot open A.

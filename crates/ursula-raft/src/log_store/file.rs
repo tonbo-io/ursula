@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::fs;
@@ -42,6 +38,7 @@ use super::RaftGroupLogRecord;
 use super::RaftGroupLogStoreInner;
 use super::ensure_consecutive_entries;
 use super::ensure_log_append_boundary;
+use super::truncate_entries_after;
 use crate::codec::encode_wire;
 use crate::engine::invalid_data;
 use crate::rt::time::Instant;
@@ -475,8 +472,11 @@ pub(crate) fn run_core_file_log_writer(
                 for (request_index, request) in batch.into_iter().enumerate() {
                     let owns_batch_sample = request_index == 0;
                     let per_request = CoreFileLogWriteTiming {
-                        write_ns: timing.write_ns / count.max(1),
-                        sync_ns: timing.sync_ns / count.max(1),
+                        write_ns: timing
+                            .write_ns
+                            .checked_div(count)
+                            .unwrap_or(timing.write_ns),
+                        sync_ns: timing.sync_ns.checked_div(count).unwrap_or(timing.sync_ns),
                         fsyncs: u64::from(owns_batch_sample),
                         fsync_records: if owns_batch_sample { count } else { 0 },
                         reclaims: if owns_batch_sample {
@@ -714,10 +714,9 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
             .as_ref()
             .map(|writer| writer.blocking_semaphore());
         spawn_log_store_blocking(blocking, move || {
-            let start_index = last_log_id.map_or(0, |log_id| log_id.index + 1);
             let mut inner = store.lock_inner()?;
             store.append_record_locked(&RaftGroupLogRecord::TruncateAfter(last_log_id))?;
-            inner.entries.retain(|index, _| *index < start_index);
+            truncate_entries_after(&mut inner.entries, last_log_id.map(|log_id| log_id.index));
             Ok(())
         })
         .await
@@ -778,9 +777,8 @@ pub(crate) fn load_log_store_inner(path: &Path) -> Result<RaftGroupLogStoreInner
     }
 
     let mut inner = RaftGroupLogStoreInner::default();
-    for (record_number, record) in read_wire_frames_from_file::<RaftGroupLogRecord>(path)?
-        .into_iter()
-        .enumerate()
+    for (record_number, record) in
+        (1_usize..).zip(read_wire_frames_from_file::<RaftGroupLogRecord>(path)?)
     {
         apply_log_store_record(&mut inner, record).map_err(|err| {
             io::Error::new(
@@ -788,7 +786,7 @@ pub(crate) fn load_log_store_inner(path: &Path) -> Result<RaftGroupLogStoreInner
                 format!(
                     "replay OpenRaft log record '{}' record {}: {err}",
                     path.display(),
-                    record_number + 1
+                    record_number
                 ),
             )
         })?;
@@ -1039,8 +1037,7 @@ pub(crate) fn apply_log_store_record(
             super::ensure_consecutive_log::<UrsulaRaftTypeConfig>(&inner.entries)
         }
         RaftGroupLogRecord::TruncateAfter(last_log_id) => {
-            let start_index = last_log_id.map_or(0, |log_id| log_id.index + 1);
-            inner.entries.retain(|index, _| *index < start_index);
+            truncate_entries_after(&mut inner.entries, last_log_id.map(|log_id| log_id.index));
             Ok(())
         }
         RaftGroupLogRecord::Purge(log_id) => {

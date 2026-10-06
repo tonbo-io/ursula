@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::future::Future;
@@ -1416,7 +1412,11 @@ impl GrpcRaftNetwork {
         // hands freed budget to the oldest waiter first (and lets no later call overtake it), so
         // a multi-MiB catch-up append is not starved by a stream of small ones. The wait shares
         // the call's OpenRaft deadline; still not admitted by then is the true overflow case.
-        let deadline = tokio::time::Instant::now() + option.hard_ttl();
+        let deadline = tokio::time::Instant::now()
+            .checked_add(option.hard_ttl())
+            .ok_or_else(|| {
+                tonic::Status::invalid_argument("raft rpc hard TTL overflows the monotonic clock")
+            })?;
         let admitted = match session.budget.clone().try_acquire_many_owned(charge) {
             Ok(permit) => Some(permit),
             Err(_) => {
@@ -1676,7 +1676,8 @@ async fn run_append_session(
         if pending.is_empty() {
             last_progress = tokio::time::Instant::now();
         }
-        let stall_deadline = last_progress + RAFT_GRPC_APPEND_STREAM_STALL_TIMEOUT;
+        let stall_wait = RAFT_GRPC_APPEND_STREAM_STALL_TIMEOUT
+            .saturating_sub(tokio::time::Instant::now().saturating_duration_since(last_progress));
         // Take a call only once the wire has room for its frame, so this loop never blocks on
         // the wire while responses (which free the peer to read more) wait unread.
         let next_call = async {
@@ -1728,7 +1729,7 @@ async fn run_append_session(
                     }
                 }
             }
-            () = tokio::time::sleep_until(stall_deadline), if !pending.is_empty() => {
+            () = tokio::time::sleep(stall_wait), if !pending.is_empty() => {
                 GRPC_APPEND_STREAM_STALLS.fetch_add(1, Ordering::Relaxed);
                 GRPC_APPEND_STREAM_SESSION_FAILURES.fetch_add(1, Ordering::Relaxed);
                 break;

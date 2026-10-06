@@ -25,10 +25,6 @@
 //!
 //! Without object storage nothing outlives a full restart, so it cannot be
 //! detected: the group initializes again, empty.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -304,7 +300,7 @@ where
         .filter(|(peer_id, _)| **peer_id != node_id)
         .map(|(peer_id, node)| (*peer_id, node.addr.clone()))
         .collect::<Vec<_>>();
-    let mut next_warning = crate::rt::time::Instant::now() + warn_every;
+    let mut last_warning = crate::rt::time::Instant::now();
     let mut warned_stop = false;
     loop {
         match raft.is_initialized().await {
@@ -368,18 +364,18 @@ where
             }
             BootstrapAction::StopForOperator => {
                 guard.stopped.store(true, Ordering::SeqCst);
-                if !warned_stop || now >= next_warning {
+                if !warned_stop || now.saturating_duration_since(last_warning) >= warn_every {
                     tracing::error!(
                         node_id,
                         raft_group_id = group,
                         "raft bootstrap: memory-WAL group {group} lost its log on every voter after it held writes (object storage holds its initialized marker); it stays without a leader and refuses writes. To initialize it again empty and accept the loss, run POST /__ursula/raft/{group}/rejoin/reinitialize?accept_data_loss=true on node {node_id}"
                     );
                     warned_stop = true;
-                    next_warning = now + warn_every;
+                    last_warning = now;
                 }
             }
             BootstrapAction::Wait => {
-                if now >= next_warning {
+                if now.saturating_duration_since(last_warning) >= warn_every {
                     if evidence == InitEvidence::Unreadable {
                         tracing::warn!(
                             "raft bootstrap: memory-WAL node {node_id} group {group} cannot read its initialized marker in object storage; not initializing until it can"
@@ -391,7 +387,7 @@ where
                             peers.len()
                         );
                     }
-                    next_warning = now + warn_every;
+                    last_warning = now;
                 }
             }
         }

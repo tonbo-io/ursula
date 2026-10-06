@@ -38,10 +38,6 @@
 //! the survivor ([`GroupRejoin::adopt_survivor`]). A group whose every voter
 //! restarted empty is stopped by its "initialized" marker in object storage
 //! instead (`crate::restart_guard`).
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -668,7 +664,7 @@ pub(crate) enum HealStep {
 }
 
 fn quorum(voter_count: usize) -> usize {
-    voter_count / 2 + 1
+    (voter_count / 2).saturating_add(1)
 }
 
 /// The next heal step for a group this node leads, if any.
