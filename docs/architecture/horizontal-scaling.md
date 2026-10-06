@@ -125,6 +125,10 @@ explicitly configure five meta voters.
 
 ## What exists and what is missing
 
+The table below records the upstream review at `c066d148`. Later implementation
+checkpoints in this document and the epic scoreboard track completed components;
+the table is not a claim about the current epic branch.
+
 | Area | Reviewed implementation | Required follow-up |
 | --- | --- | --- |
 | Stream routing | `StaticShardMap`: hash modulo group count, group modulo core count | Persist routing identity; reject incompatible joins and online group-count changes |
@@ -525,3 +529,63 @@ Projection-driven dynamic prepare/release and learner/intent startup remain
 pending. Before enabling them, add durable intent/epoch evidence and receiver
 fences, including local retirement authority that overrides a stale checkpoint.
 A cache alone must never allow traffic or restart to recreate a revoked actor.
+
+
+### Implementation checkpoint: managed intent and evidence protocol
+
+Commit `6530772` adds `SubmitMigration`, `ClaimMigrationExecutor` and
+`UpdateMigration` to the replicated control state. Requests bind an immutable
+operation key, expected placement epoch, observed source uniform membership,
+target voters and optional explicit policy. Same-key/same-payload retry returns
+the original ID, including after completion; conflicts and stale source/epoch
+observations are rejected. Normal moves retain policy; RF changes remain explicit.
+The initial executor removes outgoing replicas rather than retaining learners.
+
+```mermaid
+flowchart LR
+  I[Intent and epoch CAS] --> G[Durable executor generation]
+  G --> B[Authorize and certify receiver barriers]
+  B --> L[Prepare and fixed-prefix catch-up]
+  L --> A[Authorize membership submission]
+  A --> V[Uniform target membership and applied proofs]
+  V --> P[Placement epoch CAS]
+  P --> C[Replica cleanup and receiver retirement]
+  C --> F[Finish]
+```
+
+A claim key makes generation allocation retryable. Globally increasing
+counter values survive snapshots/log recovery and reject exhaustion instead
+of reusing an ID. Every update binds the complete executor token and expected
+intent revision. An exact retry of the latest update is unchanged; older or
+conflicting updates fail. A takeover preserves the irreversible intent and
+published placement but invalidates current receiver/learner/verification/
+cleanup authority, which must be certified again under the new generation.
+
+Activation authorization is durable before any receiver RPC; voter-change
+authorization is durable before membership submission. Lost replies therefore
+cannot make a possibly side-effecting operation appear cancellable. Errors
+retain its global lock. Only a request that has not authorized receiver effects
+can be cancelled directly. Publication requires current-generation uniform
+membership, exact target voters, no learners, all target processes applied
+through a post-membership committed prefix, and CAS against source placement
+and policy. Cleanup evidence binds membership, epoch and receiver incarnation;
+finish also needs every participant's drained executor retirement. Publication
+and physical cleanup remain separately visible through phase/draining state.
+
+These are deterministic shape/order checks for receipts from a trusted executor.
+They do not certify physical work themselves. Server receiving-process admission,
+durable assignment/retirement fences, real learner readiness, leadership/joint
+membership reconciliation, maintenance exclusion and cleanup evidence production
+are still required before exposing operation HTTP/CLI routes. A cached projection
+cannot authorize any of those mutations. New snapshots/projections reject invalid
+intent indices, generations and terminal/publication authority. Legacy/static
+snapshots default the new counter and preserve their older control commands;
+bootstrapped managed clusters reject those unconstrained mutation commands.
+
+The independent meta RPC protocol is now v2 so v1 peers cannot participate using
+different state-machine transition rules. The data Raft protocol is unchanged.
+Upgrade meta/control nodes together before using the new managed protocol.
+Tests cover pure RF3/RF5 replacement and RF cycles, plus actual three-replica
+meta consensus, compaction, a later error log and full restart/takeover. Those
+migration tests use synthetic data/receiver certificates; actual data migration
+and receiving-process fence fault coverage remain M2 acceptance work.

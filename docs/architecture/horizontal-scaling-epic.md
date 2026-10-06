@@ -1,6 +1,6 @@
 # Horizontal Scaling Epic
 
-Status: active; M1 implementation in progress under a persistent goal.
+Status: active; M1 consumers and M2 fencing foundations in progress under a persistent goal.
 Last updated: 2026-10-06.
 
 - Tracking issue: [#2: dynamic group membership](https://github.com/tonbo-io/ursula/issues/2).
@@ -43,7 +43,7 @@ are follow-up work outside the initial contract.
 | --- | --- | --- | --- | --- |
 | M0 | Isolated worktree, RF-aware design, stories and progress ledger | None | Complete: commit `4fe583d` | Worktree/baseline verified; document links and diff checks |
 | M1 | Durable control plane with persisted RF=3/5 policy | M0 | In progress | Durable restart/transport/bootstrap tests, RF/domain-policy tests |
-| M2 | One supported, recoverable group/policy migration | M1 | Planned | Subset-layout move E2E, migration-boundary DST, routing/cleanup/fencing evidence |
+| M2 | One supported, recoverable group/policy migration | M1 | In progress: prerequisites for HS-104 | Subset-layout move E2E, migration-boundary DST, routing/cleanup/fencing evidence |
 | M3 | Operator scale-out/scale-in and bounded batch rebalance | M2 | Planned | RF=3: 3→6→3; RF=5: 5→10→5; mixed-RF E2E and capacity measurements |
 | M4 | Autopilot submits safe plans through the supported executor | M3 | Planned | Deterministic policy tests, failure schedules, bounded churn and load response |
 
@@ -78,10 +78,10 @@ already accepts the meta type config.
 
 | Story | Deliverable and exit criteria | Dependencies | Status |
 | --- | --- | --- | --- |
-| HS-201 | Intent-bound state transitions, operation idempotency, epoch CAS, source/target policy and membership-step evidence; no successful finish without verified placement | M1 | Planned |
+| HS-201 | Intent-bound state transitions, operation idempotency, epoch CAS, source/target policy and membership-step evidence; no successful finish without verified placement | M1 | In progress: commit `6530772` (replicated metadata protocol; physical executor integration pending) |
 | HS-202 | Durable dynamic group prepare/release on the owning core; joining replicas never initialize themselves; revoked replicas cannot be recreated by traffic | HS-104, HS-201 | Planned |
 | HS-203 | Resumable learner catch-up, fixed-prefix applied verification, joint-membership reconciliation, leader handoff and final membership verification | HS-201, HS-202 | Planned |
-| HS-204 | Durably allocated executor generations and process-incarnation fencing, receiving-process barriers and exclusion with maintenance; delayed old/raw requests cannot bypass authority | HS-201; required before managed mutations are exposed | Planned |
+| HS-204 | Durably allocated executor generations and process-incarnation fencing, receiving-process barriers and exclusion with maintenance; delayed old/raw requests cannot bypass authority | HS-201; required before managed mutations are exposed | In progress: commit `6530772` (durable generation/receipt model; receiving-process admission pending) |
 | HS-205 | Dynamic node/gateway routing, per-group readiness/quorum inventory, reference protection, actor/background-work retirement and safe per-core journal reclamation | HS-202, HS-203, HS-204 | Planned |
 | HS-206 | Supported operation API and CLI submit/status/wait/resume with admin authority and error semantics; real-process E2E plus DST at every migration boundary | HS-201 through HS-205 | Planned |
 
@@ -173,10 +173,20 @@ unevacuated machine. Physical provisioning remains outside the Raft controller.
 | 2026-10-06 | HS-104 | Three storage tests cover monotonic reopen, unchanged/stale/conflicting versions, torn/corrupt/foreign checkpoints, failed publication and storage poisoning. Extended real CLI test selects meta voters {1,4,5} in distinct zones, stops all processes and restarts only data nodes {1,2,3}: fresh meta quorum read fails, both data majorities remain ready, acknowledged pre-adoption data survives and a new write/read succeeds | Reproduced independent meta/data quorum-loss recovery; CLI fixture passed in 26.61s. RF5 layout remains 2/2/1; no migration or snapshot-retirement acceptance is claimed |
 | 2026-10-06 | HS-104 | Workspace lib/bin tests: 922 passed, 1 ignored; workspace doc tests, final workspace Clippy with `-D warnings`, format, all seven tracked-source DST audits, madsim Raft check and existing smoke corpus passed | Local final checks passed. A first fixture variant was rejected by the meta failure-domain constraint; corrected zones before the passing process run |
 
+| 2026-10-06 | HS-201 | Commit `6530772` adds immutable keyed requests, source membership/policy validation, epoch and revision CAS, replay of lost responses, ordered fixed-prefix/target-applied evidence, and intent-bound publication. Publish changes voters and policy together and increments epoch once. Finish requires removed-replica cleanup plus retirement of all participant executors. Errors after authorizing possible receiver/membership side effects retain the operation lock | Replicated deterministic protocol implemented; physical receiver and data-Raft evidence production remain HS-202/HS-203/HS-204 |
+| 2026-10-06 | HS-204 | Commit `6530772` durably allocates globally monotonic executor generations with claim-key idempotency and process identity. Takeover preserves irreversible progress but invalidates receiving-process, learner, verification and cleanup authority until recertified. Old tokens fail even at a matching revision. Recovered/projected snapshots validate intent/active index/generation/publication/terminal invariants | Metadata authority foundation; this is not receiving-process fencing. Managed raw mutation routes remain closed; no supported migration API is exposed |
+| 2026-10-06 | HS-201/HS-204 | Eight control tests cover RF3/RF5 replacement, explicit 3→5→3 policy publication, replay/conflicting keys, stale source/epoch/revision/process evidence, incomplete/joint/unapplied target proof, generation takeover before/after publication, cleanup gates, cancellation after lost activation replies, serialization, invalid recovery records and exhausted counters | Pure tests use synthetic certificates/receipts; they prove deterministic enforcement, not actual membership movement or physical reclamation |
+| 2026-10-06 | HS-201/HS-204 | Extended three-node durable meta TCP test persists an intent and receiver-activation authorization, snapshots/purges every replica, appends a lost-activation error afterward, fully restarts and verifies exact recovered control state, same-key replay, higher replacement generation and refusal of the old token without unlocking | Real meta consensus/storage/restart; synthetic data/receiver evidence. The existing combined server process fixture remains a fixed-layout adoption/recovery regression |
+| 2026-10-06 | M1/M2 | Workspace lib/bin tests: 930 passed, 1 ignored; workspace doc tests, workspace Clippy with `-D warnings`, format, seven tracked-source DST audits, madsim Raft check and existing smoke corpus passed. Meta protocol v2 rejects v1 peers before decode; after that change all five meta transport tests passed (4.56s), managed CLI regression passed (32.17s), final Clippy/audits/format and madsim Raft check passed | New managed state semantics are separated from v1 peers. Existing smoke is compatibility evidence; migration-boundary DST and actual group/RF migration E2E remain pending |
+
 ## Current execution checkpoint
 
-Current implementation story: **HS-104**, learner/intent-aware hosting and live
-assignment consumers. Durable local recovery is implemented in `a5e6740`. HS-103 is implemented in `73f6970`: opt-in `[control]`
+Current implementation story: **HS-204**, receiving-process admission and durable
+fence/assignment ledger, followed by **HS-202/HS-104** dynamic prepare/release and
+intent-aware startup. Commit `6530772` supplies the HS-201 replicated intent,
+epoch/revision and evidence protocol plus HS-204 durable executor generations.
+Physical data/receiver evidence is not yet produced or consumed by a server
+migration executor. Durable local projection recovery is in `a5e6740`. HS-103 is implemented in `73f6970`: opt-in `[control]`
 configuration, independently selected meta3/meta5 voters, bound private RPCs,
 cohort-checked one-time meta bootstrap and adoption using actual data quorum
 certificates. Raw data-membership and backup-import mutations are rejected
@@ -197,10 +207,13 @@ runtime/maintenance/snapshot inventory consumers remain HS-104. Established
 settled data groups now recover from the identity-bound projection checkpoint
 without meta quorum; first adoption still requires fresh meta/data quorums.
 The current refresh updates the durable ordered cursor and public routing;
-it does not create or retire actors. Before wiring those mutations, implement
-the prerequisite HS-201 intent/epoch evidence and HS-204 receiver fencing
-foundations. This starts M2 dependencies while M1 remains open; milestone
-completion still requires the stated full acceptance, not only a partial cache. No actual data-group migration, CI,
+it does not create or retire actors. The HS-201 metadata prerequisites now
+exist; next persist and enforce receiving-process authority, drain/reconcile
+previous submissions, and exclude maintenance before any managed mutation.
+The local assignment/retirement ledger must override stale cached projections
+and prevent traffic/restart from recreating revoked actors. These M2 foundations
+start while M1 stays open; milestone completion still requires full acceptance.
+No actual data-group migration, CI,
 deployment or scaling-performance acceptance is claimed. M2 receiver fences
 must precede exposing managed mutations. No external blocker is recorded.
 
