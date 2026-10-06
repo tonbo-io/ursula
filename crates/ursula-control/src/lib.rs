@@ -23,12 +23,15 @@ mod model;
 mod policy;
 mod projection;
 mod receiver;
+pub use receiver::CompletedReceiverMutation;
 pub use receiver::PendingReceiverMutation;
 pub use receiver::ReceiverFencePhase;
 pub use receiver::ReceiverFenceRecord;
 pub use receiver::ReceiverLedger;
+pub use receiver::ReceiverMutationKind;
 pub use receiver::ReplicaAssignment;
 pub use receiver::ReplicaAssignmentPhase;
+pub use receiver::ReplicaMutationResult;
 mod state;
 mod view;
 

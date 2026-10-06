@@ -33,6 +33,10 @@ use ursula_raft::MetaRaftHandle;
 
 use crate::HttpState;
 
+mod replica;
+use replica::replica_prepare;
+use replica::replica_release;
+
 pub(crate) struct ManagedReceiver {
     pub(crate) store: Arc<ManagedReceiverStore>,
     recipe: ClusterBootstrap,
@@ -197,8 +201,9 @@ impl ManagedReceiver {
                 && old.process == state.process_incarnation
                 && old.phase == ReceiverFencePhase::Active
         }) {
+            self.reconcile_replica(state, &token).await?;
             self.barrier(state).await?;
-            return Ok(ledger);
+            return self.store.snapshot().map_err(|e| e.to_string());
         }
         ledger.high_water_generation = token.generation;
         ledger.fence = Some(ReceiverFenceRecord {
@@ -206,14 +211,15 @@ impl ManagedReceiver {
             process: state.process_incarnation.clone(),
             phase: ReceiverFencePhase::Activating,
         });
-        ledger = self
-            .store
+        self.store
             .persist(ledger.clone())
             .await
             .map_err(|e| e.to_string())?;
+        self.reconcile_replica(state, &token).await?;
         self.barrier(state).await?;
         // A generation can be replaced while this process waits for its queue.
         self.fresh(state, &token, false).await?;
+        ledger = self.store.snapshot().map_err(|e| e.to_string())?;
         ledger.fence.as_mut().ok_or("missing receiver fence")?.phase = ReceiverFencePhase::Active;
         ledger = self
             .store
@@ -229,8 +235,27 @@ impl ManagedReceiver {
         token: MigrationToken,
     ) -> Result<ReceiverLedger, String> {
         let _guard = self.gate.write().await;
-        self.fresh(state, &token, true).await?;
+        let view = self.fresh(state, &token, true).await?;
         let mut ledger = self.store.snapshot().map_err(|e| e.to_string())?;
+        let migration = view.state.active_migration().ok_or("no migration")?;
+        let own = self.store.identity().node.node_id;
+        if migration.target_voters.contains(&own) {
+            let epoch = migration
+                .managed
+                .as_ref()
+                .and_then(|managed| managed.published_epoch)
+                .ok_or("no published epoch")?;
+            let assignment = ledger
+                .assignments
+                .get_mut(&migration.raft_group_id)
+                .ok_or("target replica has no local assignment")?;
+            if assignment.phase != ReplicaAssignmentPhase::Hosted {
+                return Err("target replica is not hosted".to_owned());
+            }
+            assignment.epoch = epoch;
+            assignment.migration_id = token.migration_id;
+            assignment.generation = token.generation;
+        }
         let current = ledger
             .fence
             .as_mut()
@@ -264,6 +289,8 @@ pub(crate) fn router(state: HttpState) -> Router {
         .route("/__ursula/control/receiver", get(status))
         .route("/__ursula/control/receiver/activate", post(activate))
         .route("/__ursula/control/receiver/retire", post(retire))
+        .route("/__ursula/control/receiver/prepare", post(replica_prepare))
+        .route("/__ursula/control/receiver/release", post(replica_release))
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024))
         .with_state(state)
 }

@@ -77,6 +77,7 @@ impl ManagedReceiverStore {
                     .ledger
                     .validate(identity.cluster.group_count)
                     .map_err(invalid)?;
+                validate_receipt_node(&checkpoint.ledger, identity.node.node_id)?;
                 if !bound && checkpoint.ledger != ReceiverLedger::default() {
                     return Err(invalid("cannot bind existing receiver authority"));
                 }
@@ -149,6 +150,7 @@ impl ManagedReceiverStore {
                 .ledger
                 .validate_successor(&ledger, store.identity.cluster.group_count)
                 .map_err(invalid)?;
+            validate_receipt_node(&ledger, store.identity.node.node_id)?;
             let checkpoint = Checkpoint {
                 identity: store.identity.clone(),
                 ledger: ledger.clone(),
@@ -168,6 +170,21 @@ impl ManagedReceiverStore {
         })
         .await
     }
+}
+
+fn validate_receipt_node(ledger: &ReceiverLedger, node_id: u64) -> io::Result<()> {
+    if let Some(receipt) = &ledger.completed {
+        let actual = match &receipt.result {
+            ursula_control::ReplicaMutationResult::Prepared { process } => process.node_id,
+            ursula_control::ReplicaMutationResult::Released { evidence } => {
+                evidence.process.node_id
+            }
+        };
+        if actual != node_id {
+            return Err(invalid("receiver receipt differs from its bound node"));
+        }
+    }
+    Ok(())
 }
 
 fn invalid(reason: impl Into<String>) -> io::Error {
