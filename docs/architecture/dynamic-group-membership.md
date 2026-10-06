@@ -189,6 +189,13 @@ Before dynamic membership is usable on a running cluster, later PRs need to:
 - decide whether migration progression remains manual-first or gets a
   background executor.
 
+The horizontal scaling epic now has a locally validated durable meta storage
+implementation (HS-101, commit `b7352ea`). `MetaRaftFileLogStore` reuses the
+checksummed journal with atomic durable snapshots and snapshot-covered purge;
+`MetaRaftHandle::new_durable_node_with_network` recovers it without automatic
+membership initialization. Multi-node transport, production bootstrap and the
+supported operator workflow remain subsequent stories in the epic tracker.
+
 ## Implementation Map
 
 - `crates/ursula-control`: control-plane state, commands, placement views, and

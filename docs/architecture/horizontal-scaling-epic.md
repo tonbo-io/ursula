@@ -41,7 +41,7 @@ are follow-up work outside the initial contract.
 
 | Milestone | Outcome | Depends on | Status | Exit evidence |
 | --- | --- | --- | --- | --- |
-| M0 | Isolated worktree, RF-aware design, stories and progress ledger | None | Complete: local documents | Worktree/baseline verified; document links and diff checks |
+| M0 | Isolated worktree, RF-aware design, stories and progress ledger | None | Complete: commit `4fe583d` | Worktree/baseline verified; document links and diff checks |
 | M1 | Durable control plane with persisted RF=3/5 policy | M0 | In progress | Durable restart/transport/bootstrap tests, RF/domain-policy tests |
 | M2 | One supported, recoverable group/policy migration | M1 | Planned | Subset-layout move E2E, migration-boundary DST, routing/cleanup/fencing evidence |
 | M3 | Operator scale-out/scale-in and bounded batch rebalance | M2 | Planned | RF=3: 3→6→3; RF=5: 5→10→5; mixed-RF E2E and capacity measurements |
@@ -56,8 +56,8 @@ blocked implementation milestone.
 
 | Story | Deliverable and exit criteria | Dependencies | Status |
 | --- | --- | --- | --- |
-| HS-101 | Persist and restore meta vote, log, committed/applied state and snapshots; recover correctly after compaction and crash/restart without resurrecting discarded intent | M0 | In progress |
-| HS-102 | Implement default/per-group RF=3/5 and one-domain-loss policy; infer/validate existing placements on adoption; reject invalid policies and bootstrap drift | M0 | Ready |
+| HS-101 | Persist and restore meta vote, log, committed/applied state and snapshots; recover correctly after compaction and crash/restart without resurrecting discarded intent | M0 | Complete: commit `b7352ea` |
+| HS-102 | Implement default/per-group RF=3/5 and one-domain-loss policy; infer/validate existing placements on adoption; reject invalid policies and bootstrap drift | M0 | In progress |
 | HS-103 | Concrete multi-node meta transport, independent meta voters, one-time bootstrap, cluster identity and trusted client/cluster/admin node directory | HS-101, HS-102 | Planned |
 | HS-104 | Ordered placement/policy projections with full-snapshot resync; data/node startup restores assignments without reinitializing from stale TOML | HS-103 | Planned |
 
@@ -143,17 +143,20 @@ unevacuated machine. Physical provisioning remains outside the Raft controller.
 | 2026-10-06 | M0 | Established HS-101 through HS-403, dependencies, milestone exit criteria and acceptance matrices | Local tracking baseline |
 | 2026-10-06 | M0 | Checked document links, diff whitespace, scoreboard/story structure and RF/AZ examples | Document checks only; no runtime tests |
 | 2026-10-06 | HS-101 | User requested a persistent goal to autonomously complete the entire epic; began durable meta storage using the existing checksummed journal and filesystem-lock/durability primitives | Implementation in progress; validation pending |
+| 2026-10-06 | M0 | Committed design/tracker baseline in `4fe583d` | Local committed documents |
+| 2026-10-06 | HS-101 | Commit `b7352ea` adds durable meta journal, atomic checksummed snapshots, guarded purge/compaction and recoverable constructors; 8 focused tests cover process exit before/after purge and post-snapshot intent logs, torn tail, corruption, failed snapshot publication and lock exclusivity | Local implementation and reproduced process/storage tests; multi-node transport/bootstrap remain HS-103 |
+| 2026-10-06 | HS-101 | `cargo fmt --all -- --check`; workspace Clippy with `-D warnings`; workspace lib/bin tests (888 passed, 1 ignored); workspace doc tests; seven DST audits; `RUSTFLAGS='--cfg madsim'` Raft lib check and `smoke_corpus_replays` | Passed; madsim has existing warnings in runtime/data-log modules; no new meta-storage warning |
 
 ## Current execution checkpoint
 
-Current implementation story: **HS-101**, durable meta recovery. **HS-102** is
-also ready and defines the policy contract needed by bootstrap and migrations.
-Reuse the existing checksummed journal, advisory lock and blocking-I/O boundary
-for meta logs, with atomically installed durable snapshots before log purge.
-Add focused crash/restart and compaction tests before production bootstrap.
+Current implementation story: **HS-102**, configurable replication and
+failure-domain policy. HS-101 is implemented and validated in `b7352ea`.
+Persist default and resolved per-group policies with deterministic validation,
+then validate adoption from actual memberships and explicit RF changes.
 
-No milestone beyond M0 has completed implementation, CI, deployment, fault-test
-or performance evidence yet.
+M1 remains incomplete: durable storage is present, but policy, multi-node
+transport/bootstrap and projection distribution are not yet integrated. No CI,
+deployment or scaling-performance acceptance is claimed.
 There is no current external blocker recorded; pending implementation is not
 a blocker.
 
