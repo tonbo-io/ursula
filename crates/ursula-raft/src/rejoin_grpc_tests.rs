@@ -515,6 +515,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         .current_leader(3, "healthy C becomes leader")
         .await
         .unwrap();
+    engines[2].raft.runtime_config().tick(true);
     services[1].legacy.store(true, Ordering::SeqCst);
     assert!(
         probe_rejoin_vote_barrier(placement(), 1, 2, &endpoints[1], Duration::from_secs(1))
@@ -522,9 +523,29 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             .is_err(),
         "a forwarded HEAD is not evidence of that peer's own prefix"
     );
-    let proof = probe_rejoin_vote_barrier(placement(), 1, 3, &endpoints[2], Duration::from_secs(1))
-        .await
-        .expect("fresh proof from new leader C");
+    // The leader metric may precede application of the new term's blank entry.
+    // A transient ReadIndex refusal must leave the restarted voter ineligible;
+    // the production recovery driver also retries fresh outbound proofs.
+    let proof_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let proof = loop {
+        match probe_rejoin_vote_barrier(placement(), 1, 3, &endpoints[2], Duration::from_secs(1))
+            .await
+        {
+            Ok(proof) => break proof,
+            Err(error) => {
+                assert!(
+                    !gates[0].vote_gate_open(),
+                    "failed proof cannot open the gate"
+                );
+                assert!(
+                    tokio::time::Instant::now() < proof_deadline,
+                    "fresh proof from new leader C: {error}; metrics: {:?}",
+                    engines[2].raft.metrics().borrow_watched()
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    };
     assert!(proof.1 >= acked.log_id.index());
     gates[0].confirm_barrier(proof.0, proof.1);
     assert!(
