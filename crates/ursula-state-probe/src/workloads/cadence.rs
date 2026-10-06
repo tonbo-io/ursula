@@ -11,11 +11,8 @@
 //! groups) seen at a driver tick, against the node log budget. W1 is
 //! `--groups=1 --node-groups=128` (one heavy stream on a default node); the
 //! uniform workload is `--groups=128 --streams-per-group=4`.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
+use anyhow::Context;
 use anyhow::Result;
 use clap::Args;
 use serde_json::json;
@@ -83,7 +80,7 @@ struct Group {
 impl Group {
     fn apply(&mut self, command: StreamCommand, what: &str) -> Result<()> {
         self.gauge.record_applied(command.log_bytes_estimate());
-        self.commit_index += 1;
+        self.commit_index = self.commit_index.saturating_add(1);
         smx::ok(self.machine.apply(command), what)?;
         Ok(())
     }
@@ -150,7 +147,7 @@ fn maybe_flush(group: &mut Group, flush_bytes: usize) -> Result<()> {
             }
             .log_bytes_estimate(),
         );
-        group.commit_index += 1;
+        group.commit_index = group.commit_index.saturating_add(1);
     }
     Ok(())
 }
@@ -188,12 +185,23 @@ pub fn run(args: &CadenceArgs, sink: &mut Sink) -> Result<Outcome> {
     let mut largest_snapshot = 0u64;
     let tick = args.tick_appends.max(1);
     for n in 0..args.appends {
-        let group_index = usize::try_from(n % groups_n as u64).unwrap_or(0);
-        let round = n / groups_n as u64;
+        let group_index = usize::try_from(
+            n.checked_rem(groups_n as u64)
+                .context("group count must be nonzero")?,
+        )
+        .unwrap_or(0);
+        let round = n
+            .checked_div(groups_n as u64)
+            .context("group count must be nonzero")?;
         let Some(group) = groups.get_mut(group_index) else {
             continue;
         };
-        let stream_index = usize::try_from(round % group.streams.len() as u64).unwrap_or(0);
+        let stream_index = usize::try_from(
+            round
+                .checked_rem(group.streams.len() as u64)
+                .context("stream count must be nonzero")?,
+        )
+        .unwrap_or(0);
         let Some(stream_id) = group.streams.get(stream_index).cloned() else {
             continue;
         };
@@ -206,12 +214,13 @@ pub fn run(args: &CadenceArgs, sink: &mut Sink) -> Result<Outcome> {
                 close_after: false,
                 stream_seq: None,
                 producer: None,
-                now_ms: smx::T0 + n,
+                now_ms: smx::T0.saturating_add(n),
             },
             "append",
         )?;
         maybe_flush(group, flush_bytes)?;
-        if (n + 1) % tick == 0 || n + 1 == args.appends {
+        let appended = n.saturating_add(1);
+        if appended.checked_rem(tick) == Some(0) || appended == args.appends {
             let progress = groups
                 .iter()
                 .map(|group| group.gauge.progress())
@@ -219,7 +228,7 @@ pub fn run(args: &CadenceArgs, sink: &mut Sink) -> Result<Outcome> {
             let plan = cadence.plan(&progress, args.max_groups_per_tick);
             max_node_log = max_node_log.max(plan.node_log_bytes);
             if plan.pressure {
-                pressure_ticks += 1;
+                pressure_ticks = pressure_ticks.saturating_add(1);
             }
             for index in plan.groups {
                 let Some(group) = groups.get_mut(index) else {
@@ -228,8 +237,8 @@ pub fn run(args: &CadenceArgs, sink: &mut Sink) -> Result<Outcome> {
                 let mark = group.gauge.mark();
                 let bytes = snapshot_bytes(group)?;
                 group.gauge.record_snapshot(mark, bytes);
-                snapshots += 1;
-                snapshot_total += bytes;
+                snapshots = snapshots.saturating_add(1);
+                snapshot_total = snapshot_total.saturating_add(bytes);
                 largest_snapshot = largest_snapshot.max(bytes);
             }
         }

@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -98,7 +94,7 @@ pub async fn run(args: BootstrapArgs) -> Result<BootstrapResult> {
     let setup_start = Instant::now();
     let payload = Arc::new(fill_payload(args.event_bytes, 0xBEEF));
     let event_count = args.pre_events;
-    let snapshot_offset_bytes = (event_count as u64 / 2) * args.event_bytes as u64;
+    let snapshot_offset_bytes = (event_count as u64 / 2).saturating_mul(args.event_bytes as u64);
     let pending = Arc::new(tokio::sync::Semaphore::new(args.setup_concurrency.max(1)));
 
     for stream in &stream_names {
@@ -244,7 +240,7 @@ async fn run_client(
     let mut s = resp.bytes_stream();
     while let Some(chunk) = s.next().await {
         match chunk {
-            Ok(c) => bytes += c.len() as u64,
+            Ok(c) => bytes = bytes.saturating_add(c.len() as u64),
             Err(_) => {
                 err.fetch_add(1, Ordering::Relaxed);
                 return;

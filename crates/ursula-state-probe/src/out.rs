@@ -1,9 +1,5 @@
 //! Result sink (JSON lines per workload), per-checkpoint measurement of a
 //! state machine, and the [`Outcome`] each workload hands to the gate.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -126,7 +122,7 @@ pub fn measure_sm(
     counts: Vec<StreamAppendCount>,
     zstd: bool,
 ) -> Result<Measured> {
-    let heap = alloc::heap() - base.heap;
+    let heap = alloc::heap().saturating_sub(base.heap);
     let big = alloc::big_allocs_diff(&base.big, &alloc::big_allocs());
     let tight = alloc::tight_size(m);
     let gauges = m.state_gauges();

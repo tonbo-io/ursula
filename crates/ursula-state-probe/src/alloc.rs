@@ -7,10 +7,6 @@
 //! with `#[global_allocator]`; library users (tests) may install it too.
 //!
 //! Figures are requested bytes; real RSS is somewhat higher.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
@@ -116,10 +112,9 @@ pub struct Heap {
     pub blocks: i64,
 }
 
-impl std::ops::Sub for Heap {
-    type Output = Heap;
-
-    fn sub(self, rhs: Heap) -> Heap {
+impl Heap {
+    /// Field-wise difference, saturating at the `i64` bounds.
+    pub fn saturating_sub(self, rhs: Heap) -> Heap {
         Heap {
             bytes: self.bytes.saturating_sub(rhs.bytes),
             blocks: self.blocks.saturating_sub(rhs.blocks),
@@ -148,7 +143,7 @@ pub fn tight_size<T: Clone>(value: &T) -> Heap {
     let clone = value.clone();
     let after = heap();
     drop(clone);
-    after - before
+    after.saturating_sub(before)
 }
 
 /// Sizes of every live allocation of at least [`BIG`] bytes, largest first.

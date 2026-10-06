@@ -4,10 +4,6 @@
 //! Each check records whether today's code meets the design's target. Most do
 //! not yet; the gate's ratchet file records which, so a regression (a met
 //! target lost) fails and an improvement is reported for tightening.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use crate::out::Measured;
 use crate::out::Outcome;
@@ -34,7 +30,7 @@ pub fn per_stream_checks(outcome: &mut Outcome, m: &Measured, shared_refs_interv
             "f2_shared_refs_per_stream",
             "shared refs per stream <= 64 + refs added in one driver interval (F2)",
             s.shared_refs as f64,
-            (MAX_SHARED_REFS + shared_refs_interval) as f64,
+            MAX_SHARED_REFS.saturating_add(shared_refs_interval) as f64,
         );
         outcome.check(
             "f3_producers_per_stream",
@@ -66,7 +62,7 @@ pub fn per_stream_checks(outcome: &mut Outcome, m: &Measured, shared_refs_interv
         "f8_ttl_heap_entries",
         "TTL heap entries <= 2 x live TTL streams (F8)",
         g.ttl_heap_entries as f64,
-        (2 * g.ttl_streams) as f64,
+        g.ttl_streams.saturating_mul(2) as f64,
     );
 }
 
@@ -90,7 +86,7 @@ pub fn residual(m: &Measured) -> i64 {
         .iter()
         .map(|s| {
             let frame = i64::try_from(s.frame_bytes).unwrap_or(i64::MAX);
-            let allowance = s.hot_bytes + s.producer_bytes;
+            let allowance = s.hot_bytes.saturating_add(s.producer_bytes);
             frame.saturating_sub(i64::try_from(allowance).unwrap_or(i64::MAX))
         })
         .sum()

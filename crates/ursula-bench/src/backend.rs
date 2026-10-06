@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use anyhow::Context;
 use anyhow::Result;
 use bytes::Bytes;
@@ -67,8 +63,8 @@ impl Backend {
     }
 
     pub fn base_for(&self, idx: usize) -> &str {
-        self.bases
-            .get(idx % self.bases.len())
+        idx.checked_rem(self.bases.len())
+            .and_then(|index| self.bases.get(index))
             .expect("Backend::new keeps at least one base URL")
     }
 
