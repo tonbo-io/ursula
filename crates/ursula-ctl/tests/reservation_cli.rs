@@ -12,8 +12,134 @@ use ursula_ctl::reservation::Reservation;
 use ursula_ctl::reservation::SourceIdentity;
 use ursula_proto::admin::ProcessIncarnation;
 
+fn epoch_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+fn file(
+    directory: &std::path::Path,
+    name: &str,
+    value: &impl serde::Serialize,
+) -> std::path::PathBuf {
+    let path = directory.join(name);
+    std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+    path
+}
+
+fn build_host_request(
+    directory: &std::path::Path,
+    action: &str,
+    arguments: &[(&str, String)],
+) -> Value {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ursulactl"));
+    command.args(["reservation-request", action]);
+    for (name, value) in arguments {
+        command.arg(format!("--{name}")).arg(value);
+    }
+    let result = command.output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let request: Value = serde_json::from_slice(&result.stdout).unwrap();
+    file(directory, "host-request", &request);
+    request
+}
+
+fn commit_host_request(directory: &std::path::Path, snapshot: &Value, request: &Value) -> Value {
+    file(directory, "host-snapshot", snapshot);
+    file(directory, "host-request", request);
+    let run = |action: &str, response: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ursulactl"));
+        command.arg(action);
+        for (name, path) in [
+            ("cell", "cell"),
+            ("snapshot", "host-snapshot"),
+            ("request", "host-request"),
+        ] {
+            command.arg(format!("--{name}")).arg(directory.join(path));
+        }
+        if response {
+            command
+                .arg("--response")
+                .arg(directory.join("host-response"));
+        }
+        command.output().unwrap()
+    };
+    let proposed = run("reservation-propose", false);
+    assert!(
+        proposed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&proposed.stderr)
+    );
+    let mut response: Value = serde_json::from_slice(&proposed.stdout).unwrap();
+    assert_eq!(response["metadata"]["uid"], snapshot["metadata"]["uid"]);
+    // Opaque RV, deliberately nonnumeric; it only must differ after replace.
+    response["metadata"]["resourceVersion"] = json!(format!(
+        "{}-next",
+        snapshot["metadata"]["resourceVersion"].as_str().unwrap()
+    ));
+    file(directory, "host-response", &response);
+    let acknowledged = run("reservation-acknowledge", true);
+    assert!(
+        acknowledged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&acknowledged.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&acknowledged.stdout).unwrap();
+    assert_eq!(receipt["disruption_authorized"], false);
+    assert_eq!(receipt["physical_hosts_fenced"], false);
+    let saved: Reservation = serde_json::from_value(receipt["reservation"].clone()).unwrap();
+    let projections = match saved.operation() {
+        None => vec![("operation-kind", "idle"), ("stage", "idle")],
+        Some(operation) => vec![
+            ("operation-kind", "host-recovery"),
+            ("stage", operation.host.as_ref().unwrap().stage()),
+            (
+                "source-provider-instance",
+                operation.source.provider_instance.as_str(),
+            ),
+            ("source-node-uid", operation.source.node_uid.as_str()),
+            (
+                "source-node-name",
+                operation
+                    .host
+                    .as_ref()
+                    .unwrap()
+                    .source_host
+                    .node_name
+                    .as_str(),
+            ),
+        ],
+    };
+    for (field, expected) in projections {
+        let result = Command::new(env!("CARGO_BIN_EXE_ursulactl"))
+            .args(["reservation-read", "--field", field])
+            .arg("--cell")
+            .arg(directory.join("cell"))
+            .arg("--snapshot")
+            .arg(directory.join("host-response"))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(String::from_utf8(result.stdout).unwrap().trim(), expected);
+    }
+    response
+}
+
 #[test]
-fn healthy_host_capture_round_trips_through_actual_cli_without_acquiring_authority() {
+fn healthy_inventory_and_host_recovery_round_trip_through_actual_cli_without_physical_authority() {
     let directory = tempfile::tempdir().unwrap();
     let cell = CellIdentity {
         namespace: "test".into(),
@@ -85,7 +211,7 @@ fn healthy_host_capture_round_trips_through_actual_cli_without_acquiring_authori
         ("pods", pods),
         ("nodes", nodes),
         ("config", json!({"nodes":plan})),
-        ("observation", serde_json::to_value(proof).unwrap()),
+        ("observation", serde_json::to_value(&proof).unwrap()),
     ] {
         std::fs::write(
             directory.path().join(name),
@@ -175,6 +301,117 @@ fn healthy_host_capture_round_trips_through_actual_cli_without_acquiring_authori
             .unwrap()
             .len(),
         3
+    );
+    // Continue through the actual offline host builders and whole-CAS receipts.
+    // These supplied observations are fixtures, never provider credentials.
+    let dir = directory.path();
+    let request = build_host_request(dir, "reserve-host-recovery", &[
+        ("operation-id", format!("{:032x}", 1)),
+        ("executor-id", format!("{:032x}", 10)),
+        ("node-id", "1".into()),
+        ("config", dir.join("config").display().to_string()),
+    ]);
+    let mut committed = commit_host_request(dir, &response, &request);
+    let reserved: Reservation =
+        serde_json::from_str(committed["data"]["reservation"].as_str().unwrap()).unwrap();
+    let operation = reserved.operation().unwrap();
+    let fence = file(dir, "host-fence", &operation.fence)
+        .display()
+        .to_string();
+    let mut active_proof = proof.clone();
+    active_proof.started_ms = epoch_ms();
+    active_proof.completed_ms = active_proof.started_ms;
+    active_proof.verification.maintenance_executor_certified = true;
+    active_proof.verification.maintenance_fence = Some(operation.fence.clone());
+    active_proof.verification.applied.remove(&1);
+    active_proof.verification.process_incarnations.remove(&1);
+    let survivors = ursula_ctl::reservation::SurvivingPrefixObservation {
+        started_ms: active_proof.started_ms,
+        completed_ms: active_proof.completed_ms,
+        verification: ursula_ctl::quorum::SurvivingQuorumVerification {
+            excluded_voter_id: 1,
+            configured_voter_ids: [1, 2, 3].into_iter().collect(),
+            surviving_voter_ids: [2, 3].into_iter().collect(),
+            full_redundancy_restored: false,
+            verification: active_proof.verification,
+        },
+    };
+    let observation = file(dir, "host-observation", &survivors)
+        .display()
+        .to_string();
+    let request = build_host_request(dir, "admit-host-termination", &[
+        ("fence", fence.clone()),
+        ("observation", observation.clone()),
+    ]);
+    committed = commit_host_request(dir, &committed, &request);
+    let now = epoch_ms();
+    file(
+        dir,
+        "host-observation",
+        &ursula_ctl::reservation::HostTerminationObservation {
+            started_ms: now,
+            completed_ms: now,
+            provider_instance: "instance-1".into(),
+            terminal_state: "terminated".into(),
+        },
+    );
+    let request = build_host_request(dir, "record-host-termination", &[
+        ("fence", fence.clone()),
+        ("observation", observation.clone()),
+    ]);
+    committed = commit_host_request(dir, &committed, &request);
+    let request = build_host_request(dir, "admit-fenced-pod-retirement", &[(
+        "fence",
+        fence.clone(),
+    )]);
+    committed = commit_host_request(dir, &committed, &request);
+    let mut replacement_plan = operation.process_plan.clone();
+    replacement_plan[0].expected_process_incarnation = Some(ProcessIncarnation::from_bits(100));
+    file(dir, "host-config", &json!({"nodes":replacement_plan}));
+    let pod = file(dir, "host-pod", &json!({"kind":"Pod","metadata":{"namespace":"test","name":"voters-0","uid":"replacement-pod","ownerReferences":[{"kind":"StatefulSet","uid":"statefulset-uid","controller":true}]},"spec":{"nodeName":"replacement-host"}})).display().to_string();
+    let node = file(dir, "host-node", &json!({"kind":"Node","metadata":{"name":"replacement-host","uid":"replacement-node","labels":{"topology.kubernetes.io/zone":"zone-1"}},"spec":{"providerID":"replacement-instance"},"status":{"conditions":[{"type":"Ready","status":"True"}]}})).display().to_string();
+    let request = build_host_request(dir, "bind-host-replacement", &[
+        ("fence", fence.clone()),
+        ("pod-object", pod),
+        ("node-object", node),
+        ("config", dir.join("host-config").display().to_string()),
+    ]);
+    committed = commit_host_request(dir, &committed, &request);
+    let mut finished = proof;
+    finished.started_ms = epoch_ms();
+    finished.completed_ms = finished.started_ms;
+    finished
+        .verification
+        .process_incarnations
+        .insert(1, ProcessIncarnation::from_bits(100));
+    finished.verification.maintenance_fence = Some(operation.fence.clone());
+    finished.verification.maintenance_executor_retired_certified = true;
+    file(dir, "host-observation", &finished);
+    let request = build_host_request(dir, "complete-host-replacement", &[
+        ("fence", fence),
+        ("observation", observation),
+    ]);
+    committed = commit_host_request(dir, &committed, &request);
+    let final_state: Reservation =
+        serde_json::from_str(committed["data"]["reservation"].as_str().unwrap()).unwrap();
+    final_state.validate().unwrap();
+    assert!(final_state.operation().is_none());
+    assert_eq!(final_state.generation(), 1);
+    assert_eq!(
+        final_state.hosts().unwrap().voters[0]
+            .source
+            .provider_instance,
+        "replacement-instance"
+    );
+    assert!(
+        final_state
+            .completion()
+            .unwrap()
+            .host
+            .as_ref()
+            .unwrap()
+            .pod_retirement_intents
+            .contains("pod-1")
     );
 }
 

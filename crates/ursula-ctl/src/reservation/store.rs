@@ -109,6 +109,9 @@ impl ConfigMapSnapshot {
             ReservationRequest::Inventory(request) => {
                 self.propose_state(self.state.publish_hosts(request)?)
             }
+            ReservationRequest::Host(request) => {
+                self.propose_state(self.state.recover_host(request)?)
+            }
         }
     }
 

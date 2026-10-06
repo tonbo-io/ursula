@@ -2,7 +2,7 @@
 
 The `ursula-ctl::reservation` policy and the offline `reservation-propose` /
 `reservation-acknowledge` commands provide a common, fail-closed state machine
-for **planned, UID-bound Pod replacement**. They perform no Kubernetes writes,
+for **planned, UID-bound Pod replacement and exact-host recovery intents**. They perform no Kubernetes writes,
 provider calls or Raft mutations. The opt-in chart consumer described below uses
 this policy for planned Pod rollouts. Managed-node writers and abrupt host recovery
 are not yet integrated, and serving cells are not yet qualified.
@@ -76,7 +76,7 @@ Before the first inventory migration, stop every legacy executor and reconcile a
 
 Capture requires three nondeleting Ready Pods and Nodes, exact StatefulSet ownership, distinct Pod/Node/provider identities and failure domains, a complete pinned process plan, and a fresh schema-3 full-group/all-replica participation proof. Kubernetes Ready alone is insufficient. The observation may have no executor, or certify the last completed executor as retired; active or unrelated executor evidence is refused. The platform must sample complete identities before and after the Raft observation, reject changed objects/processes, and submit the exact resulting proposal. The policy validates supplied observations; it cannot authenticate them or make separately sampled Kubernetes and Raft objects atomic.
 
-Later healthy capture may update Pod/process incarnations only on the same Node UID, provider identity, Node name and failure domain, after full nonregressing Raft recovery. A recreated same-name Node cannot replace the old host record. A physical host change requires a fenced host transition, which remains outstanding. Once an operation is reserved, capture is refused; takeover retains the entire catalog. A catalogued planned Pod replacement must stay on that physical host. Completion updates its selected Pod/process identity and the all-retired write boundary atomically with release. Existing schema-1 planned consumers keep their current behavior until migration.
+Later healthy capture may update Pod/process incarnations only on the same Node UID, provider identity, Node name and failure domain, after full nonregressing Raft recovery. A recreated same-name Node cannot replace the old host record. A physical host change requires the fenced host transitions below. Once an operation is reserved, capture is refused; takeover retains the entire catalog. A catalogued planned Pod replacement must stay on that physical host. Completion updates its selected Pod/process identity and the all-retired write boundary atomically with release. Existing schema-1 planned consumers keep their current behavior until migration.
 
 Build the capture request from Kubernetes List objects and a fresh `verify-quorum` observation, then use the existing proposal/acknowledgement interface:
 
@@ -87,7 +87,7 @@ ursulactl reservation-request publish-host-inventory \
 ursulactl reservation-read --cell cell.json --snapshot committed.json --field hosts
 ```
 
-Capturing inventory grants no disruption authority and proves no physical host fence. Automatic capture/reconciliation, irreversible provider termination, persistent stale-Pod retirement intents and abrupt-host qualification remain required before automatic host recovery can be claimed.
+Capturing inventory grants no disruption authority and proves no physical host fence. Automatic capture/reconciliation, an authenticated provider adapter, safe startup ownership, common managed-node admission and abrupt-host qualification remain required before automatic host recovery can be claimed.
 
 Verification files and API receipts are operational evidence, not authenticated
 capabilities. The reviewed platform adapter must actually obtain them, supply its
@@ -95,12 +95,27 @@ current clock, reconcile the selected physical identities and activate/retire
 server tokens. This offline policy cannot make a stale local receipt current or
 prove that a provider operation completed.
 
+## Exact-host recovery transitions
+
+The host path upgrades the same persistent document to schema 3; it never creates a parallel lock. Schema-2 consumers must refuse this version. The planned chart rollout reads `operation-kind` before takeover and refuses `host-recovery`. Migration must reconcile former executors and asynchronous provider operations; schema rejection does not revoke actions they already submitted.
+
+1. `reserve_host_recovery` selects one physical owner from the settled pre-fault inventory. Source identity and all addresses remain fixed. Healthy survivor boots may be pinned anew at initial acquisition, but both must then supply fresh quorum proof and remain immutable through takeover. Another disruption cannot acquire this reservation.
+2. Activate the current token on both pinned survivors. `admit_host_termination` requires a fresh `verify-surviving-quorum` observation explicitly excluding the source, covering every configured group on both certified survivors and preserving the catalog/completion/admission prefix floor. It persists the intent to terminate only the original provider instance before any provider call.
+3. The provider adapter must authenticate its response and observe that exact instance irreversibly `terminated`. `record_host_termination` rejects `stopped`, `shutting-down`, unknown/absent instances, another provider identity, stale observations and observations preceding admission. The recorded receipt is sticky across takeover and provider record expiration. A termination request or local JSON file alone is no physical fence.
+4. Before any forced Pod deletion, CAS `admit_fenced_pod_retirement` retains the exact UID as a permanent tombstone for this operation. An observed Pod, including the original UID, must be on the original Node UID/provider instance; a recreated same-name Node is refused. With no Pod/Node objects, the transition records only the original catalog UID tombstone. This does not authenticate a presently running Pod or authorize deletion on a different physical host. The history is bounded to 32 UIDs and retained in completion. A candidate UID with a retirement intent can never become the bound replacement, so a stale executor's delayed delete cannot target an accepted replacement. Binding and additional retirement intents race through the same CAS; no new retirement is admitted after binding.
+5. `bind_host_replacement` requires the terminal receipt and original UID tombstone, a nondeleting owned replacement Pod, a Ready replacement Node, new Pod/Node/provider/process identities, the original failure domain and a physical host distinct from both survivors. Only the selected target boot may change. A second binding or a changed survivor refuses progress.
+6. Repair membership and catch-up, complete all mutations, retire the current token on all three current processes, and collect fresh all-group/all-replica proof begun after terminal fencing. `complete_host_replacement` requires the admitted prefix floor and unchanged survivor boots; it atomically updates the selected physical catalog entry, retains termination/tombstones in completion and releases ownership. Partial proofs or failed recovery leave the reservation held.
+
+Takeover preserves the exact source instance, survivor boots, termination intent/receipt, every deletion tombstone and any bound replacement. It advances only executor/generation, with no expiry-based release. API retries must use those persisted identities; name lookup cannot replace them.
+
+The platform consumer must reconcile current Pod/Node/provider identities around every action, delete with exact Kubernetes UID preconditions, and prevent retired/unbound Pods from starting a new physical owner. In particular, Kubernetes `spec.nodeName` is name-based: a new Node with the old name can inherit an existing Pod UID. Terminating the old instance does not fence that new instance, and the original UID tombstone is not permission to force-delete its process. Unknown physical ownership must stop recovery. These consumer/startup checks, actual provider calls, managed-node operation reconciliation and live fault qualification are still outstanding; this offline state machine does not implement automatic host recovery by itself.
+
 ## Offline interface
 
 `--cell` is the expected `CellIdentity` JSON; `--snapshot` is one full ConfigMap
 GET response; `--request` is the explicit JSON transition. Each input is bounded
 at 2 MiB. The request's `action` is `reserve`, `takeover`, `admit_pod_deletion`,
-`bind_pod_replacement`, `complete_pod_replacement` or `publish_host_inventory`. Reserve/takeover and host capture supply
+`bind_pod_replacement`, `complete_pod_replacement`, `publish_host_inventory`, `reserve_host_recovery`, `admit_host_termination`, `record_host_termination`, `admit_fenced_pod_retirement`, `bind_host_replacement` or `complete_host_replacement`. Reserve/takeover and host capture supply
 `now_ms`; every progress request carries its exact current `fence`. Prefix
 observations have the unchanged CLI output shape
 `{ "started_ms": ..., "completed_ms": ..., "verification": ... }`.
@@ -181,8 +196,7 @@ force deletion or Node/provider mutation is not qualified by this Pod-only path.
 Abrupt host recovery requires irreversible termination of the exact old provider
 instance before force-removing Kubernetes identities. EKS managed-node updates
 also require persistent operation/idempotency and terminal reconciliation; a timed
-out or unknown provider request cannot be released into another disruption. Those
-operations are deliberately **not admitted by this Pod-only policy**. Current
+out or unknown provider request cannot be released into another disruption. Actual provider execution and managed-node operations remain **unimplemented platform consumers**; typed host intents do not authorize them. Current
 physical identities must be captured before a host fault, rather than inferred
 from a recreated Node. Isolated EKS fault qualification and serving rollout remain
 separate gates.
@@ -198,8 +212,10 @@ are not live Kubernetes CAS, host-fencing or production RTO evidence. The
 chart shell/native CLI sequencing suite uses atomic synthetic platform transport
 and covers concurrent actual consumers, missing/conflicting stores, incomplete
 proofs, serial source replacement, ambiguous deletion, fixed replacement boots,
-partial retirement takeover, SIGTERM cancellation and no-op health checks. Raft proofs in that suite
+partial retirement takeover, SIGTERM cancellation, host-ownership takeover refusal and no-op health checks. Raft proofs in that suite
 are synthetic. A separate native three-node restart feeds live all-active and
 all-retired prefix observations through the policy and verifies six acknowledged
 payloads; its physical metadata is a native fixture, not a provider receipt.
 Real Kubernetes consumer and production-scale fault qualification remain required.
+
+The additional native abrupt-loss test SIGKILLs one memory-WAL process without preparation, verifies two-survivor live prefix admission and continued idempotent writes, takes over the same host intent, repairs a new target boot, replays each acknowledged producer sequence at the original offset and checks exact payloads on all three replicas across six groups before all-retired completion. Physical identities and the terminal-provider observation remain fixtures derived from the exited child, not AWS/Kubernetes qualification. The actual offline CLI test exercises all six host request builders, integer-map-key proof deserialization, whole-object proposals/receipts and completed physical-catalog advancement.

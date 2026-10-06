@@ -9,6 +9,8 @@ use super::SourceIdentity;
 use super::Value;
 use crate::NodeInfo;
 
+mod host_recovery;
+
 fn cell() -> CellIdentity {
     CellIdentity {
         namespace: "ursula".to_owned(),

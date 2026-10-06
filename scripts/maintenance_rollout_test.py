@@ -332,6 +332,49 @@ class RolloutTests(unittest.TestCase):
         self.assertFalse(any(e['role'] == 'ctl' for e in self.db['events']))
         self.assertIn('persistent maintenance store exists', run.stdout)
 
+    def test_planned_rollout_cannot_take_over_host_recovery(self):
+        # Drive real offline CLI transitions; only the transport/healthy proof
+        # is synthetic. Even an unadmitted host reservation blocks rollout.
+        plan = [{'id': n, 'host': f'voters-{n - 1}',
+                 'admin_url': f'http://localhost:{1000 + n}/',
+                 'expected_process_incarnation': self.db['nodes'][str(n)]['boot'],
+                 'expected_maintenance_fence': None} for n in (1, 2, 3)]
+        pods = [pod(self.db, n) for n in (1, 2, 3)]
+        for p in pods:
+            p['status'] = {'conditions': [{'type': 'Ready', 'status': 'True'}]}
+        nodes = [{'kind': 'Node', 'metadata': {'name': f'host-{n}', 'uid': f'node-{n}',
+                 'labels': {'topology.kubernetes.io/zone': f'zone-{n}'}},
+                 'spec': {'providerID': f'instance-{n}'},
+                 'status': {'conditions': [{'type': 'Ready', 'status': 'True'}]}}
+                 for n in (1, 2, 3)]
+        for request in [
+                {'action': 'publish_host_inventory', 'pods': pods, 'nodes': nodes,
+                 'process_plan': plan, 'observation': proof(self.db, plan),
+                 'now_ms': time.time_ns() // 1_000_000},
+                {'action': 'reserve_host_recovery', 'operation_id': uuid.uuid4().hex,
+                 'executor_id': uuid.uuid4().hex, 'node_id': 3, 'process_plan': plan,
+                 'now_ms': time.time_ns() // 1_000_000}]:
+            request_path = self.directory / 'request.json'
+            snapshot_path = self.directory / 'snapshot.json'
+            request_path.write_text(json.dumps(request))
+            snapshot_path.write_text(json.dumps(self.db['store']))
+            result = subprocess.run([self.env['URSULA_CTL_BINARY'], 'reservation-propose',
+                                     '--cell', str(self.directory / 'cell.json'),
+                                     '--snapshot', str(snapshot_path), '--request', str(request_path)],
+                                    capture_output=True, text=True, check=True)
+            offered = json.loads(result.stdout)
+            offered['metadata']['resourceVersion'] = str(int(self.db['store']['metadata']['resourceVersion']) + 1)
+            self.db['store'] = offered
+        self.save()
+        original = self.db['store']
+        run = self.run_shell()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('host recovery owns the reservation', run.stdout)
+        self.refresh()
+        self.assertEqual(self.db['store'], original)
+        self.assertFalse(self.deletions())
+        self.assertFalse(any(e['role'] == 'ctl' for e in self.db['events']))
+
     def test_noop_rollout_still_requires_all_group_health(self):
         for node in self.db['nodes'].values():
             node.update(image='candidate', revision='new')

@@ -820,22 +820,7 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
             voter_ids: [1, 2, 3].into_iter().collect(),
         })
         .unwrap()
-        .publish_hosts(ursula_ctl::reservation::PublishHostInventory {
-            now_ms: now_ms(),
-            process_plan: nodes.clone(),
-            observation: inventory_observation,
-            pods: (1..=3).map(|id| serde_json::json!({"kind":"Pod", "metadata":{
-                "namespace":"native", "name":format!("voters-{}", id-1),
-                "uid":if id == 3 { "native-original".to_owned() } else { format!("native-pod-{id}") },
-                "ownerReferences":[{"kind":"StatefulSet", "uid":"native-sts", "controller":true}]},
-                "spec":{"nodeName":format!("native-host-{id}")},
-                "status":{"conditions":[{"type":"Ready", "status":"True"}]}})).collect(),
-            nodes: (1..=3).map(|id| serde_json::json!({"kind":"Node", "metadata":{
-                "name":format!("native-host-{id}"), "uid":format!("native-node-{id}"),
-                "labels":{"topology.kubernetes.io/zone":format!("native-zone-{id}")}},
-                "spec":{"providerID":format!("native-instance-{id}")},
-                "status":{"conditions":[{"type":"Ready", "status":"True"}]}})).collect(),
-        })
+        .publish_hosts(native_host_inventory(&nodes, inventory_observation))
         .expect("capture all original host identities in the maintenance store")
         .propose(ursula_ctl::reservation::OwnershipRequest::Reserve {
             operation_id: format!("{:032x}", 1),
@@ -1113,6 +1098,372 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
         "native-replacement"
     );
     assert!(ctl.set_maintenance_drain(&nodes[2], false).await.is_err());
+    drop(children);
+}
+
+fn native_host_inventory(
+    nodes: &[ursula_ctl::NodeInfo],
+    observation: ursula_ctl::reservation::PrefixObservation,
+) -> ursula_ctl::reservation::PublishHostInventory {
+    ursula_ctl::reservation::PublishHostInventory {
+        now_ms: native_epoch_ms(), process_plan:nodes.to_vec(), observation,
+        pods:(1..=3).map(|id|serde_json::json!({"kind":"Pod","metadata":{
+            "namespace":"native","name":format!("voters-{}",id-1),
+            "uid":if id==3 {"native-original".to_owned()}else{format!("native-pod-{id}")},
+            "ownerReferences":[{"kind":"StatefulSet","uid":"native-sts","controller":true}]},
+            "spec":{"nodeName":format!("native-host-{id}")},"status":{"conditions":[{"type":"Ready","status":"True"}]}})).collect(),
+        nodes:(1..=3).map(|id|serde_json::json!({"kind":"Node","metadata":{
+            "name":format!("native-host-{id}"),"uid":format!("native-node-{id}"),"labels":{"topology.kubernetes.io/zone":format!("native-zone-{id}")}},
+            "spec":{"providerID":format!("native-instance-{id}")},"status":{"conditions":[{"type":"Ready","status":"True"}]}})).collect(),
+    }
+}
+
+fn native_epoch_ms() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+async fn append_idempotent_until_acked(
+    client: &reqwest::Client,
+    url: &str,
+    seq: u64,
+    payload: &'static str,
+) -> String {
+    for _ in 0..100 {
+        if let Ok(response) = client
+            .post(url)
+            .header("content-type", "text/plain")
+            .header("producer-id", "native-host-writer")
+            .header("producer-epoch", "0")
+            .header("producer-seq", seq.to_string())
+            .body(payload)
+            .send()
+            .await
+            && response.status() == reqwest::StatusCode::NO_CONTENT
+        {
+            return response
+                .headers()
+                .get("stream-next-offset")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("idempotent append did not succeed at {url}, seq {seq}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_host_recovery_keeps_ack_tail_across_abrupt_memory_voter_loss() {
+    use ursula_ctl::reservation::HostRequest;
+    use ursula_ctl::reservation::HostTerminationObservation;
+    use ursula_ctl::reservation::OwnershipRequest;
+    use ursula_ctl::reservation::PrefixObservation;
+    use ursula_ctl::reservation::SurvivingPrefixObservation;
+    let _guard = static_cluster_cli_test_guard().await;
+    let binary = env!("CARGO_BIN_EXE_ursula");
+    let ports = [free_port(), free_port(), free_port()];
+    let public = |id: u64| format!("http://127.0.0.1:{}", ports[(id - 1) as usize]);
+    let peers = (1..=3).map(|id| (id, public(id))).collect::<Vec<_>>();
+    let mut children = Vec::new();
+    let mut nodes = Vec::new();
+    for id in 1..=3 {
+        let (child, admin) =
+            spawn_per_group_memory_node(binary, id, ports[(id - 1) as usize], &peers, false);
+        children.push(child);
+        nodes.push(ctl_node(id, admin, &public(id)));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    for id in 1..=3 {
+        wait_until_ready(&client, &public(id), &mut children).await;
+    }
+    for index in 0..6 {
+        put_until_created(
+            &client,
+            &format!("{}/benchcmp/host-recovery-{index}", public(1)),
+        )
+        .await;
+    }
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).unwrap();
+    nodes = ctl.pin_nodes(&nodes, None, false).await.unwrap();
+    ursula_ctl::wait_cluster_ready(
+        "host recovery prefault",
+        &nodes,
+        &ctl,
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+        16,
+    )
+    .await
+    .unwrap();
+    for index in 0..6 {
+        append_idempotent_until_acked(
+            &client,
+            &format!("{}/benchcmp/host-recovery-{index}", public(1)),
+            0,
+            "before-fault",
+        )
+        .await;
+    }
+    let options = ursula_ctl::quorum::QuorumVerificationOptions {
+        group_count: 6,
+        core_count: 1,
+        timeout: Duration::from_secs(15),
+        poll_interval: Duration::from_millis(100),
+        allow_legacy_eligibility: false,
+    };
+    let started_ms = native_epoch_ms();
+    let proof = ursula_ctl::quorum::verify_quorum(&nodes, &ctl, &options)
+        .await
+        .unwrap();
+    let prefault = PrefixObservation {
+        started_ms,
+        completed_ms: native_epoch_ms(),
+        verification: proof,
+    };
+    let mut state =
+        ursula_ctl::reservation::Reservation::initial(ursula_ctl::reservation::CellIdentity {
+            namespace: "native".into(),
+            namespace_uid: "native-namespace".into(),
+            statefulset: "voters".into(),
+            statefulset_uid: "native-sts".into(),
+            group_count: 6,
+            core_count: 1,
+            voter_ids: [1, 2, 3].into_iter().collect(),
+        })
+        .unwrap()
+        .publish_hosts(native_host_inventory(&nodes, prefault))
+        .unwrap();
+    // A real abrupt process stop; no drain, quiesce or SIGTERM handoff.
+    let replacement_config = children[2].config_path.clone().unwrap();
+    let replacement_text = std::fs::read_to_string(&replacement_config).unwrap();
+    children[2].child.kill().unwrap();
+    children[2].child.wait().unwrap();
+    state = state
+        .recover_host(HostRequest::ReserveHostRecovery {
+            operation_id: format!("{:032x}", 100),
+            executor_id: format!("{:032x}", 200),
+            node_id: 3,
+            process_plan: nodes.clone(),
+            now_ms: native_epoch_ms(),
+        })
+        .unwrap();
+    nodes = state.operation().unwrap().process_plan.clone();
+    for node in nodes.iter().filter(|node| node.id != 3) {
+        ctl.set_maintenance_fence(node, false).await.unwrap();
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let admitted = loop {
+        let started_ms = native_epoch_ms();
+        match ursula_ctl::quorum::verify_surviving_quorum(&nodes, 3, &ctl, &options).await {
+            Ok(verification) => {
+                break SurvivingPrefixObservation {
+                    started_ms,
+                    completed_ms: native_epoch_ms(),
+                    verification,
+                };
+            }
+            Err(error) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "survivor proof: {error}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+    assert!(!admitted.verification.full_redundancy_restored);
+    state = state
+        .recover_host(HostRequest::AdmitHostTermination {
+            fence: state.operation().unwrap().fence.clone(),
+            now_ms: native_epoch_ms(),
+            observation: admitted,
+        })
+        .unwrap();
+    let started_ms = native_epoch_ms();
+    assert!(children[2].child.try_wait().unwrap().is_some());
+    let terminated = HostTerminationObservation {
+        started_ms,
+        completed_ms: native_epoch_ms(),
+        provider_instance: "native-instance-3".into(),
+        terminal_state: "terminated".into(),
+    };
+    // The native child's exit is irreversible. Node/provider metadata here is
+    // synthetic; this cannot qualify Kubernetes force deletion or AWS fencing.
+    state = state
+        .recover_host(HostRequest::RecordHostTermination {
+            fence: state.operation().unwrap().fence.clone(),
+            now_ms: native_epoch_ms(),
+            observation: terminated,
+        })
+        .unwrap();
+    state = state
+        .recover_host(HostRequest::AdmitFencedPodRetirement {
+            fence: state.operation().unwrap().fence.clone(),
+            pod: None,
+            node: None,
+        })
+        .unwrap();
+    state = state
+        .propose(OwnershipRequest::Takeover {
+            operation_id: state.operation().unwrap().fence.reservation_id().into(),
+            executor_id: format!("{:032x}", 300),
+            now_ms: native_epoch_ms(),
+        })
+        .unwrap();
+    nodes = state.operation().unwrap().process_plan.clone();
+    for node in nodes.iter().filter(|node| node.id != 3) {
+        ctl.set_maintenance_fence(node, false).await.unwrap();
+    }
+    let mut offsets = Vec::new();
+    for index in 0..6 {
+        offsets.push(
+            append_idempotent_until_acked(
+                &client,
+                &format!("{}/benchcmp/host-recovery-{index}", public(1)),
+                1,
+                "during-recovery",
+            )
+            .await,
+        );
+    }
+    drop(children.pop());
+    std::fs::write(&replacement_config, replacement_text).unwrap();
+    let mut command = Command::new(binary);
+    command
+        .arg("server")
+        .arg("--config")
+        .arg(&replacement_config)
+        .env("URSULA_START_MAINTENANCE_DRAINED", "true");
+    let mut child = spawn_child(command, format!("host-replacement-{}", ports[2]));
+    child.config_path = Some(replacement_config);
+    children.push(child);
+    wait_until_ready(&client, &public(3), &mut children).await;
+    assert!(ctl.fetch_node(&nodes[2]).await.is_err());
+    // Each client pins fetched boot identities for its lifetime. The durable
+    // reservation, rather than the old transport cache, admits this new boot.
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).unwrap();
+    nodes = ctl.pin_nodes(&nodes, Some(3), false).await.unwrap();
+    state=state.recover_host(HostRequest::BindHostReplacement {fence:state.operation().unwrap().fence.clone(),process_plan:nodes.clone(),
+        pod:serde_json::json!({"kind":"Pod","metadata":{"namespace":"native","name":"voters-2","uid":"native-host-replacement","ownerReferences":[{"kind":"StatefulSet","uid":"native-sts","controller":true}]},"spec":{"nodeName":"native-host-3-replacement"}}),
+        node:serde_json::json!({"kind":"Node","metadata":{"name":"native-host-3-replacement","uid":"native-node-3-replacement","labels":{"topology.kubernetes.io/zone":"native-zone-3"}},"spec":{"providerID":"native-instance-3-replacement"},"status":{"conditions":[{"type":"Ready","status":"True"}]}})
+    }).unwrap();
+    for node in &nodes {
+        ctl.set_maintenance_fence(node, false).await.unwrap();
+    }
+    ursula_ctl::repair_restarted_voter(
+        &nodes,
+        &nodes[2],
+        &ctl,
+        &ursula_ctl::DrainOptions {
+            drain_timeout: Duration::from_secs(60),
+            ready_timeout: Duration::from_secs(60),
+            poll_interval: Duration::from_millis(100),
+            ..Default::default()
+        },
+        &ursula_ctl::MembershipRepairOptions {
+            max_concurrency: 6,
+            operation_timeout: Duration::from_secs(5),
+            operation_reconcile_timeout: Duration::from_secs(30),
+            stall_timeout: Duration::from_secs(30),
+            ready_timeout: Duration::from_secs(60),
+            poll_interval: Duration::from_millis(100),
+        },
+    )
+    .await
+    .unwrap();
+    ursula_ctl::finish_prepared_restart(&nodes, &nodes[2], &ctl)
+        .await
+        .unwrap();
+    ursula_ctl::wait_cluster_ready(
+        "host replacement recovered",
+        &nodes,
+        &ctl,
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+        0,
+    )
+    .await
+    .unwrap();
+    for (index, offset) in offsets.iter().enumerate() {
+        let url = format!("{}/benchcmp/host-recovery-{index}", public(3));
+        assert_eq!(
+            append_idempotent_until_acked(&client, &url, 1, "during-recovery").await,
+            *offset,
+            "replayed ACK offset must survive"
+        );
+        for id in 1..=3 {
+            read_until_matches(
+                &client,
+                &format!(
+                    "{}/benchcmp/host-recovery-{index}?offset=0&max_bytes=64",
+                    public(id)
+                ),
+                b"before-faultduring-recovery",
+            )
+            .await;
+        }
+    }
+    for node in &nodes {
+        ctl.set_maintenance_fence(node, true).await.unwrap();
+    }
+    let completion_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let completion = loop {
+        let started_ms = native_epoch_ms();
+        match ursula_ctl::quorum::verify_quorum(&nodes, &ctl, &options).await {
+            Ok(proof) => {
+                assert!(proof.maintenance_executor_retired_certified);
+                break PrefixObservation {
+                    started_ms,
+                    completed_ms: native_epoch_ms(),
+                    verification: proof,
+                };
+            }
+            Err(error) => {
+                assert!(state.operation().is_some());
+                assert!(tokio::time::Instant::now() < completion_deadline, "{error}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+    state = state
+        .recover_host(HostRequest::CompleteHostReplacement {
+            fence: state.operation().unwrap().fence.clone(),
+            now_ms: native_epoch_ms(),
+            observation: completion,
+        })
+        .unwrap();
+    assert!(state.operation().is_none());
+    assert_eq!(state.generation(), 2);
+    assert_eq!(
+        state
+            .hosts()
+            .unwrap()
+            .voter(3)
+            .unwrap()
+            .source
+            .provider_instance,
+        "native-instance-3-replacement"
+    );
+    assert!(
+        state
+            .completion()
+            .unwrap()
+            .host
+            .as_ref()
+            .unwrap()
+            .pod_retirement_intents
+            .contains("native-original")
+    );
     drop(children);
 }
 
