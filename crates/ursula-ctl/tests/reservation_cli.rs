@@ -4,10 +4,6 @@
     clippy::indexing_slicing,
     reason = "integration tests assert by panicking, as clippy.toml allows for unit tests"
 )]
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::process::Command;
 
 use serde_json::Value;
@@ -179,7 +175,9 @@ fn run_host_cli(interrupt_candidate: bool) {
         .map(|id| NodeInfo {
             id,
             host: format!("voters-{id}"),
-            admin_url: format!("http://127.0.0.1:{}", 1000 + id).parse().unwrap(),
+            admin_url: format!("http://127.0.0.1:{}", 1000_u64.checked_add(id).unwrap())
+                .parse()
+                .unwrap(),
             http_url: None,
             metrics_url: None,
             expected_process_incarnation: Some(ProcessIncarnation::from_bits(u128::from(id))),
@@ -215,8 +213,8 @@ fn run_host_cli(interrupt_candidate: bool) {
                 .collect(),
         },
     };
-    let pods = json!({"kind":"PodList", "items":(1..=3).map(|id|json!({"kind":"Pod", "metadata":{
-        "namespace":"test", "name":format!("voters-{}",id-1), "uid":format!("pod-{id}"),
+    let pods = json!({"kind":"PodList", "items":(1_u64..=3).map(|id|json!({"kind":"Pod", "metadata":{
+        "namespace":"test", "name":format!("voters-{}",id.checked_sub(1).unwrap()), "uid":format!("pod-{id}"),
         "ownerReferences":[{"kind":"StatefulSet", "uid":"statefulset-uid", "controller":true}]},
         "spec":{"nodeName":format!("host-{id}")}, "status":{"conditions":[{"type":"Ready", "status":"True"}]}})).collect::<Vec<_>>()});
     let nodes = json!({"kind":"NodeList", "items":(1..=3).map(|id|json!({"kind":"Node", "metadata":{
@@ -531,7 +529,9 @@ fn proposal_is_not_a_receipt_and_conflicting_committed_state_cannot_be_adopted()
         .map(|id| NodeInfo {
             id,
             host: format!("voters-{id}"),
-            admin_url: format!("http://127.0.0.1:{}", 1000 + id).parse().unwrap(),
+            admin_url: format!("http://127.0.0.1:{}", 1000_u64.checked_add(id).unwrap())
+                .parse()
+                .unwrap(),
             http_url: None,
             metrics_url: None,
             expected_process_incarnation: Some(ProcessIncarnation::from_bits(u128::from(id))),

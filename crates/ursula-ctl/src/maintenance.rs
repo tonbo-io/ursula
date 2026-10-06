@@ -5,10 +5,6 @@
 //! process) belongs to the platform that owns it: Kubernetes and Helm for pod
 //! clusters, systemd for bare-metal hosts. A safe rolling restart runs these
 //! verbs around the platform's own restart, one node at a time.
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -30,6 +26,35 @@ use crate::plan::classify_amnesiac_voter;
 use crate::plan::plan_drain;
 use crate::plan::plan_drain_at_barriers;
 use crate::provider::NodeInfo;
+
+/// A timeout measured from its start. Comparing elapsed time cannot overflow
+/// the way `Instant::now() + timeout` does for an operator-supplied timeout.
+#[derive(Debug, Clone, Copy)]
+struct Deadline {
+    started: Instant,
+    timeout: Duration,
+}
+
+impl Deadline {
+    fn after(timeout: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            timeout,
+        }
+    }
+
+    fn reached_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started) >= self.timeout
+    }
+
+    fn is_reached(&self) -> bool {
+        self.reached_at(Instant::now())
+    }
+
+    fn remaining(&self) -> Duration {
+        self.timeout.saturating_sub(self.started.elapsed())
+    }
+}
 
 /// Knobs for [`drain_node`].
 #[derive(Debug, Clone)]
@@ -166,7 +191,7 @@ pub async fn drain_node(
         return Ok(DrainOutcome::DryRun(plan));
     }
 
-    let deadline = Instant::now() + options.drain_timeout;
+    let deadline = Deadline::after(options.drain_timeout);
     loop {
         let snap = match client.fetch_cluster(nodes).await {
             Ok(snap) => snap,
@@ -199,7 +224,7 @@ pub async fn drain_node(
         }
         let plan = plan_drain_at_barriers(&snap, target.id, &barriers);
         if plan.transfers.is_empty() {
-            if Instant::now() < deadline {
+            if !deadline.is_reached() {
                 tokio::time::sleep(options.poll_interval).await;
                 continue;
             }
@@ -215,7 +240,7 @@ pub async fn drain_node(
             clear_maintenance_drain(client, target).await;
             return Err(err);
         }
-        if Instant::now() >= deadline {
+        if deadline.is_reached() {
             clear_maintenance_drain(client, target).await;
             return Ok(DrainOutcome::Aborted {
                 reason: format!(
@@ -273,7 +298,7 @@ fn restart_fence_layout(nodes: &[NodeInfo], target: &NodeInfo) -> Result<(u64, V
         .collect::<Vec<_>>();
     survivor_ids.sort_unstable();
     survivor_ids.dedup();
-    if survivor_ids.len() + 1 != nodes.len() {
+    if survivor_ids.len().saturating_add(1) != nodes.len() {
         bail!("restart fence requires an exact, unique configured voter inventory");
     }
     let leader_anchor = survivor_ids
@@ -321,7 +346,7 @@ async fn pin_restart_leaders(
         tokio::time::sleep(RESTART_FENCE_TRANSFER_SETTLE).await;
     }
 
-    let deadline = Instant::now() + drain_options.drain_timeout;
+    let deadline = Deadline::after(drain_options.drain_timeout);
     let last_error = loop {
         let outcome = converge_restart_leader_fence_once(
             nodes,
@@ -350,7 +375,7 @@ async fn pin_restart_leaders(
             Ok(false) => anyhow!("restart-fence leadership transfers are still converging"),
             Err(error) => error,
         };
-        if Instant::now() >= deadline {
+        if deadline.is_reached() {
             break error;
         }
         tokio::time::sleep(drain_options.poll_interval).await;
@@ -535,7 +560,7 @@ pub async fn prepare_amnesiac_restart(
         .await
         .with_context(|| format!("mark maintenance-drain on amnesiac node {}", target.id))?;
     let prepared = async {
-        let deadline = Instant::now() + drain_options.drain_timeout;
+        let deadline = Deadline::after(drain_options.drain_timeout);
         loop {
             let snapshot = client.fetch_cluster(nodes).await?;
             let current = classify_amnesiac_voter(
@@ -566,7 +591,7 @@ pub async fn prepare_amnesiac_restart(
                 );
             }
             transfer_drain_plan(target, client, &plan).await?;
-            if Instant::now() >= deadline {
+            if deadline.is_reached() {
                 bail!(
                     "amnesiac drain timeout: node {} still leads {} group(s) after {:?}",
                     target.id,
@@ -888,7 +913,7 @@ async fn reconcile_group_operation<P>(
 where
     P: Fn(&crate::metrics::RaftGroupView) -> bool,
 {
-    let deadline = Instant::now() + options.operation_reconcile_timeout;
+    let deadline = Deadline::after(options.operation_reconcile_timeout);
     let mut last_error = anyhow!("postcondition has not been observed");
     let mut saw_ambiguous_result = false;
     loop {
@@ -933,7 +958,7 @@ where
                         last_error = anyhow!(
                             "full membership and catch-up observed; waiting for participation readiness"
                         );
-                        if Instant::now() >= deadline {
+                        if deadline.is_reached() {
                             break;
                         }
                         tokio::time::sleep(options.poll_interval).await;
@@ -945,7 +970,7 @@ where
                     last_error = error.context(format!(
                         "discover a stable leader while reconciling {operation_name} for group {group_id}"
                     ));
-                    if Instant::now() >= deadline {
+                    if deadline.is_reached() {
                         break;
                     }
                     tokio::time::sleep(options.poll_interval).await;
@@ -956,7 +981,7 @@ where
                 last_error = error.context(format!(
                     "observe {operation_name} postcondition across the cluster for group {group_id}"
                 ));
-                if Instant::now() >= deadline {
+                if deadline.is_reached() {
                     break;
                 }
                 tokio::time::sleep(options.poll_interval).await;
@@ -964,7 +989,7 @@ where
             }
         };
 
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.remaining();
         if remaining.is_zero() {
             break;
         }
@@ -994,7 +1019,7 @@ where
                 "Raft HTTP result is ambiguous; reconciling its postcondition before retry"
             );
         }
-        if Instant::now() >= deadline {
+        if deadline.is_reached() {
             break;
         }
         tokio::time::sleep(options.poll_interval).await;
@@ -1048,7 +1073,7 @@ async fn wait_repair_learners_caught_up(
     lag_tolerance: u64,
     options: &MembershipRepairOptions,
 ) -> Result<()> {
-    let ceiling = Instant::now() + options.ready_timeout;
+    let ceiling = Deadline::after(options.ready_timeout);
     let mut last_advance = Instant::now();
     let mut best = LearnerRepairProgress::default();
     loop {
@@ -1079,12 +1104,15 @@ async fn wait_repair_learners_caught_up(
                     target.id
                 );
             }
-            progress.attached_groups += 1;
+            progress.attached_groups = progress.attached_groups.saturating_add(1);
             let target_applied = target_view
                 .group(*group_id)
                 .and_then(|group| group.last_applied_index);
             if let Some(applied) = target_applied {
-                progress.applied_sum += u128::from(applied);
+                progress.applied_sum = progress
+                    .applied_sum
+                    .checked_add(u128::from(applied))
+                    .ok_or_else(|| anyhow!("learner catch-up applied-index sum overflowed"))?;
             }
             let peer_committed = snapshot
                 .peer_views(*group_id, target.id)
@@ -1098,7 +1126,7 @@ async fn wait_repair_learners_caught_up(
                         committed.saturating_sub(applied) <= lag_tolerance
                     });
             if caught_up {
-                progress.caught_up_groups += 1;
+                progress.caught_up_groups = progress.caught_up_groups.saturating_add(1);
             } else {
                 pending.push(format!(
                     "group {group_id}: applied={target_applied:?} peer_committed={peer_committed:?}"
@@ -1120,7 +1148,7 @@ async fn wait_repair_learners_caught_up(
                 pending.join("; ")
             );
         }
-        if now >= ceiling {
+        if ceiling.reached_at(now) {
             bail!(
                 "learner catch-up exceeded {:?}: {}",
                 options.ready_timeout,
@@ -1206,7 +1234,7 @@ async fn drain_recovery_target(
         .set_maintenance_drain(target, true)
         .await
         .with_context(|| format!("mark maintenance-drain on recovery node {}", target.id))?;
-    let deadline = Instant::now() + drain_options.drain_timeout;
+    let deadline = Deadline::after(drain_options.drain_timeout);
     loop {
         let snapshot = client.fetch_cluster(nodes).await?;
         if let Err(error) = validate_surviving_voters(
@@ -1215,7 +1243,7 @@ async fn drain_recovery_target(
             target.id,
             drain_options.lag_tolerance,
         ) {
-            if Instant::now() >= deadline {
+            if deadline.is_reached() {
                 return Err(error).context(
                     "recovery survivor eligibility did not converge before the drain deadline",
                 );
@@ -1240,7 +1268,7 @@ async fn drain_recovery_target(
             );
         }
         transfer_drain_plan(target, client, &plan).await?;
-        if Instant::now() >= deadline {
+        if deadline.is_reached() {
             bail!(
                 "recovery restart timeout: node {} still leads {} group(s) after {:?}",
                 target.id,
@@ -1457,7 +1485,7 @@ pub async fn wait_node_ready(
     client: &MetricsClient,
     options: &CatchUpOptions,
 ) -> Result<CatchUpOutcome> {
-    let ceiling = Instant::now() + options.ready_timeout;
+    let ceiling = Deadline::after(options.ready_timeout);
     let mut best = TargetProgress::default();
     let mut last_advance = Instant::now();
     loop {
@@ -1475,7 +1503,7 @@ pub async fn wait_node_ready(
         }
 
         let stalled = now.duration_since(last_advance) >= options.stall_timeout;
-        let hit_ceiling = now >= ceiling;
+        let hit_ceiling = ceiling.reached_at(now);
         if stalled || hit_ceiling {
             let cause = if hit_ceiling {
                 format!(
@@ -1506,7 +1534,7 @@ pub async fn wait_cluster_ready(
     poll_interval: Duration,
     lag_tolerance: u64,
 ) -> Result<()> {
-    let deadline = Instant::now() + timeout;
+    let deadline = Deadline::after(timeout);
     let mut ready_streak = 0usize;
     loop {
         let snap = client.try_fetch_cluster(nodes).await;
@@ -1528,7 +1556,7 @@ pub async fn wait_cluster_ready(
             ready_streak = 0;
             tracing::debug!("{phase}: not ready: {}", unready.join("; "));
         }
-        if Instant::now() >= deadline {
+        if deadline.is_reached() {
             let diagnostic = if unready.is_empty() {
                 format!("cluster was ready for {ready_streak}/2 required consecutive sample(s)")
             } else {
@@ -1734,7 +1762,7 @@ async fn stabilize_survivor_leadership(
     drain_options: &DrainOptions,
     configured_node_ids: &BTreeSet<u64>,
 ) -> Result<()> {
-    let deadline = Instant::now() + drain_options.drain_timeout;
+    let deadline = Deadline::after(drain_options.drain_timeout);
     let mut last_error = anyhow!("surviving voter leadership has not converged");
     let mut standard_handoff_attempted = BTreeSet::new();
     // A higher-term voter cannot teach its term by campaigning when the former
@@ -1918,7 +1946,7 @@ async fn stabilize_survivor_leadership(
             }
         }
 
-        if Instant::now() >= deadline {
+        if deadline.is_reached() {
             break;
         }
         tokio::time::sleep(drain_options.poll_interval).await;
@@ -2203,10 +2231,6 @@ pub(crate) fn format_unready(report: &crate::plan::ReadinessReport) -> String {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -3449,9 +3473,12 @@ mod tests {
             decide_restart_wal_backend(&[Some("disk"); 3], 3).unwrap(),
             RestartWalBackend::Disk
         );
-        assert!(decide_restart_wal_backend(&[Some("memory"), Some("disk")], 2).is_err());
-        assert!(decide_restart_wal_backend(&[Some("memory"), None], 2).is_err());
-        assert!(decide_restart_wal_backend(&[Some("memory")], 2).is_err());
+        decide_restart_wal_backend(&[Some("memory"), Some("disk")], 2)
+            .expect_err("mixed memory and disk WAL backends must not select a restart backend");
+        decide_restart_wal_backend(&[Some("memory"), None], 2)
+            .expect_err("a node with an unreported WAL backend must not select a restart backend");
+        decide_restart_wal_backend(&[Some("memory")], 2)
+            .expect_err("a partial metrics sample must not select a restart backend");
     }
 
     #[test]
@@ -3502,7 +3529,8 @@ mod tests {
                 },
             ],
         };
-        assert!(stable_non_target_leader(&conflicting, 7, 1).is_err());
+        stable_non_target_leader(&conflicting, 7, 1)
+            .expect_err("conflicting leaders must not yield a stable non-target leader");
         assert_eq!(
             stale_survivor_term_handoff(&conflicting, 7, 1).unwrap(),
             None

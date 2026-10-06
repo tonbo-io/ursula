@@ -1,11 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
-#![expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 use std::sync::Arc;
 
 use axum::Json;
@@ -50,7 +42,7 @@ async fn handle(
     }
     let value = if uri.path().contains("/configmaps/") {
         if method == Method::PUT {
-            db.puts += 1;
+            db.puts = db.puts.saturating_add(1);
             if db.mode == "conflict" {
                 return StatusCode::CONFLICT.into_response();
             }
@@ -81,7 +73,7 @@ async fn handle(
         json!({"kind":"StatefulSet","metadata":{"name":db.cell.statefulset,"namespace":db.cell.namespace,"uid":db.cell.statefulset_uid},"spec":{"replicas":3}})
     } else if uri.path().contains("/pods/") {
         assert_eq!(method, Method::GET);
-        db.pod_reads += 1;
+        db.pod_reads = db.pod_reads.saturating_add(1);
         let mut pod = db.pod.clone();
         if (db.mode == "changed-before" && db.pod_reads >= 2)
             || (db.mode == "changed-after" && db.pod_reads >= 3)
@@ -236,7 +228,9 @@ async fn startup_http_claim_commits_one_nonce_and_rejects_a_second_boot() {
     assert!(admitted.start_maintenance_drained());
     drop(db);
     identity.process_incarnation = ProcessIncarnation::from_bits(101);
-    assert!(api.admit(&identity).await.is_err());
+    api.admit(&identity)
+        .await
+        .expect_err("a second boot with a different incarnation must be rejected");
     assert_eq!(shared.lock().await.puts, 1);
     server.abort();
 }

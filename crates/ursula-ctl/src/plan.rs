@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
@@ -65,7 +61,8 @@ pub(crate) fn plan_drain_at_barriers(
             .entry(target_node_id)
             .and_modify(|count| *count = count.saturating_sub(1))
             .or_insert(0);
-        *leader_counts.entry(successor).or_insert(0) += 1;
+        let successor_count = leader_counts.entry(successor).or_insert(0);
+        *successor_count = successor_count.saturating_add(1);
         transfers.push(GroupTransfer {
             raft_group_id: group.raft_group_id,
             leader_node_id: target_node_id,
@@ -88,7 +85,8 @@ fn leader_counts(snapshot: &ClusterSnapshot) -> BTreeMap<u64, usize> {
 
     let mut counts = BTreeMap::new();
     for leader in group_leaders.into_values() {
-        *counts.entry(leader).or_insert(0) += 1;
+        let count = counts.entry(leader).or_insert(0_usize);
+        *count = count.saturating_add(1);
     }
     counts
 }
@@ -219,7 +217,7 @@ pub fn classify_amnesiac_voter(
         let mut peers_safe = true;
         for group_id in &missing_group_ids {
             let peers = snapshot.peer_views(*group_id, *target_id);
-            if peers.len() != expected.len() - 1 {
+            if peers.len().saturating_add(1) != expected.len() {
                 peers_safe = false;
                 break;
             }

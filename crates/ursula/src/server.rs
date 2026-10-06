@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -449,7 +445,6 @@ fn spawn_shutdown_signal_task(
         tracing::info!(
             "received shutdown signal; handing off leadership before draining listeners (forced exit after {SHUTDOWN_GRACE:?})"
         );
-        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
         tokio::select! {
             () = async {
                 if let Some(registry) = raft_registry {
@@ -473,7 +468,7 @@ fn spawn_shutdown_signal_task(
             () = shutdown_signal() => {
                 tracing::warn!("second shutdown signal; exiting immediately");
             }
-            () = tokio::time::sleep_until(deadline) => {
+            () = tokio::time::sleep(SHUTDOWN_GRACE) => {
                 tracing::warn!("shutdown grace period expired; exiting with drains incomplete");
             }
         }
@@ -482,10 +477,6 @@ fn spawn_shutdown_signal_task(
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 mod tests {
     use std::ffi::OsStr;
     use std::io::Write;
@@ -497,7 +488,8 @@ mod tests {
         assert!(!parse_start_maintenance_drained(None).unwrap());
         assert!(parse_start_maintenance_drained(Some(OsStr::new("true"))).unwrap());
         assert!(!parse_start_maintenance_drained(Some(OsStr::new("false"))).unwrap());
-        assert!(parse_start_maintenance_drained(Some(OsStr::new("1"))).is_err());
+        parse_start_maintenance_drained(Some(OsStr::new("1")))
+            .expect_err("a startup drain flag other than true or false must be rejected");
     }
 
     #[test]
@@ -516,12 +508,13 @@ mod tests {
                 url: format!("http://node-{node_id}:50051"),
             })
             .collect();
-        assert!(super::validate_startup_topology(&config).is_ok());
+        super::validate_startup_topology(&config).expect("a three-voter cell must be accepted");
         config.raft.groups = vec![RaftGroupConfig {
             raft_group_id: 0,
             voters: vec![1, 2, 3],
         }];
-        assert!(super::validate_startup_topology(&config).is_ok());
+        super::validate_startup_topology(&config)
+            .expect("a three-voter group over the full cell must be accepted");
         for voters in [vec![1], vec![1, 2], vec![1, 2, 4], vec![1, 2, 2, 3]] {
             config.raft.groups[0].voters = voters;
             assert!(super::validate_startup_topology(&config).is_err());

@@ -1,7 +1,3 @@
-#![expect(
-    clippy::arithmetic_side_effects,
-    reason = "pre-existing arithmetic debt; see Known debt in AGENTS.md"
-)]
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -644,8 +640,16 @@ pub(crate) fn clamp_sse_text_read(read: &mut ReadStreamResponse, encode_base64: 
         return;
     }
 
+    // `offset + len` lies within the range the stream just served, so overflow
+    // is unreachable. If it happened, send the read unclamped, never a wrong offset.
+    let Some(next_offset) = u64::try_from(len)
+        .ok()
+        .and_then(|len| read.offset.checked_add(len))
+    else {
+        return;
+    };
     read.payload.truncate(len);
-    read.next_offset = read.offset + u64::try_from(len).expect("payload len fits u64");
+    read.next_offset = next_offset;
     read.up_to_date = false;
 }
 
@@ -654,7 +658,8 @@ fn sse_text_payload_len(content_type: &str, payload: &[u8]) -> usize {
         && !payload.ends_with(b"\n")
         && let Some(newline) = payload.iter().rposition(|byte| *byte == b'\n')
     {
-        return newline + 1;
+        // An index below `payload.len()` plus one never saturates.
+        return newline.saturating_add(1);
     }
 
     match std::str::from_utf8(payload) {
