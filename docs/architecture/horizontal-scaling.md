@@ -653,3 +653,52 @@ audits, madsim Raft check and the existing smoke corpus. Static follower forward
 and the existing mixed-RF/meta3/meta5 adoption/restart CLI fixture passed (4.74s
 and 29.17s). Existing smoke remains compatibility coverage, not migration-boundary
 DST acceptance.
+
+
+### Implementation checkpoint: shared-core WAL reclamation
+
+Commit `cf05e16` adds `DurableRaftLogStoreFactory::reclaim_stopped_group_wal`.
+The caller must first persist revocation and drain/stop its engine under the
+managed receiver gate. The operation invalidates the old process-local storage
+owner lease and runs in the same serialized writer queue as normal group writes.
+It closes the append descriptor, replays the shared core journal, removes only
+the selected group's records, fsyncs an atomic replacement containing retained
+groups, and reopens the replacement inode for subsequent writes. Empty and
+never-written journals retain correct first-file/parent-directory durability.
+The journal record format and data Raft wire protocol are unchanged.
+
+Every reopened log store gets a distinct owner lease. Invalidated leases never
+become valid again, even after a newer owner opens the same group. Both direct
+stale handles and delayed old-owner commands already sent to the writer are
+rejected; storage reads through retired handles also fail. A second simultaneous
+live owner is rejected. Ordinary in-process reopening reads current journal
+state through the writer queue rather than reusing the consumed startup cache;
+otherwise votes and entries written since startup could silently disappear from
+the reopened store. Writer I/O failure freezes subsequent commands until the
+writer is dropped/recovered, instead of appending beyond possibly partial work.
+These process-local storage leases supplement the durable receiver generation;
+they do not replace it or authorize a new assignment.
+
+Three focused tests plus an explicitly invoked ignored subprocess entry point
+cover neighbor vote/committed/purged state and later writes, raw delayed
+old-lease requests, empty reopening, unopened recovered-group reclamation,
+in-process reopen, failed replacement/poisoning and process exit without Drop.
+The child also reclaims a nonexistent journal before its first writes, then
+retires one group and writes more to its neighbor before exiting. The reopened
+journal retains the neighbor exactly and contains no retired group records.
+
+The full increment passed workspace lib/bin tests (939 passed, 3 ignored), doc
+tests, workspace Clippy, format, seven DST audits, madsim Raft check and existing
+smoke. Static follower forwarding and mixed-RF/meta3/meta5 adoption/restart CLI
+regressions passed (4.27s and 27.79s). After the final nonexistent-journal parent
+fsync fix, all 39 log-store tests passed (3 ignored), and Clippy/format/audits
+passed again. The new subprocess child is ignored in the default runner and
+invoked explicitly by its parent test.
+
+This proves physical per-group WAL reclamation, not complete replica release.
+The supported prepare/release path still needs owning-core actor retirement,
+registry/read-barrier/cache removal, background-driver shutdown, persisted
+snapshot-metadata cleanup and external snapshot-reference retirement before it
+can certify `local_records_reclaimed` or expose a successful release receipt.
+The low-level reclamation API does not perform meta authorization or membership
+verification. Those responsibilities remain in the fenced migration executor.

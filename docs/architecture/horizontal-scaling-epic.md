@@ -79,10 +79,10 @@ already accepts the meta type config.
 | Story | Deliverable and exit criteria | Dependencies | Status |
 | --- | --- | --- | --- |
 | HS-201 | Intent-bound state transitions, operation idempotency, epoch CAS, source/target policy and membership-step evidence; no successful finish without verified placement | M1 | In progress: commit `6530772` (replicated metadata protocol; physical executor integration pending) |
-| HS-202 | Durable dynamic group prepare/release on the owning core; joining replicas never initialize themselves; revoked replicas cannot be recreated by traffic | HS-104, HS-201 | In progress: commit `064a1af` (assignment/tombstone storage and startup authority; physical prepare/release pending) |
+| HS-202 | Durable dynamic group prepare/release on the owning core; joining replicas never initialize themselves; revoked replicas cannot be recreated by traffic | HS-104, HS-201 | In progress: commits `064a1af`, `cf05e16` (durable hosting authority and per-group WAL reclamation; complete prepare/release pending) |
 | HS-203 | Resumable learner catch-up, fixed-prefix applied verification, joint-membership reconciliation, leader handoff and final membership verification | HS-201, HS-202 | Planned |
 | HS-204 | Durably allocated executor generations and process-incarnation fencing, receiving-process barriers and exclusion with maintenance; delayed old/raw requests cannot bypass authority | HS-201; required before managed mutations are exposed | In progress: commits `6530772`, `064a1af` (durable generations and receiver lifecycle admission; managed submission/reconciliation and full maintenance integration pending) |
-| HS-205 | Dynamic node/gateway routing, per-group readiness/quorum inventory, reference protection, actor/background-work retirement and safe per-core journal reclamation | HS-202, HS-203, HS-204 | Planned |
+| HS-205 | Dynamic node/gateway routing, per-group readiness/quorum inventory, reference protection, actor/background-work retirement and safe per-core journal reclamation | HS-202, HS-203, HS-204 | In progress: commit `cf05e16` (per-group WAL reclamation primitive; inventory/snapshot/background integration pending) |
 | HS-206 | Supported operation API and CLI submit/status/wait/resume with admin authority and error semantics; real-process E2E plus DST at every migration boundary | HS-201 through HS-205 | Planned |
 
 Start with one global active operation. M2 must move a group to a node that
@@ -182,13 +182,18 @@ unevacuated machine. Physical provisioning remains outside the Raft controller.
 | 2026-10-06 | HS-202 / HS-104 | Managed startup seeds settled assignments once, installs local hosting authority before warmup, restores explicitly assigned nonvoters without membership initialization, and rejects absent/retiring/retired assignments despite stale voters or the legacy dynamic allowlist | Reproduced storage/runtime foundation; no physical prepare/release, actor teardown or WAL reclamation claim |
 | 2026-10-06 | HS-204 | Store tests pass across independent OS-process exit/reopen at active/pending/retired checkpoints, missing/corrupt/foreign history, stale CAS and publication I/O failure. Actual meta3 TCP/receiver HTTP test covers cancellation, replaced HTTP process identity, old generations, cleanup/tombstone gates, retirement and quorum loss | Three store tests plus one HTTP test; child entry point is ignored in the default runner and invoked explicitly. Data/other-receiver cleanup certificates are synthetic; HTTP replacement is a new in-process state |
 | 2026-10-06 | M1/M2 | Workspace lib/bin tests: 936 passed, 2 ignored; workspace doc tests, Clippy with `-D warnings`, format, all seven DST audits, madsim Raft check and existing smoke passed. Static follower forwarding passed (4.74s); managed mixed-RF/meta3/meta5 CLI adoption/restart regression passed (29.17s) | Final increment checks passed. Existing smoke/CLI prove compatibility and fixed-layout recovery; migration-boundary DST, receiver binary-restart migration E2E and scale acceptance remain pending |
+| 2026-10-06 | HS-202 / HS-205 | Commit `cf05e16` adds physical per-group shared-core WAL reclamation, serialized with retained groups' writes, atomic replacement/descriptor reopening, permanent old-owner lease invalidation and current-state in-process store reopening. Failed writer I/O closes subsequent commands until recovery; empty/never-written journals preserve parent fsync requirements | Low-level storage implementation; callers must first revoke hosting and drain/stop the engine. Actor/background/snapshot retirement and the supported receiver release receipt remain pending |
+| 2026-10-06 | HS-202 | Three new tests plus a subprocess child reproduce retained neighbor vote/committed/purged state and later appends, direct and queued delayed old-owner refusal after a new owner opens, single-owner enforcement, unopened recovered-group reclamation, in-process reopening, failed replacement/poisoning and process-exit recovery | Actual filesystem/process storage evidence; no actual Raft membership movement or full replica cleanup claim |
+| 2026-10-06 | M1/M2 | Workspace lib/bin tests: 939 passed, 3 ignored; doc tests, workspace Clippy, format, all seven DST audits, madsim Raft check and existing smoke passed. Static follower forwarding passed (4.27s), mixed-RF/meta3/meta5 CLI adoption/restart passed (27.79s). After the final nonexistent-journal parent fsync fix, all 39 log-store tests passed (3 ignored), and Clippy/format/audits passed again | Existing CLI/DST remain fixed-layout compatibility evidence. The new ignored child is explicitly invoked by its parent storage test; migration acceptance remains open |
 
 ## Current execution checkpoint
 
 Current implementation stories: **HS-202/HS-104** explicit prepare/release and
 intent-aware startup, alongside **HS-204/HS-203** managed submission and actual
-membership reconciliation. Commit `064a1af` supplies durable receiving-process
-lifecycle admission, monotonic local assignments and retirement tombstones;
+membership reconciliation. Commit `cf05e16` supplies physical shared-core WAL
+reclamation and permanent old log-store owner invalidation. Commit `064a1af`
+supplies durable receiving-process lifecycle admission, monotonic local
+assignments and retirement tombstones;
 `6530772` supplies replicated intent, epoch/revision, executor generations and
 evidence ordering. The supported server migration executor does not yet produce
 physical data/cleanup receipts. Receiver activation/retirement is available on
@@ -200,10 +205,14 @@ Established startup restores settled data from the bound projection checkpoint
 voters and legacy hosting before actor construction; explicitly assigned
 nonvoters restore without membership initialization. Dynamic prepare/release
 handlers, live inventory/maintenance/snapshot consumers, actor/background teardown
-and safe per-core journal reclamation remain required. Queue barriers alone
-cannot resolve possibly committed membership changes. Next persist each managed
-submission, reconcile actual data Raft membership/applied state and lost replies,
-then wire those receipts to the resumable executor.
+and snapshot-metadata/reference retirement remain required. Per-group WAL
+reclamation now exists, but is not yet integrated with a complete receiver
+release path. Queue barriers alone
+cannot resolve possibly committed membership changes. Next add owning-core
+retirement and per-group snapshot/background barriers, then wire durable
+prepare/release to those cleanup primitives. Persist every managed submission,
+reconcile actual data Raft membership/applied state and lost replies, and wire
+physical receipts to the resumable executor.
 
 HS-103 remains implemented in `73f6970`: opt-in configuration, independent meta3/
 meta5 voters, cohort-checked one-time bootstrap and coordinated static-to-managed
