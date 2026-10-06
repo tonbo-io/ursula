@@ -25,6 +25,8 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::StaticShardMap;
 
+#[path = "managed_migration/joint_fault.rs"]
+mod joint_fault;
 #[path = "managed_migration/snapshot_fault.rs"]
 mod snapshot_fault;
 
@@ -48,6 +50,8 @@ struct Cluster {
     processes: BTreeMap<u64, Process>,
     client: reqwest::Client,
     manifest: PathBuf,
+    fault: Option<std::sync::Arc<joint_fault::Gate>>,
+    _proxies: Vec<joint_fault::Proxy>,
 }
 
 fn port() -> u16 {
@@ -64,6 +68,13 @@ impl Cluster {
     }
 
     async fn new_with_s3(storage: Option<(ursula_config::S3Config, String)>) -> Self {
+        Self::new_with_transport(storage, false).await
+    }
+
+    async fn new_with_transport(
+        storage: Option<(ursula_config::S3Config, String)>,
+        proxy: bool,
+    ) -> Self {
         let cli = Path::new(env!("CARGO_BIN_EXE_ursulactl"));
         let binary = std::env::var_os("URSULA_BINARY")
             .map(PathBuf::from)
@@ -84,14 +95,33 @@ impl Cluster {
                 })
             })
             .collect();
+        let fault = proxy.then(|| std::sync::Arc::new(joint_fault::Gate::default()));
+        let mut proxies = Vec::new();
+        let mut cluster_listeners = BTreeMap::new();
+        for (id, node) in &nodes {
+            let listener = if let Some(gate) = &fault {
+                let listener = format!("127.0.0.1:{}", port());
+                proxies.push(
+                    joint_fault::Proxy::start(
+                        &node.cluster_url,
+                        &format!("http://{listener}"),
+                        gate.clone(),
+                    )
+                    .await,
+                );
+                listener
+            } else {
+                node.cluster_url.trim_start_matches("http://").to_owned()
+            };
+            cluster_listeners.insert(*id, listener);
+        }
         let configs = nodes
             .iter()
             .map(|(id, node)| {
                 let mut config = UrsulaConfig::default();
                 config.runtime.core_count = 1;
                 config.server.listen = node.client_url.trim_start_matches("http://").to_owned();
-                config.server.cluster_listen =
-                    Some(node.cluster_url.trim_start_matches("http://").to_owned());
+                config.server.cluster_listen = Some(cluster_listeners[id].clone());
                 config.server.admin_listen =
                     node.admin_url.trim_start_matches("http://").to_owned();
                 config.raft.node_id = *id;
@@ -154,6 +184,8 @@ impl Cluster {
             processes: BTreeMap::new(),
             client,
             manifest,
+            fault,
+            _proxies: proxies,
         };
         for id in 1..=6 {
             cluster.start(id, "static");
@@ -285,7 +317,13 @@ impl Cluster {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        serde_json::from_slice(&output.stdout).unwrap()
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "CLI {arguments:?} JSON {error}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
     }
 
     async fn view(&self) -> ControlProjection {
