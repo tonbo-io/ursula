@@ -317,7 +317,8 @@ already durable, and it plans without I/O from each group's live bytes per
 segment:
 
 1. Every sealed segment older than the oldest one any group needs is deleted,
-   oldest first, and the directory is `fsync`ed.
+   oldest first, and the directory is `fsync`ed. The pass first `fsync`s the
+   segment being written, under either policy (see the invariant below).
 2. When the journal holds more than twice the live bytes of its groups (and at
    least four segments), the oldest remaining segment is freed. A group that
    holds at most a quarter of a segment live there has those records copied
@@ -333,9 +334,21 @@ segment:
    set changes, and snapshots them ahead of its cadence, so their purge frees
    the segment.
 
-Deletion never has to be durable for the journal to stay correct. A deleted
-segment that a power loss brings back replays history that later records
-supersede: copies of a group's records always follow the originals, and the
+A segment's deletion becomes durable only after the records that made it
+unneeded are durable. The purge, truncate or committed record that freed a
+segment may still be only in the page cache of the segment being written:
+under `never` that holds for any record, and under `always` for truncate and
+committed markers. Sealed segments were `fsync`ed when they rotated. So before it
+removes any segment, the pass `fsync`s the segment being written, and a failed
+`fsync` there poisons the writer. Without this, a host crash could keep the
+deletion and lose the purge: the group's last durable purge would then be
+older than its first surviving entry, a hole that stops the store from
+opening. The cost is at most one `fsync` per pass that deletes segments, about
+one per rotation.
+
+Deletion itself never has to be durable for the journal to stay correct. A
+deleted segment that a power loss brings back replays history that later
+records supersede: copies of a group's records always follow the originals, and the
 latest markers are always written again when they are copied. Replay of a
 journal whose old segments are gone sees copied entries after newer ones, so
 it allows a gap while it reads and checks that each group's log is consecutive
@@ -346,10 +359,11 @@ Reclaim errors are classified by what they leave on disk:
 - A segment that cannot be opened for a rewrite or removed leaves the journal
   as it was. The pass stops, the failure is logged and counted in
   `wal_reclaim_failures`, appends continue, and a later pass retries.
-- A failed write or `fsync` of a copy, a failed directory `fsync` after a
-  removal (later segments rely on that directory's durability), or an old frame
-  that fails verification poisons the writer: the journal may now differ from
-  what the writer believes it holds.
+- A failed write or `fsync` of a copy, a failed `fsync` of the segment being
+  written before a removal, a failed directory `fsync` after a removal (later
+  segments rely on that directory's durability), or an old frame that fails
+  verification poisons the writer: the journal may now differ from what the
+  writer believes it holds.
 
 ## Space and memory bounds
 

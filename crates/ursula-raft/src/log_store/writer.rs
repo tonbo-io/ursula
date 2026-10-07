@@ -1121,6 +1121,17 @@ impl CoreJournal {
         self.reclaim_due = plan.rewrite.is_some();
         let mut outcome = Reclaim::Done;
         if !plan.delete.is_empty() {
+            // A segment's deletion becomes durable only after the records
+            // that made it unneeded are durable. The purge, truncate or
+            // committed record that freed it may still be only in the page
+            // cache of the active segment (sealed segments were `fsync`ed
+            // when they rotated), and the directory `fsync` below makes the
+            // deletion durable. Otherwise a host crash could keep the
+            // deletion and lose the purge, leaving a hole in the log.
+            match self.active.sync() {
+                Ok(fsyncs) => sample.fsyncs = sample.fsyncs.saturating_add(fsyncs),
+                Err(error) => return Reclaim::Poisoned(error),
+            }
             let (deleted, error) = segment::delete_segments(&self.context.dir, &plan.delete);
             let removed = usize::try_from(deleted.segments).unwrap_or(usize::MAX);
             self.sealed.drain(..removed.min(self.sealed.len()));

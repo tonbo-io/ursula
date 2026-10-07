@@ -9,9 +9,11 @@
 //! fsync policy, and a crash can only cut the newest segment short.
 //!
 //! Purge deletes whole segments from the oldest one on, once no group keeps a
-//! live record in them ([`delete_segments`]). Deletion never has to be
-//! durable for the journal to stay correct: a deleted segment that a power
-//! loss brings back replays history that later records supersede.
+//! live record in them ([`delete_segments`]). The writer makes the records
+//! that freed them durable first, so a deletion never outlives the purge
+//! that justified it. Deletion itself never has to be durable for the
+//! journal to stay correct: a deleted segment that a power loss brings back
+//! replays history that later records supersede.
 //!
 //! Recovery reads the segments in order ([`recover_segments`]). Strict
 //! replay tolerates only an incomplete final frame of the newest segment.

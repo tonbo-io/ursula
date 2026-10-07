@@ -1542,17 +1542,108 @@ fn votes_survive_power_loss_under_never_and_the_metadata_is_old_or_new() {
     }
 }
 
-fn blank_entry(index: u64) -> openraft::alias::EntryOf<UrsulaRaftTypeConfig> {
-    use openraft::entry::RaftEntry;
+fn sim_log_id(index: u64) -> LogIdOf<UrsulaRaftTypeConfig> {
     use openraft::vote::RaftLeaderId;
 
+    openraft::LogId {
+        leader_id: openraft::vote::leader_id_adv::CommittedLeaderId::new(1, 1),
+        index,
+    }
+}
+
+fn blank_entry(index: u64) -> openraft::alias::EntryOf<UrsulaRaftTypeConfig> {
+    use openraft::entry::RaftEntry;
+
     openraft::alias::EntryOf::<UrsulaRaftTypeConfig>::new(
-        openraft::LogId {
-            leader_id: openraft::vote::leader_id_adv::CommittedLeaderId::new(1, 1),
-            index,
-        },
+        sim_log_id(index),
         openraft::EntryPayload::Blank,
     )
+}
+
+const PURGE_DURABILITY_SEEDS: [u64; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+
+/// Under `never` a purge reaches the journal without an `fsync`, and the
+/// reclaim pass after it deletes the segments it freed. The deletion becomes
+/// durable only after the purge does, so a power loss that drops unsynced
+/// pages never keeps the deletion without the purge: the store reopens as
+/// a verified prefix, its purge boundary covers every deleted segment, and
+/// its entries are consecutive from there.
+#[test]
+fn a_purge_is_durable_before_the_segments_it_frees_are_deleted() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("PURGE_DURABILITY_SEEDS", &PURGE_DURABILITY_SEEDS) {
+        run_with_madsim(seed, async move {
+            let wal = SimNodeWal::provision_with_fsync("purge-durability", WalFsync::Never);
+            let placement = group_placement(0);
+            let metrics = standalone_wal_metrics(placement);
+            let mut store = wal.open(placement, metrics.clone()).await;
+            for chunk in 0..60_u64 {
+                store
+                    .append(
+                        (1..=10).map(|offset| blank_entry(chunk * 10 + offset)),
+                        IOFlushed::noop(),
+                    )
+                    .await
+                    .expect("append");
+            }
+            let core = wal.root().join("core-0");
+            let before = journal_segments(&core).expect("segments");
+            assert!(
+                before.len() >= 4,
+                "seed {seed}: 600 entries span several segments: {}",
+                before.len()
+            );
+            let purged = sim_log_id(590);
+            store.purge(purged).await.expect("purge");
+            // The reclaim pass after the purge's batch has run once the next
+            // write returns.
+            store
+                .save_committed(Some(sim_log_id(600)))
+                .await
+                .expect("commit");
+            let after = journal_segments(&core).expect("segments");
+            assert!(
+                after.len() < before.len(),
+                "seed {seed}: reclaim deleted the segments the purge freed"
+            );
+            drop(store);
+
+            let report = wal.power_loss().await;
+            assert_opening(
+                wal.opening(),
+                PreviousRun::HostCrash {
+                    fsync: WalFsync::Never,
+                },
+                JournalReplayMode::VerifiedPrefix,
+                RECOVERING_AFTER_HOST_CRASH,
+                &format!("seed {seed}"),
+            );
+            let mut store = wal
+                .try_open(placement, metrics)
+                .await
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "seed {seed}: the store reopens ({report:?}): {}",
+                        err.message()
+                    )
+                });
+            let state = store.get_log_state().await.expect("log state");
+            assert_eq!(
+                state.last_purged_log_id,
+                Some(purged),
+                "seed {seed}: the purge that freed the deleted segments survives ({report:?})"
+            );
+            let log = DurableGroupLog::read(&store).await;
+            let expected = (591..)
+                .take(log.log_ids.len())
+                .map(sim_log_id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                log.log_ids, expected,
+                "seed {seed}: the retained entries are consecutive after the purge"
+            );
+        });
+    }
 }
 
 /// Appends entry `index` to every store, the `n`th append `gap * n` after
@@ -1668,9 +1759,11 @@ async fn crash_within_contract(cluster: &JournalCluster, node_id: u64, fsync: Wa
 /// out. Each round one follower crashes and restarts. It never purges,
 /// because a replica restarts its state machine from a persisted snapshot,
 /// which the simulated disk does not hold, so it also keeps group 0's log
-/// and reports the group lagging. At the end a node that purged and rewrote
-/// segments crashes too, and its journal reopens with every entry it held.
-/// Every crash stays within the durability contract.
+/// and reports the group lagging. Every follower crash stays within the
+/// durability contract. At the end a node that purged and rewrote segments
+/// loses power under either policy and its journal reopens: under `always`
+/// with every entry it held, under `never` as a verified prefix of its log
+/// that a purge boundary still covers.
 pub(super) async fn segment_crash_rounds(seed: u64, fsync: WalFsync) -> JournalWork {
     let mut cluster = JournalCluster::start_with_fsync("segment-crash", fsync).await;
     cluster.append(1, 3).await;
@@ -1691,14 +1784,45 @@ pub(super) async fn segment_crash_rounds(seed: u64, fsync: WalFsync) -> JournalW
     let purged = cluster.leader(0).await;
     let before = cluster.durable_logs(purged).await;
     cluster.stop_node(purged).await;
-    crash_within_contract(&cluster, purged, fsync).await;
+    cluster.wals[&purged].power_loss().await;
+    // The stores reopen: no deleted segment outlives the purge that freed it.
     let (_, after) = reopen_stores(&cluster, purged).await;
     for group in JOURNAL_GROUPS {
-        assert_eq!(
-            after[&group].0.log_ids, before[&group].log_ids,
-            "seed {seed}: node {purged} group {group} lost entries in a crash"
-        );
-        assert_eq!(after[&group].0.vote, before[&group].vote, "seed {seed}");
+        let (after, before) = (&after[&group].0, &before[&group]);
+        assert_eq!(after.vote, before.vote, "seed {seed}");
+        match fsync {
+            WalFsync::Always => assert_eq!(
+                after.log_ids, before.log_ids,
+                "seed {seed}: node {purged} group {group} lost entries in a power loss"
+            ),
+            // Unsynced appends and purges may be lost, never mixed up: the
+            // log stays consecutive, ends no later than before, and agrees
+            // with it wherever both hold an entry.
+            WalFsync::Never => {
+                assert!(
+                    after
+                        .log_ids
+                        .windows(2)
+                        .all(|pair| pair[0].index.checked_add(1) == Some(pair[1].index)),
+                    "seed {seed}: node {purged} group {group} reopened with a hole: {:?}",
+                    after.log_ids
+                );
+                assert!(
+                    after.log_ids.last().map(|log_id| log_id.index)
+                        <= before.log_ids.last().map(|log_id| log_id.index),
+                    "seed {seed}: node {purged} group {group}"
+                );
+                for log_id in &after.log_ids {
+                    if let Some(kept) = before
+                        .log_ids
+                        .iter()
+                        .find(|before| before.index == log_id.index)
+                    {
+                        assert_eq!(kept, log_id, "seed {seed}: node {purged} group {group}");
+                    }
+                }
+            }
+        }
     }
     work
 }
