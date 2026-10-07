@@ -82,6 +82,19 @@ impl SimNodeWal {
         self
     }
 
+    /// The same node directory, whose next run starts with the policy
+    /// `fsync`, as when an operator changes `raft.wal.fsync`.
+    #[cfg(test)]
+    pub(super) fn with_fsync(&self, fsync: WalFsync) -> Self {
+        Self {
+            root: self.root.clone(),
+            tuning: JournalTuning::new(fsync),
+            topology: self.topology.clone(),
+            run: Arc::new(Mutex::new(None)),
+            stores: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
     /// The node directory; a power loss of the node covers everything below it.
     #[cfg(test)]
     pub(super) fn root(&self) -> &Path {

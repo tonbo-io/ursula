@@ -200,7 +200,11 @@ DST then exercises the production journal, and `memory.rs` is deleted.
 
 For each policy, invariants check that no acknowledged write is lost within
 the contract above, that gated replicas never vote, and that majority loss
-stops the group until an operator accepts it.
+stops the group until an operator accepts it. Regression scenarios check that
+an accepted leader that restarts never forks the log, that a switch from
+`never` to `always` across a process crash keeps every acknowledged write or
+gates the group, and that an acceptance opens only a stalled gate for the log
+the operator saw.
 
 ## Removed
 

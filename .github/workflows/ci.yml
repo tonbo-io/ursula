@@ -241,8 +241,10 @@ jobs:
       # power loss under fsync = never, or a lost disk) votes only after it
       # applied a fresh leader barrier, the leader rebuilds or rewinds it, and
       # a group whose majority is gated stops until the operator accepts the
-      # loss of the unsynced tail. A few seeds each; DST Nightly sweeps larger
-      # ranges.
+      # loss of the unsynced tail. The filter also runs the regression
+      # schedules in recovery_tests::regression: an accepted leader that
+      # restarts, and an fsync policy switch across a process crash. A few
+      # seeds each; DST Nightly sweeps larger ranges.
       - name: Run recovery-gate scenarios
         env:
           RECOVERY_GATE_SEEDS: "1..=3"

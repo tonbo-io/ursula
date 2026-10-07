@@ -380,7 +380,12 @@ impl JournalCluster {
     }
 
     pub(super) async fn start_with_fsync(name: &str, fsync: WalFsync) -> Self {
-        let mut cluster = Self::unstarted(name, fsync);
+        Self::start_with_tuning(name, JournalTuning::new(fsync)).await
+    }
+
+    /// Three nodes whose WALs run with `tuning`.
+    pub(super) async fn start_with_tuning(name: &str, tuning: JournalTuning) -> Self {
+        let mut cluster = Self::unstarted_with_tuning(name, tuning);
         for node_id in 1..=3 {
             cluster.start_node(node_id).await;
         }
@@ -407,6 +412,10 @@ impl JournalCluster {
     }
 
     pub(super) fn unstarted(name: &str, fsync: WalFsync) -> Self {
+        Self::unstarted_with_tuning(name, JournalTuning::new(fsync))
+    }
+
+    fn unstarted_with_tuning(name: &str, tuning: JournalTuning) -> Self {
         let config = Arc::new(
             Config {
                 cluster_name: name.to_owned(),
@@ -427,7 +436,7 @@ impl JournalCluster {
                 .map(|node_id| {
                     (
                         node_id,
-                        SimNodeWal::provision_with_fsync(&format!("{name}-{node_id}"), fsync)
+                        SimNodeWal::provision_with_tuning(&format!("{name}-{node_id}"), tuning)
                             .with_group_count(JOURNAL_GROUPS.len()),
                     )
                 })
