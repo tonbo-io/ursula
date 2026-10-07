@@ -87,11 +87,14 @@ The `GroupEngine` trait is the seam between the runtime and a group's storage an
   by the zero-config development node.
 - **Raft engine** over the disk WAL (`raft.wal.path = "DIR"`). OpenRaft groups
   on the same core share one checksummed, versioned journal under
-  `DIR/raft-log`, and cross-group fsync batching avoids one writer and cache
-  per group. Snapshot plus committed-tail replay rebuilds the in-memory state
-  machine after restart, and purge-driven online checkpoints reclaim obsolete
-  physical records. A single node without `raft.wal.path` keeps the journal in
-  a temporary directory that is removed on clean shutdown.
+  `DIR/raft-log`, and cross-group fsync batching avoids one writer per group.
+  The journal is a run of segments: purge deletes whole segments once no group
+  needs them, and the few entries quiet groups leave in old segments are
+  copied forward. Each group keeps an index of where its entries are and a
+  small cache of recent ones, and reads older entries from disk. Snapshot plus
+  committed-tail replay rebuilds the in-memory state machine after restart. A
+  single node without `raft.wal.path` keeps the journal in a temporary
+  directory that is removed on clean shutdown.
 
 A factory selected at startup picks which engine each group opens, leaving the runtime code identical across modes.
 

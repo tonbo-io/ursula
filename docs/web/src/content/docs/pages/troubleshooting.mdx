@@ -21,7 +21,7 @@ Useful jq selectors:
 | Live-read watcher counts | `.cores[] | {core_id, live_read_watchers_active}` |
 | HTTP error counters | `.http.responses_by_status` |
 | WAL disk pressure | `{available: .wal_available_bytes, minimum: .wal_min_available_bytes, pressure: .wal_disk_pressure}` |
-| WAL reclaim/restart | `{physical: .wal_physical_bytes, reclaims: .wal_reclaims, recovered_bytes: .wal_recovery_bytes, recovery_ns: .wal_recovery_ns}` |
+| WAL reclaim/restart | `{physical: .wal_physical_bytes, segments: .wal_segments, reclaims: .wal_reclaims, lagging: .wal_lagging_groups, recovered_bytes: .wal_recovery_bytes, recovery_ns: .wal_recovery_ns}` |
 | WAL opening and recovery gates | `{opening: .wal_recovery, gates: .recovery_gates}` |
 
 `GET /__ursula/ready` is the process readiness probe: it returns `503` while
@@ -110,7 +110,7 @@ replicas with the longest logs. See
 ### I/O error on `raft.wal.path`
 
 The directory must be writable and owned by exactly one Ursula process. Each
-core journal holds an advisory `journal.bin.lock` containing the owner PID. Do
+core journal holds an advisory `journal.lock` containing the owner PID. Do
 not remove it while that process is alive; stop the conflicting process or fix
 the volume mount. A stale lock file is harmless because ownership is enforced
 by the OS lock, not the file's existence.

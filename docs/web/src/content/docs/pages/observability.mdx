@@ -114,15 +114,22 @@ layer is an *export-time bridge*: it reads a snapshot at the collection
 interval rather than calling the metrics SDK per record, so enabling export
 adds nothing to the append/read path.
 
-For WAL operations, the JSON snapshot includes current
-`wal_physical_bytes`; online checkpoint counts, bytes, time and failures under
-`wal_reclaims`, `wal_reclaimed_bytes`, `wal_reclaim_ns` and
-`wal_reclaim_failures`; and startup scan
-work under `wal_recovery_ns`, `wal_recovery_records`, `wal_recovery_bytes`, and
-`wal_recovery_live_entries`. Free-space admission is reported separately as
-`wal_available_bytes`, its two watermarks, `wal_disk_pressure`, and
-`wal_disk_stat_errors`. These are bounded per-node/per-core series; Ursula's
-single active generation has no segment or cache cardinality to report.
+For WAL operations, the JSON snapshot includes per core the journal's size
+and segments (`wal_physical_bytes`, `wal_segments`), rotations
+(`wal_rotations`), segments deleted and their bytes (`wal_reclaims`,
+`wal_reclaimed_bytes`), the time reclaim took and the passes that stopped on an
+error (`wal_reclaim_ns`, `wal_reclaim_failures`), live entry bytes copied out of
+old segments (`wal_rewritten_bytes`), and the groups reported lagging to the
+snapshot driver with the segments kept only for them (`wal_lagging_groups`,
+`wal_pinned_segments`). Reads report entries served from the cache and read
+from disk (`wal_cache_hits`, `wal_cache_misses`) and the frames and bytes read
+(`wal_disk_reads`, `wal_disk_read_bytes`), per core and per group. Each group
+reports its cached bytes and indexed entries (`wal_cache_bytes`,
+`wal_indexed_entries`). Startup scan work is under `wal_recovery_ns`,
+`wal_recovery_records`, `wal_recovery_bytes`, and `wal_recovery_live_entries`.
+Free-space admission is reported separately as `wal_available_bytes`, its two
+watermarks, `wal_disk_pressure`, and `wal_disk_stat_errors`. These are bounded
+per-node, per-core and per-group series.
 
 The OTLP collection interval defaults to 60s. For a quick check, shorten it so
 readings arrive without waiting (and without relying on the shutdown flush):
