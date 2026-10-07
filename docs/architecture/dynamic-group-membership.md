@@ -29,8 +29,8 @@ This phase provides:
   validation.
 - A single active migration intent with target-voter validation.
 - Placement commit and migration finish semantics.
-- A meta Raft type config, state machine, snapshot support, and in-memory log
-  store used for development and tests.
+- A meta Raft type config, state machine, and snapshot support, with an
+  in-memory log store that only its tests use.
 - Tests for the control-plane lifecycle and the meta state-machine plumbing.
 
 This phase deliberately does not provide:
@@ -189,5 +189,6 @@ Before dynamic membership is usable on a running cluster, later PRs need to:
   migration validation.
 - `crates/ursula-raft/src/meta.rs`: meta OpenRaft type config, state machine,
   snapshots, and `MetaRaftHandle`.
-- `crates/ursula-raft/src/log_store`: generic in-memory log-store support used
-  by both data Raft and the meta Raft test foundation.
+- `crates/ursula-raft/src/log_store`: the per-core journal of the data Raft
+  groups. The meta Raft has no production log store yet; its tests use a
+  test-only in-memory one.

@@ -198,12 +198,9 @@ raft:
   # a replica that ever held its group never initializes it again, and a replica that holds
   # nothing initializes only once every voter reports an empty group.
   initMembershipPerGroup: true
-  # Storage mode: logDir for persistent Raft logs, memory for volatile quorum-replicated logs.
-  # Memory WAL loses local state on every restart; restore redundancy before another restart.
-  storageMode: logDir
-  # Raft log directory used when storageMode=logDir.
+  # Raft log directory, mounted from each pod's raft-data PVC. Must be non-empty.
   logDir: /var/lib/ursula/raft
-  # When Raft WAL appends reach stable storage with storageMode=logDir. never acknowledges once
+  # When Raft WAL appends reach stable storage. never acknowledges once
   # the write is in the page cache: a host crash can cost this replica its unsynced tail, and it
   # then stays out of elections until it has caught up from the leader. A group whose majority
   # lost its tail stops until an operator accepts the loss (see README, Bootstrap Behavior).
@@ -213,10 +210,6 @@ raft:
   minAvailableBytes: 536870912
   # Resume only above this watermark to avoid readiness flapping.
   resumeAvailableBytes: 1073741824
-  # Explicit acceptance of the memory-WAL durability contract for multi-pod clusters:
-  # a minority restart heals automatically; quorum loss stops writes and may lose confirmed data,
-  # and a restart of every voter initializes the groups again, empty. See README.
-  allowVolatileMultiPeer: false
   # Optional cap for uncommitted payload bytes per group.
   maxUncommittedBytesPerGroup: null
   # Committed log entries per group between automatic full-state snapshots.
@@ -226,9 +219,8 @@ raft:
   # Payload-bearing log entries retained per group after snapshot coverage.
   maxInSnapshotLogToKeep: 64
 
+# Every server pod gets a raft-data PVC for its Raft WAL.
 persistence:
-  # Enable per-pod PVCs for durable Raft log storage.
-  enabled: true
   # StorageClass name. Empty string uses the cluster default.
   storageClassName: ""
   # PVC access modes.

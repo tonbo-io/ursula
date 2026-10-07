@@ -8,8 +8,20 @@ use ursula_shard::RaftGroupId;
 /// Persistence strategy for the runtime.
 #[derive(Debug, Clone)]
 pub enum Persistence {
+    /// No Raft: the in-memory engine. Nothing survives the process.
     InMemory,
-    Raft { log_dir: Option<PathBuf> },
+    /// Raft over the per-core journals under `log_dir`.
+    Raft { log_dir: PathBuf },
+}
+
+impl Persistence {
+    /// The Raft WAL's journal directory, if the runtime runs Raft.
+    pub fn log_dir(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::InMemory => None,
+            Self::Raft { log_dir } => Some(log_dir),
+        }
+    }
 }
 
 /// Deployment topology.

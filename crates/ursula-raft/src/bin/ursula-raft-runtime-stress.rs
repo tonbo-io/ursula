@@ -5,6 +5,8 @@
 fn main() {}
 
 #[cfg(not(madsim))]
+use std::path::PathBuf;
+#[cfg(not(madsim))]
 use std::sync::Arc;
 #[cfg(not(madsim))]
 use std::sync::atomic::AtomicU64;
@@ -18,7 +20,11 @@ use std::time::Instant;
 #[cfg(not(madsim))]
 use tokio::task::JoinSet;
 #[cfg(not(madsim))]
-use ursula_raft::RaftGroupEngineFactory;
+use ursula_config::WalFsync;
+#[cfg(not(madsim))]
+use ursula_raft::DurableRaftGroupEngineFactory;
+#[cfg(not(madsim))]
+use ursula_raft::DurableRaftLogStoreFactory;
 #[cfg(not(madsim))]
 use ursula_runtime::AppendRequest;
 #[cfg(not(madsim))]
@@ -42,7 +48,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = RuntimeConfig::new(args.core_count, args.raft_group_count);
     config.mailbox_capacity = args.mailbox_capacity;
     config.threading = RuntimeThreading::ThreadPerCore;
-    let runtime = ShardRuntime::spawn_with_engine_factory(config, RaftGroupEngineFactory)?;
+    // Without --wal-dir the journals go to a fresh directory removed at exit.
+    let (wal_dir, remove_wal_dir) = match &args.wal_dir {
+        Some(dir) => (dir.clone(), false),
+        None => (
+            std::env::temp_dir().join(format!("ursula-raft-stress-{}", std::process::id())),
+            true,
+        ),
+    };
+    let wal = DurableRaftLogStoreFactory::start(&wal_dir, args.wal_fsync)?;
+    let runtime = ShardRuntime::spawn_with_engine_factory(
+        config,
+        DurableRaftGroupEngineFactory::new(wal.clone()),
+    )?;
 
     let streams = (0..args.stream_count)
         .map(|index| BucketStreamId::new("stress", format!("stream-{index}")))
@@ -102,7 +120,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .filter(|value| **value > 0)
         .count();
     let counted_appends = total_appends.load(Ordering::Relaxed);
-    println!("engine=openraft-memory");
+    println!("engine=openraft-disk");
+    println!("wal_dir={}", wal_dir.display());
+    println!("wal_fsync={:?}", args.wal_fsync);
     println!("core_count={}", args.core_count);
     println!("raft_group_count={}", args.raft_group_count);
     println!("stream_count={}", args.stream_count);
@@ -135,6 +155,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         snapshot.per_core_routed_requests
     );
     println!("mailbox_depths={:?}", runtime.mailbox_snapshot().depths);
+    runtime.shutdown_group_engines().await?;
+    wal.shutdown().await?;
+    if remove_wal_dir {
+        std::fs::remove_dir_all(&wal_dir)?;
+    }
     Ok(())
 }
 
@@ -174,6 +199,8 @@ struct Args {
     mailbox_capacity: usize,
     payload_bytes: usize,
     duration: Duration,
+    wal_dir: Option<PathBuf>,
+    wal_fsync: WalFsync,
 }
 
 #[cfg(not(madsim))]
@@ -191,6 +218,8 @@ impl Args {
             mailbox_capacity: 1024,
             payload_bytes: 100,
             duration: Duration::from_secs(10),
+            wal_dir: None,
+            wal_fsync: WalFsync::Never,
         };
 
         let mut raw_args = std::env::args().skip(1);
@@ -220,6 +249,21 @@ impl Args {
                 "--duration-secs" => {
                     let seconds = parse_next::<f64>(&mut raw_args, "--duration-secs")?;
                     args.duration = Duration::from_secs_f64(seconds);
+                }
+                "--wal-dir" => {
+                    args.wal_dir = Some(parse_next(&mut raw_args, "--wal-dir")?);
+                }
+                "--wal-fsync" => {
+                    args.wal_fsync =
+                        match parse_next::<String>(&mut raw_args, "--wal-fsync")?.as_str() {
+                            "always" => WalFsync::Always,
+                            "never" => WalFsync::Never,
+                            other => {
+                                return Err(format!(
+                                    "invalid --wal-fsync '{other}': expected always or never"
+                                ));
+                            }
+                        };
                 }
                 "--help" | "-h" => return Err(help()),
                 other => return Err(format!("unknown argument '{other}'\n\n{}", help())),
@@ -266,5 +310,5 @@ where
 
 #[cfg(not(madsim))]
 fn help() -> String {
-    "usage: ursula-raft-runtime-stress [--core-count N] [--raft-group-count N] [--stream-count N] [--producer-count N] [--setup-concurrency N] [--mailbox-capacity N] [--payload-bytes N] [--duration-secs N]".to_owned()
+    "usage: ursula-raft-runtime-stress [--core-count N] [--raft-group-count N] [--stream-count N] [--producer-count N] [--setup-concurrency N] [--mailbox-capacity N] [--payload-bytes N] [--duration-secs N] [--wal-dir PATH] [--wal-fsync always|never]".to_owned()
 }

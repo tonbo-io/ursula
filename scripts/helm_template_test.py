@@ -93,7 +93,8 @@ class HelmTemplateConfigTest(unittest.TestCase):
             'if [ -r "${rollout_state_dir}/phase" ] && [ -r "${rollout_state_dir}/node-id" ]; then',
             rendered,
         )
-        self.assertIn("restarting|upgrading-restart-quiesce)", rendered)
+        self.assertIn("        restarting)\n", rendered)
+        self.assertNotIn("upgrading-restart-quiesce", rendered)
         self.assertIn('if [ "${rollout_node_id}" = "${node_id}" ]; then', rendered)
         self.assertIn(
             'export URSULA_START_MAINTENANCE_DRAINED="${start_maintenance_drained}"',
@@ -401,7 +402,6 @@ class HelmTemplateConfigTest(unittest.TestCase):
 
         self.assertEqual(wal["min_available_size"], "536870912")
         self.assertEqual(wal["resume_available_size"], "1073741824")
-        self.assertFalse(wal["allow_volatile_multi_peer"])
         self.assertIn(
             "readinessProbe:\n            httpGet:\n              path: /__ursula/ready\n              port: client",
             rendered,
@@ -415,19 +415,6 @@ class HelmTemplateConfigTest(unittest.TestCase):
             "raft"
         ]["wal"]
         self.assertEqual(wal["fsync"], "always")
-
-        # A memory WAL ignores the policy, including the default.
-        wal = tomllib.loads(
-            render_config(
-                "--set",
-                "s3.bucket=bkt",
-                "--set",
-                "raft.storageMode=memory",
-                "--set",
-                "raft.allowVolatileMultiPeer=true",
-            )
-        )["raft"]["wal"]
-        self.assertEqual(wal["backend"], "memory")
 
         result = subprocess.run(
             [
@@ -447,31 +434,71 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("walFsync", result.stderr)
 
-    def test_multi_peer_memory_wal_requires_explicit_opt_in(self) -> None:
-        result = subprocess.run(
-            [
-                "helm",
-                "template",
-                "test",
-                "charts/ursula",
-                "--set",
-                "raft.storageMode=memory",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("raft.allowVolatileMultiPeer=true", result.stderr)
-
-        config = render_config(
+    def test_every_server_pod_keeps_its_wal_on_the_raft_data_pvc(self) -> None:
+        ownership = (
+            "--namespace",
+            "test",
             "--set",
+            "server.updateStrategy=OnDelete",
+            "--set",
+            "server.gracefulRollout.enabled=true",
+            "--set",
+            "server.gracefulRollout.maintenanceReservation=true",
+            "--set",
+            "server.startupOwnership.enabled=true",
+        )
+        cases = {
+            "one voter": ("--set", "server.replicaCount=1"),
+            "three voters": ("--set", "server.replicaCount=3"),
+            "five voters": ("--set", "server.replicaCount=5"),
+            "shared maintenance and startup ownership": ownership,
+        }
+        for name, values in cases.items():
+            with self.subTest(name=name):
+                rendered = render_chart("--set", "s3.bucket=bkt", *values)
+                statefulset = re.search(
+                    r"kind: StatefulSet\n.*?(?=\n---|\Z)", rendered, re.S
+                ).group(0)
+                self.assertIn(
+                    "- name: raft-data\n              mountPath: /var/lib/ursula/raft",
+                    statefulset,
+                )
+                self.assertIn(
+                    "  volumeClaimTemplates:\n    - metadata:\n        name: raft-data\n",
+                    statefulset,
+                )
+                self.assertIn('storage: "20Gi"', statefulset)
+                self.assertNotIn("- name: raft-data\n          emptyDir", statefulset)
+                wal = tomllib.loads(render_config("--set", "s3.bucket=bkt", *values))["raft"]["wal"]
+                self.assertEqual(wal["path"], "/var/lib/ursula/raft")
+                self.assertNotIn("backend", wal)
+                self.assertNotIn("allow_volatile_multi_peer", wal)
+
+    def test_removed_storage_values_are_refused(self) -> None:
+        for removed in (
             "raft.storageMode=memory",
-            "--set",
             "raft.allowVolatileMultiPeer=true",
-        )
-        self.assertTrue(tomllib.loads(config)["raft"]["wal"]["allow_volatile_multi_peer"])
+            "persistence.enabled=false",
+            "raft.logDir=",
+        ):
+            with self.subTest(removed=removed):
+                result = subprocess.run(
+                    [
+                        "helm",
+                        "template",
+                        "test",
+                        "charts/ursula",
+                        "--set",
+                        "s3.bucket=bkt",
+                        "--set",
+                        removed,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(removed.split("=", 1)[0].rsplit(".", 1)[1], result.stderr)
 
     def test_cold_max_hot_bytes_zero_is_rendered(self) -> None:
         config = render_config(

@@ -82,7 +82,7 @@ data:
       rollout_phase=$(cat "${rollout_state_dir}/phase")
       rollout_node_id=$(cat "${rollout_state_dir}/node-id")
       case "${rollout_phase}" in
-        restarting|upgrading-restart-quiesce)
+        restarting)
           if [ "${rollout_node_id}" = "${node_id}" ]; then
             start_maintenance_drained=true
           fi
@@ -125,14 +125,8 @@ data:
     [raft.wal]
     min_available_size = {{ .Values.raft.minAvailableBytes | int64 | quote }}
     resume_available_size = {{ .Values.raft.resumeAvailableBytes | int64 | quote }}
-    allow_volatile_multi_peer = {{ .Values.raft.allowVolatileMultiPeer }}
-{{- if .Values.raft.storageMode | eq "memory" }}
-    backend = "memory"
-{{- else }}
-    backend = "disk"
     path = {{ .Values.raft.logDir | quote }}
     fsync = {{ .Values.raft.walFsync | quote }}
-{{- end }}
 
     [storage.cold]
 {{- if .Values.coldStorage.enabled }}

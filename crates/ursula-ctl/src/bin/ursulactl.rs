@@ -65,33 +65,9 @@ enum Command {
     /// Clear a node's maintenance-drain mark so it can hold leaderships again.
     Undrain(NodeArgs),
     /// Block until one node is back as a voter in every group and caught up.
-    /// Progress-gated: a node that keeps advancing is never timed out.
+    /// Progress-gated: a node that keeps advancing is never timed out. A
+    /// node that lost entries is rebuilt by its groups' leaders meanwhile.
     Wait(WaitArgs),
-    /// Quiesce one drained node for an immediate platform restart and pin
-    /// survivor leadership to one anchor for durable membership repair.
-    PrepareRestart(NodeArgs),
-    /// Print whether the target exposes restart quiescence without mutating it.
-    /// The legacy-unavailable result exists only for the 0.4.8 upgrade bridge.
-    RestartQuiesceCapability(NodeArgs),
-    /// Release the target and survivor maintenance fences after the prepared
-    /// replacement has caught up.
-    FinishPreparedRestart(NodeArgs),
-    /// Release only survivor fences after a prepared replacement failed. The
-    /// uncertain target remains maintenance-drained.
-    AbortPreparedRestart(NodeArgs),
-    /// Recover the uniquely identifiable memory-WAL voter that is missing
-    /// whole Raft groups. Drains and quiesces it for platform replacement.
-    PrepareAmnesiacRestart(RestartTargetArgs),
-    /// Rebuild an unready replacement by detaching it from each affected Raft
-    /// group, attaching it as a blocking learner, and promoting it after
-    /// catch-up. Safe to resume after a partially completed repair.
-    RepairRestartedVoter(RestartTargetArgs),
-    /// Drain a partial replacement that predates restart quiescence so the
-    /// platform can replace it with a binary that supports membership repair.
-    PrepareRecoveryHandoff(RestartTargetArgs),
-    /// Print the unique safely recoverable amnesiac voter id, or `none` when
-    /// every voter is ready. Refuses every other unready cluster shape.
-    ClassifyAmnesiac(AmnesiacClassifyArgs),
     /// Strictly verify that every configured node is a voter in every group,
     /// caught up, and observes a usable leader.
     VerifyCluster(VerifyClusterArgs),
@@ -428,38 +404,6 @@ struct DrainArgs {
 }
 
 #[derive(Args, Debug)]
-struct RestartTargetArgs {
-    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
-    /// Target node id from the manifest.
-    #[arg(long)]
-    node: u64,
-    /// Seconds to transfer the target's remaining leaderships before aborting.
-    #[arg(long, default_value_t = 300)]
-    drain_timeout_secs: u64,
-    #[arg(long, default_value_t = 2)]
-    poll_interval_secs: u64,
-    #[arg(long, default_value_t = 10)]
-    http_timeout_secs: u64,
-    /// Allowed replication gap on every surviving peer.
-    #[arg(long, default_value_t = 16)]
-    lag_tolerance: u64,
-}
-
-#[derive(Args, Debug)]
-struct AmnesiacClassifyArgs {
-    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
-    #[arg(long, default_value_t = 10)]
-    http_timeout_secs: u64,
-    /// Allowed replication gap on every surviving peer.
-    #[arg(long, default_value_t = 16)]
-    lag_tolerance: u64,
-}
-
-#[derive(Args, Debug)]
 struct WaitArgs {
     /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
     #[arg(long, value_name = "PATH")]
@@ -749,20 +693,6 @@ async fn main() -> Result<()> {
         Command::Drain(args) => run_drain_subcommand(args).await,
         Command::Undrain(args) => run_undrain_subcommand(args).await,
         Command::Wait(args) => run_wait_subcommand(args).await,
-        Command::PrepareRestart(args) => run_prepare_restart_subcommand(args).await,
-        Command::RestartQuiesceCapability(args) => {
-            run_restart_quiesce_capability_subcommand(args).await
-        }
-        Command::FinishPreparedRestart(args) => run_finish_prepared_restart_subcommand(args).await,
-        Command::AbortPreparedRestart(args) => run_abort_prepared_restart_subcommand(args).await,
-        Command::PrepareAmnesiacRestart(args) => {
-            run_prepare_amnesiac_restart_subcommand(args).await
-        }
-        Command::RepairRestartedVoter(args) => run_repair_restarted_voter_subcommand(args).await,
-        Command::PrepareRecoveryHandoff(args) => {
-            run_prepare_recovery_handoff_subcommand(args).await
-        }
-        Command::ClassifyAmnesiac(args) => run_classify_amnesiac_subcommand(args).await,
         Command::VerifyCluster(args) => run_verify_cluster_subcommand(args).await,
         Command::VerifyQuorum(args) => {
             let started_ms = wall_clock_unix_ms();
@@ -1196,143 +1126,6 @@ async fn run_wait_subcommand(args: WaitArgs) -> Result<()> {
             std::process::exit(2);
         }
     }
-}
-
-async fn run_prepare_restart_subcommand(args: NodeArgs) -> Result<()> {
-    let nodes = load_nodes(&args.config).await?;
-    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
-    let target = find_node(&nodes, args.node)?;
-    let preparation =
-        ursula_ctl::prepare_restart(&nodes, target, &client, &ursula_ctl::DrainOptions {
-            ready_timeout: Duration::ZERO,
-            dry_run: false,
-            ..ursula_ctl::DrainOptions::default()
-        })
-        .await?;
-    println!(
-        "node {}: quiesced with restart leaders pinned to node {}; fenced survivors={:?}",
-        target.id, preparation.leader_anchor, preparation.fenced_node_ids
-    );
-    Ok(())
-}
-
-async fn run_restart_quiesce_capability_subcommand(args: NodeArgs) -> Result<()> {
-    let nodes = load_nodes(&args.config).await?;
-    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
-    let target = find_node(&nodes, args.node)?;
-    match client.restart_quiesce_capability(target).await? {
-        ursula_ctl::RestartQuiesceCapability::Supported => println!("supported"),
-        ursula_ctl::RestartQuiesceCapability::LegacyUnavailable => {
-            println!("legacy-unavailable")
-        }
-    }
-    Ok(())
-}
-
-async fn run_finish_prepared_restart_subcommand(args: NodeArgs) -> Result<()> {
-    let nodes = load_nodes(&args.config).await?;
-    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
-    let target = find_node(&nodes, args.node)?;
-    ursula_ctl::finish_prepared_restart(&nodes, target, &client).await?;
-    println!("node {}: prepared restart fences cleared", target.id);
-    Ok(())
-}
-
-async fn run_abort_prepared_restart_subcommand(args: NodeArgs) -> Result<()> {
-    let nodes = load_nodes(&args.config).await?;
-    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
-    let target = find_node(&nodes, args.node)?;
-    ursula_ctl::abort_prepared_restart(&nodes, target, &client).await?;
-    println!(
-        "node {}: survivor restart fences cleared; target remains drained",
-        target.id
-    );
-    Ok(())
-}
-
-async fn run_prepare_amnesiac_restart_subcommand(args: RestartTargetArgs) -> Result<()> {
-    let nodes = load_nodes(&args.config).await?;
-    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
-    let target = find_node(&nodes, args.node)?;
-    let preparation =
-        ursula_ctl::prepare_amnesiac_restart(&nodes, target, &client, &ursula_ctl::DrainOptions {
-            drain_timeout: Duration::from_secs(args.drain_timeout_secs),
-            ready_timeout: Duration::ZERO,
-            poll_interval: Duration::from_secs(args.poll_interval_secs),
-            lag_tolerance: args.lag_tolerance,
-            dry_run: false,
-        })
-        .await?;
-    println!(
-        "node {}: prepared amnesiac restart for {} missing group(s); leaders pinned to node {}; fenced survivors={:?}; restart immediately",
-        target.id,
-        preparation.missing_group_count,
-        preparation.leader_anchor,
-        preparation.fenced_node_ids
-    );
-    Ok(())
-}
-
-async fn run_repair_restarted_voter_subcommand(args: RestartTargetArgs) -> Result<()> {
-    let nodes = load_nodes(&args.config).await?;
-    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
-    let target = find_node(&nodes, args.node)?;
-    let preparation = ursula_ctl::repair_restarted_voter(
-        &nodes,
-        target,
-        &client,
-        &ursula_ctl::DrainOptions {
-            drain_timeout: Duration::from_secs(args.drain_timeout_secs),
-            ready_timeout: Duration::ZERO,
-            poll_interval: Duration::from_secs(args.poll_interval_secs),
-            lag_tolerance: args.lag_tolerance,
-            dry_run: false,
-        },
-        &ursula_ctl::MembershipRepairOptions::default(),
-    )
-    .await?;
-    println!(
-        "node {}: repaired {} unready group(s) through learner catch-up; leaders pinned to node {}; fenced survivors={:?}",
-        target.id,
-        preparation.missing_group_count,
-        preparation.leader_anchor,
-        preparation.fenced_node_ids
-    );
-    Ok(())
-}
-
-async fn run_prepare_recovery_handoff_subcommand(args: RestartTargetArgs) -> Result<()> {
-    let nodes = load_nodes(&args.config).await?;
-    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
-    let target = find_node(&nodes, args.node)?;
-    let missing_groups =
-        ursula_ctl::prepare_recovery_handoff(&nodes, target, &client, &ursula_ctl::DrainOptions {
-            drain_timeout: Duration::from_secs(args.drain_timeout_secs),
-            ready_timeout: Duration::ZERO,
-            poll_interval: Duration::from_secs(args.poll_interval_secs),
-            lag_tolerance: args.lag_tolerance,
-            dry_run: false,
-        })
-        .await?;
-    println!(
-        "node {}: recovery handoff drained; {} group(s) are wholly missing; replace with a restart-quiesce-capable binary",
-        target.id, missing_groups
-    );
-    Ok(())
-}
-
-async fn run_classify_amnesiac_subcommand(args: AmnesiacClassifyArgs) -> Result<()> {
-    let nodes = load_nodes(&args.config).await?;
-    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
-    let snapshot = client.fetch_cluster(&nodes).await?;
-    let configured_node_ids = nodes.iter().map(|node| node.id).collect::<Vec<_>>();
-    match ursula_ctl::classify_amnesiac_voter(&snapshot, &configured_node_ids, args.lag_tolerance)
-        .map_err(anyhow::Error::msg)?
-    {
-        Some(candidate) => println!("{}", candidate.node_id),
-        None => println!("none"),
-    }
-    Ok(())
 }
 
 async fn run_verify_cluster_subcommand(args: VerifyClusterArgs) -> Result<()> {

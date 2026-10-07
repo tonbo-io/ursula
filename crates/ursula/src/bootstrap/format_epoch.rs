@@ -13,6 +13,7 @@
 //! namespace that a live 0.5.x cluster still uses.
 
 use std::io;
+use std::path::Path;
 use std::time::Duration;
 
 use ursula_raft::PeerFormatEpoch;
@@ -25,12 +26,13 @@ use ursula_runtime::format_marker::write_data_dir_marker;
 /// 2 s for the request, so one probe takes at most about 4 s.
 const PEER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// `data_dir` is the Raft WAL's journal directory, if the node runs Raft.
 pub(crate) async fn check_and_stamp_format_epoch(
     config: &ursula_config::UrsulaConfig,
+    data_dir: Option<&Path>,
 ) -> io::Result<()> {
     // 1. Read-only classification.
-    let data_dir = config.raft.wal.resolved_path();
-    let data_dir_state = data_dir.as_deref().map(classify_data_dir).transpose()?;
+    let data_dir_state = data_dir.map(classify_data_dir).transpose()?;
     let namespace =
         FormatEpochNamespace::from_config(&config.storage.cold, &config.storage.snapshot)?;
     let namespace_state = match &namespace {
@@ -45,7 +47,7 @@ pub(crate) async fn check_and_stamp_format_epoch(
     if let (Some(namespace), Some(MarkerState::Fresh)) = (&namespace, &namespace_state) {
         namespace.write_marker().await?;
     }
-    if let (Some(dir), Some(MarkerState::Fresh)) = (&data_dir, &data_dir_state) {
+    if let (Some(dir), Some(MarkerState::Fresh)) = (data_dir, &data_dir_state) {
         write_data_dir_marker(dir)?;
     }
     Ok(())

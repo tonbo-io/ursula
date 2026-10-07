@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 
 use crate::metrics::ClusterSnapshot;
 use crate::metrics::RaftGroupView;
@@ -153,129 +152,13 @@ pub struct GroupReadiness {
     pub ready: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AmnesiacVoter {
-    pub node_id: u64,
-    pub missing_group_ids: Vec<u64>,
-}
-
-/// Classify the one recoverable memory-WAL failure shape: exactly one node is
-/// missing local state for one or more groups, while every other configured
-/// voter reports complete, mutually consistent, caught-up replicas for the
-/// entire cluster. Any other partial state is refused rather than guessed at.
-pub fn classify_amnesiac_voter(
-    snapshot: &ClusterSnapshot,
-    configured_node_ids: &[u64],
-    lag_tolerance: u64,
-) -> Result<Option<AmnesiacVoter>, String> {
-    if configured_node_ids.len() < 3 {
-        return Err("amnesiac recovery requires at least three configured voters".to_owned());
-    }
-    let expected = configured_node_ids.iter().copied().collect::<BTreeSet<_>>();
-    if expected.len() != configured_node_ids.len() {
-        return Err("configured voter ids are not unique".to_owned());
-    }
-    let reported = snapshot
-        .per_node
-        .iter()
-        .map(|view| view.node.id)
-        .collect::<BTreeSet<_>>();
-    if reported != expected {
-        return Err(format!(
-            "metrics voter inventory differs: configured={expected:?} reported={reported:?}"
-        ));
-    }
-
-    let reports = expected
-        .iter()
-        .map(|node_id| (*node_id, check_readiness(snapshot, *node_id, lag_tolerance)))
-        .collect::<BTreeMap<_, _>>();
-    if reports.values().all(|report| report.all_ready) {
-        return Ok(None);
-    }
-
-    let mut candidates = Vec::new();
-    for (target_id, target) in &reports {
-        let missing_group_ids = target
-            .per_group
-            .values()
-            .filter(|group| !group.ready && group.target_applied_index.is_none())
-            .map(|group| group.raft_group_id)
-            .collect::<Vec<_>>();
-        if missing_group_ids.is_empty()
-            || target
-                .per_group
-                .values()
-                .any(|group| !group.ready && group.target_applied_index.is_some())
-            || reports
-                .iter()
-                .any(|(node_id, report)| node_id != target_id && !report.all_ready)
-        {
-            continue;
-        }
-
-        let mut peers_safe = true;
-        for group_id in &missing_group_ids {
-            let peers = snapshot.peer_views(*group_id, *target_id);
-            if peers.len().saturating_add(1) != expected.len() {
-                peers_safe = false;
-                break;
-            }
-            let leaders = peers
-                .values()
-                .filter_map(|group| group.current_leader)
-                .collect::<BTreeSet<_>>();
-            let peer_max_committed = peers
-                .values()
-                .filter_map(|group| group.committed_index)
-                .max();
-            if leaders.len() != 1
-                || leaders.contains(target_id)
-                || peer_max_committed.is_none()
-                || peers.values().any(|group| {
-                    group.voter_ids.iter().copied().collect::<BTreeSet<_>>() != expected
-                        || group.last_applied_index.is_none()
-                        || peer_max_committed.zip(group.last_applied_index).is_none_or(
-                            |(committed, applied)| {
-                                committed.saturating_sub(applied) > lag_tolerance
-                            },
-                        )
-                })
-            {
-                peers_safe = false;
-                break;
-            }
-        }
-        if peers_safe {
-            candidates.push(AmnesiacVoter {
-                node_id: *target_id,
-                missing_group_ids,
-            });
-        }
-    }
-
-    match candidates.len() {
-        1 => Ok(candidates.pop()),
-        0 => Err("cluster is unready but has no uniquely recoverable amnesiac voter".to_owned()),
-        _ => Err(format!(
-            "multiple amnesiac voter candidates are unsafe to recover: {:?}",
-            candidates
-                .iter()
-                .map(|candidate| candidate.node_id)
-                .collect::<Vec<_>>()
-        )),
-    }
-}
-
 /// A target node is ready when, in every raft group that any peer reports:
 ///   1. The target is listed in voter_ids (membership intact).
 ///   2. The target's last_applied_index >= max peer committed_index - lag_tolerance.
 ///   3. The target has applied something once any peer has committed past the
-///      initial membership entry. An empty voter (a memory-WAL node that
-///      re-initialized its membership on restart: 0.6.1 and earlier, or a
-///      0.6.1 leader during a rolling upgrade) is never ready, whatever the
-///      lag tolerance: the leader may never backfill it, and counting it ready
-///      leaves the group on two real copies.
+///      initial membership entry. An empty voter (a replica that lost its log
+///      and has not been rebuilt yet) is never ready, whatever the lag
+///      tolerance: counting it ready leaves the group on two real copies.
 ///
 /// Groups invisible to the target (e.g. because it just restarted and hasn't
 /// caught up enough to know about them) are treated as not-ready.
@@ -368,6 +251,8 @@ fn group_is_initialized(group: &RaftGroupView) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use url::Url;
 
     use super::*;
@@ -393,7 +278,6 @@ mod tests {
             maintenance_fence_uncertain: false,
             node: node(node_id),
             groups,
-            wal_backend: None,
             raft_maintenance: None,
         }
     }
@@ -675,79 +559,5 @@ mod tests {
         let report = check_readiness(&snapshot, 3, 16);
         assert!(!report.all_ready, "{report:?}");
         assert!(!report.per_group[&5].ready);
-    }
-
-    #[test]
-    fn classifies_an_empty_voter_as_missing() {
-        let mut snapshot = amnesiac_snapshot();
-        snapshot.per_node[2].groups[1] = group(8, 3, Some(2), None, None, vec![1, 2, 3]);
-        let candidate = classify_amnesiac_voter(&snapshot, &[1, 2, 3], 64)
-            .unwrap()
-            .unwrap();
-        assert_eq!(candidate.node_id, 3);
-        assert_eq!(candidate.missing_group_ids, vec![8]);
-    }
-
-    fn amnesiac_snapshot() -> ClusterSnapshot {
-        ClusterSnapshot {
-            per_node: vec![
-                view(1, vec![
-                    group(7, 1, Some(1), Some(100), Some(100), vec![1, 2, 3]),
-                    group(8, 1, Some(2), Some(50), Some(50), vec![1, 2, 3]),
-                ]),
-                view(2, vec![
-                    group(7, 2, Some(1), Some(100), Some(100), vec![1, 2, 3]),
-                    group(8, 2, Some(2), Some(50), Some(50), vec![1, 2, 3]),
-                ]),
-                view(3, vec![
-                    group(7, 3, Some(1), Some(100), Some(100), vec![1, 2, 3]),
-                    empty_group(8, 3),
-                ]),
-            ],
-        }
-    }
-
-    #[test]
-    fn classifies_one_amnesiac_voter_only_when_peers_are_complete() {
-        let snapshot = amnesiac_snapshot();
-        let candidate = classify_amnesiac_voter(&snapshot, &[1, 2, 3], 5)
-            .unwrap()
-            .unwrap();
-        assert_eq!(candidate.node_id, 3);
-        assert_eq!(candidate.missing_group_ids, vec![8]);
-    }
-
-    #[test]
-    fn healthy_cluster_has_no_amnesiac_candidate() {
-        let mut snapshot = amnesiac_snapshot();
-        snapshot.per_node[2].groups[1] = group(8, 3, Some(2), Some(50), Some(50), vec![1, 2, 3]);
-        assert_eq!(
-            classify_amnesiac_voter(&snapshot, &[1, 2, 3], 5).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn refuses_two_incomplete_voters() {
-        let mut snapshot = amnesiac_snapshot();
-        snapshot.per_node[1].groups[1] = empty_group(8, 2);
-        let error = classify_amnesiac_voter(&snapshot, &[1, 2, 3], 5).unwrap_err();
-        assert!(error.contains("no uniquely recoverable"), "{error}");
-    }
-
-    #[test]
-    fn refuses_missing_group_when_surviving_peer_is_lagging() {
-        let mut snapshot = amnesiac_snapshot();
-        snapshot.per_node[1].groups[1].last_applied_index = Some(1);
-        let error = classify_amnesiac_voter(&snapshot, &[1, 2, 3], 5).unwrap_err();
-        assert!(error.contains("no uniquely recoverable"), "{error}");
-    }
-
-    #[test]
-    fn refuses_missing_group_with_disputed_peer_leader() {
-        let mut snapshot = amnesiac_snapshot();
-        snapshot.per_node[1].groups[1].current_leader = Some(1);
-        let error = classify_amnesiac_voter(&snapshot, &[1, 2, 3], 5).unwrap_err();
-        assert!(error.contains("no uniquely recoverable"), "{error}");
     }
 }

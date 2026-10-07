@@ -377,10 +377,11 @@ async fn cli_static_grpc_raft_cluster_forwards_follower_writes() {
         .map(|(port, node_id)| (node_id, format!("http://127.0.0.1:{port}")))
         .collect();
 
+    let wal_root = tempfile::tempdir().expect("WAL root");
     let children = vec![
-        spawn_node(binary, 2, ports[1], &peers, false),
-        spawn_node(binary, 3, ports[2], &peers, false),
-        spawn_node(binary, 1, ports[0], &peers, true),
+        spawn_node(binary, 2, ports[1], &peers, false, wal_root.path()),
+        spawn_node(binary, 3, ports[2], &peers, false, wal_root.path()),
+        spawn_node(binary, 1, ports[0], &peers, true, wal_root.path()),
     ];
 
     let client = reqwest::Client::new();
@@ -948,8 +949,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
             1,
             &peers,
             *node_id == 1,
-            "disk",
-            Some(&log_dir),
+            &log_dir,
             "s3",
             Some(&cold_root),
         ));
@@ -1018,8 +1018,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
             1,
             &peers,
             false,
-            "disk",
-            Some(&log_dir),
+            &log_dir,
             "s3",
             Some(&cold_root),
         );
@@ -1055,13 +1054,12 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
-    // A memory-WAL voter restarted empty must not re-run per-group Initialize
-    // for the groups it bootstraps (2 and 5 of 6 for node 3): it must never
-    // report itself a voter with nothing applied. The leaders see it lost the
-    // entries it had acknowledged and rebuild it through remove, learner,
-    // catch-up and promote with no operator. `repair_restarted_voter`, which
-    // a prepared rollout still runs, then finds nothing left to do.
+async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
+    // A voter replaced on an empty WAL directory (its disk was lost) must not
+    // re-run per-group Initialize for the groups it bootstraps (2 and 5 of 6
+    // for node 3): it must never report itself a voter with nothing applied.
+    // The leaders see it lost the entries it had acknowledged and rebuild it
+    // through remove, learner, catch-up and promote with no operator.
     let _guard = static_cluster_cli_test_guard().await;
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
         tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping restart self-heal test");
@@ -1074,11 +1072,13 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
         .map(|node_id| (node_id, public(node_id)))
         .collect::<Vec<_>>();
 
+    let wal_root = tempfile::tempdir().expect("WAL root");
     let mut children = Vec::new();
     let mut nodes = Vec::new();
     for node_id in [1_u64, 2, 3] {
         let port = node_port(&ports, node_id);
-        let (child, admin_port) = spawn_per_group_memory_node(binary, node_id, port, &peers, false);
+        let (child, admin_port) =
+            spawn_per_group_node(binary, node_id, port, &peers, false, wal_root.path());
         children.push(child);
         nodes.push(ctl_node(node_id, admin_port, &public(node_id)));
     }
@@ -1229,22 +1229,19 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
             .collect::<Vec<_>>()
             .join("\n")
     );
-    ursula_ctl::prepare_restart(&nodes, &nodes[2], &ctl, &drain_options)
-        .await
-        .expect("prepare node 3 restart");
-
-    let survivors = ursula_ctl::quorum::verify_surviving_quorum(&nodes, 3, &ctl, &options)
-        .await
-        .expect("prepared source leaves both pinned survivors eligible");
-    assert!(survivors.verification.maintenance_executor_certified);
-    assert!(!survivors.full_redundancy_restored);
-
     // The chart reuses its Pod-bound tunnel addresses. Preserve the same
     // native listening configuration too: shared binding permits only a boot
     // change, never refreshing a target URL alongside its incarnation.
     let replacement_config = children[2].config_path.clone().unwrap();
     let replacement_text = std::fs::read_to_string(&replacement_config).unwrap();
     drop(children.pop());
+    let survivors = ursula_ctl::quorum::verify_surviving_quorum(&nodes, 3, &ctl, &options)
+        .await
+        .expect("with the drained source stopped, both survivors are eligible");
+    assert!(survivors.verification.maintenance_executor_certified);
+    assert!(!survivors.full_redundancy_restored);
+    // The replacement comes back on an empty WAL: the source's disk is lost.
+    remove_test_path(node_wal_dir(wal_root.path(), 3));
     std::fs::write(&replacement_config, replacement_text).unwrap();
     let mut command = Command::new(binary);
     command
@@ -1339,33 +1336,20 @@ async fn cli_restarted_memory_voter_heals_itself_and_repair_is_idempotent() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    let repair_options = ursula_ctl::MembershipRepairOptions {
-        max_concurrency: 6,
-        operation_timeout: Duration::from_secs(5),
-        operation_reconcile_timeout: Duration::from_secs(30),
-        stall_timeout: Duration::from_secs(30),
-        ready_timeout: Duration::from_secs(60),
-        poll_interval: Duration::from_millis(200),
-    };
-    ursula_ctl::repair_restarted_voter(&nodes, &nodes[2], &ctl, &drain_options, &repair_options)
+    // `wait` sees the same rebuilt voter.
+    let outcome =
+        ursula_ctl::wait_node_ready(&nodes, &nodes[2], &ctl, &ursula_ctl::CatchUpOptions {
+            stall_timeout: Duration::from_secs(30),
+            ready_timeout: Duration::from_secs(60),
+            poll_interval: Duration::from_millis(200),
+            lag_tolerance: 0,
+        })
         .await
-        .expect("repair after self-heal is a no-op");
-
-    let deadline = std::time::Instant::now()
-        .checked_add(Duration::from_secs(30))
-        .unwrap();
-    loop {
-        let snapshot = ctl.fetch_cluster(&nodes).await.expect("fetch cluster");
-        let report = ursula_ctl::plan::check_readiness(&snapshot, 3, 0);
-        if report.all_ready {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "repair left node 3 behind: {report:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+        .expect("wait for node 3");
+    assert!(
+        matches!(outcome, ursula_ctl::CatchUpOutcome::Ready),
+        "{outcome:?}"
+    );
 
     for index in 0..6 {
         read_until_matches(
@@ -1493,7 +1477,7 @@ async fn append_idempotent_until_acked(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cli_host_recovery_keeps_ack_tail_across_abrupt_memory_voter_loss() {
+async fn cli_host_recovery_keeps_ack_tail_across_abrupt_voter_loss() {
     run_cli_host_recovery(false).await;
 }
 
@@ -1513,11 +1497,18 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
     let ports = [free_port(), free_port(), free_port()];
     let public = |id: u64| format!("http://127.0.0.1:{}", node_port(&ports, id));
     let peers = (1..=3).map(|id| (id, public(id))).collect::<Vec<_>>();
+    let wal_root = tempfile::tempdir().expect("WAL root");
     let mut children = Vec::new();
     let mut nodes = Vec::new();
     for id in 1..=3 {
-        let (child, admin) =
-            spawn_per_group_memory_node(binary, id, node_port(&ports, id), &peers, false);
+        let (child, admin) = spawn_per_group_node(
+            binary,
+            id,
+            node_port(&ports, id),
+            &peers,
+            false,
+            wal_root.path(),
+        );
         children.push(child);
         nodes.push(ctl_node(id, admin, &public(id)));
     }
@@ -1681,6 +1672,8 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
         );
     }
     drop(children.pop());
+    // The replacement host starts with an empty WAL.
+    remove_test_path(node_wal_dir(wal_root.path(), 3));
     std::fs::write(&replacement_config, replacement_text).unwrap();
     let mut command = Command::new(binary);
     command
@@ -1808,6 +1801,8 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
             );
         }
         drop(children.pop());
+        // The restaged replacement starts on another empty WAL.
+        remove_test_path(node_wal_dir(wal_root.path(), 3));
         std::fs::write(&config, text).unwrap();
         let mut command = Command::new(binary);
         command
@@ -1835,30 +1830,22 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
     } else {
         ctl
     };
-    ursula_ctl::repair_restarted_voter(
-        &nodes,
-        &nodes[2],
-        &ctl,
-        &ursula_ctl::DrainOptions {
-            drain_timeout: Duration::from_secs(60),
-            ready_timeout: Duration::from_secs(60),
-            poll_interval: Duration::from_millis(100),
-            ..Default::default()
-        },
-        &ursula_ctl::MembershipRepairOptions {
-            max_concurrency: 6,
-            operation_timeout: Duration::from_secs(5),
-            operation_reconcile_timeout: Duration::from_secs(30),
+    // The leaders rebuild the replacement by themselves; the operator waits
+    // for it and lifts its startup drain.
+    let outcome =
+        ursula_ctl::wait_node_ready(&nodes, &nodes[2], &ctl, &ursula_ctl::CatchUpOptions {
             stall_timeout: Duration::from_secs(30),
             ready_timeout: Duration::from_secs(60),
             poll_interval: Duration::from_millis(100),
-        },
-    )
-    .await
-    .unwrap();
-    ursula_ctl::finish_prepared_restart(&nodes, &nodes[2], &ctl)
+            lag_tolerance: 16,
+        })
         .await
         .unwrap();
+    assert!(
+        matches!(outcome, ursula_ctl::CatchUpOutcome::Ready),
+        "{outcome:?}"
+    );
+    ursula_ctl::undrain_node(&ctl, &nodes[2]).await.unwrap();
     ursula_ctl::wait_cluster_ready(
         "host replacement recovered",
         &nodes,
@@ -1948,12 +1935,13 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
     drop(children);
 }
 
-fn spawn_per_group_memory_node(
+fn spawn_per_group_node(
     binary: &str,
     node_id: u64,
     port: u16,
     peers: &[(u64, String)],
     start_drained: bool,
+    wal_root: &Path,
 ) -> (ChildGuard, u16) {
     let config_path = std::env::temp_dir().join(format!(
         "ursula-per-group-node-{node_id}-{port}-{}.toml",
@@ -1969,8 +1957,7 @@ fn spawn_per_group_memory_node(
         6,
         peers,
         true,
-        "memory",
-        None,
+        &node_wal_dir(wal_root, node_id),
         "memory",
         None,
     );
@@ -1995,7 +1982,7 @@ fn spawn_per_group_memory_node(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cli_sigterm_hands_off_memory_leaders_and_bounds_quorum_loss() {
+async fn cli_sigterm_hands_off_leaders_and_bounds_quorum_loss() {
     let _guard = static_cluster_cli_test_guard().await;
     let binary = env!("CARGO_BIN_EXE_ursula");
     let ports = [free_port(), free_port(), free_port()];
@@ -2004,15 +1991,17 @@ async fn cli_sigterm_hands_off_memory_leaders_and_bounds_quorum_loss() {
         .zip(1_u64..)
         .map(|(port, node_id)| (node_id, format!("http://127.0.0.1:{port}")))
         .collect::<Vec<_>>();
+    let wal_root = tempfile::tempdir().expect("WAL root");
     let mut children = Vec::new();
     let mut nodes = Vec::new();
     for (node_id, url) in &peers {
-        let (child, admin_port) = spawn_per_group_memory_node(
+        let (child, admin_port) = spawn_per_group_node(
             binary,
             *node_id,
             node_port(&ports, *node_id),
             &peers,
             false,
+            wal_root.path(),
         );
         children.push(child);
         nodes.push(ctl_node(*node_id, admin_port, url));
@@ -2192,8 +2181,7 @@ fn write_node_toml(
     raft_group_count: usize,
     peers: &[(u64, String)],
     init_membership: bool,
-    wal_backend: &str,
-    wal_path: Option<&Path>,
+    wal_path: &Path,
     cold_backend: &str,
     cold_root: Option<&str>,
 ) -> u16 {
@@ -2233,16 +2221,11 @@ init_membership_per_group = false
     writeln!(
         config,
         r#"[raft.wal]
-backend = "{wal_backend}""#
+path = "{}"
+"#,
+        wal_path.display()
     )
     .unwrap();
-    if let Some(p) = wal_path {
-        writeln!(config, r#"path = "{}""#, p.display()).unwrap();
-    }
-    if wal_backend == "memory" && peers.len() > 1 {
-        writeln!(config, "allow_volatile_multi_peer = true").unwrap();
-    }
-    config.push('\n');
 
     for (peer_id, peer_url) in peers {
         writeln!(
@@ -2304,12 +2287,18 @@ gc_interval = "1s"
     admin_port
 }
 
+/// The WAL directory of node `node_id` under a test's `wal_root`.
+fn node_wal_dir(wal_root: &Path, node_id: u64) -> PathBuf {
+    wal_root.join(format!("node-{node_id}"))
+}
+
 fn spawn_node(
     binary: &str,
     node_id: u64,
     port: u16,
     peers: &[(u64, String)],
     init_membership: bool,
+    wal_root: &Path,
 ) -> ChildGuard {
     let config_path = std::env::temp_dir().join(format!(
         "ursula-node-{node_id}-{port}-{}.toml",
@@ -2325,14 +2314,13 @@ fn spawn_node(
         4,
         peers,
         init_membership,
-        "memory",
-        None,
+        &node_wal_dir(wal_root, node_id),
         "memory",
         None,
     );
     let mut command = Command::new(binary);
     command.arg("server").arg("--config").arg(&config_path);
-    let mut guard = spawn_child(command, format!("memory-node-{node_id}-{port}"));
+    let mut guard = spawn_child(command, format!("node-{node_id}-{port}"));
     guard.config_path = Some(config_path);
     guard
 }
@@ -2530,8 +2518,7 @@ fn write_cluster_config(
         raft_group_count,
         peers,
         init_membership,
-        "disk",
-        Some(log_dir),
+        log_dir,
         "memory",
         None,
     )

@@ -35,13 +35,11 @@ use crate::log_store::CoreFileLogWriter;
 use crate::log_store::CoreJournalOptions;
 use crate::log_store::NodeWal;
 use crate::log_store::RaftGroupFileLogStore;
-use crate::log_store::RaftGroupLogStore;
 use crate::log_store::RaftWalError;
 use crate::log_store::RecoveryState;
 use crate::log_store::WalOpening;
 use crate::registry::RaftGroupHandle;
 use crate::registry::RaftGroupHandleRegistry;
-use crate::rejoin::GroupBootstrap;
 use crate::rejoin::GroupRejoin;
 use crate::rejoin::PeerGroupLog;
 use crate::rejoin::RECOVERY_STALL_AFTER;
@@ -51,9 +49,7 @@ use crate::rejoin::run_group_bootstrap;
 use crate::rejoin::run_rejoin_heal;
 
 /// Minimum election timeout of every data-group Raft, in milliseconds.
-/// `ursulactl`'s restart fence waits this long for an in-flight leadership
-/// transfer to settle, so it reads the same constant.
-pub const GROUP_ELECTION_TIMEOUT_MIN_MS: u64 = 1500;
+const GROUP_ELECTION_TIMEOUT_MIN_MS: u64 = 1500;
 
 const REJOIN_VOTE_BARRIER_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -100,7 +96,6 @@ pub struct RaftEngineConfig {
     pub bootstrap_peer_connect: Duration,
     pub install_snapshot_timeout_ms: u64,
     pub snapshot_drive_interval_ms: u64,
-    pub memory_bootstrap_marker_dir: Option<PathBuf>,
     pub grpc_reconnect_after_failures: u32,
     pub snapshot_build_max_concurrency: usize,
     pub snapshot_logs_since_last: u64,
@@ -115,7 +110,6 @@ impl Default for RaftEngineConfig {
             bootstrap_peer_connect: Duration::from_millis(500),
             install_snapshot_timeout_ms: 120_000,
             snapshot_drive_interval_ms: 0,
-            memory_bootstrap_marker_dir: None,
             grpc_reconnect_after_failures: 8,
             snapshot_build_max_concurrency: 1,
             snapshot_logs_since_last: 5_000,
@@ -133,7 +127,6 @@ impl From<&ursula_config::RaftConfig> for RaftEngineConfig {
             install_snapshot_timeout_ms: cfg.install_snapshot_timeout.as_duration().as_millis()
                 as u64,
             snapshot_drive_interval_ms: 0, // set by caller from RaftSnapshotConfig
-            memory_bootstrap_marker_dir: cfg.memory_bootstrap_marker_dir.clone(),
             grpc_reconnect_after_failures: u32::try_from(cfg.grpc_reconnect_after_failures)
                 .expect("config validation ensures grpc_reconnect_after_failures fits u32"),
             snapshot_build_max_concurrency: cfg.snapshot_build_max_concurrency,
@@ -154,32 +147,6 @@ fn jittered_snapshot_logs_since_last(base: u64, placement: ShardPlacement, node_
         ^ node_id.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     // `base` is at least 1, so the remainder always exists.
     base.saturating_add(seed.checked_rem(base).unwrap_or(0))
-}
-
-fn write_bootstrap_marker(
-    node_id: u64,
-    raft_group_id: RaftGroupId,
-    marker_path: Option<&std::path::Path>,
-) {
-    let Some(path) = marker_path else {
-        return;
-    };
-    if let Some(parent) = path.parent()
-        && let Err(err) = std::fs::create_dir_all(parent)
-    {
-        tracing::error!(
-            "raft bootstrap: node {node_id} group {} failed to create marker dir: {err}",
-            raft_group_id.0
-        );
-        return;
-    }
-    if let Err(err) = std::fs::write(path, b"initialized\n") {
-        tracing::error!(
-            "raft bootstrap: node {node_id} group {} failed to write marker {}: {err}",
-            raft_group_id.0,
-            path.display()
-        );
-    }
 }
 
 /// Ask one voter what it holds for the group with the bootstrap probe vote
@@ -203,20 +170,18 @@ async fn probe_peer_group_log(
 /// Membership bootstrap of a group's initializer over gRPC; see
 /// [`run_group_bootstrap`]. One voter holding the group means the replica
 /// lost what it held; it then waits to be replicated to, and the leader's
-/// heal driver rebuilds it. A memory-WAL node with a bootstrap marker
-/// directory records the bootstrap at `marker_path`.
+/// heal driver rebuilds it.
 fn spawn_group_bootstrap(
     node_id: u64,
     raft_group_id: RaftGroupId,
     raft: RaftGroupHandle,
     rejoin: Arc<GroupRejoin>,
     nodes: BTreeMap<u64, BasicNode>,
-    marker_path: Option<PathBuf>,
     engine_config: RaftEngineConfig,
 ) {
     tokio::spawn(async move {
         let connect = engine_config.bootstrap_peer_connect;
-        let outcome = run_group_bootstrap(
+        run_group_bootstrap(
             node_id,
             raft,
             rejoin,
@@ -228,129 +193,7 @@ fn spawn_group_bootstrap(
             engine_config.bootstrap_peer_probe,
         )
         .await;
-        if matches!(
-            outcome,
-            GroupBootstrap::Initialized | GroupBootstrap::Rejoined
-        ) {
-            write_bootstrap_marker(node_id, raft_group_id, marker_path.as_deref());
-        }
     });
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RaftGroupEngineFactory;
-
-impl GroupEngineFactory for RaftGroupEngineFactory {
-    fn create<'a>(
-        &'a self,
-        placement: ShardPlacement,
-        metrics: GroupEngineMetrics,
-    ) -> GroupEngineCreateFuture<'a> {
-        Box::pin(async move {
-            let engine: Box<dyn GroupEngine> = Box::new(
-                RaftGroupEngine::new_single_node_with_optional_metrics(placement, Some(metrics))
-                    .await?,
-            );
-            Ok(engine)
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct RegisteredRaftGroupEngineFactory {
-    registry: RaftGroupHandleRegistry,
-}
-
-impl RegisteredRaftGroupEngineFactory {
-    pub fn new(registry: RaftGroupHandleRegistry) -> Self {
-        Self { registry }
-    }
-
-    pub fn registry(&self) -> &RaftGroupHandleRegistry {
-        &self.registry
-    }
-}
-
-impl GroupEngineFactory for RegisteredRaftGroupEngineFactory {
-    fn create<'a>(
-        &'a self,
-        placement: ShardPlacement,
-        metrics: GroupEngineMetrics,
-    ) -> GroupEngineCreateFuture<'a> {
-        Box::pin(async move {
-            let engine =
-                RaftGroupEngine::new_single_node_with_optional_metrics(placement, Some(metrics))
-                    .await?;
-            // The barrier goes in before the raft handle, so a forwarded read
-            // that finds the group always finds its barrier.
-            self.registry
-                .register_read_barrier(placement.raft_group_id, engine.read_barrier.clone());
-            self.registry.register(placement, engine.raft.clone());
-            self.registry.register_cold_index_cache(
-                placement.raft_group_id,
-                engine.cold_index_cache.clone(),
-            );
-            let engine: Box<dyn GroupEngine> = Box::new(engine);
-            Ok(engine)
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ColdRaftGroupEngineFactory {
-    cold_store: ColdStoreHandle,
-}
-
-impl ColdRaftGroupEngineFactory {
-    pub fn new(cold_store: ColdStoreHandle) -> Self {
-        Self { cold_store }
-    }
-}
-
-impl GroupEngineFactory for ColdRaftGroupEngineFactory {
-    fn create<'a>(
-        &'a self,
-        placement: ShardPlacement,
-        metrics: GroupEngineMetrics,
-    ) -> GroupEngineCreateFuture<'a> {
-        Box::pin(async move {
-            let config = Arc::new(
-                Config {
-                    cluster_name: format!("ursula-group-{}", placement.raft_group_id.0),
-                    heartbeat_interval: 10,
-                    election_timeout_min: 30,
-                    election_timeout_max: 60,
-                    ..Default::default()
-                }
-                .validate()
-                .map_err(|err| GroupEngineError::new(format!("invalid OpenRaft config: {err}")))?,
-            );
-            let engine: Box<dyn GroupEngine> = Box::new(
-                RaftGroupEngine::new_single_node_with_log_store_and_metrics(
-                    placement,
-                    1,
-                    BasicNode::new("local"),
-                    config,
-                    RaftGroupLogStore::shared(),
-                    Some(metrics),
-                    Some(self.cold_store.clone()),
-                )
-                .await?,
-            );
-            Ok(engine)
-        })
-    }
-}
-
-/// A group's Raft log store on this node.
-enum GroupLogStore {
-    /// The core journal, and where the group's snapshot metadata lives.
-    Durable {
-        store: Arc<RaftGroupFileLogStore>,
-        snapshot_metadata: PathBuf,
-    },
-    /// The volatile memory log.
-    Memory(Arc<RaftGroupLogStore>),
 }
 
 /// The open writer of one core's journal, if any.
@@ -517,10 +360,12 @@ impl DurableRaftLogStoreFactory {
     }
 }
 
+/// Single-node groups over the per-core journals of `log_stores`.
 #[derive(Debug, Clone)]
 pub struct DurableRaftGroupEngineFactory {
     log_stores: DurableRaftLogStoreFactory,
     cold_store: Option<ColdStoreHandle>,
+    registry: Option<RaftGroupHandleRegistry>,
 }
 
 impl DurableRaftGroupEngineFactory {
@@ -535,7 +380,19 @@ impl DurableRaftGroupEngineFactory {
         Self {
             log_stores,
             cold_store,
+            registry: None,
         }
+    }
+
+    /// Registers every group it creates in `registry`: its read barrier,
+    /// Raft handle and cold index cache.
+    pub fn with_registry(mut self, registry: RaftGroupHandleRegistry) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    pub fn registry(&self) -> Option<&RaftGroupHandleRegistry> {
+        self.registry.as_ref()
     }
 }
 
@@ -558,7 +415,7 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
                 .map_err(|err| GroupEngineError::new(format!("invalid OpenRaft config: {err}")))?,
             );
             let log_store = self.log_stores.open(placement, metrics.clone())?;
-            let engine: Box<dyn GroupEngine> = Box::new(
+            let engine =
                 RaftGroupEngine::new_single_node_with_log_store_metrics_and_snapshot_metadata(
                     placement,
                     1,
@@ -569,8 +426,19 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
                     self.cold_store.clone(),
                     Some(self.log_stores.snapshot_metadata_path(placement)),
                 )
-                .await?,
-            );
+                .await?;
+            if let Some(registry) = &self.registry {
+                // The barrier goes in before the raft handle, so a forwarded
+                // read that finds the group always finds its barrier.
+                registry
+                    .register_read_barrier(placement.raft_group_id, engine.read_barrier.clone());
+                registry.register(placement, engine.raft.clone());
+                registry.register_cold_index_cache(
+                    placement.raft_group_id,
+                    engine.cold_index_cache.clone(),
+                );
+            }
+            let engine: Box<dyn GroupEngine> = Box::new(engine);
             Ok(engine)
         })
     }
@@ -585,18 +453,22 @@ pub struct StaticGrpcRaftGroupEngineFactory {
     initialize_membership_per_group: bool,
     registry: RaftGroupHandleRegistry,
     cold_store: Option<ColdStoreHandle>,
-    log_stores: Option<DurableRaftLogStoreFactory>,
+    log_stores: DurableRaftLogStoreFactory,
     snapshot_store: Option<SharedSnapshotStore>,
     engine_config: RaftEngineConfig,
 }
 
 impl StaticGrpcRaftGroupEngineFactory {
+    /// Groups of a static gRPC cluster whose Raft logs live in `log_stores`'
+    /// journals; how they opened is published in `registry`.
     pub fn new(
         node_id: u64,
         peers: impl IntoIterator<Item = (u64, String)>,
         initialize_membership: bool,
         registry: RaftGroupHandleRegistry,
+        log_stores: DurableRaftLogStoreFactory,
     ) -> Self {
+        registry.set_wal_opening(log_stores.opening());
         Self {
             node_id,
             peers: peers.into_iter().collect(),
@@ -605,7 +477,7 @@ impl StaticGrpcRaftGroupEngineFactory {
             initialize_membership_per_group: false,
             registry,
             cold_store: None,
-            log_stores: None,
+            log_stores,
             snapshot_store: None,
             engine_config: RaftEngineConfig::default(),
         }
@@ -617,14 +489,6 @@ impl StaticGrpcRaftGroupEngineFactory {
 
     pub fn with_cold_store(mut self, cold_store: Option<ColdStoreHandle>) -> Self {
         self.cold_store = cold_store;
-        self
-    }
-
-    /// Keeps the groups' Raft logs in `log_stores`' journals, and publishes
-    /// how they opened in the registry.
-    pub fn with_raft_log_stores(mut self, log_stores: DurableRaftLogStoreFactory) -> Self {
-        self.registry.set_wal_opening(log_stores.opening());
-        self.log_stores = Some(log_stores);
         self
     }
 
@@ -649,30 +513,6 @@ impl StaticGrpcRaftGroupEngineFactory {
             .set_snapshot_build_max_concurrency(config.snapshot_build_max_concurrency);
         self.engine_config = config;
         self
-    }
-
-    fn uses_memory_log_store(&self) -> bool {
-        self.log_stores.is_none()
-    }
-
-    fn raft_memory_bootstrap_marker_path(&self, raft_group_id: RaftGroupId) -> Option<PathBuf> {
-        Some(
-            self.engine_config
-                .memory_bootstrap_marker_dir
-                .clone()?
-                .join(format!(
-                    "node-{}-group-{}.bootstrapped",
-                    self.node_id, raft_group_id.0
-                )),
-        )
-    }
-
-    fn raft_memory_bootstrap_seen(&self, raft_group_id: RaftGroupId) -> bool {
-        if !self.uses_memory_log_store() {
-            return false;
-        }
-        self.raft_memory_bootstrap_marker_path(raft_group_id)
-            .is_some_and(|path| path.exists())
     }
 
     fn peer_nodes(&self) -> BTreeMap<u64, BasicNode> {
@@ -782,37 +622,14 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     self.node_id
                 )));
             }
-            if self.should_initialize_membership(placement.raft_group_id)
-                && self.raft_memory_bootstrap_seen(placement.raft_group_id)
-            {
-                return Err(GroupEngineError::new(format!(
-                    "raft-memory node {} group {} has already bootstrapped once; refusing automatic restart because the volatile Raft log was lost. Use an explicit operator reset or persistent Raft storage.",
-                    self.node_id, placement.raft_group_id.0
-                )));
-            }
             // The log store and the recovery gate go first: a gated replica's
             // Raft core starts with elections disabled.
-            let (log_store, rejoin) = match &self.log_stores {
-                Some(log_stores) => {
-                    let store = log_stores.open(placement, metrics.clone())?;
-                    let rejoin = Arc::new(GroupRejoin::durable(
-                        self.node_id,
-                        placement.raft_group_id,
-                        &store,
-                    ));
-                    (
-                        GroupLogStore::Durable {
-                            store,
-                            snapshot_metadata: log_stores.snapshot_metadata_path(placement),
-                        },
-                        rejoin,
-                    )
-                }
-                None => (
-                    GroupLogStore::Memory(RaftGroupLogStore::shared()),
-                    Arc::new(GroupRejoin::volatile(self.node_id, placement.raft_group_id)),
-                ),
-            };
+            let store = self.log_stores.open(placement, metrics.clone())?;
+            let rejoin = Arc::new(GroupRejoin::durable(
+                self.node_id,
+                placement.raft_group_id,
+                &store,
+            ));
             let mut raft_config = Config {
                 cluster_name: format!("ursula-group-{}", placement.raft_group_id.0),
                 // Timeouts tuned for a multi-AZ EC2 cluster carrying chaos faults.
@@ -851,43 +668,20 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             let network = GrpcRaftNetworkFactory::new(placement.raft_group_id)
                 .with_reconnect_threshold(self.engine_config.grpc_reconnect_after_failures)
                 .with_rejoin(Some(rejoin.clone()));
-            let engine = match log_store {
-                GroupLogStore::Durable {
-                    store,
-                    snapshot_metadata,
-                } => {
-                    RaftGroupEngine::new_node_full(
-                        placement,
-                        self.node_id,
-                        config,
-                        network,
-                        store,
-                        Some(metrics),
-                        self.cold_store.clone(),
-                        self.snapshot_store.clone(),
-                        Some(self.registry.snapshot_build_coordinator()),
-                        Some(self.registry.snapshot_install_coordinator()),
-                        Some(snapshot_metadata),
-                    )
-                    .await?
-                }
-                GroupLogStore::Memory(store) => {
-                    RaftGroupEngine::new_node_full(
-                        placement,
-                        self.node_id,
-                        config,
-                        network,
-                        store,
-                        Some(metrics),
-                        self.cold_store.clone(),
-                        self.snapshot_store.clone(),
-                        Some(self.registry.snapshot_build_coordinator()),
-                        Some(self.registry.snapshot_install_coordinator()),
-                        None,
-                    )
-                    .await?
-                }
-            };
+            let engine = RaftGroupEngine::new_node_full(
+                placement,
+                self.node_id,
+                config,
+                network,
+                store,
+                Some(metrics),
+                self.cold_store.clone(),
+                self.snapshot_store.clone(),
+                Some(self.registry.snapshot_build_coordinator()),
+                Some(self.registry.snapshot_install_coordinator()),
+                Some(self.log_stores.snapshot_metadata_path(placement)),
+            )
+            .await?;
             // The barrier and the recovery gate go in before the raft handle,
             // so a forwarded read always finds its barrier and no vote reaches
             // the group unscreened.
@@ -926,9 +720,6 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     engine.raft_handle(),
                     rejoin,
                     self.peer_nodes_for_group(placement.raft_group_id)?,
-                    self.uses_memory_log_store()
-                        .then(|| self.raft_memory_bootstrap_marker_path(placement.raft_group_id))
-                        .flatten(),
                     self.engine_config.clone(),
                 );
             }
@@ -957,7 +748,10 @@ mod tests {
             .collect()
     }
 
-    fn factory_for_node(node_id: u64) -> StaticGrpcRaftGroupEngineFactory {
+    fn factory_for_node(
+        node_id: u64,
+        wal_root: &tempfile::TempDir,
+    ) -> StaticGrpcRaftGroupEngineFactory {
         StaticGrpcRaftGroupEngineFactory::new(
             node_id,
             [
@@ -968,6 +762,11 @@ mod tests {
             ],
             true,
             RaftGroupHandleRegistry::default(),
+            DurableRaftLogStoreFactory::start(
+                wal_root.path().join(format!("node-{node_id}")),
+                WalFsync::Never,
+            )
+            .expect("start the WAL"),
         )
         .with_per_group_voters(per_group_voters(&[(0, &[1, 2, 3]), (1, &[2, 3, 4])]))
     }
@@ -1016,7 +815,8 @@ mod tests {
 
     #[test]
     fn per_group_static_voters_override_default_peer_set() {
-        let factory = factory_for_node(1);
+        let wal_root = tempfile::tempdir().expect("WAL root");
+        let factory = factory_for_node(1, &wal_root);
 
         assert_eq!(
             peer_ids(factory.peer_nodes_for_group(RaftGroupId(0)).unwrap()),
@@ -1037,49 +837,16 @@ mod tests {
 
     #[test]
     fn per_group_initializers_are_chosen_from_group_voters() {
-        let node_1 = factory_for_node(1).with_per_group_membership_initializers(true);
-        let node_3 = factory_for_node(3).with_per_group_membership_initializers(true);
-        let node_4 = factory_for_node(4).with_per_group_membership_initializers(true);
+        let wal_root = tempfile::tempdir().expect("WAL root");
+        let node_1 = factory_for_node(1, &wal_root).with_per_group_membership_initializers(true);
+        let node_3 = factory_for_node(3, &wal_root).with_per_group_membership_initializers(true);
+        let node_4 = factory_for_node(4, &wal_root).with_per_group_membership_initializers(true);
 
         assert!(node_1.should_initialize_membership(RaftGroupId(0)));
         assert!(!node_4.should_initialize_membership(RaftGroupId(0)));
 
         assert!(node_3.should_initialize_membership(RaftGroupId(1)));
         assert!(!node_1.should_initialize_membership(RaftGroupId(1)));
-    }
-
-    #[test]
-    fn raft_memory_bootstrap_marker_blocks_reinitialize() {
-        let dir = unique_test_dir("memory-bootstrap-marker");
-
-        let engine_config = RaftEngineConfig {
-            memory_bootstrap_marker_dir: Some(dir.clone()),
-            ..Default::default()
-        };
-        let memory_factory = factory_for_node(1)
-            .with_per_group_membership_initializers(true)
-            .with_engine_config(engine_config.clone());
-        assert!(memory_factory.uses_memory_log_store());
-        assert!(!memory_factory.raft_memory_bootstrap_seen(RaftGroupId(0)));
-        write_bootstrap_marker(
-            1,
-            RaftGroupId(0),
-            memory_factory
-                .raft_memory_bootstrap_marker_path(RaftGroupId(0))
-                .as_deref(),
-        );
-        assert!(memory_factory.raft_memory_bootstrap_seen(RaftGroupId(0)));
-
-        let durable_factory = factory_for_node(1)
-            .with_raft_log_stores(
-                DurableRaftLogStoreFactory::start(dir.join("raft-log"), WalFsync::Always)
-                    .expect("start the WAL"),
-            )
-            .with_engine_config(engine_config.clone());
-        assert!(!durable_factory.uses_memory_log_store());
-        assert!(!durable_factory.raft_memory_bootstrap_seen(RaftGroupId(0)));
-
-        crate::tests::remove_test_path(dir);
     }
 
     #[test]

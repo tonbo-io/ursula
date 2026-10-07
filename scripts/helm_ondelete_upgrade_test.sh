@@ -16,8 +16,6 @@ kubectl create namespace "${namespace}" >/dev/null
 common_values="
   --set fullnameOverride=${release}
   --set server.replicaCount=1
-  --set raft.storageMode=memory
-  --set persistence.enabled=false
   --set s3.bucket=unused
   --set gateway.enabled=false
   --set server.scheduling.nodeSelector.ursula-test=never

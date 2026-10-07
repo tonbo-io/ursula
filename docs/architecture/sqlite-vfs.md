@@ -510,6 +510,10 @@ through the gateway Service. The chart deploys the gateway without a quota polic
 rate limit and no client saw a 429. Gateway `maxRequestBodyBytes` was raised to 1 GiB for the 1 GB
 snapshot; everything else is the chart default.
 
+The memory-WAL cells below record a Raft log store that Ursula has since removed. They are kept as
+measured. The disk WAL is now the only Raft WAL. Its cells here predate `raft.wal.fsync` and
+fsynced every batch, as `always` does today, while the default is now `never`.
+
 Workload: Pi Durable's `SqliteStorage` on the VFS via `openUrsulaPiStorage`, a real `Harness` with
 a faux model, turns of text, text, tool (5.0 Pi commits per turn). Latency is `Storage.commit`
 wall time after a 30 s warm-up; each cell runs 10.5 min. Agent pace: one turn per 2 s per database.
@@ -671,12 +675,11 @@ turn.
 followers, each in a different physical data center, report that they received it; a follower keeps
 what it receives in a buffer on local disk. Changes then go to object storage in batches of up to
 10 s or 16 MB, whichever comes first (Cloudflare, "Zero-latency SQLite storage in every Durable
-Object", https://blog.cloudflare.com/sqlite-in-durable-objects/). A VFS append is acknowledged when 2
-of the group's 3 replicas, one per AZ, hold it: in memory with the memory WAL, or written and flushed
-to the Raft log on local disk with the disk WAL. Ursula documents the multi-peer memory WAL as
-volatile and requires the disk WAL for production clusters: a restarted memory-WAL replica comes
-back empty, so until its leaders have rebuilt it a VFS commit has two real copies, not three. The disk-WAL
-column is the like-for-like one. Spreading followers over data centers rather than AZs is likely the stronger geographic
+Object", https://blog.cloudflare.com/sqlite-in-durable-objects/). In these cells a VFS append was acknowledged
+when 2 of the group's 3 replicas, one per AZ, held it: in memory with the memory WAL, or written and
+flushed to the Raft log on local disk with the disk WAL. The memory WAL was volatile, and has since been
+removed: a restarted memory-WAL replica came back empty, so until its leaders had rebuilt it a VFS
+commit had two real copies, not three. The disk-WAL column is the like-for-like one. Spreading followers over data centers rather than AZs is likely the stronger geographic
 guarantee, which favours the DO.
 
 **Timing.** On deployed Workers an object's clock does not advance while JavaScript runs. It catches
@@ -890,8 +893,8 @@ estimates from the published rates; the OAuth token cannot read billing.
 **In short.**
 
 - Waiting for a confirmed write costs about 18 to 20 ms at p50 in a DO in IAD, against 9.7 ms
-  (memory WAL) and 16.5 ms (disk WAL) on the VFS at agent pace. At p50 the DO is about 1.1 to 1.2x the
-  production-equivalent disk WAL.
+  (memory WAL, since removed) and 16.5 ms (disk WAL) on the VFS at agent pace. At p50 the DO is about
+  1.1 to 1.2x the production-equivalent disk WAL.
 - The DO's tail is wider. At agent pace on 64 objects its p99 is 52 ms with jittered gaps (95%
   interval 37 to 67) and 43 ms with fixed 2 s gaps (34 to 64), against 20.0 ms on the disk WAL. The
   slow commits are mostly the first commit of a turn and a 10 s cycle per object, and single commits

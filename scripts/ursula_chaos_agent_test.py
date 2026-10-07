@@ -303,8 +303,8 @@ class ChaosAgentStateTest(unittest.TestCase):
         self.assertEqual(overall, "operational")
 
     def test_catch_up_scenarios_get_longer_recovery_slo(self) -> None:
-        # process_kill recovers via raft-memory catch-up (minutes); reusing the
-        # short impairment SLO false-trips slo_missed -> repair_failed (#526).
+        # process_kill recovers via WAL replay and peer catch-up (minutes); reusing
+        # the short impairment SLO false-trips slo_missed -> repair_failed (#526).
         agent = object.__new__(ChaosAgent)
         agent.recovery_slo_secs = 120
         self.assertEqual(

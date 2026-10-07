@@ -140,11 +140,10 @@ jobs:
       # runs: same tests, larger seed ranges.
       - name: Run recovery-gate scenarios (nightly ranges)
         env:
-          MEMORY_WAL_REJOIN_SEEDS: "1..=40"
           RECOVERY_GATE_SEEDS: "1..=24"
         run: |
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
-            memory_wal_ recovery_tests --nocapture
+            recovery_tests --nocapture
 
       - name: Write simulation result summary
         if: always()

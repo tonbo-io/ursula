@@ -9,7 +9,7 @@ This page gets a **single Ursula node** running on your machine so you can try t
 | **Docker** | You just want to try Ursula. One command, no toolchain. |
 | **Build from source** | You want local binaries, plan to hack on Ursula, or can't run Docker. |
 
-Both start the same in-memory, non-replicated node on port `4437`. Nothing is persisted across restarts. For a production cluster, see [Deploy a Cluster](/docs/deploy-cluster).
+Both start a single, non-replicated node on port `4437` that keeps nothing across restarts. The source build runs the in-memory engine. The Docker image runs a single Raft node whose WAL lives in a temporary directory inside the container. For a production cluster, see [Deploy a Cluster](/docs/deploy-cluster).
 
 ## Docker
 

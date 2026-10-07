@@ -18,20 +18,10 @@ pub enum ColdBackend {
     S3,
 }
 
-/// Raft WAL persistence backend selector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WalBackend {
-    #[default]
-    Memory,
-    Disk,
-}
-
 /// When appends to the Raft WAL journal reach stable storage.
 ///
 /// Votes, the per-group log states and the node's run state are always
-/// written with `fsync`, whatever this policy says. The memory WAL ignores
-/// the policy.
+/// written with `fsync`, whatever this policy says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WalFsync {
@@ -122,7 +112,7 @@ pub struct RuntimeConfig {
     pub core_count: usize,
     /// Emergency RSS abort threshold. Exceeding it aborts the process; it does
     /// not reject writes with HTTP 503 or perform a graceful leadership handoff.
-    /// With memory WAL, this loses all local Raft logs. `None` disables the monitor.
+    /// `None` disables the monitor.
     pub node_memory_abort_cap_size: Option<HumanSize>,
     /// Minimum payload size that triggers external cold-store staging instead
     /// of inline hot-ring storage. `None` uses the default (1 MiB).
@@ -185,11 +175,6 @@ pub struct RaftConfig {
     /// replying, so this must be comfortably above the S3 per-attempt timeout
     /// plus retries.
     pub install_snapshot_timeout: HumanDuration,
-    /// Directory for memory-bootstrap marker files. When set, each group
-    /// writes a marker after successful membership initialization. On restart,
-    /// a marked memory group that would initialize membership again refuses to
-    /// start instead (the volatile Raft log was lost).
-    pub memory_bootstrap_marker_dir: Option<PathBuf>,
     /// Consecutive gRPC RPC failures before forcing a transport reconnect.
     pub grpc_reconnect_after_failures: usize,
     /// Max concurrent snapshot builds across all groups on this node.
@@ -236,7 +221,6 @@ impl Default for RaftConfig {
             bootstrap_peer_probe_interval: HumanDuration::milli(250),
             bootstrap_peer_connect: HumanDuration::milli(500),
             install_snapshot_timeout: HumanDuration::sec(120),
-            memory_bootstrap_marker_dir: None,
             grpc_reconnect_after_failures: 8,
             snapshot_build_max_concurrency: 1,
             snapshot_install_max_concurrency: 1,
@@ -250,14 +234,17 @@ impl Default for RaftConfig {
 }
 
 /// Raft write-ahead log configuration.
+///
+/// The WAL is always the per-core disk journal.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WalConfig {
-    /// WAL persistence backend.
-    pub backend: WalBackend,
-    /// Directory for on-disk WAL files. Required when `backend` is `Disk`.
+    /// Directory for the WAL files; the journals live in its `raft-log`
+    /// subdirectory. Required whenever `raft.peers` is set. A single node
+    /// without a path runs its WAL in a fresh temporary directory that is
+    /// removed on clean shutdown.
     pub path: Option<PathBuf>,
-    /// When journal appends reach stable storage (`Disk` backend only).
+    /// When journal appends reach stable storage.
     pub fsync: WalFsync,
     /// Reject writes and mark the node unready below this many available bytes.
     /// Zero disables disk-pressure admission.
@@ -265,33 +252,26 @@ pub struct WalConfig {
     /// Clear disk-pressure admission only after free space reaches this value.
     /// Must exceed `min_available_size` when the guard is enabled.
     pub resume_available_size: HumanSize,
-    /// Explicit opt-in for a multi-peer cluster whose Raft log is volatile.
-    pub allow_volatile_multi_peer: bool,
 }
 
 impl WalConfig {
-    /// Resolved on-disk log directory for the Raft WAL.
-    ///
-    /// When `backend` is `Disk` and `path` is set, appends the legacy
-    /// `raft-log` subdirectory so that existing data directories continue
-    /// to work after the config refactor.
+    /// The subdirectory of a WAL directory that holds the journals.
+    pub const LOG_SUBDIR: &str = "raft-log";
+
+    /// The configured journal directory: `path`'s `raft-log`
+    /// subdirectory. `None` when no path is configured.
     pub fn resolved_path(&self) -> Option<PathBuf> {
-        match self.backend {
-            WalBackend::Memory => None,
-            WalBackend::Disk => self.path.as_ref().map(|p| p.join("raft-log")),
-        }
+        self.path.as_ref().map(|path| path.join(Self::LOG_SUBDIR))
     }
 }
 
 impl Default for WalConfig {
     fn default() -> Self {
         Self {
-            backend: WalBackend::Memory,
             path: None,
             fsync: WalFsync::Never,
             min_available_size: HumanSize::mib(512),
             resume_available_size: HumanSize::gib(1),
-            allow_volatile_multi_peer: false,
         }
     }
 }

@@ -1,10 +1,11 @@
 // Vitest global setup: the Ursula the suite runs against, from URSULA_BIN, in the default config
 // except where noted. The per-group hot admission limit always stays at its default.
-// - Default: one `ursula server` node with a memory Raft WAL and an in-memory cold store
-//   (URSULA_COLD=none for none).
-// - E2E_NODES=3: three nodes (memory Raft WAL) behind an `ursula gateway`, with S3 as the cold
-//   store (snapshot bodies in the cold tier). See `resolveS3` for the backends: an endpoint
-//   (MinIO) with static keys, or AWS S3 with the ambient AWS_* credentials (URSULA_S3_BUCKET).
+// - Default: one `ursula server` node with its Raft WAL in its temporary directory and an
+//   in-memory cold store (URSULA_COLD=none for none).
+// - E2E_NODES=3: three nodes (each with its own Raft WAL directory) behind an `ursula gateway`,
+//   with S3 as the cold store (snapshot bodies in the cold tier). See `resolveS3` for the
+//   backends: an endpoint (MinIO) with static keys, or AWS S3 with the ambient AWS_* credentials
+//   (URSULA_S3_BUCKET).
 import { type ChildProcess, spawn } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import { createHash, createHmac, randomBytes } from "node:crypto";
@@ -148,7 +149,7 @@ async function startSingle(): Promise<Stack> {
 			"group_count = 4",
 			"",
 			"[raft.wal]",
-			'backend = "memory"',
+			`path = "${join(dir, "wal")}"`,
 			"",
 			...(cold === "none" ? [] : ["[storage.cold]", `backend = "${cold}"`, ""]),
 		].join("\n"),
@@ -251,11 +252,10 @@ async function resolveS3(): Promise<S3Target> {
 async function startCluster(): Promise<Stack> {
 	const s3 = await resolveS3();
 	const dir = mkdtempSync(join(tmpdir(), "sqlite-ursula-cluster-"));
-	// Defaults are the e2e shape; the soak (test/soak.e2e.ts) raises them with E2E_GROUPS,
-	// E2E_CORES and E2E_WAL=disk.
+	// Defaults are the e2e shape; the soak (test/soak.e2e.ts) raises them with E2E_GROUPS and
+	// E2E_CORES.
 	const groups = Number(process.env.E2E_GROUPS ?? 4);
 	const cores = Number(process.env.E2E_CORES ?? 2);
-	const wal = process.env.E2E_WAL ?? "memory";
 	const nodes: { id: number; port: number; admin: string }[] = [];
 	for (const id of [1, 2, 3]) nodes.push({ id, port: await freePort(), admin: `http://127.0.0.1:${await freePort()}` });
 	const procs: Proc[] = [];
@@ -284,7 +284,7 @@ async function startCluster(): Promise<Stack> {
 				"init_membership_per_group = false",
 				"",
 				"[raft.wal]",
-				...(wal === "disk" ? ['backend = "disk"', `path = "${join(nodeDir, "wal")}"`] : ['backend = "memory"', "allow_volatile_multi_peer = true"]),
+				`path = "${join(nodeDir, "wal")}"`,
 			];
 			for (const peer of nodes) lines.push("", "[[raft.peers]]", `node_id = ${peer.id}`, `url = "http://127.0.0.1:${peer.port}"`);
 			lines.push(

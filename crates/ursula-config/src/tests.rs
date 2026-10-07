@@ -124,7 +124,6 @@ core_count = 16
 group_count = 256
 
 [raft.wal]
-backend = "disk"
 path = "/var/lib/ursula"
 
 [[raft.peers]]
@@ -151,8 +150,10 @@ backend = "s3"
         assert_eq!(config.raft.group_count, 256);
         use crate::config::ColdBackend;
         use crate::config::RaftSnapshotBackend;
-        use crate::config::WalBackend;
-        assert_eq!(config.raft.wal.backend, WalBackend::Disk);
+        assert_eq!(
+            config.raft.wal.resolved_path(),
+            Some(std::path::PathBuf::from("/var/lib/ursula/raft-log"))
+        );
         assert_eq!(config.storage.cold.backend, ColdBackend::S3);
         assert_eq!(config.storage.snapshot.backend, RaftSnapshotBackend::S3);
         assert_eq!(config.raft.snapshot_build_max_concurrency, 1);
@@ -350,7 +351,6 @@ readahead_blocks = 7
 mod load_tests {
     use std::io::Write;
 
-    use crate::config::WalBackend;
     use crate::load::load_config;
     use crate::preset::Preset;
 
@@ -380,15 +380,12 @@ core_count = 4
 
 [raft]
 group_count = 16
-
-[raft.wal]
-backend = "memory"
 "#,
         );
         let config = load_config(Some(tmp.path()), None, Some(1)).unwrap();
         assert_eq!(config.runtime.core_count, 4);
         assert_eq!(config.raft.node_id, 1);
-        assert_eq!(config.raft.wal.backend, WalBackend::Memory);
+        assert_eq!(config.raft.wal.path, None);
     }
 
     #[test]
@@ -404,7 +401,7 @@ listen = "127.0.0.1:4437"
         // preset no longer overrides core_count
         assert_eq!(config.runtime.core_count, available_cores());
         assert_eq!(config.raft.group_count, 64); // from tiny preset
-        assert_eq!(config.raft.wal.backend, WalBackend::Memory); // from tiny preset
+        assert_eq!(config.raft.wal.path, None); // a single node may run without a path
     }
 
     #[test]
@@ -422,30 +419,8 @@ core_count = 2
     }
 
     #[test]
-    fn validation_rejects_disk_without_path() {
-        let tmp = temp_config(
-            ".toml",
-            r#"
-[raft.wal]
-backend = "disk"
-"#,
-        );
-        let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("raft.wal.path"),
-            "error should mention raft.wal.path: {msg}"
-        );
-    }
-
-    #[test]
-    fn validation_rejects_volatile_multi_peer_without_opt_in() {
-        let tmp = temp_config(
-            ".toml",
-            r#"
-[raft.wal]
-backend = "memory"
-
+    fn validation_requires_a_wal_path_with_peers() {
+        let peers = r#"
 [[raft.peers]]
 node_id = 1
 url = "http://127.0.0.1:4437"
@@ -453,35 +428,48 @@ url = "http://127.0.0.1:4437"
 [[raft.peers]]
 node_id = 2
 url = "http://127.0.0.1:4438"
-"#,
-        );
+"#;
+        let tmp = temp_config(".toml", peers);
         let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
         assert!(
-            err.to_string().contains("allow_volatile_multi_peer"),
-            "error should name the explicit opt-in: {err}"
+            matches!(
+                err,
+                crate::ConfigError::Validation(
+                    crate::validate::ValidationError::RaftWalPathRequired
+                )
+            ),
+            "{err}"
         );
-    }
 
-    #[test]
-    fn volatile_multi_peer_explicit_opt_in_is_accepted() {
         let tmp = temp_config(
             ".toml",
-            r#"
-[raft.wal]
-backend = "memory"
-allow_volatile_multi_peer = true
-
-[[raft.peers]]
-node_id = 1
-url = "http://127.0.0.1:4437"
-
-[[raft.peers]]
-node_id = 2
-url = "http://127.0.0.1:4438"
-"#,
+            &format!("[raft.wal]\npath = \"/tmp/ursula-wal\"\n{peers}"),
         );
-        let config = load_config(Some(tmp.path()), None, Some(1)).expect("explicit opt-in");
-        assert!(config.raft.wal.allow_volatile_multi_peer);
+        load_config(Some(tmp.path()), None, Some(1)).expect("a static cluster with a WAL path");
+    }
+
+    /// The memory WAL is gone: its settings are unknown keys, which fail the
+    /// load instead of being ignored.
+    #[test]
+    fn removed_memory_wal_settings_are_refused() {
+        for (section, key) in [
+            ("raft.wal", "backend = \"memory\""),
+            ("raft.wal", "backend = \"disk\""),
+            ("raft.wal", "allow_volatile_multi_peer = true"),
+            ("raft", "memory_bootstrap_marker_dir = \"/tmp/markers\""),
+        ] {
+            let tmp = temp_config(".toml", &format!("[{section}]\n{key}\n"));
+            let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+            assert!(
+                matches!(err, crate::ConfigError::TomlParse(_)),
+                "{key}: {err}"
+            );
+            let name = key.split(' ').next().unwrap();
+            assert!(
+                err.to_string().contains(&format!("unknown field `{name}`")),
+                "{key}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -492,9 +480,7 @@ url = "http://127.0.0.1:4438"
             crate::UrsulaConfig::default().raft.wal.fsync,
             WalFsync::Never
         );
-        let disk = |fsync: &str| {
-            format!("[raft.wal]\nbackend = \"disk\"\npath = \"/tmp/ursula-wal\"\n{fsync}\n")
-        };
+        let disk = |fsync: &str| format!("[raft.wal]\npath = \"/tmp/ursula-wal\"\n{fsync}\n");
         for (line, expected) in [
             ("", WalFsync::Never),
             ("fsync = \"always\"", WalFsync::Always),
@@ -515,26 +501,12 @@ url = "http://127.0.0.1:4438"
         }
     }
 
-    /// The memory WAL has nothing to `fsync`, so it ignores the policy,
-    /// including the `never` default.
-    #[test]
-    fn a_memory_wal_ignores_the_fsync_policy() {
-        for policy in ["", "fsync = \"never\"", "fsync = \"always\""] {
-            let tmp = temp_config(
-                ".toml",
-                &format!("[raft.wal]\nbackend = \"memory\"\n{policy}\n"),
-            );
-            load_config(Some(tmp.path()), None, Some(1)).expect("a memory WAL takes any policy");
-        }
-    }
-
     #[test]
     fn validation_rejects_disk_pressure_resume_at_or_below_minimum() {
         let tmp = temp_config(
             ".toml",
             r#"
 [raft.wal]
-backend = "disk"
 path = "/tmp/ursula-wal"
 min_available_size = "1GiB"
 resume_available_size = "512MiB"
@@ -593,7 +565,7 @@ max_size = "128MiB"
             ".toml",
             r#"
 [raft.wal]
-allow_volatile_multi_peer = true
+path = "/tmp/ursula-wal"
 
 [[raft.peers]]
 node_id = 1

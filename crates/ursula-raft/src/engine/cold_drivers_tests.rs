@@ -23,19 +23,15 @@ use ursula_runtime::new_external_payload_path;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 
-use super::ColdRaftGroupEngineFactory;
+use super::test_support::JournalRuntime;
+use super::test_support::spawn_journal_runtime;
 
 const GROUP: RaftGroupId = RaftGroupId(0);
 const BUCKET: &str = "raft-drivers";
 const CONTENT_TYPE: &str = "application/octet-stream";
 
-fn spawn(cold_store: Arc<ColdStore>) -> ShardRuntime {
-    ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        RuntimeConfig::new(1, 1),
-        ColdRaftGroupEngineFactory::new(cold_store.clone()),
-        Some(cold_store),
-    )
-    .expect("spawn raft runtime")
+fn spawn(cold_store: Arc<ColdStore>) -> JournalRuntime {
+    spawn_journal_runtime(RuntimeConfig::new(1, 1), Some(cold_store))
 }
 
 fn stream(name: &str) -> BucketStreamId {

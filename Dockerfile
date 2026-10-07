@@ -68,9 +68,6 @@ core_count = 16
 [raft]
 group_count = 256
 
-[raft.wal]
-backend = "memory"
-
 [storage.cold]
 backend = "none"
 

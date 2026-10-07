@@ -59,14 +59,10 @@ jobs:
           retention-days: 3
 
   soak:
-    name: Soak (${{ matrix.wal }} WAL, ${{ github.event.inputs.owners || '128' }} owners)
+    name: Soak (${{ github.event.inputs.owners || '128' }} owners)
     needs: build-ursula
     runs-on: depot-ubuntu-24.04-8
     timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        wal: [memory, disk]
     permissions:
       contents: read
       id-token: write
@@ -106,12 +102,11 @@ jobs:
           role-arn: ${{ vars.URSULA_CI_AWS_ROLE_ARN }}
           bucket: ${{ vars.URSULA_CI_S3_BUCKET }}
           region: ${{ vars.URSULA_CI_S3_REGION || 'us-east-1' }}
-          job-key: soak-${{ matrix.wal }}
+          job-key: soak
 
       - name: Soak
         timeout-minutes: 30
         env:
-          E2E_WAL: ${{ matrix.wal }}
           SOAK_SECONDS: ${{ github.event.inputs.seconds || '300' }}
           SOAK_OWNERS: ${{ github.event.inputs.owners || '128' }}
         run: |
@@ -166,7 +161,7 @@ jobs:
         if: always() && steps.leak.outcome != 'failure'
         uses: actions/upload-artifact@v6
         with:
-          name: soak-logs-${{ matrix.wal }}
+          name: soak-logs
           path: ${{ runner.temp }}/soak-logs
           retention-days: 7
 

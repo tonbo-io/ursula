@@ -407,11 +407,53 @@ fn static_grpc_membership_config_rejects_partial_group_voters() {
     assert!(message.contains("missing raft group 1"));
 }
 
+/// Single-node groups on a fresh WAL under `wal_root`, registered in
+/// `registry`, and that WAL. Shut it down with [`shutdown_test_wal`] before
+/// `wal_root` goes.
+fn registered_durable_factory(
+    wal_root: &tempfile::TempDir,
+    registry: &RaftGroupHandleRegistry,
+) -> (
+    ursula_raft::DurableRaftGroupEngineFactory,
+    ursula_raft::DurableRaftLogStoreFactory,
+) {
+    let raft_wal = ursula_raft::DurableRaftLogStoreFactory::start(
+        wal_root.path(),
+        ursula_config::WalFsync::Never,
+    )
+    .expect("start the Raft WAL");
+    (
+        ursula_raft::DurableRaftGroupEngineFactory::new(raft_wal.clone())
+            .with_registry(registry.clone()),
+        raft_wal,
+    )
+}
+
+/// Stops `runtime`'s Raft groups and closes `raft_wal` as the server does,
+/// so the test may then remove the WAL directory. Removing it under a live
+/// core writer fails the writer's next journal write, which stops the
+/// process.
+async fn shutdown_test_wal(
+    runtime: &ShardRuntime,
+    raft_wal: &ursula_raft::DurableRaftLogStoreFactory,
+) {
+    assert_eq!(
+        crate::server::shutdown_raft_wal(runtime, Some(raft_wal)).await,
+        crate::server::WalShutdown::Clean,
+        "the Raft WAL shuts down cleanly"
+    );
+}
+
 struct StaticGrpcTestNode {
     runtime: ShardRuntime,
     registry: RaftGroupHandleRegistry,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<()>,
+    raft_wal: ursula_raft::DurableRaftLogStoreFactory,
+    /// The node's own WAL directory when the test gave it none: a fresh,
+    /// empty one per start, as a node that lost its disk restarts.
+    /// [`StaticGrpcTestNode::shutdown`] closes the WAL before it goes.
+    _wal_root: Option<tempfile::TempDir>,
 }
 
 impl StaticGrpcTestNode {
@@ -431,11 +473,14 @@ impl StaticGrpcTestNode {
                 panic!("test server failed: {err}");
             }
         }
+        shutdown_test_wal(&self.runtime, &self.raft_wal).await;
     }
 }
 
 #[derive(Default)]
 struct StaticGrpcTestNodeStorage {
+    /// The node's journal directory, kept across restarts; `None` starts
+    /// every run on a fresh, empty WAL.
     raft_log_dir: Option<PathBuf>,
     cold_store: Option<ColdStoreHandle>,
     engine_config: Option<ursula_raft::RaftEngineConfig>,
@@ -459,26 +504,39 @@ async fn spawn_static_grpc_test_node(
     }
     let mut config = RuntimeConfig::new(1, raft_group_count);
     config.threading = ursula_runtime::RuntimeThreading::HostedTokio;
+    let (log_stores, wal_root) = match storage.raft_log_dir {
+        Some(raft_log_dir) => (
+            ursula_raft::DurableRaftLogStoreFactory::start(
+                raft_log_dir,
+                ursula_config::WalFsync::Always,
+            )
+            .expect("start the Raft WAL"),
+            None,
+        ),
+        None => {
+            let wal_root = tempfile::tempdir().expect("WAL root");
+            (
+                ursula_raft::DurableRaftLogStoreFactory::start(
+                    wal_root.path(),
+                    ursula_config::WalFsync::Never,
+                )
+                .expect("start the Raft WAL"),
+                Some(wal_root),
+            )
+        }
+    };
     let mut factory = StaticGrpcRaftGroupEngineFactory::new(
         node_id,
         factory_peers,
         initialize_membership,
         registry.clone(),
+        log_stores.clone(),
     );
     factory = factory.with_per_group_membership_initializers(storage.per_group_initializers);
     factory = factory.with_per_group_voters(storage.per_group_voters.clone());
     factory = factory.with_cold_store(storage.cold_store.clone());
     if let Some(engine_config) = storage.engine_config {
         factory = factory.with_engine_config(engine_config);
-    }
-    if let Some(raft_log_dir) = storage.raft_log_dir {
-        factory = factory.with_raft_log_stores(
-            ursula_raft::DurableRaftLogStoreFactory::start(
-                raft_log_dir,
-                ursula_config::WalFsync::Always,
-            )
-            .expect("start the Raft WAL"),
-        );
     }
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, storage.cold_store)
@@ -507,6 +565,8 @@ async fn spawn_static_grpc_test_node(
         registry,
         shutdown: Some(shutdown_tx),
         server,
+        raft_wal: log_stores,
+        _wal_root: wal_root,
     }
 }
 
@@ -1582,7 +1642,7 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
         spawn_runtime(
             &test_config(1, 1),
             Persistence::Raft {
-                log_dir: Some(raft_root.clone()),
+                log_dir: raft_root.clone(),
             },
             Topology::SingleNode {
                 raft_group_count: 1,
@@ -1679,7 +1739,7 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
     let spawned = spawn_runtime(
         &test_config(1, 1),
         Persistence::Raft {
-            log_dir: Some(raft_root.as_path().into()),
+            log_dir: raft_root.as_path().into(),
         },
         Topology::static_cluster(
             1,
@@ -1772,7 +1832,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
         let spawned = spawn_runtime(
             &test_config(1, 1),
             Persistence::Raft {
-                log_dir: Some(raft_root.as_path().into()),
+                log_dir: raft_root.as_path().into(),
             },
             Topology::static_cluster(1, peers.to_vec(), 1, true, Default::default())
                 .expect("valid static cluster topology"),
@@ -1835,7 +1895,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
         let spawned = spawn_runtime(
             &test_config(1, 1),
             Persistence::Raft {
-                log_dir: Some(raft_root.as_path().into()),
+                log_dir: raft_root.as_path().into(),
             },
             Topology::static_cluster(1, peers.to_vec(), 1, false, Default::default())
                 .expect("valid static cluster topology"),
@@ -1886,88 +1946,18 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
 }
 
 #[tokio::test]
-async fn raft_memory_runtime_serves_http_subset_without_wal_metrics() {
-    let app = router(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::Raft { log_dir: None },
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
-    );
-    let response = http_put(
-        &app,
-        "/benchcmp/raft-memory-http",
-        &[(CONTENT_TYPE.as_str(), "text/plain")],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let response = http_post(
-        &app,
-        "/benchcmp/raft-memory-http",
-        &[(CONTENT_TYPE.as_str(), "text/plain")],
-        Body::from("raft-memory-payload"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-    let response = http_get(&app, "/benchcmp/raft-memory-http?offset=0&max_bytes=64").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_bytes(response).await;
-    assert_eq!(&body[..], b"raft-memory-payload");
-
-    let response = http_put(
-        &app,
-        "/benchcmp/raft-memory-http/snapshot/00000000000000000019",
-        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
-        Body::from("raft-state"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-    let response = http_get(&app, "/benchcmp/raft-memory-http/bootstrap").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
-        "00000000000000000019"
-    );
-    let body = body_bytes(response).await;
-    let body = std::str::from_utf8(&body).expect("utf8 body");
-    assert!(body.contains("raft-state"));
-
-    let response = http_get(&app, "/__ursula/metrics").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_bytes(response).await;
-    let body = std::str::from_utf8(&body).expect("utf8 body");
-    assert!(body.contains("\"accepted_appends\":1"));
-    assert!(body.contains("\"wal_batches\":0"));
-    assert!(body.contains("\"wal_records\":0"));
-    assert!(body.contains("\"wal_write_ns\":0"));
-    assert!(body.contains("\"wal_sync_ns\":0"));
-    assert!(body.contains("\"raft_group_count\":0"));
-    assert!(body.contains("\"raft_groups\":[]"));
-}
-
-#[tokio::test]
 async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
+    let wal_root = tempfile::tempdir().expect("WAL root");
     let registry = RaftGroupHandleRegistry::default();
     let mut config = RuntimeConfig::new(1, 1);
     config.threading = ursula_runtime::RuntimeThreading::HostedTokio;
-    let runtime = ShardRuntime::spawn_with_engine_factory(
-        config,
-        ursula_raft::RegisteredRaftGroupEngineFactory::new(registry.clone()),
-    )
-    .expect("runtime");
+    let (factory, raft_wal) = registered_durable_factory(&wal_root, &registry);
+    let runtime = ShardRuntime::spawn_with_engine_factory(config, factory).expect("runtime");
     runtime
         .warm_group(RaftGroupId(0))
         .await
         .expect("warm raft group");
-    let app = router_with_raft_registry(runtime, registry);
+    let app = router_with_raft_registry(runtime.clone(), registry);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind listener");
@@ -2018,6 +2008,7 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
 
     shutdown_tx.send(()).expect("server is still running");
     server.await.expect("server task");
+    shutdown_test_wal(&runtime, &raft_wal).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2507,7 +2498,7 @@ async fn static_grpc_follower_serves_replicated_catch_up_read_without_leader_pro
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn static_grpc_memory_node_rejoins_all_groups_through_membership_replacement() {
+async fn static_grpc_node_that_lost_its_wal_rejoins_all_groups_through_membership_replacement() {
     let mut listeners = Vec::new();
     let mut peers = Vec::new();
     let mut addrs = Vec::new();
@@ -2576,7 +2567,8 @@ async fn static_grpc_memory_node_rejoins_all_groups_through_membership_replaceme
     let leader_base = peers[0].1.as_str();
     let mut streams_by_group: Vec<Option<BucketStreamId>> = vec![None; 6];
     for candidate in 0..10_000 {
-        let stream_id = BucketStreamId::new("benchcmp", format!("memory-rejoin-group-{candidate}"));
+        let stream_id =
+            BucketStreamId::new("benchcmp", format!("lost-wal-rejoin-group-{candidate}"));
         let group_index = usize::try_from(nodes[0].runtime.locate(&stream_id).raft_group_id.0)
             .expect("raft group id fits usize");
         if streams_by_group[group_index].is_none() {
@@ -2771,47 +2763,16 @@ async fn static_grpc_memory_node_rejoins_all_groups_through_membership_replaceme
             stale_replacement.runtime.locate(stream_id),
             stream_id,
             format!("before-{group_index}-after-stop-{group_index}").as_bytes(),
-            "emptied memory node healed from the surviving quorum",
+            "emptied node healed from the surviving quorum",
         )
         .await;
     }
-
-    let rejected_quiesce = admin_test_request(
-        &client,
-        reqwest::Method::POST,
-        format!("{}/__ursula/raft/quiesce-for-restart", peers[2].1),
-    )
-    .await
-    .send()
-    .await
-    .expect("attempt quiesce without drain");
-    assert_eq!(rejected_quiesce.status(), StatusCode::CONFLICT);
-    let mark_drain = admin_test_request(
-        &client,
-        reqwest::Method::POST,
-        format!("{}/__ursula/leadership-shed/maintenance", peers[2].1),
-    )
-    .await
-    .send()
-    .await
-    .expect("mark stale replacement drained");
-    assert_eq!(mark_drain.status(), StatusCode::OK);
-    let quiesce = admin_test_request(
-        &client,
-        reqwest::Method::POST,
-        format!("{}/__ursula/raft/quiesce-for-restart", peers[2].1),
-    )
-    .await
-    .send()
-    .await
-    .expect("quiesce stale replacement before restarting it");
-    assert_eq!(quiesce.status(), StatusCode::OK);
 
     stale_replacement.shutdown().await;
 
     let restarted_listener = tokio::net::TcpListener::bind(addrs[2])
         .await
-        .expect("rebind node 3 after quiescence");
+        .expect("rebind node 3 after its second loss");
     let restarted = spawn_static_grpc_test_node(
         3,
         restarted_listener,
@@ -2851,121 +2812,13 @@ async fn static_grpc_memory_node_rejoins_all_groups_through_membership_replaceme
             restarted.runtime.locate(stream_id),
             stream_id,
             format!("before-{group_index}-after-stop-{group_index}").as_bytes(),
-            "restarted empty memory node caught up from surviving quorum",
+            "restarted empty node caught up from surviving quorum",
         )
         .await;
     }
 
     nodes.push(restarted);
     for node in nodes {
-        node.shutdown().await;
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn static_grpc_memory_restart_with_bootstrap_marker_fails_fast() {
-    let marker_dir = tempfile::tempdir().expect("marker dir");
-    let mut listeners = Vec::new();
-    let mut peers = Vec::new();
-    let mut addrs = Vec::new();
-    for node_id in 1..=3u64 {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        peers.push((node_id, format!("http://{addr}")));
-        addrs.push(addr);
-        listeners.push(listener);
-    }
-
-    let engine_config = ursula_raft::RaftEngineConfig {
-        memory_bootstrap_marker_dir: Some(marker_dir.path().to_path_buf()),
-        bootstrap_peer_probe: Duration::from_millis(100),
-        bootstrap_peer_probe_interval: Duration::from_millis(20),
-        bootstrap_peer_connect: Duration::from_millis(20),
-        ..Default::default()
-    };
-    let mut nodes = Vec::new();
-    for (index, listener) in listeners.into_iter().enumerate() {
-        let node_id = u64::try_from(index + 1).expect("node id fits u64");
-        nodes.push(
-            spawn_static_grpc_test_node(
-                node_id,
-                listener,
-                peers.clone(),
-                peers.clone(),
-                true,
-                6,
-                StaticGrpcTestNodeStorage {
-                    engine_config: Some(engine_config.clone()),
-                    per_group_initializers: true,
-                    ..Default::default()
-                },
-            )
-            .await,
-        );
-    }
-
-    for node in &nodes {
-        tokio::time::timeout(Duration::from_secs(10), node.runtime.warm_all_groups())
-            .await
-            .expect("initial warm_all_groups timed out")
-            .expect("initial warm_all_groups");
-    }
-    let group_0_marker = marker_dir.path().join("node-1-group-0.bootstrapped");
-    for _ in 0..50 {
-        if group_0_marker.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(
-        group_0_marker.exists(),
-        "bootstrap wrote marker {}",
-        group_0_marker.display()
-    );
-    for node in nodes {
-        node.shutdown().await;
-    }
-
-    let mut restarted_nodes = Vec::new();
-    for (index, addr) in addrs.iter().enumerate() {
-        let node_id = u64::try_from(index + 1).expect("node id fits u64");
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .expect("rebind listener");
-        restarted_nodes.push(
-            spawn_static_grpc_test_node(
-                node_id,
-                listener,
-                peers.clone(),
-                peers.clone(),
-                true,
-                6,
-                StaticGrpcTestNodeStorage {
-                    engine_config: Some(engine_config.clone()),
-                    per_group_initializers: true,
-                    ..Default::default()
-                },
-            )
-            .await,
-        );
-    }
-    let restart_error = tokio::time::timeout(
-        Duration::from_secs(10),
-        restarted_nodes[0].runtime.warm_all_groups(),
-    )
-    .await
-    .expect("restart warm_all_groups timed out")
-    .expect_err("marker-backed memory restart must fail instead of reinitializing membership");
-    assert!(
-        restart_error
-            .to_string()
-            .contains("already bootstrapped once"),
-        "unexpected restart error: {restart_error}"
-    );
-
-    for node in restarted_nodes {
         node.shutdown().await;
     }
 }
@@ -4907,8 +4760,8 @@ async fn startup_maintenance_drain_disables_groups_registered_after_the_fence() 
         .registry
         .get(RaftGroupId(0))
         .expect("drained follower group");
-    // Do not let the separate memory-recovery gate hide a broken maintenance
-    // fence. Every replica must finish recovery while the leader still ticks.
+    // Do not let the separate recovery gate hide a broken maintenance fence.
+    // Every replica must finish recovery while the leader still ticks.
     tokio::time::timeout(Duration::from_secs(10), async {
         while nodes
             .iter()
@@ -4918,7 +4771,7 @@ async fn startup_maintenance_drain_disables_groups_registered_after_the_fence() 
         }
     })
     .await
-    .expect("all memory recovery barriers must open before testing the maintenance fence");
+    .expect("all recovery barriers must open before testing the maintenance fence");
     // Stop both other Raft engines so only the drained follower can campaign.
     // Disabling a peer's election flag can be overwritten by recovery policy;
     // disabling its ticker alone does not stop all outbound replication.
@@ -5210,11 +5063,27 @@ async fn ingress_body_budget_holds_credit_until_response_finishes() {
 }
 
 #[tokio::test]
-async fn an_unproven_memory_recovery_cannot_count_as_ready_after_undrain() {
+async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
+    // A replica on an empty WAL starts gated.
+    let wal_root = tempfile::tempdir().expect("WAL root");
+    let store = ursula_raft::DurableRaftLogStoreFactory::start(
+        wal_root.path(),
+        ursula_config::WalFsync::Never,
+    )
+    .expect("start the Raft WAL")
+    .open(
+        ursula_shard::ShardPlacement {
+            core_id: ursula_shard::CoreId(0),
+            shard_id: ursula_shard::ShardId(0),
+            raft_group_id: RaftGroupId(0),
+        },
+        ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+    )
+    .expect("open the log store");
     let registry = RaftGroupHandleRegistry::default();
     registry.register_rejoin(
         RaftGroupId(0),
-        Arc::new(ursula_raft::GroupRejoin::volatile(1, RaftGroupId(0))),
+        Arc::new(ursula_raft::GroupRejoin::durable(1, RaftGroupId(0), &store)),
     );
     let runtime = spawn_runtime(
         &test_config(1, 1),
@@ -5248,10 +5117,23 @@ async fn accept_unsynced_loss_opens_a_gated_replica_and_is_incarnation_bound() {
         shard_id: ursula_shard::ShardId(0),
         raft_group_id: RaftGroupId(0),
     };
-    let engine = ursula_raft::RaftGroupEngine::new_single_node(placement)
+    // A replica on an empty WAL: its gate is closed until a barrier or an
+    // operator opens it.
+    let wal_root = tempfile::tempdir().expect("WAL root");
+    let store = ursula_raft::DurableRaftLogStoreFactory::start(
+        wal_root.path(),
+        ursula_config::WalFsync::Never,
+    )
+    .expect("start the Raft WAL")
+    .open(
+        placement,
+        ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+    )
+    .expect("open the log store");
+    let gate = Arc::new(ursula_raft::GroupRejoin::durable(1, RaftGroupId(0), &store));
+    let engine = ursula_raft::RaftGroupEngine::new_single_node_on_log_store(placement, store, None)
         .await
         .expect("single-node group");
-    let gate = Arc::new(ursula_raft::GroupRejoin::volatile(1, RaftGroupId(0)));
     gate.bind(&engine.raft_handle());
     let registry = RaftGroupHandleRegistry::default();
     registry.register_rejoin(RaftGroupId(0), gate.clone());
@@ -8022,14 +7904,12 @@ fn executor_json_requires_canonical_ids_and_nonzero_generation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn executor_activation_waits_for_the_actual_raft_api_queue() {
+    let wal_root = tempfile::tempdir().expect("WAL root");
     let registry = RaftGroupHandleRegistry::default();
     let mut config = RuntimeConfig::new(1, 1);
     config.threading = ursula_runtime::RuntimeThreading::HostedTokio;
-    let runtime = ShardRuntime::spawn_with_engine_factory(
-        config,
-        ursula_raft::RegisteredRaftGroupEngineFactory::new(registry.clone()),
-    )
-    .expect("runtime");
+    let (factory, raft_wal) = registered_durable_factory(&wal_root, &registry);
+    let runtime = ShardRuntime::spawn_with_engine_factory(config, factory).expect("runtime");
     runtime
         .warm_group(RaftGroupId(0))
         .await
@@ -8062,13 +7942,15 @@ async fn executor_activation_waits_for_the_actual_raft_api_queue() {
         .expect_err("activation must wait for the raft API queue");
     release.send(()).unwrap();
     assert_eq!(activation.await.unwrap().status(), StatusCode::OK);
-    registry.quiesce_for_restart().await.unwrap();
+    // Retirement does not depend on a running Raft core.
+    raft.shutdown().await.unwrap();
     assert_eq!(
         executor_lifecycle(&app, &state, "retire", &executor_token(1))
             .await
             .status(),
         StatusCode::OK
     );
+    shutdown_test_wal(&state.runtime, &raft_wal).await;
 }
 
 #[tokio::test]

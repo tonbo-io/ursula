@@ -2,7 +2,7 @@
 title: ursulactl
 ---
 
-`ursulactl` manages the **logical** state of a running cluster over Ursula's admin and metrics HTTP APIs: which node leads which Raft groups, whether a node is caught up, and how a restarted voter is rebuilt through committed membership. It executes nothing on hosts. Physical lifecycle belongs to whatever owns the process: Helm and the StatefulSet controller on Kubernetes, systemd on hosts, OpenTofu for the infrastructure underneath. The verbs encode the safety properties an operator otherwise has to remember manually:
+`ursulactl` manages the **logical** state of a running cluster over Ursula's admin and metrics HTTP APIs: which node leads which Raft groups, and whether a node is caught up. It executes nothing on hosts. Physical lifecycle belongs to whatever owns the process: Helm and the StatefulSet controller on Kubernetes, systemd on hosts, OpenTofu for the infrastructure underneath. The verbs encode the safety properties an operator otherwise has to remember manually:
 
 - before a node goes down, transfer every Raft group it leads to a healthy successor (`drain`)
 - after it comes back, refuse to move on until `last_applied_index` has caught up to peers' `committed_index` (`wait`)
@@ -12,18 +12,16 @@ A safe rolling restart wraps the platform's restart in these verbs, one node at 
 
 ```bash
 ursulactl drain --config manifest.json --node 3
-ursulactl prepare-restart --config manifest.json --node 3
 kubectl delete pod ursula-2        # the platform restarts the pod
-ursulactl repair-restarted-voter --config manifest.json --node 3
 ursulactl wait --config manifest.json --node 3
-ursulactl finish-prepared-restart --config manifest.json --node 3
+ursulactl undrain --config manifest.json --node 3
 ursulactl verify-cluster --config manifest.json
 ```
 
 On bare metal the restart in the middle is `systemctl restart ursula` on the host. The drain planning and readiness logic is exercised under [deterministic simulation](/docs/architecture/overview).
 
 <Warning>
-The naive procedure of "restart followers, then leader" does **not** wait for `applied_index` to catch up between steps. Under `raft.wal.backend = "memory"` a target comes back without its previous log. Always drain and prepare before restart, rebuild the replacement through committed membership, and wait for catch-up before moving to the next voter.
+The naive procedure of "restart followers, then leader" does **not** wait for `applied_index` to catch up between steps. A restarted voter that lost entries, for example after a host crash under `raft.wal.fsync = "never"` or with a replaced disk, stays out of elections until its group leader has rebuilt it. Always drain before restart and wait for catch-up before moving to the next voter.
 </Warning>
 
 ## Verbs
@@ -31,9 +29,6 @@ The naive procedure of "restart followers, then leader" does **not** wait for `a
 | Verb | Effect |
 |------|--------|
 | `drain --node N` | Mark the node draining and transfer away every leadership it holds. The mark persists (the node attracts no leaderships) until `undrain`. `--dry-run` prints the transfer plan |
-| `prepare-restart --node N` | After `drain`, quiesce the target and pin every group leader to one survivor while the platform replaces it |
-| `repair-restarted-voter --node N` | For each unready group, durably detach the replacement, attach it as a blocking learner, then promote it after catch-up. Safe to resume after interruption |
-| `finish-prepared-restart --node N` | Release the target and survivor maintenance fences after repair and readiness checks |
 | `undrain --node N` | Clear the drain mark so the node may hold leaderships again |
 | `wait --node N` | Block until the node is a voter in every group and within `--lag-tolerance` of peers. Progress-gated: a node that keeps advancing is never timed out |
 | `pin-incarnations` | Save observed process identities in a manifest for subsequent commands; legacy opt-in stays uncertified |
@@ -144,15 +139,11 @@ Per-node fields, all optional except `id`:
 - `http_url`: advertised client/Raft URL used for learner attachment and survivor handoff, and for metrics when no explicit `metrics_url` is set.
 - `metrics_url`: optional metrics endpoint, for example the same tunnel as `admin_url`; it overrides metrics access without changing the peer address persisted in membership.
 
-## Restarting raft-memory nodes
+## Restarting a voter that lost its log
 
-On clusters running the volatile `raft.wal.backend = "memory"`, a restarted node has no prior Raft log. `prepare-restart` quiesces the target and pins every group leader to one surviving voter. After the platform replacement starts, `repair-restarted-voter` commits a survivor-only voter set for each unready group, adds the target as a blocking learner, and promotes it only after catch-up. Those membership transitions survive leader changes, process restarts, and a partially completed multi-group repair.
+A voter that shut down cleanly comes back with every entry it acknowledged and only catches up on what it missed. A voter that lost entries (a host crash under `raft.wal.fsync = "never"`, a journal I/O error, a wiped or replaced disk) needs no ursulactl verb either: it stays behind its recovery gate, and each group leader rebuilds it by itself, removing the voter, adding it back as a learner and promoting it after catch-up (see [Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)). Keep the node drained and run `wait` until every group has promoted it. A group whose majority lost entries at once waits for an operator instead (see [Recovering after a host crash](/docs/operations#recovering-after-a-host-crash)).
 
-From 0.6.2 the group leaders run the same sequence by themselves when a node restarts alone, planned or not, and the empty node refuses to vote until it has caught up; `repair-restarted-voter` then finds nothing left to do, or finishes what the leaders started. A group whose majority restarted empty waits for an operator instead (see [Restarting a memory-WAL node](/docs/operations#restarting-a-memory-wal-node)).
-
-Do not bypass the detach, learner, and promotion sequence with OpenRaft's process-local log-reversion trigger. It cannot provide durable progress across hundreds of independent groups; Ursula uses it only to adopt a survivor after a majority restart, where no membership change can commit. The rollout controller leaves the target drained and releases survivor fences on failure, so a later attempt can safely resume the committed membership state.
-
-The rebuild after an amnesiac restart installs snapshots for every group and can take 10+ minutes. `wait` is progress-gated, so no timeout tuning is needed: a rebuild that keeps advancing is never timed out, and `--stall-timeout-secs` (default 90) only aborts a node that stops making progress.
+The rebuild of a voter that lost its disk installs snapshots for every group and can take 10+ minutes. `wait` is progress-gated, so no timeout tuning is needed: a rebuild that keeps advancing is never timed out, and `--stall-timeout-secs` (default 90) only aborts a node that stops making progress.
 
 ## `status`
 
@@ -191,7 +182,6 @@ For custom tooling, every verb maps onto a small set of HTTP endpoints on each n
 | `status`, `wait-ready`, `wait` | `GET /__ursula/metrics` |
 | `drain` / `undrain` (maintenance guard) | `POST /__ursula/leadership-shed/maintenance`, `DELETE` to clear |
 | `drain` (transfer step) | `POST /__ursula/raft/{raft_group_id}/leader/transfer/{node_id}` |
-| `repair-restarted-voter` | `POST /__ursula/raft/{raft_group_id}/membership`, then `POST /__ursula/raft/{raft_group_id}/learners/{node_id}`, then membership promotion |
 
 The transfer endpoint refuses with `409 Conflict` if the receiving node isn't the current leader of the group, and `400` if the target node isn't a voter. ursulactl uses this to refuse to attempt a transfer it cannot reason about.
 

@@ -2,58 +2,55 @@
 //! acknowledged never helps elect a leader that lacks them, and rejoins once
 //! it holds the group's log again.
 //!
-//! A replica can lose acknowledged entries in three ways: a memory-WAL
-//! process restarts with an empty log; a disk-WAL host crashes under
-//! `raft.wal.fsync = never` (or a journal I/O failure poisons it) and keeps
-//! only the verified prefix of its journal; or its journal is wiped or
-//! replaced. The same pieces cover every case, on either log store.
+//! A replica can lose acknowledged entries in two ways: its host crashes
+//! under `raft.wal.fsync = never` (or a journal I/O failure poisons it) and
+//! it keeps only the verified prefix of its journal, or its journal is wiped
+//! or replaced. The same pieces cover both.
 //!
-//! - **Entering the gate** ([`GroupRejoin`]): a memory-WAL replica always
-//!   starts gated. A disk-WAL replica starts gated when its durable log state
-//!   ([`GroupLogState`]) says `Recovering` (the node started after a host
-//!   crash or an I/O failure, a previous run left the group recovering, or
-//!   the journal lost the log of an initialized group) or `Empty` (it never
-//!   held the group here, or held it on a disk it lost). An empty replica's
-//!   first entry records the group `Recovering` while the gate is closed, so
-//!   a restart before the gate opens comes back gated.
+//! - **Entering the gate** ([`GroupRejoin`]): a replica starts gated when its
+//!   durable log state ([`GroupLogState`]) says `Recovering` (the node
+//!   started after a host crash or an I/O failure, a previous run left the
+//!   group recovering, or the journal lost the log of an initialized group)
+//!   or `Empty` (it never held the group here, or held it on a disk it lost).
+//!   An empty replica's first entry records the group `Recovering` while the
+//!   gate is closed, so a restart before the gate opens comes back gated.
 //! - **While gated** ([`VoteGate`]): the replica does not campaign and does
-//!   not take a leadership transfer. A disk-WAL replica that led the group
-//!   starts as a follower instead of restoring its leadership, which would
-//!   append new entries under the log ids of the ones it lost. It refuses
-//!   every vote once it knows the group holds entries: its log state says so,
-//!   a leader reported a commit index of 1 or more, or a candidate's log
-//!   reached index 1. Before that a new group's first election (candidates
-//!   whose log is only the membership entry at index 0) goes through. It
-//!   still accepts appends from any leader whose vote is not lower than its
-//!   persisted vote; the disk WAL restores that vote before the Raft core
-//!   starts, so a leader of an older term is refused.
+//!   not take a leadership transfer. A replica that led the group starts as
+//!   a follower instead of restoring its leadership, which would append new
+//!   entries under the log ids of the ones it lost. It refuses every vote
+//!   once it knows the group holds entries: its log state says so, a leader
+//!   reported a commit index of 1 or more, or a candidate's log reached
+//!   index 1. Before that a new group's first election (candidates whose log
+//!   is only the membership entry at index 0) goes through. It still accepts
+//!   appends from any leader whose vote is not lower than its persisted
+//!   vote; the WAL restores that vote before the Raft core starts, so a
+//!   leader of an older term is refused.
 //! - **Opening the gate** ([`run_rejoin_vote_barrier`]): the replica asks
 //!   the current leader for a fresh outbound ReadIndex barrier and opens the
 //!   gate once it has applied the barrier's committed index. Inbound
 //!   replication alone never opens it: it may have been delayed across the
-//!   restart. A disk-WAL replica records the open gate (`Initialized`) before
-//!   it votes again. Then the node's election policy is refreshed.
+//!   restart. The replica records the open gate (`Initialized`) before it
+//!   votes again. Then the node's election policy is refreshed.
 //! - **Self-heal** ([`run_rejoin_heal`]): a leader whose follower answers
 //!   `Conflict` at or below the index that follower had already matched in
 //!   this leadership knows the follower lost entries. OpenRaft never rewinds
 //!   that progress, so the network layer hands OpenRaft an error instead of
-//!   the conflict, and the leader rebuilds the follower the way `ursulactl
-//!   repair-restarted-voter` does: remove the voter, add it back as a
-//!   learner, wait for catch-up, promote. Every step is read off the current
-//!   membership, so a leader change, a second restart or `ursulactl` doing
-//!   the same repair at the same time all converge. When the followers that
-//!   lost entries are a majority, no removal can commit; the leader holds
-//!   every committed entry, so it rewinds their replication instead and
-//!   sends them its log again (an idle group gets an unchanged membership
-//!   entry to carry the rewind).
+//!   the conflict, and the leader rebuilds the follower: remove the voter,
+//!   add it back as a learner, wait for catch-up, promote. Every step is
+//!   read off the current membership, so a leader change or a second restart
+//!   in the middle converges. When the followers that lost entries are a
+//!   majority, no removal can commit; the leader holds every committed
+//!   entry, so it rewinds their replication instead and sends them its log
+//!   again (an idle group gets an unchanged membership entry to carry the
+//!   rewind).
 //! - **Bootstrap** ([`run_group_bootstrap`]): a group's initializer whose
 //!   replica holds nothing of the group runs `Initialize` only when every
 //!   configured voter answers a probe `Vote` with an empty log and no
 //!   leader. The probe carries the lowest possible vote (term 0, the
 //!   prober's id) and no log. A peer that holds the group refuses it; a peer
 //!   with no vote yet may grant it, which only records a term-0 vote that
-//!   `Initialize` overwrites. A disk-WAL replica that ever held the group
-//!   never runs `Initialize`.
+//!   `Initialize` overwrites. A replica that ever held the group never runs
+//!   `Initialize`.
 //!
 //! If a majority of a group's voters are gated, no leader can confirm a
 //! barrier: the group has no leader and refuses writes, and its gated
@@ -353,16 +350,6 @@ impl RevertedFollowers {
     }
 }
 
-/// Where a gate records that it opened.
-#[derive(Debug)]
-enum GateLog {
-    /// The memory log store: nothing survives a restart.
-    Volatile,
-    /// The disk log store, which keeps the group's log state. Weak, so a
-    /// stopped group's store closes even while its gate is still registered.
-    Durable(Weak<RaftGroupFileLogStore>),
-}
-
 /// Why a gate opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateOpening {
@@ -420,7 +407,10 @@ pub struct GroupRejoin {
     metrics: OnceLock<MetricsReceiver>,
     gate: Mutex<VoteGate>,
     reverted: Mutex<RevertedFollowers>,
-    log: GateLog,
+    /// The group's log store, which keeps its log state and where the gate
+    /// records that it opened. Weak, so a stopped group's store closes even
+    /// while its gate is still registered.
+    store: Weak<RaftGroupFileLogStore>,
 }
 
 impl fmt::Debug for GroupRejoin {
@@ -435,30 +425,8 @@ impl fmt::Debug for GroupRejoin {
 }
 
 impl GroupRejoin {
-    fn new(node_id: u64, raft_group_id: RaftGroupId, gate: VoteGate, log: GateLog) -> Self {
-        Self {
-            node_id,
-            raft_group_id,
-            metrics: OnceLock::new(),
-            gate: Mutex::new(gate),
-            reverted: Mutex::new(RevertedFollowers::default()),
-            log,
-        }
-    }
-
-    /// The gate of a memory-WAL replica, which starts every run with an empty
-    /// log: closed, with the group's history unknown.
-    pub fn volatile(node_id: u64, raft_group_id: RaftGroupId) -> Self {
-        Self::new(
-            node_id,
-            raft_group_id,
-            VoteGate::closed(GroupEvidence::Unknown),
-            GateLog::Volatile,
-        )
-    }
-
-    /// The gate of a disk-WAL replica, from the group's durable log state in
-    /// `store`. Create it before the group's Raft core starts.
+    /// The gate of a replica, from the group's durable log state in `store`.
+    /// Create it before the group's Raft core starts.
     pub fn durable(
         node_id: u64,
         raft_group_id: RaftGroupId,
@@ -488,12 +456,14 @@ impl GroupRejoin {
                 VoteGate::closed(GroupEvidence::Unknown)
             }
         };
-        Self::new(
+        Self {
             node_id,
             raft_group_id,
-            gate,
-            GateLog::Durable(Arc::downgrade(store)),
-        )
+            metrics: OnceLock::new(),
+            gate: Mutex::new(gate),
+            reverted: Mutex::new(RevertedFollowers::default()),
+            store: Arc::downgrade(store),
+        }
     }
 
     pub fn raft_group_id(&self) -> RaftGroupId {
@@ -535,14 +505,11 @@ impl GroupRejoin {
     }
 
     /// Whether this replica ever held the group's log, as far as it knows:
-    /// a disk-WAL replica that did never runs `Initialize` again.
+    /// a replica that did never runs `Initialize` again.
     pub fn holds_group_history(&self) -> bool {
-        match &self.log {
-            GateLog::Volatile => false,
-            GateLog::Durable(store) => store
-                .upgrade()
-                .is_some_and(|store| store.log_state().is_initialized()),
-        }
+        self.store
+            .upgrade()
+            .is_some_and(|store| store.log_state().is_initialized())
     }
 
     pub(crate) fn confirm_barrier(&self, leader: UrsulaVote, commit_index: u64) {
@@ -554,20 +521,18 @@ impl GroupRejoin {
         self.vote_gate_open()
     }
 
-    /// Opens the gate, recording it first on a disk-WAL replica.
+    /// Opens the gate, recording it first.
     async fn open(&self, why: GateOpening) -> Result<(), RecoveryGateError> {
-        if let GateLog::Durable(store) = &self.log {
-            let store = store.upgrade().ok_or(RecoveryGateError::StoreClosed {
+        let store = self.store.upgrade().ok_or(RecoveryGateError::StoreClosed {
+            raft_group_id: self.raft_group_id,
+        })?;
+        store
+            .record_recovered()
+            .await
+            .map_err(|source| RecoveryGateError::Record {
                 raft_group_id: self.raft_group_id,
+                source,
             })?;
-            store
-                .record_recovered()
-                .await
-                .map_err(|source| RecoveryGateError::Record {
-                    raft_group_id: self.raft_group_id,
-                    source,
-                })?;
-        }
         self.gate().open();
         match why {
             GateOpening::CaughtUp => tracing::info!(
@@ -620,9 +585,9 @@ impl GroupRejoin {
 
     /// Operator recovery when a majority of the group's voters are gated:
     /// accept that this replica may be missing entries it acknowledged and
-    /// open its gate, so it votes and campaigns with the log it holds. A
-    /// disk-WAL replica records the open gate. Elections are refreshed by
-    /// the caller ([`RaftGroupHandleRegistry::accept_unsynced_loss`]).
+    /// open its gate, so it votes and campaigns with the log it holds. The
+    /// open gate is recorded. Elections are refreshed by the caller
+    /// ([`RaftGroupHandleRegistry::accept_unsynced_loss`]).
     pub async fn accept_unsynced_loss(
         &self,
     ) -> Result<AcceptUnsyncedLossOutcome, RecoveryGateError> {
@@ -678,13 +643,10 @@ impl GroupRejoin {
         }
     }
 
-    /// The last entry a disk-WAL replica holds, which a refusal reports so
-    /// that a bootstrap probe sees the group exists here.
+    /// The last entry this replica holds, which a refusal reports so that a
+    /// bootstrap probe sees the group exists here.
     fn last_log_id(&self) -> Option<LogIdOf<UrsulaRaftTypeConfig>> {
-        match &self.log {
-            GateLog::Volatile => None,
-            GateLog::Durable(store) => store.upgrade()?.last_log_id(),
-        }
+        self.store.upgrade()?.last_log_id()
     }
 
     /// Follower side: record an inbound AppendEntries.
@@ -1142,7 +1104,7 @@ fn heal_view(
 /// Leader-side heal driver for one group: rebuilds a voter that lost
 /// entries through remove / learner / catch-up / promote, rewinds voters
 /// that lost entries when they are a majority, and finishes a rebuild
-/// another leader or `ursulactl` started. Returns once the Raft stops.
+/// another leader started. Returns once the Raft stops.
 pub async fn run_rejoin_heal(
     raft: RaftGroupHandle,
     rejoin: Arc<GroupRejoin>,
@@ -1441,7 +1403,7 @@ mod tests {
         gate.observe_append(Some(1));
         assert_eq!(gate.screen(None), VoteScreen::Refuse);
 
-        // A disk replica that lost its unsynced tail knows from the start.
+        // A replica that lost its unsynced tail knows from the start.
         let mut gate = VoteGate::closed(GroupEvidence::Initialized);
         assert_eq!(gate.screen(Some(0)), VoteScreen::Refuse);
         assert_eq!(gate.screen(None), VoteScreen::Refuse);
@@ -1693,7 +1655,7 @@ mod tests {
         );
     }
 
-    /// A disk-WAL gate follows the group's durable log state: closed with an
+    /// A gate follows the group's durable log state: closed with an
     /// unknown history while the replica holds nothing, open once the group
     /// is initialized, closed again when a run starts without knowing how
     /// the previous one ended. A recovering replica that led the group starts

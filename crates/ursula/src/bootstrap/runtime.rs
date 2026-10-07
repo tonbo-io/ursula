@@ -35,7 +35,7 @@ use crate::bootstrap::topology::Topology;
 pub struct SpawnedRuntime {
     pub runtime: ShardRuntime,
     pub raft_registry: Option<RaftGroupHandleRegistry>,
-    /// The node's Raft WAL when its logs are on disk. Shut it down once the
+    /// The node's Raft WAL when it runs Raft. Shut it down once the
     /// runtime's groups have stopped, so the next start finds a clean run.
     pub raft_wal: Option<DurableRaftLogStoreFactory>,
 }
@@ -54,30 +54,26 @@ pub enum SpawnRuntimeError {
 enum GroupStorage {
     /// No Raft: the in-memory engine.
     InMemory,
-    /// Raft over volatile in-memory logs.
-    RaftMemory,
     /// Raft over the per-core journals of this run of the WAL.
-    RaftDisk(DurableRaftLogStoreFactory),
+    Raft(DurableRaftLogStoreFactory),
 }
 
 impl GroupStorage {
-    /// Starts the Raft WAL when `persistence` keeps the logs on disk: reads
-    /// the previous run's state and records this run before any group opens
-    /// a journal.
+    /// Starts the Raft WAL when `persistence` runs Raft: reads the previous
+    /// run's state and records this run before any group opens a journal.
     fn start(persistence: Persistence, fsync: WalFsync) -> Result<Self, SpawnRuntimeError> {
         Ok(match persistence {
             Persistence::InMemory => Self::InMemory,
-            Persistence::Raft { log_dir: None } => Self::RaftMemory,
-            Persistence::Raft { log_dir: Some(dir) } => {
-                Self::RaftDisk(DurableRaftLogStoreFactory::start(dir, fsync)?)
+            Persistence::Raft { log_dir } => {
+                Self::Raft(DurableRaftLogStoreFactory::start(log_dir, fsync)?)
             }
         })
     }
 
     fn raft_wal(&self) -> Option<DurableRaftLogStoreFactory> {
         match self {
-            Self::RaftDisk(log_stores) => Some(log_stores.clone()),
-            Self::InMemory | Self::RaftMemory => None,
+            Self::Raft(log_stores) => Some(log_stores.clone()),
+            Self::InMemory => None,
         }
     }
 }
@@ -296,19 +292,7 @@ fn spawn_singleton(
                 cold_store,
             )?
         }
-        GroupStorage::RaftMemory => match cold_store {
-            Some(ref cs) => ShardRuntime::spawn_with_engine_factory_and_cold_store(
-                runtime_config,
-                ursula_raft::ColdRaftGroupEngineFactory::new(cs.clone()),
-                cold_store,
-            )?,
-            None => ShardRuntime::spawn_with_engine_factory_and_cold_store(
-                runtime_config,
-                ursula_raft::RaftGroupEngineFactory,
-                cold_store,
-            )?,
-        },
-        GroupStorage::RaftDisk(log_stores) => {
+        GroupStorage::Raft(log_stores) => {
             let factory = ursula_raft::DurableRaftGroupEngineFactory::with_cold_store(
                 log_stores,
                 cold_store.clone(),
@@ -344,17 +328,18 @@ fn spawn_static_cluster(
     raft_engine_config: Option<RaftEngineConfig>,
     registry: RaftGroupHandleRegistry,
 ) -> Result<SpawnedRuntime, RuntimeError> {
-    if matches!(storage, GroupStorage::InMemory) {
+    let GroupStorage::Raft(log_stores) = storage else {
         return Err(RuntimeError::StaticMembershipConfig {
             message: "static cluster topology requires Raft persistence".to_owned(),
         });
-    }
-    let raft_wal = storage.raft_wal();
+    };
+    let raft_wal = Some(log_stores.clone());
     let mut factory = ursula_raft::StaticGrpcRaftGroupEngineFactory::new(
         node_id,
         peers.clone(),
         initialize_membership,
         registry.clone(),
+        log_stores,
     )
     .with_per_group_membership_initializers(membership_config.initialize_membership_per_group)
     .with_per_group_voters(membership_config.per_group_voters)
@@ -362,9 +347,6 @@ fn spawn_static_cluster(
     .with_snapshot_store(snapshot_store);
     if let Some(engine_config) = raft_engine_config {
         factory = factory.with_engine_config(engine_config);
-    }
-    if let GroupStorage::RaftDisk(log_stores) = storage {
-        factory = factory.with_raft_log_stores(log_stores);
     }
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
         runtime_config,

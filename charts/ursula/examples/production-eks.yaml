@@ -32,10 +32,8 @@ server:
 raft:
   groupCount: 256
   initMembershipPerGroup: true
-  storageMode: logDir
 
 persistence:
-  enabled: true
   storageClassName: gp3
   size: 100Gi
 

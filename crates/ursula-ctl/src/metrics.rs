@@ -11,7 +11,6 @@ use anyhow::bail;
 use reqwest::Client;
 use reqwest::Method;
 use reqwest::RequestBuilder;
-use reqwest::StatusCode;
 use serde::Deserialize;
 use ursula_proto::admin::MAINTENANCE_FENCE_HEADER;
 use ursula_proto::admin::MaintenanceFenceState;
@@ -25,12 +24,6 @@ pub struct MetricsClient {
     client: Client,
     timeout: Duration,
     incarnations: Arc<Mutex<HashMap<u64, Option<ProcessIncarnation>>>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RestartQuiesceCapability {
-    Supported,
-    LegacyUnavailable,
 }
 
 impl MetricsClient {
@@ -542,70 +535,6 @@ impl MetricsClient {
             ))
         }
     }
-
-    pub async fn quiesce_for_restart(&self, node: &NodeInfo) -> Result<()> {
-        let url = node
-            .admin_url
-            .join("/__ursula/raft/quiesce-for-restart")
-            .with_context(|| format!("compose restart-quiesce url for node {}", node.id))?;
-        let resp = self
-            .admin_request(node, Method::POST, url.clone())
-            .await?
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if status.is_success() {
-            Ok(())
-        } else {
-            Err(anyhow!(
-                "restart quiesce at node {} returned {}: {}",
-                node.id,
-                status,
-                body
-            ))
-        }
-    }
-
-    /// Probe route presence without mutating restart state.
-    ///
-    /// Ursula 0.4.8 has no restart-quiesce route and returns 404. A current
-    /// POST-only Axum route returns 405 to GET. This is the narrow rolling
-    /// upgrade discriminator for that source release; every other HTTP or
-    /// transport result fails closed.
-    pub async fn restart_quiesce_capability(
-        &self,
-        node: &NodeInfo,
-    ) -> Result<RestartQuiesceCapability> {
-        let url = node
-            .admin_url
-            .join("/__ursula/raft/quiesce-for-restart")
-            .with_context(|| format!("compose restart-quiesce url for node {}", node.id))?;
-        let resp = self
-            .client
-            .get(url.clone())
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?;
-        let status = resp.status();
-        match status {
-            StatusCode::NOT_FOUND => Ok(RestartQuiesceCapability::LegacyUnavailable),
-            StatusCode::METHOD_NOT_ALLOWED if resp.headers().contains_key("allow") => {
-                Ok(RestartQuiesceCapability::Supported)
-            }
-            status if status.is_success() => Ok(RestartQuiesceCapability::Supported),
-            _ => {
-                let body = resp.text().await.unwrap_or_default();
-                bail!(
-                    "restart-quiesce capability at node {} returned {}: {}",
-                    node.id,
-                    status,
-                    body
-                )
-            }
-        }
-    }
 }
 
 fn metrics_base_url(node: &NodeInfo) -> &url::Url {
@@ -641,9 +570,6 @@ struct RawMetrics {
     maintenance_fence_uncertain: bool,
     #[serde(default)]
     raft_groups: Vec<RawRaftGroup>,
-    /// Raft WAL backend (`"memory"`/`"disk"`); absent on older servers.
-    #[serde(default)]
-    wal_backend: Option<String>,
     #[serde(default)]
     raft_maintenance: Option<ursula_raft::RaftMaintenanceReport>,
 }
@@ -672,9 +598,6 @@ struct RawRaftGroup {
 pub struct NodeMetricsView {
     pub node: NodeInfo,
     pub groups: Vec<RaftGroupView>,
-    /// Raft WAL backend this node reports (`"memory"`/`"disk"`); `None` on
-    /// servers predating the field.
-    pub wal_backend: Option<String>,
     pub raft_maintenance: Option<ursula_raft::RaftMaintenanceReport>,
     pub process_incarnation: Option<ProcessIncarnation>,
     pub maintenance_fence: Option<MaintenanceFenceState>,
@@ -701,7 +624,6 @@ impl NodeMetricsView {
         Self {
             node,
             groups,
-            wal_backend: raw.wal_backend,
             raft_maintenance: raw.raft_maintenance,
             process_incarnation: raw.process_incarnation,
             maintenance_fence: raw.maintenance_fence,
@@ -734,9 +656,9 @@ pub struct RaftGroupView {
     pub voter_ids: Vec<u64>,
     pub learner_ids: Vec<u64>,
     /// Absent on the supported 0.6.2 upgrade source. Such sources retain
-    /// their legacy checks until replaced; they cannot certify the repaired
-    /// memory-WAL participation guarantee. Remove when no retained upgrade
-    /// source predates this metrics contract.
+    /// their legacy checks until replaced; they cannot certify that a replica
+    /// passed its recovery gate. Remove when no retained upgrade source
+    /// predates this metrics contract.
     pub maintenance: Option<ursula_raft::RaftGroupMaintenanceState>,
 }
 
@@ -1146,52 +1068,5 @@ mod tests {
         };
 
         assert_eq!(metrics_base_url(&node).port(), Some(4438));
-    }
-
-    async fn quiesce_route() -> StatusCode {
-        StatusCode::OK
-    }
-
-    async fn capability_node(app: Router) -> anyhow::Result<NodeInfo> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let address = listener.local_addr()?;
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        Ok(NodeInfo {
-            expected_process_incarnation: None,
-            expected_maintenance_fence: None,
-            id: 1,
-            admin_url: Url::parse(&format!("http://{address}"))?,
-            host: address.to_string(),
-            http_url: None,
-            metrics_url: None,
-        })
-    }
-
-    #[tokio::test]
-    async fn restart_quiesce_probe_distinguishes_legacy_route_absence() {
-        let client = MetricsClient::new(Duration::from_secs(1)).expect("metrics client");
-        let supported = capability_node(
-            Router::new().route("/__ursula/raft/quiesce-for-restart", post(quiesce_route)),
-        )
-        .await
-        .expect("supported node");
-        let legacy = capability_node(Router::new()).await.expect("legacy node");
-
-        assert_eq!(
-            client
-                .restart_quiesce_capability(&supported)
-                .await
-                .expect("probe supported node"),
-            RestartQuiesceCapability::Supported
-        );
-        assert_eq!(
-            client
-                .restart_quiesce_capability(&legacy)
-                .await
-                .expect("probe legacy node"),
-            RestartQuiesceCapability::LegacyUnavailable
-        );
     }
 }

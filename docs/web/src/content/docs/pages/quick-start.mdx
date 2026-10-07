@@ -3,7 +3,7 @@ title: Quick Start
 sidebarTitle: Quick Start
 ---
 
-This page assumes a single node is already running on `127.0.0.1:4437`. Starting one is a single Docker or Cargo command, see [Install](/docs/install). The default node is in-memory and nothing survives a restart. For disk-backed persistence, see [Configuration](/docs/configuration).
+This page assumes a single node is already running on `127.0.0.1:4437`. Starting one is a single Docker or Cargo command, see [Install](/docs/install). The default node keeps nothing across restarts. For disk-backed persistence, set `raft.wal.path` (see [Configuration](/docs/configuration)).
 
 Drive the HTTP API with `curl` from another terminal.
 
