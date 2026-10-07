@@ -269,13 +269,15 @@ pub(crate) fn core_replay_mode(verified_epoch: u64, recovery_epoch: u64) -> Jour
 /// Failure to start or shut down a node's Raft WAL.
 #[derive(Debug, thiserror::Error)]
 pub enum RaftWalError {
-    #[error("WAL topology mismatch at '{}': stored {stored:?}, configured {configured:?}; restore the original core_count and group_count", .root.display())]
+    #[error("WAL topology mismatch at '{}': stored core_count={stored_core_count}, group_count={stored_group_count}, configured core_count={configured_core_count}, group_count={configured_group_count}. Restore the stored counts, or rebuild this replica on an empty WAL from a healthy quorum using the cluster's existing routing counts. See https://ursula.tonbo.io/docs/operations#wal-routing-configuration", .root.display())]
     TopologyMismatch {
         root: PathBuf,
-        stored: super::WalTopology,
-        configured: super::WalTopology,
+        stored_core_count: u16,
+        stored_group_count: u32,
+        configured_core_count: u16,
+        configured_group_count: u32,
     },
-    #[error("WAL topology is missing at '{}' but prior WAL state exists; refusing to infer core_count and group_count from the current configuration", .root.display())]
+    #[error("WAL topology is missing at '{}' but prior WAL state exists. Refusing to infer core_count and group_count from the current configuration. For replica rebuild or single-node migration, see https://ursula.tonbo.io/docs/operations#wal-routing-configuration", .root.display())]
     MissingTopology { root: PathBuf },
     #[error("read the Raft WAL topology: {0}")]
     ReadTopology(#[source] StateFileError),
@@ -405,7 +407,8 @@ impl NodeWal {
         let previous = state_file::read::<RunState>(StateFileKind::RunState, &path)
             .map_err(RaftWalError::ReadRunState)?;
         let cores = core_dirs(&root)?;
-        super::topology::check_or_create(&root, topology, previous.is_some(), &cores)?;
+        // Even metadata-only cores are prior state: votes must not be forgotten.
+        super::topology::check_or_create(&root, topology, previous.is_some() || !cores.is_empty())?;
         let journals = journal_history(&cores)?;
         let boot_id = Disk::boot_id(&root).map(BootId);
         let opening = WalOpening::decide(previous.as_ref(), journals, boot_id.as_ref());

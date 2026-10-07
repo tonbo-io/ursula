@@ -1,7 +1,6 @@
 //! Immutable routing configuration of a node's WAL root.
 
 use std::path::Path;
-use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -15,9 +14,9 @@ const TOPOLOGY_FILE: &str = "topology.bin";
 
 /// The routing counts persisted before any group can write its journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WalTopology {
-    pub core_count: u16,
-    pub group_count: u32,
+struct WalTopology {
+    core_count: u16,
+    group_count: u32,
 }
 
 impl From<&StaticShardMap> for WalTopology {
@@ -29,42 +28,101 @@ impl From<&StaticShardMap> for WalTopology {
     }
 }
 
-/// Called under the root lock, before recovery or run-state writes. Even
-/// metadata-only cores count as old storage: votes must never be forgotten.
+/// Pure policy for binding a WAL root to its routing configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopologyDecision {
+    Create,
+    Match,
+    Mismatch { stored: WalTopology },
+    Missing,
+}
+
+impl TopologyDecision {
+    fn decide(stored: Option<WalTopology>, configured: WalTopology, has_prior_state: bool) -> Self {
+        match stored {
+            Some(stored) if stored == configured => Self::Match,
+            Some(stored) => Self::Mismatch { stored },
+            None if has_prior_state => Self::Missing,
+            None => Self::Create,
+        }
+    }
+}
+
+/// Called under the root lock, before recovery or run-state writes.
 pub(super) fn check_or_create(
     root: &Path,
     map: &StaticShardMap,
-    has_run_state: bool,
-    cores: &[PathBuf],
+    has_prior_state: bool,
 ) -> Result<(), RaftWalError> {
     let configured = WalTopology::from(map);
     let path = root.join(TOPOLOGY_FILE);
-    match state_file::read::<WalTopology>(StateFileKind::Topology, &path)
-        .map_err(RaftWalError::ReadTopology)?
-    {
-        Some(stored) if stored != configured => {
-            return Err(RaftWalError::TopologyMismatch {
-                root: root.to_owned(),
-                stored,
-                configured,
-            });
+    let stored = state_file::read::<WalTopology>(StateFileKind::Topology, &path)
+        .map_err(RaftWalError::ReadTopology)?;
+    match TopologyDecision::decide(stored, configured, has_prior_state) {
+        TopologyDecision::Create => {
+            state_file::write(
+                StateFileKind::Topology,
+                &path,
+                &path.with_extension("tmp"),
+                &configured,
+            )
+            .map_err(RaftWalError::RecordTopology)?;
+            Ok(())
         }
-        Some(_) => return Ok(()),
-        None if has_run_state || !cores.is_empty() => {
-            return Err(RaftWalError::MissingTopology {
-                root: root.to_owned(),
-            });
-        }
-        None => {}
+        TopologyDecision::Match => Ok(()),
+        TopologyDecision::Mismatch { stored } => Err(RaftWalError::TopologyMismatch {
+            root: root.to_owned(),
+            stored_core_count: stored.core_count,
+            stored_group_count: stored.group_count,
+            configured_core_count: configured.core_count,
+            configured_group_count: configured.group_count,
+        }),
+        TopologyDecision::Missing => Err(RaftWalError::MissingTopology {
+            root: root.to_owned(),
+        }),
     }
-    state_file::write(
-        StateFileKind::Topology,
-        &path,
-        &path.with_extension("tmp"),
-        &configured,
-    )
-    .map_err(RaftWalError::RecordTopology)?;
-    Ok(())
+}
+
+#[cfg(test)]
+mod decision_tests {
+    use super::*;
+
+    #[test]
+    fn topology_decisions_cover_new_existing_and_missing_records() {
+        let configured = WalTopology {
+            core_count: 4,
+            group_count: 64,
+        };
+        for has_prior_state in [false, true] {
+            assert_eq!(
+                TopologyDecision::decide(None, configured, has_prior_state),
+                if has_prior_state {
+                    TopologyDecision::Missing
+                } else {
+                    TopologyDecision::Create
+                },
+            );
+            assert_eq!(
+                TopologyDecision::decide(Some(configured), configured, has_prior_state),
+                TopologyDecision::Match,
+            );
+            for stored in [
+                WalTopology {
+                    core_count: 8,
+                    ..configured
+                },
+                WalTopology {
+                    group_count: 128,
+                    ..configured
+                },
+            ] {
+                assert_eq!(
+                    TopologyDecision::decide(Some(stored), configured, has_prior_state),
+                    TopologyDecision::Mismatch { stored },
+                );
+            }
+        }
+    }
 }
 
 #[cfg(all(test, not(madsim)))]
@@ -110,10 +168,11 @@ mod tests {
         ] {
             let error = DurableRaftLogStoreFactory::start(dir.path(), WalFsync::Always, &changed)
                 .unwrap_err();
-            assert!(
-                matches!(error, RaftWalError::TopologyMismatch { stored, configured, .. }
-                if stored == WalTopology::from(&original) && configured == WalTopology::from(&changed))
-            );
+            assert!(matches!(error, RaftWalError::TopologyMismatch {
+                    stored_core_count: 4, stored_group_count: 8,
+                    configured_core_count, configured_group_count, ..
+                } if configured_core_count == changed.core_count()
+                    && configured_group_count == changed.raft_group_count()));
             assert_eq!(
                 std::fs::read(dir.path().join(RUN_STATE_FILE)).unwrap(),
                 run_before

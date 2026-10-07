@@ -95,7 +95,6 @@ pub use sim_disk::SimPowerLoss;
 pub use state_file::StateFileDefect;
 pub use state_file::StateFileError;
 pub use state_file::StateFileKind;
-pub use topology::WalTopology;
 pub(crate) use writer::CoreFileLogWriter;
 pub use writer::CoreJournalError;
 pub(crate) use writer::CoreJournalOptions;

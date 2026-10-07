@@ -37,7 +37,7 @@ diagnosis and `ursulactl wait-ready` for cluster-wide Raft readiness.
 
 `topology.bin` binds a WAL root to `runtime.core_count` and `raft.group_count`.
 For a mismatch, restore the stored counts reported in the error. A missing
-record on an existing WAL or a corrupt record also refuses startup; do not
+record on an existing WAL or a corrupt record also refuses startup. Do not
 replace it with the current configuration. See [WAL routing
 configuration](/docs/operations#wal-routing-configuration) for the upgrade and
 replica-rebuild limitations.

@@ -125,7 +125,7 @@ Keep both values explicit and unchanged when moving a persistent volume or
 resizing its host. Without explicit values, `core_count` follows the process's
 available parallelism and `group_count` defaults to that parallelism times 16
 (resource presets set a fixed group count). Helm defaults to 4 and 64.
-Changing cores changes the journal directory of some groups; changing group
+Changing cores changes the journal directory of some groups. Changing group
 count changes stream routing. Neither is an online resharding operation.
 
 WAL roots written before this check have no topology record and cannot be
@@ -134,7 +134,7 @@ configuration or remove the check's files. Keep a backup and run the previous
 release to export data, or rebuild one replica at a time on a fresh WAL from a
 healthy quorum using the existing cluster routing counts. Follow the rejoin
 procedure below and wait for full catch-up before replacing another replica.
-A single-node deployment needs an export/import migration; a fresh WAL alone
+A single-node deployment needs an export/import migration. A fresh WAL alone
 does not preserve its data.
 
 ### Rejoining a wiped node
