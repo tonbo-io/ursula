@@ -10,6 +10,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::BucketStreamId;
+use ursula_shard::CoreId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::BucketUsageSnapshot;
 use ursula_stream::ColdFlushCandidate;
@@ -20,6 +21,9 @@ use ursula_stream::StreamErrorContext;
 use crate::command::GroupSnapshot;
 use crate::metrics::RaftSnapshotBuildSample;
 use crate::metrics::RuntimeMetricsInner;
+use crate::metrics::WalJournalSample;
+use crate::metrics::WalMemorySample;
+use crate::metrics::WalReadSample;
 use crate::metrics::WalStorageSample;
 use crate::read_index::LinearizableReadBarrier;
 use crate::request::AckColdGcResponse;
@@ -619,6 +623,23 @@ impl GroupEngineMetrics {
     pub fn record_wal_storage(&self, placement: ShardPlacement, sample: WalStorageSample) {
         self.inner
             .record_wal_storage(placement.core_id, placement.raft_group_id, sample);
+    }
+
+    /// Records what a core journal's writer did besides writing batches.
+    pub fn record_wal_journal(&self, core_id: CoreId, sample: WalJournalSample) {
+        self.inner.record_wal_journal(core_id, sample);
+    }
+
+    /// Records what a read of a group's log cost.
+    pub fn record_wal_read(&self, placement: ShardPlacement, sample: WalReadSample) {
+        self.inner
+            .record_wal_read(placement.core_id, placement.raft_group_id, sample);
+    }
+
+    /// Records the size of a group's log in memory.
+    pub fn record_wal_memory(&self, placement: ShardPlacement, sample: WalMemorySample) {
+        self.inner
+            .record_wal_memory(placement.raft_group_id, sample);
     }
 
     pub fn record_wal_recovery(

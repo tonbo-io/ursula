@@ -4,6 +4,7 @@
 //! tests run it on this store. Data groups always run on the per-core
 //! journal; nothing outside `#[cfg(test)]` can reach this module.
 
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io;
 use std::ops::RangeBounds;
@@ -12,6 +13,7 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 
 use openraft::OptionalSend;
+use openraft::RaftTypeConfig;
 use openraft::alias::EntryOf;
 use openraft::alias::LogIdOf;
 use openraft::alias::VoteOf;
@@ -21,11 +23,59 @@ use openraft::storage::LogState;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 
-use super::LogStoreInner;
 use super::ensure_consecutive_entries;
-use super::ensure_log_append_boundary;
-use super::truncate_entries_after;
 use crate::meta::MetaRaftTypeConfig;
+
+/// The meta log as this store holds it: its entries, vote, committed
+/// pointer and purge point.
+#[derive(Debug, Clone, Default)]
+struct LogStoreInner<C>
+where
+    C: RaftTypeConfig,
+    C::Entry: Clone,
+{
+    last_purged_log_id: Option<LogIdOf<C>>,
+    committed: Option<LogIdOf<C>>,
+    entries: BTreeMap<u64, EntryOf<C>>,
+    vote: Option<VoteOf<C>>,
+}
+
+/// Drops every entry after `last_index`, or all entries when it is `None`.
+fn truncate_entries_after<V>(entries: &mut BTreeMap<u64, V>, last_index: Option<u64>) {
+    match last_index {
+        Some(last_index) => entries.retain(|index, _| *index <= last_index),
+        None => entries.clear(),
+    }
+}
+
+fn ensure_log_append_boundary<C>(
+    inner: &LogStoreInner<C>,
+    entries: &[EntryOf<C>],
+) -> Result<(), io::Error>
+where
+    C: RaftTypeConfig,
+    C::Entry: Clone,
+{
+    let Some(first_entry) = entries.first() else {
+        return Ok(());
+    };
+    let Some(last_existing_index) = inner.entries.keys().next_back().copied() else {
+        return Ok(());
+    };
+
+    let first_append_index = first_entry.log_id().index;
+    if last_existing_index
+        .checked_add(1)
+        .is_some_and(|next_index| first_append_index > next_index)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("raft log store has a hole: {last_existing_index} then {first_append_index}"),
+        ));
+    }
+
+    Ok(())
+}
 
 /// The meta Raft's test log store: everything in memory, nothing survives
 /// the process.

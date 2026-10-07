@@ -250,6 +250,14 @@ jobs:
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
             recovery_tests --nocapture
 
+      # Journal segments: rotation, purge and the rewrite of a quiet group's
+      # entries while followers crash within the durability contract, and a
+      # follower that catches up from its leader's journal on disk.
+      - name: Run journal segment scenarios
+        run: |
+          RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
+            rotation_purge_and_rewrite_survive_crashes a_lagging_follower_catches_up --nocapture
+
       # Strict replay: madsim's check_determinism runs a three-node cluster on
       # the per-core journal twice per seed and fails at the first scheduling
       # difference, which the outcome-level replays cannot see.

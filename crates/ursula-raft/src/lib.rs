@@ -102,6 +102,8 @@ pub use log_store::JournalFile;
 pub use log_store::JournalHistory;
 pub use log_store::JournalOp;
 pub use log_store::JournalReplayMode;
+pub use log_store::JournalTuning;
+pub use log_store::LaggingGroups;
 #[cfg(madsim)]
 pub use log_store::LockAttempt;
 pub use log_store::MarkRecoveringError;
@@ -132,6 +134,8 @@ pub use log_store::StateFileDefect;
 pub use log_store::StateFileError;
 pub use log_store::StateFileKind;
 pub use log_store::WalOpening;
+pub use log_store::journal_segment_path;
+pub use log_store::journal_segments;
 pub use maintenance::RaftMaintenanceIssue;
 pub use maintenance::RaftMaintenanceReport;
 pub use maintenance::check_raft_maintenance;

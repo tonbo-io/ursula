@@ -39,9 +39,9 @@ use super::disk::DiskLock;
 use super::disk::JournalDisk;
 use super::disk::LockAttempt;
 use super::disk::create_dir_all_durable;
-use super::journal;
 use super::journal::JournalError;
 use super::journal::JournalReplayMode;
+use super::segment;
 use super::state_file;
 use super::state_file::StateFileError;
 use super::state_file::StateFileKind;
@@ -52,8 +52,11 @@ pub const RUN_STATE_FILE: &str = "run-state.bin";
 const WAL_LOCK_FILE: &str = "wal.lock";
 /// The directory of core `N` under the WAL root is `core-N`.
 const CORE_DIR_PREFIX: &str = "core-";
-/// Each core directory holds its journal under this name.
-pub(crate) const CORE_JOURNAL_FILE: &str = "journal.bin";
+
+/// The journal directory of core `core` under the WAL `root`.
+pub(crate) fn core_dir(root: &Path, core: u16) -> PathBuf {
+    root.join(format!("{CORE_DIR_PREFIX}{core}"))
+}
 
 /// The id the host's kernel gives its current boot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,7 +397,7 @@ impl NodeWal {
         // cores again on the next start.
         if let RecoveryState::Recovering { .. } = opening.recovery {
             for core in &cores {
-                let path = core_metadata_path(&core.join(CORE_JOURNAL_FILE));
+                let path = core_metadata_path(core);
                 mark_core_recovering(&path)
                     .map_err(|source| RaftWalError::MarkRecovering { path, source })?;
             }
@@ -468,10 +471,10 @@ fn core_dirs(root: &Path) -> Result<Vec<PathBuf>, RaftWalError> {
 /// Whether any of the `cores`' journals holds records.
 fn journal_history(cores: &[PathBuf]) -> Result<JournalHistory, RaftWalError> {
     for core in cores {
-        let path = core.join(CORE_JOURNAL_FILE);
-        if journal::holds_records(&path)
-            .map_err(|source| RaftWalError::ReadJournal { path, source })?
-        {
+        if segment::holds_records(core).map_err(|source| RaftWalError::ReadJournal {
+            path: core.clone(),
+            source,
+        })? {
             return Ok(JournalHistory::Records);
         }
     }

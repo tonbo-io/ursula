@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use ursula_config::WalFsync;
 use ursula_raft::DurableRaftLogStoreFactory;
+use ursula_raft::JournalTuning;
 use ursula_raft::RaftGroupFileLogStore;
 use ursula_raft::SimDisk;
 #[cfg(test)]
@@ -42,7 +43,7 @@ const RELEASE_SLEEPS: usize = 1_000;
 #[derive(Clone)]
 pub(crate) struct SimNodeWal {
     root: PathBuf,
-    fsync: WalFsync,
+    tuning: JournalTuning,
     /// The node's current run of the WAL; `None` while the node is down.
     run: Arc<Mutex<Option<DurableRaftLogStoreFactory>>>,
     stores: Arc<Mutex<BTreeMap<RaftGroupId, Weak<RaftGroupFileLogStore>>>>,
@@ -55,12 +56,18 @@ impl SimNodeWal {
         Self::provision_with_fsync(name, WalFsync::Always)
     }
 
-    /// Provisions a new node directory whose WAL runs with `fsync`.
+    /// Provisions a new node directory whose WAL runs with `fsync`, the
+    /// simulator's small segments and small entry caches.
     pub(super) fn provision_with_fsync(name: &str, fsync: WalFsync) -> Self {
+        Self::provision_with_tuning(name, JournalTuning::new(fsync))
+    }
+
+    /// Provisions a new node directory whose WAL runs with `tuning`.
+    pub(super) fn provision_with_tuning(name: &str, tuning: JournalTuning) -> Self {
         let root = SimDisk::provision_dir(name).expect("provision a simulated node directory");
         Self {
             root,
-            fsync,
+            tuning,
             run: Arc::new(Mutex::new(None)),
             stores: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -78,7 +85,7 @@ impl SimNodeWal {
         if let Some(run) = run.as_ref() {
             return Ok(run.clone());
         }
-        let started = DurableRaftLogStoreFactory::start(&self.root, self.fsync)
+        let started = DurableRaftLogStoreFactory::start_with(&self.root, self.tuning)
             .map_err(|err| GroupEngineError::new(format!("start the Raft WAL: {err}")))?;
         *run = Some(started.clone());
         Ok(started)

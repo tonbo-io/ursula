@@ -1,4 +1,4 @@
-//! The metadata file next to each core journal.
+//! The metadata file in each core journal's directory.
 //!
 //! It holds, for every raft group on the core, the group's vote and the state
 //! of the group's log on this replica ([`GroupLogState`]). Neither may be lost
@@ -68,10 +68,13 @@ pub(crate) struct CoreMetadata {
     groups: BTreeMap<u32, GroupMetadata>,
 }
 
-/// The metadata file of the core journal at `journal_path`.
-pub(crate) fn core_metadata_path(journal_path: &Path) -> PathBuf {
-    journal_path.with_extension("meta")
+/// The metadata file of the core journal in the directory `core_dir`.
+pub(crate) fn core_metadata_path(core_dir: &Path) -> PathBuf {
+    core_dir.join(CORE_METADATA_FILE)
 }
+
+/// The metadata file's name in a core journal directory.
+const CORE_METADATA_FILE: &str = "journal.meta";
 
 impl CoreMetadata {
     /// Reads the metadata file at `path`; empty when there is none.
@@ -186,7 +189,7 @@ mod tests {
     #[test]
     fn core_metadata_round_trips_votes_and_log_states() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = core_metadata_path(&dir.path().join("journal.bin"));
+        let path = core_metadata_path(dir.path());
         assert_eq!(path, dir.path().join("journal.meta"));
         assert_eq!(
             CoreMetadata::load(&path).expect("no file yet"),
@@ -245,7 +248,7 @@ mod tests {
     #[test]
     fn a_recovering_node_marks_every_initialized_group_of_a_core() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = core_metadata_path(&dir.path().join("journal.bin"));
+        let path = core_metadata_path(dir.path());
         assert!(!mark_core_recovering(&path).expect("no file: nothing to mark"));
         let mut metadata = CoreMetadata::default();
         metadata.initialize(1, GroupLogState::Initialized);

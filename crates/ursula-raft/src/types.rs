@@ -17,7 +17,7 @@ use ursula_shard::RaftGroupId;
 
 /// Under `fsync = always`, how long the per-core journal writer waits for the
 /// next request before it writes a batch; each arrival restarts the wait
-/// (`log_store/file.rs::collect_batch`).
+/// (`log_store/writer.rs::collect_batch`).
 pub(crate) const CORE_LOG_GROUP_COMMIT_DELAY: Duration = Duration::from_micros(200);
 /// Under `fsync = always`, the longest a batch keeps collecting requests,
 /// counted from its first.
@@ -38,6 +38,18 @@ openraft::declare_raft_types!(
         SnapshotData = Cursor<Vec<u8>>,
         AsyncRuntime = OpenRaftRuntime,
 );
+
+/// The Raft log bytes an entry is counted as: what the snapshot cadence
+/// adds when the entry is applied, and what it weighs in the WAL's entry
+/// cache.
+pub(crate) fn entry_log_bytes(entry: &openraft::alias::EntryOf<UrsulaRaftTypeConfig>) -> u64 {
+    match &entry.payload {
+        openraft::EntryPayload::Normal(command) => command.log_bytes_estimate(),
+        openraft::EntryPayload::Blank | openraft::EntryPayload::Membership(_) => {
+            ursula_stream::COMMAND_LOG_OVERHEAD_BYTES
+        }
+    }
+}
 
 pub type UrsulaAppendEntriesRequest = AppendEntriesRequest<UrsulaRaftTypeConfig>;
 pub type UrsulaAppendEntriesResponse = AppendEntriesResponse<UrsulaRaftTypeConfig>;

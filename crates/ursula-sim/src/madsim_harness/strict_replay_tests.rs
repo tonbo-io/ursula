@@ -15,6 +15,7 @@ use madsim::runtime::Handle;
 use madsim::runtime::Runtime;
 use ursula_raft::MadsimOpenRaftRuntime;
 
+use super::disk_tests::segment_crash_rounds;
 use super::seeds_from_env;
 use super::sim_test_guard;
 use crate::madsim_harness::ThreeNodeRaftSimConfig;
@@ -75,4 +76,27 @@ fn strict_replay_leader_failover_on_the_journal() {
         let config = strict_replay_config();
         MadsimOpenRaftRuntime::scope(config.seed, run_leader_failover_inner(config)).await
     });
+}
+
+/// Journals that rotate, purge and rewrite segments and read evicted entries
+/// from disk, while followers crash, schedule the same in both runs of a
+/// seed (`segment_crash_rounds`, under both fsync policies).
+#[test]
+fn strict_replay_segment_rotation_purge_and_disk_reads() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("STRICT_REPLAY_SEEDS", &STRICT_REPLAY_SEEDS[..4]) {
+        let work = Runtime::check_determinism(seed, madsim::Config::default(), || async {
+            let seed = Handle::current().seed();
+            let fsync = if seed % 2 == 0 {
+                ursula_config::WalFsync::Always
+            } else {
+                ursula_config::WalFsync::Never
+            };
+            MadsimOpenRaftRuntime::scope(seed, segment_crash_rounds(seed, fsync)).await
+        });
+        assert!(
+            work.rotations > 0 && work.reclaims > 0,
+            "seed {seed}: {work:?}"
+        );
+    }
 }
