@@ -1,0 +1,53 @@
+# futures-macro 0.3.32 as published on crates.io (normalized manifest), with
+# one change: under `cfg(madsim)`, `select!` and `stream_select!` shuffle
+# their branches by madsim's simulated clock instead of futures-util's
+# process-seeded RNG (src/shuffle.rs). Built without `cfg(madsim)`, it is the
+# published crate. The workspace `[patch.crates-io]` puts it in place of the
+# published one; keep its version equal to the futures-util in Cargo.lock.
+
+[package]
+edition = "2018"
+rust-version = "1.71"
+name = "futures-macro"
+version = "0.3.32"
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = """
+The futures-rs procedural macro implementations.
+"""
+homepage = "https://rust-lang.github.io/futures-rs"
+readme = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-lang/futures-rs"
+
+[features]
+
+[lib]
+name = "futures_macro"
+path = "src/lib.rs"
+proc-macro = true
+
+[dependencies.proc-macro2]
+version = "1.0.60"
+
+[dependencies.quote]
+version = "1.0"
+
+[dependencies.syn]
+version = "2.0.52"
+features = ["full"]
+
+[lints.rust]
+missing_debug_implementations = "warn"
+rust_2018_idioms = "warn"
+single_use_lifetimes = "warn"
+unreachable_pub = "warn"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = ["cfg(futures_sanitizer)"]

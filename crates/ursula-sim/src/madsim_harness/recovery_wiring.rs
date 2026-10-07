@@ -41,11 +41,17 @@ pub(super) fn configured_voters(
 
 /// A fresh outbound ReadIndex barrier from `leader_id`, confirmed the way the
 /// barrier RPC confirms one: a new ReadIndex round with a quorum, applied by
-/// the leader, while it still leads.
+/// the leader, while it still leads. `policy` cuts the RPC off as it cuts
+/// off the Raft RPCs between `node_id` and the leader.
 pub(super) async fn in_process_barrier(
     registry: &InProcessRaftRegistry,
+    policy: &InProcessRaftNetworkPolicy,
+    node_id: u64,
     leader_id: u64,
 ) -> Result<(UrsulaVote, u64), String> {
+    if policy.partitioned(node_id, leader_id) {
+        return Err("partitioned from the leader".to_owned());
+    }
     let leader = registry.get(leader_id).ok_or("leader is absent")?;
     let linearizer = leader
         .get_read_linearizer(openraft::ReadPolicy::ReadIndex)
@@ -65,12 +71,16 @@ pub(super) async fn in_process_barrier(
 }
 
 /// The bootstrap probe vote of `node_id` to `peer_id`, screened by the
-/// peer's gate as the network would.
+/// peer's gate and cut off by `policy` as the network would.
 pub(super) async fn in_process_probe(
     registry: &InProcessRaftRegistry,
+    policy: &InProcessRaftNetworkPolicy,
     node_id: u64,
     peer_id: u64,
 ) -> Option<PeerGroupLog> {
+    if policy.partitioned(node_id, peer_id) {
+        return None;
+    }
     let target = registry.get(peer_id)?;
     let request = ursula_raft::bootstrap_probe_vote(node_id);
     if let Some(refusal) = registry
@@ -96,6 +106,7 @@ pub(super) fn wire_recovery(
     engine: &RaftGroupEngine,
     rejoin: &Arc<GroupRejoin>,
     registry: &InProcessRaftRegistry,
+    policy: &InProcessRaftNetworkPolicy,
     voters: &BTreeMap<u64, BasicNode>,
 ) -> Vec<madsim::task::JoinHandle<()>> {
     rejoin.bind(&engine.raft_handle());
@@ -105,6 +116,7 @@ pub(super) fn wire_recovery(
     participation.register_rejoin(placement.raft_group_id, rejoin.clone());
     participation.register(placement, engine.raft_handle());
     let probe_registry = registry.clone();
+    let probe_policy = policy.clone();
     vec![
         madsim::task::spawn(ursula_raft::run_rejoin_vote_barrier(
             engine.raft_handle(),
@@ -113,7 +125,8 @@ pub(super) fn wire_recovery(
             voters.clone(),
             move |leader_id, _address| {
                 let registry = probe_registry.clone();
-                async move { in_process_barrier(&registry, leader_id).await }
+                let policy = probe_policy.clone();
+                async move { in_process_barrier(&registry, &policy, node_id, leader_id).await }
             },
             Duration::from_secs(1),
             RECOVERY_DRIVER_INTERVAL,

@@ -12,6 +12,7 @@ Subcommand list (verb-first, flat namespace):
     modularity          DoD #3 — ratcheting line budget on madsim_harness/mod.rs
     seed-inventory      DoD #7 + family discipline + per-track seed budget
     failure-guards      every failure-smoke entry has fresh PR CI coverage
+    sim-patches         vendored madsim patches match the crate graph
     all                 run every audit
 
   Reports (write target/ artifacts; CI uploads them):

@@ -21,6 +21,7 @@ RUN rustup toolchain install
 # dependency downloads.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
+COPY third_party/ ./third_party/
 
 # Build with buildx cache mounts for cargo registry, git deps, and build
 # artifacts. sharing=locked prevents concurrent writes during parallel builds.

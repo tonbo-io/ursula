@@ -16,6 +16,7 @@ members = [
     "crates/ursula-index",
     "crates/ursula-state-probe",
 ]
+exclude = ["third_party"]
 resolver = "3"
 
 [workspace.package]
@@ -105,6 +106,14 @@ ursula-stream = { path = "crates/ursula-stream", version = "=0.6.2" }
 ursula-observability = { path = "crates/ursula-observability", version = "=0.6.2" }
 yaml_serde = "0.10"
 zstd = "0.13"
+
+# Deterministic simulation: futures-util shuffles `select!` branches with an
+# RNG seeded from a process-wide counter, so OpenRaft's replication and
+# heartbeat loops would schedule differently in two runs of one madsim seed.
+# The vendored copy shuffles by madsim's simulated clock under `cfg(madsim)`
+# and is the published crate otherwise.
+[patch.crates-io]
+futures-macro = { path = "third_party/futures-macro" }
 
 [workspace.lints.rust]
 unknown_lints = "deny"

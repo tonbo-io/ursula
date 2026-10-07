@@ -723,6 +723,48 @@ def audit_failure_guards(argv: list[str]) -> int:
 # meta: run every audit
 # =============================================================================
 
+# Crates vendored under `third_party/` because their published versions break
+# madsim replay. A `[patch.crates-io]` entry whose version no longer matches
+# the crate graph is dropped by cargo with only a warning, so check the lock.
+SIM_PATCHES: dict[str, str] = {
+    # `select!` branch shuffle, keyed to futures-util's version.
+    "futures-macro": "futures-util",
+}
+
+
+def _lock_packages() -> list[dict[str, str]]:
+    packages: list[dict[str, str]] = []
+    for block in (ROOT / "Cargo.lock").read_text().split("[[package]]")[1:]:
+        fields = dict(re.findall(r'^(name|version|source) = "([^"]*)"$', block, re.MULTILINE))
+        packages.append(fields)
+    return packages
+
+
+def audit_sim_patches(argv: list[str]) -> int:
+    """Vendored simulation patches are the versions cargo actually builds."""
+    argparse.ArgumentParser(prog="dst sim-patches").parse_args(argv)
+    packages = _lock_packages()
+    problems: list[str] = []
+    for patched, keyed_to in SIM_PATCHES.items():
+        entries = [p for p in packages if p.get("name") == patched]
+        if len(entries) != 1 or "source" in entries[0]:
+            sources = [p.get("source", "path") for p in entries]
+            problems.append(f"{patched}: expected one path package in Cargo.lock, found {sources}")
+            continue
+        anchors = {p["version"] for p in packages if p.get("name") == keyed_to}
+        if anchors != {entries[0]["version"]}:
+            problems.append(
+                f"{patched} {entries[0]['version']} does not match {keyed_to} {sorted(anchors)}; "
+                f"update third_party/{patched} to the new release"
+            )
+    for problem in problems:
+        print(f"FAIL: {problem}", file=sys.stderr)
+    if problems:
+        return 1
+    print(f"OK: {len(SIM_PATCHES)} simulation patch(es) applied.")
+    return 0
+
+
 AUDITS: dict[str, callable] = {
     "nondeterminism": audit_nondeterminism,
     "pipeline-smoke": audit_pipeline_smoke,
@@ -731,6 +773,7 @@ AUDITS: dict[str, callable] = {
     "modularity": audit_modularity,
     "seed-inventory": audit_seed_inventory,
     "failure-guards": audit_failure_guards,
+    "sim-patches": audit_sim_patches,
 }
 
 
