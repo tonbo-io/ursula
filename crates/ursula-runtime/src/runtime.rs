@@ -2245,9 +2245,12 @@ fn spawn_core_worker(
             let mut tasks = FuturesUnordered::new();
             loop {
                 tokio::select! {
+                    biased;
                     _ = service_shutdown.changed() => break,
-                    Some(task) = tasks_rx.recv() => tasks.push(OwnerService(crate::rt::spawn(task))),
+                    // Reap completed services before admitting more work so a
+                    // continuously ready inbox cannot retain finished handles.
                     Some(()) = tasks.next(), if !tasks.is_empty() => {},
+                    Some(task) = tasks_rx.recv() => tasks.push(OwnerService(crate::rt::spawn(task))),
                     else => break,
                 }
             }
@@ -2261,9 +2264,10 @@ fn spawn_core_worker(
             std::future::pending::<()>().await;
         };
         tokio::select! {
+            biased;
+            _ = shutdown.changed() => {}
             _ = worker.run() => {}
             _ = services => {}
-            _ = shutdown.changed() => {}
         }
     };
     match config.threading {
