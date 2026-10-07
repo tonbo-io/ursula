@@ -420,6 +420,7 @@ fn registered_durable_factory(
     let raft_wal = ursula_raft::DurableRaftLogStoreFactory::start(
         wal_root.path(),
         ursula_config::WalFsync::Never,
+        &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
     )
     .expect("start the Raft WAL");
     (
@@ -509,6 +510,7 @@ async fn spawn_static_grpc_test_node(
             ursula_raft::DurableRaftLogStoreFactory::start(
                 raft_log_dir,
                 ursula_config::WalFsync::Always,
+                &ursula_shard::StaticShardMap::new(1, raft_group_count).expect("valid topology"),
             )
             .expect("start the Raft WAL"),
             None,
@@ -519,6 +521,8 @@ async fn spawn_static_grpc_test_node(
                 ursula_raft::DurableRaftLogStoreFactory::start(
                     wal_root.path(),
                     ursula_config::WalFsync::Never,
+                    &ursula_shard::StaticShardMap::new(1, raft_group_count)
+                        .expect("valid topology"),
                 )
                 .expect("start the Raft WAL"),
                 Some(wal_root),
@@ -5039,6 +5043,7 @@ async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
     let store = ursula_raft::DurableRaftLogStoreFactory::start(
         wal_root.path(),
         ursula_config::WalFsync::Never,
+        &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
     )
     .expect("start the Raft WAL")
     .open(
@@ -5093,6 +5098,7 @@ async fn accept_unsynced_loss_opens_a_gated_replica_and_is_incarnation_bound() {
     let store = ursula_raft::DurableRaftLogStoreFactory::start(
         wal_root.path(),
         ursula_config::WalFsync::Never,
+        &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
     )
     .expect("start the Raft WAL")
     .open(
@@ -8084,4 +8090,34 @@ fn core_journal_record_bytes(core_dir: &std::path::Path) -> u64 {
                 .saturating_sub(32)
         })
         .sum()
+}
+
+#[tokio::test]
+async fn runtime_refuses_persisted_wal_topology_changes() {
+    let dir = tempfile::tempdir().expect("WAL root");
+    let original = ursula_shard::StaticShardMap::new(4, 8).unwrap();
+    let wal = ursula_raft::DurableRaftLogStoreFactory::start(
+        dir.path(),
+        ursula_config::WalFsync::Always,
+        &original,
+    )
+    .unwrap();
+    wal.shutdown().await.unwrap();
+    drop(wal);
+    for (cores, groups) in [(8, 8), (4, 16)] {
+        let error = spawn_runtime(
+            &test_config(cores, groups),
+            Persistence::Raft {
+                log_dir: dir.path().to_owned(),
+            },
+            Topology::SingleNode {
+                raft_group_count: groups,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::SpawnRuntimeError::RaftWal(ursula_raft::RaftWalError::TopologyMismatch { .. })
+        ));
+    }
 }

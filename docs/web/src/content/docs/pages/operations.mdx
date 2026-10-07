@@ -114,6 +114,29 @@ Restart one voter at a time:
 
 Do not stop another voter before `wait` returns. Two overlapping outages of a three-voter group leave it without a quorum even if the restarts were issued separately. The chart's graceful-rollout hook runs the same sequence for every pod.
 
+### WAL routing configuration
+
+A WAL root is bound to `runtime.core_count` and `raft.group_count` in
+`<raft.wal.path>/raft-log/topology.bin`. Startup holds the WAL lock and checks both values before
+recovering any group or writing the run state. A mismatch, missing record on
+an existing WAL, or corrupt record refuses startup.
+
+Keep both values explicit and unchanged when moving a persistent volume or
+resizing its host. Without explicit values, `core_count` follows the process's
+available parallelism and `group_count` defaults to that parallelism times 16
+(resource presets set a fixed group count). Helm defaults to 4 and 64.
+Changing cores changes the journal directory of some groups; changing group
+count changes stream routing. Neither is an online resharding operation.
+
+WAL roots written before this check have no topology record and cannot be
+upgraded in place by this release. Do not manufacture a record from the new
+configuration or remove the check's files. Keep a backup and run the previous
+release to export data, or rebuild one replica at a time on a fresh WAL from a
+healthy quorum using the existing cluster routing counts. Follow the rejoin
+procedure below and wait for full catch-up before replacing another replica.
+A single-node deployment needs an export/import migration; a fresh WAL alone
+does not preserve its data.
+
 ### Rejoining a wiped node
 
 A voter whose WAL directory was wiped or replaced, for example after a lost disk, starts with an empty log for every group. For each group:

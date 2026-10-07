@@ -167,13 +167,17 @@ async fn new_recovery_engine(
     tempfile::TempDir,
 ) {
     let wal_root = tempfile::tempdir().expect("WAL root");
-    let store = DurableRaftLogStoreFactory::start(wal_root.path(), WalFsync::Never)
-        .expect("start the WAL")
-        .open(
-            placement(),
-            ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
-        )
-        .expect("open the log store");
+    let store = DurableRaftLogStoreFactory::start(
+        wal_root.path(),
+        WalFsync::Never,
+        &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+    )
+    .expect("start the WAL")
+    .open(
+        placement(),
+        ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+    )
+    .expect("open the log store");
     let gate = Arc::new(GroupRejoin::durable(id, placement().raft_group_id, &store));
     let engine = RaftGroupEngine::new_node_with_log_store_and_network(
         placement(),

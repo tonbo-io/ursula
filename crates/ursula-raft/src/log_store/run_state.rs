@@ -269,6 +269,18 @@ pub(crate) fn core_replay_mode(verified_epoch: u64, recovery_epoch: u64) -> Jour
 /// Failure to start or shut down a node's Raft WAL.
 #[derive(Debug, thiserror::Error)]
 pub enum RaftWalError {
+    #[error("WAL topology mismatch at '{}': stored {stored:?}, configured {configured:?}; restore the original core_count and group_count", .root.display())]
+    TopologyMismatch {
+        root: PathBuf,
+        stored: super::WalTopology,
+        configured: super::WalTopology,
+    },
+    #[error("WAL topology is missing at '{}' but prior WAL state exists; refusing to infer core_count and group_count from the current configuration", .root.display())]
+    MissingTopology { root: PathBuf },
+    #[error("read the Raft WAL topology: {0}")]
+    ReadTopology(#[source] StateFileError),
+    #[error("record the Raft WAL topology: {0}")]
+    RecordTopology(#[source] JournalError),
     #[error("create the Raft WAL directory '{}': {source}", .path.display())]
     CreateDir {
         path: PathBuf,
@@ -367,7 +379,11 @@ impl NodeWal {
     /// Starts a run on the WAL under `root`: takes its lock, reads the run
     /// state the previous run left, decides how to open the journals, and
     /// durably records this run before any journal write.
-    pub(crate) fn start(root: PathBuf, fsync: WalFsync) -> Result<Self, RaftWalError> {
+    pub(crate) fn start(
+        root: PathBuf,
+        fsync: WalFsync,
+        topology: &ursula_shard::StaticShardMap,
+    ) -> Result<Self, RaftWalError> {
         create_dir_all_durable(&root).map_err(|source| RaftWalError::CreateDir {
             path: root.clone(),
             source,
@@ -389,6 +405,7 @@ impl NodeWal {
         let previous = state_file::read::<RunState>(StateFileKind::RunState, &path)
             .map_err(RaftWalError::ReadRunState)?;
         let cores = core_dirs(&root)?;
+        super::topology::check_or_create(&root, topology, previous.is_some(), &cores)?;
         let journals = journal_history(&cores)?;
         let boot_id = Disk::boot_id(&root).map(BootId);
         let opening = WalOpening::decide(previous.as_ref(), journals, boot_id.as_ref());

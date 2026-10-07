@@ -191,11 +191,15 @@ async fn run_async(args: &WalArgs, name: &str, sink: &mut Sink) -> Result<Outcom
     let metrics = RuntimeMetrics::new(1, usize::try_from(groups_n).unwrap_or(usize::MAX));
     let baseline = alloc::heap().bytes;
     let mut groups = {
-        let factory = DurableRaftLogStoreFactory::start_with(root.path(), JournalTuning {
-            fsync: WalFsync::Never,
-            segment_bytes: args.segment_kib.saturating_mul(1024),
-            group_cache_bytes: args.cache_kib.saturating_mul(1024),
-        })
+        let factory = DurableRaftLogStoreFactory::start_with(
+            root.path(),
+            JournalTuning {
+                fsync: WalFsync::Never,
+                segment_bytes: args.segment_kib.saturating_mul(1024),
+                group_cache_bytes: args.cache_kib.saturating_mul(1024),
+            },
+            &ursula_shard::StaticShardMap::new(1, usize::try_from(groups_n)?)?,
+        )
         .context("start the WAL")?;
         (0..groups_n)
             .map(|id| {

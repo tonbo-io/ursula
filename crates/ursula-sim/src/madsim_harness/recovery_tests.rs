@@ -336,7 +336,8 @@ fn a_follower_that_lost_its_disk_is_rebuilt_while_writes_continue() {
                 SimNodeWal::provision_with_fsync(
                     &format!("gate-lost-disk-replacement-{victim}"),
                     WalFsync::Never,
-                ),
+                )
+                .with_group_count(JOURNAL_GROUPS.len()),
             );
             cluster.start_node(victim).await;
             assert_eq!(

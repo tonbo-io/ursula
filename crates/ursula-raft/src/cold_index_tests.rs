@@ -85,14 +85,17 @@ async fn cold_engine(cold_store: Arc<ColdStore>) -> (RaftGroupEngine, tempfile::
         .validate()
         .expect("valid config"),
     );
-    let log_store =
-        DurableRaftLogStoreFactory::start(wal_root.path(), ursula_config::WalFsync::Never)
-            .expect("start the WAL")
-            .open(
-                placement(),
-                ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
-            )
-            .expect("open the log store");
+    let log_store = DurableRaftLogStoreFactory::start(
+        wal_root.path(),
+        ursula_config::WalFsync::Never,
+        &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+    )
+    .expect("start the WAL")
+    .open(
+        placement(),
+        ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+    )
+    .expect("open the log store");
     let engine = RaftGroupEngine::new_single_node_with_log_store_and_metrics(
         placement(),
         1,

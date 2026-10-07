@@ -61,12 +61,16 @@ enum GroupStorage {
 impl GroupStorage {
     /// Starts the Raft WAL when `persistence` runs Raft: reads the previous
     /// run's state and records this run before any group opens a journal.
-    fn start(persistence: Persistence, tuning: JournalTuning) -> Result<Self, SpawnRuntimeError> {
+    fn start(
+        persistence: Persistence,
+        tuning: JournalTuning,
+        topology: &ursula_shard::StaticShardMap,
+    ) -> Result<Self, SpawnRuntimeError> {
         Ok(match persistence {
             Persistence::InMemory => Self::InMemory,
-            Persistence::Raft { log_dir } => {
-                Self::Raft(DurableRaftLogStoreFactory::start_with(log_dir, tuning)?)
-            }
+            Persistence::Raft { log_dir } => Self::Raft(DurableRaftLogStoreFactory::start_with(
+                log_dir, tuning, topology,
+            )?),
         })
     }
 
@@ -159,11 +163,20 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
     };
 
     let wal = &config.raft.wal;
-    let storage = GroupStorage::start(persistence, JournalTuning {
-        fsync: wal.fsync,
-        segment_bytes: wal.segment_size.as_bytes(),
-        group_cache_bytes: wal.group_cache_bytes(topology.raft_group_count()),
-    })?;
+    let shard_map = ursula_shard::StaticShardMap::new(
+        runtime_config.core_count,
+        runtime_config.raft_group_count,
+    )
+    .map_err(RuntimeError::from)?;
+    let storage = GroupStorage::start(
+        persistence,
+        JournalTuning {
+            fsync: wal.fsync,
+            segment_bytes: wal.segment_size.as_bytes(),
+            group_cache_bytes: wal.group_cache_bytes(topology.raft_group_count()),
+        },
+        &shard_map,
+    )?;
     let spawned = spawn_runtime_core(
         runtime_config,
         cold_store,

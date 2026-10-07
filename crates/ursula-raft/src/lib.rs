@@ -134,6 +134,7 @@ pub use log_store::StateFileDefect;
 pub use log_store::StateFileError;
 pub use log_store::StateFileKind;
 pub use log_store::WalOpening;
+pub use log_store::WalTopology;
 pub use log_store::journal_segment_path;
 pub use log_store::journal_segments;
 pub use maintenance::RaftMaintenanceIssue;

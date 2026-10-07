@@ -496,6 +496,38 @@ async fn cli_static_grpc_raft_log_dir_recovers_with_bootstrap_enabled_after_rest
         "core journal should contain records"
     );
 
+    // Configuration changes must exit before opening listeners or touching
+    // the old run state. Restoring the original counts below must still read
+    // the acknowledged payload.
+    let wal_root = log_dir.join("raft-log");
+    let before = std::fs::read(wal_root.join("run-state.bin")).unwrap();
+    for key in ["core_count", "group_count"] {
+        write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, true, &log_dir);
+        set_wal_fsync(&config_path, "always");
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        std::fs::write(
+            &config_path,
+            config.replace(&format!("{key} = 1"), &format!("{key} = 2")),
+        )
+        .unwrap();
+        let mut child = spawn_node_with_cluster_config(binary, &config_path);
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(status) = child.child.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("changed WAL topology must refuse startup");
+        assert!(!status.success(), "changed topology must not start");
+        assert_eq!(
+            std::fs::read(wal_root.join("run-state.bin")).unwrap(),
+            before
+        );
+    }
+
     write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, true, &log_dir);
     set_wal_fsync(&config_path, "always");
     {

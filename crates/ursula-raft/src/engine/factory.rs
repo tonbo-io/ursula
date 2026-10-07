@@ -230,17 +230,24 @@ pub struct DurableRaftLogStoreFactory {
 impl DurableRaftLogStoreFactory {
     /// Starts a run of the Raft WAL under `root` with the `fsync` policy and
     /// the default segment size and entry cache.
-    pub fn start(root: impl Into<PathBuf>, fsync: WalFsync) -> Result<Self, RaftWalError> {
-        Self::start_with(root, JournalTuning::new(fsync))
+    pub fn start(
+        root: impl Into<PathBuf>,
+        fsync: WalFsync,
+        topology: &ursula_shard::StaticShardMap,
+    ) -> Result<Self, RaftWalError> {
+        Self::start_with(root, JournalTuning::new(fsync), topology)
     }
 
     /// Starts a run of the Raft WAL under `root` with `tuning`.
+    /// The persisted topology must match before any journal can open.
+    /// Existing roots without a topology record are refused.
     pub fn start_with(
         root: impl Into<PathBuf>,
         tuning: JournalTuning,
+        topology: &ursula_shard::StaticShardMap,
     ) -> Result<Self, RaftWalError> {
         Ok(Self {
-            node: Arc::new(NodeWal::start(root.into(), tuning.fsync)?),
+            node: Arc::new(NodeWal::start(root.into(), tuning.fsync, topology)?),
             tuning,
             lagging: Arc::new(LaggingGroups::default()),
             core_writers: Arc::new(Mutex::new(CoreWriterSlots::Running(BTreeMap::new()))),
@@ -790,6 +797,7 @@ mod tests {
             DurableRaftLogStoreFactory::start(
                 wal_root.path().join(format!("node-{node_id}")),
                 WalFsync::Never,
+                &ursula_shard::StaticShardMap::new(1, 2).expect("valid topology"),
             )
             .expect("start the WAL"),
         )
@@ -811,7 +819,12 @@ mod tests {
     #[test]
     fn cores_open_their_journals_independently() {
         let root = unique_test_dir("parallel-core-open");
-        let factory = DurableRaftLogStoreFactory::start(&root, WalFsync::Always).expect("start");
+        let factory = DurableRaftLogStoreFactory::start(
+            &root,
+            WalFsync::Always,
+            &ursula_shard::StaticShardMap::new(2, 2).expect("valid topology"),
+        )
+        .expect("start");
         let metrics = ursula_runtime::RuntimeMetrics::new(2, 2).group_engine_metrics();
         let placement = |core: u16, group: u32| ShardPlacement {
             core_id: CoreId(core),
