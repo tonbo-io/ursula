@@ -10,6 +10,9 @@ use crate::validate::ValidationError;
 pub enum ConfigError {
     #[error("config file not found: {0}")]
     NotFound(String),
+    /// The file sets keys that a release removed.
+    #[error("{}", removed_keys_message(.0))]
+    RemovedKeys(Vec<RemovedKey>),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("TOML parse error: {0}")]
@@ -18,6 +21,83 @@ pub enum ConfigError {
     Validation(#[from] ValidationError),
     #[error("{0}")]
     Other(String),
+}
+
+/// A configuration key that a release removed. A file that still sets one
+/// fails to load with [`ConfigError::RemovedKeys`], which names the release
+/// and the replacement, instead of serde's unknown-field error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemovedKey {
+    /// Dotted path of the key, such as `raft.wal.backend`.
+    pub key: &'static str,
+    /// The Ursula release that removed it.
+    pub release: &'static str,
+    /// What replaces it.
+    pub replacement: &'static str,
+}
+
+/// Every key a release removed, checked before the file is decoded.
+pub const REMOVED_KEYS: &[RemovedKey] = &[
+    RemovedKey {
+        key: "raft.wal.backend",
+        release: "0.7",
+        replacement: "the Raft WAL is always the disk journal under raft.wal.path",
+    },
+    RemovedKey {
+        key: "raft.wal.allow_volatile_multi_peer",
+        release: "0.7",
+        replacement: "the memory WAL is gone, so no cluster runs a volatile Raft log",
+    },
+    RemovedKey {
+        key: "raft.memory_bootstrap_marker_dir",
+        release: "0.7",
+        replacement: "the memory WAL is gone, and the disk WAL keeps its own run state",
+    },
+    RemovedKey {
+        key: "raft.rejoin_probe",
+        release: "0.7",
+        replacement: "a node with an empty WAL initializes a group only after every voter \
+                      reports it empty, and logs its wait every raft.bootstrap_peer_probe",
+    },
+];
+
+fn removed_keys_message(keys: &[RemovedKey]) -> String {
+    let (subject, delete) = if keys.len() == 1 {
+        ("a removed key", "Delete it")
+    } else {
+        ("removed keys", "Delete them")
+    };
+    let details = keys
+        .iter()
+        .map(|removed| {
+            format!(
+                "`{}` was removed in Ursula {}: {}.",
+                removed.key, removed.release, removed.replacement
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("config sets {subject}. {details} {delete} from the config file.")
+}
+
+/// The removed keys `table` sets.
+fn removed_keys_in(table: &toml::Table) -> Vec<RemovedKey> {
+    REMOVED_KEYS
+        .iter()
+        .filter(|removed| {
+            let mut current = table;
+            let mut parts = removed.key.split('.').peekable();
+            while let Some(part) = parts.next() {
+                match (current.get(part), parts.peek()) {
+                    (Some(_), None) => return true,
+                    (Some(toml::Value::Table(next)), Some(_)) => current = next,
+                    _ => return false,
+                }
+            }
+            false
+        })
+        .copied()
+        .collect()
 }
 
 /// Search for a default config file when `--config` is not given.
@@ -65,7 +145,12 @@ pub fn load_config(
                 )));
             }
             let raw = std::fs::read_to_string(path)?;
-            raw.parse::<toml::Table>()?
+            let table = raw.parse::<toml::Table>()?;
+            let removed = removed_keys_in(&table);
+            if !removed.is_empty() {
+                return Err(ConfigError::RemovedKeys(removed));
+            }
+            table
         }
         None => toml::Table::new(),
     };
