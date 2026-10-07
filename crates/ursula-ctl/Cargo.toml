@@ -32,7 +32,6 @@ tracing = { workspace = true }
 url = { workspace = true, features = ["serde"] }
 ursula-observability = { workspace = true }
 ursula-proto = { workspace = true }
-ursula-shard = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
