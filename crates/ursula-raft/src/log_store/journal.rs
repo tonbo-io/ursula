@@ -42,7 +42,7 @@ use super::disk::JournalFile;
 const JOURNAL_MAGIC: [u8; 8] = *b"URSJWAL\0";
 /// The journal header version is the format epoch (`ursula_stream::FORMAT_EPOCH`).
 /// Earlier epochs check their own version exactly, so each refuses the other.
-const JOURNAL_VERSION: u16 = ursula_stream::FORMAT_EPOCH as u16;
+pub(crate) const JOURNAL_VERSION: u16 = ursula_stream::FORMAT_EPOCH as u16;
 const _: () = assert!(ursula_stream::FORMAT_EPOCH <= u16::MAX as u32);
 const JOURNAL_HEADER_LEN: usize = 32;
 const JOURNAL_HEADER_LEN_U16: u16 = 32;
@@ -67,7 +67,8 @@ const MAX_FRAME_PAYLOAD_BYTES_U64: u64 = MAX_FRAME_PAYLOAD_BYTES as u64;
 pub(crate) const WRITE_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// How replay treats a frame that fails verification.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum JournalReplayMode {
     /// Every write is expected on disk: only an incomplete final frame (a
     /// write a crash cut short) is tolerated and truncated. Any other frame

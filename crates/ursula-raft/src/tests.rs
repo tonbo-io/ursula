@@ -31,6 +31,7 @@ use openraft::testing::log::StoreBuilder;
 use openraft::testing::log::Suite;
 use openraft::type_config::TypeConfigExt;
 use openraft::vote::RaftLeaderId;
+use ursula_config::WalFsync;
 use ursula_control::ControlCommand;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::BootstrapStreamRequest;
@@ -104,10 +105,16 @@ impl
 /// Opens `placement()`'s store on a fresh per-core journal under `root`; the
 /// store owns the core writer, so dropping it closes the journal.
 fn open_core_journal_store(root: &Path) -> Result<Arc<RaftGroupFileLogStore>, GroupEngineError> {
-    DurableRaftLogStoreFactory::new(root).open(
-        placement(),
-        ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
-    )
+    DurableRaftLogStoreFactory::start(root, WalFsync::Always)
+        .map_err(|err| GroupEngineError::new(err.to_string()))?
+        .open(
+            placement(),
+            ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+        )
+}
+
+fn start_wal(root: &Path) -> DurableRaftLogStoreFactory {
+    DurableRaftLogStoreFactory::start(root, WalFsync::Always).expect("start the Raft WAL")
 }
 
 fn core_journal_path(root: &Path) -> PathBuf {
@@ -759,7 +766,8 @@ async fn raft_file_log_store_recovers_vote_committed_and_entries() {
     }
     assert_eq!(
         wire_frame_count::<CoreJournalRecord>(&core_journal_path(root.path())),
-        3
+        2,
+        "the entries and the committed marker; the vote is in the metadata file"
     );
 
     let mut reopened = open_core_journal_store(root.path()).expect("reopen file log store");
@@ -801,7 +809,8 @@ async fn raft_file_log_store_skips_duplicate_vote_and_committed_records() {
     }
     assert_eq!(
         wire_frame_count::<CoreJournalRecord>(&core_journal_path(root.path())),
-        2
+        1,
+        "one committed marker; the vote is in the metadata file"
     );
 
     let mut reopened = open_core_journal_store(root.path()).expect("reopen file log store");
@@ -2316,9 +2325,11 @@ async fn durable_raft_group_engine_records_file_log_metrics() {
     remove_test_path(&root);
 
     let config = hosted_config(1, 1);
-    let runtime =
-        ShardRuntime::spawn_with_engine_factory(config, DurableRaftGroupEngineFactory::new(&root))
-            .expect("spawn runtime with durable raft group engine factory");
+    let runtime = ShardRuntime::spawn_with_engine_factory(
+        config,
+        DurableRaftGroupEngineFactory::new(start_wal(&root)),
+    )
+    .expect("spawn runtime with durable raft group engine factory");
     let placement = placement();
     let stream_id = bsid("runtime-raft-file-metrics");
 
@@ -2350,8 +2361,10 @@ async fn durable_raft_group_engine_records_file_log_metrics() {
     assert!(metrics.wal_write_ns > 0);
     assert!(metrics.wal_sync_ns > 0);
     assert!(metrics.wal_fsyncs > 0);
-    assert!(metrics.wal_fsyncs <= metrics.wal_batches);
-    assert!(metrics.wal_fsync_records >= metrics.wal_fsyncs);
+    // Votes and the `initialized` flag replace the metadata file, which
+    // `fsync`s the file and its directory, so a batch may cost two.
+    assert!(metrics.wal_fsyncs <= metrics.wal_batches.saturating_mul(3));
+    assert!(metrics.wal_fsync_records > 0);
     assert!(metrics.wal_physical_bytes > 0);
 
     drop(runtime);
@@ -2366,9 +2379,10 @@ async fn durable_raft_group_engine_recovers_from_core_journal() {
 
     {
         let config = hosted_config(1, 1);
+        let log_stores = start_wal(&root);
         let runtime = ShardRuntime::spawn_with_engine_factory(
             config,
-            DurableRaftGroupEngineFactory::new(&root),
+            DurableRaftGroupEngineFactory::new(log_stores.clone()),
         )
         .expect("spawn durable runtime");
         runtime
@@ -2386,6 +2400,10 @@ async fn durable_raft_group_engine_recovers_from_core_journal() {
             .shutdown_group_engine(placement())
             .await
             .expect("shutdown durable group before in-process restart");
+        log_stores
+            .shutdown()
+            .await
+            .expect("shut down the Raft WAL cleanly");
     }
 
     let journal_path = root.join("core-0").join("journal.bin");
@@ -2400,9 +2418,11 @@ async fn durable_raft_group_engine_recovers_from_core_journal() {
 
     {
         let config = hosted_config(1, 1);
+        let log_stores = start_wal(&root);
+        assert_eq!(log_stores.opening().previous_run, PreviousRun::Clean);
         let recovered = ShardRuntime::spawn_with_engine_factory(
             config,
-            DurableRaftGroupEngineFactory::new(&root),
+            DurableRaftGroupEngineFactory::new(log_stores),
         )
         .expect("spawn recovered durable runtime");
         let read = recovered

@@ -22,6 +22,7 @@ mod wal_disk;
 
 pub(crate) use format_epoch::check_and_stamp_format_epoch;
 pub(crate) use leadership::handoff_shutdown_leadership;
+pub use runtime::SpawnRuntimeError;
 pub use runtime::SpawnedRuntime;
 pub use runtime::spawn_runtime;
 pub(crate) use runtime::spawn_runtime_with_maintenance_drain;

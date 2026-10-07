@@ -20,6 +20,7 @@ use openraft::storage::RaftLogStorage;
 use openraft::vote::RaftLeaderId;
 use openraft::vote::leader_id_adv::CommittedLeaderId;
 use tempfile::TempDir;
+use ursula_config::WalFsync;
 use ursula_raft::DurableRaftLogStoreFactory;
 use ursula_raft::RaftGroupFileLogStore;
 use ursula_raft::UrsulaRaftTypeConfig;
@@ -40,14 +41,21 @@ const APPENDS_PER_ITER: usize = 16;
 
 #[derive(Clone, Copy, Debug)]
 enum Backend {
-    SharedPerCore,
+    SharedPerCore(WalFsync),
     UpstreamRaftLog,
 }
 
 impl Backend {
+    const ALL: [Self; 3] = [
+        Self::SharedPerCore(WalFsync::Always),
+        Self::SharedPerCore(WalFsync::Never),
+        Self::UpstreamRaftLog,
+    ];
+
     fn name(self) -> &'static str {
         match self {
-            Self::SharedPerCore => "shared-per-core",
+            Self::SharedPerCore(WalFsync::Always) => "shared-per-core-always",
+            Self::SharedPerCore(WalFsync::Never) => "shared-per-core-never",
             Self::UpstreamRaftLog => "upstream-raft-log",
         }
     }
@@ -85,7 +93,7 @@ fn disk_wal_benches(c: &mut Criterion) {
     ));
     for &group_count in group_counts {
         for &payload_size in payload_sizes {
-            for backend in [Backend::SharedPerCore, Backend::UpstreamRaftLog] {
+            for backend in Backend::ALL {
                 let id = BenchmarkId::new(
                     backend.name(),
                     format!("groups={group_count}/payload={payload_size}"),
@@ -108,7 +116,7 @@ fn disk_wal_benches(c: &mut Criterion) {
         u64::try_from(APPENDS_PER_ITER).expect("append count fits u64"),
     ));
     for &group_count in group_counts {
-        for backend in [Backend::SharedPerCore, Backend::UpstreamRaftLog] {
+        for backend in Backend::ALL {
             append_committed.bench_with_input(
                 BenchmarkId::new(backend.name(), format!("groups={group_count}")),
                 &(backend, group_count),
@@ -132,9 +140,30 @@ fn disk_wal_benches(c: &mut Criterion) {
             BenchmarkId::from_parameter(historical_entries),
             &historical_entries,
             |b, _| {
-                b.iter(|| {
-                    let reopened = open_shared_store(dir.path(), 0);
-                    black_box(reopened);
+                // Times the journal's recovery only. Each run starts and
+                // shuts down cleanly outside the timing, so every recovery
+                // reads the journal strictly.
+                b.iter_custom(|iters| {
+                    let mut elapsed = std::time::Duration::ZERO;
+                    for _ in 0..iters {
+                        let factory =
+                            DurableRaftLogStoreFactory::start(dir.path(), WalFsync::Always)
+                                .expect("start the benchmark WAL");
+                        let started_at = std::time::Instant::now();
+                        let reopened = factory
+                            .open(
+                                placement(0),
+                                RuntimeMetrics::new(1, 1).group_engine_metrics(),
+                            )
+                            .expect("open shared-core benchmark WAL");
+                        elapsed = elapsed.saturating_add(started_at.elapsed());
+                        black_box(&reopened);
+                        drop(reopened);
+                        runtime
+                            .block_on(factory.shutdown())
+                            .expect("shut down the benchmark WAL");
+                    }
+                    elapsed
                 });
             },
         );
@@ -161,13 +190,18 @@ fn disk_wal_benches(c: &mut Criterion) {
     reads.finish();
 }
 
+/// Opens `group_count` stores on a new journal, each holding one entry, so
+/// the timed appends start at index 2 and measure steady-state appends. A
+/// group's first entry also replaces the core's metadata file (its
+/// `initialized` flag), a one-time cost per group.
 fn setup_stores(backend: Backend, group_count: usize) -> Stores {
     let dir = tempfile::tempdir().expect("create WAL benchmark directory");
     let group_count_u32 = u32::try_from(group_count).expect("benchmark group count fits u32");
-    let stores = match backend {
-        Backend::SharedPerCore => {
+    let stores: Vec<BenchStore> = match backend {
+        Backend::SharedPerCore(fsync) => {
             let metrics = RuntimeMetrics::new(1, group_count);
-            let factory = DurableRaftLogStoreFactory::new(dir.path());
+            let factory = DurableRaftLogStoreFactory::start(dir.path(), fsync)
+                .expect("start the benchmark WAL");
             (0..group_count_u32)
                 .map(|group_id| {
                     factory
@@ -190,16 +224,53 @@ fn setup_stores(backend: Backend, group_count: usize) -> Stores {
             })
             .collect(),
     };
+    warm_up(&stores);
     Stores { _dir: dir, stores }
 }
 
+/// Appends entry 1 to every store, outside the timed routine. Criterion runs
+/// setup inside the benchmark runtime, so the warm-up runs on a thread of
+/// its own.
+fn warm_up(stores: &[BenchStore]) {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("build warm-up runtime")
+                    .block_on(try_join_all(stores.iter().enumerate().map(
+                        |(group_index, store)| {
+                            let mut store = store.clone();
+                            let group_id = u32::try_from(group_index).expect("group fits u32");
+                            async move {
+                                let entry = entry(1, group_id, 256);
+                                match &mut store {
+                                    BenchStore::Ursula(store) => {
+                                        store.append([entry], IOFlushed::noop()).await
+                                    }
+                                    BenchStore::Upstream(store) => {
+                                        store.append_durable(vec![entry]).await
+                                    }
+                                }
+                            }
+                        },
+                    )))
+                    .expect("warm up the benchmark WAL");
+            })
+            .join()
+            .expect("warm-up thread");
+    });
+}
+
+/// Returns the stores, so criterion drops them (and the writers `fsync` on
+/// their way out) outside the timed routine.
 async fn append_waves(
     stores: Stores,
     payload_size: usize,
     append_count: usize,
     save_committed: bool,
-) {
-    let mut next_indexes = vec![1_u64; stores.stores.len()];
+) -> Stores {
+    let mut next_indexes = vec![2_u64; stores.stores.len()];
     let mut remaining = append_count;
     while remaining > 0 {
         let wave = remaining.min(stores.stores.len());
@@ -241,7 +312,7 @@ async fn append_waves(
         try_join_all(writes).await.expect("append benchmark wave");
         remaining = remaining.saturating_sub(wave);
     }
-    black_box(stores);
+    stores
 }
 
 impl From<Arc<RaftGroupFileLogStore>> for BenchStore {
@@ -258,7 +329,8 @@ impl From<BenchmarkRaftLogStore<UrsulaRaftTypeConfig>> for BenchStore {
 
 /// Opens one group's store on the shared per-core journal under `root`.
 fn open_shared_store(root: &std::path::Path, group_id: u32) -> Arc<RaftGroupFileLogStore> {
-    DurableRaftLogStoreFactory::new(root)
+    DurableRaftLogStoreFactory::start(root, WalFsync::Always)
+        .expect("start the benchmark WAL")
         .open(
             placement(group_id),
             RuntimeMetrics::new(1, 1).group_engine_metrics(),
@@ -268,7 +340,14 @@ fn open_shared_store(root: &std::path::Path, group_id: u32) -> Arc<RaftGroupFile
 
 async fn prepare_recovery_journal(entries: usize, payload_size: usize) -> TempDir {
     let dir = tempfile::tempdir().expect("create recovery benchmark directory");
-    let mut store = open_shared_store(dir.path(), 0);
+    let factory = DurableRaftLogStoreFactory::start(dir.path(), WalFsync::Always)
+        .expect("start the benchmark WAL");
+    let mut store = factory
+        .open(
+            placement(0),
+            RuntimeMetrics::new(1, 1).group_engine_metrics(),
+        )
+        .expect("open shared-core benchmark WAL");
     let batch = (1..=entries)
         .map(|index| {
             entry(
@@ -282,6 +361,11 @@ async fn prepare_recovery_journal(entries: usize, payload_size: usize) -> TempDi
         .append(batch, IOFlushed::noop())
         .await
         .expect("prepare recovery benchmark WAL");
+    drop(store);
+    factory
+        .shutdown()
+        .await
+        .expect("shut down the benchmark WAL");
     dir
 }
 

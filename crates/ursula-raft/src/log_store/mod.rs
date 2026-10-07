@@ -1,17 +1,26 @@
 //! OpenRaft log stores.
 //!
-//! - `file`: the durable per-group store over the shared per-core journal.
+//! - `file`: the durable per-group store over the shared per-core journal,
+//!   and the core writer that applies the fsync policy.
 //! - `journal`: the framed, checksummed journal file format.
+//! - `core_meta`: each core's metadata file: every group's vote and
+//!   `initialized` flag.
+//! - `run_state`: the node's run-state file and how the journals open after
+//!   the previous run (the replay-mode decision and the recovery state).
+//! - `state_file`: the atomically replaced, checksummed format of both.
 //! - `disk`: the I/O seam every journal file operation goes through.
 //! - `sim_disk`: the simulated disk behind the seam under `cfg(madsim)`.
 //! - `memory`: the volatile store.
 
+mod core_meta;
 mod disk;
 mod file;
 mod journal;
 mod memory;
+mod run_state;
 #[cfg(madsim)]
 mod sim_disk;
+mod state_file;
 
 use std::collections::BTreeMap;
 use std::io;
@@ -24,6 +33,7 @@ pub use disk::JournalFile;
 pub use disk::LockAttempt;
 pub(crate) use file::CoreFileLogWriter;
 pub use file::CoreJournalError;
+pub(crate) use file::CoreJournalOptions;
 pub use file::RaftGroupFileLogStore;
 pub(crate) use file::elapsed_ns;
 #[cfg(test)]
@@ -42,6 +52,16 @@ use openraft::alias::EntryOf;
 use openraft::alias::LogIdOf;
 use openraft::alias::VoteOf;
 use openraft::entry::RaftEntry;
+pub use run_state::BootId;
+pub(crate) use run_state::NodeWal;
+pub use run_state::PreviousRun;
+pub use run_state::RUN_STATE_FILE;
+pub use run_state::RaftWalError;
+pub use run_state::RecoveryReason;
+pub use run_state::RecoveryState;
+pub use run_state::RunState;
+pub use run_state::RunStatus;
+pub use run_state::WalOpening;
 use serde::Deserialize;
 use serde::Serialize;
 #[cfg(madsim)]
@@ -58,6 +78,9 @@ pub use sim_disk::SimFile;
 pub use sim_disk::SimJournalLock;
 #[cfg(madsim)]
 pub use sim_disk::SimPowerLoss;
+pub use state_file::StateFileDefect;
+pub use state_file::StateFileError;
+pub use state_file::StateFileKind;
 
 use crate::types::UrsulaRaftTypeConfig;
 
@@ -80,10 +103,10 @@ pub(crate) type RaftGroupLogStoreInner = MemoryRaftLogStoreInner<UrsulaRaftTypeC
 /// Journaled as self-describing MessagePack of openraft's own serde-capable
 /// types (via [`crate::codec::encode_wire`]) instead of hand-written proto
 /// mirrors; the on-disk format is therefore coupled to the Rust type layout,
-/// which is acceptable while every deployment upgrades atomically.
+/// which is acceptable while every deployment upgrades atomically. Votes are
+/// not journaled: each core's metadata file holds them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum RaftGroupLogRecord {
-    SaveVote(VoteOf<UrsulaRaftTypeConfig>),
     SaveCommitted(Option<LogIdOf<UrsulaRaftTypeConfig>>),
     Append(Vec<EntryOf<UrsulaRaftTypeConfig>>),
     TruncateAfter(Option<LogIdOf<UrsulaRaftTypeConfig>>),

@@ -2,26 +2,32 @@
 //! the simulated disk, one directory per node.
 //!
 //! A [`SimNodeWal`] opens a group's log store from the node's journals, so
-//! every restart recovers from what the simulated disk kept. Before it reopens
-//! a group, cuts power or simulates a process crash, it waits until the stopped
-//! engine has released the previous store, as a new process starts only after
-//! the old one has exited.
+//! every restart recovers from what the simulated disk kept. The node's WAL
+//! runs as it does in a process: the first store a stopped node opens starts
+//! a run, which reads the run state the previous run left and decides how the
+//! journals open. Stopping the node (a power loss, a process crash or a clean
+//! shutdown) ends the run. Before it reopens a group, cuts power or simulates
+//! a process crash, it waits until the stopped engine has released the
+//! previous store, as a new process starts only after the old one has exited.
 
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::path::Path;
-#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
 use std::time::Duration;
 
+use ursula_config::WalFsync;
 use ursula_raft::DurableRaftLogStoreFactory;
 use ursula_raft::RaftGroupFileLogStore;
 use ursula_raft::SimDisk;
 #[cfg(test)]
 use ursula_raft::SimPowerLoss;
+#[cfg(test)]
+use ursula_raft::WalOpening;
+use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::RuntimeMetrics;
 use ursula_shard::RaftGroupId;
@@ -35,20 +41,27 @@ const RELEASE_SLEEPS: usize = 1_000;
 /// One simulated node's journals.
 #[derive(Clone)]
 pub(crate) struct SimNodeWal {
-    #[cfg(test)]
     root: PathBuf,
-    factory: DurableRaftLogStoreFactory,
+    fsync: WalFsync,
+    /// The node's current run of the WAL; `None` while the node is down.
+    run: Arc<Mutex<Option<DurableRaftLogStoreFactory>>>,
     stores: Arc<Mutex<BTreeMap<RaftGroupId, Weak<RaftGroupFileLogStore>>>>,
 }
 
 impl SimNodeWal {
-    /// Provisions a new, durable node directory named after `name`.
+    /// Provisions a new, durable node directory named after `name`, whose
+    /// journals are `fsync`ed on every append.
     pub(super) fn provision(name: &str) -> Self {
+        Self::provision_with_fsync(name, WalFsync::Always)
+    }
+
+    /// Provisions a new node directory whose WAL runs with `fsync`.
+    pub(super) fn provision_with_fsync(name: &str, fsync: WalFsync) -> Self {
         let root = SimDisk::provision_dir(name).expect("provision a simulated node directory");
         Self {
-            factory: DurableRaftLogStoreFactory::new(&root),
-            #[cfg(test)]
             root,
+            fsync,
+            run: Arc::new(Mutex::new(None)),
             stores: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -59,6 +72,26 @@ impl SimNodeWal {
         &self.root
     }
 
+    /// The node's current run, started when the node is down.
+    fn run(&self) -> Result<DurableRaftLogStoreFactory, GroupEngineError> {
+        let mut run = self.run.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(run) = run.as_ref() {
+            return Ok(run.clone());
+        }
+        let started = DurableRaftLogStoreFactory::start(&self.root, self.fsync)
+            .map_err(|err| GroupEngineError::new(format!("start the Raft WAL: {err}")))?;
+        *run = Some(started.clone());
+        Ok(started)
+    }
+
+    /// How the node's current run opened its journals.
+    #[cfg(test)]
+    pub(super) fn opening(&self) -> WalOpening {
+        self.run()
+            .expect("start a simulated node's Raft WAL")
+            .opening()
+    }
+
     /// Opens `placement`'s log store from the node's journals, waiting first
     /// until the store the group had before is released.
     pub(super) async fn open(
@@ -66,18 +99,26 @@ impl SimNodeWal {
         placement: ShardPlacement,
         metrics: GroupEngineMetrics,
     ) -> Arc<RaftGroupFileLogStore> {
+        self.try_open(placement, metrics)
+            .await
+            .expect("open a simulated node's raft log store")
+    }
+
+    /// [`SimNodeWal::open`], reporting a journal that does not open.
+    pub(super) async fn try_open(
+        &self,
+        placement: ShardPlacement,
+        metrics: GroupEngineMetrics,
+    ) -> Result<Arc<RaftGroupFileLogStore>, GroupEngineError> {
         if let Some(previous) = self.handed_out(placement.raft_group_id) {
             wait_released(&previous).await;
         }
-        let store = self
-            .factory
-            .open(placement, metrics)
-            .expect("open a simulated node's raft log store");
+        let store = self.run()?.open(placement, metrics)?;
         self.stores
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .insert(placement.raft_group_id, Arc::downgrade(&store));
-        store
+        Ok(store)
     }
 
     /// The group's open store, if its engine still holds it.
@@ -86,10 +127,10 @@ impl SimNodeWal {
     }
 
     /// Cuts the node's power after its engines have stopped: unsynced pages
-    /// and directory entries may be lost.
+    /// and directory entries may be lost, and the host boots anew.
     #[cfg(test)]
     pub(super) async fn power_loss(&self) -> SimPowerLoss {
-        self.wait_stopped().await;
+        self.stop().await;
         SimDisk::power_loss(&self.root).expect("cut the power of a stopped simulated node")
     }
 
@@ -97,8 +138,21 @@ impl SimNodeWal {
     /// cache survives.
     #[cfg(test)]
     pub(super) async fn process_crash(&self) {
-        self.wait_stopped().await;
+        self.stop().await;
         SimDisk::process_crash(&self.root).expect("crash a stopped simulated node");
+    }
+
+    /// Ends the node's run without a clean shutdown, as a stopped process
+    /// does.
+    #[cfg(test)]
+    async fn stop(&self) {
+        self.wait_stopped().await;
+        drop(
+            self.run
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take(),
+        );
     }
 
     #[cfg(test)]

@@ -69,6 +69,7 @@ use axum::routing::get;
 use axum::routing::post;
 use axum::routing::put;
 pub use bootstrap::Persistence;
+pub use bootstrap::SpawnRuntimeError;
 pub use bootstrap::SpawnedRuntime;
 pub use bootstrap::Topology;
 pub use bootstrap::spawn_runtime;

@@ -15,7 +15,6 @@ use openraft::alias::VoteOf;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use ursula_raft::CoreJournalError;
-use ursula_raft::DurableRaftLogStoreFactory;
 use ursula_raft::InProcessRaftNetworkFactory;
 use ursula_raft::InProcessRaftNetworkPolicy;
 use ursula_raft::InProcessRaftRegistry;
@@ -25,6 +24,7 @@ use ursula_raft::JournalFile;
 use ursula_raft::JournalOp;
 use ursula_raft::JournalReplayMode;
 use ursula_raft::LockAttempt;
+use ursula_raft::RUN_STATE_FILE;
 use ursula_raft::RaftGroupEngine;
 use ursula_raft::RaftGroupFileLogStore;
 use ursula_raft::SIM_DISK_PAGE_SIZE;
@@ -876,12 +876,23 @@ fn a_reclaim_that_cannot_publish_its_generation_poisons_the_writer() {
     }
 }
 
+/// What a node finds of its run state after a power loss.
+#[derive(Debug, Clone, Copy)]
+enum RunStateAfterPowerLoss {
+    /// As the node left it: the run did not end cleanly and the host booted
+    /// anew, so the journals are read as a verified prefix.
+    Kept,
+    /// Removed by hand: nothing says the host crashed, so the journals are
+    /// read strictly.
+    Removed,
+}
+
 /// A single-node group whose synced entries are followed by an unsynced
 /// tail of committed markers, after a power loss that may reorder the tail's
-/// writeback. Returns what was synced and how a store reopened in `mode`
+/// writeback. Returns what was synced and how a store reopened afterwards
 /// fared.
 async fn reopen_after_a_reordered_unsynced_tail(
-    mode: JournalReplayMode,
+    run_state: RunStateAfterPowerLoss,
 ) -> (DurableGroupLog, Result<DurableGroupLog, String>) {
     let wal = SimNodeWal::provision("unsynced-tail");
     let placement = group_placement(0);
@@ -920,10 +931,15 @@ async fn reopen_after_a_reordered_unsynced_tail(
     }
     drop(store);
     let report = wal.power_loss().await;
-    let reopened = DurableRaftLogStoreFactory::new(wal.root())
-        .with_replay_mode(mode)
-        .open(placement, metrics);
-    let reopened = match reopened {
+    let expected_mode = match run_state {
+        RunStateAfterPowerLoss::Kept => JournalReplayMode::VerifiedPrefix,
+        RunStateAfterPowerLoss::Removed => {
+            SimDisk::remove_file(&wal.root().join(RUN_STATE_FILE)).expect("remove the run state");
+            JournalReplayMode::Strict
+        }
+    };
+    assert_eq!(wal.opening().replay_mode, expected_mode);
+    let reopened = match wal.try_open(placement, metrics).await {
         Ok(store) => Ok(DurableGroupLog::read(&store).await),
         Err(err) => Err(format!("{report:?}: {}", err.message())),
     };
@@ -934,7 +950,8 @@ const UNSYNCED_TAIL_SEEDS: [u64; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 
 /// Strict recovery expects every write on disk, so it refuses the hole a
 /// reordered writeback of unsynced committed markers can leave. It never
-/// recovers less than what was synced.
+/// recovers less than what was synced. This is why a run state that shows a
+/// host crash selects the verified prefix even under `always`.
 #[test]
 fn strict_recovery_refuses_a_reordered_unsynced_tail() {
     let _guard = sim_test_guard();
@@ -942,7 +959,7 @@ fn strict_recovery_refuses_a_reordered_unsynced_tail() {
     for seed in seeds_from_env("UNSYNCED_TAIL_SEEDS", &UNSYNCED_TAIL_SEEDS) {
         let (synced, reopened) = run_with_madsim(
             seed,
-            reopen_after_a_reordered_unsynced_tail(JournalReplayMode::Strict),
+            reopen_after_a_reordered_unsynced_tail(RunStateAfterPowerLoss::Removed),
         );
         match reopened {
             Ok(recovered) => assert_eq!(recovered, synced, "seed {seed}"),
@@ -958,15 +975,15 @@ fn strict_recovery_refuses_a_reordered_unsynced_tail() {
     );
 }
 
-/// Recovery that keeps the verified prefix recovers every synced entry and
-/// the vote after the same power losses.
+/// After the same power losses the run state selects the verified prefix,
+/// which recovers every synced entry and the vote.
 #[test]
 fn verified_prefix_recovery_keeps_every_acknowledged_write_after_a_reordered_tail() {
     let _guard = sim_test_guard();
     for seed in seeds_from_env("UNSYNCED_TAIL_SEEDS", &UNSYNCED_TAIL_SEEDS) {
         let (synced, reopened) = run_with_madsim(
             seed,
-            reopen_after_a_reordered_unsynced_tail(JournalReplayMode::VerifiedPrefix),
+            reopen_after_a_reordered_unsynced_tail(RunStateAfterPowerLoss::Kept),
         );
         assert_eq!(
             reopened.unwrap_or_else(|err| panic!("seed {seed}: {err}")),

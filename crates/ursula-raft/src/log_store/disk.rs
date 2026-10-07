@@ -67,6 +67,10 @@ pub trait JournalDisk {
     fn sync_dir(path: &Path) -> io::Result<()>;
     /// Tries to take the exclusive lock at `path` without blocking.
     fn try_lock(path: &Path) -> io::Result<LockAttempt<Self::Lock>>;
+    /// The id of the current boot of the host that holds `path`, or `None`
+    /// when the platform does not report one. It changes on every host
+    /// restart and never on a process restart.
+    fn boot_id(path: &Path) -> Option<String>;
 }
 
 /// An open file of a [`JournalDisk`].
@@ -90,6 +94,29 @@ pub enum LockAttempt<L> {
     /// Another owner holds the lock; `owner` is what it recorded, if anything.
     Held { owner: Option<String> },
 }
+
+/// Creates `path` and `fsync`s the parent of every directory it creates. A
+/// file's own `fsync` makes the file's entry durable only once its directory
+/// is, so a new directory's entry needs its parent `fsync`ed too, or a power
+/// loss can drop the whole directory with every acknowledged write in it.
+pub(crate) fn create_dir_all_durable(path: &Path) -> io::Result<()> {
+    let created_parents = path
+        .ancestors()
+        .take_while(|dir| !dir.as_os_str().is_empty() && !Disk::exists(dir))
+        .filter_map(Path::parent)
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    Disk::create_dir_all(path)?;
+    for parent in created_parents.iter().rev() {
+        Disk::sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+/// The kernel's id of the current boot. Inside a container it is the host's.
+#[cfg(all(not(madsim), target_os = "linux"))]
+const LINUX_BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 
 /// The operating-system disk: `std::fs` plus an advisory `flock` for the
 /// journal lock.
@@ -183,6 +210,22 @@ impl JournalDisk for OsDisk {
             file,
             path: path.to_owned(),
         }))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn boot_id(_path: &Path) -> Option<String> {
+        match fs::read_to_string(LINUX_BOOT_ID_PATH) {
+            Ok(boot_id) => Some(boot_id.trim().to_owned()).filter(|boot_id| !boot_id.is_empty()),
+            Err(err) => {
+                tracing::warn!(path = LINUX_BOOT_ID_PATH, %err, "read the kernel boot id");
+                None
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn boot_id(_path: &Path) -> Option<String> {
+        None
     }
 }
 

@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
 use std::time::Duration;
 
+use futures_util::future::join_all;
 use openraft::BasicNode;
 use openraft::Config;
 use openraft::Raft;
@@ -15,6 +17,7 @@ use openraft::network::RPCOption;
 use openraft::rt::WatchReceiver;
 use tokio::time::Instant;
 use tonic::transport::Endpoint;
+use ursula_config::WalFsync;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineCreateFuture;
@@ -31,9 +34,13 @@ use crate::grpc::GrpcRaftNetwork;
 use crate::grpc::GrpcRaftNetworkFactory;
 use crate::grpc::probe_rejoin_vote_barrier;
 use crate::log_store::CoreFileLogWriter;
-use crate::log_store::JournalReplayMode;
+use crate::log_store::CoreJournalOptions;
+use crate::log_store::NodeWal;
 use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RaftGroupLogStore;
+use crate::log_store::RaftWalError;
+use crate::log_store::RecoveryState;
+use crate::log_store::WalOpening;
 use crate::registry::RaftGroupHandleRegistry;
 use crate::rejoin::GroupRejoin;
 use crate::rejoin::PeerGroupLog;
@@ -434,41 +441,65 @@ impl GroupEngineFactory for ColdRaftGroupEngineFactory {
 /// The open writer of one core's journal, if any.
 type CoreWriterSlot = Arc<Mutex<Weak<CoreFileLogWriter>>>;
 
-/// Opens each group's durable log store over its core's shared journal.
+/// The core writers of a running WAL, by core.
+#[derive(Debug)]
+enum CoreWriterSlots {
+    Running(BTreeMap<u16, CoreWriterSlot>),
+    /// [`DurableRaftLogStoreFactory::shutdown`] closed every writer; no
+    /// journal opens again in this run.
+    ShutDown,
+}
+
+/// Opens each group's durable log store over its core's shared journal, for
+/// one run of the node's Raft WAL.
+///
+/// [`DurableRaftLogStoreFactory::start`] begins the run: it reads the run
+/// state the previous run left, decides how the journals open
+/// ([`WalOpening`]) and records this run before any journal write.
+/// [`DurableRaftLogStoreFactory::shutdown`] ends it cleanly.
 #[derive(Debug, Clone)]
 pub struct DurableRaftLogStoreFactory {
-    root: PathBuf,
-    replay_mode: JournalReplayMode,
+    node: Arc<NodeWal>,
     /// One slot per core. Opening a journal holds only its core's slot, so
     /// cores recover their journals in parallel.
-    core_writers: Arc<Mutex<BTreeMap<u16, CoreWriterSlot>>>,
+    core_writers: Arc<Mutex<CoreWriterSlots>>,
 }
 
 impl DurableRaftLogStoreFactory {
-    /// A factory over the journals under `root` that recovers them in
-    /// [`JournalReplayMode::Strict`].
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self {
-            root: root.into(),
-            replay_mode: JournalReplayMode::Strict,
-            core_writers: Arc::new(Mutex::new(BTreeMap::new())),
-        }
+    /// Starts a run of the Raft WAL under `root` with the `fsync` policy.
+    pub fn start(root: impl Into<PathBuf>, fsync: WalFsync) -> Result<Self, RaftWalError> {
+        Ok(Self {
+            node: Arc::new(NodeWal::start(root.into(), fsync)?),
+            core_writers: Arc::new(Mutex::new(CoreWriterSlots::Running(BTreeMap::new()))),
+        })
     }
 
-    /// Recovers each core journal in `replay_mode` when it first opens.
-    pub fn with_replay_mode(mut self, replay_mode: JournalReplayMode) -> Self {
-        self.replay_mode = replay_mode;
-        self
+    pub fn root(&self) -> &Path {
+        self.node.root()
+    }
+
+    pub fn fsync(&self) -> WalFsync {
+        self.node.fsync()
+    }
+
+    /// How this run opens the journals the previous run left.
+    pub fn opening(&self) -> WalOpening {
+        self.node.opening()
+    }
+
+    /// Whether this node's logs may be missing entries it acknowledged.
+    pub fn recovery_state(&self) -> RecoveryState {
+        self.node.opening().recovery
     }
 
     pub(crate) fn core_journal_path(&self, core_id: CoreId) -> PathBuf {
-        self.root
+        self.root()
             .join(format!("core-{}", core_id.0))
             .join("journal.bin")
     }
 
     pub(crate) fn snapshot_metadata_path(&self, placement: ShardPlacement) -> PathBuf {
-        self.root
+        self.root()
             .join(format!("core-{}", placement.core_id.0))
             .join(format!("group-{}.snapshot.json", placement.raft_group_id.0))
     }
@@ -479,21 +510,32 @@ impl DurableRaftLogStoreFactory {
         metrics: GroupEngineMetrics,
     ) -> Result<Arc<CoreFileLogWriter>, GroupEngineError> {
         let poisoned = || GroupEngineError::new("core file log writer mutex poisoned");
-        let slot = self
-            .core_writers
-            .lock()
-            .map_err(|_poisoned| poisoned())?
-            .entry(placement.core_id.0)
-            .or_default()
-            .clone();
+        let slot = match &mut *self.core_writers.lock().map_err(|_poisoned| poisoned())? {
+            CoreWriterSlots::Running(slots) => {
+                slots.entry(placement.core_id.0).or_default().clone()
+            }
+            CoreWriterSlots::ShutDown => {
+                return Err(GroupEngineError::new(format!(
+                    "open OpenRaft core journal: {}",
+                    RaftWalError::ShutDown {
+                        root: self.root().to_owned(),
+                    }
+                )));
+            }
+        };
         let mut slot = slot.lock().map_err(|_poisoned| poisoned())?;
         if let Some(writer) = slot.upgrade() {
             return Ok(writer);
         }
 
+        let opening = self.node.opening();
         let writer = CoreFileLogWriter::open(
             self.core_journal_path(placement.core_id),
-            self.replay_mode,
+            CoreJournalOptions {
+                fsync: self.fsync(),
+                recovery_epoch: opening.recovery_epoch,
+                run_state: self.node.run_state().clone(),
+            },
             Some((placement, metrics)),
         )
         .map_err(|err| GroupEngineError::new(format!("open OpenRaft core journal: {err}")))?;
@@ -510,6 +552,53 @@ impl DurableRaftLogStoreFactory {
         RaftGroupFileLogStore::open(placement, metrics, core_writer)
             .map_err(|err| GroupEngineError::new(format!("open OpenRaft file log: {err}")))
     }
+
+    /// Ends this run cleanly: closes every core writer, each of which
+    /// `fsync`s its journal, and only then records a clean shutdown. Stop the
+    /// Raft groups first; a write after this fails and no journal opens
+    /// again. When a writer cannot close, the run is not recorded as clean.
+    pub async fn shutdown(&self) -> Result<(), RaftWalError> {
+        let slots = {
+            let mut core_writers = self
+                .core_writers
+                .lock()
+                .map_err(|_poisoned| RaftWalError::LockPoisoned)?;
+            match std::mem::replace(&mut *core_writers, CoreWriterSlots::ShutDown) {
+                CoreWriterSlots::Running(slots) => slots,
+                CoreWriterSlots::ShutDown => {
+                    return Err(RaftWalError::ShutDown {
+                        root: self.root().to_owned(),
+                    });
+                }
+            }
+        };
+        let mut writers = Vec::with_capacity(slots.len());
+        for (core, slot) in slots {
+            let writer = slot
+                .lock()
+                .map_err(|_poisoned| RaftWalError::LockPoisoned)?
+                .upgrade();
+            writers.extend(writer.map(|writer| (core, writer)));
+        }
+        let closed = join_all(writers.iter().map(|(core, writer)| async move {
+            writer
+                .close()
+                .await
+                .map_err(|source| RaftWalError::CloseJournal {
+                    core: *core,
+                    source,
+                })
+        }))
+        .await;
+        closed.into_iter().collect::<Result<Vec<()>, _>>()?;
+        self.node.record_clean()?;
+        tracing::info!(
+            root = %self.root().display(),
+            cores = writers.len(),
+            "shut down the Raft WAL cleanly"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -519,16 +608,16 @@ pub struct DurableRaftGroupEngineFactory {
 }
 
 impl DurableRaftGroupEngineFactory {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self {
-            log_stores: DurableRaftLogStoreFactory::new(root),
-            cold_store: None,
-        }
+    pub fn new(log_stores: DurableRaftLogStoreFactory) -> Self {
+        Self::with_cold_store(log_stores, None)
     }
 
-    pub fn with_cold_store(root: impl Into<PathBuf>, cold_store: Option<ColdStoreHandle>) -> Self {
+    pub fn with_cold_store(
+        log_stores: DurableRaftLogStoreFactory,
+        cold_store: Option<ColdStoreHandle>,
+    ) -> Self {
         Self {
-            log_stores: DurableRaftLogStoreFactory::new(root),
+            log_stores,
             cold_store,
         }
     }
@@ -615,8 +704,11 @@ impl StaticGrpcRaftGroupEngineFactory {
         self
     }
 
-    pub fn with_raft_log_dir(mut self, root: impl Into<PathBuf>) -> Self {
-        self.log_stores = Some(DurableRaftLogStoreFactory::new(root));
+    /// Keeps the groups' Raft logs in `log_stores`' journals, and publishes
+    /// how they opened in the registry.
+    pub fn with_raft_log_stores(mut self, log_stores: DurableRaftLogStoreFactory) -> Self {
+        self.registry.set_wal_opening(log_stores.opening());
+        self.log_stores = Some(log_stores);
         self
     }
 
@@ -980,7 +1072,7 @@ mod tests {
     #[test]
     fn cores_open_their_journals_independently() {
         let root = unique_test_dir("parallel-core-open");
-        let factory = DurableRaftLogStoreFactory::new(&root);
+        let factory = DurableRaftLogStoreFactory::start(&root, WalFsync::Always).expect("start");
         let metrics = ursula_runtime::RuntimeMetrics::new(2, 2).group_engine_metrics();
         let placement = |core: u16, group: u32| ShardPlacement {
             core_id: CoreId(core),
@@ -988,13 +1080,13 @@ mod tests {
             raft_group_id: RaftGroupId(group),
         };
         // Stand in for a long recovery of core 0 by holding its slot.
-        let slot = factory
-            .core_writers
-            .lock()
-            .expect("slots")
-            .entry(0)
-            .or_default()
-            .clone();
+        let slot = {
+            let mut core_writers = factory.core_writers.lock().expect("slots");
+            let CoreWriterSlots::Running(slots) = &mut *core_writers else {
+                panic!("a started WAL is running");
+            };
+            slots.entry(0).or_default().clone()
+        };
         let held = slot.lock().expect("hold core 0");
 
         // Core 0's slot stays held on this thread, so this open would never
@@ -1064,7 +1156,10 @@ mod tests {
         assert!(memory_factory.raft_memory_bootstrap_seen(RaftGroupId(0)));
 
         let durable_factory = factory_for_node(1)
-            .with_raft_log_dir(dir.join("raft-log"))
+            .with_raft_log_stores(
+                DurableRaftLogStoreFactory::start(dir.join("raft-log"), WalFsync::Always)
+                    .expect("start the WAL"),
+            )
             .with_engine_config(engine_config.clone());
         assert!(!durable_factory.uses_memory_log_store());
         assert!(!durable_factory.raft_memory_bootstrap_seen(RaftGroupId(0)));
