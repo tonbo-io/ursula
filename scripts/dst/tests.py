@@ -4,7 +4,7 @@ Run with `python3 -m pytest scripts/dst/tests.py` from the repo root.
 
 These don't try to be a full unit-test suite — they verify:
   - every subcommand is dispatchable
-  - the 7 audits parse/scan without crashing and return a valid exit code
+  - the 8 audits parse/scan without crashing and return a valid exit code
   - shared parsing helpers don't lie about seed counts
 """
 
@@ -49,3 +49,23 @@ def test_corpus_files_exist():
     assert common.FAILURE_CORPUS.exists()
     assert common.SCHEDULE_CORPUS.exists()
     assert common.SMOKE_CORPUS.exists()
+
+
+@pytest.mark.parametrize(
+    "packages",
+    [
+        # The patch was dropped: cargo resolved the published crate.
+        [
+            {"name": "futures-macro", "version": "0.3.32", "source": "registry+https://github.com/rust-lang/crates.io-index"},
+            {"name": "futures-util", "version": "0.3.32", "source": "registry+https://github.com/rust-lang/crates.io-index"},
+        ],
+        # futures-util moved past the vendored version.
+        [
+            {"name": "futures-macro", "version": "0.3.32"},
+            {"name": "futures-util", "version": "0.3.33", "source": "registry+https://github.com/rust-lang/crates.io-index"},
+        ],
+    ],
+)
+def test_sim_patches_audit_rejects_a_dropped_patch(monkeypatch, packages):
+    monkeypatch.setattr(audits, "_lock_packages", lambda: packages)
+    assert audits.audit_sim_patches([]) == 1

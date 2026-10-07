@@ -264,7 +264,7 @@ This is a **critical** part of Ursula's testing strategy. The `ursula-sim` crate
 **Running DST**:
 
 ```bash
-# Audit DST guards (7 audits)
+# Audit DST guards (8 audits)
 python3 -m scripts.dst all
 
 # Run smoke corpus replays
