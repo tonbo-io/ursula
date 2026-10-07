@@ -1,10 +1,10 @@
 //! Format-epoch markers on the Raft WAL directory and the object-storage
-//! namespace (format epoch 2).
+//! namespace.
 //!
 //! A node classifies both read-only first, then probes its peers, and only
 //! then writes the missing markers (object storage first, then the
 //! directory). A refused node therefore never stamps a directory or a
-//! namespace that a live 0.5.x cluster still uses.
+//! namespace that a live cluster of another epoch still uses.
 //!
 //! - Directory: `{raft.wal.path}/raft-log/FORMAT_EPOCH`. Absent, or empty but
 //!   for a leftover `FORMAT_EPOCH.tmp`, the directory is fresh. Non-empty
@@ -29,6 +29,7 @@ use serde::Serialize;
 use ursula_config::RaftSnapshotBackend;
 use ursula_config::config::ColdBackend;
 use ursula_stream::FORMAT_EPOCH;
+use ursula_stream::UPGRADE_GUIDE_URL;
 
 use crate::ColdConfig;
 
@@ -81,7 +82,8 @@ fn epoch_mismatch(location: String, marker: &FormatEpochMarker) -> io::Error {
         io::ErrorKind::InvalidData,
         format!(
             "{location} is format epoch {} (written by {}); this binary reads format epoch \
-             {FORMAT_EPOCH} only. There is no in-place upgrade: install fresh, or run the \
+             {FORMAT_EPOCH} only. There is no in-place upgrade: move the data to a new cluster \
+             with ursulactl backup-create and restore ({UPGRADE_GUIDE_URL}), or run the \
              release that wrote it",
             marker.format_epoch, marker.written_by
         ),

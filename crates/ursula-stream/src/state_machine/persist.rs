@@ -53,7 +53,7 @@ impl StreamStateMachine {
         });
 
         StreamSnapshot {
-            format_epoch: crate::FORMAT_EPOCH,
+            version: crate::STREAM_SNAPSHOT_VERSION,
             buckets,
             erased_buckets,
             streams,
@@ -81,13 +81,13 @@ impl StreamStateMachine {
                 ),
             );
         }
-        if snapshot.format_epoch != crate::FORMAT_EPOCH {
+        if snapshot.version != crate::STREAM_SNAPSHOT_VERSION {
             return StreamResponse::error(
                 StreamErrorCode::ImportInvalid,
                 format!(
                     "snapshot import failed validation: {}",
-                    StreamSnapshotError::FormatEpoch {
-                        found: snapshot.format_epoch,
+                    StreamSnapshotError::UnsupportedVersion {
+                        found: snapshot.version,
                     }
                 ),
             );
@@ -119,9 +119,9 @@ impl StreamStateMachine {
     }
 
     pub fn restore(snapshot: StreamSnapshot) -> Result<Self, StreamSnapshotError> {
-        if snapshot.format_epoch != crate::FORMAT_EPOCH {
-            return Err(StreamSnapshotError::FormatEpoch {
-                found: snapshot.format_epoch,
+        if snapshot.version != crate::STREAM_SNAPSHOT_VERSION {
+            return Err(StreamSnapshotError::UnsupportedVersion {
+                found: snapshot.version,
             });
         }
         let mut machine = Self {

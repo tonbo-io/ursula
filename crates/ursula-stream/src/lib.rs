@@ -3,8 +3,8 @@
 //! Module map:
 //!
 //! - [`command`]: replicated command variants applied to the state machine.
-//! - [`format`]: the format epoch every persisted format and the Raft RPC
-//!   protocol share, and its policy.
+//! - [`format`]: the version of every persisted or replicated artifact, the
+//!   format epoch, and the rule for changing them.
 //! - [`response`]: result variants and error codes returned per command.
 //! - [`model`]: persistent data types (metadata, segments, producer state, plans).
 //! - [`json_records`]: canonical JSON message text: LF-terminated messages,
@@ -30,8 +30,16 @@ mod validate;
 
 pub use command::COMMAND_LOG_OVERHEAD_BYTES;
 pub use command::StreamCommand;
+pub use format::BACKUP_FORMAT_VERSION;
+pub use format::COLD_INDEX_PAGE_VERSION;
 pub use format::FORMAT_EPOCH;
-pub use format::format_epoch_refusal;
+pub use format::GROUP_SNAPSHOT_VERSION;
+pub use format::RAFT_GRPC_PROTOCOL_VERSION;
+pub use format::RAFT_WAL_VERSION;
+pub use format::SNAPSHOT_REFERENCE_VERSION;
+pub use format::STREAM_SNAPSHOT_VERSION;
+pub use format::UPGRADE_GUIDE_URL;
+pub use format::other_release_refusal;
 pub use json_records::NonCanonicalJsonPayload;
 pub use json_records::canonical_json_record_ends;
 pub use model::AppendStreamInput;

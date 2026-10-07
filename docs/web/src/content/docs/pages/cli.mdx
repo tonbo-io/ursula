@@ -37,6 +37,9 @@ The naive procedure of "restart followers, then leader" does **not** wait for `a
 | `verify-cluster` | Require every configured voter to be present and caught up in two consecutive samples before the next rollout step |
 | `verify-quorum` | Confirm every configured group with a fresh ReadIndex round and require every replica to apply its fixed prefix under the same leader term |
 | `verify-survivors` | Confirm fresh prefixes on two observed survivors while preserving the three-voter configuration; does not certify full redundancy or physical fencing |
+| `backup-create` | Export every Raft group into a backup at a local directory or `s3://bucket/prefix` |
+| `backup-verify` | Check a backup's manifest, sizes, checksums and every group snapshot without contacting a cluster |
+| `restore` | Restore a verified backup into a fresh, empty cluster with the same group count, once the cluster confirms it holds every cold object the backup references |
 
 Mutating verbs exit `0` on success and `2` on an abort (drain timeout, no safe transfer target, catch-up stall). Anything else is a configuration or transport error with a single-line, machine-greppable message.
 
@@ -182,8 +185,30 @@ For custom tooling, every verb maps onto a small set of HTTP endpoints on each n
 | `status`, `wait-ready`, `wait` | `GET /__ursula/metrics` |
 | `drain` / `undrain` (maintenance guard) | `POST /__ursula/leadership-shed/maintenance`, `DELETE` to clear |
 | `drain` (transfer step) | `POST /__ursula/raft/{raft_group_id}/leader/transfer/{node_id}` |
+| `backup-create` | `GET /__ursula/backup/info`, `GET /__ursula/backup/group/{raft_group_id}` |
+| `restore` | `GET /__ursula/backup/info`, `POST /__ursula/backup/group/{raft_group_id}/cold-check`, `POST /__ursula/backup/group/{raft_group_id}/import` |
 
 The transfer endpoint returns a typed rejection: `409 Conflict` for a changed leader or a recovering target, `400` for an invalid target, `404` for an unregistered group, and `500` for a stopped Raft. Drain re-observes and re-plans the two `409` cases; other errors stop the operation.
+
+## Backup and restore
+
+`backup-create`, `backup-verify` and `restore` implement the backup workflow in [Backup and disaster recovery](/docs/operations#backup-and-disaster-recovery). A backup location is a local directory or `s3://bucket/prefix`.
+
+```bash
+ursulactl backup-create --config cluster.json --location s3://backups/ursula/2026-10-07
+ursulactl backup-verify --location s3://backups/ursula/2026-10-07
+ursulactl restore --config new-cluster.json --location s3://backups/ursula/2026-10-07
+```
+
+- `backup-create` writes one MessagePack snapshot per Raft group and `manifest.json`. It asks every node for each group and keeps the answer with the highest commit index. `--created-unix-ms` overrides the manifest timestamp.
+- `backup-verify` checks that the manifest lists every group once, and each object's size, BLAKE3 checksum and snapshot. It reads only the backup.
+- `restore` verifies the backup, refuses a target whose backup format or group count differs, and then asks the target to check every group's cold references against its cold store. Only when nothing is missing does it import the groups, one replicated write each. A target group that already holds data refuses the import. Restore into a fresh, empty cluster.
+
+`backup-create` and `restore` take `--http-timeout-secs` (default `30`). The cold check looks up every object a group references, 32 at a time, in one request per group, so a group with tens of thousands of cold objects needs a longer timeout. An `s3://` location uses the AWS SDK credential chain and `AWS_REGION`. For MinIO or another S3-compatible store, also set `AWS_ENDPOINT_URL`.
+
+The backup format is 2 for Ursula 0.6 and 0.7, independent of the server's format epoch. `ursulactl` 0.7 verifies and restores 0.6 backups, and creates backups of 0.6 clusters. It does not restore into a 0.6 cluster. See [Upgrading from 0.6](/docs/operations#upgrading-from-06).
+
+Each command exits `0` on success and non-zero with an error that names the failed check. A refused `restore` imports nothing.
 
 ## `verify-quorum`
 

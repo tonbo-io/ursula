@@ -1,4 +1,4 @@
-//! Startup format gate (format epoch 2).
+//! Startup format-epoch gate.
 //!
 //! Runs before the runtime is spawned, in an order that writes nothing until
 //! every check has passed:
@@ -10,7 +10,7 @@
 //!    directory.
 //!
 //! So a refused node exits non-zero without stamping a directory or a
-//! namespace that a live 0.5.x cluster still uses.
+//! namespace that a live cluster of another epoch still uses.
 
 use std::io;
 use std::path::Path;
@@ -86,10 +86,11 @@ async fn probe_peers(config: &ursula_config::UrsulaConfig) -> io::Result<()> {
                     format!(
                         "peer {} ({}) refused Raft protocol {}: {message}. Format epochs \
                          differ; a node cannot join a cluster of another format epoch. Install \
-                         this release as a new cluster",
+                         this release as a new cluster and move the data with a backup ({})",
                         peer.node_id,
                         peer.url,
-                        ursula_runtime::FORMAT_EPOCH
+                        ursula_runtime::FORMAT_EPOCH,
+                        ursula_runtime::UPGRADE_GUIDE_URL
                     ),
                 ));
             }

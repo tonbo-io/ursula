@@ -63,9 +63,10 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
     let mut pending_cold_gc = Vec::new();
     let mut footer_seen = false;
 
-    // E5: the format-epoch frame comes first and is checked before any other
-    // frame is decoded, so a 0.5.x snapshot fails here rather than on a
-    // stream frame it would misread.
+    // E5: the version frame (`FormatEpoch` on the wire, carrying the group
+    // snapshot version) comes first and is checked before any other frame is
+    // decoded, so a 0.5.x snapshot fails here rather than on a stream frame
+    // it would misread.
     // A first frame that does not decode is corruption, not an old
     // snapshot; only a frame that decodes but is not `FormatEpoch` gets E5.
     let first = if cursor.has_remaining() {
@@ -77,23 +78,13 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
     };
     match first {
         Some(proto::snapshot_frame_v1::Frame::FormatEpoch(value)) => {
-            if value.epoch != ursula_stream::FORMAT_EPOCH {
-                return Err(SnapshotStoreError::Deserialize(
-                    ursula_stream::format_epoch_refusal(
-                        "snapshot",
-                        &format!("is format epoch {}", value.epoch),
-                    ),
-                ));
+            if value.epoch != ursula_stream::GROUP_SNAPSHOT_VERSION {
+                return Err(SnapshotStoreError::UnsupportedVersion {
+                    found: Some(value.epoch),
+                });
             }
         }
-        _ => {
-            return Err(SnapshotStoreError::Deserialize(
-                ursula_stream::format_epoch_refusal(
-                    "snapshot",
-                    "has no leading format-epoch frame (Ursula 0.5.x or earlier, format epoch 1)",
-                ),
-            ));
-        }
+        _ => return Err(SnapshotStoreError::UnsupportedVersion { found: None }),
     }
 
     while cursor.has_remaining() {
@@ -103,7 +94,7 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
         match frame {
             proto::snapshot_frame_v1::Frame::FormatEpoch(_) => {
                 return Err(SnapshotStoreError::Deserialize(
-                    "snapshot format-epoch frame is not the first frame".to_owned(),
+                    "snapshot version frame is not the first frame".to_owned(),
                 ));
             }
             proto::snapshot_frame_v1::Frame::Header(value) => {
@@ -153,7 +144,7 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
         placement: placement_from_proto(required(header.placement, "snapshot header placement")?),
         group_commit_index: header.group_commit_index,
         stream_snapshot: StreamSnapshot {
-            format_epoch: ursula_stream::FORMAT_EPOCH,
+            version: ursula_stream::STREAM_SNAPSHOT_VERSION,
             buckets: header.buckets,
             erased_buckets: header.erased_buckets,
             streams,
@@ -200,7 +191,7 @@ fn bucket_usage_to_proto(value: ursula_stream::BucketUsageSnapshot) -> proto::Bu
 /// only the entry being encoded is copied, one frame at a time.
 struct GroupSnapshotFrameIter {
     snapshot: Arc<GroupSnapshot>,
-    format_epoch: bool,
+    version_frame: bool,
     header: bool,
     next_stream: usize,
     next_append_count: usize,
@@ -212,7 +203,7 @@ impl GroupSnapshotFrameIter {
     fn new(snapshot: Arc<GroupSnapshot>) -> Self {
         Self {
             snapshot,
-            format_epoch: true,
+            version_frame: true,
             header: true,
             next_stream: 0,
             next_append_count: 0,
@@ -246,10 +237,10 @@ impl Iterator for GroupSnapshotFrameIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         let snapshot = &*self.snapshot;
-        let frame = if self.format_epoch {
-            self.format_epoch = false;
+        let frame = if self.version_frame {
+            self.version_frame = false;
             proto::snapshot_frame_v1::Frame::FormatEpoch(proto::FormatEpochV1 {
-                epoch: ursula_stream::FORMAT_EPOCH,
+                epoch: ursula_stream::GROUP_SNAPSHOT_VERSION,
             })
         } else if self.header {
             self.header = false;
@@ -610,7 +601,7 @@ mod tests {
             },
             group_commit_index: 42,
             stream_snapshot: StreamSnapshot {
-                format_epoch: ursula_stream::FORMAT_EPOCH,
+                version: ursula_stream::STREAM_SNAPSHOT_VERSION,
                 buckets: vec!["bucket".to_owned()],
                 erased_buckets: vec!["erased-bucket".to_owned()],
                 streams: Vec::new(),
@@ -748,13 +739,13 @@ mod tests {
         assert_eq!(restored.state_gauges(), machine.state_gauges());
     }
 
-    fn epoch_frame(epoch: u32) -> Bytes {
+    fn version_frame(version: u32) -> Bytes {
         encode_frame(proto::SnapshotFrameV1 {
             frame: Some(proto::snapshot_frame_v1::Frame::FormatEpoch(
-                proto::FormatEpochV1 { epoch },
+                proto::FormatEpochV1 { epoch: version },
             )),
         })
-        .expect("encode epoch frame")
+        .expect("encode version frame")
     }
 
     fn header_v1() -> proto::SnapshotHeaderV1 {
@@ -790,42 +781,48 @@ mod tests {
         .expect("encode footer")
     }
 
-    /// E5: the epoch frame comes first and is checked before any other frame.
+    /// E5: the version frame comes first and is checked before any other
+    /// frame. It carries the group snapshot version, which Ursula 0.6 wrote
+    /// too, so a 0.6 snapshot decodes.
     #[test]
-    fn decode_requires_a_leading_epoch_frame_of_this_epoch() {
-        let epoch = ursula_stream::FORMAT_EPOCH;
-        let valid = [epoch_frame(epoch), header_frame(), footer_frame()].concat();
-        decode_group_snapshot(&valid).expect("a snapshot of this epoch decodes");
+    fn decode_requires_a_leading_frame_of_this_group_snapshot_version() {
+        let version = ursula_stream::GROUP_SNAPSHOT_VERSION;
+        let valid = [version_frame(version), header_frame(), footer_frame()].concat();
+        decode_group_snapshot(&valid).expect("a snapshot of this version decodes");
 
-        let previous = format!("is format epoch {}", epoch - 1);
-        let cases = [
+        for (bytes, expected) in [
+            ([header_frame(), footer_frame()].concat(), None),
             (
-                [header_frame(), footer_frame()].concat(),
-                "no leading format-epoch frame",
+                [version_frame(version - 1), header_frame(), footer_frame()].concat(),
+                Some(version - 1),
             ),
             (
-                [epoch_frame(epoch - 1), header_frame(), footer_frame()].concat(),
-                previous.as_str(),
+                [version_frame(version + 1), header_frame(), footer_frame()].concat(),
+                Some(version + 1),
             ),
             (
-                [header_frame(), epoch_frame(epoch), footer_frame()].concat(),
-                "no leading format-epoch frame",
+                [header_frame(), version_frame(version), footer_frame()].concat(),
+                None,
             ),
-            (
-                [
-                    epoch_frame(epoch),
-                    header_frame(),
-                    epoch_frame(epoch),
-                    footer_frame(),
-                ]
-                .concat(),
-                "not the first frame",
-            ),
-        ];
-        for (bytes, expected) in cases {
+        ] {
             let error = decode_group_snapshot(&bytes).expect_err("refused");
-            assert!(error.to_string().contains(expected), "{error}");
+            assert!(
+                matches!(error, SnapshotStoreError::UnsupportedVersion { found } if found == expected),
+                "{error}"
+            );
         }
+        let repeated = [
+            version_frame(version),
+            header_frame(),
+            version_frame(version),
+            footer_frame(),
+        ]
+        .concat();
+        let error = decode_group_snapshot(&repeated).expect_err("refused");
+        assert!(
+            matches!(&error, SnapshotStoreError::Deserialize(message) if message.contains("not the first frame")),
+            "{error}"
+        );
     }
 
     #[test]
@@ -849,7 +846,7 @@ mod tests {
             )),
         })
         .expect("encode header");
-        let header = [epoch_frame(ursula_stream::FORMAT_EPOCH), header].concat();
+        let header = [version_frame(ursula_stream::GROUP_SNAPSHOT_VERSION), header].concat();
 
         assert!(matches!(
             decode_group_snapshot(&header),
@@ -882,7 +879,7 @@ mod tests {
             last_created_at_ms: 0,
         };
         [
-            epoch_frame(ursula_stream::FORMAT_EPOCH),
+            version_frame(ursula_stream::GROUP_SNAPSHOT_VERSION),
             encode_frame(proto::SnapshotFrameV1 {
                 frame: Some(proto::snapshot_frame_v1::Frame::Header(header)),
             })

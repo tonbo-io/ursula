@@ -5,6 +5,8 @@
 //! - [`cold_store`]: opendal-backed cold tier handle and object path helpers.
 //! - [`cold_index`]: cold-index pages (binary format, stores, cache), their
 //!   writes with the clip rule and rollback, and leader-side page repair.
+//! - [`cold_references`]: the cold objects a stream snapshot references and
+//!   whether a cold store holds them, checked before a backup restore.
 //! - [`cold_refs`]: value types of the shared pack-reference compaction driver
 //!   (F2), the cold orphan sweep (F14h) and the external-locator offload
 //!   (F5), and object-name age parsing.
@@ -30,6 +32,7 @@
 
 mod admission;
 pub mod cold_index;
+mod cold_references;
 mod cold_refs;
 mod cold_store;
 pub mod cold_worker;
@@ -74,6 +77,10 @@ pub use cold_index::select_cold_chunk_compaction;
 pub use cold_index::write_cold_chunk_index_pages_in_generation;
 pub use cold_index::write_cold_chunk_index_pages_with_rollback_in_generation;
 pub use cold_index::write_proven_external_index_pages;
+pub use cold_references::ColdReferenceError;
+pub use cold_references::ColdReferenceReport;
+pub use cold_references::MISSING_COLD_OBJECT_SAMPLE;
+pub use cold_references::check_cold_references;
 pub use cold_refs::ColdOrphanSweepPlan;
 pub use cold_refs::ColdOrphanSweepReport;
 pub use cold_refs::ColdOrphanSweepRequest;
@@ -239,6 +246,7 @@ pub use snapshot_store::encode_binary_envelope;
 pub use snapshot_store::resolved_snapshot_backend;
 pub use snapshot_store::snapshot_store_from_config;
 pub use ursula_config::config::ColdConfig;
+pub use ursula_stream::BACKUP_FORMAT_VERSION;
 pub use ursula_stream::COMMITTED_WRITE_UNIT_BYTES;
 pub use ursula_stream::ColdChunkRef;
 pub use ursula_stream::ColdFlushCandidate;
@@ -250,11 +258,13 @@ pub use ursula_stream::ExternalPayloadRef;
 pub use ursula_stream::FORMAT_EPOCH;
 pub use ursula_stream::MAX_COLD_SNAPSHOT_BYTES;
 pub use ursula_stream::ProducerRequest;
+pub use ursula_stream::STREAM_SNAPSHOT_VERSION;
 pub use ursula_stream::SnapshotDigest;
 pub use ursula_stream::StreamErrorCode;
 pub use ursula_stream::StreamErrorContext;
 pub use ursula_stream::StreamSnapshot;
-pub use ursula_stream::format_epoch_refusal;
+pub use ursula_stream::UPGRADE_GUIDE_URL;
+pub use ursula_stream::other_release_refusal;
 pub use ursula_stream::validate_bucket_id;
 
 #[cfg(test)]

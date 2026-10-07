@@ -464,6 +464,20 @@ pub struct BackupInfo {
     pub format_version: u32,
     pub raft_group_count: u32,
 }
+/// Answer of `POST /__ursula/backup/group/{group}/cold-check`, whose body is
+/// one backup group object: whether the answering node's cold store holds
+/// every cold object the group references. `ursulactl restore` asks it for
+/// every group before the first import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupColdCheck {
+    pub raft_group_id: u32,
+    /// Distinct cold objects the group references, index pages included.
+    pub referenced_objects: u64,
+    /// How many of them the cold store does not hold.
+    pub missing_objects: u64,
+    /// Some missing keys, relative to `storage.cold.root`.
+    pub missing_sample: Vec<String>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotResponse {
     pub raft_group_id: u32,

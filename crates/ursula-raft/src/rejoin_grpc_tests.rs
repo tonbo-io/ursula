@@ -369,7 +369,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         .append(Request::new(pb::RaftRpcEnvelopeV1 {
             raft_group_id: placement().raft_group_id.0,
             node_id: 1,
-            protocol_version: ursula_stream::FORMAT_EPOCH,
+            protocol_version: ursula_stream::RAFT_GRPC_PROTOCOL_VERSION,
             payload: encode_wire(&delayed),
         }))
         .await
@@ -400,7 +400,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             .transfer_leader(Request::new(pb::RaftTransferLeaderRequestV1 {
                 raft_group_id: placement().raft_group_id.0,
                 node_id: 1,
-                protocol_version: ursula_stream::FORMAT_EPOCH,
+                protocol_version: ursula_stream::RAFT_GRPC_PROTOCOL_VERSION,
                 request: encode_wire(&transfer),
             }))
             .await
@@ -458,7 +458,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             let error = raw
                 .rejoin_barrier(pb::RejoinBarrierRequestV1 {
                     raft_group_id: placement().raft_group_id.0,
-                    protocol_version: ursula_stream::FORMAT_EPOCH,
+                    protocol_version: ursula_stream::RAFT_GRPC_PROTOCOL_VERSION,
                 })
                 .await
                 .unwrap_err();
@@ -529,7 +529,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         .append(Request::new(pb::RaftRpcEnvelopeV1 {
             raft_group_id: placement().raft_group_id.0,
             node_id: 1,
-            protocol_version: ursula_stream::FORMAT_EPOCH,
+            protocol_version: ursula_stream::RAFT_GRPC_PROTOCOL_VERSION,
             payload: encode_wire(&delayed),
         }))
         .await

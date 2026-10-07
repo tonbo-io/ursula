@@ -1,10 +1,10 @@
 //! Format-epoch checks on the Raft gRPC plane.
 //!
 //! The Raft gRPC protocol version is the format epoch
-//! (`ursula_stream::FORMAT_EPOCH`). Every inbound RPC checks it before the
-//! group id and the payload, and Ursula 0.5.x does the same, so a mismatch is
-//! answered `FAILED_PRECONDITION` with [`PROTOCOL_MISMATCH_TEXT`] in the
-//! message. Two mechanisms keep a node of one epoch from serving next to a
+//! (`ursula_stream::RAFT_GRPC_PROTOCOL_VERSION`). Every inbound RPC checks it
+//! before the group id and the payload, and Ursula 0.5.x and 0.6 do the same,
+//! so a mismatch is answered `FAILED_PRECONDITION` with
+//! [`PROTOCOL_MISMATCH_TEXT`] in the message. Two mechanisms keep a node of one epoch from serving next to a
 //! node of another:
 //!
 //! - **Startup peer probe** ([`probe_peer_format_epoch`]): before a node
@@ -25,7 +25,7 @@ use tonic::transport::Endpoint;
 
 use crate::raft_internal_proto;
 
-/// Text every protocol-version refusal carries, in 0.5.x and in this binary.
+/// Text every protocol-version refusal carries, in 0.5.x, 0.6 and this binary.
 pub(crate) const PROTOCOL_MISMATCH_TEXT: &str = "raft grpc protocol mismatch";
 
 /// The group id the startup probe names. No node registers it, so a peer on

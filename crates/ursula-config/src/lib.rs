@@ -9,6 +9,8 @@ pub use config::*;
 pub use human::HumanDuration;
 pub use human::HumanSize;
 pub use load::ConfigError;
+pub use load::REMOVED_KEYS;
+pub use load::RemovedKey;
 pub use load::find_default_config;
 pub use load::load_config;
 pub use preset::Preset;

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use ursula_shard::BucketStreamId;
+use ursula_stream::COLD_INDEX_PAGE_VERSION;
 use ursula_stream::ColdChunkRef;
 use ursula_stream::ObjectPayloadRef;
 use ursula_stream::StreamReadColdIndexSegment;
@@ -18,7 +19,6 @@ use crate::cold_store::ColdStoreHandle;
 pub type ColdIndexPageStoreFuture<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'a>>;
 
 const COLD_INDEX_PAGE_MAGIC: &[u8; 8] = b"UCIDX001";
-const COLD_INDEX_PAGE_VERSION: u16 = 2;
 const COLD_INDEX_ENTRY_COLD_CHUNK: u8 = 1;
 const COLD_INDEX_ENTRY_EXTERNAL_SEGMENT: u8 = 2;
 const FNV64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;

@@ -730,10 +730,10 @@ async fn main() -> Result<()> {
 }
 
 fn backup_client(nodes: &[NodeInfo], http_timeout_secs: u64) -> Result<backup::BackupClient> {
-    backup::BackupClient::new(
+    Ok(backup::BackupClient::new(
         MetricsClient::new(Duration::from_secs(http_timeout_secs))?,
         nodes.to_vec(),
-    )
+    )?)
 }
 
 fn wall_clock_unix_ms() -> u64 {
@@ -782,8 +782,8 @@ async fn run_restore_subcommand(args: BackupCreateArgs) -> Result<()> {
     let store = backup::BackupStore::open(&args.location)?;
     let report = backup::restore(&client, &store).await?;
     println!(
-        "restore complete: {} groups, {} buckets, {} streams",
-        report.groups, report.buckets, report.streams
+        "restore complete: {} groups, {} buckets, {} streams, {} cold objects present",
+        report.groups, report.buckets, report.streams, report.cold_objects
     );
     Ok(())
 }

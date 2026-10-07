@@ -2161,6 +2161,202 @@ async fn cli_sigterm_hands_off_leaders_and_bounds_quorum_loss() {
     sigterm_and_wait_for_clean_exit(&mut children[0]).await;
 }
 
+/// The upgrade path from Ursula 0.6: `ursulactl restore` of a backup that
+/// 0.6.2's `ursulactl backup-create` wrote, into a node of this build.
+///
+/// The fixture under `crates/ursula-ctl/tests/fixtures/backup-0.6.2` came
+/// from a 0.6.2 node with `group_count = 4` and no cold store, so every byte
+/// is hot. Its streams, all in bucket `compat`: `text`, `json` and `binary`
+/// (two writes each), `closed` (closed by an empty append), `ttl`
+/// (`Stream-TTL: 3153600000`), `expires` (`Stream-Expires-At` in 2100),
+/// `producer` (producer `writer-a`, epoch 2, sequences 0 to 2) and `seq`
+/// (`Stream-Seq` 0005, 0006, 0007). The expected values below are what 0.6.2
+/// answered for the same requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_restores_a_backup_written_by_ursula_0_6_2() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the 0.6.2 backup restore test");
+        return;
+    };
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../ursula-ctl/tests/fixtures/backup-0.6.2")
+        .canonicalize()
+        .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let config_path = root.path().join("node.toml");
+    let admin_port = write_single_node_cluster_config(
+        &config_path,
+        port,
+        1,
+        4,
+        &base_url,
+        true,
+        &root.path().join("wal"),
+    );
+    let mut child = spawn_node_with_cluster_config(binary, &config_path);
+    let client = reqwest::Client::new();
+    wait_until_ready(&client, &base_url, std::slice::from_mut(&mut child)).await;
+    let nodes = vec![ctl_node(1, admin_port, &base_url)];
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(10)).unwrap();
+    ursula_ctl::wait_ready(
+        &ctl,
+        &nodes,
+        4,
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("every group elects its leader");
+
+    let store = ursula_ctl::backup::BackupStore::open(fixture.to_str().unwrap()).unwrap();
+    let backup = ursula_ctl::backup::BackupClient::new(ctl, nodes).unwrap();
+    let report = ursula_ctl::backup::restore(&backup, &store)
+        .await
+        .expect("a 0.6.2 backup restores");
+    assert_eq!(
+        (report.groups, report.buckets, report.streams),
+        (4, 4, 8),
+        "every group, bucket and stream of the fixture"
+    );
+    assert_eq!(report.cold_objects, 0, "the fixture is hot only");
+
+    let mut binary_body = (0u8..=255).collect::<Vec<u8>>();
+    binary_body.extend_from_slice(b"\x00\xff\xfe\x80tail");
+    let expected: [(&str, &str, &[u8], &str); 8] = [
+        ("text", "text/plain", b"hello\nworld\n", "1791399953818"),
+        (
+            "json",
+            "application/json",
+            "{\"id\":1}\n{\"id\":2}\n{\"id\":3,\"name\":\"h\u{e9}llo\"}\n".as_bytes(),
+            "1791399953846",
+        ),
+        (
+            "binary",
+            "application/octet-stream",
+            &binary_body,
+            "1791399953861",
+        ),
+        ("closed", "text/plain", b"last words\n", "1791399953876"),
+        ("ttl", "text/plain", b"lives a century\n", "1791399953888"),
+        ("expires", "text/plain", b"until 2100\n", "1791399953894"),
+        (
+            "producer",
+            "text/plain",
+            b"writer-a 0\nwriter-a 1\nwriter-a 2\n",
+            "1791399953899",
+        ),
+        (
+            "seq",
+            "text/plain",
+            b"seq 5\nseq 6\nseq 7\n",
+            "1791399953922",
+        ),
+    ];
+    for (stream, content_type, body, incarnation) in expected {
+        let url = format!("{base_url}/compat/{stream}");
+        let head = client.head(&url).send().await.unwrap();
+        assert_eq!(head.status(), reqwest::StatusCode::OK, "HEAD {stream}");
+        let header = |name: &str| {
+            head.headers()
+                .get(name)
+                .map(|value| value.to_str().unwrap().to_owned())
+        };
+        assert_eq!(header("content-type").as_deref(), Some(content_type));
+        assert_eq!(
+            header("stream-next-offset").as_deref(),
+            Some(format!("{:020}", body.len()).as_str()),
+            "{stream} tail"
+        );
+        assert_eq!(
+            header("stream-incarnation").as_deref(),
+            Some(incarnation),
+            "{stream} keeps its incarnation"
+        );
+        assert_eq!(
+            header("stream-closed").as_deref(),
+            (stream == "closed").then_some("true"),
+            "{stream} close state"
+        );
+        assert_eq!(
+            header("stream-ttl").as_deref(),
+            (stream == "ttl").then_some("3153600000"),
+            "{stream} TTL"
+        );
+        assert_eq!(
+            header("stream-expires-at").as_deref(),
+            (stream == "expires").then_some("2100-01-01T00:00:00.000Z"),
+            "{stream} expiry"
+        );
+        let read = client
+            .get(format!("{url}?offset=-1&max_bytes=1048576"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(read.status(), reqwest::StatusCode::OK, "GET {stream}");
+        assert_eq!(&read.bytes().await.unwrap()[..], body, "{stream} bytes");
+    }
+
+    // Producer state carried over: a retry of the last sequence is a
+    // duplicate, a gap and a stale epoch are refused, and the next sequence
+    // appends.
+    let produce = |epoch: u64, seq: u64, body: &'static str| {
+        client
+            .post(format!("{base_url}/compat/producer"))
+            .header("content-type", "text/plain")
+            .header("producer-id", "writer-a")
+            .header("producer-epoch", epoch.to_string())
+            .header("producer-seq", seq.to_string())
+            .body(body)
+            .send()
+    };
+    let duplicate = produce(2, 2, "writer-a 2\n").await.unwrap();
+    assert_eq!(duplicate.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        duplicate.headers()["stream-next-offset"],
+        "00000000000000000033"
+    );
+    let gap = produce(2, 4, "gap\n").await.unwrap();
+    assert_eq!(gap.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(gap.headers()["producer-expected-seq"], "3");
+    let stale = produce(1, 0, "stale\n").await.unwrap();
+    assert_eq!(stale.status(), reqwest::StatusCode::FORBIDDEN);
+    let next = produce(2, 3, "writer-a 3\n").await.unwrap();
+    assert_eq!(next.status(), reqwest::StatusCode::OK);
+    assert_eq!(next.headers()["stream-next-offset"], "00000000000000000044");
+
+    // The last Stream-Seq carried over.
+    let append_seq = |seq: &'static str, body: &'static str| {
+        client
+            .post(format!("{base_url}/compat/seq"))
+            .header("content-type", "text/plain")
+            .header("stream-seq", seq)
+            .body(body)
+            .send()
+    };
+    let replayed = append_seq("0007", "again\n").await.unwrap();
+    assert_eq!(replayed.status(), reqwest::StatusCode::CONFLICT);
+    let accepted = append_seq("0008", "seq 8\n").await.unwrap();
+    assert_eq!(accepted.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        accepted.headers()["stream-next-offset"],
+        "00000000000000000024"
+    );
+
+    // The closed stream stays closed.
+    let closed = client
+        .post(format!("{base_url}/compat/closed"))
+        .header("content-type", "text/plain")
+        .body("more\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(closed.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(closed.headers()["stream-closed"], "true");
+}
+
 async fn sigterm_and_wait_for_clean_exit(child: &mut ChildGuard) {
     let status = Command::new("kill")
         .arg("-TERM")
