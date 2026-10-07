@@ -239,6 +239,7 @@ pub use snapshot_store::encode_binary_envelope;
 pub use snapshot_store::resolved_snapshot_backend;
 pub use snapshot_store::snapshot_store_from_config;
 pub use ursula_config::config::ColdConfig;
+pub use ursula_stream::BACKUP_FORMAT_VERSION;
 pub use ursula_stream::COMMITTED_WRITE_UNIT_BYTES;
 pub use ursula_stream::ColdChunkRef;
 pub use ursula_stream::ColdFlushCandidate;
@@ -250,11 +251,13 @@ pub use ursula_stream::ExternalPayloadRef;
 pub use ursula_stream::FORMAT_EPOCH;
 pub use ursula_stream::MAX_COLD_SNAPSHOT_BYTES;
 pub use ursula_stream::ProducerRequest;
+pub use ursula_stream::STREAM_SNAPSHOT_VERSION;
 pub use ursula_stream::SnapshotDigest;
 pub use ursula_stream::StreamErrorCode;
 pub use ursula_stream::StreamErrorContext;
 pub use ursula_stream::StreamSnapshot;
-pub use ursula_stream::format_epoch_refusal;
+pub use ursula_stream::UPGRADE_GUIDE_URL;
+pub use ursula_stream::other_release_refusal;
 pub use ursula_stream::validate_bucket_id;
 
 #[cfg(test)]

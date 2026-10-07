@@ -2409,7 +2409,7 @@ fn snapshot_restore_rejects_invalid_entries() {
             streams: Vec::new(),
             bucket_usage: Vec::new(),
             last_created_at_ms: 0,
-            format_epoch: crate::FORMAT_EPOCH,
+            version: crate::STREAM_SNAPSHOT_VERSION,
         })
         .expect_err("duplicate bucket"),
         StreamSnapshotError::DuplicateBucket("benchcmp".to_owned())
@@ -2424,7 +2424,7 @@ fn snapshot_restore_rejects_invalid_entries() {
             streams: vec![entry],
             bucket_usage: Vec::new(),
             last_created_at_ms: 0,
-            format_epoch: crate::FORMAT_EPOCH,
+            version: crate::STREAM_SNAPSHOT_VERSION,
         })
     };
 
@@ -3862,13 +3862,13 @@ fn purge_bucket_removes_streams_but_preserves_accounting_idempotently() {
 }
 
 #[test]
-fn restore_refuses_another_format_epoch() {
+fn restore_refuses_another_stream_snapshot_version() {
     let mut snapshot = machine().snapshot();
-    snapshot.format_epoch = crate::FORMAT_EPOCH - 1;
+    snapshot.version = crate::STREAM_SNAPSHOT_VERSION + 1;
     assert_eq!(
-        StreamStateMachine::restore(snapshot.clone()).expect_err("other epoch"),
-        StreamSnapshotError::FormatEpoch {
-            found: crate::FORMAT_EPOCH - 1,
+        StreamStateMachine::restore(snapshot.clone()).expect_err("other version"),
+        StreamSnapshotError::UnsupportedVersion {
+            found: crate::STREAM_SNAPSHOT_VERSION + 1,
         }
     );
     assert!(matches!(

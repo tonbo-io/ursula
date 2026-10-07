@@ -14,7 +14,7 @@
 //!           | payload (MessagePack) | u32 CRC32 of every byte before it
 //! ```
 //!
-//! The version is the format epoch, as in the journal header.
+//! The version is the Raft WAL version, as in the journal header.
 
 use std::io;
 use std::path::Path;
@@ -81,9 +81,10 @@ pub enum StateFileError {
     },
     #[error("'{}' is not an Ursula WAL {kind:?} file", .path.display())]
     WrongKind { path: PathBuf, kind: StateFileKind },
-    #[error("{}", ursula_stream::format_epoch_refusal(
+    #[error("{}", ursula_stream::other_release_refusal(
         &format!("WAL state file '{}'", .path.display()),
         &format!("uses Ursula WAL version {version}"),
+        &format!("Ursula WAL version {JOURNAL_VERSION}"),
     ))]
     UnsupportedVersion { path: PathBuf, version: u16 },
     #[error("WAL state file '{}' is corrupt: {defect}", .path.display())]
@@ -352,10 +353,10 @@ mod tests {
             );
         }
 
-        let mut other_epoch = bytes.clone();
+        let mut other_version = bytes.clone();
         let other = JOURNAL_VERSION.wrapping_sub(1);
-        other_epoch[8..10].copy_from_slice(&other.to_le_bytes());
-        let err = decode_sample(&other_epoch).expect_err("another format epoch");
+        other_version[8..10].copy_from_slice(&other.to_le_bytes());
+        let err = decode_sample(&other_version).expect_err("another WAL version");
         assert!(
             matches!(err, StateFileError::UnsupportedVersion { version, .. } if version == other)
         );

@@ -287,7 +287,8 @@ async fn init_state(
         )?
     };
 
-    // Format epoch 2: refuse 0.5.x data and peers before anything is written.
+    // Format epoch: refuse data and peers of another epoch before anything is
+    // written.
     let log_dir = persistence.log_dir().map(std::path::Path::to_path_buf);
     crate::bootstrap::check_and_stamp_format_epoch(config, log_dir.as_deref()).await?;
 

@@ -730,10 +730,10 @@ async fn main() -> Result<()> {
 }
 
 fn backup_client(nodes: &[NodeInfo], http_timeout_secs: u64) -> Result<backup::BackupClient> {
-    backup::BackupClient::new(
+    Ok(backup::BackupClient::new(
         MetricsClient::new(Duration::from_secs(http_timeout_secs))?,
         nodes.to_vec(),
-    )
+    )?)
 }
 
 fn wall_clock_unix_ms() -> u64 {
