@@ -1,9 +1,10 @@
 // Producer fencing: a new owner's claim (a new producer epoch) fences every earlier owner.
+import { readFileSync } from "node:fs";
 import { expect, it } from "vitest";
 import { attach, openUrsulaPiStorage, status, UrsulaReplicationError } from "../src/index.ts";
 import { openHarness } from "./harness-kit.ts";
 import { ctx, freshFile } from "./helpers.ts";
-import { integrity, openPlain, runChild, streamPath, ursulaUrl, walContains } from "./kit.ts";
+import { integrity, openPlain, runChild, streamPath, ursulaUrl } from "./kit.ts";
 
 const xs = (db: ReturnType<typeof openPlain>): string[] => (db.prepare("SELECT x FROM t ORDER BY x").all() as { x: string }[]).map((r) => r.x);
 const attempt = (f: () => void): string => {
@@ -24,6 +25,7 @@ it("a fenced writer's commit fails, stays out of its file, and the new owner is 
 	const a = openPlain(fileA);
 	a.exec("CREATE TABLE t(x TEXT)");
 	a.exec("INSERT INTO t VALUES ('a1')");
+	const walBefore = readFileSync(`${fileA}-wal`);
 
 	const b = runChild(fileB, url, ["INSERT INTO t VALUES ('b1')"], { CHILD_EXIT: "1" });
 	expect((await b.exited).code).toBe(0);
@@ -31,8 +33,11 @@ it("a fenced writer's commit fails, stays out of its file, and the new owner is 
 
 	expect(attempt(() => a.exec("INSERT INTO t VALUES ('a2')"))).toMatch(/disk I\/O error/);
 	expect(status(fileA)).toMatchObject({ poisoned: true, fenced: true });
+	expect(status(fileA).reason).toMatch(/superseded.*\(403\)/);
 	expect(xs(a)).toEqual(["a1"]);
-	expect(walContains(fileA, "a2")).toBe(false);
+	// A short marker can occur in WAL salts/checksums before the rejected write.
+	// Compare every byte instead: no part of the rejected transaction may reach disk.
+	expect(readFileSync(`${fileA}-wal`)).toEqual(walBefore);
 	expect(integrity(a)).toBe("ok");
 	a.close();
 
