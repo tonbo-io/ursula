@@ -67,7 +67,8 @@ The Raft WAL is always the per-core disk journal. A node with `raft.peers` set
 refuses to start without `raft.wal.path`. A single node without a path creates a
 fresh `ursula-wal-*` directory under the system temporary directory, logs its
 location at startup, and removes it on a clean shutdown (`SIGTERM` or Ctrl-C).
-Its streams survive no restart. Set `raft.wal.path` to keep them. Configurations
+A failed start, or a shutdown that cannot close the WAL, leaves the directory in
+place. Its streams survive no restart. Set `raft.wal.path` to keep them. Configurations
 that still set `raft.wal.backend`, `raft.wal.allow_volatile_multi_peer` or
 `raft.memory_bootstrap_marker_dir` fail to load with an unknown-field error.
 

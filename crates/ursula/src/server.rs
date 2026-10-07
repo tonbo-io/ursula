@@ -151,9 +151,9 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         state = state.with_startup_maintenance_fence(admission.maintenance_fence);
     }
     state.register_otel_metrics();
-    serve(state, &config).await?;
+    let wal_shutdown = serve(state, &config).await?;
     if let Some(wal_dir) = wal_dir {
-        wal_dir.close();
+        wal_dir.close(wal_shutdown);
     }
     Ok(())
 }
@@ -170,8 +170,11 @@ enum RaftWalDir {
     /// `raft.wal.path`, kept across runs.
     Configured(PathBuf),
     /// No path is configured, which only a single node allows: a fresh
-    /// temporary directory for this run, removed on clean shutdown.
-    Temporary(tempfile::TempDir),
+    /// temporary directory for this run. Only [`RaftWalDir::close`] after a
+    /// clean WAL shutdown removes it. Dropping it, as an error return does,
+    /// leaves it, because a core writer may still write to it, and a journal
+    /// write that fails stops the process.
+    Temporary(PathBuf),
 }
 
 impl RaftWalDir {
@@ -179,11 +182,14 @@ impl RaftWalDir {
         match &wal.path {
             Some(path) => Ok(Self::Configured(path.clone())),
             None => {
-                let dir = tempfile::Builder::new().prefix("ursula-wal-").tempdir()?;
+                let dir = tempfile::Builder::new()
+                    .prefix("ursula-wal-")
+                    .tempdir()?
+                    .keep();
                 tracing::info!(
-                    path = %dir.path().display(),
+                    path = %dir.display(),
                     "raft.wal.path is not set: the Raft WAL runs in a temporary directory that \
-                     is removed on clean shutdown"
+                     is removed after a clean shutdown"
                 );
                 Ok(Self::Temporary(dir))
             }
@@ -192,20 +198,26 @@ impl RaftWalDir {
 
     /// The journal directory: the WAL directory's `raft-log` subdirectory.
     fn log_dir(&self) -> PathBuf {
-        let root = match self {
-            Self::Configured(path) => path.as_path(),
-            Self::Temporary(dir) => dir.path(),
-        };
+        let (Self::Configured(root) | Self::Temporary(root)) = self;
         root.join(ursula_config::WalConfig::LOG_SUBDIR)
     }
 
-    /// After a clean shutdown: removes a temporary WAL directory.
-    fn close(self) {
-        let Self::Temporary(dir) = self else {
+    /// After the server stopped: removes a temporary WAL directory once its
+    /// WAL shut down cleanly. Only then has every core writer closed, so
+    /// nothing writes to the directory any more.
+    fn close(self, shutdown: WalShutdown) {
+        let Self::Temporary(path) = self else {
             return;
         };
-        let path = dir.path().to_owned();
-        match dir.close() {
+        if shutdown != WalShutdown::Clean {
+            tracing::warn!(
+                path = %path.display(),
+                ?shutdown,
+                "kept the temporary Raft WAL directory: the WAL did not shut down cleanly"
+            );
+            return;
+        }
+        match std::fs::remove_dir_all(&path) {
             Ok(()) => tracing::info!(
                 path = %path.display(),
                 "removed the temporary Raft WAL directory"
@@ -390,10 +402,11 @@ fn static_grpc_node_hosts_group(
         .is_some_and(|voters| voters.contains(&node_id))
 }
 
+/// Serves until a shutdown signal, then stops the Raft groups and the WAL.
 async fn serve(
     state: HttpState,
     config: &ursula_config::UrsulaConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<WalShutdown, Box<dyn std::error::Error>> {
     let listen: SocketAddr = config.server.listen.parse()?;
     let cluster_listen = config
         .server
@@ -480,9 +493,22 @@ async fn serve(
         admin_res?;
     }
     tracing::info!("all listeners drained; stopping the Raft groups");
-    shutdown_raft_wal(&runtime, raft_wal.as_ref()).await;
+    let wal_shutdown = shutdown_raft_wal(&runtime, raft_wal.as_ref()).await;
     tracing::info!("exiting");
-    Ok(())
+    Ok(wal_shutdown)
+}
+
+/// How [`shutdown_raft_wal`] ended the node's Raft WAL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalShutdown {
+    /// The node runs no Raft WAL.
+    NoWal,
+    /// Every core writer closed and `fsync`ed its journal, and the run is
+    /// recorded as clean. Nothing writes to the WAL any more.
+    Clean,
+    /// A writer did not close, or the clean run was not recorded. A writer
+    /// may still be open.
+    Unclean,
 }
 
 /// The end of a graceful shutdown, after the leadership handoff and the
@@ -492,12 +518,12 @@ async fn serve(
 /// unclean, so the next start reads it as a crash. The shutdown grace period
 /// still bounds this: when it expires first the process exits without
 /// recording a clean shutdown.
-async fn shutdown_raft_wal(
+pub(crate) async fn shutdown_raft_wal(
     runtime: &ursula_runtime::ShardRuntime,
     raft_wal: Option<&ursula_raft::DurableRaftLogStoreFactory>,
-) {
+) -> WalShutdown {
     let Some(raft_wal) = raft_wal else {
-        return;
+        return WalShutdown::NoWal;
     };
     // A group that failed to stop can write no more once its core writer
     // has closed, so the WAL still shuts down cleanly.
@@ -505,11 +531,17 @@ async fn shutdown_raft_wal(
         tracing::warn!(%err, "failed to stop every Raft group before closing the WAL");
     }
     match raft_wal.shutdown().await {
-        Ok(()) => tracing::info!("Raft WAL synced and recorded as cleanly shut down"),
-        Err(err) => tracing::warn!(
-            %err,
-            "Raft WAL did not shut down cleanly; the next start treats this run as a crash"
-        ),
+        Ok(()) => {
+            tracing::info!("Raft WAL synced and recorded as cleanly shut down");
+            WalShutdown::Clean
+        }
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                "Raft WAL did not shut down cleanly; the next start treats this run as a crash"
+            );
+            WalShutdown::Unclean
+        }
     }
 }
 
@@ -715,7 +747,10 @@ mod tests {
                 "recovery_epoch": 0,
             })
         );
-        super::shutdown_raft_wal(&state.runtime, Some(&raft_wal)).await;
+        assert_eq!(
+            super::shutdown_raft_wal(&state.runtime, Some(&raft_wal)).await,
+            super::WalShutdown::Clean
+        );
         assert!(
             matches!(
                 raft_wal.shutdown().await,
@@ -726,8 +761,8 @@ mod tests {
     }
 
     /// Without `raft.wal.path` a single node runs its WAL in a fresh
-    /// temporary directory, removed once the server shut down cleanly. Only
-    /// the zero-config default runs without Raft.
+    /// temporary directory, removed once the server shut down cleanly and
+    /// kept otherwise. Only the zero-config default runs without Raft.
     #[tokio::test]
     async fn a_single_node_without_a_wal_path_runs_in_a_temporary_directory() {
         let mut config = ursula_config::UrsulaConfig::default();
@@ -743,10 +778,10 @@ mod tests {
         assert!(super::runs_raft(&config, None));
 
         let wal_dir = super::RaftWalDir::resolve(&config.raft.wal).unwrap();
-        let super::RaftWalDir::Temporary(dir) = &wal_dir else {
+        let super::RaftWalDir::Temporary(root) = &wal_dir else {
             panic!("no path configured: {wal_dir:?}");
         };
-        let root = dir.path().to_owned();
+        let root = root.clone();
         let log_dir = wal_dir.log_dir();
         assert_eq!(log_dir, root.join("raft-log"));
         let state = super::init_state(
@@ -760,10 +795,35 @@ mod tests {
         .unwrap();
         let raft_wal = state.raft_wal().cloned().expect("the node runs Raft");
         assert_eq!(raft_wal.root(), log_dir.as_path());
-        super::shutdown_raft_wal(&state.runtime, Some(&raft_wal)).await;
+        let shutdown = super::shutdown_raft_wal(&state.runtime, Some(&raft_wal)).await;
+        assert_eq!(shutdown, super::WalShutdown::Clean);
         assert!(root.exists());
-        wal_dir.close();
+        wal_dir.close(shutdown);
         assert!(!root.exists(), "a clean shutdown removes the temporary WAL");
+    }
+
+    /// A temporary WAL directory stays unless its WAL shut down cleanly: a
+    /// core writer may still write to it.
+    #[test]
+    fn a_temporary_wal_directory_stays_without_a_clean_shutdown() {
+        let config = ursula_config::UrsulaConfig::default();
+        let resolve = || {
+            let wal_dir = super::RaftWalDir::resolve(&config.raft.wal).unwrap();
+            let super::RaftWalDir::Temporary(root) = &wal_dir else {
+                panic!("no path configured: {wal_dir:?}");
+            };
+            let root = root.clone();
+            (wal_dir, root)
+        };
+        let (wal_dir, unclean) = resolve();
+        wal_dir.close(super::WalShutdown::Unclean);
+        assert!(unclean.exists(), "an unclean shutdown keeps the directory");
+        let (wal_dir, dropped) = resolve();
+        drop(wal_dir);
+        assert!(dropped.exists(), "an error return keeps the directory");
+        for root in [unclean, dropped] {
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
