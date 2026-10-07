@@ -16,6 +16,11 @@
 //! which its journal was last read back to its verified prefix. A journal not
 //! read since the epoch began is still read that way, however later runs
 //! ended.
+//!
+//! A run that starts [`RecoveryState::Recovering`] moves every initialized
+//! group of every core into recovery in the core's metadata file before it
+//! records itself as running, so the groups stay out of elections until
+//! their recovery gates open, however later runs end.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -26,11 +31,15 @@ use serde::Deserialize;
 use serde::Serialize;
 use ursula_config::WalFsync;
 
+use super::core_meta::MarkRecoveringError;
+use super::core_meta::core_metadata_path;
+use super::core_meta::mark_core_recovering;
 use super::disk::Disk;
 use super::disk::DiskLock;
 use super::disk::JournalDisk;
 use super::disk::LockAttempt;
 use super::disk::create_dir_all_durable;
+use super::journal;
 use super::journal::JournalError;
 use super::journal::JournalReplayMode;
 use super::state_file;
@@ -41,6 +50,10 @@ use super::state_file::StateFileKind;
 pub const RUN_STATE_FILE: &str = "run-state.bin";
 /// The lock one node holds on its WAL root while it runs.
 const WAL_LOCK_FILE: &str = "wal.lock";
+/// The directory of core `N` under the WAL root is `core-N`.
+const CORE_DIR_PREFIX: &str = "core-";
+/// Each core directory holds its journal under this name.
+pub(crate) const CORE_JOURNAL_FILE: &str = "journal.bin";
 
 /// The id the host's kernel gives its current boot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,13 +97,25 @@ pub struct RunState {
     pub recovery_epoch: u64,
 }
 
+/// Whether the core journals under a WAL root hold records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalHistory {
+    /// No core journal holds a record.
+    Empty,
+    /// Some core journal holds records.
+    Records,
+}
+
 /// How the previous run that opened the journals ended, read from its run
 /// state and the current boot id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PreviousRun {
-    /// No run state: a new WAL root, or one whose run state was removed.
+    /// No run state and no journal record: a new node or a new disk.
     Absent,
+    /// No run state, but core journals hold records: the run state was
+    /// removed or lost, so how the run that wrote them ended is unknown.
+    Unrecorded,
     /// The previous run shut down cleanly: every journal was `fsync`ed.
     Clean,
     /// The previous run's process stopped on the host that still runs, so
@@ -122,6 +147,9 @@ pub enum RecoveryReason {
     HostCrash,
     /// An I/O error stopped a journal writer.
     Poisoned,
+    /// The run state is missing while journals hold records: how the run
+    /// that wrote them ended is unknown.
+    UnknownHistory,
 }
 
 /// How this run opens the journals.
@@ -138,11 +166,18 @@ pub struct WalOpening {
 }
 
 impl PreviousRun {
-    /// Reads `previous`, the run state the previous run left, given the
-    /// current `boot_id`.
-    pub fn interpret(previous: Option<&RunState>, boot_id: Option<&BootId>) -> Self {
+    /// Reads `previous`, the run state the previous run left, given what
+    /// the core `journals` hold and the current `boot_id`.
+    pub fn interpret(
+        previous: Option<&RunState>,
+        journals: JournalHistory,
+        boot_id: Option<&BootId>,
+    ) -> Self {
         let Some(previous) = previous else {
-            return Self::Absent;
+            return match journals {
+                JournalHistory::Empty => Self::Absent,
+                JournalHistory::Records => Self::Unrecorded,
+            };
         };
         match previous.status {
             RunStatus::Clean => Self::Clean,
@@ -163,7 +198,9 @@ impl PreviousRun {
     pub fn replay_mode(self) -> JournalReplayMode {
         match self {
             Self::Absent | Self::Clean | Self::ProcessCrash => JournalReplayMode::Strict,
-            Self::HostCrash { .. } | Self::Poisoned => JournalReplayMode::VerifiedPrefix,
+            Self::Unrecorded | Self::HostCrash { .. } | Self::Poisoned => {
+                JournalReplayMode::VerifiedPrefix
+            }
         }
     }
 
@@ -185,15 +222,22 @@ impl PreviousRun {
             Self::Poisoned => RecoveryState::Recovering {
                 reason: RecoveryReason::Poisoned,
             },
+            Self::Unrecorded => RecoveryState::Recovering {
+                reason: RecoveryReason::UnknownHistory,
+            },
         }
     }
 }
 
 impl WalOpening {
     /// The "Opening the journal" decision for a run on `boot_id` after the
-    /// run that left `previous`.
-    pub fn decide(previous: Option<&RunState>, boot_id: Option<&BootId>) -> Self {
-        let previous_run = PreviousRun::interpret(previous, boot_id);
+    /// run that left `previous` and the core `journals`.
+    pub fn decide(
+        previous: Option<&RunState>,
+        journals: JournalHistory,
+        boot_id: Option<&BootId>,
+    ) -> Self {
+        let previous_run = PreviousRun::interpret(previous, journals, boot_id);
         let replay_mode = previous_run.replay_mode();
         let prior_epoch = previous.map_or(0, |previous| previous.recovery_epoch);
         let recovery_epoch = match replay_mode {
@@ -245,6 +289,24 @@ pub enum RaftWalError {
     },
     #[error("read the Raft WAL run state: {0}")]
     ReadRunState(#[source] StateFileError),
+    #[error("list the core journals under '{}': {source}", .root.display())]
+    ListCores {
+        root: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("read the core journal '{}': {source}", .path.display())]
+    ReadJournal {
+        path: PathBuf,
+        #[source]
+        source: JournalError,
+    },
+    #[error("move the raft groups of '{}' into recovery: {source}", .path.display())]
+    MarkRecovering {
+        path: PathBuf,
+        #[source]
+        source: MarkRecoveringError,
+    },
     #[error("record the Raft WAL run state: {0}")]
     RecordRunState(#[source] JournalError),
     #[error("the Raft WAL under '{}' has shut down", .root.display())]
@@ -323,9 +385,20 @@ impl NodeWal {
         let path = root.join(RUN_STATE_FILE);
         let previous = state_file::read::<RunState>(StateFileKind::RunState, &path)
             .map_err(RaftWalError::ReadRunState)?;
+        let cores = core_dirs(&root)?;
+        let journals = journal_history(&cores)?;
         let boot_id = Disk::boot_id(&root).map(BootId);
-        let opening = WalOpening::decide(previous.as_ref(), boot_id.as_ref());
+        let opening = WalOpening::decide(previous.as_ref(), journals, boot_id.as_ref());
         log_opening(&root, previous.as_ref(), boot_id.as_ref(), fsync, &opening);
+        // Before this run records itself, so a crash in between marks the
+        // cores again on the next start.
+        if let RecoveryState::Recovering { .. } = opening.recovery {
+            for core in &cores {
+                let path = core_metadata_path(&core.join(CORE_JOURNAL_FILE));
+                mark_core_recovering(&path)
+                    .map_err(|source| RaftWalError::MarkRecovering { path, source })?;
+            }
+        }
         let run_state = RunStateFile::new(path, RunState {
             boot_id,
             fsync,
@@ -375,6 +448,36 @@ impl NodeWal {
     }
 }
 
+/// The core directories under the WAL `root`, in name order.
+fn core_dirs(root: &Path) -> Result<Vec<PathBuf>, RaftWalError> {
+    let entries = Disk::read_dir(root).map_err(|source| RaftWalError::ListCores {
+        root: root.to_owned(),
+        source,
+    })?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(CORE_DIR_PREFIX))
+        })
+        .collect())
+}
+
+/// Whether any of the `cores`' journals holds records.
+fn journal_history(cores: &[PathBuf]) -> Result<JournalHistory, RaftWalError> {
+    for core in cores {
+        let path = core.join(CORE_JOURNAL_FILE);
+        if journal::holds_records(&path)
+            .map_err(|source| RaftWalError::ReadJournal { path, source })?
+        {
+            return Ok(JournalHistory::Records);
+        }
+    }
+    Ok(JournalHistory::Empty)
+}
+
 fn log_opening(
     root: &Path,
     previous: Option<&RunState>,
@@ -408,6 +511,7 @@ mod tests {
     use ursula_config::WalFsync;
 
     use super::BootId;
+    use super::JournalHistory;
     use super::JournalReplayMode;
     use super::PreviousRun;
     use super::RecoveryReason;
@@ -430,10 +534,11 @@ mod tests {
         }
     }
 
-    /// The previous run's state, the current boot id, and what opening
-    /// decides.
+    /// The previous run's state, what the journals hold, the current boot
+    /// id, and what opening decides.
     type Row = (
         Option<RunState>,
+        JournalHistory,
         Option<&'static str>,
         PreviousRun,
         JournalReplayMode,
@@ -447,6 +552,9 @@ mod tests {
     const POISONED: RecoveryState = RecoveryState::Recovering {
         reason: RecoveryReason::Poisoned,
     };
+    const UNKNOWN_HISTORY: RecoveryState = RecoveryState::Recovering {
+        reason: RecoveryReason::UnknownHistory,
+    };
     const STRICT: JournalReplayMode = JournalReplayMode::Strict;
     const PREFIX: JournalReplayMode = JournalReplayMode::VerifiedPrefix;
 
@@ -454,6 +562,8 @@ mod tests {
     /// with the boot id known or not.
     #[test]
     fn opening_the_journal_follows_the_decision_table() {
+        use JournalHistory::Empty;
+        use JournalHistory::Records;
         use RunStatus::Clean;
         use RunStatus::Poisoned;
         use RunStatus::Running;
@@ -461,12 +571,30 @@ mod tests {
         use WalFsync::Never;
 
         let rows: &[Row] = &[
-            // No run state: a new WAL root.
-            (None, Some("b"), PreviousRun::Absent, STRICT, NORMAL),
-            (None, None, PreviousRun::Absent, STRICT, NORMAL),
+            // No run state and no journal record: a new node or a new disk.
+            (None, Empty, Some("b"), PreviousRun::Absent, STRICT, NORMAL),
+            (None, Empty, None, PreviousRun::Absent, STRICT, NORMAL),
+            // No run state, but journals hold records: fail safe.
+            (
+                None,
+                Records,
+                Some("b"),
+                PreviousRun::Unrecorded,
+                PREFIX,
+                UNKNOWN_HISTORY,
+            ),
+            (
+                None,
+                Records,
+                None,
+                PreviousRun::Unrecorded,
+                PREFIX,
+                UNKNOWN_HISTORY,
+            ),
             // A clean shutdown, under either policy, on any boot.
             (
                 Some(previous(Some("a"), Always, Clean)),
+                Records,
                 Some("b"),
                 PreviousRun::Clean,
                 STRICT,
@@ -474,6 +602,7 @@ mod tests {
             ),
             (
                 Some(previous(Some("a"), Never, Clean)),
+                Records,
                 Some("a"),
                 PreviousRun::Clean,
                 STRICT,
@@ -481,6 +610,7 @@ mod tests {
             ),
             (
                 Some(previous(None, Never, Clean)),
+                Records,
                 None,
                 PreviousRun::Clean,
                 STRICT,
@@ -489,6 +619,7 @@ mod tests {
             // Same boot: a process crash; the page cache kept every write.
             (
                 Some(previous(Some("a"), Never, Running)),
+                Records,
                 Some("a"),
                 PreviousRun::ProcessCrash,
                 STRICT,
@@ -496,6 +627,7 @@ mod tests {
             ),
             (
                 Some(previous(Some("a"), Always, Running)),
+                Records,
                 Some("a"),
                 PreviousRun::ProcessCrash,
                 STRICT,
@@ -504,6 +636,7 @@ mod tests {
             // Another boot: a host crash.
             (
                 Some(previous(Some("a"), Never, Running)),
+                Records,
                 Some("b"),
                 PreviousRun::HostCrash { fsync: Never },
                 PREFIX,
@@ -511,6 +644,7 @@ mod tests {
             ),
             (
                 Some(previous(Some("a"), Always, Running)),
+                Records,
                 Some("b"),
                 PreviousRun::HostCrash { fsync: Always },
                 PREFIX,
@@ -519,6 +653,7 @@ mod tests {
             // An unknown boot id without a clean end counts as a host crash.
             (
                 Some(previous(None, Never, Running)),
+                Records,
                 None,
                 PreviousRun::HostCrash { fsync: Never },
                 PREFIX,
@@ -526,6 +661,7 @@ mod tests {
             ),
             (
                 Some(previous(Some("a"), Never, Running)),
+                Records,
                 None,
                 PreviousRun::HostCrash { fsync: Never },
                 PREFIX,
@@ -533,6 +669,7 @@ mod tests {
             ),
             (
                 Some(previous(None, Always, Running)),
+                Records,
                 Some("a"),
                 PreviousRun::HostCrash { fsync: Always },
                 PREFIX,
@@ -541,6 +678,7 @@ mod tests {
             // An I/O error stopped the previous run, under either policy.
             (
                 Some(previous(Some("a"), Always, Poisoned)),
+                Records,
                 Some("a"),
                 PreviousRun::Poisoned,
                 PREFIX,
@@ -548,15 +686,16 @@ mod tests {
             ),
             (
                 Some(previous(Some("a"), Never, Poisoned)),
+                Records,
                 Some("b"),
                 PreviousRun::Poisoned,
                 PREFIX,
                 POISONED,
             ),
         ];
-        for (previous, boot_id, previous_run, replay_mode, recovery) in rows {
+        for (previous, journals, boot_id, previous_run, replay_mode, recovery) in rows {
             let boot_id = boot_id.map(boot);
-            let opening = WalOpening::decide(previous.as_ref(), boot_id.as_ref());
+            let opening = WalOpening::decide(previous.as_ref(), *journals, boot_id.as_ref());
             let prior_epoch = previous
                 .as_ref()
                 .map_or(0, |previous| previous.recovery_epoch);
@@ -572,7 +711,7 @@ mod tests {
                     recovery: *recovery,
                     recovery_epoch,
                 },
-                "previous {previous:?}, boot {boot_id:?}"
+                "previous {previous:?}, journals {journals:?}, boot {boot_id:?}"
             );
         }
     }
@@ -591,14 +730,16 @@ mod tests {
         // A host crash starts epoch 5; a process crash right after it, before
         // a core was read, keeps epoch 5, so that core still reads its prefix.
         let crashed = previous(Some("a"), WalFsync::Always, RunStatus::Running);
-        let after_host_crash = WalOpening::decide(Some(&crashed), Some(&boot("b")));
+        let after_host_crash =
+            WalOpening::decide(Some(&crashed), JournalHistory::Records, Some(&boot("b")));
         assert_eq!(after_host_crash.recovery_epoch, 5);
         let restarted = RunState {
             boot_id: Some(boot("b")),
             recovery_epoch: after_host_crash.recovery_epoch,
             ..crashed
         };
-        let after_process_crash = WalOpening::decide(Some(&restarted), Some(&boot("b")));
+        let after_process_crash =
+            WalOpening::decide(Some(&restarted), JournalHistory::Records, Some(&boot("b")));
         assert_eq!(after_process_crash.replay_mode, STRICT);
         assert_eq!(after_process_crash.recovery_epoch, 5);
         assert_eq!(

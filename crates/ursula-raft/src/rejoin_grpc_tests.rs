@@ -158,7 +158,7 @@ async fn new_recovery_engine(
     config: Arc<Config>,
     registry: &RaftGroupHandleRegistry,
 ) -> (RaftGroupEngine, Arc<RaftGroupLogStore>, Arc<GroupRejoin>) {
-    let gate = Arc::new(GroupRejoin::new(id, placement().raft_group_id));
+    let gate = Arc::new(GroupRejoin::volatile(id, placement().raft_group_id));
     let store = RaftGroupLogStore::shared();
     let engine = RaftGroupEngine::new_node_with_log_store_and_network(
         placement(),
@@ -255,7 +255,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         .collect::<BTreeMap<_, _>>();
     // This fixture represents an initial bootstrap after proving every voter
     // empty and the object-store initialized marker absent.
-    gates[1].allow_fresh_bootstrap();
+    gates[1].allow_fresh_bootstrap().await.unwrap();
     registries[1].refresh_group_elections(placement().raft_group_id);
     engines[1].raft.initialize(nodes).await.unwrap();
     engines[1]
@@ -290,7 +290,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     assert!(proof.1 >= baseline.log_id.index());
     for gate in &gates {
         gate.confirm_barrier(proof.0, proof.1);
-        assert!(gate.vote_gate_open());
+        assert!(gate.try_open().await.unwrap());
     }
     let mut leader_store = stores[1].clone();
     let delayed = UrsulaAppendEntriesRequest {
@@ -444,7 +444,10 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         assert_eq!(observed.raft_group_id, placement().raft_group_id.0);
         assert!(observed.required_applied_index >= acked.log_id.index());
         gates[0].confirm_barrier(proof.0, proof.1);
-        assert!(!gates[0].vote_gate_open(), "proof must also be applied");
+        assert!(
+            !gates[0].try_open().await.unwrap(),
+            "proof must also be applied"
+        );
         assert_eq!(services[1].unknown_rpc_requests.load(Ordering::SeqCst), 0);
     }
     services[0].pause_replication.store(false, Ordering::SeqCst);
@@ -455,7 +458,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         .applied_index_at_least(Some(acked.log_id.index()), "A catches up")
         .await
         .unwrap();
-    assert!(gates[0].vote_gate_open());
+    assert!(gates[0].try_open().await.unwrap());
     registries[0].refresh_group_elections(placement().raft_group_id);
     assert!(registries[0].recovery_barriers_ready());
     registries[0].mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
@@ -547,7 +550,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     assert!(proof.1 >= acked.log_id.index());
     gates[0].confirm_barrier(proof.0, proof.1);
     assert!(
-        !gates[0].vote_gate_open(),
+        !gates[0].try_open().await.unwrap(),
         "a previous incarnation's proof cannot be reused"
     );
     services[0].pause_replication.store(false, Ordering::SeqCst);
@@ -558,7 +561,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         .applied_index_at_least(Some(proof.1), "second recovery applied")
         .await
         .unwrap();
-    assert!(gates[0].vote_gate_open());
+    assert!(gates[0].try_open().await.unwrap());
     for engine in &engines {
         let payload = read_stream_via_state_machine(engine, stream_id.clone(), 1024)
             .await
@@ -623,7 +626,7 @@ async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
         .enumerate()
         .map(|(index, endpoint)| (u64::try_from(index).unwrap() + 1, BasicNode::new(endpoint)))
         .collect::<BTreeMap<_, _>>();
-    gates[1].allow_fresh_bootstrap();
+    gates[1].allow_fresh_bootstrap().await.unwrap();
     engines[1].raft.runtime_config().elect(true);
     engines[1].raft.initialize(nodes).await.unwrap();
     engines[1]

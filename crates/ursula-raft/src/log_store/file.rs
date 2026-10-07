@@ -7,10 +7,16 @@
 //! task over the simulated disk. Callers await a reply that arrives after the
 //! batch is written and, when the fsync policy needs it, `fsync`ed.
 //!
-//! Each group's vote and `initialized` flag live in the core's metadata file
+//! Each group's vote and log state live in the core's metadata file
 //! (`core_meta`), which the writer replaces with an `fsync` under either
 //! policy. Committed, truncate and purge markers and the entries stay in the
 //! journal.
+//!
+//! A group's first entry or purge records it initialized in the same batch.
+//! While the group's recovery gate is closed and the replica holds nothing
+//! of the group, its history is unknown (a new replica or a wiped disk), so
+//! that first entry records it recovering instead: a restart before the gate
+//! opens comes back gated.
 //!
 //! The fsync policy shapes each batch:
 //!
@@ -35,8 +41,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 #[cfg(not(madsim))]
 use std::task::Context;
 #[cfg(not(madsim))]
@@ -55,6 +59,7 @@ use openraft::storage::IOFlushed;
 use openraft::storage::LogState;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
+use openraft::vote::RaftLeaderId;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use ursula_config::WalFsync;
@@ -67,6 +72,7 @@ use super::CoreJournalRecord;
 use super::RaftGroupLogRecord;
 use super::RaftGroupLogStoreInner;
 use super::core_meta::CoreMetadata;
+use super::core_meta::GroupLogState;
 use super::core_meta::core_metadata_path;
 use super::disk::Disk;
 use super::disk::DiskLock;
@@ -84,6 +90,7 @@ use super::journal::JournalWriter;
 use super::journal::RecordTooLarge;
 use super::journal::Replayed;
 use super::journal::WRITE_BUFFER_BYTES;
+use super::run_state::RecoveryState;
 use super::run_state::RunStateFile;
 use super::run_state::RunStatus;
 use super::run_state::core_replay_mode;
@@ -227,6 +234,10 @@ pub(crate) struct CoreJournalOptions {
     pub(crate) recovery_epoch: u64,
     /// Where a poisoned writer records the failure.
     pub(crate) run_state: Arc<RunStateFile>,
+    /// Whether the node's logs may be missing entries they acknowledged. A
+    /// group whose journal holds entries but whose metadata says it is empty
+    /// is recorded recovering in that case, initialized otherwise.
+    pub(crate) node_recovery: RecoveryState,
 }
 
 /// One raft group's durable OpenRaft log, stored in its core's shared journal.
@@ -235,8 +246,8 @@ pub struct RaftGroupFileLogStore {
     placement: ShardPlacement,
     metrics: GroupEngineMetrics,
     inner: Mutex<RaftGroupLogStoreInner>,
-    /// Mirrors the group's durable `initialized` flag.
-    initialized: AtomicBool,
+    /// Mirrors the group's durable log state.
+    log: Mutex<StoreLog>,
     /// Serializes mutations so the journal records them in the same order as
     /// the in-memory state applies them.
     write_order: crate::rt::sync::Mutex<()>,
@@ -259,7 +270,53 @@ pub(crate) struct CoreFileLogWriter {
 #[derive(Debug, Default)]
 struct RecoveredGroup {
     inner: RaftGroupLogStoreInner,
-    initialized: bool,
+    log: GroupLogState,
+}
+
+/// Whether an empty group's history on this replica is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyHistory {
+    /// The group starts here: its first entry records it initialized. An
+    /// empty store starts so; it is a new group, or no recovery gate guards
+    /// it, or its gate is open.
+    New,
+    /// The replica may have held the group before, on a disk it lost: its
+    /// first entry records it recovering, until its recovery gate opens.
+    Unknown,
+}
+
+/// A group's log state as its store last recorded it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreLog {
+    Empty(EmptyHistory),
+    Initialized,
+    Recovering,
+}
+
+impl StoreLog {
+    fn new(log: GroupLogState) -> Self {
+        match log {
+            GroupLogState::Empty => Self::Empty(EmptyHistory::New),
+            GroupLogState::Initialized => Self::Initialized,
+            GroupLogState::Recovering => Self::Recovering,
+        }
+    }
+
+    fn durable(self) -> GroupLogState {
+        match self {
+            Self::Empty(_) => GroupLogState::Empty,
+            Self::Initialized => GroupLogState::Initialized,
+            Self::Recovering => GroupLogState::Recovering,
+        }
+    }
+
+    /// What the group's first entry or purge records.
+    fn first_entry(self) -> GroupLogState {
+        match self {
+            Self::Empty(EmptyHistory::New) | Self::Initialized => GroupLogState::Initialized,
+            Self::Empty(EmptyHistory::Unknown) | Self::Recovering => GroupLogState::Recovering,
+        }
+    }
 }
 
 /// Recovered per-group state, handed out once per group.
@@ -292,13 +349,20 @@ struct CoreFileLogWrite {
 
 #[derive(Debug)]
 enum CoreWriteOp {
-    /// A record appended to the journal.
-    Record(CoreJournalRecord),
+    /// A record appended to the journal. When it is the first entry or purge
+    /// of an empty group, the metadata file records the group as `first`.
+    Record {
+        record: CoreJournalRecord,
+        first: GroupLogState,
+    },
     /// A group's vote, kept in the metadata file.
     Vote {
         group_id: u32,
         vote: VoteOf<UrsulaRaftTypeConfig>,
     },
+    /// An initialized group entering or leaving recovery, kept in the
+    /// metadata file.
+    LogState { group_id: u32, state: GroupLogState },
 }
 
 /// What one request's write cost, as reported to its group's metrics.
@@ -320,17 +384,111 @@ impl RaftGroupFileLogStore {
             placement,
             metrics,
             inner: Mutex::new(recovered.inner),
-            initialized: AtomicBool::new(recovered.initialized),
+            log: Mutex::new(StoreLog::new(recovered.log)),
             write_order: crate::rt::sync::Mutex::new(()),
             core_writer,
         }))
     }
 
+    /// The group's durable log state on this replica.
+    pub fn log_state(&self) -> GroupLogState {
+        self.store_log().durable()
+    }
+
     /// Whether this replica ever persisted an entry or a purge of the group.
-    /// The flag is durable and never cleared, even when a crash later costs
-    /// the log its entries.
+    /// It never becomes false again, even when a crash later costs the log
+    /// its entries.
     pub fn initialized(&self) -> bool {
-        self.initialized.load(Ordering::Acquire)
+        self.log_state().is_initialized()
+    }
+
+    /// The id of the last entry the store holds, or of the last purged one.
+    pub(crate) fn last_log_id(&self) -> Option<LogIdOf<UrsulaRaftTypeConfig>> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner
+            .entries
+            .last_key_value()
+            .map(|(_, entry)| entry.log_id)
+            .or(inner.last_purged_log_id)
+    }
+
+    fn store_log(&self) -> StoreLog {
+        *self
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_store_log(&self, log: StoreLog) {
+        *self
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = log;
+    }
+
+    /// The group's recovery gate is closed: while the store is empty, its
+    /// first entry records the group recovering, because the replica may
+    /// have held the group on a disk it lost.
+    pub(crate) fn hold_unknown_history(&self) {
+        let mut log = self
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *log == StoreLog::Empty(EmptyHistory::New) {
+            *log = StoreLog::Empty(EmptyHistory::Unknown);
+        }
+    }
+
+    /// A recovering replica that led its group may have lost entries it
+    /// appended as leader while its followers kept them. OpenRaft restores a
+    /// replica whose vote is a committed vote for itself as the leader of
+    /// that term, which would append new entries under the log ids of those
+    /// lost ones and silently fork the group's log. The replica's vote for
+    /// itself is therefore presented uncommitted, so it starts as a follower
+    /// that already voted in that term; the metadata file keeps the vote.
+    pub(crate) fn start_as_follower(&self, node_id: u64) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(vote) = inner.vote
+            && vote.is_committed()
+            && *vote.leader_id().node_id() == node_id
+        {
+            inner.vote = Some(VoteOf::<UrsulaRaftTypeConfig>::new(
+                vote.leader_id().term(),
+                node_id,
+            ));
+        }
+    }
+
+    /// The group's recovery gate opened: a recovering group is durably
+    /// initialized again, and an empty group's first entry records it
+    /// initialized.
+    pub(crate) async fn record_recovered(&self) -> Result<(), CoreJournalError> {
+        let _order = self.write_order.lock().await;
+        match self.store_log() {
+            StoreLog::Initialized | StoreLog::Empty(EmptyHistory::New) => Ok(()),
+            StoreLog::Empty(EmptyHistory::Unknown) => {
+                self.set_store_log(StoreLog::Empty(EmptyHistory::New));
+                Ok(())
+            }
+            StoreLog::Recovering => {
+                let timing = self
+                    .core_writer
+                    .write(CoreWriteOp::LogState {
+                        group_id: self.placement.raft_group_id.0,
+                        state: GroupLogState::Initialized,
+                    })
+                    .await?;
+                self.record_timing(1, timing);
+                self.set_store_log(StoreLog::Initialized);
+                Ok(())
+            }
+        }
     }
 
     /// How the core journal holding this group was read when it opened.
@@ -344,16 +502,26 @@ impl RaftGroupFileLogStore {
             .map_err(|_poisoned| CoreJournalError::LockPoisoned)
     }
 
-    /// Journals `record` and waits until the writer acknowledges it.
+    /// Journals `record` and waits until the writer acknowledges it. Call
+    /// with `write_order` held.
     async fn append_record(&self, record: RaftGroupLogRecord) -> Result<(), CoreJournalError> {
         let record_count = raft_group_log_record_count(&record);
+        let initializes = raft_group_log_record_initializes(&record);
+        let store_log = self.store_log();
+        let first = store_log.first_entry();
         let timing = self
             .core_writer
-            .append(CoreJournalRecord {
-                group_id: self.placement.raft_group_id.0,
-                record,
+            .write(CoreWriteOp::Record {
+                record: CoreJournalRecord {
+                    group_id: self.placement.raft_group_id.0,
+                    record,
+                },
+                first,
             })
             .await?;
+        if initializes && let StoreLog::Empty(_) = store_log {
+            self.set_store_log(StoreLog::new(first));
+        }
         self.record_timing(record_count, timing);
         Ok(())
     }
@@ -444,12 +612,35 @@ impl CoreFileLogWriter {
         }
         // The journal now reads in full in this epoch. A group whose journal
         // holds entries or a purge is initialized, even if a crash came
-        // between the journal write and the metadata write.
+        // between the journal write and the metadata write. A group that was
+        // initialized but whose journal holds nothing of it lost its log (a
+        // replaced or wiped journal): it recovers.
         let mut metadata_changed = metadata.set_verified_epoch(options.recovery_epoch);
+        let repaired = match options.node_recovery {
+            RecoveryState::Normal => GroupLogState::Initialized,
+            RecoveryState::Recovering { .. } => GroupLogState::Recovering,
+        };
         for (group_id, inner) in &recovered.groups {
-            if !inner.entries.is_empty() || inner.last_purged_log_id.is_some() {
-                metadata_changed |= metadata.mark_initialized(*group_id);
+            if holds_log(inner) {
+                metadata_changed |= metadata.initialize(*group_id, repaired);
             }
+        }
+        let lost = metadata
+            .groups()
+            .filter(|(group_id, group)| {
+                group.log == GroupLogState::Initialized
+                    && !recovered.groups.get(group_id).is_some_and(holds_log)
+            })
+            .map(|(group_id, _)| group_id)
+            .collect::<Vec<_>>();
+        for group_id in lost {
+            tracing::warn!(
+                path = %journal_path.display(),
+                raft_group_id = group_id,
+                "raft group was initialized on this replica but its journal holds none of its log; \
+                 it recovers before it votes again"
+            );
+            metadata_changed |= metadata.set_log_state(group_id, GroupLogState::Recovering);
         }
         if metadata_changed {
             metadata.store(&metadata_path)?;
@@ -460,14 +651,14 @@ impl CoreFileLogWriter {
             .map(|(group_id, inner)| {
                 (group_id, RecoveredGroup {
                     inner,
-                    initialized: false,
+                    log: GroupLogState::Empty,
                 })
             })
             .collect::<BTreeMap<_, _>>();
         for (group_id, group) in metadata.groups() {
             let recovered = groups.entry(group_id).or_default();
             recovered.inner.vote = group.vote;
-            recovered.initialized = group.initialized;
+            recovered.log = group.log;
         }
 
         let mut journal = JournalWriter::open(&journal_path, FIRST_SEQUENCE)?;
@@ -537,13 +728,6 @@ impl CoreFileLogWriter {
         let (reply, response) = oneshot::channel();
         self.send(CoreWriterRequest::Write(CoreFileLogWrite { op, reply }))?;
         response.await.map_err(|_dropped| self.stopped())?
-    }
-
-    async fn append(
-        &self,
-        record: CoreJournalRecord,
-    ) -> Result<CoreFileLogWriteTiming, CoreJournalError> {
-        self.write(CoreWriteOp::Record(record)).await
     }
 
     async fn save_vote(
@@ -836,17 +1020,21 @@ fn write_core_log_batch(
     let mut accepted = Vec::with_capacity(batch.len());
     let mut flushed = Ok(());
     let mut journal_records = 0_u64;
-    let mut votes = 0_u64;
+    let mut metadata_ops = 0_u64;
     let mut requires_sync = false;
     let mut reclaim_due = false;
     let mut metadata_changed = false;
     for request in batch {
         match &request.op {
             CoreWriteOp::Vote { group_id, vote } => {
-                votes = votes.saturating_add(1);
+                metadata_ops = metadata_ops.saturating_add(1);
                 metadata_changed |= metadata.set_vote(*group_id, *vote);
             }
-            CoreWriteOp::Record(record) => {
+            CoreWriteOp::LogState { group_id, state } => {
+                metadata_ops = metadata_ops.saturating_add(1);
+                metadata_changed |= metadata.set_log_state(*group_id, *state);
+            }
+            CoreWriteOp::Record { record, first } => {
                 if flushed.is_ok() {
                     if let Err(too_large) = journal.append::<WireCodec<CoreJournalRecord>>(record) {
                         request.reply(Err(CoreJournalError::RecordTooLarge(too_large)));
@@ -863,7 +1051,7 @@ fn write_core_log_batch(
                     RaftGroupLogRecord::Purge(_) | RaftGroupLogRecord::TruncateAfter(_)
                 );
                 if raft_group_log_record_initializes(&record.record) {
-                    metadata_changed |= metadata.mark_initialized(record.group_id);
+                    metadata_changed |= metadata.initialize(record.group_id, *first);
                 }
             }
         }
@@ -897,9 +1085,9 @@ fn write_core_log_batch(
     };
 
     let fsync_records = match (sync_journal, metadata_changed) {
-        (true, true) => journal_records.saturating_add(votes),
+        (true, true) => journal_records.saturating_add(metadata_ops),
         (true, false) => journal_records,
-        (false, true) => votes,
+        (false, true) => metadata_ops,
         (false, false) => 0,
     };
     let mut storage = WalStorageSample {
@@ -1186,9 +1374,6 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
             callback.io_completed(Err(err.clone().into()));
             return Err(err.into());
         }
-        if !entries.is_empty() {
-            self.initialized.store(true, Ordering::Release);
-        }
         {
             let mut inner = self.lock_inner()?;
             for entry in entries {
@@ -1227,7 +1412,6 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
 
         self.append_record(RaftGroupLogRecord::Purge(log_id))
             .await?;
-        self.initialized.store(true, Ordering::Release);
         let mut inner = self.lock_inner()?;
         inner.last_purged_log_id = Some(log_id);
         inner.entries.retain(|index, _| *index > log_id.index);
@@ -1549,6 +1733,11 @@ fn raft_group_log_record_requires_sync(record: &RaftGroupLogRecord) -> bool {
     )
 }
 
+/// Whether a group's recovered log holds anything: entries or a purge.
+fn holds_log(inner: &RaftGroupLogStoreInner) -> bool {
+    !inner.entries.is_empty() || inner.last_purged_log_id.is_some()
+}
+
 /// Whether this record shows the group was initialized on this replica: it
 /// persists an entry or a purge (which follows a snapshot).
 fn raft_group_log_record_initializes(record: &RaftGroupLogRecord) -> bool {
@@ -1634,6 +1823,7 @@ mod tests {
     use super::CoreMetadata;
     use super::EntryOf;
     use super::FIRST_SEQUENCE;
+    use super::GroupLogState;
     use super::IOFlushed;
     use super::JournalError;
     use super::JournalReplayMode;
@@ -1649,6 +1839,7 @@ mod tests {
     use super::RaftLogStorage;
     use super::Reclaim;
     use super::RecordTooLarge;
+    use super::RecoveryState;
     use super::Rewrite;
     use super::RunStateFile;
     use super::ShardPlacement;
@@ -1772,6 +1963,7 @@ mod tests {
                     recovery_epoch,
                 },
             )),
+            node_recovery: RecoveryState::Normal,
         }
     }
 
@@ -2210,7 +2402,11 @@ mod tests {
             recovered.inner.entries.keys().copied().collect::<Vec<_>>(),
             [1, 2, 3, 4]
         );
-        assert!(recovered.initialized, "a group with entries is initialized");
+        assert_eq!(
+            recovered.log,
+            GroupLogState::Initialized,
+            "a group with entries is initialized"
+        );
         drop(writer);
         assert_eq!(
             strict(&path).replayed.sequence,
@@ -2346,6 +2542,7 @@ mod tests {
 
         let mut store = open();
         assert!(store.initialized(), "the flag survives a restart");
+        assert_eq!(store.log_state(), GroupLogState::Initialized);
         store.truncate_after(None).await.expect("drop every entry");
         drop(store);
         let mut store = open();
@@ -2354,7 +2551,97 @@ mod tests {
             None
         );
         assert!(store.initialized(), "the flag is never cleared");
+        assert_eq!(
+            store.log_state(),
+            GroupLogState::Recovering,
+            "an initialized group whose journal holds none of its log recovers"
+        );
         drop(store);
+        remove_journal(&path);
+    }
+
+    /// While a group's recovery gate is closed, an empty store's first entry
+    /// records the group recovering (its history is unknown). Opening the
+    /// gate durably records it initialized again.
+    #[tokio::test]
+    async fn an_unknown_history_records_recovering_until_the_gate_opens() {
+        let path = temp_journal_path("core-unknown-history");
+        let metrics = RuntimeMetrics::new(1, 2);
+        let open = || {
+            let writer = open_writer(&path, JournalReplayMode::Strict).expect("open core writer");
+            RaftGroupFileLogStore::open(placement(1), metrics.group_engine_metrics(), writer)
+                .expect("open group store")
+        };
+        let mut store = open();
+        store.hold_unknown_history();
+        assert_eq!(store.log_state(), GroupLogState::Empty);
+        store
+            .append([blank_entry(1)], IOFlushed::noop())
+            .await
+            .expect("append an entry");
+        assert_eq!(store.log_state(), GroupLogState::Recovering);
+        drop(store);
+
+        let store = open();
+        assert_eq!(
+            store.log_state(),
+            GroupLogState::Recovering,
+            "a restart before the gate opened comes back recovering"
+        );
+        store
+            .record_recovered()
+            .await
+            .expect("record the open gate");
+        assert_eq!(store.log_state(), GroupLogState::Initialized);
+        drop(store);
+        assert_eq!(open().log_state(), GroupLogState::Initialized);
+        remove_journal(&path);
+
+        // An empty group whose gate opened before its first entry (a fresh
+        // bootstrap) starts initialized.
+        let path = temp_journal_path("core-new-history");
+        let open = || {
+            let writer = open_writer(&path, JournalReplayMode::Strict).expect("open core writer");
+            RaftGroupFileLogStore::open(placement(1), metrics.group_engine_metrics(), writer)
+                .expect("open group store")
+        };
+        let mut store = open();
+        store.hold_unknown_history();
+        store.record_recovered().await.expect("open the gate");
+        store
+            .append([blank_entry(1)], IOFlushed::noop())
+            .await
+            .expect("append an entry");
+        assert_eq!(store.log_state(), GroupLogState::Initialized);
+        drop(store);
+        remove_journal(&path);
+    }
+
+    /// A recovering node records a group that its metadata missed (a crash
+    /// between the journal and the metadata write) as recovering.
+    #[test]
+    fn a_recovering_node_repairs_a_missing_flag_as_recovering() {
+        let path = temp_journal_path("core-recovering-heal");
+        write_records(&path, [record(
+            7,
+            RaftGroupLogRecord::Append(vec![blank_entry(1)]),
+        )]);
+        let writer = CoreFileLogWriter::open(
+            path.clone(),
+            CoreJournalOptions {
+                node_recovery: RecoveryState::Recovering {
+                    reason: crate::log_store::RecoveryReason::HostCrash,
+                },
+                ..options(&path, WalFsync::Never, 1)
+            },
+            None,
+        )
+        .expect("open core writer");
+        assert_eq!(
+            writer.take_recovered(RaftGroupId(7)).expect("group 7").log,
+            GroupLogState::Recovering
+        );
+        drop(writer);
         remove_journal(&path);
     }
 
@@ -2370,21 +2657,17 @@ mod tests {
         assert!(!core_metadata_path(&path).exists());
 
         let writer = open_writer(&path, JournalReplayMode::Strict).expect("open core writer");
-        assert!(
-            writer
-                .take_recovered(RaftGroupId(7))
-                .expect("group 7")
-                .initialized
+        assert_eq!(
+            writer.take_recovered(RaftGroupId(7)).expect("group 7").log,
+            GroupLogState::Initialized
         );
-        assert!(
-            !writer
-                .take_recovered(RaftGroupId(9))
-                .expect("group 9")
-                .initialized
+        assert_eq!(
+            writer.take_recovered(RaftGroupId(9)).expect("group 9").log,
+            GroupLogState::Empty
         );
         let metadata = CoreMetadata::load(&core_metadata_path(&path)).expect("metadata");
-        assert!(metadata.group(7).initialized);
-        assert!(!metadata.group(9).initialized);
+        assert_eq!(metadata.group(7).log, GroupLogState::Initialized);
+        assert_eq!(metadata.group(9).log, GroupLogState::Empty);
         drop(writer);
         remove_journal(&path);
     }

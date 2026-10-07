@@ -11,10 +11,10 @@
 //!   ([`GrpcRaftNetworkFactory`]) used for inter-node Raft RPCs.
 //! - [`log_store`]: in-memory and durable Raft log stores. The durable store
 //!   writes the shared per-core journal through an I/O seam whose `cfg(madsim)`
-//!   implementation is the simulated disk (`SimDisk`), keeps votes and
-//!   `initialized` flags in per-core metadata files, and records each run of
-//!   the node in a run-state file that decides how the journals reopen
-//!   ([`WalOpening`]).
+//!   implementation is the simulated disk (`SimDisk`), keeps votes and each
+//!   group's log state ([`GroupLogState`]) in per-core metadata files, and
+//!   records each run of the node in a run-state file that decides how the
+//!   journals reopen ([`WalOpening`]).
 //! - [`registry`]: [`RaftGroupHandleRegistry`] and the single-node test network.
 //! - [`maintenance`]: configuration-backed local Raft maintenance eligibility.
 //! - [`state_machine`]: per-group [`RaftGroupStateMachine`] and snapshot builder.
@@ -28,10 +28,9 @@
 //!   the per-group log gauges the snapshot driver reads.
 //! - [`snapshot_references`]: prepared external-pointer pins and recoverable
 //!   current-reference publication outside RaftCore.
-//! - [`rejoin`]: memory-WAL rejoin: the bootstrap probe, the vote gate of an
-//!   emptied replica, and the leader-side heal driver.
-//! - [`restart_guard`]: memory-WAL full-restart guard: the per-group
-//!   "initialized" marker in object storage and the bootstrap decision table.
+//! - [`rejoin`]: the recovery gate of a replica that may be missing entries
+//!   it acknowledged (either log store), the leader-side heal driver, and the
+//!   bootstrap probe.
 //! - [`snapshot_codec`]: the group-snapshot frame codec; [`group_snapshot_frames`]
 //!   and [`decode_group_snapshot`] are re-exported for measurement tools.
 
@@ -55,7 +54,6 @@ mod meta;
 mod read_index;
 mod registry;
 mod rejoin;
-mod restart_guard;
 mod rt;
 #[cfg(madsim)]
 mod sim_runtime;
@@ -99,16 +97,19 @@ pub use grpc::request_self_election_via_transfer;
 pub use log_store::BootId;
 pub use log_store::CoreJournalError;
 pub use log_store::FrameDefect;
+pub use log_store::GroupLogState;
 pub use log_store::HeaderDefect;
 #[cfg(madsim)]
 pub use log_store::JournalDisk;
 pub use log_store::JournalError;
 #[cfg(madsim)]
 pub use log_store::JournalFile;
+pub use log_store::JournalHistory;
 pub use log_store::JournalOp;
 pub use log_store::JournalReplayMode;
 #[cfg(madsim)]
 pub use log_store::LockAttempt;
+pub use log_store::MarkRecoveringError;
 pub use log_store::MemoryRaftLogStore;
 pub use log_store::MetaRaftLogStore;
 pub use log_store::PreviousRun;
@@ -166,17 +167,18 @@ pub use registry::RaftGroupHandle;
 pub use registry::RaftGroupHandleRegistry;
 pub use registry::SingleNodeRaftNetwork;
 pub use registry::SingleNodeRaftNetworkFactory;
-pub use rejoin::AdoptSurvivorOutcome;
+pub use rejoin::AcceptUnsyncedLossOutcome;
+pub use rejoin::AcceptUnsyncedLossReport;
+pub use rejoin::GroupBootstrap;
 pub use rejoin::GroupRejoin;
 pub use rejoin::PeerGroupLog;
+pub use rejoin::RECOVERY_STALL_AFTER;
+pub use rejoin::RecoveryGateError;
+pub use rejoin::RecoveryGateStatus;
 pub use rejoin::bootstrap_probe_vote;
+pub use rejoin::run_group_bootstrap;
 pub use rejoin::run_rejoin_heal;
 pub use rejoin::run_rejoin_vote_barrier;
-pub use restart_guard::InitMarkerStore;
-pub use restart_guard::MemoryInitMarkers;
-pub use restart_guard::MemoryWalBootstrap;
-pub use restart_guard::RestartGuard;
-pub use restart_guard::run_memory_wal_bootstrap;
 #[cfg(madsim)]
 pub use sim_runtime::MadsimOpenRaftRuntime;
 pub use snapshot_codec::decode_group_snapshot;

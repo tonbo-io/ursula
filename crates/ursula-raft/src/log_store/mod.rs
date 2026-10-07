@@ -3,8 +3,8 @@
 //! - `file`: the durable per-group store over the shared per-core journal,
 //!   and the core writer that applies the fsync policy.
 //! - `journal`: the framed, checksummed journal file format.
-//! - `core_meta`: each core's metadata file: every group's vote and
-//!   `initialized` flag.
+//! - `core_meta`: each core's metadata file: every group's vote and log
+//!   state (empty, initialized or recovering).
 //! - `run_state`: the node's run-state file and how the journals open after
 //!   the previous run (the replay-mode decision and the recovery state).
 //! - `state_file`: the atomically replaced, checksummed format of both.
@@ -25,6 +25,8 @@ mod state_file;
 use std::collections::BTreeMap;
 use std::io;
 
+pub use core_meta::GroupLogState;
+pub use core_meta::MarkRecoveringError;
 #[cfg(madsim)]
 pub use disk::JournalDisk;
 #[cfg(madsim)]
@@ -53,6 +55,8 @@ use openraft::alias::LogIdOf;
 use openraft::alias::VoteOf;
 use openraft::entry::RaftEntry;
 pub use run_state::BootId;
+pub(crate) use run_state::CORE_JOURNAL_FILE;
+pub use run_state::JournalHistory;
 pub(crate) use run_state::NodeWal;
 pub use run_state::PreviousRun;
 pub use run_state::RUN_STATE_FILE;

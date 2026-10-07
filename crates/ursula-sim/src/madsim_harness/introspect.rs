@@ -304,8 +304,11 @@ pub(super) fn cold_store_operation_name(operation: ColdStoreOperation) -> &'stat
     }
 }
 
-pub(super) fn sim_event_from_network_event(event: InProcessRaftNetworkEvent) -> SimEvent {
-    match event {
+/// The trace event of a network event. Vote answers are not traced: the
+/// recovery-gate scenarios observe them directly, and recorded traces stay
+/// as they were.
+pub(super) fn sim_event_from_network_event(event: InProcessRaftNetworkEvent) -> Option<SimEvent> {
+    Some(match event {
         InProcessRaftNetworkEvent::PolicyChanged { action } => {
             let (action, source, target, delay_ms) = network_policy_action_parts(action);
             SimEvent::NetworkPolicyChanged {
@@ -346,7 +349,8 @@ pub(super) fn sim_event_from_network_event(event: InProcessRaftNetworkEvent) -> 
             target,
             kind: network_rpc_kind_name(kind).to_owned(),
         },
-    }
+        InProcessRaftNetworkEvent::VoteAnswered { .. } => return None,
+    })
 }
 
 pub(super) fn network_policy_action_parts(

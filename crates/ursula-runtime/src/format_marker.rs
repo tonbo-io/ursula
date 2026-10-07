@@ -38,13 +38,6 @@ const DATA_DIR_MARKER_TMP: &str = "FORMAT_EPOCH.tmp";
 /// Marker key at the root of the object-storage namespace. Bucket ids match
 /// `^[a-z0-9_-]{4,64}$`, so no tenant prefix can collide with it.
 pub const OBJECT_MARKER: &str = "URSULA_FORMAT_EPOCH";
-/// Directory of the per-group "initialized" markers (0.6.2), next to
-/// [`OBJECT_MARKER`]: `URSULA_GROUP_INITIALIZED/group-{id}`. A memory-WAL
-/// group writes its marker before it acknowledges a write, so a restart of
-/// every voter is told apart from a fresh install. Upper case, so no bucket
-/// prefix collides with it; 0.6.1 never reads it.
-pub const GROUP_INIT_MARKER_DIR: &str = "URSULA_GROUP_INITIALIZED";
-
 /// Marker content. `written_by` is informational and never compared.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FormatEpochMarker {
@@ -248,46 +241,6 @@ impl FormatEpochNamespace {
                 marker,
             ))
         }
-    }
-
-    fn group_marker_key(&self, raft_group_id: u32) -> String {
-        format!(
-            "{}{GROUP_INIT_MARKER_DIR}/group-{raft_group_id}",
-            self.namespace
-        )
-    }
-
-    /// Whether the group's "initialized" marker exists. An unreadable store
-    /// is an error, never `false`.
-    pub async fn group_marker_exists(&self, raft_group_id: u32) -> io::Result<bool> {
-        let key = self.group_marker_key(raft_group_id);
-        match self.operator.stat(&key).await {
-            Ok(_) => Ok(true),
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
-            Err(err) => Err(io::Error::other(format!(
-                "read group marker {}/{GROUP_INIT_MARKER_DIR}/group-{raft_group_id}: {err}",
-                self.display
-            ))),
-        }
-    }
-
-    /// Write the group's "initialized" marker (idempotent: a plain put).
-    pub async fn write_group_marker(&self, raft_group_id: u32) -> io::Result<()> {
-        let key = self.group_marker_key(raft_group_id);
-        let body = serde_json::json!({
-            "raft_group_id": raft_group_id,
-            "written_by": format!("ursula {}", env!("CARGO_PKG_VERSION")),
-        });
-        self.operator
-            .write(&key, body.to_string().into_bytes())
-            .await
-            .map(|_| ())
-            .map_err(|err| {
-                io::Error::other(format!(
-                    "write group marker {}/{GROUP_INIT_MARKER_DIR}/group-{raft_group_id}: {err}",
-                    self.display
-                ))
-            })
     }
 
     /// Whether the namespace holds anything besides its own entry and the
@@ -533,24 +486,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("is not empty"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn group_markers_live_beside_the_format_marker_and_keep_the_namespace_current() {
-        let operator = memory_operator();
-        let ns = memory_namespace(&operator, "snapshots/");
-        ns.write_marker().await.unwrap();
-        assert!(!ns.group_marker_exists(3).await.unwrap());
-        ns.write_group_marker(3).await.unwrap();
-        // Idempotent.
-        ns.write_group_marker(3).await.unwrap();
-        assert!(ns.group_marker_exists(3).await.unwrap());
-        assert!(!ns.group_marker_exists(4).await.unwrap());
-        operator
-            .stat(&format!("snapshots/{GROUP_INIT_MARKER_DIR}/group-3"))
-            .await
-            .expect("write_group_marker stores the group marker");
-        assert_eq!(ns.classify().await.unwrap(), MarkerState::Current);
     }
 
     #[tokio::test]

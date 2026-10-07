@@ -28,6 +28,7 @@ pub(crate) fn register_wal_recovery(recovery: ursula_raft::RecoveryState) {
         ursula_raft::RecoveryState::Recovering { reason } => (1, match reason {
             ursula_raft::RecoveryReason::HostCrash => "host_crash",
             ursula_raft::RecoveryReason::Poisoned => "poisoned",
+            ursula_raft::RecoveryReason::UnknownHistory => "unknown_history",
         }),
     };
     let _ = global::meter("ursula-raft")
@@ -35,6 +36,35 @@ pub(crate) fn register_wal_recovery(recovery: ursula_raft::RecoveryState) {
         .with_description("1 while this node's Raft logs may be missing acknowledged entries")
         .with_callback(move |observer| {
             observer.observe(recovering, &[KeyValue::new("reason", reason)]);
+        })
+        .build();
+}
+
+/// Register `ursula.raft.recovery_gates`: the groups whose recovery gate on
+/// this node is closed, by status. `stalled` groups see no leader that could
+/// confirm a barrier and wait for an operator.
+pub(crate) fn register_recovery_gates(registry: ursula_raft::RaftGroupHandleRegistry) {
+    let _ = global::meter("ursula-raft")
+        .u64_observable_gauge("ursula.raft.recovery_gates")
+        .with_description(
+            "Raft groups whose recovery gate on this node is closed, by status; stalled groups \
+             wait for an operator to accept the loss of the unsynced tail",
+        )
+        .with_callback(move |observer| {
+            let gates = registry.recovery_gates();
+            for (status, label) in [
+                (
+                    ursula_raft::RecoveryGateStatus::AwaitingBarrier,
+                    "awaiting_barrier",
+                ),
+                (ursula_raft::RecoveryGateStatus::CatchingUp, "catching_up"),
+                (ursula_raft::RecoveryGateStatus::Stalled, "stalled"),
+            ] {
+                let count = gates.values().filter(|gate| **gate == status).count();
+                observer.observe(u64::try_from(count).unwrap_or(u64::MAX), &[KeyValue::new(
+                    "status", label,
+                )]);
+            }
         })
         .build();
 }

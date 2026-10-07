@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::BasicNode;
 use openraft::Config;
 use openraft::alias::LogIdOf;
 use openraft::alias::VoteOf;
@@ -18,6 +17,8 @@ use openraft::storage::RaftLogStorage;
 use ursula_config::WalFsync;
 use ursula_raft::CoreJournalError;
 use ursula_raft::DurableRaftLogStoreFactory;
+use ursula_raft::GroupLogState;
+use ursula_raft::GroupRejoin;
 use ursula_raft::InProcessRaftNetworkFactory;
 use ursula_raft::InProcessRaftNetworkPolicy;
 use ursula_raft::InProcessRaftRegistry;
@@ -52,10 +53,11 @@ use ursula_shard::RaftGroupId;
 use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 
+use super::recovery_wiring;
+use super::recovery_wiring::VoteLog;
 use super::seeds_from_env;
 use super::sim_test_guard;
 use crate::madsim_harness::run_with_madsim;
-use crate::madsim_harness::sim_network_policy;
 use crate::madsim_harness::sim_wal::SimNodeWal;
 use crate::madsim_harness::sim_wal::standalone_wal_metrics;
 
@@ -304,10 +306,10 @@ fn sim_disk_is_scoped_to_one_runtime() {
     });
 }
 
-const JOURNAL_POWER_LOSS_SEEDS: [u64; 6] = [1, 2, 3, 5, 8, 13];
-const JOURNAL_GROUPS: [u32; 2] = [0, 1];
+pub(super) const JOURNAL_POWER_LOSS_SEEDS: [u64; 6] = [1, 2, 3, 5, 8, 13];
+pub(super) const JOURNAL_GROUPS: [u32; 2] = [0, 1];
 
-fn group_placement(raft_group_id: u32) -> ShardPlacement {
+pub(super) fn group_placement(raft_group_id: u32) -> ShardPlacement {
     ShardPlacement {
         core_id: CoreId(0),
         shard_id: ShardId(raft_group_id),
@@ -315,19 +317,19 @@ fn group_placement(raft_group_id: u32) -> ShardPlacement {
     }
 }
 
-fn group_stream(raft_group_id: u32) -> BucketStreamId {
+pub(super) fn group_stream(raft_group_id: u32) -> BucketStreamId {
     BucketStreamId::new("simulated", format!("journal-group-{raft_group_id}"))
 }
 
 /// What one replica holds for a group, read from its log store.
 #[derive(Debug, PartialEq, Eq)]
-struct DurableGroupLog {
-    vote: Option<VoteOf<UrsulaRaftTypeConfig>>,
-    log_ids: Vec<LogIdOf<UrsulaRaftTypeConfig>>,
+pub(super) struct DurableGroupLog {
+    pub(super) vote: Option<VoteOf<UrsulaRaftTypeConfig>>,
+    pub(super) log_ids: Vec<LogIdOf<UrsulaRaftTypeConfig>>,
 }
 
 impl DurableGroupLog {
-    async fn read(store: &Arc<RaftGroupFileLogStore>) -> Self {
+    pub(super) async fn read(store: &Arc<RaftGroupFileLogStore>) -> Self {
         let mut store = store.clone();
         let vote = store.read_vote().await.expect("read vote");
         let entries = store
@@ -341,14 +343,21 @@ impl DurableGroupLog {
     }
 }
 
-/// Three nodes whose two raft groups share each node's core-0 journal.
-struct JournalCluster {
+/// Three nodes whose two raft groups share each node's core-0 journal. Every
+/// replica runs the production recovery gate and its drivers, and node 1
+/// bootstraps each group as an initializer does.
+pub(super) struct JournalCluster {
     config: Arc<Config>,
-    policy: InProcessRaftNetworkPolicy,
-    wals: BTreeMap<u64, SimNodeWal>,
+    pub(super) policy: InProcessRaftNetworkPolicy,
+    /// Every vote answer the network delivered.
+    pub(super) votes: VoteLog,
+    pub(super) wals: BTreeMap<u64, SimNodeWal>,
     registries: BTreeMap<u32, InProcessRaftRegistry>,
-    engines: BTreeMap<(u32, u64), RaftGroupEngine>,
-    acknowledged: BTreeMap<u32, Vec<u8>>,
+    pub(super) engines: BTreeMap<(u32, u64), RaftGroupEngine>,
+    pub(super) rejoins: BTreeMap<(u32, u64), Arc<GroupRejoin>>,
+    /// Each node's process-owned recovery tasks, stopped with the node.
+    drivers: BTreeMap<u64, Vec<madsim::task::JoinHandle<()>>>,
+    pub(super) acknowledged: BTreeMap<u32, Vec<u8>>,
 }
 
 impl JournalCluster {
@@ -356,7 +365,7 @@ impl JournalCluster {
         Self::start_with_fsync(name, WalFsync::Always).await
     }
 
-    async fn start_with_fsync(name: &str, fsync: WalFsync) -> Self {
+    pub(super) async fn start_with_fsync(name: &str, fsync: WalFsync) -> Self {
         let config = Arc::new(
             Config {
                 cluster_name: name.to_owned(),
@@ -368,9 +377,11 @@ impl JournalCluster {
             .validate()
             .expect("valid raft config"),
         );
+        let (policy, votes) = recovery_wiring::vote_recording_network_policy();
         let mut cluster = Self {
             config,
-            policy: sim_network_policy(),
+            policy,
+            votes,
             wals: (1..=3)
                 .map(|node_id| {
                     (
@@ -384,19 +395,14 @@ impl JournalCluster {
                 .map(|group| (*group, InProcessRaftRegistry::default()))
                 .collect(),
             engines: BTreeMap::new(),
+            rejoins: BTreeMap::new(),
+            drivers: BTreeMap::new(),
             acknowledged: BTreeMap::new(),
         };
         for node_id in 1..=3 {
             cluster.start_node(node_id).await;
         }
-        let voters = (1..=3)
-            .map(|node_id| (node_id, BasicNode::new(format!("node-{node_id}"))))
-            .collect::<BTreeMap<_, _>>();
         for group in JOURNAL_GROUPS {
-            cluster.engines[&(group, 1)]
-                .initialize_membership(voters.clone())
-                .await
-                .expect("initialize the group");
             let leader = cluster.leader(group).await;
             cluster
                 .engines
@@ -410,15 +416,27 @@ impl JournalCluster {
                 .await
                 .expect("create the group's stream");
         }
+        // The followers' gates open once they applied the leader's barrier.
+        cluster.wait_gates_open(Duration::from_secs(5)).await;
+        // The first election of a new group may take the votes of replicas
+        // whose history is still unknown; scenarios check the votes after it.
+        cluster.votes.clear();
         cluster
     }
 
-    async fn start_node(&mut self, node_id: u64) {
+    pub(super) async fn start_node(&mut self, node_id: u64) {
+        let voters = recovery_wiring::configured_voters(1..=3);
+        let mut drivers = Vec::new();
         for group in JOURNAL_GROUPS {
             let placement = group_placement(group);
             let store = self.wals[&node_id]
                 .open(placement, standalone_wal_metrics(placement))
                 .await;
+            let rejoin = Arc::new(GroupRejoin::durable(
+                node_id,
+                placement.raft_group_id,
+                &store,
+            ));
             let registry = self.registries[&group].clone();
             let engine = RaftGroupEngine::new_node_with_log_store_and_network(
                 placement,
@@ -426,19 +444,51 @@ impl JournalCluster {
                 self.config.clone(),
                 InProcessRaftNetworkFactory::new(registry.clone())
                     .with_source(node_id)
-                    .with_policy(self.policy.clone()),
+                    .with_policy(self.policy.clone())
+                    .with_rejoin(rejoin.clone()),
                 store,
                 None,
                 None,
             )
             .await
             .expect("start a journal-backed replica");
+            drivers.extend(recovery_wiring::wire_recovery(
+                node_id, placement, &engine, &rejoin, &registry, &voters,
+            ));
             registry.register(node_id, engine.raft_handle());
+            if node_id == 1 && !rejoin.holds_group_history() {
+                let raft = engine.raft_handle();
+                let rejoin = rejoin.clone();
+                let voters = voters.clone();
+                drivers.push(madsim::task::spawn(async move {
+                    ursula_raft::run_group_bootstrap(
+                        node_id,
+                        raft,
+                        rejoin,
+                        voters,
+                        move |peer_id, _address| {
+                            let registry = registry.clone();
+                            async move {
+                                recovery_wiring::in_process_probe(&registry, node_id, peer_id).await
+                            }
+                        },
+                        Duration::from_millis(50),
+                        Duration::from_secs(5),
+                    )
+                    .await;
+                }));
+            }
             self.engines.insert((group, node_id), engine);
+            self.rejoins.insert((group, node_id), rejoin);
         }
+        self.drivers.insert(node_id, drivers);
     }
 
-    async fn stop_node(&mut self, node_id: u64) {
+    pub(super) async fn stop_node(&mut self, node_id: u64) {
+        for driver in self.drivers.remove(&node_id).unwrap_or_default() {
+            driver.abort();
+            let _ = driver.await;
+        }
         for group in JOURNAL_GROUPS {
             self.registries[&group].unregister(node_id);
             let engine = self
@@ -449,7 +499,7 @@ impl JournalCluster {
         }
     }
 
-    async fn leader(&self, group: u32) -> u64 {
+    pub(super) async fn leader(&self, group: u32) -> u64 {
         let (_, engine) = self
             .engines
             .iter()
@@ -469,7 +519,7 @@ impl JournalCluster {
 
     /// Appends `count` payloads through the group's leader, retrying while
     /// leadership moves.
-    async fn append(&mut self, group: u32, count: usize) {
+    pub(super) async fn append(&mut self, group: u32, count: usize) {
         for _ in 0..count {
             let acknowledged = self.acknowledged.entry(group).or_default();
             let payload = format!("g{group}-{};", acknowledged.len()).into_bytes();
@@ -524,7 +574,7 @@ impl JournalCluster {
     }
 
     /// A node that leads no group, chosen from the seed.
-    async fn follower_of_every_group(&self, seed: u64) -> u64 {
+    pub(super) async fn follower_of_every_group(&self, seed: u64) -> u64 {
         let mut leaders = Vec::new();
         for group in JOURNAL_GROUPS {
             leaders.push(self.leader(group).await);
@@ -538,7 +588,7 @@ impl JournalCluster {
         followers[index]
     }
 
-    async fn durable_logs(&self, node_id: u64) -> BTreeMap<u32, DurableGroupLog> {
+    pub(super) async fn durable_logs(&self, node_id: u64) -> BTreeMap<u32, DurableGroupLog> {
         let mut logs = BTreeMap::new();
         for group in JOURNAL_GROUPS {
             let store = self.wals[&node_id]
@@ -549,8 +599,26 @@ impl JournalCluster {
         logs
     }
 
+    /// Waits until the recovery gate of every running replica is open.
+    pub(super) async fn wait_gates_open(&self, timeout: Duration) {
+        let deadline = madsim::time::Instant::now() + timeout;
+        while let Some(((group, node_id), rejoin)) = self
+            .rejoins
+            .iter()
+            .filter(|(key, _)| self.engines.contains_key(key))
+            .find(|(_, rejoin)| !rejoin.vote_gate_open())
+        {
+            assert!(
+                madsim::time::Instant::now() < deadline,
+                "node {node_id} group {group}: the recovery gate never opened ({:?})",
+                rejoin.status()
+            );
+            madsim::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// Every acknowledged write is readable from every replica.
-    async fn verify_reads(&self) {
+    pub(super) async fn verify_reads(&self) {
         for ((group, node_id), engine) in &self.engines {
             let expected = &self.acknowledged[group];
             let mut last = Vec::new();
@@ -949,20 +1017,20 @@ fn a_reclaim_that_cannot_publish_its_generation_poisons_the_writer() {
 #[derive(Debug, Clone, Copy)]
 enum RunStateAfterPowerLoss {
     /// As the node left it: the run did not end cleanly and the host booted
-    /// anew, so the journals are read as a verified prefix.
+    /// anew.
     Kept,
-    /// Removed by hand: nothing says the host crashed, so the journals are
-    /// read strictly.
+    /// Removed by hand while the journal holds records: how the run ended is
+    /// unknown.
     Removed,
 }
 
 /// A single-node group whose synced entries are followed by an unsynced
 /// tail of committed markers, after a power loss that may reorder the tail's
-/// writeback. Returns what was synced and how a store reopened afterwards
-/// fared.
+/// writeback. Returns what was synced, how the WAL opened afterwards, and
+/// how a store reopened then fared.
 async fn reopen_after_a_reordered_unsynced_tail(
     run_state: RunStateAfterPowerLoss,
-) -> (DurableGroupLog, Result<DurableGroupLog, String>) {
+) -> (DurableGroupLog, WalOpening, Result<DurableGroupLog, String>) {
     let wal = SimNodeWal::provision("unsynced-tail");
     let placement = group_placement(0);
     let metrics = standalone_wal_metrics(placement);
@@ -1000,59 +1068,60 @@ async fn reopen_after_a_reordered_unsynced_tail(
     }
     drop(store);
     let report = wal.power_loss().await;
-    let expected_mode = match run_state {
-        RunStateAfterPowerLoss::Kept => JournalReplayMode::VerifiedPrefix,
-        RunStateAfterPowerLoss::Removed => {
-            SimDisk::remove_file(&wal.root().join(RUN_STATE_FILE)).expect("remove the run state");
-            JournalReplayMode::Strict
-        }
-    };
-    assert_eq!(wal.opening().replay_mode, expected_mode);
+    if let RunStateAfterPowerLoss::Removed = run_state {
+        SimDisk::remove_file(&wal.root().join(RUN_STATE_FILE)).expect("remove the run state");
+    }
+    let opening = wal.opening();
     let reopened = match wal.try_open(placement, metrics).await {
         Ok(store) => Ok(DurableGroupLog::read(&store).await),
         Err(err) => Err(format!("{report:?}: {}", err.message())),
     };
-    (synced, reopened)
+    (synced, opening, reopened)
 }
 
 const UNSYNCED_TAIL_SEEDS: [u64; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 
-/// Strict recovery expects every write on disk, so it refuses the hole a
-/// reordered writeback of unsynced committed markers can leave. It never
-/// recovers less than what was synced. This is why a run state that shows a
-/// host crash selects the verified prefix even under `always`.
-#[test]
-fn strict_recovery_refuses_a_reordered_unsynced_tail() {
-    let _guard = sim_test_guard();
-    let mut refused = 0;
-    for seed in seeds_from_env("UNSYNCED_TAIL_SEEDS", &UNSYNCED_TAIL_SEEDS) {
-        let (synced, reopened) = run_with_madsim(
-            seed,
-            reopen_after_a_reordered_unsynced_tail(RunStateAfterPowerLoss::Removed),
-        );
-        match reopened {
-            Ok(recovered) => assert_eq!(recovered, synced, "seed {seed}"),
-            Err(err) => {
-                assert!(err.contains("checksum mismatch"), "seed {seed}: {err}");
-                refused += 1;
-            }
-        }
-    }
-    assert!(
-        refused > 0,
-        "a reordered writeback must sometimes leave a hole strict recovery refuses"
-    );
-}
-
-/// After the same power losses the run state selects the verified prefix,
-/// which recovers every synced entry and the vote.
+/// A reordered writeback of unsynced committed markers can leave a hole
+/// that strict recovery refuses (`log_store` unit tests cover the refusal).
+/// After the power loss the run state selects the verified prefix, even
+/// under `always`, which recovers every synced entry and the vote.
 #[test]
 fn verified_prefix_recovery_keeps_every_acknowledged_write_after_a_reordered_tail() {
     let _guard = sim_test_guard();
     for seed in seeds_from_env("UNSYNCED_TAIL_SEEDS", &UNSYNCED_TAIL_SEEDS) {
-        let (synced, reopened) = run_with_madsim(
+        let (synced, opening, reopened) = run_with_madsim(
             seed,
             reopen_after_a_reordered_unsynced_tail(RunStateAfterPowerLoss::Kept),
+        );
+        assert_eq!(opening.replay_mode, JournalReplayMode::VerifiedPrefix);
+        assert_eq!(
+            reopened.unwrap_or_else(|err| panic!("seed {seed}: {err}")),
+            synced,
+            "seed {seed}"
+        );
+    }
+}
+
+/// A run state removed while the journal holds records says nothing about
+/// how the run that wrote them ended, so the node fails safe: it reads the
+/// journal as a verified prefix, which recovers every synced entry even
+/// across the reordered tail, and reports that it is recovering.
+#[test]
+fn a_removed_run_state_still_reads_the_journal_as_a_verified_prefix() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("UNSYNCED_TAIL_SEEDS", &UNSYNCED_TAIL_SEEDS) {
+        let (synced, opening, reopened) = run_with_madsim(
+            seed,
+            reopen_after_a_reordered_unsynced_tail(RunStateAfterPowerLoss::Removed),
+        );
+        assert_opening(
+            opening,
+            PreviousRun::Unrecorded,
+            JournalReplayMode::VerifiedPrefix,
+            RecoveryState::Recovering {
+                reason: RecoveryReason::UnknownHistory,
+            },
+            &format!("seed {seed}"),
         );
         assert_eq!(
             reopened.unwrap_or_else(|err| panic!("seed {seed}: {err}")),
@@ -1067,7 +1136,7 @@ fn verified_prefix_recovery_keeps_every_acknowledged_write_after_a_reordered_tai
 async fn reopen_stores(
     cluster: &JournalCluster,
     node_id: u64,
-) -> (WalOpening, BTreeMap<u32, (DurableGroupLog, bool)>) {
+) -> (WalOpening, BTreeMap<u32, (DurableGroupLog, GroupLogState)>) {
     let wal = &cluster.wals[&node_id];
     let mut logs = BTreeMap::new();
     for group in JOURNAL_GROUPS {
@@ -1075,7 +1144,7 @@ async fn reopen_stores(
         let store = wal.open(placement, standalone_wal_metrics(placement)).await;
         logs.insert(
             group,
-            (DurableGroupLog::read(&store).await, store.initialized()),
+            (DurableGroupLog::read(&store).await, store.log_state()),
         );
     }
     (wal.opening(), logs)
@@ -1085,9 +1154,9 @@ async fn reopen_stores(
 /// power loss can cost it acknowledged entries. The restart detects it: the
 /// run state shows a host crash under `never`, the journals are read as a
 /// verified prefix and the node reports that it is recovering. What it keeps
-/// is a prefix of its log, and its vote and `initialized` flags, which are
-/// always `fsync`ed, survive. Without the recovery gate the replica must not
-/// rejoin, so the stores are only reopened.
+/// is a prefix of its log, and its vote and log state, which are always
+/// `fsync`ed, survive; every group it held is recovering. The stores are
+/// only reopened here; `recovery_tests` covers the replica's rejoin.
 #[test]
 fn fsync_never_power_loss_is_detected_and_keeps_a_verified_prefix_and_the_vote() {
     let _guard = sim_test_guard();
@@ -1116,7 +1185,7 @@ fn fsync_never_power_loss_is_detected_and_keeps_a_verified_prefix_and_the_vote()
             );
             let mut lost = 0_usize;
             for group in JOURNAL_GROUPS {
-                let (before, (after, initialized)) = (&before[&group], &after[&group]);
+                let (before, (after, log_state)) = (&before[&group], &after[&group]);
                 assert_eq!(
                     after.vote, before.vote,
                     "seed {seed}: node {victim} group {group} lost its vote ({report:?})"
@@ -1128,9 +1197,10 @@ fn fsync_never_power_loss_is_detected_and_keeps_a_verified_prefix_and_the_vote()
                     before.log_ids,
                     after.log_ids
                 );
-                assert!(
-                    initialized,
-                    "seed {seed}: node {victim} group {group} forgot it was initialized"
+                assert_eq!(
+                    *log_state,
+                    GroupLogState::Recovering,
+                    "seed {seed}: node {victim} group {group} is not recovering"
                 );
                 lost =
                     lost.saturating_add(before.log_ids.len().saturating_sub(after.log_ids.len()));

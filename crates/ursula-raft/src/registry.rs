@@ -49,8 +49,10 @@ use crate::log_store::RecoveryState;
 use crate::log_store::WalOpening;
 use crate::meta::MetaRaftTypeConfig;
 use crate::read_index::ReadIndexBarrier;
-use crate::rejoin::AdoptSurvivorOutcome;
+use crate::rejoin::AcceptUnsyncedLossOutcome;
 use crate::rejoin::GroupRejoin;
+use crate::rejoin::RecoveryGateError;
+use crate::rejoin::RecoveryGateStatus;
 use crate::snapshot_codec::decode_group_snapshot;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::state_machine::SnapshotBuildCoordinator;
@@ -157,8 +159,8 @@ impl RaftNetworkV2<MetaRaftTypeConfig> for SingleNodeRaftNetwork {
 pub struct InProcessRaftRegistry {
     nodes: Arc<Mutex<BTreeMap<u64, Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>>>>,
     full_snapshot_calls: Arc<Mutex<BTreeMap<u64, usize>>>,
-    /// Each node's memory-WAL rejoin state, screening the votes and appends
-    /// delivered to it.
+    /// Each node's recovery gate, screening the votes and appends delivered
+    /// to it.
     rejoins: Arc<Mutex<BTreeMap<u64, Arc<GroupRejoin>>>>,
 }
 
@@ -189,7 +191,7 @@ impl InProcessRaftRegistry {
     }
 
     /// Screen the votes and appends delivered to `node_id` through its
-    /// memory-WAL rejoin state (replaces a previous registration).
+    /// recovery gate (replaces a previous registration).
     pub fn register_rejoin(&self, node_id: u64, rejoin: Arc<GroupRejoin>) {
         self.rejoins
             .lock()
@@ -242,8 +244,8 @@ impl InProcessRaftNetworkFactory {
         }
     }
 
-    /// The sending node's memory-WAL rejoin state: replication answers that
-    /// show a follower lost its log go to it instead of to OpenRaft.
+    /// The sending node's recovery gate: replication answers that show a
+    /// follower lost its log go to it instead of to OpenRaft.
     pub fn with_rejoin(mut self, rejoin: Arc<GroupRejoin>) -> Self {
         self.rejoin = Some(rejoin);
         self
@@ -329,6 +331,15 @@ pub enum InProcessRaftNetworkEvent {
         source: Option<u64>,
         target: u64,
         kind: InProcessRaftRpcKind,
+    },
+    /// The target answered a vote request; `granted` when it accepted and
+    /// saved the candidate's vote. `target_gate` is the target's recovery
+    /// gate when the request reached it, if it has one.
+    VoteAnswered {
+        source: Option<u64>,
+        target: u64,
+        granted: bool,
+        target_gate: Option<RecoveryGateStatus>,
     },
 }
 
@@ -667,19 +678,24 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             target: self.target,
             kind: InProcessRaftRpcKind::Vote,
         });
-        if let Some(refusal) = self
-            .registry
-            .rejoin(self.target)
-            .and_then(|rejoin| rejoin.screen_vote(&rpc))
-        {
-            return Ok(refusal);
-        }
-        target.vote(rpc).await.map_err(|err| {
-            RPCError::Network(NetworkError::from_string(format!(
-                "remote Vote on node {}: {err}",
-                self.target
-            )))
-        })
+        let target_rejoin = self.registry.rejoin(self.target);
+        let target_gate = target_rejoin.as_ref().map(|rejoin| rejoin.status());
+        let response = match target_rejoin.and_then(|rejoin| rejoin.screen_vote(&rpc)) {
+            Some(refusal) => refusal,
+            None => target.vote(rpc).await.map_err(|err| {
+                RPCError::Network(NetworkError::from_string(format!(
+                    "remote Vote on node {}: {err}",
+                    self.target
+                )))
+            })?,
+        };
+        self.policy.notify(InProcessRaftNetworkEvent::VoteAnswered {
+            source: self.source,
+            target: self.target,
+            granted: response.vote_granted,
+            target_gate,
+        });
+        Ok(response)
     }
 
     async fn full_snapshot(
@@ -746,7 +762,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
                 .is_some_and(|rejoin| !rejoin.may_campaign())
         {
             return Err(RPCError::Network(NetworkError::from_string(
-                "memory-WAL recovery barrier is not applied; refusing leadership transfer",
+                "the recovery gate is closed; refusing leadership transfer",
             )));
         }
         target.handle_transfer_leader(req).await.map_err(|err| {
@@ -915,8 +931,8 @@ pub struct RaftGroupHandleRegistry {
     /// Each group's coalescing ReadIndex barrier, so forwarded gRPC reads
     /// share confirmation rounds with the group's local reads.
     read_barriers: Arc<Mutex<BTreeMap<u32, Arc<ReadIndexBarrier>>>>,
-    /// Memory-WAL rejoin state per group: the vote gate and the followers a
-    /// leader saw lose their log.
+    /// Recovery gate per group: the vote gate and the followers a leader saw
+    /// lose their log.
     rejoins: Arc<Mutex<BTreeMap<u32, Arc<GroupRejoin>>>>,
     dynamic_hosted_groups: Arc<Mutex<BTreeSet<RaftGroupId>>>,
     leadership_shed: LeadershipShedFlag,
@@ -996,7 +1012,7 @@ impl RaftGroupHandleRegistry {
         self.transport_shutdown.send_replace(true);
     }
 
-    /// Stop every local Raft core before an intentional memory-WAL restart.
+    /// Stop every local Raft core before an intentional restart.
     ///
     /// OpenRaft's one-shot log-reversion permission must be installed on each
     /// leader only after the old follower can no longer answer replication
@@ -1127,8 +1143,8 @@ impl RaftGroupHandleRegistry {
             .cloned()
     }
 
-    /// Records the group's memory-WAL rejoin state. Register it before the
-    /// Raft handle, so no vote reaches the group unscreened.
+    /// Records the group's recovery gate. Register it before the Raft
+    /// handle, so no vote reaches the group unscreened.
     pub fn register_rejoin(&self, raft_group_id: RaftGroupId, rejoin: Arc<GroupRejoin>) {
         self.rejoins
             .lock()
@@ -1136,7 +1152,7 @@ impl RaftGroupHandleRegistry {
             .insert(raft_group_id.0, rejoin);
     }
 
-    /// The group's memory-WAL rejoin state, if it has one.
+    /// The group's recovery gate, if it has one.
     pub fn rejoin(&self, raft_group_id: RaftGroupId) -> Option<Arc<GroupRejoin>> {
         self.rejoins
             .lock()
@@ -1152,49 +1168,42 @@ impl RaftGroupHandleRegistry {
             .is_some_and(|rejoin| rejoin.is_reverted_follower(target))
     }
 
-    /// Operator recovery after a majority restart of a memory-WAL group; see
-    /// [`GroupRejoin::adopt_survivor`].
-    pub async fn adopt_rejoin_survivor(
+    /// Operator recovery when a majority of the group's voters are gated:
+    /// open this node's recovery gate for the group, accepting that its
+    /// replica may be missing entries it acknowledged, and let the group
+    /// campaign again (see [`GroupRejoin::accept_unsynced_loss`]).
+    pub async fn accept_unsynced_loss(
         &self,
         raft_group_id: RaftGroupId,
-        survivor: u64,
-    ) -> Result<AdoptSurvivorOutcome, String> {
-        let raft = self
-            .require_group(raft_group_id)
-            .map_err(|err| err.to_string())?;
-        let rejoin = self.rejoin(raft_group_id).ok_or_else(|| {
-            format!(
-                "raft group {} has no memory-WAL rejoin state (not a memory-WAL group)",
-                raft_group_id.0
-            )
-        })?;
-        rejoin.adopt_survivor(&raft, survivor).await
+    ) -> Result<AcceptUnsyncedLossOutcome, RecoveryGateError> {
+        let rejoin = self
+            .rejoin(raft_group_id)
+            .filter(|_| self.contains_group(raft_group_id))
+            .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
+        let outcome = rejoin.accept_unsynced_loss().await?;
+        self.refresh_group_elections(raft_group_id);
+        Ok(outcome)
     }
 
-    /// Memory-WAL groups whose initializer on this node stopped because every
-    /// voter restarted empty after the group held writes.
-    pub fn full_restart_stopped_groups(&self) -> Vec<u32> {
+    /// The recovery gate of every group that has one on this node.
+    pub fn recovery_gates(&self) -> BTreeMap<u32, RecoveryGateStatus> {
         self.rejoins
             .lock()
             .expect("raft group rejoin mutex")
             .iter()
-            .filter(|(_, rejoin)| rejoin.restart_guard().stopped_for_operator())
-            .map(|(group, _)| *group)
+            .map(|(group, rejoin)| (*group, rejoin.status()))
             .collect()
     }
 
-    /// Operator recovery after a restart of every voter of a memory-WAL
-    /// group: let this node's stopped initializer run `Initialize` again,
-    /// dropping what the group held. `Ok(false)`: the group has not stopped
-    /// on this node.
-    pub fn accept_rejoin_data_loss(&self, raft_group_id: RaftGroupId) -> Result<bool, String> {
-        let rejoin = self.rejoin(raft_group_id).ok_or_else(|| {
-            format!(
-                "raft group {} has no memory-WAL rejoin state (not a memory-WAL group)",
-                raft_group_id.0
-            )
-        })?;
-        Ok(rejoin.restart_guard().accept_data_loss())
+    /// Groups whose gated replica on this node got no leader barrier and
+    /// applied nothing for [`crate::RECOVERY_STALL_AFTER`]: they wait for an
+    /// operator to accept the loss of the unsynced tail.
+    pub fn stalled_recovery_groups(&self) -> Vec<u32> {
+        self.recovery_gates()
+            .into_iter()
+            .filter(|(_, status)| *status == RecoveryGateStatus::Stalled)
+            .map(|(group, _)| group)
+            .collect()
     }
 
     /// The group's shared cold-index page cache, if one was registered.
@@ -1356,8 +1365,8 @@ impl RaftGroupHandleRegistry {
         self.leadership_shed_state().is_shed()
     }
 
-    /// A memory-WAL node cannot receive a planned leadership handoff until
-    /// every registered group has applied its fresh recovery barrier.
+    /// A node cannot receive a planned leadership handoff until the recovery
+    /// gate of every registered group is open.
     pub fn recovery_barriers_ready(&self) -> bool {
         self.rejoins
             .lock()
@@ -1407,7 +1416,7 @@ impl RaftGroupHandleRegistry {
                     membership_log_index: metrics.membership_config.log_id().map(|id| id.index()),
                     stopped_for_operator: self
                         .rejoin(RaftGroupId(raft_group_id))
-                        .is_some_and(|rejoin| rejoin.restart_guard().stopped_for_operator()),
+                        .is_some_and(|rejoin| rejoin.status() == RecoveryGateStatus::Stalled),
                 },
                 log,
             });
@@ -1565,7 +1574,7 @@ impl RaftGroupHandleRegistry {
                     .is_some_and(|rejoin| !rejoin.may_campaign()))
         {
             return Err(GroupEngineError::new(
-                "memory-WAL recovery barrier is not applied; refusing leadership transfer",
+                "the recovery gate is closed; refusing leadership transfer",
             ));
         }
         raft.handle_transfer_leader(request)

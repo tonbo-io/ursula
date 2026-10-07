@@ -5214,7 +5214,7 @@ async fn an_unproven_memory_recovery_cannot_count_as_ready_after_undrain() {
     let registry = RaftGroupHandleRegistry::default();
     registry.register_rejoin(
         RaftGroupId(0),
-        Arc::new(ursula_raft::GroupRejoin::new(1, RaftGroupId(0))),
+        Arc::new(ursula_raft::GroupRejoin::volatile(1, RaftGroupId(0))),
     );
     let runtime = spawn_runtime(
         &test_config(1, 1),
@@ -5234,8 +5234,87 @@ async fn an_unproven_memory_recovery_cannot_count_as_ready_after_undrain() {
     let ready = http_get(&app, READINESS_PATH).await;
     assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body: serde_json::Value = serde_json::from_slice(&body_bytes(ready).await).unwrap();
-    assert_eq!(body["reason"], json!("memory_wal_recovery_barrier"));
+    assert_eq!(body["reason"], json!("recovery_gate_closed"));
     assert_eq!(body["recovery_barriers_ready"], json!(false));
+}
+
+/// `accept-unsynced-loss` is an incarnation-bound admin mutation: it opens
+/// the recovery gate of this node's replica, reports the replica's log, and
+/// clears the readiness reason the closed gate gave.
+#[tokio::test]
+async fn accept_unsynced_loss_opens_a_gated_replica_and_is_incarnation_bound() {
+    let placement = ursula_shard::ShardPlacement {
+        core_id: ursula_shard::CoreId(0),
+        shard_id: ursula_shard::ShardId(0),
+        raft_group_id: RaftGroupId(0),
+    };
+    let engine = ursula_raft::RaftGroupEngine::new_single_node(placement)
+        .await
+        .expect("single-node group");
+    let gate = Arc::new(ursula_raft::GroupRejoin::volatile(1, RaftGroupId(0)));
+    gate.bind(&engine.raft_handle());
+    let registry = RaftGroupHandleRegistry::default();
+    registry.register_rejoin(RaftGroupId(0), gate.clone());
+    registry.register(placement, engine.raft_handle());
+    let runtime = spawn_runtime(
+        &test_config(1, 1),
+        Persistence::InMemory,
+        Topology::SingleNode {
+            raft_group_count: 1,
+        },
+    )
+    .expect("runtime")
+    .runtime;
+    let state = HttpState::with_raft_registry(runtime, registry.clone());
+    let client = client_router_with_admission(state.clone(), IngressAdmission::default());
+    let ready = http_get(&client, READINESS_PATH).await;
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes(ready).await).unwrap();
+    assert_eq!(body["reason"], json!("recovery_gate_closed"));
+
+    let admin = admin_router(state.clone());
+    let path = "/__ursula/raft/0/recovery/accept-unsynced-loss";
+    let unbound = admin
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unbound.status(), StatusCode::PRECONDITION_REQUIRED);
+    assert!(!gate.vote_gate_open(), "a refused request opened the gate");
+
+    for expected in [
+        ursula_raft::AcceptUnsyncedLossOutcome::GateOpened,
+        ursula_raft::AcceptUnsyncedLossOutcome::AlreadyOpen,
+    ] {
+        let response = http_post(&admin, path, &[], Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let report: ursula_raft::AcceptUnsyncedLossReport =
+            serde_json::from_slice(&body_bytes(response).await).expect("typed report");
+        assert_eq!(report.raft_group_id, 0);
+        assert_eq!(report.node_id, 1);
+        assert_eq!(report.outcome, expected);
+    }
+    assert!(gate.vote_gate_open());
+    assert!(registry.recovery_barriers_ready());
+    let ready = http_get(&client, READINESS_PATH).await;
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes(ready).await).unwrap();
+    assert_eq!(body["recovery_barriers_ready"], json!(true));
+    assert_eq!(body["recovery_stalled_groups"], json!([]));
+
+    let missing = http_post(
+        &admin,
+        "/__ursula/raft/7/recovery/accept-unsynced-loss",
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    engine.shutdown().await.expect("stop the group");
 }
 
 #[tokio::test]

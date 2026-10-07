@@ -22,7 +22,6 @@ use std::io::Seek;
 #[cfg(not(madsim))]
 use std::io::Write;
 use std::path::Path;
-#[cfg(not(madsim))]
 use std::path::PathBuf;
 
 #[cfg(not(madsim))]
@@ -56,6 +55,8 @@ pub trait JournalDisk {
     fn open_read(path: &Path) -> io::Result<Self::File>;
     /// Whether `path` exists.
     fn exists(path: &Path) -> bool;
+    /// The paths of the entries of the directory at `path`, in name order.
+    fn read_dir(path: &Path) -> io::Result<Vec<PathBuf>>;
     /// Truncates the file at `path` to `len` bytes and `fsync`s its data.
     fn truncate(path: &Path, len: u64) -> io::Result<()>;
     /// Atomically replaces `to` with `from`. The new name is durable only
@@ -164,6 +165,14 @@ impl JournalDisk for OsDisk {
 
     fn exists(path: &Path) -> bool {
         path.exists()
+    }
+
+    fn read_dir(path: &Path) -> io::Result<Vec<PathBuf>> {
+        let mut entries = fs::read_dir(path)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<io::Result<Vec<_>>>()?;
+        entries.sort();
+        Ok(entries)
     }
 
     fn truncate(path: &Path, len: u64) -> io::Result<()> {
