@@ -23,6 +23,7 @@ pub use disk::JournalFile;
 #[cfg(madsim)]
 pub use disk::LockAttempt;
 pub(crate) use file::CoreFileLogWriter;
+pub use file::CoreJournalError;
 pub use file::RaftGroupFileLogStore;
 pub(crate) use file::elapsed_ns;
 #[cfg(test)]

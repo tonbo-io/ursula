@@ -56,8 +56,6 @@ pub trait JournalDisk {
     fn open_read(path: &Path) -> io::Result<Self::File>;
     /// Whether `path` exists.
     fn exists(path: &Path) -> bool;
-    /// The length of the file at `path`.
-    fn file_len(path: &Path) -> io::Result<u64>;
     /// Truncates the file at `path` to `len` bytes and `fsync`s its data.
     fn truncate(path: &Path, len: u64) -> io::Result<()>;
     /// Atomically replaces `to` with `from`. The new name is durable only
@@ -139,10 +137,6 @@ impl JournalDisk for OsDisk {
 
     fn exists(path: &Path) -> bool {
         path.exists()
-    }
-
-    fn file_len(path: &Path) -> io::Result<u64> {
-        Ok(fs::metadata(path)?.len())
     }
 
     fn truncate(path: &Path, len: u64) -> io::Result<()> {

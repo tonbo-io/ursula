@@ -114,6 +114,17 @@ Replay has two modes, chosen by the caller:
 
 Startup recovery and online reclaim use `Strict`. Online reclaim never
 truncates: a live journal that fails verification stops the writer instead.
+
+The writer is fail-stop. A failed write or `fsync` of the journal, or of the
+directory that publishes a new generation, poisons the core's writer for good:
+the failing batch and every later request fail with `WriterPoisoned`, and the
+writer never appends after a possibly partial frame or retries an `fsync`
+whose dirty pages the kernel may already have dropped. The process then
+aborts, because only a restart can re-read what is really on disk. Deterministic
+simulation keeps the poisoned writer instead, so it can observe it and restart
+the node. A reclaim that fails before it replaces the journal leaves the
+journal as it was: the batch that triggered it stays acknowledged, the failure
+is logged and counted in `wal_reclaim_failures`, and appends continue.
 Both modes refuse unknown versions, a damaged file header, oversized frames
 and frames whose checksums verify but whose payload does not decode. The
 decoder bounds a single frame at 512 MiB before allocating.
@@ -138,8 +149,9 @@ The v1 writer performs an online generation checkpoint after a purge or
 truncate once the core journal reaches 64 MiB:
 
 1. append and sync the purge/truncate record;
-2. replay the durable journal into the current live state of every group;
-3. write and sync a new checksummed generation containing only that state;
+2. replay the live journal into the current live state of every group,
+   checking that it holds exactly the bytes the writer wrote;
+3. write and sync the next checksummed generation containing only that state;
 4. atomically replace `journal.bin` and sync its parent directory;
 5. reopen the append handle and continue batching.
 
@@ -183,7 +195,8 @@ counters:
 - `wal_fsyncs` and `wal_fsync_records` show actual physical flush count and the
   number of logical records sharing those flushes;
 - `wal_reclaims`, `wal_reclaimed_bytes`, and `wal_reclaim_ns` show online
-  checkpoint frequency, effect, and cost;
+  checkpoint frequency, effect, and cost, and `wal_reclaim_failures` counts
+  checkpoints that failed and left the journal unchanged;
 - `wal_physical_bytes` reports the current active journal size, summed across
   cores globally;
 - the existing `wal_batches`, `wal_records`, `wal_write_ns`, and `wal_sync_ns`

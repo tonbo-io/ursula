@@ -93,6 +93,7 @@ pub use grpc::confirm_quorum_prefix;
 pub use grpc::raft_grpc_metrics_snapshot;
 pub use grpc::raft_grpc_service;
 pub use grpc::request_self_election_via_transfer;
+pub use log_store::CoreJournalError;
 pub use log_store::FrameDefect;
 pub use log_store::HeaderDefect;
 #[cfg(madsim)]

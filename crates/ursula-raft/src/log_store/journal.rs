@@ -191,14 +191,15 @@ pub enum JournalError {
     #[error(transparent)]
     RecordTooLarge(#[from] RecordTooLarge),
     #[error(
-        "journal '{}' has {bytes} bytes after its last whole frame at offset {offset} while \
-         its writer is running",
+        "journal '{}' holds {verified} verified bytes and {unverified} more, but its writer \
+         wrote {written}",
         .path.display()
     )]
-    UnexpectedTail {
+    NotAsWritten {
         path: PathBuf,
-        offset: u64,
-        bytes: u64,
+        written: u64,
+        verified: u64,
+        unverified: u64,
     },
 }
 
@@ -209,6 +210,12 @@ impl JournalError {
             op,
             source,
         }
+    }
+
+    /// Whether the operating system failed an operation, as opposed to the
+    /// file failing verification.
+    pub(crate) fn is_io(&self) -> bool {
+        matches!(self, Self::Io { .. })
     }
 
     /// The `io::ErrorKind` OpenRaft sees for this failure.
@@ -222,7 +229,7 @@ impl JournalError {
             | Self::OversizedFrame { .. }
             | Self::Undecodable { .. }
             | Self::Rejected { .. }
-            | Self::UnexpectedTail { .. } => io::ErrorKind::InvalidData,
+            | Self::NotAsWritten { .. } => io::ErrorKind::InvalidData,
             Self::RecordTooLarge(_) => io::ErrorKind::InvalidInput,
         }
     }
@@ -290,19 +297,18 @@ impl Replayed {
         }
     }
 
-    /// Fails unless the file ends exactly after its last verified frame, as
-    /// a journal whose writer is running does.
-    pub(crate) fn require_clean(&self, path: &Path) -> Result<(), JournalError> {
-        match self.tail {
-            ReplayTail::Clean => Ok(()),
-            ReplayTail::Incomplete { .. } | ReplayTail::Unverified { .. } => {
-                Err(JournalError::UnexpectedTail {
-                    path: path.to_owned(),
-                    offset: self.verified_len,
-                    bytes: self.dropped_bytes(),
-                })
-            }
+    /// Fails unless the file holds exactly the `written` bytes its running
+    /// writer wrote, all of them verified.
+    pub(crate) fn require_written(&self, path: &Path, written: u64) -> Result<(), JournalError> {
+        if self.tail == ReplayTail::Clean && self.verified_len == written {
+            return Ok(());
         }
+        Err(JournalError::NotAsWritten {
+            path: path.to_owned(),
+            written,
+            verified: self.verified_len,
+            unverified: self.dropped_bytes(),
+        })
     }
 }
 
@@ -570,12 +576,20 @@ impl JournalWriter {
         Ok(())
     }
 
-    /// Writes the pending frames and `fsync`s the file, plus its parent
-    /// directory once when the file is new. Returns the number of `fsync`s.
-    pub(crate) fn sync(&mut self) -> Result<u64, JournalError> {
+    /// Writes the pending frames and `fsync`s the file data, but not its
+    /// directory entry: for a new file that a rename and a directory `fsync`
+    /// publish. Returns the number of `fsync`s.
+    pub(crate) fn sync_data(&mut self) -> Result<u64, JournalError> {
         self.flush()?;
         JournalFile::sync_data(&mut self.file)
             .map_err(|source| JournalError::io(&self.path, JournalOp::Sync, source))?;
+        Ok(1)
+    }
+
+    /// Writes the pending frames and `fsync`s the file, plus its parent
+    /// directory once when the file is new. Returns the number of `fsync`s.
+    pub(crate) fn sync(&mut self) -> Result<u64, JournalError> {
+        self.sync_data()?;
         if !self.parent_unsynced {
             return Ok(1);
         }
@@ -1153,8 +1167,25 @@ mod tests {
         assert_eq!(replayed.tail, ReplayTail::Incomplete { bytes: 3 });
         assert_eq!(file_len(&path), len);
         let err = replayed
-            .require_clean(&path)
+            .require_written(&path, len)
             .expect_err("a running writer never leaves a torn tail");
-        assert!(matches!(err, JournalError::UnexpectedTail { bytes: 3, .. }));
+        assert!(matches!(err, JournalError::NotAsWritten {
+            unverified: 3,
+            ..
+        }));
+
+        recover(&path, JournalReplayMode::Strict).expect("truncate the tail");
+        let replayed = replay::<Codec>(&path, JournalReplayMode::Strict, |_| Ok(()))
+            .expect("replay the truncated journal");
+        replayed
+            .require_written(&path, replayed.verified_len)
+            .expect("the file is what the writer wrote");
+        let err = replayed
+            .require_written(&path, len)
+            .expect_err("the writer wrote more than the file holds");
+        assert!(matches!(err, JournalError::NotAsWritten {
+            unverified: 0,
+            ..
+        }));
     }
 }

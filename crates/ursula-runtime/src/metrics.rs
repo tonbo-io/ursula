@@ -381,6 +381,8 @@ runtime_metrics! {
     sum wal_reclaimed_bytes:
         core per_core_wal_reclaimed_bytes, group per_group_wal_reclaimed_bytes;
     sum wal_reclaim_ns: core per_core_wal_reclaim_ns, group per_group_wal_reclaim_ns;
+    sum wal_reclaim_failures:
+        core per_core_wal_reclaim_failures, group per_group_wal_reclaim_failures;
     sum wal_physical_bytes: core per_core_wal_physical_bytes;
     sum wal_recovery_ns: core per_core_wal_recovery_ns;
     sum wal_recovery_records: core per_core_wal_recovery_records;
@@ -422,6 +424,23 @@ runtime_metrics! {
 pub struct RuntimeMailboxSnapshot {
     pub depths: Vec<usize>,
     pub capacities: Vec<usize>,
+}
+
+/// What one journal write reports beyond its own latency.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalStorageSample {
+    /// `fsync` calls the write issued, on files and directories.
+    pub fsyncs: u64,
+    /// Records made durable by those `fsync`s.
+    pub fsync_records: u64,
+    /// Online rewrites of the journal.
+    pub reclaims: u64,
+    pub reclaimed_bytes: u64,
+    pub reclaim_ns: u64,
+    /// Online rewrites that failed and left the journal as it was.
+    pub reclaim_failures: u64,
+    /// The current size of the core's journal.
+    pub physical_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -620,32 +639,34 @@ impl RuntimeMetricsInner {
         &self,
         core_id: CoreId,
         group_id: RaftGroupId,
-        fsyncs: u64,
-        fsync_records: u64,
-        reclaims: u64,
-        reclaimed_bytes: u64,
-        reclaim_ns: u64,
-        physical_bytes: u64,
+        sample: WalStorageSample,
     ) {
         let core_index = usize::from(core_id.0);
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
-        self.per_core_wal_fsyncs.add_at(core_index, fsyncs);
-        self.per_group_wal_fsyncs.add_at(group_index, fsyncs);
+        self.per_core_wal_fsyncs.add_at(core_index, sample.fsyncs);
+        self.per_group_wal_fsyncs.add_at(group_index, sample.fsyncs);
         self.per_core_wal_fsync_records
-            .add_at(core_index, fsync_records);
+            .add_at(core_index, sample.fsync_records);
         self.per_group_wal_fsync_records
-            .add_at(group_index, fsync_records);
-        self.per_core_wal_reclaims.add_at(core_index, reclaims);
-        self.per_group_wal_reclaims.add_at(group_index, reclaims);
+            .add_at(group_index, sample.fsync_records);
+        self.per_core_wal_reclaims
+            .add_at(core_index, sample.reclaims);
+        self.per_group_wal_reclaims
+            .add_at(group_index, sample.reclaims);
         self.per_core_wal_reclaimed_bytes
-            .add_at(core_index, reclaimed_bytes);
+            .add_at(core_index, sample.reclaimed_bytes);
         self.per_group_wal_reclaimed_bytes
-            .add_at(group_index, reclaimed_bytes);
-        self.per_core_wal_reclaim_ns.add_at(core_index, reclaim_ns);
+            .add_at(group_index, sample.reclaimed_bytes);
+        self.per_core_wal_reclaim_ns
+            .add_at(core_index, sample.reclaim_ns);
         self.per_group_wal_reclaim_ns
-            .add_at(group_index, reclaim_ns);
+            .add_at(group_index, sample.reclaim_ns);
+        self.per_core_wal_reclaim_failures
+            .add_at(core_index, sample.reclaim_failures);
+        self.per_group_wal_reclaim_failures
+            .add_at(group_index, sample.reclaim_failures);
         self.per_core_wal_physical_bytes
-            .store_at(core_index, physical_bytes);
+            .store_at(core_index, sample.physical_bytes);
     }
 
     pub(crate) fn record_wal_recovery(
@@ -952,7 +973,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 134] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 137] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -1046,6 +1067,9 @@ mod metric_manifest_tests {
         "wal_reclaim_ns",
         "per_core_wal_reclaim_ns",
         "per_group_wal_reclaim_ns",
+        "wal_reclaim_failures",
+        "per_core_wal_reclaim_failures",
+        "per_group_wal_reclaim_failures",
         "wal_physical_bytes",
         "per_core_wal_physical_bytes",
         "wal_recovery_ns",

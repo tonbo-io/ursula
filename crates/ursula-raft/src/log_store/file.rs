@@ -39,6 +39,7 @@ use openraft::storage::RaftLogStorage;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use ursula_runtime::GroupEngineMetrics;
+use ursula_runtime::WalStorageSample;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 
@@ -57,6 +58,7 @@ use super::journal::JournalError;
 use super::journal::JournalOp;
 use super::journal::JournalReplayMode;
 use super::journal::JournalWriter;
+use super::journal::RecordTooLarge;
 use super::journal::Replayed;
 use super::journal::WRITE_BUFFER_BYTES;
 use super::truncate_entries_after;
@@ -78,7 +80,7 @@ const CORE_LOG_ONLINE_RECLAIM_MIN_BYTES: u64 = 16 * 1024;
 
 /// Failure of the per-core journal.
 #[derive(Debug, Clone, thiserror::Error)]
-pub(crate) enum CoreJournalError {
+pub enum CoreJournalError {
     #[error("OpenRaft core journal I/O on '{}': {source}", .path.display())]
     Io {
         path: PathBuf,
@@ -113,10 +115,21 @@ pub(crate) enum CoreJournalError {
         #[source]
         source: Arc<io::Error>,
     },
+    #[error(transparent)]
+    RecordTooLarge(#[from] RecordTooLarge),
+    #[error(
+        "OpenRaft core journal '{}' stopped after an I/O failure; only a restart can re-read \
+         what is on disk: {cause}",
+        .journal.display()
+    )]
+    WriterPoisoned {
+        journal: PathBuf,
+        cause: Arc<JournalError>,
+    },
     #[error("OpenRaft core journal writer for '{}' has stopped", .journal.display())]
     WriterStopped { journal: PathBuf },
     #[error("OpenRaft core journal state mutex poisoned")]
-    Poisoned,
+    LockPoisoned,
 }
 
 impl CoreJournalError {
@@ -145,8 +158,10 @@ impl From<CoreJournalError> for io::Error {
             CoreJournalError::Locked { .. } | CoreJournalError::GroupAlreadyOpen { .. } => {
                 io::ErrorKind::AlreadyExists
             }
+            CoreJournalError::RecordTooLarge(_) => io::ErrorKind::InvalidInput,
+            CoreJournalError::WriterPoisoned { cause, .. } => cause.kind(),
             CoreJournalError::WriterStopped { .. } => io::ErrorKind::BrokenPipe,
-            CoreJournalError::Poisoned => io::ErrorKind::Other,
+            CoreJournalError::LockPoisoned => io::ErrorKind::Other,
         };
         io::Error::new(kind, err)
     }
@@ -193,16 +208,12 @@ struct CoreFileLogWrite {
     reply: oneshot::Sender<Result<CoreFileLogWriteTiming, CoreJournalError>>,
 }
 
+/// What one request's write cost, as reported to its group's metrics.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CoreFileLogWriteTiming {
     write_ns: u64,
     sync_ns: u64,
-    fsyncs: u64,
-    fsync_records: u64,
-    reclaims: u64,
-    reclaimed_bytes: u64,
-    reclaim_ns: u64,
-    physical_bytes: u64,
+    storage: WalStorageSample,
 }
 
 impl RaftGroupFileLogStore {
@@ -224,7 +235,7 @@ impl RaftGroupFileLogStore {
     fn lock_inner(&self) -> Result<MutexGuard<'_, RaftGroupLogStoreInner>, CoreJournalError> {
         self.inner
             .lock()
-            .map_err(|_poisoned| CoreJournalError::Poisoned)
+            .map_err(|_poisoned| CoreJournalError::LockPoisoned)
     }
 
     /// Journals `record` and waits until the writer acknowledges it.
@@ -243,15 +254,8 @@ impl RaftGroupFileLogStore {
             timing.write_ns,
             timing.sync_ns,
         );
-        self.metrics.record_wal_storage(
-            self.placement,
-            timing.fsyncs,
-            timing.fsync_records,
-            timing.reclaims,
-            timing.reclaimed_bytes,
-            timing.reclaim_ns,
-            timing.physical_bytes,
-        );
+        self.metrics
+            .record_wal_storage(self.placement, timing.storage);
         Ok(())
     }
 }
@@ -308,13 +312,12 @@ impl CoreFileLogWriter {
                 "truncated the OpenRaft core journal after its last verified frame"
             );
         }
-        if let Some((before, after)) =
-            compact_core_journal(&journal_path, &recovered.groups, replayed.sequence)?
+        if let Some(generation) = compact_core_journal(&journal_path, &recovered.groups, &replayed)?
         {
             tracing::info!(
                 path = %journal_path.display(),
-                before_bytes = before,
-                after_bytes = after,
+                before_bytes = generation.before,
+                after_bytes = generation.after,
                 "compacted recovered OpenRaft core journal"
             );
         }
@@ -346,7 +349,7 @@ impl CoreFileLogWriter {
         let mut groups = self
             .groups
             .lock()
-            .map_err(|_poisoned| CoreJournalError::Poisoned)?;
+            .map_err(|_poisoned| CoreJournalError::LockPoisoned)?;
         if !groups.opened.insert(raft_group_id.0) {
             return Err(CoreJournalError::GroupAlreadyOpen {
                 journal: self.journal_path.clone(),
@@ -477,12 +480,23 @@ fn stop_core_file_log_writer(worker: WriterWorker) {
     worker.abort();
 }
 
+/// The state of a core journal's writer.
+enum WriterState {
+    /// Appending to the journal.
+    Open(JournalWriter),
+    /// An I/O failure left the journal in doubt. After a failed write the
+    /// file may end in a partial frame, and a failed `fsync` may have dropped
+    /// dirty pages that a later `fsync` would report as durable. The writer
+    /// never touches the file again: every request fails with the cause.
+    Poisoned(Arc<JournalError>),
+}
+
 async fn run_core_file_log_writer(
     journal_path: PathBuf,
     journal: JournalWriter,
     mut rx: mpsc::UnboundedReceiver<CoreFileLogWrite>,
 ) {
-    let mut journal = Some(journal);
+    let mut state = WriterState::Open(journal);
     while let Some(first) = rx.recv().await {
         let mut batch = vec![first];
         if let Some(next) = recv_within(&mut rx, CORE_LOG_GROUP_COMMIT_DELAY).await {
@@ -495,8 +509,13 @@ async fn run_core_file_log_writer(
             batch.push(next);
         }
 
-        let result = write_core_log_batch(&journal_path, &mut journal, &batch);
-        reply_core_log_batch(batch, result);
+        state = match state {
+            WriterState::Open(journal) => write_core_log_batch(&journal_path, journal, batch),
+            WriterState::Poisoned(cause) => {
+                refuse_core_log_batch(&journal_path, &cause, batch);
+                WriterState::Poisoned(cause)
+            }
+        };
     }
 }
 
@@ -549,115 +568,213 @@ async fn recv_within(
         .flatten()
 }
 
-fn reply_core_log_batch(
+/// Writes one batch: encodes every request, writes the frames, `fsync`s them
+/// when a request needs it, reclaims the journal online after a purge or
+/// truncate, and replies. Returns the writer's next state.
+fn write_core_log_batch(
+    journal_path: &Path,
+    mut journal: JournalWriter,
     batch: Vec<CoreFileLogWrite>,
-    result: Result<CoreFileLogWriteTiming, CoreJournalError>,
-) {
-    let timing = match result {
-        Ok(timing) => timing,
-        Err(err) => {
-            for request in batch {
-                if request.reply.send(Err(err.clone())).is_err() {
-                    tracing::trace!("raft log append caller stopped waiting");
-                }
+) -> WriterState {
+    let write_started_at = Instant::now();
+    let mut accepted = Vec::with_capacity(batch.len());
+    let mut flushed = Ok(());
+    for request in batch {
+        if flushed.is_ok() {
+            if let Err(too_large) = journal.append::<WireCodec<CoreJournalRecord>>(&request.record)
+            {
+                request.reply(Err(CoreJournalError::RecordTooLarge(too_large)));
+                continue;
             }
-            return;
+            if journal.pending_bytes() >= WRITE_BUFFER_BYTES {
+                flushed = journal.flush();
+            }
+        }
+        accepted.push(request);
+    }
+    if accepted.is_empty() {
+        return WriterState::Open(journal);
+    }
+    let requires_sync = accepted
+        .iter()
+        .any(|request| raft_group_log_record_requires_sync(&request.record.record));
+    let written = flushed.and_then(|()| journal.flush()).and_then(|()| {
+        let write_ns = elapsed_ns(write_started_at);
+        if !requires_sync {
+            return Ok((write_ns, 0, 0));
+        }
+        let sync_started_at = Instant::now();
+        let fsyncs = journal.sync()?;
+        Ok((write_ns, elapsed_ns(sync_started_at), fsyncs))
+    });
+    let (write_ns, sync_ns, fsyncs) = match written {
+        Ok(written) => written,
+        Err(cause) => {
+            drop(journal);
+            return poison_core_journal(journal_path, cause, accepted);
         }
     };
-    let count = u64::try_from(batch.len()).unwrap_or(u64::MAX);
-    for (request_index, request) in batch.into_iter().enumerate() {
-        let owns_batch_sample = request_index == 0;
-        let batch_sample = |value: u64| if owns_batch_sample { value } else { 0 };
-        let per_request = CoreFileLogWriteTiming {
-            write_ns: timing
-                .write_ns
-                .checked_div(count)
-                .unwrap_or(timing.write_ns),
-            sync_ns: timing.sync_ns.checked_div(count).unwrap_or(timing.sync_ns),
-            fsyncs: u64::from(owns_batch_sample),
-            fsync_records: batch_sample(count),
-            reclaims: batch_sample(timing.reclaims),
-            reclaimed_bytes: batch_sample(timing.reclaimed_bytes),
-            reclaim_ns: batch_sample(timing.reclaim_ns),
-            physical_bytes: timing.physical_bytes,
-        };
-        if request.reply.send(Ok(per_request)).is_err() {
-            tracing::trace!("raft log append caller stopped waiting");
+
+    let mut storage = WalStorageSample {
+        fsyncs,
+        fsync_records: if requires_sync {
+            u64::try_from(accepted.len()).unwrap_or(u64::MAX)
+        } else {
+            0
+        },
+        physical_bytes: journal.len(),
+        ..WalStorageSample::default()
+    };
+    let reclaim_due = journal.len() >= CORE_LOG_ONLINE_RECLAIM_MIN_BYTES
+        && accepted.iter().any(|request| {
+            matches!(
+                &request.record.record,
+                RaftGroupLogRecord::Purge(_) | RaftGroupLogRecord::TruncateAfter(_)
+            )
+        });
+    let state = if reclaim_due {
+        reclaim_after_batch(journal_path, journal, &mut storage)
+    } else {
+        WriterState::Open(journal)
+    };
+
+    // The batch is durable whatever the reclaim did.
+    reply_core_log_batch(accepted, write_ns, sync_ns, storage);
+    if let WriterState::Poisoned(cause) = &state {
+        on_journal_poisoned(journal_path, cause);
+    }
+    state
+}
+
+/// Rewrites the journal online and records the outcome in `storage`. A
+/// failure that leaves the live journal as it was is logged and counted; one
+/// that leaves it in doubt poisons the writer.
+fn reclaim_after_batch(
+    journal_path: &Path,
+    journal: JournalWriter,
+    storage: &mut WalStorageSample,
+) -> WriterState {
+    let started_at = Instant::now();
+    match reclaim_core_journal(journal_path, journal) {
+        Reclaim::Done {
+            journal,
+            generation,
+        } => {
+            if let Some(generation) = generation {
+                let reclaimed_bytes = generation.before.saturating_sub(generation.after);
+                storage.reclaims = 1;
+                storage.reclaimed_bytes = reclaimed_bytes;
+                storage.reclaim_ns = elapsed_ns(started_at);
+                storage.fsyncs = storage.fsyncs.saturating_add(generation.fsyncs);
+                storage.physical_bytes = journal.len();
+                tracing::info!(
+                    path = %journal_path.display(),
+                    before_bytes = generation.before,
+                    after_bytes = generation.after,
+                    reclaimed_bytes,
+                    "reclaimed obsolete OpenRaft core WAL records online"
+                );
+            }
+            WriterState::Open(journal)
+        }
+        Reclaim::Abandoned { journal, error } => {
+            storage.reclaim_failures = 1;
+            tracing::error!(
+                path = %journal_path.display(),
+                %error,
+                "online reclaim of the OpenRaft core journal failed; the journal is unchanged"
+            );
+            WriterState::Open(journal)
+        }
+        Reclaim::Poisoned(cause) => {
+            storage.reclaim_failures = 1;
+            WriterState::Poisoned(Arc::new(cause))
         }
     }
 }
 
-fn write_core_log_batch(
+/// Fails `batch` with `cause` and poisons the writer.
+fn poison_core_journal(
     journal_path: &Path,
-    journal: &mut Option<JournalWriter>,
-    batch: &[CoreFileLogWrite],
-) -> Result<CoreFileLogWriteTiming, CoreJournalError> {
-    let writer = match journal {
-        Some(writer) => writer,
-        None => journal.insert(JournalWriter::open(journal_path, FIRST_SEQUENCE)?),
-    };
-    let write_started_at = Instant::now();
+    cause: JournalError,
+    batch: Vec<CoreFileLogWrite>,
+) -> WriterState {
+    let cause = Arc::new(cause);
+    refuse_core_log_batch(journal_path, &cause, batch);
+    on_journal_poisoned(journal_path, &cause);
+    WriterState::Poisoned(cause)
+}
+
+/// Fails every request of `batch` because the writer is poisoned by `cause`.
+fn refuse_core_log_batch(
+    journal_path: &Path,
+    cause: &Arc<JournalError>,
+    batch: Vec<CoreFileLogWrite>,
+) {
     for request in batch {
-        writer
-            .append::<WireCodec<CoreJournalRecord>>(&request.record)
-            .map_err(JournalError::from)?;
-        if writer.pending_bytes() >= WRITE_BUFFER_BYTES {
-            writer.flush()?;
+        request.reply(Err(CoreJournalError::WriterPoisoned {
+            journal: journal_path.to_owned(),
+            cause: cause.clone(),
+        }));
+    }
+}
+
+/// Runs once, when an I/O failure poisons the writer. This is the one place a
+/// journal failure reaches beyond the requests it fails: only a restart can
+/// re-read what is really on disk, so production stops the process here.
+/// Recording the failure in the node's run state belongs here as well.
+fn on_journal_poisoned(journal_path: &Path, cause: &JournalError) {
+    tracing::error!(
+        path = %journal_path.display(),
+        error = %cause,
+        "OpenRaft core journal failed; the writer is poisoned and the process stops"
+    );
+    stop_process_after_journal_failure();
+}
+
+/// Aborts: unwinding or a graceful shutdown could write more.
+#[cfg(not(any(test, madsim)))]
+fn stop_process_after_journal_failure() {
+    std::process::abort();
+}
+
+/// Unit tests and the simulator keep the process and the poisoned writer, so
+/// they can observe it and restart the node themselves.
+#[cfg(any(test, madsim))]
+fn stop_process_after_journal_failure() {}
+
+/// Replies to every request of a durable batch. The first request carries the
+/// batch-wide counters, so each is counted once.
+fn reply_core_log_batch(
+    batch: Vec<CoreFileLogWrite>,
+    write_ns: u64,
+    sync_ns: u64,
+    storage: WalStorageSample,
+) {
+    let count = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+    for (request_index, request) in batch.into_iter().enumerate() {
+        let storage = if request_index == 0 {
+            storage
+        } else {
+            WalStorageSample {
+                physical_bytes: storage.physical_bytes,
+                ..WalStorageSample::default()
+            }
+        };
+        request.reply(Ok(CoreFileLogWriteTiming {
+            write_ns: write_ns.checked_div(count).unwrap_or(write_ns),
+            sync_ns: sync_ns.checked_div(count).unwrap_or(sync_ns),
+            storage,
+        }));
+    }
+}
+
+impl CoreFileLogWrite {
+    fn reply(self, result: Result<CoreFileLogWriteTiming, CoreJournalError>) {
+        if self.reply.send(result).is_err() {
+            tracing::trace!("raft log append caller stopped waiting");
         }
     }
-    writer.flush()?;
-    let write_ns = elapsed_ns(write_started_at);
-
-    let requires_sync = batch
-        .iter()
-        .any(|request| raft_group_log_record_requires_sync(&request.record.record));
-    let sync_ns = if requires_sync {
-        let sync_started_at = Instant::now();
-        writer.sync()?;
-        elapsed_ns(sync_started_at)
-    } else {
-        0
-    };
-    let reclaim_started_at = Instant::now();
-    let mut reclaims = 0;
-    let mut reclaimed_bytes = 0;
-    if batch.iter().any(|request| {
-        matches!(
-            &request.record.record,
-            RaftGroupLogRecord::Purge(_) | RaftGroupLogRecord::TruncateAfter(_)
-        )
-    }) && let Some((before, after)) =
-        reclaim_core_journal_if_needed(journal_path, journal, CORE_LOG_ONLINE_RECLAIM_MIN_BYTES)?
-    {
-        reclaims = 1;
-        reclaimed_bytes = before.saturating_sub(after);
-        tracing::info!(
-            path = %journal_path.display(),
-            before_bytes = before,
-            after_bytes = after,
-            reclaimed_bytes = before.saturating_sub(after),
-            "reclaimed obsolete OpenRaft core WAL records online"
-        );
-    }
-    let reclaim_ns = if reclaims == 0 {
-        0
-    } else {
-        elapsed_ns(reclaim_started_at)
-    };
-    Ok(CoreFileLogWriteTiming {
-        write_ns,
-        sync_ns,
-        fsyncs: u64::from(requires_sync).saturating_add(reclaims),
-        fsync_records: if requires_sync || reclaims != 0 {
-            u64::try_from(batch.len()).unwrap_or(u64::MAX)
-        } else {
-            0
-        },
-        reclaims,
-        reclaimed_bytes,
-        reclaim_ns,
-        physical_bytes: journal.as_ref().map_or(0, JournalWriter::len),
-    })
 }
 
 impl RaftLogReader<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
@@ -819,41 +936,61 @@ fn recover_core_journal(
     Ok(RecoveredJournal { groups, replayed })
 }
 
-/// Reads the journal a running writer appends to. Its writer finished every
-/// frame it started, so anything but whole verified frames means the file
-/// is not what the writer wrote; nothing is truncated.
-fn read_live_core_journal(journal_path: &Path) -> Result<RecoveredJournal, JournalError> {
+/// Reads the journal a running writer appends to, which holds exactly the
+/// `written` bytes the writer wrote. Anything else means the file is not what
+/// the writer wrote; nothing is truncated.
+fn read_live_core_journal(
+    journal_path: &Path,
+    written: u64,
+) -> Result<(RecoveredJournal, u64), JournalError> {
     let mut groups = BTreeMap::<u32, RaftGroupLogStoreInner>::new();
     let replayed = journal::replay::<WireCodec<CoreJournalRecord>>(
         journal_path,
         JournalReplayMode::Strict,
         |record| apply_log_store_record(groups.entry(record.group_id).or_default(), record.record),
     )?;
-    replayed.require_clean(journal_path)?;
-    Ok(RecoveredJournal { groups, replayed })
+    replayed.require_written(journal_path, written)?;
+    let sequence = replayed
+        .sequence
+        .ok_or_else(|| JournalError::NotAsWritten {
+            path: journal_path.to_owned(),
+            written,
+            verified: replayed.verified_len,
+            unverified: 0,
+        })?;
+    Ok((RecoveredJournal { groups, replayed }, sequence))
 }
 
-/// Rewrites the journal as the next generation holding only `inners`, when
-/// that is smaller, and returns the sizes before and after. `live_sequence` is
-/// the sequence of the journal being replaced.
-fn compact_core_journal(
-    journal_path: &Path,
-    inners: &BTreeMap<u32, RaftGroupLogStoreInner>,
-    live_sequence: Option<u64>,
-) -> Result<Option<(u64, u64)>, JournalError> {
-    let Some(live_sequence) = live_sequence else {
-        return Ok(None);
-    };
-    let before = Disk::file_len(journal_path)
-        .map_err(|source| JournalError::io(journal_path, JournalOp::Stat, source))?;
-    let compact_path = journal_path.with_extension("compact");
-    if Disk::exists(&compact_path) {
-        Disk::remove_file(&compact_path)
-            .map_err(|source| JournalError::io(&compact_path, JournalOp::Remove, source))?;
-    }
+/// The next generation of a core journal, written and synced next to it.
+#[derive(Debug)]
+struct NextGeneration {
+    path: PathBuf,
+    len: u64,
+    fsyncs: u64,
+}
 
-    let mut handle = JournalWriter::open(&compact_path, live_sequence.wrapping_add(1))?;
-    for (group_id, inner) in inners {
+/// A generation that replaced the journal.
+#[derive(Debug, Clone, Copy)]
+struct InstalledGeneration {
+    before: u64,
+    after: u64,
+    fsyncs: u64,
+}
+
+/// Writes generation `live_sequence + 1` of `journal_path`, holding only
+/// `groups`, to a temporary file and syncs it. The journal is untouched.
+fn write_next_generation(
+    journal_path: &Path,
+    groups: &BTreeMap<u32, RaftGroupLogStoreInner>,
+    live_sequence: u64,
+) -> Result<NextGeneration, JournalError> {
+    let path = journal_path.with_extension("compact");
+    if Disk::exists(&path) {
+        Disk::remove_file(&path)
+            .map_err(|source| JournalError::io(&path, JournalOp::Remove, source))?;
+    }
+    let mut handle = JournalWriter::open(&path, live_sequence.wrapping_add(1))?;
+    for (group_id, inner) in groups {
         let mut write = |record| -> Result<(), JournalError> {
             handle.append::<WireCodec<CoreJournalRecord>>(&CoreJournalRecord {
                 group_id: *group_id,
@@ -879,46 +1016,121 @@ fn compact_core_journal(
             ))?;
         }
     }
-    handle.sync()?;
-    let after = handle.len();
-    drop(handle);
-
-    if after >= before {
-        Disk::remove_file(&compact_path)
-            .map_err(|source| JournalError::io(&compact_path, JournalOp::Remove, source))?;
-        return Ok(None);
-    }
-    Disk::rename(&compact_path, journal_path)
-        .map_err(|source| JournalError::io(journal_path, JournalOp::Rename, source))?;
-    if let Some(parent) = journal_path.parent() {
-        Disk::sync_dir(parent)
-            .map_err(|source| JournalError::io(journal_path, JournalOp::SyncDir, source))?;
-    }
-    Ok(Some((before, after)))
+    // The rename and the directory `fsync` in `install_generation` publish
+    // the file, so its own directory entry needs no `fsync` first.
+    let fsyncs = handle.sync_data()?;
+    Ok(NextGeneration {
+        len: handle.len(),
+        path,
+        fsyncs,
+    })
 }
 
-fn reclaim_core_journal_if_needed(
+/// Removes a generation that would not shrink the journal.
+fn discard_generation(generation: &NextGeneration) -> Result<(), JournalError> {
+    Disk::remove_file(&generation.path)
+        .map_err(|source| JournalError::io(&generation.path, JournalOp::Remove, source))
+}
+
+/// Replaces the journal with `generation` and `fsync`s the directory, so the
+/// replacement survives a crash.
+fn install_generation(
     journal_path: &Path,
-    journal: &mut Option<JournalWriter>,
-    min_physical_bytes: u64,
-) -> Result<Option<(u64, u64)>, CoreJournalError> {
-    if journal
-        .as_ref()
-        .is_none_or(|writer| writer.len() < min_physical_bytes)
-    {
+    generation: &NextGeneration,
+) -> Result<u64, JournalError> {
+    Disk::rename(&generation.path, journal_path)
+        .map_err(|source| JournalError::io(journal_path, JournalOp::Rename, source))?;
+    let Some(parent) = journal_path.parent() else {
+        return Ok(0);
+    };
+    Disk::sync_dir(parent)
+        .map_err(|source| JournalError::io(journal_path, JournalOp::SyncDir, source))?;
+    Ok(1)
+}
+
+/// Rewrites a recovered journal as its next generation when that is smaller.
+fn compact_core_journal(
+    journal_path: &Path,
+    groups: &BTreeMap<u32, RaftGroupLogStoreInner>,
+    replayed: &Replayed,
+) -> Result<Option<InstalledGeneration>, JournalError> {
+    let Some(live_sequence) = replayed.sequence else {
         return Ok(None);
+    };
+    let before = replayed.verified_len;
+    let generation = write_next_generation(journal_path, groups, live_sequence)?;
+    if generation.len >= before {
+        discard_generation(&generation)?;
+        return Ok(None);
+    }
+    let fsyncs = install_generation(journal_path, &generation)?;
+    Ok(Some(InstalledGeneration {
+        before,
+        after: generation.len,
+        fsyncs: generation.fsyncs.saturating_add(fsyncs),
+    }))
+}
+
+/// What an online reclaim left behind.
+#[derive(Debug)]
+enum Reclaim {
+    /// Appends continue on `journal`, which is the next generation when one
+    /// replaced the old journal.
+    Done {
+        journal: JournalWriter,
+        generation: Option<InstalledGeneration>,
+    },
+    /// The rewrite failed before it touched the journal, which is unchanged.
+    Abandoned {
+        journal: JournalWriter,
+        error: JournalError,
+    },
+    /// The journal on disk is not what the writer wrote, or may not be the
+    /// generation the writer would append to: it can no longer be trusted.
+    Poisoned(JournalError),
+}
+
+/// Rewrites the journal online as its next generation, holding only every
+/// group's live state.
+fn reclaim_core_journal(journal_path: &Path, journal: JournalWriter) -> Reclaim {
+    let before = journal.len();
+    let (live, live_sequence) = match read_live_core_journal(journal_path, before) {
+        Ok(live) => live,
+        Err(error) if error.is_io() => return Reclaim::Abandoned { journal, error },
+        Err(error) => return Reclaim::Poisoned(error),
+    };
+    let generation = match write_next_generation(journal_path, &live.groups, live_sequence) {
+        Ok(generation) => generation,
+        Err(error) => return Reclaim::Abandoned { journal, error },
+    };
+    if generation.len >= before {
+        return match discard_generation(&generation) {
+            Ok(()) => Reclaim::Done {
+                journal,
+                generation: None,
+            },
+            Err(error) => Reclaim::Abandoned { journal, error },
+        };
     }
 
     // Close the append handle before atomically replacing the path. This
     // avoids continuing to append to the unlinked old file after `rename` and
     // keeps the replacement portable to filesystems that reject renaming over
     // an open destination.
-    journal.take();
-
-    let live = read_live_core_journal(journal_path)?;
-    let compacted = compact_core_journal(journal_path, &live.groups, live.replayed.sequence)?;
-    *journal = Some(JournalWriter::open(journal_path, FIRST_SEQUENCE)?);
-    Ok(compacted)
+    drop(journal);
+    let installed = install_generation(journal_path, &generation)
+        .and_then(|fsyncs| Ok((JournalWriter::open(journal_path, FIRST_SEQUENCE)?, fsyncs)));
+    match installed {
+        Ok((journal, fsyncs)) => Reclaim::Done {
+            journal,
+            generation: Some(InstalledGeneration {
+                before,
+                after: generation.len,
+                fsyncs: generation.fsyncs.saturating_add(fsyncs),
+            }),
+        },
+        Err(error) => Reclaim::Poisoned(error),
+    }
 }
 
 /// Frames Raft log records as length-delimited MessagePack for the shared
@@ -1054,15 +1266,19 @@ mod tests {
     use super::RaftGroupId;
     use super::RaftGroupLogRecord;
     use super::RaftLogStorage;
+    use super::Reclaim;
     use super::ShardPlacement;
     use super::UrsulaRaftTypeConfig;
     use super::VoteOf;
+    use super::WalStorageSample;
     use super::WireCodec;
+    use super::WriterState;
     use super::compact_core_journal;
     use super::io;
     use super::journal::ReplayTail;
     use super::raft_group_log_record_requires_sync;
-    use super::reclaim_core_journal_if_needed;
+    use super::reclaim_after_batch;
+    use super::reclaim_core_journal;
     use super::recover_core_journal;
 
     static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1238,12 +1454,17 @@ mod tests {
         let recovered = strict(&path);
         assert_eq!(recovered.replayed.sequence, Some(FIRST_SEQUENCE));
 
-        let compacted = compact_core_journal(&path, &recovered.groups, recovered.replayed.sequence)
+        let compacted = compact_core_journal(&path, &recovered.groups, &recovered.replayed)
             .expect("compact journal")
             .expect("redundant journal should shrink");
 
-        assert_eq!(compacted.0, before);
-        assert!(compacted.1 < compacted.0);
+        assert_eq!(compacted.before, before);
+        assert!(compacted.after < compacted.before);
+        assert_eq!(compacted.after, file_len(&path));
+        assert_eq!(
+            compacted.fsyncs, 2,
+            "the new generation's data and the rename"
+        );
         let recovered = strict(&path);
         assert_eq!(
             recovered.replayed.sequence,
@@ -1268,16 +1489,19 @@ mod tests {
                 .chain([record(7, RaftGroupLogRecord::Purge(test_log_id(255)))]),
         );
         let before = file_len(&path);
-        let mut journal = Some(JournalWriter::open(&path, FIRST_SEQUENCE).expect("open journal"));
+        let journal = JournalWriter::open(&path, FIRST_SEQUENCE).expect("open journal");
 
-        let (reclaim_before, reclaim_after) =
-            reclaim_core_journal_if_needed(&path, &mut journal, 0)
-                .expect("online reclaim")
-                .expect("historical journal should shrink");
-        assert_eq!(reclaim_before, before);
-        assert!(reclaim_after < reclaim_before);
+        let Reclaim::Done {
+            journal: mut writer,
+            generation: Some(generation),
+        } = reclaim_core_journal(&path, journal)
+        else {
+            panic!("the historical journal shrinks");
+        };
+        assert_eq!(generation.before, before);
+        assert!(generation.after < generation.before);
+        assert_eq!(writer.len(), generation.after);
 
-        let writer = journal.as_mut().expect("reopened journal");
         writer
             .append::<WireCodec<CoreJournalRecord>>(&record(
                 7,
@@ -1285,9 +1509,10 @@ mod tests {
             ))
             .expect("append after atomic replacement");
         writer.sync().expect("sync append after reclaim");
-        drop(journal);
+        drop(writer);
 
         let recovered = strict(&path);
+        assert_eq!(recovered.replayed.sequence, Some(FIRST_SEQUENCE + 1));
         let group = recovered.groups.get(&7).expect("recovered group");
         assert_eq!(group.last_purged_log_id, Some(test_log_id(255)));
         assert_eq!(group.entries.keys().copied().collect::<Vec<_>>(), [
@@ -1297,7 +1522,8 @@ mod tests {
     }
 
     /// Online reclaim reads the journal its writer appends to. A frame that
-    /// fails verification there is never truncated away.
+    /// fails verification there poisons the writer and is never truncated
+    /// away.
     #[test]
     fn online_reclaim_never_truncates_a_live_journal_that_fails_verification() {
         let path = temp_journal_path("core-journal-reclaim-corrupt");
@@ -1309,19 +1535,63 @@ mod tests {
             .write(true)
             .open(&path)
             .expect("open journal");
-        file.seek(SeekFrom::Start(40)).expect("seek into frame 1");
+        file.seek(SeekFrom::Start(48)).expect("seek into frame 1");
         file.write_all(b"corrupt").expect("corrupt frame 1");
         file.sync_data().expect("sync corruption");
         let len = file_len(&path);
-        let mut journal = Some(JournalWriter::open(&path, FIRST_SEQUENCE).expect("open journal"));
+        let journal = JournalWriter::open(&path, FIRST_SEQUENCE).expect("open journal");
 
-        let err = reclaim_core_journal_if_needed(&path, &mut journal, 0)
-            .expect_err("a corrupt live journal is not reclaimed");
+        let mut storage = WalStorageSample::default();
+        let WriterState::Poisoned(cause) = reclaim_after_batch(&path, journal, &mut storage) else {
+            panic!("a corrupt live journal poisons the writer");
+        };
         assert!(
-            matches!(&err, CoreJournalError::Journal(err) if matches!(**err, JournalError::CorruptFrame { frame: 1, .. })),
-            "unexpected error: {err}"
+            matches!(*cause, JournalError::CorruptFrame { frame: 1, .. }),
+            "unexpected error: {cause}"
         );
+        assert_eq!(storage.reclaim_failures, 1);
         assert_eq!(file_len(&path), len, "nothing is truncated");
+        crate::tests::remove_test_path(&path);
+    }
+
+    /// A rewrite that fails before it touches the journal leaves it as it
+    /// was: the failure is counted and appends continue.
+    #[test]
+    fn a_reclaim_that_fails_before_the_rename_keeps_the_writer_open() {
+        let path = temp_journal_path("core-journal-reclaim-abandoned");
+        write_records(
+            &path,
+            (1..=8)
+                .map(|index| record(7, RaftGroupLogRecord::Append(vec![blank_entry(index)])))
+                .chain([record(7, RaftGroupLogRecord::Purge(test_log_id(7)))]),
+        );
+        let len = file_len(&path);
+        // The next generation cannot be written where a directory stands.
+        let blocker = path.with_extension("compact");
+        fs::create_dir(&blocker).expect("block the next generation");
+        let journal = JournalWriter::open(&path, FIRST_SEQUENCE).expect("open journal");
+
+        let mut storage = WalStorageSample::default();
+        let WriterState::Open(mut journal) = reclaim_after_batch(&path, journal, &mut storage)
+        else {
+            panic!("a failed rewrite leaves the journal trustworthy");
+        };
+        assert_eq!(storage.reclaim_failures, 1);
+        assert_eq!(storage.reclaims, 0);
+        assert_eq!(file_len(&path), len, "the journal is unchanged");
+
+        journal
+            .append::<WireCodec<CoreJournalRecord>>(&record(
+                7,
+                RaftGroupLogRecord::Append(vec![blank_entry(9)]),
+            ))
+            .expect("append after the failed rewrite");
+        journal.sync().expect("sync after the failed rewrite");
+        drop(journal);
+        let mut recovered = strict(&path);
+        let group = recovered.groups.remove(&7).expect("recovered group");
+        assert_eq!(group.entries.keys().copied().collect::<Vec<_>>(), [8, 9]);
+        fs::remove_dir(&blocker).expect("remove the blocker");
         crate::tests::remove_test_path(&path);
     }
 
@@ -1343,16 +1613,20 @@ mod tests {
         ]);
         let before = file_len(&path);
         assert!(before >= CORE_LOG_ONLINE_RECLAIM_MIN_BYTES);
-        let mut journal = Some(JournalWriter::open(&path, FIRST_SEQUENCE).expect("open journal"));
+        let journal = JournalWriter::open(&path, FIRST_SEQUENCE).expect("open journal");
 
-        let (reclaim_before, reclaim_after) =
-            reclaim_core_journal_if_needed(&path, &mut journal, CORE_LOG_ONLINE_RECLAIM_MIN_BYTES)
-                .expect("production-threshold online reclaim")
-                .expect("production-sized historical journal should shrink");
-        assert_eq!(reclaim_before, before);
-        assert!(reclaim_after < 1024 * 1024);
+        let Reclaim::Done {
+            journal,
+            generation: Some(generation),
+        } = reclaim_core_journal(&path, journal)
+        else {
+            panic!("the production-sized historical journal shrinks");
+        };
+        assert_eq!(generation.before, before);
+        assert!(generation.after < 1024 * 1024);
         println!(
-            "production-threshold reclaim: before_bytes={reclaim_before} after_bytes={reclaim_after}"
+            "production-threshold reclaim: before_bytes={} after_bytes={}",
+            generation.before, generation.after
         );
 
         drop(journal);
@@ -1434,6 +1708,35 @@ mod tests {
         let reopened = CoreFileLogWriter::open(path.clone(), JournalReplayMode::Strict, None)
             .expect("core lock releases on drop");
         drop(reopened);
+        remove_journal(&path);
+    }
+
+    /// `wal_fsyncs` counts `fsync` calls, not batches: a batch of replay
+    /// hints is written without one.
+    #[tokio::test]
+    async fn wal_fsyncs_count_fsyncs_not_batches() {
+        let path = temp_journal_path("core-fsync-metrics");
+        let metrics = RuntimeMetrics::new(1, 2);
+        let writer = CoreFileLogWriter::open(path.clone(), JournalReplayMode::Strict, None)
+            .expect("open core writer");
+        let mut store =
+            RaftGroupFileLogStore::open(placement(1), metrics.group_engine_metrics(), writer)
+                .expect("open group store");
+        store
+            .append([blank_entry(1)], IOFlushed::noop())
+            .await
+            .expect("append an entry");
+        store
+            .save_committed(Some(test_log_id(1)))
+            .await
+            .expect("journal a committed marker");
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.wal_batches, 2);
+        assert_eq!(snapshot.wal_fsyncs, 1);
+        assert_eq!(snapshot.wal_fsync_records, 1);
+        assert_eq!(snapshot.wal_physical_bytes, file_len(&path));
+        drop(store);
         remove_journal(&path);
     }
 
