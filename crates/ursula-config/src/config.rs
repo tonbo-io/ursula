@@ -27,6 +27,22 @@ pub enum WalBackend {
     Disk,
 }
 
+/// When appends to the Raft WAL journal reach stable storage.
+///
+/// Votes, the per-group `initialized` flags and the node's run state are
+/// always written with `fsync`, whatever this policy says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WalFsync {
+    /// Acknowledge a batch of appends only after it is `fsync`ed.
+    #[default]
+    Always,
+    /// Acknowledge appends once they reach the page cache. A process crash
+    /// loses nothing; a host crash can lose the unsynced tail, which the
+    /// replica then has to recover from its peers.
+    Never,
+}
+
 /// Raft snapshot store backend selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -244,6 +260,12 @@ pub struct WalConfig {
     pub backend: WalBackend,
     /// Directory for on-disk WAL files. Required when `backend` is `Disk`.
     pub path: Option<PathBuf>,
+    /// When journal appends reach stable storage (`Disk` backend only).
+    ///
+    /// The default is `always` until replicas that may have lost
+    /// acknowledged appends rejoin through a recovery gate; `never` then
+    /// becomes the default.
+    pub fsync: WalFsync,
     /// Reject writes and mark the node unready below this many available bytes.
     /// Zero disables disk-pressure admission.
     pub min_available_size: HumanSize,
@@ -273,6 +295,7 @@ impl Default for WalConfig {
         Self {
             backend: WalBackend::Memory,
             path: None,
+            fsync: WalFsync::Always,
             min_available_size: HumanSize::mib(512),
             resume_available_size: HumanSize::gib(1),
             allow_volatile_multi_peer: false,

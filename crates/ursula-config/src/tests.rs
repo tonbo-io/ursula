@@ -485,6 +485,69 @@ url = "http://127.0.0.1:4438"
     }
 
     #[test]
+    fn wal_fsync_defaults_to_always_and_parses_both_policies() {
+        use crate::config::WalFsync;
+
+        assert_eq!(
+            crate::UrsulaConfig::default().raft.wal.fsync,
+            WalFsync::Always
+        );
+        let disk = |fsync: &str| {
+            format!("[raft.wal]\nbackend = \"disk\"\npath = \"/tmp/ursula-wal\"\n{fsync}\n")
+        };
+        for (line, expected) in [
+            ("", WalFsync::Always),
+            ("fsync = \"always\"", WalFsync::Always),
+            ("fsync = \"never\"", WalFsync::Never),
+        ] {
+            let tmp = temp_config(".toml", &disk(line));
+            let config = load_config(Some(tmp.path()), None, Some(1)).expect("valid fsync policy");
+            assert_eq!(config.raft.wal.fsync, expected, "{line:?}");
+        }
+
+        for invalid in ["fsync = \"interval\"", "fsync = \"Always\"", "fsync = true"] {
+            let tmp = temp_config(".toml", &disk(invalid));
+            let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+            assert!(
+                matches!(err, crate::ConfigError::TomlParse(_)),
+                "{invalid:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_rejects_fsync_never_without_a_disk_wal() {
+        let tmp = temp_config(
+            ".toml",
+            r#"
+[raft.wal]
+backend = "memory"
+fsync = "never"
+"#,
+        );
+        let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::Validation(
+                    crate::validate::ValidationError::RaftWalFsyncRequiresDisk
+                )
+            ),
+            "{err}"
+        );
+
+        let tmp = temp_config(
+            ".toml",
+            r#"
+[raft.wal]
+backend = "memory"
+fsync = "always"
+"#,
+        );
+        load_config(Some(tmp.path()), None, Some(1)).expect("the default policy needs no disk");
+    }
+
+    #[test]
     fn validation_rejects_disk_pressure_resume_at_or_below_minimum() {
         let tmp = temp_config(
             ".toml",
