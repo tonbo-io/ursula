@@ -328,12 +328,14 @@ pub(crate) fn wal_recovery_metrics(
     wal: &ursula_raft::wal::RaftWal,
 ) -> ursula_proto::telemetry::WalRecoveryMetrics {
     use ursula_proto::telemetry::PreviousWalRun;
+    use ursula_proto::telemetry::WalJournalSync;
     use ursula_proto::telemetry::WalRecoveryMetrics;
     use ursula_proto::telemetry::WalRecoveryReason;
     use ursula_proto::telemetry::WalRecoveryState;
     use ursula_proto::telemetry::WalReplayMode;
     use ursula_proto::telemetry::WalSyncPolicy;
     use ursula_raft::wal::JournalReplayMode;
+    use ursula_raft::wal::JournalSync;
     use ursula_raft::wal::PreviousRun;
     use ursula_raft::wal::RecoveryReason;
     use ursula_raft::wal::RecoveryState;
@@ -369,6 +371,10 @@ pub(crate) fn wal_recovery_metrics(
             },
         },
         recovery_epoch: opening.recovery_epoch,
+        journal_sync: Some(match opening.journal_sync {
+            JournalSync::NotNeeded => WalJournalSync::NotNeeded,
+            JournalSync::BeforeRecording => WalJournalSync::BeforeRecording,
+        }),
     }
 }
 

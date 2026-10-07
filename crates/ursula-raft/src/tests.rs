@@ -2896,6 +2896,7 @@ async fn registry_commands_execute_on_the_owner_and_waiters_do_not_block_rpc() {
     }
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn replicated_append_batch_reserves_hot_capacity_across_unapplied_entries() {
     let dir = tempfile::tempdir().unwrap();

@@ -366,6 +366,12 @@ pub enum WalRecoveryState {
     Normal,
     Recovering { reason: WalRecoveryReason },
 }
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WalJournalSync {
+    NotNeeded,
+    BeforeRecording,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalRecoveryMetrics {
     pub fsync: WalSyncPolicy,
@@ -373,6 +379,7 @@ pub struct WalRecoveryMetrics {
     pub replay_mode: WalReplayMode,
     pub recovery: WalRecoveryState,
     pub recovery_epoch: u64,
+    pub journal_sync: Option<WalJournalSync>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]

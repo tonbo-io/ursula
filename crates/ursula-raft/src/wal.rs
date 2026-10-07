@@ -14,6 +14,7 @@ pub use crate::log_store::JournalFile;
 pub use crate::log_store::JournalHistory;
 pub use crate::log_store::JournalOp;
 pub use crate::log_store::JournalReplayMode;
+pub use crate::log_store::JournalSync;
 pub use crate::log_store::JournalTuning;
 pub use crate::log_store::LaggingGroups;
 #[cfg(madsim)]

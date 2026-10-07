@@ -1378,9 +1378,7 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
         .await
         .unwrap();
     leader
-        .client_write(GroupWriteCommand::Stream(StreamCommand::CreateBucket {
-            bucket_id: "before-pause".into(),
-        }))
+        .client_write(GroupWriteCommand::Stream(StreamCommand::ReplicationBarrier))
         .await
         .unwrap();
     let before = leader.metrics().borrow_watched().last_log_index;
@@ -1396,9 +1394,7 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
     let writing = leader.clone();
     let append = tokio::spawn(async move {
         writing
-            .client_write(GroupWriteCommand::Stream(StreamCommand::CreateBucket {
-                bucket_id: "during-pause".into(),
-            }))
+            .client_write(GroupWriteCommand::Stream(StreamCommand::ReplicationBarrier))
             .await
     });
     // This times out with the synchronous append implementation: Replicate
@@ -1412,6 +1408,10 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
         )
         .await
         .unwrap();
+    assert!(
+        !append.is_finished(),
+        "leader cannot acknowledge until its own journal completes"
+    );
     drop(release);
     append.await.unwrap().unwrap();
     for engine in engines {
