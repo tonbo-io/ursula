@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
+use ursula_config::WalFsync;
 use ursula_config::config::ColdBackend;
+use ursula_raft::DurableRaftLogStoreFactory;
 use ursula_raft::RaftEngineConfig;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::StaticGrpcRaftMembershipConfig;
@@ -33,6 +35,51 @@ use crate::bootstrap::topology::Topology;
 pub struct SpawnedRuntime {
     pub runtime: ShardRuntime,
     pub raft_registry: Option<RaftGroupHandleRegistry>,
+    /// The node's Raft WAL when its logs are on disk. Shut it down once the
+    /// runtime's groups have stopped, so the next start finds a clean run.
+    pub raft_wal: Option<DurableRaftLogStoreFactory>,
+}
+
+/// Failure to spawn a runtime.
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnRuntimeError {
+    #[error(transparent)]
+    Runtime(#[from] RuntimeError),
+    #[error(transparent)]
+    RaftWal(#[from] ursula_raft::RaftWalError),
+}
+
+/// Where the runtime's groups keep their Raft logs, once the WAL has
+/// started.
+enum GroupStorage {
+    /// No Raft: the in-memory engine.
+    InMemory,
+    /// Raft over volatile in-memory logs.
+    RaftMemory,
+    /// Raft over the per-core journals of this run of the WAL.
+    RaftDisk(DurableRaftLogStoreFactory),
+}
+
+impl GroupStorage {
+    /// Starts the Raft WAL when `persistence` keeps the logs on disk: reads
+    /// the previous run's state and records this run before any group opens
+    /// a journal.
+    fn start(persistence: Persistence, fsync: WalFsync) -> Result<Self, SpawnRuntimeError> {
+        Ok(match persistence {
+            Persistence::InMemory => Self::InMemory,
+            Persistence::Raft { log_dir: None } => Self::RaftMemory,
+            Persistence::Raft { log_dir: Some(dir) } => {
+                Self::RaftDisk(DurableRaftLogStoreFactory::start(dir, fsync)?)
+            }
+        })
+    }
+
+    fn raft_wal(&self) -> Option<DurableRaftLogStoreFactory> {
+        match self {
+            Self::RaftDisk(log_stores) => Some(log_stores.clone()),
+            Self::InMemory | Self::RaftMemory => None,
+        }
+    }
 }
 
 /// Spawn a runtime from a typed `ursula_config::UrsulaConfig`.
@@ -40,7 +87,7 @@ pub fn spawn_runtime(
     config: &ursula_config::UrsulaConfig,
     persistence: Persistence,
     topology: Topology,
-) -> Result<SpawnedRuntime, RuntimeError> {
+) -> Result<SpawnedRuntime, SpawnRuntimeError> {
     spawn_runtime_with_maintenance_drain(config, persistence, topology, false)
 }
 
@@ -51,7 +98,7 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
     persistence: Persistence,
     topology: Topology,
     start_maintenance_drained: bool,
-) -> Result<SpawnedRuntime, RuntimeError> {
+) -> Result<SpawnedRuntime, SpawnRuntimeError> {
     let mut runtime_config =
         RuntimeConfig::from_ursula_config(&config.runtime, topology.raft_group_count());
     runtime_config.raft_max_uncommitted_bytes_per_group =
@@ -126,10 +173,11 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
         None
     };
 
+    let storage = GroupStorage::start(persistence, config.raft.wal.fsync)?;
     let spawned = spawn_runtime_core(
         runtime_config,
         cold_store,
-        persistence,
+        storage,
         &topology,
         snapshot_store.clone(),
         Some(engine_config),
@@ -214,14 +262,14 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
 fn spawn_runtime_core(
     runtime_config: RuntimeConfig,
     cold_store: Option<ColdStoreHandle>,
-    persistence: Persistence,
+    storage: GroupStorage,
     topology: &Topology,
     snapshot_store: Option<SharedSnapshotStore>,
     raft_engine_config: Option<RaftEngineConfig>,
     registry: Option<RaftGroupHandleRegistry>,
 ) -> Result<SpawnedRuntime, RuntimeError> {
     match topology {
-        Topology::SingleNode { .. } => spawn_singleton(runtime_config, cold_store, persistence),
+        Topology::SingleNode { .. } => spawn_singleton(runtime_config, cold_store, storage),
         Topology::StaticCluster {
             node_id,
             peers,
@@ -231,7 +279,7 @@ fn spawn_runtime_core(
         } => spawn_static_cluster(
             runtime_config,
             cold_store,
-            persistence,
+            storage,
             *node_id,
             peers.clone(),
             *raft_group_count,
@@ -247,10 +295,11 @@ fn spawn_runtime_core(
 fn spawn_singleton(
     runtime_config: RuntimeConfig,
     cold_store: Option<ColdStoreHandle>,
-    persistence: Persistence,
+    storage: GroupStorage,
 ) -> Result<SpawnedRuntime, RuntimeError> {
-    let runtime = match persistence {
-        Persistence::InMemory => {
+    let raft_wal = storage.raft_wal();
+    let runtime = match storage {
+        GroupStorage::InMemory => {
             let factory = InMemoryGroupEngineFactory::with_cold_store(cold_store.clone());
             ShardRuntime::spawn_with_engine_factory_and_cold_store(
                 runtime_config,
@@ -258,7 +307,7 @@ fn spawn_singleton(
                 cold_store,
             )?
         }
-        Persistence::Raft { log_dir: None } => match cold_store {
+        GroupStorage::RaftMemory => match cold_store {
             Some(ref cs) => ShardRuntime::spawn_with_engine_factory_and_cold_store(
                 runtime_config,
                 ursula_raft::ColdRaftGroupEngineFactory::new(cs.clone()),
@@ -270,9 +319,9 @@ fn spawn_singleton(
                 cold_store,
             )?,
         },
-        Persistence::Raft { log_dir: Some(dir) } => {
+        GroupStorage::RaftDisk(log_stores) => {
             let factory = ursula_raft::DurableRaftGroupEngineFactory::with_cold_store(
-                dir,
+                log_stores,
                 cold_store.clone(),
             );
             ShardRuntime::spawn_with_engine_factory_and_cold_store(
@@ -285,6 +334,7 @@ fn spawn_singleton(
     Ok(SpawnedRuntime {
         runtime,
         raft_registry: None,
+        raft_wal,
     })
 }
 
@@ -295,7 +345,7 @@ fn spawn_singleton(
 fn spawn_static_cluster(
     runtime_config: RuntimeConfig,
     cold_store: Option<ColdStoreHandle>,
-    persistence: Persistence,
+    storage: GroupStorage,
     node_id: u64,
     peers: Vec<(u64, String)>,
     _raft_group_count: usize,
@@ -305,11 +355,12 @@ fn spawn_static_cluster(
     raft_engine_config: Option<RaftEngineConfig>,
     registry: RaftGroupHandleRegistry,
 ) -> Result<SpawnedRuntime, RuntimeError> {
-    if !matches!(persistence, Persistence::Raft { .. }) {
+    if matches!(storage, GroupStorage::InMemory) {
         return Err(RuntimeError::StaticMembershipConfig {
             message: "static cluster topology requires Raft persistence".to_owned(),
         });
     }
+    let raft_wal = storage.raft_wal();
     let mut factory = ursula_raft::StaticGrpcRaftGroupEngineFactory::new(
         node_id,
         peers.clone(),
@@ -323,8 +374,8 @@ fn spawn_static_cluster(
     if let Some(engine_config) = raft_engine_config {
         factory = factory.with_engine_config(engine_config);
     }
-    if let Persistence::Raft { log_dir: Some(dir) } = persistence {
-        factory = factory.with_raft_log_dir(dir);
+    if let GroupStorage::RaftDisk(log_stores) = storage {
+        factory = factory.with_raft_log_stores(log_stores);
     }
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
         runtime_config,
@@ -334,5 +385,6 @@ fn spawn_static_cluster(
     Ok(SpawnedRuntime {
         runtime,
         raft_registry: Some(registry),
+        raft_wal,
     })
 }

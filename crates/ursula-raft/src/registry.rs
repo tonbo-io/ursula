@@ -45,6 +45,8 @@ use ursula_runtime::default_snapshot_store;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 
+use crate::log_store::RecoveryState;
+use crate::log_store::WalOpening;
 use crate::meta::MetaRaftTypeConfig;
 use crate::read_index::ReadIndexBarrier;
 use crate::rejoin::AdoptSurvivorOutcome;
@@ -922,6 +924,8 @@ pub struct RaftGroupHandleRegistry {
     snapshot_store: Arc<Mutex<SharedSnapshotStore>>,
     snapshot_build: Arc<Mutex<SnapshotBuildCoordinator>>,
     snapshot_install: SnapshotInstallCoordinator,
+    /// How this node's Raft WAL opened, when its logs are durable.
+    wal_opening: Arc<Mutex<Option<WalOpening>>>,
 }
 
 impl Default for RaftGroupHandleRegistry {
@@ -938,6 +942,7 @@ impl Default for RaftGroupHandleRegistry {
             snapshot_store: Arc::new(Mutex::new(default_snapshot_store())),
             snapshot_build: Arc::new(Mutex::new(SnapshotBuildCoordinator::new(1))),
             snapshot_install: SnapshotInstallCoordinator::new(1),
+            wal_opening: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -961,6 +966,28 @@ impl Drop for PrefetchedSnapshotGuard {
 }
 
 impl RaftGroupHandleRegistry {
+    /// Records how this node's Raft WAL opened.
+    pub fn set_wal_opening(&self, opening: WalOpening) {
+        *self
+            .wal_opening
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(opening);
+    }
+
+    /// How this node's Raft WAL opened; `None` when its logs are volatile.
+    pub fn wal_opening(&self) -> Option<WalOpening> {
+        *self
+            .wal_opening
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Whether this node's Raft logs may be missing entries it acknowledged;
+    /// `None` when its logs are volatile.
+    pub fn wal_recovery_state(&self) -> Option<RecoveryState> {
+        self.wal_opening().map(|opening| opening.recovery)
+    }
+
     /// Stops long-lived Raft transport sessions before the node server exits.
     ///
     /// This lets peers reconnect promptly instead of retaining a stream backed

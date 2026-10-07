@@ -1672,6 +1672,14 @@
           "minLength": 1,
           "description": "Raft log directory for logDir mode."
         },
+        "walFsync": {
+          "type": "string",
+          "enum": [
+            "always",
+            "never"
+          ],
+          "description": "When Raft WAL appends reach stable storage in logDir mode: always acknowledges after fsync; never acknowledges from the page cache, so a host crash can lose this replica's unsynced tail."
+        },
         "minAvailableBytes": {
           "type": "integer",
           "minimum": 0,

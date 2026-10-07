@@ -12,8 +12,10 @@ use openraft::BasicNode;
 use openraft::Config;
 use openraft::alias::LogIdOf;
 use openraft::alias::VoteOf;
+use openraft::storage::IOFlushed;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
+use ursula_config::WalFsync;
 use ursula_raft::CoreJournalError;
 use ursula_raft::DurableRaftLogStoreFactory;
 use ursula_raft::InProcessRaftNetworkFactory;
@@ -25,13 +27,19 @@ use ursula_raft::JournalFile;
 use ursula_raft::JournalOp;
 use ursula_raft::JournalReplayMode;
 use ursula_raft::LockAttempt;
+use ursula_raft::PreviousRun;
+use ursula_raft::RUN_STATE_FILE;
 use ursula_raft::RaftGroupEngine;
 use ursula_raft::RaftGroupFileLogStore;
+use ursula_raft::RaftWalError;
+use ursula_raft::RecoveryReason;
+use ursula_raft::RecoveryState;
 use ursula_raft::SIM_DISK_PAGE_SIZE;
 use ursula_raft::SimDisk;
 use ursula_raft::SimDiskError;
 use ursula_raft::SimDiskFault;
 use ursula_raft::UrsulaRaftTypeConfig;
+use ursula_raft::WalOpening;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
@@ -76,6 +84,27 @@ fn core_journal_error(err: &io::Error) -> Option<&CoreJournalError> {
 fn core_journal(root: &Path) -> PathBuf {
     root.join("core-0").join("journal.bin")
 }
+
+/// Asserts how a node's WAL opened: what it read of the previous run, how it
+/// read the journals, and whether its logs may be missing acknowledged
+/// entries.
+fn assert_opening(
+    opening: WalOpening,
+    previous_run: PreviousRun,
+    replay_mode: JournalReplayMode,
+    recovery: RecoveryState,
+    context: &str,
+) {
+    assert_eq!(
+        (opening.previous_run, opening.replay_mode, opening.recovery),
+        (previous_run, replay_mode, recovery),
+        "{context}: {opening:?}"
+    );
+}
+
+const RECOVERING_AFTER_HOST_CRASH: RecoveryState = RecoveryState::Recovering {
+    reason: RecoveryReason::HostCrash,
+};
 
 #[test]
 fn sim_disk_power_loss_keeps_synced_bytes_and_may_reorder_unsynced_pages() {
@@ -324,6 +353,10 @@ struct JournalCluster {
 
 impl JournalCluster {
     async fn start(name: &str) -> Self {
+        Self::start_with_fsync(name, WalFsync::Always).await
+    }
+
+    async fn start_with_fsync(name: &str, fsync: WalFsync) -> Self {
         let config = Arc::new(
             Config {
                 cluster_name: name.to_owned(),
@@ -339,7 +372,12 @@ impl JournalCluster {
             config,
             policy: sim_network_policy(),
             wals: (1..=3)
-                .map(|node_id| (node_id, SimNodeWal::provision(&format!("{name}-{node_id}"))))
+                .map(|node_id| {
+                    (
+                        node_id,
+                        SimNodeWal::provision_with_fsync(&format!("{name}-{node_id}"), fsync),
+                    )
+                })
                 .collect(),
             registries: JOURNAL_GROUPS
                 .iter()
@@ -563,6 +601,26 @@ fn power_loss_restart_keeps_every_acknowledged_write() {
             cluster.stop_node(victim).await;
             let report = cluster.wals[&victim].power_loss().await;
             cluster.start_node(victim).await;
+            // Unsynced replay hints can leave holes, so the journals are read
+            // as a verified prefix, but every acknowledged append was synced.
+            assert_opening(
+                cluster.wals[&victim].opening(),
+                PreviousRun::HostCrash {
+                    fsync: WalFsync::Always,
+                },
+                JournalReplayMode::VerifiedPrefix,
+                RecoveryState::Normal,
+                &format!("seed {seed}"),
+            );
+            for group in JOURNAL_GROUPS {
+                let store = cluster.wals[&victim]
+                    .store(RaftGroupId(group))
+                    .expect("running store");
+                assert_eq!(
+                    store.journal_replay_mode(),
+                    JournalReplayMode::VerifiedPrefix
+                );
+            }
             let after = cluster.durable_logs(victim).await;
             for group in JOURNAL_GROUPS {
                 let (before, after) = (&before[&group], &after[&group]);
@@ -638,6 +696,17 @@ fn journal_io_error_poisons_the_node_until_restart(
             cluster.stop_node(victim).await;
             cluster.wals[&victim].process_crash().await;
             cluster.start_node(victim).await;
+            // The writer recorded the failure before the process stopped, so
+            // the restart reads every journal as a verified prefix.
+            assert_opening(
+                cluster.wals[&victim].opening(),
+                PreviousRun::Poisoned,
+                JournalReplayMode::VerifiedPrefix,
+                RecoveryState::Recovering {
+                    reason: RecoveryReason::Poisoned,
+                },
+                &format!("seed {seed}"),
+            );
             for group in JOURNAL_GROUPS {
                 cluster.append(group, 2).await;
             }
@@ -876,12 +945,23 @@ fn a_reclaim_that_cannot_publish_its_generation_poisons_the_writer() {
     }
 }
 
+/// What a node finds of its run state after a power loss.
+#[derive(Debug, Clone, Copy)]
+enum RunStateAfterPowerLoss {
+    /// As the node left it: the run did not end cleanly and the host booted
+    /// anew, so the journals are read as a verified prefix.
+    Kept,
+    /// Removed by hand: nothing says the host crashed, so the journals are
+    /// read strictly.
+    Removed,
+}
+
 /// A single-node group whose synced entries are followed by an unsynced
 /// tail of committed markers, after a power loss that may reorder the tail's
-/// writeback. Returns what was synced and how a store reopened in `mode`
+/// writeback. Returns what was synced and how a store reopened afterwards
 /// fared.
 async fn reopen_after_a_reordered_unsynced_tail(
-    mode: JournalReplayMode,
+    run_state: RunStateAfterPowerLoss,
 ) -> (DurableGroupLog, Result<DurableGroupLog, String>) {
     let wal = SimNodeWal::provision("unsynced-tail");
     let placement = group_placement(0);
@@ -920,10 +1000,15 @@ async fn reopen_after_a_reordered_unsynced_tail(
     }
     drop(store);
     let report = wal.power_loss().await;
-    let reopened = DurableRaftLogStoreFactory::new(wal.root())
-        .with_replay_mode(mode)
-        .open(placement, metrics);
-    let reopened = match reopened {
+    let expected_mode = match run_state {
+        RunStateAfterPowerLoss::Kept => JournalReplayMode::VerifiedPrefix,
+        RunStateAfterPowerLoss::Removed => {
+            SimDisk::remove_file(&wal.root().join(RUN_STATE_FILE)).expect("remove the run state");
+            JournalReplayMode::Strict
+        }
+    };
+    assert_eq!(wal.opening().replay_mode, expected_mode);
+    let reopened = match wal.try_open(placement, metrics).await {
         Ok(store) => Ok(DurableGroupLog::read(&store).await),
         Err(err) => Err(format!("{report:?}: {}", err.message())),
     };
@@ -934,7 +1019,8 @@ const UNSYNCED_TAIL_SEEDS: [u64; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 
 /// Strict recovery expects every write on disk, so it refuses the hole a
 /// reordered writeback of unsynced committed markers can leave. It never
-/// recovers less than what was synced.
+/// recovers less than what was synced. This is why a run state that shows a
+/// host crash selects the verified prefix even under `always`.
 #[test]
 fn strict_recovery_refuses_a_reordered_unsynced_tail() {
     let _guard = sim_test_guard();
@@ -942,7 +1028,7 @@ fn strict_recovery_refuses_a_reordered_unsynced_tail() {
     for seed in seeds_from_env("UNSYNCED_TAIL_SEEDS", &UNSYNCED_TAIL_SEEDS) {
         let (synced, reopened) = run_with_madsim(
             seed,
-            reopen_after_a_reordered_unsynced_tail(JournalReplayMode::Strict),
+            reopen_after_a_reordered_unsynced_tail(RunStateAfterPowerLoss::Removed),
         );
         match reopened {
             Ok(recovered) => assert_eq!(recovered, synced, "seed {seed}"),
@@ -958,20 +1044,406 @@ fn strict_recovery_refuses_a_reordered_unsynced_tail() {
     );
 }
 
-/// Recovery that keeps the verified prefix recovers every synced entry and
-/// the vote after the same power losses.
+/// After the same power losses the run state selects the verified prefix,
+/// which recovers every synced entry and the vote.
 #[test]
 fn verified_prefix_recovery_keeps_every_acknowledged_write_after_a_reordered_tail() {
     let _guard = sim_test_guard();
     for seed in seeds_from_env("UNSYNCED_TAIL_SEEDS", &UNSYNCED_TAIL_SEEDS) {
         let (synced, reopened) = run_with_madsim(
             seed,
-            reopen_after_a_reordered_unsynced_tail(JournalReplayMode::VerifiedPrefix),
+            reopen_after_a_reordered_unsynced_tail(RunStateAfterPowerLoss::Kept),
         );
         assert_eq!(
             reopened.unwrap_or_else(|err| panic!("seed {seed}: {err}")),
             synced,
             "seed {seed}"
         );
+    }
+}
+
+/// The opening and the durable logs of `node_id`'s groups, read from stores
+/// opened without starting the replicas.
+async fn reopen_stores(
+    cluster: &JournalCluster,
+    node_id: u64,
+) -> (WalOpening, BTreeMap<u32, (DurableGroupLog, bool)>) {
+    let wal = &cluster.wals[&node_id];
+    let mut logs = BTreeMap::new();
+    for group in JOURNAL_GROUPS {
+        let placement = group_placement(group);
+        let store = wal.open(placement, standalone_wal_metrics(placement)).await;
+        logs.insert(
+            group,
+            (DurableGroupLog::read(&store).await, store.initialized()),
+        );
+    }
+    (wal.opening(), logs)
+}
+
+/// Under `never` a follower acknowledges appends from the page cache, so a
+/// power loss can cost it acknowledged entries. The restart detects it: the
+/// run state shows a host crash under `never`, the journals are read as a
+/// verified prefix and the node reports that it is recovering. What it keeps
+/// is a prefix of its log, and its vote and `initialized` flags, which are
+/// always `fsync`ed, survive. Without the recovery gate the replica must not
+/// rejoin, so the stores are only reopened.
+#[test]
+fn fsync_never_power_loss_is_detected_and_keeps_a_verified_prefix_and_the_vote() {
+    let _guard = sim_test_guard();
+    let mut lost = 0_usize;
+    for seed in seeds_from_env("JOURNAL_POWER_LOSS_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
+        let lost_on_seed = run_with_madsim(seed, async move {
+            let mut cluster =
+                JournalCluster::start_with_fsync("never-power-loss", WalFsync::Never).await;
+            for group in JOURNAL_GROUPS {
+                cluster.append(group, 6).await;
+            }
+            let victim = cluster.follower_of_every_group(seed).await;
+            let before = cluster.durable_logs(victim).await;
+            cluster.stop_node(victim).await;
+            let report = cluster.wals[&victim].power_loss().await;
+
+            let (opening, after) = reopen_stores(&cluster, victim).await;
+            assert_opening(
+                opening,
+                PreviousRun::HostCrash {
+                    fsync: WalFsync::Never,
+                },
+                JournalReplayMode::VerifiedPrefix,
+                RECOVERING_AFTER_HOST_CRASH,
+                &format!("seed {seed}"),
+            );
+            let mut lost = 0_usize;
+            for group in JOURNAL_GROUPS {
+                let (before, (after, initialized)) = (&before[&group], &after[&group]);
+                assert_eq!(
+                    after.vote, before.vote,
+                    "seed {seed}: node {victim} group {group} lost its vote ({report:?})"
+                );
+                assert!(
+                    before.log_ids.starts_with(&after.log_ids),
+                    "seed {seed}: node {victim} group {group} kept no prefix of its log \
+                     ({report:?}): before {:?}, after {:?}",
+                    before.log_ids,
+                    after.log_ids
+                );
+                assert!(
+                    initialized,
+                    "seed {seed}: node {victim} group {group} forgot it was initialized"
+                );
+                lost =
+                    lost.saturating_add(before.log_ids.len().saturating_sub(after.log_ids.len()));
+            }
+            lost
+        });
+        lost = lost.saturating_add(lost_on_seed);
+    }
+    assert!(
+        lost > 0,
+        "a power loss under fsync = never must sometimes cost a follower acknowledged entries"
+    );
+}
+
+/// A graceful shutdown `fsync`s every journal before it records a clean
+/// run, so under `never` even a power loss right after it loses nothing,
+/// and the restart reads the journals strictly.
+#[test]
+fn clean_shutdown_then_power_loss_reads_strictly_and_loses_nothing() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("JOURNAL_POWER_LOSS_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
+        run_with_madsim(seed, async move {
+            let mut cluster =
+                JournalCluster::start_with_fsync("never-clean-shutdown", WalFsync::Never).await;
+            for group in JOURNAL_GROUPS {
+                cluster.append(group, 6).await;
+            }
+            let victim = cluster.follower_of_every_group(seed).await;
+            let before = cluster.durable_logs(victim).await;
+            let wal = cluster.wals[&victim].clone();
+            wal.clean_shutdown(cluster.stop_node(victim)).await;
+            wal.power_loss().await;
+            cluster.start_node(victim).await;
+            assert_opening(
+                cluster.wals[&victim].opening(),
+                PreviousRun::Clean,
+                JournalReplayMode::Strict,
+                RecoveryState::Normal,
+                &format!("seed {seed}"),
+            );
+            let after = cluster.durable_logs(victim).await;
+            for group in JOURNAL_GROUPS {
+                let (before, after) = (&before[&group], &after[&group]);
+                assert_eq!(after.vote, before.vote, "seed {seed}");
+                assert!(
+                    after.log_ids.starts_with(&before.log_ids),
+                    "seed {seed}: group {group} lost entries: before {:?}, after {:?}",
+                    before.log_ids,
+                    after.log_ids
+                );
+            }
+            for group in JOURNAL_GROUPS {
+                cluster.append(group, 3).await;
+            }
+            cluster.verify_reads().await;
+        });
+    }
+}
+
+/// A process crash keeps the page cache, so under `never` the restart on
+/// the same boot loses nothing and reads the journals strictly.
+#[test]
+fn process_crash_under_never_reads_strictly_and_loses_nothing() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("JOURNAL_POWER_LOSS_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
+        run_with_madsim(seed, async move {
+            let mut cluster =
+                JournalCluster::start_with_fsync("never-process-crash", WalFsync::Never).await;
+            for group in JOURNAL_GROUPS {
+                cluster.append(group, 6).await;
+            }
+            let victim = cluster.follower_of_every_group(seed).await;
+            let before = cluster.durable_logs(victim).await;
+            cluster.stop_node(victim).await;
+            cluster.wals[&victim].process_crash().await;
+            cluster.start_node(victim).await;
+            assert_opening(
+                cluster.wals[&victim].opening(),
+                PreviousRun::ProcessCrash,
+                JournalReplayMode::Strict,
+                RecoveryState::Normal,
+                &format!("seed {seed}"),
+            );
+            let after = cluster.durable_logs(victim).await;
+            for group in JOURNAL_GROUPS {
+                let (before, after) = (&before[&group], &after[&group]);
+                assert_eq!(after.vote, before.vote, "seed {seed}");
+                assert!(
+                    after.log_ids.starts_with(&before.log_ids),
+                    "seed {seed}: group {group} lost entries: before {:?}, after {:?}",
+                    before.log_ids,
+                    after.log_ids
+                );
+            }
+            for group in JOURNAL_GROUPS {
+                cluster.append(group, 3).await;
+            }
+            cluster.verify_reads().await;
+        });
+    }
+}
+
+/// The run state is replaced through a temporary file, an `fsync`, a rename
+/// and a directory `fsync`. A power loss at any step leaves the old or the
+/// new version, never a torn one: a run that could not publish its run state
+/// fails to start, and after the power loss the next run reads the clean
+/// shutdown before it.
+#[test]
+fn the_run_state_is_the_old_or_the_new_version_after_a_power_loss() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("STATE_FILE_SEEDS", &[1, 2, 3, 5, 8]) {
+        run_with_madsim(seed, async move {
+            let root = sim_dir("run-state");
+            let start = || DurableRaftLogStoreFactory::start(&root, WalFsync::Never);
+            let temp = root.join("run-state.running.tmp");
+            start()
+                .expect("a first run")
+                .shutdown()
+                .await
+                .expect("ends cleanly");
+            for (path, fault) in [
+                (temp.clone(), SimDiskFault::Write),
+                (temp.clone(), SimDiskFault::Sync),
+                (root.clone(), SimDiskFault::Sync),
+            ] {
+                SimDisk::inject_fault(&path, fault).expect("arm the fault");
+                let err = start().expect_err("the run state is not published");
+                assert!(
+                    matches!(err, RaftWalError::RecordRunState(_)),
+                    "seed {seed} {fault:?}: {err}"
+                );
+                SimDisk::power_loss(&root).expect("power loss");
+                let run = start().expect("the old run state still reads");
+                assert_eq!(
+                    run.opening().previous_run,
+                    PreviousRun::Clean,
+                    "seed {seed} {fault:?}"
+                );
+                run.shutdown().await.expect("ends cleanly");
+            }
+
+            // A published run state survives the power loss.
+            drop(start().expect("a run that crashes"));
+            SimDisk::power_loss(&root).expect("power loss");
+            assert_eq!(
+                start()
+                    .expect("the new run state reads")
+                    .opening()
+                    .previous_run,
+                PreviousRun::HostCrash {
+                    fsync: WalFsync::Never
+                },
+                "seed {seed}"
+            );
+        });
+    }
+}
+
+/// Votes live in the core's metadata file, which is `fsync`ed under any
+/// policy: a power loss under `never` keeps the vote and the `initialized`
+/// flag. A vote whose metadata replacement cannot be published poisons the
+/// writer, and after a power loss the previous vote reads back whole.
+#[test]
+fn votes_survive_power_loss_under_never_and_the_metadata_is_old_or_new() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("STATE_FILE_SEEDS", &[1, 2, 3, 5, 8]) {
+        run_with_madsim(seed, async move {
+            let wal = SimNodeWal::provision_with_fsync("never-votes", WalFsync::Never);
+            let placement = group_placement(0);
+            let metrics = standalone_wal_metrics(placement);
+            let mut engine = RaftGroupEngine::new_single_node_on_log_store(
+                placement,
+                wal.open(placement, metrics.clone()).await,
+                None,
+            )
+            .await
+            .expect("start a single-node group");
+            engine
+                .create_stream(
+                    CreateStreamRequest::new(group_stream(0), "application/octet-stream"),
+                    placement,
+                    ColdWriteAdmission::default(),
+                )
+                .await
+                .expect("create a stream");
+            let store = wal.store(RaftGroupId(0)).expect("running store");
+            let first = DurableGroupLog::read(&store).await.vote.expect("a vote");
+            drop(store);
+            engine.shutdown().await.expect("stop the group");
+            drop(engine);
+
+            wal.power_loss().await;
+            let mut store = wal.open(placement, metrics.clone()).await;
+            assert_eq!(
+                store.read_vote().await.expect("vote"),
+                Some(first),
+                "seed {seed}"
+            );
+            assert!(store.initialized(), "seed {seed}");
+
+            // A later term than any a new single-node group reaches.
+            let second = openraft::Vote::new_committed(1_000, 1);
+            assert_ne!(first, second);
+            SimDisk::inject_fault(&wal.root().join("core-0"), SimDiskFault::Sync)
+                .expect("fail the metadata publish");
+            let err = store
+                .save_vote(&second)
+                .await
+                .expect_err("an unpublished vote is not acknowledged");
+            assert!(
+                matches!(
+                    core_journal_error(&err),
+                    Some(CoreJournalError::WriterPoisoned { .. })
+                ),
+                "seed {seed}: {err}"
+            );
+            drop(store);
+            wal.power_loss().await;
+            let mut store = wal.open(placement, metrics.clone()).await;
+            assert_eq!(
+                store.read_vote().await.expect("vote"),
+                Some(first),
+                "seed {seed}"
+            );
+
+            store.save_vote(&second).await.expect("save the vote");
+            drop(store);
+            wal.power_loss().await;
+            let mut store = wal.open(placement, metrics).await;
+            assert_eq!(
+                store.read_vote().await.expect("vote"),
+                Some(second),
+                "seed {seed}"
+            );
+        });
+    }
+}
+
+fn blank_entry(index: u64) -> openraft::alias::EntryOf<UrsulaRaftTypeConfig> {
+    use openraft::entry::RaftEntry;
+    use openraft::vote::RaftLeaderId;
+
+    openraft::alias::EntryOf::<UrsulaRaftTypeConfig>::new(
+        openraft::LogId {
+            leader_id: openraft::vote::leader_id_adv::CommittedLeaderId::new(1, 1),
+            index,
+        },
+        openraft::EntryPayload::Blank,
+    )
+}
+
+/// Appends entry `index` to every store, the `n`th append `gap * n` after
+/// the first, and returns the `fsync`s they cost.
+async fn append_spread(
+    stores: &[Arc<RaftGroupFileLogStore>],
+    metrics: &RuntimeMetrics,
+    index: u64,
+    gap: Duration,
+) -> u64 {
+    let before = metrics.snapshot().wal_fsyncs;
+    let appends = stores
+        .iter()
+        .enumerate()
+        .map(|(position, store)| {
+            let mut store = store.clone();
+            let delay = gap.saturating_mul(u32::try_from(position).expect("position fits u32"));
+            madsim::task::spawn(async move {
+                madsim::time::sleep(delay).await;
+                store
+                    .append([blank_entry(index)], IOFlushed::noop())
+                    .await
+                    .expect("append");
+            })
+        })
+        .collect::<Vec<_>>();
+    for append in appends {
+        append.await.expect("append task");
+    }
+    metrics.snapshot().wal_fsyncs.saturating_sub(before)
+}
+
+/// Under `always` a batch is a group commit: it keeps collecting while
+/// appends keep arriving, so a burst costs one `fsync` in whatever order its
+/// senders run, and appends that arrive after the window closed each get
+/// their own. madsim timers fire no earlier than 1 ms, so the sub-millisecond
+/// window itself is covered by a unit test of the writer.
+#[test]
+fn a_burst_of_appends_lands_in_one_group_commit() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("GROUP_COMMIT_SEEDS", &[1, 2, 3, 5, 8, 13]) {
+        run_with_madsim(seed, async move {
+            let wal = SimNodeWal::provision("group-commit");
+            let metrics = RuntimeMetrics::new(1, 16);
+            let mut stores = Vec::new();
+            for group in 0..16 {
+                stores.push(
+                    wal.open(group_placement(group), metrics.group_engine_metrics())
+                        .await,
+                );
+            }
+            // First entries also mark each group initialized.
+            append_spread(&stores, &metrics, 1, Duration::ZERO).await;
+
+            assert_eq!(
+                append_spread(&stores, &metrics, 2, Duration::ZERO).await,
+                1,
+                "seed {seed}: a burst of 16 appends is one group commit"
+            );
+            assert_eq!(
+                append_spread(&stores, &metrics, 3, Duration::from_millis(5)).await,
+                16,
+                "seed {seed}: appends 5 ms apart each arrive after the window closed"
+            );
+        });
     }
 }

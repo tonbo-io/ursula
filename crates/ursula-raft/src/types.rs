@@ -15,9 +15,13 @@ use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_shard::RaftGroupId;
 
-/// How long the per-core journal writer waits for a second request before it
-/// writes a batch (`log_store/file.rs::run_core_file_log_writer`).
+/// Under `fsync = always`, how long the per-core journal writer waits for the
+/// next request before it writes a batch; each arrival restarts the wait
+/// (`log_store/file.rs::collect_batch`).
 pub(crate) const CORE_LOG_GROUP_COMMIT_DELAY: Duration = Duration::from_micros(200);
+/// Under `fsync = always`, the longest a batch keeps collecting requests,
+/// counted from its first.
+pub(crate) const CORE_LOG_GROUP_COMMIT_MAX_DELAY: Duration = Duration::from_millis(1);
 /// The most requests the per-core journal writer puts in one batch.
 pub(crate) const CORE_LOG_GROUP_COMMIT_MAX_BATCH: usize = 1024;
 

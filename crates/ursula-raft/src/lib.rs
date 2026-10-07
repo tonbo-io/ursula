@@ -11,7 +11,10 @@
 //!   ([`GrpcRaftNetworkFactory`]) used for inter-node Raft RPCs.
 //! - [`log_store`]: in-memory and durable Raft log stores. The durable store
 //!   writes the shared per-core journal through an I/O seam whose `cfg(madsim)`
-//!   implementation is the simulated disk (`SimDisk`).
+//!   implementation is the simulated disk (`SimDisk`), keeps votes and
+//!   `initialized` flags in per-core metadata files, and records each run of
+//!   the node in a run-state file that decides how the journals reopen
+//!   ([`WalOpening`]).
 //! - [`registry`]: [`RaftGroupHandleRegistry`] and the single-node test network.
 //! - [`maintenance`]: configuration-backed local Raft maintenance eligibility.
 //! - [`state_machine`]: per-group [`RaftGroupStateMachine`] and snapshot builder.
@@ -93,6 +96,7 @@ pub use grpc::confirm_quorum_prefix;
 pub use grpc::raft_grpc_metrics_snapshot;
 pub use grpc::raft_grpc_service;
 pub use grpc::request_self_election_via_transfer;
+pub use log_store::BootId;
 pub use log_store::CoreJournalError;
 pub use log_store::FrameDefect;
 pub use log_store::HeaderDefect;
@@ -107,9 +111,16 @@ pub use log_store::JournalReplayMode;
 pub use log_store::LockAttempt;
 pub use log_store::MemoryRaftLogStore;
 pub use log_store::MetaRaftLogStore;
+pub use log_store::PreviousRun;
+pub use log_store::RUN_STATE_FILE;
 pub use log_store::RaftGroupFileLogStore;
 pub use log_store::RaftGroupLogStore;
+pub use log_store::RaftWalError;
 pub use log_store::RecordTooLarge;
+pub use log_store::RecoveryReason;
+pub use log_store::RecoveryState;
+pub use log_store::RunState;
+pub use log_store::RunStatus;
 #[cfg(madsim)]
 pub use log_store::SIM_DISK_PAGE_SIZE;
 #[cfg(madsim)]
@@ -124,6 +135,10 @@ pub use log_store::SimFile;
 pub use log_store::SimJournalLock;
 #[cfg(madsim)]
 pub use log_store::SimPowerLoss;
+pub use log_store::StateFileDefect;
+pub use log_store::StateFileError;
+pub use log_store::StateFileKind;
+pub use log_store::WalOpening;
 pub use maintenance::RaftMaintenanceIssue;
 pub use maintenance::RaftMaintenanceReport;
 pub use maintenance::check_raft_maintenance;

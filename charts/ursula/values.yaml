@@ -203,6 +203,11 @@ raft:
   storageMode: logDir
   # Raft log directory used when storageMode=logDir.
   logDir: /var/lib/ursula/raft
+  # When Raft WAL appends reach stable storage with storageMode=logDir. always acknowledges a
+  # batch after fsync. never acknowledges once the write is in the page cache, so a host crash can
+  # lose this replica's unsynced tail. The default becomes never once replicas that lost
+  # acknowledged appends rejoin through the recovery gate.
+  walFsync: always
   # Reject writes and readiness below this many free bytes on the WAL filesystem.
   minAvailableBytes: 536870912
   # Resume only above this watermark to avoid readiness flapping.

@@ -131,6 +131,7 @@ data:
 {{- else }}
     backend = "disk"
     path = {{ .Values.raft.logDir | quote }}
+    fsync = {{ .Values.raft.walFsync | quote }}
 {{- end }}
 
     [storage.cold]

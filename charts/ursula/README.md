@@ -414,6 +414,7 @@ container receives only chart-managed container settings plus explicit
 | `raft.initMembershipPerGroup` | `true` | Idempotent per-group membership bootstrap flag; persistent groups may keep it enabled across restarts. |
 | `raft.storageMode` | `logDir` | Raft storage mode: `logDir` persists logs locally; `memory` uses volatile quorum-replicated logs. See the memory-WAL durability contract above. |
 | `raft.logDir` | `/var/lib/ursula/raft` | Raft log directory mounted to the `raft-data` volume. |
+| `raft.walFsync` | `always` | When Raft WAL appends reach stable storage in `logDir` mode. `always` acknowledges a batch after `fsync`. `never` acknowledges once the write is in the page cache, so a host crash can lose this replica's unsynced tail. Votes and the run state are always written with `fsync`. Renders `raft.wal.fsync`. |
 | `raft.minAvailableBytes` | `536870912` | Reject writes and readiness below this many free bytes on the WAL filesystem. `0` disables the guard. |
 | `raft.resumeAvailableBytes` | `1073741824` | Free bytes required before WAL disk pressure clears; must exceed the minimum. |
 | `raft.allowVolatileMultiPeer` | `false` | Required explicit acceptance of the memory-WAL durability contract for multi-pod clusters. Shared S3 initialized markers are required to detect an all-voter restart. |

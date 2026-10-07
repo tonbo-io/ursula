@@ -18,6 +18,10 @@
 //! - [`SimDisk::inject_fault`] fails the next write or `fsync` on a path. A
 //!   failed `fsync` marks the pages clean without persisting them, as Linux
 //!   does, so a later successful `fsync` does not make them durable.
+//!
+//! The disk also stands in for the host's boot id
+//! ([`JournalDisk::boot_id`]): a power loss under a prefix starts a new boot
+//! for every path below it, and a process crash does not.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -162,6 +166,8 @@ struct DiskState {
     locks: BTreeSet<PathBuf>,
     faults: BTreeSet<(PathBuf, SimDiskFault)>,
     next_root: u64,
+    /// The prefix of every power loss so far, in order.
+    power_losses: Vec<PathBuf>,
 }
 
 #[derive(Default)]
@@ -468,7 +474,19 @@ impl DiskState {
             self.durable.retain(|path, _| !path.starts_with(&orphan));
         }
         self.faults.retain(|(path, _)| !under_prefix(path));
+        self.power_losses.push(prefix.to_owned());
         Ok(report)
+    }
+
+    /// The simulated boot of the host holding `path`: one more for every
+    /// power loss that covered it.
+    fn boot_id(&self, path: &Path) -> String {
+        let boots = self
+            .power_losses
+            .iter()
+            .filter(|prefix| path.starts_with(prefix))
+            .count();
+        format!("sim-boot-{boots}")
     }
 }
 
@@ -600,6 +618,10 @@ impl JournalDisk for SimDisk {
                 path: path.to_owned(),
             }))
         })
+    }
+
+    fn boot_id(path: &Path) -> Option<String> {
+        with_disk(|state| state.boot_id(path)).ok()
     }
 }
 

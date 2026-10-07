@@ -472,7 +472,13 @@ async fn spawn_static_grpc_test_node(
         factory = factory.with_engine_config(engine_config);
     }
     if let Some(raft_log_dir) = storage.raft_log_dir {
-        factory = factory.with_raft_log_dir(raft_log_dir);
+        factory = factory.with_raft_log_stores(
+            ursula_raft::DurableRaftLogStoreFactory::start(
+                raft_log_dir,
+                ursula_config::WalFsync::Always,
+            )
+            .expect("start the Raft WAL"),
+        );
     }
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, storage.cold_store)
@@ -1774,6 +1780,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
         .expect("runtime");
         let runtime = spawned.runtime;
         let registry = spawned.raft_registry.expect("registry");
+        let raft_wal = spawned.raft_wal.expect("a durable runtime starts its WAL");
         runtime.warm_all_groups().await.expect("warm group");
         let placement = runtime.locate(&BucketStreamId::new("benchcmp", "static-raft-log-restart"));
         let shutdown_runtime = runtime.clone();
@@ -1808,6 +1815,10 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             .shutdown_group_engine(placement)
             .await
             .expect("shut down durable group before restart");
+        raft_wal
+            .shutdown()
+            .await
+            .expect("shut down the Raft WAL cleanly");
     }
 
     let journal_path = raft_root.join("core-0").join("journal.bin");
@@ -1832,6 +1843,15 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
         .expect("restarted runtime");
         let runtime = spawned.runtime;
         let registry = spawned.raft_registry.expect("registry");
+        let opening = spawned.raft_wal.expect("restarted WAL").opening();
+        assert_eq!(opening.previous_run, ursula_raft::PreviousRun::Clean);
+        assert_eq!(opening.replay_mode, ursula_raft::JournalReplayMode::Strict);
+        assert_eq!(opening.recovery, ursula_raft::RecoveryState::Normal);
+        assert_eq!(
+            registry.wal_opening(),
+            Some(opening),
+            "the registry publishes how the WAL opened"
+        );
         runtime
             .warm_all_groups()
             .await

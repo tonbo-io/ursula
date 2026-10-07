@@ -20,6 +20,25 @@ use opentelemetry::metrics::Meter;
 use ursula_runtime::RuntimeMetrics;
 use ursula_runtime::RuntimeMetricsSnapshot;
 
+/// Register `ursula.wal.recovering`: 1 while this node's Raft logs may be
+/// missing entries it acknowledged (see `ursula_raft::RecoveryState`).
+pub(crate) fn register_wal_recovery(recovery: ursula_raft::RecoveryState) {
+    let (recovering, reason) = match recovery {
+        ursula_raft::RecoveryState::Normal => (0, "none"),
+        ursula_raft::RecoveryState::Recovering { reason } => (1, match reason {
+            ursula_raft::RecoveryReason::HostCrash => "host_crash",
+            ursula_raft::RecoveryReason::Poisoned => "poisoned",
+        }),
+    };
+    let _ = global::meter("ursula-raft")
+        .u64_observable_gauge("ursula.wal.recovering")
+        .with_description("1 while this node's Raft logs may be missing acknowledged entries")
+        .with_callback(move |observer| {
+            observer.observe(recovering, &[KeyValue::new("reason", reason)]);
+        })
+        .build();
+}
+
 /// Register observable instruments backed by the runtime metrics snapshot.
 ///
 /// Safe to call unconditionally: with no OTLP meter provider the instruments

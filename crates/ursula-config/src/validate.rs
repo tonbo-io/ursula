@@ -5,11 +5,16 @@ use thiserror::Error;
 use crate::config::ColdBackend;
 use crate::config::UrsulaConfig;
 use crate::config::WalBackend;
+use crate::config::WalFsync;
 
 #[derive(Debug, Error)]
 pub enum ValidationError {
     #[error("raft.wal.path is required when backend is 'disk'")]
     RaftWalPathRequired,
+    #[error(
+        "raft.wal.fsync = \"never\" requires backend = \"disk\"; a memory WAL has nothing to fsync"
+    )]
+    RaftWalFsyncRequiresDisk,
     #[error(
         "multi-peer raft with a memory WAL is volatile; set raft.wal.allow_volatile_multi_peer = true only for development, benchmark, or chaos use"
     )]
@@ -39,6 +44,9 @@ impl UrsulaConfig {
         }
         if self.raft.wal.backend == WalBackend::Disk && self.raft.wal.path.is_none() {
             return Err(ValidationError::RaftWalPathRequired);
+        }
+        if self.raft.wal.backend == WalBackend::Memory && self.raft.wal.fsync == WalFsync::Never {
+            return Err(ValidationError::RaftWalFsyncRequiresDisk);
         }
         if self.raft.wal.backend == WalBackend::Memory
             && self.raft.peers.len() > 1
