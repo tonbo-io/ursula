@@ -17,14 +17,16 @@
 //! - **While gated** ([`VoteGate`]): the replica does not campaign and does
 //!   not take a leadership transfer. A replica that led the group starts as
 //!   a follower instead of restoring its leadership, which would append new
-//!   entries under the log ids of the ones it lost. It refuses every vote
-//!   once it knows the group holds entries: its log state says so, a leader
-//!   reported a commit index of 1 or more, or a candidate's log reached
-//!   index 1. Before that a new group's first election (candidates whose log
-//!   is only the membership entry at index 0) goes through. It still accepts
-//!   appends from any leader whose vote is not lower than its persisted
-//!   vote; the WAL restores that vote before the Raft core starts, so a
-//!   leader of an older term is refused.
+//!   entries under the log ids of the ones it lost. That demotion is
+//!   recorded before the Raft core starts, so no later start restores the
+//!   leadership either, after a clean shutdown or once the gate opened. It
+//!   refuses every vote once it knows the group holds entries: its log state
+//!   says so, a leader reported a commit index of 1 or more, or a
+//!   candidate's log reached index 1. Before that a new group's first
+//!   election (candidates whose log is only the membership entry at index 0)
+//!   goes through. It still accepts appends from any leader whose vote is
+//!   not lower than its persisted vote; the WAL restores that vote before
+//!   the Raft core starts, so a leader of an older term is refused.
 //! - **Opening the gate** ([`run_rejoin_vote_barrier`]): the replica asks
 //!   the current leader for a fresh outbound ReadIndex barrier and opens the
 //!   gate once it has applied the barrier's committed index. Inbound
@@ -383,6 +385,15 @@ pub enum RecoveryGateError {
         #[source]
         source: CoreJournalError,
     },
+    #[error(
+        "record that this replica of raft group {}, which led it, starts as a follower: {source}",
+        .raft_group_id.0
+    )]
+    StartAsFollower {
+        raft_group_id: RaftGroupId,
+        #[source]
+        source: CoreJournalError,
+    },
 }
 
 /// One replica's recovery state for one group: the inbound vote gate and,
@@ -413,12 +424,14 @@ impl fmt::Debug for GroupRejoin {
 
 impl GroupRejoin {
     /// The gate of a replica, from the group's durable log state in `store`.
-    /// Create it before the group's Raft core starts.
-    pub fn durable(
+    /// Create it before the group's Raft core starts. A recovering replica
+    /// that led the group records that it starts as a follower first; when
+    /// that write fails, the group does not start.
+    pub async fn durable(
         node_id: u64,
         raft_group_id: RaftGroupId,
         store: &Arc<RaftGroupFileLogStore>,
-    ) -> Self {
+    ) -> Result<Self, RecoveryGateError> {
         let gate = match store.log_state() {
             GroupLogState::Initialized => VoteGate::Open,
             GroupLogState::Recovering => {
@@ -429,7 +442,12 @@ impl GroupRejoin {
                      acknowledged; it stays out of elections until it has applied a fresh \
                      leader barrier"
                 );
-                store.start_as_follower(node_id);
+                store.start_as_follower(node_id).await.map_err(|source| {
+                    RecoveryGateError::StartAsFollower {
+                        raft_group_id,
+                        source,
+                    }
+                })?;
                 VoteGate::closed(GroupEvidence::Initialized)
             }
             GroupLogState::Empty => {
@@ -443,7 +461,7 @@ impl GroupRejoin {
                 VoteGate::closed(GroupEvidence::Unknown)
             }
         };
-        Self {
+        Ok(Self {
             node_id,
             raft_group_id,
             metrics: OnceLock::new(),
@@ -451,7 +469,7 @@ impl GroupRejoin {
             reverted: Mutex::new(RevertedFollowers::default()),
             store: Arc::downgrade(store),
             changes: UrsulaRaftTypeConfig::watch_channel(()).0,
-        }
+        })
     }
 
     pub fn raft_group_id(&self) -> RaftGroupId {
@@ -1181,7 +1199,9 @@ mod tests {
         )
         .expect("start");
         let mut store = open(&wal);
-        let gate = GroupRejoin::durable(1, placement.raft_group_id, &store);
+        let gate = GroupRejoin::durable(1, placement.raft_group_id, &store)
+            .await
+            .expect("open the gate");
         assert_eq!(gate.status(), RecoveryGateStatus::AwaitingBarrier);
         assert!(!gate.may_campaign());
         assert!(!gate.holds_group_history());
@@ -1207,7 +1227,12 @@ mod tests {
         )
         .expect("start");
         let store = open(&wal);
-        assert!(GroupRejoin::durable(1, placement.raft_group_id, &store).vote_gate_open());
+        assert!(
+            GroupRejoin::durable(1, placement.raft_group_id, &store)
+                .await
+                .expect("open the gate")
+                .vote_gate_open()
+        );
         drop(store);
         wal.shutdown().await.expect("clean shutdown");
 
@@ -1223,7 +1248,9 @@ mod tests {
         .expect("start");
         let mut store = open(&wal);
         assert_eq!(store.log_state(), GroupLogState::Recovering);
-        let gate = GroupRejoin::durable(1, placement.raft_group_id, &store);
+        let gate = GroupRejoin::durable(1, placement.raft_group_id, &store)
+            .await
+            .expect("open the gate");
         assert_eq!(gate.status(), RecoveryGateStatus::AwaitingBarrier);
         assert!(gate.holds_group_history(), "it never initializes again");
         assert_eq!(gate.gate().screen(Some(0)), VoteScreen::Refuse);
@@ -1254,6 +1281,23 @@ mod tests {
         );
         assert_eq!(store.log_state(), GroupLogState::Initialized);
         drop((gate, store));
+        wal.shutdown().await.expect("clean shutdown");
+
+        // The replica that led the group restarts with its gate open and its
+        // vote for itself uncommitted: it does not restore that leadership.
+        let wal = RaftWal::start(
+            dir.path(),
+            WalFsync::Never,
+            &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+        )
+        .expect("start");
+        let mut store = open(&wal);
+        let gate = GroupRejoin::durable(1, placement.raft_group_id, &store)
+            .await
+            .expect("open the gate");
+        assert!(gate.vote_gate_open());
+        assert_eq!(store.read_vote().await.expect("vote"), Some(vote(1, 1)));
+        drop((gate, store));
         drop(wal);
 
         // A crash of the next run (no clean shutdown) on the same host keeps
@@ -1265,7 +1309,9 @@ mod tests {
         )
         .expect("start");
         let store = open(&wal);
-        let gate = GroupRejoin::durable(1, placement.raft_group_id, &store);
+        let gate = GroupRejoin::durable(1, placement.raft_group_id, &store)
+            .await
+            .expect("open the gate");
         assert_eq!(
             gate.vote_gate_open(),
             cfg!(target_os = "linux"),

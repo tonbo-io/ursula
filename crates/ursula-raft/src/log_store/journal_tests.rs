@@ -904,6 +904,65 @@ async fn an_unknown_history_records_recovering_until_the_gate_opens() {
     assert_eq!(open().log_state(), GroupLogState::Initialized);
 }
 
+/// A recovering replica that led its group starts as a follower: its vote
+/// for itself is recorded uncommitted before its Raft core starts. The
+/// demotion is durable, so a clean shutdown and a restart that does not
+/// demote again still find the vote uncommitted. A vote for another leader,
+/// or one already uncommitted, is left as it is and nothing is written.
+#[tokio::test]
+async fn a_recovering_leaders_demotion_survives_a_clean_restart() {
+    for (node_id, recorded, expected) in [
+        (
+            1,
+            openraft::Vote::new_committed(7, 1),
+            openraft::Vote::new(7, 1),
+        ),
+        (
+            2,
+            openraft::Vote::new_committed(7, 1),
+            openraft::Vote::new_committed(7, 1),
+        ),
+        (1, openraft::Vote::new(7, 1), openraft::Vote::new(7, 1)),
+    ] {
+        let core = Core::small(WalFsync::Always);
+        let metadata = core_metadata_path(&core.dir);
+        let writer = core.writer();
+        let mut store = core.store(&writer, 1);
+        store.hold_unknown_history();
+        append(&mut store, [blank_entry(1)]).await;
+        store.save_vote(&recorded).await.expect("vote");
+        drop(store);
+        drop(writer);
+
+        let writer = core.writer();
+        let mut store = core.store(&writer, 1);
+        assert_eq!(store.log_state(), GroupLogState::Recovering);
+        let before = fs::read(&metadata).expect("metadata file");
+        store
+            .start_as_follower(node_id)
+            .await
+            .expect("record the demotion");
+        assert_eq!(store.read_vote().await.expect("vote"), Some(expected));
+        assert_eq!(
+            fs::read(&metadata).expect("metadata file") == before,
+            expected == recorded,
+            "node {node_id}: the metadata file changes exactly when the vote is demoted"
+        );
+        drop(store);
+        writer.close().await.expect("shut the writer down cleanly");
+        drop(writer);
+
+        let writer = core.writer();
+        let mut store = core.store(&writer, 1);
+        assert_eq!(
+            store.read_vote().await.expect("vote"),
+            Some(expected),
+            "node {node_id} recorded {recorded:?}"
+        );
+        assert_eq!(store.log_state(), GroupLogState::Recovering);
+    }
+}
+
 /// A crash between a group's first journal write and the metadata write
 /// leaves entries without the flag; recovery restores it, as recovering
 /// when the node is recovering.

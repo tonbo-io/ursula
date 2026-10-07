@@ -178,7 +178,11 @@ async fn new_recovery_engine(
         ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
     )
     .expect("open the log store");
-    let gate = Arc::new(GroupRejoin::durable(id, placement().raft_group_id, &store));
+    let gate = Arc::new(
+        GroupRejoin::durable(id, placement().raft_group_id, &store)
+            .await
+            .expect("open the gate"),
+    );
     let engine = RaftGroupEngine::new_node_with_log_store_and_network(
         placement(),
         id,

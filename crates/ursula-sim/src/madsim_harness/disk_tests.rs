@@ -452,11 +452,11 @@ impl JournalCluster {
             let store = self.wals[&node_id]
                 .open(placement, self.metrics[&node_id].group_engine_metrics())
                 .await;
-            let rejoin = Arc::new(GroupRejoin::durable(
-                node_id,
-                placement.raft_group_id,
-                &store,
-            ));
+            let rejoin = Arc::new(
+                GroupRejoin::durable(node_id, placement.raft_group_id, &store)
+                    .await
+                    .expect("open the recovery gate"),
+            );
             let registry = self.registries[&group].clone();
             let mut config = (*self.config).clone();
             config.enable_elect =

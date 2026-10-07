@@ -2654,9 +2654,10 @@ pub(crate) async fn accept_unsynced_loss(
         Err(err @ ursula_raft::RecoveryGateError::StoreClosed { .. }) => {
             (StatusCode::CONFLICT, err.to_string()).into_response()
         }
-        Err(err @ ursula_raft::RecoveryGateError::Record { .. }) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-        }
+        Err(
+            err @ (ursula_raft::RecoveryGateError::Record { .. }
+            | ursula_raft::RecoveryGateError::StartAsFollower { .. }),
+        ) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     }
 }
 

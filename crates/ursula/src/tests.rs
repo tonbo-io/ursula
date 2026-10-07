@@ -5059,7 +5059,11 @@ async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
     let registry = RaftGroupHandleRegistry::default();
     registry.register_rejoin(
         RaftGroupId(0),
-        Arc::new(ursula_raft::GroupRejoin::durable(1, RaftGroupId(0), &store)),
+        Arc::new(
+            ursula_raft::GroupRejoin::durable(1, RaftGroupId(0), &store)
+                .await
+                .expect("open the gate"),
+        ),
     );
     let runtime = spawn_runtime(
         &test_config(1, 1),
@@ -5107,7 +5111,11 @@ async fn accept_unsynced_loss_opens_a_gated_replica_and_is_incarnation_bound() {
         ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
     )
     .expect("open the log store");
-    let gate = Arc::new(ursula_raft::GroupRejoin::durable(1, RaftGroupId(0), &store));
+    let gate = Arc::new(
+        ursula_raft::GroupRejoin::durable(1, RaftGroupId(0), &store)
+            .await
+            .expect("open the gate"),
+    );
     let engine = ursula_raft::RaftGroupEngine::new_single_node(
         placement,
         1,

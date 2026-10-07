@@ -129,7 +129,13 @@ recovering replica still rejects appends from a leader with a stale term. A
 recovering replica that led its group starts as a follower: OpenRaft restores a
 replica whose committed vote names itself as that term's leader without an
 election, and with a truncated log it would reuse the log ids of entries it
-lost and fork the group.
+lost and fork the group. Before its Raft core starts, the replica records its
+vote for itself uncommitted in the metadata file, with the same `fsync`ed
+write as any vote, and only then runs with it. A failed write stops the group
+from starting. The committed vote is then gone from disk, so no later start
+restores the leadership, whether it follows a clean shutdown or comes after
+the gate opened, by a barrier or by an operator. A vote for another replica is
+never changed, and nothing is written for it.
 
 On the leader, a follower whose log moved backwards is rebuilt through the
 existing remove, learner and promote steps. If a majority of the followers
