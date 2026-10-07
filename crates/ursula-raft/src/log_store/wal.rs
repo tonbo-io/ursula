@@ -141,6 +141,7 @@ impl RaftWal {
         let opening = self.node.opening();
         let writer =
             CoreFileLogWriter::open(self.core_dir(placement.core_id), CoreJournalOptions {
+                previous_run: opening.previous_run,
                 core: placement.core_id,
                 tuning: self.tuning,
                 recovery_epoch: opening.recovery_epoch,

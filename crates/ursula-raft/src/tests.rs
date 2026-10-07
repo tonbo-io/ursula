@@ -2769,8 +2769,12 @@ async fn registry_commands_execute_on_the_owner_and_waiters_do_not_block_rpc() {
     let wal_root = tempfile::tempdir().unwrap();
     let registry = RaftGroupHandleRegistry::default();
     let runtime = ShardRuntime::spawn_with_engine_factory(
-        RuntimeConfig::new(2, 4),
-        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path()))
+        {
+            let mut config = RuntimeConfig::new(1, 2);
+            config.cpu_affinity = Some(true);
+            config
+        },
+        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 1, 2))
             .with_registry(registry.clone()),
     )
     .unwrap();
@@ -2800,7 +2804,7 @@ async fn registry_commands_execute_on_the_owner_and_waiters_do_not_block_rpc() {
             })
             .await
             .unwrap();
-        assert_eq!(name, format!("ursula-core-{}", group.0));
+        assert_eq!(name, "ursula-core-0");
         let (release, wait) = tokio::sync::oneshot::channel::<()>();
         let (entered, entry) = tokio::sync::oneshot::channel();
         let slow = handle.clone();
@@ -2819,6 +2823,24 @@ async fn registry_commands_execute_on_the_owner_and_waiters_do_not_block_rpc() {
             .unwrap();
         release.send(()).unwrap();
         waiting.await.unwrap();
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let (held, released) = tokio::sync::oneshot::channel::<()>();
+        let caller = handle.clone();
+        let task = tokio::spawn(async move {
+            caller
+                .call(move |_| async move {
+                    let _held = held;
+                    entered.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                })
+                .await
+        });
+        entry.await.unwrap();
+        task.abort();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), released).await,
+            Ok(Err(_))
+        ));
         handle.shutdown().await.unwrap();
     }
 }
@@ -2827,7 +2849,7 @@ async fn registry_commands_execute_on_the_owner_and_waiters_do_not_block_rpc() {
 async fn replicated_append_batch_reserves_hot_capacity_across_unapplied_entries() {
     let dir = tempfile::tempdir().unwrap();
     let placement = placement();
-    let factory = DurableRaftGroupEngineFactory::new(start_wal(dir.path()));
+    let factory = DurableRaftGroupEngineFactory::new(start_wal(dir.path(), 1, 1));
     let metrics = ursula_runtime::RuntimeMetrics::new(1, 1);
     let mut engine = factory
         .create(placement, metrics.group_engine_metrics())

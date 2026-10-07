@@ -98,7 +98,7 @@ The optional diagnostic WAL engine remains part of the HTTP prototype for recove
 
 This prototype does not yet prove CPU saturation. It only proves that the request path can be shaped so independent streams do not need to share a single global mutable state machine.
 
-Metrics on the mutation, append, and routing paths use padded per-core and per-group atomics. Snapshot reads derive total accepted appends, successful state mutations, mutation apply time, routed requests, and mailbox send wait from per-core counters. Mailbox-full events are also per-core, so measurement does not add a global atomic write to every append.
+Metrics on the mutation, append, and routing paths use padded per-core and per-group atomics. Snapshot reads derive total accepted appends, successful state mutations, mutation apply time, routed requests, and mailbox send wait from per-core counters. Mailbox-full events are also per-core. Some high-watermark and gRPC transport counters still update process-wide atomics on the append path; this is not a synchronization-free path.
 
 The WAL prototype uses the same metrics shape. `GroupEngineMetrics` lets a group engine record WAL batch count, record count, write time, and sync time on the owning core/group. In-memory engines leave these counters at zero. This is diagnostic only; production OpenRaft storage still needs real group-commit histograms and log replication metrics.
 
@@ -212,10 +212,11 @@ owner. Read-only metric receivers may cross threads. Mailbox jobs run concurrent
 a proposal waiting for quorum must not block an incoming vote or AppendEntries.
 Inbound append routing takes no process-wide registry mutex.
 
-Each core's transport pool owns its peer connections and append sessions. Session
-backpressure remains byte-bounded per core/peer, so the aggregate node budget can
-be core_count times the former per-peer budget. Groups on the same core still
-share that peer's queue and flow control. No wire protocol change is required.
+Each core's transport pool owns its peer connections and append sessions. Send sessions share a node-wide semaphore budget, and inbound streams share a
+separate node-wide budget, each configured by `raft.append_transport_budget_bytes`
+(default 128 MiB). Adding cores or peers does not multiply these charged-byte limits.
+These bound accounted queued frames, not total RSS or tonic/socket buffers. Groups
+on the same core still share that peer's queue and flow control. No wire protocol change is required.
 
 Ordinary append actors drain up to 32 already-queued appends and 1 MiB of
 payload, stopping at the first non-append command and adding no batching delay.
@@ -230,16 +231,23 @@ after writing, applying the durable log index and satisfying the configured sync
 policy. Subsequent log mutations wait for that callback, and errors poison the
 pending state. Readers merge the pending suffix with the durable index. This
 allows replication of a new batch to overlap local WAL I/O without an unbounded
-pending-log cache. `blocking_append` is used by durable WAL measurements.
+pending-log cache. On every non-clean restart, a committed self-vote is presented
+uncommitted so a crashed leader cannot reuse log IDs held by its followers.
+Dropped writer callbacks fail pending state and notify OpenRaft; rejected submitted
+records poison the writer. `blocking_append` is used by durable WAL measurements.
 
-Linux owner threads attempt CPU affinity within their inherited allowed cpuset;
-explicit oversubscription wraps over those CPUs. Affinity failures are logged.
+`runtime.cpu_affinity` controls Linux affinity. By default, owner threads pin only
+when the inherited allowed cpuset size equals `runtime.core_count`; a CFS quota
+alone is not an exclusive cpuset. `false` disables pinning and `true` forces it
+(round-robin if oversubscribed). Affinity failures are logged.
 Other platforms retain one OS thread per owner without physical CPU affinity.
 Each active core journal still uses a dedicated blocking writer. The main Tokio
 runtime and its blocking pool are additional threads; total process threads are
 not equal to runtime.core_count.
 
-DST validates ordering and failure semantics with hosted tasks and simulated disk.
+DST routes AppendEntries and votes through the production registry and owner mailbox.
+It validates ordering and failure semantics with hosted tasks and simulated disk,
+including abrupt writer abort with a replicated pending leader tail.
 It cannot validate physical CPU placement, cache-line contention or multicore
 throughput. Real-thread owner dispatch tests and delayed-writer tests cover those
 execution boundaries locally; throughput scaling still requires a multicore

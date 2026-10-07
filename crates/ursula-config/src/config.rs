@@ -110,6 +110,9 @@ impl Default for ServerConfig {
 pub struct RuntimeConfig {
     /// Number of CPU cores / tokio worker threads to use.
     pub core_count: usize,
+    /// CPU affinity: None pins only when the allowed cpuset equals core_count.
+    /// true forces pinning; false disables it.
+    pub cpu_affinity: Option<bool>,
     /// Emergency RSS abort threshold. Exceeding it aborts the process; it does
     /// not reject writes with HTTP 503 or perform a graceful leadership handoff.
     /// `None` disables the monitor.
@@ -127,6 +130,7 @@ impl Default for RuntimeConfig {
             core_count: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4),
+            cpu_affinity: None,
             node_memory_abort_cap_size: None,
             external_payload_min_size: None,
             live_read_max_waiters_per_core: Some(65_536),
@@ -138,6 +142,8 @@ impl Default for RuntimeConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RaftConfig {
+    /// Node-wide append transport bytes per direction, shared by all cores/peers.
+    pub append_transport_budget_bytes: usize,
     /// Unique node ID within the static gRPC Raft cluster.
     /// Must be present in `peers` and must be non-zero.
     pub node_id: u64,
@@ -221,6 +227,7 @@ impl Default for RaftConfig {
             bootstrap_peer_probe_interval: HumanDuration::milli(250),
             bootstrap_peer_connect: HumanDuration::milli(500),
             install_snapshot_timeout: HumanDuration::sec(120),
+            append_transport_budget_bytes: 128 * 1024 * 1024,
             grpc_reconnect_after_failures: 8,
             snapshot_build_max_concurrency: 1,
             snapshot_install_max_concurrency: 1,

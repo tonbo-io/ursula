@@ -84,6 +84,7 @@ pub use engine::StaticGrpcRaftGroupEngineFactory;
 pub use format_epoch::FormatEpochMismatch;
 pub use format_epoch::PeerFormatEpoch;
 pub use format_epoch::probe_peer_format_epoch;
+pub use grpc::CoreRaftTransport;
 pub use grpc::GrpcRaftNetwork;
 pub use grpc::GrpcRaftNetworkFactory;
 pub use grpc::QuorumPrefix;

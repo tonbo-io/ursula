@@ -14,6 +14,7 @@ use crate::rejoin::bootstrap_probe_vote;
 
 #[derive(Clone)]
 pub(crate) struct GrpcRecoveryTransport {
+    pub transport: std::sync::Arc<crate::grpc::CoreRaftTransport>,
     pub placement: ShardPlacement,
     pub node_id: u64,
     pub timeout: Duration,
@@ -21,14 +22,19 @@ pub(crate) struct GrpcRecoveryTransport {
 impl RecoveryTransport for GrpcRecoveryTransport {
     type Error = crate::grpc::RecoveryProbeError;
     async fn probe(&self, peer: u64, address: String) -> Option<PeerGroupLog> {
-        GrpcRaftNetwork::new(self.placement.raft_group_id, peer, &address)
-            .vote(
-                bootstrap_probe_vote(self.node_id),
-                RPCOption::new(self.timeout),
-            )
-            .await
-            .ok()
-            .map(|response| PeerGroupLog::from_vote_response(&response))
+        GrpcRaftNetwork::new(
+            self.transport.clone(),
+            self.placement.raft_group_id,
+            peer,
+            &address,
+        )
+        .vote(
+            bootstrap_probe_vote(self.node_id),
+            RPCOption::new(self.timeout),
+        )
+        .await
+        .ok()
+        .map(|response| PeerGroupLog::from_vote_response(&response))
     }
     async fn barrier(
         &self,
@@ -36,6 +42,7 @@ impl RecoveryTransport for GrpcRecoveryTransport {
         address: String,
     ) -> Result<(UrsulaVote, u64), Self::Error> {
         probe_rejoin_vote_barrier(
+            self.transport.clone(),
             self.placement,
             self.node_id,
             leader,

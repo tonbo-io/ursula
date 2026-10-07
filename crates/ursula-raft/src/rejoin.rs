@@ -528,6 +528,13 @@ impl GroupRejoin {
         raft_group_id: RaftGroupId,
         store: &Arc<RaftGroupFileLogStore>,
     ) -> Result<Self, RecoveryGateError> {
+        store
+            .prevent_crashed_leader_resume(node_id)
+            .await
+            .map_err(|source| RecoveryGateError::StartAsFollower {
+                raft_group_id,
+                source,
+            })?;
         let gate = match store.log_state() {
             GroupLogState::Initialized => VoteGate::Open,
             GroupLogState::Recovering => {

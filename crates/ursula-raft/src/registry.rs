@@ -210,6 +210,8 @@ impl GroupEntry {
 
 #[derive(Debug, Clone)]
 pub struct RaftGroupHandleRegistry {
+    pub(crate) append_send_budget: crate::grpc::AppendTransportBudget,
+    pub(crate) append_receive_budget: crate::grpc::AppendTransportBudget,
     groups: Arc<arc_swap::ArcSwap<BTreeMap<u32, Arc<GroupEntry>>>>,
     dynamic_hosted_groups: Arc<Mutex<BTreeSet<RaftGroupId>>>,
     election: ElectionPolicy,
@@ -225,6 +227,8 @@ impl Default for RaftGroupHandleRegistry {
     fn default() -> Self {
         let (transport_shutdown, _) = watch::channel(false);
         Self {
+            append_send_budget: Default::default(),
+            append_receive_budget: Default::default(),
             groups: Arc::new(arc_swap::ArcSwap::from_pointee(BTreeMap::new())),
             dynamic_hosted_groups: Arc::new(Mutex::new(BTreeSet::new())),
             election: ElectionPolicy::default(),
@@ -274,7 +278,7 @@ pub enum QuorumProofError {
 /// Confirm a fresh ReadIndex under the same committed leader vote.
 pub(crate) async fn confirm_recovery_barrier(
     group: RaftGroupId,
-    raft: &RaftGroupHandle,
+    raft: &OwnerRaftHandle,
     barrier: &dyn ursula_runtime::LinearizableReadBarrier,
 ) -> Result<(crate::UrsulaVote, u64), QuorumProofError> {
     let before = raft.metrics().borrow_watched().clone();
@@ -296,6 +300,12 @@ pub(crate) async fn confirm_recovery_barrier(
 pub use crate::election::LeadershipTransferError;
 
 impl RaftGroupHandleRegistry {
+    /// Configure the node-wide budget for each direction before constructing transports.
+    pub fn with_append_transport_budget_bytes(mut self, bytes: usize) -> Self {
+        self.append_send_budget = crate::grpc::AppendTransportBudget::new(bytes);
+        self.append_receive_budget = crate::grpc::AppendTransportBudget::new(bytes);
+        self
+    }
     /// The local campaign policy, shared by registration, recovery and RPCs.
     pub fn election_policy(&self) -> ElectionPolicy {
         self.election.clone()
@@ -449,7 +459,10 @@ impl RaftGroupHandleRegistry {
     }
 
     pub fn register(&self, placement: ShardPlacement, raft: RaftGroupHandle) {
-        let owner = OwnerRaftHandle::new(raft);
+        let owner = self
+            .read_barrier(placement.raft_group_id)
+            .map(|barrier| barrier.owner().clone())
+            .unwrap_or_else(|| OwnerRaftHandle::new(raft));
         self.update_group(placement.raft_group_id, |entry| {
             let resources = std::mem::take(entry.resources_mut());
             *entry = GroupEntry::Active {
@@ -468,7 +481,7 @@ impl RaftGroupHandleRegistry {
         self.update_group(group, |entry| entry.resources_mut().cache = cache.clone());
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, madsim))]
     pub(crate) fn register_read_barrier(&self, group: RaftGroupId, barrier: Arc<ReadIndexBarrier>) {
         self.update_group(group, |entry| {
             entry.resources_mut().barrier = Some(barrier.clone())
@@ -789,7 +802,7 @@ impl RaftGroupHandleRegistry {
             raft.append_entries(request).await
         })
         .await
-        .map_err(|error| GroupEngineError::new(format!("owner stopped: {error}")))?
+        .map_err(crate::owner::owner_stopped)?
         .map_err(|error| GroupEngineError::new(format!("OpenRaft AppendEntries: {error}")))
     }
 
@@ -807,7 +820,7 @@ impl RaftGroupHandleRegistry {
             raft.vote(request).await
         })
         .await
-        .map_err(|error| GroupEngineError::new(format!("owner stopped: {error}")))?
+        .map_err(crate::owner::owner_stopped)?
         .map_err(|error| GroupEngineError::new(format!("OpenRaft Vote: {error}")))
     }
 

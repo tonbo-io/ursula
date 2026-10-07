@@ -94,9 +94,7 @@ impl ReadIndexBarrier {
             }
             raft.call(|raft| async move { confirm(&raft).await })
                 .await
-                .map_err(|error| {
-                    GroupEngineError::new(format!("owner read barrier stopped: {error}"))
-                })?
+                .map_err(crate::owner::owner_stopped)?
         }
         .boxed()
         .shared();

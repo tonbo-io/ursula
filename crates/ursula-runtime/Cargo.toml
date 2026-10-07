@@ -58,7 +58,3 @@ harness = false
 
 [lints]
 workspace = true
-
-[[bench]]
-name = "mailbox_burst"
-harness = false

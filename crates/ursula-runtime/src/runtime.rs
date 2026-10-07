@@ -145,6 +145,7 @@ pub fn cold_gc_defer_backoff_ms(attempts: u32) -> u64 {
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub core_count: usize,
+    pub cpu_affinity: Option<bool>,
     pub raft_group_count: usize,
     pub mailbox_capacity: usize,
     pub threading: RuntimeThreading,
@@ -164,6 +165,7 @@ impl RuntimeConfig {
         let threading = RuntimeThreading::HostedTokio;
         Self {
             core_count,
+            cpu_affinity: None,
             raft_group_count,
             mailbox_capacity: 1024,
             threading,
@@ -191,6 +193,7 @@ impl RuntimeConfig {
     /// Build runtime configuration from a typed `ursula_config::RuntimeConfig`.
     pub fn from_ursula_config(cfg: &ursula_config::RuntimeConfig, raft_group_count: usize) -> Self {
         let mut config = Self::new(cfg.core_count, raft_group_count);
+        config.cpu_affinity = cfg.cpu_affinity;
         config.live_read_max_waiters_per_core = cfg
             .live_read_max_waiters_per_core
             .and_then(|n| if n == 0 { None } else { Some(n as u64) });
@@ -296,7 +299,7 @@ impl ShardRuntime {
                 read_materialization: read_materialization.clone(),
                 read_barriers: read_barriers.clone(),
             };
-            spawn_core_worker(config.threading, worker)?;
+            spawn_core_worker(&config, worker)?;
             mailboxes.push(CoreMailbox { core_id, tx });
         }
         Ok(Self {
@@ -2059,8 +2062,8 @@ macro_rules! shard_runtime_operations {
 
 crate::ops::runtime_operations!(shard_runtime_operations);
 
-fn spawn_core_worker(threading: RuntimeThreading, worker: CoreWorker) -> Result<(), RuntimeError> {
-    match threading {
+fn spawn_core_worker(config: &RuntimeConfig, worker: CoreWorker) -> Result<(), RuntimeError> {
+    match config.threading {
         RuntimeThreading::HostedTokio => {
             crate::rt::spawn(worker.run());
             Ok(())
@@ -2068,24 +2071,27 @@ fn spawn_core_worker(threading: RuntimeThreading, worker: CoreWorker) -> Result<
         #[cfg(not(madsim))]
         RuntimeThreading::ThreadPerCore => {
             let core_id = worker.core_id;
+            #[cfg(target_os = "linux")]
+            let affinity = (config.cpu_affinity, config.core_count);
             std::thread::Builder::new()
                 .name(format!("ursula-core-{}", core_id.0))
                 .spawn(move || {
                     #[cfg(target_os = "linux")]
                     if let Some(cpus) = core_affinity::get_core_ids() {
+                        let enabled = affinity.0.unwrap_or(cpus.len() == affinity.1);
                         // Respect the inherited cpuset; explicit oversubscription
                         // maps workers round-robin onto the allowed CPUs.
-                        if let Some(cpu) = usize::from(core_id.0)
-                            .checked_rem(cpus.len())
-                            .and_then(|index| cpus.get(index))
+                        if enabled
+                            && let Some(cpu) = usize::from(core_id.0)
+                                .checked_rem(cpus.len())
+                                .and_then(|index| cpus.get(index))
+                            && !core_affinity::set_for_current(*cpu)
                         {
-                            if !core_affinity::set_for_current(*cpu) {
-                                tracing::warn!(
-                                    core_id = core_id.0,
-                                    cpu = cpu.id,
-                                    "could not set worker CPU affinity"
-                                );
-                            }
+                            tracing::warn!(
+                                core_id = core_id.0,
+                                cpu = cpu.id,
+                                "could not set worker CPU affinity"
+                            );
                         }
                     } else {
                         tracing::warn!(

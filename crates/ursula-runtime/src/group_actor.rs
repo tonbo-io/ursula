@@ -684,35 +684,17 @@ impl GroupActor {
             streams.into_iter().zip(replies).zip(responses)
         {
             drop(guard);
-            let response = response.map_err(|error| {
-                crate::metrics::record_cold_backpressure_error(
-                    &self.metrics,
-                    self.placement,
-                    incoming_bytes,
-                    self.cold_write_admission,
-                    &error,
-                );
-                RuntimeError::group_engine(self.placement, error)
-            });
+            let response = CoreWorker::record_append_result(
+                &self.metrics,
+                self.placement,
+                incoming_bytes,
+                self.cold_write_admission,
+                elapsed,
+                response,
+            );
             let changed = response
                 .as_ref()
                 .is_ok_and(|response| !response.deduplicated);
-            if let Ok(response) = &response
-                && changed
-            {
-                self.metrics
-                    .record_append(self.placement.core_id, self.placement.raft_group_id);
-                self.metrics.record_applied_mutation(
-                    self.placement.core_id,
-                    self.placement.raft_group_id,
-                    elapsed,
-                );
-                self.metrics.record_cold_hot_backlog(
-                    self.placement.raft_group_id,
-                    response.stream_hot_bytes,
-                    response.group_hot_bytes,
-                );
-            }
             reply(tx, response);
             if changed && !changed_streams.contains(&stream) {
                 changed_streams.push(stream);

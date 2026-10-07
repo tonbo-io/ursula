@@ -138,6 +138,7 @@ impl Core {
 
     fn options(&self, recovery_epoch: u64, node_recovery: RecoveryState) -> CoreJournalOptions {
         CoreJournalOptions {
+            previous_run: super::run_state::PreviousRun::Absent,
             core: CoreId(0),
             tuning: self.tuning,
             recovery_epoch,
@@ -1327,8 +1328,8 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
         .raft_handle()
         .wait(Some(Duration::from_secs(2)))
         .metrics(
-            |metrics| metrics.last_log_index > before,
-            "replication overlaps local WAL I/O",
+            |metrics| metrics.last_applied.map(|id| id.index) > before,
+            "follower durable apply overlaps leader WAL I/O",
         )
         .await
         .unwrap();

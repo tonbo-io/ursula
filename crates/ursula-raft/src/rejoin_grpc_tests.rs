@@ -187,7 +187,8 @@ async fn new_recovery_engine(
         placement(),
         id,
         config,
-        GrpcRaftNetworkFactory::new(placement().raft_group_id).with_rejoin(Some(gate.clone())),
+        GrpcRaftNetworkFactory::new(Arc::default(), placement().raft_group_id)
+            .with_rejoin(Some(gate.clone())),
         store.clone(),
         None,
         None,
@@ -319,9 +320,16 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             .await
             .unwrap();
     }
-    let proof = probe_rejoin_vote_barrier(placement(), 1, 2, &endpoints[1], Duration::from_secs(1))
-        .await
-        .expect("fresh explicit barrier");
+    let proof = probe_rejoin_vote_barrier(
+        Arc::default(),
+        placement(),
+        1,
+        2,
+        &endpoints[1],
+        Duration::from_secs(1),
+    )
+    .await
+    .expect("fresh explicit barrier");
     assert!(proof.1 >= baseline.log_id.index());
     for gate in &gates {
         gate.confirm_barrier(proof.0, proof.1);
@@ -417,9 +425,16 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     for legacy in [false, true] {
         services[1].legacy.store(legacy, Ordering::SeqCst);
         assert!(
-            probe_rejoin_vote_barrier(placement(), 1, 2, &endpoints[1], Duration::from_millis(150))
-                .await
-                .is_err(),
+            probe_rejoin_vote_barrier(
+                Arc::default(),
+                placement(),
+                1,
+                2,
+                &endpoints[1],
+                Duration::from_millis(150)
+            )
+            .await
+            .is_err(),
             "capability and low-term Vote cannot replace a fresh quorum proof"
         );
         assert_eq!(services[1].unknown_rpc_requests.load(Ordering::SeqCst), 0);
@@ -472,10 +487,16 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
                 1
             );
         }
-        let proof =
-            probe_rejoin_vote_barrier(placement(), 1, 2, &endpoints[1], Duration::from_secs(1))
-                .await
-                .expect("fresh recovery proof, including legacy bridge");
+        let proof = probe_rejoin_vote_barrier(
+            Arc::default(),
+            placement(),
+            1,
+            2,
+            &endpoints[1],
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("fresh recovery proof, including legacy bridge");
         assert!(proof.1 >= acked.log_id.index());
         let observed =
             crate::confirm_quorum_prefix(placement(), 2, &endpoints[1], Duration::from_secs(1))
@@ -561,9 +582,16 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     engines[2].raft.runtime_config().tick(true);
     services[1].legacy.store(true, Ordering::SeqCst);
     assert!(
-        probe_rejoin_vote_barrier(placement(), 1, 2, &endpoints[1], Duration::from_secs(1))
-            .await
-            .is_err(),
+        probe_rejoin_vote_barrier(
+            Arc::default(),
+            placement(),
+            1,
+            2,
+            &endpoints[1],
+            Duration::from_secs(1)
+        )
+        .await
+        .is_err(),
         "a forwarded HEAD is not evidence of that peer's own prefix"
     );
     // The leader metric may precede application of the new term's blank entry.
@@ -571,8 +599,15 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     // the production recovery driver also retries fresh outbound proofs.
     let proof_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let proof = loop {
-        match probe_rejoin_vote_barrier(placement(), 1, 3, &endpoints[2], Duration::from_secs(1))
-            .await
+        match probe_rejoin_vote_barrier(
+            Arc::default(),
+            placement(),
+            1,
+            3,
+            &endpoints[2],
+            Duration::from_secs(1),
+        )
+        .await
         {
             Ok(proof) => break proof,
             Err(error) => {

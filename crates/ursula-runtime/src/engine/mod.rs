@@ -741,6 +741,10 @@ pub struct StreamEngineError {
 /// structured source, so it keeps an owned `message`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum GroupInfraError {
+    #[error("the Raft owner has stopped")]
+    OwnerStopped,
+    #[error("write outcome is unknown; the proposal may have committed")]
+    OutcomeUnknown,
     #[error("{message}")]
     Internal { message: String },
     #[error("ProtoDecode: protobuf raft payload missing {field}")]

@@ -72,11 +72,12 @@ impl OwnerRaftHandle {
             let mut jobs = FuturesUnordered::new();
             loop {
                 crate::rt::select! {
+                    biased;
+                    _ = jobs.next(), if !jobs.is_empty() => {},
                     job = receiver.recv() => match job {
                         Some(job) => jobs.push(job(raft.clone())),
                         None => break,
                     },
-                    _ = jobs.next(), if !jobs.is_empty() => {},
                 }
             }
             while jobs.next().await.is_some() {}
@@ -93,13 +94,19 @@ impl OwnerRaftHandle {
         Fut: Future<Output = R> + Send + 'static,
         R: Send + 'static,
     {
-        let (reply, response) = oneshot::channel();
+        let (mut reply, response) = oneshot::channel();
         self.mailbox
             .sender
             .send(Box::new(move |raft| {
                 Box::pin(async move {
-                    if reply.send(operation(raft).await).is_err() {
-                        tracing::trace!("owner Raft caller stopped waiting");
+                    crate::rt::select! {
+                        biased;
+                        _ = reply.closed() => {},
+                        result = operation(raft) => {
+                            if reply.send(result).is_err() {
+                                tracing::trace!("owner Raft caller stopped waiting");
+                            }
+                        },
                     }
                 })
             }))
@@ -243,13 +250,9 @@ impl OwnerRaftHandle {
             .await?
     }
     pub async fn shutdown(&self) -> Result<(), GroupEngineError> {
-        self.call(move |raft| async move {
-            raft.shutdown()
-                .await
-                .map_err(|error| GroupEngineError::new(format!("shutdown Raft: {error}")))
-        })
-        .await
-        .map_err(|error| GroupEngineError::new(format!("shutdown owner: {error}")))?
+        self.call(move |raft| async move { raft.shutdown().await.map_err(owner_stopped) })
+            .await
+            .map_err(owner_stopped)?
     }
 }
 
@@ -279,4 +282,10 @@ impl OwnerTrigger {
             .call(move |raft| async move { raft.trigger().allow_next_revert(&target, allow).await })
             .await?
     }
+}
+
+/// Keep the transport classification structured while recording the original fatal cause.
+pub(crate) fn owner_stopped(error: impl std::fmt::Display) -> GroupEngineError {
+    tracing::debug!(%error, "owner Raft operation stopped");
+    GroupEngineError::Infra(ursula_runtime::GroupInfraError::OwnerStopped)
 }

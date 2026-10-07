@@ -79,10 +79,49 @@ pub(crate) static GRPC_LEADER_CHANNELS: OnceLock<Mutex<BTreeMap<String, Channel>
     OnceLock::new();
 /// Shared only by groups constructed on one owner core. Connections and
 /// encoders are created by that core, never by a process-wide first caller.
-#[derive(Debug, Default)]
-pub(crate) struct CoreRaftTransport {
+#[derive(Debug)]
+pub struct CoreRaftTransport {
+    pub(crate) budget: AppendTransportBudget,
     channels: Mutex<BTreeMap<String, SharedRaftChannel>>,
     sessions: Mutex<BTreeMap<String, SharedAppendSession>>,
+}
+/// Node-wide accounting shared across owner pools and peers. Connections remain core-local.
+#[derive(Debug, Clone)]
+pub(crate) struct AppendTransportBudget {
+    pub(crate) semaphore: Arc<Semaphore>,
+    pub(crate) bytes: usize,
+}
+impl AppendTransportBudget {
+    pub(crate) fn new(bytes: usize) -> Self {
+        let bytes = bytes
+            .clamp(1, u32::MAX as usize)
+            .min(Semaphore::MAX_PERMITS);
+        Self {
+            semaphore: Arc::new(Semaphore::new(bytes)),
+            bytes,
+        }
+    }
+}
+impl Default for AppendTransportBudget {
+    fn default() -> Self {
+        Self::new(128 * 1024 * 1024)
+    }
+}
+impl CoreRaftTransport {
+    pub(crate) fn with_budget(budget: AppendTransportBudget) -> Self {
+        Self {
+            channels: Mutex::default(),
+            sessions: Mutex::default(),
+            budget,
+        }
+    }
+}
+impl Default for CoreRaftTransport {
+    fn default() -> Self {
+        Self::with_budget(AppendTransportBudget::new(
+            RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES,
+        ))
+    }
 }
 static GRPC_APPEND_STREAM_SESSIONS_OPENED: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_SESSION_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -155,8 +194,15 @@ pub(crate) async fn confirm_quorum_prefix(
     address: &str,
     timeout: Duration,
 ) -> Result<QuorumPrefix, RecoveryProbeError> {
-    let (vote, index) =
-        probe_rejoin_vote_barrier(placement, leader_id, leader_id, address, timeout).await?;
+    let (vote, index) = probe_rejoin_vote_barrier(
+        Arc::default(),
+        placement,
+        leader_id,
+        leader_id,
+        address,
+        timeout,
+    )
+    .await?;
     Ok(QuorumPrefix {
         raft_group_id: placement.raft_group_id.0,
         leader_id,
@@ -177,13 +223,14 @@ pub(crate) async fn confirm_quorum_prefix(
 /// ReadIndexBarrier only coalesces rounds whose confirmation has not started;
 /// an inbound request never joins an already-started confirmation round.
 pub(crate) async fn probe_rejoin_vote_barrier(
+    transport: Arc<CoreRaftTransport>,
     placement: ursula_shard::ShardPlacement,
     node_id: u64,
     leader_id: u64,
     address: &str,
     timeout: Duration,
 ) -> Result<(UrsulaVote, u64), RecoveryProbeError> {
-    let mut network = GrpcRaftNetwork::new(placement.raft_group_id, leader_id, address);
+    let mut network = GrpcRaftNetwork::new(transport, placement.raft_group_id, leader_id, address);
     let mut client = network.client()?;
     let envelope = network.vote_envelope(crate::rejoin::bootstrap_probe_vote(node_id));
     GRPC_VOTE_REQUESTS.fetch_add(1, Ordering::Relaxed);
@@ -354,7 +401,9 @@ impl Drop for QueuedAppendBytes {
 /// [`RAFT_GRPC_APPEND_STREAM_MIN_CHARGE_BYTES`] so tiny heartbeats bound the queue length too, and
 /// at most the whole budget so one oversized message still passes when nothing else is queued.
 fn append_budget_charge(encoded_len: usize, budget: usize) -> u32 {
-    let charge = encoded_len.clamp(RAFT_GRPC_APPEND_STREAM_MIN_CHARGE_BYTES, budget);
+    let charge = encoded_len
+        .max(RAFT_GRPC_APPEND_STREAM_MIN_CHARGE_BYTES)
+        .min(budget);
     u32::try_from(charge).unwrap_or(u32::MAX)
 }
 
@@ -513,8 +562,6 @@ const RAFT_GRPC_APPEND_STREAM_MAX_BATCH_ITEMS: usize = 32;
 /// retry after a 250 ms RPC timeout queued another copy of the same entries while the timed-out
 /// copies were still sent (EKS, 128 SQLite-VFS owners: ~0.7 GB/min per node to OOM).
 const RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
-/// Follower side, per inbound stream: decoded Append frames held before they are answered.
-const RAFT_GRPC_APPEND_STREAM_SERVER_MAX_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
 const RAFT_GRPC_APPEND_STREAM_MIN_CHARGE_BYTES: usize = 1024;
 /// Request frames between the session loop and the HTTP/2 encoder. Kept small so queued calls
 /// wait where an expired caller can still be skipped.
@@ -590,6 +637,17 @@ pub fn raft_grpc_service(
     .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
 }
 
+fn group_rpc_status(error: ursula_runtime::GroupEngineError) -> tonic::Status {
+    if matches!(
+        error.infra(),
+        Some(ursula_runtime::GroupInfraError::OwnerStopped)
+    ) {
+        tonic::Status::unavailable(error.to_string())
+    } else {
+        tonic::Status::internal(error.to_string())
+    }
+}
+
 async fn handle_append_envelope(
     registry: RaftGroupHandleRegistry,
     envelope: raft_internal_proto::RaftRpcEnvelopeV1,
@@ -601,7 +659,7 @@ async fn handle_append_envelope(
     let response = registry
         .append_entries(raft_group_id, request)
         .await
-        .map_err(|err| tonic::Status::internal(err.to_string()))?;
+        .map_err(group_rpc_status)?;
     Ok(raft_internal_proto::RaftRpcAckV1 {
         payload: encode_wire(&response),
     })
@@ -679,9 +737,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         // Decoded frames waiting for (or in) processing hold a share of this budget; the next
         // frame is not read off the stream until it fits, so a slow follower pushes back through
         // HTTP/2 flow control instead of buffering the leader's backlog in memory.
-        let budget = Arc::new(Semaphore::new(
-            RAFT_GRPC_APPEND_STREAM_SERVER_MAX_BUFFERED_BYTES,
-        ));
+        let budget = registry.append_receive_budget.clone();
         let shutdown = registry.subscribe_transport_shutdown();
         let requests = futures_util::stream::unfold(
             (request.into_inner(), shutdown, budget),
@@ -696,14 +752,11 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 };
                 let buffered = match &request {
                     Ok(frame) => {
-                        let charge = append_budget_charge(
-                            frame.encoded_len(),
-                            RAFT_GRPC_APPEND_STREAM_SERVER_MAX_BUFFERED_BYTES,
-                        );
+                        let charge = append_budget_charge(frame.encoded_len(), budget.bytes);
                         let permit = tokio::select! {
                             biased;
                             _ = shutdown.changed() => return None,
-                            permit = budget.clone().acquire_many_owned(charge) => permit.ok()?,
+                            permit = budget.semaphore.clone().acquire_many_owned(charge) => permit.ok()?,
                         };
                         Some(QueuedAppendBytes::new(
                             permit,
@@ -754,7 +807,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .registry
             .vote(raft_group_id, request)
             .await
-            .map_err(|err| tonic::Status::internal(err.to_string()))?;
+            .map_err(group_rpc_status)?;
         let mut response = tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
             payload: encode_wire(&response),
         });
@@ -787,7 +840,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .registry
             .install_full_snapshot(raft_group_id, vote, snapshot)
             .await
-            .map_err(|err| tonic::Status::internal(err.to_string()))?;
+            .map_err(group_rpc_status)?;
         Ok(tonic::Response::new(
             raft_internal_proto::RaftFullSnapshotAckV1 {
                 response: encode_wire(&response),
@@ -1080,18 +1133,13 @@ pub struct GrpcRaftNetworkFactory {
 }
 
 impl GrpcRaftNetworkFactory {
-    pub fn new(raft_group_id: RaftGroupId) -> Self {
+    pub fn new(transport: Arc<CoreRaftTransport>, raft_group_id: RaftGroupId) -> Self {
         Self {
-            transport: Arc::default(),
+            transport,
             raft_group_id,
             reconnect_threshold: 8,
             rejoin: None,
         }
-    }
-
-    pub(crate) fn with_transport(mut self, transport: Arc<CoreRaftTransport>) -> Self {
-        self.transport = transport;
-        self
     }
 
     pub fn with_reconnect_threshold(mut self, threshold: u32) -> Self {
@@ -1155,18 +1203,24 @@ impl Debug for GrpcRaftNetwork {
 }
 
 impl GrpcRaftNetwork {
-    pub fn new(raft_group_id: RaftGroupId, target: u64, address: impl Into<String>) -> Self {
-        Self::with_threshold(raft_group_id, target, address, 8)
+    pub fn new(
+        transport: Arc<CoreRaftTransport>,
+        raft_group_id: RaftGroupId,
+        target: u64,
+        address: impl Into<String>,
+    ) -> Self {
+        Self::with_threshold(transport, raft_group_id, target, address, 8)
     }
 
     pub fn with_threshold(
+        transport: Arc<CoreRaftTransport>,
         raft_group_id: RaftGroupId,
         target: u64,
         address: impl Into<String>,
         reconnect_threshold: u32,
     ) -> Self {
         Self::with_transport(
-            Arc::default(),
+            transport,
             raft_group_id,
             target,
             address,
@@ -1340,10 +1394,7 @@ impl GrpcRaftNetwork {
             .map_err(|err| tonic::Status::unavailable(err.to_string()))?;
         let session = shared_append_session(&self.transport, &self.endpoint, client)
             .map_err(tonic::Status::unavailable)?;
-        let charge = append_budget_charge(
-            envelope.encoded_len(),
-            RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES,
-        );
+        let charge = append_budget_charge(envelope.encoded_len(), self.transport.budget.bytes);
         // Fair admission: a call that does not fit waits in the semaphore's FIFO queue, which
         // hands freed budget to the oldest waiter first (and lets no later call overtake it), so
         // a multi-MiB catch-up append is not starved by a stream of small ones. The wait shares
@@ -1366,9 +1417,11 @@ impl GrpcRaftNetwork {
             GRPC_APPEND_STREAM_BACKPRESSURE_REJECTIONS.fetch_add(1, Ordering::Relaxed);
             return Err(tonic::Status::unavailable(format!(
                 "{APPEND_STREAM_BACKLOG_FULL}: {} of {} bytes queued",
-                RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES
+                self.transport
+                    .budget
+                    .bytes
                     .saturating_sub(session.budget.available_permits()),
-                RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES,
+                self.transport.budget.bytes,
             )));
         };
         let queued = QueuedAppendBytes::new(
@@ -1523,7 +1576,7 @@ fn shared_append_session(
     let session = SharedAppendSession {
         _task: Arc::new(AppendSessionTask::Running(task)),
         sender,
-        budget: Arc::new(Semaphore::new(RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES)),
+        budget: transport.budget.semaphore.clone(),
     };
     sessions.insert(endpoint.to_owned(), session.clone());
     Ok(session)
@@ -1877,6 +1930,27 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
 
 #[cfg(test)]
 mod reconnect_tests {
+    #[test]
+    fn node_budget_is_shared_across_core_pools_and_small_limits_are_valid() {
+        let budget = super::AppendTransportBudget::new(512);
+        let a = super::CoreRaftTransport::with_budget(budget.clone());
+        let b = super::CoreRaftTransport::with_budget(budget);
+        let charge = super::append_budget_charge(1, 512);
+        assert_eq!(charge, 512);
+        let permit = a
+            .budget
+            .semaphore
+            .clone()
+            .try_acquire_many_owned(charge)
+            .unwrap();
+        assert!(matches!(
+            b.budget.semaphore.clone().try_acquire_owned(),
+            Err(tokio::sync::TryAcquireError::NoPermits)
+        ));
+        drop(permit);
+        assert_eq!(b.budget.semaphore.available_permits(), 512);
+    }
+
     fn test_network(
         transport: Arc<CoreRaftTransport>,
         group: RaftGroupId,

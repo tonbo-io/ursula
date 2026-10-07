@@ -61,6 +61,7 @@ fn test_config(
     mailbox_capacity: usize,
 ) -> RuntimeConfig {
     RuntimeConfig {
+        cpu_affinity: None,
         core_count,
         raft_group_count,
         mailbox_capacity,

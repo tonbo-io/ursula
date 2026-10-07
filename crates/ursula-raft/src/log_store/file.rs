@@ -137,6 +137,17 @@ impl StoreLog {
 }
 
 impl RaftGroupFileLogStore {
+    /// Simulation fault: hold the writer before performing a collected batch's I/O.
+    #[cfg(madsim)]
+    pub fn pause_simulated_writer(&self, paused: bool) {
+        self.core_writer.pause_simulated(paused);
+    }
+    /// Simulation process death: discard queued writes, without flushing or a clean marker.
+    #[cfg(madsim)]
+    pub fn abort_simulated_writer(&self) {
+        self.core_writer.abort_simulated();
+    }
+
     pub(crate) fn open(
         placement: ShardPlacement,
         metrics: GroupEngineMetrics,
@@ -193,6 +204,18 @@ impl RaftGroupFileLogStore {
         if *log == StoreLog::Empty(EmptyHistory::New) {
             *log = StoreLog::Empty(EmptyHistory::Unknown);
         }
+    }
+
+    /// A crash may lose an enqueued tail that followers already persisted,
+    /// even under `always` and even if this replica lost no acknowledged I/O.
+    pub(crate) async fn prevent_crashed_leader_resume(
+        &self,
+        node_id: u64,
+    ) -> Result<(), CoreJournalError> {
+        if self.core_writer.previous_run != super::run_state::PreviousRun::Clean {
+            self.start_as_follower(node_id).await?;
+        }
+        Ok(())
     }
 
     /// A recovering replica that led its group may have lost entries it

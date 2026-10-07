@@ -364,6 +364,7 @@ impl From<CoreJournalError> for io::Error {
 /// How a core journal is opened.
 #[derive(Debug, Clone)]
 pub(crate) struct CoreJournalOptions {
+    pub(crate) previous_run: super::run_state::PreviousRun,
     pub(crate) core: CoreId,
     pub(crate) tuning: JournalTuning,
     /// The run's recovery epoch: a journal last read in full in an earlier
@@ -384,8 +385,11 @@ pub(crate) struct CoreJournalOptions {
 /// The single writer of one core's journal.
 #[derive(Debug)]
 pub(crate) struct CoreFileLogWriter {
+    #[cfg(madsim)]
+    pause: crate::rt::sync::watch::Sender<bool>,
     dir: PathBuf,
     replay_mode: JournalReplayMode,
+    pub(crate) previous_run: super::run_state::PreviousRun,
     tx: Option<mpsc::UnboundedSender<CoreWriterRequest>>,
     groups: Arc<Mutex<CoreGroups>>,
     group_cache_bytes: u64,
@@ -437,7 +441,27 @@ type WriteResult = Result<CoreFileLogWriteTiming, CoreJournalError>;
 
 enum WriteReply {
     Wait(oneshot::Sender<WriteResult>),
-    Flush(Box<dyn FnOnce(WriteResult) + Send>),
+    Flush(FlushCompletion),
+}
+
+/// Even an aborted writer must release a submitted append with a failure.
+struct FlushCompletion {
+    callback: Option<Box<dyn FnOnce(WriteResult) + Send>>,
+    stopped: CoreJournalError,
+}
+impl FlushCompletion {
+    fn complete(mut self, result: WriteResult) {
+        if let Some(callback) = self.callback.take() {
+            callback(result);
+        }
+    }
+}
+impl Drop for FlushCompletion {
+    fn drop(&mut self) {
+        if let Some(callback) = self.callback.take() {
+            callback(Err(self.stopped.clone()));
+        }
+    }
 }
 
 impl std::fmt::Debug for WriteReply {
@@ -477,6 +501,17 @@ pub(crate) struct CoreFileLogWriteTiming {
 }
 
 impl CoreFileLogWriter {
+    #[cfg(madsim)]
+    pub(crate) fn pause_simulated(&self, paused: bool) {
+        self.pause.send_replace(paused);
+    }
+    #[cfg(madsim)]
+    pub(crate) fn abort_simulated(&self) {
+        if let Some(worker) = &self.worker {
+            worker.abort();
+        }
+    }
+
     /// Opens the journal in the core directory `dir`: takes its lock, reads
     /// the core's metadata file, replays every segment into each group's
     /// log and starts the writer.
@@ -615,8 +650,12 @@ impl CoreFileLogWriter {
             opened: BTreeSet::new(),
         }));
         let (tx, rx) = mpsc::unbounded_channel();
+        #[cfg(madsim)]
+        let (pause, paused) = crate::rt::sync::watch::channel(false);
         let journal = CoreJournal {
             context: WriterContext {
+                #[cfg(madsim)]
+                paused,
                 name: writer_name(&dir),
                 dir: dir.clone(),
                 metadata_path,
@@ -637,8 +676,11 @@ impl CoreFileLogWriter {
         };
         let worker = spawn_core_file_log_writer(Box::new(journal), rx)?;
         Ok(Arc::new(Self {
+            #[cfg(madsim)]
+            pause,
             dir,
             replay_mode,
+            previous_run: options.previous_run,
             tx: Some(tx),
             groups,
             group_cache_bytes: cache_bytes,
@@ -724,7 +766,10 @@ impl CoreFileLogWriter {
     ) {
         let request = CoreWriterRequest::Write(CoreFileLogWrite {
             op,
-            reply: WriteReply::Flush(Box::new(complete)),
+            reply: WriteReply::Flush(FlushCompletion {
+                callback: Some(Box::new(complete)),
+                stopped: self.stopped(),
+            }),
         });
         match &self.tx {
             Some(tx) => {
@@ -835,6 +880,8 @@ fn stop_core_file_log_writer(worker: WriterWorker) {
 /// What a core journal's writer works with besides the journal itself.
 #[derive(Debug)]
 struct WriterContext {
+    #[cfg(madsim)]
+    paused: crate::rt::sync::watch::Receiver<bool>,
     dir: PathBuf,
     metadata_path: PathBuf,
     core: CoreId,
@@ -891,6 +938,14 @@ async fn run_core_file_log_writer(
             WriterState::Poisoned { .. } => WalFsync::Never,
         };
         let batch = collect_batch(&mut rx, first, fsync).await;
+        #[cfg(madsim)]
+        if let WriterState::Open(journal) = &mut state {
+            while *journal.context.paused.borrow() {
+                if journal.context.paused.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
         state = match state {
             WriterState::Open(journal) => match write_core_log_batch(journal, batch.writes) {
                 WriterState::Open(journal) => maintain(journal),
@@ -1500,7 +1555,8 @@ fn write_core_log_batch(
     let mut metadata_ops = 0_u64;
     let mut requires_sync = false;
     let mut metadata_changed = false;
-    for request in batch {
+    let mut batch = batch.into_iter();
+    while let Some(request) = batch.next() {
         let position = match &request.op {
             CoreWriteOp::Vote { group_id, vote } => {
                 metadata_ops = metadata_ops.saturating_add(1);
@@ -1514,6 +1570,20 @@ fn write_core_log_batch(
             }
             CoreWriteOp::Record { record, first, log } => {
                 if let Err(error) = journal.validate(log, record) {
+                    if matches!(request.reply, WriteReply::Flush(_)) {
+                        let cause = JournalError::Io {
+                            path: journal.context.dir.clone(),
+                            op: JournalOp::Append,
+                            source: error.into(),
+                        };
+                        let mut failed = accepted
+                            .into_iter()
+                            .map(|(request, _)| request)
+                            .collect::<Vec<_>>();
+                        failed.push(request);
+                        failed.extend(batch);
+                        return poison_core_journal(&journal.context, cause, failed);
+                    }
                     request.reply(Err(error));
                     continue;
                 }
@@ -1526,6 +1596,20 @@ fn write_core_log_batch(
                     {
                         Ok(loc) => position = Some((FramePos { segment, loc }, log.clone())),
                         Err(too_large) => {
+                            if matches!(request.reply, WriteReply::Flush(_)) {
+                                let cause = JournalError::Io {
+                                    path: journal.context.dir.clone(),
+                                    op: JournalOp::Append,
+                                    source: io::Error::new(io::ErrorKind::InvalidInput, too_large),
+                                };
+                                let mut failed = accepted
+                                    .into_iter()
+                                    .map(|(request, _)| request)
+                                    .collect::<Vec<_>>();
+                                failed.push(request);
+                                failed.extend(batch);
+                                return poison_core_journal(&journal.context, cause, failed);
+                            }
                             request.reply(Err(CoreJournalError::RecordTooLarge(too_large)));
                             continue;
                         }
@@ -1797,7 +1881,7 @@ fn send_reply(reply: WriteReply, result: Result<CoreFileLogWriteTiming, CoreJour
                 tracing::trace!("raft log append caller stopped waiting");
             }
         }
-        WriteReply::Flush(complete) => complete(result),
+        WriteReply::Flush(complete) => complete.complete(result),
     }
 }
 

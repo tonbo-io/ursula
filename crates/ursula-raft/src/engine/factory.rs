@@ -402,10 +402,13 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .entry(placement.core_id.0)
-                .or_default()
+                .or_insert_with(|| {
+                    Arc::new(crate::grpc::CoreRaftTransport::with_budget(
+                        self.registry.append_send_budget.clone(),
+                    ))
+                })
                 .clone();
-            let network = GrpcRaftNetworkFactory::new(placement.raft_group_id)
-                .with_transport(transport)
+            let network = GrpcRaftNetworkFactory::new(transport.clone(), placement.raft_group_id)
                 .with_reconnect_threshold(self.engine_config.grpc_reconnect_after_failures)
                 .with_rejoin(Some(rejoin.clone()));
             let engine = RaftGroupEngine::new_node(
@@ -430,6 +433,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 &self.registry,
                 nodes,
                 crate::recovery_transport::GrpcRecoveryTransport {
+                    transport,
                     placement,
                     node_id: self.node_id,
                     timeout: self.engine_config.bootstrap_peer_connect,

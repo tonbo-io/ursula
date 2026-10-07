@@ -60,5 +60,9 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 name = "disk_wal"
 harness = false
 
+[[bench]]
+name = "owner_burst"
+harness = false
+
 [lints]
 workspace = true
