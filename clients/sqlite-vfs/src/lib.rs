@@ -1278,7 +1278,9 @@ unsafe fn full_pathname(path: &str) -> Result<String, String> {
             buf.len() as c_int,
             buf.as_mut_ptr() as *mut c_char,
         );
-        if rc != OK {
+        // SQLite reports successful canonicalization through a symlink using
+        // an extended SQLITE_OK code (for example macOS /var -> /private/var).
+        if rc != OK && rc != ffi::SQLITE_OK_SYMLINK {
             return Err(format!("xFullPathname({path}): {rc}"));
         }
         Ok(CStr::from_ptr(buf.as_ptr() as *const c_char)

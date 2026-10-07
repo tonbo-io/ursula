@@ -1,6 +1,8 @@
 // Attach is the only writer of a file it recovers: one owner per file on a host (lock file), and no
 // other connection open while pages are rewritten.
 import { spawn } from "node:child_process";
+import { mkdirSync, symlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { expect, it } from "vitest";
 import { attach, loadUrsulaVfs, status } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
@@ -15,6 +17,20 @@ const xs = (file: string): string[] => {
 		db.close();
 	}
 };
+
+it("attach accepts SQLite's successful symlink canonicalization", () => {
+	const root = dirname(freshFile());
+	const actual = join(root, "symlink-target");
+	const alias = join(root, "symlink-alias");
+	mkdirSync(actual);
+	symlinkSync(actual, alias, "dir");
+	const file = join(alias, "db.sqlite");
+	attach(file, ursulaUrl() + streamPath());
+	const db = openPlain(file);
+	db.exec("CREATE TABLE t(x TEXT); INSERT INTO t VALUES ('canonical')");
+	db.close();
+	expect(xs(join(actual, "db.sqlite"))).toEqual(["canonical"]);
+});
 
 it("a second process cannot attach a file another process has attached", async () => {
 	const file = freshFile();
