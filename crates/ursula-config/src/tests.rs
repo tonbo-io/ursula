@@ -485,18 +485,18 @@ url = "http://127.0.0.1:4438"
     }
 
     #[test]
-    fn wal_fsync_defaults_to_always_and_parses_both_policies() {
+    fn wal_fsync_defaults_to_never_and_parses_both_policies() {
         use crate::config::WalFsync;
 
         assert_eq!(
             crate::UrsulaConfig::default().raft.wal.fsync,
-            WalFsync::Always
+            WalFsync::Never
         );
         let disk = |fsync: &str| {
             format!("[raft.wal]\nbackend = \"disk\"\npath = \"/tmp/ursula-wal\"\n{fsync}\n")
         };
         for (line, expected) in [
-            ("", WalFsync::Always),
+            ("", WalFsync::Never),
             ("fsync = \"always\"", WalFsync::Always),
             ("fsync = \"never\"", WalFsync::Never),
         ] {
@@ -515,36 +515,17 @@ url = "http://127.0.0.1:4438"
         }
     }
 
+    /// The memory WAL has nothing to `fsync`, so it ignores the policy,
+    /// including the `never` default.
     #[test]
-    fn validation_rejects_fsync_never_without_a_disk_wal() {
-        let tmp = temp_config(
-            ".toml",
-            r#"
-[raft.wal]
-backend = "memory"
-fsync = "never"
-"#,
-        );
-        let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                crate::ConfigError::Validation(
-                    crate::validate::ValidationError::RaftWalFsyncRequiresDisk
-                )
-            ),
-            "{err}"
-        );
-
-        let tmp = temp_config(
-            ".toml",
-            r#"
-[raft.wal]
-backend = "memory"
-fsync = "always"
-"#,
-        );
-        load_config(Some(tmp.path()), None, Some(1)).expect("the default policy needs no disk");
+    fn a_memory_wal_ignores_the_fsync_policy() {
+        for policy in ["", "fsync = \"never\"", "fsync = \"always\""] {
+            let tmp = temp_config(
+                ".toml",
+                &format!("[raft.wal]\nbackend = \"memory\"\n{policy}\n"),
+            );
+            load_config(Some(tmp.path()), None, Some(1)).expect("a memory WAL takes any policy");
+        }
     }
 
     #[test]
@@ -688,8 +669,8 @@ listen = "127.0.0.1:4437"
         assert_eq!(original.runtime.core_count, restored.runtime.core_count);
         assert_eq!(original.raft.group_count, restored.raft.group_count);
         assert_eq!(
-            original.raft.rejoin_probe.as_duration(),
-            restored.raft.rejoin_probe.as_duration()
+            original.raft.bootstrap_peer_probe.as_duration(),
+            restored.raft.bootstrap_peer_probe.as_duration()
         );
         assert_eq!(
             original.storage.cold.flush_size.as_bytes(),

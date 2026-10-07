@@ -59,11 +59,14 @@ curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST "h
 curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/leadership-shed/maintenance
 curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X DELETE http://127.0.0.1:4438/__ursula/leadership-shed/maintenance
 
+# Accept the loss of one group's unsynced tail on this node (see Recovering after a host crash)
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/42/recovery/accept-unsynced-loss
+
 ```
 
 The leader-transfer endpoint refuses with `409 Conflict` if the receiving node isn't the current leader and `400 Bad Request` if the target isn't a voter. This is why `ursulactl` is the safer way to chain these calls: it consults metrics first.
 
-On a memory-WAL cluster the group leader keeps every group at its configured voters: if the membership endpoint drops a configured voter, the leader adds it back as a learner and promotes it again once it has caught up (see [Restarting a memory-WAL node](#restarting-a-memory-wal-node)). Membership changes there are for repair, not for shrinking a group.
+The group leader keeps every group at its configured voters: if the membership endpoint drops a configured voter, the leader adds it back as a learner and promotes it again once it has caught up (see [Recovering after a host crash](#recovering-after-a-host-crash)). Membership changes are for repair, not for shrinking a group.
 
 The membership endpoint has the same leader-only contract: it answers `409 Conflict` (with the current leader's id in the body) when the receiving node does not lead the group, and `400 Bad Request` without a non-empty `voters` query parameter. On success it returns the log index at which the new voter set was committed. It replaces the whole voter set in one call, so include every node that should remain a voter.
 
@@ -97,11 +100,35 @@ prevent local memory-WAL loss on exit or handle SIGKILL and OOM.
 
 ### Rejoining a wiped node
 
-Rebuild a wiped voter through committed membership: remove it from each affected voter set, attach it as a blocking learner with its current address, and promote it only after snapshot and log catch-up. Use `ursulactl repair-restarted-voter` for the cluster-wide, resumable sequence. A process-local log-reversion trigger is not a durable recovery contract; the admin API uses it only to adopt a survivor after a majority of a memory-WAL group restarted (below). A memory-WAL node restarted alone is rebuilt automatically from 0.6.2.
+Rebuild a wiped voter through committed membership: remove it from each affected voter set, attach it as a blocking learner with its current address, and promote it only after snapshot and log catch-up. Use `ursulactl repair-restarted-voter` for the cluster-wide, resumable sequence. A node that lost its log restarts behind the recovery gate, and the group leader rebuilds it the same way without an operator (see [Recovering after a host crash](#recovering-after-a-host-crash)).
+
+### Recovering after a host crash
+
+With the default `raft.wal.fsync = "never"`, a disk-WAL node acknowledges appends from the page cache. A process crash loses nothing. A host crash or power loss, or a journal I/O failure, can cost the node the unsynced tail of its journals. The node detects it on the next start from its run state (`wal_recovery` in `GET /__ursula/metrics`, the `ursula.wal.recovering` gauge) and keeps the frames that still verify. A node whose run state file is missing while its journals hold records is treated the same way. Every group the node held enters the recovery gate, which is recorded in the node's metadata and survives further restarts:
+
+- The node does not campaign, takes no leadership transfer and grants no vote. A node that led the group starts as a follower. It still accepts appends from a leader of its current term or a later one.
+- It asks the group's leader for a fresh ReadIndex barrier, applies the log up to the barrier's index and then opens the gate. Until then readiness answers `503` with reason `recovery_gate_closed`, and `recovery_gates` in `GET /__ursula/metrics` lists the gated groups.
+- The leader sees that the node lost entries it had acknowledged and rebuilds it: it removes the voter, adds it back as a learner and promotes it once it caught up. If the voters that lost entries are a majority, no removal can commit, so the leader resends its own log to them instead.
+
+While at most a minority of a group's voters lost their tail, the other voters hold every acknowledged write and nothing is lost. Wait for every group to open the gate on a node before you stop another voter.
+
+**A majority of a group's voters lost their tail at once.** The gated voters refuse every vote, so the group elects no leader and writes answer `503`. After `30s` without a leader barrier and without applying anything, each gated replica reports its group stalled: readiness reason `recovery_stalled`, the group under `recovery_stalled_groups` in `GET /__ursula/ready` and under `recovery_gates.stalled` in the metrics, the `ursula.raft.recovery_gates{status="stalled"}` gauge, and an error log naming the group. Writes acknowledged after the last `fsync` of the surviving replicas may be gone. Only an operator can accept that. For each stalled group:
+
+1. Read `last_log_index` for the group from `GET /__ursula/metrics` on every voter.
+2. On the gated replica with the longest log, run the call below through its admin listener. Repeat on the next longest until the replicas whose gate is open form a majority of the voters. A replica that was not gated counts as open.
+3. The group elects a leader among the open replicas, preferring the longest log, and the remaining gated replicas catch up from it and open their gates.
+
+```bash
+# group 42 on this node
+process_incarnation=$(curl --fail http://127.0.0.1:4438/__ursula/metrics | jq -er .process_incarnation)
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/42/recovery/accept-unsynced-loss
+```
+
+It answers `{"raft_group_id": 42, "node_id": 1, "outcome": "gate_opened", "last_log_index": 1234}`, or `"already_open"` when the gate was open. The open gate is recorded, so a restart does not close it again. A single-voter group has no other replica to recover from, so it needs this call after every host crash under `never`. Use `fsync = "always"` where that is not acceptable.
 
 ### Restarting a memory-WAL node
 
-Every restart of a node on `raft.wal.backend = "memory"`, planned or not, wipes its local Raft log and replicated state. Multi-peer deployments must explicitly accept this volatile-WAL contract with `raft.wal.allow_volatile_multi_peer`. From 0.6.2 a restarted node is rebuilt automatically from surviving voters when a minority lose state. If a quorum loses state, affected groups stop completing writes; acknowledged writes held only on the lost voters may already be gone. A restart of every voter is detected by initialized markers only with shared object storage. These mechanisms do not establish a recovery-time upper bound or production qualification under delayed RPCs and snapshot-store failures.
+Every restart of a node on `raft.wal.backend = "memory"`, planned or not, wipes its local Raft log and replicated state. Multi-peer deployments must explicitly accept this volatile-WAL contract with `raft.wal.allow_volatile_multi_peer`. A restarted node goes through the same recovery gate as a disk-WAL node after a host crash, and is rebuilt automatically from surviving voters when a minority lose state. If a quorum loses state, affected groups stop completing writes, and acknowledged writes held only on the lost voters may already be gone. A restart of every voter cannot be detected: the groups initialize again, empty. These mechanisms do not establish a recovery-time upper bound or production qualification under delayed RPCs and snapshot-store failures.
 
 `runtime.node_memory_abort_cap_size` is an emergency process-abort threshold, not HTTP admission control. Exceeding it calls `abort()` without graceful leadership handoff; with memory WAL, that loses the node's local state just like OOM. It does not return `503`. Leave room below the container memory limit for normal operation and recovery, and use write admission and backpressure to manage load.
 
@@ -113,36 +140,9 @@ Every restart of a node on `raft.wal.backend = "memory"`, planned or not, wipes 
 
 `ursulactl verify-cluster` shows the node unready until every group has promoted it. The chart's graceful-rollout hook still runs `repair-restarted-voter` after a prepared restart; it finds nothing left to do. During a rolling upgrade from 0.6.0 or 0.6.1, a group whose leader still runs the earlier release is not rebuilt automatically; the hook rebuilds it, and the 0.6.2 node refuses to vote meanwhile.
 
-**A majority restarts at once (two nodes of three).** The recovery path stops completing writes and waits for an operator instead of automatically adopting an incomplete log. This is a fail-closed recovery mechanism, not preservation of writes that existed only on the lost voters. Writes answer `503` with `Retry-After` while no leader exists; a surviving node that still believes it leads accepts writes it cannot commit, so they time out.
+**A majority restarts at once (two nodes of three).** If the leader survived, it resends its log to both emptied followers and the group heals without an operator. Otherwise the emptied voters refuse every vote, the group has no leader, writes answer `503` with `Retry-After`, and the gated replicas report the group stalled. Recover as after a majority host crash ([Recovering after a host crash](#recovering-after-a-host-crash)): accept the loss on one emptied replica, so that the surviving replica's log is the only one that can win the election. Acknowledged writes that only the lost nodes held are gone.
 
-To recover from a majority restart, pick the survivor whose log you keep: on each affected group, the voter with the highest `last_log_index` in `GET /__ursula/metrics`. Acknowledged writes that only the lost nodes held are gone; adopting the survivor accepts that. Then run, on every node of the group (through each node's admin listener, as below):
-
-```bash
-# group 42, survivor node 1
-# Pin this node before accepting the recovery plan.
-process_incarnation=$(curl --fail http://127.0.0.1:4438/__ursula/metrics | jq -er .process_incarnation)
-curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/42/rejoin/adopt-survivor/1
-```
-
-On an empty node this lets it vote for the survivor (and only the survivor) while it is behind (`"action": "vote_released"`). On the survivor, if it still leads, it lets it replicate the emptied nodes from the start (`"followers_reset"`); if it does not lead (`"survivor_not_leader"`), it wins the next election once the others released their vote. The group then heals as after a minority restart. This is the only use of OpenRaft's one-shot log-reversion reset; it is process-local, so repeat the call if the survivor restarts or loses leadership before the emptied nodes caught up.
-
-**Every node restarts at once.** Every voter of every group comes back empty, which looks exactly like a fresh install to the bootstrap probe. Object storage tells them apart: each memory-WAL group keeps an "initialized" marker, `URSULA_GROUP_INITIALIZED/group-{id}`, next to the format-epoch marker (at the cold-storage root, or under the snapshot prefix when only snapshots use S3).
-
-- A group leader writes the marker before it proposes the group's first write, and proposes no write until the marker is stored (`503` with `Retry-After` meanwhile, for example while object storage is unreachable). A process checks this once per group, so an outage later does not stop writes. No write is ever acknowledged without the marker.
-- A replica whose applied state already holds writes (a group created by 0.6.1, which writes no marker) writes the marker too, so a cluster upgraded from 0.6.1 is protected once every pod runs 0.6.2, with no new write. 0.6.1 ignores the marker, so a downgrade is safe; it just loses the protection.
-- When every voter of a group reports an empty log, the group's initializer reads the marker. No marker: the group never acknowledged a write, and it initializes as on a fresh install. This covers a crash of every node during the first bootstrap: no operator is needed. Marker present: the group held writes that no node has any more. It does not initialize: it has no leader and refuses writes (`503`), and the initializer logs `lost its log on every voter after it held writes` with the group id and lists the group under `memory_wal_full_restart_groups` in `GET /__ursula/ready` (readiness in this source answers `503` because a configured group is stopped; the process can still serve other healthy groups). Marker unreadable (object storage unreachable): it does not initialize, and retries until it can read the marker.
-
-The writes are gone; only the operator can accept that. On the node that lists the group (the group's initializer: with per-group initializers, the voter at position `group id mod voter count`, counting from 0, in the group's sorted voter list), run, through its admin listener:
-
-```bash
-# group 42: initialize it again, empty, accepting the loss of its writes
-process_incarnation=$(curl --fail http://127.0.0.1:4438/__ursula/metrics | jq -er .process_incarnation)
-curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST 'http://127.0.0.1:4438/__ursula/raft/42/rejoin/reinitialize?accept_data_loss=true'
-```
-
-It answers `{"action": "reinitialize_accepted"}`, and the group initializes on the next probe. Without `accept_data_loss=true` it answers `400`; on a node where the group has not stopped, `409`. Cold objects the group wrote before the restart stay in object storage, unreferenced. To start such a cluster over instead, install it on a new object-storage prefix (as for any fresh install).
-
-Without object storage (memory cold store and inline snapshots) nothing survives a restart of every node, so it cannot be detected: the groups initialize again, empty, and every acknowledged write is lost.
+**Every node restarts at once.** Every voter of every group comes back empty, which looks exactly like a fresh install to the bootstrap probe. The groups initialize again, empty, and every acknowledged write is lost. Cold objects the groups wrote before the restart stay in object storage, unreferenced. To start such a cluster over cleanly, install it on a new object-storage prefix (as for any fresh install).
 
 `POST /__ursula/cluster-probe` also exists on the client plane, but it is machinery rather than an operator surface: nodes send each other heartbeat-sized bodies through it to verify cluster-plane egress, and it bypasses ingress admission.
 

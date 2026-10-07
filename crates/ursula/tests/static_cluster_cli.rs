@@ -331,19 +331,20 @@ async fn cli_sigterm_drains_listeners_and_exits_cleanly() {
 
     // A killed process records nothing, so the next start reads it as a crash:
     // a process crash where the kernel reports a boot id, a host crash where
-    // it does not.
+    // it does not. Under the default `fsync = "never"` a host crash may have
+    // cost the node its unsynced tail, so it recovers.
     child.child.kill().expect("kill the node");
     child.child.wait().expect("reap the node");
     let mut child = spawn_node_with_cluster_config(binary, &config_path);
     wait_until_ready(&client, &base_url, std::slice::from_mut(&mut child)).await;
     let recovery = wal_recovery(&client, &base_url).await;
-    let expected = if cfg!(target_os = "linux") {
-        "process_crash"
+    let (expected_run, expected_state) = if cfg!(target_os = "linux") {
+        ("process_crash", "normal")
     } else {
-        "host_crash"
+        ("host_crash", "recovering")
     };
-    assert_eq!(recovery["previous_run"]["kind"], expected, "{recovery}");
-    assert_eq!(recovery["recovery"]["state"], "normal", "{recovery}");
+    assert_eq!(recovery["previous_run"]["kind"], expected_run, "{recovery}");
+    assert_eq!(recovery["recovery"]["state"], expected_state, "{recovery}");
     drop(child);
 
     std::fs::remove_dir_all(&root).expect("remove temp root");
@@ -470,7 +471,12 @@ async fn cli_static_grpc_raft_log_dir_recovers_with_bootstrap_enabled_after_rest
     let config_path = root.join("cluster.toml");
     let log_dir = root.join("raft-log");
 
+    // Every exit here is a kill. Under `fsync = "always"` the restart serves
+    // on every platform; under `never` a platform without a boot id reads the
+    // kill as a host crash and the single voter waits for an operator
+    // (`cli_single_voter_with_an_unknown_history_serves_after_accept_unsynced_loss`).
     write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, true, &log_dir);
+    set_wal_fsync(&config_path, "always");
     {
         let mut child = spawn_node_with_cluster_config(binary, &config_path);
         let client = reqwest::Client::new();
@@ -495,6 +501,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_with_bootstrap_enabled_after_rest
     );
 
     write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, true, &log_dir);
+    set_wal_fsync(&config_path, "always");
     {
         let mut child = spawn_node_with_cluster_config(binary, &config_path);
         let client = reqwest::Client::new();
@@ -529,6 +536,77 @@ async fn cli_static_grpc_raft_log_dir_recovers_with_bootstrap_enabled_after_rest
     }
 
     std::fs::remove_dir_all(&root).expect("remove temp root");
+}
+
+/// A single voter whose run state is gone while its journal holds records
+/// cannot know whether it lost acknowledged writes: it comes back gated, its
+/// group has no leader and readiness says why. An operator who accepts the
+/// loss of the unsynced tail opens the gate, and the node serves again with
+/// what its journal kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_single_voter_with_an_unknown_history_serves_after_accept_unsynced_loss() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping CLI recovery gate test");
+        return;
+    };
+    let port = free_port();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let root = tempfile::tempdir().expect("temp root");
+    let config_path = root.path().join("cluster.toml");
+    let log_dir = root.path().join("raft-log");
+    let admin_port =
+        write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, true, &log_dir);
+    let admin_url = format!("http://127.0.0.1:{admin_port}");
+    let client = reqwest::Client::new();
+    let stream_url = format!("{base_url}/benchcmp/cli-unknown-history");
+    {
+        let mut child = spawn_node_with_cluster_config(binary, &config_path);
+        wait_until_ready(&client, &base_url, std::slice::from_mut(&mut child)).await;
+        put_until_created(&client, &stream_url).await;
+        post_until_no_content(&client, &stream_url, "kept-by-the-page-cache").await;
+        // Killed: the page cache keeps every write.
+    }
+    std::fs::remove_file(log_dir.join("raft-log").join("run-state.bin"))
+        .expect("remove the run state");
+
+    let mut child = spawn_node_with_cluster_config(binary, &config_path);
+    wait_until_ready(&client, &base_url, std::slice::from_mut(&mut child)).await;
+    let recovery = wal_recovery(&client, &base_url).await;
+    assert_eq!(recovery["previous_run"]["kind"], "unrecorded", "{recovery}");
+    assert_eq!(
+        recovery["recovery"]["reason"], "unknown_history",
+        "{recovery}"
+    );
+    let ready = client
+        .get(format!("{base_url}/__ursula/ready"))
+        .send()
+        .await
+        .expect("readiness");
+    assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let ready: serde_json::Value = ready.json().await.expect("readiness JSON");
+    assert_eq!(ready["reason"], "recovery_gate_closed", "{ready}");
+
+    let response = admin_test_post(
+        &client,
+        format!("{admin_url}/__ursula/raft/0/recovery/accept-unsynced-loss"),
+    )
+    .await
+    .send()
+    .await
+    .expect("accept the unsynced loss");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let report: ursula_raft::AcceptUnsyncedLossReport =
+        response.json().await.expect("typed report");
+    assert_eq!(
+        report.outcome,
+        ursula_raft::AcceptUnsyncedLossOutcome::GateOpened
+    );
+    let payload =
+        read_until_replicated(&client, &format!("{stream_url}?offset=0&max_bytes=64")).await;
+    assert_eq!(payload, b"kept-by-the-page-cache");
+    post_until_no_content(&client, &stream_url, "-after").await;
+    drop(child);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2417,6 +2495,23 @@ fn write_single_node_cluster_config(
     )
     .expect("enable per-group membership initialization");
     admin_port
+}
+
+/// Sets `raft.wal.fsync` in the node config at `path`.
+fn set_wal_fsync(path: &Path, fsync: &str) {
+    let config = std::fs::read_to_string(path).expect("read node config");
+    assert!(
+        config.contains("[raft.wal]\n"),
+        "a node config with a WAL section"
+    );
+    std::fs::write(
+        path,
+        config.replace(
+            "[raft.wal]\n",
+            &format!("[raft.wal]\nfsync = \"{fsync}\"\n"),
+        ),
+    )
+    .expect("write node config");
 }
 
 fn write_cluster_config(

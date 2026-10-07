@@ -328,6 +328,9 @@ impl HttpState {
         if let Some(raft_wal) = &self.raft_wal {
             otel_metrics::register_wal_recovery(raft_wal.recovery_state());
         }
+        if let Some(registry) = &self.raft_registry {
+            otel_metrics::register_recovery_gates(registry.clone());
+        }
     }
 
     pub(crate) fn with_process_incarnation(mut self, boot: ProcessIncarnation) -> Self {
@@ -999,12 +1002,8 @@ fn admin_ops_router(state: HttpState) -> Router {
             post(request_raft_self_election),
         )
         .route(
-            "/__ursula/raft/{raft_group_id}/rejoin/adopt-survivor/{node_id}",
-            post(adopt_rejoin_survivor),
-        )
-        .route(
-            "/__ursula/raft/{raft_group_id}/rejoin/reinitialize",
-            post(reinitialize_rejoin_group),
+            "/__ursula/raft/{raft_group_id}/recovery/accept-unsynced-loss",
+            post(accept_unsynced_loss),
         )
         .route(
             "/__ursula/leadership-shed/maintenance",
@@ -1346,13 +1345,12 @@ async fn readiness(State(state): State<HttpState>) -> Response {
             .as_ref()
             .is_some_and(ursula_raft::RaftMaintenanceReport::ready);
     let ready = !disk.pressure && !format_epoch_mismatch && recovery_ready && raft_ready;
-    // Memory-WAL groups whose voters all restarted empty after holding
-    // writes: they refuse writes until an operator re-initializes them. Not
-    // a serving guarantee for the affected groups. Their recovery gates stay
-    // closed, so the node must not count toward a planned-disruption budget.
-    let full_restart_groups = state
+    // Groups whose gated replica here got no leader barrier and applied
+    // nothing for a while: a majority of their voters may be gated, and they
+    // refuse writes until an operator accepts the loss of the unsynced tail.
+    let stalled_groups = state
         .raft_registry()
-        .map(RaftGroupHandleRegistry::full_restart_stopped_groups)
+        .map(RaftGroupHandleRegistry::stalled_recovery_groups)
         .unwrap_or_default();
     let status = if ready {
         StatusCode::OK
@@ -1367,8 +1365,10 @@ async fn readiness(State(state): State<HttpState>) -> Response {
                 Some("format_epoch_mismatch")
             } else if disk.pressure {
                 Some("wal_disk_pressure")
+            } else if !stalled_groups.is_empty() {
+                Some("recovery_stalled")
             } else if !recovery_ready {
-                Some("memory_wal_recovery_barrier")
+                Some("recovery_gate_closed")
             } else if !raft_ready {
                 Some("raft_maintenance_unready")
             } else {
@@ -1377,7 +1377,7 @@ async fn readiness(State(state): State<HttpState>) -> Response {
             "format_epoch_mismatch": format_epoch_mismatch,
             "recovery_barriers_ready": recovery_ready,
             "raft_maintenance": raft_maintenance,
-            "memory_wal_full_restart_groups": full_restart_groups,
+            "recovery_stalled_groups": stalled_groups,
             "wal_disk_pressure": disk.pressure,
             "wal_available_bytes": disk.available_bytes,
             "wal_min_available_bytes": disk.min_available_bytes,
@@ -1897,6 +1897,11 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
             serde_json::to_value(state.raft_wal.as_ref().map(WalRecoveryReport::new))
                 .unwrap_or(serde_json::Value::Null),
         );
+        object.insert(
+            "recovery_gates".to_owned(),
+            serde_json::to_value(state.raft_registry().map(RecoveryGatesReport::new))
+                .unwrap_or(serde_json::Value::Null),
+        );
         let wal_disk = state.wal_disk.snapshot();
         object.insert(
             "wal_available_bytes".to_owned(),
@@ -1938,6 +1943,32 @@ impl WalRecoveryReport {
             fsync: raft_wal.fsync(),
             opening: raft_wal.opening(),
         }
+    }
+}
+
+/// The groups whose recovery gate on this node is closed, in the metrics JSON
+/// as `recovery_gates`. A gated replica stays out of elections until it has
+/// applied a fresh leader barrier; a `stalled` one sees no leader and waits
+/// for an operator.
+#[derive(Debug, serde::Serialize)]
+struct RecoveryGatesReport {
+    gated: BTreeMap<u32, ursula_raft::RecoveryGateStatus>,
+    stalled: Vec<u32>,
+}
+
+impl RecoveryGatesReport {
+    fn new(registry: &RaftGroupHandleRegistry) -> Self {
+        let gated = registry
+            .recovery_gates()
+            .into_iter()
+            .filter(|(_, status)| *status != ursula_raft::RecoveryGateStatus::Open)
+            .collect::<BTreeMap<_, _>>();
+        let stalled = gated
+            .iter()
+            .filter(|(_, status)| **status == ursula_raft::RecoveryGateStatus::Stalled)
+            .map(|(group, _)| *group)
+            .collect();
+        Self { gated, stalled }
     }
 }
 
@@ -2681,73 +2712,16 @@ pub(crate) fn parse_raft_group_id(raw: u64) -> Result<RaftGroupId, std::num::Try
     u32::try_from(raw).map(RaftGroupId)
 }
 
-/// Operator recovery after a majority of a memory-WAL group restarted empty:
-/// run it on every replica of the group with the same survivor (the replica
-/// whose log is kept). An empty replica may then vote for the survivor; the
-/// survivor, while it leads, replicates the emptied followers from the start.
-pub(crate) async fn adopt_rejoin_survivor(
-    State(state): State<HttpState>,
-    Path((raft_group_id, survivor)): Path<(u64, u64)>,
-) -> Response {
-    let (raft_group_id, _raft) = match resolve_raft_group(&state, raft_group_id) {
-        Ok(resolved) => resolved,
-        Err(response) => return *response,
-    };
-    let Some(registry) = state.raft_registry() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
-    };
-    match registry
-        .adopt_rejoin_survivor(raft_group_id, survivor)
-        .await
-    {
-        Ok(outcome) => {
-            let (action, followers): (&str, Vec<u64>) = match outcome {
-                ursula_raft::AdoptSurvivorOutcome::VoteReleased => ("vote_released", Vec::new()),
-                ursula_raft::AdoptSurvivorOutcome::FollowersReset(followers) => {
-                    ("followers_reset", followers.into_iter().collect())
-                }
-                ursula_raft::AdoptSurvivorOutcome::NotLeader => ("survivor_not_leader", Vec::new()),
-            };
-            json_response(
-                StatusCode::OK,
-                serde_json::json!({
-                    "raft_group_id": raft_group_id.0,
-                    "survivor": survivor,
-                    "action": action,
-                    "followers": followers,
-                })
-                .to_string(),
-            )
-        }
-        Err(err) => (StatusCode::CONFLICT, format!("adopt survivor: {err}")).into_response(),
-    }
-}
-
-/// Operator recovery after a restart of every voter of a memory-WAL group:
-/// initialize the group again, empty, accepting the loss of what it held. Run
-/// it on the node that reports the group in `memory_wal_full_restart_groups`
-/// (readiness); it requires `accept_data_loss=true`.
-pub(crate) async fn reinitialize_rejoin_group(
+/// Operator recovery when a majority of a group's voters are gated after a
+/// crash may have cost them their unsynced tail: open this node's recovery
+/// gate for the group, accepting that its replica may be missing entries it
+/// acknowledged, so it votes and campaigns with the log it holds. Run it on
+/// the gated replicas with the longest logs until a leader is elected.
+pub(crate) async fn accept_unsynced_loss(
     State(state): State<HttpState>,
     Path(raft_group_id): Path<u64>,
-    RawQuery(raw_query): RawQuery,
 ) -> Response {
-    let query = match parse_query(raw_query.as_deref()) {
-        Ok(query) => query,
-        Err(response) => return *response,
-    };
-    if query.get("accept_data_loss").map(String::as_str) != Some("true") {
-        return (
-            StatusCode::BAD_REQUEST,
-            "re-initializing a group drops every write it held; pass accept_data_loss=true",
-        )
-            .into_response();
-    }
-    let (raft_group_id, _raft) = match resolve_raft_group(&state, raft_group_id) {
+    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
         Ok(resolved) => resolved,
         Err(response) => return *response,
     };
@@ -2758,25 +2732,29 @@ pub(crate) async fn reinitialize_rejoin_group(
         )
             .into_response();
     };
-    match registry.accept_rejoin_data_loss(raft_group_id) {
-        Ok(true) => json_response(
-            StatusCode::OK,
-            serde_json::json!({
-                "raft_group_id": raft_group_id.0,
-                "action": "reinitialize_accepted",
-            })
-            .to_string(),
-        ),
-        Ok(false) => (
-            StatusCode::CONFLICT,
-            format!(
-                "raft group {} has not stopped for a full restart on this node; run it on the \
-                 node whose readiness lists the group in memory_wal_full_restart_groups",
-                raft_group_id.0
-            ),
-        )
-            .into_response(),
-        Err(err) => (StatusCode::CONFLICT, format!("reinitialize: {err}")).into_response(),
+    match registry.accept_unsynced_loss(raft_group_id).await {
+        Ok(outcome) => {
+            let metrics = raft.metrics().borrow_watched().clone();
+            (
+                StatusCode::OK,
+                axum::Json(ursula_raft::AcceptUnsyncedLossReport {
+                    raft_group_id: raft_group_id.0,
+                    node_id: metrics.id,
+                    outcome,
+                    last_log_index: metrics.last_log_index,
+                }),
+            )
+                .into_response()
+        }
+        Err(err @ ursula_raft::RecoveryGateError::NotRegistered { .. }) => {
+            (StatusCode::NOT_FOUND, err.to_string()).into_response()
+        }
+        Err(err @ ursula_raft::RecoveryGateError::StoreClosed { .. }) => {
+            (StatusCode::CONFLICT, err.to_string()).into_response()
+        }
+        Err(err @ ursula_raft::RecoveryGateError::Record { .. }) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+        }
     }
 }
 

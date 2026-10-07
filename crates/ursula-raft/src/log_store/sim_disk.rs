@@ -568,6 +568,23 @@ impl JournalDisk for SimDisk {
         with_disk(|state| state.resolve(path).is_some()).unwrap_or(false)
     }
 
+    fn read_dir(path: &Path) -> io::Result<Vec<PathBuf>> {
+        io_with_disk(|state| match state.resolve(path) {
+            Some(Entry::Dir) => Ok(state
+                .visible
+                .keys()
+                .filter(|entry| entry.parent() == Some(path))
+                .cloned()
+                .collect()),
+            Some(Entry::File(_)) => Err(SimDiskError::NotDirectory {
+                path: path.to_owned(),
+            }),
+            None => Err(SimDiskError::NotFound {
+                path: path.to_owned(),
+            }),
+        })
+    }
+
     fn truncate(path: &Path, len: u64) -> io::Result<()> {
         io_with_disk(|state| {
             let inode = state.resolve_file(path)?;

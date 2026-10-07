@@ -605,6 +605,19 @@ impl JournalWriter {
     }
 }
 
+/// Whether the journal at `path` holds anything beyond its file header.
+pub(crate) fn holds_records(path: &Path) -> Result<bool, JournalError> {
+    if !Disk::exists(path) {
+        return Ok(false);
+    }
+    let file =
+        Disk::open_read(path).map_err(|source| JournalError::io(path, JournalOp::Open, source))?;
+    let len = file
+        .file_len()
+        .map_err(|source| JournalError::io(path, JournalOp::Stat, source))?;
+    Ok(len > JOURNAL_HEADER_LEN_U64)
+}
+
 /// Reads and verifies every frame of `path` in `mode`, streaming each record
 /// through `visit`. The file is not modified: see [`recover`].
 pub(crate) fn replay<C: FrameCodec>(

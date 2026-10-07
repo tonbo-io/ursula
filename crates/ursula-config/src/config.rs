@@ -29,17 +29,20 @@ pub enum WalBackend {
 
 /// When appends to the Raft WAL journal reach stable storage.
 ///
-/// Votes, the per-group `initialized` flags and the node's run state are
-/// always written with `fsync`, whatever this policy says.
+/// Votes, the per-group log states and the node's run state are always
+/// written with `fsync`, whatever this policy says. The memory WAL ignores
+/// the policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WalFsync {
     /// Acknowledge a batch of appends only after it is `fsync`ed.
-    #[default]
     Always,
     /// Acknowledge appends once they reach the page cache. A process crash
-    /// loses nothing; a host crash can lose the unsynced tail, which the
-    /// replica then has to recover from its peers.
+    /// loses nothing. A host crash can lose the replica's unsynced tail: the
+    /// replica then stays out of elections until it has caught up from the
+    /// group's leader, and a group whose majority lost it stops until an
+    /// operator accepts the loss.
+    #[default]
     Never,
 }
 
@@ -169,18 +172,13 @@ pub struct RaftConfig {
     /// each entry's voters must be a non-empty subset of `peers`.
     #[serde(default)]
     pub groups: Vec<RaftGroupConfig>,
-    /// How long a restarting disk-WAL node with S3 snapshots and an empty
-    /// log directory waits to observe an already-established (or freshly
-    /// re-elected) leader before deciding the group is truly new and
-    /// bootstrapping it. Must exceed the election window. A memory-WAL node
-    /// asks every voter instead and initializes only when all are empty.
-    pub rejoin_probe: HumanDuration,
-    /// Timeout for probing static peers during bootstrap before logging a
-    /// warning. Continues retrying indefinitely.
+    /// How often a group's initializer that holds nothing of the group logs
+    /// that it still waits for every voter to report an empty group before
+    /// it initializes the group. It keeps probing indefinitely.
     pub bootstrap_peer_probe: HumanDuration,
-    /// Interval between static-peer reachability probes during bootstrap.
+    /// Interval between bootstrap probes of the other voters.
     pub bootstrap_peer_probe_interval: HumanDuration,
-    /// gRPC connect timeout when probing static peers.
+    /// Timeout of one bootstrap probe of another voter.
     pub bootstrap_peer_connect: HumanDuration,
     /// OpenRaft's `install_snapshot_timeout` covers the whole FullSnapshot RPC.
     /// The receiver downloads and installs the referenced object before
@@ -234,7 +232,6 @@ impl Default for RaftConfig {
             wal: WalConfig::default(),
             peers: Vec::new(),
             groups: Vec::new(),
-            rejoin_probe: HumanDuration::sec(6),
             bootstrap_peer_probe: HumanDuration::sec(60),
             bootstrap_peer_probe_interval: HumanDuration::milli(250),
             bootstrap_peer_connect: HumanDuration::milli(500),
@@ -261,10 +258,6 @@ pub struct WalConfig {
     /// Directory for on-disk WAL files. Required when `backend` is `Disk`.
     pub path: Option<PathBuf>,
     /// When journal appends reach stable storage (`Disk` backend only).
-    ///
-    /// The default is `always` until replicas that may have lost
-    /// acknowledged appends rejoin through a recovery gate; `never` then
-    /// becomes the default.
     pub fsync: WalFsync,
     /// Reject writes and mark the node unready below this many available bytes.
     /// Zero disables disk-pressure admission.
@@ -295,7 +288,7 @@ impl Default for WalConfig {
         Self {
             backend: WalBackend::Memory,
             path: None,
-            fsync: WalFsync::Always,
+            fsync: WalFsync::Never,
             min_available_size: HumanSize::mib(512),
             resume_available_size: HumanSize::gib(1),
             allow_volatile_multi_peer: false,

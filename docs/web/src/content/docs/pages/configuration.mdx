@@ -58,7 +58,7 @@ Without `server.cluster_listen`, `server.listen` serves both client/API and Raft
 | `raft.group_count` | `core_count × 16` | Total Raft groups. Higher values improve stream-to-group hash spread |
 | `raft.wal.backend` | `memory` | `memory` (volatile, survives no restart) or `disk` (durable, required for clusters) |
 | `raft.wal.path` | none | Required for `backend = "disk"`. Raft logs live under `PATH/raft-log`, and removing the directory wipes state cleanly |
-| `raft.wal.fsync` | `always` | When journal appends reach stable storage with `backend = "disk"`. `always` acknowledges a batch after `fsync`. `never` acknowledges once the write is in the page cache. Votes and the node's run state are always written with `fsync` |
+| `raft.wal.fsync` | `never` | When journal appends reach stable storage with `backend = "disk"`. `never` acknowledges once the write is in the page cache. `always` acknowledges a batch after `fsync`. Votes, each group's log state and the node's run state are always written with `fsync`. The memory WAL ignores it |
 | `raft.wal.min_available_size` | `512MiB` | Reject writes and mark `/__ursula/ready` unavailable below this much free WAL-filesystem space. `0` disables the guard |
 | `raft.wal.resume_available_size` | `1GiB` | Free space required before disk-pressure admission clears. Must exceed the minimum |
 | `raft.wal.allow_volatile_multi_peer` | `false` | Explicit development/benchmark/chaos opt-in required for more than one peer with a memory WAL |
@@ -73,9 +73,16 @@ With `fsync = "never"`, a process crash loses nothing because the page cache
 survives it, and a graceful shutdown `fsync`s every journal before it exits. A
 host crash or power loss can drop the unsynced tail of that replica's journal.
 The replica restarts from the frames that still verify and reports that it is
-recovering. The other voters still hold every acknowledged write. The default
-stays `always` until such a replica rejoins through a recovery gate, and then
-changes to `never`. `never` requires `backend = "disk"`.
+recovering. Each of its groups stays behind a recovery gate: it does not
+campaign or vote until it has applied a fresh barrier from the group's leader,
+so it never helps elect a leader that lacks a write it acknowledged. While at
+most a minority of a group's voters lost their tail, the other voters hold
+every acknowledged write and the group keeps serving. If a majority lost it at
+once, the group has no leader and refuses writes until an operator accepts the
+loss (see [Operations](/docs/operations#recovering-after-a-host-crash)).
+
+With `fsync = "always"`, a host crash loses no acknowledged write. Every batch
+waits for an `fsync`, which costs write latency.
 
 ## Cold storage
 

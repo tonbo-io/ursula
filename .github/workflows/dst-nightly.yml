@@ -136,6 +136,16 @@ jobs:
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
             external_locators_survive --nocapture
 
+      # Recovery-gate scenarios beyond the PR subset that ci.yml's DST job
+      # runs: same tests, larger seed ranges.
+      - name: Run recovery-gate scenarios (nightly ranges)
+        env:
+          MEMORY_WAL_REJOIN_SEEDS: "1..=40"
+          RECOVERY_GATE_SEEDS: "1..=24"
+        run: |
+          RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
+            memory_wal_ recovery_tests --nocapture
+
       - name: Write simulation result summary
         if: always()
         run: python3 -m scripts.dst result-summary

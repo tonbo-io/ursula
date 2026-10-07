@@ -695,7 +695,9 @@ fn run_with_madsim<T>(seed: u64, workload: impl Future<Output = T>) -> T {
 pub(super) fn sim_network_policy() -> InProcessRaftNetworkPolicy {
     let policy = InProcessRaftNetworkPolicy::default();
     policy.set_observer(|event| {
-        SimTrace::record(sim_event_from_network_event(event));
+        if let Some(event) = sim_event_from_network_event(event) {
+            SimTrace::record(event);
+        }
     });
     policy
 }

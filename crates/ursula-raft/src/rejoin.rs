@@ -1,43 +1,66 @@
-//! Memory-WAL rejoin: a replica that restarted with an empty Raft log
-//! heals itself, and never votes before it holds the group's log again.
+//! The recovery gate: a replica whose Raft log may be missing entries it
+//! acknowledged never helps elect a leader that lacks them, and rejoins once
+//! it holds the group's log again.
 //!
-//! A memory-WAL replica loses its Raft log when its process restarts. Three
-//! server-side pieces protect acknowledged writes. Recovery uses a fresh
-//! outbound ReadIndex proof; replicated commands and persisted formats are
-//! unchanged. During a rolling upgrade, the probe can use the 0.6.2 read and
-//! vote RPCs until every peer supports the explicit recovery-barrier RPC.
+//! A replica can lose acknowledged entries in three ways: a memory-WAL
+//! process restarts with an empty log; a disk-WAL host crashes under
+//! `raft.wal.fsync = never` (or a journal I/O failure poisons it) and keeps
+//! only the verified prefix of its journal; or its journal is wiped or
+//! replaced. The same pieces cover every case, on either log store.
 //!
-//! - **Bootstrap decision** ([`bootstrap_decision`]): a group's initializer
-//!   runs `Initialize` only when every configured voter answers a probe
-//!   `Vote` with an empty log and no leader. The probe carries the lowest
-//!   possible vote (term 0, the prober's id) and no log. A peer that holds
-//!   the group refuses it; a peer with no vote yet may grant it, which only
-//!   records a term-0 vote that `Initialize` overwrites and that never
-//!   counts as initialized. One peer that holds committed entries or
-//!   follows a leader means the group exists: the replica waits to be
-//!   replicated to instead of founding a second group.
-//! - **Vote gate** ([`VoteGate`]): from start until it holds the log that a
-//!   leader confirmed in a fresh post-start ReadIndex round, the replica
-//!   refuses every candidate whose log is non-empty, and every candidate
-//!   once it has seen that the group has committed entries. A fresh group's
-//!   first election (candidates whose log is only the membership entry at
-//!   index 0) goes through untouched.
+//! - **Entering the gate** ([`GroupRejoin`]): a memory-WAL replica always
+//!   starts gated. A disk-WAL replica starts gated when its durable log state
+//!   ([`GroupLogState`]) says `Recovering` (the node started after a host
+//!   crash or an I/O failure, a previous run left the group recovering, or
+//!   the journal lost the log of an initialized group) or `Empty` (it never
+//!   held the group here, or held it on a disk it lost). An empty replica's
+//!   first entry records the group `Recovering` while the gate is closed, so
+//!   a restart before the gate opens comes back gated.
+//! - **While gated** ([`VoteGate`]): the replica does not campaign and does
+//!   not take a leadership transfer. A disk-WAL replica that led the group
+//!   starts as a follower instead of restoring its leadership, which would
+//!   append new entries under the log ids of the ones it lost. It refuses
+//!   every vote once it knows the group holds entries: its log state says so,
+//!   a leader reported a commit index of 1 or more, or a candidate's log
+//!   reached index 1. Before that a new group's first election (candidates
+//!   whose log is only the membership entry at index 0) goes through. It
+//!   still accepts appends from any leader whose vote is not lower than its
+//!   persisted vote; the disk WAL restores that vote before the Raft core
+//!   starts, so a leader of an older term is refused.
+//! - **Opening the gate** ([`run_rejoin_vote_barrier`]): the replica asks
+//!   the current leader for a fresh outbound ReadIndex barrier and opens the
+//!   gate once it has applied the barrier's committed index. Inbound
+//!   replication alone never opens it: it may have been delayed across the
+//!   restart. A disk-WAL replica records the open gate (`Initialized`) before
+//!   it votes again. Then the node's election policy is refreshed.
 //! - **Self-heal** ([`run_rejoin_heal`]): a leader whose follower answers
 //!   `Conflict` at or below the index that follower had already matched in
-//!   this leadership knows the follower lost its log. OpenRaft never rewinds
+//!   this leadership knows the follower lost entries. OpenRaft never rewinds
 //!   that progress, so the network layer hands OpenRaft an error instead of
 //!   the conflict, and the leader rebuilds the follower the way `ursulactl
 //!   repair-restarted-voter` does: remove the voter, add it back as a
 //!   learner, wait for catch-up, promote. Every step is read off the current
 //!   membership, so a leader change, a second restart or `ursulactl` doing
-//!   the same repair at the same time all converge.
+//!   the same repair at the same time all converge. When the followers that
+//!   lost entries are a majority, no removal can commit; the leader holds
+//!   every committed entry, so it rewinds their replication instead and
+//!   sends them its log again (an idle group gets an unchanged membership
+//!   entry to carry the rewind).
+//! - **Bootstrap** ([`run_group_bootstrap`]): a group's initializer whose
+//!   replica holds nothing of the group runs `Initialize` only when every
+//!   configured voter answers a probe `Vote` with an empty log and no
+//!   leader. The probe carries the lowest possible vote (term 0, the
+//!   prober's id) and no log. A peer that holds the group refuses it; a peer
+//!   with no vote yet may grant it, which only records a term-0 vote that
+//!   `Initialize` overwrites. A disk-WAL replica that ever held the group
+//!   never runs `Initialize`.
 //!
-//! A group whose majority restarted empty has no quorum of healthy voters:
-//! the leader never removes a voter then, and the empty replicas never vote
-//! for a candidate. The group stops accepting writes until an operator picks
-//! the survivor ([`GroupRejoin::adopt_survivor`]). A group whose every voter
-//! restarted empty is stopped by its "initialized" marker in object storage
-//! instead (`crate::restart_guard`).
+//! If a majority of a group's voters are gated, no leader can confirm a
+//! barrier: the group has no leader and refuses writes, and its gated
+//! replicas report it ([`RecoveryGateStatus::Stalled`]). An operator who
+//! accepts the loss of the unsynced tail opens the gate on enough replicas
+//! ([`GroupRejoin::accept_unsynced_loss`]); a normal election then needs a
+//! candidate whose log is at least as long as each of theirs.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -47,6 +70,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::PoisonError;
+use std::sync::Weak;
 use std::time::Duration;
 
 use openraft::BasicNode;
@@ -57,12 +81,15 @@ use openraft::alias::LogIdOf;
 use openraft::rt::WatchReceiver;
 use openraft::type_config::alias::WatchReceiverOf;
 use openraft::vote::RaftLeaderId;
+use serde::Deserialize;
+use serde::Serialize;
 use ursula_shard::RaftGroupId;
 
+use crate::log_store::CoreJournalError;
+use crate::log_store::GroupLogState;
+use crate::log_store::RaftGroupFileLogStore;
 use crate::registry::RaftGroupHandle;
 use crate::registry::RaftGroupHandleRegistry;
-use crate::restart_guard::InitMarkerStore;
-use crate::restart_guard::RestartGuard;
 use crate::types::UrsulaAppendEntriesRequest;
 use crate::types::UrsulaAppendEntriesResponse;
 use crate::types::UrsulaRaftTypeConfig;
@@ -74,6 +101,11 @@ type MetricsReceiver = WatchReceiverOf<UrsulaRaftTypeConfig, RaftMetrics<UrsulaR
 
 /// How often the leader-side heal driver re-reads its group.
 pub const REJOIN_HEAL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long a gated replica goes without a leader barrier and without
+/// applying anything before it reports its group stalled: a majority of the
+/// group's voters may be gated, and the group waits for an operator.
+pub const RECOVERY_STALL_AFTER: Duration = Duration::from_secs(30);
 
 /// How long one membership step of the heal driver may take.
 const REJOIN_HEAL_STEP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -105,110 +137,167 @@ pub(crate) enum VoteScreen {
 
 /// The catch-up point from a fresh outbound quorum-confirmed probe. The legacy
 /// RPC bridge uses the leader's last log as a conservative bound.
-#[derive(Debug, Clone)]
-struct CatchUpTarget {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatchUpTarget {
     leader: UrsulaVote,
     commit_index: u64,
 }
 
-/// Per-group vote gate of a memory-WAL replica (pure state; see the module
-/// docs).
-#[derive(Debug, Default)]
-pub(crate) struct VoteGate {
-    open: bool,
-    /// The group has committed entries somewhere: a leader reported a
-    /// commit index of 1 or more, or a candidate's log reached index 1.
-    initialized_seen: bool,
-    catch_up: Option<CatchUpTarget>,
-    /// Operator recovery: the one candidate this replica may vote for while
-    /// it is still behind.
-    released_for: Option<u64>,
+/// What a gated replica knows about its group's history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GroupEvidence {
+    /// Nothing yet: a new group's first election may still need this
+    /// replica's vote.
+    Unknown,
+    /// The group holds entries: every candidate is refused.
+    Initialized,
+}
+
+/// How far a gated replica got towards opening its gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GateRecovery {
+    /// No leader has confirmed a barrier yet.
+    AwaitingBarrier,
+    /// No leader confirmed a barrier and nothing was applied for a long
+    /// time: a majority of the group's voters may be gated, and the group
+    /// waits for an operator.
+    Stalled,
+    /// A leader confirmed `target`; the replica catches up to it.
+    CatchingUp(CatchUpTarget),
+}
+
+/// Per-group vote gate (pure state; see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VoteGate {
+    /// The replica holds every entry it acknowledged: it votes and
+    /// campaigns.
+    Open,
+    /// The replica may be missing entries it acknowledged.
+    Closed {
+        group: GroupEvidence,
+        recovery: GateRecovery,
+    },
+}
+
+/// A group's recovery gate on this replica, as status reports show it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryGateStatus {
+    /// The replica votes and campaigns.
+    Open,
+    /// Gated; no leader has confirmed a barrier yet.
+    AwaitingBarrier,
+    /// Gated, and for [`RECOVERY_STALL_AFTER`] no leader confirmed a barrier
+    /// and nothing was applied: the group waits for an operator to accept
+    /// the loss of the unsynced tail.
+    Stalled,
+    /// Gated; a leader confirmed a barrier and the replica catches up.
+    CatchingUp,
 }
 
 impl VoteGate {
-    pub(crate) fn is_open(&self) -> bool {
-        self.open
+    pub(crate) fn closed(group: GroupEvidence) -> Self {
+        Self::Closed {
+            group,
+            recovery: GateRecovery::AwaitingBarrier,
+        }
     }
 
-    /// Record an inbound AppendEntries from `leader`.
-    pub(crate) fn observe_append(&mut self, _leader: &UrsulaVote, leader_commit: Option<u64>) {
-        if self.open {
-            return;
+    pub(crate) fn is_open(&self) -> bool {
+        matches!(self, Self::Open)
+    }
+
+    pub(crate) fn status(&self) -> RecoveryGateStatus {
+        match self {
+            Self::Open => RecoveryGateStatus::Open,
+            Self::Closed { recovery, .. } => match recovery {
+                GateRecovery::AwaitingBarrier => RecoveryGateStatus::AwaitingBarrier,
+                GateRecovery::Stalled => RecoveryGateStatus::Stalled,
+                GateRecovery::CatchingUp(_) => RecoveryGateStatus::CatchingUp,
+            },
         }
-        if leader_commit.is_some_and(|index| index >= 1) {
-            self.initialized_seen = true;
+    }
+
+    /// Record an inbound AppendEntries that carried `leader_commit`.
+    pub(crate) fn observe_append(&mut self, leader_commit: Option<u64>) {
+        if let Self::Closed { group, .. } = self
+            && leader_commit.is_some_and(|index| index >= 1)
+        {
+            *group = GroupEvidence::Initialized;
         }
     }
 
     /// Only this process's outbound recovery probe may establish a catch-up
     /// target. Inbound replication may have been delayed across the restart.
     pub(crate) fn confirm_barrier(&mut self, leader: UrsulaVote, commit_index: u64) {
-        if self.open || !leader.is_committed() {
+        let Self::Closed { group, recovery } = self else {
+            return;
+        };
+        if !leader.is_committed() {
             return;
         }
-        self.initialized_seen |= commit_index >= 1;
-        let newer_leader = match &self.catch_up {
-            None => true,
-            Some(target) => leader > target.leader,
-        };
-        if newer_leader {
-            self.catch_up = Some(CatchUpTarget {
-                leader,
-                commit_index,
-            });
-        } else if let Some(target) = &mut self.catch_up
-            && target.leader == leader
-        {
-            target.commit_index = target.commit_index.max(commit_index);
+        if commit_index >= 1 {
+            *group = GroupEvidence::Initialized;
+        }
+        match recovery {
+            GateRecovery::CatchingUp(target) if target.leader == leader => {
+                target.commit_index = target.commit_index.max(commit_index);
+            }
+            // A deposed (or incomparable) leader does not move the target.
+            GateRecovery::CatchingUp(target)
+                if leader.partial_cmp(&target.leader) != Some(std::cmp::Ordering::Greater) => {}
+            GateRecovery::AwaitingBarrier | GateRecovery::Stalled | GateRecovery::CatchingUp(_) => {
+                *recovery = GateRecovery::CatchingUp(CatchUpTarget {
+                    leader,
+                    commit_index,
+                });
+            }
         }
     }
 
-    fn allow_fresh_bootstrap(&mut self) {
-        self.open = true;
-    }
-
-    /// Open the gate if the replica has caught up.
-    pub(crate) fn refresh(&mut self, local: LocalReplica) {
-        if !self.open && self.caught_up(local) {
-            self.open = true;
+    /// No barrier and no progress for long enough: report the group
+    /// stalled. A target that led nowhere for that long is dropped; the next
+    /// barrier sets a new one. Returns whether the gate just stalled.
+    pub(crate) fn stall(&mut self) -> bool {
+        match self {
+            Self::Closed { recovery, .. } if *recovery != GateRecovery::Stalled => {
+                *recovery = GateRecovery::Stalled;
+                true
+            }
+            Self::Open | Self::Closed { .. } => false,
         }
     }
 
-    fn caught_up(&self, local: LocalReplica) -> bool {
-        self.catch_up.as_ref().is_some_and(|target| {
-            local
-                .last_applied
-                .is_some_and(|applied| applied >= target.commit_index)
-        })
+    /// Whether the replica applied the barrier it was given.
+    pub(crate) fn caught_up(&self, local: LocalReplica) -> bool {
+        match self {
+            Self::Open => true,
+            Self::Closed { recovery, .. } => match recovery {
+                GateRecovery::CatchingUp(target) => local
+                    .last_applied
+                    .is_some_and(|applied| applied >= target.commit_index),
+                GateRecovery::AwaitingBarrier | GateRecovery::Stalled => false,
+            },
+        }
     }
 
-    /// Decide one vote request from `candidate`, whose last log index is
+    pub(crate) fn open(&mut self) {
+        *self = Self::Open;
+    }
+
+    /// Decide one vote request whose candidate's last log index is
     /// `candidate_last_log_index`.
-    pub(crate) fn screen(
-        &mut self,
-        candidate: u64,
-        candidate_last_log_index: Option<u64>,
-        local: LocalReplica,
-    ) -> VoteScreen {
-        self.refresh(local);
-        if self.open {
+    pub(crate) fn screen(&mut self, candidate_last_log_index: Option<u64>) -> VoteScreen {
+        let Self::Closed { group, .. } = self else {
             return VoteScreen::Pass;
-        }
-        if self.released_for == Some(candidate) {
-            return VoteScreen::Pass;
-        }
+        };
         if candidate_last_log_index.is_some_and(|index| index >= 1) {
-            self.initialized_seen = true;
-            return VoteScreen::Refuse;
+            *group = GroupEvidence::Initialized;
         }
-        if self.initialized_seen {
-            return VoteScreen::Refuse;
+        match group {
+            GroupEvidence::Unknown => VoteScreen::Pass,
+            GroupEvidence::Initialized => VoteScreen::Refuse,
         }
-        VoteScreen::Pass
-    }
-
-    fn release_for(&mut self, candidate: u64) {
-        self.released_for = Some(candidate);
     }
 }
 
@@ -218,15 +307,25 @@ impl VoteGate {
 struct RevertedFollowers {
     leader: Option<UrsulaVote>,
     targets: BTreeSet<u64>,
-    /// Operator-authorized rewinds, until Raft replication metrics show the
+    /// Rewinds this leader allowed, until Raft replication metrics show the
     /// old matched point was reset. ReadIndex also sends Append RPCs; its
     /// Conflict confirms leadership but does not reset replication progress.
-    /// Consuming permission on that response would strand operator recovery.
+    /// Consuming the allowance on that response would strand the rewind.
     allowed_reverts: BTreeMap<u64, u64>,
 }
 
 impl RevertedFollowers {
-    fn operator_reset_pending(
+    /// The rewinds `leader` allowed, by target, with the index each target
+    /// had matched.
+    fn allowed(&self, leader: &UrsulaVote) -> BTreeMap<u64, u64> {
+        if self.leader.as_ref() == Some(leader) {
+            self.allowed_reverts.clone()
+        } else {
+            BTreeMap::new()
+        }
+    }
+
+    fn rewind_pending(
         &mut self,
         target: u64,
         leader: &UrsulaVote,
@@ -242,7 +341,7 @@ impl RevertedFollowers {
         };
         // A fast rebuild can reset and advance metrics between our samples.
         // A successful RPC through the former matched point also ends the
-        // authorization, so a second loss never inherits this override.
+        // allowance, so a second loss never inherits it.
         if matched.is_none_or(|matched| matched < previous)
             || confirmed.is_some_and(|confirmed| confirmed >= previous)
         {
@@ -254,15 +353,74 @@ impl RevertedFollowers {
     }
 }
 
-/// One memory-WAL replica's rejoin state for one group: the inbound vote
-/// gate and, while it leads, the followers it saw lose their log.
+/// Where a gate records that it opened.
+#[derive(Debug)]
+enum GateLog {
+    /// The memory log store: nothing survives a restart.
+    Volatile,
+    /// The disk log store, which keeps the group's log state. Weak, so a
+    /// stopped group's store closes even while its gate is still registered.
+    Durable(Weak<RaftGroupFileLogStore>),
+}
+
+/// Why a gate opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateOpening {
+    /// The replica applied a fresh leader barrier.
+    CaughtUp,
+    /// Every voter reported an empty group: this replica initializes it.
+    FreshBootstrap,
+    /// An operator accepted the loss of the unsynced tail.
+    AcceptedLoss,
+}
+
+/// What [`GroupRejoin::accept_unsynced_loss`] did on one replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptUnsyncedLossOutcome {
+    /// The gate was closed and is now open: the replica votes and campaigns
+    /// with the log it holds.
+    GateOpened,
+    /// The gate was already open.
+    AlreadyOpen,
+}
+
+/// The answer of `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`
+/// on one node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptUnsyncedLossReport {
+    pub raft_group_id: u32,
+    pub node_id: u64,
+    pub outcome: AcceptUnsyncedLossOutcome,
+    /// The last log index this replica holds; an election prefers the
+    /// longest log among the replicas whose gates are open.
+    pub last_log_index: Option<u64>,
+}
+
+/// Failure to open a recovery gate.
+#[derive(Debug, thiserror::Error)]
+pub enum RecoveryGateError {
+    #[error("raft group {} is not registered on this node", .raft_group_id.0)]
+    NotRegistered { raft_group_id: RaftGroupId },
+    #[error("raft group {} has stopped: its log store is closed", .raft_group_id.0)]
+    StoreClosed { raft_group_id: RaftGroupId },
+    #[error("record that raft group {}'s recovery gate opened: {source}", .raft_group_id.0)]
+    Record {
+        raft_group_id: RaftGroupId,
+        #[source]
+        source: CoreJournalError,
+    },
+}
+
+/// One replica's recovery state for one group: the inbound vote gate and,
+/// while it leads, the followers it saw lose entries.
 pub struct GroupRejoin {
     node_id: u64,
     raft_group_id: RaftGroupId,
     metrics: OnceLock<MetricsReceiver>,
     gate: Mutex<VoteGate>,
     reverted: Mutex<RevertedFollowers>,
-    restart_guard: RestartGuard,
+    log: GateLog,
 }
 
 impl fmt::Debug for GroupRejoin {
@@ -271,47 +429,91 @@ impl fmt::Debug for GroupRejoin {
             .field("node_id", &self.node_id)
             .field("raft_group_id", &self.raft_group_id)
             .field("bound", &self.metrics.get().is_some())
+            .field("status", &self.status())
             .finish_non_exhaustive()
     }
 }
 
 impl GroupRejoin {
-    pub fn new(node_id: u64, raft_group_id: RaftGroupId) -> Self {
+    fn new(node_id: u64, raft_group_id: RaftGroupId, gate: VoteGate, log: GateLog) -> Self {
         Self {
             node_id,
             raft_group_id,
             metrics: OnceLock::new(),
-            gate: Mutex::new(VoteGate::default()),
+            gate: Mutex::new(gate),
             reverted: Mutex::new(RevertedFollowers::default()),
-            restart_guard: RestartGuard::new(raft_group_id, None),
+            log,
         }
     }
 
-    /// Keep the group's "initialized" marker in `store` (object storage), so
-    /// a restart of every voter stops the group instead of re-initializing
-    /// it (see `crate::restart_guard`).
-    pub fn with_init_markers(mut self, store: Option<Arc<dyn InitMarkerStore>>) -> Self {
-        self.restart_guard = RestartGuard::new(self.raft_group_id, store);
-        self
+    /// The gate of a memory-WAL replica, which starts every run with an empty
+    /// log: closed, with the group's history unknown.
+    pub fn volatile(node_id: u64, raft_group_id: RaftGroupId) -> Self {
+        Self::new(
+            node_id,
+            raft_group_id,
+            VoteGate::closed(GroupEvidence::Unknown),
+            GateLog::Volatile,
+        )
+    }
+
+    /// The gate of a disk-WAL replica, from the group's durable log state in
+    /// `store`. Create it before the group's Raft core starts.
+    pub fn durable(
+        node_id: u64,
+        raft_group_id: RaftGroupId,
+        store: &Arc<RaftGroupFileLogStore>,
+    ) -> Self {
+        let gate = match store.log_state() {
+            GroupLogState::Initialized => VoteGate::Open,
+            GroupLogState::Recovering => {
+                tracing::warn!(
+                    node_id,
+                    raft_group_id = raft_group_id.0,
+                    "recovery gate: this replica may be missing Raft log entries it \
+                     acknowledged; it stays out of elections until it has applied a fresh \
+                     leader barrier"
+                );
+                store.start_as_follower(node_id);
+                VoteGate::closed(GroupEvidence::Initialized)
+            }
+            GroupLogState::Empty => {
+                tracing::debug!(
+                    node_id,
+                    raft_group_id = raft_group_id.0,
+                    "recovery gate: this replica holds nothing of the group yet; it joins only a \
+                     new group's first election until it has applied a leader barrier"
+                );
+                store.hold_unknown_history();
+                VoteGate::closed(GroupEvidence::Unknown)
+            }
+        };
+        Self::new(
+            node_id,
+            raft_group_id,
+            gate,
+            GateLog::Durable(Arc::downgrade(store)),
+        )
     }
 
     pub fn raft_group_id(&self) -> RaftGroupId {
         self.raft_group_id
     }
 
-    /// The group's full-restart guard.
-    pub fn restart_guard(&self) -> &RestartGuard {
-        &self.restart_guard
+    fn gate(&self) -> std::sync::MutexGuard<'_, VoteGate> {
+        self.gate.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Attach the group's Raft metrics. Call once the Raft exists and before
     /// it is reachable from the network.
     pub fn bind(&self, raft: &RaftGroupHandle) {
-        raft.runtime_config().elect(false);
+        if !self.vote_gate_open() {
+            raft.runtime_config().elect(false);
+        }
         if self.metrics.set(raft.metrics()).is_err() {
             tracing::warn!(
                 raft_group_id = self.raft_group_id.0,
-                "memory-WAL rejoin metrics were already bound"
+                "recovery gate metrics were already bound"
             );
         }
     }
@@ -322,55 +524,140 @@ impl GroupRejoin {
             .map(|metrics| metrics.borrow_watched().clone())
     }
 
-    /// Whether the vote gate is open: the replica caught up once.
+    /// Whether the vote gate is open.
     pub fn vote_gate_open(&self) -> bool {
-        let local = self.metrics().map(|metrics| local_replica(&metrics));
-        let mut gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(local) = local {
-            gate.refresh(local);
-        }
-        gate.is_open()
+        self.gate().is_open()
     }
 
-    /// Called only after every peer was proven empty and the initialized
-    /// marker was absent (or the operator explicitly accepted data loss).
-    pub(crate) fn allow_fresh_bootstrap(&self) {
-        self.gate
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .allow_fresh_bootstrap();
+    /// The gate as status reports show it.
+    pub fn status(&self) -> RecoveryGateStatus {
+        self.gate().status()
+    }
+
+    /// Whether this replica ever held the group's log, as far as it knows:
+    /// a disk-WAL replica that did never runs `Initialize` again.
+    pub fn holds_group_history(&self) -> bool {
+        match &self.log {
+            GateLog::Volatile => false,
+            GateLog::Durable(store) => store
+                .upgrade()
+                .is_some_and(|store| store.log_state().is_initialized()),
+        }
     }
 
     pub(crate) fn confirm_barrier(&self, leader: UrsulaVote, commit_index: u64) {
-        self.gate
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .confirm_barrier(leader, commit_index);
+        self.gate().confirm_barrier(leader, commit_index);
     }
 
-    /// Campaigning is subject to both this barrier and the node's shed policy.
+    /// Campaigning is subject to both this gate and the node's shed policy.
     pub(crate) fn may_campaign(&self) -> bool {
         self.vote_gate_open()
-            || self
-                .gate
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .released_for
-                == Some(self.node_id)
+    }
+
+    /// Opens the gate, recording it first on a disk-WAL replica.
+    async fn open(&self, why: GateOpening) -> Result<(), RecoveryGateError> {
+        if let GateLog::Durable(store) = &self.log {
+            let store = store.upgrade().ok_or(RecoveryGateError::StoreClosed {
+                raft_group_id: self.raft_group_id,
+            })?;
+            store
+                .record_recovered()
+                .await
+                .map_err(|source| RecoveryGateError::Record {
+                    raft_group_id: self.raft_group_id,
+                    source,
+                })?;
+        }
+        self.gate().open();
+        match why {
+            GateOpening::CaughtUp => tracing::info!(
+                node_id = self.node_id,
+                raft_group_id = self.raft_group_id.0,
+                "recovery gate opened: this replica applied a fresh leader barrier"
+            ),
+            GateOpening::FreshBootstrap => tracing::info!(
+                node_id = self.node_id,
+                raft_group_id = self.raft_group_id.0,
+                "recovery gate opened: every voter reported an empty group"
+            ),
+            GateOpening::AcceptedLoss => tracing::warn!(
+                node_id = self.node_id,
+                raft_group_id = self.raft_group_id.0,
+                "recovery gate opened by an operator who accepted the loss of the unsynced \
+                 tail; this replica votes with the log it holds"
+            ),
+        }
+        Ok(())
+    }
+
+    /// Opens the gate once the replica has applied its barrier. Returns
+    /// whether the gate is open.
+    pub(crate) async fn try_open(&self) -> Result<bool, RecoveryGateError> {
+        let Some(metrics) = self.metrics() else {
+            return Ok(self.vote_gate_open());
+        };
+        {
+            let gate = self.gate();
+            if gate.is_open() {
+                return Ok(true);
+            }
+            if !gate.caught_up(local_replica(&metrics)) {
+                return Ok(false);
+            }
+        }
+        self.open(GateOpening::CaughtUp).await?;
+        Ok(true)
+    }
+
+    /// Called only after every peer was proven empty: this replica
+    /// initializes the group.
+    pub(crate) async fn allow_fresh_bootstrap(&self) -> Result<(), RecoveryGateError> {
+        if self.vote_gate_open() {
+            return Ok(());
+        }
+        self.open(GateOpening::FreshBootstrap).await
+    }
+
+    /// Operator recovery when a majority of the group's voters are gated:
+    /// accept that this replica may be missing entries it acknowledged and
+    /// open its gate, so it votes and campaigns with the log it holds. A
+    /// disk-WAL replica records the open gate. Elections are refreshed by
+    /// the caller ([`RaftGroupHandleRegistry::accept_unsynced_loss`]).
+    pub async fn accept_unsynced_loss(
+        &self,
+    ) -> Result<AcceptUnsyncedLossOutcome, RecoveryGateError> {
+        if self.vote_gate_open() {
+            return Ok(AcceptUnsyncedLossOutcome::AlreadyOpen);
+        }
+        self.open(GateOpening::AcceptedLoss).await?;
+        Ok(AcceptUnsyncedLossOutcome::GateOpened)
+    }
+
+    /// Returns whether the gate just stalled.
+    fn stall(&self) -> bool {
+        let stalled = self.gate().stall();
+        if stalled {
+            tracing::error!(
+                node_id = self.node_id,
+                raft_group_id = self.raft_group_id.0,
+                "recovery gate: no leader confirmed a barrier for this gated replica and it \
+                 applied nothing; a majority of the group's voters may be gated, so the group \
+                 has no leader and refuses writes. To accept the loss of writes acknowledged \
+                 after the last fsync, run POST /__ursula/raft/{}/recovery/accept-unsynced-loss \
+                 on the gated replicas with the longest logs until a leader is elected",
+                self.raft_group_id.0
+            );
+        }
+        stalled
     }
 
     /// Follower side: screen an inbound vote request. `Some` is the refusal
     /// to send back instead of handing the request to OpenRaft.
     pub fn screen_vote(&self, request: &UrsulaVoteRequest) -> Option<UrsulaVoteResponse> {
         let metrics = self.metrics()?;
-        let local = local_replica(&metrics);
         let candidate = *request.vote.leader_id().node_id();
         let candidate_index = log_index(request.last_log_id.as_ref());
-        let screen = self
-            .gate
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .screen(candidate, candidate_index, local);
+        let screen = self.gate().screen(candidate_index);
         match screen {
             VoteScreen::Pass => None,
             VoteScreen::Refuse => {
@@ -379,24 +666,31 @@ impl GroupRejoin {
                     raft_group_id = self.raft_group_id.0,
                     candidate,
                     candidate_last_log_index = ?candidate_index,
-                    last_applied = ?local.last_applied,
-                    "memory-WAL rejoin: refusing a vote until this replica has caught up"
+                    last_applied = ?metrics.last_applied.as_ref().map(|log_id| log_id.index()),
+                    "recovery gate: refusing a vote until this replica has caught up"
                 );
                 Some(UrsulaVoteResponse::new(
                     metrics.vote,
-                    metrics.last_applied,
+                    self.last_log_id().or(metrics.last_applied),
                     false,
                 ))
             }
         }
     }
 
+    /// The last entry a disk-WAL replica holds, which a refusal reports so
+    /// that a bootstrap probe sees the group exists here.
+    fn last_log_id(&self) -> Option<LogIdOf<UrsulaRaftTypeConfig>> {
+        match &self.log {
+            GateLog::Volatile => None,
+            GateLog::Durable(store) => store.upgrade()?.last_log_id(),
+        }
+    }
+
     /// Follower side: record an inbound AppendEntries.
     pub fn observe_inbound_append(&self, request: &UrsulaAppendEntriesRequest) {
-        self.gate
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .observe_append(&request.vote, log_index(request.leader_commit.as_ref()));
+        self.gate()
+            .observe_append(log_index(request.leader_commit.as_ref()));
     }
 
     /// Leader side: whether `response` from `target` shows that the target
@@ -430,8 +724,7 @@ impl GroupRejoin {
                 None
             }
         };
-        let operator_reset_pending =
-            reverted.operator_reset_pending(target, leader, matched, confirmed);
+        let rewind_pending = reverted.rewind_pending(target, leader, matched, confirmed);
         if !matches!(response, UrsulaAppendEntriesResponse::Conflict) {
             return false;
         }
@@ -441,8 +734,13 @@ impl GroupRejoin {
         if !matched.is_some_and(|matched| prev <= matched) {
             return false;
         }
-        if operator_reset_pending {
-            return false;
+        // A rewind is handed to OpenRaft only through the conflict of a request
+        // that carried entries, so it ends the replication stream it belongs
+        // to. A heartbeat's conflict would reset the progress under a stream
+        // whose acknowledgements are still on their way, which OpenRaft does
+        // not survive; it stays an error until then.
+        if rewind_pending {
+            return sent_last_log_id.is_none();
         }
         if reverted.leader.as_ref() != Some(leader) {
             reverted.leader = Some(*leader);
@@ -455,8 +753,7 @@ impl GroupRejoin {
                 target,
                 conflict_index = prev,
                 matched_index = ?matched,
-                "memory-WAL rejoin: follower lost Raft log entries it had acknowledged; \
-                 rebuilding it through learner catch-up"
+                "recovery: follower lost Raft log entries it had acknowledged; rebuilding it"
             );
         }
         true
@@ -470,6 +767,15 @@ impl GroupRejoin {
         } else {
             BTreeSet::new()
         }
+    }
+
+    /// The rewinds this replica allowed under `leader`, by target, with the
+    /// index each target had matched.
+    fn allowed_rewinds(&self, leader: &UrsulaVote) -> BTreeMap<u64, u64> {
+        self.reverted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .allowed(leader)
     }
 
     /// Whether `target` lost its log under this replica's current leadership.
@@ -486,88 +792,41 @@ impl GroupRejoin {
             .remove(&target);
     }
 
-    /// Operator recovery after a majority restart, run on every replica of
-    /// the group with the same `survivor`:
-    ///
-    /// - on an empty replica, it lets this replica vote for `survivor` while
-    ///   it is still behind;
-    /// - on the survivor while it leads, it lets OpenRaft rewind its
-    ///   progress for every follower that lost its log, so it replicates
-    ///   them from the start.
-    ///
-    /// Acknowledged writes the survivor does not hold are lost; that is the
-    /// operator's decision.
-    pub async fn adopt_survivor(
+    /// Leader side: let OpenRaft rewind its progress for `targets`, so it
+    /// replicates them from where their logs really end. OpenRaft's one-shot
+    /// permission goes in first; only then do their conflicts reach it.
+    async fn rewind_followers(
         &self,
         raft: &RaftGroupHandle,
-        survivor: u64,
-    ) -> Result<AdoptSurvivorOutcome, String> {
-        if survivor != self.node_id {
-            self.gate
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .release_for(survivor);
-            tracing::warn!(
-                node_id = self.node_id,
-                raft_group_id = self.raft_group_id.0,
-                survivor,
-                "memory-WAL rejoin: operator released the vote gate for the survivor"
-            );
-            return Ok(AdoptSurvivorOutcome::VoteReleased);
-        }
-        let Some(metrics) = self.metrics() else {
-            return Err("group metrics are not bound yet".to_owned());
-        };
-        if metrics.state != ServerState::Leader {
-            self.gate
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .release_for(survivor);
-            return Ok(AdoptSurvivorOutcome::NotLeader);
-        }
-        let targets = self.reverted_followers(&metrics.vote);
-        for target in &targets {
+        targets: &BTreeSet<u64>,
+    ) -> Result<(), String> {
+        let metrics = raft.metrics().borrow_watched().clone();
+        for target in targets {
             raft.trigger()
                 .allow_next_revert(target, true)
                 .await
                 .map_err(|err| format!("allow next revert for node {target}: {err}"))?
                 .map_err(|err| format!("allow next revert for node {target}: {err}"))?;
         }
-        {
-            let mut reverted = self.reverted.lock().unwrap_or_else(PoisonError::into_inner);
-            for target in &targets {
-                reverted.targets.remove(target);
-                if let Some(matched) = metrics
-                    .replication
-                    .as_ref()
-                    .and_then(|replication| replication.get(target))
-                    .and_then(|matched| log_index(matched.as_ref()))
-                {
-                    reverted.allowed_reverts.insert(*target, matched);
-                }
+        let mut reverted = self.reverted.lock().unwrap_or_else(PoisonError::into_inner);
+        if reverted.leader.as_ref() != Some(&metrics.vote) {
+            reverted.leader = Some(metrics.vote);
+            reverted.targets.clear();
+            reverted.allowed_reverts.clear();
+        }
+        for target in targets {
+            reverted.targets.remove(target);
+            if let Some(matched) = metrics
+                .replication
+                .as_ref()
+                .and_then(|replication| replication.get(target))
+                .and_then(|matched| log_index(matched.as_ref()))
+            {
+                reverted.allowed_reverts.insert(*target, matched);
             }
         }
-        tracing::warn!(
-            node_id = self.node_id,
-            raft_group_id = self.raft_group_id.0,
-            followers = ?targets,
-            "memory-WAL rejoin: operator adopted this leader's log; replicating emptied followers from the start"
-        );
-        Ok(AdoptSurvivorOutcome::FollowersReset(targets))
+        Ok(())
     }
-}
-
-/// What [`GroupRejoin::adopt_survivor`] did on one replica.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AdoptSurvivorOutcome {
-    /// This replica may now vote for the survivor.
-    VoteReleased,
-    /// This replica is the survivor and leads: these followers are
-    /// replicated from the start.
-    FollowersReset(BTreeSet<u64>),
-    /// This replica is the survivor but does not lead (it campaigns once the
-    /// other replicas released their vote).
-    NotLeader,
 }
 
 /// What one probed voter reported about a group.
@@ -591,7 +850,7 @@ impl PeerGroupLog {
     }
 }
 
-/// What a memory-WAL initializer does with a group it has no log for.
+/// What an initializer does with a group it holds nothing of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootstrapDecision {
     /// Every voter is empty: a fresh group. Run `Initialize`.
@@ -629,6 +888,109 @@ pub fn bootstrap_probe_vote(node_id: u64) -> UrsulaVoteRequest {
     UrsulaVoteRequest::new(UrsulaVote::new(0, node_id), None)
 }
 
+/// How a group bootstrap ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupBootstrap {
+    /// The group was already initialized when the loop looked.
+    AlreadyInitialized,
+    Initialized,
+    Rejoined,
+    /// The Raft stopped, or `Initialize` failed.
+    Stopped,
+}
+
+/// Membership bootstrap of a group's initializer whose replica holds nothing
+/// of the group. It runs `Initialize` only once every other configured voter
+/// answered that it is empty too and no leader was seen. `probe` asks one
+/// peer (`(id, address)`) with the bootstrap probe vote.
+pub async fn run_group_bootstrap<P, F>(
+    node_id: u64,
+    raft: RaftGroupHandle,
+    rejoin: Arc<GroupRejoin>,
+    nodes: BTreeMap<u64, BasicNode>,
+    probe: P,
+    interval: Duration,
+    warn_every: Duration,
+) -> GroupBootstrap
+where
+    P: Fn(u64, String) -> F,
+    F: Future<Output = Option<PeerGroupLog>>,
+{
+    let group = rejoin.raft_group_id().0;
+    let peers = nodes
+        .iter()
+        .filter(|(peer_id, _)| **peer_id != node_id)
+        .map(|(peer_id, node)| (*peer_id, node.addr.clone()))
+        .collect::<Vec<_>>();
+    let mut last_warning = crate::rt::time::Instant::now();
+    loop {
+        match raft.is_initialized().await {
+            Ok(true) => return GroupBootstrap::AlreadyInitialized,
+            Ok(false) => {}
+            Err(err) => {
+                tracing::error!(
+                    "raft bootstrap: node {node_id} group {group} failed to check initialization: {err}"
+                );
+                return GroupBootstrap::Stopped;
+            }
+        }
+        if rejoin.holds_group_history() {
+            return GroupBootstrap::AlreadyInitialized;
+        }
+        let leader_seen = raft.metrics().borrow_watched().current_leader.is_some();
+        let answers = if leader_seen {
+            Vec::new()
+        } else {
+            futures_util::future::join_all(
+                peers
+                    .iter()
+                    .map(|(peer_id, address)| probe(*peer_id, address.clone())),
+            )
+            .await
+        };
+        let decision = if leader_seen {
+            BootstrapDecision::Rejoin
+        } else {
+            bootstrap_decision(&answers)
+        };
+        match decision {
+            BootstrapDecision::Initialize => {
+                if let Err(err) = rejoin.allow_fresh_bootstrap().await {
+                    tracing::error!(
+                        "raft bootstrap: node {node_id} group {group} could not open its recovery gate: {err}"
+                    );
+                    return GroupBootstrap::Stopped;
+                }
+                if let Err(err) = raft.initialize(nodes).await {
+                    tracing::error!(
+                        "raft bootstrap: node {node_id} group {group} failed to initialize membership: {err}"
+                    );
+                    return GroupBootstrap::Stopped;
+                }
+                return GroupBootstrap::Initialized;
+            }
+            BootstrapDecision::Rejoin => {
+                tracing::info!(
+                    "raft bootstrap: node {node_id} group {group} holds nothing of a group another voter holds; not initializing, waiting to be replicated to"
+                );
+                return GroupBootstrap::Rejoined;
+            }
+            BootstrapDecision::Wait => {
+                let now = crate::rt::time::Instant::now();
+                if now.saturating_duration_since(last_warning) >= warn_every {
+                    let answered = answers.iter().filter(|answer| answer.is_some()).count();
+                    tracing::warn!(
+                        "raft bootstrap: node {node_id} group {group} waits for every voter before initializing; {answered}/{} answered",
+                        peers.len()
+                    );
+                    last_warning = now;
+                }
+            }
+        }
+        crate::rt::time::sleep(interval).await;
+    }
+}
+
 /// The leader's view of one group, as the heal driver reads it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct HealView {
@@ -641,17 +1003,27 @@ pub(crate) struct HealView {
     pub voters: BTreeSet<u64>,
     pub learners: BTreeSet<u64>,
     pub reverted: BTreeSet<u64>,
+    /// Voters whose rewind this leader allowed but OpenRaft has not done yet:
+    /// their progress still shows the index they had matched.
+    pub awaiting_rewind: BTreeSet<u64>,
     pub matched: BTreeMap<u64, Option<u64>>,
     pub committed: Option<u64>,
     /// The group's configured (static) voters.
     pub configured: BTreeSet<u64>,
 }
 
-/// One membership step of the heal driver.
+/// One step of the heal driver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HealStep {
     /// Remove a voter that lost its log; `voters` is the new voter set.
     RemoveVoter { target: u64, voters: BTreeSet<u64> },
+    /// The voters that lost entries are a majority, so no removal can
+    /// commit: rewind their replication and send them this leader's log.
+    RewindVoters { targets: BTreeSet<u64> },
+    /// OpenRaft rewinds a follower only on the conflict of a request that
+    /// carries entries, and an idle group sends none: propose an unchanged
+    /// membership so replication carries one.
+    ReplicateRewound,
     /// Remove a learner that lost its log, so it is added back fresh.
     RemoveLearner { target: u64 },
     /// Add a configured voter that is missing as a learner.
@@ -675,13 +1047,20 @@ pub(crate) fn plan_heal_step(view: &HealView) -> Option<HealStep> {
     if !view.uniform {
         return view.stale_joint.then_some(HealStep::FinishJoint);
     }
-    if let Some(target) = view.voters.intersection(&view.reverted).next() {
+    let reverted_voters = view
+        .voters
+        .intersection(&view.reverted)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if let Some(target) = reverted_voters.first() {
         // The removal commits only with a quorum of the current voters that
-        // still hold their log. Without one (a majority restarted empty)
-        // nothing is proposed: the group waits for an operator.
+        // still hold their log. Without one, this leader rewinds them: it
+        // holds every committed entry and they cannot vote meanwhile.
         let healthy_voters = view.voters.difference(&view.reverted).count();
         if healthy_voters < quorum(view.voters.len()) {
-            return None;
+            return Some(HealStep::RewindVoters {
+                targets: reverted_voters,
+            });
         }
         let mut voters = view.voters.clone();
         voters.remove(target);
@@ -689,6 +1068,9 @@ pub(crate) fn plan_heal_step(view: &HealView) -> Option<HealStep> {
             target: *target,
             voters,
         });
+    }
+    if !view.awaiting_rewind.is_empty() {
+        return Some(HealStep::ReplicateRewound);
     }
     if let Some(target) = view.learners.intersection(&view.reverted).next() {
         return Some(HealStep::RemoveLearner { target: *target });
@@ -724,35 +1106,46 @@ fn heal_view(
     configured: &BTreeSet<u64>,
 ) -> HealView {
     let membership = metrics.membership_config.membership();
+    let matched = metrics
+        .replication
+        .as_ref()
+        .map(|replication| {
+            replication
+                .iter()
+                .map(|(node_id, matched)| (*node_id, log_index(matched.as_ref())))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let voters = membership.voter_ids().collect::<BTreeSet<_>>();
+    let awaiting_rewind = rejoin
+        .allowed_rewinds(&metrics.vote)
+        .into_iter()
+        .filter(|(target, previous)| {
+            voters.contains(target) && matched.get(target).copied().flatten() == Some(*previous)
+        })
+        .map(|(target, _)| target)
+        .collect();
     HealView {
         is_leader: metrics.state == ServerState::Leader,
         uniform: membership.get_joint_config().len() == 1,
         stale_joint: false,
-        voters: membership.voter_ids().collect(),
+        voters,
         learners: membership.learner_ids().collect(),
         reverted: rejoin.reverted_followers(&metrics.vote),
-        matched: metrics
-            .replication
-            .as_ref()
-            .map(|replication| {
-                replication
-                    .iter()
-                    .map(|(node_id, matched)| (*node_id, log_index(matched.as_ref())))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        awaiting_rewind,
+        matched,
         committed: log_index(metrics.committed.as_ref()),
         configured: configured.clone(),
     }
 }
 
-/// Leader-side heal driver for one group of a memory-WAL node: rebuilds a
-/// voter that lost its log through remove / learner / catch-up / promote,
-/// and finishes a rebuild another leader or `ursulactl` started. Returns
-/// once the Raft stops.
+/// Leader-side heal driver for one group: rebuilds a voter that lost
+/// entries through remove / learner / catch-up / promote, rewinds voters
+/// that lost entries when they are a majority, and finishes a rebuild
+/// another leader or `ursulactl` started. Returns once the Raft stops.
 pub async fn run_rejoin_heal(
     raft: RaftGroupHandle,
-    rejoin: std::sync::Arc<GroupRejoin>,
+    rejoin: Arc<GroupRejoin>,
     configured: BTreeMap<u64, BasicNode>,
     interval: Duration,
 ) {
@@ -781,7 +1174,7 @@ pub async fn run_rejoin_heal(
             node_id,
             raft_group_id = group,
             step = ?step,
-            "memory-WAL rejoin: healing a replica that restarted empty"
+            "recovery: healing a replica that lost Raft log entries"
         );
         let result = match &step {
             HealStep::RemoveVoter { voters, .. } => crate::rt::time::timeout(
@@ -790,6 +1183,13 @@ pub async fn run_rejoin_heal(
             )
             .await
             .map(|result| result.map(|_| ()).map_err(|err| err.to_string())),
+            HealStep::RewindVoters { targets } => {
+                crate::rt::time::timeout(
+                    REJOIN_HEAL_STEP_TIMEOUT,
+                    rejoin.rewind_followers(&raft, targets),
+                )
+                .await
+            }
             HealStep::RemoveLearner { target } => crate::rt::time::timeout(
                 REJOIN_HEAL_STEP_TIMEOUT,
                 raft.change_membership(
@@ -817,8 +1217,9 @@ pub async fn run_rejoin_heal(
             .await
             .map(|result| result.map(|_| ()).map_err(|err| err.to_string())),
             // A no-op change on a joint config is OpenRaft's own second step:
-            // it commits the new config alone.
-            HealStep::FinishJoint => crate::rt::time::timeout(
+            // it commits the new config alone; on a uniform config it only
+            // proposes the same config again.
+            HealStep::ReplicateRewound | HealStep::FinishJoint => crate::rt::time::timeout(
                 REJOIN_HEAL_STEP_TIMEOUT,
                 raft.change_membership(ChangeMembers::AddVoterIds(BTreeSet::new()), false),
             )
@@ -830,34 +1231,47 @@ pub async fn run_rejoin_heal(
                 HealStep::RemoveVoter { target, .. } | HealStep::RemoveLearner { target } => {
                     rejoin.clear_reverted(*target);
                 }
-                HealStep::AddLearner { .. } | HealStep::FinishJoint => {}
+                HealStep::RewindVoters { targets } => tracing::warn!(
+                    node_id,
+                    raft_group_id = group,
+                    followers = ?targets,
+                    "recovery: a majority of voters lost entries; replicating this leader's log \
+                     to them again"
+                ),
+                HealStep::AddLearner { .. }
+                | HealStep::ReplicateRewound
+                | HealStep::FinishJoint => {}
                 HealStep::Promote { target, .. } => tracing::info!(
                     node_id,
                     raft_group_id = group,
                     target,
-                    "memory-WAL rejoin: the replica is a caught-up voter again"
+                    "recovery: the replica is a caught-up voter again"
                 ),
             },
             Ok(Err(err)) => tracing::warn!(
                 node_id,
                 raft_group_id = group,
                 step = ?step,
-                "memory-WAL rejoin: heal step failed, retrying: {err}"
+                "recovery: heal step failed, retrying: {err}"
             ),
-            Err(_) => tracing::warn!(
+            Err(_elapsed) => tracing::warn!(
                 node_id,
                 raft_group_id = group,
                 step = ?step,
-                "memory-WAL rejoin: heal step timed out, retrying"
+                "recovery: heal step timed out, retrying"
             ),
         }
     }
 }
 
-/// Drive memory-WAL participation from fresh outbound leader proofs. The
-/// supplied probe must confirm a new post-call ReadIndex with a quorum and
-/// return that leader's committed vote and required local applied index.
-/// Transport-independent so simulation exercises the production gate driver.
+/// Opens a gated replica's recovery gate from fresh outbound leader proofs.
+/// The supplied probe must confirm a new post-call ReadIndex with a quorum
+/// and return that leader's committed vote and required local applied
+/// index. A replica that for `stall_after` gets no barrier and applies
+/// nothing reports its group stalled. Once the gate is open, here or through
+/// an operator, the group's election policy is refreshed and the driver
+/// returns. Transport-independent so simulation exercises the production
+/// driver.
 pub async fn run_rejoin_vote_barrier<P, F>(
     raft: RaftGroupHandle,
     rejoin: Arc<GroupRejoin>,
@@ -866,20 +1280,37 @@ pub async fn run_rejoin_vote_barrier<P, F>(
     probe: P,
     probe_timeout: Duration,
     interval: Duration,
+    stall_after: Duration,
 ) where
     P: Fn(u64, String) -> F,
     F: Future<Output = Result<(UrsulaVote, u64), String>>,
 {
     let raft_group_id = rejoin.raft_group_id;
     let mut last_barrier_leader = None;
+    let mut last_applied = None;
+    let mut last_progress = crate::rt::time::Instant::now();
     loop {
-        registry.refresh_group_elections(raft_group_id);
-        if rejoin.vote_gate_open() {
-            return;
+        match rejoin.try_open().await {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(err) => tracing::warn!(
+                raft_group_id = raft_group_id.0,
+                "recovery gate: could not record the open gate, retrying: {err}"
+            ),
         }
         let metrics = raft.metrics().borrow_watched().clone();
         if metrics.running_state.is_err() {
             return;
+        }
+        let now = crate::rt::time::Instant::now();
+        let applied = log_index(metrics.last_applied.as_ref());
+        if applied > last_applied {
+            last_applied = applied;
+            last_progress = now;
+        }
+        if now.saturating_duration_since(last_progress) >= stall_after && rejoin.stall() {
+            // The leader whose barrier led nowhere may be asked again.
+            last_barrier_leader = None;
         }
         if let Some(leader_id) = metrics.current_leader
             && last_barrier_leader != Some(metrics.vote)
@@ -887,38 +1318,57 @@ pub async fn run_rejoin_vote_barrier<P, F>(
         {
             let outcome =
                 crate::rt::time::timeout(probe_timeout, probe(leader_id, node.addr.clone())).await;
-            let (leader, index) = match outcome {
-                Ok(Ok(proof)) => proof,
-                other => {
-                    tracing::debug!(
+            match outcome {
+                Ok(Ok((leader, index))) => {
+                    rejoin.confirm_barrier(leader, index);
+                    last_barrier_leader = Some(leader);
+                    last_progress = crate::rt::time::Instant::now();
+                    tracing::info!(
+                        node_id = metrics.id,
                         raft_group_id = raft_group_id.0,
-                        ?other,
-                        "recovery barrier probe failed"
+                        barrier_index = index,
+                        "recovery gate: a fresh leader barrier confirmed; catching up"
                     );
-                    crate::rt::time::sleep(interval).await;
                     continue;
                 }
-            };
-            rejoin.confirm_barrier(leader, index);
-            last_barrier_leader = Some(leader);
-            registry.refresh_group_elections(raft_group_id);
-            if rejoin.vote_gate_open() {
-                tracing::info!(
-                    node_id = metrics.id,
+                other => tracing::debug!(
                     raft_group_id = raft_group_id.0,
-                    barrier_index = index,
-                    "memory-WAL rejoin: fresh quorum barrier applied; participation restored"
-                );
-                return;
+                    ?other,
+                    "recovery barrier probe failed"
+                ),
             }
         }
         crate::rt::time::sleep(interval).await;
     }
+    // The gate never closes again in this run, so this refresh, after the
+    // gate opened, is the one that lets the group campaign.
+    registry.refresh_group_elections(raft_group_id);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
+
+    use openraft::alias::LogIdOf;
+    use openraft::vote::RaftLeaderId;
+
+    use super::BootstrapDecision;
+    use super::GateRecovery;
+    use super::GroupEvidence;
+    use super::HealStep;
+    use super::HealView;
+    use super::LocalReplica;
+    use super::PeerGroupLog;
+    use super::RecoveryGateStatus;
+    use super::RevertedFollowers;
+    use super::VoteGate;
+    use super::VoteScreen;
+    use super::bootstrap_decision;
+    use super::plan_heal_step;
+    use crate::types::UrsulaRaftTypeConfig;
+    use crate::types::UrsulaVote;
+    use crate::types::UrsulaVoteResponse;
 
     fn vote(term: u64, node_id: u64) -> UrsulaVote {
         UrsulaVote::new(term, node_id)
@@ -938,7 +1388,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_rewind_survives_read_index_conflicts_but_ends_after_repair() {
+    fn a_rewind_survives_read_index_conflicts_but_ends_after_repair() {
         let leader = leader(3, 1);
         let mut reverted = RevertedFollowers {
             leader: Some(leader),
@@ -946,123 +1396,129 @@ mod tests {
             ..Default::default()
         };
         // ReadIndex conflicts leave Raft's replication progress untouched.
-        assert!(reverted.operator_reset_pending(2, &leader, Some(20), None));
-        assert!(reverted.operator_reset_pending(2, &leader, Some(20), None));
-        // A real rewind resets the progress; permission cannot cover another
-        // loss even after this follower has caught up again.
-        assert!(!reverted.operator_reset_pending(2, &leader, None, None));
-        assert!(!reverted.operator_reset_pending(2, &leader, Some(30), None));
+        assert!(reverted.rewind_pending(2, &leader, Some(20), None));
+        assert!(reverted.rewind_pending(2, &leader, Some(20), None));
+        // A real rewind resets the progress; the allowance cannot cover
+        // another loss even after this follower has caught up again.
+        assert!(!reverted.rewind_pending(2, &leader, None, None));
+        assert!(!reverted.rewind_pending(2, &leader, Some(30), None));
         // A fast catch-up can happen between metrics samples. Its successful
         // Append still proves that the prior prefix has been restored.
-        assert!(reverted.operator_reset_pending(3, &leader, Some(20), Some(19)));
-        assert!(!reverted.operator_reset_pending(3, &leader, Some(30), Some(20)));
-        assert!(!reverted.operator_reset_pending(3, &leader, Some(30), None));
+        assert!(reverted.rewind_pending(3, &leader, Some(20), Some(19)));
+        assert!(!reverted.rewind_pending(3, &leader, Some(30), Some(20)));
+        assert!(!reverted.rewind_pending(3, &leader, Some(30), None));
     }
 
     #[test]
-    fn operator_rewind_permission_does_not_cross_a_leader_change() {
+    fn a_rewind_allowance_does_not_cross_a_leader_change() {
         let mut reverted = RevertedFollowers {
             leader: Some(leader(3, 1)),
             allowed_reverts: BTreeMap::from([(2, 20)]),
             ..Default::default()
         };
-        assert!(!reverted.operator_reset_pending(2, &leader(4, 3), Some(20), None));
+        assert!(!reverted.rewind_pending(2, &leader(4, 3), Some(20), None));
         assert!(reverted.allowed_reverts.is_empty());
     }
 
     #[test]
-    fn a_fresh_replica_votes_in_the_first_election() {
-        let mut gate = VoteGate::default();
+    fn an_unknown_history_gate_votes_in_a_new_groups_first_election() {
+        let mut gate = VoteGate::closed(GroupEvidence::Unknown);
         // The initializer's candidate log is only the membership entry.
-        assert_eq!(gate.screen(1, Some(0), follower(None)), VoteScreen::Pass);
-        assert_eq!(gate.screen(1, None, follower(None)), VoteScreen::Pass);
+        assert_eq!(gate.screen(Some(0)), VoteScreen::Pass);
+        assert_eq!(gate.screen(None), VoteScreen::Pass);
+        assert!(!gate.is_open(), "passing a first election opens nothing");
     }
 
     #[test]
-    fn an_empty_replica_refuses_a_candidate_with_entries_until_it_caught_up() {
-        let mut gate = VoteGate::default();
-        assert_eq!(gate.screen(2, Some(11), follower(None)), VoteScreen::Refuse);
+    fn a_gated_replica_refuses_every_vote_once_the_group_holds_entries() {
+        let mut gate = VoteGate::closed(GroupEvidence::Unknown);
+        assert_eq!(gate.screen(Some(11)), VoteScreen::Refuse);
         // Having seen entries, it refuses an index-0 candidate too: that can
         // only be another emptied replica.
-        assert_eq!(gate.screen(3, Some(0), follower(None)), VoteScreen::Refuse);
+        assert_eq!(gate.screen(Some(0)), VoteScreen::Refuse);
 
-        gate.observe_append(&leader(2, 1), Some(11));
+        let mut gate = VoteGate::closed(GroupEvidence::Unknown);
+        gate.observe_append(Some(1));
+        assert_eq!(gate.screen(None), VoteScreen::Refuse);
+
+        // A disk replica that lost its unsynced tail knows from the start.
+        let mut gate = VoteGate::closed(GroupEvidence::Initialized);
+        assert_eq!(gate.screen(Some(0)), VoteScreen::Refuse);
+        assert_eq!(gate.screen(None), VoteScreen::Refuse);
+    }
+
+    #[test]
+    fn the_gate_opens_only_after_applying_a_fresh_barrier() {
+        let mut gate = VoteGate::closed(GroupEvidence::Initialized);
+        assert_eq!(gate.status(), RecoveryGateStatus::AwaitingBarrier);
+        gate.observe_append(Some(11));
+        assert!(
+            !gate.caught_up(follower(Some(11))),
+            "inbound replication is no proof"
+        );
         gate.confirm_barrier(leader(2, 1), 11);
-        assert_eq!(
-            gate.screen(2, Some(12), follower(Some(10))),
-            VoteScreen::Refuse
-        );
-        assert!(!gate.is_open());
-        assert_eq!(
-            gate.screen(2, Some(12), follower(Some(11))),
-            VoteScreen::Pass
-        );
+        assert_eq!(gate.status(), RecoveryGateStatus::CatchingUp);
+        assert!(!gate.caught_up(follower(Some(10))));
+        assert!(gate.caught_up(follower(Some(11))));
+        // Catching up never opens the gate by itself: the driver records it
+        // first, so screening keeps refusing until then.
+        assert_eq!(gate.screen(Some(12)), VoteScreen::Refuse);
+        gate.open();
         assert!(gate.is_open());
-        // Once open it stays open.
-        assert_eq!(gate.screen(3, Some(0), follower(None)), VoteScreen::Pass);
+        assert_eq!(gate.status(), RecoveryGateStatus::Open);
+        assert_eq!(gate.screen(Some(12)), VoteScreen::Pass);
+        // An open gate stays open and ignores later evidence.
+        gate.confirm_barrier(leader(3, 2), 40);
+        gate.observe_append(Some(40));
+        assert!(!gate.stall());
+        assert!(gate.is_open());
     }
 
     #[test]
     fn the_catch_up_point_follows_the_highest_leader() {
-        let mut gate = VoteGate::default();
+        let mut gate = VoteGate::closed(GroupEvidence::Unknown);
         gate.confirm_barrier(leader(2, 1), 5);
         // A deposed leader's lower commit does not lower the target.
         gate.confirm_barrier(leader(1, 3), 1);
         gate.confirm_barrier(leader(3, 2), 9);
-        assert_eq!(
-            gate.screen(2, Some(9), follower(Some(5))),
-            VoteScreen::Refuse
-        );
-        assert_eq!(gate.screen(2, Some(9), follower(Some(9))), VoteScreen::Pass);
+        assert!(!gate.caught_up(follower(Some(5))));
+        assert!(gate.caught_up(follower(Some(9))));
+        // The same leader's later barrier only raises the target.
+        gate.confirm_barrier(leader(3, 2), 7);
+        assert!(gate.caught_up(follower(Some(9))));
+        gate.confirm_barrier(leader(3, 2), 12);
+        assert!(!gate.caught_up(follower(Some(9))));
     }
 
     #[test]
-    fn fresh_bootstrap_opens_its_gate_and_an_operator_release_names_one_candidate() {
-        let mut gate = VoteGate::default();
-        gate.allow_fresh_bootstrap();
-        assert_eq!(gate.screen(2, Some(4), follower(None)), VoteScreen::Pass);
-
-        let mut gate = VoteGate::default();
-        gate.observe_append(&leader(4, 1), Some(20));
-        gate.release_for(3);
-        assert_eq!(gate.screen(2, Some(20), follower(None)), VoteScreen::Refuse);
-        assert_eq!(gate.screen(3, Some(20), follower(None)), VoteScreen::Pass);
-    }
-
-    #[test]
-    fn delayed_replication_never_releases_a_restarted_vote_gate() {
-        let mut gate = VoteGate::default();
-        gate.observe_append(&leader(2, 1), Some(5));
-        gate.observe_append(&leader(2, 1), Some(12));
-        assert_eq!(
-            gate.screen(3, Some(5), follower(Some(5))),
-            VoteScreen::Refuse
-        );
-        // Even applying every inbound entry is not a post-start proof.
-        assert_eq!(
-            gate.screen(3, Some(12), follower(Some(12))),
-            VoteScreen::Refuse
-        );
-        gate.confirm_barrier(leader(2, 1), 12);
-        assert_eq!(
-            gate.screen(3, Some(5), follower(Some(5))),
-            VoteScreen::Refuse
-        );
-        assert_eq!(
-            gate.screen(3, Some(12), follower(Some(12))),
-            VoteScreen::Pass
-        );
-    }
-
-    #[test]
-    fn heartbeat_without_commit_and_uncommitted_proof_never_open_the_gate() {
-        let mut gate = VoteGate::default();
-        gate.observe_append(&leader(2, 1), None);
-        gate.refresh(follower(None));
-        assert!(!gate.is_open());
+    fn uncommitted_proofs_never_count() {
+        let mut gate = VoteGate::closed(GroupEvidence::Unknown);
+        gate.observe_append(None);
         gate.confirm_barrier(vote(3, 1), 20);
-        gate.refresh(follower(Some(20)));
-        assert!(!gate.is_open());
+        assert_eq!(gate.status(), RecoveryGateStatus::AwaitingBarrier);
+        assert!(!gate.caught_up(follower(Some(20))));
+    }
+
+    #[test]
+    fn a_gate_without_progress_stalls_until_a_barrier_arrives() {
+        let mut gate = VoteGate::closed(GroupEvidence::Initialized);
+        assert!(gate.stall());
+        assert!(!gate.stall(), "it stalls once");
+        assert_eq!(gate.status(), RecoveryGateStatus::Stalled);
+        gate.confirm_barrier(leader(2, 1), 3);
+        assert_eq!(gate.status(), RecoveryGateStatus::CatchingUp);
+        // The barrier led nowhere for too long: its target is dropped, and a
+        // new barrier is needed.
+        assert!(gate.stall());
+        assert_eq!(gate, VoteGate::Closed {
+            group: GroupEvidence::Initialized,
+            recovery: GateRecovery::Stalled,
+        });
+        assert!(!gate.caught_up(follower(Some(3))));
+        gate.confirm_barrier(leader(2, 1), 3);
+        assert!(gate.caught_up(follower(Some(3))));
+        gate.open();
+        assert!(!gate.stall(), "an open gate never stalls");
     }
 
     #[test]
@@ -1122,6 +1578,7 @@ mod tests {
             voters: voters.iter().copied().collect(),
             learners: learners.iter().copied().collect(),
             reverted: reverted.iter().copied().collect(),
+            awaiting_rewind: BTreeSet::new(),
             matched: BTreeMap::new(),
             committed: Some(10),
             configured: BTreeSet::from([1, 2, 3]),
@@ -1161,9 +1618,20 @@ mod tests {
     }
 
     #[test]
-    fn the_heal_driver_never_acts_without_a_healthy_quorum_or_leadership() {
-        // A majority lost its log: no removal could commit.
-        assert_eq!(plan_heal_step(&view(&[1, 2, 3], &[], &[2, 3])), None);
+    fn the_heal_driver_rewinds_a_majority_that_lost_entries_and_needs_leadership() {
+        // A majority lost entries: no removal could commit, so this leader
+        // replicates its log to them again.
+        assert_eq!(
+            plan_heal_step(&view(&[1, 2, 3], &[], &[2, 3])),
+            Some(HealStep::RewindVoters {
+                targets: BTreeSet::from([2, 3]),
+            })
+        );
+        // Until OpenRaft rewinds them, an idle group is given an entry to
+        // replicate.
+        let mut rewinding = view(&[1, 2, 3], &[], &[]);
+        rewinding.awaiting_rewind = BTreeSet::from([2, 3]);
+        assert_eq!(plan_heal_step(&rewinding), Some(HealStep::ReplicateRewound));
         let mut follower_view = view(&[1, 2, 3], &[], &[3]);
         follower_view.is_leader = false;
         assert_eq!(plan_heal_step(&follower_view), None);
@@ -1216,6 +1684,139 @@ mod tests {
                 voters: BTreeSet::from([1, 2, 3, 4, 5]),
             })
         );
+        // Three of five lost entries: rewind all three.
+        assert_eq!(
+            plan_heal_step(&five(&[1, 2, 3, 4, 5], &[], &[3, 4, 5])),
+            Some(HealStep::RewindVoters {
+                targets: BTreeSet::from([3, 4, 5]),
+            })
+        );
+    }
+
+    /// A disk-WAL gate follows the group's durable log state: closed with an
+    /// unknown history while the replica holds nothing, open once the group
+    /// is initialized, closed again when a run starts without knowing how
+    /// the previous one ended. A recovering replica that led the group starts
+    /// as a follower, and an operator's acceptance is durable.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_durable_gate_follows_the_group_log_state_across_restarts() {
+        use openraft::entry::RaftEntry;
+        use openraft::storage::IOFlushed;
+        use openraft::storage::RaftLogReader;
+        use openraft::storage::RaftLogStorage;
+        use ursula_config::WalFsync;
+        use ursula_shard::CoreId;
+        use ursula_shard::RaftGroupId;
+        use ursula_shard::ShardId;
+        use ursula_shard::ShardPlacement;
+
+        use super::AcceptUnsyncedLossOutcome;
+        use super::GroupRejoin;
+        use crate::engine::DurableRaftLogStoreFactory;
+        use crate::log_store::GroupLogState;
+        use crate::log_store::RUN_STATE_FILE;
+        use crate::log_store::RaftGroupFileLogStore;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let placement = ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(0),
+            raft_group_id: RaftGroupId(0),
+        };
+        let metrics = ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
+        let open = |wal: &DurableRaftLogStoreFactory| -> std::sync::Arc<RaftGroupFileLogStore> {
+            wal.open(placement, metrics.clone())
+                .expect("open the store")
+        };
+        let entry = |index| {
+            openraft::alias::EntryOf::<UrsulaRaftTypeConfig>::new(
+                log_id(1, 1, index),
+                openraft::EntryPayload::Blank,
+            )
+        };
+
+        // A new replica: its history is unknown, so the gate is closed and
+        // the replica may bootstrap the group.
+        let wal = DurableRaftLogStoreFactory::start(dir.path(), WalFsync::Never).expect("start");
+        let mut store = open(&wal);
+        let gate = GroupRejoin::durable(1, placement.raft_group_id, &store);
+        assert_eq!(gate.status(), RecoveryGateStatus::AwaitingBarrier);
+        assert!(!gate.may_campaign());
+        assert!(!gate.holds_group_history());
+        // Every voter reported an empty group: the gate opens and the first
+        // entry records the group initialized.
+        gate.allow_fresh_bootstrap().await.expect("fresh bootstrap");
+        assert!(gate.vote_gate_open());
+        store.save_vote(&leader(1, 1)).await.expect("vote");
+        store
+            .append([entry(1)], IOFlushed::noop())
+            .await
+            .expect("append");
+        assert_eq!(store.log_state(), GroupLogState::Initialized);
+        assert!(gate.holds_group_history());
+        drop((gate, store));
+        wal.shutdown().await.expect("clean shutdown");
+
+        // A clean restart: the replica holds every entry it acknowledged.
+        let wal = DurableRaftLogStoreFactory::start(dir.path(), WalFsync::Never).expect("start");
+        let store = open(&wal);
+        assert!(GroupRejoin::durable(1, placement.raft_group_id, &store).vote_gate_open());
+        drop(store);
+        wal.shutdown().await.expect("clean shutdown");
+
+        // The run state is gone while the journal holds records: the group
+        // recovers. It refuses every vote, and the replica that led it starts
+        // as a follower.
+        std::fs::remove_file(dir.path().join(RUN_STATE_FILE)).expect("remove the run state");
+        let wal = DurableRaftLogStoreFactory::start(dir.path(), WalFsync::Never).expect("start");
+        let mut store = open(&wal);
+        assert_eq!(store.log_state(), GroupLogState::Recovering);
+        let gate = GroupRejoin::durable(1, placement.raft_group_id, &store);
+        assert_eq!(gate.status(), RecoveryGateStatus::AwaitingBarrier);
+        assert!(gate.holds_group_history(), "it never initializes again");
+        assert_eq!(gate.gate().screen(Some(0)), VoteScreen::Refuse);
+        // Its refusals report the log it holds, so a bootstrap probe sees
+        // that the group exists here.
+        assert_eq!(gate.last_log_id(), Some(log_id(1, 1, 1)));
+        assert_eq!(
+            PeerGroupLog::from_vote_response(&UrsulaVoteResponse::new(
+                vote(1, 1),
+                gate.last_log_id(),
+                false
+            )),
+            PeerGroupLog::Initialized
+        );
+        assert_eq!(
+            store.read_vote().await.expect("vote"),
+            Some(vote(1, 1)),
+            "its vote for itself is no longer a committed leadership"
+        );
+        // The operator accepts the loss: the open gate is durable.
+        assert_eq!(
+            gate.accept_unsynced_loss().await.expect("accept"),
+            AcceptUnsyncedLossOutcome::GateOpened
+        );
+        assert_eq!(
+            gate.accept_unsynced_loss().await.expect("accept again"),
+            AcceptUnsyncedLossOutcome::AlreadyOpen
+        );
+        assert_eq!(store.log_state(), GroupLogState::Initialized);
+        drop((gate, store));
+        drop(wal);
+
+        // A crash of the next run (no clean shutdown) on the same host keeps
+        // the open gate.
+        let wal = DurableRaftLogStoreFactory::start(dir.path(), WalFsync::Always).expect("start");
+        let store = open(&wal);
+        let gate = GroupRejoin::durable(1, placement.raft_group_id, &store);
+        assert_eq!(
+            gate.vote_gate_open(),
+            cfg!(target_os = "linux"),
+            "without a boot id an unclean end reads as a host crash under never"
+        );
+        drop((gate, store));
+        wal.shutdown().await.expect("clean shutdown");
     }
 
     #[test]

@@ -207,10 +207,9 @@ impl RollingRestartValidator {
                         accepting_transfers: true,
                         membership_joint: membership.get_joint_config().len() != 1,
                         membership_log_index: metrics.membership_config.log_id().map(|id| id.index),
-                        stopped_for_operator: self
-                            .registry
-                            .rejoin(node_id)
-                            .is_some_and(|rejoin| rejoin.restart_guard().stopped_for_operator()),
+                        stopped_for_operator: self.registry.rejoin(node_id).is_some_and(|rejoin| {
+                            rejoin.status() == ursula_raft::RecoveryGateStatus::Stalled
+                        }),
                     }),
                 }],
                 wal_backend: None,

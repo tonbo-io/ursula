@@ -5,16 +5,11 @@ use thiserror::Error;
 use crate::config::ColdBackend;
 use crate::config::UrsulaConfig;
 use crate::config::WalBackend;
-use crate::config::WalFsync;
 
 #[derive(Debug, Error)]
 pub enum ValidationError {
     #[error("raft.wal.path is required when backend is 'disk'")]
     RaftWalPathRequired,
-    #[error(
-        "raft.wal.fsync = \"never\" requires backend = \"disk\"; a memory WAL has nothing to fsync"
-    )]
-    RaftWalFsyncRequiresDisk,
     #[error(
         "multi-peer raft with a memory WAL is volatile; set raft.wal.allow_volatile_multi_peer = true only for development, benchmark, or chaos use"
     )]
@@ -44,9 +39,6 @@ impl UrsulaConfig {
         }
         if self.raft.wal.backend == WalBackend::Disk && self.raft.wal.path.is_none() {
             return Err(ValidationError::RaftWalPathRequired);
-        }
-        if self.raft.wal.backend == WalBackend::Memory && self.raft.wal.fsync == WalFsync::Never {
-            return Err(ValidationError::RaftWalFsyncRequiresDisk);
         }
         if self.raft.wal.backend == WalBackend::Memory
             && self.raft.peers.len() > 1
@@ -140,7 +132,6 @@ impl UrsulaConfig {
 
     fn validate_non_zero_durations(&self) -> Result<(), ValidationError> {
         for (name, value) in [
-            ("raft.rejoin_probe", self.raft.rejoin_probe.as_duration()),
             (
                 "raft.bootstrap_peer_probe_interval",
                 self.raft.bootstrap_peer_probe_interval.as_duration(),
