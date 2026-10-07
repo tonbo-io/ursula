@@ -83,8 +83,8 @@ async fn probe_peers(config: &ursula_config::UrsulaConfig) -> io::Result<()> {
                     io::ErrorKind::InvalidData,
                     format!(
                         "peer {} ({}) refused Raft protocol {}: {message}. Format epochs \
-                         differ; an Ursula 0.6 node cannot join a 0.5.x cluster. Install 0.6 as \
-                         a new cluster",
+                         differ; a node cannot join a cluster of another format epoch. Install \
+                         this release as a new cluster",
                         peer.node_id,
                         peer.url,
                         ursula_runtime::FORMAT_EPOCH

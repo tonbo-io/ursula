@@ -36,9 +36,9 @@ use ursula_stream::StreamStateMachine;
 use crate::MetricsClient;
 use crate::NodeInfo;
 
-/// The backup format is the format epoch. A 0.5.x ursulactl refuses this
-/// version through its own check; this tool refuses 0.5.x backups and
-/// clusters (E9).
+/// The backup format is the format epoch. An ursulactl of another epoch
+/// refuses this version through its own check; this tool refuses backups and
+/// clusters of other epochs (E9).
 pub const BACKUP_FORMAT_VERSION: u32 = ursula_stream::FORMAT_EPOCH;
 const MANIFEST_OBJECT: &str = "manifest.json";
 
@@ -121,8 +121,8 @@ fn group_object_name(raft_group_id: u32) -> String {
 
 fn e9_epoch_only() -> String {
     format!(
-        "this ursulactl reads and writes format epoch {BACKUP_FORMAT_VERSION} only (Ursula 0.5.x \
-         backups and clusters cannot be mixed with 0.6)"
+        "this ursulactl reads and writes format epoch {BACKUP_FORMAT_VERSION} only (backups and \
+         clusters of another format epoch cannot be mixed with it)"
     )
 }
 
@@ -517,7 +517,11 @@ mod tests {
             .await
             .expect("write manifest");
         let err = verify(&store).await.expect_err("epoch-1 manifest rejected");
-        assert!(err.to_string().contains("format epoch 2 only"), "{err}");
+        assert!(
+            err.to_string()
+                .contains(&format!("format epoch {BACKUP_FORMAT_VERSION} only")),
+            "{err}"
+        );
     }
 
     /// E9: restore checks the target's format before the first import, so a

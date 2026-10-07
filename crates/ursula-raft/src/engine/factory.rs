@@ -31,6 +31,7 @@ use crate::grpc::GrpcRaftNetwork;
 use crate::grpc::GrpcRaftNetworkFactory;
 use crate::grpc::probe_rejoin_vote_barrier;
 use crate::log_store::CoreFileLogWriter;
+use crate::log_store::JournalReplayMode;
 use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RaftGroupLogStore;
 use crate::registry::RaftGroupHandleRegistry;
@@ -430,18 +431,34 @@ impl GroupEngineFactory for ColdRaftGroupEngineFactory {
     }
 }
 
+/// The open writer of one core's journal, if any.
+type CoreWriterSlot = Arc<Mutex<Weak<CoreFileLogWriter>>>;
+
+/// Opens each group's durable log store over its core's shared journal.
 #[derive(Debug, Clone)]
 pub struct DurableRaftLogStoreFactory {
     root: PathBuf,
-    core_writers: Arc<Mutex<BTreeMap<u16, Weak<CoreFileLogWriter>>>>,
+    replay_mode: JournalReplayMode,
+    /// One slot per core. Opening a journal holds only its core's slot, so
+    /// cores recover their journals in parallel.
+    core_writers: Arc<Mutex<BTreeMap<u16, CoreWriterSlot>>>,
 }
 
 impl DurableRaftLogStoreFactory {
+    /// A factory over the journals under `root` that recovers them in
+    /// [`JournalReplayMode::Strict`].
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            replay_mode: JournalReplayMode::Strict,
             core_writers: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Recovers each core journal in `replay_mode` when it first opens.
+    pub fn with_replay_mode(mut self, replay_mode: JournalReplayMode) -> Self {
+        self.replay_mode = replay_mode;
+        self
     }
 
     pub(crate) fn core_journal_path(&self, core_id: CoreId) -> PathBuf {
@@ -461,20 +478,26 @@ impl DurableRaftLogStoreFactory {
         placement: ShardPlacement,
         metrics: GroupEngineMetrics,
     ) -> Result<Arc<CoreFileLogWriter>, GroupEngineError> {
-        let mut writers = self
+        let poisoned = || GroupEngineError::new("core file log writer mutex poisoned");
+        let slot = self
             .core_writers
             .lock()
-            .map_err(|_poisoned| GroupEngineError::new("core file log writer mutex poisoned"))?;
-        if let Some(writer) = writers.get(&placement.core_id.0).and_then(Weak::upgrade) {
+            .map_err(|_poisoned| poisoned())?
+            .entry(placement.core_id.0)
+            .or_default()
+            .clone();
+        let mut slot = slot.lock().map_err(|_poisoned| poisoned())?;
+        if let Some(writer) = slot.upgrade() {
             return Ok(writer);
         }
 
         let writer = CoreFileLogWriter::open(
             self.core_journal_path(placement.core_id),
+            self.replay_mode,
             Some((placement, metrics)),
         )
         .map_err(|err| GroupEngineError::new(format!("open OpenRaft core journal: {err}")))?;
-        writers.insert(placement.core_id.0, Arc::downgrade(&writer));
+        *slot = Arc::downgrade(&writer);
         Ok(writer)
     }
 
@@ -951,6 +974,37 @@ mod tests {
             std::process::id(),
             ordinal,
         ))
+    }
+
+    /// A core recovering its journal does not hold up another core's.
+    #[test]
+    fn cores_open_their_journals_independently() {
+        let root = unique_test_dir("parallel-core-open");
+        let factory = DurableRaftLogStoreFactory::new(&root);
+        let metrics = ursula_runtime::RuntimeMetrics::new(2, 2).group_engine_metrics();
+        let placement = |core: u16, group: u32| ShardPlacement {
+            core_id: CoreId(core),
+            shard_id: ShardId(group),
+            raft_group_id: RaftGroupId(group),
+        };
+        // Stand in for a long recovery of core 0 by holding its slot.
+        let slot = factory
+            .core_writers
+            .lock()
+            .expect("slots")
+            .entry(0)
+            .or_default()
+            .clone();
+        let held = slot.lock().expect("hold core 0");
+
+        // Core 0's slot stays held on this thread, so this open would never
+        // return if it waited for core 0.
+        let store = factory
+            .open(placement(1, 1), metrics)
+            .expect("core 1 opens while core 0 recovers");
+        drop(store);
+        drop(held);
+        crate::tests::remove_test_path(&root);
     }
 
     #[test]

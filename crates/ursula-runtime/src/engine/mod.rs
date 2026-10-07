@@ -20,6 +20,7 @@ use ursula_stream::StreamErrorContext;
 use crate::command::GroupSnapshot;
 use crate::metrics::RaftSnapshotBuildSample;
 use crate::metrics::RuntimeMetricsInner;
+use crate::metrics::WalStorageSample;
 use crate::read_index::LinearizableReadBarrier;
 use crate::request::AckColdGcResponse;
 use crate::request::AdvanceRetentionRequest;
@@ -615,26 +616,9 @@ impl GroupEngineMetrics {
         );
     }
 
-    pub fn record_wal_storage(
-        &self,
-        placement: ShardPlacement,
-        fsyncs: u64,
-        fsync_records: u64,
-        reclaims: u64,
-        reclaimed_bytes: u64,
-        reclaim_ns: u64,
-        physical_bytes: u64,
-    ) {
-        self.inner.record_wal_storage(
-            placement.core_id,
-            placement.raft_group_id,
-            fsyncs,
-            fsync_records,
-            reclaims,
-            reclaimed_bytes,
-            reclaim_ns,
-            physical_bytes,
-        );
+    pub fn record_wal_storage(&self, placement: ShardPlacement, sample: WalStorageSample) {
+        self.inner
+            .record_wal_storage(placement.core_id, placement.raft_group_id, sample);
     }
 
     pub fn record_wal_recovery(

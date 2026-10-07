@@ -90,24 +90,51 @@ second fsync; it does not change the durable append acknowledgement.
 
 ## On-disk contract
 
-Each active core owns one `core-N/journal.bin`. The v1 format starts with a
-magic/version header and encodes every record as:
+Each active core owns one `core-N/journal.bin`. Format epoch 3 starts the
+file with a 32-byte header (magic, version, header length, a 64-bit generation
+sequence and a CRC32 of the header) and encodes every record as:
 
 ```text
-u32 payload length | u32 CRC32 | MessagePack payload
+u32 payload length | u32 header CRC | u32 payload CRC | MessagePack payload
 ```
 
-Recovery refuses unknown versions, impossible lengths, checksum failures, and
-decoding failures. An incomplete final frame is treated as a crash-torn tail
-and truncated to the last complete checksummed frame. The decoder bounds a
-single frame at 512 MiB before allocating.
+The header CRC covers the generation sequence and the length, so a damaged
+length is detected before replay trusts it. The payload CRC covers the
+sequence, the length and the payload. A new journal is generation 1, and every
+rewrite (startup compaction, online reclaim) writes the next generation, so a
+frame verifies only in the file generation that wrote it.
+
+Replay has two modes, chosen by the caller:
+
+- `Strict` tolerates only an incomplete final frame, which it truncates. Any
+  other frame that fails verification fails recovery with its frame number and
+  offset.
+- `VerifiedPrefix` keeps the frames before the first one that fails
+  verification and truncates the rest, reporting the dropped bytes.
+
+Startup recovery and online reclaim use `Strict`. Online reclaim never
+truncates: a live journal that fails verification stops the writer instead.
+
+The writer is fail-stop. A failed write or `fsync` of the journal, or of the
+directory that publishes a new generation, poisons the core's writer for good:
+the failing batch and every later request fail with `WriterPoisoned`, and the
+writer never appends after a possibly partial frame or retries an `fsync`
+whose dirty pages the kernel may already have dropped. The process then
+aborts, because only a restart can re-read what is really on disk. Deterministic
+simulation keeps the poisoned writer instead, so it can observe it and restart
+the node. A reclaim that fails before it replaces the journal leaves the
+journal as it was: the batch that triggered it stays acknowledged, the failure
+is logged and counted in `wal_reclaim_failures`, and appends continue.
+Both modes refuse unknown versions, a damaged file header, oversized frames
+and frames whose checksums verify but whose payload does not decode. The
+decoder bounds a single frame at 512 MiB before allocating.
 
 The writer holds an exclusive advisory lock in `journal.bin.lock`. A second
 process receives a diagnostic error naming the journal, lock path, and recorded
 owner PID instead of concurrently modifying the same WAL.
 
-The journal header version is the format epoch, 2 since Ursula 0.6. There is
-no migration: a version-1 journal (Ursula 0.5.x) and a journal without the
+The journal header version is the format epoch, 3 since the single Raft WAL
+work. There is no migration: journals of epochs 1 and 2 and files without the
 Ursula WAL magic are refused, and the data directory's `FORMAT_EPOCH` marker
 refuses an older directory before any journal is opened.
 
@@ -122,8 +149,11 @@ The v1 writer performs an online generation checkpoint after a purge or
 truncate once the core journal reaches 64 MiB:
 
 1. append and sync the purge/truncate record;
-2. replay the durable journal into the current live state of every group;
-3. write and sync a new checksummed generation containing only that state;
+2. replay the live journal into the current live state of every group,
+   checking that it holds exactly the bytes the writer wrote;
+3. write and sync the next checksummed generation containing only that state,
+   with each group's entries in Append frames of about 8 MiB, so a group's
+   live log of any size stays below the 512 MiB frame limit;
 4. atomically replace `journal.bin` and sync its parent directory;
 5. reopen the append handle and continue batching.
 
@@ -167,7 +197,8 @@ counters:
 - `wal_fsyncs` and `wal_fsync_records` show actual physical flush count and the
   number of logical records sharing those flushes;
 - `wal_reclaims`, `wal_reclaimed_bytes`, and `wal_reclaim_ns` show online
-  checkpoint frequency, effect, and cost;
+  checkpoint frequency, effect, and cost, and `wal_reclaim_failures` counts
+  checkpoints that failed and left the journal unchanged;
 - `wal_physical_bytes` reports the current active journal size, summed across
   cores globally;
 - the existing `wal_batches`, `wal_records`, `wal_write_ns`, and `wal_sync_ns`

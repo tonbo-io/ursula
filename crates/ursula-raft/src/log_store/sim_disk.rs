@@ -550,14 +550,6 @@ impl JournalDisk for SimDisk {
         with_disk(|state| state.resolve(path).is_some()).unwrap_or(false)
     }
 
-    fn file_len(path: &Path) -> io::Result<u64> {
-        io_with_disk(|state| {
-            let inode = state.resolve_file(path)?;
-            Ok(state.inode(inode).map_or(0, |inode| inode.data.len()))
-        })
-        .map(|len| u64::try_from(len).unwrap_or(u64::MAX))
-    }
-
     fn truncate(path: &Path, len: u64) -> io::Result<()> {
         io_with_disk(|state| {
             let inode = state.resolve_file(path)?;

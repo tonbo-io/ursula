@@ -61,8 +61,9 @@ pub(crate) fn record_format_epoch_mismatch(direction: &'static str, message: &st
     tracing::error!(
         direction,
         message,
-        "raft grpc protocol mismatch: format epochs differ (an Ursula 0.6 node cannot run \
-         next to a 0.5.x node); /__ursula/ready answers 503 format_epoch_mismatch until restart"
+        "raft grpc protocol mismatch: format epochs differ (nodes of different format epochs \
+         cannot run in one cluster); /__ursula/ready answers 503 format_epoch_mismatch until \
+         restart"
     );
     FormatEpochMismatch::global().record();
 }
