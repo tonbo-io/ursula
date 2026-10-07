@@ -173,6 +173,18 @@ log moved since the operator looked is no longer the one the operator chose.
 The admin incarnation precondition still applies, so a restarted process
 refuses a plan made against the one before it.
 
+### Known gap: a wiped voter accepts appends from a stale leader
+
+The gate screens votes but not appends. A voter that lost its disk also lost
+its vote, so it accepts appends from any leader, including one of a term it
+had already voted past. A leader of an older term that reaches only that
+voter can then commit an entry at an index a newer leader also committed.
+Closing the gap needs the replica to refuse such leaders before its gate
+opens, which this design does not do yet
+([#405](https://github.com/tonbo-io/ursula/issues/405)). The DST schedule that shows it,
+`a_wiped_voter_never_lets_a_stale_leader_commit`, asserts that no index is
+committed with two different entries and stays ignored until then.
+
 ## Journal hardening
 
 - **Fail-stop.** Any write or `fsync` error stops the core writer. Pending

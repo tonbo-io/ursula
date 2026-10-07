@@ -26,7 +26,9 @@
 //!   election (candidates whose log is only the membership entry at index 0)
 //!   goes through. It still accepts appends from any leader whose vote is
 //!   not lower than its persisted vote; the WAL restores that vote before
-//!   the Raft core starts, so a leader of an older term is refused.
+//!   the Raft core starts, so a leader of an older term is refused. A
+//!   replica that lost its disk lost its vote too and accepts appends from
+//!   any leader, a known gap the gate does not close.
 //! - **Opening the gate** ([`run_rejoin_vote_barrier`]): the replica asks
 //!   the current leader for a fresh outbound ReadIndex barrier and opens the
 //!   gate once it has applied the barrier's committed index. Inbound
