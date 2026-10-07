@@ -90,19 +90,15 @@ init_membership = false
 # clusters where different groups have different voter sets).
 init_membership_per_group = false
 
-# How long a restarting node waits to observe an already-established leader
-# before deciding the group is truly new and bootstrapping it.  Must exceed
-# the election window.
-# rejoin_probe = "6s"
-
-# Timeout for probing static peers during bootstrap before logging a warning.
-# Continues retrying indefinitely.
+# A group's initializer that holds nothing of the group initializes it only
+# once every voter reports an empty group.  How often it logs that it is
+# still waiting; it keeps probing indefinitely.
 # bootstrap_peer_probe = "60s"
 
-# Interval between static-peer reachability probes during bootstrap.
+# Interval between bootstrap probes of the other voters.
 # bootstrap_peer_probe_interval = "250ms"
 
-# gRPC connect timeout when probing static peers.
+# Timeout of one bootstrap probe of another voter.
 # bootstrap_peer_connect = "500ms"
 
 # OpenRaft's install_snapshot_timeout covers the whole FullSnapshot RPC.
@@ -133,6 +129,14 @@ backend = "memory"
 # Directory for on-disk WAL files.  Required when backend is "disk".
 # Ursula appends a "raft-log" subdirectory automatically.
 # path = "/data/ursula"
+
+# When disk WAL appends reach stable storage: "never" | "always"
+#   never   — acknowledge from the page cache.  A host crash can cost a
+#             replica its unsynced tail; it then catches up from the leader
+#             before it votes again.  A group whose majority lost it stops
+#             until an operator accepts the loss.
+#   always  — acknowledge after fsync.
+# fsync = "never"
 
 # ------------------------------------------------------------------------------
 # [raft.peers]  — Static gRPC Raft peers (repeatable table)

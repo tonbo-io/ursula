@@ -1657,7 +1657,7 @@
         },
         "initMembershipPerGroup": {
           "type": "boolean",
-          "description": "Idempotent per-group membership bootstrap. Memory-WAL initialization waits for all voters; S3 initialized markers prevent silently reinitializing previously used all-empty groups."
+          "description": "Idempotent per-group membership bootstrap. A replica that ever held its group never initializes it again; one that holds nothing initializes only once every voter reports an empty group."
         },
         "storageMode": {
           "type": "string",
@@ -1678,7 +1678,7 @@
             "always",
             "never"
           ],
-          "description": "When Raft WAL appends reach stable storage in logDir mode: always acknowledges after fsync; never acknowledges from the page cache, so a host crash can lose this replica's unsynced tail."
+          "description": "When Raft WAL appends reach stable storage in logDir mode (default never): never acknowledges from the page cache, so a host crash can cost this replica its unsynced tail and it rejoins through the recovery gate; always acknowledges after fsync."
         },
         "minAvailableBytes": {
           "type": "integer",
@@ -1692,7 +1692,7 @@
         },
         "allowVolatileMultiPeer": {
           "type": "boolean",
-          "description": "Explicit acceptance of volatile multi-pod memory WAL: minority restarts heal automatically; quorum state loss stops writes and may lose acknowledged data. Shared S3 initialized markers block silent reinitialization after all voters restart; resuming requires explicit acceptance of data loss."
+          "description": "Explicit acceptance of volatile multi-pod memory WAL: minority restarts heal automatically; quorum state loss stops writes and may lose acknowledged data; a restart of every voter initializes the groups again, empty."
         },
         "maxUncommittedBytesPerGroup": {
           "type": [

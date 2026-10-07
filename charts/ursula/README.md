@@ -122,23 +122,25 @@ redirect URL configuration.
 
 ## Bootstrap Behavior
 
-`raft.initMembershipPerGroup` defaults to `true` so a fresh cluster can initialize per-group Raft membership automatically. Persistent `logDir` deployments can keep it enabled across restarts and upgrades: initialization checks existing Raft state before changing membership.
+`raft.initMembershipPerGroup` defaults to `true` so a fresh cluster can initialize per-group Raft membership automatically. Deployments can keep it enabled across restarts and upgrades: a replica that ever held its group never initializes it again, and a replica that holds nothing initializes the group only once every configured voter reports an empty group and no leader.
+
+### Disk-WAL fsync policy and recovery
+
+With `raft.storageMode=logDir`, `raft.walFsync` (default `never`) chooses when Raft WAL appends reach stable storage. Under `never` a process crash loses nothing, but a host crash or power loss can cost a replica the unsynced tail of its journals. Such a replica restarts behind a recovery gate for every group it held: it does not campaign or vote until it has applied a fresh barrier from the group's leader, and the leader rebuilds it. Readiness answers `503` with reason `recovery_gate_closed` meanwhile. While at most a minority of a group's voters lost their tail, no acknowledged write is lost.
+
+If a majority of a group's voters lose their tail at once, the group has no leader and refuses writes, and the gated replicas report it stalled (readiness reason `recovery_stalled`). It resumes only after an operator accepts the loss of writes acknowledged after the last `fsync`, with `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss` on the gated replicas with the longest logs. Set `raft.walFsync=always` to acknowledge every batch after `fsync` instead. See the [operations guide](https://ursula.tonbo.io/docs/operations#recovering-after-a-host-crash).
 
 ### Memory-WAL Durability Contract
 
-`raft.storageMode=memory` loses the node's local Raft logs and replicated state on every process restart, including OOM or the emergency RSS abort threshold. Set `persistence.enabled=false` and explicitly opt in with `raft.allowVolatileMultiPeer=true`. A PVC does not make memory WAL persistent.
+`raft.storageMode=memory` loses the node's local Raft logs and replicated state on every process restart, including OOM or the emergency RSS abort threshold. Set `persistence.enabled=false` and explicitly opt in with `raft.allowVolatileMultiPeer=true`. A PVC does not make memory WAL persistent. The memory WAL ignores `raft.walFsync`.
 
-From 0.6.2, the recovery behavior is per Raft group:
+A restarted memory-WAL node goes through the same recovery gate as a disk-WAL node after a host crash. Per Raft group:
 
 - **A minority of voters restart:** surviving leaders automatically remove an amnesiac voter, add it as a learner, wait for catch-up, and promote it. For three voters, this covers one unrecovered voter at a time. Wait for every group to regain its caught-up voter set before restarting another node; overlapping restarts count as simultaneous loss. The process has no published recovery-time upper bound.
-- **A quorum of voters lose state:** the affected groups stop completing writes. Acknowledged writes held only by the lost voters may already be gone. Recovery requires an operator to adopt a surviving log and accept that loss; automatic repair does not reconstruct it from S3.
-- **All voters lose state:** with shared S3 object storage, `URSULA_GROUP_INITIALIZED/group-{id}` markers prevent groups that previously held writes from silently bootstrapping empty. They remain stopped until an operator calls the initializer's `rejoin/reinitialize?accept_data_loss=true` endpoint. The marker detects prior use; it is not a backup of the lost log.
+- **A quorum of voters lose state:** if the leader survived, it resends its log to them. Otherwise the affected groups stop completing writes. Acknowledged writes held only by the lost voters may already be gone. Recovery requires an operator to accept that loss with `accept-unsynced-loss`; automatic repair does not reconstruct it from S3.
+- **All voters lose state:** a restart of every voter cannot be detected. The groups initialize again, empty.
 
-The full-restart guard requires shared S3 cold storage or an S3 snapshot store, an unchanged object-storage root/prefix, and preservation of the initialized markers. Before acknowledging the first write, the group leader stores its marker; if it cannot do so, writes fail closed. If the initializer cannot read the marker, it retries without initializing. Without shared object storage, an all-empty restart cannot be distinguished from a fresh cluster and may initialize empty. During an upgrade from 0.6.1, all replicas must run 0.6.2 before relying on this guard.
-
-The repaired vote gate in this source requires a fresh post-start quorum-confirmed leader barrier and local application through its index before restoring voting, automatic elections or targeted leadership transfers. A delayed old AppendEntries cannot provide that proof. All voters must run the repaired gate before relying on this guarantee; unpatched 0.6.2 has a reproduced early-release defect. A rolling upgrade can obtain proof from an older leader through its existing linearizable read and vote RPCs.
-
-These recovery mechanisms do not by themselves establish production qualification: test the chosen topology under single-voter loss, delayed replication, snapshot-store failures, and production memory limits. Readiness in this source checks the configured group inventory, running replicas, recovery barriers, complete uniform voter sets, applied membership and bounded local lag. It does not continuously prove quorum availability or serialize separate maintenance workflows. `ursulactl verify-quorum` obtains fresh per-group confirmations and verifies application through their fixed prefixes; this observation still requires an exclusive maintenance reservation and physical fencing before it can authorize a disruption. See the [operations guide](https://ursula.tonbo.io/docs/operations#restarting-a-memory-wal-node) for the recovery endpoints and their limits.
+These recovery mechanisms do not by themselves establish production qualification: test the chosen topology under single-voter loss, delayed replication, snapshot-store failures, and production memory limits. Readiness in this source checks the configured group inventory, running replicas, recovery gates, complete uniform voter sets, applied membership and bounded local lag. It does not continuously prove quorum availability or serialize separate maintenance workflows. `ursulactl verify-quorum` obtains fresh per-group confirmations and verifies application through their fixed prefixes; this observation still requires an exclusive maintenance reservation and physical fencing before it can authorize a disruption. See the [operations guide](https://ursula.tonbo.io/docs/operations#restarting-a-memory-wal-node) for the recovery endpoint and its limits.
 
 ## Static Membership And `server.replicaCount`
 
@@ -414,10 +416,10 @@ container receives only chart-managed container settings plus explicit
 | `raft.initMembershipPerGroup` | `true` | Idempotent per-group membership bootstrap flag; persistent groups may keep it enabled across restarts. |
 | `raft.storageMode` | `logDir` | Raft storage mode: `logDir` persists logs locally; `memory` uses volatile quorum-replicated logs. See the memory-WAL durability contract above. |
 | `raft.logDir` | `/var/lib/ursula/raft` | Raft log directory mounted to the `raft-data` volume. |
-| `raft.walFsync` | `always` | When Raft WAL appends reach stable storage in `logDir` mode. `always` acknowledges a batch after `fsync`. `never` acknowledges once the write is in the page cache, so a host crash can lose this replica's unsynced tail. Votes and the run state are always written with `fsync`. Renders `raft.wal.fsync`. |
+| `raft.walFsync` | `never` | When Raft WAL appends reach stable storage in `logDir` mode. `never` acknowledges once the write is in the page cache: a host crash can cost this replica its unsynced tail, and it rejoins through the recovery gate. `always` acknowledges a batch after `fsync`. Votes, group log states and the run state are always written with `fsync`. Renders `raft.wal.fsync`. |
 | `raft.minAvailableBytes` | `536870912` | Reject writes and readiness below this many free bytes on the WAL filesystem. `0` disables the guard. |
 | `raft.resumeAvailableBytes` | `1073741824` | Free bytes required before WAL disk pressure clears; must exceed the minimum. |
-| `raft.allowVolatileMultiPeer` | `false` | Required explicit acceptance of the memory-WAL durability contract for multi-pod clusters. Shared S3 initialized markers are required to detect an all-voter restart. |
+| `raft.allowVolatileMultiPeer` | `false` | Required explicit acceptance of the memory-WAL durability contract for multi-pod clusters. A restart of every voter initializes the groups again, empty. |
 | `raft.maxUncommittedBytesPerGroup` | `null` | Optional per-group cap for raft-submitted but not-yet-applied payload bytes. Renders `raft.max_uncommitted_size_per_group` in the generated config when set; `0` disables the cap. |
 | `raft.snapshotLogsSinceLast` | `5000` | Committed log entries per group between automatic full-state snapshots. Higher values trade log memory for lower snapshot CPU and tail latency. |
 | `raft.snapshotPressureMaxGroupsPerTick` | `16` | Maximum groups snapshotted by one pressure pass. |
