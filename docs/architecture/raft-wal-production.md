@@ -1,7 +1,9 @@
 # Production Raft WAL with an in-memory state machine
 
 Status: accepted, including the operational rollout gate tracked by
-[#273](https://github.com/tonbo-io/ursula/issues/273).
+[#273](https://github.com/tonbo-io/ursula/issues/273). The `fsync` policy,
+removal of the memory backend, and the journal hardening that follows are
+specified in [Single Raft WAL with an fsync policy](single-raft-wal.md).
 
 ## Decision
 
