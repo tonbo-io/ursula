@@ -453,13 +453,20 @@ impl JournalCluster {
             .await
             .expect("start a journal-backed replica");
             drivers.extend(recovery_wiring::wire_recovery(
-                node_id, placement, &engine, &rejoin, &registry, &voters,
+                node_id,
+                placement,
+                &engine,
+                &rejoin,
+                &registry,
+                &self.policy,
+                &voters,
             ));
             registry.register(node_id, engine.raft_handle());
             if node_id == 1 && !rejoin.holds_group_history() {
                 let raft = engine.raft_handle();
                 let rejoin = rejoin.clone();
                 let voters = voters.clone();
+                let policy = self.policy.clone();
                 drivers.push(madsim::task::spawn(async move {
                     ursula_raft::run_group_bootstrap(
                         node_id,
@@ -468,8 +475,12 @@ impl JournalCluster {
                         voters,
                         move |peer_id, _address| {
                             let registry = registry.clone();
+                            let policy = policy.clone();
                             async move {
-                                recovery_wiring::in_process_probe(&registry, node_id, peer_id).await
+                                recovery_wiring::in_process_probe(
+                                    &registry, &policy, node_id, peer_id,
+                                )
+                                .await
                             }
                         },
                         Duration::from_millis(50),

@@ -416,6 +416,18 @@ impl InProcessRaftNetworkPolicy {
         self.notify_policy_changed(InProcessRaftNetworkPolicyEvent::Clear);
     }
 
+    /// Whether `source` and `target` are cut off from each other in either
+    /// direction. Calls that reach a peer outside the Raft network, such as
+    /// the recovery gate's barrier and bootstrap probes, ask it so a
+    /// partition stops them too.
+    pub fn partitioned(&self, source: u64, target: u64) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .expect("in-process raft network policy mutex");
+        inner.partitions.contains(&(source, target)) || inner.partitions.contains(&(target, source))
+    }
+
     fn decision(
         &self,
         source: Option<u64>,
