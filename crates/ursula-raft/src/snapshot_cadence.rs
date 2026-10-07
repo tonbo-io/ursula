@@ -12,6 +12,10 @@
 //! budget, it snapshots the groups that free the most log per snapshot byte
 //! first, until the node would fall to half of the budget.
 //!
+//! Groups the Raft WAL reports lagging (their live log keeps old journal
+//! segments on disk) go first, ahead of the cadence and the pressure pass,
+//! as long as they applied log since their last snapshot.
+//!
 //! The policy is pure: the snapshot driver feeds it each group's
 //! [`GroupLogProgress`], read from the [`GroupLogGauge`] its state machine
 //! maintains, and the state probe feeds it simulated groups.
@@ -105,12 +109,53 @@ impl SnapshotCadence {
     /// the node would fall to the pressure target. Either way the order is
     /// most log freed per snapshot byte first, then the lowest index.
     pub fn plan(&self, groups: &[GroupLogProgress], max_groups: usize) -> SnapshotPlan {
+        self.plan_with_lagging(groups, &[], max_groups)
+    }
+
+    /// [`SnapshotCadence::plan`], with the groups whose `lagging` flag is set
+    /// first, most log first, whenever they hold log since their last
+    /// snapshot. A missing flag counts as unset.
+    pub fn plan_with_lagging(
+        &self,
+        groups: &[GroupLogProgress],
+        lagging: &[bool],
+        max_groups: usize,
+    ) -> SnapshotPlan {
+        let is_lagging = |index: usize| {
+            lagging.get(index).copied().unwrap_or(false)
+                && groups
+                    .get(index)
+                    .is_some_and(|progress| progress.log_entries > 0)
+        };
+        let mut forced = (0..groups.len())
+            .filter(|index| is_lagging(*index))
+            .collect::<Vec<_>>();
+        forced.sort_by(|left, right| {
+            let bytes = |index: &usize| groups.get(*index).map_or(0, |progress| progress.log_bytes);
+            bytes(right).cmp(&bytes(left)).then_with(|| left.cmp(right))
+        });
+        forced.truncate(max_groups);
+        let mut plan = self.plan_cadence(groups, &forced, max_groups.saturating_sub(forced.len()));
+        let mut selected = forced;
+        selected.append(&mut plan.groups);
+        plan.groups = selected;
+        plan
+    }
+
+    /// The cadence and pressure plan over the groups not in `skip`.
+    fn plan_cadence(
+        &self,
+        groups: &[GroupLogProgress],
+        skip: &[usize],
+        max_groups: usize,
+    ) -> SnapshotPlan {
         let node_log_bytes = groups
             .iter()
             .map(|progress| progress.log_bytes)
             .fold(0u64, u64::saturating_add);
         let pressure = node_log_bytes >= self.pressure_watermark_bytes();
         let mut order = (0..groups.len())
+            .filter(|index| !skip.contains(index))
             .filter(|index| {
                 groups.get(*index).is_some_and(|progress| {
                     if pressure {
@@ -328,6 +373,37 @@ mod tests {
         assert_eq!(plan.node_log_bytes, 50 * MIB);
         // 14/8 > 10/6 > 14/10 > 12/16; stop once at or below 32 MiB.
         assert_eq!(plan.groups, vec![0, 3]);
+    }
+
+    /// Lagging groups go first, most log first, ahead of due groups and
+    /// whatever their own cadence says, unless they applied nothing since
+    /// their last snapshot.
+    #[test]
+    fn lagging_groups_are_snapshotted_first() {
+        let cadence = SnapshotCadence::new(1 << 30, 128, 100_000);
+        let groups = [
+            progress(5 * MIB, MIB),
+            progress(MIB, 0),
+            progress(2 * MIB, 4 * MIB),
+            progress(3 * MIB, 4 * MIB),
+            GroupLogProgress {
+                has_snapshot: true,
+                ..GroupLogProgress::default()
+            },
+        ];
+        assert!(!cadence.is_due(&groups[2]) && !cadence.is_due(&groups[3]));
+        let plan = cadence.plan_with_lagging(&groups, &[false, false, true, true, true], 16);
+        assert_eq!(plan.groups, vec![3, 2, 0]);
+        assert_eq!(
+            cadence
+                .plan_with_lagging(&groups, &[false, false, true, true], 1)
+                .groups,
+            vec![3]
+        );
+        assert_eq!(
+            cadence.plan_with_lagging(&groups, &[], 16),
+            cadence.plan(&groups, 16)
+        );
     }
 
     #[test]

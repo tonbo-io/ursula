@@ -50,14 +50,14 @@
   },
   {
     "category": "tokio_runtime_builder",
-    "path": "crates/ursula-raft/src/log_store/file.rs",
+    "path": "crates/ursula-raft/src/log_store/writer.rs",
     "snippet_contains": "tokio::runtime::Builder::new_current_thread()",
     "reason": "already-cfg-gated",
     "plan": "no action: paired with the std_thread_spawn entry below; the current-thread runtime that drives the per-core journal writer thread is built only in the cfg(not(madsim)) spawn_core_file_log_writer, while cfg(madsim) spawns the writer loop as a simulated task"
   },
   {
     "category": "std_thread_spawn",
-    "path": "crates/ursula-raft/src/log_store/file.rs",
+    "path": "crates/ursula-raft/src/log_store/writer.rs",
     "snippet_contains": "std::thread::Builder::new()",
     "reason": "already-cfg-gated",
     "plan": "no action: spawn_core_file_log_writer has split impls — cfg(not(madsim)) runs the per-core journal writer on its own OS thread with a current-thread runtime, cfg(madsim) spawns the same async writer loop as a simulated task over the simulated disk"

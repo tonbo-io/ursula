@@ -123,7 +123,10 @@
     "w6_w1.records": 200000.0,
     "w6_w1.residual_bytes": 344.0,
     "w6_w1.retained_records": 2000.0,
-    "w6_w1.snapshot_bytes": 400426.0
+    "w6_w1.snapshot_bytes": 400426.0,
+    "wal.heap_bytes": 10989912.0,
+    "wal.peak_heap_bytes": 17869870.0,
+    "wal.retained_bytes": 282161152.0
   },
   "targets": {
     "cadence_g128.f12_node_log_within_budget": true,
@@ -207,6 +210,8 @@
     "w6_w1.f3_receipt_items_per_stream": true,
     "w6_w1.f5_staged_external_refs_per_stream": true,
     "w6_w1.f7_capacity_slack": true,
-    "w6_w1.f8_ttl_heap_entries": true
+    "w6_w1.f8_ttl_heap_entries": true,
+    "wal.wal_heap_within_index_and_caches": true,
+    "wal.wal_peak_heap_within_index_and_caches": true
   }
 }

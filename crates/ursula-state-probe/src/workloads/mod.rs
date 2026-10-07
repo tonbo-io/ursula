@@ -1,6 +1,6 @@
 //! Workload drivers. W1 to W6 and the planner probe drive the real
 //! `StreamStateMachine` (L1); [`l2`] drives the real `ShardRuntime` on both
-//! engines (L2). Each returns an [`crate::out::Outcome`] for the gate and
+//! engines (L2); [`wal`] drives the Raft log stores on one core journal. Each returns an [`crate::out::Outcome`] for the gate and
 //! writes one JSONL row per checkpoint.
 
 pub mod cadence;
@@ -11,6 +11,7 @@ pub mod w2;
 pub mod w3;
 pub mod w4;
 pub mod w5;
+pub mod wal;
 
 use std::path::Path;
 
@@ -30,6 +31,7 @@ pub enum Workload {
     W5(w5::W5Args),
     Planner(planner::PlannerArgs),
     L2(l2::L2Args),
+    Wal(wal::WalArgs),
 }
 
 impl Workload {
@@ -47,6 +49,7 @@ impl Workload {
                 .clone()
                 .unwrap_or_else(|| "planner_cost".to_owned()),
             Workload::L2(args) => l2::default_name(args),
+            Workload::Wal(args) => wal::default_name(args),
         }
     }
 
@@ -62,6 +65,7 @@ impl Workload {
             Workload::W5(args) => w5::run(args, &mut sink),
             Workload::Planner(args) => planner::run(args, &mut sink),
             Workload::L2(args) => l2::run(args, &mut sink),
+            Workload::Wal(args) => wal::run(args, &mut sink),
         }
     }
 }

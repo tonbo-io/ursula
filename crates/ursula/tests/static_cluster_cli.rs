@@ -491,13 +491,8 @@ async fn cli_static_grpc_raft_log_dir_recovers_with_bootstrap_enabled_after_rest
         .await;
     }
 
-    let journal_path = log_dir.join("raft-log").join("core-0").join("journal.bin");
-    assert!(journal_path.exists(), "core journal should exist");
     assert!(
-        std::fs::metadata(&journal_path)
-            .expect("core journal metadata")
-            .len()
-            > 0,
+        core_journal_record_bytes(&log_dir.join("raft-log").join("core-0")) > 0,
         "core journal should contain records"
     );
 
@@ -714,27 +709,18 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
     // test only fails when a node truly never persists, not when it persists
     // a beat later than the read.
     for node_id in 1..=3 {
-        let journal_path = root
+        let core_dir = root
             .join(format!("node-{node_id}-log"))
             .join("raft-log")
-            .join("core-0")
-            .join("journal.bin");
+            .join("core-0");
         let mut last_len = 0u64;
         for _ in 0..100 {
-            if journal_path.exists() {
-                last_len = std::fs::metadata(&journal_path)
-                    .expect("node journal metadata")
-                    .len();
-                if last_len > 0 {
-                    break;
-                }
+            last_len = core_journal_record_bytes(&core_dir);
+            if last_len > 0 {
+                break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(
-            journal_path.exists(),
-            "node {node_id} journal should exist after polling for ~5s",
-        );
         assert!(
             last_len > 0,
             "node {node_id} journal should contain records after polling for ~5s (saw len={last_len})",
@@ -2771,4 +2757,18 @@ fn remove_test_path(path: impl AsRef<std::path::Path>) {
     {
         panic!("remove test path {}: {err}", path.display());
     }
+}
+
+/// The bytes the segments of the core journal in `core_dir` hold beyond
+/// their headers; zero before the journal exists.
+fn core_journal_record_bytes(core_dir: &Path) -> u64 {
+    ursula_raft::journal_segments(core_dir)
+        .expect("list the core journal segments")
+        .iter()
+        .map(|(_, path)| {
+            std::fs::metadata(path)
+                .map(|metadata| metadata.len().saturating_sub(32))
+                .unwrap_or(0)
+        })
+        .sum()
 }

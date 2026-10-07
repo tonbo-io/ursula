@@ -377,13 +377,23 @@ runtime_metrics! {
     sum wal_fsyncs: core per_core_wal_fsyncs, group per_group_wal_fsyncs;
     sum wal_fsync_records:
         core per_core_wal_fsync_records, group per_group_wal_fsync_records;
-    sum wal_reclaims: core per_core_wal_reclaims, group per_group_wal_reclaims;
-    sum wal_reclaimed_bytes:
-        core per_core_wal_reclaimed_bytes, group per_group_wal_reclaimed_bytes;
-    sum wal_reclaim_ns: core per_core_wal_reclaim_ns, group per_group_wal_reclaim_ns;
-    sum wal_reclaim_failures:
-        core per_core_wal_reclaim_failures, group per_group_wal_reclaim_failures;
+    sum wal_reclaims: core per_core_wal_reclaims;
+    sum wal_reclaimed_bytes: core per_core_wal_reclaimed_bytes;
+    sum wal_reclaim_ns: core per_core_wal_reclaim_ns;
+    sum wal_reclaim_failures: core per_core_wal_reclaim_failures;
+    sum wal_rewritten_bytes: core per_core_wal_rewritten_bytes;
+    sum wal_rotations: core per_core_wal_rotations;
     sum wal_physical_bytes: core per_core_wal_physical_bytes;
+    sum wal_segments: core per_core_wal_segments;
+    sum wal_pinned_segments: core per_core_wal_pinned_segments;
+    sum wal_lagging_groups: core per_core_wal_lagging_groups;
+    sum wal_cache_hits: core per_core_wal_cache_hits, group per_group_wal_cache_hits;
+    sum wal_cache_misses: core per_core_wal_cache_misses, group per_group_wal_cache_misses;
+    sum wal_disk_reads: core per_core_wal_disk_reads, group per_group_wal_disk_reads;
+    sum wal_disk_read_bytes:
+        core per_core_wal_disk_read_bytes, group per_group_wal_disk_read_bytes;
+    sum wal_cache_bytes: group per_group_wal_cache_bytes;
+    sum wal_indexed_entries: group per_group_wal_indexed_entries;
     sum wal_recovery_ns: core per_core_wal_recovery_ns;
     sum wal_recovery_records: core per_core_wal_recovery_records;
     sum wal_recovery_bytes: core per_core_wal_recovery_bytes;
@@ -433,14 +443,55 @@ pub struct WalStorageSample {
     pub fsyncs: u64,
     /// Records made durable by those `fsync`s.
     pub fsync_records: u64,
-    /// Online rewrites of the journal.
+    /// The current size of the core's journal, all segments.
+    pub physical_bytes: u64,
+}
+
+/// What a core journal's writer did besides writing batches: rotating
+/// segments and reclaiming old ones. Counters add up; gauges replace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalJournalSample {
+    /// `fsync` calls of rotations and reclaim passes, on files and
+    /// directories.
+    pub fsyncs: u64,
+    pub rotations: u64,
+    /// Segments deleted, and their bytes.
     pub reclaims: u64,
     pub reclaimed_bytes: u64,
     pub reclaim_ns: u64,
-    /// Online rewrites that failed and left the journal as it was.
+    /// Reclaim passes that stopped on an error and left the journal correct.
     pub reclaim_failures: u64,
-    /// The current size of the core's journal.
+    /// Live entry bytes copied out of old segments.
+    pub rewritten_bytes: u64,
+    /// Gauge: the journal's size, all segments.
     pub physical_bytes: u64,
+    /// Gauge: the journal's segments.
+    pub segments: u64,
+    /// Gauge: sealed segments kept only for lagging groups.
+    pub pinned_segments: u64,
+    /// Gauge: groups reported lagging to the snapshot driver.
+    pub lagging_groups: u64,
+}
+
+/// What a read of a group's log cost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalReadSample {
+    /// Entries served from the group's cache.
+    pub cache_hits: u64,
+    /// Entries read from disk.
+    pub cache_misses: u64,
+    /// Frames read from disk, and their bytes.
+    pub disk_reads: u64,
+    pub disk_read_bytes: u64,
+}
+
+/// The size of a group's log in memory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalMemorySample {
+    /// Bytes of cached entries.
+    pub cache_bytes: u64,
+    /// Entries the group's index holds.
+    pub indexed_entries: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -649,24 +700,67 @@ impl RuntimeMetricsInner {
             .add_at(core_index, sample.fsync_records);
         self.per_group_wal_fsync_records
             .add_at(group_index, sample.fsync_records);
-        self.per_core_wal_reclaims
-            .add_at(core_index, sample.reclaims);
-        self.per_group_wal_reclaims
-            .add_at(group_index, sample.reclaims);
-        self.per_core_wal_reclaimed_bytes
-            .add_at(core_index, sample.reclaimed_bytes);
-        self.per_group_wal_reclaimed_bytes
-            .add_at(group_index, sample.reclaimed_bytes);
-        self.per_core_wal_reclaim_ns
-            .add_at(core_index, sample.reclaim_ns);
-        self.per_group_wal_reclaim_ns
-            .add_at(group_index, sample.reclaim_ns);
-        self.per_core_wal_reclaim_failures
-            .add_at(core_index, sample.reclaim_failures);
-        self.per_group_wal_reclaim_failures
-            .add_at(group_index, sample.reclaim_failures);
         self.per_core_wal_physical_bytes
             .store_at(core_index, sample.physical_bytes);
+    }
+
+    pub(crate) fn record_wal_journal(&self, core_id: CoreId, sample: WalJournalSample) {
+        let core_index = usize::from(core_id.0);
+        self.per_core_wal_fsyncs.add_at(core_index, sample.fsyncs);
+        self.per_core_wal_rotations
+            .add_at(core_index, sample.rotations);
+        self.per_core_wal_reclaims
+            .add_at(core_index, sample.reclaims);
+        self.per_core_wal_reclaimed_bytes
+            .add_at(core_index, sample.reclaimed_bytes);
+        self.per_core_wal_reclaim_ns
+            .add_at(core_index, sample.reclaim_ns);
+        self.per_core_wal_reclaim_failures
+            .add_at(core_index, sample.reclaim_failures);
+        self.per_core_wal_rewritten_bytes
+            .add_at(core_index, sample.rewritten_bytes);
+        self.per_core_wal_physical_bytes
+            .store_at(core_index, sample.physical_bytes);
+        self.per_core_wal_segments
+            .store_at(core_index, sample.segments);
+        self.per_core_wal_pinned_segments
+            .store_at(core_index, sample.pinned_segments);
+        self.per_core_wal_lagging_groups
+            .store_at(core_index, sample.lagging_groups);
+    }
+
+    pub(crate) fn record_wal_read(
+        &self,
+        core_id: CoreId,
+        group_id: RaftGroupId,
+        sample: WalReadSample,
+    ) {
+        let core_index = usize::from(core_id.0);
+        let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
+        self.per_core_wal_cache_hits
+            .add_at(core_index, sample.cache_hits);
+        self.per_group_wal_cache_hits
+            .add_at(group_index, sample.cache_hits);
+        self.per_core_wal_cache_misses
+            .add_at(core_index, sample.cache_misses);
+        self.per_group_wal_cache_misses
+            .add_at(group_index, sample.cache_misses);
+        self.per_core_wal_disk_reads
+            .add_at(core_index, sample.disk_reads);
+        self.per_group_wal_disk_reads
+            .add_at(group_index, sample.disk_reads);
+        self.per_core_wal_disk_read_bytes
+            .add_at(core_index, sample.disk_read_bytes);
+        self.per_group_wal_disk_read_bytes
+            .add_at(group_index, sample.disk_read_bytes);
+    }
+
+    pub(crate) fn record_wal_memory(&self, group_id: RaftGroupId, sample: WalMemorySample) {
+        let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
+        self.per_group_wal_cache_bytes
+            .store_at(group_index, sample.cache_bytes);
+        self.per_group_wal_indexed_entries
+            .store_at(group_index, sample.indexed_entries);
     }
 
     pub(crate) fn record_wal_recovery(
@@ -973,7 +1067,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 137] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 159] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -1060,18 +1154,40 @@ mod metric_manifest_tests {
         "per_group_wal_fsync_records",
         "wal_reclaims",
         "per_core_wal_reclaims",
-        "per_group_wal_reclaims",
         "wal_reclaimed_bytes",
         "per_core_wal_reclaimed_bytes",
-        "per_group_wal_reclaimed_bytes",
         "wal_reclaim_ns",
         "per_core_wal_reclaim_ns",
-        "per_group_wal_reclaim_ns",
         "wal_reclaim_failures",
         "per_core_wal_reclaim_failures",
-        "per_group_wal_reclaim_failures",
+        "wal_rewritten_bytes",
+        "per_core_wal_rewritten_bytes",
+        "wal_rotations",
+        "per_core_wal_rotations",
         "wal_physical_bytes",
         "per_core_wal_physical_bytes",
+        "wal_segments",
+        "per_core_wal_segments",
+        "wal_pinned_segments",
+        "per_core_wal_pinned_segments",
+        "wal_lagging_groups",
+        "per_core_wal_lagging_groups",
+        "wal_cache_hits",
+        "per_core_wal_cache_hits",
+        "per_group_wal_cache_hits",
+        "wal_cache_misses",
+        "per_core_wal_cache_misses",
+        "per_group_wal_cache_misses",
+        "wal_disk_reads",
+        "per_core_wal_disk_reads",
+        "per_group_wal_disk_reads",
+        "wal_disk_read_bytes",
+        "per_core_wal_disk_read_bytes",
+        "per_group_wal_disk_read_bytes",
+        "wal_cache_bytes",
+        "per_group_wal_cache_bytes",
+        "wal_indexed_entries",
+        "per_group_wal_indexed_entries",
         "wal_recovery_ns",
         "per_core_wal_recovery_ns",
         "wal_recovery_records",

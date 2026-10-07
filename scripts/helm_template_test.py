@@ -402,10 +402,44 @@ class HelmTemplateConfigTest(unittest.TestCase):
 
         self.assertEqual(wal["min_available_size"], "536870912")
         self.assertEqual(wal["resume_available_size"], "1073741824")
+        self.assertEqual(wal["segment_size"], "67108864")
+        self.assertEqual(wal["cache_size"], "268435456")
         self.assertIn(
             "readinessProbe:\n            httpGet:\n              path: /__ursula/ready\n              port: client",
             rendered,
         )
+
+    def test_wal_segment_and_cache_sizes_are_rendered_and_validated(self) -> None:
+        wal = tomllib.loads(
+            render_config(
+                "--set",
+                "s3.bucket=bkt",
+                "--set",
+                "raft.walSegmentBytes=8388608",
+                "--set",
+                "raft.walCacheBytes=33554432",
+            )
+        )["raft"]["wal"]
+        self.assertEqual(wal["segment_size"], "8388608")
+        self.assertEqual(wal["cache_size"], "33554432")
+
+        result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                "charts/ursula",
+                "--set",
+                "s3.bucket=bkt",
+                "--set",
+                "raft.walSegmentBytes=1024",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("walSegmentBytes", result.stderr)
 
     def test_wal_fsync_policy_is_rendered_and_validated(self) -> None:
         wal = tomllib.loads(render_config("--set", "s3.bucket=bkt"))["raft"]["wal"]

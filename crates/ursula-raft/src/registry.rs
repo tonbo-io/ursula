@@ -45,6 +45,7 @@ use ursula_runtime::default_snapshot_store;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 
+use crate::log_store::LaggingGroups;
 use crate::log_store::RecoveryState;
 use crate::log_store::WalOpening;
 use crate::meta::MetaRaftTypeConfig;
@@ -954,6 +955,8 @@ pub struct RaftGroupHandleRegistry {
     snapshot_install: SnapshotInstallCoordinator,
     /// How this node's Raft WAL opened, when its logs are durable.
     wal_opening: Arc<Mutex<Option<WalOpening>>>,
+    /// The groups this node's WAL reports lagging, when its logs are durable.
+    wal_lagging_groups: Arc<Mutex<Option<Arc<LaggingGroups>>>>,
 }
 
 impl Default for RaftGroupHandleRegistry {
@@ -971,6 +974,7 @@ impl Default for RaftGroupHandleRegistry {
             snapshot_build: Arc::new(Mutex::new(SnapshotBuildCoordinator::new(1))),
             snapshot_install: SnapshotInstallCoordinator::new(1),
             wal_opening: Arc::new(Mutex::new(None)),
+            wal_lagging_groups: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -1008,6 +1012,23 @@ impl RaftGroupHandleRegistry {
             .wal_opening
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Attaches the lagging groups this node's Raft WAL reports.
+    pub fn set_wal_lagging_groups(&self, lagging: Arc<LaggingGroups>) {
+        *self
+            .wal_lagging_groups
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(lagging);
+    }
+
+    /// The groups whose live records keep old journal segments alive, which
+    /// the snapshot driver snapshots first; `None` until a WAL is attached.
+    pub fn wal_lagging_groups(&self) -> Option<Arc<LaggingGroups>> {
+        self.wal_lagging_groups
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 
     /// Whether this node's Raft logs may be missing entries it acknowledged;

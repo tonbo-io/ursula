@@ -1,7 +1,8 @@
 //! Suites and the ratchet gate (§7.2, §7.3).
 //!
 //! The `pr` suite runs reduced-scale W1 and W3 to W6, the reduced starvation
-//! reproduction, the planner probe and the L2 engine probes in a few minutes.
+//! reproduction, the planner probe, the L2 engine probes and the Raft WAL
+//! memory probe in a few minutes.
 //! The `nightly` suite runs the full-scale audit set. The gate compares a
 //! suite's [`Outcome`] with a ratchet file:
 //!
@@ -34,6 +35,7 @@ use crate::workloads::w2::W2Args;
 use crate::workloads::w3::W3Args;
 use crate::workloads::w4::W4Args;
 use crate::workloads::w5::W5Args;
+use crate::workloads::wal::WalArgs;
 
 /// Default ratchet tolerance (§7.2: today's value plus 10%).
 pub const DEFAULT_TOLERANCE: f64 = 0.10;
@@ -148,6 +150,12 @@ pub fn pr_suite() -> Result<Vec<Job>> {
             "cadence_g128",
             Workload::Cadence(parse::<CadenceArgs>(
                 "--groups=128 --streams-per-group=4 --appends=1000000 --budget-mib=128 --flush-kib=256 --name=cadence_g128",
+            )?),
+        ),
+        job(
+            "wal",
+            Workload::Wal(parse::<WalArgs>(
+                "--groups=16 --retain-kib=32768 --appends=200000 --cache-kib=512 --quiet-every=4 --name=wal",
             )?),
         ),
     ])

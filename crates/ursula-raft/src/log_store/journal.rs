@@ -1,10 +1,11 @@
-//! Append-only framed journal, format epoch 3.
+//! Append-only framed journal segment, format epoch 3.
 //!
-//! Persistence is kept orthogonal to serialization. The journal moves opaque
-//! checksummed frames to and from a file and handles the durability concerns:
-//! append, `fsync`, verification on replay, and the torn tail a crash leaves.
-//! How a record turns into a payload is the [`FrameCodec`]'s business. Every
-//! file operation goes through the [`Disk`] seam.
+//! Persistence is kept orthogonal to serialization. A journal segment moves
+//! opaque checksummed frames to and from a file and handles the durability
+//! concerns: append, `fsync`, verification on replay, and the torn tail a
+//! crash leaves. How a record turns into a payload is the [`FrameCodec`]'s
+//! business. Every file operation goes through the [`Disk`] seam. A core's
+//! journal is a sequence of these segments (see `segment`).
 //!
 //! Layout, little-endian:
 //!
@@ -14,18 +15,19 @@
 //! frame   u32 payload length | u32 header CRC | u32 payload CRC | payload
 //! ```
 //!
-//! The header CRC covers the file's sequence and the payload length, so a
-//! damaged length is caught before replay trusts it. The payload CRC covers the
-//! sequence, the length and the payload.
+//! The header CRC covers the segment's sequence and the payload length, so a
+//! damaged length is caught before replay trusts it. The payload CRC covers
+//! the sequence, the length and the payload.
 //!
-//! The sequence names one generation of the file. A new journal starts at
-//! [`FIRST_SEQUENCE`], and every rewrite (startup compaction, online reclaim)
-//! writes the next generation at the previous sequence plus one. A frame
-//! therefore verifies only in the generation that wrote it: bytes of another
-//! generation fail verification instead of replaying as current records.
+//! The sequence numbers the segment within its core's journal: the first
+//! segment is [`FIRST_SEQUENCE`] and each rotation starts the next one. A
+//! frame therefore verifies only in the segment that wrote it: bytes of
+//! another segment fail verification instead of replaying as its records.
 //!
 //! Replay never skips a frame that fails verification. [`JournalReplayMode`]
 //! decides whether such a frame fails the replay or ends the verified prefix.
+//! A frame whose position an index recorded can also be read on its own
+//! ([`read_frame`]), with the same verification.
 
 use std::fmt;
 use std::io;
@@ -46,19 +48,21 @@ pub(crate) const JOURNAL_VERSION: u16 = ursula_stream::FORMAT_EPOCH as u16;
 const _: () = assert!(ursula_stream::FORMAT_EPOCH <= u16::MAX as u32);
 const JOURNAL_HEADER_LEN: usize = 32;
 const JOURNAL_HEADER_LEN_U16: u16 = 32;
-const JOURNAL_HEADER_LEN_U64: u64 = 32;
+pub(crate) const JOURNAL_HEADER_LEN_U64: u64 = 32;
 /// The header bytes its own checksum covers.
 const JOURNAL_HEADER_CHECKED_LEN: usize = 28;
 const FRAME_HEADER_LEN: usize = 12;
 const FRAME_HEADER_LEN_U64: u64 = 12;
 
-/// The sequence of a newly created journal.
+/// The sequence of a core journal's first segment.
 pub(crate) const FIRST_SEQUENCE: u64 = 1;
 
 /// Maximum encoded payload accepted from disk or written as one journal frame.
 ///
 /// This is intentionally above Ursula's 256 MiB Raft RPC limit while still
 /// preventing a corrupted length field from requesting an unbounded allocation.
+/// Records are written as the store receives them and live entries are
+/// rewritten in small chunks, so no write depends on reaching this limit.
 pub const MAX_FRAME_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
 const MAX_FRAME_PAYLOAD_BYTES_U64: u64 = MAX_FRAME_PAYLOAD_BYTES as u64;
 
@@ -121,6 +125,9 @@ pub enum HeaderDefect {
     Length(u16),
     #[error("reserved header bytes are not zero")]
     Reserved,
+    /// The header names another segment than the file name does.
+    #[error("the header names segment {found}, expected segment {expected}")]
+    Sequence { expected: u64, found: u64 },
 }
 
 /// Why a frame failed verification.
@@ -132,6 +139,9 @@ pub enum FrameDefect {
     /// The payload does not match its checksum.
     #[error("payload checksum mismatch")]
     PayloadChecksum,
+    /// A frame read at a recorded position declares another length.
+    #[error("the frame declares {found} payload bytes, expected {expected}")]
+    Length { expected: u32, found: u32 },
 }
 
 /// Failure of the journal file.
@@ -162,6 +172,29 @@ pub enum JournalError {
         offset: u64,
         defect: FrameDefect,
     },
+    /// A frame read at a position the index recorded fails verification.
+    #[error("journal '{}' frame at offset {offset}: {defect}", .path.display())]
+    CorruptFrameAt {
+        path: PathBuf,
+        offset: u64,
+        defect: FrameDefect,
+    },
+    /// A segment that the journal rotated away from ends in an incomplete
+    /// frame. Rotation `fsync`s a segment before the next one starts, so
+    /// only the newest segment can be cut short by a crash.
+    #[error(
+        "journal segment '{}' ends in an incomplete frame of {bytes} bytes, but a newer segment \
+         follows it",
+        .path.display()
+    )]
+    IncompleteSealedSegment { path: PathBuf, bytes: u64 },
+    /// The segments of a core journal skip a sequence number.
+    #[error("journal '{}' has segment {found} after segment {previous}", .dir.display())]
+    MissingSegment {
+        dir: PathBuf,
+        previous: u64,
+        found: u64,
+    },
     #[error(
         "journal '{}' frame {frame} at offset {offset} declares {declared} bytes, exceeding the \
          {MAX_FRAME_PAYLOAD_BYTES} byte limit",
@@ -181,6 +214,35 @@ pub enum JournalError {
         #[source]
         source: io::Error,
     },
+    /// A frame read at a position the index recorded verifies but does not
+    /// decode.
+    #[error("journal '{}' frame at offset {offset} does not decode: {source}", .path.display())]
+    UndecodableAt {
+        path: PathBuf,
+        offset: u64,
+        #[source]
+        source: io::Error,
+    },
+    /// A frame written at `offset` holds a record its group's log refused.
+    #[error("journal '{}' frame at offset {offset} cannot be applied: {source}", .path.display())]
+    RejectedAt {
+        path: PathBuf,
+        offset: u64,
+        #[source]
+        source: io::Error,
+    },
+    /// A frame the index points at does not hold the entry it should.
+    #[error(
+        "journal '{}' frame at offset {offset} does not hold entry {index} of raft group \
+         {raft_group_id}",
+        .path.display()
+    )]
+    FrameMismatch {
+        path: PathBuf,
+        offset: u64,
+        raft_group_id: u32,
+        index: u64,
+    },
     #[error("journal '{}' frame {frame} at offset {offset} cannot be replayed: {source}", .path.display())]
     Rejected {
         path: PathBuf,
@@ -191,17 +253,6 @@ pub enum JournalError {
     },
     #[error(transparent)]
     RecordTooLarge(#[from] RecordTooLarge),
-    #[error(
-        "journal '{}' holds {verified} verified bytes and {unverified} more, but its writer \
-         wrote {written}",
-        .path.display()
-    )]
-    NotAsWritten {
-        path: PathBuf,
-        written: u64,
-        verified: u64,
-        unverified: u64,
-    },
 }
 
 impl JournalError {
@@ -227,10 +278,15 @@ impl JournalError {
             | Self::UnsupportedVersion { .. }
             | Self::CorruptHeader { .. }
             | Self::CorruptFrame { .. }
+            | Self::CorruptFrameAt { .. }
+            | Self::IncompleteSealedSegment { .. }
+            | Self::MissingSegment { .. }
             | Self::OversizedFrame { .. }
             | Self::Undecodable { .. }
-            | Self::Rejected { .. }
-            | Self::NotAsWritten { .. } => io::ErrorKind::InvalidData,
+            | Self::UndecodableAt { .. }
+            | Self::RejectedAt { .. }
+            | Self::FrameMismatch { .. }
+            | Self::Rejected { .. } => io::ErrorKind::InvalidData,
             Self::RecordTooLarge(_) => io::ErrorKind::InvalidInput,
         }
     }
@@ -254,7 +310,8 @@ pub struct RecordTooLarge {
 /// What a replay verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Replayed {
-    /// The generation sequence of the file; `None` when it is missing or empty.
+    /// The segment sequence the file's header names; `None` when the file
+    /// is missing or empty.
     pub(crate) sequence: Option<u64>,
     /// Frames verified and visited.
     pub(crate) frames: u64,
@@ -291,25 +348,12 @@ impl Replayed {
     };
 
     /// Bytes after the verified frames.
+    #[cfg(all(test, not(madsim)))]
     pub(crate) fn dropped_bytes(&self) -> u64 {
         match self.tail {
             ReplayTail::Clean => 0,
             ReplayTail::Incomplete { bytes } | ReplayTail::Unverified { bytes, .. } => bytes,
         }
-    }
-
-    /// Fails unless the file holds exactly the `written` bytes its running
-    /// writer wrote, all of them verified.
-    pub(crate) fn require_written(&self, path: &Path, written: u64) -> Result<(), JournalError> {
-        if self.tail == ReplayTail::Clean && self.verified_len == written {
-            return Ok(());
-        }
-        Err(JournalError::NotAsWritten {
-            path: path.to_owned(),
-            written,
-            verified: self.verified_len,
-            unverified: self.dropped_bytes(),
-        })
     }
 }
 
@@ -348,7 +392,7 @@ where T: serde::Serialize + serde::de::DeserializeOwned
     }
 }
 
-/// The checksum of a frame's length within generation `sequence`.
+/// The checksum of a frame's length within segment `sequence`.
 fn header_checksum(sequence: u64, len: u32) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&sequence.to_le_bytes());
@@ -405,8 +449,8 @@ impl HeaderFault {
     }
 }
 
-/// Checks a file header and returns its generation sequence. `bytes` holds
-/// the file's first bytes, at most a whole header.
+/// Checks a file header and returns its segment sequence. `bytes` holds the
+/// file's first bytes, at most a whole header.
 fn parse_header(bytes: &[u8]) -> Result<u64, HeaderFault> {
     let magic_len = bytes.len().min(JOURNAL_MAGIC.len());
     if bytes.get(..magic_len) != JOURNAL_MAGIC.get(..magic_len) {
@@ -443,6 +487,21 @@ struct FrameHeader {
     payload_checksum: u32,
 }
 
+/// Where a frame starts in its segment file, and its payload length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FrameLoc {
+    /// The offset of the frame's own header.
+    pub(crate) offset: u64,
+    pub(crate) len: u32,
+}
+
+impl FrameLoc {
+    /// The bytes the frame takes in its file, header included.
+    pub(crate) fn file_bytes(&self) -> u64 {
+        FRAME_HEADER_LEN_U64.saturating_add(u64::from(self.len))
+    }
+}
+
 impl FrameHeader {
     fn parse(bytes: [u8; FRAME_HEADER_LEN]) -> Self {
         let [l0, l1, l2, l3, h0, h1, h2, h3, p0, p1, p2, p3] = bytes;
@@ -454,7 +513,7 @@ impl FrameHeader {
     }
 }
 
-/// The single writer of one journal file.
+/// The single writer of one journal segment.
 ///
 /// [`JournalWriter::append`] encodes frames into a buffer that reaches the
 /// file on [`JournalWriter::flush`] (or once it is full) and becomes durable
@@ -474,25 +533,32 @@ pub(crate) struct JournalWriter {
 }
 
 impl JournalWriter {
-    /// Opens the journal at `path` for appending. A missing or empty file
-    /// becomes a new journal of generation `new_sequence`, whose header and
-    /// directory entry are durable after the first [`JournalWriter::sync`].
-    /// The parent directory must exist.
-    pub(crate) fn open(path: &Path, new_sequence: u64) -> Result<Self, JournalError> {
+    /// Opens the segment at `path` for appending. A missing or empty file
+    /// becomes a new segment `sequence`, whose header and directory entry are
+    /// durable after the first [`JournalWriter::sync`]. An existing file must
+    /// be segment `sequence`. The parent directory must exist.
+    pub(crate) fn open(path: &Path, sequence: u64) -> Result<Self, JournalError> {
         let mut file = Disk::open_append(path)
             .map_err(|source| JournalError::io(path, JournalOp::Open, source))?;
         let file_len = file
             .file_len()
             .map_err(|source| JournalError::io(path, JournalOp::Stat, source))?;
-        let (sequence, pending) = if file_len == 0 {
-            (new_sequence, encode_header(new_sequence))
+        let pending = if file_len == 0 {
+            encode_header(sequence)
         } else {
             let available = file_len.min(JOURNAL_HEADER_LEN_U64);
             let mut header = vec![0_u8; usize::try_from(available).unwrap_or(JOURNAL_HEADER_LEN)];
             file.read_exact(&mut header)
                 .map_err(|source| JournalError::io(path, JournalOp::Read, source))?;
-            let sequence = parse_header(&header).map_err(|fault| fault.into_error(path))?;
-            (sequence, Vec::new())
+            let found = parse_header(&header).map_err(|fault| fault.into_error(path))?;
+            if found != sequence {
+                return Err(HeaderFault::Defect(HeaderDefect::Sequence {
+                    expected: sequence,
+                    found,
+                })
+                .into_error(path));
+            }
+            Vec::new()
         };
         Ok(Self {
             path: path.to_owned(),
@@ -512,20 +578,28 @@ impl JournalWriter {
         self
     }
 
+    /// The segment's sequence.
+    pub(crate) fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
     /// The length of the file once the pending frames are written.
     pub(crate) fn len(&self) -> u64 {
         self.written
             .saturating_add(u64::try_from(self.pending.len()).unwrap_or(u64::MAX))
     }
 
-    /// Encodes `record` as the next frame. It reaches the file on the next
-    /// [`JournalWriter::flush`]. A record that does not fit in one frame is
-    /// refused and leaves the journal unchanged.
+    /// Encodes `record` as the next frame and returns where it starts. It
+    /// reaches the file on the next [`JournalWriter::flush`]. A record that
+    /// does not fit in one frame is refused and leaves the journal unchanged.
     pub(crate) fn append<C: FrameCodec>(
         &mut self,
         record: &C::Record,
-    ) -> Result<(), RecordTooLarge> {
+    ) -> Result<FrameLoc, RecordTooLarge> {
         let start = self.pending.len();
+        let offset = self
+            .written
+            .saturating_add(u64::try_from(start).unwrap_or(u64::MAX));
         self.pending.extend_from_slice(&[0; FRAME_HEADER_LEN]);
         C::encode_into(record, &mut self.pending);
         let payload_start = start.saturating_add(FRAME_HEADER_LEN);
@@ -552,7 +626,7 @@ impl JournalWriter {
             let [p0, p1, p2, p3] = payload_checksum.to_le_bytes();
             header.copy_from_slice(&[l0, l1, l2, l3, h0, h1, h2, h3, p0, p1, p2, p3]);
         }
-        Ok(())
+        Ok(FrameLoc { offset, len })
     }
 
     /// Bytes of encoded frames not written to the file yet.
@@ -605,7 +679,7 @@ impl JournalWriter {
     }
 }
 
-/// Whether the journal at `path` holds anything beyond its file header.
+/// Whether the segment at `path` holds anything beyond its file header.
 pub(crate) fn holds_records(path: &Path) -> Result<bool, JournalError> {
     if !Disk::exists(path) {
         return Ok(false);
@@ -619,11 +693,11 @@ pub(crate) fn holds_records(path: &Path) -> Result<bool, JournalError> {
 }
 
 /// Reads and verifies every frame of `path` in `mode`, streaming each record
-/// through `visit`. The file is not modified: see [`recover`].
+/// with its position through `visit`. The file is not modified.
 pub(crate) fn replay<C: FrameCodec>(
     path: &Path,
     mode: JournalReplayMode,
-    visit: impl FnMut(C::Record) -> io::Result<()>,
+    visit: impl FnMut(FrameLoc, C::Record) -> io::Result<()>,
 ) -> Result<Replayed, JournalError> {
     if !Disk::exists(path) {
         return Ok(Replayed::EMPTY);
@@ -638,10 +712,11 @@ pub(crate) fn replay<C: FrameCodec>(
 
 /// [`replay`], then truncates whatever follows the verified frames, so the
 /// file ends at a frame boundary and can be appended to.
+#[cfg(all(test, not(madsim)))]
 pub(crate) fn recover<C: FrameCodec>(
     path: &Path,
     mode: JournalReplayMode,
-    visit: impl FnMut(C::Record) -> io::Result<()>,
+    visit: impl FnMut(FrameLoc, C::Record) -> io::Result<()>,
 ) -> Result<Replayed, JournalError> {
     let replayed = replay::<C>(path, mode, visit)?;
     if replayed.tail != ReplayTail::Clean {
@@ -652,13 +727,13 @@ pub(crate) fn recover<C: FrameCodec>(
 }
 
 /// Reads every record of `path`, truncating what follows the verified frames.
-#[cfg(test)]
+#[cfg(all(test, not(madsim)))]
 pub(crate) fn recover_all<C: FrameCodec>(
     path: &Path,
     mode: JournalReplayMode,
 ) -> Result<(Vec<C::Record>, Replayed), JournalError> {
     let mut records = Vec::new();
-    let replayed = recover::<C>(path, mode, |record| {
+    let replayed = recover::<C>(path, mode, |_loc, record| {
         records.push(record);
         Ok(())
     })?;
@@ -678,7 +753,7 @@ pub(crate) fn decode_frames<C: FrameCodec>(
         file_len,
         JournalReplayMode::Strict,
         |buf| io::Read::read_exact(&mut rest, buf),
-        |record| {
+        |_loc, record| {
             records.push(record);
             Ok(())
         },
@@ -692,7 +767,7 @@ fn scan<C: FrameCodec>(
     file_len: u64,
     mode: JournalReplayMode,
     mut read_exact: impl FnMut(&mut [u8]) -> io::Result<()>,
-    mut visit: impl FnMut(C::Record) -> io::Result<()>,
+    mut visit: impl FnMut(FrameLoc, C::Record) -> io::Result<()>,
 ) -> Result<Replayed, JournalError> {
     if file_len == 0 {
         return Ok(Replayed::EMPTY);
@@ -762,7 +837,11 @@ fn scan<C: FrameCodec>(
             offset,
             source,
         })?;
-        visit(record).map_err(|source| JournalError::Rejected {
+        let loc = FrameLoc {
+            offset,
+            len: header.len,
+        };
+        visit(loc, record).map_err(|source| JournalError::Rejected {
             path: path.to_owned(),
             frame,
             offset,
@@ -778,6 +857,64 @@ fn scan<C: FrameCodec>(
         frames,
         verified_len: offset,
         tail,
+    })
+}
+
+/// Reads the frame at `loc` of segment `sequence`, open as `file` from
+/// `path`, verifies it as replay would and decodes its record. `buf` is
+/// reused across reads.
+pub(crate) fn read_frame<C: FrameCodec>(
+    file: &mut DiskFile,
+    path: &Path,
+    sequence: u64,
+    loc: FrameLoc,
+    buf: &mut Vec<u8>,
+) -> Result<C::Record, JournalError> {
+    let corrupt = |defect| JournalError::CorruptFrameAt {
+        path: path.to_owned(),
+        offset: loc.offset,
+        defect,
+    };
+    if u64::from(loc.len) > MAX_FRAME_PAYLOAD_BYTES_U64 {
+        return Err(JournalError::OversizedFrame {
+            path: path.to_owned(),
+            frame: 0,
+            offset: loc.offset,
+            declared: u64::from(loc.len),
+        });
+    }
+    let total = usize::try_from(loc.file_bytes()).map_err(|_overflow| {
+        corrupt(FrameDefect::Length {
+            expected: loc.len,
+            found: loc.len,
+        })
+    })?;
+    buf.resize(total, 0);
+    file.read_at(loc.offset, buf)
+        .map_err(|source| JournalError::io(path, JournalOp::Read, source))?;
+    let Some((header, payload)) = buf.split_first_chunk::<FRAME_HEADER_LEN>() else {
+        return Err(corrupt(FrameDefect::Length {
+            expected: loc.len,
+            found: 0,
+        }));
+    };
+    let header = FrameHeader::parse(*header);
+    if header.len != loc.len {
+        return Err(corrupt(FrameDefect::Length {
+            expected: loc.len,
+            found: header.len,
+        }));
+    }
+    if header.header_checksum != header_checksum(sequence, header.len) {
+        return Err(corrupt(FrameDefect::HeaderChecksum));
+    }
+    if payload_checksum(header.header_checksum, payload) != header.payload_checksum {
+        return Err(corrupt(FrameDefect::PayloadChecksum));
+    }
+    C::decode(payload).map_err(|source| JournalError::UndecodableAt {
+        path: path.to_owned(),
+        offset: loc.offset,
+        source,
     })
 }
 
@@ -807,8 +944,11 @@ mod tests {
     use super::Replayed;
     use super::header_checksum;
     use super::payload_checksum;
+    use super::read_frame;
     use super::recover_all;
     use super::replay;
+    use crate::log_store::disk::Disk;
+    use crate::log_store::disk::JournalDisk;
 
     type Codec = JsonCodec<String>;
 
@@ -890,12 +1030,21 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("journal");
         write_records(&path, 7, &["first"]);
-        // An existing journal keeps its own sequence.
-        write_records(&path, FIRST_SEQUENCE, &["second"]);
+        write_records(&path, 7, &["second"]);
 
         let (records, replayed) = recover(&path, JournalReplayMode::Strict).expect("replay");
         assert_eq!(records, ["first", "second"]);
         assert_eq!(replayed.sequence, Some(7));
+        // A segment opens only as the segment it is.
+        let err =
+            JournalWriter::open(&path, FIRST_SEQUENCE).expect_err("segment 7 is not segment 1");
+        assert!(matches!(err, JournalError::CorruptHeader {
+            defect: HeaderDefect::Sequence {
+                expected: FIRST_SEQUENCE,
+                found: 7
+            },
+            ..
+        }));
     }
 
     #[test]
@@ -1176,29 +1325,48 @@ mod tests {
         write_records(&path, FIRST_SEQUENCE, &["a"]);
         append_raw(&path, &[1, 2, 3]);
         let len = file_len(&path);
-        let replayed = replay::<Codec>(&path, JournalReplayMode::Strict, |_| Ok(()))
+        let replayed = replay::<Codec>(&path, JournalReplayMode::Strict, |_, _| Ok(()))
             .expect("replay a torn tail");
         assert_eq!(replayed.tail, ReplayTail::Incomplete { bytes: 3 });
         assert_eq!(file_len(&path), len);
-        let err = replayed
-            .require_written(&path, len)
-            .expect_err("a running writer never leaves a torn tail");
-        assert!(matches!(err, JournalError::NotAsWritten {
-            unverified: 3,
+    }
+
+    /// A frame read at the position its append returned verifies as replay
+    /// would: against its segment's sequence, its length and its payload.
+    #[test]
+    fn a_frame_reads_back_at_its_position_with_the_same_verification() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("journal");
+        let mut writer = JournalWriter::open(&path, 3).expect("open journal");
+        let locs = ["a", "bb", "ccc"]
+            .map(|record| writer.append::<Codec>(&record.to_owned()).expect("append"));
+        writer.sync().expect("sync");
+        let mut buf = Vec::new();
+        let mut file = Disk::open_read(&path).expect("open for reading");
+        for (loc, expected) in locs.iter().zip(["a", "bb", "ccc"]) {
+            let record = read_frame::<Codec>(&mut file, &path, 3, *loc, &mut buf).expect("read");
+            assert_eq!(record, expected);
+        }
+        let [_, second, _] = locs;
+        let err = read_frame::<Codec>(&mut file, &path, 4, second, &mut buf)
+            .expect_err("another segment's sequence");
+        assert!(matches!(err, JournalError::CorruptFrameAt {
+            defect: FrameDefect::HeaderChecksum,
             ..
         }));
-
-        recover(&path, JournalReplayMode::Strict).expect("truncate the tail");
-        let replayed = replay::<Codec>(&path, JournalReplayMode::Strict, |_| Ok(()))
-            .expect("replay the truncated journal");
-        replayed
-            .require_written(&path, replayed.verified_len)
-            .expect("the file is what the writer wrote");
-        let err = replayed
-            .require_written(&path, len)
-            .expect_err("the writer wrote more than the file holds");
-        assert!(matches!(err, JournalError::NotAsWritten {
-            unverified: 0,
+        let mut longer = second;
+        longer.len = longer.len.saturating_add(1);
+        let err = read_frame::<Codec>(&mut file, &path, 3, longer, &mut buf)
+            .expect_err("a recorded length that does not match");
+        assert!(matches!(err, JournalError::CorruptFrameAt {
+            defect: FrameDefect::Length { .. },
+            ..
+        }));
+        overwrite(&path, second.offset + FRAME_HEADER_LEN_U64 + 1, b"x");
+        let err = read_frame::<Codec>(&mut file, &path, 3, second, &mut buf)
+            .expect_err("a damaged payload");
+        assert!(matches!(err, JournalError::CorruptFrameAt {
+            defect: FrameDefect::PayloadChecksum,
             ..
         }));
     }

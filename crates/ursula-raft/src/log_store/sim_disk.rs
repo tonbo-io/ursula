@@ -15,9 +15,9 @@
 //!   madsim's deterministic RNG, so a later page can survive while an earlier
 //!   one is lost (writeback reordering, which leaves zero-filled holes), and
 //!   reverts directory operations that were not `fsync`ed.
-//! - [`SimDisk::inject_fault`] fails the next write or `fsync` on a path. A
-//!   failed `fsync` marks the pages clean without persisting them, as Linux
-//!   does, so a later successful `fsync` does not make them durable.
+//! - [`SimDisk::inject_fault`] fails the next write, `fsync` or removal on a
+//!   path. A failed `fsync` marks the pages clean without persisting them, as
+//!   Linux does, so a later successful `fsync` does not make them durable.
 //!
 //! The disk also stands in for the host's boot id
 //! ([`JournalDisk::boot_id`]): a power loss under a prefix starts a new boot
@@ -61,6 +61,8 @@ pub enum SimDiskFault {
     Write,
     /// The next `fsync` of the file or directory fails.
     Sync,
+    /// The next removal of the file fails and removes nothing.
+    Remove,
 }
 
 /// What [`SimDisk::power_loss`] did.
@@ -520,6 +522,12 @@ impl SimDisk {
         .map_err(SimDiskError::into_io)
     }
 
+    /// Disarms every fault not yet fired on a path under `prefix`.
+    pub fn clear_faults(prefix: &Path) -> io::Result<()> {
+        with_disk(|state| state.faults.retain(|(path, _)| !path.starts_with(prefix)))
+            .map_err(SimDiskError::into_io)
+    }
+
     /// The contents of the file at `path` as the running process reads them.
     pub fn read(path: &Path) -> io::Result<Vec<u8>> {
         io_with_disk(|state| {
@@ -614,6 +622,7 @@ impl JournalDisk for SimDisk {
     fn remove_file(path: &Path) -> io::Result<()> {
         io_with_disk(|state| {
             state.resolve_file(path)?;
+            state.take_fault(path, SimDiskFault::Remove)?;
             state.visible.remove(path);
             Ok(())
         })
@@ -663,6 +672,11 @@ impl JournalFile for SimFile {
         })?;
         self.read_pos = end;
         Ok(())
+    }
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.read_pos = usize::try_from(offset).unwrap_or(usize::MAX);
+        self.read_exact(buf)
     }
 
     fn append(&mut self, buf: &[u8]) -> io::Result<()> {

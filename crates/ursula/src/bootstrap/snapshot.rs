@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use ursula_raft::LeadershipShedReason;
@@ -150,14 +151,20 @@ pub(crate) fn group_log_progress(snapshot: &RaftGroupMetricsSnapshot) -> GroupLo
     progress
 }
 
-/// Groups to snapshot this tick under the byte-based cadence (F12e).
+/// Groups to snapshot this tick under the byte-based cadence (F12e), with
+/// the groups the Raft WAL reports `lagging` first.
 pub(crate) fn plan_snapshot_drive<'a>(
     snapshots: &'a [RaftGroupMetricsSnapshot],
     cadence: &SnapshotCadence,
     max_groups: usize,
+    lagging: &BTreeSet<RaftGroupId>,
 ) -> (SnapshotPlan, Vec<&'a RaftGroupMetricsSnapshot>) {
     let progress = snapshots.iter().map(group_log_progress).collect::<Vec<_>>();
-    let plan = cadence.plan(&progress, max_groups.max(1));
+    let lagging = snapshots
+        .iter()
+        .map(|snapshot| lagging.contains(&RaftGroupId(snapshot.raft_group_id)))
+        .collect::<Vec<_>>();
+    let plan = cadence.plan_with_lagging(&progress, &lagging, max_groups.max(1));
     let selected = plan
         .groups
         .iter()
@@ -193,6 +200,7 @@ pub fn spawn_snapshot_driver(
     let runtime = runtime.clone();
     let registry = registry.clone();
     let coordinator = registry.snapshot_build_coordinator();
+    let wal_lagging = registry.wal_lagging_groups();
     spawn_log_pressure_monitor(coordinator.clone(), &cadence);
     tokio::spawn(async move {
         let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX));
@@ -257,7 +265,18 @@ pub fn spawn_snapshot_driver(
             }
 
             let mut pause = interval;
-            let (plan, selected) = plan_snapshot_drive(&snaps, &cadence, max_groups_per_tick);
+            let lagging = wal_lagging
+                .as_ref()
+                .map(|lagging| lagging.groups())
+                .unwrap_or_default();
+            if !lagging.is_empty() {
+                tracing::info!(
+                    groups = ?lagging,
+                    "snapshot driver: the Raft WAL reports groups keeping old segments"
+                );
+            }
+            let (plan, selected) =
+                plan_snapshot_drive(&snaps, &cadence, max_groups_per_tick, &lagging);
             if should_drive_snapshots(bad_tick, plan.pressure) {
                 let mut triggered = 0u64;
                 for snapshot in selected {
@@ -283,7 +302,18 @@ pub fn spawn_snapshot_driver(
                 }
             }
 
-            tokio::time::sleep(pause).await;
+            // A change in the WAL's lagging groups starts the next tick
+            // early, so they are snapshotted and purged sooner.
+            match &wal_lagging {
+                Some(lagging) => {
+                    tokio::select! {
+                        biased;
+                        () = tokio::time::sleep(pause) => {}
+                        () = lagging.changed() => {}
+                    }
+                }
+                None => tokio::time::sleep(pause).await,
+            }
         }
     });
 }

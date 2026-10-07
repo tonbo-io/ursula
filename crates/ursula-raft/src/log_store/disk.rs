@@ -80,6 +80,9 @@ pub trait JournalFile: Debug + Send {
     fn file_len(&self) -> io::Result<u64>;
     /// Reads exactly `buf.len()` bytes at the read position and advances it.
     fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()>;
+    /// Reads exactly `buf.len()` bytes starting at `offset`. The read
+    /// position after it is unspecified.
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()>;
     /// Appends `buf` at the end of the file. The bytes are durable only after
     /// [`JournalFile::sync_data`].
     fn append(&mut self, buf: &[u8]) -> io::Result<()>;
@@ -245,6 +248,11 @@ impl JournalFile for File {
     }
 
     fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        Read::read_exact(self, buf)
+    }
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.seek(io::SeekFrom::Start(offset))?;
         Read::read_exact(self, buf)
     }
 

@@ -246,6 +246,13 @@ pub struct WalConfig {
     pub path: Option<PathBuf>,
     /// When journal appends reach stable storage.
     pub fsync: WalFsync,
+    /// The size at which each core's journal starts a new segment. Purge
+    /// deletes whole segments, so it is also the granularity at which disk
+    /// space comes back.
+    pub segment_size: HumanSize,
+    /// Recent Raft entries kept in memory across the node, split evenly
+    /// between its Raft groups. Older entries are read from disk.
+    pub cache_size: HumanSize,
     /// Reject writes and mark the node unready below this many available bytes.
     /// Zero disables disk-pressure admission.
     pub min_available_size: HumanSize,
@@ -257,6 +264,14 @@ pub struct WalConfig {
 impl WalConfig {
     /// The subdirectory of a WAL directory that holds the journals.
     pub const LOG_SUBDIR: &str = "raft-log";
+    /// The smallest `segment_size`.
+    pub const MIN_SEGMENT_SIZE: u64 = 4 * 1024;
+
+    /// The entry cache of each group when the node hosts `groups` groups.
+    pub fn group_cache_bytes(&self, groups: usize) -> u64 {
+        let groups = u64::try_from(groups.max(1)).unwrap_or(u64::MAX);
+        self.cache_size.as_bytes().checked_div(groups).unwrap_or(0)
+    }
 
     /// The configured journal directory: `path`'s `raft-log`
     /// subdirectory. `None` when no path is configured.
@@ -270,6 +285,8 @@ impl Default for WalConfig {
         Self {
             path: None,
             fsync: WalFsync::Never,
+            segment_size: HumanSize::mib(64),
+            cache_size: HumanSize::mib(256),
             min_available_size: HumanSize::mib(512),
             resume_available_size: HumanSize::gib(1),
         }

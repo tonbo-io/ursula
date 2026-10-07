@@ -30,14 +30,16 @@ use super::RaftGroupEngine;
 use crate::grpc::GrpcRaftNetwork;
 use crate::grpc::GrpcRaftNetworkFactory;
 use crate::grpc::probe_rejoin_vote_barrier;
-use crate::log_store::CORE_JOURNAL_FILE;
 use crate::log_store::CoreFileLogWriter;
 use crate::log_store::CoreJournalOptions;
+use crate::log_store::JournalTuning;
+use crate::log_store::LaggingGroups;
 use crate::log_store::NodeWal;
 use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RaftWalError;
 use crate::log_store::RecoveryState;
 use crate::log_store::WalOpening;
+use crate::log_store::core_dir;
 use crate::registry::RaftGroupHandle;
 use crate::registry::RaftGroupHandleRegistry;
 use crate::rejoin::GroupRejoin;
@@ -218,16 +220,29 @@ enum CoreWriterSlots {
 #[derive(Debug, Clone)]
 pub struct DurableRaftLogStoreFactory {
     node: Arc<NodeWal>,
+    tuning: JournalTuning,
+    lagging: Arc<LaggingGroups>,
     /// One slot per core. Opening a journal holds only its core's slot, so
     /// cores recover their journals in parallel.
     core_writers: Arc<Mutex<CoreWriterSlots>>,
 }
 
 impl DurableRaftLogStoreFactory {
-    /// Starts a run of the Raft WAL under `root` with the `fsync` policy.
+    /// Starts a run of the Raft WAL under `root` with the `fsync` policy and
+    /// the default segment size and entry cache.
     pub fn start(root: impl Into<PathBuf>, fsync: WalFsync) -> Result<Self, RaftWalError> {
+        Self::start_with(root, JournalTuning::new(fsync))
+    }
+
+    /// Starts a run of the Raft WAL under `root` with `tuning`.
+    pub fn start_with(
+        root: impl Into<PathBuf>,
+        tuning: JournalTuning,
+    ) -> Result<Self, RaftWalError> {
         Ok(Self {
-            node: Arc::new(NodeWal::start(root.into(), fsync)?),
+            node: Arc::new(NodeWal::start(root.into(), tuning.fsync)?),
+            tuning,
+            lagging: Arc::new(LaggingGroups::default()),
             core_writers: Arc::new(Mutex::new(CoreWriterSlots::Running(BTreeMap::new()))),
         })
     }
@@ -240,6 +255,16 @@ impl DurableRaftLogStoreFactory {
         self.node.fsync()
     }
 
+    pub fn tuning(&self) -> JournalTuning {
+        self.tuning
+    }
+
+    /// The groups whose live records keep old journal segments alive, for
+    /// the snapshot driver.
+    pub fn lagging_groups(&self) -> Arc<LaggingGroups> {
+        self.lagging.clone()
+    }
+
     /// How this run opens the journals the previous run left.
     pub fn opening(&self) -> WalOpening {
         self.node.opening()
@@ -250,10 +275,9 @@ impl DurableRaftLogStoreFactory {
         self.node.opening().recovery
     }
 
-    pub(crate) fn core_journal_path(&self, core_id: CoreId) -> PathBuf {
-        self.root()
-            .join(format!("core-{}", core_id.0))
-            .join(CORE_JOURNAL_FILE)
+    /// The journal directory of core `core_id`.
+    pub fn core_dir(&self, core_id: CoreId) -> PathBuf {
+        core_dir(self.root(), core_id.0)
     }
 
     pub(crate) fn snapshot_metadata_path(&self, placement: ShardPlacement) -> PathBuf {
@@ -287,17 +311,17 @@ impl DurableRaftLogStoreFactory {
         }
 
         let opening = self.node.opening();
-        let writer = CoreFileLogWriter::open(
-            self.core_journal_path(placement.core_id),
-            CoreJournalOptions {
-                fsync: self.fsync(),
+        let writer =
+            CoreFileLogWriter::open(self.core_dir(placement.core_id), CoreJournalOptions {
+                core: placement.core_id,
+                tuning: self.tuning,
                 recovery_epoch: opening.recovery_epoch,
                 run_state: self.node.run_state().clone(),
                 node_recovery: opening.recovery,
-            },
-            Some((placement, metrics)),
-        )
-        .map_err(|err| GroupEngineError::new(format!("open OpenRaft core journal: {err}")))?;
+                lagging: self.lagging.clone(),
+                metrics: Some((placement, metrics)),
+            })
+            .map_err(|err| GroupEngineError::new(format!("open OpenRaft core journal: {err}")))?;
         *slot = Arc::downgrade(&writer);
         Ok(writer)
     }
@@ -469,6 +493,7 @@ impl StaticGrpcRaftGroupEngineFactory {
         log_stores: DurableRaftLogStoreFactory,
     ) -> Self {
         registry.set_wal_opening(log_stores.opening());
+        registry.set_wal_lagging_groups(log_stores.lagging_groups());
         Self {
             node_id,
             peers: peers.into_iter().collect(),

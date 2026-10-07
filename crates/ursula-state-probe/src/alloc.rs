@@ -20,6 +20,8 @@ use std::sync::atomic::Ordering::SeqCst;
 pub struct Counting;
 
 static LIVE_BYTES: AtomicI64 = AtomicI64::new(0);
+/// The highest [`LIVE_BYTES`] since the last [`reset_peak`].
+static PEAK_BYTES: AtomicI64 = AtomicI64::new(0);
 static LIVE_BLOCKS: AtomicI64 = AtomicI64::new(0);
 static TOTAL_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
@@ -34,7 +36,10 @@ fn signed(size: usize) -> i64 {
 }
 
 fn on_alloc(ptr: *mut u8, size: usize) {
-    LIVE_BYTES.fetch_add(signed(size), Relaxed);
+    let live = LIVE_BYTES
+        .fetch_add(signed(size), Relaxed)
+        .saturating_add(signed(size));
+    PEAK_BYTES.fetch_max(live, Relaxed);
     LIVE_BLOCKS.fetch_add(1, Relaxed);
     TOTAL_ALLOCS.fetch_add(1, Relaxed);
     if size >= BIG {
@@ -128,6 +133,16 @@ pub fn heap() -> Heap {
         bytes: LIVE_BYTES.load(Relaxed),
         blocks: LIVE_BLOCKS.load(Relaxed),
     }
+}
+
+/// The highest live heap since the last [`reset_peak`] (or process start).
+pub fn peak_bytes() -> i64 {
+    PEAK_BYTES.load(Relaxed)
+}
+
+/// Restarts the peak at the current live heap.
+pub fn reset_peak() {
+    PEAK_BYTES.store(LIVE_BYTES.load(Relaxed), Relaxed);
 }
 
 /// Allocations made since process start.

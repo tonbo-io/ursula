@@ -688,13 +688,8 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         while let Some((entry, responder)) = entries.try_next().await? {
             self.last_applied_log_id = Some(entry.log_id);
 
-            let log_bytes = match &entry.payload {
-                EntryPayload::Normal(command) => command.log_bytes_estimate(),
-                EntryPayload::Blank | EntryPayload::Membership(_) => {
-                    ursula_stream::COMMAND_LOG_OVERHEAD_BYTES
-                }
-            };
-            self.log_gauge.record_applied(log_bytes);
+            self.log_gauge
+                .record_applied(crate::types::entry_log_bytes(&entry));
             let response = match entry.payload {
                 EntryPayload::Blank => RaftGroupResponse::Blank,
                 EntryPayload::Normal(command) => {

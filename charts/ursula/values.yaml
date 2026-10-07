@@ -206,6 +206,12 @@ raft:
   # lost its tail stops until an operator accepts the loss (see README, Bootstrap Behavior).
   # always acknowledges a batch after fsync.
   walFsync: never
+  # Size at which each core's journal starts a new segment. Purge deletes whole segments, so this is
+  # also how much disk space comes back at a time.
+  walSegmentBytes: 67108864
+  # Recent Raft entries kept in memory across the node, split evenly between its groups. Older
+  # entries (a lagging follower's catch-up) are read from disk.
+  walCacheBytes: 268435456
   # Reject writes and readiness below this many free bytes on the WAL filesystem.
   minAvailableBytes: 536870912
   # Resume only above this watermark to avoid readiness flapping.

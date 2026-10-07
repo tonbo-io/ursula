@@ -1712,10 +1712,7 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
     assert!(body.contains("\"wal_write_ns\":"));
     assert!(body.contains("\"wal_sync_ns\":"));
 
-    let journal_path = raft_root.join("core-0").join("journal.bin");
-    let journal_len = std::fs::metadata(&journal_path)
-        .expect("raft core journal")
-        .len();
+    let journal_len = core_journal_record_bytes(&raft_root.join("core-0"));
     assert!(
         journal_len > 0,
         "expected raft journal records, got {journal_len} bytes"
@@ -1802,13 +1799,8 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
     assert!(body.contains("\"wal_batches\":"));
     assert!(body.contains("\"wal_records\":"));
 
-    let journal_path = raft_root.join("core-0").join("journal.bin");
-    assert!(journal_path.exists(), "core journal should exist");
     assert!(
-        std::fs::metadata(&journal_path)
-            .expect("core journal metadata")
-            .len()
-            > 0,
+        core_journal_record_bytes(&raft_root.join("core-0")) > 0,
         "core journal should contain records"
     );
 
@@ -1881,13 +1873,8 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             .expect("shut down the Raft WAL cleanly");
     }
 
-    let journal_path = raft_root.join("core-0").join("journal.bin");
-    assert!(journal_path.exists(), "core journal should exist");
     assert!(
-        std::fs::metadata(&journal_path)
-            .expect("core journal metadata")
-            .len()
-            > 0,
+        core_journal_record_bytes(&raft_root.join("core-0")) > 0,
         "core journal should contain records"
     );
 
@@ -3237,16 +3224,11 @@ async fn static_grpc_raft_group_engine_replicates_with_core_journals() {
             node_index + 1
         );
 
-        let journal_path = raft_root
+        let core_dir = raft_root
             .join(format!("node-{}", node_index + 1))
-            .join("core-0")
-            .join("journal.bin");
-        assert!(journal_path.exists(), "node journal should exist");
+            .join("core-0");
         assert!(
-            std::fs::metadata(&journal_path)
-                .expect("node journal metadata")
-                .len()
-                > 0,
+            core_journal_record_bytes(&core_dir) > 0,
             "node journal should contain records"
         );
     }
@@ -3413,16 +3395,11 @@ async fn static_grpc_raft_durable_cold_flush_replicates_manifest() {
     }
 
     for (node_index, _) in peers.iter().enumerate() {
-        let journal_path = raft_root
+        let core_dir = raft_root
             .join(format!("node-{}", node_index + 1))
-            .join("core-0")
-            .join("journal.bin");
-        assert!(journal_path.exists(), "node journal should exist");
+            .join("core-0");
         assert!(
-            std::fs::metadata(&journal_path)
-                .expect("node journal metadata")
-                .len()
-                > 0,
+            core_journal_record_bytes(&core_dir) > 0,
             "node journal should contain records"
         );
     }
@@ -3767,16 +3744,9 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
 
     if let Some(raft_root) = &raft_root {
         for node_id in 1..=3 {
-            let journal_path = raft_root
-                .join(format!("node-{node_id}"))
-                .join("core-0")
-                .join("journal.bin");
-            assert!(journal_path.exists(), "node journal should exist");
+            let core_dir = raft_root.join(format!("node-{node_id}")).join("core-0");
             assert!(
-                std::fs::metadata(&journal_path)
-                    .expect("node journal metadata")
-                    .len()
-                    > 0,
+                core_journal_record_bytes(&core_dir) > 0,
                 "node journal should contain records"
             );
         }
@@ -5559,6 +5529,8 @@ mod cold_health {
 }
 
 mod snapshot_driver {
+    use std::collections::BTreeSet;
+
     use ursula_raft::RaftGroupMetricsSnapshot;
     use ursula_raft::snapshot_cadence::GroupLogProgress;
     use ursula_raft::snapshot_cadence::SnapshotCadence;
@@ -5646,7 +5618,7 @@ mod snapshot_driver {
                 has_snapshot: true,
             }),
         ];
-        let (plan, selected) = plan_snapshot_drive(&snapshots, &cadence, 16);
+        let (plan, selected) = plan_snapshot_drive(&snapshots, &cadence, 16, &BTreeSet::new());
         assert!(!plan.pressure);
         assert_eq!(
             selected
@@ -5655,8 +5627,20 @@ mod snapshot_driver {
                 .collect::<Vec<_>>(),
             vec![0, 2]
         );
-        let (_, one) = plan_snapshot_drive(&snapshots, &cadence, 1);
+        let (_, one) = plan_snapshot_drive(&snapshots, &cadence, 1, &BTreeSet::new());
         assert_eq!(one.len(), 1);
+
+        // A group the Raft WAL reports lagging goes first, though its own
+        // cadence does not call for a snapshot yet.
+        let lagging = BTreeSet::from([ursula_shard::RaftGroupId(1)]);
+        let (_, selected) = plan_snapshot_drive(&snapshots, &cadence, 16, &lagging);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|snapshot| snapshot.raft_group_id)
+                .collect::<Vec<_>>(),
+            vec![1, 0, 2]
+        );
     }
 
     #[test]
@@ -5669,7 +5653,7 @@ mod snapshot_driver {
             snap(2, Some(100), Some(1), log(14 * MIB, 10 * MIB)),
             snap(3, Some(100), Some(1), log(10 * MIB, 6 * MIB)),
         ];
-        let (plan, selected) = plan_snapshot_drive(&snapshots, &cadence, 16);
+        let (plan, selected) = plan_snapshot_drive(&snapshots, &cadence, 16, &BTreeSet::new());
         assert!(plan.pressure);
         assert_eq!(
             selected
@@ -8085,4 +8069,19 @@ pub(crate) fn remove_test_path(path: impl AsRef<std::path::Path>) {
     {
         panic!("remove test path {}: {err}", path.display());
     }
+}
+
+/// The bytes the segments of the core journal in `core_dir` hold beyond
+/// their headers.
+fn core_journal_record_bytes(core_dir: &std::path::Path) -> u64 {
+    ursula_raft::journal_segments(core_dir)
+        .expect("list the core journal segments")
+        .iter()
+        .map(|(_, path)| {
+            std::fs::metadata(path)
+                .expect("segment metadata")
+                .len()
+                .saturating_sub(32)
+        })
+        .sum()
 }

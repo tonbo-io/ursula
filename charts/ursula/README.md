@@ -406,6 +406,8 @@ container receives only chart-managed container settings plus explicit
 | `raft.initMembershipPerGroup` | `true` | Idempotent per-group membership bootstrap flag; persistent groups may keep it enabled across restarts. |
 | `raft.logDir` | `/var/lib/ursula/raft` | Raft log directory mounted to the `raft-data` PVC. Renders `raft.wal.path`. Must be non-empty. |
 | `raft.walFsync` | `never` | When Raft WAL appends reach stable storage. `never` acknowledges once the write is in the page cache: a host crash can cost this replica its unsynced tail, and it rejoins through the recovery gate. `always` acknowledges a batch after `fsync`. Votes, group log states and the run state are always written with `fsync`. Renders `raft.wal.fsync`. |
+| `raft.walSegmentBytes` | `67108864` | Size at which each core's journal starts a new segment. Purge deletes whole segments, so this is also how much disk space comes back at a time. Renders `raft.wal.segment_size`. |
+| `raft.walCacheBytes` | `268435456` | Recent Raft entries kept in memory across the node, split evenly between its groups. Older entries, such as a lagging follower's catch-up, are read from disk. Renders `raft.wal.cache_size`. |
 | `raft.minAvailableBytes` | `536870912` | Reject writes and readiness below this many free bytes on the WAL filesystem. `0` disables the guard. |
 | `raft.resumeAvailableBytes` | `1073741824` | Free bytes required before WAL disk pressure clears; must exceed the minimum. |
 | `raft.maxUncommittedBytesPerGroup` | `null` | Optional per-group cap for raft-submitted but not-yet-applied payload bytes. Renders `raft.max_uncommitted_size_per_group` in the generated config when set; `0` disables the cap. |

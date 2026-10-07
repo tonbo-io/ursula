@@ -27,6 +27,7 @@ use ursula_raft::JournalError;
 use ursula_raft::JournalFile;
 use ursula_raft::JournalOp;
 use ursula_raft::JournalReplayMode;
+use ursula_raft::JournalTuning;
 use ursula_raft::LockAttempt;
 use ursula_raft::PreviousRun;
 use ursula_raft::RUN_STATE_FILE;
@@ -41,6 +42,8 @@ use ursula_raft::SimDiskError;
 use ursula_raft::SimDiskFault;
 use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_raft::WalOpening;
+use ursula_raft::journal_segment_path;
+use ursula_raft::journal_segments;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
@@ -83,8 +86,19 @@ fn core_journal_error(err: &io::Error) -> Option<&CoreJournalError> {
     err.get_ref()?.downcast_ref::<CoreJournalError>()
 }
 
-fn core_journal(root: &Path) -> PathBuf {
-    root.join("core-0").join("journal.bin")
+/// The segment of core 0's journal under the node directory `root` that
+/// appends go to, and the one a rotation starts next.
+fn active_segments(root: &Path) -> [PathBuf; 2] {
+    let core = root.join("core-0");
+    let newest = journal_segments(&core)
+        .expect("list the journal segments")
+        .last()
+        .map(|(sequence, _)| *sequence)
+        .expect("the journal has a segment");
+    [
+        journal_segment_path(&core, newest),
+        journal_segment_path(&core, newest.saturating_add(1)),
+    ]
 }
 
 /// Asserts how a node's WAL opened: what it read of the previous run, how it
@@ -271,12 +285,12 @@ fn sim_disk_refuses_power_loss_while_a_node_holds_its_journal_lock() {
     run_with_madsim(1, async {
         let dir = sim_dir("running");
         let LockAttempt::Acquired(lock) =
-            SimDisk::try_lock(&dir.join("journal.bin.lock")).expect("try lock")
+            SimDisk::try_lock(&dir.join("journal.lock")).expect("try lock")
         else {
             panic!("the first owner takes the lock");
         };
         assert!(matches!(
-            SimDisk::try_lock(&dir.join("journal.bin.lock")).expect("try lock"),
+            SimDisk::try_lock(&dir.join("journal.lock")).expect("try lock"),
             LockAttempt::Held { .. }
         ));
         let err = SimDisk::power_loss(&dir).expect_err("a running node keeps its power");
@@ -357,6 +371,8 @@ pub(super) struct JournalCluster {
     pub(super) rejoins: BTreeMap<(u32, u64), Arc<GroupRejoin>>,
     /// Each node's process-owned recovery tasks, stopped with the node.
     drivers: BTreeMap<u64, Vec<madsim::task::JoinHandle<()>>>,
+    /// Each node's WAL metrics, kept across its restarts.
+    pub(super) metrics: BTreeMap<u64, RuntimeMetrics>,
     pub(super) acknowledged: BTreeMap<u32, Vec<u8>>,
 }
 
@@ -397,6 +413,9 @@ impl JournalCluster {
             engines: BTreeMap::new(),
             rejoins: BTreeMap::new(),
             drivers: BTreeMap::new(),
+            metrics: (1..=3)
+                .map(|node_id| (node_id, RuntimeMetrics::new(1, JOURNAL_GROUPS.len())))
+                .collect(),
             acknowledged: BTreeMap::new(),
         };
         for node_id in 1..=3 {
@@ -430,7 +449,7 @@ impl JournalCluster {
         for group in JOURNAL_GROUPS {
             let placement = group_placement(group);
             let store = self.wals[&node_id]
-                .open(placement, standalone_wal_metrics(placement))
+                .open(placement, self.metrics[&node_id].group_engine_metrics())
                 .await;
             let rejoin = Arc::new(GroupRejoin::durable(
                 node_id,
@@ -628,6 +647,55 @@ impl JournalCluster {
         }
     }
 
+    /// Snapshots `group` on every running replica but `skip` and purges all
+    /// but the last `keep` entries the snapshot covers, as the snapshot
+    /// driver's snapshots do.
+    pub(super) async fn snapshot_and_purge(&self, group: u32, keep: u64, skip: u64) {
+        for ((engine_group, node_id), engine) in &self.engines {
+            if *engine_group != group
+                || *node_id == skip
+                || self.stopped_by_storage_error(group, *node_id)
+            {
+                continue;
+            }
+            let raft = engine.raft_handle();
+            let applied = openraft::rt::WatchReceiver::borrow_watched(&raft.metrics())
+                .last_applied
+                .map_or(0, |log_id| log_id.index);
+            raft.trigger().snapshot().await.expect("trigger a snapshot");
+            let snapshot = raft
+                .wait(Some(Duration::from_secs(5)))
+                .metrics(
+                    |metrics| {
+                        metrics
+                            .snapshot
+                            .is_some_and(|snapshot| snapshot.index >= applied)
+                    },
+                    "snapshot built",
+                )
+                .await
+                .expect("wait for the snapshot")
+                .snapshot
+                .expect("snapshot log id");
+            let purge_upto = snapshot.index.saturating_sub(keep);
+            raft.trigger()
+                .purge_log(purge_upto)
+                .await
+                .expect("trigger a purge");
+            raft.wait(Some(Duration::from_secs(5)))
+                .metrics(
+                    |metrics| {
+                        metrics
+                            .purged
+                            .is_some_and(|purged| purged.index >= purge_upto)
+                    },
+                    "log purged",
+                )
+                .await
+                .expect("wait for the purge");
+        }
+    }
+
     /// Every acknowledged write is readable from every replica.
     pub(super) async fn verify_reads(&self) {
         for ((group, node_id), engine) in &self.engines {
@@ -747,16 +815,28 @@ fn journal_io_error_poisons_the_node_until_restart(
             let mut store = cluster.wals[&victim]
                 .store(RaftGroupId(0))
                 .expect("a running replica holds its store");
-            let journal = core_journal(cluster.wals[&victim].root());
-            SimDisk::inject_fault(&journal, fault).expect("arm the fault");
+            // The fault fires on the segment appends go to, or on the next
+            // one when a rotation comes first.
+            for segment in active_segments(cluster.wals[&victim].root()) {
+                SimDisk::inject_fault(&segment, fault).expect("arm the fault");
+            }
 
-            for group in JOURNAL_GROUPS {
-                cluster.append(group, 3).await;
+            for _ in 0..20 {
+                for group in JOURNAL_GROUPS {
+                    cluster.append(group, 1).await;
+                }
+                if JOURNAL_GROUPS
+                    .iter()
+                    .all(|group| cluster.stopped_by_storage_error(*group, victim))
+                {
+                    break;
+                }
             }
             assert!(
                 cluster.wait_stopped_by_storage_error(victim).await,
                 "seed {seed}: the error stops every replica on node {victim}"
             );
+            SimDisk::clear_faults(cluster.wals[&victim].root()).expect("disarm the other fault");
             let last = store.get_log_state().await.expect("log state").last_log_id;
             let err = store
                 .truncate_after(last)
@@ -814,8 +894,8 @@ fn journal_fsync_error_poisons_the_node_until_restart() {
     );
 }
 
-/// A single-node group with enough history that a purge rewrites its
-/// journal online (the simulator lowers the reclaim threshold).
+/// A single-node group with enough history to span several journal
+/// segments (the simulator rotates every 4 KiB), so a purge deletes some.
 struct ReclaimGroup {
     wal: SimNodeWal,
     metrics: RuntimeMetrics,
@@ -923,21 +1003,27 @@ impl ReclaimGroup {
     }
 }
 
-/// A purge rewrites a large journal online, writing every group's live
-/// entries in several chunks (the simulator lowers the chunk size). The
-/// rewrite replaces the journal with a rename and a directory `fsync`, so a
-/// power loss right after it keeps the purge and every retained entry.
+/// A purge deletes the segments no entry is left in. The purge record was
+/// synced before them, so a power loss right after keeps the purge and every
+/// retained entry, whether or not the deletions reached the disk.
 #[test]
-fn online_reclaim_survives_power_loss() {
+fn a_purge_deletes_segments_and_survives_power_loss() {
     let _guard = sim_test_guard();
     for seed in seeds_from_env("ONLINE_RECLAIM_SEEDS", &[1, 2, 3]) {
         run_with_madsim(seed, async move {
-            let group = ReclaimGroup::start("online-reclaim").await;
+            let group = ReclaimGroup::start("segment-purge").await;
+            let segments = journal_segments(&group.wal.root().join("core-0"))
+                .expect("segments")
+                .len();
+            assert!(
+                segments >= 3,
+                "seed {seed}: 120 entries span {segments} segments"
+            );
             group.purge().await;
             let metrics = group.metrics.snapshot();
             assert!(
                 metrics.wal_reclaims >= 1,
-                "seed {seed}: the purge rewrote the journal online"
+                "seed {seed}: the purge deleted a segment"
             );
             assert_eq!(metrics.wal_reclaim_failures, 0);
             let before = group.durable_log().await;
@@ -946,23 +1032,24 @@ fn online_reclaim_survives_power_loss() {
     }
 }
 
-/// A rewrite that fails before it replaces the journal leaves the journal as
-/// it was: the purge that triggered it stays acknowledged, the failure is
-/// counted, the group keeps writing, and a power loss loses nothing.
+/// A segment that cannot be removed stays in the journal, which remains
+/// correct: the purge that freed it stays acknowledged, the failure is
+/// counted, the group keeps writing, a later pass removes the segment, and
+/// a power loss loses nothing.
 #[test]
-fn a_failed_online_reclaim_keeps_the_journal_and_the_group_running() {
+fn a_segment_that_cannot_be_removed_keeps_the_journal_and_the_group_running() {
     let _guard = sim_test_guard();
     for seed in seeds_from_env("ONLINE_RECLAIM_SEEDS", &[1, 2, 3]) {
         run_with_madsim(seed, async move {
             let mut group = ReclaimGroup::start("failed-reclaim").await;
-            let next_generation = core_journal(group.wal.root()).with_extension("compact");
-            SimDisk::inject_fault(&next_generation, SimDiskFault::Write)
-                .expect("fail the next generation");
+            let core = group.wal.root().join("core-0");
+            let oldest = journal_segment_path(&core, 1);
+            SimDisk::inject_fault(&oldest, SimDiskFault::Remove).expect("fail the removal");
             group.purge().await;
             let metrics = group.metrics.snapshot();
             assert!(
                 metrics.wal_reclaim_failures >= 1,
-                "seed {seed}: the rewrite failed"
+                "seed {seed}: the removal failed"
             );
 
             group.append(120..130).await;
@@ -973,18 +1060,23 @@ fn a_failed_online_reclaim_keeps_the_journal_and_the_group_running() {
                 raft_metrics.running_state.is_ok(),
                 "seed {seed}: the group keeps running"
             );
+            group.purge().await;
+            assert!(
+                !SimDisk::exists(&oldest),
+                "seed {seed}: a later pass removed the segment"
+            );
             let before = group.durable_log().await;
             assert_eq!(group.power_loss_and_reopen().await, before);
         });
     }
 }
 
-/// A rewrite whose directory `fsync` fails leaves it unknown which
-/// generation a crash keeps, so it poisons the writer. The purge that
-/// triggered it was durable and stays acknowledged, and a power loss then
-/// recovers either generation with every acknowledged entry.
+/// A failed directory `fsync` after segments were removed, or after a
+/// rotation created one, poisons the writer: a later segment's durability
+/// relies on that directory. The purge was durable and stays acknowledged,
+/// and a power loss then recovers every retained entry.
 #[test]
-fn a_reclaim_that_cannot_publish_its_generation_poisons_the_writer() {
+fn a_journal_directory_fsync_failure_poisons_the_writer() {
     let _guard = sim_test_guard();
     for seed in seeds_from_env("ONLINE_RECLAIM_SEEDS", &[1, 2, 3]) {
         run_with_madsim(seed, async move {
@@ -1450,17 +1542,108 @@ fn votes_survive_power_loss_under_never_and_the_metadata_is_old_or_new() {
     }
 }
 
-fn blank_entry(index: u64) -> openraft::alias::EntryOf<UrsulaRaftTypeConfig> {
-    use openraft::entry::RaftEntry;
+fn sim_log_id(index: u64) -> LogIdOf<UrsulaRaftTypeConfig> {
     use openraft::vote::RaftLeaderId;
 
+    openraft::LogId {
+        leader_id: openraft::vote::leader_id_adv::CommittedLeaderId::new(1, 1),
+        index,
+    }
+}
+
+fn blank_entry(index: u64) -> openraft::alias::EntryOf<UrsulaRaftTypeConfig> {
+    use openraft::entry::RaftEntry;
+
     openraft::alias::EntryOf::<UrsulaRaftTypeConfig>::new(
-        openraft::LogId {
-            leader_id: openraft::vote::leader_id_adv::CommittedLeaderId::new(1, 1),
-            index,
-        },
+        sim_log_id(index),
         openraft::EntryPayload::Blank,
     )
+}
+
+const PURGE_DURABILITY_SEEDS: [u64; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+
+/// Under `never` a purge reaches the journal without an `fsync`, and the
+/// reclaim pass after it deletes the segments it freed. The deletion becomes
+/// durable only after the purge does, so a power loss that drops unsynced
+/// pages never keeps the deletion without the purge: the store reopens as
+/// a verified prefix, its purge boundary covers every deleted segment, and
+/// its entries are consecutive from there.
+#[test]
+fn a_purge_is_durable_before_the_segments_it_frees_are_deleted() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("PURGE_DURABILITY_SEEDS", &PURGE_DURABILITY_SEEDS) {
+        run_with_madsim(seed, async move {
+            let wal = SimNodeWal::provision_with_fsync("purge-durability", WalFsync::Never);
+            let placement = group_placement(0);
+            let metrics = standalone_wal_metrics(placement);
+            let mut store = wal.open(placement, metrics.clone()).await;
+            for chunk in 0..60_u64 {
+                store
+                    .append(
+                        (1..=10).map(|offset| blank_entry(chunk * 10 + offset)),
+                        IOFlushed::noop(),
+                    )
+                    .await
+                    .expect("append");
+            }
+            let core = wal.root().join("core-0");
+            let before = journal_segments(&core).expect("segments");
+            assert!(
+                before.len() >= 4,
+                "seed {seed}: 600 entries span several segments: {}",
+                before.len()
+            );
+            let purged = sim_log_id(590);
+            store.purge(purged).await.expect("purge");
+            // The reclaim pass after the purge's batch has run once the next
+            // write returns.
+            store
+                .save_committed(Some(sim_log_id(600)))
+                .await
+                .expect("commit");
+            let after = journal_segments(&core).expect("segments");
+            assert!(
+                after.len() < before.len(),
+                "seed {seed}: reclaim deleted the segments the purge freed"
+            );
+            drop(store);
+
+            let report = wal.power_loss().await;
+            assert_opening(
+                wal.opening(),
+                PreviousRun::HostCrash {
+                    fsync: WalFsync::Never,
+                },
+                JournalReplayMode::VerifiedPrefix,
+                RECOVERING_AFTER_HOST_CRASH,
+                &format!("seed {seed}"),
+            );
+            let mut store = wal
+                .try_open(placement, metrics)
+                .await
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "seed {seed}: the store reopens ({report:?}): {}",
+                        err.message()
+                    )
+                });
+            let state = store.get_log_state().await.expect("log state");
+            assert_eq!(
+                state.last_purged_log_id,
+                Some(purged),
+                "seed {seed}: the purge that freed the deleted segments survives ({report:?})"
+            );
+            let log = DurableGroupLog::read(&store).await;
+            let expected = (591..)
+                .take(log.log_ids.len())
+                .map(sim_log_id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                log.log_ids, expected,
+                "seed {seed}: the retained entries are consecutive after the purge"
+            );
+        });
+    }
 }
 
 /// Appends entry `index` to every store, the `n`th append `gap * n` after
@@ -1503,7 +1686,11 @@ fn a_burst_of_appends_lands_in_one_group_commit() {
     let _guard = sim_test_guard();
     for seed in seeds_from_env("GROUP_COMMIT_SEEDS", &[1, 2, 3, 5, 8, 13]) {
         run_with_madsim(seed, async move {
-            let wal = SimNodeWal::provision("group-commit");
+            // Segments large enough that no rotation adds its `fsync`s.
+            let wal = SimNodeWal::provision_with_tuning("group-commit", JournalTuning {
+                segment_bytes: 1024 * 1024,
+                ..JournalTuning::new(WalFsync::Always)
+            });
             let metrics = RuntimeMetrics::new(1, 16);
             let mut stores = Vec::new();
             for group in 0..16 {
@@ -1524,6 +1711,191 @@ fn a_burst_of_appends_lands_in_one_group_commit() {
                 append_spread(&stores, &metrics, 3, Duration::from_millis(5)).await,
                 16,
                 "seed {seed}: appends 5 ms apart each arrive after the window closed"
+            );
+        });
+    }
+}
+
+/// What the journals of a cluster did over a scenario, summed over nodes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct JournalWork {
+    pub(super) rotations: u64,
+    pub(super) reclaims: u64,
+    pub(super) rewritten_bytes: u64,
+    pub(super) disk_reads: u64,
+}
+
+impl JournalWork {
+    fn of(cluster: &JournalCluster) -> Self {
+        cluster.metrics.values().map(RuntimeMetrics::snapshot).fold(
+            Self::default(),
+            |work, metrics| Self {
+                rotations: work.rotations.saturating_add(metrics.wal_rotations),
+                reclaims: work.reclaims.saturating_add(metrics.wal_reclaims),
+                rewritten_bytes: work
+                    .rewritten_bytes
+                    .saturating_add(metrics.wal_rewritten_bytes),
+                disk_reads: work.disk_reads.saturating_add(metrics.wal_disk_reads),
+            },
+        )
+    }
+}
+
+/// Crashes the stopped node `node_id` within the durability contract of
+/// `fsync`: a power loss under `always`, a process crash under `never`.
+async fn crash_within_contract(cluster: &JournalCluster, node_id: u64, fsync: WalFsync) {
+    match fsync {
+        WalFsync::Always => {
+            cluster.wals[&node_id].power_loss().await;
+        }
+        WalFsync::Never => cluster.wals[&node_id].process_crash().await,
+    }
+}
+
+/// Rounds of writes, snapshots and purges with a crash in each, on a
+/// three-node cluster whose journals run with `fsync`. Group 0 is busy: each
+/// round appends to it, then the replicas snapshot and purge it. Group 1 is
+/// quiet: its few entries stay in old segments until reclaim rewrites them
+/// out. Each round one follower crashes and restarts. It never purges,
+/// because a replica restarts its state machine from a persisted snapshot,
+/// which the simulated disk does not hold, so it also keeps group 0's log
+/// and reports the group lagging. Every follower crash stays within the
+/// durability contract. At the end a node that purged and rewrote segments
+/// loses power under either policy and its journal reopens: under `always`
+/// with every entry it held, under `never` as a verified prefix of its log
+/// that a purge boundary still covers.
+pub(super) async fn segment_crash_rounds(seed: u64, fsync: WalFsync) -> JournalWork {
+    let mut cluster = JournalCluster::start_with_fsync("segment-crash", fsync).await;
+    cluster.append(1, 3).await;
+    let victim = cluster.follower_of_every_group(seed).await;
+    for _round in 0..4 {
+        cluster.append(0, 40).await;
+        cluster.snapshot_and_purge(0, 8, victim).await;
+        cluster.stop_node(victim).await;
+        crash_within_contract(&cluster, victim, fsync).await;
+        cluster.start_node(victim).await;
+        cluster.wait_gates_open(Duration::from_secs(5)).await;
+    }
+    cluster.append(0, 5).await;
+    cluster.append(1, 1).await;
+    cluster.verify_reads().await;
+    let work = JournalWork::of(&cluster);
+
+    let purged = cluster.leader(0).await;
+    let before = cluster.durable_logs(purged).await;
+    cluster.stop_node(purged).await;
+    cluster.wals[&purged].power_loss().await;
+    // The stores reopen: no deleted segment outlives the purge that freed it.
+    let (_, after) = reopen_stores(&cluster, purged).await;
+    for group in JOURNAL_GROUPS {
+        let (after, before) = (&after[&group].0, &before[&group]);
+        assert_eq!(after.vote, before.vote, "seed {seed}");
+        match fsync {
+            WalFsync::Always => assert_eq!(
+                after.log_ids, before.log_ids,
+                "seed {seed}: node {purged} group {group} lost entries in a power loss"
+            ),
+            // Unsynced appends and purges may be lost, never mixed up: the
+            // log stays consecutive, ends no later than before, and agrees
+            // with it wherever both hold an entry.
+            WalFsync::Never => {
+                assert!(
+                    after
+                        .log_ids
+                        .windows(2)
+                        .all(|pair| pair[0].index.checked_add(1) == Some(pair[1].index)),
+                    "seed {seed}: node {purged} group {group} reopened with a hole: {:?}",
+                    after.log_ids
+                );
+                assert!(
+                    after.log_ids.last().map(|log_id| log_id.index)
+                        <= before.log_ids.last().map(|log_id| log_id.index),
+                    "seed {seed}: node {purged} group {group}"
+                );
+                for log_id in &after.log_ids {
+                    if let Some(kept) = before
+                        .log_ids
+                        .iter()
+                        .find(|before| before.index == log_id.index)
+                    {
+                        assert_eq!(kept, log_id, "seed {seed}: node {purged} group {group}");
+                    }
+                }
+            }
+        }
+    }
+    work
+}
+
+const SEGMENT_CRASH_SEEDS: [u64; 6] = [1, 2, 3, 4, 5, 6];
+
+/// Rotation, purge and the rewrite of a quiet group's entries run on every
+/// node's journal while followers crash, and every acknowledged write stays
+/// readable on every replica (`segment_crash_rounds`).
+#[test]
+fn rotation_purge_and_rewrite_survive_crashes() {
+    let _guard = sim_test_guard();
+    let mut total = JournalWork::default();
+    for seed in seeds_from_env("SEGMENT_CRASH_SEEDS", &SEGMENT_CRASH_SEEDS) {
+        let fsync = if seed % 2 == 0 {
+            WalFsync::Always
+        } else {
+            WalFsync::Never
+        };
+        let work = run_with_madsim(seed, segment_crash_rounds(seed, fsync));
+        assert!(
+            work.rotations > 0,
+            "seed {seed}: the journals rotated: {work:?}"
+        );
+        assert!(
+            work.reclaims > 0,
+            "seed {seed}: purges deleted segments: {work:?}"
+        );
+        total.rewritten_bytes = total.rewritten_bytes.saturating_add(work.rewritten_bytes);
+    }
+    assert!(
+        total.rewritten_bytes > 0,
+        "reclaim rewrote the quiet group's entries: {total:?}"
+    );
+}
+
+/// A follower that was down while the leader wrote far more than its entry
+/// cache holds catches up from the leader's journal on disk, and every
+/// acknowledged write reads back on it.
+#[test]
+fn a_lagging_follower_catches_up_from_the_leaders_disk() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("JOURNAL_POWER_LOSS_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
+        run_with_madsim(seed, async move {
+            let mut cluster =
+                JournalCluster::start_with_fsync("lagging-follower", WalFsync::Never).await;
+            let victim = cluster.follower_of_every_group(seed).await;
+            cluster.stop_node(victim).await;
+            cluster.wals[&victim].process_crash().await;
+            for group in JOURNAL_GROUPS {
+                cluster.append(group, 60).await;
+            }
+            let leaders = {
+                let mut leaders = Vec::new();
+                for group in JOURNAL_GROUPS {
+                    leaders.push(cluster.leader(group).await);
+                }
+                leaders
+            };
+            let before = leaders
+                .iter()
+                .map(|leader| cluster.metrics[leader].snapshot().wal_disk_reads)
+                .sum::<u64>();
+            cluster.start_node(victim).await;
+            cluster.wait_gates_open(Duration::from_secs(10)).await;
+            cluster.verify_reads().await;
+            let after = leaders
+                .iter()
+                .map(|leader| cluster.metrics[leader].snapshot().wal_disk_reads)
+                .sum::<u64>();
+            assert!(
+                after > before,
+                "seed {seed}: the leaders read the entries the follower missed from disk"
             );
         });
     }

@@ -4,6 +4,7 @@ use thiserror::Error;
 
 use crate::config::ColdBackend;
 use crate::config::UrsulaConfig;
+use crate::config::WalConfig;
 
 #[derive(Debug, Error)]
 pub enum ValidationError {
@@ -21,6 +22,8 @@ pub enum ValidationError {
     GroupOutOfRange(u32, usize),
     #[error("partial raft.groups config is not supported; missing raft group {0} of {1}")]
     MissingGroup(u32, usize),
+    #[error("raft.wal.segment_size ({segment_size} bytes) must be at least {minimum} bytes")]
+    WalSegmentTooSmall { segment_size: u64, minimum: u64 },
     #[error("{0}")]
     Other(String),
 }
@@ -43,6 +46,13 @@ impl UrsulaConfig {
             return Err(ValidationError::Other(format!(
                 "raft.wal.resume_available_size ({resume} bytes) must exceed min_available_size ({minimum} bytes)",
             )));
+        }
+        let segment_size = self.raft.wal.segment_size.as_bytes();
+        if segment_size < WalConfig::MIN_SEGMENT_SIZE {
+            return Err(ValidationError::WalSegmentTooSmall {
+                segment_size,
+                minimum: WalConfig::MIN_SEGMENT_SIZE,
+            });
         }
         if self.storage.cold.backend == ColdBackend::S3 {
             let bucket = self

@@ -144,8 +144,13 @@ fn sim_journal_store(name: &str) -> Arc<RaftGroupFileLogStore> {
         .expect("open the log store")
 }
 
-fn core_journal_path(root: &Path) -> PathBuf {
-    root.join("core-0").join("journal.bin")
+/// The frames of core 0's journal under the WAL `root`, all segments.
+fn core_journal_frames(root: &Path) -> usize {
+    crate::journal_segments(&root.join("core-0"))
+        .expect("list the journal segments")
+        .iter()
+        .map(|(_, path)| wire_frame_count::<CoreJournalRecord>(path))
+        .sum()
 }
 
 #[tokio::test]
@@ -794,7 +799,7 @@ async fn raft_file_log_store_recovers_vote_committed_and_entries() {
             .expect("save committed");
     }
     assert_eq!(
-        wire_frame_count::<CoreJournalRecord>(&core_journal_path(root.path())),
+        core_journal_frames(root.path()),
         2,
         "the entries and the committed marker; the vote is in the metadata file"
     );
@@ -837,7 +842,7 @@ async fn raft_file_log_store_skips_duplicate_vote_and_committed_records() {
             .expect("save duplicate committed");
     }
     assert_eq!(
-        wire_frame_count::<CoreJournalRecord>(&core_journal_path(root.path())),
+        core_journal_frames(root.path()),
         1,
         "one committed marker; the vote is in the metadata file"
     );
@@ -883,10 +888,7 @@ async fn raft_file_log_store_recovers_truncate_and_purge() {
             .expect("append after truncate");
         store.purge(log_id(2)).await.expect("purge file log");
     }
-    assert_eq!(
-        wire_frame_count::<CoreJournalRecord>(&core_journal_path(root.path())),
-        4
-    );
+    assert_eq!(core_journal_frames(root.path()), 4);
 
     let mut reopened = open_core_journal_store(root.path()).expect("reopen file log store");
     let state = reopened.get_log_state().await.expect("log state");
@@ -2457,13 +2459,12 @@ async fn durable_raft_group_engine_recovers_from_core_journal() {
             .expect("shut down the Raft WAL cleanly");
     }
 
-    let journal_path = root.join("core-0").join("journal.bin");
-    assert!(journal_path.exists(), "core journal should exist");
+    let segments = crate::journal_segments(&root.join("core-0")).expect("journal segments");
+    assert!(!segments.is_empty(), "core journal should exist");
     assert!(
-        fs::metadata(&journal_path)
-            .expect("core journal metadata")
-            .len()
-            > 0,
+        segments
+            .iter()
+            .any(|(_, segment)| fs::metadata(segment).expect("segment metadata").len() > 32),
         "core journal should contain records"
     );
 

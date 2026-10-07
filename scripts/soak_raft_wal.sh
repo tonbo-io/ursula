@@ -19,9 +19,9 @@ mkdir -p "$artifact_root"
 } >"$artifact_root/environment.txt"
 
 cargo test -p ursula-raft \
-  log_store::file::tests::online_reclaim_converges_at_production_threshold \
+  log_store::journal_tests::segment_reclaim_converges_at_production_size \
   --lib -- --exact --ignored --nocapture \
-  2>&1 | tee "$artifact_root/online-reclaim.txt"
+  2>&1 | tee "$artifact_root/segment-reclaim.txt"
 
 tests=(
   cli_static_grpc_raft_log_dir_replicates_between_nodes

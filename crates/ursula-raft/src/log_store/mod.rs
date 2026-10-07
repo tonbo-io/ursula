@@ -1,8 +1,15 @@
 //! OpenRaft log stores.
 //!
-//! - `file`: the durable per-group store over the shared per-core journal,
-//!   and the core writer that applies the fsync policy.
-//! - `journal`: the framed, checksummed journal file format.
+//! - `file`: the durable per-group store over the shared per-core journal.
+//! - `writer`: the single writer of each core's journal: batches, the fsync
+//!   policy, rotation and reclaim.
+//! - `group_log`: one group's log in memory: its markers, an index of where
+//!   each live entry's frame is, and a bounded cache of recent entries.
+//! - `segment`: the segment files of a core journal: naming, recovery across
+//!   segments, rotation and deletion.
+//! - `reclaim`: which segments a reclaim pass deletes or rewrites, and which
+//!   groups it reports lagging.
+//! - `journal`: the framed, checksummed format of one segment.
 //! - `core_meta`: each core's metadata file: every group's vote and log
 //!   state (empty, initialized or recovering).
 //! - `run_state`: the node's run-state file and how the journals open after
@@ -16,15 +23,20 @@
 mod core_meta;
 mod disk;
 mod file;
+mod group_log;
 mod journal;
+#[cfg(all(test, not(madsim)))]
+mod journal_tests;
 #[cfg(test)]
 mod meta_test_store;
+mod reclaim;
 mod run_state;
+mod segment;
 #[cfg(madsim)]
 mod sim_disk;
 mod state_file;
+mod writer;
 
-use std::collections::BTreeMap;
 use std::io;
 
 pub use core_meta::GroupLogState;
@@ -35,13 +47,7 @@ pub use disk::JournalDisk;
 pub use disk::JournalFile;
 #[cfg(madsim)]
 pub use disk::LockAttempt;
-pub(crate) use file::CoreFileLogWriter;
-pub use file::CoreJournalError;
-pub(crate) use file::CoreJournalOptions;
 pub use file::RaftGroupFileLogStore;
-pub(crate) use file::elapsed_ns;
-#[cfg(test)]
-pub(crate) use file::read_wire_frames;
 pub use journal::FrameDefect;
 pub use journal::HeaderDefect;
 pub use journal::JournalError;
@@ -53,10 +59,8 @@ pub(crate) use meta_test_store::MetaTestLogStore;
 use openraft::RaftTypeConfig;
 use openraft::alias::EntryOf;
 use openraft::alias::LogIdOf;
-use openraft::alias::VoteOf;
 use openraft::entry::RaftEntry;
 pub use run_state::BootId;
-pub(crate) use run_state::CORE_JOURNAL_FILE;
 pub use run_state::JournalHistory;
 pub(crate) use run_state::NodeWal;
 pub use run_state::PreviousRun;
@@ -67,6 +71,9 @@ pub use run_state::RecoveryState;
 pub use run_state::RunState;
 pub use run_state::RunStatus;
 pub use run_state::WalOpening;
+pub(crate) use run_state::core_dir;
+pub use segment::journal_segment_path;
+pub use segment::journal_segments;
 use serde::Deserialize;
 use serde::Serialize;
 #[cfg(madsim)]
@@ -86,24 +93,16 @@ pub use sim_disk::SimPowerLoss;
 pub use state_file::StateFileDefect;
 pub use state_file::StateFileError;
 pub use state_file::StateFileKind;
+pub(crate) use writer::CoreFileLogWriter;
+pub use writer::CoreJournalError;
+pub(crate) use writer::CoreJournalOptions;
+pub use writer::JournalTuning;
+pub use writer::LaggingGroups;
+pub(crate) use writer::elapsed_ns;
+#[cfg(test)]
+pub(crate) use writer::read_wire_frames;
 
 use crate::types::UrsulaRaftTypeConfig;
-
-/// A group's log as a log store holds it in memory: its entries, vote,
-/// committed pointer and purge point.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct LogStoreInner<C>
-where
-    C: RaftTypeConfig,
-    C::Entry: Clone,
-{
-    last_purged_log_id: Option<LogIdOf<C>>,
-    committed: Option<LogIdOf<C>>,
-    entries: BTreeMap<u64, EntryOf<C>>,
-    vote: Option<VoteOf<C>>,
-}
-
-pub(crate) type RaftGroupLogStoreInner = LogStoreInner<UrsulaRaftTypeConfig>;
 
 /// One durable operation appended to a group's raft log journal.
 ///
@@ -128,14 +127,6 @@ pub(crate) struct CoreJournalRecord {
     pub(crate) record: RaftGroupLogRecord,
 }
 
-/// Drops every entry after `last_index`, or all entries when it is `None`.
-pub(crate) fn truncate_entries_after<V>(entries: &mut BTreeMap<u64, V>, last_index: Option<u64>) {
-    match last_index {
-        Some(last_index) => entries.retain(|index, _| *index <= last_index),
-        None => entries.clear(),
-    }
-}
-
 pub(crate) fn ensure_consecutive_entries<C>(entries: &[EntryOf<C>]) -> Result<(), io::Error>
 where
     C: RaftTypeConfig,
@@ -152,57 +143,6 @@ where
                 format!("raft log entries are not consecutive: {current} then {next}"),
             ));
         }
-    }
-    Ok(())
-}
-
-pub(crate) fn ensure_log_append_boundary<C>(
-    inner: &LogStoreInner<C>,
-    entries: &[EntryOf<C>],
-) -> Result<(), io::Error>
-where
-    C: RaftTypeConfig,
-    C::Entry: Clone,
-{
-    let Some(first_entry) = entries.first() else {
-        return Ok(());
-    };
-    let Some(last_existing_index) = inner.entries.keys().next_back().copied() else {
-        return Ok(());
-    };
-
-    let first_append_index = first_entry.log_id().index;
-    if last_existing_index
-        .checked_add(1)
-        .is_some_and(|next_index| first_append_index > next_index)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("raft log store has a hole: {last_existing_index} then {first_append_index}"),
-        ));
-    }
-
-    Ok(())
-}
-
-pub(crate) fn ensure_consecutive_log<C>(
-    entries: &BTreeMap<u64, EntryOf<C>>,
-) -> Result<(), io::Error>
-where
-    C: RaftTypeConfig,
-    C::Entry: Clone,
-{
-    let mut previous: Option<u64> = None;
-    for index in entries.keys().copied() {
-        if let Some(previous) = previous
-            && previous.checked_add(1) != Some(index)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("raft log store has a hole: {previous} then {index}"),
-            ));
-        }
-        previous = Some(index);
     }
     Ok(())
 }

@@ -520,6 +520,50 @@ resume_available_size = "512MiB"
     }
 
     #[test]
+    fn wal_segment_and_cache_sizes_load_and_split_the_cache_between_groups() {
+        let config = load_config(None, None, Some(1)).unwrap();
+        assert_eq!(config.raft.wal.segment_size.as_bytes(), 64 << 20);
+        assert_eq!(config.raft.wal.cache_size.as_bytes(), 256 << 20);
+        assert_eq!(config.raft.wal.group_cache_bytes(128), 2 << 20);
+        assert_eq!(config.raft.wal.group_cache_bytes(0), 256 << 20);
+
+        let tmp = temp_config(
+            ".toml",
+            r#"
+[raft.wal]
+path = "/tmp/ursula-wal"
+segment_size = "8MiB"
+cache_size = "32MiB"
+"#,
+        );
+        let config = load_config(Some(tmp.path()), None, Some(1)).unwrap();
+        assert_eq!(config.raft.wal.segment_size.as_bytes(), 8 << 20);
+        assert_eq!(config.raft.wal.group_cache_bytes(32), 1 << 20);
+
+        let tmp = temp_config(
+            ".toml",
+            r#"
+[raft.wal]
+path = "/tmp/ursula-wal"
+segment_size = "1KiB"
+"#,
+        );
+        let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::Validation(
+                    crate::validate::ValidationError::WalSegmentTooSmall {
+                        segment_size: 1024,
+                        minimum: 4096
+                    }
+                )
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn validation_rejects_s3_without_bucket() {
         let tmp = temp_config(
             ".toml",

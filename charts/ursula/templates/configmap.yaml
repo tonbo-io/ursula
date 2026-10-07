@@ -127,6 +127,8 @@ data:
     resume_available_size = {{ .Values.raft.resumeAvailableBytes | int64 | quote }}
     path = {{ .Values.raft.logDir | quote }}
     fsync = {{ .Values.raft.walFsync | quote }}
+    segment_size = {{ .Values.raft.walSegmentBytes | int64 | quote }}
+    cache_size = {{ .Values.raft.walCacheBytes | int64 | quote }}
 
     [storage.cold]
 {{- if .Values.coldStorage.enabled }}
