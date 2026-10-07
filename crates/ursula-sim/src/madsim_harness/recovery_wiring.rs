@@ -39,6 +39,22 @@ pub(super) fn configured_voters(
         .collect()
 }
 
+#[derive(Debug)]
+pub(super) enum RecoveryProbeError {
+    Partitioned,
+    MissingGate,
+    Proof(ursula_raft::QuorumProofError),
+}
+impl std::fmt::Display for RecoveryProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Partitioned => f.write_str("partitioned from leader"),
+            Self::MissingGate => f.write_str("leader gate is absent"),
+            Self::Proof(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+
 /// A fresh outbound ReadIndex barrier from `leader_id`, confirmed the way the
 /// barrier RPC confirms one: a new ReadIndex round with a quorum, applied by
 /// the leader, while it still leads. `policy` cuts the RPC off as it cuts
@@ -48,26 +64,18 @@ pub(super) async fn in_process_barrier(
     policy: &InProcessRaftNetworkPolicy,
     node_id: u64,
     leader_id: u64,
-) -> Result<(UrsulaVote, u64), String> {
+) -> Result<(UrsulaVote, u64), RecoveryProbeError> {
     if policy.partitioned(node_id, leader_id) {
-        return Err("partitioned from the leader".to_owned());
+        return Err(RecoveryProbeError::Partitioned);
     }
-    let leader = registry.get(leader_id).ok_or("leader is absent")?;
-    let linearizer = leader
-        .get_read_linearizer(openraft::ReadPolicy::ReadIndex)
+    let group = registry
+        .rejoin(leader_id)
+        .ok_or(RecoveryProbeError::MissingGate)?
+        .raft_group_id();
+    registry
+        .confirm_recovery_barrier(leader_id, group)
         .await
-        .map_err(|err| err.to_string())?;
-    let index = linearizer.read_log_id().index();
-    linearizer
-        .try_await_ready(&leader, Some(Duration::from_secs(1)))
-        .await
-        .map_err(|err| err.to_string())?
-        .map_err(|err| format!("leader apply timeout: {err:?}"))?;
-    let metrics = openraft::rt::WatchReceiver::borrow_watched(&leader.metrics()).clone();
-    if metrics.current_leader != Some(leader_id) || !metrics.vote.is_committed() {
-        return Err("probe target lost leadership".to_owned());
-    }
-    Ok((metrics.vote, index))
+        .map_err(RecoveryProbeError::Proof)
 }
 
 /// The bootstrap probe vote of `node_id` to `peer_id`, screened by the
@@ -138,7 +146,7 @@ struct InProcessRecoveryTransport {
 }
 
 impl ursula_raft::RecoveryTransport for InProcessRecoveryTransport {
-    type Error = String;
+    type Error = RecoveryProbeError;
     async fn probe(&self, peer: u64, _address: String) -> Option<PeerGroupLog> {
         in_process_probe(&self.registry, &self.policy, self.node_id, peer).await
     }

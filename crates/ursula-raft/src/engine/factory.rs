@@ -348,6 +348,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     self.node_id
                 )));
             }
+            let nodes = self.peer_nodes_for_group(placement.raft_group_id)?;
             // The log store and the recovery gate go first: a gated replica's
             // Raft core starts with elections disabled.
             let store = self.log_stores.open(placement, metrics.clone())?;
@@ -414,7 +415,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 &engine,
                 rejoin,
                 &self.registry,
-                self.peer_nodes_for_group(placement.raft_group_id)?,
+                nodes,
                 crate::recovery_transport::GrpcRecoveryTransport {
                     placement,
                     node_id: self.node_id,
@@ -423,7 +424,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 crate::rejoin::RecoveryConfig {
                     initialize: self.should_initialize_membership(placement.raft_group_id),
                     interval: REJOIN_HEAL_INTERVAL,
-                    barrier_timeout: Duration::from_secs(3),
+                    barrier_timeout: crate::rejoin::RECOVERY_BARRIER_TIMEOUT,
                     stall_after: RECOVERY_STALL_AFTER,
                     bootstrap_interval: self.engine_config.bootstrap_peer_probe_interval,
                     bootstrap_warn_after: self.engine_config.bootstrap_peer_probe,

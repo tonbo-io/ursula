@@ -334,6 +334,17 @@ impl MetricsClient {
             .with_context(|| format!("POST {url}"))?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::CONFLICT {
+            let rejection: TransferLeaderResponse =
+                serde_json::from_str(&body).context("decode rejected leadership transfer")?;
+            if !rejection.transferred
+                && rejection
+                    .rejection
+                    .is_some_and(|reason| reason.should_replan())
+            {
+                return Ok(rejection);
+            }
+        }
         if status.is_success() {
             serde_json::from_str::<TransferLeaderResponse>(&body)
                 .with_context(|| format!("decode transfer-leader response: {body}"))
@@ -356,9 +367,8 @@ impl MetricsClient {
         raft_group_id: u64,
         current_term: u64,
     ) -> Result<()> {
-        self.fetch_node(voter)
+        self.observed_incarnation(voter)
             .await?
-            .process_incarnation
             .context("self-election requires process identity")?;
         let url = voter
             .admin_url
@@ -385,9 +395,8 @@ impl MetricsClient {
         leader: &NodeInfo,
         group: u32,
     ) -> Result<ursula_proto::admin::QuorumPrefix> {
-        self.fetch_node(leader)
+        self.observed_incarnation(leader)
             .await?
-            .process_incarnation
             .context("quorum proof requires process identity")?;
         let url = leader
             .admin_url
@@ -922,7 +931,7 @@ mod tests {
         *identity.lock().unwrap() = Some(ProcessIncarnation::from_bits(1));
         let error = client.request_self_election(&node, 0, 7).await.unwrap_err();
         assert!(
-            error.to_string().contains("changed during"),
+            error.to_string().contains("requires process identity"),
             "changed identity must stop before HTTP or consensus mutation: {error}"
         );
         task.abort();
@@ -980,10 +989,13 @@ mod tests {
     async fn current_quorum_proof_uses_guarded_admin_without_a_raft_endpoint() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let scrapes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = scrapes.clone();
         let app = Router::new()
-            .route("/__ursula/metrics", axum::routing::get(|| async {
+            .route("/__ursula/metrics", axum::routing::get(move || { let observed = observed.clone(); async move {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 axum::Json(serde_json::json!({"process_node_id":1,"process_incarnation":"00000000000000000000000000000001"}))
-            }))
+            }}))
             .route("/__ursula/raft/0/quorum", axum::routing::get(|headers: axum::http::HeaderMap| async move {
                 assert_eq!(headers[PROCESS_INCARNATION_HEADER], "00000000000000000000000000000001");
                 axum::Json(ursula_proto::admin::QuorumPrefix { raft_group_id: 0, leader_id: 1, leader_term: 3, required_applied_index: 17 })
@@ -998,13 +1010,58 @@ mod tests {
             expected_process_incarnation: None,
             expected_maintenance_fence: None,
         };
-        let proof = MetricsClient::new(Duration::from_secs(1))
-            .unwrap()
-            .confirm_quorum(&node, 0)
-            .await
-            .unwrap();
-        assert_eq!(proof.required_applied_index, 17);
+        let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
+        client.fetch_node(&node).await.unwrap();
+        for _ in 0..3 {
+            let proof = client.confirm_quorum(&node, 0).await.unwrap();
+            assert_eq!(proof.required_applied_index, 17);
+        }
+        assert_eq!(scrapes.load(std::sync::atomic::Ordering::SeqCst), 1);
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn transfer_conflicts_replan_only_for_typed_retryable_rejections() {
+        use ursula_proto::admin::TransferRejection;
+
+        for (reason, retryable) in [
+            (TransferRejection::NotLeader, true),
+            (TransferRejection::RecoveringTarget, true),
+            (TransferRejection::InvalidTarget, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route("/__ursula/metrics", axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"process_node_id":1,"process_incarnation":"00000000000000000000000000000001"}))
+                }))
+                .route("/__ursula/raft/0/leader/transfer/2", post(move || async move {
+                    (axum::http::StatusCode::CONFLICT, axum::Json(TransferLeaderResponse {
+                        raft_group_id: 0, from: Some(1), to: Some(2), current_leader: None,
+                        transferred: false, rejection: Some(reason), reason: None,
+                    }))
+                }));
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let node = NodeInfo {
+                id: 1,
+                host: address.to_string(),
+                admin_url: format!("http://{address}").parse().unwrap(),
+                http_url: None,
+                metrics_url: None,
+                expected_process_incarnation: None,
+                expected_maintenance_fence: None,
+            };
+            let result = MetricsClient::new(Duration::from_secs(1))
+                .unwrap()
+                .transfer_leader(&node, 0, 2)
+                .await;
+            if retryable {
+                assert_eq!(result.unwrap().rejection, Some(reason));
+            } else {
+                assert!(result.unwrap_err().to_string().contains("409"));
+            }
+            task.abort();
+        }
     }
 
     #[tokio::test]

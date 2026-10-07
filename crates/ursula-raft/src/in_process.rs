@@ -36,6 +36,7 @@ use crate::types::UrsulaRaftTypeConfig;
 #[derive(Debug, Clone, Default)]
 pub struct InProcessRaftRegistry {
     nodes: Arc<Mutex<BTreeMap<u64, Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>>>>,
+    barriers: Arc<Mutex<BTreeMap<u64, Arc<crate::read_index::ReadIndexBarrier>>>>,
     full_snapshot_calls: Arc<Mutex<BTreeMap<u64, usize>>>,
     /// Each node's recovery gate, screening the votes and appends delivered
     /// to it.
@@ -44,6 +45,13 @@ pub struct InProcessRaftRegistry {
 
 impl InProcessRaftRegistry {
     pub fn register(&self, node_id: u64, raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>) {
+        self.barriers
+            .lock()
+            .expect("in-process barrier mutex")
+            .insert(
+                node_id,
+                Arc::new(crate::read_index::ReadIndexBarrier::new(raft.clone())),
+            );
         self.nodes
             .lock()
             .expect("in-process raft registry mutex")
@@ -54,6 +62,10 @@ impl InProcessRaftRegistry {
         &self,
         node_id: u64,
     ) -> Option<Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>> {
+        self.barriers
+            .lock()
+            .expect("in-process barrier mutex")
+            .remove(&node_id);
         self.nodes
             .lock()
             .expect("in-process raft registry mutex")
@@ -66,6 +78,24 @@ impl InProcessRaftRegistry {
             .expect("in-process raft registry mutex")
             .get(&node_id)
             .cloned()
+    }
+
+    pub async fn confirm_recovery_barrier(
+        &self,
+        node_id: u64,
+        group: ursula_shard::RaftGroupId,
+    ) -> Result<(crate::UrsulaVote, u64), crate::QuorumProofError> {
+        let raft = self
+            .get(node_id)
+            .ok_or(crate::QuorumProofError::NotRegistered { group })?;
+        let barrier = self
+            .barriers
+            .lock()
+            .expect("in-process barrier mutex")
+            .get(&node_id)
+            .cloned()
+            .ok_or(crate::QuorumProofError::NotRegistered { group })?;
+        crate::registry::confirm_recovery_barrier(group, &raft, barrier.as_ref()).await
     }
 
     /// Screen the votes and appends delivered to `node_id` through its

@@ -250,6 +250,22 @@ mod tests {
     }
 }
 
+/// Machine-readable reason for a rejected leadership handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferRejection {
+    NotRegistered,
+    NotLeader,
+    InvalidTarget,
+    RecoveringTarget,
+    RaftStopped,
+}
+impl TransferRejection {
+    pub fn should_replan(self) -> bool {
+        matches!(self, Self::NotLeader | Self::RecoveringTarget)
+    }
+}
+
 /// Result of submitting a planned leadership transfer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferLeaderResponse {
@@ -261,6 +277,7 @@ pub struct TransferLeaderResponse {
     #[serde(default)]
     pub current_leader: Option<u64>,
     pub transferred: bool,
+    pub rejection: Option<TransferRejection>,
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -321,8 +338,7 @@ pub struct RaftGroupMaintenanceState {
 }
 
 /// One fresh, outbound ReadIndex confirmation bound to its committed leader.
-/// The legacy bridge returns the leader's last log as a conservative apply
-/// bound; callers must wait for every required replica to apply that prefix.
+/// Callers must wait for every required replica to apply that prefix.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QuorumPrefix {
     pub raft_group_id: u32,

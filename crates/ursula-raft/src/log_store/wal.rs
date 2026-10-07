@@ -57,7 +57,11 @@ pub struct RaftWal {
 impl RaftWal {
     /// Starts a run of the Raft WAL under `root` with the `fsync` policy and
     /// the default segment size and entry cache.
-    pub fn start(root: impl Into<PathBuf>, fsync: WalFsync, topology: &ursula_shard::StaticShardMap) -> Result<Self, RaftWalError> {
+    pub fn start(
+        root: impl Into<PathBuf>,
+        fsync: WalFsync,
+        topology: &ursula_shard::StaticShardMap,
+    ) -> Result<Self, RaftWalError> {
         Self::start_with(root, JournalTuning::new(fsync), topology)
     }
 
@@ -81,10 +85,6 @@ impl RaftWal {
 
     pub fn fsync(&self) -> WalFsync {
         self.node.fsync()
-    }
-
-    pub fn tuning(&self) -> JournalTuning {
-        self.tuning
     }
 
     /// The groups whose live records keep old journal segments alive, for
@@ -233,7 +233,12 @@ mod tests {
     #[test]
     fn cores_open_their_journals_independently() {
         let root = unique_test_dir("parallel-core-open");
-        let factory = RaftWal::start(&root, WalFsync::Always, &ursula_shard::StaticShardMap::new(2, 2).expect("valid topology")).expect("start");
+        let factory = RaftWal::start(
+            &root,
+            WalFsync::Always,
+            &ursula_shard::StaticShardMap::new(2, 2).expect("valid topology"),
+        )
+        .expect("start");
         let metrics = ursula_runtime::RuntimeMetrics::new(2, 2).group_engine_metrics();
         let placement = |core: u16, group: u32| ShardPlacement {
             core_id: CoreId(core),

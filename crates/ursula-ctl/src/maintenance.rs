@@ -421,6 +421,10 @@ async fn transfer_drain_plan(
             .transfer_leader(target, transfer.raft_group_id, transfer.preferred_successor)
             .await?;
         if !resp.transferred {
+            if resp.rejection.is_some_and(|reason| reason.should_replan()) {
+                // The next drain iteration re-observes leadership and eligibility.
+                return Ok(());
+            }
             bail!(
                 "leader transfer rejected for group {}: {}",
                 transfer.raft_group_id,

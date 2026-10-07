@@ -79,7 +79,8 @@ impl LeadershipShedState {
     }
 
     /// Transfers trigger an election, so they use the campaign policy too.
-    pub fn should_accept_transfer(self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn should_accept_transfer(self) -> bool {
         self.should_campaign()
     }
 
@@ -103,7 +104,8 @@ impl LeadershipShedState {
         self.is_shed()
     }
 
-    pub fn transfer_rejection_reason(self) -> Option<LeadershipShedReason> {
+    #[cfg(test)]
+    pub(crate) fn transfer_rejection_reason(self) -> Option<LeadershipShedReason> {
         if self.contains(Self::CLUSTER_EGRESS) {
             Some(LeadershipShedReason::ClusterEgress)
         } else if self.contains(Self::MAINTENANCE_DRAIN) {
@@ -145,7 +147,7 @@ pub struct ElectionPolicy {
 }
 
 impl ElectionPolicy {
-    pub fn flag(&self) -> LeadershipShedFlag {
+    pub(crate) fn flag(&self) -> LeadershipShedFlag {
         self.shed.clone()
     }
     pub fn state(&self) -> LeadershipShedState {

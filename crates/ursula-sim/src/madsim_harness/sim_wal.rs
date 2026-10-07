@@ -94,9 +94,8 @@ impl SimNodeWal {
         if let Some(run) = run.as_ref() {
             return Ok(run.clone());
         }
-        let started =
-            RaftWal::start_with(&self.root, self.tuning, &self.topology)
-                .map_err(|err| GroupEngineError::new(format!("start the Raft WAL: {err}")))?;
+        let started = RaftWal::start_with(&self.root, self.tuning, &self.topology)
+            .map_err(|err| GroupEngineError::new(format!("start the Raft WAL: {err}")))?;
         *run = Some(started.clone());
         Ok(started)
     }

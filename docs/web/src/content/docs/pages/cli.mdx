@@ -183,11 +183,11 @@ For custom tooling, every verb maps onto a small set of HTTP endpoints on each n
 | `drain` / `undrain` (maintenance guard) | `POST /__ursula/leadership-shed/maintenance`, `DELETE` to clear |
 | `drain` (transfer step) | `POST /__ursula/raft/{raft_group_id}/leader/transfer/{node_id}` |
 
-The transfer endpoint refuses with `409 Conflict` if the receiving node isn't the current leader of the group, and `400` if the target node isn't a voter. ursulactl uses this to refuse to attempt a transfer it cannot reason about.
+The transfer endpoint returns a typed rejection: `409 Conflict` for a changed leader or a recovering target, `400` for an invalid target, `404` for an unregistered group, and `500` for a stopped Raft. Drain re-observes and re-plans the two `409` cases; other errors stop the operation.
 
 ## `verify-quorum`
 
-This source provides a bounded observation for recovery measurements and maintenance tooling. Supply the deployed group and core counts explicitly; the example below uses 256 groups and two cores:
+This source provides a bounded observation for recovery measurements and maintenance tooling. Supply the deployed group count explicitly; the example below uses 256 groups:
 
 ```bash
 ursulactl verify-quorum --config cluster.json --expected-groups 256 --timeout-secs 120

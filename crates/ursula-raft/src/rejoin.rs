@@ -103,6 +103,8 @@ pub const REJOIN_HEAL_INTERVAL: Duration = Duration::from_millis(500);
 pub const RECOVERY_STALL_AFTER: Duration = Duration::from_secs(30);
 
 /// How long one membership step of the heal driver may take.
+pub(crate) const RECOVERY_BARRIER_TIMEOUT: Duration = Duration::from_secs(3);
+
 const REJOIN_HEAL_STEP_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn log_index(log_id: Option<&LogIdOf<UrsulaRaftTypeConfig>>) -> Option<u64> {

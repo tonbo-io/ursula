@@ -271,3 +271,8 @@ mod incarnation_gc_tests;
 mod tests;
 #[cfg(test)]
 mod tidy_driver_tests;
+
+pub use metrics::WalJournalSample;
+pub use metrics::WalMemorySample;
+pub use metrics::WalReadSample;
+pub use metrics::WalStorageSample;

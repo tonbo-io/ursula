@@ -10,7 +10,6 @@ use openraft::BasicNode;
 use openraft::rt::WatchReceiver;
 
 use super::GroupRejoin;
-use super::MetricsReceiver;
 use super::PeerGroupLog;
 use super::run_group_bootstrap;
 use super::run_rejoin_heal;
@@ -100,8 +99,8 @@ mod recovery_task_tests {
 
 /// A retry deadline is still needed for unavailable peers and stall reporting.
 /// Local state changes wake the driver without waiting for that deadline.
-pub(super) async fn wait_recovery_change(
-    metrics: &mut MetricsReceiver,
+pub(super) async fn wait_recovery_change<T: Send + Sync>(
+    metrics: &mut openraft::type_config::alias::WatchReceiverOf<crate::UrsulaRaftTypeConfig, T>,
     gate: &mut openraft::type_config::alias::WatchReceiverOf<crate::UrsulaRaftTypeConfig, ()>,
     retry: Duration,
 ) -> bool {

@@ -2466,7 +2466,6 @@ pub(crate) async fn transfer_raft_leader(
     Path((raft_group_id, node_id)): Path<(u64, u64)>,
 ) -> Response {
     use ursula_proto::admin::TransferLeaderResponse;
-    use ursula_raft::LeadershipTransferError;
 
     let (group, raft) = match resolve_raft_group(&state, raft_group_id) {
         Ok(resolved) => resolved,
@@ -2483,31 +2482,61 @@ pub(crate) async fn transfer_raft_leader(
             to: Some(node_id),
             current_leader: None,
             transferred: true,
+            rejection: None,
             reason: None,
         })
         .into_response(),
-        Err(error) => {
-            let status = match &error {
-                LeadershipTransferError::NotRegistered { .. } => StatusCode::NOT_FOUND,
-                LeadershipTransferError::NotLeader { .. }
-                | LeadershipTransferError::RecoveringTarget { .. } => StatusCode::CONFLICT,
-                LeadershipTransferError::InvalidTarget { .. } => StatusCode::BAD_REQUEST,
-                LeadershipTransferError::Raft { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            (
-                status,
-                axum::Json(TransferLeaderResponse {
-                    raft_group_id,
-                    from: Some(metrics.id),
-                    to: Some(node_id),
-                    current_leader: metrics.current_leader,
-                    transferred: false,
-                    reason: Some(error.to_string()),
-                }),
-            )
-                .into_response()
-        }
+        Err(error) => transfer_raft_error_response(
+            raft_group_id,
+            metrics.id,
+            node_id,
+            metrics.current_leader,
+            error,
+        ),
     }
+}
+
+fn transfer_raft_error_response(
+    group: u64,
+    from: u64,
+    to: u64,
+    leader: Option<u64>,
+    error: ursula_raft::LeadershipTransferError,
+) -> Response {
+    use ursula_proto::admin::TransferLeaderResponse;
+    use ursula_proto::admin::TransferRejection;
+    use ursula_raft::LeadershipTransferError;
+    let (status, rejection) = match &error {
+        LeadershipTransferError::NotRegistered { .. } => {
+            (StatusCode::NOT_FOUND, TransferRejection::NotRegistered)
+        }
+        LeadershipTransferError::NotLeader { .. } => {
+            (StatusCode::CONFLICT, TransferRejection::NotLeader)
+        }
+        LeadershipTransferError::RecoveringTarget { .. } => {
+            (StatusCode::CONFLICT, TransferRejection::RecoveringTarget)
+        }
+        LeadershipTransferError::InvalidTarget { .. } => {
+            (StatusCode::BAD_REQUEST, TransferRejection::InvalidTarget)
+        }
+        LeadershipTransferError::Raft { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            TransferRejection::RaftStopped,
+        ),
+    };
+    (
+        status,
+        axum::Json(TransferLeaderResponse {
+            raft_group_id: group,
+            from: Some(from),
+            to: Some(to),
+            current_leader: leader,
+            transferred: false,
+            rejection: Some(rejection),
+            reason: Some(error.to_string()),
+        }),
+    )
+        .into_response()
 }
 
 async fn confirm_raft_quorum(

@@ -19,7 +19,7 @@ pub(crate) struct GrpcRecoveryTransport {
     pub timeout: Duration,
 }
 impl RecoveryTransport for GrpcRecoveryTransport {
-    type Error = String;
+    type Error = crate::grpc::RecoveryProbeError;
     async fn probe(&self, peer: u64, address: String) -> Option<PeerGroupLog> {
         GrpcRaftNetwork::new(self.placement.raft_group_id, peer, &address)
             .vote(
@@ -40,7 +40,7 @@ impl RecoveryTransport for GrpcRecoveryTransport {
             self.node_id,
             leader,
             &address,
-            Duration::from_secs(3),
+            crate::rejoin::RECOVERY_BARRIER_TIMEOUT,
         )
         .await
     }

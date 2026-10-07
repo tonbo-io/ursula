@@ -110,8 +110,9 @@ where
         .filter(|(peer_id, _)| **peer_id != node_id)
         .map(|(peer_id, node)| (*peer_id, node.addr.clone()))
         .collect::<Vec<_>>();
+    let mut last_probe = None;
     let mut last_warning = crate::rt::time::Instant::now();
-    let mut observed = raft.metrics();
+    let mut observed = raft.server_metrics();
     let mut changes = rejoin.changes.subscribe();
     loop {
         match raft.is_initialized().await {
@@ -128,6 +129,17 @@ where
             return GroupBootstrap::AlreadyInitialized;
         }
         let leader_seen = raft.metrics().borrow_watched().current_leader.is_some();
+        if !leader_seen && let Some(at) = last_probe {
+            let remaining = interval
+                .saturating_sub(crate::rt::time::Instant::now().saturating_duration_since(at));
+            if !remaining.is_zero() {
+                if !wait_recovery_change(&mut observed, &mut changes, remaining).await {
+                    return GroupBootstrap::Stopped;
+                }
+                continue;
+            }
+        }
+        last_probe = Some(crate::rt::time::Instant::now());
         let answers = if leader_seen {
             Vec::new()
         } else {

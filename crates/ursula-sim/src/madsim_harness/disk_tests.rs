@@ -380,42 +380,7 @@ impl JournalCluster {
     }
 
     pub(super) async fn start_with_fsync(name: &str, fsync: WalFsync) -> Self {
-        let config = Arc::new(
-            Config {
-                cluster_name: name.to_owned(),
-                heartbeat_interval: 10,
-                election_timeout_min: 50,
-                election_timeout_max: 100,
-                ..Default::default()
-            }
-            .validate()
-            .expect("valid raft config"),
-        );
-        let (policy, votes) = recovery_wiring::vote_recording_network_policy();
-        let mut cluster = Self {
-            config,
-            policy,
-            votes,
-            wals: (1..=3)
-                .map(|node_id| {
-                    (
-                        node_id,
-                        SimNodeWal::provision_with_fsync(&format!("{name}-{node_id}"), fsync)
-                            .with_group_count(JOURNAL_GROUPS.len()),
-                    )
-                })
-                .collect(),
-            registries: JOURNAL_GROUPS
-                .iter()
-                .map(|group| (*group, InProcessRaftRegistry::default()))
-                .collect(),
-            engines: BTreeMap::new(),
-            rejoins: BTreeMap::new(),
-            metrics: (1..=3)
-                .map(|node_id| (node_id, RuntimeMetrics::new(1, JOURNAL_GROUPS.len())))
-                .collect(),
-            acknowledged: BTreeMap::new(),
-        };
+        let mut cluster = Self::unstarted(name, fsync);
         for node_id in 1..=3 {
             cluster.start_node(node_id).await;
         }
@@ -441,6 +406,45 @@ impl JournalCluster {
         cluster
     }
 
+    pub(super) fn unstarted(name: &str, fsync: WalFsync) -> Self {
+        let config = Arc::new(
+            Config {
+                cluster_name: name.to_owned(),
+                heartbeat_interval: 10,
+                election_timeout_min: 50,
+                election_timeout_max: 100,
+                ..Default::default()
+            }
+            .validate()
+            .expect("valid raft config"),
+        );
+        let (policy, votes) = recovery_wiring::vote_recording_network_policy();
+        Self {
+            config,
+            policy,
+            votes,
+            wals: (1..=3)
+                .map(|node_id| {
+                    (
+                        node_id,
+                        SimNodeWal::provision_with_fsync(&format!("{name}-{node_id}"), fsync)
+                            .with_group_count(JOURNAL_GROUPS.len()),
+                    )
+                })
+                .collect(),
+            registries: JOURNAL_GROUPS
+                .iter()
+                .map(|group| (*group, InProcessRaftRegistry::default()))
+                .collect(),
+            engines: BTreeMap::new(),
+            rejoins: BTreeMap::new(),
+            metrics: (1..=3)
+                .map(|node_id| (node_id, RuntimeMetrics::new(1, JOURNAL_GROUPS.len())))
+                .collect(),
+            acknowledged: BTreeMap::new(),
+        }
+    }
+
     pub(super) async fn start_node(&mut self, node_id: u64) {
         let voters = recovery_wiring::configured_voters(1..=3);
         for group in JOURNAL_GROUPS {
@@ -454,10 +458,13 @@ impl JournalCluster {
                 &store,
             ));
             let registry = self.registries[&group].clone();
+            let mut config = (*self.config).clone();
+            config.enable_elect =
+                ursula_raft::ElectionPolicy::default().may_campaign(Some(&rejoin));
             let engine = RaftGroupEngine::new_node_with_log_store_and_network(
                 placement,
                 node_id,
-                self.config.clone(),
+                Arc::new(config),
                 InProcessRaftNetworkFactory::new(registry.clone())
                     .with_source(node_id)
                     .with_policy(self.policy.clone())
@@ -1895,8 +1902,7 @@ fn wal_topology_publication_survives_power_loss() {
                 ));
                 assert!(!SimDisk::exists(&root.join(RUN_STATE_FILE)));
                 SimDisk::power_loss(&root).unwrap();
-                let wal =
-                    RaftWal::start(&root, WalFsync::Never, &topology).unwrap();
+                let wal = RaftWal::start(&root, WalFsync::Never, &topology).unwrap();
                 drop(wal);
                 SimDisk::power_loss(&root).unwrap();
                 let changed = ursula_shard::StaticShardMap::new(8, 64).unwrap();

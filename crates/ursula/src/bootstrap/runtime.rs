@@ -68,9 +68,9 @@ impl GroupStorage {
     ) -> Result<Self, SpawnRuntimeError> {
         Ok(match persistence {
             Persistence::InMemory => Self::InMemory,
-            Persistence::Raft { log_dir } => Self::Raft(RaftWal::start_with(
-                log_dir, tuning, topology,
-            )?),
+            Persistence::Raft { log_dir } => {
+                Self::Raft(RaftWal::start_with(log_dir, tuning, topology)?)
+            }
         })
     }
 

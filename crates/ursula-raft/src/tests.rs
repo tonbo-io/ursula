@@ -2699,3 +2699,67 @@ async fn registry_handoff_rejects_reverted_follower_and_transfers_to_healthy_vot
         .unwrap();
     shutdown_all(&engines).await;
 }
+
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn recovery_proof_rejects_a_vote_change_after_read_index() {
+    struct VoteChangingBarrier {
+        raft: crate::RaftGroupHandle,
+        barrier: Arc<crate::read_index::ReadIndexBarrier>,
+    }
+    impl ursula_runtime::LinearizableReadBarrier for VoteChangingBarrier {
+        fn confirm(&self) -> ursula_runtime::ReadIndexFuture {
+            let raft = self.raft.clone();
+            let round = self.barrier.round();
+            Box::pin(async move {
+                let outcome = round.await?;
+                raft.runtime_config().elect(false);
+                raft.append_entries(UrsulaAppendEntriesRequest {
+                    vote: UrsulaVote::new_committed(99, 2),
+                    prev_log_id: None,
+                    entries: Vec::new(),
+                    leader_commit: None,
+                })
+                .await
+                .unwrap();
+                raft.wait(Some(Duration::from_secs(2)))
+                    .metrics(|m| m.current_term == 99, "new vote published")
+                    .await
+                    .unwrap();
+                Ok(outcome)
+            })
+        }
+    }
+    let (_root, store) = fresh_journal_store();
+    let engine = RaftGroupEngine::new_single_node(
+        placement(),
+        1,
+        BasicNode::new("local"),
+        raft_config("changed-proof", 30, 60),
+        store,
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    engine
+        .raft
+        .wait(Some(Duration::from_secs(2)))
+        .current_leader(1, "leader elected")
+        .await
+        .unwrap();
+    let barrier = VoteChangingBarrier {
+        raft: engine.raft.clone(),
+        barrier: engine.read_barrier.clone(),
+    };
+    let result = crate::registry::confirm_recovery_barrier(
+        placement().raft_group_id,
+        &engine.raft,
+        &barrier,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(crate::QuorumProofError::LeadershipChanged { .. })
+    ));
+    engine.shutdown().await.unwrap();
+}

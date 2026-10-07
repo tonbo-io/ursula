@@ -1138,7 +1138,6 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
         group_count: 6,
         timeout: Duration::from_secs(15),
         poll_interval: Duration::from_millis(100),
-        allow_legacy_eligibility: false,
     };
     ursula_ctl::wait_cluster_ready(
         "pre-fault host inventory",
@@ -1568,7 +1567,6 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
         group_count: 6,
         timeout: Duration::from_secs(15),
         poll_interval: Duration::from_millis(100),
-        allow_legacy_eligibility: false,
     };
     let started_ms = native_epoch_ms();
     let proof = ursula_ctl::quorum::verify_quorum(&nodes, &ctl, &options)

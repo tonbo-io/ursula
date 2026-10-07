@@ -29,8 +29,8 @@ use openraft::storage::LogState;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use openraft::vote::RaftLeaderId;
-use ursula_proto::telemetry::WalReadSample;
 use ursula_runtime::GroupEngineMetrics;
+use ursula_runtime::WalReadSample;
 use ursula_shard::ShardPlacement;
 
 use super::CoreJournalRecord;

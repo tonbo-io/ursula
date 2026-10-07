@@ -190,7 +190,7 @@ pub async fn run_rejoin_heal(
     let mut last_joint = None;
     let mut last_attempt = None;
     let mut joint_since = crate::rt::time::Instant::now();
-    let mut observed = raft.metrics();
+    let mut observed = raft.server_metrics();
     let mut changes = rejoin.changes.subscribe();
     loop {
         if !wait_recovery_change(&mut observed, &mut changes, interval).await {

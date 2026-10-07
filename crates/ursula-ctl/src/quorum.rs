@@ -29,9 +29,6 @@ pub struct QuorumVerificationOptions {
     pub group_count: u32,
     pub timeout: Duration,
     pub poll_interval: Duration,
-    /// Diagnostic compatibility for the pinned 0.6.2 baseline only. Such a
-    /// result explicitly cannot certify process-local participation gates.
-    pub allow_legacy_eligibility: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,9 +91,8 @@ fn validate_inventory(
     snapshot: &ClusterSnapshot,
     voters: &BTreeSet<u64>,
     group_count: u32,
-    allow_legacy: bool,
 ) -> Result<bool> {
-    validate_observed_inventory(snapshot, voters, voters, group_count, allow_legacy)
+    validate_observed_inventory(snapshot, voters, voters, group_count)
 }
 
 fn validate_observed_inventory(
@@ -104,7 +100,6 @@ fn validate_observed_inventory(
     voters: &BTreeSet<u64>,
     observed_voters: &BTreeSet<u64>,
     group_count: u32,
-    allow_legacy: bool,
 ) -> Result<bool> {
     if !observed_voters.is_subset(voters) || observed_voters.len() <= voters.len() / 2 {
         bail!("observed configured voters cannot form a quorum");
@@ -177,8 +172,8 @@ fn validate_observed_inventory(
             }
         }
     }
-    if !participation_certified && !allow_legacy {
-        bail!("legacy metrics cannot certify participation; only baseline diagnostics may opt in");
+    if !participation_certified {
+        bail!("metrics cannot certify participation");
     }
     Ok(participation_certified)
 }
@@ -279,13 +274,7 @@ async fn verify_observed_quorum(
     }
     let observe = async {
         let initial = client.fetch_cluster(nodes).await?;
-        validate_observed_inventory(
-            &initial,
-            &voters,
-            &observed_voters,
-            options.group_count,
-            options.allow_legacy_eligibility,
-        )?;
+        validate_observed_inventory(&initial, &voters, &observed_voters, options.group_count)?;
         let mut probes = Vec::new();
         for group_id in 0..options.group_count {
             let leaders = initial
@@ -326,7 +315,6 @@ async fn verify_observed_quorum(
                 &voters,
                 &observed_voters,
                 options.group_count,
-                options.allow_legacy_eligibility,
             )?;
             match apply_evidence(&snapshot, &prefixes)? {
                 Some(applied) => {
@@ -475,7 +463,7 @@ mod tests {
     #[test]
     fn captured_apply_target_does_not_follow_continuous_commits() {
         let sample = snapshot();
-        assert!(validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, false).unwrap());
+        assert!(validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2).unwrap());
         assert!(apply_evidence(&sample, &prefixes(20)).unwrap().is_some());
         assert!(apply_evidence(&sample, &prefixes(21)).unwrap().is_none());
     }
@@ -486,8 +474,8 @@ mod tests {
         sample.per_node.retain(|node| node.node.id != 3);
         let voters = BTreeSet::from([1, 2, 3]);
         let survivors = BTreeSet::from([1, 2]);
-        assert!(validate_observed_inventory(&sample, &voters, &survivors, 2, false).unwrap());
-        validate_inventory(&sample, &voters, 2, false)
+        assert!(validate_observed_inventory(&sample, &voters, &survivors, 2).unwrap());
+        validate_inventory(&sample, &voters, 2)
             .expect_err("inventory without the third voter must be rejected");
         assert_eq!(
             apply_evidence(&sample, &prefixes(20))
@@ -501,7 +489,7 @@ mod tests {
                 group.voter_ids = vec![1, 2];
             }
         }
-        validate_observed_inventory(&sample, &voters, &survivors, 2, false)
+        validate_observed_inventory(&sample, &voters, &survivors, 2)
             .expect_err("survivors that drop a configured voter must be rejected");
     }
 
@@ -509,20 +497,13 @@ mod tests {
     fn survivor_observation_cannot_exclude_a_second_required_replica() {
         let mut sample = snapshot();
         sample.per_node.retain(|node| node.node.id == 1);
-        validate_observed_inventory(
-            &sample,
-            &BTreeSet::from([1, 2, 3]),
-            &BTreeSet::from([1]),
-            2,
-            false,
-        )
-        .expect_err("survivor observation of a single replica must be rejected");
+        validate_observed_inventory(&sample, &BTreeSet::from([1, 2, 3]), &BTreeSet::from([1]), 2)
+            .expect_err("survivor observation of a single replica must be rejected");
         validate_observed_inventory(
             &sample,
             &BTreeSet::from([1, 2, 3]),
             &BTreeSet::from([1, 2]),
             2,
-            false,
         )
         .expect_err(
             "survivor observation that excludes a second required replica must be rejected",
@@ -532,7 +513,6 @@ mod tests {
             &BTreeSet::from([1, 2, 3]),
             &BTreeSet::from([1, 4]),
             2,
-            false,
         )
         .expect_err("survivor observation that names an unknown node must be rejected");
     }
@@ -549,7 +529,6 @@ mod tests {
             group_count: 2,
             timeout: Duration::from_secs(1),
             poll_interval: Duration::from_millis(10),
-            allow_legacy_eligibility: false,
         };
         for (manifest, excluded) in [(&nodes[..], 4), (&nodes[..2], 1)] {
             let error = verify_surviving_quorum(manifest, excluded, &client, &options)
@@ -568,7 +547,7 @@ mod tests {
         for node in &mut sample.per_node {
             node.groups.pop();
         }
-        validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, false)
+        validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2)
             .expect_err("a group missing on every node must be rejected");
     }
 
@@ -576,11 +555,11 @@ mod tests {
     fn duplicate_node_or_group_is_rejected() {
         let mut sample = snapshot();
         sample.per_node[2] = sample.per_node[1].clone();
-        validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, false)
+        validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2)
             .expect_err("a duplicate node must be rejected");
         let mut sample = snapshot();
         sample.per_node[0].groups[1] = sample.per_node[0].groups[0].clone();
-        validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, false)
+        validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2)
             .expect_err("a duplicate group must be rejected");
     }
 
@@ -596,13 +575,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_opt_in_never_certifies_participation() {
+    fn missing_maintenance_reports_never_certify_participation() {
         let mut sample = snapshot();
         sample.per_node[0].raft_maintenance = None;
         sample.per_node[0].groups[0].maintenance = None;
-        validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, false)
-            .expect_err("legacy metrics must not certify participation without opt-in");
-        assert!(!validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, true).unwrap());
+        validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2).expect_err(
+            "legacy metrics must not certify participation without a maintenance report",
+        );
     }
 
     #[test]
@@ -615,7 +594,7 @@ mod tests {
                 1 => group.maintenance.as_mut().unwrap().membership_joint = true,
                 _ => group.maintenance.as_mut().unwrap().recovery_ready = false,
             }
-            validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2, true)
+            validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2)
                 .expect_err("a learner, joint membership or closed recovery must be ineligible");
         }
     }
@@ -650,7 +629,6 @@ mod tests {
                 group_count: 2,
                 timeout: Duration::from_millis(25),
                 poll_interval: Duration::from_secs(1),
-                allow_legacy_eligibility: false,
             },
         )
         .await;

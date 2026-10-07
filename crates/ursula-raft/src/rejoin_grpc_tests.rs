@@ -440,7 +440,10 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         crate::confirm_quorum_prefix(placement(), 2, &endpoints[1], Duration::from_secs(1))
             .await
             .unwrap_err();
-    assert!(changed_vote.contains("changed its vote"), "{changed_vote}");
+    assert!(matches!(
+        changed_vote,
+        crate::grpc::RecoveryProbeError::LeadershipChanged
+    ));
     for legacy in [false, true, false] {
         services[1].legacy.store(legacy, Ordering::SeqCst);
         if legacy {

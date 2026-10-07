@@ -45,7 +45,6 @@ use crate::election::ElectionPolicy;
 pub use crate::election::LeadershipShedFlag;
 pub use crate::election::LeadershipShedReason;
 pub use crate::election::LeadershipShedState;
-use crate::log_store::RecoveryState;
 use crate::log_store::WalOpening;
 use crate::meta::MetaRaftTypeConfig;
 use crate::read_index::ReadIndexBarrier;
@@ -270,6 +269,28 @@ pub enum QuorumProofError {
     },
 }
 
+/// Confirm a fresh ReadIndex under the same committed leader vote.
+pub(crate) async fn confirm_recovery_barrier(
+    group: RaftGroupId,
+    raft: &RaftGroupHandle,
+    barrier: &dyn ursula_runtime::LinearizableReadBarrier,
+) -> Result<(crate::UrsulaVote, u64), QuorumProofError> {
+    let before = raft.metrics().borrow_watched().clone();
+    if before.current_leader != Some(before.id) || !before.vote.is_committed() {
+        return Err(QuorumProofError::NotLeader { group });
+    }
+    let index = barrier
+        .confirm()
+        .await
+        .map_err(|source| QuorumProofError::Read { group, source })?
+        .ok_or(QuorumProofError::LeadershipChanged { group })?;
+    let after = raft.metrics().borrow_watched().clone();
+    if after.current_leader != Some(after.id) || after.vote != before.vote {
+        return Err(QuorumProofError::LeadershipChanged { group });
+    }
+    Ok((after.vote, index))
+}
+
 pub use crate::election::LeadershipTransferError;
 
 impl RaftGroupHandleRegistry {
@@ -334,20 +355,7 @@ impl RaftGroupHandleRegistry {
                 .ok_or(QuorumProofError::NotRegistered { group })?;
             (raft, barrier)
         };
-        let before = raft.metrics().borrow_watched().clone();
-        if before.current_leader != Some(before.id) || !before.vote.is_committed() {
-            return Err(QuorumProofError::NotLeader { group });
-        }
-        let index = barrier
-            .round()
-            .await
-            .map_err(|source| QuorumProofError::Read { group, source })?
-            .ok_or(QuorumProofError::LeadershipChanged { group })?;
-        let after = raft.metrics().borrow_watched().clone();
-        if after.current_leader != Some(after.id) || after.vote != before.vote {
-            return Err(QuorumProofError::LeadershipChanged { group });
-        }
-        Ok((after.vote, index))
+        confirm_recovery_barrier(group, &raft, barrier.as_ref()).await
     }
 
     /// Records how this node's Raft WAL opened.
@@ -364,12 +372,6 @@ impl RaftGroupHandleRegistry {
             .wal_opening
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-    }
-
-    /// Whether this node's Raft logs may be missing entries it acknowledged;
-    /// `None` until a WAL is attached.
-    pub fn wal_recovery_state(&self) -> Option<RecoveryState> {
-        self.wal_opening().map(|opening| opening.recovery)
     }
 
     /// Stops long-lived Raft transport sessions before the node server exits.
@@ -643,10 +645,6 @@ impl RaftGroupHandleRegistry {
             .clone()
     }
 
-    pub fn leadership_shed_flag(&self) -> LeadershipShedFlag {
-        self.election.flag()
-    }
-
     pub fn leadership_shed_state(&self) -> LeadershipShedState {
         self.election.state()
     }
@@ -702,7 +700,8 @@ impl RaftGroupHandleRegistry {
         }
     }
 
-    pub fn is_leadership_shed(&self) -> bool {
+    #[cfg(test)]
+    fn is_leadership_shed(&self) -> bool {
         self.leadership_shed_state().is_shed()
     }
 

@@ -2087,7 +2087,6 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
         group_count: 6,
         timeout: Duration::from_secs(5),
         poll_interval: Duration::from_millis(10),
-        allow_legacy_eligibility: false,
     };
     let proof = ursula_ctl::quorum::verify_quorum(&manifest, &client, &options)
         .await
@@ -7585,7 +7584,7 @@ async fn stale_process_admin_requests_cannot_change_a_replacement_or_clear_its_d
             .unwrap();
         assert_eq!(response.status(), status);
         assert!(
-            !registry.is_leadership_shed(),
+            !registry.leadership_shed_state().is_shed(),
             "rejected request changed replacement state"
         );
     }
@@ -7605,7 +7604,7 @@ async fn stale_process_admin_requests_cannot_change_a_replacement_or_clear_its_d
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(registry.is_leadership_shed());
+    assert!(registry.leadership_shed_state().is_shed());
     let response = app
         .clone()
         .oneshot(
@@ -7620,7 +7619,7 @@ async fn stale_process_admin_requests_cannot_change_a_replacement_or_clear_its_d
         .unwrap();
     assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
     assert!(
-        registry.is_leadership_shed(),
+        registry.leadership_shed_state().is_shed(),
         "old executor cleared a replacement fence"
     );
     let response = app
@@ -7666,7 +7665,7 @@ async fn admin_mutation_without_observed_incarnation_is_rejected_before_drain() 
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
-    assert!(!registry.is_leadership_shed());
+    assert!(!registry.leadership_shed_state().is_shed());
 }
 
 fn executor_fence_test_state() -> HttpState {
@@ -7762,7 +7761,10 @@ async fn admin_executor_takeover_and_retirement_protect_real_drain_mutations() {
             .await
             .unwrap();
         assert_eq!(response.status(), expected);
-        assert_eq!(registry.is_leadership_shed(), expected == StatusCode::OK);
+        assert_eq!(
+            registry.leadership_shed_state().is_shed(),
+            expected == StatusCode::OK
+        );
     }
     assert_eq!(
         executor_lifecycle(&app, &state, "retire", &new)
@@ -7793,7 +7795,7 @@ async fn admin_executor_takeover_and_retirement_protect_real_drain_mutations() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
-    assert!(registry.is_leadership_shed());
+    assert!(registry.leadership_shed_state().is_shed());
     let response = app
         .oneshot(
             Request::builder()
@@ -7832,7 +7834,7 @@ async fn malformed_present_executor_header_cannot_fall_back_to_uncertified_mode(
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
-    assert!(!registry.is_leadership_shed());
+    assert!(!registry.leadership_shed_state().is_shed());
 }
 
 #[tokio::test]
@@ -7990,7 +7992,7 @@ async fn cli_uses_saved_executor_identity_and_never_refreshes_after_takeover() {
         .await
         .unwrap();
     old_client.set_maintenance_drain(&node, true).await.unwrap();
-    assert!(registry.is_leadership_shed());
+    assert!(registry.leadership_shed_state().is_shed());
     let old_node = node.clone();
     node.expected_maintenance_fence = Some(executor_token(2));
     let new_client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
@@ -8014,12 +8016,12 @@ async fn cli_uses_saved_executor_identity_and_never_refreshes_after_takeover() {
         .pin_nodes(std::slice::from_ref(&old_node), None, false)
         .await
         .expect_err("the replaced executor must not pin the node");
-    assert!(registry.is_leadership_shed());
+    assert!(registry.leadership_shed_state().is_shed());
     new_client
         .set_maintenance_drain(&node, false)
         .await
         .unwrap();
-    assert!(!registry.is_leadership_shed());
+    assert!(!registry.leadership_shed_state().is_shed());
     new_client.set_maintenance_fence(&node, true).await.unwrap();
     // A fresh invocation may retry retirement; it must never activate the
     // retired token or discover a new authority from reported server state.
@@ -8118,12 +8120,8 @@ fn core_journal_record_bytes(core_dir: &std::path::Path) -> u64 {
 async fn runtime_refuses_persisted_wal_topology_changes() {
     let dir = tempfile::tempdir().expect("WAL root");
     let original = ursula_shard::StaticShardMap::new(4, 8).unwrap();
-    let wal = ursula_raft::RaftWal::start(
-        dir.path(),
-        ursula_config::WalFsync::Always,
-        &original,
-    )
-    .unwrap();
+    let wal = ursula_raft::RaftWal::start(dir.path(), ursula_config::WalFsync::Always, &original)
+        .unwrap();
     wal.shutdown().await.unwrap();
     drop(wal);
     for (cores, groups) in [(8, 8), (4, 16)] {
@@ -8206,4 +8204,49 @@ async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrie
         .unwrap();
     runtime.shutdown_group_engines().await.unwrap();
     spawned.raft_wal.unwrap().shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn leadership_transfer_http_errors_have_precise_status_and_typed_rejections() {
+    use ursula_proto::admin::TransferLeaderResponse;
+    use ursula_proto::admin::TransferRejection;
+    use ursula_raft::LeadershipTransferError;
+    let group = RaftGroupId(0);
+    for (error, status, reason) in [
+        (
+            LeadershipTransferError::NotRegistered { group },
+            StatusCode::NOT_FOUND,
+            TransferRejection::NotRegistered,
+        ),
+        (
+            LeadershipTransferError::NotLeader { group },
+            StatusCode::CONFLICT,
+            TransferRejection::NotLeader,
+        ),
+        (
+            LeadershipTransferError::InvalidTarget { group, target: 2 },
+            StatusCode::BAD_REQUEST,
+            TransferRejection::InvalidTarget,
+        ),
+        (
+            LeadershipTransferError::RecoveringTarget { group, target: 2 },
+            StatusCode::CONFLICT,
+            TransferRejection::RecoveringTarget,
+        ),
+        (
+            LeadershipTransferError::Raft {
+                group,
+                source: openraft::error::Fatal::Stopped,
+            },
+            StatusCode::INTERNAL_SERVER_ERROR,
+            TransferRejection::RaftStopped,
+        ),
+    ] {
+        let response = transfer_raft_error_response(0, 1, 2, Some(1), error);
+        assert_eq!(response.status(), status);
+        let body: TransferLeaderResponse =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(body.rejection, Some(reason));
+        assert!(!body.transferred);
+    }
 }

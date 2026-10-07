@@ -136,8 +136,8 @@ mod tests {
     use ursula_shard::RaftGroupId;
 
     use super::*;
-    use crate::RaftWal;
     use crate::GroupRejoin;
+    use crate::RaftWal;
     use crate::log_store::RUN_STATE_FILE;
     use crate::types::UrsulaRaftTypeConfig;
 
@@ -147,8 +147,7 @@ mod tests {
         let original = StaticShardMap::new(4, 8).unwrap();
         let placement = original.placement(RaftGroupId(4)).unwrap();
         let metrics = RuntimeMetrics::new(4, 8).group_engine_metrics();
-        let wal =
-            RaftWal::start(dir.path(), WalFsync::Always, &original).unwrap();
+        let wal = RaftWal::start(dir.path(), WalFsync::Always, &original).unwrap();
         let mut store = wal.open(placement, metrics.clone()).unwrap();
         let vote = crate::types::UrsulaVote::new(7, 1);
         store.save_vote(&vote).await.unwrap();
@@ -166,8 +165,7 @@ mod tests {
             StaticShardMap::new(8, 8).unwrap(),
             StaticShardMap::new(4, 16).unwrap(),
         ] {
-            let error = RaftWal::start(dir.path(), WalFsync::Always, &changed)
-                .unwrap_err();
+            let error = RaftWal::start(dir.path(), WalFsync::Always, &changed).unwrap_err();
             assert!(matches!(error, RaftWalError::TopologyMismatch {
                     stored_core_count: 4, stored_group_count: 8,
                     configured_core_count, configured_group_count, ..
@@ -183,8 +181,7 @@ mod tests {
             );
             assert!(!dir.path().join("core-4").exists());
         }
-        let wal =
-            RaftWal::start(dir.path(), WalFsync::Always, &original).unwrap();
+        let wal = RaftWal::start(dir.path(), WalFsync::Always, &original).unwrap();
         let mut store = wal.open(placement, metrics).unwrap();
         assert_eq!(store.read_vote().await.unwrap(), Some(vote));
         assert_eq!(store.try_get_log_entries(1..=1).await.unwrap().len(), 1);
@@ -196,8 +193,7 @@ mod tests {
     async fn topology_is_required_even_without_journal_records() {
         let topology = StaticShardMap::new(4, 64).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let wal =
-            RaftWal::start(dir.path(), WalFsync::Never, &topology).unwrap();
+        let wal = RaftWal::start(dir.path(), WalFsync::Never, &topology).unwrap();
         wal.shutdown().await.unwrap();
         drop(wal);
         std::fs::remove_file(dir.path().join(TOPOLOGY_FILE)).unwrap();
@@ -219,8 +215,7 @@ mod tests {
     async fn corrupt_topology_is_not_overwritten_and_lock_precedes_validation() {
         let dir = tempfile::tempdir().unwrap();
         let topology = StaticShardMap::new(4, 64).unwrap();
-        let wal =
-            RaftWal::start(dir.path(), WalFsync::Always, &topology).unwrap();
+        let wal = RaftWal::start(dir.path(), WalFsync::Always, &topology).unwrap();
         let changed = StaticShardMap::new(8, 64).unwrap();
         assert!(matches!(
             RaftWal::start(dir.path(), WalFsync::Always, &changed),
