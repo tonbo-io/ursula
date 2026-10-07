@@ -66,9 +66,12 @@ decision.
 ## Metadata and run state
 
 Each core keeps a small metadata file next to its journal. It holds every
-group's vote and an `initialized` flag that is set once the group first
-persists membership. It is replaced with a temporary file, `fsync`, rename and
-directory `fsync`. Votes change only during elections, so this cost stays off
+group's vote and its log state: `Empty`, `Initialized` (the group has persisted
+membership or an entry) or `Recovering` (the replica may be missing entries it
+acknowledged). `Recovering` stays recorded until the group's recovery gate
+opens, so a process crash or a clean shutdown in the meantime comes back gated.
+The file is replaced with a temporary file, `fsync`, rename and directory
+`fsync`. Votes change only during elections, so this cost stays off
 the data path. The vote no longer forces an `fsync` of the shared journal,
 which with `fdatasync` would flush every group's dirty pages on that core.
 
@@ -76,8 +79,9 @@ The node keeps a run-state file with:
 
 - the boot id of the run that last opened the journals;
 - the `fsync` policy of that run;
-- a `clean` flag;
-- a `poisoned` flag.
+- the run's status: `running`, `clean` or `poisoned`;
+- a recovery epoch, raised by every run that needs a verified-prefix read, so
+  that a core opened later in the run is still read that way once.
 
 At startup the node reads it, decides how to open the journals, and then
 durably records the current boot id with `clean = false`. It does this before
@@ -91,13 +95,20 @@ treated as an unclean crash.
 
 ## Opening the journal
 
-| Previous run | Interpretation | Journal handling |
-| --- | --- | --- |
-| `clean = true`, or the policy was `always` | Every write is on disk | Strict: only a torn final frame of the newest segment is tolerated; other corruption fails closed |
-| Policy `never`, `clean = false`, same boot id | Process crash; the page cache survived | Strict, as above |
-| Policy `never`, `clean = false`, different or unknown boot id | Host crash; writeback may have left holes | Keep the frames up to the first one that fails verification and truncate the rest. Every group on the core enters the recovery gate. |
-| `poisoned = true` | An I/O error stopped the previous run | As for a host crash |
-| No run state and no journal | New node or new disk | Bootstrap probe; never initialize a group that a peer reports initialized |
+| Previous run | Interpretation | Journal read | Recovery gate |
+| --- | --- | --- | --- |
+| No run state, no journal | New node or new disk | None | Bootstrap probe; never initialize a group that a peer reports initialized |
+| No run state, a journal holds records | Unknown history | Verified prefix | Every initialized group |
+| `clean` | Every write is on disk | Strict | No |
+| `running`, same boot id | Process crash; the page cache survived | Strict | No |
+| `running`, other or unknown boot id, policy `always` | Host crash; every acknowledged write was fsynced | Verified prefix, because committed and truncate markers are unsynced | No |
+| `running`, other or unknown boot id, policy `never` | Host crash; writeback may have left holes | Verified prefix | Every initialized group |
+| `poisoned` | An I/O error stopped the previous run | Verified prefix | Every initialized group |
+
+Strict tolerates only an incomplete final frame; any other corruption fails
+closed. Verified prefix keeps the frames up to the first one that fails
+verification and truncates the rest, and the journal is rewritten before the
+core writes again.
 
 Writeback after a host crash can persist later pages before earlier ones.
 Verification therefore cannot skip a bad frame. Because frame checksums cover
@@ -114,17 +125,28 @@ is the barrier from the memory-WAL rejoin work, now applied to any replica in
 the recovery state.
 
 The vote is restored from the metadata file before the Raft core starts, so a
-recovering replica still rejects appends from a leader with a stale term.
+recovering replica still rejects appends from a leader with a stale term. A
+recovering replica that led its group starts as a follower: OpenRaft restores a
+replica whose committed vote names itself as that term's leader without an
+election, and with a truncated log it would reuse the log ids of entries it
+lost and fork the group.
 
 On the leader, a follower whose log moved backwards is rebuilt through the
-existing remove, learner and promote steps. In managed mode this becomes the
-control plane's `RebuildReplica` operation.
+existing remove, learner and promote steps. If a majority of the followers
+moved backwards while the leader kept its log, removal cannot commit, so the
+leader rewinds their replication progress instead. Neither case needs an
+operator. In managed mode this becomes the control plane's `RebuildReplica`
+operation.
 
 If a majority of a group's voters are gated, no leader can produce a barrier.
-The group stays stopped and reports it. An operator can accept the loss of the
-unsynced tail, which opens the gate on the replicas with the longest verified
-prefix. This replaces `adopt-survivor` and `reinitialize`. The `initialized`
-flag replaces the S3 initialized markers, so the restart guard is removed.
+A gated replica that applies nothing for 30 seconds reports itself stalled,
+and the group stays stopped. An operator then accepts the loss of the unsynced
+tail on the replicas with the longest last log id until a majority of the
+voters is open, and normal election picks the longest verified log. Accepting
+on more replicas than needed lets election choose any log at least as long as
+a majority's. This replaces `adopt-survivor` and `reinitialize`. A group whose
+state is `Initialized` or `Recovering` never runs `Initialize`, which replaces
+the S3 initialized markers and the restart guard.
 
 ## Journal hardening
 
@@ -168,10 +190,11 @@ stops the group until an operator accepts it.
 ## Delivery
 
 1. The journal I/O trait and the madsim disk, with DST running on the
-   production journal.
-2. Fail-stop on I/O errors, format epoch 3 and reclaim fixes.
-3. The `fsync` policy, the metadata and run-state files, the shutdown path,
-   the recovery gate, and removal of the memory backend.
+   production journal (#395).
+2. Fail-stop on I/O errors, format epoch 3 and reclaim fixes (#396).
+3. The `fsync` policy, the metadata and run-state files and the shutdown path
+   (#397), the recovery gate and the default `never` (#398), then removal of
+   the memory backend.
 4. Segments, rewrite-based reclaim and bounded memory.
 
 The meta-Raft control plane work starts after step 3.
