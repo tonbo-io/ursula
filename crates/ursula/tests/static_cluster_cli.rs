@@ -2221,6 +2221,7 @@ async fn cli_restores_a_backup_written_by_ursula_0_6_2() {
         (4, 4, 8),
         "every group, bucket and stream of the fixture"
     );
+    assert_eq!(report.cold_objects, 0, "the fixture is hot only");
 
     let mut binary_body = (0u8..=255).collect::<Vec<u8>>();
     binary_body.extend_from_slice(b"\x00\xff\xfe\x80tail");

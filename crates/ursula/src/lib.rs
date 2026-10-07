@@ -936,6 +936,10 @@ fn admin_ops_router(state: HttpState) -> Router {
             post(import_backup_group),
         )
         .route(
+            "/__ursula/backup/group/{raft_group_id}/cold-check",
+            post(check_backup_group_cold_objects),
+        )
+        .route(
             "/__ursula/raft/{raft_group_id}/snapshot",
             post(trigger_raft_snapshot),
         )
@@ -2190,6 +2194,49 @@ struct BackupVersionProbe {
     version: Option<u32>,
 }
 
+/// Reads one backup group object addressed to group `raft_group_id`: the
+/// group must exist here and the body must be a stream snapshot of this
+/// server's version (E10). A refusal is the `400` to answer.
+fn decode_backup_group(
+    state: &HttpState,
+    raft_group_id: u64,
+    body: &[u8],
+) -> Result<(RaftGroupId, ursula_runtime::StreamSnapshot), Box<Response>> {
+    let bad_request =
+        |message: String| Box::new((StatusCode::BAD_REQUEST, message).into_response());
+    let group_count = u64::from(state.runtime.raft_group_count());
+    if raft_group_id >= group_count {
+        return Err(bad_request(format!(
+            "raft group {raft_group_id} out of range 0..{group_count}"
+        )));
+    }
+    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
+        return Err(bad_request("invalid raft group id".to_owned()));
+    };
+    // E10: read only the version first, so a 0.5.x group answers 400 instead
+    // of being decoded under this version's rules.
+    match rmp_serde::from_slice::<BackupVersionProbe>(body) {
+        Ok(BackupVersionProbe {
+            version: Some(version),
+        }) if version == ursula_runtime::STREAM_SNAPSHOT_VERSION => {}
+        Ok(BackupVersionProbe { version }) => {
+            let found = version.map_or_else(
+                || "no stream snapshot version (Ursula 0.5.x or earlier)".to_owned(),
+                |version| format!("an unsupported stream snapshot version ({version})"),
+            );
+            return Err(bad_request(format!(
+                "backup group has {found}; this server imports stream snapshot version {} \
+                 (Ursula 0.6 and later) only",
+                ursula_runtime::STREAM_SNAPSHOT_VERSION
+            )));
+        }
+        Err(err) => return Err(bad_request(format!("decode backup snapshot: {err}"))),
+    }
+    let snapshot = rmp_serde::from_slice(body)
+        .map_err(|err| bad_request(format!("decode backup snapshot: {err}")))?;
+    Ok((raft_group_id, snapshot))
+}
+
 /// Imports one group's backup snapshot into an empty group as a replicated
 /// write. Non-empty groups fail closed with `409`; invalid payloads with
 /// `400`. The restored cluster keeps its own raft identity and membership.
@@ -2199,55 +2246,9 @@ pub(crate) async fn import_backup_group(
     Path(raft_group_id): Path<u64>,
     body: axum::body::Bytes,
 ) -> Response {
-    let group_count = u64::from(state.runtime.raft_group_count());
-    if raft_group_id >= group_count {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("raft group {raft_group_id} out of range 0..{group_count}"),
-        )
-            .into_response();
-    }
-    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
-        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
-    };
-    // E10: read only the version first, so a 0.5.x group answers 400 instead
-    // of being decoded under this version's rules.
-    match rmp_serde::from_slice::<BackupVersionProbe>(&body) {
-        Ok(BackupVersionProbe {
-            version: Some(version),
-        }) if version == ursula_runtime::STREAM_SNAPSHOT_VERSION => {}
-        Ok(BackupVersionProbe { version }) => {
-            let found = version.map_or_else(
-                || "no stream snapshot version (Ursula 0.5.x or earlier)".to_owned(),
-                |version| format!("an unsupported stream snapshot version ({version})"),
-            );
-            return (
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "backup group has {found}; this server imports stream snapshot version {} \
-                     (Ursula 0.6 and later) only",
-                    ursula_runtime::STREAM_SNAPSHOT_VERSION
-                ),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("decode backup snapshot: {err}"),
-            )
-                .into_response();
-        }
-    }
-    let snapshot: ursula_runtime::StreamSnapshot = match rmp_serde::from_slice(&body) {
-        Ok(snapshot) => snapshot,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("decode backup snapshot: {err}"),
-            )
-                .into_response();
-        }
+    let (raft_group_id, snapshot) = match decode_backup_group(&state, raft_group_id, &body) {
+        Ok(decoded) => decoded,
+        Err(response) => return *response,
     };
     match state
         .runtime
@@ -2269,6 +2270,51 @@ pub(crate) async fn import_backup_group(
             runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
         }
     }
+}
+
+/// Checks that this node's cold store holds every cold object one backup
+/// group references, without importing anything. A backup carries the
+/// references, not the objects, so `ursulactl restore` asks this for every
+/// group before its first import. Any node answers: they share one cold
+/// store.
+pub(crate) async fn check_backup_group_cold_objects(
+    State(state): State<HttpState>,
+    Path(raft_group_id): Path<u64>,
+    body: axum::body::Bytes,
+) -> Response {
+    let (raft_group_id, snapshot) = match decode_backup_group(&state, raft_group_id, &body) {
+        Ok(decoded) => decoded,
+        Err(response) => return *response,
+    };
+    let cold_store = state.runtime.cold_store();
+    match ursula_runtime::check_cold_references(cold_store.as_ref(), snapshot).await {
+        Ok(report) => (
+            StatusCode::OK,
+            axum::Json(ursula_proto::admin::BackupColdCheck {
+                raft_group_id: raft_group_id.0,
+                referenced_objects: report.referenced,
+                missing_objects: report.missing,
+                missing_sample: report.missing_sample,
+            }),
+        )
+            .into_response(),
+        Err(err) => cold_reference_error_response(&err),
+    }
+}
+
+fn cold_reference_error_response(err: &ursula_runtime::ColdReferenceError) -> Response {
+    let status = match err {
+        ursula_runtime::ColdReferenceError::InvalidSnapshot(_)
+        | ursula_runtime::ColdReferenceError::Unplannable { .. } => StatusCode::BAD_REQUEST,
+        ursula_runtime::ColdReferenceError::ColdStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    let message = std::iter::successors(Some(err as &(dyn std::error::Error + 'static)), |error| {
+        error.source()
+    })
+    .map(ToString::to_string)
+    .collect::<Vec<_>>()
+    .join(": ");
+    (status, message).into_response()
 }
 
 pub(crate) async fn trigger_raft_snapshot(

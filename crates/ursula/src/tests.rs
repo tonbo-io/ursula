@@ -6655,6 +6655,105 @@ async fn backup_import_refuses_groups_without_this_stream_snapshot_version() {
     }
 }
 
+fn cold_runtime_router(cold_store: Option<ColdStoreHandle>) -> Router {
+    router(
+        ShardRuntime::spawn_with_engine_factory_and_cold_store(
+            RuntimeConfig::new(1, 1),
+            InMemoryGroupEngineFactory::with_cold_store(cold_store.clone()),
+            cold_store,
+        )
+        .expect("runtime"),
+    )
+}
+
+async fn backup_cold_check(app: &Router, body: &Bytes) -> ursula_proto::admin::BackupColdCheck {
+    let response = http_post(
+        app,
+        "/__ursula/backup/group/0/cold-check",
+        &[(CONTENT_TYPE.as_str(), "application/x-msgpack")],
+        Body::from(body.clone()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_slice(&body_bytes(response).await).expect("cold check JSON")
+}
+
+/// A backup carries cold references, not cold objects. The cold check finds
+/// every object a group references in the source cluster's cold store, and
+/// names what a target cold store lacks: the index pages when nothing was
+/// copied, a chunk when the copy is incomplete. It imports nothing.
+#[tokio::test]
+async fn backup_cold_check_names_cold_objects_the_target_lacks() {
+    let cold_store: ColdStoreHandle = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let source = cold_runtime_router(Some(cold_store.clone()));
+    let response = http_put(
+        &source,
+        "/tenant-a/cold",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("abcdef"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = http_post(
+        &source,
+        "/__ursula/flush-cold/tenant-a/cold?min_hot_bytes=4&max_bytes=4",
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = http_get(&source, "/__ursula/backup/group/0").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let export = body_bytes(response).await;
+
+    let complete = backup_cold_check(&source, &export).await;
+    assert_eq!(complete.missing_objects, 0, "{complete:?}");
+    assert!(
+        complete.referenced_objects >= 2,
+        "an index page and its chunk: {complete:?}"
+    );
+
+    // Another cold store: the index page is missing, so nothing it names can
+    // be reached either. Without a cold store at all, the same.
+    for target in [
+        cold_runtime_router(Some(Arc::new(
+            ColdStore::memory().expect("memory cold store"),
+        ))),
+        cold_runtime_router(None),
+    ] {
+        let empty = backup_cold_check(&target, &export).await;
+        assert!(empty.missing_objects >= 1, "{empty:?}");
+        assert_eq!(empty.missing_objects, empty.referenced_objects);
+        assert!(
+            empty
+                .missing_sample
+                .iter()
+                .all(|key| key.starts_with("tenant-a/cold/cold-index/")),
+            "{empty:?}"
+        );
+        let response = http_get(&target, "/tenant-a/cold?offset=0").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "nothing imported");
+    }
+
+    // An incomplete copy: the page is there, one chunk it names is not.
+    let pages = cold_store
+        .list_cold_index_pages()
+        .await
+        .expect("list pages");
+    let page = ursula_runtime::ColdIndexPageStore::get_page(
+        &ursula_runtime::ColdStoreColdIndexPageStore::new(cold_store.clone()),
+        &pages[0],
+    )
+    .await
+    .expect("read page")
+    .expect("page exists");
+    let lost = page.cold_chunks[0].s3_path.clone();
+    cold_store.delete_chunk(&lost).await.expect("delete chunk");
+    let partial = backup_cold_check(&source, &export).await;
+    assert_eq!(partial.missing_objects, 1, "{partial:?}");
+    assert_eq!(partial.missing_sample, vec![lost]);
+}
+
 // #136: the full recovery drill against the HTTP surface. Build a cluster,
 // write two tenants' streams (records, close state, app snapshot, retention
 // floor), export every group, destroy the cluster, restore into a fresh one,

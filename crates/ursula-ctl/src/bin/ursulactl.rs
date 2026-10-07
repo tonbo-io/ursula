@@ -782,8 +782,8 @@ async fn run_restore_subcommand(args: BackupCreateArgs) -> Result<()> {
     let store = backup::BackupStore::open(&args.location)?;
     let report = backup::restore(&client, &store).await?;
     println!(
-        "restore complete: {} groups, {} buckets, {} streams",
-        report.groups, report.buckets, report.streams
+        "restore complete: {} groups, {} buckets, {} streams, {} cold objects present",
+        report.groups, report.buckets, report.streams, report.cold_objects
     );
     Ok(())
 }

@@ -5,6 +5,8 @@
 //! - [`cold_store`]: opendal-backed cold tier handle and object path helpers.
 //! - [`cold_index`]: cold-index pages (binary format, stores, cache), their
 //!   writes with the clip rule and rollback, and leader-side page repair.
+//! - [`cold_references`]: the cold objects a stream snapshot references and
+//!   whether a cold store holds them, checked before a backup restore.
 //! - [`cold_refs`]: value types of the shared pack-reference compaction driver
 //!   (F2), the cold orphan sweep (F14h) and the external-locator offload
 //!   (F5), and object-name age parsing.
@@ -30,6 +32,7 @@
 
 mod admission;
 pub mod cold_index;
+mod cold_references;
 mod cold_refs;
 mod cold_store;
 pub mod cold_worker;
@@ -74,6 +77,10 @@ pub use cold_index::select_cold_chunk_compaction;
 pub use cold_index::write_cold_chunk_index_pages_in_generation;
 pub use cold_index::write_cold_chunk_index_pages_with_rollback_in_generation;
 pub use cold_index::write_proven_external_index_pages;
+pub use cold_references::ColdReferenceError;
+pub use cold_references::ColdReferenceReport;
+pub use cold_references::MISSING_COLD_OBJECT_SAMPLE;
+pub use cold_references::check_cold_references;
 pub use cold_refs::ColdOrphanSweepPlan;
 pub use cold_refs::ColdOrphanSweepReport;
 pub use cold_refs::ColdOrphanSweepRequest;

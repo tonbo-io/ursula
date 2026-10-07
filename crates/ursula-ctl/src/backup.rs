@@ -26,12 +26,15 @@
 //! - Cold-store objects referenced by snapshots are part of the backup set:
 //!   the restored cluster must be pointed at the same (or a copied) cold
 //!   store namespace. `verify` decodes and validates every snapshot but does
-//!   not dereference cold objects.
+//!   not dereference cold objects. `restore` asks the target cluster to check
+//!   every group's references against its cold store before the first
+//!   import, and stops without importing anything if an object is missing.
 
 use std::collections::HashSet;
 
 use serde::Deserialize;
 use serde::Serialize;
+use ursula_proto::admin::BackupColdCheck;
 use ursula_proto::admin::BackupInfo;
 use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamSnapshotError;
@@ -45,6 +48,11 @@ use crate::NodeInfo;
 /// backup or cluster reports format 1 and is refused.
 pub const BACKUP_FORMAT_VERSION: u32 = ursula_stream::BACKUP_FORMAT_VERSION;
 const MANIFEST_OBJECT: &str = "manifest.json";
+/// The procedure that copies a source cluster's cold objects into the target.
+pub const COLD_COPY_GUIDE_URL: &str =
+    "https://ursula.tonbo.io/docs/operations#copying-cold-objects";
+/// How many missing cold object keys a restore refusal names.
+const MISSING_COLD_OBJECT_SAMPLE: usize = 5;
 
 /// Why a backup, verification or restore stopped.
 #[derive(Debug, thiserror::Error)]
@@ -137,6 +145,30 @@ pub enum BackupError {
     TargetIdentity { raft_group_id: u32, detail: String },
     #[error("group {raft_group_id}: target not empty: {detail}")]
     TargetNotEmpty { raft_group_id: u32, detail: String },
+    /// The target's cold store lacks objects the backup references. Nothing
+    /// was imported.
+    #[error(
+        "{missing} of the {referenced} cold objects this backup references are missing from the \
+         target cluster's cold store (first: {}). Nothing was imported. Copy the source \
+         cluster's cold objects into the target's storage.cold.root and run restore again: \
+         {COLD_COPY_GUIDE_URL}",
+        .sample.join(", ")
+    )]
+    ColdObjectsMissing {
+        missing: u64,
+        referenced: u64,
+        sample: Vec<String>,
+    },
+    /// The target answers no cold-object check: it runs a release before
+    /// 0.7, which this ursulactl does not restore into.
+    #[error(
+        "{url}: the target cluster cannot check cold objects (HTTP {status}); restore with the \
+         ursulactl of the target's release"
+    )]
+    ColdCheckUnsupported {
+        url: url::Url,
+        status: reqwest::StatusCode,
+    },
     #[error("admin URL")]
     Url(#[from] url::ParseError),
     #[error("{url}: request failed")]
@@ -426,6 +458,56 @@ impl BackupClient {
         }
         Err(last_error.unwrap_or(BackupError::NoNodes))
     }
+
+    /// Asks the target whether its cold store holds every cold object one
+    /// group references. Any node answers; they share one cold store.
+    async fn check_cold_objects(
+        &self,
+        raft_group_id: u32,
+        body: Vec<u8>,
+    ) -> Result<BackupColdCheck, BackupError> {
+        let mut last_error = None;
+        for node in &self.nodes {
+            let url = node.admin_url.join(&format!(
+                "/__ursula/backup/group/{raft_group_id}/cold-check"
+            ))?;
+            let request = self
+                .metrics
+                .admin_request(node, reqwest::Method::POST, url.clone())
+                .await
+                .map_err(|source| BackupError::AdminRequest {
+                    node_id: node.id,
+                    source: source.into(),
+                })?;
+            match request
+                .header("content-type", "application/x-msgpack")
+                .body(body.clone())
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    return response
+                        .json::<BackupColdCheck>()
+                        .await
+                        .map_err(|source| BackupError::Request { url, source });
+                }
+                Ok(response)
+                    if matches!(
+                        response.status(),
+                        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+                    ) =>
+                {
+                    return Err(BackupError::ColdCheckUnsupported {
+                        url,
+                        status: response.status(),
+                    });
+                }
+                Ok(response) => last_error = Some(status_error(url, response).await),
+                Err(source) => last_error = Some(BackupError::Request { url, source }),
+            }
+        }
+        Err(last_error.unwrap_or(BackupError::NoNodes))
+    }
 }
 
 async fn status_error(url: url::Url, response: reqwest::Response) -> BackupError {
@@ -501,6 +583,15 @@ pub struct VerifyReport {
     pub streams: u64,
 }
 
+#[derive(Debug)]
+pub struct RestoreReport {
+    pub groups: u32,
+    pub buckets: u64,
+    pub streams: u64,
+    /// Cold objects the target confirmed it holds, index pages included.
+    pub cold_objects: u64,
+}
+
 pub async fn verify(store: &BackupStore) -> Result<VerifyReport, BackupError> {
     let manifest = store.read_manifest().await?;
     if manifest.format_version != BACKUP_FORMAT_VERSION {
@@ -563,7 +654,7 @@ pub async fn verify(store: &BackupStore) -> Result<VerifyReport, BackupError> {
 pub async fn restore(
     client: &BackupClient,
     store: &BackupStore,
-) -> Result<VerifyReport, BackupError> {
+) -> Result<RestoreReport, BackupError> {
     // Never push unverified bytes at a cluster: restore always verifies the
     // whole backup first and fails closed before the first import.
     let report = verify(store).await?;
@@ -577,11 +668,37 @@ pub async fn restore(
             target: info.raft_group_count,
         });
     }
+    // Every group's cold references must resolve in the target before the
+    // first import: an import cannot be taken back, and a restore that
+    // imported some groups refuses to run again on the now non-empty target.
+    let mut referenced = 0u64;
+    let mut missing = 0u64;
+    let mut sample = Vec::new();
+    for group in &manifest.groups {
+        let body = store.read(&group.object).await?;
+        let check = client.check_cold_objects(group.raft_group_id, body).await?;
+        referenced = referenced.saturating_add(check.referenced_objects);
+        missing = missing.saturating_add(check.missing_objects);
+        let room = MISSING_COLD_OBJECT_SAMPLE.saturating_sub(sample.len());
+        sample.extend(check.missing_sample.into_iter().take(room));
+    }
+    if missing > 0 {
+        return Err(BackupError::ColdObjectsMissing {
+            missing,
+            referenced,
+            sample,
+        });
+    }
     for group in &manifest.groups {
         let body = store.read(&group.object).await?;
         client.import_group(group.raft_group_id, body).await?;
     }
-    Ok(report)
+    Ok(RestoreReport {
+        groups: report.groups,
+        buckets: report.buckets,
+        streams: report.streams,
+        cold_objects: referenced,
+    })
 }
 
 #[cfg(test)]
@@ -810,6 +927,138 @@ mod tests {
         );
         assert_eq!(imports.load(Ordering::SeqCst), 0);
     }
+
+    /// Restore asks the target to check every group's cold references
+    /// before the first import. Missing objects, or a target that cannot
+    /// check, stop it with nothing imported.
+    #[tokio::test]
+    async fn restore_imports_nothing_when_the_target_lacks_cold_objects() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        use axum::routing::post;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_in(dir.path()).await;
+        let first = snapshot_bytes(vec!["tenant-a".to_owned()]);
+        let second = snapshot_bytes(vec!["tenant-b".to_owned()]);
+        for (id, body) in [(0, &first), (1, &second)] {
+            store
+                .write(&group_object_name(id), body.clone())
+                .await
+                .expect("write group");
+        }
+        let manifest = manifest_for(&[(0, &first), (1, &second)]);
+        store
+            .write(
+                MANIFEST_OBJECT,
+                serde_json::to_vec(&manifest).expect("encode"),
+            )
+            .await
+            .expect("write manifest");
+
+        for cold_check_supported in [true, false] {
+            let imports = Arc::new(AtomicUsize::new(0));
+            let counted = imports.clone();
+            let mut app = Router::new()
+                .route(
+                    "/__ursula/backup/info",
+                    get(|| async {
+                        Json(BackupInfo {
+                            format_version: BACKUP_FORMAT_VERSION,
+                            raft_group_count: 2,
+                        })
+                    }),
+                )
+                .route(
+                    "/__ursula/metrics",
+                    get(|| async {
+                        Json(serde_json::json!({
+                            "process_node_id": 1,
+                            "process_incarnation": "00000000000000000000000000000001"
+                        }))
+                    }),
+                )
+                .route(
+                    "/__ursula/backup/group/{group}/import",
+                    post(move || {
+                        let counted = counted.clone();
+                        async move {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::OK
+                        }
+                    }),
+                );
+            if cold_check_supported {
+                app = app.route(
+                    "/__ursula/backup/group/{group}/cold-check",
+                    post(
+                        |axum::extract::Path(group): axum::extract::Path<u32>| async move {
+                            Json(BackupColdCheck {
+                                raft_group_id: group,
+                                referenced_objects: 4,
+                                missing_objects: u64::from(group),
+                                missing_sample: (0..group)
+                                    .map(|index| format!("tenant-b/cold/chunk-{index}"))
+                                    .collect(),
+                            })
+                        },
+                    ),
+                );
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let client = BackupClient::new(
+                MetricsClient::new(std::time::Duration::from_secs(1)).unwrap(),
+                vec![NodeInfo {
+                    id: 1,
+                    admin_url: format!("http://{address}").parse().unwrap(),
+                    host: address.to_string(),
+                    http_url: None,
+                    metrics_url: None,
+                    expected_process_incarnation: None,
+                    expected_maintenance_fence: None,
+                }],
+            )
+            .unwrap();
+
+            let err = restore(&client, &store)
+                .await
+                .expect_err("an incomplete cold store is refused");
+            if cold_check_supported {
+                assert!(
+                    matches!(
+                        &err,
+                        BackupError::ColdObjectsMissing {
+                            missing: 1,
+                            referenced: 8,
+                            sample,
+                        } if sample == &["tenant-b/cold/chunk-0".to_owned()]
+                    ),
+                    "{err}"
+                );
+            } else {
+                assert!(
+                    matches!(err, BackupError::ColdCheckUnsupported {
+                        status: reqwest::StatusCode::NOT_FOUND,
+                        ..
+                    }),
+                    "{err}"
+                );
+            }
+            assert_eq!(imports.load(Ordering::SeqCst), 0, "nothing imported");
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn import_identity_failure_never_hops_to_another_restore_target() {
         use std::sync::Arc;
