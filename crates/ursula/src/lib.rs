@@ -287,6 +287,9 @@ pub struct HttpState {
     /// (e.g. ursulactl auto-enabling empty-log rejoin only for `memory`).
     wal_backend: &'static str,
     wal_disk: WalDiskMonitor,
+    /// The node's Raft WAL when its logs are on disk: how it opened, and the
+    /// clean shutdown at exit.
+    raft_wal: Option<ursula_raft::DurableRaftLogStoreFactory>,
     /// A Raft protocol (format-epoch) mismatch seen since start: readiness
     /// answers 503 `format_epoch_mismatch` until restart.
     format_epoch_mismatch: ursula_raft::FormatEpochMismatch,
@@ -322,6 +325,9 @@ impl HttpState {
     /// provider is installed.
     pub fn register_otel_metrics(&self) {
         otel_metrics::register(&self.runtime.metrics());
+        if let Some(raft_wal) = &self.raft_wal {
+            otel_metrics::register_wal_recovery(raft_wal.recovery_state());
+        }
     }
 
     pub(crate) fn with_process_incarnation(mut self, boot: ProcessIncarnation) -> Self {
@@ -357,6 +363,7 @@ impl HttpState {
             external_payload_min_bytes: 1024 * 1024,
             wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
+            raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
         }
     }
@@ -380,6 +387,7 @@ impl HttpState {
             external_payload_min_bytes: 1024 * 1024,
             wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
+            raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
         }
     }
@@ -424,6 +432,7 @@ impl HttpState {
             external_payload_min_bytes: 1024 * 1024,
             wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
+            raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
         }
     }
@@ -465,6 +474,20 @@ impl HttpState {
     pub(crate) fn with_wal_disk_monitor(mut self, monitor: WalDiskMonitor) -> Self {
         self.wal_disk = monitor;
         self
+    }
+
+    /// Record the node's Raft WAL, so the metrics JSON reports how it opened
+    /// and the server shuts it down cleanly.
+    pub fn with_raft_wal(
+        mut self,
+        raft_wal: Option<ursula_raft::DurableRaftLogStoreFactory>,
+    ) -> Self {
+        self.raft_wal = raft_wal;
+        self
+    }
+
+    pub(crate) fn raft_wal(&self) -> Option<&ursula_raft::DurableRaftLogStoreFactory> {
+        self.raft_wal.as_ref()
     }
 
     #[cfg(test)]
@@ -1869,6 +1892,11 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
             "wal_backend".to_owned(),
             serde_json::json!(state.wal_backend),
         );
+        object.insert(
+            "wal_recovery".to_owned(),
+            serde_json::to_value(state.raft_wal.as_ref().map(WalRecoveryReport::new))
+                .unwrap_or(serde_json::Value::Null),
+        );
         let wal_disk = state.wal_disk.snapshot();
         object.insert(
             "wal_available_bytes".to_owned(),
@@ -1892,6 +1920,25 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         );
     }
     json_response(StatusCode::OK, body.to_string())
+}
+
+/// How the node's Raft WAL opened, in the metrics JSON as `wal_recovery`.
+/// `recovery.state` is `recovering` while the node's logs may be missing
+/// entries it acknowledged.
+#[derive(Debug, serde::Serialize)]
+struct WalRecoveryReport {
+    fsync: ursula_config::WalFsync,
+    #[serde(flatten)]
+    opening: ursula_raft::WalOpening,
+}
+
+impl WalRecoveryReport {
+    fn new(raft_wal: &ursula_raft::DurableRaftLogStoreFactory) -> Self {
+        Self {
+            fsync: raft_wal.fsync(),
+            opening: raft_wal.opening(),
+        }
+    }
 }
 
 /// Upper bound on how long a metrics scrape waits for the per-group

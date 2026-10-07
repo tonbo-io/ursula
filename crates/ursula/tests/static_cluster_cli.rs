@@ -320,7 +320,46 @@ async fn cli_sigterm_drains_listeners_and_exits_cleanly() {
         "expected clean exit after SIGTERM, got {exit_status}"
     );
 
+    // The graceful exit stopped the groups, synced the journals and recorded
+    // a clean run, so the restart reads its journals strictly.
+    let mut child = spawn_node_with_cluster_config(binary, &config_path);
+    wait_until_ready(&client, &base_url, std::slice::from_mut(&mut child)).await;
+    let recovery = wal_recovery(&client, &base_url).await;
+    assert_eq!(recovery["previous_run"]["kind"], "clean", "{recovery}");
+    assert_eq!(recovery["replay_mode"], "strict", "{recovery}");
+    assert_eq!(recovery["recovery"]["state"], "normal", "{recovery}");
+
+    // A killed process records nothing, so the next start reads it as a crash:
+    // a process crash where the kernel reports a boot id, a host crash where
+    // it does not.
+    child.child.kill().expect("kill the node");
+    child.child.wait().expect("reap the node");
+    let mut child = spawn_node_with_cluster_config(binary, &config_path);
+    wait_until_ready(&client, &base_url, std::slice::from_mut(&mut child)).await;
+    let recovery = wal_recovery(&client, &base_url).await;
+    let expected = if cfg!(target_os = "linux") {
+        "process_crash"
+    } else {
+        "host_crash"
+    };
+    assert_eq!(recovery["previous_run"]["kind"], expected, "{recovery}");
+    assert_eq!(recovery["recovery"]["state"], "normal", "{recovery}");
+    drop(child);
+
     std::fs::remove_dir_all(&root).expect("remove temp root");
+}
+
+/// How the node's Raft WAL opened, from its metrics JSON.
+async fn wal_recovery(client: &reqwest::Client, base_url: &str) -> serde_json::Value {
+    let metrics: serde_json::Value = client
+        .get(format!("{base_url}/__ursula/metrics"))
+        .send()
+        .await
+        .expect("metrics")
+        .json()
+        .await
+        .expect("metrics JSON");
+    metrics["wal_recovery"].clone()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -218,6 +218,7 @@ async fn init_state(
         start_maintenance_drained,
     )?;
     let runtime = spawned.runtime;
+    let raft_wal = spawned.raft_wal;
 
     if !raft_peers.is_empty() {
         if per_group_voters.is_empty() {
@@ -258,7 +259,8 @@ async fn init_state(
     let mut state = state
         .with_configured_node_id(config.raft.node_id)
         .with_runtime_config(&config.runtime)
-        .with_wal_backend(wal_backend);
+        .with_wal_backend(wal_backend)
+        .with_raft_wal(raft_wal);
     if let Some(wal_path) = config.raft.wal.resolved_path() {
         let monitor = crate::bootstrap::initialize_wal_disk_monitor(
             &wal_path,
@@ -337,6 +339,8 @@ async fn serve(
         .map(|s| s.parse::<SocketAddr>())
         .transpose()?;
     let admin_listen: SocketAddr = config.server.admin_listen.parse()?;
+    let runtime = state.runtime.clone();
+    let raft_wal = state.raft_wal().cloned();
 
     let shutdown = Arc::new(Notify::new());
     spawn_shutdown_signal_task(
@@ -412,8 +416,38 @@ async fn serve(
         serve_res?;
         admin_res?;
     }
-    tracing::info!("all listeners drained; exiting");
+    tracing::info!("all listeners drained; stopping the Raft groups");
+    shutdown_raft_wal(&runtime, raft_wal.as_ref()).await;
+    tracing::info!("exiting");
     Ok(())
+}
+
+/// The end of a graceful shutdown, after the leadership handoff and the
+/// listener drain: stops every Raft group, then the core journal writers,
+/// each of which `fsync`s its journal, and only then records a clean
+/// shutdown in the run state. A failure is logged and leaves the run
+/// unclean, so the next start reads it as a crash. The shutdown grace period
+/// still bounds this: when it expires first the process exits without
+/// recording a clean shutdown.
+async fn shutdown_raft_wal(
+    runtime: &ursula_runtime::ShardRuntime,
+    raft_wal: Option<&ursula_raft::DurableRaftLogStoreFactory>,
+) {
+    let Some(raft_wal) = raft_wal else {
+        return;
+    };
+    // A group that failed to stop can write no more once its core writer
+    // has closed, so the WAL still shuts down cleanly.
+    if let Err(err) = runtime.shutdown_group_engines().await {
+        tracing::warn!(%err, "failed to stop every Raft group before closing the WAL");
+    }
+    match raft_wal.shutdown().await {
+        Ok(()) => tracing::info!("Raft WAL synced and recorded as cleanly shut down"),
+        Err(err) => tracing::warn!(
+            %err,
+            "Raft WAL did not shut down cleanly; the next start treats this run as a crash"
+        ),
+    }
 }
 
 /// Adapt the shared shutdown [`Notify`] into an owned future for
@@ -430,10 +464,13 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 const SHUTDOWN_HANDOFF_GRACE: Duration = Duration::from_secs(5);
 
 /// Translate SIGTERM (systemd stop, Kubernetes pod termination) and Ctrl-C
-/// into a bounded leadership handoff followed by listener draining. A second
-/// signal, or the overall grace deadline expiring, exits immediately. Memory
-/// WAL still loses all local state on exit; this is an availability optimization,
-/// not protection against overlapping voter losses.
+/// into a bounded leadership handoff followed by listener draining, after
+/// which `serve` stops the Raft groups and shuts the WAL down cleanly. A
+/// second signal, or the overall grace deadline expiring, exits immediately
+/// without recording a clean shutdown, so the next start treats the run as a
+/// crash. Memory WAL still loses all local state on exit; this is an
+/// availability optimization, not protection against overlapping voter
+/// losses.
 fn spawn_shutdown_signal_task(
     shutdown: Arc<Notify>,
     raft_registry: Option<ursula_raft::RaftGroupHandleRegistry>,
@@ -466,10 +503,15 @@ fn spawn_shutdown_signal_task(
                 std::future::pending::<()>().await;
             } => {}
             () = shutdown_signal() => {
-                tracing::warn!("second shutdown signal; exiting immediately");
+                tracing::warn!(
+                    "second shutdown signal; exiting immediately without a clean WAL shutdown"
+                );
             }
             () = tokio::time::sleep(SHUTDOWN_GRACE) => {
-                tracing::warn!("shutdown grace period expired; exiting with drains incomplete");
+                tracing::warn!(
+                    "shutdown grace period expired; exiting with drains incomplete and without a \
+                     clean WAL shutdown"
+                );
             }
         }
         std::process::exit(0);
@@ -556,6 +598,58 @@ mod tests {
                 .unwrap();
         assert_eq!(metrics["process_node_id"], 7);
         assert_eq!(metrics["process_incarnation"].as_str().unwrap().len(), 32);
+    }
+
+    /// A node with a disk WAL reports how the WAL opened: a new WAL root is
+    /// read strictly and its logs are complete.
+    #[tokio::test]
+    async fn disk_wal_boot_reports_how_the_wal_opened() {
+        use axum::body::Body;
+        use axum::body::to_bytes;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ursula_config::UrsulaConfig::default();
+        config.runtime.core_count = 1;
+        config.raft.group_count = 1;
+        config.raft.node_id = 7;
+        config.raft.wal.backend = ursula_config::WalBackend::Disk;
+        config.raft.wal.path = Some(dir.path().to_owned());
+        config.raft.wal.fsync = ursula_config::WalFsync::Never;
+        config.raft.wal.min_available_size = ursula_config::HumanSize::bytes(0);
+        let state = super::init_state(&config, None, false).await.unwrap();
+        let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
+        let response = crate::admin_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/__ursula/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let metrics: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            metrics["wal_recovery"],
+            serde_json::json!({
+                "fsync": "never",
+                "previous_run": {"kind": "absent"},
+                "replay_mode": "strict",
+                "recovery": {"state": "normal"},
+                "recovery_epoch": 0,
+            })
+        );
+        super::shutdown_raft_wal(&state.runtime, Some(&raft_wal)).await;
+        assert!(
+            matches!(
+                raft_wal.shutdown().await,
+                Err(ursula_raft::RaftWalError::ShutDown { .. })
+            ),
+            "the server shut the WAL down"
+        );
     }
 
     #[test]

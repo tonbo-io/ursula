@@ -1618,6 +1618,22 @@ impl ShardRuntime {
         .await
     }
 
+    /// Shuts down every hosted group engine, one per group concurrently,
+    /// waiting for each to release its durable resources. A group that was
+    /// never created is skipped. Returns the first failure after every group
+    /// has been asked to stop.
+    pub async fn shutdown_group_engines(&self) -> Result<(), RuntimeError> {
+        let shutdowns = (0..self.raft_group_count()).map(|raw_group_id| async move {
+            let placement = self.placement_for_group(RaftGroupId(raw_group_id))?;
+            self.shutdown_group_engine(placement).await
+        });
+        futures_util::future::join_all(shutdowns)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<()>, _>>()
+            .map(|_stopped| ())
+    }
+
     #[cfg(madsim)]
     pub async fn shutdown_group_engine_for_simulation(
         &self,
