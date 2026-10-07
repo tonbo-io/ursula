@@ -5529,6 +5529,8 @@ mod cold_health {
 }
 
 mod snapshot_driver {
+    use std::collections::BTreeSet;
+
     use ursula_raft::RaftGroupMetricsSnapshot;
     use ursula_raft::snapshot_cadence::GroupLogProgress;
     use ursula_raft::snapshot_cadence::SnapshotCadence;
@@ -5616,7 +5618,7 @@ mod snapshot_driver {
                 has_snapshot: true,
             }),
         ];
-        let (plan, selected) = plan_snapshot_drive(&snapshots, &cadence, 16);
+        let (plan, selected) = plan_snapshot_drive(&snapshots, &cadence, 16, &BTreeSet::new());
         assert!(!plan.pressure);
         assert_eq!(
             selected
@@ -5625,8 +5627,20 @@ mod snapshot_driver {
                 .collect::<Vec<_>>(),
             vec![0, 2]
         );
-        let (_, one) = plan_snapshot_drive(&snapshots, &cadence, 1);
+        let (_, one) = plan_snapshot_drive(&snapshots, &cadence, 1, &BTreeSet::new());
         assert_eq!(one.len(), 1);
+
+        // A group the Raft WAL reports lagging goes first, though its own
+        // cadence does not call for a snapshot yet.
+        let lagging = BTreeSet::from([ursula_shard::RaftGroupId(1)]);
+        let (_, selected) = plan_snapshot_drive(&snapshots, &cadence, 16, &lagging);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|snapshot| snapshot.raft_group_id)
+                .collect::<Vec<_>>(),
+            vec![1, 0, 2]
+        );
     }
 
     #[test]
@@ -5639,7 +5653,7 @@ mod snapshot_driver {
             snap(2, Some(100), Some(1), log(14 * MIB, 10 * MIB)),
             snap(3, Some(100), Some(1), log(10 * MIB, 6 * MIB)),
         ];
-        let (plan, selected) = plan_snapshot_drive(&snapshots, &cadence, 16);
+        let (plan, selected) = plan_snapshot_drive(&snapshots, &cadence, 16, &BTreeSet::new());
         assert!(plan.pressure);
         assert_eq!(
             selected
