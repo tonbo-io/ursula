@@ -1659,18 +1659,10 @@
           "type": "boolean",
           "description": "Idempotent per-group membership bootstrap. A replica that ever held its group never initializes it again; one that holds nothing initializes only once every voter reports an empty group."
         },
-        "storageMode": {
-          "type": "string",
-          "enum": [
-            "logDir",
-            "memory"
-          ],
-          "description": "Raft storage mode: logDir persists logs locally; memory uses volatile quorum-replicated logs and loses local state on restart."
-        },
         "logDir": {
           "type": "string",
           "minLength": 1,
-          "description": "Raft log directory for logDir mode."
+          "description": "Raft log directory, mounted from each pod's raft-data PVC. Renders raft.wal.path."
         },
         "walFsync": {
           "type": "string",
@@ -1678,7 +1670,7 @@
             "always",
             "never"
           ],
-          "description": "When Raft WAL appends reach stable storage in logDir mode (default never): never acknowledges from the page cache, so a host crash can cost this replica its unsynced tail and it rejoins through the recovery gate; always acknowledges after fsync."
+          "description": "When Raft WAL appends reach stable storage (default never): never acknowledges from the page cache, so a host crash can cost this replica its unsynced tail and it rejoins through the recovery gate; always acknowledges after fsync."
         },
         "minAvailableBytes": {
           "type": "integer",
@@ -1689,10 +1681,6 @@
           "type": "integer",
           "minimum": 0,
           "description": "Free WAL filesystem bytes required before pressure clears."
-        },
-        "allowVolatileMultiPeer": {
-          "type": "boolean",
-          "description": "Explicit acceptance of volatile multi-pod memory WAL: minority restarts heal automatically; quorum state loss stops writes and may lose acknowledged data; a restart of every voter initializes the groups again, empty."
         },
         "maxUncommittedBytesPerGroup": {
           "type": [
@@ -1717,16 +1705,13 @@
           "minimum": 0,
           "description": "Payload-bearing raft log entries retained per group after snapshot coverage."
         }
-      }
+      },
+      "additionalProperties": false
     },
     "persistence": {
       "type": "object",
-      "description": "Per-pod PVC settings for durable Raft logs.",
+      "description": "Settings of the raft-data PVC every server pod gets for its Raft WAL.",
       "properties": {
-        "enabled": {
-          "type": "boolean",
-          "description": "Enable PVCs."
-        },
         "storageClassName": {
           "type": "string",
           "description": "StorageClass name. Empty uses default."
@@ -1751,7 +1736,8 @@
             "type": "string"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "s3": {
       "type": "object",

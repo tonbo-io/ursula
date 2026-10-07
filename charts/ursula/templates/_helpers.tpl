@@ -265,7 +265,6 @@ accepted. The entrypoint should only guard runtime-derived pod ordinal state.
 {{- $clientPort := .Values.server.ports.client | int -}}
 {{- $clusterDomain := .Values.global.clusterDomain | toString -}}
 {{- $raftGroupCount := .Values.raft.groupCount | int -}}
-{{- $storageMode := .Values.raft.storageMode | toString -}}
 {{- $logDir := .Values.raft.logDir | toString -}}
 {{- include "ursula.validateDnsLabel" (dict "name" "Release.Namespace" "value" $namespace) -}}
 {{- include "ursula.validateDnsLabel" (dict "name" "fullname" "value" $fullname) -}}
@@ -308,21 +307,14 @@ accepted. The entrypoint should only guard runtime-derived pod ordinal state.
 {{- if or (lt $clientPort 1) (gt $clientPort 65535) -}}
 {{- fail (printf "server.ports.client must be between 1 and 65535; got %v" .Values.server.ports.client) -}}
 {{- end -}}
-{{- $storageModeIsValid := or ($storageMode | eq "logDir") ($storageMode | eq "memory") -}}
-{{- if $storageModeIsValid | not -}}
-{{- fail (printf "raft.storageMode must be logDir or memory; got %q" .Values.raft.storageMode) -}}
-{{- end -}}
-{{- if and ($storageMode | eq "logDir") ($logDir | eq "") -}}
-{{- fail "raft.logDir must be non-empty when raft.storageMode=logDir" -}}
+{{- if $logDir | eq "" -}}
+{{- fail "raft.logDir must be non-empty" -}}
 {{- end -}}
 {{- $walFsync := .Values.raft.walFsync | toString -}}
 {{- if or ($walFsync | eq "always") ($walFsync | eq "never") | not -}}
 {{- fail (printf "raft.walFsync must be always or never; got %q" .Values.raft.walFsync) -}}
 {{- end -}}
-{{- if and ($storageMode | eq "memory") (gt $replicaCount 1) (not .Values.raft.allowVolatileMultiPeer) -}}
-{{- fail "multi-pod raft.storageMode=memory requires raft.allowVolatileMultiPeer=true to accept the volatile-WAL durability contract; see README Bootstrap Behavior for recovery guarantees" -}}
-{{- end -}}
-{{- if and ($storageMode | eq "logDir") (gt (.Values.raft.minAvailableBytes | int64) 0) (le (.Values.raft.resumeAvailableBytes | int64) (.Values.raft.minAvailableBytes | int64)) -}}
+{{- if and (gt (.Values.raft.minAvailableBytes | int64) 0) (le (.Values.raft.resumeAvailableBytes | int64) (.Values.raft.minAvailableBytes | int64)) -}}
 {{- fail "raft.resumeAvailableBytes must exceed raft.minAvailableBytes when disk-pressure admission is enabled" -}}
 {{- end -}}
 {{- $serverUsesS3 := or .Values.coldStorage.enabled (.Values.snapshotStore.backend | eq "s3") -}}

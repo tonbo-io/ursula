@@ -193,10 +193,6 @@ spec:
             optional: true
         - name: tmp
           emptyDir: {}
-        {{- if not .Values.persistence.enabled }}
-        - name: raft-data
-          emptyDir: {}
-        {{- end }}
       {{- with .Values.server.scheduling.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -231,7 +227,6 @@ spec:
             matchLabels:
               {{- include "ursula.selectorLabels" . | nindent 14 }}
       {{- end }}
-  {{- if .Values.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:
         name: raft-data
@@ -248,4 +243,3 @@ spec:
         resources:
           requests:
             storage: {{ .Values.persistence.size | quote }}
-  {{- end }}

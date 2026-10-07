@@ -26,13 +26,11 @@
     "create": true
     "name": "ursula-indexer"
 "persistence":
-  "enabled": true
   "size": "50Gi"
   "storageClassName": "gp3"
 "raft":
   "groupCount": 256
   "initMembershipPerGroup": false
-  "storageMode": "logDir"
 "s3":
   "bucket": "ursula-chaos-jul21-232814779190-us-east-1"
   "prefix": "storage"
