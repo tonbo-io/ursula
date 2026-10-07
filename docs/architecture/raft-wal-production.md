@@ -104,7 +104,7 @@ sequence, the length and the payload. A new journal is generation 1, and every
 rewrite (startup compaction, online reclaim) writes the next generation, so a
 frame verifies only in the file generation that wrote it.
 
-Replay has two modes, chosen by the caller:
+Replay has two modes:
 
 - `Strict` tolerates only an incomplete final frame, which it truncates. Any
   other frame that fails verification fails recovery with its frame number and
@@ -112,8 +112,12 @@ Replay has two modes, chosen by the caller:
 - `VerifiedPrefix` keeps the frames before the first one that fails
   verification and truncates the rest, reporting the dropped bytes.
 
-Startup recovery and online reclaim use `Strict`. Online reclaim never
-truncates: a live journal that fails verification stops the writer instead.
+Startup recovery picks the mode from the run state (below). Online reclaim
+uses `Strict` and never truncates: a live journal that fails verification
+stops the writer instead. A journal read as a verified prefix is always
+rewritten as its next generation, so every frame it keeps is on disk before
+the core writes again, even a frame whose `fsync` failed and that only the
+page cache still held.
 
 The writer is fail-stop. A failed write or `fsync` of the journal, or of the
 directory that publishes a new generation, poisons the core's writer for good:
@@ -131,7 +135,55 @@ decoder bounds a single frame at 512 MiB before allocating.
 
 The writer holds an exclusive advisory lock in `journal.bin.lock`. A second
 process receives a diagnostic error naming the journal, lock path, and recorded
-owner PID instead of concurrently modifying the same WAL.
+owner PID instead of concurrently modifying the same WAL. The node also holds
+`wal.lock` at the WAL root for the whole run, so a second process never
+touches the run state.
+
+### Metadata and run-state files
+
+Votes are not journal records. Each core keeps `core-N/journal.meta` next to
+its journal with every group's vote and an `initialized` flag, which is set
+before a group's first entry or purge is acknowledged and is never cleared.
+Recovery reads votes from this file, and a group whose journal holds entries
+but whose flag is missing (a crash between the two writes) gets the flag back.
+The file also records the recovery epoch in which the journal was last read
+in full.
+
+The node keeps `run-state.bin` at the WAL root: the boot id of the run that
+last opened the journals (`/proc/sys/kernel/random/boot_id`, absent on other
+platforms), that run's fsync policy, how it ended (`running`, `clean` or
+`poisoned`) and a recovery epoch counter.
+
+Both files are replaced whole: a temporary file is written, `fsync`ed,
+renamed over the old file and published with a directory `fsync`, so a crash
+leaves either version. Each file carries its own magic, the format epoch, a
+length and a CRC32, and a damaged file fails startup.
+
+At startup the node reads the run state, decides how to read the journals,
+and durably records itself as `running` with the current boot id before any
+journal write:
+
+| Previous run | Replay | Recovery state |
+| --- | --- | --- |
+| No run state | `Strict` | normal |
+| `clean` | `Strict` | normal |
+| `running`, same boot id (process crash) | `Strict` | normal |
+| `running`, other or unknown boot id (host crash), policy `always` | `VerifiedPrefix` | normal |
+| `running`, other or unknown boot id (host crash), policy `never` | `VerifiedPrefix` | recovering |
+| `poisoned` | `VerifiedPrefix` | recovering |
+
+A host crash needs the verified prefix even under `always`, because committed
+and truncate markers are written without `fsync` and writeback can leave a
+hole before acknowledged frames. A run that starts after a host crash or a
+poisoned run begins a new recovery epoch. Cores open lazily, so a core whose
+metadata shows an older epoch has not been read since the crash and is still
+read as a verified prefix, however the runs in between ended.
+
+"Recovering" means the node's logs may be missing entries it acknowledged.
+The node logs it at warn, reports it in the metrics JSON (`wal_recovery`), as
+the `ursula.wal.recovering` gauge, and through
+`RaftGroupHandleRegistry::wal_recovery_state`. It does not yet change how the
+node votes.
 
 The journal header version is the format epoch, 3 since the single Raft WAL
 work. There is no migration: journals of epochs 1 and 2 and files without the
@@ -172,15 +224,34 @@ OpenRaft purge record that establishes the safe logical boundary.
 
 ## Durability and application boundary
 
-Acknowledged application writes retain the existing quorum contract. Append
-completion is tied to the durable WAL flush callback, and votes are persisted
-before election progress is acknowledged. Purge also remains synchronous
-because the online generation checkpoint may physically discard the entries it
-covers.
+`raft.wal.fsync` chooses when appends reach stable storage. The default is
+`always` until replicas that lost acknowledged appends rejoin through a
+recovery gate.
+
+- `always`: a batch is acknowledged after its `fsync`. The writer collects a
+  group commit: it keeps collecting while requests keep arriving, each within
+  200 µs of the last, for at most 1 ms after the first and up to 1,024
+  requests, so one `fsync` covers a burst however its senders are scheduled.
+- `never`: the writer takes what is queued when it wakes, without waiting, and
+  acknowledges once the batch is in the page cache. A process crash loses
+  nothing. A host crash can drop the unsynced tail, which the run state then
+  reports.
+
+Under either policy votes and `initialized` flags are acknowledged only after
+the metadata file is replaced with an `fsync`, and the generation rewrites,
+the run state and a clean shutdown `fsync` as well. A graceful shutdown stops
+the Raft groups, closes every core writer (each `fsync`s its journal), and only
+then records `clean`. If the shutdown grace period expires first, the process
+exits without it and the next start reads the run as a crash.
+
+Under `always`, acknowledged application writes retain the existing quorum
+contract: append completion is tied to the durable WAL flush callback. Purge
+also remains synchronous because the online generation checkpoint may
+physically discard the entries it covers.
 
 Committed and truncate markers are replay hints, matching OpenRaft's `log-wal`
 contract. They are written immediately but do not request their own fsync. The
-next append, vote, or purge flushes them with its durable batch. If a crash loses
+next append or purge flushes them with its durable batch. If a crash loses
 one first, the durable entries remain and OpenRaft re-establishes the committed
 or conflict-truncation boundary after restart. A fresh state machine never
 blindly applies the durable suffix: it restores the latest persisted snapshot,
@@ -195,7 +266,8 @@ The runtime metrics snapshot now exposes bounded-cardinality core/group WAL
 counters:
 
 - `wal_fsyncs` and `wal_fsync_records` show actual physical flush count and the
-  number of logical records sharing those flushes;
+  number of logical records sharing those flushes. A metadata replacement
+  counts two `fsync`s, the file and its directory;
 - `wal_reclaims`, `wal_reclaimed_bytes`, and `wal_reclaim_ns` show online
   checkpoint frequency, effect, and cost, and `wal_reclaim_failures` counts
   checkpoints that failed and left the journal unchanged;
