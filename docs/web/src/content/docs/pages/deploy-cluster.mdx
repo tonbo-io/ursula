@@ -76,7 +76,7 @@ curl http://127.0.0.1:4437/__ursula/metrics
 
 ## Production notes
 
-- Run three voters across three availability zones, each with its own zonal persistent volume for the Raft log. Never use memory Raft storage or ephemeral voter data in production.
+- Run three voters across three availability zones, each with its own zonal persistent volume for the Raft log. Never use ephemeral voter data in production. The chart always gives each voter pod a `raft-data` volume claim.
 - Shared S3 is required for any multi-node cluster: replicas must be able to read chunks flushed by any leader.
 - Put stateless gateway replicas behind authenticated TLS ingress and keep voter and peer Services private. Ursula itself has no TLS or auth (see [Security](/docs/security)).
 - Kubernetes rolling updates do not transfer Raft leaders on their own. For an operationally safe restart, wrap the platform's restart in [ursulactl's maintenance verbs](/docs/cli): `ursulactl drain` the node, let Kubernetes restart the pod, then `ursulactl wait --node N` and `undrain` before moving to the next one. See [Operations](/docs/operations) for day-2 work.
@@ -117,7 +117,6 @@ group_count = 256
 init_membership_per_group = true
 
 [raft.wal]
-backend = "disk"
 path = "/var/lib/ursula"
 
 [storage.cold]

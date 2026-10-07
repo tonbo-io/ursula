@@ -25,7 +25,7 @@ Useful jq selectors:
 | WAL opening and recovery gates | `{opening: .wal_recovery, gates: .recovery_gates}` |
 
 `GET /__ursula/ready` is the process readiness probe: it returns `503` while
-the disk-WAL guard is active, while a group's recovery gate is closed on this
+the WAL disk-pressure guard is active, while a group's recovery gate is closed on this
 node, and after a Raft protocol mismatch with a peer
 (`"reason": "format_epoch_mismatch"`). Ursula does **not** expose `/healthz`, `/readyz`,
 Prometheus `/metrics`, or `/cluster/status`; use the JSON snapshot for detailed
@@ -33,9 +33,13 @@ diagnosis and `ursulactl wait-ready` for cluster-wide Raft readiness.
 
 ## Startup failures
 
-### `raft.wal.path is required when WAL backend is 'disk'`
+### `raft.wal.path is required when raft.peers is set`
 
-Set `raft.wal.path` when `raft.wal.backend = "disk"`. Use `raft.wal.backend = "memory"` for volatile tests.
+Every node of a static cluster keeps its Raft WAL in `raft.wal.path`. Set it to a directory on a persistent volume. Only a single node without `raft.peers` may omit it, and then its WAL lives in a temporary directory that is removed on clean shutdown.
+
+### Config fails to load with `unknown field` on a WAL key
+
+The config sets a removed key: `raft.wal.backend`, `raft.wal.allow_volatile_multi_peer` or `raft.memory_bootstrap_marker_dir`. The Raft WAL is always the disk journal under `raft.wal.path`, so delete those keys.
 
 ### `raft.node_id must be non-zero`
 
@@ -44,16 +48,6 @@ Static Raft mode requires a unique `raft.node_id` in the config file or a `--nod
 ### `raft.peers` must include this node id
 
 The local `raft.node_id` must appear in `[[raft.peers]]`. The peer list always includes self.
-
-### Multi-peer Raft with a memory WAL is volatile
-
-Use `raft.wal.backend = "disk"` for a real cluster. Memory WAL remains available
-for development, benchmarks, and chaos tests, but more than one configured peer
-requires `raft.wal.allow_volatile_multi_peer = true` so the loss-on-restart
-contract is explicit. A memory-WAL node restarted alone is rebuilt by its group
-leaders. A group whose majority restarted at once stops accepting writes until an
-operator accepts the loss (see
-[Restarting a memory-WAL node](/docs/operations#restarting-a-memory-wal-node)).
 
 ### `storage.cold.s3.bucket is required when cold backend is 's3'`
 
@@ -95,7 +89,7 @@ The node exchanged a Raft RPC with a peer on another format epoch after it start
 
 The node's logs may be missing entries it acknowledged: it started after a host
 crash or power loss under `raft.wal.fsync = "never"`, after a journal I/O error,
-or without its run state file, or it is a memory-WAL node that restarted. Each
+or without its run state file, or with an emptied WAL directory. Each
 gated group waits until it has applied a fresh barrier from the group's leader,
 and its leader rebuilds the replica meanwhile. `recovery_gates` in
 `/__ursula/metrics` lists the gated groups. This normally clears in seconds
@@ -129,11 +123,10 @@ by the OS lock, not the file's existence.
 
 - First start must include `raft.init_membership_per_group = true` (or `raft.init_membership = true`) on every voting node.
 - Every peer URL must be reachable from every node.
-- All peers must use the same `raft.wal.backend` mode. Mismatch causes silent join failures.
 
 ### Replacing or restarting a node leaves it leaderless
 
-Restart with the **same** `raft.node_id` and peer list. A fresh `raft.wal.path` means rehydrating from peers, which can be slow on cold-storage-only history.
+Restart with the **same** `raft.node_id` and peer list. A fresh `raft.wal.path` means rehydrating from peers, which can be slow on cold-storage-only history (see [Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)).
 
 ## Write path
 
@@ -208,7 +201,7 @@ Either an election is in progress or quorum is lost for that group. Only streams
 State-machine apply runs on the follower's owner core. If CPU is pinned, `last_applied` trails. Check:
 
 - Per-core mailbox depth (sustained queueing means saturation).
-- Disk pressure if `raft.wal.backend = "disk"` (fsync latency).
+- Disk pressure on the WAL volume (`fsync` latency, in particular with `raft.wal.fsync = "always"`).
 - A pathological hot stream forcing constant cold flushes (`hot_bytes_total` per group).
 
 ### Manually trigger a snapshot

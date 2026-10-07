@@ -54,8 +54,8 @@ No numeric ordering of resourceVersions is assumed.
    addresses, token, inventory and both survivor process pins remain fixed. A
    second replacement binding is refused. The Node's provider identity is stored
    as an opaque value; this observation **does not fence the original host**.
-5. Complete repair and all mutating admin work, retire the current token on all
-   three processes, and obtain a new schema-3 all-retired prefix observation from
+5. Wait until the replacement has caught up, complete all mutating admin work,
+   retire the current token on all three processes, and obtain a new schema-3 all-retired prefix observation from
    the bound process plan. Mixed active/retired tokens, missing groups/replicas,
    stale processes or a lower prefix cannot release the operation. CAS
    `complete_pod_replacement` stores the completion receipt and retains the global
@@ -104,7 +104,7 @@ The host path upgrades the same persistent document to schema 3; it never create
 3. The provider adapter must authenticate its response and observe that exact instance irreversibly `terminated`. `record_host_termination` rejects `stopped`, `shutting-down`, unknown/absent instances, another provider identity, stale observations and observations preceding admission. The recorded receipt is sticky across takeover and provider record expiration. A termination request or local JSON file alone is no physical fence.
 4. Before any forced Pod deletion, CAS `admit_fenced_pod_retirement` retains the exact UID as a permanent tombstone for this operation. An observed Pod, including the original UID, must be on the original Node UID/provider instance; a recreated same-name Node is refused. With no Pod/Node objects, the transition records only the original catalog UID tombstone. This does not authenticate a presently running Pod or authorize deletion on a different physical host. The history is bounded to 32 UIDs and retained in completion. A candidate UID with a retirement intent can never become the bound replacement, so a stale executor's delayed delete cannot target an accepted replacement. Binding and additional retirement intents race through the same CAS; no new retirement is admitted after binding.
 5. `bind_host_replacement` requires the terminal receipt and original UID tombstone, a nondeleting owned replacement Pod, a Ready replacement Node, new Pod/Node/provider/process identities, the original failure domain and a physical host distinct from both survivors. Only the selected target boot may change. A second binding or a changed survivor refuses progress.
-6. Repair membership and catch-up, complete all mutations, retire the current token on all three current processes, and collect fresh all-group/all-replica proof begun after terminal fencing. `complete_host_replacement` requires the admitted prefix floor and unchanged survivor boots; it atomically updates the selected physical catalog entry, retains termination/tombstones in completion and releases ownership. Partial proofs or failed recovery leave the reservation held.
+6. Wait until the group leaders have rebuilt the replacement and it has caught up, complete all mutations, retire the current token on all three current processes, and collect fresh all-group/all-replica proof begun after terminal fencing. `complete_host_replacement` requires the admitted prefix floor and unchanged survivor boots; it atomically updates the selected physical catalog entry, retains termination/tombstones in completion and releases ownership. Partial proofs or failed recovery leave the reservation held.
 
 Takeover preserves the exact source instance, survivor boots, termination intent/receipt, every deletion tombstone and any bound replacement. It advances only executor/generation, with no expiry-based release. API retries must use those persisted identities; name lookup cannot replace them.
 
@@ -174,9 +174,9 @@ A failed or cancelled hook stops its tunnels and leaves the reservation intact.
 A new executor takes over the same operation at a higher generation. After an
 accepted but ambiguously observed delete, it resumes that original target and
 retains both survivor boots and the admission prefix floor. Binding an already
-retired source is observation only: repair validates the fixed surviving pair
-before membership changes, without demanding a complete three-voter membership
-during the selected target's remove/learner/promote interval. Once the replacement
+retired source is observation only. The catch-up wait that follows does not
+demand a complete three-voter membership while the group leaders rebuild the
+selected target through remove, learner and promote. Once the replacement
 is bound, another container restart or Pod UID change refuses advancement. Partial
 token retirement is reconciled by a higher-generation takeover before release.
 Another source cannot be reserved before completion preserves a full-group receipt.
@@ -240,6 +240,6 @@ all-retired prefix observations through the policy and verifies six acknowledged
 payloads; its physical metadata is a native fixture, not a provider receipt.
 Real Kubernetes consumer and production-scale fault qualification remain required.
 
-The additional native abrupt-loss test SIGKILLs one memory-WAL process without preparation, verifies two-survivor live prefix admission and continued idempotent writes, takes over the same host intent, repairs a new target boot, replays each acknowledged producer sequence at the original offset and checks exact payloads on all three replicas across six groups before all-retired completion. Physical identities and the terminal-provider observation remain fixtures derived from the exited child, not AWS/Kubernetes qualification. The actual offline CLI test exercises all six host request builders, integer-map-key proof deserialization, whole-object proposals/receipts and completed physical-catalog advancement.
+The additional native abrupt-loss test SIGKILLs one voter process without preparation, verifies two-survivor live prefix admission and continued idempotent writes, takes over the same host intent, starts a new target boot on an empty WAL directory that the group leaders rebuild without an operator, replays each acknowledged producer sequence at the original offset and checks exact payloads on all three replicas across six groups before all-retired completion. Physical identities and the terminal-provider observation remain fixtures derived from the exited child, not AWS/Kubernetes qualification. The actual offline CLI test exercises all six host request builders, integer-map-key proof deserialization, whole-object proposals/receipts and completed physical-catalog advancement.
 
 The interrupted-candidate regression kills the already-bound target a second time while retaining the same two survivors and exclusive operation. It records the exact failed candidate, refuses unbinding without a terminal fixture receipt, preserves the newer two-survivor prefix and retired UID, admits another distinct physical/process identity, then checks all ACKed payloads, offsets and deduplicated replay on all three replicas. Candidate fencing is synthetic; this does not qualify actual EC2 termination or automatic host reconstruction. Additional native policy tests cover delayed same-generation candidate actions, takeover, retained prefix and UID history, bounded repeated failures, recreated physical identities, ambiguous CAS acknowledgements and competing startup boots. The actual CLI case round-trips all three new request builders through proposal and exact acknowledgement before binding the next candidate.

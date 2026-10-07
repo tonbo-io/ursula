@@ -205,10 +205,10 @@ node's run state, carries the recovery forward.
 
 ### Recovery gate
 
-`rejoin` holds one gate per group and replica, for both log stores. A
-disk-WAL gate starts from the group's log state: open when `initialized`,
-closed when `recovering`, and closed with an unknown history when `empty`. A
-memory-WAL gate always starts closed with an unknown history.
+`rejoin` holds one gate per group and replica. A gate starts from the group's
+log state: open when `initialized`, closed when `recovering`, and closed with
+an unknown history when `empty` (the replica never held the group here, or
+held it on a disk it lost).
 
 While closed, the replica does not campaign (its Raft core starts with
 elections disabled), refuses a leadership transfer to itself, and refuses
@@ -231,8 +231,8 @@ replica that is not recovering keeps every entry it ever replicated.
 
 The barrier driver asks the current leader for a fresh outbound ReadIndex
 barrier (`RejoinBarrier`) and opens the gate once the replica applied the
-barrier's committed index. Inbound replication alone never opens it. A
-disk-WAL gate first records `initialized`, then opens, and the driver
+barrier's committed index. Inbound replication alone never opens it. The
+gate first records `initialized`, then opens, and the driver
 refreshes the group's election policy after the gate opened (refreshing
 before the final check could leave elections disabled).
 
@@ -375,9 +375,10 @@ Disk WAL monitors available space every second. Below
 `/__ursula/ready` returns `503`, elections are disabled, and leaders are
 offered to healthy voters. Admission clears only after
 `raft.wal.resume_available_size`, providing hysteresis; a stat failure fails
-closed. Helm defaults these watermarks to 512 MiB and 1 GiB and keeps
-`raft.storageMode=logDir` with a per-pod PVC. Multi-peer memory WAL now requires
-the explicit `allow_volatile_multi_peer` development/benchmark/chaos opt-in.
+closed. Helm defaults these watermarks to 512 MiB and 1 GiB and always gives
+each voter pod a `raft-data` PVC at `raft.logDir`. The disk journal is the only
+Raft WAL: a static cluster requires `raft.wal.path`, and a single node without
+one keeps its journals in a temporary directory removed on clean shutdown.
 
 `scripts/soak_raft_wal.sh` first writes past the real 64-MiB reclaim threshold
 and proves purge/checkpoint converges the physical file to the live generation.

@@ -81,16 +81,17 @@ A request enters the HTTP server, routing maps the bucket and stream name to one
 
 ## The replaceable group engine
 
-The `GroupEngine` trait is the seam between the runtime and a group's storage and replication strategy. Three engines ship today:
+The `GroupEngine` trait is the seam between the runtime and a group's storage and replication strategy. Two engines ship today:
 
-- **In-memory, non-replicated.** Used in tests and as a performance baseline.
-- **Disk-backed Raft engine** (`raft.wal.backend = "disk"` with
-  `raft.wal.path = "DIR"`). OpenRaft groups on the same core share one
-  checksummed, versioned journal under `DIR/raft-log`; cross-group fsync
-  batching avoids one writer and cache per group. Snapshot plus committed-tail
-  replay rebuilds the in-memory state machine after restart, and purge-driven
-  online checkpoints reclaim obsolete physical records.
-- **Memory-log Raft engine** (`raft.wal.backend = "memory"`). OpenRaft with an in-memory log store. Fast iteration, no persistence.
+- **In-memory, non-replicated.** Used in tests, as a performance baseline, and
+  by the zero-config development node.
+- **Raft engine** over the disk WAL (`raft.wal.path = "DIR"`). OpenRaft groups
+  on the same core share one checksummed, versioned journal under
+  `DIR/raft-log`, and cross-group fsync batching avoids one writer and cache
+  per group. Snapshot plus committed-tail replay rebuilds the in-memory state
+  machine after restart, and purge-driven online checkpoints reclaim obsolete
+  physical records. A single node without `raft.wal.path` keeps the journal in
+  a temporary directory that is removed on clean shutdown.
 
 A factory selected at startup picks which engine each group opens, leaving the runtime code identical across modes.
 
