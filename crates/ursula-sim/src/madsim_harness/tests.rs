@@ -5,8 +5,13 @@ use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
+use ursula_raft::RaftGroupLogStore;
+
 use super::raft_scenarios::apply_barrier;
 use super::*;
+
+#[path = "disk_tests.rs"]
+mod disk_tests;
 
 static SIM_TEST_LOCK: Mutex<()> = Mutex::new(());
 

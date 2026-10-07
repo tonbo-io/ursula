@@ -32,8 +32,6 @@ use ursula_raft::InProcessRaftRegistry;
 use ursula_raft::InProcessRaftRpcKind;
 use ursula_raft::MadsimOpenRaftRuntime;
 use ursula_raft::RaftGroupEngine;
-use ursula_raft::RaftGroupEngineFactory;
-use ursula_raft::RaftGroupLogStore;
 use ursula_raft::RaftGroupStateMachine;
 use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_runtime::AppendExternalRequest;
@@ -587,6 +585,9 @@ use introspect::sim_event_from_cold_store_event;
 use introspect::sim_event_from_network_event;
 #[cfg(test)]
 mod rolling_restart;
+mod sim_wal;
+use sim_wal::SimNodeWal;
+use sim_wal::standalone_wal_metrics;
 
 pub fn stable_replay_outcome(mut outcome: ThreeNodeRaftSimOutcome) -> ThreeNodeRaftSimOutcome {
     outcome.trace = outcome.trace.stable_replay();
@@ -710,14 +711,16 @@ pub(super) fn sim_cold_store() -> ColdStore {
     cold_store
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 struct MadsimScopedRaftGroupEngineFactory {
     seed: u64,
+    wal: SimNodeWal,
 }
 
 impl MadsimScopedRaftGroupEngineFactory {
     fn new(seed: u64) -> Self {
-        Self { seed }
+        let wal = SimNodeWal::provision("runtime-raft-engine-node");
+        Self { seed, wal }
     }
 }
 
@@ -728,9 +731,16 @@ impl GroupEngineFactory for MadsimScopedRaftGroupEngineFactory {
         metrics: GroupEngineMetrics,
     ) -> GroupEngineCreateFuture<'a> {
         let seed = self.seed ^ u64::from(placement.raft_group_id.0);
+        let wal = self.wal.clone();
         Box::pin(MadsimOpenRaftRuntime::scope(seed, async move {
-            let inner = RaftGroupEngineFactory.create(placement, metrics).await?;
-            let engine: Box<dyn GroupEngine> = Box::new(MadsimScopedGroupEngine { seed, inner });
+            let log_store = wal.open(placement, metrics.clone()).await;
+            let inner =
+                RaftGroupEngine::new_single_node_on_log_store(placement, log_store, Some(metrics))
+                    .await?;
+            let engine: Box<dyn GroupEngine> = Box::new(MadsimScopedGroupEngine {
+                seed,
+                inner: Box::new(inner),
+            });
             Ok(engine)
         }))
     }
@@ -745,6 +755,7 @@ struct MadsimRuntimeRaftNetworkFactory {
     followers: Arc<Mutex<Vec<(u64, RaftGroupEngine)>>>,
     leaders: Arc<Mutex<BTreeMap<u32, u64>>>,
     groups: Arc<Mutex<BTreeMap<u32, RuntimeRaftNetworkGroupControl>>>,
+    node_wals: Arc<Mutex<BTreeMap<u64, SimNodeWal>>>,
 }
 
 #[derive(Clone)]
@@ -753,7 +764,7 @@ struct RuntimeRaftNetworkGroupControl {
     config: Arc<Config>,
     registry: InProcessRaftRegistry,
     metrics: GroupEngineMetrics,
-    log_stores: BTreeMap<u64, Arc<RaftGroupLogStore>>,
+    wals: BTreeMap<u64, SimNodeWal>,
 }
 
 impl MadsimRuntimeRaftNetworkFactory {
@@ -774,6 +785,7 @@ impl MadsimRuntimeRaftNetworkFactory {
             followers: Arc::new(Mutex::new(Vec::new())),
             leaders: Arc::new(Mutex::new(BTreeMap::new())),
             groups: Arc::new(Mutex::new(BTreeMap::new())),
+            node_wals: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -838,13 +850,17 @@ impl MadsimRuntimeRaftNetworkFactory {
     }
 
     async fn log_store_last_log_index(&self, node_id: u64) -> Option<u64> {
-        let log_store = self
+        let mut log_store = self
             .groups
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .values()
-            .find_map(|control| control.log_stores.get(&node_id).cloned())?;
-        let mut log_store = log_store;
+            .find_map(|control| {
+                control
+                    .wals
+                    .get(&node_id)?
+                    .store(control.placement.raft_group_id)
+            })?;
         log_store
             .get_log_state()
             .await
@@ -969,11 +985,12 @@ impl MadsimRuntimeRaftNetworkFactory {
                 .cloned()
                 .ok_or_else(|| GroupEngineError::new("runtime raft group control not found"))?
         };
-        let log_store = control.log_stores.get(&node_id).cloned().ok_or_else(|| {
+        let wal = control.wals.get(&node_id).cloned().ok_or_else(|| {
             GroupEngineError::new(format!(
                 "runtime raft log store for node {node_id} not found"
             ))
         })?;
+        let log_store = wal.open(control.placement, control.metrics.clone()).await;
         let engine = RaftGroupEngine::new_node_with_log_store_and_network(
             control.placement,
             node_id,
@@ -1008,6 +1025,7 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
         let followers = self.followers.clone();
         let leaders = self.leaders.clone();
         let groups = self.groups.clone();
+        let node_wals = self.node_wals.clone();
         Box::pin(MadsimOpenRaftRuntime::scope(seed, async move {
             let registry = InProcessRaftRegistry::default();
             let mut config = Config {
@@ -1036,10 +1054,18 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
             }
 
             let mut engines = Vec::new();
-            let mut log_stores = BTreeMap::new();
+            let mut wals = BTreeMap::new();
             for node_id in 1..=3 {
-                let log_store = RaftGroupLogStore::shared();
-                log_stores.insert(node_id, log_store.clone());
+                let wal = node_wals
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .entry(node_id)
+                    .or_insert_with(|| {
+                        SimNodeWal::provision(&format!("runtime-raft-node-{node_id}"))
+                    })
+                    .clone();
+                let log_store = wal.open(placement, metrics.clone()).await;
+                wals.insert(node_id, wal);
                 let engine = RaftGroupEngine::new_node_with_log_store_and_network(
                     placement,
                     node_id,
@@ -1077,7 +1103,7 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
                     config: config.clone(),
                     registry: registry.clone(),
                     metrics: metrics.clone(),
-                    log_stores,
+                    wals,
                 });
 
             let leader_index = engines
@@ -2093,7 +2119,7 @@ pub(super) async fn build_three_node_cluster_with_cold_store(
     policy: InProcessRaftNetworkPolicy,
     cold_store: Option<ColdStoreHandle>,
 ) -> (InProcessRaftRegistry, Vec<RaftGroupEngine>, u64) {
-    let (registry, engines, _log_stores, _config, leader_id) =
+    let (registry, engines, _wals, _config, leader_id) =
         build_restartable_three_node_cluster_with_cold_store(policy, cold_store).await;
     (registry, engines, leader_id)
 }
@@ -2103,7 +2129,7 @@ pub(super) async fn build_restartable_three_node_cluster(
 ) -> (
     InProcessRaftRegistry,
     Vec<RaftGroupEngine>,
-    Vec<Arc<RaftGroupLogStore>>,
+    Vec<SimNodeWal>,
     Arc<Config>,
     u64,
 ) {
@@ -2116,7 +2142,7 @@ async fn build_restartable_three_node_cluster_with_cold_store(
 ) -> (
     InProcessRaftRegistry,
     Vec<RaftGroupEngine>,
-    Vec<Arc<RaftGroupLogStore>>,
+    Vec<SimNodeWal>,
     Arc<Config>,
     u64,
 ) {
@@ -2138,9 +2164,9 @@ async fn build_restartable_three_node_cluster_with_cold_store(
     }
 
     let mut engines = Vec::new();
-    let mut log_stores = Vec::new();
+    let mut wals = Vec::new();
     for node_id in 1..=3 {
-        let log_store = RaftGroupLogStore::shared();
+        let wal = SimNodeWal::provision(&format!("three-node-{node_id}"));
         let engine = RaftGroupEngine::new_node_with_log_store_and_network(
             placement(),
             node_id,
@@ -2148,7 +2174,8 @@ async fn build_restartable_three_node_cluster_with_cold_store(
             InProcessRaftNetworkFactory::new(registry.clone())
                 .with_source(node_id)
                 .with_policy(policy.clone()),
-            log_store.clone(),
+            wal.open(placement(), standalone_wal_metrics(placement()))
+                .await,
             None,
             cold_store.clone(),
         )
@@ -2156,7 +2183,7 @@ async fn build_restartable_three_node_cluster_with_cold_store(
         .expect("create simulated raft group node");
         registry.register(node_id, engine.raft_handle());
         engines.push(engine);
-        log_stores.push(log_store);
+        wals.push(wal);
     }
 
     engines[0]
@@ -2170,7 +2197,7 @@ async fn build_restartable_three_node_cluster_with_cold_store(
         .await
         .expect("wait for simulated leader");
     let leader_id = leader_metrics.current_leader.expect("leader id");
-    (registry, engines, log_stores, config, leader_id)
+    (registry, engines, wals, config, leader_id)
 }
 
 pub(super) async fn build_lagging_learner_snapshot_cluster(
@@ -2209,7 +2236,9 @@ pub(super) async fn build_lagging_learner_snapshot_cluster_with_cold_store(
             InProcessRaftNetworkFactory::new(registry.clone())
                 .with_source(node_id)
                 .with_policy(policy.clone()),
-            RaftGroupLogStore::shared(),
+            SimNodeWal::provision(&format!("lagging-learner-{node_id}"))
+                .open(placement(), standalone_wal_metrics(placement()))
+                .await,
             None,
             cold_store.clone(),
         )
@@ -2253,7 +2282,7 @@ pub(super) async fn build_three_node_snapshot_purge_cluster(
 ) -> (
     InProcessRaftRegistry,
     Vec<RaftGroupEngine>,
-    Vec<Arc<RaftGroupLogStore>>,
+    Vec<SimNodeWal>,
     u64,
 ) {
     let registry = InProcessRaftRegistry::default();
@@ -2278,9 +2307,9 @@ pub(super) async fn build_three_node_snapshot_purge_cluster(
     }
 
     let mut engines = Vec::new();
-    let mut log_stores = Vec::new();
+    let mut wals = Vec::new();
     for node_id in 1..=3 {
-        let log_store = RaftGroupLogStore::shared();
+        let wal = SimNodeWal::provision(&format!("snapshot-purge-{node_id}"));
         let engine = RaftGroupEngine::new_node_with_log_store_and_network(
             placement(),
             node_id,
@@ -2288,7 +2317,8 @@ pub(super) async fn build_three_node_snapshot_purge_cluster(
             InProcessRaftNetworkFactory::new(registry.clone())
                 .with_source(node_id)
                 .with_policy(policy.clone()),
-            log_store.clone(),
+            wal.open(placement(), standalone_wal_metrics(placement()))
+                .await,
             None,
             None,
         )
@@ -2296,7 +2326,7 @@ pub(super) async fn build_three_node_snapshot_purge_cluster(
         .expect("create snapshot-purge simulated raft group node");
         registry.register(node_id, engine.raft_handle());
         engines.push(engine);
-        log_stores.push(log_store);
+        wals.push(wal);
     }
 
     engines[0]
@@ -2310,7 +2340,7 @@ pub(super) async fn build_three_node_snapshot_purge_cluster(
         .await
         .expect("wait for snapshot-purge simulated leader");
     let leader_id = leader_metrics.current_leader.expect("leader id");
-    (registry, engines, log_stores, leader_id)
+    (registry, engines, wals, leader_id)
 }
 
 pub(super) fn placement() -> ShardPlacement {
