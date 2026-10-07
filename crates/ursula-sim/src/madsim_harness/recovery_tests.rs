@@ -1,7 +1,8 @@
 //! DST of the recovery gate on the disk WAL under `raft.wal.fsync = never`:
-//! replicas that may have lost acknowledged entries never help elect a
-//! leader that lacks them, rejoin through a fresh leader barrier, and a group
-//! whose majority lost entries stops until an operator accepts the loss.
+//! replicas that may have lost acknowledged entries (a host crash, or a lost
+//! disk) never help elect a leader that lacks them, rejoin through a fresh
+//! leader barrier, and a group whose majority lost entries stops until an
+//! operator accepts the loss.
 //!
 //! Every scenario runs three nodes with two raft groups sharing each node's
 //! core journal (`JournalCluster`), with the production gate, barrier
@@ -44,6 +45,7 @@ use super::recovery_wiring::RECOVERY_STALL_AFTER;
 use super::seeds_from_env;
 use super::sim_test_guard;
 use crate::madsim_harness::run_with_madsim;
+use crate::madsim_harness::sim_wal::SimNodeWal;
 
 const NODES: [u64; 3] = [1, 2, 3];
 
@@ -305,6 +307,75 @@ fn a_follower_power_loss_rejoins_through_the_recovery_gate() {
         refused > 0,
         "a gated follower must sometimes be asked for its vote, and refuse"
     );
+}
+
+/// A follower loses its disk and comes back on a new, empty WAL directory,
+/// holding nothing of either group. Its gates are closed with the groups'
+/// history unknown: it would join only a new group's first election, and
+/// both groups hold entries, so it refuses every vote. As the initializer of
+/// a group it holds nothing of, it probes the other voters and does not
+/// initialize the group again. Writes keep flowing while the leaders see it
+/// lost the entries it had acknowledged and rebuild it through remove,
+/// learner, catch-up and promote, with no operator. Its gates open once it
+/// has applied a fresh barrier, and no acknowledged write is lost.
+#[test]
+fn a_follower_that_lost_its_disk_is_rebuilt_while_writes_continue() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("RECOVERY_GATE_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
+        run_with_madsim(seed, async move {
+            let context = format!("seed {seed}");
+            let mut cluster =
+                JournalCluster::start_with_fsync("gate-lost-disk", WalFsync::Never).await;
+            for group in JOURNAL_GROUPS {
+                cluster.append(group, 6).await;
+            }
+            let victim = cluster.follower_of_every_group(seed).await;
+            cluster.stop_node(victim).await;
+            cluster.wals.insert(
+                victim,
+                SimNodeWal::provision_with_fsync(
+                    &format!("gate-lost-disk-replacement-{victim}"),
+                    WalFsync::Never,
+                ),
+            );
+            cluster.start_node(victim).await;
+            assert_eq!(
+                cluster.wals[&victim].opening().previous_run,
+                PreviousRun::Absent,
+                "{context}: a new disk has no run state"
+            );
+            for group in JOURNAL_GROUPS {
+                assert_eq!(
+                    gate(&cluster, group, victim),
+                    RecoveryGateStatus::AwaitingBarrier,
+                    "{context}: node {victim} group {group}"
+                );
+                assert_eq!(
+                    log_state(&cluster, group, victim),
+                    GroupLogState::Empty,
+                    "{context}: node {victim} group {group}"
+                );
+            }
+
+            // Writes keep flowing while the emptied replica is rebuilt.
+            for group in JOURNAL_GROUPS {
+                cluster.append(group, 12).await;
+            }
+            wait_healed(&cluster, &context, Duration::from_secs(20)).await;
+            for group in JOURNAL_GROUPS {
+                assert_eq!(
+                    log_state(&cluster, group, victim),
+                    GroupLogState::Initialized,
+                    "{context}: the open gate is recorded"
+                );
+            }
+            for group in JOURNAL_GROUPS {
+                cluster.append(group, 4).await;
+            }
+            assert_no_vote_while_gated(&cluster, &context);
+            cluster.verify_reads().await;
+        });
+    }
 }
 
 /// (b) The leader of a group loses power under `never`. The two followers

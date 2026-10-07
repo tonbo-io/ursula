@@ -153,13 +153,28 @@ impl RaftInternal for RecoveryTestService {
     }
 }
 
+/// A replica of node `id` on a fresh, empty WAL, as a new node or one that
+/// lost its disk starts: its gate is closed with the group's history
+/// unknown. The returned directory holds the WAL and must outlive the store.
 async fn new_recovery_engine(
     id: u64,
     config: Arc<Config>,
     registry: &RaftGroupHandleRegistry,
-) -> (RaftGroupEngine, Arc<RaftGroupLogStore>, Arc<GroupRejoin>) {
-    let gate = Arc::new(GroupRejoin::volatile(id, placement().raft_group_id));
-    let store = RaftGroupLogStore::shared();
+) -> (
+    RaftGroupEngine,
+    Arc<RaftGroupFileLogStore>,
+    Arc<GroupRejoin>,
+    tempfile::TempDir,
+) {
+    let wal_root = tempfile::tempdir().expect("WAL root");
+    let store = DurableRaftLogStoreFactory::start(wal_root.path(), WalFsync::Never)
+        .expect("start the WAL")
+        .open(
+            placement(),
+            ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+        )
+        .expect("open the log store");
+    let gate = Arc::new(GroupRejoin::durable(id, placement().raft_group_id, &store));
     let engine = RaftGroupEngine::new_node_with_log_store_and_network(
         placement(),
         id,
@@ -170,13 +185,20 @@ async fn new_recovery_engine(
         None,
     )
     .await
-    .expect("new memory engine");
+    .expect("new engine on an empty WAL");
     gate.bind(&engine.raft_handle());
     registry.register_rejoin(placement().raft_group_id, gate.clone());
     registry.register_read_barrier(placement().raft_group_id, engine.read_barrier.clone());
     registry.register(placement(), engine.raft_handle());
-    (engine, store, gate)
+    (engine, store, gate, wal_root)
 }
+
+const ELECTION_TIMEOUT_MIN_MS: u64 = 300;
+const ELECTION_TIMEOUT_MAX_MS: u64 = 600;
+/// Longer than any election timeout: a replica that could campaign would
+/// have started an election by then.
+const LONGER_THAN_AN_ELECTION: Duration =
+    Duration::from_millis(ELECTION_TIMEOUT_MAX_MS.saturating_mul(2));
 
 #[tokio::test]
 async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_grpc() {
@@ -184,8 +206,10 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         Config {
             cluster_name: "recovery-delayed-grpc".to_owned(),
             heartbeat_interval: 10,
-            election_timeout_min: 50,
-            election_timeout_max: 100,
+            // Every vote is `fsync`ed to the core metadata file before it is
+            // granted; leave a vote RPC room for that.
+            election_timeout_min: ELECTION_TIMEOUT_MIN_MS,
+            election_timeout_max: ELECTION_TIMEOUT_MAX_MS,
             enable_tick: false,
             snapshot_policy: SnapshotPolicy::Never,
             ..Default::default()
@@ -200,6 +224,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     let mut engines = Vec::new();
     let mut stores = Vec::new();
     let mut gates = Vec::new();
+    let mut wal_roots = Vec::new();
     for id in 1..=3 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         endpoints.push(format!("http://{}", listener.local_addr().unwrap()));
@@ -241,12 +266,14 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         servers.push(tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         }));
-        let (engine, store, gate) = new_recovery_engine(id, config.clone(), &registry).await;
+        let (engine, store, gate, wal_root) =
+            new_recovery_engine(id, config.clone(), &registry).await;
         registries.push(registry);
         services.push(service);
         engines.push(engine);
         stores.push(store);
         gates.push(gate);
+        wal_roots.push(wal_root);
     }
     let nodes = endpoints
         .iter()
@@ -254,7 +281,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         .map(|(index, endpoint)| (u64::try_from(index).unwrap() + 1, BasicNode::new(endpoint)))
         .collect::<BTreeMap<_, _>>();
     // This fixture represents an initial bootstrap after proving every voter
-    // empty and the object-store initialized marker absent.
+    // empty.
     gates[1].allow_fresh_bootstrap().await.unwrap();
     registries[1].refresh_group_elections(placement().raft_group_id);
     engines[1].raft.initialize(nodes).await.unwrap();
@@ -315,12 +342,15 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         .applied_index_at_least(Some(acked.log_id.index()), "ACK on A")
         .await
         .unwrap();
+    // A loses its disk and restarts empty.
     services[0].pause_replication.store(true, Ordering::SeqCst);
     engines[0].shutdown().await.unwrap();
-    let (fresh, store, gate) = new_recovery_engine(1, config.clone(), &registries[0]).await;
+    let (fresh, store, gate, wal_root) =
+        new_recovery_engine(1, config.clone(), &registries[0]).await;
     engines[0] = fresh;
     stores[0] = store;
     gates[0] = gate;
+    wal_roots[0] = wal_root;
     let channel = tonic::transport::Endpoint::from_shared(endpoints[0].clone())
         .unwrap()
         .connect()
@@ -346,7 +376,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     assert!(!registries[0].recovery_barriers_ready());
     let term = engines[0].raft.metrics().borrow_watched().current_term;
     engines[0].raft.runtime_config().tick(true);
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    tokio::time::sleep(LONGER_THAN_AN_ELECTION).await;
     assert_eq!(
         engines[0].raft.metrics().borrow_watched().current_term,
         term,
@@ -370,7 +400,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         "a leadership transfer must not bypass recovery"
     );
     engines[2].raft.trigger().elect().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::sleep(LONGER_THAN_AN_ELECTION).await;
     assert_ne!(
         engines[2].raft.metrics().borrow_watched().current_leader,
         Some(3),
@@ -465,7 +495,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     registries[0].refresh_group_elections(placement().raft_group_id);
     services[0].pause_replication.store(true, Ordering::SeqCst);
     let term = engines[0].raft.metrics().borrow_watched().current_term;
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    tokio::time::sleep(LONGER_THAN_AN_ELECTION).await;
     assert_eq!(
         engines[0].raft.metrics().borrow_watched().current_term,
         term,
@@ -479,10 +509,11 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     // forwarded legacy HEAD as proof of the stale peer's own log.
     services[0].pause_replication.store(true, Ordering::SeqCst);
     engines[0].shutdown().await.unwrap();
-    let (fresh, store, gate) = new_recovery_engine(1, config, &registries[0]).await;
+    let (fresh, store, gate, wal_root) = new_recovery_engine(1, config, &registries[0]).await;
     engines[0] = fresh;
     stores[0] = store;
     gates[0] = gate;
+    wal_roots[0] = wal_root;
     client
         .append(Request::new(pb::RaftRpcEnvelopeV1 {
             raft_group_id: placement().raft_group_id.0,
@@ -503,7 +534,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     engines[0].raft.runtime_config().tick(true);
     let term = engines[0].raft.metrics().borrow_watched().current_term;
     engines[1].raft.runtime_config().tick(false);
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    tokio::time::sleep(LONGER_THAN_AN_ELECTION).await;
     assert_eq!(
         engines[0].raft.metrics().borrow_watched().current_term,
         term,
@@ -598,6 +629,7 @@ async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
     let mut servers = Vec::new();
     let mut engines = Vec::new();
     let mut gates = Vec::new();
+    let mut wal_roots = Vec::new();
     for id in 1..=3 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         endpoints.push(format!("http://{}", listener.local_addr().unwrap()));
@@ -616,10 +648,11 @@ async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
                 .await
                 .unwrap();
         }));
-        let (engine, _, gate) = new_recovery_engine(id, config.clone(), &registry).await;
+        let (engine, _, gate, wal_root) = new_recovery_engine(id, config.clone(), &registry).await;
         services.push(service);
         engines.push(engine);
         gates.push(gate);
+        wal_roots.push(wal_root);
     }
     let nodes = endpoints
         .iter()

@@ -18,15 +18,11 @@ use ursula_runtime::ShardRuntime;
 use ursula_runtime::load_cold_chunks_from_pages;
 use ursula_shard::BucketStreamId;
 
-use super::ColdRaftGroupEngineFactory;
+use super::test_support::JournalRuntime;
+use super::test_support::spawn_journal_runtime;
 
-fn spawn_raft_with_cold_store(config: RuntimeConfig, cold_store: Arc<ColdStore>) -> ShardRuntime {
-    ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        config,
-        ColdRaftGroupEngineFactory::new(cold_store.clone()),
-        Some(cold_store),
-    )
-    .expect("spawn raft runtime")
+fn spawn_raft_with_cold_store(config: RuntimeConfig, cold_store: Arc<ColdStore>) -> JournalRuntime {
+    spawn_journal_runtime(config, Some(cold_store))
 }
 
 /// C7/F14g: the cold generation of the stream's live incarnation.

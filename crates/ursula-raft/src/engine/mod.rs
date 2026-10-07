@@ -5,6 +5,8 @@ mod compact_tests;
 #[cfg(test)]
 mod external_index_after_commit_tests;
 mod factory;
+#[cfg(test)]
+mod test_support;
 
 use std::collections::BTreeMap;
 use std::io;
@@ -12,13 +14,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use factory::ColdRaftGroupEngineFactory;
 pub use factory::DurableRaftGroupEngineFactory;
 pub use factory::DurableRaftLogStoreFactory;
 pub use factory::GROUP_ELECTION_TIMEOUT_MIN_MS;
 pub use factory::RaftEngineConfig;
-pub use factory::RaftGroupEngineFactory;
-pub use factory::RegisteredRaftGroupEngineFactory;
 pub use factory::StaticGrpcRaftGroupEngineFactory;
 use openraft::BasicNode;
 use openraft::Config;
@@ -113,7 +112,6 @@ use crate::forward::forward_read_stream_to_leader;
 use crate::forward::group_engine_client_write_error;
 use crate::forward::group_engine_forward_to_leader_error;
 use crate::forward::write_result_from_raft_response;
-use crate::log_store::RaftGroupLogStore;
 use crate::read_index::ReadIndexBarrier;
 use crate::registry::SingleNodeRaftNetworkFactory;
 use crate::state_machine::RaftGroupStateMachine;
@@ -143,19 +141,8 @@ pub(crate) fn should_forward_stale_follower_read_error(
 }
 
 impl RaftGroupEngine {
-    pub async fn new_single_node(placement: ShardPlacement) -> Result<Self, GroupEngineError> {
-        Self::new_single_node_with_optional_metrics(placement, None).await
-    }
-
-    pub(crate) async fn new_single_node_with_optional_metrics(
-        placement: ShardPlacement,
-        metrics: Option<GroupEngineMetrics>,
-    ) -> Result<Self, GroupEngineError> {
-        Self::new_single_node_on_log_store(placement, RaftGroupLogStore::shared(), metrics).await
-    }
-
-    /// A single-node group over `log_store`, with the defaults of
-    /// [`RaftGroupEngine::new_single_node`].
+    /// A single-node group over `log_store`, with the timeouts of a
+    /// single-node runtime.
     pub async fn new_single_node_on_log_store<LS>(
         placement: ShardPlacement,
         log_store: LS,
@@ -181,34 +168,6 @@ impl RaftGroupEngine {
             BasicNode::new("local"),
             config,
             log_store,
-            metrics,
-            None,
-        )
-        .await
-    }
-
-    pub async fn new_single_node_with_config(
-        placement: ShardPlacement,
-        node_id: u64,
-        node: BasicNode,
-        config: Arc<Config>,
-    ) -> Result<Self, GroupEngineError> {
-        Self::new_single_node_with_config_and_metrics(placement, node_id, node, config, None).await
-    }
-
-    pub(crate) async fn new_single_node_with_config_and_metrics(
-        placement: ShardPlacement,
-        node_id: u64,
-        node: BasicNode,
-        config: Arc<Config>,
-        metrics: Option<GroupEngineMetrics>,
-    ) -> Result<Self, GroupEngineError> {
-        Self::new_single_node_with_log_store_and_metrics(
-            placement,
-            node_id,
-            node,
-            config,
-            RaftGroupLogStore::shared(),
             metrics,
             None,
         )

@@ -4,16 +4,11 @@ use thiserror::Error;
 
 use crate::config::ColdBackend;
 use crate::config::UrsulaConfig;
-use crate::config::WalBackend;
 
 #[derive(Debug, Error)]
 pub enum ValidationError {
-    #[error("raft.wal.path is required when backend is 'disk'")]
+    #[error("raft.wal.path is required when raft.peers is set")]
     RaftWalPathRequired,
-    #[error(
-        "multi-peer raft with a memory WAL is volatile; set raft.wal.allow_volatile_multi_peer = true only for development, benchmark, or chaos use"
-    )]
-    VolatileMultiPeerNotAllowed,
     #[error("storage.cold.s3.bucket is required when cold backend is 's3'")]
     ColdS3BucketRequired,
     #[error("raft.node_id {0} must be present in raft.peers")]
@@ -37,23 +32,17 @@ impl UrsulaConfig {
                 "raft.node_id is required (use --node-id CLI flag)".into(),
             ));
         }
-        if self.raft.wal.backend == WalBackend::Disk && self.raft.wal.path.is_none() {
+        // A static cluster member keeps its WAL across restarts; only a
+        // single node may run on a temporary one.
+        if !self.raft.peers.is_empty() && self.raft.wal.path.is_none() {
             return Err(ValidationError::RaftWalPathRequired);
         }
-        if self.raft.wal.backend == WalBackend::Memory
-            && self.raft.peers.len() > 1
-            && !self.raft.wal.allow_volatile_multi_peer
-        {
-            return Err(ValidationError::VolatileMultiPeerNotAllowed);
-        }
-        if self.raft.wal.backend == WalBackend::Disk {
-            let minimum = self.raft.wal.min_available_size.as_bytes();
-            let resume = self.raft.wal.resume_available_size.as_bytes();
-            if minimum > 0 && resume <= minimum {
-                return Err(ValidationError::Other(format!(
-                    "raft.wal.resume_available_size ({resume} bytes) must exceed min_available_size ({minimum} bytes)",
-                )));
-            }
+        let minimum = self.raft.wal.min_available_size.as_bytes();
+        let resume = self.raft.wal.resume_available_size.as_bytes();
+        if minimum > 0 && resume <= minimum {
+            return Err(ValidationError::Other(format!(
+                "raft.wal.resume_available_size ({resume} bytes) must exceed min_available_size ({minimum} bytes)",
+            )));
         }
         if self.storage.cold.backend == ColdBackend::S3 {
             let bucket = self

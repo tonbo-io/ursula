@@ -9,8 +9,8 @@
 //!   response, and error types that travel through the Raft state machine.
 //! - [`grpc`]: gRPC service ([`RaftGrpcService`]) and network factory
 //!   ([`GrpcRaftNetworkFactory`]) used for inter-node Raft RPCs.
-//! - [`log_store`]: in-memory and durable Raft log stores. The durable store
-//!   writes the shared per-core journal through an I/O seam whose `cfg(madsim)`
+//! - [`log_store`]: the Raft log store, the only Raft WAL. It writes the
+//!   shared per-core journal through an I/O seam whose `cfg(madsim)`
 //!   implementation is the simulated disk (`SimDisk`), keeps votes and each
 //!   group's log state ([`GroupLogState`]) in per-core metadata files, and
 //!   records each run of the node in a run-state file that decides how the
@@ -29,8 +29,7 @@
 //! - [`snapshot_references`]: prepared external-pointer pins and recoverable
 //!   current-reference publication outside RaftCore.
 //! - [`rejoin`]: the recovery gate of a replica that may be missing entries
-//!   it acknowledged (either log store), the leader-side heal driver, and the
-//!   bootstrap probe.
+//!   it acknowledged, the leader-side heal driver, and the bootstrap probe.
 //! - [`snapshot_codec`]: the group-snapshot frame codec; [`group_snapshot_frames`]
 //!   and [`decode_group_snapshot`] are re-exported for measurement tools.
 
@@ -64,14 +63,11 @@ mod state_machine;
 mod telemetry;
 mod types;
 
-pub use engine::ColdRaftGroupEngineFactory;
 pub use engine::DurableRaftGroupEngineFactory;
 pub use engine::DurableRaftLogStoreFactory;
 pub use engine::GROUP_ELECTION_TIMEOUT_MIN_MS;
 pub use engine::RaftEngineConfig;
 pub use engine::RaftGroupEngine;
-pub use engine::RaftGroupEngineFactory;
-pub use engine::RegisteredRaftGroupEngineFactory;
 pub use engine::StaticGrpcRaftGroupEngineFactory;
 pub use format_epoch::FormatEpochMismatch;
 pub use format_epoch::PeerFormatEpoch;
@@ -110,12 +106,9 @@ pub use log_store::JournalReplayMode;
 #[cfg(madsim)]
 pub use log_store::LockAttempt;
 pub use log_store::MarkRecoveringError;
-pub use log_store::MemoryRaftLogStore;
-pub use log_store::MetaRaftLogStore;
 pub use log_store::PreviousRun;
 pub use log_store::RUN_STATE_FILE;
 pub use log_store::RaftGroupFileLogStore;
-pub use log_store::RaftGroupLogStore;
 pub use log_store::RaftWalError;
 pub use log_store::RecordTooLarge;
 pub use log_store::RecoveryReason;

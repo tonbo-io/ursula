@@ -173,17 +173,6 @@ impl StreamStateMachine {
         Self::default()
     }
 
-    /// Whether any client write ever changed this group: a bucket, a stream,
-    /// usage, or an erasure fence. A memory-WAL replica that holds such state
-    /// records in object storage that the group holds acknowledged writes.
-    pub fn holds_client_state(&self) -> bool {
-        !self.buckets.is_empty()
-            || !self.erased_buckets.is_empty()
-            || !self.bucket_usage.is_empty()
-            || self.last_created_at_ms > 0
-            || self.registry.slots().next().is_some()
-    }
-
     fn stream_slot(&self, stream_id: &BucketStreamId) -> Option<&StreamSlot> {
         self.registry.slot(stream_id)
     }

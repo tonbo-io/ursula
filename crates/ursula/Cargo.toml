@@ -21,7 +21,6 @@ jemalloc = [
 ]
 jemalloc-prof = [
     "jemalloc",
-    "dep:tempfile",
     "dep:tikv-jemalloc-ctl",
     "tikv-jemalloc-ctl/profiling",
     "tikv-jemallocator/profiling",
@@ -44,7 +43,7 @@ serde = { workspace = true }
 rmp-serde = { workspace = true }
 blake3 = { workspace = true }
 serde_json = { workspace = true }
-tempfile = { workspace = true, optional = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
 tikv-jemallocator = { workspace = true, optional = true }
@@ -71,7 +70,6 @@ anyhow = { workspace = true }
 criterion = { workspace = true }
 flate2 = { workspace = true }
 proptest = { workspace = true }
-tempfile = { workspace = true }
 toml = { workspace = true }
 # Path-only: a versionless dev-dependency is dropped from the published
 # manifest, so `ursula` publishes without waiting for `ursula-ctl`.

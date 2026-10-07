@@ -990,7 +990,7 @@ impl RaftGroupHandleRegistry {
             .unwrap_or_else(|poison| poison.into_inner()) = Some(opening);
     }
 
-    /// How this node's Raft WAL opened; `None` when its logs are volatile.
+    /// How this node's Raft WAL opened; `None` until a WAL is attached.
     pub fn wal_opening(&self) -> Option<WalOpening> {
         *self
             .wal_opening
@@ -999,7 +999,7 @@ impl RaftGroupHandleRegistry {
     }
 
     /// Whether this node's Raft logs may be missing entries it acknowledged;
-    /// `None` when its logs are volatile.
+    /// `None` until a WAL is attached.
     pub fn wal_recovery_state(&self) -> Option<RecoveryState> {
         self.wal_opening().map(|opening| opening.recovery)
     }
@@ -1010,40 +1010,6 @@ impl RaftGroupHandleRegistry {
     /// by a node instance that is already shutting down.
     pub fn shutdown_transport(&self) {
         self.transport_shutdown.send_replace(true);
-    }
-
-    /// Stop every local Raft core before an intentional restart.
-    ///
-    /// OpenRaft's one-shot log-reversion permission must be installed on each
-    /// leader only after the old follower can no longer answer replication
-    /// requests. Otherwise the old process may consume that permission before
-    /// the replacement loses its volatile log. The admin server stays alive so
-    /// the rollout controller can prove the node is quiesced and arm the peers.
-    pub async fn quiesce_for_restart(&self) -> Result<usize, String> {
-        self.shutdown_transport();
-        let groups = self
-            .groups
-            .lock()
-            .expect("raft group handle registry mutex")
-            .iter()
-            .map(|(raft_group_id, raft)| (*raft_group_id, raft.clone()))
-            .collect::<Vec<_>>();
-        let group_count = groups.len();
-        let results = join_all(groups.into_iter().map(|(raft_group_id, raft)| async move {
-            raft.shutdown()
-                .await
-                .map_err(|err| format!("group {raft_group_id}: {err}"))
-        }))
-        .await;
-        let failures = results
-            .into_iter()
-            .filter_map(Result::err)
-            .collect::<Vec<_>>();
-        if failures.is_empty() {
-            Ok(group_count)
-        } else {
-            Err(failures.join("; "))
-        }
     }
 
     /// Confirm that API messages submitted before this observation have been
@@ -1748,7 +1714,8 @@ mod tests {
 
     async fn reference_failure_group(
         store: Arc<FailingReferenceStore>,
-    ) -> (RaftGroupHandleRegistry, RaftGroupHandle) {
+    ) -> (RaftGroupHandleRegistry, RaftGroupHandle, tempfile::TempDir) {
+        let wal_root = tempfile::tempdir().unwrap();
         let registry = RaftGroupHandleRegistry::default();
         registry.set_snapshot_store(Some(store.clone()));
         let placement = ShardPlacement {
@@ -1777,13 +1744,22 @@ mod tests {
             1,
             config,
             SingleNodeRaftNetworkFactory,
-            crate::log_store::RaftGroupLogStore::shared(),
+            crate::engine::DurableRaftLogStoreFactory::start(
+                wal_root.path(),
+                ursula_config::WalFsync::Never,
+            )
+            .unwrap()
+            .open(
+                placement,
+                ursula_runtime::RuntimeMetrics::new(1, 8).group_engine_metrics(),
+            )
+            .unwrap(),
             state_machine,
         )
         .await
         .unwrap();
         registry.register(placement, raft.clone());
-        (registry, raft)
+        (registry, raft, wal_root)
     }
 
     fn reference_failure_snapshot() -> TypeConfigSnapshotOf<UrsulaRaftTypeConfig> {
@@ -1808,7 +1784,7 @@ mod tests {
             let store = Arc::new(FailingReferenceStore::default());
             store.fail_pin.store(fail_pin, Ordering::SeqCst);
             store.fail_current.store(!fail_pin, Ordering::SeqCst);
-            let (registry, raft) = reference_failure_group(store.clone()).await;
+            let (registry, raft, _wal_root) = reference_failure_group(store.clone()).await;
             let first = registry
                 .install_full_snapshot(
                     RaftGroupId(7),
@@ -1878,7 +1854,7 @@ mod tests {
     #[tokio::test]
     async fn rejected_snapshot_releases_its_pin_without_publishing_a_current_pointer() {
         let store = Arc::new(FailingReferenceStore::default());
-        let (registry, raft) = reference_failure_group(store.clone()).await;
+        let (registry, raft, _wal_root) = reference_failure_group(store.clone()).await;
         raft.vote(crate::types::UrsulaVoteRequest::new(
             crate::types::UrsulaVote::new(5, 1),
             None,

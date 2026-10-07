@@ -10,13 +10,15 @@
 //! - `state_file`: the atomically replaced, checksummed format of both.
 //! - `disk`: the I/O seam every journal file operation goes through.
 //! - `sim_disk`: the simulated disk behind the seam under `cfg(madsim)`.
-//! - `memory`: the volatile store.
+//! - `meta_test_store`: an in-memory store for the meta Raft's unit tests
+//!   only (`cfg(test)`).
 
 mod core_meta;
 mod disk;
 mod file;
 mod journal;
-mod memory;
+#[cfg(test)]
+mod meta_test_store;
 mod run_state;
 #[cfg(madsim)]
 mod sim_disk;
@@ -46,9 +48,8 @@ pub use journal::JournalError;
 pub use journal::JournalOp;
 pub use journal::JournalReplayMode;
 pub use journal::RecordTooLarge;
-pub use memory::MemoryRaftLogStore;
-pub use memory::MetaRaftLogStore;
-pub use memory::RaftGroupLogStore;
+#[cfg(test)]
+pub(crate) use meta_test_store::MetaTestLogStore;
 use openraft::RaftTypeConfig;
 use openraft::alias::EntryOf;
 use openraft::alias::LogIdOf;
@@ -88,8 +89,10 @@ pub use state_file::StateFileKind;
 
 use crate::types::UrsulaRaftTypeConfig;
 
+/// A group's log as a log store holds it in memory: its entries, vote,
+/// committed pointer and purge point.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct MemoryRaftLogStoreInner<C>
+pub(crate) struct LogStoreInner<C>
 where
     C: RaftTypeConfig,
     C::Entry: Clone,
@@ -100,7 +103,7 @@ where
     vote: Option<VoteOf<C>>,
 }
 
-pub(crate) type RaftGroupLogStoreInner = MemoryRaftLogStoreInner<UrsulaRaftTypeConfig>;
+pub(crate) type RaftGroupLogStoreInner = LogStoreInner<UrsulaRaftTypeConfig>;
 
 /// One durable operation appended to a group's raft log journal.
 ///
@@ -154,7 +157,7 @@ where
 }
 
 pub(crate) fn ensure_log_append_boundary<C>(
-    inner: &MemoryRaftLogStoreInner<C>,
+    inner: &LogStoreInner<C>,
     entries: &[EntryOf<C>],
 ) -> Result<(), io::Error>
 where

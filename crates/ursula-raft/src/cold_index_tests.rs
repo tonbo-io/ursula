@@ -38,8 +38,8 @@ use ursula_stream::ColdChunkRef;
 use ursula_stream::ExternalPayloadRef;
 use ursula_stream::StreamCommand;
 
+use crate::engine::DurableRaftLogStoreFactory;
 use crate::engine::RaftGroupEngine;
-use crate::log_store::RaftGroupLogStore;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::types::UrsulaRaftTypeConfig;
 
@@ -70,7 +70,10 @@ fn read_req(stream_id: BucketStreamId, offset: u64, max_len: usize) -> ReadStrea
     }
 }
 
-async fn cold_engine(cold_store: Arc<ColdStore>) -> RaftGroupEngine {
+/// A single-node group with `cold_store`, on the per-core journal in the
+/// returned directory, which must outlive the engine.
+async fn cold_engine(cold_store: Arc<ColdStore>) -> (RaftGroupEngine, tempfile::TempDir) {
+    let wal_root = tempfile::tempdir().expect("WAL root");
     let config = Arc::new(
         Config {
             cluster_name: "ursula-cold-index".to_owned(),
@@ -82,17 +85,26 @@ async fn cold_engine(cold_store: Arc<ColdStore>) -> RaftGroupEngine {
         .validate()
         .expect("valid config"),
     );
-    RaftGroupEngine::new_single_node_with_log_store_and_metrics(
+    let log_store =
+        DurableRaftLogStoreFactory::start(wal_root.path(), ursula_config::WalFsync::Never)
+            .expect("start the WAL")
+            .open(
+                placement(),
+                ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+            )
+            .expect("open the log store");
+    let engine = RaftGroupEngine::new_single_node_with_log_store_and_metrics(
         placement(),
         1,
         BasicNode::new("local"),
         config,
-        RaftGroupLogStore::shared(),
+        log_store,
         None,
         Some(cold_store),
     )
     .await
-    .expect("create raft group engine")
+    .expect("create raft group engine");
+    (engine, wal_root)
 }
 
 fn external_payload(s3_path: &str, len: u64) -> ExternalPayloadRef {
@@ -220,7 +232,7 @@ async fn openraft_snapshot_with_regressed_frontier_builds_and_installs() {
 #[tokio::test]
 async fn stale_flush_leaves_no_page_entry() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let mut engine = cold_engine(cold_store.clone()).await;
+    let (mut engine, _wal_root) = cold_engine(cold_store.clone()).await;
     let stream_id = bsid("raft-stale-flush");
     engine
         .create_stream(
@@ -307,7 +319,7 @@ async fn stale_flush_leaves_no_page_entry() {
 #[tokio::test]
 async fn raft_read_path_shares_the_page_cache_that_apply_invalidates() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let mut engine = cold_engine(cold_store.clone()).await;
+    let (mut engine, _wal_root) = cold_engine(cold_store.clone()).await;
     let stream_id = bsid("raft-shared-cache");
     engine
         .create_stream(

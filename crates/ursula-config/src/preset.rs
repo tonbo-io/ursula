@@ -2,14 +2,13 @@ use thiserror::Error;
 
 use crate::config::ColdCacheConfig;
 use crate::config::UrsulaConfig;
-use crate::config::WalBackend;
 use crate::human::HumanSize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Preset {
-    /// Development defaults: memory WAL, single-node, no cold storage.
-    /// Used as the implicit preset when no config file and no explicit
-    /// `--preset` are given.
+    /// Development defaults: single node, no cold storage. Used as the
+    /// implicit preset when no config file and no explicit `--preset` are
+    /// given; the server then runs the in-memory engine without Raft.
     #[default]
     Default,
     Tiny,
@@ -52,14 +51,12 @@ impl From<Preset> for UrsulaConfig {
         let mut config = Self::default();
         match preset {
             Preset::Default => {
-                config.raft.wal.backend = WalBackend::Memory;
                 config.raft.node_id = 1;
             }
             Preset::Tiny => {
                 config.runtime.live_read_max_waiters_per_core = Some(8_192);
                 config.raft.group_count = 64;
                 config.raft.max_uncommitted_size_per_group = Some(HumanSize::mib(8));
-                config.raft.wal.backend = WalBackend::Memory;
                 config.server.http_inflight_body_size = HumanSize::mib(64);
                 config.storage.cold.flush_size = HumanSize::mib(4);
                 config.storage.cold.flush_max_concurrency = 2;

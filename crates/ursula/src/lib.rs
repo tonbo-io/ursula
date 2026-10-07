@@ -282,12 +282,8 @@ pub struct HttpState {
     pub node_memory: NodeMemoryMonitor,
     leadership_shed: LeadershipShedFlag,
     external_payload_min_bytes: usize,
-    /// Raft WAL backend name (`"memory"` / `"disk"`) surfaced in the metrics
-    /// JSON so operator tooling can tell a volatile node from a durable one
-    /// (e.g. ursulactl auto-enabling empty-log rejoin only for `memory`).
-    wal_backend: &'static str,
     wal_disk: WalDiskMonitor,
-    /// The node's Raft WAL when its logs are on disk: how it opened, and the
+    /// The node's Raft WAL when it runs Raft: how it opened, and the
     /// clean shutdown at exit.
     raft_wal: Option<ursula_raft::DurableRaftLogStoreFactory>,
     /// A Raft protocol (format-epoch) mismatch seen since start: readiness
@@ -364,7 +360,6 @@ impl HttpState {
             node_memory: NodeMemoryMonitor::default(),
             leadership_shed: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             external_payload_min_bytes: 1024 * 1024,
-            wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
@@ -388,7 +383,6 @@ impl HttpState {
             node_memory: NodeMemoryMonitor::default(),
             leadership_shed,
             external_payload_min_bytes: 1024 * 1024,
-            wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
@@ -433,7 +427,6 @@ impl HttpState {
             node_memory: NodeMemoryMonitor::default(),
             leadership_shed,
             external_payload_min_bytes: 1024 * 1024,
-            wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
@@ -469,11 +462,6 @@ impl HttpState {
     }
 
     /// Record the raft WAL backend so it appears in the metrics JSON.
-    pub fn with_wal_backend(mut self, backend: &'static str) -> Self {
-        self.wal_backend = backend;
-        self
-    }
-
     pub(crate) fn with_wal_disk_monitor(mut self, monitor: WalDiskMonitor) -> Self {
         self.wal_disk = monitor;
         self
@@ -990,10 +978,6 @@ fn admin_ops_router(state: HttpState) -> Router {
             post(add_raft_learner),
         )
         .route(
-            "/__ursula/raft/quiesce-for-restart",
-            post(quiesce_raft_for_restart),
-        )
-        .route(
             "/__ursula/raft/{raft_group_id}/leader/transfer/{node_id}",
             post(transfer_raft_leader),
         )
@@ -1432,63 +1416,6 @@ async fn clear_maintenance_drain(State(state): State<HttpState>) -> Response {
     leadership_shed_status(State(state)).await
 }
 
-async fn quiesce_raft_for_restart(State(state): State<HttpState>) -> Response {
-    let Some(registry) = state.raft_registry() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
-    };
-    if !registry
-        .leadership_shed_state()
-        .contains(ursula_raft::LeadershipShedState::MAINTENANCE_DRAIN)
-    {
-        return (
-            StatusCode::CONFLICT,
-            "maintenance drain must be active before Raft restart quiescence",
-        )
-            .into_response();
-    }
-    let groups = registry.metrics_snapshot();
-    let Some(node_id) = groups.first().map(|group| group.node_id) else {
-        return (StatusCode::CONFLICT, "no local Raft groups are registered").into_response();
-    };
-    let led_groups = groups
-        .into_iter()
-        .filter(|group| group.current_leader == Some(node_id))
-        .map(|group| group.raft_group_id)
-        .collect::<Vec<_>>();
-    if !led_groups.is_empty() {
-        return json_response(
-            StatusCode::CONFLICT,
-            serde_json::json!({
-                "quiesced": false,
-                "node_id": node_id,
-                "reason": "node still leads raft groups",
-                "raft_group_ids": led_groups,
-            })
-            .to_string(),
-        );
-    }
-    match registry.quiesce_for_restart().await {
-        Ok(group_count) => json_response(
-            StatusCode::OK,
-            serde_json::json!({
-                "quiesced": true,
-                "node_id": node_id,
-                "raft_group_count": group_count,
-            })
-            .to_string(),
-        ),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("quiesce raft groups for restart: {err}"),
-        )
-            .into_response(),
-    }
-}
-
 pub fn client_router_with_admission(state: HttpState, admission: IngressAdmission) -> Router {
     let finite_record_response =
         |_status: StatusCode,
@@ -1887,10 +1814,6 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         object.insert(
             "node_memory_abort_cap_bytes".to_owned(),
             serde_json::json!(cap),
-        );
-        object.insert(
-            "wal_backend".to_owned(),
-            serde_json::json!(state.wal_backend),
         );
         object.insert(
             "wal_recovery".to_owned(),

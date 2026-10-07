@@ -149,8 +149,9 @@ message GroupReadResponseV1 {
   bytes payload = 2;
 }
 
-// A fresh quorum-confirmed recovery boundary. It is requested by a memory-WAL
-// replica after starting empty; delayed inbound AppendEntries are not evidence.
+// A fresh quorum-confirmed recovery boundary. A replica behind the recovery
+// gate requests it from the leader; delayed inbound AppendEntries are not
+// evidence.
 message RejoinBarrierRequestV1 {
   uint32 raft_group_id = 1;
   uint32 protocol_version = 2;

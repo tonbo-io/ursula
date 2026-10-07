@@ -44,7 +44,8 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut preset = args.preset;
 
     // When no config file and no explicit preset are given, fall back to the
-    // default single-node development preset (memory WAL, node-id = 1).
+    // default single-node development preset: the in-memory engine without
+    // Raft, node-id = 1.
     if config_path.is_none() && preset.is_none() {
         preset = Some(Preset::Default);
     }
@@ -130,7 +131,18 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     // No format stamps, Raft actors, transport or listeners exist before admission.
-    let mut state = init_state(&config, preset, start_maintenance_drained)
+    let wal_dir = if runs_raft(&config, preset) {
+        Some(RaftWalDir::resolve(&config.raft.wal)?)
+    } else {
+        None
+    };
+    let persistence = match &wal_dir {
+        Some(wal_dir) => Persistence::Raft {
+            log_dir: wal_dir.log_dir(),
+        },
+        None => Persistence::InMemory,
+    };
+    let mut state = init_state(&config, persistence, start_maintenance_drained)
         .await?
         .with_process_incarnation(boot);
     if let Some(admission) = startup_admission {
@@ -139,7 +151,72 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         state = state.with_startup_maintenance_fence(admission.maintenance_fence);
     }
     state.register_otel_metrics();
-    serve(state, &config).await
+    serve(state, &config).await?;
+    if let Some(wal_dir) = wal_dir {
+        wal_dir.close();
+    }
+    Ok(())
+}
+
+/// Whether the server runs Raft. Only the zero-config development mode (the
+/// `default` preset on a single node) runs the in-memory engine without it.
+fn runs_raft(config: &ursula_config::UrsulaConfig, preset: Option<Preset>) -> bool {
+    preset != Some(Preset::Default) || !config.raft.peers.is_empty()
+}
+
+/// Where this process keeps its Raft WAL.
+#[derive(Debug)]
+enum RaftWalDir {
+    /// `raft.wal.path`, kept across runs.
+    Configured(PathBuf),
+    /// No path is configured, which only a single node allows: a fresh
+    /// temporary directory for this run, removed on clean shutdown.
+    Temporary(tempfile::TempDir),
+}
+
+impl RaftWalDir {
+    fn resolve(wal: &ursula_config::WalConfig) -> std::io::Result<Self> {
+        match &wal.path {
+            Some(path) => Ok(Self::Configured(path.clone())),
+            None => {
+                let dir = tempfile::Builder::new().prefix("ursula-wal-").tempdir()?;
+                tracing::info!(
+                    path = %dir.path().display(),
+                    "raft.wal.path is not set: the Raft WAL runs in a temporary directory that \
+                     is removed on clean shutdown"
+                );
+                Ok(Self::Temporary(dir))
+            }
+        }
+    }
+
+    /// The journal directory: the WAL directory's `raft-log` subdirectory.
+    fn log_dir(&self) -> PathBuf {
+        let root = match self {
+            Self::Configured(path) => path.as_path(),
+            Self::Temporary(dir) => dir.path(),
+        };
+        root.join(ursula_config::WalConfig::LOG_SUBDIR)
+    }
+
+    /// After a clean shutdown: removes a temporary WAL directory.
+    fn close(self) {
+        let Self::Temporary(dir) = self else {
+            return;
+        };
+        let path = dir.path().to_owned();
+        match dir.close() {
+            Ok(()) => tracing::info!(
+                path = %path.display(),
+                "removed the temporary Raft WAL directory"
+            ),
+            Err(err) => tracing::warn!(
+                path = %path.display(),
+                %err,
+                "could not remove the temporary Raft WAL directory"
+            ),
+        }
+    }
 }
 
 fn init_telemetry(
@@ -152,7 +229,7 @@ fn init_telemetry(
 
 async fn init_state(
     config: &ursula_config::UrsulaConfig,
-    preset: Option<Preset>,
+    persistence: Persistence,
     start_maintenance_drained: bool,
 ) -> Result<HttpState, Box<dyn std::error::Error>> {
     let raft_peers: Vec<(u64, String)> = config
@@ -168,16 +245,6 @@ async fn init_state(
         )
         .into());
     }
-
-    let persistence = if preset == Some(Preset::Default) && raft_peers.is_empty() {
-        // Default single-node dev mode: use the simple InMemory engine (no
-        // Raft overhead).  This matches the old default profile behaviour.
-        Persistence::InMemory
-    } else {
-        Persistence::Raft {
-            log_dir: config.raft.wal.resolved_path(),
-        }
-    };
 
     let per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>> = config
         .raft
@@ -209,7 +276,8 @@ async fn init_state(
     };
 
     // Format epoch 2: refuse 0.5.x data and peers before anything is written.
-    crate::bootstrap::check_and_stamp_format_epoch(config).await?;
+    let log_dir = persistence.log_dir().map(std::path::Path::to_path_buf);
+    crate::bootstrap::check_and_stamp_format_epoch(config, log_dir.as_deref()).await?;
 
     let spawned = spawn_runtime_with_maintenance_drain(
         config,
@@ -252,16 +320,11 @@ async fn init_state(
             per_group_voters,
         )
     };
-    let wal_backend = match config.raft.wal.backend {
-        ursula_config::WalBackend::Memory => "memory",
-        ursula_config::WalBackend::Disk => "disk",
-    };
     let mut state = state
         .with_configured_node_id(config.raft.node_id)
         .with_runtime_config(&config.runtime)
-        .with_wal_backend(wal_backend)
         .with_raft_wal(raft_wal);
-    if let Some(wal_path) = config.raft.wal.resolved_path() {
+    if let Some(wal_path) = log_dir {
         let monitor = crate::bootstrap::initialize_wal_disk_monitor(
             &wal_path,
             config.raft.wal.min_available_size.as_bytes(),
@@ -468,9 +531,7 @@ const SHUTDOWN_HANDOFF_GRACE: Duration = Duration::from_secs(5);
 /// which `serve` stops the Raft groups and shuts the WAL down cleanly. A
 /// second signal, or the overall grace deadline expiring, exits immediately
 /// without recording a clean shutdown, so the next start treats the run as a
-/// crash. Memory WAL still loses all local state on exit; this is an
-/// availability optimization, not protection against overlapping voter
-/// losses.
+/// crash.
 fn spawn_shutdown_signal_task(
     shutdown: Arc<Notify>,
     raft_registry: Option<ursula_raft::RaftGroupHandleRegistry>,
@@ -582,7 +643,13 @@ mod tests {
         config.raft.group_count = 1;
         config.raft.node_id = 7;
         assert!(config.raft.peers.is_empty());
-        let state = super::init_state(&config, None, false).await.unwrap();
+        let wal = tempfile::tempdir().unwrap();
+        let persistence = crate::Persistence::Raft {
+            log_dir: wal.path().join("raft-log"),
+        };
+        let state = super::init_state(&config, persistence, false)
+            .await
+            .unwrap();
         let response = crate::admin_router(state)
             .oneshot(
                 Request::builder()
@@ -600,10 +667,10 @@ mod tests {
         assert_eq!(metrics["process_incarnation"].as_str().unwrap().len(), 32);
     }
 
-    /// A node with a disk WAL reports how the WAL opened: a new WAL root is
-    /// read strictly and its logs are complete.
+    /// A node reports how the WAL opened: a new WAL root is read strictly
+    /// and its logs are complete.
     #[tokio::test]
-    async fn disk_wal_boot_reports_how_the_wal_opened() {
+    async fn boot_reports_how_the_wal_opened() {
         use axum::body::Body;
         use axum::body::to_bytes;
         use axum::http::Request;
@@ -613,11 +680,17 @@ mod tests {
         config.runtime.core_count = 1;
         config.raft.group_count = 1;
         config.raft.node_id = 7;
-        config.raft.wal.backend = ursula_config::WalBackend::Disk;
         config.raft.wal.path = Some(dir.path().to_owned());
         config.raft.wal.fsync = ursula_config::WalFsync::Never;
         config.raft.wal.min_available_size = ursula_config::HumanSize::bytes(0);
-        let state = super::init_state(&config, None, false).await.unwrap();
+        let wal_dir = super::RaftWalDir::resolve(&config.raft.wal).unwrap();
+        assert!(matches!(wal_dir, super::RaftWalDir::Configured(_)));
+        let persistence = crate::Persistence::Raft {
+            log_dir: wal_dir.log_dir(),
+        };
+        let state = super::init_state(&config, persistence, false)
+            .await
+            .unwrap();
         let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
         let response = crate::admin_router(state.clone())
             .oneshot(
@@ -652,6 +725,47 @@ mod tests {
         );
     }
 
+    /// Without `raft.wal.path` a single node runs its WAL in a fresh
+    /// temporary directory, removed once the server shut down cleanly. Only
+    /// the zero-config default runs without Raft.
+    #[tokio::test]
+    async fn a_single_node_without_a_wal_path_runs_in_a_temporary_directory() {
+        let mut config = ursula_config::UrsulaConfig::default();
+        config.runtime.core_count = 1;
+        config.raft.group_count = 1;
+        config.raft.node_id = 1;
+        config.raft.wal.min_available_size = ursula_config::HumanSize::bytes(0);
+        assert!(!super::runs_raft(
+            &config,
+            Some(ursula_config::Preset::Default)
+        ));
+        assert!(super::runs_raft(&config, Some(ursula_config::Preset::Tiny)));
+        assert!(super::runs_raft(&config, None));
+
+        let wal_dir = super::RaftWalDir::resolve(&config.raft.wal).unwrap();
+        let super::RaftWalDir::Temporary(dir) = &wal_dir else {
+            panic!("no path configured: {wal_dir:?}");
+        };
+        let root = dir.path().to_owned();
+        let log_dir = wal_dir.log_dir();
+        assert_eq!(log_dir, root.join("raft-log"));
+        let state = super::init_state(
+            &config,
+            crate::Persistence::Raft {
+                log_dir: log_dir.clone(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        let raft_wal = state.raft_wal().cloned().expect("the node runs Raft");
+        assert_eq!(raft_wal.root(), log_dir.as_path());
+        super::shutdown_raft_wal(&state.runtime, Some(&raft_wal)).await;
+        assert!(root.exists());
+        wal_dir.close();
+        assert!(!root.exists(), "a clean shutdown removes the temporary WAL");
+    }
+
     #[test]
     fn loads_minimal_toml_config() {
         let mut tmp = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
@@ -666,9 +780,6 @@ core_count = 4
 
 [raft]
 group_count = 16
-
-[raft.wal]
-backend = "memory"
 "#
         )
         .unwrap();

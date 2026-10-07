@@ -1,8 +1,8 @@
 //! L2 cross-checks through the real `ShardRuntime` (core workers, group
 //! actors, real cold-flush orchestration with packing, memory cold store) on
 //! the in-memory engine and the single-node OpenRaft engine
-//! (`ColdRaftGroupEngineFactory`), then the group snapshot encoded with the
-//! real codec.
+//! (`DurableRaftGroupEngineFactory`, on a per-core journal in a temporary
+//! directory), then the group snapshot encoded with the real codec.
 //!
 //! - `w1`: one stream, inline appends, a flush worker pass every tick.
 //! - `w2`: N trickle streams in one group, a flush worker pass every tick.
@@ -17,7 +17,9 @@ use clap::Args;
 use clap::ValueEnum;
 use serde_json::Value;
 use serde_json::json;
-use ursula_raft::ColdRaftGroupEngineFactory;
+use ursula_config::WalFsync;
+use ursula_raft::DurableRaftGroupEngineFactory;
+use ursula_raft::DurableRaftLogStoreFactory;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdChunkRef;
 use ursula_runtime::ColdStore;
@@ -109,21 +111,39 @@ pub fn default_name(args: &L2Args) -> String {
     })
 }
 
-fn spawn(engine: Engine, cold: ColdStoreHandle, admission: Option<u64>) -> Result<ShardRuntime> {
+/// Spawns a runtime of `engine`. The Raft engine's journals live in the
+/// returned temporary directory, which must outlive the runtime.
+fn spawn(
+    engine: Engine,
+    cold: ColdStoreHandle,
+    admission: Option<u64>,
+) -> Result<(ShardRuntime, Option<tempfile::TempDir>)> {
     let config = RuntimeConfig::new(1, 1).with_cold_max_hot_bytes_per_group(admission);
-    let runtime = match engine {
-        Engine::Raft => ShardRuntime::spawn_with_engine_factory_and_cold_store(
-            config,
-            ColdRaftGroupEngineFactory::new(cold.clone()),
-            Some(cold),
-        ),
-        Engine::Memory => ShardRuntime::spawn_with_engine_factory_and_cold_store(
-            config,
-            InMemoryGroupEngineFactory::with_cold_store(Some(cold.clone())),
-            Some(cold),
+    let (runtime, wal_root) = match engine {
+        Engine::Raft => {
+            let wal_root = tempfile::tempdir().context("create the Raft WAL directory")?;
+            let log_stores = DurableRaftLogStoreFactory::start(wal_root.path(), WalFsync::Never)
+                .context("start the Raft WAL")?;
+            (
+                ShardRuntime::spawn_with_engine_factory_and_cold_store(
+                    config,
+                    DurableRaftGroupEngineFactory::with_cold_store(log_stores, Some(cold.clone())),
+                    Some(cold),
+                ),
+                Some(wal_root),
+            )
+        }
+        Engine::Memory => (
+            ShardRuntime::spawn_with_engine_factory_and_cold_store(
+                config,
+                InMemoryGroupEngineFactory::with_cold_store(Some(cold.clone())),
+                Some(cold),
+            ),
+            None,
         ),
     };
-    runtime.map_err(|err| anyhow::anyhow!("spawn runtime: {err}"))
+    let runtime = runtime.map_err(|err| anyhow::anyhow!("spawn runtime: {err}"))?;
+    Ok((runtime, wal_root))
 }
 
 async fn create(rt: &ShardRuntime, id: &BucketStreamId) -> Result<()> {
@@ -194,7 +214,7 @@ pub fn run(args: &L2Args, sink: &mut Sink) -> Result<Outcome> {
 async fn w1(args: &L2Args, sink: &mut Sink) -> Result<Outcome> {
     let admission = (args.admission_mib > 0).then_some(args.admission_mib << 20);
     let cold: ColdStoreHandle = Arc::new(ColdStore::memory().context("memory cold store")?);
-    let rt = spawn(args.engine, cold, admission)?;
+    let (rt, _wal_root) = spawn(args.engine, cold, admission)?;
     let id = BucketStreamId::new("bkt1", "h0001-log");
     create(&rt, &id).await?;
     let mut rng = payload::Rng::new(1);
@@ -251,7 +271,7 @@ async fn w1(args: &L2Args, sink: &mut Sink) -> Result<Outcome> {
 )]
 async fn w2(args: &L2Args, sink: &mut Sink) -> Result<Outcome> {
     let cold: ColdStoreHandle = Arc::new(ColdStore::memory().context("memory cold store")?);
-    let rt = spawn(args.engine, cold, None)?;
+    let (rt, _wal_root) = spawn(args.engine, cold, None)?;
     let ids: Vec<_> = (0..args.streams)
         .map(|i| BucketStreamId::new("bkt1", format!("h{i:05}-log{i:05}")))
         .collect();
@@ -332,7 +352,7 @@ async fn w2(args: &L2Args, sink: &mut Sink) -> Result<Outcome> {
 /// slices into an exclusive object with the existing `CompactCold`.
 async fn compact_on(engine: Engine) -> Result<(Value, bool)> {
     let cold: ColdStoreHandle = Arc::new(ColdStore::memory().context("memory cold store")?);
-    let rt = spawn(engine, cold.clone(), None)?;
+    let (rt, _wal_root) = spawn(engine, cold.clone(), None)?;
     let a = BucketStreamId::new("bkt1", "h1-log-a");
     let b = BucketStreamId::new("bkt1", "h2-log-b");
     create(&rt, &a).await?;

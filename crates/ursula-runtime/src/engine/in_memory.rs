@@ -809,12 +809,6 @@ impl InMemoryGroupEngine {
         self.state_machine.bucket_usage_report()
     }
 
-    /// Whether any client write ever changed this group's applied state.
-    /// Public so the Raft engine can read it.
-    pub fn holds_client_state(&self) -> bool {
-        self.state_machine.holds_client_state()
-    }
-
     /// Bounded-state gauges of the applied state (§7.5 of
     /// `bounded-stream-state.md`). Public so the Raft engine can serve them.
     pub fn state_gauges(&self) -> ursula_stream::GroupStateGauges {
