@@ -301,6 +301,8 @@ async fn the_journal_rotates_into_numbered_segments() {
     for index in 1..=40 {
         append(&mut store, [payload_entry(index, 512)]).await;
     }
+    // The writer rotates after it replies; closing waits for that.
+    writer.close().await.expect("close the writer");
     let segments = core.segments();
     assert!(
         segments.len() >= 4,
@@ -341,6 +343,11 @@ async fn purge_deletes_the_segments_no_group_needs() {
     for index in 1..=40 {
         append(&mut store, [payload_entry(index, 512)]).await;
     }
+    // The writer rotates after it replies; the next write waits for that.
+    store
+        .save_committed(Some(log_id(39)))
+        .await
+        .expect("commit");
     let before = core.segments();
     store.purge(log_id(36)).await.expect("purge");
     // The pass runs after the purge's batch; the next write waits for it.
@@ -721,7 +728,18 @@ async fn a_missing_segment_fails_strict_and_ends_the_verified_prefix() {
     let store = core.store(&writer, 1);
     let kept = log_ids(&store).await;
     assert!(kept.starts_with(&[1, 2]) && kept.len() < 40);
-    assert_eq!(core.segments(), [1, 2]);
+    // Recovery keeps segments 1 and 2 and removes every one after the gap.
+    // Segment 2 is full, so the writer seals it as it starts and appends go
+    // to a new segment 3. Closing waits for that rotation, which otherwise
+    // races the listing.
+    writer.close().await.expect("close the writer");
+    assert_eq!(core.segments(), [1, 2, 3]);
+    assert!(
+        super::read_wire_frames::<CoreJournalRecord>(&fs::read(core.segment(3)).expect("read"))
+            .expect("decode segment 3")
+            .is_empty(),
+        "segment 3 is new, not the one removed"
+    );
 }
 
 /// A new segment's header is durable before anything goes to it, so a
