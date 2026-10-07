@@ -21,14 +21,14 @@ use ursula_runtime::RuntimeMetrics;
 use ursula_runtime::RuntimeMetricsSnapshot;
 
 /// Register `ursula.wal.recovering`: 1 while this node's Raft logs may be
-/// missing entries it acknowledged (see `ursula_raft::RecoveryState`).
-pub(crate) fn register_wal_recovery(recovery: ursula_raft::RecoveryState) {
+/// missing entries it acknowledged (see `ursula_raft::wal::RecoveryState`).
+pub(crate) fn register_wal_recovery(recovery: ursula_raft::wal::RecoveryState) {
     let (recovering, reason) = match recovery {
-        ursula_raft::RecoveryState::Normal => (0, "none"),
-        ursula_raft::RecoveryState::Recovering { reason } => (1, match reason {
-            ursula_raft::wal::diagnostics::RecoveryReason::HostCrash => "host_crash",
-            ursula_raft::wal::diagnostics::RecoveryReason::Poisoned => "poisoned",
-            ursula_raft::wal::diagnostics::RecoveryReason::UnknownHistory => "unknown_history",
+        ursula_raft::wal::RecoveryState::Normal => (0, "none"),
+        ursula_raft::wal::RecoveryState::Recovering { reason } => (1, match reason {
+            ursula_raft::wal::RecoveryReason::HostCrash => "host_crash",
+            ursula_raft::wal::RecoveryReason::Poisoned => "poisoned",
+            ursula_raft::wal::RecoveryReason::UnknownHistory => "unknown_history",
         }),
     };
     let _ = global::meter("ursula-raft")

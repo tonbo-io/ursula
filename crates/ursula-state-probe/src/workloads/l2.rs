@@ -20,7 +20,7 @@ use serde_json::Value;
 use serde_json::json;
 use ursula_config::WalFsync;
 use ursula_raft::DurableRaftGroupEngineFactory;
-use ursula_raft::RaftWal;
+use ursula_raft::wal::RaftWal;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdChunkRef;
 use ursula_runtime::ColdStore;

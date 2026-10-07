@@ -24,7 +24,7 @@ fn owner_burst(c: &mut Criterion) {
     group.throughput(Throughput::Elements(32));
     for cores in [1, 4] {
         let root = tempfile::tempdir().expect("WAL directory");
-        let wal = ursula_raft::RaftWal::start(
+        let wal = ursula_raft::wal::RaftWal::start(
             root.path(),
             ursula_config::WalFsync::Always,
             &ursula_shard::StaticShardMap::new(cores, cores).expect("topology"),
@@ -125,6 +125,11 @@ fn owner_burst(c: &mut Criterion) {
                 },
             );
         }
+        caller.block_on(async {
+            runtime.stop_owner_services().await;
+            runtime.shutdown_group_engines().await.expect("stop groups");
+            assert!(runtime.shutdown_owners().await.is_empty());
+        });
     }
     group.finish();
 }

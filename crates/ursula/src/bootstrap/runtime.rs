@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use ursula_config::config::ColdBackend;
-use ursula_raft::JournalTuning;
 use ursula_raft::RaftEngineConfig;
 use ursula_raft::RaftGroupHandleRegistry;
-use ursula_raft::RaftWal;
 use ursula_raft::StaticGrpcRaftMembershipConfig;
+use ursula_raft::wal::JournalTuning;
+use ursula_raft::wal::RaftWal;
 use ursula_runtime::ColdStore;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::InMemoryGroupEngineFactory;
@@ -46,7 +46,7 @@ pub enum SpawnRuntimeError {
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
     #[error(transparent)]
-    RaftWal(#[from] ursula_raft::RaftWalError),
+    RaftWal(#[from] ursula_raft::wal::RaftWalError),
 }
 
 /// Where the runtime's groups keep their Raft logs, once the WAL has
@@ -218,6 +218,7 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
             config.raft.snapshot_pressure_max_groups_per_tick,
         );
         leadership::spawn_leadership_balancer(
+            &spawned.runtime,
             &registry,
             *node_id,
             peers,
@@ -238,13 +239,18 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
             })
             .collect();
         egress::spawn_egress_gate(
+            &spawned.runtime,
             &registry,
             *node_id,
             peers,
             per_group_voters,
             &config.governance.cluster_probe,
         );
-        commit_stall::spawn_commit_stall_watchdog(&registry, &config.governance.commit_stall);
+        commit_stall::spawn_commit_stall_watchdog(
+            &spawned.runtime,
+            &registry,
+            &config.governance.commit_stall,
+        );
         // Hot bytes are a cold-tier backlog signal only when a cold store can
         // drain them. Memory-only clusters intentionally retain all payloads
         // hot, so applying the cold-health watermark there would eventually

@@ -107,6 +107,7 @@ pub enum StreamResponse {
         next_offset: Option<u64>,
         context: Vec<StreamErrorContext>,
     },
+    ReplicationBarrier,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

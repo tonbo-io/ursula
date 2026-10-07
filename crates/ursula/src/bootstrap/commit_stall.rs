@@ -130,6 +130,7 @@ impl CommitStallTracker {
 
 /// Config-driven commit stall watchdog.
 pub fn spawn_commit_stall_watchdog(
+    runtime: &ursula_runtime::ShardRuntime,
     registry: &RaftGroupHandleRegistry,
     cs_cfg: &ursula_config::CommitStallConfig,
 ) {
@@ -139,7 +140,8 @@ pub fn spawn_commit_stall_watchdog(
     }
     let threshold_ms = cs_cfg.threshold.as_duration().as_millis() as usize;
     let registry = registry.clone();
-    tokio::spawn(async move {
+    let owner = runtime.clone();
+    if let Err(error) = owner.spawn_on_owner(ursula_shard::CoreId(0), async move {
         let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(2_000));
         let threshold = Duration::from_millis(u64::try_from(threshold_ms).unwrap_or(15_000));
         let mut tracker = CommitStallTracker::default();
@@ -197,5 +199,7 @@ pub fn spawn_commit_stall_watchdog(
                 }
             }
         }
-    });
+    }) {
+        tracing::error!(%error, "failed to schedule background driver on owner");
+    }
 }

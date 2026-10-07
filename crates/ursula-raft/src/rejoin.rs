@@ -17,18 +17,16 @@
 //! - **While gated** ([`VoteGate`]): the replica does not campaign and does
 //!   not take a leadership transfer. A replica that led the group starts as
 //!   a follower instead of restoring its leadership, which would append new
-//!   entries under the log ids of the ones it lost. That demotion is
-//!   recorded before the Raft core starts, so no later start restores the
-//!   leadership either, after a clean shutdown or once the gate opened. It
-//!   refuses every vote once it knows the group holds entries: its log state
-//!   says so, a leader reported a commit index of 1 or more, or a
-//!   candidate's log reached index 1. Before that a new group's first
-//!   election (candidates whose log is only the membership entry at index 0)
-//!   goes through. It still accepts appends from any leader whose vote is
-//!   not lower than its persisted vote; the WAL restores that vote before
-//!   the Raft core starts, so a leader of an older term is refused. A
-//!   replica that lost its disk lost its vote too and accepts appends from
-//!   any leader, a known gap the gate does not close.
+//!   entries under the log ids of the ones it lost. This demotion is persisted
+//!   before the core starts, including a process crash with a queued tail.
+//!   It refuses every vote
+//!   once it knows the group holds entries: its log state says so, a leader
+//!   reported a commit index of 1 or more, or a candidate's log reached
+//!   index 1. A new group's first election (membership entry at index 0)
+//!   goes through only after fresh peer probes establish a durable vote
+//!   floor. Until that floor is established it refuses replication and
+//!   elections; afterwards it refuses leaders below the floor. Peer probes
+//!   intersect every possible committing quorum without counting this replica.
 //! - **Opening the gate** ([`run_rejoin_vote_barrier`]): the replica asks
 //!   the current leader for a fresh outbound ReadIndex barrier and opens the
 //!   gate once it has applied the barrier's committed index. Inbound
@@ -39,19 +37,15 @@
 //!   `Conflict` at or below the index that follower had already matched in
 //!   this leadership knows the follower lost entries. OpenRaft never rewinds
 //!   that progress, so the network layer hands OpenRaft an error instead of
-//!   the conflict, and the leader rebuilds the follower: remove the voter,
-//!   add it back as a learner, wait for catch-up, promote. Every step is
-//!   read off the current membership, so a leader change or a second restart
-//!   in the middle converges. When the followers that lost entries are a
-//!   majority, no removal can commit; the leader holds every committed
-//!   entry, so it rewinds their replication instead and sends them its log
-//!   again (an idle group gets an unchanged membership entry to carry the
-//!   rewind).
+//!   the conflict. Recovery permits a log rewind and sends the surviving
+//!   leader's entries again; an idle group gets a stream-state no-op
+//!   `ReplicationBarrier`. This driver never changes membership. Managed
+//!   membership changes belong solely to the committed meta operation.
 //! - **Bootstrap** ([`run_group_bootstrap`]): a group's initializer whose
 //!   replica holds nothing of the group runs `Initialize` only when every
 //!   configured voter answers a probe `Vote` with an empty log and no
 //!   leader. The probe carries the lowest possible vote (term 0, the
-//!   prober's id) and no log. A peer that holds the group refuses it; a peer
+//!   node id 0) and no log. A peer that holds the group refuses it; a peer
 //!   with no vote yet may grant it, which only records a term-0 vote that
 //!   `Initialize` overwrites. A replica that ever held the group never runs
 //!   `Initialize`.
@@ -443,6 +437,8 @@ pub struct AcceptUnsyncedLossReport {
 /// Failure to open a recovery gate.
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryGateError {
+    #[error("persist recovery vote floor: {0}")]
+    VoteFloor(#[source] std::io::Error),
     #[error("raft group {} owner stopped: {source}", .raft_group_id.0)]
     OwnerStopped {
         raft_group_id: RaftGroupId,
@@ -499,7 +495,9 @@ pub struct GroupRejoin {
     raft_group_id: RaftGroupId,
     metrics: OnceLock<MetricsReceiver>,
     gate: Mutex<VoteGate>,
+    vote_floor: Mutex<Option<UrsulaVote>>,
     reverted: Mutex<RevertedFollowers>,
+    response_epochs: Mutex<BTreeMap<u64, u64>>,
     /// The group's log store, which keeps its log state and where the gate
     /// records that it opened. Weak, so a stopped group's store closes even
     /// while its gate is still registered.
@@ -569,10 +567,76 @@ impl GroupRejoin {
             raft_group_id,
             metrics: OnceLock::new(),
             gate: Mutex::new(gate),
+            vote_floor: Mutex::new(None),
             reverted: Mutex::new(RevertedFollowers::default()),
+            response_epochs: Mutex::new(BTreeMap::new()),
             store: Arc::downgrade(store),
             changes: UrsulaRaftTypeConfig::watch_channel(()).0,
         })
+    }
+
+    /// Replication cannot count this replica until it has sampled an intersecting
+    /// set of peers after restart. Open gates retain their normal Raft vote check.
+    pub fn replication_allowed(&self, vote: UrsulaVote) -> bool {
+        self.vote_floor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map_or_else(|| self.vote_gate_open(), |floor| vote >= floor)
+    }
+
+    pub(crate) async fn establish_vote_floor(
+        &self,
+        vote: UrsulaVote,
+    ) -> Result<(), RecoveryGateError> {
+        use openraft::storage::RaftLogStorage;
+        let Some(mut store) = self.store.upgrade() else {
+            return Err(RecoveryGateError::StoreClosed {
+                raft_group_id: self.raft_group_id,
+            });
+        };
+        // A peer's historical self-vote is evidence of the term, not proof
+        // that this restarted process is still its leader. Persisting its
+        // committed bit would undo startup's durable demotion and resurrect
+        // that leadership after an accepted-loss clean restart.
+        let durable_vote = if *vote.leader_id().node_id() == self.node_id {
+            UrsulaVote::new(vote.leader_id().term(), self.node_id)
+        } else {
+            vote
+        };
+        store
+            .save_vote(&durable_vote)
+            .await
+            .map_err(RecoveryGateError::VoteFloor)?;
+        *self
+            .vote_floor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(vote);
+        self.changes.send_if_modified(|()| true);
+        Ok(())
+    }
+
+    /// Fence RPC acknowledgements started before a follower's recovery proof.
+    pub fn begin_peer_recovery(&self, peer: u64) {
+        let mut epochs = self
+            .response_epochs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let epoch = epochs.entry(peer).or_default();
+        *epoch = epoch.saturating_add(1);
+        drop(epochs);
+        // Repeated proof attempts belong to the same recovery. Keep an
+        // armed rewind until replication or a snapshot confirms its repair;
+        // otherwise ReadIndex retries can continually disarm catch-up.
+        self.changes.send_if_modified(|()| true);
+    }
+
+    pub(crate) fn response_epoch(&self, peer: u64) -> u64 {
+        self.response_epochs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&peer)
+            .copied()
+            .unwrap_or_default()
     }
 
     pub fn raft_group_id(&self) -> RaftGroupId {
@@ -621,8 +685,12 @@ impl GroupRejoin {
             .is_some_and(|store| store.log_state().is_initialized())
     }
 
-    pub(crate) fn confirm_barrier(&self, leader: UrsulaVote, commit_index: u64) {
+    pub(crate) fn confirm_barrier(&self, leader: UrsulaVote, commit_index: u64) -> bool {
+        if !self.replication_allowed(leader) {
+            return false;
+        }
         self.gate().confirm_barrier(leader, commit_index);
+        true
     }
 
     /// Campaigning is subject to both this gate and the node's shed policy.
@@ -770,7 +838,20 @@ impl GroupRejoin {
         let metrics = self.metrics()?;
         let candidate = *request.vote.leader_id().node_id();
         let candidate_index = log_index(request.last_log_id.as_ref());
-        let screen = self.gate().screen(candidate_index);
+        let floor = *self
+            .vote_floor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let current_vote = floor
+            .filter(|floor| *floor > metrics.vote)
+            .unwrap_or(metrics.vote);
+        let screen = if request.vote < current_vote
+            || (!self.vote_gate_open() && floor.is_none() && request.vote.leader_id().term() > 0)
+        {
+            VoteScreen::Refuse
+        } else {
+            self.gate().screen(candidate_index)
+        };
         match screen {
             VoteScreen::Pass => None,
             VoteScreen::Refuse => {
@@ -783,7 +864,7 @@ impl GroupRejoin {
                     "recovery gate: refusing a vote until this replica has caught up"
                 );
                 Some(UrsulaVoteResponse::new(
-                    metrics.vote,
+                    current_vote,
                     self.last_log_id().or(metrics.last_applied),
                     false,
                 ))
@@ -870,6 +951,25 @@ impl GroupRejoin {
         true
     }
 
+    /// A current-epoch snapshot acknowledgement can complete a rewind without
+    /// an Append response or an observable decrease in replication metrics.
+    pub(crate) fn snapshot_repaired(
+        &self,
+        target: u64,
+        leader: &UrsulaVote,
+        last: Option<&LogIdOf<UrsulaRaftTypeConfig>>,
+    ) {
+        let mut reverted = self.reverted.lock().unwrap_or_else(PoisonError::into_inner);
+        if reverted.leader.as_ref() == Some(leader)
+            && reverted
+                .allowed_reverts
+                .get(&target)
+                .is_some_and(|previous| log_index(last).is_some_and(|index| index >= *previous))
+        {
+            reverted.allowed_reverts.remove(&target);
+        }
+    }
+
     /// The followers that lost their log under `leader`.
     pub fn reverted_followers(&self, leader: &UrsulaVote) -> BTreeSet<u64> {
         let reverted = self.reverted.lock().unwrap_or_else(PoisonError::into_inner);
@@ -895,14 +995,6 @@ impl GroupRejoin {
             .is_some_and(|metrics| self.reverted_followers(&metrics.vote).contains(&target))
     }
 
-    fn clear_reverted(&self, target: u64) {
-        self.reverted
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .targets
-            .remove(&target);
-    }
-
     /// Leader side: let OpenRaft rewind its progress for `targets`, so it
     /// replicates them from where their logs really end. OpenRaft's one-shot
     /// permission goes in first; only then do their conflicts reach it.
@@ -910,14 +1002,24 @@ impl GroupRejoin {
         &self,
         raft: &RaftGroupHandle,
         targets: &BTreeSet<u64>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ursula_runtime::GroupEngineError> {
         let metrics = raft.metrics().borrow_watched().clone();
         for target in targets {
             raft.trigger()
                 .allow_next_revert(target, true)
                 .await
-                .map_err(|err| format!("allow next revert for node {target}: {err}"))?
-                .map_err(|err| format!("allow next revert for node {target}: {err}"))?;
+                .map_err(|err| {
+                    ursula_runtime::GroupEngineError::backend(
+                        ursula_runtime::BackendOperation::AllowLogReversion,
+                        err,
+                    )
+                })?
+                .map_err(|err| {
+                    ursula_runtime::GroupEngineError::backend(
+                        ursula_runtime::BackendOperation::AllowLogReversion,
+                        err,
+                    )
+                })?;
         }
         let mut reverted = self.reverted.lock().unwrap_or_else(PoisonError::into_inner);
         if reverted.leader.as_ref() != Some(&metrics.vote) {
@@ -1214,134 +1316,26 @@ mod tests {
         );
     }
 
-    fn view(voters: &[u64], learners: &[u64], reverted: &[u64]) -> HealView {
-        HealView {
+    #[test]
+    fn repair_only_rewinds_logs_and_never_changes_membership() {
+        let mut view = HealView {
             is_leader: true,
-            uniform: true,
-            stale_joint: false,
-            voters: voters.iter().copied().collect(),
-            learners: learners.iter().copied().collect(),
-            reverted: reverted.iter().copied().collect(),
+            reverted: BTreeSet::from([2, 3]),
             awaiting_rewind: BTreeSet::new(),
-            matched: BTreeMap::new(),
-            committed: Some(10),
-            configured: BTreeSet::from([1, 2, 3]),
-        }
-    }
-
-    #[test]
-    fn the_heal_driver_walks_remove_learner_catch_up_promote() {
-        assert_eq!(
-            plan_heal_step(&view(&[1, 2, 3], &[], &[3])),
-            Some(HealStep::RemoveVoter {
-                target: 3,
-                voters: BTreeSet::from([1, 2]),
-            })
-        );
-        assert_eq!(
-            plan_heal_step(&view(&[1, 2], &[], &[])),
-            Some(HealStep::AddLearner { target: 3 })
-        );
-        let mut catching_up = view(&[1, 2], &[3], &[]);
-        catching_up.matched.insert(3, Some(9));
-        assert_eq!(plan_heal_step(&catching_up), None);
-        catching_up.matched.insert(3, Some(10));
-        assert_eq!(
-            plan_heal_step(&catching_up),
-            Some(HealStep::Promote {
-                target: 3,
-                voters: BTreeSet::from([1, 2, 3]),
-            })
-        );
-        // A learner that restarted again mid-heal is dropped and re-added.
-        assert_eq!(
-            plan_heal_step(&view(&[1, 2], &[3], &[3])),
-            Some(HealStep::RemoveLearner { target: 3 })
-        );
-        assert_eq!(plan_heal_step(&view(&[1, 2, 3], &[], &[])), None);
-    }
-
-    #[test]
-    fn the_heal_driver_rewinds_a_majority_that_lost_entries_and_needs_leadership() {
-        // A majority lost entries: no removal could commit, so this leader
-        // replicates its log to them again.
-        assert_eq!(
-            plan_heal_step(&view(&[1, 2, 3], &[], &[2, 3])),
-            Some(HealStep::RewindVoters {
-                targets: BTreeSet::from([2, 3]),
-            })
-        );
-        // Until OpenRaft rewinds them, an idle group is given an entry to
-        // replicate.
-        let mut rewinding = view(&[1, 2, 3], &[], &[]);
-        rewinding.awaiting_rewind = BTreeSet::from([2, 3]);
-        assert_eq!(plan_heal_step(&rewinding), Some(HealStep::ReplicateRewound));
-        let mut follower_view = view(&[1, 2, 3], &[], &[3]);
-        follower_view.is_leader = false;
-        assert_eq!(plan_heal_step(&follower_view), None);
-        // A voter outside the static config: not a restart repair, leave it
-        // to the operator.
-        assert_eq!(plan_heal_step(&view(&[1, 2, 4], &[], &[])), None);
-    }
-
-    #[test]
-    fn the_heal_driver_rebuilds_two_overlapping_restarts_in_a_group_of_five() {
-        let five = |voters: &[u64], learners: &[u64], reverted: &[u64]| HealView {
-            configured: BTreeSet::from([1, 2, 3, 4, 5]),
-            ..view(voters, learners, reverted)
         };
-        // 4 and 5 restarted: both are removed while three healthy voters
-        // remain a quorum.
-        assert!(matches!(
-            plan_heal_step(&five(&[1, 2, 3, 4, 5], &[], &[4, 5])),
-            Some(HealStep::RemoveVoter { .. })
-        ));
-        assert!(matches!(
-            plan_heal_step(&five(&[1, 2, 3, 4], &[], &[4])),
-            Some(HealStep::RemoveVoter { target: 4, .. })
-        ));
         assert_eq!(
-            plan_heal_step(&five(&[1, 2, 3], &[], &[])),
-            Some(HealStep::AddLearner { target: 4 })
-        );
-        // 4 caught up while 5 is not back yet: promote 4 alone.
-        let mut partly = five(&[1, 2, 3], &[4], &[]);
-        partly.matched.insert(4, Some(10));
-        assert_eq!(
-            plan_heal_step(&partly),
-            Some(HealStep::Promote {
-                target: 4,
-                voters: BTreeSet::from([1, 2, 3, 4]),
-            })
-        );
-        partly.matched.insert(4, Some(9));
-        assert_eq!(
-            plan_heal_step(&partly),
-            Some(HealStep::AddLearner { target: 5 })
-        );
-        let mut last = five(&[1, 2, 3, 4], &[5], &[]);
-        last.matched.insert(5, Some(10));
-        assert_eq!(
-            plan_heal_step(&last),
-            Some(HealStep::Promote {
-                target: 5,
-                voters: BTreeSet::from([1, 2, 3, 4, 5]),
-            })
-        );
-        // Three of five lost entries: rewind all three.
-        assert_eq!(
-            plan_heal_step(&five(&[1, 2, 3, 4, 5], &[], &[3, 4, 5])),
+            plan_heal_step(&view),
             Some(HealStep::RewindVoters {
-                targets: BTreeSet::from([3, 4, 5]),
+                targets: BTreeSet::from([2, 3])
             })
         );
+        view.reverted.clear();
+        view.awaiting_rewind.insert(2);
+        assert_eq!(plan_heal_step(&view), Some(HealStep::ReplicateRewound));
+        view.is_leader = false;
+        assert_eq!(plan_heal_step(&view), None);
     }
 
-    /// A gate follows the group's durable log state: closed with an
-    /// unknown history while the replica holds nothing, open once the group
-    /// is initialized, closed again when a run starts without knowing how
-    /// the previous one ended. A recovering replica that led the group starts
-    /// as a follower, and an operator's acceptance is durable.
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn a_durable_gate_follows_the_group_log_state_across_restarts() {
@@ -1360,10 +1354,10 @@ mod tests {
         use super::AcceptUnsyncedLossReport;
         use super::GroupRejoin;
         use super::RecoveryGateError;
-        use crate::RaftWal;
         use crate::log_store::GroupLogState;
         use crate::log_store::RUN_STATE_FILE;
         use crate::log_store::RaftGroupFileLogStore;
+        use crate::log_store::RaftWal;
 
         let dir = tempfile::tempdir().expect("temp dir");
         let placement = ShardPlacement {
@@ -1398,6 +1392,49 @@ mod tests {
         assert_eq!(gate.status(), RecoveryGateStatus::AwaitingBarrier);
         assert!(!gate.may_campaign());
         assert!(!gate.holds_group_history());
+        assert!(
+            !gate.replication_allowed(leader(1, 1)),
+            "unknown history cannot acknowledge even a high vote"
+        );
+        gate.establish_vote_floor(leader(1, 1))
+            .await
+            .expect("persist floor");
+        assert!(
+            !gate.replication_allowed(leader(0, 1)),
+            "older leaders are fenced"
+        );
+        assert!(gate.replication_allowed(leader(1, 1)));
+        assert_eq!(store.read_vote().await.expect("floor"), Some(vote(1, 1)));
+        store
+            .save_vote(&vote(0, 1))
+            .await
+            .expect("stale core vote cannot lower the floor");
+        assert_eq!(
+            store.read_vote().await.expect("monotonic floor"),
+            Some(vote(1, 1))
+        );
+        {
+            let mut rewinds = gate.reverted.lock().unwrap();
+            rewinds.leader = Some(leader(1, 1));
+            rewinds.allowed_reverts.insert(2, 1);
+        }
+        gate.snapshot_repaired(2, &leader(1, 1), Some(&log_id(1, 1, 1)));
+        assert!(
+            gate.allowed_rewinds(&leader(1, 1)).is_empty(),
+            "snapshot-only repair consumes the old rewind allowance"
+        );
+        gate.reverted.lock().unwrap().allowed_reverts.insert(2, 1);
+        let pending_epoch = gate.response_epoch(2);
+        gate.begin_peer_recovery(2);
+        assert!(
+            gate.allowed_rewinds(&leader(1, 1)).contains_key(&2),
+            "a repeated proof attempt must preserve the pending rewind"
+        );
+        assert_ne!(
+            pending_epoch,
+            gate.response_epoch(2),
+            "pre-recovery responses are invalidated"
+        );
         // Every voter reported an empty group: the gate opens and the first
         // entry records the group initialized.
         gate.allow_fresh_bootstrap().await.expect("fresh bootstrap");
@@ -1552,35 +1589,6 @@ mod tests {
         drop((gate, store));
         wal.shutdown().await.expect("clean shutdown");
     }
-
-    #[test]
-    fn the_heal_driver_restores_lost_voters_before_finishing_a_joint_config() {
-        let mut joint = view(&[1, 2, 3], &[], &[2, 3]);
-        joint.uniform = false;
-        for stale in [false, true] {
-            joint.stale_joint = stale;
-            assert_eq!(
-                plan_heal_step(&joint),
-                Some(HealStep::RewindVoters {
-                    targets: BTreeSet::from([2, 3]),
-                })
-            );
-        }
-        joint.reverted.clear();
-        assert_eq!(plan_heal_step(&joint), Some(HealStep::FinishJoint));
-    }
-
-    #[test]
-    fn the_heal_driver_flattens_only_a_joint_config_nothing_else_finishes() {
-        let mut joint = view(&[1, 2, 3], &[], &[]);
-        joint.uniform = false;
-        // Just entered: OpenRaft's own second step is still on its way.
-        assert_eq!(plan_heal_step(&joint), None);
-        joint.stale_joint = true;
-        assert_eq!(plan_heal_step(&joint), Some(HealStep::FinishJoint));
-        joint.is_leader = false;
-        assert_eq!(plan_heal_step(&joint), None);
-    }
 }
 
 mod attach;
@@ -1589,6 +1597,7 @@ mod bootstrap;
 mod heal;
 pub use attach::RecoveryConfig;
 pub use attach::RecoveryGate;
+pub use attach::RecoveryMembershipAuthority;
 pub use attach::RecoveryTransport;
 pub use barrier::run_rejoin_vote_barrier;
 #[cfg(test)]

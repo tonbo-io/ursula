@@ -240,6 +240,42 @@ curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST ht
 
 Purge only after the snapshot replicates. Otherwise a slow follower may need log entries you just dropped.
 
+## A Raft group stopped while applying a committed record
+
+An application panic or internal application error stops only that local Raft
+group. Other groups continue running. The failed group reports
+`apply_failure` in `/__ursula/metrics`, including its term, log index, failure
+kind, and message; its maintenance `running` flag is false and readiness fails.
+Ordinary stream errors (for example, a missing stream) remain protocol responses.
+
+The failed entry is still committed in the WAL. It is not acknowledged as
+successfully applied, skipped, or included in a new snapshot. A deterministic
+bug can stop the same group on every replica when each reaches that record.
+Restarting the same buggy binary will encounter it again.
+
+To recover without losing committed data:
+
+1. Save metrics, error logs, the exact binary revision, and a consistent backup
+   of the stopped node's WAL volume. Keep the original volume and configuration.
+2. Fix the deterministic application bug and validate replay using a copy of
+   that WAL. Confirm that the failed record applies and that earlier data remains
+   readable. If the cause is an unavailable dependency rather than code, restore
+   that dependency before replay.
+3. Deploy the corrected binary and restart the stopped replica with its **original
+   WAL directory and snapshot metadata**. Follow the normal maintenance procedure;
+   a group whose quorum is stopped needs enough corrected replicas to restore its
+   quorum. Do not clear recovery gates to bypass missing-log detection.
+4. Check that `apply_failure` is absent, `last_applied.index` has passed the failed
+   index, the group has a leader, and readiness succeeds. Verify reads of data
+   written before the failure and submit a fresh write.
+
+Do not truncate the WAL, delete the failed record, force a purge, or restore an
+older backup over the existing volume. Ursula does not offer a local skip switch:
+skipping a committed command independently on replicas would diverge their state.
+The native regression `poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_wal`
+exercises the supported restart/replay procedure with a disk WAL, a deterministic
+apply failure, and an unaffected group sharing the same core journal.
+
 ## Cold flush issues
 
 ### Writes succeed but data never reaches S3

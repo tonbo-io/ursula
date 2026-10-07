@@ -13,6 +13,10 @@ use crate::model::NodeState;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlCommand {
+    Operation {
+        command: crate::OperationCommand,
+        now_ms: u64,
+    },
     RegisterNode {
         node_id: NodeId,
         client_url: String,
@@ -75,7 +79,8 @@ pub enum ControlCommand {
 impl ControlCommand {
     pub fn now_ms(&self) -> u64 {
         match self {
-            Self::RegisterNode { now_ms, .. }
+            Self::Operation { now_ms, .. }
+            | Self::RegisterNode { now_ms, .. }
             | Self::SetNodeState { now_ms, .. }
             | Self::SeedPlacement { now_ms, .. }
             | Self::BeginMigration { now_ms, .. }
@@ -92,6 +97,7 @@ impl ControlCommand {
 impl fmt::Display for ControlCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::Operation { .. } => "operation",
             Self::RegisterNode { .. } => "register_node",
             Self::SetNodeState { .. } => "set_node_state",
             Self::SeedPlacement { .. } => "seed_placement",
@@ -108,6 +114,7 @@ impl fmt::Display for ControlCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlResponse {
+    Operation(Result<crate::OperationOutcome, crate::OperationError>),
     Ok,
     MigrationStarted { migration_id: u64 },
     Rejected { reason: String },
@@ -115,13 +122,14 @@ pub enum ControlResponse {
 
 impl ControlResponse {
     pub fn is_rejected(&self) -> bool {
-        matches!(self, Self::Rejected { .. })
+        matches!(self, Self::Rejected { .. } | Self::Operation(Err(_)))
     }
 }
 
 impl fmt::Display for ControlResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::Operation(_) => "operation",
             Self::Ok => "ok",
             Self::MigrationStarted { .. } => "migration_started",
             Self::Rejected { .. } => "rejected",

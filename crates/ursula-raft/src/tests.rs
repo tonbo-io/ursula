@@ -171,6 +171,7 @@ fn core_journal_frames(root: &Path) -> usize {
         .sum()
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_file_log_store_passes_openraft_conformance_suite() {
     Suite::test_all(FileLogStoreBuilder)
@@ -565,6 +566,7 @@ fn wire_frame_count<T: serde::Serialize + serde::de::DeserializeOwned>(path: &Pa
         .len()
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_log_store_appends_reads_truncates_and_purges() {
     let (_root, mut store) = fresh_journal_store();
@@ -626,6 +628,7 @@ async fn raft_log_store_appends_reads_truncates_and_purges() {
     assert_eq!(entries[0].log_id, log_id(3));
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_log_store_persists_vote_and_committed_pointer() {
     let (_root, mut store) = fresh_journal_store();
@@ -645,6 +648,7 @@ async fn raft_log_store_persists_vote_and_committed_pointer() {
     );
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_log_store_rejects_holes() {
     let (_root, mut store) = fresh_journal_store();
@@ -793,6 +797,7 @@ async fn meta_raft_log_store_rejects_holes() {
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_file_log_store_recovers_vote_committed_and_entries() {
     let root = tempfile::tempdir().expect("journal root");
@@ -841,6 +846,7 @@ async fn raft_file_log_store_recovers_vote_committed_and_entries() {
     assert_eq!(entries[1].log_id, log_id(2));
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_file_log_store_skips_duplicate_vote_and_committed_records() {
     let root = tempfile::tempdir().expect("journal root");
@@ -873,6 +879,7 @@ async fn raft_file_log_store_skips_duplicate_vote_and_committed_records() {
     );
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_file_log_store_recovers_truncate_and_purge() {
     let root = tempfile::tempdir().expect("journal root");
@@ -922,6 +929,7 @@ async fn raft_file_log_store_recovers_truncate_and_purge() {
     assert_eq!(entries[0].log_id, log_id(3));
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_file_log_restart_rebuilds_only_through_the_committed_marker() {
     let root = tempfile::tempdir().expect("journal root");
@@ -983,6 +991,7 @@ async fn raft_file_log_restart_rebuilds_only_through_the_committed_marker() {
     assert_eq!(read.payload, b"committed");
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn single_node_meta_raft_applies_node_registration() {
     let config = raft_config("ursula-meta-single-node-test", 30, 60);
@@ -1046,6 +1055,7 @@ async fn single_node_meta_raft_applies_node_registration() {
         .expect("shutdown single-node meta raft handle");
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn meta_raft_handle_registers_initial_data_nodes() {
     let config = raft_config("ursula-meta-initial-data-nodes-test", 30, 60);
@@ -1094,6 +1104,7 @@ async fn meta_raft_handle_registers_initial_data_nodes() {
         .expect("shutdown single-node meta raft handle");
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn meta_raft_handle_rejects_invalid_initial_data_nodes() {
     let config = raft_config("ursula-meta-invalid-initial-data-nodes-test", 30, 60);
@@ -1128,6 +1139,7 @@ async fn meta_raft_handle_rejects_invalid_initial_data_nodes() {
         .expect("shutdown single-node meta raft handle");
 }
 
+#[cfg(not(madsim))]
 #[test]
 fn dynamic_group_hosting_allows_non_voter_warmup() {
     let wal_root = tempfile::tempdir().expect("WAL root");
@@ -1159,6 +1171,35 @@ fn dynamic_group_hosting_allows_non_voter_warmup() {
     assert!(factory.hosts_group(placement));
 }
 
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn bootstrap_probe_preserves_fresh_initializer_io_progress() {
+    let (_wal_root, log_store) = fresh_journal_store();
+    let raft = Raft::<UrsulaRaftTypeConfig, RaftGroupStateMachine>::new(
+        1,
+        raft_config("bootstrap-probe-progress", 30, 60),
+        SingleNodeRaftNetworkFactory,
+        log_store,
+        RaftGroupStateMachine::new(placement()),
+    )
+    .await
+    .expect("fresh Raft");
+    // A peer with a larger node ID must not raise this node's term-zero vote:
+    // Initialize writes its membership entry under this node's own term-zero ID.
+    let probe = bootstrap_probe_vote();
+    assert_eq!(*probe.vote.leader_id().node_id(), 0);
+    raft.vote(probe).await.expect("bootstrap probe");
+    raft.initialize(BTreeMap::from([(1, BasicNode::new("local"))]))
+        .await
+        .expect("initialize after peer probe");
+    raft.wait(Some(Duration::from_secs(2)))
+        .current_leader(1, "initialize remains live")
+        .await
+        .expect("leadership");
+    raft.shutdown().await.expect("shutdown");
+}
+
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn single_node_openraft_group_applies_client_writes() {
     let config = raft_config("ursula-single-node-test", 30, 60);
@@ -1211,6 +1252,7 @@ async fn single_node_openraft_group_applies_client_writes() {
     raft.shutdown().await.expect("shutdown raft group");
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn three_node_openraft_group_replicates_group_writes() {
     let (_registry, engines, leader_id, _wal_roots) =
@@ -1270,6 +1312,7 @@ async fn three_node_openraft_group_replicates_group_writes() {
 /// read or live-read registration from its own state: a new leader has
 /// acknowledged a write it never saw. Each answers a forward or a
 /// leader-unknown error (HTTP 307 or 503), never the stale view.
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn deposed_leader_refuses_linearizable_reads() {
     let policy = InProcessRaftNetworkPolicy::default();
@@ -1994,6 +2037,7 @@ async fn build_madsim_three_node_raft_cluster_with_policy(
     (registry, engines, leader_id)
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn openraft_installs_snapshot_for_lagging_learner() {
     let registry = InProcessRaftRegistry::default();
@@ -2169,6 +2213,7 @@ async fn openraft_installs_snapshot_for_lagging_learner() {
     shutdown_all(&engines).await;
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_group_engine_implements_runtime_group_engine_over_openraft() {
     let (_wal_root, log_store) = fresh_journal_store();
@@ -2224,6 +2269,7 @@ async fn raft_group_engine_implements_runtime_group_engine_over_openraft() {
     engine.shutdown().await.expect("shutdown raft group engine");
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_group_engine_preserves_stream_error_next_offset() {
     let (_wal_root, log_store) = fresh_journal_store();
@@ -2275,6 +2321,7 @@ async fn raft_group_engine_preserves_stream_error_next_offset() {
     engine.shutdown().await.expect("shutdown raft group engine");
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_group_engine_recovers_client_writes_from_file_log() {
     let root = tempfile::tempdir().expect("journal root");
@@ -2330,6 +2377,7 @@ async fn raft_group_engine_recovers_client_writes_from_file_log() {
         .expect("shutdown recovered engine");
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn shard_runtime_uses_raft_group_engine_factory_for_owned_group() {
     let wal_root = tempfile::tempdir().expect("WAL root");
@@ -2359,6 +2407,7 @@ async fn shard_runtime_uses_raft_group_engine_factory_for_owned_group() {
     assert_eq!(read.payload, b"payload");
 }
 
+#[cfg(not(madsim))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn warm_group_registers_runtime_owned_raft_handle() {
     let wal_root = tempfile::tempdir().expect("WAL root");
@@ -2390,6 +2439,7 @@ async fn warm_group_registers_runtime_owned_raft_handle() {
         .expect("wait for registered leader");
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn durable_raft_group_engine_records_file_log_metrics() {
     let root = temp_log_path("raft-file-log-metrics-root").with_extension("");
@@ -2442,6 +2492,7 @@ async fn durable_raft_group_engine_records_file_log_metrics() {
     remove_test_path(&root);
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn durable_raft_group_engine_recovers_from_core_journal() {
     let root = temp_log_path("raft-core-journal-recover-root").with_extension("");
@@ -2655,9 +2706,9 @@ async fn registry_handoff_rejects_reverted_follower_and_transfers_to_healthy_vot
             .await
             .expect("open the gate"),
     );
+    gate.allow_fresh_bootstrap().await.unwrap();
     gate.bind(&raft);
-    registry.register_rejoin(placement().raft_group_id, gate.clone());
-    registry.register(placement(), raft.clone());
+    registry.register_engine(engine, Some(gate.clone()));
     let metrics = raft.metrics().borrow_watched().clone();
     let matched = metrics.replication.as_ref().unwrap()[&target];
     assert!(gate.follower_lost_log(
@@ -2886,4 +2937,54 @@ async fn replicated_append_batch_reserves_hot_capacity_across_unapplied_entries(
         ))
     ));
     engine.shutdown().await.unwrap();
+}
+
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn group_shutdown_drains_canceled_snapshot_metadata_publication() {
+    let (_root, store) = fresh_journal_store();
+    let engine = Arc::new(
+        RaftGroupEngine::new_single_node(
+            placement(),
+            1,
+            BasicNode::new("local"),
+            raft_config("snapshot-shutdown", 30, 60),
+            store,
+            Default::default(),
+        )
+        .await
+        .unwrap(),
+    );
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, blocked) = std::sync::mpsc::channel();
+    let metadata = tokio::spawn(crate::state_machine::snapshot_metadata_work(
+        engine.metadata_serial.clone(),
+        move || {
+            entered.send(()).unwrap();
+            blocked.recv().unwrap();
+            Ok(())
+        },
+    ));
+    started.await.unwrap();
+    metadata.abort();
+    assert!(metadata.await.unwrap_err().is_cancelled());
+    let shutdown = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.shutdown().await }
+    });
+    engine
+        .raft
+        .wait(Some(Duration::from_secs(2)))
+        .metrics(
+            |metrics| matches!(metrics.state, openraft::ServerState::Shutdown),
+            "Raft stopped before metadata is drained",
+        )
+        .await
+        .unwrap();
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown must retain WAL ownership until metadata completes"
+    );
+    release.send(()).unwrap();
+    shutdown.await.unwrap().unwrap();
 }

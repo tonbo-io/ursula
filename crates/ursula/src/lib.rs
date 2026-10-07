@@ -3,16 +3,15 @@
 //!
 //! Module map:
 //!
-//! - [`admin_fence`]: process-local executor ordering for administrative mutations.
 //! - [`json_text`]: JSON Message Text (P1): validation, flattening and lexical
 //!   minification of `application/json` write bodies.
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
 //! - [`bootstrap`]: typed-config `spawn_*_runtime` constructors and cold-flush worker.
 //! - [`server`]: command arguments and the long-running server service entrypoint.
 
-mod admin_fence;
 mod bootstrap;
 mod cold_snapshot;
+mod control_plane;
 pub mod json_text;
 mod otel_metrics;
 pub mod server;
@@ -39,7 +38,6 @@ use std::time::SystemTime;
 #[cfg(not(madsim))]
 use std::time::UNIX_EPOCH;
 
-use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
@@ -75,14 +73,11 @@ pub use bootstrap::Topology;
 pub use bootstrap::spawn_runtime;
 use chrono::DateTime;
 use futures_util::stream;
-use openraft::BasicNode;
 use openraft::rt::WatchReceiver;
 use tower_http::compression::CompressionLayer;
 use tower_http::compression::CompressionLevel;
 use tower_http::compression::predicate::Predicate;
 use tower_http::compression::predicate::SizeAbove;
-use ursula_proto::admin::MAINTENANCE_FENCE_HEADER;
-use ursula_proto::admin::MaintenanceFence;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
 use ursula_proto::admin::ProcessIncarnation;
 use ursula_raft::LeadershipShedReason;
@@ -270,8 +265,10 @@ impl WallClock for SystemWallClock {
 
 #[derive(Clone)]
 pub struct HttpState {
+    meta_control: Option<ursula_raft::MetaRaftHandle>,
+    live_topology: Option<tokio::sync::watch::Receiver<ursula_control::ControlPlaneState>>,
+    control_action_gate: Arc<tokio::sync::Mutex<control_plane::LocalActionState>>,
     process_incarnation: ProcessIncarnation,
-    admin_fence: admin_fence::AdminMutationFence,
     configured_node_id: Option<u64>,
     runtime: ShardRuntime,
     raft_registry: Option<RaftGroupHandleRegistry>,
@@ -283,13 +280,29 @@ pub struct HttpState {
     wal_disk: WalDiskMonitor,
     /// The node's Raft WAL when it runs Raft: how it opened, and the
     /// clean shutdown at exit.
-    raft_wal: Option<ursula_raft::RaftWal>,
+    raft_wal: Option<ursula_raft::wal::RaftWal>,
     /// A Raft protocol (format-epoch) mismatch seen since start: readiness
     /// answers 503 `format_epoch_mismatch` until restart.
     format_epoch_mismatch: ursula_raft::FormatEpochMismatch,
 }
 
 impl HttpState {
+    pub fn with_meta_control(mut self, handle: ursula_raft::MetaRaftHandle) -> Self {
+        self.meta_control = Some(handle);
+        self
+    }
+
+    pub fn with_live_topology(
+        mut self,
+        topology: tokio::sync::watch::Receiver<ursula_control::ControlPlaneState>,
+    ) -> Self {
+        if let Some(router) = &mut self.client_write_router {
+            router.live_topology = Some(topology.clone());
+        }
+        self.live_topology = Some(topology);
+        self
+    }
+
     /// The static topology is the expected inventory. Observed metrics cannot
     /// establish which groups or voters are missing after a restart.
     fn raft_maintenance_report(&self) -> Option<ursula_raft::RaftMaintenanceReport> {
@@ -299,6 +312,18 @@ impl HttpState {
         let node_id = topology
             .node_id
             .or_else(|| snapshots.first().map(|group| group.node_id))?;
+        if let Some(live) = &self.live_topology {
+            let view = live.borrow();
+            let expected = view
+                .placements
+                .iter()
+                .filter(|(_, placement)| placement.voters.contains(&node_id))
+                .map(|(group, placement)| (group.0, placement.voters.clone()))
+                .collect();
+            return Some(ursula_raft::check_raft_maintenance(
+                &snapshots, node_id, expected, 16,
+            ));
+        }
         let all_voters = topology.peers.keys().copied().collect::<BTreeSet<_>>();
         let expected = (0..self.runtime.raft_group_count())
             .filter_map(|id| {
@@ -332,14 +357,6 @@ impl HttpState {
         self
     }
 
-    pub(crate) fn with_startup_maintenance_fence(
-        mut self,
-        fence: ursula_proto::admin::MaintenanceFenceState,
-    ) -> Self {
-        self.admin_fence = admin_fence::AdminMutationFence::from_startup(fence);
-        self
-    }
-
     pub(crate) fn with_configured_node_id(mut self, node_id: u64) -> Self {
         self.configured_node_id = Some(node_id);
         self
@@ -348,7 +365,11 @@ impl HttpState {
     pub fn new(runtime: ShardRuntime) -> Self {
         Self {
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
-            admin_fence: admin_fence::AdminMutationFence::default(),
+            meta_control: None,
+            live_topology: None,
+            control_action_gate: Arc::new(tokio::sync::Mutex::new(
+                control_plane::LocalActionState::Idle,
+            )),
             configured_node_id: None,
             runtime,
             raft_registry: None,
@@ -369,7 +390,11 @@ impl HttpState {
     ) -> Self {
         Self {
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
-            admin_fence: admin_fence::AdminMutationFence::default(),
+            meta_control: None,
+            live_topology: None,
+            control_action_gate: Arc::new(tokio::sync::Mutex::new(
+                control_plane::LocalActionState::Idle,
+            )),
             configured_node_id: None,
             runtime,
             raft_registry: Some(raft_registry),
@@ -414,7 +439,11 @@ impl HttpState {
                 per_group_voters,
             )),
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
-            admin_fence: admin_fence::AdminMutationFence::default(),
+            meta_control: None,
+            live_topology: None,
+            control_action_gate: Arc::new(tokio::sync::Mutex::new(
+                control_plane::LocalActionState::Idle,
+            )),
             configured_node_id: None,
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
@@ -449,12 +478,12 @@ impl HttpState {
 
     /// Record the node's Raft WAL, so the metrics JSON reports how it opened
     /// and the server shuts it down cleanly.
-    pub fn with_raft_wal(mut self, raft_wal: Option<ursula_raft::RaftWal>) -> Self {
+    pub fn with_raft_wal(mut self, raft_wal: Option<ursula_raft::wal::RaftWal>) -> Self {
         self.raft_wal = raft_wal;
         self
     }
 
-    pub(crate) fn raft_wal(&self) -> Option<&ursula_raft::RaftWal> {
+    pub(crate) fn raft_wal(&self) -> Option<&ursula_raft::wal::RaftWal> {
         self.raft_wal.as_ref()
     }
 
@@ -521,14 +550,7 @@ impl HttpMetrics {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
-struct HttpMetricsSnapshot {
-    sse_streams_opened: u64,
-    sse_read_iterations: u64,
-    sse_data_events: u64,
-    sse_control_events: u64,
-    sse_error_events: u64,
-}
+use ursula_proto::telemetry::HttpMetricsSnapshot;
 
 /// Resolves the current leader of a raft group to a client-reachable base URL
 /// so a write/read that lands on a non-leader can be answered with a 307
@@ -539,6 +561,7 @@ struct HttpMetricsSnapshot {
 /// them too.
 #[derive(Clone, Debug)]
 pub struct ClientWriteLeaderRouter {
+    live_topology: Option<tokio::sync::watch::Receiver<ursula_control::ControlPlaneState>>,
     peers: Arc<BTreeMap<u64, String>>,
     node_id: Option<u64>,
     per_group_voters: Arc<BTreeMap<RaftGroupId, BTreeSet<u64>>>,
@@ -555,6 +578,7 @@ impl ClientWriteLeaderRouter {
         per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
     ) -> Self {
         Self {
+            live_topology: None,
             peers: Arc::new(
                 peers
                     .into_iter()
@@ -575,6 +599,14 @@ impl ClientWriteLeaderRouter {
         if Some(leader_id) == self.node_id {
             return None;
         }
+        if let Some(live) = &self.live_topology {
+            let view = live.borrow();
+            let node = view.nodes.get(&leader_id)?;
+            if node.state != ursula_control::NodeState::Active {
+                return None;
+            }
+            return Some((leader_id, node.client_url.trim_end_matches('/').to_owned()));
+        }
         let leader_base = self
             .peers
             .get(&leader_id)
@@ -586,6 +618,12 @@ impl ClientWriteLeaderRouter {
         let RuntimeError::GroupNotHosted { raft_group_id, .. } = err else {
             return None;
         };
+        if let Some(live) = &self.live_topology {
+            return live
+                .borrow()
+                .placement_view(*raft_group_id)?
+                .active_voter_client_url(self.node_id);
+        }
         let voters = self.per_group_voters.get(raft_group_id)?;
         voters
             .iter()
@@ -911,12 +949,13 @@ pub fn admin_router(state: HttpState) -> Router {
 fn admin_ops_router(state: HttpState) -> Router {
     let router = Router::new()
         .route(
-            "/__ursula/maintenance/fence/activate",
-            post(activate_admin_fence),
+            control_plane::OPERATION_PATH,
+            post(control_plane::operation),
         )
+        .route(control_plane::STATE_PATH, get(control_plane::state))
         .route(
-            "/__ursula/maintenance/fence/retire",
-            post(retire_admin_fence),
+            ursula_proto::admin::MAINTENANCE_READINESS_PATH,
+            get(maintenance_readiness),
         )
         .route(
             "/__ursula/flush-cold/{bucket}/{stream}",
@@ -946,14 +985,6 @@ fn admin_ops_router(state: HttpState) -> Router {
         .route(
             "/__ursula/raft/{raft_group_id}/purge",
             post(trigger_raft_purge),
-        )
-        .route(
-            "/__ursula/raft/{raft_group_id}/membership",
-            post(change_raft_membership),
-        )
-        .route(
-            "/__ursula/raft/{raft_group_id}/learners/{node_id}",
-            post(add_raft_learner),
         )
         .route(
             "/__ursula/raft/{raft_group_id}/leader/transfer/{node_id}",
@@ -1023,79 +1054,21 @@ async fn require_admin_incarnation(
         if let Some(response) = reject_admin_incarnation(&state, request.headers()) {
             return response;
         }
-        // Lifecycle handlers take the write guard themselves. They remain
-        // process-bound and validate the supplied immutable executor token.
-        if *request.method() == Method::POST
-            && matches!(
-                request.uri().path(),
-                "/__ursula/maintenance/fence/activate" | "/__ursula/maintenance/fence/retire"
-            )
-        {
-            return next.run(request).await;
-        }
-        let fence_header = match request.headers().get(MAINTENANCE_FENCE_HEADER) {
-            Some(header) => match header.to_str() {
-                Ok(value) => Some(value),
-                Err(_) => return admin_fence::FenceRejection::Changed.response(),
-            },
-            None => None,
-        };
-        let guard = match state.admin_fence.admit_mutation(fence_header).await {
-            Ok(guard) => guard,
-            Err(rejection) => return rejection.response(),
-        };
-        // Dropping the caller's response future must not cancel an admitted
-        // actor/Core mutation and release its guard before its reply arrives.
-        return match tokio::spawn(async move {
-            let response = next.run(request).await;
-            guard.complete();
-            response
-        })
-        .await
-        {
+        // An admitted request owns its completion even if its HTTP caller leaves.
+        // Membership operations retain their meta action receipt independently.
+        return match tokio::spawn(async move { next.run(request).await }).await {
             Ok(response) => response,
             Err(error) => {
                 tracing::error!(%error, "admitted admin mutation task failed");
-                admin_fence::FenceRejection::Uncertain.response()
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "admin mutation task failed",
+                )
+                    .into_response()
             }
         };
     }
     next.run(request).await
-}
-
-async fn confirm_admin_command_submission(state: &HttpState) -> Result<(), String> {
-    if let Some(registry) = &state.raft_registry {
-        registry.confirm_admin_command_submission().await?;
-    }
-    Ok(())
-}
-
-async fn activate_admin_fence(
-    State(state): State<HttpState>,
-    Json(fence): Json<MaintenanceFence>,
-) -> Response {
-    match state
-        .admin_fence
-        .activate(fence, confirm_admin_command_submission(&state))
-        .await
-    {
-        Ok(snapshot) => Json(snapshot).into_response(),
-        Err(rejection) => rejection.response(),
-    }
-}
-
-async fn retire_admin_fence(
-    State(state): State<HttpState>,
-    Json(fence): Json<MaintenanceFence>,
-) -> Response {
-    match state
-        .admin_fence
-        .retire(fence, confirm_admin_command_submission(&state))
-        .await
-    {
-        Ok(snapshot) => Json(snapshot).into_response(),
-        Err(rejection) => rejection.response(),
-    }
 }
 
 /// Cluster-plane routes: inter-node gRPC carrying Raft RPCs, snapshot
@@ -1105,6 +1078,12 @@ async fn retire_admin_fence(
 pub fn cluster_router_from_state(state: HttpState) -> Router {
     let raft_registry = state.raft_registry.clone().unwrap_or_default();
     Router::new()
+        .route(control_plane::EVIDENCE_PATH, get(control_plane::evidence))
+        .route(control_plane::ACTION_PATH, post(control_plane::action))
+        .route(
+            control_plane::ACTION_DRAIN_PATH,
+            post(control_plane::drain_action),
+        )
         .route_service(
             RAFT_GRPC_APPEND_PATH,
             raft_grpc_service(state.clone(), raft_registry.clone()),
@@ -1323,7 +1302,7 @@ async fn readiness(State(state): State<HttpState>) -> Response {
     let raft_ready = state.raft_registry().is_none()
         || raft_maintenance
             .as_ref()
-            .is_some_and(ursula_raft::RaftMaintenanceReport::ready);
+            .is_some_and(ursula_raft::RaftMaintenanceReport::serving_ready);
     let ready = !disk.pressure && !format_epoch_mismatch && recovery_ready && raft_ready;
     // Groups whose gated replica here got no leader barrier and applied
     // nothing for a while: a majority of their voters may be gated, and they
@@ -1350,7 +1329,7 @@ async fn readiness(State(state): State<HttpState>) -> Response {
             } else if !recovery_ready {
                 Some("recovery_gate_closed")
             } else if !raft_ready {
-                Some("raft_maintenance_unready")
+                Some("raft_replica_unready")
             } else {
                 None
             },
@@ -1366,6 +1345,28 @@ async fn readiness(State(state): State<HttpState>) -> Response {
         })
         .to_string(),
     )
+}
+
+async fn maintenance_readiness(State(state): State<HttpState>) -> Response {
+    let raft_maintenance = state.raft_maintenance_report();
+    let ready = !state.wal_disk.snapshot().pressure
+        && !state.format_epoch_mismatch.recorded()
+        && (state.raft_registry().is_none()
+            || raft_maintenance
+                .as_ref()
+                .is_some_and(ursula_proto::admin::RaftMaintenanceReport::ready));
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        axum::Json(ursula_proto::admin::MaintenanceReadiness {
+            ready,
+            raft_maintenance,
+        }),
+    )
+        .into_response()
 }
 
 async fn leadership_shed_status(State(state): State<HttpState>) -> Response {
@@ -1749,115 +1750,44 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         .raft_registry()
         .map(RaftGroupHandleRegistry::metrics_snapshot)
         .unwrap_or_default();
-    let mut body = render_metrics(
+    let mut diagnostics = render_metrics(
         state.runtime.metrics().snapshot(),
         state.runtime.mailbox_snapshot(),
         state.http_metrics.snapshot(),
         &raft_groups,
         state.runtime.cold_store_info().as_ref(),
     );
-    // Splice process-level memory observability onto the metrics JSON so
-    // a chaos node's RSS trajectory is visible from any HTTP client (the
-    // status-publishing pipeline survives SSM exec failures).
-    let rss = state.node_memory.last_rss_bytes();
-    let cap = state.node_memory.abort_cap_bytes().unwrap_or_default();
-    let group_state_gauges = group_state_gauges_json(&state).await;
-    let maintenance_fence = state.admin_fence.snapshot().await;
-    if let Some(object) = body.as_object_mut() {
-        object.insert(
-            "process_incarnation".to_owned(),
-            serde_json::json!(state.process_incarnation),
-        );
-        object.insert(
-            "maintenance_fence".to_owned(),
-            serde_json::json!(maintenance_fence),
-        );
-        object.insert(
-            "maintenance_fence_uncertain".to_owned(),
-            serde_json::json!(state.admin_fence.is_uncertain()),
-        );
-        object.insert(
-            "process_node_id".to_owned(),
-            serde_json::json!(
+    diagnostics.configured_raft_group_count = state.runtime.raft_group_count();
+    diagnostics.group_state_gauges = group_state_gauges_json(&state).await;
+    diagnostics.process_rss_bytes = state.node_memory.last_rss_bytes();
+    diagnostics.node_memory_abort_cap_bytes =
+        state.node_memory.abort_cap_bytes().unwrap_or_default();
+    diagnostics.wal_recovery = state.raft_wal.as_ref().map(render::wal_recovery_metrics);
+    diagnostics.recovery_gates = state
+        .raft_registry()
+        .map(RaftGroupHandleRegistry::recovery_report);
+    let wal_disk = state.wal_disk.snapshot();
+    diagnostics.wal_available_bytes = wal_disk.available_bytes;
+    diagnostics.wal_min_available_bytes = wal_disk.min_available_bytes;
+    diagnostics.wal_resume_available_bytes = wal_disk.resume_available_bytes;
+    diagnostics.wal_disk_pressure = wal_disk.pressure;
+    diagnostics.wal_disk_stat_errors = wal_disk.stat_errors;
+    axum::Json(ursula_proto::admin::NodeMetrics {
+        process_incarnation: Some(state.process_incarnation.clone()),
+        process_node_id: state
+            .configured_node_id
+            .or_else(|| {
                 state
-                    .configured_node_id
-                    .or_else(|| state
-                        .client_write_router
-                        .as_ref()
-                        .and_then(|topology| topology.node_id))
-                    .or_else(|| raft_groups.first().map(|group| group.node_id))
-            ),
-        );
-        object.insert(
-            "configured_raft_group_count".to_owned(),
-            serde_json::json!(state.runtime.raft_group_count()),
-        );
-        object.insert(
-            "raft_maintenance".to_owned(),
-            serde_json::json!(state.raft_maintenance_report()),
-        );
-        object.insert("group_state_gauges".to_owned(), group_state_gauges);
-        object.insert("process_rss_bytes".to_owned(), serde_json::json!(rss));
-        object.insert(
-            "node_memory_abort_cap_bytes".to_owned(),
-            serde_json::json!(cap),
-        );
-        object.insert(
-            "wal_recovery".to_owned(),
-            serde_json::to_value(state.raft_wal.as_ref().map(WalRecoveryReport::new))
-                .unwrap_or(serde_json::Value::Null),
-        );
-        object.insert(
-            "recovery_gates".to_owned(),
-            serde_json::to_value(
-                state
-                    .raft_registry()
-                    .map(RaftGroupHandleRegistry::recovery_report),
-            )
-            .unwrap_or(serde_json::Value::Null),
-        );
-        let wal_disk = state.wal_disk.snapshot();
-        object.insert(
-            "wal_available_bytes".to_owned(),
-            serde_json::json!(wal_disk.available_bytes),
-        );
-        object.insert(
-            "wal_min_available_bytes".to_owned(),
-            serde_json::json!(wal_disk.min_available_bytes),
-        );
-        object.insert(
-            "wal_resume_available_bytes".to_owned(),
-            serde_json::json!(wal_disk.resume_available_bytes),
-        );
-        object.insert(
-            "wal_disk_pressure".to_owned(),
-            serde_json::json!(wal_disk.pressure),
-        );
-        object.insert(
-            "wal_disk_stat_errors".to_owned(),
-            serde_json::json!(wal_disk.stat_errors),
-        );
-    }
-    json_response(StatusCode::OK, body.to_string())
-}
-
-/// How the node's Raft WAL opened, in the metrics JSON as `wal_recovery`.
-/// `recovery.state` is `recovering` while the node's logs may be missing
-/// entries it acknowledged.
-#[derive(Debug, serde::Serialize)]
-struct WalRecoveryReport {
-    fsync: ursula_config::WalFsync,
-    #[serde(flatten)]
-    opening: ursula_raft::WalOpening,
-}
-
-impl WalRecoveryReport {
-    fn new(raft_wal: &ursula_raft::RaftWal) -> Self {
-        Self {
-            fsync: raft_wal.fsync(),
-            opening: raft_wal.opening(),
-        }
-    }
+                    .client_write_router
+                    .as_ref()
+                    .and_then(|topology| topology.node_id)
+            })
+            .or_else(|| raft_groups.first().map(|group| group.node_id)),
+        raft_groups: raft_groups.iter().map(render::raft_group_metrics).collect(),
+        raft_maintenance: state.raft_maintenance_report(),
+        diagnostics,
+    })
+    .into_response()
 }
 
 /// Upper bound on how long a metrics scrape waits for the per-group
@@ -1867,38 +1797,46 @@ const GROUP_STATE_GAUGES_TIMEOUT: Duration = Duration::from_secs(2);
 /// Per-group bounded-state gauges (`docs/architecture/bounded-stream-state.md`
 /// §7.5) for `/__ursula/metrics`: one object per Raft group with the group id,
 /// whether this node hosts it, and either the gauges or an error.
-async fn group_state_gauges_json(state: &HttpState) -> serde_json::Value {
+async fn group_state_gauges_json(
+    state: &HttpState,
+) -> ursula_proto::telemetry::GroupGaugeCollection {
+    use ursula_proto::telemetry::GroupGaugeCollection;
+    use ursula_proto::telemetry::GroupGaugeMetrics;
     let Ok(groups) = http_time::timeout(
         GROUP_STATE_GAUGES_TIMEOUT,
         state.runtime.state_gauges_all_groups(),
     )
     .await
     else {
-        return serde_json::json!({ "error": "timed out collecting group state gauges" });
+        return GroupGaugeCollection::Error {
+            error: "timed out collecting group state gauges".to_owned(),
+        };
     };
-    let groups = groups
-        .into_iter()
-        .map(|(group, result)| match result {
-            Ok(gauges) => {
-                let mut value = serde_json::to_value(gauges).unwrap_or(serde_json::Value::Null);
-                if let Some(object) = value.as_object_mut() {
-                    object.insert("raft_group_id".to_owned(), serde_json::json!(group.0));
-                    object.insert("hosted".to_owned(), serde_json::json!(true));
-                }
-                value
-            }
-            Err(RuntimeError::GroupNotHosted { .. }) => serde_json::json!({
-                "raft_group_id": group.0,
-                "hosted": false,
-            }),
-            Err(err) => serde_json::json!({
-                "raft_group_id": group.0,
-                "hosted": true,
-                "error": err.to_string(),
-            }),
-        })
-        .collect::<Vec<_>>();
-    serde_json::Value::Array(groups)
+    GroupGaugeCollection::Groups(
+        groups
+            .into_iter()
+            .map(|(group, result)| match result {
+                Ok(gauges) => GroupGaugeMetrics {
+                    raft_group_id: group.0,
+                    hosted: true,
+                    gauges: Some(gauges),
+                    error: None,
+                },
+                Err(RuntimeError::GroupNotHosted { .. }) => GroupGaugeMetrics {
+                    raft_group_id: group.0,
+                    hosted: false,
+                    gauges: None,
+                    error: None,
+                },
+                Err(error) => GroupGaugeMetrics {
+                    raft_group_id: group.0,
+                    hosted: true,
+                    gauges: None,
+                    error: Some(error.to_string()),
+                },
+            })
+            .collect(),
+    )
 }
 
 #[cfg(feature = "jemalloc-prof")]
@@ -2405,109 +2343,6 @@ pub(crate) async fn trigger_raft_purge(
         .into_response()
 }
 
-pub(crate) async fn add_raft_learner(
-    State(state): State<HttpState>,
-    Path((raft_group_id, node_id)): Path<(u64, u64)>,
-    axum::extract::Query(query): axum::extract::Query<ursula_proto::admin::AddLearnerQuery>,
-) -> Response {
-    if query.addr.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "addr query parameter is required").into_response();
-    }
-    let address = query.addr;
-    let blocking = query.blocking.unwrap_or(true);
-    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
-        Ok(resolved) => resolved,
-        Err(response) => return *response,
-    };
-    match raft
-        .add_learner(node_id, BasicNode::new(address.clone()), blocking)
-        .await
-    {
-        Ok(response) => (
-            StatusCode::OK,
-            axum::Json(ursula_proto::admin::AddLearnerResponse {
-                raft_group_id: raft_group_id.0,
-                node_id,
-                log_index: response.log_id.index(),
-            }),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("add raft learner: {err}"),
-        )
-            .into_response(),
-    }
-}
-
-pub(crate) async fn change_raft_membership(
-    State(state): State<HttpState>,
-    Path(raft_group_id): Path<u64>,
-    axum::extract::Query(query): axum::extract::Query<ursula_proto::admin::MembershipQuery>,
-) -> Response {
-    let voters = match parse_voter_ids(&query.voters) {
-        Ok(voters) => voters,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
-    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
-        Ok(resolved) => resolved,
-        Err(response) => return *response,
-    };
-    let metrics = raft.metrics().borrow_watched().clone();
-    if metrics.current_leader != Some(metrics.id) {
-        return (
-            StatusCode::CONFLICT,
-            axum::Json(ursula_proto::admin::MembershipResponse {
-                raft_group_id: raft_group_id.0,
-                current_leader: metrics.current_leader,
-                changed: false,
-                reason: Some("not leader".to_owned()),
-                voter_ids: BTreeSet::new(),
-                log_index: None,
-            }),
-        )
-            .into_response();
-    }
-
-    match raft.change_membership(voters.clone(), false).await {
-        Ok(response) => (
-            StatusCode::OK,
-            axum::Json(ursula_proto::admin::MembershipResponse {
-                raft_group_id: raft_group_id.0,
-                voter_ids: voters,
-                log_index: Some(response.log_id.index()),
-                changed: true,
-                current_leader: None,
-                reason: None,
-            }),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("change raft membership: {err}"),
-        )
-            .into_response(),
-    }
-}
-
-pub(crate) fn parse_voter_ids(raw: &str) -> Result<BTreeSet<u64>, String> {
-    let mut voters = BTreeSet::new();
-    for part in raw.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            return Err("voters contains an empty node id".to_owned());
-        }
-        let node_id = part
-            .parse::<u64>()
-            .map_err(|err| format!("invalid voter id '{part}': {err}"))?;
-        voters.insert(node_id);
-    }
-    if voters.is_empty() {
-        return Err("voters must not be empty".to_owned());
-    }
-    Ok(voters)
-}
-
 pub(crate) async fn transfer_raft_leader(
     State(state): State<HttpState>,
     Path((raft_group_id, node_id)): Path<(u64, u64)>,
@@ -2700,7 +2535,8 @@ pub(crate) async fn accept_unsynced_loss(
         ) => (StatusCode::CONFLICT, err.to_string()).into_response(),
         Err(
             err @ (ursula_raft::RecoveryGateError::Record { .. }
-            | ursula_raft::RecoveryGateError::StartAsFollower { .. }),
+            | ursula_raft::RecoveryGateError::StartAsFollower { .. }
+            | ursula_raft::RecoveryGateError::VoteFloor(_)),
         ) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
         Err(err @ ursula_raft::RecoveryGateError::OwnerStopped { .. }) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()

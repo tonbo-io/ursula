@@ -609,6 +609,9 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
     /// Votes go to the core's metadata file, which is always `fsync`ed.
     async fn save_vote(&mut self, vote: &VoteOf<UrsulaRaftTypeConfig>) -> Result<(), io::Error> {
         let _order = self.write_order.lock().await;
+        if self.vote().is_some_and(|current| current >= *vote) {
+            return Ok(());
+        }
         self.record_vote(*vote).await?;
         Ok(())
     }

@@ -10,6 +10,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ursula_chaos_agent import (
+    APPEND_LATENCY_BOUNDS_MS,
+    append_latency_summary,
     CATCH_UP_RECOVERY_SLO_SECS,
     IMPAIRMENT_SCENARIOS,
     NODE_SERVICE_UNIT,
@@ -633,6 +635,8 @@ class ChaosAgentStateTest(unittest.TestCase):
         self.assertEqual(created, [])
 
         agent.active_append_count = 0
+        agent.append_latency_success = [0] * (len(APPEND_LATENCY_BOUNDS_MS) + 1)
+        agent.append_latency_failed = [0] * (len(APPEND_LATENCY_BOUNDS_MS) + 1)
         with patch(
             "ursula_chaos_agent.time.monotonic",
             return_value=100.0 + WORKLOAD_ROLLOVER_UNKNOWN_GRACE_SECS + 1,
@@ -653,6 +657,8 @@ class ChaosAgentStateTest(unittest.TestCase):
         agent.state_lock = threading.Lock()
         agent.rollover_in_progress = False
         agent.active_append_count = 0
+        agent.append_latency_success = [0] * (len(APPEND_LATENCY_BOUNDS_MS) + 1)
+        agent.append_latency_failed = [0] * (len(APPEND_LATENCY_BOUNDS_MS) + 1)
 
         def fail(_lane_id):
             raise RuntimeError("append failed")
@@ -663,6 +669,8 @@ class ChaosAgentStateTest(unittest.TestCase):
             agent.append_once(3)
 
         self.assertEqual(agent.active_append_count, 0)
+        self.assertEqual(sum(agent.append_latency_failed), 1)
+        self.assertEqual(sum(agent.append_latency_success), 0)
 
 
 if __name__ == "__main__":

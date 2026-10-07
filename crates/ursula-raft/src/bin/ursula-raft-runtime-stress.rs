@@ -24,7 +24,7 @@ use ursula_config::WalFsync;
 #[cfg(not(madsim))]
 use ursula_raft::DurableRaftGroupEngineFactory;
 #[cfg(not(madsim))]
-use ursula_raft::RaftWal;
+use ursula_raft::wal::RaftWal;
 #[cfg(not(madsim))]
 use ursula_runtime::AppendRequest;
 #[cfg(not(madsim))]

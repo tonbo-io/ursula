@@ -522,7 +522,7 @@ impl CoreFileLogWriter {
         create_dir_all_durable(&dir).map_err(|source| CoreJournalError::io(&dir, source))?;
         let lock = acquire_journal_lock(&dir)?;
         let metadata_path = core_metadata_path(&dir);
-        let mut metadata = CoreMetadata::load(&metadata_path)?;
+        let (mut metadata, metadata_missing) = CoreMetadata::load_with_presence(&metadata_path)?;
         let replay_mode = core_replay_mode(metadata.verified_epoch(), options.recovery_epoch);
         let cache_bytes = options.tuning.group_cache_bytes;
         let recovery_started_at = Instant::now();
@@ -592,14 +592,21 @@ impl CoreFileLogWriter {
         // initialized but whose journal holds nothing of it lost its log (a
         // replaced or wiped journal): it recovers.
         let mut metadata_changed = metadata.set_verified_epoch(options.recovery_epoch);
-        let repaired = match options.node_recovery {
-            RecoveryState::Normal => GroupLogState::Initialized,
-            RecoveryState::Recovering { .. } => GroupLogState::Recovering,
+        // A verified prefix may discard acknowledged frames even under Always
+        // (media corruption). Gate every group sharing this journal before
+        // exposing the repaired prefix to Raft.
+        let damaged = recovered.end != RecoveryEnd::Clean || metadata_missing;
+        let repaired = match (options.node_recovery, damaged) {
+            (RecoveryState::Normal, false) => GroupLogState::Initialized,
+            _ => GroupLogState::Recovering,
         };
         for (group_id, log) in &logs {
             if log.holds_log() {
                 metadata_changed |= metadata.initialize(*group_id, repaired);
             }
+        }
+        if damaged {
+            metadata_changed |= metadata.mark_recovering();
         }
         let lost = metadata
             .groups()
@@ -1554,6 +1561,7 @@ fn write_core_log_batch(
     let mut journal_records = 0_u64;
     let mut metadata_ops = 0_u64;
     let mut requires_sync = false;
+    let mut membership_sync = false;
     let mut metadata_changed = false;
     let mut batch = batch.into_iter();
     while let Some(request) = batch.next() {
@@ -1620,6 +1628,8 @@ fn write_core_log_batch(
                 }
                 journal_records = journal_records.saturating_add(1);
                 requires_sync |= raft_group_log_record_requires_sync(&record.record);
+                membership_sync |= matches!(&record.record, RaftGroupLogRecord::Append(entries)
+                    if entries.iter().any(|entry| matches!(entry.payload, openraft::EntryPayload::Membership(_))));
                 if raft_group_log_record_initializes(&record.record) {
                     metadata_changed |= journal.metadata.initialize(record.group_id, *first);
                 }
@@ -1641,7 +1651,8 @@ fn write_core_log_batch(
             )
         )
     });
-    let sync_journal = requires_sync && journal.context.tuning.fsync == WalFsync::Always;
+    let sync_journal =
+        membership_sync || (requires_sync && journal.context.tuning.fsync == WalFsync::Always);
     let written = flushed
         .and_then(|()| journal.active.flush())
         .and_then(|()| {

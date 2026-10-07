@@ -37,6 +37,7 @@ pub(crate) fn initialize_wal_disk_monitor(
 }
 
 pub(crate) fn spawn_wal_disk_gate(
+    runtime: &ursula_runtime::ShardRuntime,
     path: PathBuf,
     monitor: WalDiskMonitor,
     registry: Option<RaftGroupHandleRegistry>,
@@ -45,7 +46,8 @@ pub(crate) fn spawn_wal_disk_gate(
     if !monitor.enabled() {
         return;
     }
-    tokio::spawn(async move {
+    let owner = runtime.clone();
+    if let Err(error) = owner.spawn_on_owner(ursula_shard::CoreId(0), async move {
         if monitor.is_pressured() {
             enter_pressure(
                 registry.as_ref(),
@@ -56,10 +58,16 @@ pub(crate) fn spawn_wal_disk_gate(
         }
         loop {
             tokio::time::sleep(WAL_DISK_SAMPLE_INTERVAL).await;
-            let transition = match fs4::available_space(&path) {
-                Ok(available) => monitor.observe_available(available),
-                Err(err) => {
+            let probe_path = path.clone();
+            let sampled = tokio::task::spawn_blocking(move || fs4::available_space(probe_path)).await;
+            let transition = match sampled {
+                Ok(Ok(available)) => monitor.observe_available(available),
+                Ok(Err(err)) => {
                     tracing::error!(path = %path.display(), %err, "cannot inspect Raft WAL free space");
+                    monitor.observe_error()
+                }
+                Err(error) => {
+                    tracing::error!(%error, "Raft WAL disk probe task stopped");
                     monitor.observe_error()
                 }
             };
@@ -82,7 +90,9 @@ pub(crate) fn spawn_wal_disk_gate(
                 WalDiskTransition::NoChange => {}
             }
         }
-    });
+    }) {
+        tracing::error!(%error, "failed to schedule background driver on owner");
+    }
 }
 
 async fn enter_pressure(

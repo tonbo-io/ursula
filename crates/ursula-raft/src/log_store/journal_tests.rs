@@ -687,6 +687,11 @@ async fn corruption_in_an_older_segment_fails_strict_and_ends_the_verified_prefi
         (1..=first_entry_of_segment_2).collect::<Vec<_>>(),
         "every entry before the bad frame, none after"
     );
+    assert_eq!(
+        store.log_state(),
+        GroupLogState::Recovering,
+        "media corruption under Always must close the recovery gate"
+    );
     assert_eq!(core.segments(), [1, 2], "the later segments are gone");
     assert_eq!(file_len(&core.segment(2)), frame_2);
     // Appends continue on the truncated segment and survive a restart.
@@ -1026,12 +1031,12 @@ async fn a_crashed_leaders_demotion_survives_an_immediate_clean_restart() {
 }
 
 /// A crash between a group's first journal write and the metadata write
-/// leaves entries without the flag; recovery restores it, as recovering
-/// when the node is recovering.
+/// leaves entries without the flag. Missing metadata also means missing votes,
+/// so recovery restores the flag as recovering regardless of the run state.
 #[test]
 fn recovery_restores_a_missing_initialized_flag() {
     for (node_recovery, expected) in [
-        (RecoveryState::Normal, GroupLogState::Initialized),
+        (RecoveryState::Normal, GroupLogState::Recovering),
         (
             RecoveryState::Recovering {
                 reason: RecoveryReason::HostCrash,
@@ -1223,6 +1228,28 @@ async fn segment_reclaim_converges_at_production_size() {
     drop(writer);
     let writer = core.writer();
     assert_eq!(log_ids(&core.store(&writer, 1)).await, [1, 2, 3, 4]);
+}
+
+#[tokio::test]
+async fn missing_metadata_beside_a_nonempty_journal_closes_the_recovery_gate() {
+    let core = Core::small(WalFsync::Always);
+    let writer = core.writer();
+    let mut store = core.store(&writer, 1);
+    append(&mut store, [blank_entry(1)]).await;
+    store
+        .save_vote(&openraft::Vote::new_committed(5, 2))
+        .await
+        .expect("vote");
+    drop((store, writer));
+    fs::remove_file(core.dir.join("journal.meta")).expect("lose metadata");
+    let writer = core.writer();
+    let mut store = core.store(&writer, 1);
+    assert_eq!(store.log_state(), GroupLogState::Recovering);
+    assert_eq!(store.read_vote().await.expect("vote"), None);
+    let gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
+        .await
+        .expect("gate");
+    assert!(!gate.replication_allowed(openraft::Vote::new_committed(1, 1)));
 }
 
 /// Hold the real writer between records. Append must publish readable entries

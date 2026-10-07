@@ -105,7 +105,17 @@ pub async fn wait_ready(
     loop {
         let snapshot = client.try_fetch_cluster(nodes).await;
         if cluster_ready(&snapshot, nodes.len(), expected_groups, &mut last_summary) {
-            return Ok(snapshot);
+            let mut maintenance_ready = true;
+            for node in nodes {
+                if !client.maintenance_ready(node).await.unwrap_or(false) {
+                    last_summary = format!("node {} is not safe for maintenance", node.id);
+                    maintenance_ready = false;
+                    break;
+                }
+            }
+            if maintenance_ready {
+                return Ok(snapshot);
+            }
         }
         if started.elapsed() >= timeout {
             bail!("cluster not ready after {:?}: {last_summary}", timeout);
@@ -182,7 +192,6 @@ mod tests {
     fn node(id: u64) -> NodeInfo {
         NodeInfo {
             expected_process_incarnation: None,
-            expected_maintenance_fence: None,
             id,
             admin_url: Url::parse(&format!("http://10.0.0.{id}:4438")).unwrap(),
             host: format!("10.0.0.{id}"),
@@ -225,16 +234,12 @@ mod tests {
             per_node: vec![
                 NodeMetricsView {
                     process_incarnation: None,
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
                     node: node(1),
                     groups: vec![group(7, Some(1)), group(8, Some(2))],
                     raft_maintenance: None,
                 },
                 NodeMetricsView {
                     process_incarnation: None,
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
                     node: node(2),
                     groups: vec![group(7, Some(1)), group(8, Some(2))],
                     raft_maintenance: None,
@@ -250,8 +255,6 @@ mod tests {
         let snapshot = ClusterSnapshot {
             per_node: vec![NodeMetricsView {
                 process_incarnation: None,
-                maintenance_fence: None,
-                maintenance_fence_uncertain: false,
                 node: node(1),
                 groups: vec![group(7, None)],
                 raft_maintenance: None,
@@ -267,8 +270,6 @@ mod tests {
         let snapshot = ClusterSnapshot {
             per_node: vec![NodeMetricsView {
                 process_incarnation: None,
-                maintenance_fence: None,
-                maintenance_fence_uncertain: false,
                 node: node(1),
                 groups: vec![group(7, Some(1)), empty_group(8)],
                 raft_maintenance: None,

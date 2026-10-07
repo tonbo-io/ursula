@@ -173,8 +173,9 @@ async fn confirm(raft: &RaftGroupHandle) -> Outcome {
                 self_id(),
             ))
         }
-        Err(fatal) => Err(GroupEngineError::new(format!(
-            "OpenRaft {OPERATION} could not apply the read index: {fatal}"
-        ))),
+        Err(fatal) => Err(GroupEngineError::backend(
+            ursula_runtime::BackendOperation::ReadIndex,
+            fatal,
+        )),
     }
 }

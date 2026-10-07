@@ -20,14 +20,14 @@ use std::sync::Weak;
 use std::time::Duration;
 
 use ursula_config::WalFsync;
-use ursula_raft::JournalTuning;
-use ursula_raft::RaftGroupFileLogStore;
-use ursula_raft::RaftWal;
+use ursula_raft::wal::JournalTuning;
+use ursula_raft::wal::RaftGroupFileLogStore;
+use ursula_raft::wal::RaftWal;
+use ursula_raft::wal::SimDisk;
 #[cfg(test)]
-use ursula_raft::WalOpening;
-use ursula_raft::wal::diagnostics::SimDisk;
+use ursula_raft::wal::SimPowerLoss;
 #[cfg(test)]
-use ursula_raft::wal::diagnostics::SimPowerLoss;
+use ursula_raft::wal::WalOpening;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::RuntimeMetrics;

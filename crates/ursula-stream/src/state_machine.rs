@@ -362,6 +362,7 @@ impl StreamStateMachine {
 
     pub fn apply(&mut self, command: StreamCommand) -> StreamResponse {
         match command {
+            StreamCommand::ReplicationBarrier => StreamResponse::ReplicationBarrier,
             StreamCommand::CreateBucket { bucket_id } => self.create_bucket(bucket_id),
             StreamCommand::CreateStream {
                 stream_id,

@@ -242,7 +242,68 @@ pub enum GroupReadStreamBody {
     },
 }
 
-pub struct GroupReadStreamParts {
+/// A local read plan or an owned remote read, materialized outside the group actor.
+pub enum GroupReadStreamParts {
+    Prepared(PreparedGroupReadStreamParts),
+    Deferred(crate::engine::GroupReadStreamFuture<'static>),
+}
+
+impl GroupReadStreamParts {
+    pub fn deferred(
+        future: impl std::future::Future<Output = Result<ReadStreamResponse, GroupEngineError>>
+        + Send
+        + 'static,
+    ) -> Self {
+        Self::Deferred(Box::pin(future))
+    }
+    pub fn from_response(response: ReadStreamResponse) -> Self {
+        Self::Prepared(PreparedGroupReadStreamParts::from_response(response))
+    }
+    pub fn from_plan(
+        placement: ShardPlacement,
+        stream_id: BucketStreamId,
+        plan: StreamReadPlan,
+        cold_store: Option<ColdStoreHandle>,
+        cold_index_cache: Option<Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>>,
+    ) -> Self {
+        Self::Prepared(PreparedGroupReadStreamParts::from_plan(
+            placement,
+            stream_id,
+            plan,
+            cold_store,
+            cold_index_cache,
+        ))
+    }
+    pub async fn into_response(self) -> Result<ReadStreamResponse, GroupEngineError> {
+        match self {
+            Self::Prepared(parts) => parts.into_response().await,
+            Self::Deferred(future) => future.await,
+        }
+    }
+    pub fn payload_is_empty(&self) -> bool {
+        matches!(self, Self::Prepared(parts) if parts.payload_is_empty())
+    }
+    pub fn is_open_tail(&self) -> bool {
+        matches!(self, Self::Prepared(parts) if parts.up_to_date && !parts.closed)
+    }
+    pub fn tail_incarnation(&self) -> Option<u64> {
+        match self {
+            Self::Prepared(parts)
+                if parts.payload_is_empty() && parts.up_to_date && !parts.closed =>
+            {
+                Some(parts.incarnation)
+            }
+            _ => None,
+        }
+    }
+    pub fn mark_not_up_to_date(&mut self) {
+        if let Self::Prepared(parts) = self {
+            parts.up_to_date = false;
+        }
+    }
+}
+
+pub struct PreparedGroupReadStreamParts {
     pub placement: ShardPlacement,
     /// See [`ReadStreamResponse::incarnation`].
     pub incarnation: u64,
@@ -254,7 +315,7 @@ pub struct GroupReadStreamParts {
     pub body: GroupReadStreamBody,
 }
 
-impl GroupReadStreamParts {
+impl PreparedGroupReadStreamParts {
     pub fn from_response(response: ReadStreamResponse) -> Self {
         Self {
             placement: response.placement,

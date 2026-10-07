@@ -11,7 +11,13 @@ description = "Control-plane state for Ursula dynamic node registration, group p
 
 [dependencies]
 serde = { workspace = true }
+thiserror = { workspace = true }
+ursula-proto = { workspace = true }
 ursula-shard = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

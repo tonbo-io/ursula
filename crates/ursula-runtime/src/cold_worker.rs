@@ -44,7 +44,8 @@ pub fn spawn_cold_compaction_worker_if_configured(
     let shared_refs = SharedRefCompactionConfig::new(max_bytes, max_streams, gc_grace_ms);
     runtime.set_compaction_debt_chunk_bytes(target_bytes);
     let runtime = runtime.clone();
-    tokio::spawn(async move {
+    let owner = runtime.clone();
+    if let Err(error) = owner.spawn_on_owner(ursula_shard::CoreId(0), async move {
         loop {
             match runtime
                 .compact_cold_once(target_bytes, max_bytes, max_streams, gc_grace_ms)
@@ -73,7 +74,9 @@ pub fn spawn_cold_compaction_worker_if_configured(
             }
             tokio::time::sleep(interval).await;
         }
-    });
+    }) {
+        tracing::error!(%error, "failed to schedule background driver on owner");
+    }
 }
 
 /// Start the periodic cold-flush worker if the configured interval is non-zero.
@@ -93,7 +96,8 @@ pub fn spawn_cold_flush_worker_if_configured(
     let max_hot_age = Some(config.flush_max_hot_age.as_duration()).filter(|age| !age.is_zero());
     let max_concurrency = config.flush_max_concurrency.max(1);
     let runtime = runtime.clone();
-    tokio::spawn(async move {
+    let owner = runtime.clone();
+    if let Err(error) = owner.spawn_on_owner(ursula_shard::CoreId(0), async move {
         loop {
             let metrics = runtime.metrics();
             let observed_hot_bytes = metrics.inner.cold_hot_bytes();
@@ -128,7 +132,9 @@ pub fn spawn_cold_flush_worker_if_configured(
             }
             tokio::time::sleep(interval).await;
         }
-    });
+    }) {
+        tracing::error!(%error, "failed to schedule background driver on owner");
+    }
 }
 
 /// Start the periodic cold-gc worker if the configured interval is non-zero.
@@ -142,14 +148,17 @@ pub fn spawn_cold_gc_worker_if_configured(
     }
     let max_entries = config.gc_max_entries.max(1);
     let runtime = runtime.clone();
-    tokio::spawn(async move {
+    let owner = runtime.clone();
+    if let Err(error) = owner.spawn_on_owner(ursula_shard::CoreId(0), async move {
         loop {
             if let Err(err) = runtime.run_cold_gc_all_groups_once(max_entries).await {
                 tracing::error!("cold gc worker error: {err}");
             }
             tokio::time::sleep(interval).await;
         }
-    });
+    }) {
+        tracing::error!(%error, "failed to schedule background driver on owner");
+    }
 }
 
 /// Pause between cold-index repair steps.
@@ -167,7 +176,8 @@ pub fn spawn_cold_index_repair_worker(runtime: &ShardRuntime) {
         return;
     }
     let runtime = runtime.clone();
-    tokio::spawn(async move {
+    let owner = runtime.clone();
+    if let Err(error) = owner.spawn_on_owner(ursula_shard::CoreId(0), async move {
         loop {
             tokio::time::sleep(COLD_INDEX_REPAIR_INTERVAL).await;
             let report = runtime
@@ -184,7 +194,9 @@ pub fn spawn_cold_index_repair_worker(runtime: &ShardRuntime) {
                 );
             }
         }
-    });
+    }) {
+        tracing::error!(%error, "failed to schedule background driver on owner");
+    }
 }
 
 /// Pause between external-locator offload passes. Well below the 10 s age
@@ -205,7 +217,8 @@ pub fn spawn_cold_ref_offload_worker(runtime: &ShardRuntime) {
         return;
     }
     let runtime = runtime.clone();
-    tokio::spawn(async move {
+    let owner = runtime.clone();
+    if let Err(error) = owner.spawn_on_owner(ursula_shard::CoreId(0), async move {
         loop {
             tokio::time::sleep(COLD_REF_OFFLOAD_INTERVAL).await;
             let report = runtime
@@ -224,7 +237,9 @@ pub fn spawn_cold_ref_offload_worker(runtime: &ShardRuntime) {
                 );
             }
         }
-    });
+    }) {
+        tracing::error!(%error, "failed to schedule background driver on owner");
+    }
 }
 
 /// Pause between cold orphan-sweep steps.
@@ -243,7 +258,8 @@ pub fn spawn_cold_orphan_sweep_worker(runtime: &ShardRuntime) {
         return;
     }
     let runtime = runtime.clone();
-    tokio::spawn(async move {
+    let owner = runtime.clone();
+    if let Err(error) = owner.spawn_on_owner(ursula_shard::CoreId(0), async move {
         loop {
             tokio::time::sleep(COLD_ORPHAN_SWEEP_INTERVAL).await;
             let report = runtime
@@ -262,7 +278,9 @@ pub fn spawn_cold_orphan_sweep_worker(runtime: &ShardRuntime) {
                 );
             }
         }
-    });
+    }) {
+        tracing::error!(%error, "failed to schedule background driver on owner");
+    }
 }
 
 #[cfg(test)]

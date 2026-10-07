@@ -16,5 +16,11 @@ spec:
       port: {{ .Values.server.ports.client }}
       targetPort: client
       protocol: TCP
+    {{- if .Values.raft.meta.enabled }}
+    - name: meta
+      port: {{ .Values.server.ports.meta }}
+      targetPort: meta
+      protocol: TCP
+    {{- end }}
   selector:
     {{- include "ursula.selectorLabels" . | nindent 4 }}

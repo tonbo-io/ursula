@@ -95,6 +95,7 @@ fn driver(min_refs: usize, gc_grace_ms: u64) -> SharedRefCompactionConfig {
     }
 }
 
+#[cfg(not(madsim))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raft_shared_ref_driver_compacts_and_packs_are_gced() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
@@ -135,6 +136,7 @@ async fn raft_shared_ref_driver_compacts_and_packs_are_gced() {
     assert_eq!(read_all(&runtime, &a).await, expected_a);
 }
 
+#[cfg(not(madsim))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raft_orphan_sweep_reclaims_only_unreferenced_objects() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));

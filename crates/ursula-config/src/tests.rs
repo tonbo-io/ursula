@@ -419,8 +419,61 @@ core_count = 2
     }
 
     #[test]
+    fn static_durable_clusters_require_meta_configuration_by_default() {
+        let tmp = temp_config(
+            ".toml",
+            r#"
+[raft.wal]
+path = "/tmp/ursula-wal"
+[[raft.peers]]
+node_id = 1
+url = "http://127.0.0.1:4437"
+"#,
+        );
+        let error = load_config(Some(tmp.path()), None, Some(1))
+            .expect_err("static production defaults to meta authority");
+        assert!(matches!(
+            error,
+            crate::ConfigError::Validation(crate::validate::ValidationError::Other(_))
+        ));
+        let tmp = temp_config(
+            ".toml",
+            r#"
+[raft.wal]
+path = "/tmp/ursula-wal"
+[[raft.peers]]
+node_id = 1
+url = "http://127.0.0.1:4437"
+[[raft.meta.peers]]
+node_id = 1
+url = "http://127.0.0.1:4439"
+"#,
+        );
+        let config =
+            load_config(Some(tmp.path()), None, Some(1)).expect("valid static meta configuration");
+        assert!(config.raft.meta.enabled);
+        let tmp = temp_config(
+            ".toml",
+            r#"
+[raft.wal]
+path = "/tmp/ursula-wal"
+[[raft.meta.peers]]
+node_id = 1
+url = "http://127.0.0.1:4439"
+"#,
+        );
+        let config = load_config(Some(tmp.path()), None, Some(1))
+            .expect("durable standalone has a typed self meta peer");
+        assert!(config.raft.uses_meta_authority());
+        assert!(!crate::UrsulaConfig::default().raft.uses_meta_authority());
+    }
+
+    #[test]
     fn validation_requires_a_wal_path_with_peers() {
         let peers = r#"
+[raft.meta]
+enabled = false
+
 [[raft.peers]]
 node_id = 1
 url = "http://127.0.0.1:4437"
@@ -480,7 +533,11 @@ url = "http://127.0.0.1:4438"
             crate::UrsulaConfig::default().raft.wal.fsync,
             WalFsync::Never
         );
-        let disk = |fsync: &str| format!("[raft.wal]\npath = \"/tmp/ursula-wal\"\n{fsync}\n");
+        let disk = |fsync: &str| {
+            format!(
+                "[raft.meta]\nenabled = false\n[raft.wal]\npath = \"/tmp/ursula-wal\"\n{fsync}\n"
+            )
+        };
         for (line, expected) in [
             ("", WalFsync::Never),
             ("fsync = \"always\"", WalFsync::Always),
@@ -506,6 +563,8 @@ url = "http://127.0.0.1:4438"
         let tmp = temp_config(
             ".toml",
             r#"
+[raft.meta]
+enabled = false
 [raft.wal]
 path = "/tmp/ursula-wal"
 min_available_size = "1GiB"
@@ -530,6 +589,8 @@ resume_available_size = "512MiB"
         let tmp = temp_config(
             ".toml",
             r#"
+[raft.meta]
+enabled = false
 [raft.wal]
 path = "/tmp/ursula-wal"
 segment_size = "8MiB"
@@ -543,6 +604,8 @@ cache_size = "32MiB"
         let tmp = temp_config(
             ".toml",
             r#"
+[raft.meta]
+enabled = false
 [raft.wal]
 path = "/tmp/ursula-wal"
 segment_size = "1KiB"
@@ -610,6 +673,9 @@ max_size = "128MiB"
             r#"
 [raft.wal]
 path = "/tmp/ursula-wal"
+
+[raft.meta]
+enabled = false
 
 [[raft.peers]]
 node_id = 1

@@ -288,6 +288,7 @@ pub(crate) async fn handoff_shutdown_leadership(
 
 /// Config-driven leadership balancer.
 pub fn spawn_leadership_balancer(
+    runtime: &ursula_runtime::ShardRuntime,
     registry: &RaftGroupHandleRegistry,
     node_id: u64,
     peers: &[(u64, String)],
@@ -301,7 +302,8 @@ pub fn spawn_leadership_balancer(
     let peer_timeout_ms = lb_cfg.peer_timeout.as_duration().as_millis() as usize;
     let registry = registry.clone();
     let peers: Vec<(u64, String)> = peers.to_vec();
-    tokio::spawn(async move {
+    let owner = runtime.clone();
+    if let Err(error) = owner.spawn_on_owner(ursula_shard::CoreId(0), async move {
         let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(5_000));
         let client = match reqwest::Client::builder()
             .timeout(Duration::from_millis(
@@ -374,5 +376,7 @@ pub fn spawn_leadership_balancer(
                 }
             }
         }
-    });
+    }) {
+        tracing::error!(%error, "failed to schedule background driver on owner");
+    }
 }

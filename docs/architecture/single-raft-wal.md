@@ -61,7 +61,8 @@ Ursula ports these techniques instead:
 
 `never` turns a quorum of simultaneous host crashes from an outage into a
 bounded loss of the most recent writes. Choosing it is an explicit operator
-decision.
+decision. Membership entries are always fsynced, including under `never`, so a
+new group retains its election configuration after an immediate power loss.
 
 ## Metadata and run state
 
@@ -101,7 +102,7 @@ treated as an unclean crash.
 | No run state, a journal holds records | Unknown history | Verified prefix | Every initialized group |
 | `clean` | Every write is on disk | Strict | No |
 | `running`, same boot id | Process crash; the page cache survived | Strict | No |
-| `running`, other or unknown boot id, policy `always` | Host crash; every acknowledged write was fsynced | Verified prefix, because committed and truncate markers are unsynced | No |
+| `running`, other or unknown boot id, policy `always` | Host crash; every acknowledged write was fsynced | Verified prefix, because committed and truncate markers are unsynced | If replay discards bytes, every group on that core |
 | `running`, other or unknown boot id, policy `never` | Host crash; writeback may have left holes | Verified prefix | Every initialized group |
 | `poisoned` | An I/O error stopped the previous run | Verified prefix | Every initialized group |
 
@@ -132,10 +133,39 @@ elect a leader that lacks them. While gated it does not campaign and it grants
 no votes. The gate opens once the replica has applied the committed index
 returned by a fresh outbound ReadIndex barrier from the current leader. This
 is the barrier from the memory-WAL rejoin work, now applied to any replica in
-the recovery state.
+the recovery state. The barrier request also fences outstanding append replies
+on the leader: replies to RPCs started before this request cannot subsequently
+count toward commit. This requires the updated recovery transport on the leader.
 
-The vote is restored from the metadata file before the Raft core starts, so a
-recovering replica still rejects appends from a leader with a stale term. A
+Before a gated replica acknowledges replication, it persists a vote floor
+under a membership authority. With meta enabled, fresh linearizable meta reads
+before and after peer vote samples must agree on the placement, operation and
+process identities. The samples must intersect every possible quorum of the
+current, previous, desired and temporary survivor configurations. Empty
+term-zero peers do not count as historical-vote witnesses. This allows
+one surviving data leader to repair followers even when data ReadIndex cannot
+yet succeed. A merely local committed-state watch is not sufficient authority.
+
+Without meta, explicitly immutable static cohorts may use their fixed voter
+intersection. That mode rejects membership-changing operations; its background
+repair driver only rewinds logs and appends a `ReplicationBarrier` no-op, never
+removes, promotes or re-adds voters. Unknown mutable membership instead requires
+a fresh data-leader ReadIndex proof. Discovery includes live Raft membership
+and control-plane addresses; old bootstrap addresses alone are not authority.
+A barrier arriving before its vote floor is retried for the same leader.
+
+Fresh genesis is the narrow exception: a replica with no initialized history
+can adopt a floor only after every configured peer reports an empty group,
+so the first election can precede the first ReadIndex. The meta-controlled
+factory separately disables static reinitialization of existing groups.
+The `ReplicationBarrier` command is appended to the command enum; old nodes
+cannot decode it, so this version requires the documented all-stop upgrade,
+not a mixed-version rolling deployment.
+Missing metadata beside a nonempty journal is unknown history and enters the
+same gate. A missing node run state starts an epoch above every surviving
+core's verified epoch.
+
+The vote is restored from the metadata file before the Raft core starts. A
 recovering replica that led its group starts as a follower: OpenRaft restores a
 replica whose committed vote names itself as that term's leader without an
 election, and with a truncated log it would reuse the log ids of entries it
@@ -147,14 +177,14 @@ restores the leadership, whether it follows a clean shutdown or comes after
 the gate opened, by a barrier or by an operator. A vote for another replica is
 never changed, and nothing is written for it.
 
-On the leader, a follower whose log moved backwards is rebuilt through the
-existing remove, learner and promote steps. If a majority of the followers
-moved backwards while the leader kept its log, removal cannot commit, so the
-leader rewinds their replication progress instead. Neither case needs an
-operator. In managed mode this becomes the control plane's `RebuildReplica`
-operation.
+On a surviving leader, a follower whose log moved backwards is repaired by
+rewinding its replication progress and sending the leader's log again. An idle
+group gets a state-preserving `ReplicationBarrier` entry. Background repair
+never changes membership, including while a joint configuration is pending.
+Managed membership changes require the control plane's typed operation.
 
-If a majority of a group's voters are gated, no leader can produce a barrier.
+If a majority is gated and no surviving leader can repair replication under
+authoritative membership, no leader can produce an opening barrier.
 A gated replica that applies nothing for 30 seconds reports itself stalled,
 and the group stays stopped. An operator then accepts the loss of the unsynced
 tail on the replicas with the longest last log id until a majority of the
@@ -162,7 +192,12 @@ voters is open, and normal election picks the longest verified log. Accepting
 on more replicas than needed lets election choose any log at least as long as
 a majority's. This replaces `adopt-survivor` and `reinitialize`. A group whose
 state is `Initialized` or `Recovering` never runs `Initialize`, which replaces
-the S3 initialized markers and the restart guard.
+the S3 initialized markers and the restart guard. Do not reset votes or rerun
+`Initialize` on one replica to recover a missing configuration. Existing media
+damage that has destroyed every membership requires an offline restore of the
+whole group from a known consistent backup, or explicit recreation as a new
+group after retiring the old group on every voter. Accepting an unsynced tail
+alone does not authorize discarding durable membership or stream history.
 
 An acceptance is a compare-and-act on what the operator saw. Its request names
 the replica's last log index and current term, as the group's metrics showed
@@ -173,24 +208,26 @@ log moved since the operator looked is no longer the one the operator chose.
 The admin incarnation precondition still applies, so a restarted process
 refuses a plan made against the one before it.
 
-### Known gap: a wiped voter accepts appends from a stale leader
+### Wiped voters reject stale leaders
 
-The gate screens votes but not appends. A voter that lost its disk also lost
-its vote, so it accepts appends from any leader, including one of a term it
-had already voted past. A leader of an older term that reaches only that
-voter can then commit an entry at an index a newer leader also committed.
-Closing the gap needs the replica to refuse such leaders before its gate
-opens, which this design does not do yet
-([#405](https://github.com/tonbo-io/ursula/issues/405)). The DST schedule that shows it,
-`a_wiped_voter_never_lets_a_stale_leader_commit`, asserts that no index is
-committed with two different entries and stays ignored until then.
+A replica that has lost its vote history refuses append and snapshot
+acknowledgements until it persists an authority-validated vote floor. It then
+rejects lower-term leaders while the recovery gate continues to block elections
+until fresh ReadIndex and applied-prefix evidence agree. This closes the stale
+leader commit path described in [#405](https://github.com/tonbo-io/ursula/issues/405).
+The deterministic wiped-voter regression asserts that an index cannot be
+committed with two different entries.
 
 ## Journal hardening
 
 - **Fail-stop.** Any write or `fsync` error stops the core writer. Pending
   requests fail, the writer tries to record `poisoned = true`, and the process
   aborts. It never appends after a partial frame and never retries a failed
-  `fsync`.
+  `fsync`. If writing the poison marker also fails, a same-boot restart still
+  uses strict checksum/sequence replay: malformed frames fail startup; intact
+  page-cache frames preserve the acknowledged prefix. After a host crash,
+  prefix replay that drops any bytes durably gates every group on that core,
+  even under `always` (which cannot rule out media corruption).
 - **Format epoch 3.** Each frame's checksum covers its length, its payload and
   the segment sequence number. Epoch 2 journals are refused.
 - **Segments.** The journal rotates at a target size. Purge deletes whole

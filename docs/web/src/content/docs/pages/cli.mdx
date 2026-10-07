@@ -52,33 +52,20 @@ ursulactl pin-incarnations --config cluster.json > pinned-cluster.json
 ursulactl drain --config pinned-cluster.json --node 3
 ```
 
-The saved nodes carry `expected_process_incarnation`. After an admitted Pod replacement, `pin-incarnations --replace-node 3` can bind that one replacement; every survivor must still match its saved identity. The Helm rollout persists these pins and the admitted source/replacement Pod UIDs in state schema 3. Resuming the same replacement validates its saved process instead of refreshing it after a container restart. It stops on a missing saved plan, changed survivor, or another unadmitted replacement.
+The saved nodes carry `expected_process_incarnation`. After an intentional process
+replacement, `pin-incarnations --replace-node 3` binds only that replacement;
+every survivor must still match its saved identity. Missing identities fail
+closed. `verify-quorum` reports process identities separately from participation.
 
-`--allow-legacy-incarnation` is the deployed through-0.6.2 migration option: those servers have no identity precondition and the output reports `process_incarnations_certified=false`. Retire the option when those upgrade sources and retained legacy rollout states are gone. `verify-quorum` records the observed process identities and their certification separately from Raft participation. Instance identity does not serialize concurrent executors or prove a failed host is physically fenced.
-
-## Maintenance executor admission
-
-A reviewed cell reservation consumer can add one immutable `maintenance_fence` object at the manifest root: `reservation_id` and `executor_id` are 32 lowercase hexadecimal characters, and `generation` is a nonzero cell-wide monotonically increasing integer. Every saved node carries that same token as `expected_maintenance_fence`; inconsistent or partially populated plans are rejected. The lifecycle commands require saved process identities for every configured voter:
-
-```bash
-ursulactl activate-maintenance-fence --config admitted-cluster.json
-ursulactl drain --config admitted-cluster.json --node 3
-# After replacement and reconciliation of its physical lifecycle:
-ursulactl retire-maintenance-fence --config admitted-cluster.json
-ursulactl verify-quorum --config admitted-cluster.json --expected-groups 256
-```
-
-These commands install or retire the supplied token; they do not acquire a shared reservation, choose generations, authorize Pod deletion, or establish provider-host fencing. A multi-node command may stop after partial acknowledgement. Keep the external operation reserved, resume its same identities, and require all relevant acknowledgements before advancing. Expiry is not authority to select another voter. A new executor uses the higher generation admitted by the external CAS operation; CLI never adopts a token discovered in metrics or refreshes it after 412/428.
-
-Activation waits for admitted mutation handlers and then confirms prior messages were processed by each captured local Raft API queue. Caller cancellation leaves its admitted handler running; abnormal handler termination latches that process closed. Failed or cancelled activation/retirement stays closed until the same pending lifecycle completes or an externally admitted higher generation activates. Retirement retains its generation and cannot be reopened by the same token. This confirms submission ordering, not completion of asynchronous replication, snapshot work, or physical operations. Fresh all-replica prefix certification and external lifecycle reconciliation remain required before releasing the reservation.
-
-New processes start `unclaimed`, explicitly uncertified until admission. An explicit `pin-incarnations --replace-node` can bind only that selected unclaimed replacement while preserving the token; other voters must still match the active saved authority. Once activated, all mutating admin requests require `x-ursula-maintenance-fence` as `reservation_id:generation:executor_id` in addition to the process-incarnation header. Metrics report `maintenance_fence` and `maintenance_fence_uncertain`; `verify-quorum` schema 3 records `maintenance_executor_certified` only when every observed process matches the same caller-supplied active token. A subsequent proof can inspect the same retired token and reports `maintenance_executor_retired_certified` only when all observed processes have retired it; a mix of active and retired nodes certifies neither state. These flags certify process-local admission or retirement, not the external reservation or physical fencing. Existing chart and Cloud consumers are uncertified until their shared reservation integration is complete.
+Meta Raft serializes maintenance operations and pins participant process epochs.
+Use `operation` for replica movement, lost-volume rebuild, and decommission.
+Ordinary restarts preserving the PVC claim a fresh process epoch directly.
 
 ## The admin plane
 
 Nodes carry **no cluster-mutation surface on the network**. The mutating operator endpoints (raft snapshot/purge/membership/learners/leader-transfer, maintenance drain, cold-flush trigger, bucket purge) plus metrics and usage are served on a separate **admin plane** bound to `server.admin_listen`, which defaults to loopback (`127.0.0.1:4438`). The public client plane (`:4437`) serves only stream traffic and read-only metrics and usage.
 
-Metrics use an explicit `metrics_url` when configured, then `http_url`, then `admin_url`. The chart's rollout hook sets `metrics_url` to its Pod-bound admin tunnel so it can inspect a replacement before cluster DNS becomes reachable. Mutating verbs always use `admin_url`; learner attachment and Raft handoff retain the advertised `http_url`.
+Metrics use an explicit `metrics_url` when configured, then `http_url`, then `admin_url`. Set `metrics_url` to a Pod-bound admin tunnel to inspect a replacement before cluster DNS becomes reachable. Mutating verbs always use `admin_url`; learner attachment and Raft handoff retain the advertised `http_url`.
 
 ursulactl is a plain HTTP client and opens no tunnels itself. When the admin plane is not directly reachable, bring your own forward and point the manifest's `admin_url` at it. On Kubernetes, `kubectl port-forward` reaches the loopback-bound plane inside each pod:
 
@@ -235,21 +222,26 @@ After one voter becomes unavailable, this source can separately observe the two 
 ursulactl verify-survivors --config cluster.json --excluded-node-id 3 --expected-groups 256 --timeout-secs 120
 ```
 
-Every group must still have the complete uniform three-voter membership, no learners and open participation gates on both observed replicas. Both survivors must agree on a reachable leader and apply each newly confirmed fixed prefix. The command rejects a second missing replica, an unknown exclusion or a changed topology; it never shrinks the configured membership to fit observations. Legacy diagnostics retain the explicit opt-in and do not certify participation.
+Every group must still have the complete uniform three-voter membership, no learners and open participation gates on both observed replicas. Both survivors must agree on a reachable leader and apply each newly confirmed fixed prefix. The command rejects a second missing replica, an unknown exclusion or a changed topology; it never shrinks the configured membership to fit observations. Missing safety fields fail closed.
 
 The output is scoped as `surviving_quorum`, records the configured and observed voter sets, and always reports `full_redundancy_restored=false`. Excluding a voter from observation does not prove its old process or host is stopped. Hard fencing and an exclusive maintenance reservation remain prerequisites for physical replacement, and the complete `verify-quorum` check is required before any subsequent disruption.
 
-### Shared reservation proposals
+## `operation`
 
-`reservation-propose --cell cell.json --snapshot before.json --request request.json`
-produces a whole-ConfigMap CAS proposal without contacting Kubernetes.
-`reservation-acknowledge` takes the same inputs plus `--response response.json` and
-validates the exact successful update receipt. Conflicts stop without refreshing
-authority; missing stores do not initialize themselves.
+Submit typed maintenance intent to the meta-Raft authority through a pinned admin endpoint:
 
-The policy covers sticky, one-source planned Pod replacement, current-token fresh
-prefix admission and all-retired completion after the original Pod UID is gone.
-Its inputs are operational evidence, not authentication. Chart/Cloud consumers and
-physical host fencing still need integration and qualification; this offline
-interface alone grants no disruption authority. The full protocol is documented
-in `docs/architecture/maintenance-reservation.md`.
+```bash
+ursulactl operation --config cluster.json --node-id 1 --request intent.json
+```
+
+The request file uses the shared `OperationRequest` schema. `Begin` selects
+`MoveReplicas`, `RebuildReplica`, or `DecommissionNode`; subsequent requests
+carry the returned operation token. The server collects quorum/apply evidence
+from the committed peer inventory. Kubernetes only performs the requested
+physical lifecycle step after the relevant retirement response.
+
+An ordinary restart preserving its PVC needs no rebuild operation. Drain and
+restart one voter at a time, then require maintenance readiness before the next
+restart. The former ConfigMap reservation and provider-specific startup commands
+have been removed. See `docs/architecture/meta-control-plane.md` for operation
+sequencing, failure recovery, and migration from a meta-disabled deployment.

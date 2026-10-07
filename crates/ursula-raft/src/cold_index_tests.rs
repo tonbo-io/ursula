@@ -38,8 +38,8 @@ use ursula_stream::ColdChunkRef;
 use ursula_stream::ExternalPayloadRef;
 use ursula_stream::StreamCommand;
 
-use crate::RaftWal;
 use crate::engine::RaftGroupEngine;
+use crate::log_store::RaftWal;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::types::UrsulaRaftTypeConfig;
 
@@ -232,6 +232,7 @@ async fn openraft_snapshot_with_regressed_frontier_builds_and_installs() {
 
 /// F14e: a stale flush on the Raft engine is rejected before it writes a
 /// page entry, so no entry is left behind for an unreferenced chunk.
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn stale_flush_leaves_no_page_entry() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
@@ -319,6 +320,7 @@ async fn stale_flush_leaves_no_page_entry() {
 /// cold-index page cache, so the page invalidation that runs when a
 /// replicated `FlushCold` applies (on every replica) also drops the pages the
 /// read path cached.
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_read_path_shares_the_page_cache_that_apply_invalidates() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));

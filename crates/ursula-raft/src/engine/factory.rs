@@ -145,7 +145,9 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
                     ..Default::default()
                 }
                 .validate()
-                .map_err(|err| GroupEngineError::new(format!("invalid OpenRaft config: {err}")))?,
+                .map_err(|err| {
+                    GroupEngineError::backend(ursula_runtime::BackendOperation::ValidateConfig, err)
+                })?,
             );
             let log_store = self.log_stores.open(placement, metrics.clone())?;
             let engine = RaftGroupEngine::new_single_node(
@@ -255,30 +257,56 @@ impl StaticGrpcRaftGroupEngineFactory {
         &self,
         raft_group_id: RaftGroupId,
     ) -> Result<BTreeMap<u64, BasicNode>, GroupEngineError> {
+        if let Some(state) = self.registry.control_state() {
+            let placement = state
+                .placements
+                .get(&raft_group_id)
+                .ok_or(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::MissingGroupMembership {
+                        group: raft_group_id,
+                    },
+                ))?;
+            return placement
+                .voters
+                .iter()
+                .map(|node_id| {
+                    state
+                        .nodes
+                        .get(node_id)
+                        .map(|node| (*node_id, BasicNode::new(node.cluster_url.clone())))
+                        .ok_or(GroupEngineError::Infra(
+                            ursula_runtime::GroupInfraError::MissingVoterAddress {
+                                group: raft_group_id,
+                                node_id: *node_id,
+                            },
+                        ))
+                })
+                .collect();
+        }
         let voters = if self.per_group_voters.is_empty() {
             return Ok(self.peer_nodes());
         } else {
-            self.per_group_voters.get(&raft_group_id).ok_or_else(|| {
-                GroupEngineError::new(format!(
-                    "raft group {} is missing from static per-group voter config",
-                    raft_group_id.0
-                ))
+            self.per_group_voters.get(&raft_group_id).ok_or({
+                GroupEngineError::Infra(ursula_runtime::GroupInfraError::MissingGroupMembership {
+                    group: raft_group_id,
+                })
             })?
         };
         if voters.is_empty() {
-            return Err(GroupEngineError::new(format!(
-                "raft group {} has an empty static voter set",
-                raft_group_id.0
-            )));
+            return Err(GroupEngineError::Infra(
+                ursula_runtime::GroupInfraError::EmptyGroupMembership {
+                    group: raft_group_id,
+                },
+            ));
         }
 
         let mut nodes = BTreeMap::new();
         for node_id in voters {
-            let address = self.peers.get(node_id).ok_or_else(|| {
-                GroupEngineError::new(format!(
-                    "raft group {} voter {} is not present in static peer config",
-                    raft_group_id.0, node_id
-                ))
+            let address = self.peers.get(node_id).ok_or({
+                GroupEngineError::Infra(ursula_runtime::GroupInfraError::MissingVoterAddress {
+                    group: raft_group_id,
+                    node_id: *node_id,
+                })
             })?;
             nodes.insert(*node_id, BasicNode::new(address.clone()));
         }
@@ -295,7 +323,7 @@ impl StaticGrpcRaftGroupEngineFactory {
     }
 
     fn should_initialize_membership(&self, raft_group_id: RaftGroupId) -> bool {
-        if !self.initialize_membership {
+        if !self.initialize_membership || self.registry.control_state().is_some() {
             return false;
         }
         if !self.per_group_voters.is_empty()
@@ -325,6 +353,12 @@ impl StaticGrpcRaftGroupEngineFactory {
 
 impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
     fn hosts_group(&self, placement: ShardPlacement) -> bool {
+        if let Some(hosts) = self
+            .registry
+            .control_hosts_group(placement.raft_group_id, self.node_id)
+        {
+            return hosts;
+        }
         if self.per_group_voters.is_empty() {
             return true;
         }
@@ -345,11 +379,16 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
         metrics: GroupEngineMetrics,
     ) -> GroupEngineCreateFuture<'a> {
         Box::pin(async move {
-            if !self.peers.contains_key(&self.node_id) {
-                return Err(GroupEngineError::new(format!(
-                    "raft node {} is not present in static peer config",
-                    self.node_id
-                )));
+            let registered_live = self
+                .registry
+                .control_state()
+                .is_some_and(|state| state.nodes.contains_key(&self.node_id));
+            if !registered_live && !self.peers.contains_key(&self.node_id) {
+                return Err(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::MissingLocalAddress {
+                        node_id: self.node_id,
+                    },
+                ));
             }
             let nodes = self.peer_nodes_for_group(placement.raft_group_id)?;
             // The log store and the recovery gate go first: a gated replica's
@@ -393,10 +432,9 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                         self.node_id,
                     ));
             }
-            let config =
-                Arc::new(raft_config.validate().map_err(|err| {
-                    GroupEngineError::new(format!("invalid OpenRaft config: {err}"))
-                })?);
+            let config = Arc::new(raft_config.validate().map_err(|err| {
+                GroupEngineError::backend(ursula_runtime::BackendOperation::ValidateConfig, err)
+            })?);
             let transport = self
                 .transports
                 .lock()
@@ -409,6 +447,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 })
                 .clone();
             let network = GrpcRaftNetworkFactory::new(transport.clone(), placement.raft_group_id)
+                .with_registry(self.registry.clone())
                 .with_reconnect_threshold(self.engine_config.grpc_reconnect_after_failures)
                 .with_rejoin(Some(rejoin.clone()));
             let engine = RaftGroupEngine::new_node(
@@ -421,6 +460,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     metrics: Some(metrics),
                     cold_store: self.cold_store.clone(),
                     snapshot_store: self.snapshot_store.clone(),
+                    process_authority: Some(self.registry.clone()),
                     snapshot_build: Some(self.registry.snapshot_build_coordinator()),
                     snapshot_install: Some(self.registry.snapshot_install_coordinator()),
                     snapshot_metadata_path: Some(self.log_stores.snapshot_metadata_path(placement)),
@@ -433,12 +473,18 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 &self.registry,
                 nodes,
                 crate::recovery_transport::GrpcRecoveryTransport {
+                    registry: self.registry.clone(),
                     transport,
                     placement,
                     node_id: self.node_id,
                     timeout: self.engine_config.bootstrap_peer_connect,
                 },
                 crate::rejoin::RecoveryConfig {
+                    membership_authority: if self.registry.control_state().is_some() {
+                        crate::RecoveryMembershipAuthority::CurrentLeader
+                    } else {
+                        crate::RecoveryMembershipAuthority::ImmutableStatic
+                    },
                     initialize: self.should_initialize_membership(placement.raft_group_id),
                     interval: REJOIN_HEAL_INTERVAL,
                     barrier_timeout: crate::rejoin::RECOVERY_BARRIER_TIMEOUT,
@@ -498,6 +544,7 @@ mod tests {
         .with_per_group_voters(per_group_voters(&[(0, &[1, 2, 3]), (1, &[2, 3, 4])]))
     }
 
+    #[cfg(not(madsim))]
     #[test]
     fn per_group_static_voters_override_default_peer_set() {
         let wal_root = tempfile::tempdir().expect("WAL root");
@@ -514,12 +561,15 @@ mod tests {
         let err = factory
             .peer_nodes_for_group(RaftGroupId(2))
             .expect_err("partial per-group voter config must not fall back to all peers");
-        assert!(
-            err.message()
-                .contains("missing from static per-group voter config")
-        );
+        assert!(matches!(
+            err,
+            GroupEngineError::Infra(ursula_runtime::GroupInfraError::MissingGroupMembership {
+                group: RaftGroupId(2)
+            })
+        ));
     }
 
+    #[cfg(not(madsim))]
     #[test]
     fn per_group_initializers_are_chosen_from_group_voters() {
         let wal_root = tempfile::tempdir().expect("WAL root");

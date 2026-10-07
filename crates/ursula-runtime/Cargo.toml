@@ -26,6 +26,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
 tracing = { workspace = true }
 ursula-config = { workspace = true }
+ursula-proto = { workspace = true }
 ursula-shard = { workspace = true }
 ursula-stream = { workspace = true }
 zstd = { workspace = true }
@@ -37,6 +38,7 @@ sim-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 core_affinity = { workspace = true }
 
 [dev-dependencies]
+dhat = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
 tempfile = { workspace = true }
 

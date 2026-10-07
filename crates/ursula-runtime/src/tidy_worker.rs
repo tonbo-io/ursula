@@ -19,7 +19,8 @@ pub const TIDY_MAX_STREAMS_PER_GROUP: usize = 64;
 /// Start the periodic tidy driver.
 pub fn spawn_tidy_worker(runtime: &ShardRuntime) {
     let runtime = runtime.clone();
-    tokio::spawn(async move {
+    let owner = runtime.clone();
+    if let Err(error) = owner.spawn_on_owner(ursula_shard::CoreId(0), async move {
         loop {
             tokio::time::sleep(TIDY_INTERVAL).await;
             match runtime
@@ -38,5 +39,7 @@ pub fn spawn_tidy_worker(runtime: &ShardRuntime) {
                 Err(err) => tracing::debug!("tidy pass incomplete: {err}"),
             }
         }
-    });
+    }) {
+        tracing::error!(%error, "failed to schedule background driver on owner");
+    }
 }

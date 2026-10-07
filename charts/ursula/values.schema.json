@@ -296,6 +296,12 @@
               "type": "integer",
               "minimum": 1,
               "maximum": 65535
+            },
+            "meta": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535,
+              "description": "Private meta-Raft transport port."
             }
           },
           "required": [
@@ -537,88 +543,6 @@
             "tolerations",
             "affinity",
             "topologySpreadConstraints"
-          ]
-        },
-        "gracefulRollout": {
-          "type": "object",
-          "additionalProperties": false,
-          "description": "Post-upgrade job that drains, replaces and verifies one voter at a time. Only meaningful with updateStrategy=OnDelete, which stages a new template without replacing any pod.",
-          "properties": {
-            "enabled": {
-              "type": "boolean"
-            },
-            "expectedGroups": {
-              "type": [
-                "integer",
-                "null"
-              ],
-              "minimum": 1,
-              "description": "Groups verify-cluster should find. Null defaults to raft.groupCount."
-            },
-            "activeDeadlineSeconds": {
-              "type": "integer",
-              "minimum": 1
-            },
-            "kubectlImage": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "repository": {
-                  "type": "string",
-                  "minLength": 1
-                },
-                "tag": {
-                  "type": "string",
-                  "minLength": 1
-                },
-                "pullPolicy": {
-                  "type": "string",
-                  "enum": [
-                    "Always",
-                    "IfNotPresent",
-                    "Never"
-                  ]
-                }
-              },
-              "required": [
-                "repository",
-                "tag",
-                "pullPolicy"
-              ]
-            },
-            "resources": {
-              "type": "object"
-            },
-            "maintenanceReservation": {
-              "type": "boolean",
-              "description": "Use shared persistent reservation CAS and process fencing for planned Pod rollouts. Requires explicit new-cell store bootstrap and token-capable voters; missing stores fail closed. False is the uncertified legacy migration."
-            }
-          },
-          "required": [
-            "enabled",
-            "activeDeadlineSeconds",
-            "kubectlImage",
-            "resources"
-          ]
-        },
-        "startupOwnership": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "description": "Require a settled host catalog and pre-transport boot admission through the shared maintenance CAS."
-            },
-            "provider": {
-              "type": "string",
-              "enum": [
-                "aws-nitro"
-              ]
-            }
-          },
-          "required": [
-            "enabled",
-            "provider"
           ]
         }
       },
@@ -1714,6 +1638,18 @@
           "type": "integer",
           "minimum": 0,
           "description": "Payload-bearing raft log entries retained per group after snapshot coverage."
+        },
+        "meta": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "enabled"
+          ],
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

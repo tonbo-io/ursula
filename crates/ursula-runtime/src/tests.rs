@@ -3383,6 +3383,89 @@ async fn read_materialization_is_bounded_without_blocking_group_actor() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_materialization_admission_is_independent_per_owner() {
+    let factory = BlockingReadFactory::block_materialization();
+    let mut config = RuntimeConfig::new(2, 2);
+    config.mailbox_capacity = 1;
+    config.threading = RuntimeThreading::HostedTokio;
+    let runtime =
+        ShardRuntime::spawn_with_engine_factory(config, factory.clone()).expect("runtime");
+    let first_stream = BucketStreamId::new("benchcmp", "owner-read-first");
+    let first_owner = runtime.locate(&first_stream).core_id;
+    let second_stream = (0..100)
+        .map(|id| BucketStreamId::new("benchcmp", format!("owner-read-{id}")))
+        .find(|stream| runtime.locate(stream).core_id != first_owner)
+        .expect("other core");
+    create_stream(&runtime, &first_stream).await;
+    create_stream(&runtime, &second_stream).await;
+    let mut readers = Vec::new();
+    for stream in [first_stream, second_stream] {
+        let runtime = runtime.clone();
+        readers.push(tokio::spawn(async move {
+            runtime.read_stream(read_req(stream, 0, 16)).await
+        }));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            factory.materialized.notified(),
+        )
+        .await
+        .expect("each core admits a read while the other core is saturated");
+    }
+    assert!(readers.iter().all(|reader| !reader.is_finished()));
+    factory.release.notify_waiters();
+    for reader in readers {
+        assert_eq!(reader.await.expect("join").expect("read").payload, b"ready");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forwarded_reads_release_the_group_actor_while_waiting_for_the_leader() {
+    let factory = BlockingReadFactory {
+        defer_forward: true,
+        ..Default::default()
+    };
+    let runtime = ShardRuntime::spawn_with_engine_factory(test_config(1, 1, 8), factory.clone())
+        .expect("runtime");
+    let stream = BucketStreamId::new("benchcmp", "deferred-forward");
+    create_stream(&runtime, &stream).await;
+    for head in [false, true] {
+        let reader = runtime.clone();
+        let id = stream.clone();
+        let pending = tokio::spawn(async move {
+            if head {
+                reader
+                    .head_stream(HeadStreamRequest {
+                        stream_id: id,
+                        now_ms: 0,
+                        linearizable: true,
+                        read_index: None,
+                    })
+                    .await
+                    .map(|_| ())
+            } else {
+                reader.read_stream(read_req(id, 0, 16)).await.map(|_| ())
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            factory.materialized.notified(),
+        )
+        .await
+        .expect("forward started");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            runtime.append(AppendRequest::new(stream.clone(), 1)),
+        )
+        .await
+        .expect("append must complete before the remote read returns")
+        .expect("append");
+        assert!(!pending.is_finished());
+        factory.release.notify_one();
+        pending.await.expect("reader task").expect("reader");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn group_engine_errors_include_group_context_and_do_not_record_success_metrics() {
     let runtime = ShardRuntime::spawn_with_engine_factory(test_config(2, 8, 128), FailingFactory)
         .expect("spawn runtime");
@@ -3623,6 +3706,7 @@ struct BlockingReadFactory {
     release: Arc<Notify>,
     read_count: Arc<AtomicU64>,
     block_parts: bool,
+    defer_forward: bool,
 }
 
 impl Default for BlockingReadFactory {
@@ -3633,6 +3717,7 @@ impl Default for BlockingReadFactory {
             release: Arc::new(Notify::new()),
             read_count: Arc::new(AtomicU64::new(0)),
             block_parts: false,
+            defer_forward: false,
         }
     }
 }
@@ -3661,6 +3746,7 @@ impl GroupEngineFactory for BlockingReadFactory {
                 release: self.release.clone(),
                 read_count: self.read_count.clone(),
                 block_parts: self.block_parts,
+                defer_forward: self.defer_forward,
             });
             Ok(engine)
         })
@@ -3675,6 +3761,7 @@ struct BlockingReadEngine {
     release: Arc<Notify>,
     read_count: Arc<AtomicU64>,
     block_parts: bool,
+    defer_forward: bool,
 }
 
 impl GroupEngine for BlockingReadEngine {
@@ -3685,6 +3772,25 @@ impl GroupEngine for BlockingReadEngine {
         admission: ColdWriteAdmission,
     ) -> GroupCreateStreamFuture<'a> {
         self.inner.create_stream(request, placement, admission)
+    }
+
+    fn forwarded_head_stream(
+        &self,
+        request: &HeadStreamRequest,
+        placement: ShardPlacement,
+    ) -> Option<GroupHeadStreamFuture<'static>> {
+        if !self.defer_forward {
+            return None;
+        }
+        let entered = self.materialized.clone();
+        let release = self.release.clone();
+        let request = request.clone();
+        let mut inner = self.inner.clone();
+        Some(Box::pin(async move {
+            entered.notify_one();
+            release.notified().await;
+            inner.head_stream(request, placement).await
+        }))
     }
 
     fn head_stream<'a>(
@@ -3736,24 +3842,44 @@ impl GroupEngine for BlockingReadEngine {
             assert_eq!(placement, self.placement);
             read_count.fetch_add(1, Ordering::Relaxed);
             entered.notify_one();
+            if self.defer_forward {
+                let entered = self.materialized.clone();
+                let release = self.release.clone();
+                return Ok(GroupReadStreamParts::deferred(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(ReadStreamResponse {
+                        placement,
+                        offset: request.offset,
+                        next_offset: request.offset,
+                        content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+                        payload: Vec::new(),
+                        up_to_date: true,
+                        closed: false,
+                        incarnation: 0,
+                    })
+                }));
+            }
             if self.block_parts {
-                return Ok(GroupReadStreamParts {
-                    placement,
-                    offset: request.offset,
-                    next_offset: request.offset.saturating_add(
-                        u64::try_from(b"ready".len()).expect("payload len fits u64"),
-                    ),
-                    content_type: DEFAULT_CONTENT_TYPE.to_owned(),
-                    up_to_date: true,
-                    closed: false,
-                    body: GroupReadStreamBody::Blocking {
-                        entered: self.entered.clone(),
-                        materialized: self.materialized.clone(),
-                        release: self.release.clone(),
-                        payload: b"ready".to_vec(),
+                return Ok(GroupReadStreamParts::Prepared(
+                    crate::PreparedGroupReadStreamParts {
+                        placement,
+                        offset: request.offset,
+                        next_offset: request.offset.saturating_add(
+                            u64::try_from(b"ready".len()).expect("payload len fits u64"),
+                        ),
+                        content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+                        up_to_date: true,
+                        closed: false,
+                        body: GroupReadStreamBody::Blocking {
+                            entered: self.entered.clone(),
+                            materialized: self.materialized.clone(),
+                            release: self.release.clone(),
+                            payload: b"ready".to_vec(),
+                        },
+                        incarnation: 0,
                     },
-                    incarnation: 0,
-                });
+                ));
             }
             let response = ReadStreamResponse {
                 placement,
@@ -4347,4 +4473,60 @@ async fn lone_small_flush_is_packed_and_small_exclusive_chunk_is_compaction_debt
         .expect("read flushed stream");
     assert_eq!(&read.payload[..100], &[b'a'; 100]);
     assert_eq!(&read.payload[100..], large.as_slice());
+}
+
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn owner_threads_are_joined_after_group_shutdown() {
+    for threading in [
+        RuntimeThreading::HostedTokio,
+        RuntimeThreading::ThreadPerCore,
+    ] {
+        let mut config = RuntimeConfig::new(2, 2);
+        config.threading = threading;
+        let runtime = ShardRuntime::spawn(config).expect("runtime");
+        let stream = BucketStreamId::new("benchcmp", "joined-owner");
+        create_stream(&runtime, &stream).await;
+        runtime.shutdown_group_engines().await.expect("stop groups");
+        let failed =
+            tokio::time::timeout(std::time::Duration::from_secs(2), runtime.shutdown_owners())
+                .await
+                .expect("owners joined");
+        assert_eq!(failed, Vec::<CoreId>::new());
+        assert_eq!(runtime.shutdown_owners().await, Vec::<CoreId>::new());
+    }
+}
+
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn owner_services_run_on_the_owner_and_are_cancelled_at_shutdown() {
+    let mut config = test_config(2, 2, 16);
+    config.threading = RuntimeThreading::ThreadPerCore;
+    let runtime = ShardRuntime::spawn(config).expect("owners");
+    for core in [CoreId(0), CoreId(1)] {
+        let thread = runtime
+            .spawn_on_owner(core, async {
+                std::thread::current()
+                    .name()
+                    .expect("named owner")
+                    .to_owned()
+            })
+            .expect("schedule")
+            .await
+            .expect("completion");
+        assert_eq!(thread, format!("ursula-core-{}", core.0));
+    }
+    let (started_tx, started_rx) = oneshot::channel();
+    let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+    let pending = runtime
+        .spawn_on_owner(CoreId(0), async move {
+            let _drop_guard = dropped_tx;
+            started_tx.send(()).expect("start");
+            std::future::pending::<()>().await;
+        })
+        .expect("service");
+    started_rx.await.expect("started");
+    assert!(runtime.shutdown_owners().await.is_empty());
+    pending.await.expect_err("service cancelled");
+    dropped_rx.await.expect_err("service future dropped");
 }

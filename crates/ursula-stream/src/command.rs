@@ -185,6 +185,8 @@ pub enum StreamCommand {
         incarnation: u64,
         command: Box<StreamCommand>,
     },
+    /// Advances Raft replication without changing stream state or membership.
+    ReplicationBarrier,
 }
 
 /// Fixed per-command allowance of [`StreamCommand::log_bytes_estimate`]:
@@ -233,6 +235,7 @@ impl StreamCommand {
 impl fmt::Display for StreamCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ReplicationBarrier => f.write_str("replication_barrier"),
             Self::CreateBucket { bucket_id } => write!(f, "create_bucket:{bucket_id}"),
             Self::CreateStream { stream_id, .. } => write!(f, "create_stream:{stream_id}"),
             Self::CreateExternal {

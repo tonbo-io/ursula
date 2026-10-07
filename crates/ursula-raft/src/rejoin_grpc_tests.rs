@@ -153,6 +153,33 @@ impl RaftInternal for RecoveryTestService {
     }
 }
 
+async fn establish_peer_floor(gate: &GroupRejoin, node_id: u64, endpoints: &[String]) {
+    use openraft::RaftNetworkV2;
+    let mut floor = UrsulaVote::new(0, 0);
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        let peer = u64::try_from(index).unwrap().checked_add(1).unwrap();
+        if peer == node_id {
+            continue;
+        }
+        let response = crate::grpc::GrpcRaftNetwork::new(
+            Arc::default(),
+            placement().raft_group_id,
+            peer,
+            endpoint,
+        )
+        .vote(
+            crate::bootstrap_probe_vote(),
+            openraft::network::RPCOption::new(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+        if response.vote > floor {
+            floor = response.vote;
+        }
+    }
+    gate.establish_vote_floor(floor).await.unwrap();
+}
+
 /// A replica of node `id` on a fresh, empty WAL, as a new node or one that
 /// lost its disk starts: its gate is closed with the group's history
 /// unknown. The returned directory holds the WAL and must outlive the store.
@@ -196,10 +223,169 @@ async fn new_recovery_engine(
     .await
     .expect("new engine on an empty WAL");
     gate.bind(&engine.raft_handle());
-    registry.register_rejoin(placement().raft_group_id, gate.clone());
-    registry.register_read_barrier(placement().raft_group_id, engine.read_barrier.clone());
-    registry.register(placement(), engine.raft_handle());
+    registry.register_engine(&engine, Some(gate.clone()));
     (engine, store, gate, wal_root)
+}
+
+#[tokio::test]
+async fn recovery_driver_retries_a_proof_that_arrived_before_its_vote_floor() {
+    let registry = RaftGroupHandleRegistry::default();
+    let (engine, _store, gate, _root) =
+        new_recovery_engine(1, Arc::new(Config::default()), &registry).await;
+    let nodes = BTreeMap::from([(1, openraft::BasicNode::new("http://unused"))]);
+    engine
+        .raft_handle()
+        .initialize(nodes.clone())
+        .await
+        .unwrap();
+    engine
+        .wait_for_current_leader(1, Duration::from_secs(3))
+        .await
+        .unwrap();
+    engine
+        .raft_handle()
+        .wait(Some(Duration::from_secs(3)))
+        .applied_index_at_least(Some(1), "bootstrap applied")
+        .await
+        .unwrap();
+    let metrics = engine.raft_handle().metrics().borrow_watched().clone();
+    let vote = metrics.vote;
+    let index = metrics.last_applied.unwrap().index;
+    let probes = Arc::new(AtomicUsize::new(0));
+    let observed_probes = probes.clone();
+    let (first, mut first_seen) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(crate::run_rejoin_vote_barrier(
+        engine.read_barrier.owner().clone(),
+        gate.clone(),
+        registry.election_policy(),
+        nodes,
+        move |_leader, _address| {
+            observed_probes.fetch_add(1, Ordering::SeqCst);
+            first.send(()).unwrap();
+            async move { Ok::<_, std::convert::Infallible>((vote, index)) }
+        },
+        Duration::from_secs(1),
+        Duration::from_millis(10),
+        Duration::from_secs(3600),
+    ));
+    tokio::time::timeout(Duration::from_secs(2), first_seen.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!gate.vote_gate_open());
+    gate.establish_vote_floor(vote).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("floor notification/retry must open the gate without waiting for stall timeout")
+        .unwrap();
+    assert!(gate.vote_gate_open());
+    assert!(probes.load(Ordering::SeqCst) >= 2);
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn retired_static_peer_votes_cannot_establish_a_recovery_floor() {
+    #[derive(Clone)]
+    struct Transport {
+        current_quorum: Arc<AtomicBool>,
+        probes: Arc<AtomicUsize>,
+        vote: crate::UrsulaVote,
+        index: u64,
+    }
+    impl crate::RecoveryTransport for Transport {
+        type Error = ();
+        async fn probe(&self, _peer: u64, _address: String) -> Option<crate::rejoin::PeerGroupLog> {
+            Some(crate::rejoin::PeerGroupLog::Initialized)
+        }
+        async fn vote(&self, _peer: u64, _address: String) -> Option<crate::UrsulaVoteResponse> {
+            Some(crate::UrsulaVoteResponse::new(
+                crate::UrsulaVote::new(0, 0),
+                None,
+                false,
+            ))
+        }
+        async fn barrier(
+            &self,
+            _peer: u64,
+            _address: String,
+        ) -> Result<(crate::UrsulaVote, u64), ()> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            if self.current_quorum.load(Ordering::SeqCst) {
+                Ok((self.vote, self.index))
+            } else {
+                Err(())
+            }
+        }
+    }
+    let registry = RaftGroupHandleRegistry::default();
+    let (engine, _store, gate, _root) =
+        new_recovery_engine(1, Arc::new(Config::default()), &registry).await;
+    engine
+        .raft_handle()
+        .initialize(BTreeMap::from([(
+            1,
+            openraft::BasicNode::new("http://local"),
+        )]))
+        .await
+        .unwrap();
+    engine
+        .wait_for_current_leader(1, Duration::from_secs(3))
+        .await
+        .unwrap();
+    engine
+        .raft_handle()
+        .wait(Some(Duration::from_secs(3)))
+        .applied_index_at_least(Some(1), "bootstrap applied")
+        .await
+        .unwrap();
+    let metrics = engine.raft_handle().metrics().borrow_watched().clone();
+    let quorum = Arc::new(AtomicBool::new(false));
+    let probes = Arc::new(AtomicUsize::new(0));
+    let nodes = BTreeMap::from([
+        (1, openraft::BasicNode::new("http://local")),
+        (2, openraft::BasicNode::new("http://retired-2")),
+        (3, openraft::BasicNode::new("http://retired-3")),
+    ]);
+    engine.attach_recovery(
+        gate.clone(),
+        &registry,
+        nodes,
+        Transport {
+            current_quorum: quorum.clone(),
+            probes: probes.clone(),
+            vote: metrics.vote,
+            index: metrics.last_applied.unwrap().index,
+        },
+        crate::RecoveryConfig {
+            membership_authority: crate::RecoveryMembershipAuthority::CurrentLeader,
+            initialize: false,
+            interval: Duration::from_millis(10),
+            barrier_timeout: Duration::from_millis(100),
+            stall_after: Duration::from_secs(3600),
+            bootstrap_interval: Duration::from_secs(1),
+            bootstrap_warn_after: Duration::from_secs(1),
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while probes.load(Ordering::SeqCst) < 6 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !gate.replication_allowed(metrics.vote),
+        "a majority of old static voters is not a current quorum floor"
+    );
+    quorum.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !gate.vote_gate_open() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    engine.shutdown().await.unwrap();
 }
 
 const ELECTION_TIMEOUT_MIN_MS: u64 = 300;
@@ -287,10 +473,23 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     let nodes = endpoints
         .iter()
         .enumerate()
-        .map(|(index, endpoint)| (u64::try_from(index).unwrap() + 1, BasicNode::new(endpoint)))
+        .map(|(index, endpoint)| {
+            (
+                u64::try_from(index).unwrap().checked_add(1).unwrap(),
+                BasicNode::new(endpoint),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     // This fixture represents an initial bootstrap after proving every voter
     // empty.
+    for (index, gate) in gates.iter().enumerate() {
+        establish_peer_floor(
+            gate,
+            u64::try_from(index).unwrap().checked_add(1).unwrap(),
+            &endpoints,
+        )
+        .await;
+    }
     gates[1].allow_fresh_bootstrap().await.unwrap();
     registries[1].refresh_group_elections(placement().raft_group_id);
     engines[1].raft.initialize(nodes).await.unwrap();
@@ -367,6 +566,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     stores[0] = store;
     gates[0] = gate;
     wal_roots[0] = wal_root;
+    establish_peer_floor(&gates[0], 1, &endpoints).await;
     let channel = tonic::transport::Endpoint::from_shared(endpoints[0].clone())
         .unwrap()
         .connect()
@@ -375,6 +575,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     let mut client = pb::raft_internal_client::RaftInternalClient::new(channel);
     client
         .append(Request::new(pb::RaftRpcEnvelopeV1 {
+            process_identity: Default::default(),
             raft_group_id: placement().raft_group_id.0,
             node_id: 1,
             protocol_version: ursula_stream::FORMAT_EPOCH,
@@ -406,6 +607,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     assert!(
         client
             .transfer_leader(Request::new(pb::RaftTransferLeaderRequestV1 {
+                process_identity: Default::default(),
                 raft_group_id: placement().raft_group_id.0,
                 node_id: 1,
                 protocol_version: ursula_stream::FORMAT_EPOCH,
@@ -472,6 +674,8 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
                     .unwrap();
             let error = raw
                 .rejoin_barrier(pb::RejoinBarrierRequestV1 {
+                    process_identity: Default::default(),
+                    requester_id: 3,
                     raft_group_id: placement().raft_group_id.0,
                     protocol_version: ursula_stream::FORMAT_EPOCH,
                 })
@@ -546,21 +750,26 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     stores[0] = store;
     gates[0] = gate;
     wal_roots[0] = wal_root;
-    client
+    establish_peer_floor(&gates[0], 1, &endpoints).await;
+    let stale_error = client
         .append(Request::new(pb::RaftRpcEnvelopeV1 {
+            process_identity: Default::default(),
             raft_group_id: placement().raft_group_id.0,
             node_id: 1,
             protocol_version: ursula_stream::FORMAT_EPOCH,
             payload: encode_wire(&delayed),
         }))
         .await
-        .unwrap();
-    engines[0]
-        .raft
-        .wait(Some(Duration::from_secs(5)))
-        .applied_index_at_least(Some(baseline.log_id.index()), "second stale prefix")
-        .await
-        .unwrap();
+        .expect_err("the persisted peer floor rejects a pre-restart leader vote");
+    assert_eq!(stale_error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        engines[0]
+            .raft
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .is_none()
+    );
     registries[0].mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
     registries[0].clear_leadership_shed(LeadershipShedReason::MaintenanceDrain);
     engines[0].raft.runtime_config().tick(true);
@@ -703,10 +912,26 @@ async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
     let nodes = endpoints
         .iter()
         .enumerate()
-        .map(|(index, endpoint)| (u64::try_from(index).unwrap() + 1, BasicNode::new(endpoint)))
+        .map(|(index, endpoint)| {
+            (
+                u64::try_from(index).unwrap().checked_add(1).unwrap(),
+                BasicNode::new(endpoint),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
+    for (index, gate) in gates.iter().enumerate() {
+        establish_peer_floor(
+            gate,
+            u64::try_from(index).unwrap().checked_add(1).unwrap(),
+            &endpoints,
+        )
+        .await;
+    }
     gates[1].allow_fresh_bootstrap().await.unwrap();
     engines[1].raft.runtime_config().elect(true);
+    // Bootstrap must retry a transient RPC failure under concurrent test load.
+    // Freeze ticks only after the fixture has an established leader.
+    engines[1].raft.runtime_config().tick(true);
     engines[1].raft.initialize(nodes).await.unwrap();
     engines[1]
         .raft
@@ -714,6 +939,7 @@ async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
         .current_leader(2, "initial leader")
         .await
         .unwrap();
+    engines[1].raft.runtime_config().tick(false);
     let stream_id = bsid("ack-cursor");
     create_stream_via_raft(&engines[1], stream_id.clone()).await;
     let initial = engines[1]

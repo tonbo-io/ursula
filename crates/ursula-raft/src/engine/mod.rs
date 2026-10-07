@@ -120,6 +120,7 @@ use crate::types::UrsulaRaftTypeConfig;
 /// Optional capabilities of a group engine, independent of its transport and log store.
 #[derive(Default)]
 pub struct RaftGroupEngineOptions {
+    pub process_authority: Option<crate::RaftGroupHandleRegistry>,
     pub metrics: Option<GroupEngineMetrics>,
     pub cold_store: Option<ColdStoreHandle>,
     pub snapshot_store: Option<SharedSnapshotStore>,
@@ -129,6 +130,10 @@ pub struct RaftGroupEngineOptions {
 }
 
 pub struct RaftGroupEngine {
+    pub(crate) snapshot_installs: Arc<crate::state_machine::SnapshotInstallLifecycle>,
+    pub(crate) metadata_serial: Arc<crate::rt::sync::Mutex<()>>,
+    pub(crate) process_authority: Option<crate::RaftGroupHandleRegistry>,
+    pub(crate) apply_failure: Arc<std::sync::Mutex<Option<ursula_proto::admin::RaftApplyFailure>>>,
     pub(crate) recovery_tasks: crate::rejoin::RecoveryGate,
     pub(crate) raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
     pub(crate) placement: ShardPlacement,
@@ -171,7 +176,9 @@ impl RaftGroupEngine {
                 ..Default::default()
             }
             .validate()
-            .map_err(|err| GroupEngineError::new(format!("invalid OpenRaft config: {err}")))?,
+            .map_err(|err| {
+                GroupEngineError::backend(ursula_runtime::BackendOperation::ValidateConfig, err)
+            })?,
         );
         Self::new_single_node_with_log_store_and_metrics(
             placement,
@@ -252,13 +259,13 @@ impl RaftGroupEngine {
         .await?;
 
         let initialized = engine.raft.is_initialized().await.map_err(|err| {
-            GroupEngineError::new(format!("check OpenRaft initialization: {err}"))
+            GroupEngineError::backend(ursula_runtime::BackendOperation::CheckInitialized, err)
         })?;
         if !initialized {
             let mut nodes = BTreeMap::new();
             nodes.insert(node_id, node);
             engine.raft.initialize(nodes).await.map_err(|err| {
-                GroupEngineError::new(format!("initialize OpenRaft group: {err}"))
+                GroupEngineError::backend(ursula_runtime::BackendOperation::Initialize, err)
             })?;
         }
         engine
@@ -266,7 +273,9 @@ impl RaftGroupEngine {
             .wait(Some(Duration::from_secs(2)))
             .current_leader(node_id, "single-node OpenRaft group should elect itself")
             .await
-            .map_err(|err| GroupEngineError::new(format!("wait for OpenRaft leadership: {err}")))?;
+            .map_err(|err| {
+                GroupEngineError::backend(ursula_runtime::BackendOperation::WaitForLeader, err)
+            })?;
 
         Ok(engine)
     }
@@ -313,6 +322,7 @@ impl RaftGroupEngine {
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
         let RaftGroupEngineOptions {
+            process_authority,
             metrics,
             cold_store,
             snapshot_store,
@@ -335,11 +345,15 @@ impl RaftGroupEngine {
         state_machine
             .restore_persisted_snapshot()
             .await
-            .map_err(|err| GroupEngineError::new(format!("restore OpenRaft snapshot: {err}")))?;
+            .map_err(|err| {
+                GroupEngineError::backend(ursula_runtime::BackendOperation::RestoreSnapshot, err)
+            })?;
         // One page cache per group, shared by the read path and the state
         // machine: invalidations on apply (FlushCold, CompactCold, snapshot
         // install) then reach reads on every replica, followers included.
         let cold_index_cache = state_machine.engine.cold_index_cache();
+        let apply_failure = state_machine.apply_failure.clone();
+        let metadata_serial = state_machine.metadata_serial.clone();
         let raft = Raft::<UrsulaRaftTypeConfig, RaftGroupStateMachine>::new(
             node_id,
             config,
@@ -348,9 +362,15 @@ impl RaftGroupEngine {
             state_machine,
         )
         .await
-        .map_err(|err| GroupEngineError::new(format!("create OpenRaft group: {err}")))?;
+        .map_err(|err| {
+            GroupEngineError::backend(ursula_runtime::BackendOperation::CreateGroup, err)
+        })?;
 
         Ok(Self {
+            snapshot_installs: Arc::default(),
+            metadata_serial,
+            process_authority,
+            apply_failure,
             recovery_tasks: crate::rejoin::RecoveryGate::default(),
             read_barrier: Arc::new(ReadIndexBarrier::new(raft.clone())),
             raft,
@@ -365,15 +385,14 @@ impl RaftGroupEngine {
         nodes: BTreeMap<u64, BasicNode>,
     ) -> Result<(), GroupEngineError> {
         let initialized = self.raft.is_initialized().await.map_err(|err| {
-            GroupEngineError::new(format!("check OpenRaft initialization: {err}"))
+            GroupEngineError::backend(ursula_runtime::BackendOperation::CheckInitialized, err)
         })?;
         if initialized {
             return Ok(());
         }
-        self.raft
-            .initialize(nodes)
-            .await
-            .map_err(|err| GroupEngineError::new(format!("initialize OpenRaft group: {err}")))
+        self.raft.initialize(nodes).await.map_err(|err| {
+            GroupEngineError::backend(ursula_runtime::BackendOperation::Initialize, err)
+        })
     }
 
     pub async fn wait_for_current_leader(
@@ -386,7 +405,9 @@ impl RaftGroupEngine {
             .current_leader(node_id, "OpenRaft group should observe expected leader")
             .await
             .map(|_| ())
-            .map_err(|err| GroupEngineError::new(format!("wait for OpenRaft leadership: {err}")))
+            .map_err(|err| {
+                GroupEngineError::backend(ursula_runtime::BackendOperation::WaitForLeader, err)
+            })
     }
 
     pub fn raft_handle(&self) -> Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine> {
@@ -407,11 +428,16 @@ impl RaftGroupEngine {
     }
 
     pub async fn shutdown(&self) -> Result<(), GroupEngineError> {
+        self.snapshot_installs.close();
         self.recovery_tasks.shutdown().await;
-        self.raft
-            .shutdown()
-            .await
-            .map_err(|err| GroupEngineError::new(format!("shutdown OpenRaft group: {err}")))
+        let result = self.raft.shutdown().await.map_err(|err| {
+            GroupEngineError::backend(ursula_runtime::BackendOperation::Shutdown, err)
+        });
+        self.snapshot_installs.drain().await;
+        // A canceled snapshot waiter cannot cancel fsync. Drain its owned
+        // publication guard before the owner releases/reopens the durable WAL.
+        let _published = self.metadata_serial.lock().await;
+        result
     }
 
     /// This replica's applied group state, leader or follower (simulation
@@ -423,10 +449,9 @@ impl RaftGroupEngine {
     ) -> Result<ursula_runtime::GroupSnapshot, GroupEngineError> {
         self.with_state_machine(move |state_machine| {
             Box::pin(async move {
-                state_machine
-                    .group_snapshot()
-                    .await
-                    .map_err(|err| GroupEngineError::new(format!("group snapshot: {err}")))
+                state_machine.group_snapshot().await.map_err(|err| {
+                    GroupEngineError::backend(ursula_runtime::BackendOperation::BuildSnapshot, err)
+                })
             })
         })
         .await?
@@ -464,6 +489,14 @@ impl RaftGroupEngine {
         &self,
         command: GroupWriteCommand,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
+        if let Some(authority) = &self.process_authority {
+            authority
+                .confirm_process_authority()
+                .await
+                .map_err(|error| {
+                    GroupEngineError::backend(ursula_runtime::BackendOperation::Write, error)
+                })?;
+        }
         let response = match self.raft.client_write(command).await {
             Ok(response) => response,
             Err(err) => {
@@ -471,6 +504,14 @@ impl RaftGroupEngine {
                 return Err(group_engine_client_write_error(err, self_id));
             }
         };
+        if let Some(authority) = &self.process_authority {
+            authority
+                .confirm_process_authority()
+                .await
+                .map_err(|error| {
+                    GroupEngineError::backend(ursula_runtime::BackendOperation::Write, error)
+                })?;
+        }
         write_result_from_raft_response(response.data)?
     }
 
@@ -502,10 +543,9 @@ impl RaftGroupEngine {
     where
         V: OptionalSend + 'static,
     {
-        self.raft
-            .with_state_machine(f)
-            .await
-            .map_err(|err| GroupEngineError::new(format!("OpenRaft state-machine access: {err}")))
+        self.raft.with_state_machine(f).await.map_err(|err| {
+            GroupEngineError::backend(ursula_runtime::BackendOperation::AccessStateMachine, err)
+        })
     }
 
     /// The live stream's cold-index generation (F14g; 0 when absent).
@@ -566,9 +606,12 @@ impl RaftGroupEngine {
         {
             GroupWriteResponse::TouchStreamAccess(response) => response,
             other => {
-                return Err(GroupEngineError::new(format!(
-                    "unexpected touch stream access write response: {other:?}"
-                )));
+                return Err(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::UnexpectedResponse {
+                        expected: ursula_runtime::GroupResponseKind::TouchStreamAccess,
+                        actual: other.kind(),
+                    },
+                ));
             }
         };
         if response.expired {
@@ -681,9 +724,12 @@ impl GroupEngine for RaftGroupEngine {
             return Box::pin(async move {
                 match self.write(GroupWriteCommand::from(request)).await? {
                     GroupWriteResponse::CreateStream(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected create stream write response: {other:?}"
-                    ))),
+                    other => Err(GroupEngineError::Infra(
+                        ursula_runtime::GroupInfraError::UnexpectedResponse {
+                            expected: ursula_runtime::GroupResponseKind::CreateStream,
+                            actual: other.kind(),
+                        },
+                    )),
                 }
             });
         }
@@ -692,9 +738,12 @@ impl GroupEngine for RaftGroupEngine {
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
                 return match response {
                     GroupWriteResponse::CreateStream(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected create stream write response: {other:?}"
-                    ))),
+                    other => Err(GroupEngineError::Infra(
+                        ursula_runtime::GroupInfraError::UnexpectedResponse {
+                            expected: ursula_runtime::GroupResponseKind::CreateStream,
+                            actual: other.kind(),
+                        },
+                    )),
                 };
             }
             self.with_state_machine({
@@ -710,9 +759,12 @@ impl GroupEngine for RaftGroupEngine {
             .await??;
             match self.write(GroupWriteCommand::from(request)).await? {
                 GroupWriteResponse::CreateStream(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected create stream write response: {other:?}"
-                ))),
+                other => Err(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::UnexpectedResponse {
+                        expected: ursula_runtime::GroupResponseKind::CreateStream,
+                        actual: other.kind(),
+                    },
+                )),
             }
         })
     }
@@ -727,11 +779,35 @@ impl GroupEngine for RaftGroupEngine {
             // (F14g), so the engine writes no page entry before proposing.
             match self.write(GroupWriteCommand::from(request)).await? {
                 GroupWriteResponse::CreateStream(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected external create stream write response: {other:?}"
-                ))),
+                other => Err(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::UnexpectedResponse {
+                        expected: ursula_runtime::GroupResponseKind::CreateStream,
+                        actual: other.kind(),
+                    },
+                )),
             }
         })
+    }
+
+    fn forwarded_head_stream(
+        &self,
+        request: &HeadStreamRequest,
+        placement: ShardPlacement,
+    ) -> Option<GroupHeadStreamFuture<'static>> {
+        if self.raft.is_leader() {
+            return None;
+        }
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        let leader = metrics.current_leader?;
+        let node = metrics
+            .membership_config
+            .membership()
+            .get_node(&leader)?
+            .clone();
+        let request = request.clone();
+        Some(Box::pin(async move {
+            forward_head_stream_to_leader(placement, &node, request).await
+        }))
     }
 
     fn head_stream<'a>(
@@ -740,11 +816,9 @@ impl GroupEngine for RaftGroupEngine {
         placement: ShardPlacement,
     ) -> GroupHeadStreamFuture<'a> {
         Box::pin(async move {
-            if !self.raft.is_leader()
-                && let Some(leader_node) = self.current_leader_node().await
-            {
-                return forward_head_stream_to_leader(placement, &leader_node, request).await;
-            }
+            // Follower I/O is planned by forwarded_head_stream before entering
+            // the actor. A leadership change here returns a retryable routing
+            // error instead of borrowing the actor across a network round trip.
             if request.linearizable {
                 self.require_linearizable_leader_read("head_stream", request.read_index)
                     .await?;
@@ -822,9 +896,9 @@ impl GroupEngine for RaftGroupEngine {
                 if !self.raft.is_leader()
                     && let Some(leader_node) = self.current_leader_node().await
                 {
-                    let response =
-                        forward_read_stream_to_leader(placement, &leader_node, request).await?;
-                    return Ok(GroupReadStreamParts::from_response(response));
+                    return Ok(GroupReadStreamParts::deferred(async move {
+                        forward_read_stream_to_leader(placement, &leader_node, request).await
+                    }));
                 }
                 self.require_linearizable_leader_read(
                     "leader-only read_stream",
@@ -843,10 +917,10 @@ impl GroupEngine for RaftGroupEngine {
                     Ok(false) => {}
                     Ok(true) | Err(_) => {
                         if let Some(leader_node) = self.current_leader_node().await {
-                            let response =
+                            return Ok(GroupReadStreamParts::deferred(async move {
                                 forward_read_stream_to_leader(placement, &leader_node, request)
-                                    .await?;
-                            return Ok(GroupReadStreamParts::from_response(response));
+                                    .await
+                            }));
                         }
                         self.require_local_leader_for_read("read_stream").await?;
                     }
@@ -886,13 +960,14 @@ impl GroupEngine for RaftGroupEngine {
                         // whether this stream/cursor actually exists.
                         let mut authoritative_request = original_request;
                         authoritative_request.leader_only = true;
-                        let response = forward_read_stream_to_leader(
-                            placement,
-                            &leader_node,
-                            authoritative_request,
-                        )
-                        .await?;
-                        return Ok(GroupReadStreamParts::from_response(response));
+                        return Ok(GroupReadStreamParts::deferred(async move {
+                            forward_read_stream_to_leader(
+                                placement,
+                                &leader_node,
+                                authoritative_request,
+                            )
+                            .await
+                        }));
                     }
                     return Err(self.not_leader_for_read("read_stream boundary").await);
                 }
@@ -908,16 +983,16 @@ impl GroupEngine for RaftGroupEngine {
             if owner_pinned && !self.raft.is_leader() {
                 return Err(self.not_leader_for_read("live read_stream").await);
             }
-            if !self.raft.is_leader() && parts.up_to_date && !parts.closed {
+            if !self.raft.is_leader() && parts.is_open_tail() {
                 if parts.payload_is_empty()
                     && let Some(leader_node) = self.current_leader_node().await
                 {
-                    let response =
+                    return Ok(GroupReadStreamParts::deferred(async move {
                         forward_read_stream_to_leader(placement, &leader_node, original_request)
-                            .await?;
-                    return Ok(GroupReadStreamParts::from_response(response));
+                            .await
+                    }));
                 }
-                parts.up_to_date = false;
+                parts.mark_not_up_to_date();
             }
             Ok(parts)
         })
@@ -960,18 +1035,24 @@ impl GroupEngine for RaftGroupEngine {
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
                 return match response {
                     GroupWriteResponse::PublishSnapshot(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected publish snapshot write response: {other:?}"
-                    ))),
+                    other => Err(GroupEngineError::Infra(
+                        ursula_runtime::GroupInfraError::UnexpectedResponse {
+                            expected: ursula_runtime::GroupResponseKind::PublishSnapshot,
+                            actual: other.kind(),
+                        },
+                    )),
                 };
             }
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
                 .await?;
             match self.write(GroupWriteCommand::from(request)).await? {
                 GroupWriteResponse::PublishSnapshot(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected publish snapshot write response: {other:?}"
-                ))),
+                other => Err(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::UnexpectedResponse {
+                        expected: ursula_runtime::GroupResponseKind::PublishSnapshot,
+                        actual: other.kind(),
+                    },
+                )),
             }
         })
     }
@@ -986,18 +1067,24 @@ impl GroupEngine for RaftGroupEngine {
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
                 return match response {
                     GroupWriteResponse::AdvanceRetention(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected advance retention write response: {other:?}"
-                    ))),
+                    other => Err(GroupEngineError::Infra(
+                        ursula_runtime::GroupInfraError::UnexpectedResponse {
+                            expected: ursula_runtime::GroupResponseKind::AdvanceRetention,
+                            actual: other.kind(),
+                        },
+                    )),
                 };
             }
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
                 .await?;
             match self.write(GroupWriteCommand::from(request)).await? {
                 GroupWriteResponse::AdvanceRetention(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected advance retention write response: {other:?}"
-                ))),
+                other => Err(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::UnexpectedResponse {
+                        expected: ursula_runtime::GroupResponseKind::AdvanceRetention,
+                        actual: other.kind(),
+                    },
+                )),
             }
         })
     }
@@ -1015,16 +1102,22 @@ impl GroupEngine for RaftGroupEngine {
             {
                 return match response {
                     GroupWriteResponse::ImportGroupState(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected group state import response: {other:?}"
-                    ))),
+                    other => Err(GroupEngineError::Infra(
+                        ursula_runtime::GroupInfraError::UnexpectedResponse {
+                            expected: ursula_runtime::GroupResponseKind::ImportGroupState,
+                            actual: other.kind(),
+                        },
+                    )),
                 };
             }
             match self.write(command).await? {
                 GroupWriteResponse::ImportGroupState(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected group state import response: {other:?}"
-                ))),
+                other => Err(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::UnexpectedResponse {
+                        expected: ursula_runtime::GroupResponseKind::ImportGroupState,
+                        actual: other.kind(),
+                    },
+                )),
             }
         })
     }
@@ -1043,16 +1136,22 @@ impl GroupEngine for RaftGroupEngine {
             {
                 return match response {
                     GroupWriteResponse::TidyStream(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected tidy stream write response: {other:?}"
-                    ))),
+                    other => Err(GroupEngineError::Infra(
+                        ursula_runtime::GroupInfraError::UnexpectedResponse {
+                            expected: ursula_runtime::GroupResponseKind::TidyStream,
+                            actual: other.kind(),
+                        },
+                    )),
                 };
             }
             match self.write(command).await? {
                 GroupWriteResponse::TidyStream(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected tidy stream write response: {other:?}"
-                ))),
+                other => Err(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::UnexpectedResponse {
+                        expected: ursula_runtime::GroupResponseKind::TidyStream,
+                        actual: other.kind(),
+                    },
+                )),
             }
         })
     }
@@ -1093,7 +1192,9 @@ impl GroupEngine for RaftGroupEngine {
                         object,
                     )
                     .await
-                    .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                    .map_err(|err| {
+                        GroupEngineError::backend(ursula_runtime::BackendOperation::ColdIndex, err)
+                    })?;
                     report.page_entries_clipped =
                         report.page_entries_clipped.saturating_add(clipped);
                 }
@@ -1111,9 +1212,12 @@ impl GroupEngine for RaftGroupEngine {
                             report.refs_offloaded.saturating_add(response.removed);
                     }
                     Ok(other) => {
-                        return Err(GroupEngineError::new(format!(
-                            "unexpected offload cold refs write response: {other:?}"
-                        )));
+                        return Err(GroupEngineError::Infra(
+                            ursula_runtime::GroupInfraError::UnexpectedResponse {
+                                expected: ursula_runtime::GroupResponseKind::OffloadColdRefs,
+                                actual: other.kind(),
+                            },
+                        ));
                     }
                     Err(err) if err.code().is_some() => {
                         report.rejected = report.rejected.saturating_add(1);
@@ -1213,9 +1317,12 @@ impl GroupEngine for RaftGroupEngine {
                 .await?
             {
                 GroupWriteResponse::TouchStreamAccess(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected touch stream access write response: {other:?}"
-                ))),
+                other => Err(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::UnexpectedResponse {
+                        expected: ursula_runtime::GroupResponseKind::TouchStreamAccess,
+                        actual: other.kind(),
+                    },
+                )),
             }
         })
     }
@@ -1274,18 +1381,24 @@ impl GroupEngine for RaftGroupEngine {
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
                 return match response {
                     GroupWriteResponse::CloseStream(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected close stream write response: {other:?}"
-                    ))),
+                    other => Err(GroupEngineError::Infra(
+                        ursula_runtime::GroupInfraError::UnexpectedResponse {
+                            expected: ursula_runtime::GroupResponseKind::CloseStream,
+                            actual: other.kind(),
+                        },
+                    )),
                 };
             }
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
                 .await?;
             match self.write(GroupWriteCommand::from(request)).await? {
                 GroupWriteResponse::CloseStream(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected close stream write response: {other:?}"
-                ))),
+                other => Err(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::UnexpectedResponse {
+                        expected: ursula_runtime::GroupResponseKind::CloseStream,
+                        actual: other.kind(),
+                    },
+                )),
             }
         })
     }
@@ -1298,9 +1411,12 @@ impl GroupEngine for RaftGroupEngine {
         Box::pin(async move {
             match self.write(GroupWriteCommand::from(request)).await? {
                 GroupWriteResponse::DeleteStream(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected delete stream write response: {other:?}"
-                ))),
+                other => Err(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::UnexpectedResponse {
+                        expected: ursula_runtime::GroupResponseKind::DeleteStream,
+                        actual: other.kind(),
+                    },
+                )),
             }
         })
     }
@@ -1334,9 +1450,12 @@ impl GroupEngine for RaftGroupEngine {
                 .await?
             {
                 GroupWriteResponse::PurgeBucket(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected purge bucket write response: {other:?}"
-                ))),
+                other => Err(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::UnexpectedResponse {
+                        expected: ursula_runtime::GroupResponseKind::PurgeBucket,
+                        actual: other.kind(),
+                    },
+                )),
             }
         })
     }
@@ -1354,9 +1473,12 @@ impl GroupEngine for RaftGroupEngine {
                 .await?
             {
                 GroupWriteResponse::AckColdGc(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected ack cold gc write response: {other:?}"
-                ))),
+                other => Err(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::UnexpectedResponse {
+                        expected: ursula_runtime::GroupResponseKind::AckColdGc,
+                        actual: other.kind(),
+                    },
+                )),
             }
         })
     }
@@ -1376,9 +1498,12 @@ impl GroupEngine for RaftGroupEngine {
                 .await?
             {
                 GroupWriteResponse::DeferColdGc(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected defer cold gc write response: {other:?}"
-                ))),
+                other => Err(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::UnexpectedResponse {
+                        expected: ursula_runtime::GroupResponseKind::DeferColdGc,
+                        actual: other.kind(),
+                    },
+                )),
             }
         })
     }
@@ -1464,7 +1589,9 @@ impl GroupEngine for RaftGroupEngine {
             let (report, compaction_pages) =
                 repair_cold_index_streams(&store, self.cold_index_cache.as_deref(), &inputs)
                     .await
-                    .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                    .map_err(|err| {
+                        GroupEngineError::backend(ursula_runtime::BackendOperation::ColdIndex, err)
+                    })?;
             // F14f: reclaim objects wholly below each visited stream's
             // retained offset once the retention grace has passed.
             if !retention_targets.is_empty() {
@@ -1584,9 +1711,12 @@ impl GroupEngine for RaftGroupEngine {
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
                 return match response {
                     GroupWriteResponse::Append(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected external append write response: {other:?}"
-                    ))),
+                    other => Err(GroupEngineError::Infra(
+                        ursula_runtime::GroupInfraError::UnexpectedResponse {
+                            expected: ursula_runtime::GroupResponseKind::Append,
+                            actual: other.kind(),
+                        },
+                    )),
                 };
             }
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
@@ -1596,9 +1726,12 @@ impl GroupEngine for RaftGroupEngine {
             // append committed.
             match self.write(GroupWriteCommand::from(request)).await? {
                 GroupWriteResponse::Append(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected external append write response: {other:?}"
-                ))),
+                other => Err(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::UnexpectedResponse {
+                        expected: ursula_runtime::GroupResponseKind::Append,
+                        actual: other.kind(),
+                    },
+                )),
             }
         })
     }
@@ -1614,9 +1747,12 @@ impl GroupEngine for RaftGroupEngine {
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
                 return match response {
                     GroupWriteResponse::Append(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected append write response: {other:?}"
-                    ))),
+                    other => Err(GroupEngineError::Infra(
+                        ursula_runtime::GroupInfraError::UnexpectedResponse {
+                            expected: ursula_runtime::GroupResponseKind::Append,
+                            actual: other.kind(),
+                        },
+                    )),
                 };
             }
             if admission.max_hot_bytes_per_group.is_some() {
@@ -1634,9 +1770,12 @@ impl GroupEngine for RaftGroupEngine {
             }
             match self.write(GroupWriteCommand::from(request)).await? {
                 GroupWriteResponse::Append(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected append write response: {other:?}"
-                ))),
+                other => Err(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::UnexpectedResponse {
+                        expected: ursula_runtime::GroupResponseKind::Append,
+                        actual: other.kind(),
+                    },
+                )),
             }
         })
     }
@@ -1670,7 +1809,9 @@ impl GroupEngine for RaftGroupEngine {
                     &request.chunk,
                 )
                 .await
-                .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                .map_err(|err| {
+                    GroupEngineError::backend(ursula_runtime::BackendOperation::ColdIndex, err)
+                })?;
                 // The clip rule may have removed stale entries that a cached
                 // page still holds.
                 if clipped_entries(&rollback) > 0
@@ -1683,9 +1824,12 @@ impl GroupEngine for RaftGroupEngine {
             let (result, rollback_safe) = match self.write(GroupWriteCommand::from(request)).await {
                 Ok(GroupWriteResponse::FlushCold(response)) => (Ok(response), false),
                 Ok(other) => (
-                    Err(GroupEngineError::new(format!(
-                        "unexpected flush cold write response: {other:?}"
-                    ))),
+                    Err(GroupEngineError::Infra(
+                        ursula_runtime::GroupInfraError::UnexpectedResponse {
+                            expected: ursula_runtime::GroupResponseKind::FlushCold,
+                            actual: other.kind(),
+                        },
+                    )),
                     false,
                 ),
                 Err(err) => {
@@ -1703,9 +1847,10 @@ impl GroupEngine for RaftGroupEngine {
                 rollback_cold_index_pages(&store, rollback)
                     .await
                     .map_err(|err| {
-                        GroupEngineError::new(format!(
-                            "rollback cold index after flush rejection: {err}"
-                        ))
+                        GroupEngineError::backend(
+                            ursula_runtime::BackendOperation::RollbackColdIndex,
+                            err,
+                        )
                     })?;
             }
             result
@@ -1737,7 +1882,9 @@ impl GroupEngine for RaftGroupEngine {
                         &request.replacement,
                     )
                     .await
-                    .map_err(|err| GroupEngineError::new(err.to_string()))?
+                    .map_err(|err| {
+                        GroupEngineError::backend(ursula_runtime::BackendOperation::ColdIndex, err)
+                    })?
                 } else {
                     let Some(rollback) =
                         replace_cold_chunk_index_pages_with_rollback_in_generation(
@@ -1748,10 +1895,15 @@ impl GroupEngine for RaftGroupEngine {
                             &request.replacement,
                         )
                         .await
-                        .map_err(|err| GroupEngineError::new(err.to_string()))?
+                        .map_err(|err| {
+                            GroupEngineError::backend(
+                                ursula_runtime::BackendOperation::ColdIndex,
+                                err,
+                            )
+                        })?
                     else {
-                        return Err(GroupEngineError::new(
-                            "cold compaction input no longer matches the cold index",
+                        return Err(GroupEngineError::Infra(
+                            ursula_runtime::GroupInfraError::StaleColdIndex,
                         ));
                     };
                     rollback
@@ -1761,9 +1913,12 @@ impl GroupEngine for RaftGroupEngine {
             let (result, rollback_safe) = match self.write(GroupWriteCommand::from(request)).await {
                 Ok(GroupWriteResponse::CompactCold(response)) => (Ok(response), false),
                 Ok(other) => (
-                    Err(GroupEngineError::new(format!(
-                        "unexpected compact cold write response: {other:?}"
-                    ))),
+                    Err(GroupEngineError::Infra(
+                        ursula_runtime::GroupInfraError::UnexpectedResponse {
+                            expected: ursula_runtime::GroupResponseKind::CompactCold,
+                            actual: other.kind(),
+                        },
+                    )),
                     false,
                 ),
                 Err(err) => {
@@ -1781,9 +1936,10 @@ impl GroupEngine for RaftGroupEngine {
                 rollback_cold_index_pages(&store, rollback)
                     .await
                     .map_err(|err| {
-                        GroupEngineError::new(format!(
-                            "rollback cold index after compaction failure: {err}"
-                        ))
+                        GroupEngineError::backend(
+                            ursula_runtime::BackendOperation::RollbackColdIndex,
+                            err,
+                        )
                     })?;
             }
             result
@@ -1794,10 +1950,12 @@ impl GroupEngine for RaftGroupEngine {
         Box::pin(async move {
             self.with_state_machine(move |state_machine| {
                 Box::pin(async move {
-                    state_machine
-                        .group_snapshot()
-                        .await
-                        .map_err(|err| GroupEngineError::new(err.to_string()))
+                    state_machine.group_snapshot().await.map_err(|err| {
+                        GroupEngineError::backend(
+                            ursula_runtime::BackendOperation::BuildSnapshot,
+                            err,
+                        )
+                    })
                 })
             })
             .await?

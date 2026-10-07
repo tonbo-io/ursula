@@ -99,10 +99,15 @@ fn should_drive_snapshots(bad_tick: bool, log_pressure: bool) -> bool {
 
 /// Keeps the coordinator's log-pressure flag (read by HTTP admission) in step
 /// with the node's unsnapshotted Raft log bytes.
-fn spawn_log_pressure_monitor(coordinator: SnapshotBuildCoordinator, cadence: &SnapshotCadence) {
+fn spawn_log_pressure_monitor(
+    runtime: &ShardRuntime,
+    coordinator: SnapshotBuildCoordinator,
+    cadence: &SnapshotCadence,
+) {
     let limit = log_pressure_limit_bytes(cadence);
     let resume = log_pressure_resume_bytes(cadence);
-    tokio::spawn(async move {
+    let owner = runtime.clone();
+    if let Err(error) = owner.spawn_on_owner(ursula_shard::CoreId(0), async move {
         loop {
             let log_bytes = coordinator
                 .log_progress()
@@ -121,7 +126,9 @@ fn spawn_log_pressure_monitor(coordinator: SnapshotBuildCoordinator, cadence: &S
             }
             tokio::time::sleep(LOG_PRESSURE_POLL).await;
         }
-    });
+    }) {
+        tracing::error!(%error, "failed to schedule background driver on owner");
+    }
 }
 
 /// Default driver interval: 5 s with an external snapshot store, whose
@@ -181,7 +188,7 @@ pub fn spawn_snapshot_driver(
     s3_cfg: Option<&ursula_config::S3Config>,
     interval_ms: usize,
     cadence: SnapshotCadence,
-    wal_lagging: Option<std::sync::Arc<ursula_raft::LaggingGroups>>,
+    wal_lagging: Option<std::sync::Arc<ursula_raft::wal::LaggingGroups>>,
     max_groups_per_tick: usize,
 ) {
     if interval_ms == 0 {
@@ -201,8 +208,9 @@ pub fn spawn_snapshot_driver(
     let runtime = runtime.clone();
     let registry = registry.clone();
     let coordinator = registry.snapshot_build_coordinator();
-    spawn_log_pressure_monitor(coordinator.clone(), &cadence);
-    tokio::spawn(async move {
+    spawn_log_pressure_monitor(&runtime, coordinator.clone(), &cadence);
+    let owner = runtime.clone();
+    if let Err(error) = owner.spawn_on_owner(ursula_shard::CoreId(0), async move {
         let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX));
         let mut consecutive_bad = 0usize;
         let mut consecutive_good = 0usize;
@@ -317,7 +325,9 @@ pub fn spawn_snapshot_driver(
                 None => tokio::time::sleep(pause).await,
             }
         }
-    });
+    }) {
+        tracing::error!(%error, "failed to schedule background driver on owner");
+    }
 }
 
 #[cfg(test)]

@@ -137,8 +137,8 @@ mod tests {
 
     use super::*;
     use crate::GroupRejoin;
-    use crate::RaftWal;
     use crate::log_store::RUN_STATE_FILE;
+    use crate::log_store::RaftWal;
     use crate::types::UrsulaRaftTypeConfig;
 
     #[tokio::test]

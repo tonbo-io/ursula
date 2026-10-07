@@ -33,8 +33,12 @@ pub(crate) fn decode_wire<T: DeserializeOwned>(
     bytes: &[u8],
     what: &str,
 ) -> Result<T, GroupEngineError> {
-    rmp_serde::from_slice(bytes)
-        .map_err(|err| GroupEngineError::new(format!("decode wire {what}: {err}")))
+    rmp_serde::from_slice(bytes).map_err(|err| {
+        GroupEngineError::Infra(GroupInfraError::WireDecode {
+            payload: what.to_owned(),
+            source: ursula_runtime::BackendErrorSource::new(err),
+        })
+    })
 }
 
 pub(crate) fn placement_from_parts(
@@ -43,8 +47,13 @@ pub(crate) fn placement_from_parts(
     raft_group_id: u32,
     field: &str,
 ) -> Result<ShardPlacement, GroupEngineError> {
-    let core_id = u16::try_from(core_id)
-        .map_err(|_overflow| GroupEngineError::new(format!("{field}.core_id does not fit u16")))?;
+    let core_id = u16::try_from(core_id).map_err(|_overflow| {
+        GroupEngineError::Infra(GroupInfraError::WireRange {
+            context: field.to_owned(),
+            field: ursula_runtime::WireField::CoreId,
+            value: u128::from(core_id),
+        })
+    })?;
     Ok(ShardPlacement {
         core_id: CoreId(core_id),
         shard_id: ShardId(shard_id),

@@ -72,6 +72,9 @@ pub(super) async fn in_process_barrier(
         .rejoin(leader_id)
         .ok_or(RecoveryProbeError::MissingGate)?
         .raft_group_id();
+    if let Some(rejoin) = registry.rejoin(leader_id) {
+        rejoin.begin_peer_recovery(node_id);
+    }
     registry
         .confirm_recovery_barrier(leader_id, group)
         .await
@@ -89,8 +92,15 @@ pub(super) async fn in_process_probe(
     if policy.partitioned(node_id, peer_id) {
         return None;
     }
+    let request = ursula_raft::bootstrap_probe_vote();
+    if let Some(refusal) = registry
+        .rejoin(peer_id)
+        .and_then(|rejoin| rejoin.screen_vote(&request))
+    {
+        return Some(PeerGroupLog::from_vote_response(&refusal));
+    }
     registry
-        .vote(peer_id, ursula_raft::bootstrap_probe_vote(node_id))
+        .vote(peer_id, request)
         .await
         .ok()
         .map(|response| PeerGroupLog::from_vote_response(&response))
@@ -108,6 +118,7 @@ pub(super) fn wire_recovery(
     registry: &InProcessRaftRegistry,
     policy: &InProcessRaftNetworkPolicy,
     voters: &BTreeMap<u64, BasicNode>,
+    membership_authority: ursula_raft::RecoveryMembershipAuthority,
 ) {
     registry.register_rejoin(node_id, rejoin.clone());
     engine.attach_recovery(
@@ -120,6 +131,7 @@ pub(super) fn wire_recovery(
             node_id,
         },
         ursula_raft::RecoveryConfig {
+            membership_authority,
             initialize: node_id == 1,
             interval: RECOVERY_DRIVER_INTERVAL,
             barrier_timeout: Duration::from_secs(1),
@@ -141,6 +153,20 @@ impl ursula_raft::RecoveryTransport for InProcessRecoveryTransport {
     type Error = RecoveryProbeError;
     async fn probe(&self, peer: u64, _address: String) -> Option<PeerGroupLog> {
         in_process_probe(&self.registry, &self.policy, self.node_id, peer).await
+    }
+    async fn vote(&self, peer: u64, _address: String) -> Option<ursula_raft::UrsulaVoteResponse> {
+        if self.policy.partitioned(self.node_id, peer) {
+            return None;
+        }
+        let request = ursula_raft::bootstrap_probe_vote();
+        if let Some(refusal) = self
+            .registry
+            .rejoin(peer)
+            .and_then(|gate| gate.screen_vote(&request))
+        {
+            return Some(refusal);
+        }
+        self.registry.vote(peer, request).await.ok()
     }
     async fn barrier(
         &self,

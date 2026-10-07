@@ -310,6 +310,10 @@ impl InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
         match response {
+            StreamResponse::ReplicationBarrier => {
+                self.advance_commit_index();
+                Ok(GroupWriteResponse::ReplicationBarrier)
+            }
             StreamResponse::Created {
                 next_offset,
                 closed,
@@ -2138,7 +2142,8 @@ pub(crate) fn ensure_bucket_exists(
 /// Stream id a command targets, if any (bucket and GC commands have none).
 fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
     match command {
-        StreamCommand::CreateBucket { .. }
+        StreamCommand::ReplicationBarrier
+        | StreamCommand::CreateBucket { .. }
         | StreamCommand::PurgeBucket { .. }
         | StreamCommand::AckColdGc { .. }
         | StreamCommand::DeferColdGc { .. }

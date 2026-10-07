@@ -262,7 +262,6 @@ mod tests {
     fn node(id: u64) -> NodeInfo {
         NodeInfo {
             expected_process_incarnation: None,
-            expected_maintenance_fence: None,
             id,
             admin_url: Url::parse(&format!("http://10.0.0.{id}:4438")).unwrap(),
             host: format!("10.0.0.{id}"),
@@ -274,8 +273,6 @@ mod tests {
     fn view(node_id: u64, groups: Vec<RaftGroupView>) -> NodeMetricsView {
         NodeMetricsView {
             process_incarnation: None,
-            maintenance_fence: None,
-            maintenance_fence_uncertain: false,
             node: node(node_id),
             groups,
             raft_maintenance: None,
@@ -299,7 +296,14 @@ mod tests {
             last_applied_index: applied,
             voter_ids: voters,
             learner_ids: vec![],
-            maintenance: None,
+            maintenance: Some(ursula_proto::admin::RaftGroupMaintenanceState {
+                running: true,
+                recovery_ready: true,
+                accepting_transfers: true,
+                membership_joint: false,
+                membership_log_index: Some(0),
+                stopped_for_operator: false,
+            }),
         }
     }
 

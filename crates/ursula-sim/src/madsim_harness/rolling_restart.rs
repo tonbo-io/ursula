@@ -185,8 +185,6 @@ impl RollingRestartValidator {
             let view = NodeMetricsView {
                 // This harness models Raft state directly, not an HTTP process.
                 process_incarnation: None,
-                maintenance_fence: None,
-                maintenance_fence_uncertain: false,
                 node: synthetic_node_info(node_id),
                 groups: vec![RaftGroupView {
                     raft_group_id,
@@ -223,7 +221,6 @@ impl RollingRestartValidator {
 fn synthetic_node_info(node_id: u64) -> NodeInfo {
     NodeInfo {
         expected_process_incarnation: None,
-        expected_maintenance_fence: None,
         id: node_id,
         // The planner never reaches over the network in this validator; we
         // synthesise the admin URL so NodeInfo's invariants are satisfied.

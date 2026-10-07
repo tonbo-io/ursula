@@ -202,6 +202,68 @@ This matters for the migration because lagging-follower and restart-level tests 
 - No immediate monoio rewrite of axum/tonic code.
 - No migration of all current operational workers before ownership boundaries are stable.
 
+
+## Owner contention measurements (2026-10-07)
+
+The `atomic_padding` runtime benchmark now includes `owner_max_counter` and
+`owner_read_admission`. Before replacing the process-wide read-materialization
+semaphore, the latter measured these intervals on an Apple M5 with the dev
+profile (10,000 acquire/drop operations per thread, 10 samples):
+
+| Threads | Shared semaphore | One semaphore per owner |
+| --- | --- | --- |
+| 1 | 759–773 us | 775–784 us |
+| 2 | 3.23–3.26 ms | 790–813 us |
+| 4 | 7.79–8.24 ms | 912–963 us |
+| 8 | 21.09–21.53 ms | 2.14–2.30 ms |
+
+Run with `cargo bench --profile dev -p ursula-runtime --bench atomic_padding --
+owner_read_admission --warm-up-time 0.1 --measurement-time 0.2 --sample-size 10`.
+These isolate atomic contention, not end-to-end request latency or cluster
+throughput. Read-materialization admission is now bounded by mailbox capacity
+**per owner core**; the maximum node-wide concurrent materializations is the
+sum of those budgets. The stream-hot-byte high watermark is collected from
+per-group counters at scrape time. gRPC counters occupy separate cache lines;
+the queued-byte gauge still measures the process-wide total.
+
+A separate optimized atomic-only probe (seven runs, median, 1,000,000 operations
+per thread) measured shared versus owner-local `fetch_max`: 4.94/4.94 ms with one
+thread, 45.58/4.99 ms with two, 131.37/5.10 ms with four, and 264.15/5.64 ms with
+eight. Two threads updating adjacent versus padded counters measured
+12.15/1.80 ms. The checked-in `owner_max_counter` and
+`atomic_padding_false_sharing` benchmarks retain these comparison workloads;
+CPU, optimization level, and scheduler placement affect the absolute numbers.
+
+`http_ownership` compares 32 concurrent loopback HTTP requests that read a
+warmed owner group's gauges. The same client runtime, one owner, router and
+request path are used, with only HTTP accept/handler placement changed. In a
+dev-profile run, main-runtime serving took 1.070–1.108 ms per batch and owner
+serving took 1.020–1.227 ms. These overlapping intervals do **not** establish
+an HTTP latency improvement. They provide a repeatable cost probe for the
+ownership change, without conflating it with Raft, S3 or WAL throughput:
+
+```
+cargo bench --profile dev -p ursula --bench http_ownership -- \
+  --warm-up-time 0.2 --measurement-time 0.5 --sample-size 10
+```
+
+HTTP listeners now use one SO_REUSEPORT socket per owner on Unix. Socket
+registration, accept and axum handlers run on that owner's Tokio executor;
+requests for another core still cross the explicit runtime mailbox. Node-wide
+background coordinators run on owner 0 and retain bounded group passes; they
+are not claimed to be independently sharded drivers. Their placement cost can
+be inspected with the `owner_dispatch` benchmark (100 gauge commands per
+batch, same executor versus caller-to-owner). Same-owner placement alone is
+not sufficient to remove actor scheduling overhead: the current mailbox path
+still routes through the core dispatcher and group actor.
+
+Owner thread/task handles and service tasks are retained. Shutdown first drains
+HTTP, cancels and joins services, stops group engines and syncs the WAL, then
+joins owners. A regression asserts that every service's captured resource is
+dropped before shutdown returns. Forwarded GET and HEAD futures are owned and
+run outside the group actor under its owner's materialization budget. A
+blocked-remote regression holds the response indefinitely and proves a same-
+group append completes before releasing either forwarded read.
 ## Owner-core execution and WAL submission
 
 Production group construction runs on the owning current-thread runtime. The

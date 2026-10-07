@@ -4,14 +4,17 @@
 {{- $namespace := .Release.Namespace -}}
 {{- $clusterDomain := .Values.global.clusterDomain | toString -}}
 {{- $clientPort := .Values.server.ports.client | int -}}
+{{- $metaPort := .Values.server.ports.meta | int -}}
 {{- $replicaCount := .Values.server.replicaCount | int -}}
 {{- $peers := list -}}
 {{- $nodes := list -}}
+{{- $metaPeers := list -}}
 {{- range $i := until $replicaCount -}}
 {{- $podName := printf "%s-%d" $fullname $i -}}
 {{- $host := printf "%s.%s.%s.svc.%s" $podName $headless $namespace $clusterDomain -}}
 {{- $clientUrl := printf "http://%s:%d" $host $clientPort -}}
 {{- $nodeId := add1 $i -}}
+{{- $metaPeers = append $metaPeers (dict "node_id" $nodeId "url" (printf "http://%s:%d" $host $metaPort)) -}}
 {{- $peers = append $peers (dict "node_id" $nodeId "url" $clientUrl) -}}
 {{- $nodes = append $nodes (dict "id" $nodeId "http_url" $clientUrl "host" $host "name" $podName) -}}
 {{- end -}}
@@ -76,20 +79,6 @@ data:
     config_path="${config_dir}/ursula.toml"
     mkdir -p "${config_dir}"
 
-    start_maintenance_drained=false
-    rollout_state_dir="/var/run/ursula-rollout-state"
-    if [ -r "${rollout_state_dir}/phase" ] && [ -r "${rollout_state_dir}/node-id" ]; then
-      rollout_phase=$(cat "${rollout_state_dir}/phase")
-      rollout_node_id=$(cat "${rollout_state_dir}/node-id")
-      case "${rollout_phase}" in
-        restarting)
-          if [ "${rollout_node_id}" = "${node_id}" ]; then
-            start_maintenance_drained=true
-          fi
-          ;;
-      esac
-    fi
-
     # Restrict generated config permissions: it may contain S3 credentials.
     old_umask=$(umask)
     umask 077
@@ -118,6 +107,15 @@ data:
 {{- end }}
 {{- range $peers }}
     [[raft.peers]]
+    node_id = {{ .node_id }}
+    url = {{ .url | quote }}
+{{- end }}
+
+    [raft.meta]
+    enabled = {{ .Values.raft.meta.enabled }}
+    listen = "0.0.0.0:{{ $metaPort }}"
+{{- range $metaPeers }}
+    [[raft.meta.peers]]
     node_id = {{ .node_id }}
     url = {{ .url | quote }}
 {{- end }}
@@ -195,7 +193,6 @@ data:
     chmod 600 "${config_path}"
     umask "${old_umask}"
 
-    export URSULA_START_MAINTENANCE_DRAINED="${start_maintenance_drained}"
     exec /usr/local/bin/ursula server --config "${config_path}" --node-id "${node_id}" "$@"
   cluster-manifest.json: |
 {{ dict "nodes" $nodes | toPrettyJson | indent 4 }}

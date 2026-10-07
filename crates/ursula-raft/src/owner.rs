@@ -289,10 +289,3 @@ pub(crate) fn owner_stopped(error: impl std::fmt::Display) -> GroupEngineError {
     tracing::debug!(%error, "owner Raft operation stopped");
     GroupEngineError::Infra(ursula_runtime::GroupInfraError::OwnerStopped)
 }
-
-pub(crate) fn owner_raft_error(error: RaftError<C>) -> GroupEngineError {
-    match error {
-        RaftError::Fatal(error) => owner_stopped(error),
-        RaftError::APIError(impossible) => match impossible {},
-    }
-}

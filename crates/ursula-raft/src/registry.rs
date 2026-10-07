@@ -40,6 +40,7 @@ use ursula_runtime::SnapshotLocation;
 use ursula_runtime::SnapshotPointer;
 use ursula_runtime::default_snapshot_store;
 use ursula_shard::RaftGroupId;
+#[cfg(test)]
 use ursula_shard::ShardPlacement;
 
 use crate::election::ElectionPolicy;
@@ -50,6 +51,8 @@ use crate::log_store::WalOpening;
 use crate::meta::MetaRaftTypeConfig;
 use crate::owner::OwnerRaftHandle;
 use crate::read_index::ReadIndexBarrier;
+use crate::registry_error::RegistryError;
+use crate::registry_error::SnapshotStage;
 use crate::rejoin::AcceptUnsyncedLossReport;
 use crate::rejoin::GroupRejoin;
 use crate::rejoin::RecoveryGateError;
@@ -165,51 +168,22 @@ pub type RaftGroupHandle = Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>;
 /// A group's shared cold-index page cache.
 pub type GroupColdIndexCache = Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>;
 
-/// Resources staged before publication of a group handle. Optional resources
-/// describe supported capabilities (single-node groups need no recovery gate).
-#[derive(Debug, Default, Clone)]
-struct GroupResources {
+/// All resources are published atomically after engine construction.
+#[derive(Debug, Clone)]
+struct GroupEntry {
+    snapshot_installs: Arc<crate::state_machine::SnapshotInstallLifecycle>,
+    apply_failure: Arc<Mutex<Option<ursula_proto::admin::RaftApplyFailure>>>,
+    raft: OwnerRaftHandle,
     cache: Option<GroupColdIndexCache>,
-    barrier: Option<Arc<ReadIndexBarrier>>,
+    barrier: Arc<ReadIndexBarrier>,
     recovery: Option<Arc<GroupRejoin>>,
 }
 
 #[derive(Debug, Clone)]
-enum GroupEntry {
-    Preparing(GroupResources),
-    Active {
-        raft: OwnerRaftHandle,
-        resources: GroupResources,
-    },
-}
-
-impl Default for GroupEntry {
-    fn default() -> Self {
-        Self::Preparing(GroupResources::default())
-    }
-}
-
-impl GroupEntry {
-    fn resources(&self) -> &GroupResources {
-        match self {
-            Self::Preparing(resources) | Self::Active { resources, .. } => resources,
-        }
-    }
-    fn resources_mut(&mut self) -> &mut GroupResources {
-        match self {
-            Self::Preparing(resources) | Self::Active { resources, .. } => resources,
-        }
-    }
-    fn raft(&self) -> Option<&OwnerRaftHandle> {
-        match self {
-            Self::Preparing(_) => None,
-            Self::Active { raft, .. } => Some(raft),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct RaftGroupHandleRegistry {
+    process_authority:
+        Arc<Mutex<Option<(u64, ursula_control::ProcessIdentity, crate::MetaRaftHandle)>>>,
+    control_topology: Arc<Mutex<Option<watch::Receiver<ursula_control::ControlPlaneState>>>>,
     pub(crate) append_send_budget: crate::grpc::AppendTransportBudget,
     pub(crate) append_receive_budget: crate::grpc::AppendTransportBudget,
     groups: Arc<arc_swap::ArcSwap<BTreeMap<u32, Arc<GroupEntry>>>>,
@@ -227,9 +201,11 @@ impl Default for RaftGroupHandleRegistry {
     fn default() -> Self {
         let (transport_shutdown, _) = watch::channel(false);
         Self {
+            process_authority: Arc::default(),
             append_send_budget: Default::default(),
             append_receive_budget: Default::default(),
             groups: Arc::new(arc_swap::ArcSwap::from_pointee(BTreeMap::new())),
+            control_topology: Arc::new(Mutex::new(None)),
             dynamic_hosted_groups: Arc::new(Mutex::new(BTreeSet::new())),
             election: ElectionPolicy::default(),
             transport_shutdown,
@@ -300,12 +276,46 @@ pub(crate) async fn confirm_recovery_barrier(
 pub use crate::election::LeadershipTransferError;
 
 impl RaftGroupHandleRegistry {
-    /// Configure the node-wide budget for each direction before constructing transports.
     pub fn with_append_transport_budget_bytes(mut self, bytes: usize) -> Self {
         self.append_send_budget = crate::grpc::AppendTransportBudget::new(bytes);
         self.append_receive_budget = crate::grpc::AppendTransportBudget::new(bytes);
         self
     }
+
+    pub fn set_process_authority(
+        &self,
+        node_id: u64,
+        identity: ursula_control::ProcessIdentity,
+        meta: crate::MetaRaftHandle,
+    ) {
+        *self
+            .process_authority
+            .lock()
+            .expect("process authority lock") = Some((node_id, identity, meta));
+    }
+    pub(crate) async fn confirm_process_authority(&self) -> Result<(), crate::MetaRaftError> {
+        let Some((node, identity, meta)) = self.process_authority() else {
+            return Ok(());
+        };
+        if meta.read_linearizable_processes().await?.get(&node)
+            != Some(&ursula_control::ProcessState::Active(identity))
+        {
+            return Err(crate::MetaRaftError::new(
+                "data process fence",
+                "process is retired or superseded",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn process_authority(
+        &self,
+    ) -> Option<(u64, ursula_control::ProcessIdentity, crate::MetaRaftHandle)> {
+        self.process_authority
+            .lock()
+            .expect("process authority lock")
+            .clone()
+    }
+
     /// The local campaign policy, shared by registration, recovery and RPCs.
     pub fn election_policy(&self) -> ElectionPolicy {
         self.election.clone()
@@ -356,15 +366,8 @@ impl RaftGroupHandleRegistry {
             let entry = groups
                 .get(&group.0)
                 .ok_or(QuorumProofError::NotRegistered { group })?;
-            let raft = entry
-                .raft()
-                .cloned()
-                .ok_or(QuorumProofError::NotRegistered { group })?;
-            let barrier = entry
-                .resources()
-                .barrier
-                .clone()
-                .ok_or(QuorumProofError::NotRegistered { group })?;
+            let raft = entry.raft.clone();
+            let barrier = entry.barrier.clone();
             (raft, barrier)
         };
         confirm_recovery_barrier(group, &raft, barrier.as_ref()).await
@@ -402,7 +405,7 @@ impl RaftGroupHandleRegistry {
             .groups
             .load()
             .iter()
-            .filter_map(|(id, entry)| entry.raft().map(|raft| (*id, raft.clone())))
+            .map(|(id, entry)| (*id, entry.raft.clone()))
             .collect::<Vec<_>>();
         let results = join_all(groups.into_iter().map(|(id, raft)| async move {
             match raft.with_raft_state(|_| ()).await {
@@ -427,19 +430,18 @@ impl RaftGroupHandleRegistry {
     }
 
     /// Publish all group resources together, before any transport can find its Raft handle.
-    pub(crate) fn register_engine(
+    pub fn register_engine(
         &self,
         engine: &crate::RaftGroupEngine,
         recovery: Option<Arc<GroupRejoin>>,
     ) {
-        let handle = engine.read_barrier.owner().clone();
-        let entry = Arc::new(GroupEntry::Active {
-            raft: handle,
-            resources: GroupResources {
-                cache: engine.cold_index_cache.clone(),
-                barrier: Some(engine.read_barrier.clone()),
-                recovery,
-            },
+        let entry = Arc::new(GroupEntry {
+            snapshot_installs: engine.snapshot_installs.clone(),
+            apply_failure: engine.apply_failure.clone(),
+            raft: engine.read_barrier.owner().clone(),
+            cache: engine.cold_index_cache.clone(),
+            barrier: engine.read_barrier.clone(),
+            recovery,
         });
         self.groups.rcu(|groups| {
             let mut groups = (**groups).clone();
@@ -449,57 +451,56 @@ impl RaftGroupHandleRegistry {
         self.refresh_group_elections(engine.placement.raft_group_id);
     }
 
-    fn update_group(&self, group: RaftGroupId, update: impl Fn(&mut GroupEntry)) {
-        self.groups.rcu(|groups| {
-            let mut groups = (**groups).clone();
-            let entry = groups.entry(group.0).or_default();
-            update(Arc::make_mut(entry));
-            groups
-        });
-    }
-
-    pub fn register(&self, placement: ShardPlacement, raft: RaftGroupHandle) {
-        let owner = self
-            .read_barrier(placement.raft_group_id)
-            .map(|barrier| barrier.owner().clone())
-            .unwrap_or_else(|| OwnerRaftHandle::new(raft));
-        self.update_group(placement.raft_group_id, |entry| {
-            let resources = std::mem::take(entry.resources_mut());
-            *entry = GroupEntry::Active {
-                raft: owner.clone(),
-                resources,
-            };
-        });
-        self.refresh_group_elections(placement.raft_group_id);
-    }
-
-    pub fn register_cold_index_cache(
+    #[cfg(any(test, madsim))]
+    pub(crate) fn register_test_group(
         &self,
         group: RaftGroupId,
-        cache: Option<GroupColdIndexCache>,
+        barrier: Arc<ReadIndexBarrier>,
+        recovery: Option<Arc<GroupRejoin>>,
     ) {
-        self.update_group(group, |entry| entry.resources_mut().cache = cache.clone());
+        let entry = Arc::new(GroupEntry {
+            snapshot_installs: Arc::default(),
+            apply_failure: Arc::default(),
+            raft: barrier.owner().clone(),
+            cache: None,
+            barrier,
+            recovery,
+        });
+        self.groups.rcu(|groups| {
+            let mut groups = (**groups).clone();
+            groups.insert(group.0, entry.clone());
+            groups
+        });
+        self.refresh_group_elections(group);
     }
 
     #[cfg(any(test, madsim))]
-    pub(crate) fn register_read_barrier(&self, group: RaftGroupId, barrier: Arc<ReadIndexBarrier>) {
-        self.update_group(group, |entry| {
-            entry.resources_mut().barrier = Some(barrier.clone())
+    pub(crate) fn register_rejoin(&self, group: RaftGroupId, recovery: Arc<GroupRejoin>) {
+        self.groups.rcu(|groups| {
+            let mut groups = (**groups).clone();
+            if let Some(entry) = groups.get_mut(&group.0) {
+                Arc::make_mut(entry).recovery = Some(recovery.clone());
+            }
+            groups
         });
+        self.refresh_group_elections(group);
+    }
+
+    pub(crate) fn apply_health(
+        &self,
+        group: RaftGroupId,
+    ) -> Option<Arc<Mutex<Option<ursula_proto::admin::RaftApplyFailure>>>> {
+        self.groups
+            .load()
+            .get(&group.0)
+            .map(|entry| entry.apply_failure.clone())
     }
 
     pub(crate) fn read_barrier(&self, group: RaftGroupId) -> Option<Arc<ReadIndexBarrier>> {
         self.groups
             .load()
             .get(&group.0)
-            .and_then(|entry| entry.resources().barrier.clone())
-    }
-
-    pub fn register_rejoin(&self, group: RaftGroupId, rejoin: Arc<GroupRejoin>) {
-        self.update_group(group, |entry| {
-            entry.resources_mut().recovery = Some(rejoin.clone())
-        });
-        self.refresh_group_elections(group);
+            .map(|entry| entry.barrier.clone())
     }
 
     /// The group's recovery gate, if it has one.
@@ -507,7 +508,7 @@ impl RaftGroupHandleRegistry {
         self.groups
             .load()
             .get(&raft_group_id.0)
-            .and_then(|entry| entry.resources().recovery.clone())
+            .and_then(|entry| entry.recovery.clone())
     }
 
     /// Whether `target` lost its log under this node's leadership of the
@@ -550,13 +551,7 @@ impl RaftGroupHandleRegistry {
         self.groups
             .load()
             .iter()
-            .filter_map(|(id, entry)| {
-                entry
-                    .resources()
-                    .recovery
-                    .as_ref()
-                    .map(|gate| (*id, gate.status()))
-            })
+            .filter_map(|(id, entry)| entry.recovery.as_ref().map(|gate| (*id, gate.status())))
             .collect()
     }
 
@@ -576,18 +571,69 @@ impl RaftGroupHandleRegistry {
         self.groups
             .load()
             .get(&raft_group_id.0)
-            .and_then(|entry| entry.resources().cache.clone())
+            .and_then(|entry| entry.cache.clone())
     }
 
     pub fn get(&self, raft_group_id: RaftGroupId) -> Option<OwnerRaftHandle> {
         self.groups
             .load()
             .get(&raft_group_id.0)
-            .and_then(|entry| entry.raft().cloned())
+            .map(|entry| entry.raft.clone())
     }
 
     pub fn contains_group(&self, raft_group_id: RaftGroupId) -> bool {
         self.get(raft_group_id).is_some()
+    }
+
+    pub fn set_control_topology(
+        &self,
+        topology: watch::Receiver<ursula_control::ControlPlaneState>,
+    ) {
+        *self
+            .control_topology
+            .lock()
+            .expect("control topology mutex") = Some(topology);
+    }
+
+    pub fn control_state(&self) -> Option<ursula_control::ControlPlaneState> {
+        self.control_topology
+            .lock()
+            .expect("control topology mutex")
+            .as_ref()
+            .map(|receiver| receiver.borrow().clone())
+    }
+
+    /// Pending desired replicas may be prepared, but committed removals cannot
+    /// be reopened by a stale static configuration or old dynamic-host flag.
+    pub fn control_hosts_group(&self, group: RaftGroupId, node_id: u64) -> Option<bool> {
+        let topology = self
+            .control_topology
+            .lock()
+            .expect("control topology mutex");
+        let receiver = topology.as_ref()?;
+        let state = receiver.borrow();
+        Some(
+            state
+                .placements
+                .get(&group)
+                .is_some_and(|placement| placement.hosts(node_id))
+                || state
+                    .operations
+                    .active
+                    .as_ref()
+                    .and_then(|operation| operation.desired.get(&group))
+                    .is_some_and(|voters| voters.contains(&node_id)),
+        )
+    }
+
+    pub fn forget_unhosted_group(&self, group: RaftGroupId, node_id: u64) {
+        if self.control_hosts_group(group, node_id) == Some(false) {
+            self.groups.rcu(|groups| {
+                let mut next = (**groups).clone();
+                next.remove(&group.0);
+                next
+            });
+        }
     }
 
     pub fn allow_dynamic_group_hosting(&self, raft_group_id: RaftGroupId) -> bool {
@@ -605,11 +651,7 @@ impl RaftGroupHandleRegistry {
     }
 
     pub fn len(&self) -> usize {
-        self.groups
-            .load()
-            .values()
-            .filter(|entry| entry.raft().is_some())
-            .count()
+        self.groups.load().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -692,21 +734,15 @@ impl RaftGroupHandleRegistry {
     fn set_registered_group_elections(&self) {
         let groups = self.groups.load();
         for entry in groups.values() {
-            if let Some(raft) = entry.raft() {
-                self.election
-                    .refresh(raft, entry.resources().recovery.clone());
-            }
+            self.election.refresh(&entry.raft, entry.recovery.clone());
         }
     }
 
     /// Serialize recovery-barrier changes with maintenance policy updates.
     pub(crate) fn refresh_group_elections(&self, group: RaftGroupId) {
         let groups = self.groups.load();
-        if let Some(entry) = groups.get(&group.0)
-            && let Some(raft) = entry.raft()
-        {
-            self.election
-                .refresh(raft, entry.resources().recovery.clone());
+        if let Some(entry) = groups.get(&group.0) {
+            self.election.refresh(&entry.raft, entry.recovery.clone());
         }
     }
 
@@ -733,7 +769,6 @@ impl RaftGroupHandleRegistry {
     pub fn recovery_barriers_ready(&self) -> bool {
         self.groups.load().values().all(|entry| {
             entry
-                .resources()
                 .recovery
                 .as_ref()
                 .is_none_or(|gate| gate.may_campaign())
@@ -745,17 +780,21 @@ impl RaftGroupHandleRegistry {
             .groups
             .load()
             .iter()
-            .filter_map(|(id, entry)| entry.raft().map(|raft| (*id, raft.clone())))
+            .map(|(id, entry)| (*id, entry.raft.clone(), entry.apply_failure.clone()))
             .collect::<Vec<_>>();
 
         let log_progress = self.snapshot_build_coordinator().log_progress();
         let mut snapshots = Vec::with_capacity(groups.len());
-        for (raft_group_id, raft) in groups {
+        for (raft_group_id, raft, failure) in groups {
             let log = log_progress
                 .get(&raft_group_id)
                 .copied()
                 .unwrap_or_default();
             let metrics = raft.metrics().borrow_watched().clone();
+            let apply_failure = failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             let membership = metrics.membership_config.membership();
             snapshots.push(RaftGroupMetricsSnapshot {
                 raft_group_id,
@@ -770,7 +809,8 @@ impl RaftGroupHandleRegistry {
                 voter_ids: membership.voter_ids().collect(),
                 learner_ids: membership.learner_ids().collect(),
                 maintenance: crate::types::RaftGroupMaintenanceState {
-                    running: metrics.running_state.is_ok()
+                    running: apply_failure.is_none()
+                        && metrics.running_state.is_ok()
                         && metrics.state != openraft::ServerState::Shutdown,
                     recovery_ready: self
                         .rejoin(RaftGroupId(raft_group_id))
@@ -783,6 +823,7 @@ impl RaftGroupHandleRegistry {
                         .is_some_and(|rejoin| rejoin.status().is_stalled()),
                 },
                 log,
+                apply_failure,
             });
         }
         snapshots
@@ -792,36 +833,50 @@ impl RaftGroupHandleRegistry {
         &self,
         raft_group_id: RaftGroupId,
         request: AppendEntriesRequest<UrsulaRaftTypeConfig>,
-    ) -> Result<AppendEntriesResponse<UrsulaRaftTypeConfig>, GroupEngineError> {
+    ) -> Result<AppendEntriesResponse<UrsulaRaftTypeConfig>, RegistryError> {
         let raft = self.require_group(raft_group_id)?;
         let rejoin = self.rejoin(raft_group_id);
         raft.call(move |raft| async move {
             if let Some(rejoin) = rejoin {
+                if !rejoin.replication_allowed(request.vote) {
+                    return Err(RegistryError::RecoveryVoteFloor {
+                        group: raft_group_id,
+                    });
+                }
                 rejoin.observe_inbound_append(&request);
             }
-            raft.append_entries(request).await
+            raft.append_entries(request)
+                .await
+                .map_err(|source| RegistryError::Request {
+                    group: raft_group_id,
+                    source,
+                })
         })
         .await
-        .map_err(crate::owner::owner_stopped)?
-        .map_err(crate::owner::owner_raft_error)
+        .map_err(|source| RegistryError::Raft {
+            group: raft_group_id,
+            source,
+        })?
     }
 
     pub async fn vote(
         &self,
         raft_group_id: RaftGroupId,
         request: VoteRequest<UrsulaRaftTypeConfig>,
-    ) -> Result<VoteResponse<UrsulaRaftTypeConfig>, GroupEngineError> {
+    ) -> Result<VoteResponse<UrsulaRaftTypeConfig>, RegistryError> {
         let raft = self.require_group(raft_group_id)?;
-        let rejoin = self.rejoin(raft_group_id);
-        raft.call(move |raft| async move {
-            if let Some(refusal) = rejoin.and_then(|rejoin| rejoin.screen_vote(&request)) {
-                return Ok(refusal);
-            }
-            raft.vote(request).await
-        })
-        .await
-        .map_err(crate::owner::owner_stopped)?
-        .map_err(crate::owner::owner_raft_error)
+        if let Some(refusal) = self
+            .rejoin(raft_group_id)
+            .and_then(|rejoin| rejoin.screen_vote(&request))
+        {
+            return Ok(refusal);
+        }
+        raft.vote(request)
+            .await
+            .map_err(|err| RegistryError::Request {
+                group: raft_group_id,
+                source: err,
+            })
     }
 
     pub async fn install_full_snapshot(
@@ -829,41 +884,95 @@ impl RaftGroupHandleRegistry {
         raft_group_id: RaftGroupId,
         vote: VoteOf<UrsulaRaftTypeConfig>,
         snapshot: TypeConfigSnapshotOf<UrsulaRaftTypeConfig>,
-    ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, GroupEngineError> {
-        let raft = self.require_group(raft_group_id)?;
-        let _install_permit = self.snapshot_install.acquire().await?;
-        let prefetched = self
-            .prefetch_snapshot_for_install(raft_group_id, snapshot)
-            .await?;
-        let snapshot = prefetched.snapshot;
-        let _prefetch_guard = prefetched.guard;
-        let result = raft
-            .install_full_snapshot(vote, snapshot)
-            .await
-            .map_err(crate::owner::owner_stopped);
-        drop(_prefetch_guard);
-        let publication = self
-            .snapshot_install
-            .references(raft_group_id.0)
-            .publish_current(&self.snapshot_store(), raft_group_id.0)
-            .await
-            .map_err(|err| {
-                GroupEngineError::new(format!("publish installed snapshot reference: {err}"))
+    ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, RegistryError> {
+        let (raft, lifetime) = {
+            let groups = self.groups.load();
+            let entry = groups
+                .get(&raft_group_id.0)
+                .ok_or(RegistryError::NotRegistered {
+                    group: raft_group_id,
+                })?;
+            let lifetime = entry
+                .snapshot_installs
+                .admit()
+                .ok_or(RegistryError::ShuttingDown {
+                    group: raft_group_id,
+                })?;
+            (entry.raft.clone(), lifetime)
+        };
+        if self
+            .rejoin(raft_group_id)
+            .is_some_and(|rejoin| !rejoin.replication_allowed(vote))
+        {
+            return Err(RegistryError::RecoveryVoteFloor {
+                group: raft_group_id,
             });
-        // Publication errors remain ordinary transport errors. The accepted
-        // pointer stays pinned, and a repeated install retries publication.
-        result.and_then(|response| publication.map(|()| response))
+        }
+        let registry = self.clone();
+        // The task owns the permit and prefetch until Raft finishes consuming
+        // it. Cancelling an RPC only drops the join handle, never the payload.
+        let install = crate::rt::spawn(async move {
+            let _lifetime = lifetime;
+            let lock = registry.snapshot_install.install_lock(raft_group_id.0);
+            let _serial = lock.lock().await;
+            let _install_permit = registry.snapshot_install.acquire().await?;
+            let current = raft
+                .get_snapshot()
+                .await
+                .map_err(|err| RegistryError::Request {
+                    group: raft_group_id,
+                    source: err,
+                })?;
+            let already_current = current.as_ref().is_some_and(|current| {
+                current.meta == snapshot.meta
+                    && current.snapshot.get_ref() == snapshot.snapshot.get_ref()
+            });
+            let prefetched = if already_current {
+                PrefetchedInstallSnapshot {
+                    snapshot,
+                    guard: None,
+                }
+            } else {
+                registry
+                    .prefetch_snapshot_for_install(raft_group_id, snapshot)
+                    .await?
+            };
+            let _prefetch_guard = prefetched.guard;
+            let result = raft
+                .install_full_snapshot(vote, prefetched.snapshot)
+                .await
+                .map_err(|err| RegistryError::Raft {
+                    group: raft_group_id,
+                    source: err,
+                });
+            drop(_prefetch_guard);
+            let publication = registry
+                .snapshot_install
+                .references(raft_group_id.0)
+                .publish_current(&registry.snapshot_store(), raft_group_id.0)
+                .await
+                .map_err(|err| RegistryError::Snapshot {
+                    group: raft_group_id,
+                    stage: SnapshotStage::Publish,
+                    source: err,
+                });
+            result.and_then(|response| publication.map(|()| response))
+        });
+        install.await.map_err(RegistryError::Task)?
     }
 
     async fn prefetch_snapshot_for_install(
         &self,
         raft_group_id: RaftGroupId,
         snapshot: TypeConfigSnapshotOf<UrsulaRaftTypeConfig>,
-    ) -> Result<PrefetchedInstallSnapshot, GroupEngineError> {
+    ) -> Result<PrefetchedInstallSnapshot, RegistryError> {
         let pointer_bytes = snapshot.snapshot.into_inner();
-        let pointer = SnapshotPointer::decode(&pointer_bytes).map_err(|err| {
-            GroupEngineError::new(format!("decode OpenRaft snapshot pointer: {err}"))
-        })?;
+        let pointer =
+            SnapshotPointer::decode(&pointer_bytes).map_err(|err| RegistryError::Snapshot {
+                group: raft_group_id,
+                stage: SnapshotStage::DecodePointer,
+                source: err,
+            })?;
         let SnapshotPointer {
             snapshot_id,
             location,
@@ -884,43 +993,49 @@ impl RaftGroupHandleRegistry {
             .references(raft_group_id.0)
             .prepare(&snapshot_store, raft_group_id.0, &location)
             .await
-            .map_err(|err| {
-                GroupEngineError::new(format!("pin incoming snapshot before install: {err}"))
+            .map_err(|err| RegistryError::Snapshot {
+                group: raft_group_id,
+                stage: SnapshotStage::Pin,
+                source: err,
             })?;
-        let snapshot_bytes = snapshot_store.download(&location).await.map_err(|err| {
-            GroupEngineError::new(format!(
-                "prefetch OpenRaft snapshot {snapshot_id} before install: {err}"
-            ))
-        })?;
-        let group_snapshot = decode_group_snapshot(&snapshot_bytes).map_err(|err| {
-            GroupEngineError::new(format!(
-                "decode prefetched OpenRaft snapshot {snapshot_id}: {err}"
-            ))
-        })?;
+        let snapshot_bytes =
+            snapshot_store
+                .download(&location)
+                .await
+                .map_err(|err| RegistryError::Snapshot {
+                    group: raft_group_id,
+                    stage: SnapshotStage::Download,
+                    source: err,
+                })?;
+        let group_snapshot =
+            decode_group_snapshot(&snapshot_bytes).map_err(|err| RegistryError::Snapshot {
+                group: raft_group_id,
+                stage: SnapshotStage::DecodeBody,
+                source: err,
+            })?;
         drop(snapshot_bytes);
         // Keep fallible object-store I/O outside OpenRaft's state-machine
         // worker: a write-snapshot error there is fatal to RaftCore. Keep the
         // original external pointer so large snapshots are not duplicated in
         // the Raft RPC payload; install_snapshot consumes the decoded group.
-        let pointer = SnapshotPointer {
+        let mut pointer = SnapshotPointer {
             snapshot_id,
             location,
         };
-        let cache_key = self.snapshot_install.cache_prefetched(
-            &pointer.snapshot_id,
-            &pointer.location,
-            group_snapshot,
-            reference,
-        );
+        let cache_key =
+            self.snapshot_install
+                .cache_prefetched(&mut pointer, group_snapshot, reference);
         let guard = PrefetchedSnapshotGuard {
             snapshot_install: self.snapshot_install.clone(),
             cache_key,
         };
-        let pointer_bytes = pointer.encode_binary().map_err(|err| {
-            GroupEngineError::new(format!(
-                "encode prefetched OpenRaft snapshot pointer: {err}"
-            ))
-        })?;
+        let pointer_bytes = pointer
+            .encode_binary()
+            .map_err(|err| RegistryError::Snapshot {
+                group: raft_group_id,
+                stage: SnapshotStage::EncodePointer,
+                source: err,
+            })?;
         Ok(PrefetchedInstallSnapshot {
             snapshot: TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
                 meta: snapshot.meta,
@@ -934,24 +1049,27 @@ impl RaftGroupHandleRegistry {
         &self,
         raft_group_id: RaftGroupId,
         request: TransferLeaderRequest<UrsulaRaftTypeConfig>,
-    ) -> Result<(), GroupEngineError> {
+    ) -> Result<(), RegistryError> {
         let raft = self.require_group(raft_group_id)?;
         if *request.to_node_id() == raft.metrics().borrow_watched().id
             && !self.may_campaign(raft_group_id)
         {
-            return Err(GroupEngineError::new(
-                "the recovery gate is closed; refusing leadership transfer",
-            ));
+            return Err(RegistryError::RecoveryGateClosed {
+                group: raft_group_id,
+            });
         }
         raft.handle_transfer_leader(request)
             .await
-            .map_err(|err| GroupEngineError::new(format!("OpenRaft handle_transfer_leader: {err}")))
+            .map_err(|err| RegistryError::Raft {
+                group: raft_group_id,
+                source: err,
+            })
     }
 
     pub async fn build_snapshot_for_transfer(
         &self,
         raft_group_id: RaftGroupId,
-    ) -> Result<TypeConfigSnapshotOf<UrsulaRaftTypeConfig>, GroupEngineError> {
+    ) -> Result<TypeConfigSnapshotOf<UrsulaRaftTypeConfig>, RegistryError> {
         let raft = self.require_group(raft_group_id)?;
         let snapshot = raft
             .with_state_machine(|state_machine| {
@@ -961,21 +1079,22 @@ impl RaftGroupHandleRegistry {
                 })
             })
             .await
-            .map_err(|err| GroupEngineError::new(format!("OpenRaft build snapshot: {err}")))?
-            .map_err(|err| GroupEngineError::new(format!("build OpenRaft snapshot: {err}")))?;
+            .map_err(|err| RegistryError::Raft {
+                group: raft_group_id,
+                source: err,
+            })?
+            .map_err(|err| RegistryError::SnapshotIo {
+                group: raft_group_id,
+                source: err,
+            })?;
         Ok(snapshot)
     }
 
-    fn require_group(
-        &self,
-        raft_group_id: RaftGroupId,
-    ) -> Result<OwnerRaftHandle, GroupEngineError> {
-        self.get(raft_group_id).ok_or_else(|| {
-            GroupEngineError::new(format!(
-                "raft group {} is not registered on this node",
-                raft_group_id.0
-            ))
-        })
+    fn require_group(&self, raft_group_id: RaftGroupId) -> Result<OwnerRaftHandle, RegistryError> {
+        self.get(raft_group_id)
+            .ok_or_else(|| RegistryError::NotRegistered {
+                group: raft_group_id,
+            })
     }
 }
 
@@ -1000,23 +1119,19 @@ mod tests {
 
     use super::*;
 
-    /// F13: forwarded gRPC reads look up the group's shared page cache here.
-    #[test]
-    fn registry_hands_out_the_registered_group_page_cache() {
-        let registry = RaftGroupHandleRegistry::default();
-        let group = ursula_shard::RaftGroupId(3);
-        assert!(registry.cold_index_cache(group).is_none());
-        let cache: GroupColdIndexCache = Arc::new(ColdIndexPageCache::new(
-            Arc::new(ColdStoreColdIndexPageStore::new(Arc::new(
-                ursula_runtime::ColdStore::memory().expect("memory cold store"),
-            ))),
-            8,
-        ));
-        registry.register_cold_index_cache(group, Some(cache.clone()));
-        let shared = registry.cold_index_cache(group).expect("registered cache");
-        assert!(Arc::ptr_eq(&shared, &cache));
-        registry.register_cold_index_cache(group, None);
-        assert!(registry.cold_index_cache(group).is_none());
+    /// F13: forwarded reads share the page cache published with the engine.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn registry_hands_out_the_registered_group_page_cache() {
+        let (registry, raft, _root) =
+            reference_failure_group(Arc::new(FailingReferenceStore::default())).await;
+        let group = RaftGroupId(7);
+        let first = registry.cold_index_cache(group).expect("registered cache");
+        let second = registry.cold_index_cache(group).expect("same cache");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(registry.read_barrier(group).is_some());
+        assert_eq!(registry.len(), 1);
+        raft.shutdown().await.unwrap();
     }
 
     #[derive(Debug)]
@@ -1033,6 +1148,10 @@ mod tests {
         pause_current: std::sync::atomic::AtomicBool,
         entered_current: crate::rt::sync::Notify,
         release_current: crate::rt::sync::Notify,
+        downloads: std::sync::atomic::AtomicUsize,
+        pause_download: std::sync::atomic::AtomicBool,
+        entered_download: crate::rt::sync::Notify,
+        release_download: crate::rt::sync::Notify,
     }
 
     impl SnapshotStore for FailingReferenceStore {
@@ -1051,7 +1170,14 @@ mod tests {
             &'a self,
             _location: &'a SnapshotLocation,
         ) -> SnapshotStoreFuture<'a, Vec<u8>> {
-            Box::pin(async { Ok(group_snapshot_bytes()) })
+            Box::pin(async {
+                self.downloads.fetch_add(1, Ordering::SeqCst);
+                if self.pause_download.load(Ordering::SeqCst) {
+                    self.entered_download.notify_one();
+                    self.release_download.notified().await;
+                }
+                Ok(group_snapshot_bytes())
+            })
         }
         fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
             Box::pin(async { Ok(()) })
@@ -1117,6 +1243,17 @@ mod tests {
     async fn reference_failure_group(
         store: Arc<FailingReferenceStore>,
     ) -> (RaftGroupHandleRegistry, RaftGroupHandle, tempfile::TempDir) {
+        let (registry, engine, root) = reference_failure_engine(store).await;
+        (registry, engine.raft_handle(), root)
+    }
+
+    async fn reference_failure_engine(
+        store: Arc<FailingReferenceStore>,
+    ) -> (
+        RaftGroupHandleRegistry,
+        crate::RaftGroupEngine,
+        tempfile::TempDir,
+    ) {
         let wal_root = tempfile::tempdir().unwrap();
         let registry = RaftGroupHandleRegistry::default();
         registry.set_snapshot_store(Some(store.clone()));
@@ -1125,15 +1262,6 @@ mod tests {
             shard_id: ursula_shard::ShardId(0),
             raft_group_id: RaftGroupId(7),
         };
-        let state_machine = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
-            placement,
-            None,
-            None,
-            store,
-            SnapshotBuildCoordinator::default(),
-            registry.snapshot_install_coordinator(),
-            None,
-        );
         let config = Arc::new(
             openraft::Config {
                 enable_tick: false,
@@ -1142,11 +1270,12 @@ mod tests {
             .validate()
             .unwrap(),
         );
-        let raft = RaftGroupHandle::new(
+        let engine = crate::RaftGroupEngine::new_node(
+            placement,
             1,
             config,
             SingleNodeRaftNetworkFactory,
-            crate::RaftWal::start(
+            crate::log_store::RaftWal::start(
                 wal_root.path(),
                 ursula_config::WalFsync::Never,
                 &ursula_shard::StaticShardMap::new(1, 8).expect("valid topology"),
@@ -1157,12 +1286,17 @@ mod tests {
                 ursula_runtime::RuntimeMetrics::new(1, 8).group_engine_metrics(),
             )
             .unwrap(),
-            state_machine,
+            crate::RaftGroupEngineOptions {
+                snapshot_store: Some(store),
+                snapshot_install: Some(registry.snapshot_install_coordinator()),
+                cold_store: Some(Arc::new(ursula_runtime::ColdStore::memory().unwrap())),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
-        registry.register(placement, raft.clone());
-        (registry, raft, wal_root)
+        registry.register_engine(&engine, None);
+        (registry, engine, wal_root)
     }
 
     fn reference_failure_snapshot() -> TypeConfigSnapshotOf<UrsulaRaftTypeConfig> {
@@ -1181,6 +1315,7 @@ mod tests {
         snapshot
     }
 
+    #[cfg(not(madsim))]
     #[tokio::test]
     async fn snapshot_reference_put_failures_retry_without_restarting_raft() {
         for fail_pin in [true, false] {
@@ -1217,6 +1352,7 @@ mod tests {
                     "temporary reference failure must not retain a full inline snapshot"
                 );
             }
+            let retry_started = crate::rt::time::Instant::now();
             store.fail_pin.store(false, Ordering::SeqCst);
             store.fail_current.store(false, Ordering::SeqCst);
             registry
@@ -1227,6 +1363,17 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            assert_eq!(
+                store.downloads.load(Ordering::SeqCst),
+                1,
+                "publication retry must reuse installed snapshot"
+            );
+            if !fail_pin {
+                assert!(
+                    retry_started.elapsed() >= Duration::from_millis(90),
+                    "publication retry must back off"
+                );
+            }
             assert_eq!(
                 store.current.lock().unwrap().as_deref(),
                 Some("reference-fault.snap")
@@ -1239,8 +1386,16 @@ mod tests {
                 .await
                 .unwrap();
             raft.client_write(ursula_runtime::GroupWriteCommand::Stream(
-                ursula_stream::StreamCommand::CreateBucket {
-                    bucket_id: "after-retry".to_owned(),
+                ursula_stream::StreamCommand::CreateStream {
+                    stream_id: ursula_shard::BucketStreamId::new("after-retry", "events"),
+                    content_type: "application/octet-stream".to_owned(),
+                    initial_payload: bytes::Bytes::new(),
+                    close_after: false,
+                    stream_seq: None,
+                    producer: None,
+                    stream_ttl_seconds: None,
+                    stream_expires_at_ms: None,
+                    now_ms: 0,
                 },
             ))
             .await
@@ -1254,6 +1409,120 @@ mod tests {
         }
     }
 
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn shutdown_drains_canceled_install_before_reopened_group_publication() {
+        let store = Arc::new(FailingReferenceStore::default());
+        store.pause_current.store(true, Ordering::SeqCst);
+        let (registry, engine, _root) = reference_failure_engine(store.clone()).await;
+        let request = crate::rt::spawn({
+            let registry = registry.clone();
+            async move {
+                registry
+                    .install_full_snapshot(
+                        RaftGroupId(7),
+                        crate::types::UrsulaVote::new_committed(1, 2),
+                        reference_failure_snapshot(),
+                    )
+                    .await
+            }
+        });
+        store.entered_current.notified().await;
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        let raft = engine.raft_handle();
+        let shutdown = crate::rt::spawn(async move { engine.shutdown().await });
+        raft.wait(Some(Duration::from_secs(2)))
+            .metrics(
+                |metrics| matches!(metrics.state, openraft::ServerState::Shutdown),
+                "Raft stops before draining reference publication",
+            )
+            .await
+            .unwrap();
+        assert!(!shutdown.is_finished());
+        let refused = registry
+            .install_full_snapshot(
+                RaftGroupId(7),
+                crate::types::UrsulaVote::new_committed(1, 2),
+                reference_failure_snapshot(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, RegistryError::ShuttingDown { .. }));
+        store.pause_current.store(false, Ordering::SeqCst);
+        store.release_current.notify_one();
+        shutdown.await.unwrap().unwrap();
+        // Reopen against the same external reference namespace. No canceled
+        // task from the retired engine may publish or reconcile behind this.
+        let (replacement_registry, replacement, _replacement_root) =
+            reference_failure_engine(store.clone()).await;
+        let mut snapshot = reference_failure_snapshot();
+        snapshot.snapshot = external_snapshot("replacement").snapshot;
+        replacement_registry
+            .install_full_snapshot(
+                RaftGroupId(7),
+                crate::types::UrsulaVote::new_committed(1, 2),
+                snapshot,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.current.lock().unwrap().as_deref(),
+            Some("replacement.snap")
+        );
+        assert!(store.pins.lock().unwrap().contains("replacement.snap"));
+        replacement.shutdown().await.unwrap();
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn cancelled_snapshot_rpc_keeps_install_alive_and_serializes_duplicate() {
+        let store = Arc::new(FailingReferenceStore::default());
+        store.pause_download.store(true, Ordering::SeqCst);
+        let (registry, raft, _wal_root) = reference_failure_group(store.clone()).await;
+        let request = crate::rt::spawn({
+            let registry = registry.clone();
+            async move {
+                registry
+                    .install_full_snapshot(
+                        RaftGroupId(7),
+                        crate::types::UrsulaVote::new_committed(1, 2),
+                        reference_failure_snapshot(),
+                    )
+                    .await
+            }
+        });
+        store.entered_download.notified().await;
+        request.abort();
+        let _cancelled = request.await;
+        store.pause_download.store(false, Ordering::SeqCst);
+        store.release_download.notify_one();
+        registry
+            .install_full_snapshot(
+                RaftGroupId(7),
+                crate::types::UrsulaVote::new_committed(1, 2),
+                reference_failure_snapshot(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.downloads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            raft.metrics()
+                .borrow_watched()
+                .last_applied
+                .unwrap()
+                .index(),
+            1
+        );
+        raft.metrics()
+            .borrow_watched()
+            .running_state
+            .as_ref()
+            .unwrap();
+        raft.shutdown().await.unwrap();
+    }
+
+    #[cfg(not(madsim))]
     #[tokio::test]
     async fn rejected_snapshot_releases_its_pin_without_publishing_a_current_pointer() {
         let store = Arc::new(FailingReferenceStore::default());
@@ -1278,6 +1547,7 @@ mod tests {
         raft.shutdown().await.unwrap();
     }
 
+    #[cfg(not(madsim))]
     #[tokio::test]
     async fn lagging_reference_put_keeps_the_new_current_and_every_prepared_pointer_pinned() {
         let store = Arc::new(FailingReferenceStore::default());
@@ -1417,7 +1687,7 @@ mod tests {
             .expect("prefetch external snapshot");
 
         let pointer = SnapshotPointer::decode(prefetched.snapshot.snapshot.get_ref()).unwrap();
-        assert_eq!(pointer.snapshot_id, "snapshot-a");
+        assert!(pointer.snapshot_id.ends_with(":snapshot-a"));
         assert!(matches!(pointer.location, SnapshotLocation::S3 { .. }));
         let cached = registry
             .snapshot_install_coordinator()
@@ -1470,6 +1740,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_prefetch_guards_have_independent_entries() {
+        let registry = RaftGroupHandleRegistry::default();
+        registry.set_snapshot_store(Some(Arc::new(StaticSnapshotStore {
+            bytes: Some(group_snapshot_bytes()),
+        })));
+        let first = registry
+            .prefetch_snapshot_for_install(RaftGroupId(7), external_snapshot("same"))
+            .await
+            .unwrap();
+        let second = registry
+            .prefetch_snapshot_for_install(RaftGroupId(7), external_snapshot("same"))
+            .await
+            .unwrap();
+        let first_pointer = SnapshotPointer::decode(first.snapshot.snapshot.get_ref()).unwrap();
+        let second_pointer = SnapshotPointer::decode(second.snapshot.snapshot.get_ref()).unwrap();
+        assert_ne!(first_pointer.snapshot_id, second_pointer.snapshot_id);
+        drop(first);
+        assert!(
+            registry
+                .snapshot_install
+                .take_prefetched(&second_pointer)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn prefetch_snapshot_for_install_guard_clears_unconsumed_cache() {
         let registry = RaftGroupHandleRegistry::default();
         registry.set_snapshot_store(Some(Arc::new(StaticSnapshotStore {
@@ -1502,8 +1798,10 @@ mod tests {
             .await
             .expect_err("missing snapshot should fail before OpenRaft install");
 
-        assert!(err.message().contains("prefetch OpenRaft snapshot missing"));
-        assert!(err.message().contains("snapshot not found"));
+        assert!(matches!(err, RegistryError::Snapshot {
+            stage: SnapshotStage::Download,
+            ..
+        }));
     }
 
     #[tokio::test]

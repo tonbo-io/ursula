@@ -70,10 +70,11 @@ pub fn bootstrap_decision<'a>(
 
 /// The probe vote: the lowest vote a node can send, with no log. A peer that
 /// holds the group refuses it. A peer with no vote yet may grant it, which
-/// only records a term-0 vote: harmless, since that never counts as
-/// initialized and `Initialize` overwrites it.
-pub fn bootstrap_probe_vote(node_id: u64) -> UrsulaVoteRequest {
-    UrsulaVoteRequest::new(UrsulaVote::new(0, node_id), None)
+/// only records the lowest term-0 vote. Using the probing node ID here can
+/// raise a fresh initializer above its own term-0 membership entry and violate
+/// OpenRaft monotonic I/O progress when `Initialize` runs.
+pub fn bootstrap_probe_vote() -> UrsulaVoteRequest {
+    UrsulaVoteRequest::new(UrsulaVote::new(0, 0), None)
 }
 
 /// How a group bootstrap ended.

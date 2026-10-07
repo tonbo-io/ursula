@@ -3,16 +3,16 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Args;
-use tokio::sync::Notify;
+use tokio::sync::watch;
 use ursula_config::Preset;
 use ursula_config::find_default_config;
 use ursula_config::load_config;
 use ursula_observability::serve::serve_until_shutdown;
 use ursula_observability::serve::shutdown_signal;
+use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 
 use crate::HttpState;
@@ -77,60 +77,10 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         preset.unwrap_or(Preset::Default)
     );
 
-    let mut start_maintenance_drained = parse_start_maintenance_drained(
+    let start_maintenance_drained = parse_start_maintenance_drained(
         std::env::var_os("URSULA_START_MAINTENANCE_DRAINED").as_deref(),
     )?;
     let boot = ursula_proto::admin::ProcessIncarnation::from_bits(rand::random());
-    let mut startup_admission = None;
-    match std::env::var("URSULA_STARTUP_RESERVATION") {
-        Ok(value) if value == "true" => {
-            validate_startup_topology(&config)?;
-            let helper = std::env::current_exe()?.with_file_name("ursulactl");
-            let mut helper_command = tokio::process::Command::new(helper);
-            helper_command
-                .args([
-                    "startup-admit",
-                    "--node-id",
-                    &config.raft.node_id.to_string(),
-                    "--group-count",
-                    &config.raft.group_count.to_string(),
-                    "--core-count",
-                    &config.runtime.core_count.to_string(),
-                    "--process-incarnation",
-                    boot.as_str(),
-                ])
-                .kill_on_drop(true);
-            let output =
-                tokio::time::timeout(Duration::from_secs(65), helper_command.output()).await??;
-            if !output.status.success() {
-                return Err(std::io::Error::other(format!(
-                    "startup reservation refused: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ))
-                .into());
-            }
-            let admission: ursula_proto::admin::StartupAdmission =
-                serde_json::from_slice(&output.stdout)?;
-            admission.validate().map_err(std::io::Error::other)?;
-            if admission.process_incarnation != boot {
-                return Err(std::io::Error::other(
-                    "startup helper changed the fresh process incarnation",
-                )
-                .into());
-            }
-            start_maintenance_drained |= admission.start_maintenance_drained();
-            startup_admission = Some(admission);
-        }
-        Ok(value) if value == "false" => (),
-        Err(std::env::VarError::NotPresent) => (),
-        _ => {
-            return Err(std::io::Error::other(
-                "URSULA_STARTUP_RESERVATION must be exactly true or false",
-            )
-            .into());
-        }
-    }
-    // No format stamps, Raft actors, transport or listeners exist before admission.
     let wal_dir = if runs_raft(&config, preset) {
         Some(RaftWalDir::resolve(&config.raft.wal)?)
     } else {
@@ -142,16 +92,79 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
         None => Persistence::InMemory,
     };
+    let meta_authority = if config.raft.uses_meta_authority() {
+        let root = config.raft.wal.path.as_ref().ok_or_else(|| {
+            std::io::Error::other("meta authority requires a persistent WAL path")
+        })?;
+        Some(
+            crate::bootstrap::meta::start_meta_authority(
+                &config,
+                root.join("meta-raft"),
+                boot.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let mut state = init_state(&config, persistence, start_maintenance_drained)
         .await?
         .with_process_incarnation(boot);
-    if let Some(admission) = startup_admission {
-        // No admin requests can enter the Raft API queue before this gate is
-        // installed: all listeners are opened by serve.
-        state = state.with_startup_maintenance_fence(admission.maintenance_fence);
-    }
+    let live_cleanup = if let Some(authority) = &meta_authority {
+        let topology = authority.handle.committed_state();
+        let mut applied = topology.clone();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if applied
+                    .borrow()
+                    .operations
+                    .accepts_process(config.raft.node_id, &authority.process)
+                {
+                    break;
+                }
+                applied.changed().await.map_err(std::io::Error::other)?;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await??;
+        state = state
+            .with_meta_control(authority.handle.clone())
+            .with_live_topology(topology.clone());
+        let registry = state
+            .raft_registry()
+            .ok_or_else(|| std::io::Error::other("meta authority requires data Raft registry"))?
+            .clone();
+        registry.set_process_authority(
+            config.raft.node_id,
+            authority.process.clone(),
+            authority.handle.clone(),
+        );
+        Some(crate::bootstrap::spawn_live_topology_cleanup(
+            state.runtime.clone(),
+            registry,
+            config.raft.node_id,
+            ursula_shard::StaticShardMap::new(config.runtime.core_count, config.raft.group_count)?,
+            topology,
+        )?)
+    } else {
+        None
+    };
     state.register_otel_metrics();
-    let wal_shutdown = serve(state, &config).await?;
+    let cleanup_runtime = state.runtime.clone();
+    let cleanup_wal = state.raft_wal().cloned();
+    let served = serve(state, &config).await;
+    cleanup_runtime.stop_owner_services().await;
+    if served.is_err() {
+        shutdown_raft_wal(&cleanup_runtime, cleanup_wal.as_ref()).await;
+        cleanup_runtime.shutdown_owners().await;
+    }
+    if let Some(cleanup) = live_cleanup {
+        let _cancelled = cleanup.await;
+    }
+    if let Some(authority) = meta_authority {
+        authority.shutdown().await?;
+    }
+    let wal_shutdown = served?;
     if let Some(wal_dir) = wal_dir {
         wal_dir.close(wal_shutdown);
     }
@@ -345,6 +358,7 @@ async fn init_state(
         )?;
         state = state.with_wal_disk_monitor(monitor.clone());
         crate::bootstrap::spawn_wal_disk_gate(
+            &state.runtime,
             wal_path,
             monitor,
             state.raft_registry().cloned(),
@@ -364,30 +378,6 @@ fn parse_start_maintenance_drained(value: Option<&OsStr>) -> Result<bool, std::i
             "URSULA_START_MAINTENANCE_DRAINED must be exactly true or false",
         )),
     }
-}
-
-fn validate_startup_topology(config: &ursula_config::UrsulaConfig) -> Result<(), std::io::Error> {
-    let voters = BTreeSet::from([1, 2, 3]);
-    if config.raft.peers.len() != 3
-        || config
-            .raft
-            .peers
-            .iter()
-            .map(|peer| peer.node_id)
-            .collect::<BTreeSet<_>>()
-            != voters
-        || !voters.contains(&config.raft.node_id)
-        || config.raft.groups.iter().any(|group| {
-            group.voters.iter().copied().collect::<BTreeSet<_>>() != voters
-                || group.voters.len() != 3
-        })
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "startup ownership requires the fixed three-voter topology on every group",
-        ));
-    }
-    Ok(())
 }
 
 fn static_grpc_node_hosts_group(
@@ -419,9 +409,9 @@ async fn serve(
     let runtime = state.runtime.clone();
     let raft_wal = state.raft_wal().cloned();
 
-    let shutdown = Arc::new(Notify::new());
-    spawn_shutdown_signal_task(
-        shutdown.clone(),
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let signal_task = spawn_shutdown_signal_task(
+        shutdown,
         state.raft_registry().cloned(),
         config.raft.node_id,
         config
@@ -431,70 +421,56 @@ async fn serve(
             .map(|peer| (peer.node_id, peer.url.clone()))
             .collect(),
     );
-
-    let admin_app = crate::admin_router(state.clone());
-    let admin_listener = tokio::net::TcpListener::bind(admin_listen).await?;
-    let admin_task = tokio::spawn(serve_until_shutdown(
-        admin_listener,
-        admin_app,
-        notified(shutdown.clone()),
-        None,
-    ));
-
-    if let Some(cluster_addr) = cluster_listen {
-        let client_app = client_router_with_admission(
-            state.clone(),
-            crate::IngressAdmission::new(&config.server)
-                .with_wal_disk_monitor(state.wal_disk_monitor())
-                .with_raft_log_pressure(
-                    state
-                        .raft_registry()
-                        .map(ursula_raft::RaftGroupHandleRegistry::snapshot_build_coordinator),
-                ),
+    let admission = crate::IngressAdmission::new(&config.server)
+        .with_wal_disk_monitor(state.wal_disk_monitor())
+        .with_raft_log_pressure(
+            state
+                .raft_registry()
+                .map(ursula_raft::RaftGroupHandleRegistry::snapshot_build_coordinator),
         );
-        let cluster_app = cluster_router_from_state(state);
-        let client_listener = tokio::net::TcpListener::bind(listen).await?;
-        let cluster_listener = tokio::net::TcpListener::bind(cluster_addr).await?;
-        let client_task = tokio::spawn(serve_until_shutdown(
-            client_listener,
-            client_app,
-            notified(shutdown.clone()),
-            None,
+    let mut endpoints = vec![(admin_listen, crate::admin_router(state.clone()))];
+    if let Some(cluster_addr) = cluster_listen {
+        endpoints.push((
+            listen,
+            client_router_with_admission(state.clone(), admission),
         ));
-        let cluster_task = tokio::spawn(serve_until_shutdown(
-            cluster_listener,
-            cluster_app,
-            notified(shutdown),
-            None,
-        ));
-        let (client_res, cluster_res, admin_res) =
-            tokio::try_join!(client_task, cluster_task, admin_task)?;
-        client_res?;
-        cluster_res?;
-        admin_res?;
+        endpoints.push((cluster_addr, cluster_router_from_state(state)));
     } else {
-        let admission = crate::IngressAdmission::new(&config.server)
-            .with_wal_disk_monitor(state.wal_disk_monitor())
-            .with_raft_log_pressure(
-                state
-                    .raft_registry()
-                    .map(ursula_raft::RaftGroupHandleRegistry::snapshot_build_coordinator),
-            );
-        let app = cluster_router_from_state(state.clone())
-            .merge(client_router_with_admission(state, admission));
-        let listener = tokio::net::TcpListener::bind(listen).await?;
-        let serve_task = tokio::spawn(serve_until_shutdown(
-            listener,
-            app,
-            notified(shutdown),
-            None,
+        endpoints.push((
+            listen,
+            cluster_router_from_state(state.clone())
+                .merge(client_router_with_admission(state, admission)),
         ));
-        let (serve_res, admin_res) = tokio::try_join!(serve_task, admin_task)?;
-        serve_res?;
-        admin_res?;
+    }
+    // Bind every socket before starting a service, so a bind error cannot
+    // leave a partially serving node. Accept, parsing and handler execution
+    // then run on the owners; Linux distributes connections with SO_REUSEPORT.
+    let mut listeners = Vec::new();
+    for (addr, app) in endpoints {
+        for owner in 0..config.runtime.core_count {
+            let core_id = CoreId(u16::try_from(owner)?);
+            listeners.push((core_id, bind_owner_listener(addr)?, app.clone()));
+        }
+    }
+    let mut servers = Vec::new();
+    for (core_id, listener, app) in listeners {
+        let stop = shutdown_rx.clone();
+        servers.push(runtime.spawn_on_owner(core_id, async move {
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            serve_until_shutdown(listener, app, owner_shutdown(stop), None).await
+        })?);
+    }
+    for result in futures_util::future::join_all(servers).await {
+        result??;
     }
     tracing::info!("all listeners drained; stopping the Raft groups");
+    runtime.stop_owner_services().await;
     let wal_shutdown = shutdown_raft_wal(&runtime, raft_wal.as_ref()).await;
+    let failed_owners = runtime.shutdown_owners().await;
+    if !failed_owners.is_empty() {
+        tracing::warn!(?failed_owners, "owner workers stopped abnormally");
+    }
+    signal_task.abort();
     tracing::info!("exiting");
     Ok(wal_shutdown)
 }
@@ -521,7 +497,7 @@ pub(crate) enum WalShutdown {
 /// recording a clean shutdown.
 pub(crate) async fn shutdown_raft_wal(
     runtime: &ursula_runtime::ShardRuntime,
-    raft_wal: Option<&ursula_raft::RaftWal>,
+    raft_wal: Option<&ursula_raft::wal::RaftWal>,
 ) -> WalShutdown {
     let Some(raft_wal) = raft_wal else {
         return WalShutdown::NoWal;
@@ -546,10 +522,24 @@ pub(crate) async fn shutdown_raft_wal(
     }
 }
 
-/// Adapt the shared shutdown [`Notify`] into an owned future for
-/// [`serve_until_shutdown`].
-async fn notified(shutdown: Arc<Notify>) {
-    shutdown.notified().await;
+/// Build a nonblocking listener before registering it with the owner's reactor.
+fn bind_owner_listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    Ok(socket.into())
+}
+
+async fn owner_shutdown(mut shutdown: watch::Receiver<bool>) {
+    let _closed = shutdown.wait_for(|stopped| *stopped).await;
 }
 
 /// Grace period between the first shutdown signal and a forced exit, so a hung
@@ -566,11 +556,11 @@ const SHUTDOWN_HANDOFF_GRACE: Duration = Duration::from_secs(5);
 /// without recording a clean shutdown, so the next start treats the run as a
 /// crash.
 fn spawn_shutdown_signal_task(
-    shutdown: Arc<Notify>,
+    shutdown: watch::Sender<bool>,
     raft_registry: Option<ursula_raft::RaftGroupHandleRegistry>,
     node_id: u64,
     peers: Vec<(u64, String)>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         shutdown_signal().await;
         tracing::info!(
@@ -593,7 +583,7 @@ fn spawn_shutdown_signal_task(
                     }
                     registry.shutdown_transport();
                 }
-                shutdown.notify_waiters();
+                shutdown.send_replace(true);
                 std::future::pending::<()>().await;
             } => {}
             () = shutdown_signal() => {
@@ -609,7 +599,7 @@ fn spawn_shutdown_signal_task(
             }
         }
         std::process::exit(0);
-    });
+    })
 }
 
 #[cfg(test)]
@@ -619,6 +609,63 @@ mod tests {
 
     use super::parse_start_maintenance_drained;
 
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn http_accept_and_handlers_execute_on_an_owner() {
+        let mut config = ursula_runtime::RuntimeConfig::new(2, 2);
+        config.threading = ursula_runtime::RuntimeThreading::ThreadPerCore;
+        let runtime = ursula_runtime::ShardRuntime::spawn(config).expect("owners");
+        let first = super::bind_owner_listener("127.0.0.1:0".parse().expect("addr"))
+            .expect("first listener");
+        let addr = first.local_addr().expect("bound addr");
+        let second = super::bind_owner_listener(addr).expect("shared port");
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let mut servers = Vec::new();
+        for (core, listener) in [(0, first), (1, second)] {
+            let stopped = shutdown.subscribe();
+            servers.push(
+                runtime
+                    .spawn_on_owner(ursula_shard::CoreId(core), async move {
+                        let app = axum::Router::new().route(
+                            "/",
+                            axum::routing::get(|| async {
+                                std::thread::current()
+                                    .name()
+                                    .expect("owner name")
+                                    .to_owned()
+                            }),
+                        );
+                        ursula_observability::serve::serve_until_shutdown(
+                            tokio::net::TcpListener::from_std(listener).expect("owner reactor"),
+                            app,
+                            super::owner_shutdown(stopped),
+                            None,
+                        )
+                        .await
+                    })
+                    .expect("serve"),
+            );
+        }
+        let client = reqwest::Client::new();
+        for _ in 0..16 {
+            let owner = client
+                .get(format!("http://{addr}/"))
+                .header("Connection", "close")
+                .send()
+                .await
+                .expect("http")
+                .text()
+                .await
+                .expect("body");
+            assert!(matches!(owner.as_str(), "ursula-core-0" | "ursula-core-1"));
+        }
+        shutdown.send_replace(true);
+        for server in servers {
+            server.await.expect("owner alive").expect("drained");
+        }
+        assert!(runtime.shutdown_owners().await.is_empty());
+    }
+
     #[test]
     fn startup_maintenance_drain_is_strict_and_opt_in() {
         assert!(!parse_start_maintenance_drained(None).unwrap());
@@ -626,43 +673,6 @@ mod tests {
         assert!(!parse_start_maintenance_drained(Some(OsStr::new("false"))).unwrap());
         parse_start_maintenance_drained(Some(OsStr::new("1")))
             .expect_err("a startup drain flag other than true or false must be rejected");
-    }
-
-    #[test]
-    fn startup_ownership_refuses_topologies_outside_the_catalogued_cell() {
-        use ursula_config::RaftGroupConfig;
-        use ursula_config::RaftPeerConfig;
-        use ursula_config::UrsulaConfig;
-
-        let mut config = UrsulaConfig::default();
-        config.raft.node_id = 1;
-        config.raft.group_count = 1;
-        assert!(super::validate_startup_topology(&config).is_err());
-        config.raft.peers = (1..=3)
-            .map(|node_id| RaftPeerConfig {
-                node_id,
-                url: format!("http://node-{node_id}:50051"),
-            })
-            .collect();
-        super::validate_startup_topology(&config).expect("a three-voter cell must be accepted");
-        config.raft.groups = vec![RaftGroupConfig {
-            raft_group_id: 0,
-            voters: vec![1, 2, 3],
-        }];
-        super::validate_startup_topology(&config)
-            .expect("a three-voter group over the full cell must be accepted");
-        for voters in [vec![1], vec![1, 2], vec![1, 2, 4], vec![1, 2, 2, 3]] {
-            config.raft.groups[0].voters = voters;
-            assert!(super::validate_startup_topology(&config).is_err());
-        }
-        config.raft.groups.clear();
-        config.raft.node_id = 4;
-        assert!(super::validate_startup_topology(&config).is_err());
-        config.raft.node_id = 1;
-        config.raft.peers[2].node_id = 2;
-        assert!(super::validate_startup_topology(&config).is_err());
-        config.raft.peers.truncate(1);
-        assert!(super::validate_startup_topology(&config).is_err());
     }
 
     #[tokio::test]
@@ -756,7 +766,7 @@ mod tests {
         assert!(
             matches!(
                 raft_wal.shutdown().await,
-                Err(ursula_raft::RaftWalError::ShutDown { .. })
+                Err(ursula_raft::wal::RaftWalError::ShutDown { .. })
             ),
             "the server shut the WAL down"
         );

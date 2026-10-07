@@ -291,7 +291,7 @@ impl WalOpening {
 /// How a core journal is read: in [`JournalReplayMode::VerifiedPrefix`] when
 /// it has not been read back since the current recovery epoch began.
 pub(crate) fn core_replay_mode(verified_epoch: u64, recovery_epoch: u64) -> JournalReplayMode {
-    if verified_epoch < recovery_epoch {
+    if verified_epoch != recovery_epoch {
         JournalReplayMode::VerifiedPrefix
     } else {
         JournalReplayMode::Strict
@@ -338,6 +338,8 @@ pub enum RaftWalError {
     },
     #[error("read the Raft WAL run state: {0}")]
     ReadRunState(#[source] StateFileError),
+    #[error("read core metadata while recovering epochs: {0}")]
+    ReadCoreMetadata(#[source] StateFileError),
     #[error("list the core journals under '{}': {source}", .root.display())]
     ListCores {
         root: PathBuf,
@@ -449,7 +451,16 @@ impl NodeWal {
         super::topology::check_or_create(&root, topology, previous.is_some() || !cores.is_empty())?;
         let journals = journal_history(&cores)?;
         let boot_id = Disk::boot_id(&root).map(BootId);
-        let opening = WalOpening::decide(previous.as_ref(), journals, boot_id.as_ref(), fsync);
+        let mut opening = WalOpening::decide(previous.as_ref(), journals, boot_id.as_ref(), fsync);
+        if previous.is_none() && !cores.is_empty() {
+            let mut greatest_epoch = 0;
+            for core in &cores {
+                let metadata = super::core_meta::CoreMetadata::load(&core_metadata_path(core))
+                    .map_err(RaftWalError::ReadCoreMetadata)?;
+                greatest_epoch = greatest_epoch.max(metadata.verified_epoch());
+            }
+            opening.recovery_epoch = greatest_epoch.saturating_add(1);
+        }
         log_opening(&root, previous.as_ref(), boot_id.as_ref(), fsync, &opening);
         // Before this run records itself, so a crash in between marks the
         // cores again on the next start.
@@ -885,9 +896,10 @@ mod tests {
         assert_eq!(core_replay_mode(0, 0), STRICT);
         assert_eq!(core_replay_mode(3, 3), STRICT);
         assert_eq!(core_replay_mode(2, 3), PREFIX);
-        // A run state removed by hand restarts the count; the journal was
-        // verified since.
-        assert_eq!(core_replay_mode(5, 0), STRICT);
+        // A missing run state restarts the count. An older verification
+        // must not make the new unknown-history epoch read strictly.
+        assert_eq!(core_replay_mode(5, 0), PREFIX);
+        assert_eq!(core_replay_mode(5, 1), PREFIX);
 
         // A host crash starts epoch 5; a process crash right after it, before
         // a core was read, keeps epoch 5, so that core still reads its prefix.

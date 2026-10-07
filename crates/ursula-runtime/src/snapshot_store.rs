@@ -34,6 +34,7 @@ pub struct SnapshotReferenceConfig {
 }
 
 impl SnapshotReferenceConfig {
+    #[cfg(not(madsim))]
     fn voters_for(&self, raft_group_id: u32) -> &BTreeSet<u64> {
         self.per_group_voters
             .get(&raft_group_id)
@@ -1127,6 +1128,8 @@ pub fn snapshot_store_from_config(
     cold_cfg: &crate::ColdConfig,
     references: SnapshotReferenceConfig,
 ) -> Result<Option<SharedSnapshotStore>, SnapshotStoreError> {
+    #[cfg(madsim)]
+    drop(references);
     match resolved_snapshot_backend(cfg.backend, cold_cfg.backend) {
         ursula_config::RaftSnapshotBackend::Auto | ursula_config::RaftSnapshotBackend::Inline => {
             Ok(None)

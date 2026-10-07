@@ -1,3 +1,6 @@
+mod backend_error;
+pub use backend_error::BackendErrorSource;
+pub use backend_error::BackendOperation;
 #[cfg(test)]
 mod hygiene_tests;
 pub mod in_memory;
@@ -190,6 +193,62 @@ pub enum GroupWriteResponse {
     TidyStream(crate::request::TidyStreamResponse),
     DeferColdGc(DeferColdGcResponse),
     OffloadColdRefs(crate::cold_refs::OffloadStreamColdRefsResponse),
+    ReplicationBarrier,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GroupResponseKind {
+    Write,
+    CreateStream,
+    Append,
+    PublishSnapshot,
+    AdvanceRetention,
+    TouchStreamAccess,
+    FlushCold,
+    CompactCold,
+    CloseStream,
+    DeleteStream,
+    AckColdGc,
+    PurgeBucket,
+    ImportGroupState,
+    TidyStream,
+    DeferColdGc,
+    OffloadColdRefs,
+    Blank,
+    Membership,
+    ReplicationBarrier,
+}
+impl GroupWriteResponse {
+    pub fn kind(&self) -> GroupResponseKind {
+        match self {
+            Self::ReplicationBarrier => GroupResponseKind::ReplicationBarrier,
+            Self::CreateStream(..) => GroupResponseKind::CreateStream,
+            Self::Append(..) => GroupResponseKind::Append,
+            Self::PublishSnapshot(..) => GroupResponseKind::PublishSnapshot,
+            Self::AdvanceRetention(..) => GroupResponseKind::AdvanceRetention,
+            Self::TouchStreamAccess(..) => GroupResponseKind::TouchStreamAccess,
+            Self::FlushCold(..) => GroupResponseKind::FlushCold,
+            Self::CompactCold(..) => GroupResponseKind::CompactCold,
+            Self::CloseStream(..) => GroupResponseKind::CloseStream,
+            Self::DeleteStream(..) => GroupResponseKind::DeleteStream,
+            Self::AckColdGc(..) => GroupResponseKind::AckColdGc,
+            Self::PurgeBucket(..) => GroupResponseKind::PurgeBucket,
+            Self::ImportGroupState(..) => GroupResponseKind::ImportGroupState,
+            Self::TidyStream(..) => GroupResponseKind::TidyStream,
+            Self::DeferColdGc(..) => GroupResponseKind::DeferColdGc,
+            Self::OffloadColdRefs(..) => GroupResponseKind::OffloadColdRefs,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SynchronizationResource {
+    LeaderChannels,
+    CoreWriters,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireField {
+    CoreId,
+    ReadMaxLen,
 }
 
 pub trait GroupEngine: Send + 'static {
@@ -222,6 +281,16 @@ pub trait GroupEngine: Send + 'static {
                 request.stream_id
             )))
         })
+    }
+
+    /// Plan an owned follower forward without borrowing the actor's engine.
+    /// The runtime executes this work under its materialization budget.
+    fn forwarded_head_stream(
+        &self,
+        _request: &HeadStreamRequest,
+        _placement: ShardPlacement,
+    ) -> Option<GroupHeadStreamFuture<'static>> {
+        None
     }
 
     fn head_stream<'a>(
@@ -741,6 +810,47 @@ pub struct StreamEngineError {
 /// structured source, so it keeps an owned `message`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum GroupInfraError {
+    #[error("{operation:?}: {source}")]
+    Backend {
+        operation: BackendOperation,
+        #[source]
+        source: BackendErrorSource,
+    },
+    #[error("decode wire {payload}: {source}")]
+    WireDecode {
+        payload: String,
+        #[source]
+        source: BackendErrorSource,
+    },
+    #[error("unexpected write response: expected {expected:?}, received {actual:?}")]
+    UnexpectedResponse {
+        expected: GroupResponseKind,
+        actual: GroupResponseKind,
+    },
+    #[error("response count mismatch: expected {expected:?}, received {actual:?}")]
+    ResponseCount { expected: usize, actual: usize },
+    #[error("{context}.{field:?} value {value} is outside its wire range")]
+    WireRange {
+        context: String,
+        field: WireField,
+        value: u128,
+    },
+    #[error("synchronization resource {resource:?} was poisoned")]
+    Poisoned { resource: SynchronizationResource },
+    #[error("cold compaction input no longer matches the cold index")]
+    StaleColdIndex,
+
+    #[error("Raft group {group:?} is missing from configured membership")]
+    MissingGroupMembership { group: ursula_shard::RaftGroupId },
+    #[error("Raft group {group:?} has no configured voters")]
+    EmptyGroupMembership { group: ursula_shard::RaftGroupId },
+    #[error("Raft group {group:?} voter {node_id} has no configured peer address")]
+    MissingVoterAddress {
+        group: ursula_shard::RaftGroupId,
+        node_id: u64,
+    },
+    #[error("Raft node {node_id} has no configured peer address")]
+    MissingLocalAddress { node_id: u64 },
     #[error("the Raft owner has stopped")]
     OwnerStopped,
     #[error("write outcome is unknown; the proposal may have committed")]
@@ -827,7 +937,7 @@ pub enum GroupEngineError {
     #[error("{}", .0.message)]
     Stream(StreamEngineError),
     #[error("{}", .0.message())]
-    Infra(GroupInfraError),
+    Infra(#[source] GroupInfraError),
     #[error("{message}")]
     ForwardToLeader {
         message: String,
@@ -842,6 +952,16 @@ pub enum GroupEngineError {
 }
 
 impl GroupEngineError {
+    pub fn backend(
+        operation: BackendOperation,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Infra(GroupInfraError::Backend {
+            operation,
+            source: BackendErrorSource::new(source),
+        })
+    }
+
     pub fn new(message: impl Into<String>) -> Self {
         Self::Infra(GroupInfraError::internal(message))
     }

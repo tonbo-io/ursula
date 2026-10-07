@@ -87,8 +87,13 @@ pub(crate) fn head_stream_read_v1(
 pub(crate) fn read_stream_read_v1(
     request: &ReadStreamRequest,
 ) -> Result<raft_internal_proto::ReadStreamReadV1, GroupEngineError> {
-    let max_len = u64::try_from(request.max_len)
-        .map_err(|_overflow| GroupEngineError::new("read max_len does not fit u64"))?;
+    let max_len = u64::try_from(request.max_len).map_err(|_overflow| {
+        GroupEngineError::Infra(ursula_runtime::GroupInfraError::WireRange {
+            context: "read".to_owned(),
+            field: ursula_runtime::WireField::ReadMaxLen,
+            value: request.max_len as u128,
+        })
+    })?;
     Ok(raft_internal_proto::ReadStreamReadV1 {
         offset: request.offset,
         max_len,
@@ -150,7 +155,7 @@ pub(crate) async fn forward_group_read_to_leader(
         .map(|response| response.into_inner())
         .map_err(|err| {
             crate::format_epoch::observe_outbound_status("GroupRead", &err);
-            GroupEngineError::new(format!("forward group read to leader: {err}"))
+            GroupEngineError::backend(ursula_runtime::BackendOperation::ForwardRead, err)
         })
 }
 
@@ -183,24 +188,37 @@ pub(crate) async fn forward_purge_bucket_to_leader(
         .await
         .map_err(|err| {
             crate::format_epoch::observe_outbound_status("GroupWrite", &err);
-            GroupEngineError::new(format!("forward group write to leader: {err}"))
+            GroupEngineError::backend(ursula_runtime::BackendOperation::ForwardWrite, err)
         })?
         .into_inner();
-    let mut results = response.results.into_iter();
-    let result = results
-        .next()
-        .ok_or_else(|| GroupEngineError::new("forward group write returned no result"))?;
-    if results.next().is_some() {
-        return Err(GroupEngineError::new(
-            "forward group write returned more than one result",
+    let actual = response.results.len();
+    if actual != 1 {
+        return Err(GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::ResponseCount {
+                expected: 1,
+                actual,
+            },
         ));
     }
+    let result = response
+        .results
+        .into_iter()
+        .next()
+        .ok_or(GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::ResponseCount {
+                expected: 1,
+                actual: 0,
+            },
+        ))?;
     if result.ok {
         match decode_wire(&result.payload, "bucket purge response")? {
             GroupWriteResponse::PurgeBucket(response) => Ok(response),
-            other => Err(GroupEngineError::new(format!(
-                "unexpected forwarded bucket purge response: {other:?}"
-            ))),
+            other => Err(GroupEngineError::Infra(
+                ursula_runtime::GroupInfraError::UnexpectedResponse {
+                    expected: ursula_runtime::GroupResponseKind::PurgeBucket,
+                    actual: other.kind(),
+                },
+            )),
         }
     } else {
         Err(decode_wire::<GroupEngineError>(
@@ -214,21 +232,30 @@ pub(crate) async fn grpc_leader_channel(addr: &str) -> Result<Channel, GroupEngi
     let cache = GRPC_LEADER_CHANNELS.get_or_init(|| Mutex::new(BTreeMap::new()));
     if let Some(channel) = cache
         .lock()
-        .map_err(|_poisoned| GroupEngineError::new("gRPC leader channel cache mutex poisoned"))?
+        .map_err(|_poisoned| {
+            GroupEngineError::Infra(ursula_runtime::GroupInfraError::Poisoned {
+                resource: ursula_runtime::SynchronizationResource::LeaderChannels,
+            })
+        })?
         .get(addr)
         .cloned()
     {
         return Ok(channel);
     }
-    let endpoint = Endpoint::from_shared(addr.to_owned())
-        .map_err(|err| GroupEngineError::new(format!("invalid gRPC leader endpoint: {err}")))?;
+    let endpoint = Endpoint::from_shared(addr.to_owned()).map_err(|err| {
+        GroupEngineError::backend(ursula_runtime::BackendOperation::Endpoint, err)
+    })?;
     let channel = endpoint
         .connect()
         .await
-        .map_err(|err| GroupEngineError::new(format!("connect gRPC leader: {err}")))?;
+        .map_err(|err| GroupEngineError::backend(ursula_runtime::BackendOperation::Connect, err))?;
     cache
         .lock()
-        .map_err(|_poisoned| GroupEngineError::new("gRPC leader channel cache mutex poisoned"))?
+        .map_err(|_poisoned| {
+            GroupEngineError::Infra(ursula_runtime::GroupInfraError::Poisoned {
+                resource: ursula_runtime::SynchronizationResource::LeaderChannels,
+            })
+        })?
         .insert(addr.to_owned(), channel.clone());
     Ok(channel)
 }
@@ -288,9 +315,18 @@ pub(crate) fn write_result_from_raft_response(
 ) -> Result<Result<GroupWriteResponse, GroupEngineError>, GroupEngineError> {
     match response {
         RaftGroupResponse::Write(result) => Ok(result),
-        other @ (RaftGroupResponse::Blank | RaftGroupResponse::Membership) => Err(
-            GroupEngineError::new(format!("unexpected OpenRaft write response: {other:?}")),
-        ),
+        RaftGroupResponse::Blank => Err(GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::UnexpectedResponse {
+                expected: ursula_runtime::GroupResponseKind::Write,
+                actual: ursula_runtime::GroupResponseKind::Blank,
+            },
+        )),
+        RaftGroupResponse::Membership => Err(GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::UnexpectedResponse {
+                expected: ursula_runtime::GroupResponseKind::Write,
+                actual: ursula_runtime::GroupResponseKind::Membership,
+            },
+        )),
     }
 }
 
@@ -310,7 +346,7 @@ pub(crate) fn group_engine_client_write_error(
             false,
         );
     }
-    GroupEngineError::new(format!("OpenRaft client_write: {err}"))
+    GroupEngineError::backend(ursula_runtime::BackendOperation::Write, err)
 }
 
 /// Map a failed ReadIndex barrier (`Raft::get_read_linearizer`). Nothing was
@@ -347,9 +383,7 @@ pub(crate) fn group_engine_linearizable_read_error(
                 self_id,
             )
         }
-        None => GroupEngineError::new(format!(
-            "OpenRaft {operation} could not confirm leadership: {err}"
-        )),
+        None => GroupEngineError::backend(ursula_runtime::BackendOperation::ReadIndex, err),
     }
 }
 

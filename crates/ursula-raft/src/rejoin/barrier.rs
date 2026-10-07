@@ -82,7 +82,11 @@ pub async fn run_rejoin_vote_barrier<P, F, E>(
                 crate::rt::time::timeout(probe_timeout, probe(leader_id, node.addr.clone())).await;
             match outcome {
                 Ok(Ok((leader, index))) => {
-                    rejoin.confirm_barrier(leader, index);
+                    // A proof can arrive before the independent vote-floor task.
+                    // Do not suppress future probes until the gate accepted it.
+                    if !rejoin.confirm_barrier(leader, index) {
+                        continue;
+                    }
                     last_barrier_leader = Some(leader);
                     last_progress = crate::rt::time::Instant::now();
                     tracing::info!(

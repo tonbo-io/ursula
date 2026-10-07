@@ -1,9 +1,3 @@
-use std::alloc::GlobalAlloc;
-use std::alloc::Layout;
-use std::alloc::System;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-
 use criterion::BatchSize;
 use criterion::BenchmarkId;
 use criterion::Criterion;
@@ -19,45 +13,16 @@ use fixture::MAX_FLUSH_BYTES;
 use fixture::MIN_HOT_BYTES;
 use fixture::build_state;
 
-struct TrackAlloc;
-
-static ALLOC_TOTAL: AtomicUsize = AtomicUsize::new(0);
-static CURRENT_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-#[expect(
-    unsafe_code,
-    reason = "an allocation-counting global allocator must implement the unsafe GlobalAlloc trait"
-)]
-// SAFETY: every method delegates to `System` with the caller's layout and only
-// updates atomic counters around the call.
-unsafe impl GlobalAlloc for TrackAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: delegated to the system allocator with the same layout.
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            ALLOC_TOTAL.fetch_add(layout.size(), Ordering::Relaxed);
-            CURRENT_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        }
-        ptr
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: delegated to the system allocator with the same pointer and layout.
-        unsafe { System.dealloc(ptr, layout) };
-        CURRENT_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-    }
-}
-
 #[global_allocator]
-static GLOBAL: TrackAlloc = TrackAlloc;
+static GLOBAL: dhat::Alloc = dhat::Alloc;
 
-fn snapshot() -> (usize, usize) {
-    (
-        ALLOC_TOTAL.load(Ordering::Relaxed),
-        CURRENT_BYTES.load(Ordering::Relaxed),
-    )
+fn snapshot() -> (u64, usize) {
+    let stats = dhat::HeapStats::get();
+    (stats.total_bytes, stats.curr_bytes)
 }
 
 fn plan_next_cold_flush_alloc_benches(c: &mut Criterion) {
+    let _profiler = dhat::Profiler::builder().testing().build();
     let mut group = c.benchmark_group("plan_next_cold_flush_alloc");
 
     for scenario in [
@@ -86,7 +51,7 @@ fn plan_next_cold_flush_alloc_benches(c: &mut Criterion) {
         let (_, current_after_drop) = snapshot();
 
         let allocated = alloc_after_plan.saturating_sub(alloc_before);
-        eprintln!(
+        tracing::info!(
             "  [mem] {}:\n    machine: {} bytes\n    before plan: {} bytes\n    allocated during plan: {} bytes\n    after plan (with result): {} bytes\n    after drop result: {} bytes",
             scenario.name(),
             machine_bytes,

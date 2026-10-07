@@ -116,6 +116,7 @@ pub(crate) async fn probe_peer_with_protocol(
         Err(err) => return PeerFormatEpoch::Unreachable(format!("connect: {err}")),
     };
     let mut request = tonic::Request::new(raft_internal_proto::RaftRpcEnvelopeV1 {
+        process_identity: Default::default(),
         raft_group_id: FORMAT_EPOCH_PROBE_GROUP,
         node_id: 0,
         protocol_version,

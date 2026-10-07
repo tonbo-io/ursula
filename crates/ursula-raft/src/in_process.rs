@@ -53,18 +53,7 @@ impl InProcessRaftRegistry {
             .insert(node_id, barrier.clone());
         let endpoint = crate::RaftGroupHandleRegistry::default();
         let group = ursula_shard::RaftGroupId(0);
-        if let Some(gate) = self.rejoin(node_id) {
-            endpoint.register_rejoin(group, gate);
-        }
-        endpoint.register_read_barrier(group, barrier);
-        endpoint.register(
-            ursula_shard::ShardPlacement {
-                shard_id: ursula_shard::ShardId(0),
-                core_id: ursula_shard::CoreId(0),
-                raft_group_id: group,
-            },
-            raft.clone(),
-        );
+        endpoint.register_test_group(group, barrier, self.rejoin(node_id));
         self.endpoints
             .lock()
             .expect("endpoint registry")
@@ -135,7 +124,15 @@ impl InProcessRaftRegistry {
             .ok_or(ursula_runtime::GroupEngineError::Infra(
                 ursula_runtime::GroupInfraError::OwnerStopped,
             ))?;
-        endpoint.vote(ursula_shard::RaftGroupId(0), request).await
+        endpoint
+            .vote(ursula_shard::RaftGroupId(0), request)
+            .await
+            .map_err(|error| {
+                ursula_runtime::GroupEngineError::backend(
+                    ursula_runtime::BackendOperation::Vote,
+                    error,
+                )
+            })
     }
 
     /// Screen the votes and appends delivered to `node_id` through its
@@ -305,6 +302,7 @@ pub struct InProcessRaftNetworkPolicy {
 #[derive(Debug, Default)]
 struct InProcessRaftNetworkPolicyState {
     delay: Option<Duration>,
+    append_response_delay: Option<Duration>,
     partitions: BTreeSet<(u64, u64)>,
 }
 
@@ -324,6 +322,15 @@ impl InProcessRaftNetworkPolicy {
             .observer
             .lock()
             .expect("in-process raft network observer mutex") = Some(Arc::new(observer));
+    }
+
+    /// Delay acknowledgements after the replica has executed AppendEntries.
+    /// This models a reply that survives a receiver reboot in the network.
+    pub fn set_append_response_delay(&self, delay: Option<Duration>) {
+        self.inner
+            .lock()
+            .expect("in-process policy mutex")
+            .append_response_delay = delay;
     }
 
     pub fn set_delay(&self, delay: Option<Duration>) {
@@ -590,6 +597,10 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             target: self.target,
             kind: InProcessRaftRpcKind::AppendEntries,
         });
+        let response_epoch = self
+            .rejoin
+            .as_ref()
+            .map(|rejoin| rejoin.response_epoch(self.target));
         let leader = rpc.vote;
         let prev_log_id = rpc.prev_log_id;
         let sent_last_log_id = rpc.entries.last().map(|entry| entry.log_id);
@@ -602,6 +613,26 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
                     self.target
                 )))
             })?;
+        drop(target);
+        let response_delay = self
+            .policy
+            .inner
+            .lock()
+            .expect("in-process policy mutex")
+            .append_response_delay;
+        if let Some(delay) = response_delay {
+            crate::rt::time::sleep(delay).await;
+        }
+        if response_epoch
+            != self
+                .rejoin
+                .as_ref()
+                .map(|rejoin| rejoin.response_epoch(self.target))
+        {
+            return Err(RPCError::Network(NetworkError::from_string(
+                "append acknowledgement predates follower recovery",
+            )));
+        }
         if let Some(rejoin) = &self.rejoin
             && rejoin.follower_lost_log(
                 self.target,
@@ -682,7 +713,21 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             target: self.target,
             kind: InProcessRaftRpcKind::FullSnapshot,
         });
-        target
+        if self
+            .registry
+            .rejoin(self.target)
+            .is_some_and(|gate| !gate.replication_allowed(vote))
+        {
+            return Err(StreamingError::Unreachable(Unreachable::from_string(
+                "recovery vote floor is not established",
+            )));
+        }
+        let snapshot_last_log_id = snapshot.meta.last_log_id;
+        let response_epoch = self
+            .rejoin
+            .as_ref()
+            .map(|rejoin| rejoin.response_epoch(self.target));
+        let response = target
             .install_full_snapshot(vote, snapshot)
             .await
             .map_err(|err| {
@@ -690,7 +735,23 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
                     "remote full snapshot on node {}: {err}",
                     self.target
                 )))
-            })
+            })?;
+        if response_epoch
+            != self
+                .rejoin
+                .as_ref()
+                .map(|rejoin| rejoin.response_epoch(self.target))
+        {
+            return Err(StreamingError::Network(NetworkError::from_string(
+                "snapshot acknowledgement predates follower recovery",
+            )));
+        }
+        if response.vote == vote
+            && let Some(rejoin) = &self.rejoin
+        {
+            rejoin.snapshot_repaired(self.target, &vote, snapshot_last_log_id.as_ref());
+        }
+        Ok(response)
     }
 
     async fn transfer_leader(

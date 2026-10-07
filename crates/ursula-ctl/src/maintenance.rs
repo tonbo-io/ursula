@@ -489,6 +489,7 @@ mod tests {
 
     async fn mock_metrics(State(state): State<MockNode>) -> Json<serde_json::Value> {
         Json(json!({
+
             "raft_groups": [{
                 "raft_group_id": 7,
                 "node_id": state.node_id,
@@ -586,7 +587,6 @@ mod tests {
             let url = url::Url::parse(&format!("http://{address}")).unwrap();
             nodes.push(NodeInfo {
                 expected_process_incarnation: None,
-                expected_maintenance_fence: None,
                 id: node_id,
                 admin_url: url.clone(),
                 host: address.to_string(),
@@ -600,7 +600,6 @@ mod tests {
     fn n(id: u64, host: &str) -> NodeInfo {
         NodeInfo {
             expected_process_incarnation: None,
-            expected_maintenance_fence: None,
             id,
             admin_url: url::Url::parse(&format!("http://{host}:4438")).unwrap(),
             host: host.to_owned(),
@@ -678,24 +677,18 @@ mod tests {
             per_node: vec![
                 NodeMetricsView {
                     process_incarnation: None,
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
                     node: n(1, "10.0.0.1"),
                     groups: vec![group(7, 1, Some(1), 50, 50)],
                     raft_maintenance: None,
                 },
                 NodeMetricsView {
                     process_incarnation: None,
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(1), 100, 100)],
                     raft_maintenance: None,
                 },
                 NodeMetricsView {
                     process_incarnation: None,
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
                     node: n(3, "10.0.0.3"),
                     groups: vec![group(7, 3, Some(1), 95, 100)],
                     raft_maintenance: None,
@@ -715,8 +708,6 @@ mod tests {
         let snapshot = ClusterSnapshot {
             per_node: vec![NodeMetricsView {
                 process_incarnation: None,
-                maintenance_fence: None,
-                maintenance_fence_uncertain: false,
                 node: n(2, "10.0.0.2"),
                 groups: vec![group(7, 2, Some(2), 100, 100)],
                 raft_maintenance: None,
@@ -811,16 +802,12 @@ mod tests {
             per_node: vec![
                 NodeMetricsView {
                     process_incarnation: None,
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
                     node: n(1, "10.0.0.1"),
                     groups: vec![group(7, 1, Some(2), 50, 50)],
                     raft_maintenance: None,
                 },
                 NodeMetricsView {
                     process_incarnation: None,
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(2), 100, 100)],
                     raft_maintenance: None,
@@ -838,24 +825,18 @@ mod tests {
             per_node: vec![
                 NodeMetricsView {
                     process_incarnation: None,
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
                     node: n(1, "10.0.0.1"),
                     groups: vec![group(7, 1, Some(2), 100, 100)],
                     raft_maintenance: None,
                 },
                 NodeMetricsView {
                     process_incarnation: None,
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(2), 100, 100)],
                     raft_maintenance: None,
                 },
                 NodeMetricsView {
                     process_incarnation: None,
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
                     node: n(3, "10.0.0.3"),
                     groups: vec![group(7, 3, Some(1), 100, 100)],
                     raft_maintenance: None,

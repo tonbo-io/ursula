@@ -11,9 +11,7 @@ use anyhow::bail;
 use reqwest::Client;
 use reqwest::Method;
 use reqwest::RequestBuilder;
-use serde::Deserialize;
-use ursula_proto::admin::MAINTENANCE_FENCE_HEADER;
-use ursula_proto::admin::MaintenanceFenceState;
+use ursula_proto::admin::NodeMetrics as RawMetrics;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
 use ursula_proto::admin::ProcessIncarnation;
 pub use ursula_proto::admin::TransferLeaderResponse;
@@ -38,6 +36,34 @@ impl MetricsClient {
             timeout,
             incarnations: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Submit typed intent to the meta leader. The server collects replication
+    /// evidence; adapters cannot supply arbitrary prefix assertions.
+    pub async fn submit_operation(
+        &self,
+        node: &NodeInfo,
+        request: &ursula_control::OperationRequest,
+    ) -> Result<ursula_control::ControlResponse> {
+        let url = node.admin_url.join("/__ursula/control/operation")?;
+        let response = self
+            .admin_request(node, Method::POST, url)
+            .await?
+            .json(request)
+            .send()
+            .await
+            .context("submit meta operation")?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("read meta operation result")?;
+        let result: ursula_control::ControlResponse = serde_json::from_str(&body)
+            .with_context(|| format!("meta operation returned {status}: {body}"))?;
+        if !status.is_success() || result.is_rejected() {
+            bail!("meta operation rejected: {result:?}");
+        }
+        Ok(result)
     }
 
     pub fn timeout(&self) -> Duration {
@@ -105,75 +131,7 @@ impl MetricsClient {
         if let Some(identity) = &incarnation {
             request = request.header(PROCESS_INCARNATION_HEADER, identity.as_str());
         }
-        if let Some(fence) = &node.expected_maintenance_fence {
-            if incarnation.is_none() {
-                bail!(
-                    "executor fencing requires process identity at node {}",
-                    node.id
-                );
-            }
-            request = request.header(MAINTENANCE_FENCE_HEADER, fence.header_value());
-        }
-        // Concrete migration consumers: deployed servers through 0.6.2 lack
-        // the identity field and cannot enforce this precondition. Preserve
-        // their existing transport only until those sources are retired.
         Ok(request)
-    }
-
-    /// Install/retire the caller's already-admitted token on one fixed process.
-    /// This does not acquire a cell reservation or refresh either identity.
-    pub async fn set_maintenance_fence(
-        &self,
-        node: &NodeInfo,
-        retire: bool,
-    ) -> Result<MaintenanceFenceState> {
-        let fence = node
-            .expected_maintenance_fence
-            .as_ref()
-            .context("maintenance lifecycle requires a saved executor token")?;
-        node.expected_process_incarnation
-            .as_ref()
-            .context("maintenance lifecycle requires a saved process identity")?;
-        let mut observed = node.clone();
-        // Lifecycle admission intentionally handles Unclaimed/pending/Retired
-        // metrics, but must preserve the immutable process pin.
-        observed.expected_maintenance_fence = None;
-        self.fetch_node(&observed).await?;
-        let operation = if retire { "retire" } else { "activate" };
-        let url = node
-            .admin_url
-            .join(&format!("/__ursula/maintenance/fence/{operation}"))?;
-        let response = self
-            .admin_request(&observed, Method::POST, url)
-            .await?
-            .json(fence)
-            .send()
-            .await?;
-        let status = response.status();
-        let body = response.text().await?;
-        if !status.is_success() {
-            bail!(
-                "maintenance {operation} at node {} returned {status}: {body}; stop without refreshing authority",
-                node.id
-            );
-        }
-        let reported: MaintenanceFenceState = serde_json::from_str(&body)?;
-        let expected = if retire {
-            MaintenanceFenceState::Retired {
-                fence: fence.clone(),
-            }
-        } else {
-            MaintenanceFenceState::Active {
-                fence: fence.clone(),
-            }
-        };
-        if reported != expected {
-            bail!(
-                "node {} acknowledged a different maintenance executor state",
-                node.id
-            );
-        }
-        Ok(reported)
     }
 
     /// Return a manifest pinned to each observed server instance. Refreshing
@@ -182,9 +140,7 @@ impl MetricsClient {
         &self,
         nodes: &[NodeInfo],
         replacement: Option<u64>,
-        allow_legacy: bool,
     ) -> Result<Vec<NodeInfo>> {
-        crate::provider::validate_maintenance_fences(nodes)?;
         let ids = nodes.iter().map(|node| node.id).collect::<BTreeSet<_>>();
         if ids.len() != nodes.len()
             || nodes.is_empty()
@@ -198,46 +154,10 @@ impl MetricsClient {
             if replacement == Some(node.id) {
                 node.expected_process_incarnation = None;
             }
-            let mut observed = node.clone();
-            if replacement == Some(node.id) {
-                observed.expected_maintenance_fence = None;
-            }
-            let view = self.fetch_node(&observed).await?;
-            if replacement == Some(node.id)
-                && let Some(expected) = &node.expected_maintenance_fence
-            {
-                let unclaimed =
-                    view.maintenance_fence.as_ref() == Some(&MaintenanceFenceState::Unclaimed);
-                let same = view.maintenance_fence.as_ref()
-                    == Some(&MaintenanceFenceState::Active {
-                        fence: expected.clone(),
-                    });
-                if (!unclaimed && !same)
-                    || view.maintenance_fence_uncertain
-                    || view.process_incarnation.is_none()
-                {
-                    bail!(
-                        "replacement node {} has another or unresolved maintenance authority",
-                        node.id
-                    );
-                }
-            }
-            if replacement.is_some()
-                && replacement != Some(node.id)
-                && let Some(expected) = &node.expected_maintenance_fence
-                && view.maintenance_fence.as_ref()
-                    != Some(&MaintenanceFenceState::Active {
-                        fence: expected.clone(),
-                    })
-            {
+            let view = self.fetch_node(&node).await?;
+            if view.process_incarnation.is_none() {
                 bail!(
-                    "surviving node {} lacks the saved active maintenance authority",
-                    node.id
-                );
-            }
-            if view.process_incarnation.is_none() && !allow_legacy {
-                bail!(
-                    "node {} lacks process identity; only the deployed legacy migration may opt in",
+                    "node {} lacks process identity; all nodes must report an incarnation",
                     node.id
                 );
             }
@@ -245,6 +165,24 @@ impl MetricsClient {
             pinned.push(node);
         }
         Ok(pinned)
+    }
+
+    /// The admin endpoint certifies the full maintenance inventory, separately
+    /// from Kubernetes serving readiness.
+    pub async fn maintenance_ready(&self, node: &NodeInfo) -> Result<bool> {
+        let url = node
+            .admin_url
+            .join(ursula_proto::admin::MAINTENANCE_READINESS_PATH)?;
+        let response = self.client.get(url).send().await?;
+        if !response.status().is_success() {
+            return Ok(false);
+        }
+        let report: ursula_proto::admin::MaintenanceReadiness = response.json().await?;
+        Ok(report.ready
+            && report
+                .raft_maintenance
+                .as_ref()
+                .is_some_and(ursula_proto::admin::RaftMaintenanceReport::ready))
     }
 
     pub async fn fetch_node(&self, node: &NodeInfo) -> Result<NodeMetricsView> {
@@ -280,21 +218,10 @@ impl MetricsClient {
             );
         }
         self.pin_incarnation(node, &body.process_incarnation)?;
-        if let Some(expected) = &node.expected_maintenance_fence {
-            let bound = matches!(body.maintenance_fence.as_ref(),
-                Some(MaintenanceFenceState::Active { fence } | MaintenanceFenceState::Retired { fence }) if fence == expected);
-            if !bound || body.maintenance_fence_uncertain {
-                bail!(
-                    "node {} maintenance executor differs from the saved plan or has unresolved work",
-                    node.id
-                );
-            }
-        }
         Ok(NodeMetricsView::new(node.clone(), body))
     }
 
     pub async fn fetch_cluster(&self, nodes: &[NodeInfo]) -> Result<ClusterSnapshot> {
-        crate::provider::validate_maintenance_fences(nodes)?;
         let mut per_node = Vec::with_capacity(nodes.len());
         for node in nodes {
             per_node.push(self.fetch_node(node).await?);
@@ -563,50 +490,12 @@ fn metrics_base_url(node: &NodeInfo) -> &url::Url {
         .unwrap_or(&node.admin_url)
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct RawMetrics {
-    #[serde(default)]
-    process_incarnation: Option<ProcessIncarnation>,
-    #[serde(default)]
-    process_node_id: Option<u64>,
-    #[serde(default)]
-    maintenance_fence: Option<MaintenanceFenceState>,
-    #[serde(default)]
-    maintenance_fence_uncertain: bool,
-    #[serde(default)]
-    raft_groups: Vec<RawRaftGroup>,
-    #[serde(default)]
-    raft_maintenance: Option<ursula_proto::admin::RaftMaintenanceReport>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct RawRaftGroup {
-    raft_group_id: u64,
-    node_id: u64,
-    #[serde(default)]
-    current_term: Option<u64>,
-    #[serde(default)]
-    current_leader: Option<u64>,
-    #[serde(default)]
-    committed_index: Option<u64>,
-    #[serde(default)]
-    last_applied_index: Option<u64>,
-    #[serde(default)]
-    voter_ids: Vec<u64>,
-    #[serde(default)]
-    learner_ids: Vec<u64>,
-    #[serde(default)]
-    maintenance: Option<ursula_proto::admin::RaftGroupMaintenanceState>,
-}
-
 #[derive(Debug, Clone)]
 pub struct NodeMetricsView {
     pub node: NodeInfo,
     pub groups: Vec<RaftGroupView>,
     pub raft_maintenance: Option<ursula_proto::admin::RaftMaintenanceReport>,
     pub process_incarnation: Option<ProcessIncarnation>,
-    pub maintenance_fence: Option<MaintenanceFenceState>,
-    pub maintenance_fence_uncertain: bool,
 }
 
 impl NodeMetricsView {
@@ -623,7 +512,7 @@ impl NodeMetricsView {
                 last_applied_index: g.last_applied_index,
                 voter_ids: g.voter_ids,
                 learner_ids: g.learner_ids,
-                maintenance: g.maintenance,
+                maintenance: Some(g.maintenance),
             })
             .collect();
         Self {
@@ -631,8 +520,6 @@ impl NodeMetricsView {
             groups,
             raft_maintenance: raw.raft_maintenance,
             process_incarnation: raw.process_incarnation,
-            maintenance_fence: raw.maintenance_fence,
-            maintenance_fence_uncertain: raw.maintenance_fence_uncertain,
         }
     }
 
@@ -660,16 +547,13 @@ pub struct RaftGroupView {
     pub last_applied_index: Option<u64>,
     pub voter_ids: Vec<u64>,
     pub learner_ids: Vec<u64>,
-    /// Absent on the supported 0.6.2 upgrade source. Such sources retain
-    /// their legacy checks until replaced; they cannot certify that a replica
-    /// passed its recovery gate. Remove when no retained upgrade source
-    /// predates this metrics contract.
+    /// Missing health information never certifies participation readiness.
     pub maintenance: Option<ursula_proto::admin::RaftGroupMaintenanceState>,
 }
 
 impl RaftGroupView {
     pub fn participation_ready(&self) -> bool {
-        self.maintenance.as_ref().is_none_or(|health| {
+        self.maintenance.as_ref().is_some_and(|health| {
             health.running
                 && health.recovery_ready
                 && !health.membership_joint
@@ -763,7 +647,7 @@ mod tests {
         let app = Router::new()
             .route("/__ursula/metrics", axum::routing::get(move || {
                 let identity = metrics_identity.lock().unwrap().clone();
-                async move { axum::Json(serde_json::json!({"process_incarnation": identity, "process_node_id": id, "raft_groups": []})) }
+                async move { axum::Json(serde_json::json!({"process_incarnation": identity, "process_node_id": id,  "raft_groups": []})) }
             }))
             .route("/__ursula/leadership-shed/maintenance", post(move |headers: axum::http::HeaderMap| {
                 let identity = mutation_identity.lock().unwrap().clone();
@@ -786,7 +670,6 @@ mod tests {
                 http_url: None,
                 metrics_url: None,
                 expected_process_incarnation: None,
-                expected_maintenance_fence: None,
             },
             current,
             applied,
@@ -838,18 +721,18 @@ mod tests {
             incarnation_node(2, Some(ProcessIncarnation::from_bits(2))).await;
         let nodes = MetricsClient::new(Duration::from_secs(1))
             .unwrap()
-            .pin_nodes(&[a, b], None, false)
+            .pin_nodes(&[a, b], None)
             .await
             .unwrap();
         *a_identity.lock().unwrap() = Some(ProcessIncarnation::from_bits(3));
         let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
         client
-            .pin_nodes(&nodes, None, false)
+            .pin_nodes(&nodes, None)
             .await
             .expect_err("a changed process incarnation must not match the saved manifest");
         let replaced = MetricsClient::new(Duration::from_secs(1))
             .unwrap()
-            .pin_nodes(&nodes, Some(1), false)
+            .pin_nodes(&nodes, Some(1))
             .await
             .unwrap();
         assert_eq!(
@@ -863,7 +746,7 @@ mod tests {
         *b_identity.lock().unwrap() = Some(ProcessIncarnation::from_bits(4));
         MetricsClient::new(Duration::from_secs(1))
             .unwrap()
-            .pin_nodes(&nodes, Some(1), false)
+            .pin_nodes(&nodes, Some(1))
             .await
             .expect_err("a changed survivor incarnation must not be replaced silently");
         a_task.abort();
@@ -871,19 +754,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_identity_requires_explicit_manifest_migration_and_never_matches_a_saved_pin() {
+    async fn missing_identity_cannot_be_pinned_or_match_a_saved_pin() {
         let (mut node, _, _, task) = incarnation_node(1, None).await;
         MetricsClient::new(Duration::from_secs(1))
             .unwrap()
-            .pin_nodes(&[node.clone()], None, false)
+            .pin_nodes(&[node.clone()], None)
             .await
             .expect_err("a legacy identity must require explicit manifest migration");
-        let migrated = MetricsClient::new(Duration::from_secs(1))
-            .unwrap()
-            .pin_nodes(&[node.clone()], None, true)
-            .await
-            .unwrap();
-        assert!(migrated[0].expected_process_incarnation.is_none());
         node.expected_process_incarnation = Some(ProcessIncarnation::from_bits(1));
         MetricsClient::new(Duration::from_secs(1))
             .unwrap()
@@ -946,7 +823,7 @@ mod tests {
                 "/__ursula/metrics",
                 axum::routing::get(|| async {
                     axum::Json(serde_json::json!({
-                "process_node_id":1,"process_incarnation":"00000000000000000000000000000001"}))
+                 "raft_groups": [], "process_node_id":1,"process_incarnation":"00000000000000000000000000000001"}))
                 }),
             )
             .route(
@@ -971,7 +848,6 @@ mod tests {
             http_url: None,
             metrics_url: None,
             expected_process_incarnation: None,
-            expected_maintenance_fence: None,
         };
         let error = MetricsClient::new(Duration::from_secs(1))
             .unwrap()
@@ -994,7 +870,7 @@ mod tests {
         let app = Router::new()
             .route("/__ursula/metrics", axum::routing::get(move || { let observed = observed.clone(); async move {
                 observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                axum::Json(serde_json::json!({"process_node_id":1,"process_incarnation":"00000000000000000000000000000001"}))
+                axum::Json(serde_json::json!({ "raft_groups": [], "process_node_id":1,"process_incarnation":"00000000000000000000000000000001"}))
             }}))
             .route("/__ursula/raft/0/quorum", axum::routing::get(|headers: axum::http::HeaderMap| async move {
                 assert_eq!(headers[PROCESS_INCARNATION_HEADER], "00000000000000000000000000000001");
@@ -1008,7 +884,6 @@ mod tests {
             http_url: None,
             metrics_url: None,
             expected_process_incarnation: None,
-            expected_maintenance_fence: None,
         };
         let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
         client.fetch_node(&node).await.unwrap();
@@ -1033,7 +908,7 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let app = Router::new()
                 .route("/__ursula/metrics", axum::routing::get(|| async {
-                    axum::Json(serde_json::json!({"process_node_id":1,"process_incarnation":"00000000000000000000000000000001"}))
+                    axum::Json(serde_json::json!({ "raft_groups": [], "process_node_id":1,"process_incarnation":"00000000000000000000000000000001"}))
                 }))
                 .route("/__ursula/raft/0/leader/transfer/2", post(move || async move {
                     (axum::http::StatusCode::CONFLICT, axum::Json(TransferLeaderResponse {
@@ -1049,7 +924,6 @@ mod tests {
                 http_url: None,
                 metrics_url: None,
                 expected_process_incarnation: None,
-                expected_maintenance_fence: None,
             };
             let result = MetricsClient::new(Duration::from_secs(1))
                 .unwrap()
@@ -1075,7 +949,7 @@ mod tests {
                 "/__ursula/metrics",
                 axum::routing::get(|| async {
                     axum::Json(serde_json::json!({
-                        "raft_groups": [{"raft_group_id": 0, "node_id": 1}]
+                         "raft_groups": [{"raft_group_id": 0, "node_id": 1, "voter_ids": [], "learner_ids": [], "maintenance": ursula_proto::admin::RaftGroupMaintenanceState::default()}]
                     }))
                 }),
             )
@@ -1099,7 +973,6 @@ mod tests {
         let advertised = Url::parse("http://replacement.invalid:4437").unwrap();
         let node = NodeInfo {
             expected_process_incarnation: None,
-            expected_maintenance_fence: None,
             id: 1,
             admin_url: tunnel.clone(),
             host: "replacement".to_owned(),
@@ -1123,12 +996,11 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             axum::serve(listener, Router::new().route("/__ursula/metrics", axum::routing::get(|| async {
-                axum::Json(serde_json::json!({"raft_groups": [{"raft_group_id": 0, "node_id": 2}]}))
+                axum::Json(serde_json::json!({ "raft_groups": [{"raft_group_id": 0, "node_id": 2, "voter_ids": [], "learner_ids": [], "maintenance": ursula_proto::admin::RaftGroupMaintenanceState::default()}]}))
             }))).await.unwrap();
         });
         let node = NodeInfo {
             expected_process_incarnation: None,
-            expected_maintenance_fence: None,
             id: 1,
             admin_url: Url::parse(&format!("http://{address}")).unwrap(),
             host: address.to_string(),
@@ -1148,7 +1020,6 @@ mod tests {
     fn metrics_use_client_url_when_available() {
         let node = NodeInfo {
             expected_process_incarnation: None,
-            expected_maintenance_fence: None,
             id: 1,
             admin_url: Url::parse("http://127.0.0.1:4438").expect("admin url"),
             host: "127.0.0.1".to_owned(),
@@ -1163,7 +1034,6 @@ mod tests {
     fn metrics_fall_back_to_admin_url_for_legacy_manifests() {
         let node = NodeInfo {
             expected_process_incarnation: None,
-            expected_maintenance_fence: None,
             id: 1,
             admin_url: Url::parse("http://127.0.0.1:4438").expect("admin url"),
             host: "127.0.0.1".to_owned(),

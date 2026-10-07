@@ -871,7 +871,6 @@ mod tests {
                 http_url: None,
                 metrics_url: None,
                 expected_process_incarnation: None,
-                expected_maintenance_fence: None,
             }],
         )
         .unwrap();
@@ -980,7 +979,6 @@ mod tests {
                 http_url: None,
                 metrics_url: None,
                 expected_process_incarnation: None,
-                expected_maintenance_fence: None,
             }],
         )
         .unwrap();
@@ -1025,7 +1023,7 @@ mod tests {
                         "/__ursula/metrics",
                         get(|| async {
                             axum::Json(serde_json::json!({
-                    "process_node_id":1, "process_incarnation":"00000000000000000000000000000001"}))
+                     "raft_groups": [], "process_node_id":1, "process_incarnation":"00000000000000000000000000000001"}))
                         }),
                     )
                     .route(
@@ -1053,7 +1051,6 @@ mod tests {
             http_url: None,
             metrics_url: None,
             expected_process_incarnation: None,
-            expected_maintenance_fence: None,
         };
         let metrics = MetricsClient::new(std::time::Duration::from_secs(1)).unwrap();
         let client = BackupClient::new(metrics, vec![node.clone(), node]).unwrap();

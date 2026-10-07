@@ -149,7 +149,8 @@ pub fn spawn_cold_health_gate(
     let errors_per_tick_high = u64::try_from(ch_cfg.errors_per_tick_high).unwrap_or(1);
     let metrics = runtime.metrics();
     let registry = registry.clone();
-    tokio::spawn(async move {
+    let owner = runtime.clone();
+    if let Err(error) = owner.spawn_on_owner(ursula_shard::CoreId(0), async move {
         let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(2_000));
         let mut tracker = ColdHealthTracker::new(
             unhealthy_ticks,
@@ -211,5 +212,7 @@ pub fn spawn_cold_health_gate(
                 ColdHealthDecision::NoChange => {}
             }
         }
-    });
+    }) {
+        tracing::error!(%error, "failed to schedule background driver on owner");
+    }
 }

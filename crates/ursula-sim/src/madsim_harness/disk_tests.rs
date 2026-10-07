@@ -19,31 +19,31 @@ use ursula_raft::GroupRejoin;
 use ursula_raft::InProcessRaftNetworkFactory;
 use ursula_raft::InProcessRaftNetworkPolicy;
 use ursula_raft::InProcessRaftRegistry;
-use ursula_raft::JournalTuning;
 use ursula_raft::RaftGroupEngine;
-use ursula_raft::RaftGroupFileLogStore;
-use ursula_raft::RaftWal;
-use ursula_raft::RaftWalError;
-use ursula_raft::RecoveryState;
 use ursula_raft::UrsulaRaftTypeConfig;
-use ursula_raft::WalOpening;
-use ursula_raft::wal::diagnostics::CoreJournalError;
-use ursula_raft::wal::diagnostics::GroupLogState;
-use ursula_raft::wal::diagnostics::JournalDisk;
-use ursula_raft::wal::diagnostics::JournalError;
-use ursula_raft::wal::diagnostics::JournalFile;
-use ursula_raft::wal::diagnostics::JournalOp;
-use ursula_raft::wal::diagnostics::JournalReplayMode;
-use ursula_raft::wal::diagnostics::LockAttempt;
-use ursula_raft::wal::diagnostics::PreviousRun;
-use ursula_raft::wal::diagnostics::RUN_STATE_FILE;
-use ursula_raft::wal::diagnostics::RecoveryReason;
-use ursula_raft::wal::diagnostics::SIM_DISK_PAGE_SIZE;
-use ursula_raft::wal::diagnostics::SimDisk;
-use ursula_raft::wal::diagnostics::SimDiskError;
-use ursula_raft::wal::diagnostics::SimDiskFault;
-use ursula_raft::wal::diagnostics::journal_segment_path;
-use ursula_raft::wal::diagnostics::journal_segments;
+use ursula_raft::wal::CoreJournalError;
+use ursula_raft::wal::GroupLogState;
+use ursula_raft::wal::JournalDisk;
+use ursula_raft::wal::JournalError;
+use ursula_raft::wal::JournalFile;
+use ursula_raft::wal::JournalOp;
+use ursula_raft::wal::JournalReplayMode;
+use ursula_raft::wal::JournalTuning;
+use ursula_raft::wal::LockAttempt;
+use ursula_raft::wal::PreviousRun;
+use ursula_raft::wal::RUN_STATE_FILE;
+use ursula_raft::wal::RaftGroupFileLogStore;
+use ursula_raft::wal::RaftWal;
+use ursula_raft::wal::RaftWalError;
+use ursula_raft::wal::RecoveryReason;
+use ursula_raft::wal::RecoveryState;
+use ursula_raft::wal::SIM_DISK_PAGE_SIZE;
+use ursula_raft::wal::SimDisk;
+use ursula_raft::wal::SimDiskError;
+use ursula_raft::wal::SimDiskFault;
+use ursula_raft::wal::WalOpening;
+use ursula_raft::wal::journal_segment_path;
+use ursula_raft::wal::journal_segments;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
@@ -361,12 +361,13 @@ impl DurableGroupLog {
 /// replica runs the production recovery gate and its drivers, and node 1
 /// bootstraps each group as an initializer does.
 pub(super) struct JournalCluster {
+    pub(super) membership_authority: ursula_raft::RecoveryMembershipAuthority,
     config: Arc<Config>,
     pub(super) policy: InProcessRaftNetworkPolicy,
     /// Every vote answer the network delivered.
     pub(super) votes: VoteLog,
     pub(super) wals: BTreeMap<u64, SimNodeWal>,
-    registries: BTreeMap<u32, InProcessRaftRegistry>,
+    pub(super) registries: BTreeMap<u32, InProcessRaftRegistry>,
     pub(super) engines: BTreeMap<(u32, u64), RaftGroupEngine>,
     pub(super) rejoins: BTreeMap<(u32, u64), Arc<GroupRejoin>>,
     /// Each node's WAL metrics, kept across its restarts.
@@ -429,6 +430,7 @@ impl JournalCluster {
         );
         let (policy, votes) = recovery_wiring::vote_recording_network_policy();
         Self {
+            membership_authority: ursula_raft::RecoveryMembershipAuthority::ImmutableStatic,
             config,
             policy,
             votes,
@@ -492,6 +494,7 @@ impl JournalCluster {
                 &registry,
                 &self.policy,
                 &voters,
+                self.membership_authority,
             );
             registry.register(node_id, engine.raft_handle());
             self.engines.insert((group, node_id), engine);
@@ -1939,4 +1942,104 @@ fn wal_topology_publication_survives_power_loss() {
             }
         });
     }
+}
+
+/// Membership survives even when the first application tail is allowed to vanish.
+#[test]
+fn never_fsync_keeps_bootstrap_membership_across_immediate_power_loss() {
+    use openraft::entry::RaftEntry;
+    let _guard = sim_test_guard();
+    for seed in [1, 2, 3, 5, 8] {
+        run_with_madsim(seed, async move {
+            let wal = SimNodeWal::provision_with_fsync("membership-power-loss", WalFsync::Never);
+            let placement = group_placement(0);
+            let mut store = wal.open(placement, standalone_wal_metrics(placement)).await;
+            let membership = openraft::Membership::new(
+                vec![std::collections::BTreeSet::from([1, 2, 3])],
+                BTreeMap::from([
+                    (1, openraft::BasicNode::default()),
+                    (2, openraft::BasicNode::default()),
+                    (3, openraft::BasicNode::default()),
+                ]),
+            )
+            .expect("valid membership");
+            let entry = openraft::alias::EntryOf::<UrsulaRaftTypeConfig>::new(
+                sim_log_id(0),
+                openraft::EntryPayload::Membership(membership),
+            );
+            store
+                .blocking_append([entry])
+                .await
+                .expect("membership append");
+            drop(store);
+            wal.power_loss().await;
+            let mut store = wal.open(placement, standalone_wal_metrics(placement)).await;
+            let entries = store
+                .try_get_log_entries(0..1)
+                .await
+                .expect("membership read");
+            assert!(
+                matches!(
+                    entries.first().map(|entry| &entry.payload),
+                    Some(openraft::EntryPayload::Membership(_))
+                ),
+                "seed {seed}"
+            );
+        });
+    }
+}
+
+/// A failed poison marker cannot hide journal damage on a same-boot restart.
+/// A full frame whose fsync failed is safe to replay from the unchanged page
+/// cache; every earlier acknowledged frame must still be present.
+#[test]
+fn failed_poison_marker_preserves_acknowledged_prefix_on_process_restart() {
+    let _guard = sim_test_guard();
+    run_with_madsim(7, async {
+        let wal = SimNodeWal::provision("failed-poison-marker");
+        let placement = group_placement(0);
+        let mut store = wal.open(placement, standalone_wal_metrics(placement)).await;
+        store
+            .blocking_append([blank_entry(1)])
+            .await
+            .expect("acknowledged append");
+        SimDisk::inject_fault(&active_segments(wal.root())[0], SimDiskFault::Sync)
+            .expect("fail journal fsync");
+        SimDisk::inject_fault(
+            &wal.root().join("run-state.poisoned-core-0.tmp"),
+            SimDiskFault::Write,
+        )
+        .expect("fail poison record");
+        use openraft::type_config::TypeConfigExt;
+        let (completed, completion) = UrsulaRaftTypeConfig::oneshot();
+        store
+            .append(
+                [blank_entry(2)],
+                openraft::storage::IOFlushed::signal(completed),
+            )
+            .await
+            .expect("append queued before writer failure");
+        let error = completion
+            .await
+            .expect("writer callback")
+            .expect_err("journal poisoned");
+        assert!(matches!(
+            core_journal_error(&error),
+            Some(CoreJournalError::WriterPoisoned { .. })
+        ));
+        drop(store);
+        wal.process_crash().await;
+        let mut store = wal.open(placement, standalone_wal_metrics(placement)).await;
+        assert_eq!(wal.opening().previous_run, PreviousRun::ProcessCrash);
+        assert_eq!(wal.opening().replay_mode, JournalReplayMode::Strict);
+        assert_eq!(
+            store
+                .try_get_log_entries(1..2)
+                .await
+                .expect("acknowledged prefix")
+                .first()
+                .map(|entry| entry.log_id),
+            Some(sim_log_id(1))
+        );
+    });
 }

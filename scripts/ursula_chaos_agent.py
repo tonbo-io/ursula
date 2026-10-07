@@ -10,6 +10,7 @@ status JSON for the docs `/status` page.
 from __future__ import annotations
 
 import argparse
+import bisect
 import hashlib
 import json
 import os
@@ -28,6 +29,25 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+
+# Fixed bounded histogram: reported quantiles are bucket upper bounds (10% spacing).
+APPEND_LATENCY_BOUNDS_MS = [0.1 * 1.1 ** index for index in range(166)]
+
+def append_latency_summary(counts: list[int]) -> dict[str, Any]:
+    total = sum(counts)
+    result: dict[str, Any] = {"count": total, "bucket_counts": list(counts),
+                              "bucket_upper_bounds_ms": APPEND_LATENCY_BOUNDS_MS,
+                              "quantiles_are_upper_bounds": True}
+    for label, fraction in [("p50_ms", 0.5), ("p99_ms", 0.99), ("p999_ms", 0.999)]:
+        cumulative = 0
+        result[label] = None
+        for index, count in enumerate(counts):
+            cumulative += count
+            if total and cumulative >= total * fraction:
+                result[label] = APPEND_LATENCY_BOUNDS_MS[index] if index < len(APPEND_LATENCY_BOUNDS_MS) else None
+                break
+    return result
 
 
 BUCKET = "chaos"
@@ -522,6 +542,8 @@ class ChaosAgent:
         self.append_shed = 0
         self.last_append_shed_error: str | None = None
         self.state_lock = threading.Lock()
+        self.append_latency_success = [0] * (len(APPEND_LATENCY_BOUNDS_MS) + 1)
+        self.append_latency_failed = [0] * (len(APPEND_LATENCY_BOUNDS_MS) + 1)
         self.publish_lock = threading.Lock()
         self.reader_success = 0
         self.reader_errors = 0
@@ -1108,10 +1130,16 @@ class ChaosAgent:
             if self.rollover_in_progress:
                 return False
             self.active_append_count += 1
+        started = time.perf_counter()
+        succeeded = False
         try:
-            return self._append_once_active(lane_id)
+            succeeded = self._append_once_active(lane_id)
+            return succeeded
         finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
             with self.state_lock:
+                histogram = self.append_latency_success if succeeded else self.append_latency_failed
+                histogram[bisect.bisect_left(APPEND_LATENCY_BOUNDS_MS, elapsed_ms)] += 1
                 self.active_append_count = max(0, self.active_append_count - 1)
 
     def _append_once_active(self, lane_id: int | None = None) -> bool:
@@ -3350,6 +3378,11 @@ class ChaosAgent:
                 and not rollover_in_progress
             )
             active_append_count = self.active_append_count
+            append_latency = {
+                "scope": "logical workload append including retries; cumulative histogram",
+                "success": append_latency_summary(self.append_latency_success),
+                "failed_or_shed": append_latency_summary(self.append_latency_failed),
+            }
         if self.current_injection() is not None:
             published_next_fault_at = None
         status = {
@@ -3364,6 +3397,7 @@ class ChaosAgent:
             "topology": topology,
             "workload": {
                 "append_target_per_second": self.append_per_second,
+                "append_latency": append_latency,
                 "status_interval_secs": status_interval_secs,
                 "append_success_total": self.append_success,
                 "append_error_total": self.append_errors,

@@ -5,6 +5,25 @@ use proptest::prelude::*;
 
 use super::*;
 
+#[test]
+fn replication_barrier_preserves_stream_snapshot_state() {
+    let mut machine = StreamStateMachine::new();
+    assert!(matches!(
+        machine.apply(StreamCommand::CreateBucket {
+            bucket_id: "barrier".to_owned()
+        }),
+        StreamResponse::BucketCreated { .. }
+    ));
+    let before = machine.snapshot();
+    for _ in 0..3 {
+        assert_eq!(
+            machine.apply(StreamCommand::ReplicationBarrier),
+            StreamResponse::ReplicationBarrier
+        );
+    }
+    assert_eq!(machine.snapshot(), before);
+}
+
 const OCTET: &str = "application/octet-stream";
 
 fn stream(id: &str) -> BucketStreamId {

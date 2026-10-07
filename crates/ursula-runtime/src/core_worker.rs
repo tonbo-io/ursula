@@ -362,14 +362,14 @@ impl CoreWorker {
         &mut self,
         placement: ShardPlacement,
     ) -> Result<GroupMailbox, RuntimeError> {
+        let engine_factory = self.engine_factory.clone();
+        if !engine_factory.hosts_group(placement) {
+            return Err(RuntimeError::GroupNotHosted {
+                core_id: placement.core_id,
+                raft_group_id: placement.raft_group_id,
+            });
+        }
         if !self.groups.contains_key(&placement.raft_group_id) {
-            let engine_factory = self.engine_factory.clone();
-            if !engine_factory.hosts_group(placement) {
-                return Err(RuntimeError::GroupNotHosted {
-                    core_id: placement.core_id,
-                    raft_group_id: placement.raft_group_id,
-                });
-            }
             let metrics = GroupEngineMetrics {
                 inner: self.metrics.clone(),
             };
@@ -762,10 +762,9 @@ impl CoreWorker {
         );
         match parts {
             Ok(parts)
-                if parts.payload_is_empty()
-                    && parts.up_to_date
-                    && !parts.closed
-                    && watcher.waits_on(parts.incarnation) =>
+                if parts
+                    .tail_incarnation()
+                    .is_some_and(|incarnation| watcher.waits_on(incarnation)) =>
             {
                 if watcher.response_tx.is_closed() {
                     return;
@@ -1285,10 +1284,31 @@ impl CoreWorker {
     pub(crate) async fn head_stream(
         group: &mut Box<dyn GroupEngine>,
         metrics: Arc<RuntimeMetricsInner>,
+        read_materialization: Arc<Semaphore>,
         request: HeadStreamRequest,
         placement: ShardPlacement,
-    ) -> Result<HeadStreamResponse, RuntimeError> {
+        response_tx: oneshot::Sender<Result<HeadStreamResponse, RuntimeError>>,
+    ) {
         let exec_started_at = Instant::now();
+        if let Some(forward) = group.forwarded_head_stream(&request, placement) {
+            metrics.record_group_engine_exec(
+                placement.core_id,
+                placement.raft_group_id,
+                elapsed_ns(exec_started_at),
+            );
+            crate::rt::spawn(async move {
+                let response = match read_materialization.acquire_owned().await {
+                    Ok(_permit) => forward
+                        .await
+                        .map_err(|error| RuntimeError::group_engine(placement, error)),
+                    Err(_closed) => Err(RuntimeError::MailboxClosed {
+                        core_id: placement.core_id,
+                    }),
+                };
+                reply(response_tx, response);
+            });
+            return;
+        }
         let response = group
             .head_stream(request, placement)
             .await
@@ -1298,7 +1318,7 @@ impl CoreWorker {
             placement.raft_group_id,
             elapsed_ns(exec_started_at),
         );
-        response
+        reply(response_tx, response);
     }
 
     pub(crate) async fn snapshot_group(
@@ -1660,12 +1680,15 @@ impl CoreWorker {
                 .await
                 .map_err(|err| RuntimeError::group_engine(placement, err));
             match parts {
-                Ok(parts) if parts.payload_is_empty() && parts.up_to_date && !parts.closed => {
+                Ok(parts) if parts.tail_incarnation().is_some() => {
                     // A watcher pinned to another incarnation is released
                     // with this read: its stream was recreated (D12).
-                    let (waiting, recreated): (Vec<_>, Vec<_>) = watchers
-                        .into_iter()
-                        .partition(|watcher| watcher.waits_on(parts.incarnation));
+                    let (waiting, recreated): (Vec<_>, Vec<_>) =
+                        watchers.into_iter().partition(|watcher| {
+                            parts
+                                .tail_incarnation()
+                                .is_some_and(|incarnation| watcher.waits_on(incarnation))
+                        });
                     pending.extend(waiting);
                     if !recreated.is_empty() {
                         Self::send_read_parts_to_watchers(

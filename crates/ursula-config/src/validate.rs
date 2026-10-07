@@ -47,6 +47,21 @@ impl UrsulaConfig {
         if !self.raft.peers.is_empty() && self.raft.wal.path.is_none() {
             return Err(ValidationError::RaftWalPathRequired);
         }
+        if self.raft.uses_meta_authority() {
+            let ids: BTreeSet<_> = self
+                .raft
+                .meta
+                .peers
+                .iter()
+                .map(|peer| peer.node_id)
+                .collect();
+            if ids.len() != self.raft.meta.peers.len()
+                || !ids.contains(&self.raft.node_id)
+                || self.raft.wal.path.is_none()
+            {
+                return Err(ValidationError::Other("enabled meta Raft requires a persistent WAL and unique meta peers including this node".to_owned()));
+            }
+        }
         let minimum = self.raft.wal.min_available_size.as_bytes();
         let resume = self.raft.wal.resume_available_size.as_bytes();
         if minimum > 0 && resume <= minimum {

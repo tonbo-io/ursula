@@ -24,17 +24,17 @@ use ursula_raft::AcceptUnsyncedLossOutcome;
 use ursula_raft::AcceptUnsyncedLossReport;
 use ursula_raft::RecoveryGateError;
 use ursula_raft::RecoveryGateStatus;
-use ursula_raft::RecoveryState;
 use ursula_raft::UrsulaAppendEntriesRequest;
 use ursula_raft::UrsulaAppendEntriesResponse;
 use ursula_raft::UrsulaRaftTypeConfig;
-use ursula_raft::wal::diagnostics::GroupLogState;
-use ursula_raft::wal::diagnostics::JournalDisk;
-use ursula_raft::wal::diagnostics::JournalReplayMode;
-use ursula_raft::wal::diagnostics::PreviousRun;
-use ursula_raft::wal::diagnostics::RUN_STATE_FILE;
-use ursula_raft::wal::diagnostics::RecoveryReason;
-use ursula_raft::wal::diagnostics::SimDisk;
+use ursula_raft::wal::GroupLogState;
+use ursula_raft::wal::JournalDisk;
+use ursula_raft::wal::JournalReplayMode;
+use ursula_raft::wal::PreviousRun;
+use ursula_raft::wal::RUN_STATE_FILE;
+use ursula_raft::wal::RecoveryReason;
+use ursula_raft::wal::RecoveryState;
+use ursula_raft::wal::SimDisk;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::GroupEngine;
@@ -907,6 +907,91 @@ fn a_replica_that_lost_its_log_rejects_a_stale_term_leader() {
     }
 }
 
+/// A wiped disk loses votes too; fresh peer floors must fence stale leaders.
+#[test]
+fn a_wiped_voter_cannot_help_a_restarted_stale_leader_commit() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("RECOVERY_GATE_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
+        run_with_madsim(seed, async move {
+            let context = format!("seed {seed}");
+            let group = 0;
+            let mut cluster =
+                JournalCluster::start_with_fsync("gate-wiped-stale-term", WalFsync::Always).await;
+            for group in JOURNAL_GROUPS {
+                cluster.append(group, 4).await;
+            }
+            let old_leader = wait_leader(&cluster, group, &context).await;
+            let old_vote = metrics(&cluster, group, old_leader).vote;
+            let others = NODES
+                .into_iter()
+                .filter(|node_id| *node_id != old_leader)
+                .collect::<Vec<_>>();
+            for node_id in &others {
+                cluster.policy.partition_bidirectional(old_leader, *node_id);
+            }
+            // The other two elect a leader of a newer term.
+            let deadline = madsim::time::Instant::now() + Duration::from_secs(10);
+            let new_leader = loop {
+                if let Some(leader) = others.iter().copied().find(|node_id| {
+                    let replica = metrics(&cluster, group, *node_id);
+                    replica.state == openraft::ServerState::Leader
+                        && replica.vote.leader_id().term() > old_vote.leader_id().term()
+                }) {
+                    break leader;
+                }
+                assert!(
+                    madsim::time::Instant::now() < deadline,
+                    "{context}: no new leader"
+                );
+                madsim::time::sleep(Duration::from_millis(25)).await;
+            };
+            let voter = others
+                .iter()
+                .copied()
+                .find(|node_id| *node_id != new_leader)
+                .expect("a voter of the new leader");
+            assert_eq!(
+                attempt_append(&mut cluster, group, new_leader, b"new-term;").await,
+                Attempt::Acknowledged,
+                "new leader commits with victim before disk loss"
+            );
+            cluster
+                .acknowledged
+                .get_mut(&group)
+                .expect("group")
+                .extend_from_slice(b"new-term;");
+            cluster.policy.partition_bidirectional(new_leader, voter);
+            cluster.stop_node(voter).await;
+            cluster.wals.insert(
+                voter,
+                SimNodeWal::provision_with_fsync("wiped-voter-replacement", WalFsync::Always)
+                    .with_group_count(JOURNAL_GROUPS.len()),
+            );
+            cluster.start_node(voter).await;
+            // Restarting the stale leader erases its follower matched indexes.
+            cluster.stop_node(old_leader).await;
+            cluster.wals[&old_leader].process_crash().await;
+            cluster.start_node(old_leader).await;
+            // The old leader reaches the emptied voter only: it cannot commit.
+            cluster.policy.heal_bidirectional(old_leader, voter);
+            let attempt = attempt_append(&mut cluster, group, old_leader, b"stale;").await;
+            assert_ne!(attempt, Attempt::Acknowledged, "{context}");
+
+            cluster.policy.clear();
+            wait_healed(&cluster, &context, Duration::from_secs(10)).await;
+            assert_no_vote_while_gated(&cluster, &context);
+            let leader = wait_leader(&cluster, group, &context).await;
+            let mut acknowledged = BTreeMap::new();
+            acknowledged.insert(group, read_local(&cluster, group, leader).await);
+            assert_eq!(
+                acknowledged[&group], cluster.acknowledged[&group],
+                "{context}: the stale leader's write must never commit"
+            );
+            cluster.verify_reads().await;
+        });
+    }
+}
+
 #[test]
 fn bootstrap_with_absent_peers_advances_time_and_recovers_when_they_arrive() {
     let _guard = sim_test_guard();
@@ -924,7 +1009,7 @@ fn bootstrap_with_absent_peers_advances_time_and_recovers_when_they_arrive() {
 }
 
 #[test]
-fn another_power_loss_during_remove_voter_finishes_the_joint_without_losing_acks() {
+fn mutable_membership_recovery_requires_authority_and_does_not_flatten_the_joint() {
     let _guard = sim_test_guard();
     // With owner mailbox dispatch, seed 5 drops both tails. Keep the loss and
     // joint-membership preconditions asserted so scheduling drift cannot skip the scenario.
@@ -932,6 +1017,7 @@ fn another_power_loss_during_remove_voter_finishes_the_joint_without_losing_acks
         run_with_madsim(seed, async move {
             let mut cluster =
                 JournalCluster::start_with_fsync("joint-second-loss", WalFsync::Never).await;
+            cluster.membership_authority = ursula_raft::RecoveryMembershipAuthority::CurrentLeader;
             let context = format!("joint second loss seed {seed}");
             for group in JOURNAL_GROUPS {
                 cluster.append(group, 6).await;
@@ -954,12 +1040,37 @@ fn another_power_loss_during_remove_voter_finishes_the_joint_without_losing_acks
                     .await
                     .unwrap();
             }
+            // Create a fresh unsynced application tail after leadership alignment.
+            for group in JOURNAL_GROUPS {
+                cluster.append(group, 20).await;
+            }
             let followers: Vec<_> = NODES.into_iter().filter(|id| *id != leader).collect();
             let (a, b) = (followers[0], followers[1]);
+            for group in JOURNAL_GROUPS {
+                let committed = metrics(&cluster, group, leader)
+                    .last_applied
+                    .map(|log| log.index());
+                for follower in [a, b] {
+                    cluster.engines[&(group, follower)]
+                        .raft_handle()
+                        .wait(Some(Duration::from_secs(5)))
+                        .applied_index_at_least(committed, "both followers hold the unsynced tail")
+                        .await
+                        .unwrap();
+                }
+            }
             // Keep B alive, but prevent it from acknowledging RemoveVoter(A).
             cluster.policy.partition_bidirectional(leader, b);
             cluster.policy.partition_bidirectional(a, b);
-            assert!(power_loss_and_restart(&mut cluster, a).await > 0);
+            power_loss_and_restart(&mut cluster, a).await;
+            // A recovering replica now waits for peer vote floors before it
+            // can return a lost-log conflict. Initiate the same RemoveVoter
+            // transition explicitly while B is unavailable.
+            let raft = cluster.engines[&(0, leader)].raft_handle();
+            let remove = madsim::task::spawn(async move {
+                raft.change_membership(std::collections::BTreeSet::from([leader, b]), false)
+                    .await
+            });
             let deadline = madsim::time::Instant::now() + Duration::from_secs(5);
             let joint_group = loop {
                 if let Some(group) = JOURNAL_GROUPS.into_iter().find(|group| {
@@ -980,16 +1091,91 @@ fn another_power_loss_during_remove_voter_finishes_the_joint_without_losing_acks
             };
             let joint = metrics(&cluster, joint_group, leader);
             assert!(joint.committed < *joint.membership_config.log_id());
-            // B loses its tail only after A's removal is pending.
-            let before_loss = metrics(&cluster, joint_group, b).last_log_index;
-            assert!(power_loss_and_restart(&mut cluster, b).await > 0);
-            assert!(metrics(&cluster, joint_group, b).last_log_index < before_loss);
+            // Crash B only after A's removal is pending. Without a meta
+            // authority this changing configuration cannot be inferred from
+            // static bootstrap peers, even if this crash retains every page.
+            power_loss_and_restart(&mut cluster, b).await;
             cluster.policy.clear();
-            wait_healed(&cluster, &context, Duration::from_secs(15)).await;
+            madsim::time::sleep(Duration::from_secs(1)).await;
+            assert_gated(&cluster, a, &context);
+            assert_gated(&cluster, b, &context);
+            let after = metrics(&cluster, joint_group, leader);
+            assert_eq!(
+                *after.membership_config.log_id(),
+                *joint.membership_config.log_id()
+            );
+            assert!(
+                after
+                    .membership_config
+                    .membership()
+                    .get_joint_config()
+                    .len()
+                    > 1
+            );
             assert_no_vote_while_gated(&cluster, &context);
-            cluster.verify_reads().await;
+            for group in JOURNAL_GROUPS {
+                assert_eq!(
+                    read_local(&cluster, group, leader).await,
+                    cluster.acknowledged[&group]
+                );
+            }
+            remove.abort();
+            let _ = remove.await;
         });
     }
+}
+
+#[test]
+fn an_append_ack_delayed_across_reboot_and_barrier_is_fenced() {
+    use openraft::RaftNetworkFactory;
+    use openraft::RaftNetworkV2;
+    let _guard = sim_test_guard();
+    run_with_madsim(7, async {
+        let mut cluster = JournalCluster::start_with_fsync("delayed-ack", WalFsync::Never).await;
+        for group in JOURNAL_GROUPS {
+            cluster.append(group, 3).await;
+        }
+        let leader = wait_leader(&cluster, 0, "delayed ack").await;
+        let victim = NODES
+            .into_iter()
+            .find(|node| *node != leader)
+            .expect("follower");
+        let before = metrics(&cluster, 0, leader);
+        let policy = ursula_raft::InProcessRaftNetworkPolicy::default();
+        policy.set_append_response_delay(Some(Duration::from_secs(20)));
+        let mut factory =
+            ursula_raft::InProcessRaftNetworkFactory::new(cluster.registries[&0].clone())
+                .with_source(leader)
+                .with_policy(policy)
+                .with_rejoin(cluster.rejoins[&(0, leader)].clone());
+        let mut network = factory
+            .new_client(victim, &openraft::BasicNode::default())
+            .await;
+        let pending = madsim::task::spawn(async move {
+            network
+                .append_entries(
+                    UrsulaAppendEntriesRequest {
+                        vote: before.vote,
+                        prev_log_id: before.committed,
+                        entries: Vec::new(),
+                        leader_commit: before.committed,
+                    },
+                    openraft::network::RPCOption::new(Duration::from_secs(30)),
+                )
+                .await
+        });
+        madsim::time::sleep(Duration::from_millis(100)).await;
+        power_loss_and_restart(&mut cluster, victim).await;
+        wait_healed(&cluster, "delayed ack", Duration::from_secs(10)).await;
+        assert!(
+            matches!(
+                pending.await.expect("reply task"),
+                Err(openraft::error::RPCError::Network(_))
+            ),
+            "the pre-reboot response must not be usable after recovery"
+        );
+        cluster.verify_reads().await;
+    });
 }
 
 /// A process crash loses a leader's enqueued (not yet written) suffix even

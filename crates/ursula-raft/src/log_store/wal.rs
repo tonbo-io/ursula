@@ -119,18 +119,22 @@ impl RaftWal {
         placement: ShardPlacement,
         metrics: GroupEngineMetrics,
     ) -> Result<Arc<CoreFileLogWriter>, GroupEngineError> {
-        let poisoned = || GroupEngineError::new("core file log writer mutex poisoned");
+        let poisoned = || {
+            GroupEngineError::Infra(ursula_runtime::GroupInfraError::Poisoned {
+                resource: ursula_runtime::SynchronizationResource::CoreWriters,
+            })
+        };
         let slot = match &mut *self.core_writers.lock().map_err(|_poisoned| poisoned())? {
             CoreWriterSlots::Running(slots) => {
                 slots.entry(placement.core_id.0).or_default().clone()
             }
             CoreWriterSlots::ShutDown => {
-                return Err(GroupEngineError::new(format!(
-                    "open OpenRaft core journal: {}",
+                return Err(GroupEngineError::backend(
+                    ursula_runtime::BackendOperation::OpenJournal,
                     RaftWalError::ShutDown {
                         root: self.root().to_owned(),
-                    }
-                )));
+                    },
+                ));
             }
         };
         let mut slot = slot.lock().map_err(|_poisoned| poisoned())?;
@@ -150,7 +154,9 @@ impl RaftWal {
                 lagging: self.lagging.clone(),
                 metrics: Some((placement, metrics)),
             })
-            .map_err(|err| GroupEngineError::new(format!("open OpenRaft core journal: {err}")))?;
+            .map_err(|err| {
+                GroupEngineError::backend(ursula_runtime::BackendOperation::OpenJournal, err)
+            })?;
         *slot = Arc::downgrade(&writer);
         Ok(writer)
     }
@@ -161,8 +167,9 @@ impl RaftWal {
         metrics: GroupEngineMetrics,
     ) -> Result<Arc<RaftGroupFileLogStore>, GroupEngineError> {
         let core_writer = self.core_writer(placement, metrics.clone())?;
-        RaftGroupFileLogStore::open(placement, metrics, core_writer)
-            .map_err(|err| GroupEngineError::new(format!("open OpenRaft file log: {err}")))
+        RaftGroupFileLogStore::open(placement, metrics, core_writer).map_err(|err| {
+            GroupEngineError::backend(ursula_runtime::BackendOperation::OpenLog, err)
+        })
     }
 
     /// Ends this run cleanly: closes every core writer, each of which
@@ -231,6 +238,7 @@ mod tests {
     }
 
     /// A core recovering its journal does not hold up another core's.
+    #[cfg(not(madsim))]
     #[test]
     fn cores_open_their_journals_independently() {
         let root = unique_test_dir("parallel-core-open");

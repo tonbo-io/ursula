@@ -124,6 +124,7 @@ fn offload_now() -> OffloadColdRefsRequest {
     }
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn writes_no_page_entry_before_a_proposal() {
     let (cold_store, runtime, s) = setup("locators").await;

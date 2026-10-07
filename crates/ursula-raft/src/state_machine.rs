@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use futures_util::Stream;
@@ -147,7 +148,9 @@ impl SnapshotBuildCoordinator {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|err| GroupEngineError::new(format!("snapshot build gate closed: {err}")))
+            .map_err(|err| {
+                GroupEngineError::backend(ursula_runtime::BackendOperation::AdmitSnapshotBuild, err)
+            })
     }
 
     /// Takes a build permit only if one is free right now. The policy path
@@ -227,19 +230,80 @@ pub struct SnapshotInstallCoordinator {
     inner: Arc<SnapshotInstallCoordinatorInner>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct InstallActivity {
+    closed: bool,
+    active: usize,
+}
+
+/// Owned by one engine incarnation, including canceled RPCs' admitted work.
+#[derive(Debug)]
+pub(crate) struct SnapshotInstallLifecycle {
+    activity: crate::rt::sync::watch::Sender<InstallActivity>,
+}
+
+impl Default for SnapshotInstallLifecycle {
+    fn default() -> Self {
+        Self {
+            activity: crate::rt::sync::watch::channel(InstallActivity::default()).0,
+        }
+    }
+}
+
+impl SnapshotInstallLifecycle {
+    pub(crate) fn admit(self: &Arc<Self>) -> Option<SnapshotInstallLease> {
+        let mut admitted = false;
+        self.activity.send_if_modified(|state| {
+            if state.closed {
+                return false;
+            }
+            state.active = state.active.saturating_add(1);
+            admitted = true;
+            true
+        });
+        admitted.then(|| SnapshotInstallLease(self.clone()))
+    }
+
+    pub(crate) fn close(&self) {
+        self.activity.send_modify(|state| state.closed = true);
+    }
+
+    pub(crate) async fn drain(&self) {
+        let mut activity = self.activity.subscribe();
+        while activity.borrow_and_update().active != 0 {
+            if activity.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+pub(crate) struct SnapshotInstallLease(Arc<SnapshotInstallLifecycle>);
+
+impl Drop for SnapshotInstallLease {
+    fn drop(&mut self) {
+        self.0
+            .activity
+            .send_modify(|state| state.active = state.active.saturating_sub(1));
+    }
+}
+
 #[derive(Debug)]
 struct SnapshotInstallCoordinatorInner {
     semaphore: Arc<Semaphore>,
+    next_install: AtomicU64,
     /// Snapshots downloaded and decoded before OpenRaft's install, keyed by
     /// pointer. Install consumes the decoded group, so it decodes once.
     prefetched: Mutex<BTreeMap<String, PrefetchedGroupSnapshot>>,
     references: Mutex<BTreeMap<u32, Arc<SnapshotReferences>>>,
+    installs: Mutex<BTreeMap<u32, Arc<crate::rt::sync::Mutex<()>>>>,
 }
 
 #[derive(Debug)]
 pub(crate) struct PrefetchedGroupSnapshot {
     pub(crate) snapshot: GroupSnapshot,
     reference: Option<SnapshotReferenceLease>,
+    original_snapshot_id: String,
 }
 
 impl Default for SnapshotInstallCoordinator {
@@ -253,8 +317,10 @@ impl SnapshotInstallCoordinator {
         Self {
             inner: Arc::new(SnapshotInstallCoordinatorInner {
                 semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
+                next_install: AtomicU64::new(0),
                 prefetched: Mutex::new(BTreeMap::new()),
                 references: Mutex::new(BTreeMap::new()),
+                installs: Mutex::new(BTreeMap::new()),
             }),
         }
     }
@@ -265,7 +331,22 @@ impl SnapshotInstallCoordinator {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|err| GroupEngineError::new(format!("snapshot install gate closed: {err}")))
+            .map_err(|err| {
+                GroupEngineError::backend(
+                    ursula_runtime::BackendOperation::AdmitSnapshotInstall,
+                    err,
+                )
+            })
+    }
+
+    pub(crate) fn install_lock(&self, group: u32) -> Arc<crate::rt::sync::Mutex<()>> {
+        self.inner
+            .installs
+            .lock()
+            .expect("snapshot install mutex")
+            .entry(group)
+            .or_default()
+            .clone()
     }
 
     pub fn cache_key(snapshot_id: &str, location: &SnapshotLocation) -> String {
@@ -300,12 +381,16 @@ impl SnapshotInstallCoordinator {
 
     pub(crate) fn cache_prefetched(
         &self,
-        snapshot_id: &str,
-        location: &SnapshotLocation,
+        pointer: &mut SnapshotPointer,
         snapshot: GroupSnapshot,
         reference: Option<SnapshotReferenceLease>,
     ) -> String {
-        let key = Self::cache_key(snapshot_id, location);
+        let install = self.inner.next_install.fetch_add(1, Ordering::Relaxed);
+        let original_snapshot_id = pointer.snapshot_id.clone();
+        // This token exists only on the in-process handoff. Installation
+        // restores the original pointer before persisting or advertising it.
+        pointer.snapshot_id = format!("install-{install}:{}", pointer.snapshot_id);
+        let key = Self::cache_key(&pointer.snapshot_id, &pointer.location);
         self.inner
             .prefetched
             .lock()
@@ -313,6 +398,7 @@ impl SnapshotInstallCoordinator {
             .insert(key.clone(), PrefetchedGroupSnapshot {
                 snapshot,
                 reference,
+                original_snapshot_id,
             });
         key
     }
@@ -351,12 +437,16 @@ pub(crate) struct CurrentSnapshot {
 const RETAINED_RETIRED_EXTERNAL_SNAPSHOTS: usize = 1;
 
 pub struct RaftGroupStateMachine {
+    pub(crate) apply_failure: Arc<Mutex<Option<ursula_proto::admin::RaftApplyFailure>>>,
+    #[cfg(test)]
+    pub(crate) fail_apply_at: Option<u64>,
     pub(crate) placement: ShardPlacement,
     pub(crate) engine: InMemoryGroupEngine,
     pub(crate) metrics: Option<GroupEngineMetrics>,
     pub(crate) last_applied_log_id: Option<LogIdOf<UrsulaRaftTypeConfig>>,
     pub(crate) last_membership: StoredMembershipOf<UrsulaRaftTypeConfig>,
     pub(crate) current_snapshot: Arc<Mutex<Option<CurrentSnapshot>>>,
+    pub(crate) metadata_serial: Arc<crate::rt::sync::Mutex<()>>,
     pub(crate) snapshot_store: SharedSnapshotStore,
     pub(crate) snapshot_build: SnapshotBuildCoordinator,
     pub(crate) snapshot_install: SnapshotInstallCoordinator,
@@ -375,6 +465,26 @@ struct PersistedSnapshot {
 }
 
 impl RaftGroupStateMachine {
+    fn stop_apply(
+        &self,
+        log_id: LogIdOf<UrsulaRaftTypeConfig>,
+        error: crate::apply_failure::ApplyError,
+    ) -> io::Error {
+        let failure = ursula_proto::admin::RaftApplyFailure {
+            term: log_id.committed_leader_id().term,
+            index: log_id.index(),
+            kind: error.kind(),
+            message: error.to_string(),
+        };
+        tracing::error!(raft_group_id = self.placement.raft_group_id.0,
+            log_index = failure.index, error = %error, "stopping group after deterministic apply failure; retain WAL for corrected-code replay");
+        *self
+            .apply_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(failure);
+        io::Error::other(error)
+    }
+
     pub fn new(placement: ShardPlacement) -> Self {
         Self::new_with_metrics(placement, None)
     }
@@ -422,6 +532,9 @@ impl RaftGroupStateMachine {
     ) -> Self {
         let log_gauge = snapshot_build.log_gauge(placement.raft_group_id.0);
         Self {
+            apply_failure: Arc::default(),
+            #[cfg(test)]
+            fail_apply_at: None,
             placement,
             engine: match cold_store {
                 Some(cold_store) => InMemoryGroupEngine::with_cold_store(cold_store),
@@ -431,6 +544,7 @@ impl RaftGroupStateMachine {
             last_applied_log_id: None,
             last_membership: StoredMembershipOf::<UrsulaRaftTypeConfig>::default(),
             current_snapshot: Arc::new(Mutex::new(None)),
+            metadata_serial: Arc::default(),
             snapshot_store,
             snapshot_build,
             snapshot_install,
@@ -633,6 +747,7 @@ impl RaftGroupStateMachine {
             snapshot: Arc::new(snapshot),
             meta: self.snapshot_meta(),
             current_snapshot: self.current_snapshot.clone(),
+            metadata_serial: self.metadata_serial.clone(),
             snapshot_store: self.snapshot_store.clone(),
             metrics: self.metrics.clone(),
             _build_permit: build_permit,
@@ -686,18 +801,41 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         let mut applied_entries = 0usize;
         let mut apply_ns = 0u64;
         while let Some((entry, responder)) = entries.try_next().await? {
-            self.last_applied_log_id = Some(entry.log_id);
-
-            self.log_gauge
-                .record_applied(crate::types::entry_log_bytes(&entry));
+            let entry_bytes = crate::types::entry_log_bytes(&entry);
             let response = match entry.payload {
                 EntryPayload::Blank => RaftGroupResponse::Blank,
                 EntryPayload::Normal(command) => {
                     let apply_started_at = Instant::now();
                     applied_entries = applied_entries.saturating_add(1);
-                    let response = RaftGroupResponse::Write(
-                        self.engine.apply_committed_write(command, self.placement),
-                    );
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        #[cfg(test)]
+                        assert_ne!(
+                            self.fail_apply_at,
+                            Some(entry.log_id.index()),
+                            "injected deterministic apply failure"
+                        );
+                        self.engine.apply_committed_write(command, self.placement)
+                    }));
+                    let response = match outcome {
+                        Ok(Err(error @ GroupEngineError::Infra(_))) => {
+                            return Err(self.stop_apply(
+                                entry.log_id,
+                                crate::apply_failure::ApplyError::Infrastructure(error),
+                            ));
+                        }
+                        Ok(result) => RaftGroupResponse::Write(result),
+                        Err(payload) => {
+                            let message = payload
+                                .downcast_ref::<&str>()
+                                .map(|value| (*value).to_owned())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "non-string panic payload".to_owned());
+                            return Err(self.stop_apply(
+                                entry.log_id,
+                                crate::apply_failure::ApplyError::Panic { message },
+                            ));
+                        }
+                    };
                     apply_ns = apply_ns.saturating_add(elapsed_ns(apply_started_at));
                     response
                 }
@@ -710,6 +848,10 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
                 }
             };
 
+            // A fatal application never advances the durable replay boundary
+            // or acknowledges the failed command. The WAL remains authoritative.
+            self.last_applied_log_id = Some(entry.log_id);
+            self.log_gauge.record_applied(entry_bytes);
             if let Some(responder) = responder {
                 responder.send(response);
             }
@@ -774,8 +916,19 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         meta: &SnapshotMetaOf<UrsulaRaftTypeConfig>,
         snapshot: SnapshotDataOf<UrsulaRaftTypeConfig>,
     ) -> Result<(), io::Error> {
-        let pointer_bytes = snapshot.into_inner();
-        let pointer = SnapshotPointer::decode(&pointer_bytes)
+        let mut pointer_bytes = snapshot.into_inner();
+        // A publication retry still passes through Raft's vote checks, but the
+        // already durable snapshot needs neither download nor installation.
+        if self
+            .current_snapshot
+            .lock()
+            .expect("snapshot mutex")
+            .as_ref()
+            .is_some_and(|current| current.meta == *meta && current.pointer_bytes == pointer_bytes)
+        {
+            return Ok(());
+        }
+        let mut pointer = SnapshotPointer::decode(&pointer_bytes)
             .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
         // Decode exactly once (bounded-stream-state F12c): inline bytes are
         // decoded in place, and a prefetched external snapshot arrives
@@ -788,6 +941,8 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             location => match self.snapshot_install.take_prefetched(&pointer) {
                 Some(prefetched) => {
                     reference = prefetched.reference;
+                    pointer.snapshot_id = prefetched.original_snapshot_id;
+                    pointer_bytes = pointer.encode_binary().map_err(|err| err.into_io())?;
                     prefetched.snapshot
                 }
                 None => {
@@ -813,22 +968,23 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         self.last_membership = meta.last_membership.clone();
         self.log_gauge
             .record_snapshot(self.log_gauge.mark(), pointer.location.size_hint());
-        {
-            let mut current = self.current_snapshot.lock().expect("snapshot mutex");
-            persist_snapshot_metadata(
-                self.snapshot_metadata_path.as_deref(),
+        let current_snapshot = self.current_snapshot.clone();
+        let metadata_path = self.snapshot_metadata_path.clone();
+        let references = self
+            .snapshot_install
+            .references(self.placement.raft_group_id.0);
+        let meta = meta.clone();
+        snapshot_metadata_work(self.metadata_serial.clone(), move || {
+            let _reference = reference;
+            persist_snapshot_metadata(metadata_path.as_deref(), &meta, &pointer_bytes)?;
+            *current_snapshot.lock().expect("snapshot mutex") = Some(CurrentSnapshot {
                 meta,
-                &pointer_bytes,
-            )?;
-            *current = Some(CurrentSnapshot {
-                meta: meta.clone(),
                 pointer_bytes,
             });
-            self.snapshot_install
-                .references(self.placement.raft_group_id.0)
-                .commit_current(&pointer.location);
-        }
-        drop(reference);
+            references.commit_current(&pointer.location);
+            Ok(())
+        })
+        .await?;
         Ok(())
     }
 
@@ -854,6 +1010,7 @@ pub struct RaftGroupSnapshotBuilder {
     snapshot: Arc<GroupSnapshot>,
     pub(crate) meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
     current_snapshot: Arc<Mutex<Option<CurrentSnapshot>>>,
+    pub(crate) metadata_serial: Arc<crate::rt::sync::Mutex<()>>,
     snapshot_store: SharedSnapshotStore,
     metrics: Option<GroupEngineMetrics>,
     _build_permit: OwnedSemaphorePermit,
@@ -960,32 +1117,37 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                 inline_fallback,
             );
         }
-        let chosen = {
-            let mut guard = self.current_snapshot.lock().expect("snapshot mutex");
+        let current_snapshot = self.current_snapshot.clone();
+        let metadata_path = self.snapshot_metadata_path.clone();
+        let meta = self.meta.clone();
+        let references = self.references.clone();
+        let log_gauge = self.log_gauge.clone();
+        let log_mark = self.log_mark;
+        let chosen = snapshot_metadata_work(self.metadata_serial.clone(), move || {
+            let _reference = reference;
+            let previous = current_snapshot.lock().expect("snapshot mutex").clone();
             // A build captured before a newer install must not overwrite its
             // durable metadata, reference or pointer when the upload finishes.
-            if let Some(current) = guard.as_ref()
-                && current.meta.last_log_id > self.meta.last_log_id
+            if let Some(current) = previous.as_ref()
+                && current.meta.last_log_id > meta.last_log_id
             {
-                current.clone()
+                Ok(current.clone())
             } else {
-                persist_snapshot_metadata(
-                    self.snapshot_metadata_path.as_deref(),
-                    &self.meta,
-                    &pointer_bytes,
-                )?;
+                persist_snapshot_metadata(metadata_path.as_deref(), &meta, &pointer_bytes)?;
                 let current = CurrentSnapshot {
-                    meta: self.meta.clone(),
+                    meta,
                     pointer_bytes,
                 };
-                guard.replace(current.clone());
-                self.references.commit_current(&pointer.location);
-                self.log_gauge
-                    .record_snapshot(self.log_mark, pointer.location.size_hint());
-                current
+                current_snapshot
+                    .lock()
+                    .expect("snapshot mutex")
+                    .replace(current.clone());
+                references.commit_current(&pointer.location);
+                log_gauge.record_snapshot(log_mark, pointer.location.size_hint());
+                Ok(current)
             }
-        };
-        drop(reference);
+        })
+        .await?;
         if let Err(err) = self
             .references
             .publish_current(&self.snapshot_store, self.placement.raft_group_id.0)
@@ -1017,6 +1179,28 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
     }
 }
 
+/// Keep metadata fsync and the serialized pointer transition off core workers.
+pub(crate) async fn snapshot_metadata_work<T: Send + 'static>(
+    serial: Arc<crate::rt::sync::Mutex<()>>,
+    work: impl FnOnce() -> Result<T, io::Error> + Send + 'static,
+) -> Result<T, io::Error> {
+    let serial = serial.lock_owned().await;
+    let work = move || {
+        let _serial = serial;
+        work()
+    };
+    #[cfg(not(madsim))]
+    {
+        tokio::task::spawn_blocking(work)
+            .await
+            .map_err(io::Error::other)?
+    }
+    #[cfg(madsim)]
+    {
+        work()
+    }
+}
+
 fn persist_snapshot_metadata(
     path: Option<&Path>,
     meta: &SnapshotMetaOf<UrsulaRaftTypeConfig>,
@@ -1042,10 +1226,8 @@ fn persist_snapshot_metadata(
         file.sync_all()?;
     }
     std::fs::rename(&temporary, path)?;
-    if let Some(parent) = path.parent()
-        && let Ok(directory) = std::fs::File::open(parent)
-    {
-        directory.sync_all()?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
     }
     Ok(())
 }
@@ -1102,6 +1284,24 @@ mod tests {
     }
 
     #[cfg(not(madsim))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn metadata_work_does_not_block_the_core_executor() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let entered = Arc::new(crate::rt::sync::Notify::new());
+        let worker_entered = entered.clone();
+        let metadata = crate::rt::spawn(snapshot_metadata_work(Arc::default(), move || {
+            worker_entered.notify_one();
+            wait.recv_timeout(std::time::Duration::from_secs(2))
+                .map_err(io::Error::other)
+        }));
+        entered.notified().await;
+        // This runs on the same single-thread executor as snapshot installation.
+        // Running blocking metadata work inline would time out before reaching it.
+        release.send(()).unwrap();
+        metadata.await.unwrap().unwrap();
+    }
+
+    #[cfg(not(madsim))]
     #[tokio::test]
     async fn persisted_snapshot_restores_state_machine_before_log_replay() {
         use ursula_shard::CoreId;
@@ -1124,6 +1324,7 @@ mod tests {
             snapshot: Arc::new(test_group_snapshot(placement, 42)),
             meta: test_snapshot_meta(42),
             current_snapshot,
+            metadata_serial: Arc::default(),
             snapshot_store: default_snapshot_store(),
             metrics: None,
             _build_permit: test_build_permit().await,
@@ -1187,6 +1388,7 @@ mod tests {
             snapshot: Arc::new(test_group_snapshot(placement, 42)),
             meta: test_snapshot_meta(42),
             current_snapshot: Arc::new(Mutex::new(None)),
+            metadata_serial: Arc::default(),
             snapshot_store: default_snapshot_store(),
             metrics: None,
             _build_permit: test_build_permit().await,
@@ -1296,6 +1498,76 @@ mod tests {
 
     #[cfg(not(madsim))]
     #[tokio::test]
+    async fn canceled_snapshot_builder_keeps_pin_until_metadata_publication() {
+        let placement = ShardPlacement {
+            core_id: ursula_shard::CoreId(0),
+            shard_id: ursula_shard::ShardId(0),
+            raft_group_id: ursula_shard::RaftGroupId(7),
+        };
+        let store: SharedSnapshotStore = Arc::new(
+            ursula_runtime::S3SnapshotStore::memory_for_tests("canceled-snapshot-pin".to_owned())
+                .unwrap(),
+        );
+        let current_snapshot = Arc::new(Mutex::new(None));
+        let references = Arc::new(SnapshotReferences::default());
+        let mut builder = RaftGroupSnapshotBuilder {
+            placement,
+            snapshot: Arc::new(test_group_snapshot(placement, 1)),
+            meta: test_snapshot_meta(1),
+            current_snapshot: current_snapshot.clone(),
+            metadata_serial: Arc::default(),
+            snapshot_store: store.clone(),
+            metrics: None,
+            _build_permit: test_build_permit().await,
+            log_gauge: Arc::default(),
+            log_mark: GroupLogMark::default(),
+            references: references.clone(),
+            snapshot_metadata_path: None,
+        };
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking({
+            let current = current_snapshot.clone();
+            move || {
+                let _guard = current.lock().unwrap();
+                entered.send(()).unwrap();
+                blocked.recv().unwrap();
+            }
+        });
+        started.await.unwrap();
+        let build = tokio::spawn(async move { builder.build_snapshot().await });
+        // Original, builder, blocking gate, and metadata operation each own the
+        // pointer. The fourth owner proves the build reached publication.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while Arc::strong_count(&current_snapshot) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        build.abort();
+        assert!(build.await.unwrap_err().is_cancelled());
+        assert_eq!(references.active_reference_count(), 1);
+        references.publish_current(&store, 7).await.unwrap();
+        assert_eq!(references.active_reference_count(), 1);
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while references.active_reference_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let current = current_snapshot.lock().unwrap().clone().unwrap();
+        let pointer = SnapshotPointer::decode(&current.pointer_bytes).unwrap();
+        let restored =
+            decode_group_snapshot(&store.download(&pointer.location).await.unwrap()).unwrap();
+        assert_eq!(restored.group_commit_index, 1);
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
     async fn snapshot_builder_keeps_external_snapshots_referenced_by_published_pointers() {
         use std::sync::Arc;
 
@@ -1325,6 +1597,7 @@ mod tests {
             snapshot: Arc::new(test_group_snapshot(placement, 1)),
             meta: test_snapshot_meta(1),
             current_snapshot: current_snapshot.clone(),
+            metadata_serial: Arc::default(),
             snapshot_store: snapshot_store.clone(),
             metrics: None,
             _build_permit: test_build_permit().await,
@@ -1342,6 +1615,7 @@ mod tests {
             snapshot: Arc::new(test_group_snapshot(placement, 2)),
             meta: test_snapshot_meta(2),
             current_snapshot: current_snapshot.clone(),
+            metadata_serial: Arc::default(),
             snapshot_store: snapshot_store.clone(),
             metrics: None,
             _build_permit: test_build_permit().await,
@@ -1376,6 +1650,7 @@ mod tests {
             snapshot: Arc::new(test_group_snapshot(placement, 3)),
             meta: test_snapshot_meta(3),
             current_snapshot,
+            metadata_serial: Arc::default(),
             snapshot_store,
             metrics: None,
             _build_permit: test_build_permit().await,
@@ -1458,6 +1733,7 @@ mod tests {
             snapshot: Arc::new(test_group_snapshot(placement, 3)),
             meta: test_snapshot_meta(3),
             current_snapshot: current_snapshot.clone(),
+            metadata_serial: Arc::default(),
             snapshot_store: Arc::new(FailingSnapshotStore),
             metrics: None,
             _build_permit: test_build_permit().await,

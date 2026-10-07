@@ -144,6 +144,7 @@ pub(crate) fn plan_cluster_egress_shed(
 
 /// Config-driven cluster egress gate.
 pub fn spawn_egress_gate(
+    runtime: &ursula_runtime::ShardRuntime,
     registry: &RaftGroupHandleRegistry,
     node_id: u64,
     peers: &[(u64, String)],
@@ -164,7 +165,8 @@ pub fn spawn_egress_gate(
     let heal_ticks = cp_cfg.heal_ticks.max(1);
     let registry = registry.clone();
     let peers = peers.to_vec();
-    tokio::spawn(async move {
+    let owner = runtime.clone();
+    if let Err(error) = owner.spawn_on_owner(ursula_shard::CoreId(0), async move {
         let interval = Duration::from_millis(
             u64::try_from(interval_ms)
                 .unwrap_or(u64::try_from(DEFAULT_CLUSTER_PROBE_INTERVAL_MS).unwrap_or(500)),
@@ -252,5 +254,7 @@ pub fn spawn_egress_gate(
                 registry.clear_leadership_shed(LeadershipShedReason::ClusterEgress);
             }
         }
-    });
+    }) {
+        tracing::error!(%error, "failed to schedule background driver on owner");
+    }
 }

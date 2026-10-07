@@ -239,19 +239,6 @@ Validate values consumed by the generated entrypoint before manifests are
 accepted. The entrypoint should only guard runtime-derived pod ordinal state.
 */}}
 {{- define "ursula.validateEntrypointConfig" -}}
-{{- if .Values.server.startupOwnership.enabled -}}
-{{- if eq (include "ursula.serviceAccountName" .) "default" -}}
-{{- fail "startupOwnership requires a dedicated non-default serviceAccount" -}}
-{{- end -}}
-{{- if or (ne (int .Values.server.replicaCount) 3) (ne .Values.server.updateStrategy "OnDelete") (not .Values.server.gracefulRollout.enabled) (not .Values.server.gracefulRollout.maintenanceReservation) -}}
-{{- fail "startupOwnership requires three voters, OnDelete and shared maintenance rollout" -}}
-{{- end -}}
-{{- range .Values.server.extraEnv -}}
-{{- if hasPrefix "URSULA_STARTUP_" .name -}}
-{{- fail "server.extraEnv cannot override reserved URSULA_STARTUP_ identity fields" -}}
-{{- end -}}
-{{- end -}}
-{{- end -}}
 {{- $fullname := include "ursula.fullname" . -}}
 {{- $headless := include "ursula.headlessServiceName" . -}}
 {{- $namespace := .Release.Namespace -}}

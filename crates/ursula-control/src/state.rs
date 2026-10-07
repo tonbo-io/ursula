@@ -20,6 +20,8 @@ use crate::view::PlacementNode;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlPlaneState {
+    #[serde(default)]
+    pub operations: crate::OperationState,
     pub nodes: BTreeMap<NodeId, ClusterNode>,
     pub placements: BTreeMap<RaftGroupId, DataGroupPlacement>,
     pub migrations: BTreeMap<u64, GroupMigration>,
@@ -37,6 +39,7 @@ impl Default for ControlPlaneState {
 impl ControlPlaneState {
     pub fn new(config: MetaConfig) -> Self {
         Self {
+            operations: crate::OperationState::default(),
             nodes: BTreeMap::new(),
             placements: BTreeMap::new(),
             migrations: BTreeMap::new(),
@@ -47,7 +50,41 @@ impl ControlPlaneState {
     }
 
     pub fn apply(&mut self, command: ControlCommand) -> ControlResponse {
+        if self.operations.active.is_some() && !matches!(command, ControlCommand::Operation { .. })
+        {
+            return ControlResponse::Operation(Err(crate::OperationError::Busy));
+        }
         match command {
+            ControlCommand::Operation { command, now_ms } => {
+                if self.active_migration.is_some() {
+                    return ControlResponse::Operation(Err(crate::OperationError::Busy));
+                }
+                let nodes = self
+                    .nodes
+                    .iter()
+                    .filter(|(_, node)| node.state != NodeState::Removed)
+                    .map(|(id, _)| *id)
+                    .collect();
+                let decommissioned =
+                    self.operations
+                        .active
+                        .as_ref()
+                        .and_then(|operation| match operation.kind {
+                            crate::OperationKind::DecommissionNode { node_id, .. } => Some(node_id),
+                            _ => None,
+                        });
+                let result = self
+                    .operations
+                    .apply(command, now_ms, &nodes, &mut self.placements);
+                if matches!(result, Ok(crate::OperationOutcome::Completed))
+                    && let Some(node_id) = decommissioned
+                    && let Some(node) = self.nodes.get_mut(&node_id)
+                {
+                    node.state = NodeState::Removed;
+                    node.updated_at_ms = now_ms;
+                }
+                ControlResponse::Operation(result)
+            }
             ControlCommand::RegisterNode {
                 node_id,
                 client_url,

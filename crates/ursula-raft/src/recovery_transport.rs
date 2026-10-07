@@ -7,13 +7,14 @@ use ursula_shard::ShardPlacement;
 
 use crate::UrsulaVote;
 use crate::grpc::GrpcRaftNetwork;
-use crate::grpc::probe_rejoin_vote_barrier;
+use crate::grpc::probe_rejoin_vote_barrier_fenced;
 use crate::rejoin::PeerGroupLog;
 use crate::rejoin::RecoveryTransport;
 use crate::rejoin::bootstrap_probe_vote;
 
 #[derive(Clone)]
 pub(crate) struct GrpcRecoveryTransport {
+    pub registry: crate::RaftGroupHandleRegistry,
     pub transport: std::sync::Arc<crate::grpc::CoreRaftTransport>,
     pub placement: ShardPlacement,
     pub node_id: u64,
@@ -28,26 +29,37 @@ impl RecoveryTransport for GrpcRecoveryTransport {
             peer,
             &address,
         )
-        .vote(
-            bootstrap_probe_vote(self.node_id),
-            RPCOption::new(self.timeout),
-        )
+        .with_registry(self.registry.clone())
+        .vote(bootstrap_probe_vote(), RPCOption::new(self.timeout))
         .await
         .ok()
         .map(|response| PeerGroupLog::from_vote_response(&response))
+    }
+    async fn vote(&self, peer: u64, address: String) -> Option<crate::UrsulaVoteResponse> {
+        GrpcRaftNetwork::new(
+            self.transport.clone(),
+            self.placement.raft_group_id,
+            peer,
+            &address,
+        )
+        .with_registry(self.registry.clone())
+        .vote(bootstrap_probe_vote(), RPCOption::new(self.timeout))
+        .await
+        .ok()
     }
     async fn barrier(
         &self,
         leader: u64,
         address: String,
     ) -> Result<(UrsulaVote, u64), Self::Error> {
-        probe_rejoin_vote_barrier(
+        probe_rejoin_vote_barrier_fenced(
             self.transport.clone(),
             self.placement,
             self.node_id,
             leader,
             &address,
             crate::rejoin::RECOVERY_BARRIER_TIMEOUT,
+            Some(self.registry.clone()),
         )
         .await
     }

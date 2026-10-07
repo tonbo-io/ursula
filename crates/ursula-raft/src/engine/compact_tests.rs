@@ -80,6 +80,7 @@ async fn page_chunks(cold_store: &Arc<ColdStore>, stream: &BucketStreamId) -> Ve
         .expect("load cold index page")
 }
 
+#[cfg(not(madsim))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raft_compacts_shared_slice_into_exclusive_chunk() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));

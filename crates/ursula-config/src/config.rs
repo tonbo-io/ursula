@@ -142,6 +142,8 @@ impl Default for RuntimeConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RaftConfig {
+    /// Dedicated durable control-plane Raft authority.
+    pub meta: MetaRaftConfig,
     /// Node-wide append transport bytes per direction, shared by all cores/peers.
     pub append_transport_budget_bytes: usize,
     /// Unique node ID within the static gRPC Raft cluster.
@@ -210,9 +212,18 @@ pub struct RaftConfig {
     pub max_in_snapshot_log_to_keep: u64,
 }
 
+impl RaftConfig {
+    /// Persistent deployments use the meta authority; ephemeral local development
+    /// has no independent identity or placement authority to bootstrap.
+    pub fn uses_meta_authority(&self) -> bool {
+        self.meta.enabled && (self.wal.path.is_some() || !self.peers.is_empty())
+    }
+}
+
 impl Default for RaftConfig {
     fn default() -> Self {
         Self {
+            meta: MetaRaftConfig::default(),
             node_id: 0,
             group_count: std::thread::available_parallelism()
                 .map(|n| n.get().saturating_mul(16).max(1))
@@ -236,6 +247,24 @@ impl Default for RaftConfig {
             snapshot_log_budget: HumanSize::gib(1),
             snapshot_backstop_logs: 100_000,
             max_in_snapshot_log_to_keep: 64,
+        }
+    }
+}
+
+/// Meta consensus uses an independent listener and durable WAL directory.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MetaRaftConfig {
+    pub enabled: bool,
+    pub listen: String,
+    pub peers: Vec<RaftPeerConfig>,
+}
+impl Default for MetaRaftConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            listen: "127.0.0.1:4439".to_owned(),
+            peers: Vec::new(),
         }
     }
 }

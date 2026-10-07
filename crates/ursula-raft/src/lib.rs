@@ -2,6 +2,7 @@
 //!
 //! Module map:
 //!
+//! - [`apply_failure`]: typed group-local fatal application failures.
 //! - [`types`]: shared `UrsulaRaftTypeConfig`, type aliases, and the
 //!   [`RaftGroupResponse`] applied-entry response around the canonical
 //!   `ursula_runtime` write types.
@@ -12,18 +13,21 @@
 //! - [`log_store`]: the Raft log store, the only Raft WAL. It writes the
 //!   shared per-core journal through an I/O seam whose `cfg(madsim)`
 //!   implementation is the simulated disk (`SimDisk`), keeps votes and each
-//!   group's log state ([`wal::diagnostics::GroupLogState`]) in per-core metadata files, and
+//!   group's log state ([`wal::GroupLogState`]) in per-core metadata files, and
 //!   records each run of the node in a run-state file that decides how the
-//!   journals reopen ([`WalOpening`]).
-//! - [`wal`]: node WAL facade and separately named format diagnostics.
+//!   journals reopen ([`wal::WalOpening`]).
+//! - [`wal`]: the single public WAL facade, format types, and simulation adapters.
 //! - [`election`]: shared campaign and leadership transfer policy.
 //! - [`recovery_transport`]: native transport adapter for recovery probes.
+//! - [`registry_error`]: typed registry errors and gRPC status classification.
 //! - [`registry`]: [`RaftGroupHandleRegistry`] and the single-node network.
 //! - `in_process`: fault-injection network, compiled only for tests and madsim.
 //! - [`owner`]: mailbox dispatch onto each group owner runtime.
 //! - [`maintenance`]: configuration-backed local Raft maintenance eligibility.
 //! - [`state_machine`]: per-group [`RaftGroupStateMachine`] and snapshot builder.
-//! - [`meta`]: meta-group OpenRaft type config and control-plane state machine.
+//! - [`meta`]: durable control state, committed watches and coalesced leader reads.
+//! - [`meta_disk`]: fsync-always control log and checksummed snapshot persistence.
+//! - [`meta_transport`]: independent meta replication and leader-forwarded reads/writes.
 //! - [`engine`]: [`RaftGroupEngine`] + `GroupEngine` impl, with the engine
 //!   factories under `engine::factory`.
 //! - [`format_epoch`]: the Raft protocol (format-epoch) peer probe and the
@@ -47,6 +51,9 @@ pub mod raft_internal_proto {
     tonic::include_proto!("ursula.raft.v1");
 }
 
+mod apply_failure;
+#[cfg(all(test, not(madsim)))]
+mod apply_failure_tests;
 mod owner;
 pub use owner::OwnerRaftHandle;
 mod codec;
@@ -60,9 +67,14 @@ mod in_process;
 mod log_store;
 mod maintenance;
 mod meta;
+mod meta_disk;
+#[cfg(all(test, not(madsim)))]
+mod meta_durable_tests;
+mod meta_transport;
 mod read_index;
 mod recovery_transport;
 mod registry;
+mod registry_error;
 mod rejoin;
 mod rt;
 #[cfg(madsim)]
@@ -123,13 +135,6 @@ pub use in_process::InProcessRaftNetworkPolicyEvent;
 pub use in_process::InProcessRaftRegistry;
 #[cfg(any(test, madsim))]
 pub use in_process::InProcessRaftRpcKind;
-pub use log_store::JournalTuning;
-pub use log_store::LaggingGroups;
-pub use log_store::RaftGroupFileLogStore;
-pub use log_store::RaftWal;
-pub use log_store::RaftWalError;
-pub use log_store::RecoveryState;
-pub use log_store::WalOpening;
 pub use maintenance::RaftMaintenanceIssue;
 pub use maintenance::RaftMaintenanceReport;
 pub use maintenance::check_raft_maintenance;
@@ -140,6 +145,10 @@ pub use meta::MetaRaftHandle;
 pub use meta::MetaRaftSnapshotBuilder;
 pub use meta::MetaRaftStateMachine;
 pub use meta::MetaRaftTypeConfig;
+pub use meta_disk::MetaDiskLogStore;
+pub use meta_transport::MetaGrpcNetworkFactory;
+pub use meta_transport::MetaGrpcService;
+pub use meta_transport::meta_peer_initialized;
 pub use registry::LeadershipShedFlag;
 pub use registry::LeadershipShedReason;
 pub use registry::LeadershipShedState;
@@ -149,6 +158,8 @@ pub use registry::RaftGroupHandle;
 pub use registry::RaftGroupHandleRegistry;
 pub use registry::SingleNodeRaftNetwork;
 pub use registry::SingleNodeRaftNetworkFactory;
+pub use registry_error::RegistryError;
+pub use registry_error::SnapshotStage;
 pub use rejoin::AcceptUnsyncedLossOutcome;
 pub use rejoin::AcceptUnsyncedLossReport;
 pub use rejoin::GroupBootstrap;
@@ -159,6 +170,7 @@ pub use rejoin::RecoveryConfig;
 pub use rejoin::RecoveryGate;
 pub use rejoin::RecoveryGateError;
 pub use rejoin::RecoveryGateStatus;
+pub use rejoin::RecoveryMembershipAuthority;
 pub use rejoin::RecoveryTransport;
 pub use rejoin::bootstrap_probe_vote;
 pub use rejoin::run_group_bootstrap;
@@ -188,3 +200,11 @@ mod tests;
 
 #[cfg(test)]
 mod cold_index_tests;
+
+pub use meta_transport::MetaRecoveryStatus;
+pub use meta_transport::meta_authorize_genesis;
+pub use meta_transport::meta_peer_recovery_floor;
+pub use meta_transport::meta_peer_recovery_status;
+
+#[cfg(all(test, not(madsim)))]
+mod process_fence_measurement;

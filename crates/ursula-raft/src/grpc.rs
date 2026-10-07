@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crossbeam_utils::CachePadded;
 use futures_util::Stream;
 use futures_util::StreamExt;
 use openraft::BasicNode;
@@ -29,6 +30,8 @@ use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
 use openraft::vote::RaftLeaderId;
 use prost::Message;
+use serde::Deserialize;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
@@ -123,38 +126,59 @@ impl Default for CoreRaftTransport {
         ))
     }
 }
-static GRPC_APPEND_STREAM_SESSIONS_OPENED: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_SESSION_FAILURES: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_REQUESTS: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_RESPONSES: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_REQUEST_BYTES: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_REQUEST_FRAMES: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_RESPONSE_FRAMES: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_BATCH_FRAMES: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_BATCH_ITEMS_MAX: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_INFLIGHT: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_INFLIGHT_MAX: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_QUEUED_BYTES: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_QUEUED_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_BACKPRESSURE_REJECTIONS: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_EXPIRED_UNSENT: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_STALLS: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_SERVER_BUFFERED_BYTES: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_SERVER_BUFFERED_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_HEARTBEAT_REQUESTS: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_HEARTBEAT_REQUEST_BYTES: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_REPLICATION_REQUESTS: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_REPLICATION_REQUEST_BYTES: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_REPLICATION_ENTRIES: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(0);
-static GRPC_VOTE_REQUESTS: AtomicU64 = AtomicU64::new(0);
-static GRPC_VOTE_REQUEST_BYTES: AtomicU64 = AtomicU64::new(0);
-static GRPC_VOTE_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(0);
-static GRPC_SNAPSHOT_REQUESTS: AtomicU64 = AtomicU64::new(0);
-static GRPC_SNAPSHOT_REQUEST_BYTES: AtomicU64 = AtomicU64::new(0);
-static GRPC_SNAPSHOT_PAYLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
-static GRPC_SNAPSHOT_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_STREAM_SESSIONS_OPENED: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_SESSION_FAILURES: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_REQUESTS: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_RESPONSES: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_REQUEST_BYTES: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_RESPONSE_BYTES: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_REQUEST_FRAMES: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_RESPONSE_FRAMES: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_BATCH_FRAMES: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_BATCH_ITEMS_MAX: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_INFLIGHT: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_INFLIGHT_MAX: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_QUEUED_BYTES: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_QUEUED_BYTES_MAX: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_BACKPRESSURE_REJECTIONS: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_EXPIRED_UNSENT: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_HARD_TTL_TIMEOUTS: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_STALLS: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_SERVER_BUFFERED_BYTES: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_STREAM_SERVER_BUFFERED_BYTES_MAX: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_HEARTBEAT_REQUESTS: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_HEARTBEAT_REQUEST_BYTES: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_REPLICATION_REQUESTS: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_REPLICATION_REQUEST_BYTES: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_REPLICATION_ENTRIES: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_RESPONSE_BYTES: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static GRPC_VOTE_REQUESTS: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static GRPC_VOTE_REQUEST_BYTES: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static GRPC_VOTE_RESPONSE_BYTES: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static GRPC_SNAPSHOT_REQUESTS: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static GRPC_SNAPSHOT_REQUEST_BYTES: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static GRPC_SNAPSHOT_PAYLOAD_BYTES: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static GRPC_SNAPSHOT_RESPONSE_BYTES: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
 use crate::registry::RaftGroupHandleRegistry;
 
 const APPEND_STREAM_BACKLOG_FULL: &str = "raft append stream backlog full";
@@ -222,6 +246,7 @@ pub(crate) async fn confirm_quorum_prefix(
 ///
 /// ReadIndexBarrier only coalesces rounds whose confirmation has not started;
 /// an inbound request never joins an already-started confirmation round.
+#[cfg(test)]
 pub(crate) async fn probe_rejoin_vote_barrier(
     transport: Arc<CoreRaftTransport>,
     placement: ursula_shard::ShardPlacement,
@@ -230,9 +255,25 @@ pub(crate) async fn probe_rejoin_vote_barrier(
     address: &str,
     timeout: Duration,
 ) -> Result<(UrsulaVote, u64), RecoveryProbeError> {
+    probe_rejoin_vote_barrier_fenced(
+        transport, placement, node_id, leader_id, address, timeout, None,
+    )
+    .await
+}
+
+pub(crate) async fn probe_rejoin_vote_barrier_fenced(
+    transport: Arc<CoreRaftTransport>,
+    placement: ursula_shard::ShardPlacement,
+    node_id: u64,
+    leader_id: u64,
+    address: &str,
+    timeout: Duration,
+    registry: Option<crate::RaftGroupHandleRegistry>,
+) -> Result<(UrsulaVote, u64), RecoveryProbeError> {
     let mut network = GrpcRaftNetwork::new(transport, placement.raft_group_id, leader_id, address);
+    network.registry = registry;
     let mut client = network.client()?;
-    let envelope = network.vote_envelope(crate::rejoin::bootstrap_probe_vote(node_id));
+    let envelope = network.vote_envelope(crate::rejoin::bootstrap_probe_vote());
     GRPC_VOTE_REQUESTS.fetch_add(1, Ordering::Relaxed);
     GRPC_VOTE_REQUEST_BYTES.fetch_add(envelope.encoded_len() as u64, Ordering::Relaxed);
     let mut capability_request = tonic::Request::new(envelope);
@@ -254,6 +295,8 @@ pub(crate) async fn probe_rejoin_vote_barrier(
     if explicit_barrier {
         let mut barrier_request =
             tonic::Request::new(raft_internal_proto::RejoinBarrierRequestV1 {
+                process_identity: network.process_identity(),
+                requester_id: node_id,
                 raft_group_id: placement.raft_group_id.0,
                 protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
             });
@@ -305,7 +348,7 @@ pub(crate) async fn probe_rejoin_vote_barrier(
     }
     let response = network
         .vote(
-            crate::rejoin::bootstrap_probe_vote(node_id),
+            crate::rejoin::bootstrap_probe_vote(),
             RPCOption::new(timeout),
         )
         .await?;
@@ -407,51 +450,7 @@ fn append_budget_charge(encoded_len: usize, budget: usize) -> u32 {
     u32::try_from(charge).unwrap_or(u32::MAX)
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
-pub struct RaftGrpcMetricsSnapshot {
-    pub raft_grpc_append_stream_sessions_opened: u64,
-    pub raft_grpc_append_stream_session_failures: u64,
-    pub raft_grpc_append_stream_requests: u64,
-    pub raft_grpc_append_stream_responses: u64,
-    pub raft_grpc_append_stream_request_bytes: u64,
-    pub raft_grpc_append_stream_response_bytes: u64,
-    pub raft_grpc_append_stream_request_frames: u64,
-    pub raft_grpc_append_stream_response_frames: u64,
-    pub raft_grpc_append_stream_batch_frames: u64,
-    pub raft_grpc_append_stream_batch_items_max: u64,
-    pub raft_grpc_append_stream_inflight: u64,
-    pub raft_grpc_append_stream_inflight_max: u64,
-    /// Leader side: bytes of Append calls queued for peers but not yet taken by the HTTP/2
-    /// encoder, bounded per peer by `RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES`.
-    pub raft_grpc_append_stream_queued_bytes: u64,
-    pub raft_grpc_append_stream_queued_bytes_max: u64,
-    /// Append calls refused because the peer's queue was full (the replication
-    /// stream backs off instead of piling up more copies of its entries).
-    pub raft_grpc_append_stream_backpressure_rejections: u64,
-    /// Queued Append calls dropped unsent because their caller had already timed out.
-    pub raft_grpc_append_stream_expired_unsent: u64,
-    /// Append sessions closed because the peer stopped answering.
-    pub raft_grpc_append_stream_stalls: u64,
-    /// Follower side: decoded inbound Append frames not yet answered.
-    pub raft_grpc_append_stream_server_buffered_bytes: u64,
-    pub raft_grpc_append_stream_server_buffered_bytes_max: u64,
-    /// Logical protobuf bytes before tonic's optional ZSTD compression and
-    /// HTTP/2 framing. Compare these counters with VPC/CUR bytes to calculate
-    /// transport and billing amplification.
-    pub raft_grpc_append_heartbeat_requests: u64,
-    pub raft_grpc_append_heartbeat_request_bytes: u64,
-    pub raft_grpc_append_replication_requests: u64,
-    pub raft_grpc_append_replication_request_bytes: u64,
-    pub raft_grpc_append_replication_entries: u64,
-    pub raft_grpc_append_response_bytes: u64,
-    pub raft_grpc_vote_requests: u64,
-    pub raft_grpc_vote_request_bytes: u64,
-    pub raft_grpc_vote_response_bytes: u64,
-    pub raft_grpc_snapshot_requests: u64,
-    pub raft_grpc_snapshot_request_bytes: u64,
-    pub raft_grpc_snapshot_payload_bytes: u64,
-    pub raft_grpc_snapshot_response_bytes: u64,
-}
+pub use ursula_proto::telemetry::RaftGrpcMetricsSnapshot;
 
 pub fn raft_grpc_metrics_snapshot() -> RaftGrpcMetricsSnapshot {
     RaftGrpcMetricsSnapshot {
@@ -483,6 +482,8 @@ pub fn raft_grpc_metrics_snapshot() -> RaftGrpcMetricsSnapshot {
         raft_grpc_append_stream_backpressure_rejections: GRPC_APPEND_STREAM_BACKPRESSURE_REJECTIONS
             .load(Ordering::Relaxed),
         raft_grpc_append_stream_expired_unsent: GRPC_APPEND_STREAM_EXPIRED_UNSENT
+            .load(Ordering::Relaxed),
+        raft_grpc_append_stream_hard_ttl_timeouts: GRPC_APPEND_STREAM_HARD_TTL_TIMEOUTS
             .load(Ordering::Relaxed),
         raft_grpc_append_stream_stalls: GRPC_APPEND_STREAM_STALLS.load(Ordering::Relaxed),
         raft_grpc_append_stream_server_buffered_bytes: GRPC_APPEND_STREAM_SERVER_BUFFERED_BYTES
@@ -634,21 +635,44 @@ pub fn raft_grpc_service(
     .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
 }
 
-fn group_rpc_status(error: ursula_runtime::GroupEngineError) -> tonic::Status {
-    if matches!(
-        error.infra(),
-        Some(ursula_runtime::GroupInfraError::OwnerStopped)
-    ) {
-        tonic::Status::unavailable(error.to_string())
-    } else {
-        tonic::Status::internal(error.to_string())
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct FencedProcess {
+    pub(crate) node_id: u64,
+    pub(crate) identity: ursula_control::ProcessIdentity,
+}
+
+pub(crate) async fn validate_process_fence(
+    registry: &crate::RaftGroupHandleRegistry,
+    bytes: &[u8],
+) -> Result<(), tonic::Status> {
+    let Some((local_node, local_identity, meta)) = registry.process_authority() else {
+        return Ok(());
+    };
+    let sender: FencedProcess = rmp_serde::from_slice(bytes).map_err(|error| {
+        tonic::Status::failed_precondition(format!("missing or invalid process epoch: {error}"))
+    })?;
+    // A stale meta follower cannot certify a retired data process. This read
+    // goes to the meta leader and confirms quorum before accepting the RPC.
+    let processes = meta
+        .read_linearizable_processes()
+        .await
+        .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+    if processes.get(&local_node) != Some(&ursula_control::ProcessState::Active(local_identity))
+        || processes.get(&sender.node_id)
+            != Some(&ursula_control::ProcessState::Active(sender.identity))
+    {
+        return Err(tonic::Status::failed_precondition(
+            "data RPC process epoch is retired or superseded",
+        ));
     }
+    Ok(())
 }
 
 async fn handle_append_envelope(
     registry: RaftGroupHandleRegistry,
     envelope: raft_internal_proto::RaftRpcEnvelopeV1,
 ) -> Result<raft_internal_proto::RaftRpcAckV1, tonic::Status> {
+    validate_process_fence(&registry, &envelope.process_identity).await?;
     let raft_group_id =
         validate_raft_rpc_preamble(&registry, envelope.protocol_version, envelope.raft_group_id)?;
     let request: UrsulaAppendEntriesRequest =
@@ -656,7 +680,8 @@ async fn handle_append_envelope(
     let response = registry
         .append_entries(raft_group_id, request)
         .await
-        .map_err(group_rpc_status)?;
+        .map_err(tonic::Status::from)?;
+    validate_process_fence(&registry, &envelope.process_identity).await?;
     Ok(raft_internal_proto::RaftRpcAckV1 {
         payload: encode_wire(&response),
     })
@@ -705,6 +730,54 @@ async fn handle_append_stream_item(
         ),
     };
     raft_internal_proto::RaftAppendStreamResponseItem { request_id, result }
+}
+
+// Frame boundaries are transport batching only: one slow group must not withhold completed
+// acknowledgements for other groups. Retain the decoded-byte charge until every item in a
+// frame finishes, while emitting each completed item without waiting for its frame siblings.
+#[expect(
+    clippy::result_large_err,
+    reason = "tonic streaming responses require an unboxed Status at the transport boundary"
+)]
+fn append_stream_responses<S, F, Fut>(
+    requests: S,
+    handle: F,
+) -> impl Stream<Item = Result<raft_internal_proto::RaftAppendStreamResponse, tonic::Status>>
+where
+    S: Stream<
+        Item = (
+            Result<raft_internal_proto::RaftAppendStreamRequest, tonic::Status>,
+            Option<QueuedAppendBytes>,
+        ),
+    >,
+    F: Fn(raft_internal_proto::RaftAppendStreamRequestItem) -> Fut + Clone,
+    Fut: Future<Output = raft_internal_proto::RaftAppendStreamResponseItem>,
+{
+    requests
+        .flat_map(move |(request, buffered)| {
+            let buffered = Arc::new(buffered);
+            let items = match request {
+                Ok(frame) => frame.items.into_iter().map(Ok).collect::<Vec<_>>(),
+                Err(error) => vec![Err(error)],
+            };
+            let handle = handle.clone();
+            futures_util::stream::iter(items).map(move |item| {
+                let buffered = buffered.clone();
+                let handle = handle.clone();
+                async move {
+                    let _buffered = buffered;
+                    Ok(handle(item?).await)
+                }
+            })
+        })
+        .buffer_unordered(64)
+        .ready_chunks(RAFT_GRPC_APPEND_STREAM_MAX_BATCH_ITEMS)
+        .map(|items| {
+            items
+                .into_iter()
+                .collect::<Result<Vec<_>, tonic::Status>>()
+                .map(|items| raft_internal_proto::RaftAppendStreamResponse { items })
+        })
 }
 
 #[tonic::async_trait]
@@ -767,24 +840,9 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 Some(((request, buffered), (requests, shutdown, budget)))
             },
         );
-        let responses = requests
-            .map(move |(request, buffered)| {
-                let registry = registry.clone();
-                let concurrency = concurrency.clone();
-                async move {
-                    let _buffered = buffered;
-                    let request = request?;
-                    let items = futures_util::stream::iter(request.items)
-                        .map(|item| {
-                            handle_append_stream_item(registry.clone(), concurrency.clone(), item)
-                        })
-                        .buffer_unordered(64)
-                        .collect()
-                        .await;
-                    Ok(raft_internal_proto::RaftAppendStreamResponse { items })
-                }
-            })
-            .buffer_unordered(64);
+        let responses = append_stream_responses(requests, move |item| {
+            handle_append_stream_item(registry.clone(), concurrency.clone(), item)
+        });
         Ok(tonic::Response::new(Box::pin(responses)))
     }
 
@@ -793,6 +851,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RaftRpcEnvelopeV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftRpcAckV1>, tonic::Status> {
         let envelope = request.into_inner();
+        validate_process_fence(&self.registry, &envelope.process_identity).await?;
         let raft_group_id = validate_raft_rpc_preamble(
             &self.registry,
             envelope.protocol_version,
@@ -804,7 +863,8 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .registry
             .vote(raft_group_id, request)
             .await
-            .map_err(group_rpc_status)?;
+            .map_err(tonic::Status::from)?;
+        validate_process_fence(&self.registry, &envelope.process_identity).await?;
         let mut response = tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
             payload: encode_wire(&response),
         });
@@ -820,6 +880,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RaftFullSnapshotRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftFullSnapshotAckV1>, tonic::Status> {
         let request = request.into_inner();
+        validate_process_fence(&self.registry, &request.process_identity).await?;
         let raft_group_id = validate_raft_rpc_preamble(
             &self.registry,
             request.protocol_version,
@@ -837,7 +898,8 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .registry
             .install_full_snapshot(raft_group_id, vote, snapshot)
             .await
-            .map_err(group_rpc_status)?;
+            .map_err(tonic::Status::from)?;
+        validate_process_fence(&self.registry, &request.process_identity).await?;
         Ok(tonic::Response::new(
             raft_internal_proto::RaftFullSnapshotAckV1 {
                 response: encode_wire(&response),
@@ -872,11 +934,19 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 .map(|payload| decode_wire(&payload, "group command"))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+            self.registry
+                .confirm_process_authority()
+                .await
+                .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
             let results = raft
                 .call(move |raft| async move { write_commands_on_raft(raft, commands).await })
                 .await
                 .map_err(|err| tonic::Status::unavailable(err.to_string()))?
                 .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
+            self.registry
+                .confirm_process_authority()
+                .await
+                .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
             let results = results
                 .into_iter()
                 .map(|result| match result {
@@ -903,11 +973,15 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RejoinBarrierRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RejoinBarrierResponseV1>, tonic::Status> {
         let request = request.into_inner();
+        validate_process_fence(&self.registry, &request.process_identity).await?;
         let group = validate_raft_rpc_preamble(
             &self.registry,
             request.protocol_version,
             request.raft_group_id,
         )?;
+        if let Some(rejoin) = self.registry.rejoin(group) {
+            rejoin.begin_peer_recovery(request.requester_id);
+        }
         let (vote, index) = self
             .registry
             .confirm_recovery_barrier(group)
@@ -921,6 +995,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 }
                 _ => tonic::Status::failed_precondition(error.to_string()),
             })?;
+        validate_process_fence(&self.registry, &request.process_identity).await?;
         Ok(tonic::Response::new(
             raft_internal_proto::RejoinBarrierResponseV1 {
                 vote: encode_wire(&vote),
@@ -934,6 +1009,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RaftTransferLeaderRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftTransferLeaderAckV1>, tonic::Status> {
         let request = request.into_inner();
+        validate_process_fence(&self.registry, &request.process_identity).await?;
         let raft_group_id = validate_raft_rpc_preamble(
             &self.registry,
             request.protocol_version,
@@ -990,9 +1066,18 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                         ))
                     })
                 });
+            let process_authority = Some(self.registry.clone());
+            let apply_failure = self
+                .registry
+                .apply_health(placement.raft_group_id)
+                .ok_or_else(|| tonic::Status::not_found("raft group is not registered"))?;
             let result = raft
                 .call(move |raft| async move {
                     let mut engine = RaftGroupEngine {
+                        snapshot_installs: Arc::default(),
+                        metadata_serial: Arc::default(),
+                        process_authority,
+                        apply_failure,
                         recovery_tasks: crate::rejoin::RecoveryGate::default(),
                         raft,
                         placement,
@@ -1123,6 +1208,7 @@ pub(crate) fn validate_grpc_metadata(protocol_version: u32) -> Result<(), GrpcRp
 
 #[derive(Debug, Clone)]
 pub struct GrpcRaftNetworkFactory {
+    registry: Option<crate::RaftGroupHandleRegistry>,
     transport: Arc<CoreRaftTransport>,
     raft_group_id: RaftGroupId,
     reconnect_threshold: u32,
@@ -1130,9 +1216,15 @@ pub struct GrpcRaftNetworkFactory {
 }
 
 impl GrpcRaftNetworkFactory {
+    pub fn with_registry(mut self, registry: crate::RaftGroupHandleRegistry) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
     pub fn new(transport: Arc<CoreRaftTransport>, raft_group_id: RaftGroupId) -> Self {
         Self {
             transport,
+            registry: None,
             raft_group_id,
             reconnect_threshold: 8,
             rejoin: None,
@@ -1164,12 +1256,14 @@ impl RaftNetworkFactory<UrsulaRaftTypeConfig> for GrpcRaftNetworkFactory {
             self.reconnect_threshold,
         );
         network.rejoin = self.rejoin.clone();
+        network.registry = self.registry.clone();
         network
     }
 }
 
 #[derive(Clone)]
 pub struct GrpcRaftNetwork {
+    registry: Option<crate::RaftGroupHandleRegistry>,
     transport: Arc<CoreRaftTransport>,
     raft_group_id: RaftGroupId,
     target: u64,
@@ -1200,6 +1294,27 @@ impl Debug for GrpcRaftNetwork {
 }
 
 impl GrpcRaftNetwork {
+    async fn confirm_live_process(&self) -> Result<(), RPCError<UrsulaRaftTypeConfig>> {
+        if let Some(registry) = &self.registry {
+            validate_process_fence(registry, &self.process_identity())
+                .await
+                .map_err(raft_rpc_network_error)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_registry(mut self, registry: crate::RaftGroupHandleRegistry) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+    fn process_identity(&self) -> bytes::Bytes {
+        self.registry
+            .as_ref()
+            .and_then(|registry| registry.process_authority())
+            .map(|(node_id, identity, _)| encode_wire(&FencedProcess { node_id, identity }))
+            .unwrap_or_default()
+    }
+
     pub fn new(
         transport: Arc<CoreRaftTransport>,
         raft_group_id: RaftGroupId,
@@ -1235,6 +1350,7 @@ impl GrpcRaftNetwork {
         let endpoint = normalize_grpc_endpoint(address.into());
         let (client, channel_generation) = shared_raft_client(&transport, &endpoint, None);
         Self {
+            registry: None,
             raft_group_id,
             target,
             endpoint,
@@ -1289,6 +1405,7 @@ impl GrpcRaftNetwork {
         request: &UrsulaAppendEntriesRequest,
     ) -> raft_internal_proto::RaftRpcEnvelopeV1 {
         raft_internal_proto::RaftRpcEnvelopeV1 {
+            process_identity: self.process_identity(),
             raft_group_id: self.raft_group_id.0,
             node_id: self.target,
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
@@ -1301,6 +1418,7 @@ impl GrpcRaftNetwork {
         request: &TransferLeaderRequest<UrsulaRaftTypeConfig>,
     ) -> raft_internal_proto::RaftTransferLeaderRequestV1 {
         raft_internal_proto::RaftTransferLeaderRequestV1 {
+            process_identity: self.process_identity(),
             raft_group_id: self.raft_group_id.0,
             node_id: self.target,
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
@@ -1313,6 +1431,7 @@ impl GrpcRaftNetwork {
         request: UrsulaVoteRequest,
     ) -> raft_internal_proto::RaftRpcEnvelopeV1 {
         raft_internal_proto::RaftRpcEnvelopeV1 {
+            process_identity: self.process_identity(),
             raft_group_id: self.raft_group_id.0,
             node_id: self.target,
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
@@ -1441,9 +1560,12 @@ impl GrpcRaftNetwork {
             Ok(Err(_)) => Err(tonic::Status::unavailable(
                 "raft append stream closed without a response",
             )),
-            Err(_) => Err(tonic::Status::deadline_exceeded(
-                "raft append stream exceeded the OpenRaft hard TTL",
-            )),
+            Err(_elapsed) => {
+                GRPC_APPEND_STREAM_HARD_TTL_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                Err(tonic::Status::deadline_exceeded(
+                    "raft append stream exceeded the OpenRaft hard TTL",
+                ))
+            }
         }
     }
 
@@ -1836,9 +1958,24 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
         rpc: UrsulaAppendEntriesRequest,
         option: RPCOption,
     ) -> Result<UrsulaAppendEntriesResponse, RPCError<UrsulaRaftTypeConfig>> {
+        let response_epoch = self
+            .rejoin
+            .as_ref()
+            .map(|rejoin| rejoin.response_epoch(self.target));
         let envelope = self.append_envelope(&rpc);
         record_append_logical_sample(append_logical_sample(&rpc, envelope.encoded_len()));
         let ack = self.append_rpc(envelope, option).await?;
+        self.confirm_live_process().await?;
+        if response_epoch
+            != self
+                .rejoin
+                .as_ref()
+                .map(|rejoin| rejoin.response_epoch(self.target))
+        {
+            return Err(raft_rpc_network_error(
+                "append acknowledgement predates follower recovery".to_owned(),
+            ));
+        }
         GRPC_APPEND_RESPONSE_BYTES.fetch_add(ack.encoded_len() as u64, Ordering::Relaxed);
         let response: UrsulaAppendEntriesResponse = self.decode_rpc_ack("Append", &ack.payload)?;
         if let Some(rejoin) = &self.rejoin
@@ -1871,6 +2008,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
                 client.vote(request).await
             })
             .await?;
+        self.confirm_live_process().await?;
         GRPC_VOTE_RESPONSE_BYTES.fetch_add(ack.encoded_len() as u64, Ordering::Relaxed);
         self.decode_rpc_ack("Vote", &ack.payload)
     }
@@ -1882,7 +2020,13 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
         _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         option: RPCOption,
     ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, StreamingError<UrsulaRaftTypeConfig>> {
+        let snapshot_last_log_id = snapshot.meta.last_log_id;
+        let response_epoch = self
+            .rejoin
+            .as_ref()
+            .map(|rejoin| rejoin.response_epoch(self.target));
         let request = raft_internal_proto::RaftFullSnapshotRequestV1 {
+            process_identity: self.process_identity(),
             raft_group_id: self.raft_group_id.0,
             node_id: self.target,
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
@@ -1903,9 +2047,29 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
             )
             .await
             .map_err(StreamingError::from)?;
+        if response_epoch
+            != self
+                .rejoin
+                .as_ref()
+                .map(|rejoin| rejoin.response_epoch(self.target))
+        {
+            return Err(StreamingError::from(raft_rpc_network_error(
+                "snapshot acknowledgement predates follower recovery".to_owned(),
+            )));
+        }
+        self.confirm_live_process()
+            .await
+            .map_err(StreamingError::from)?;
         GRPC_SNAPSHOT_RESPONSE_BYTES.fetch_add(ack.encoded_len() as u64, Ordering::Relaxed);
-        self.decode_rpc_ack("FullSnapshot", &ack.response)
-            .map_err(StreamingError::from)
+        let response: SnapshotResponse<UrsulaRaftTypeConfig> = self
+            .decode_rpc_ack("FullSnapshot", &ack.response)
+            .map_err(StreamingError::from)?;
+        if response.vote == vote
+            && let Some(rejoin) = &self.rejoin
+        {
+            rejoin.snapshot_repaired(self.target, &vote, snapshot_last_log_id.as_ref());
+        }
+        Ok(response)
     }
 
     async fn transfer_leader(
@@ -1970,6 +2134,67 @@ mod reconnect_tests {
     use ursula_stream::StreamCommand;
 
     use super::*;
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn append_stream_ack_does_not_wait_for_slow_group_in_same_frame() {
+        static BUFFERED: AtomicU64 = AtomicU64::new(0);
+        static MAX_BUFFERED: AtomicU64 = AtomicU64::new(0);
+        let budget = Arc::new(Semaphore::new(1));
+        let buffered = QueuedAppendBytes::new(
+            budget.clone().acquire_owned().await.expect("byte permit"),
+            1,
+            &BUFFERED,
+            &MAX_BUFFERED,
+        );
+        let frame = raft_internal_proto::RaftAppendStreamRequest {
+            items: [1, 2]
+                .into_iter()
+                .map(
+                    |request_id| raft_internal_proto::RaftAppendStreamRequestItem {
+                        request_id,
+                        envelope: None,
+                    },
+                )
+                .collect(),
+        };
+        let release_slow = Arc::new(tokio::sync::Notify::new());
+        let slow = release_slow.clone();
+        let responses = append_stream_responses(
+            futures_util::stream::iter([(Ok(frame), Some(buffered))]),
+            move |item| {
+                let slow = slow.clone();
+                async move {
+                    if item.request_id == 1 {
+                        slow.notified().await;
+                    }
+                    raft_internal_proto::RaftAppendStreamResponseItem {
+                        request_id: item.request_id,
+                        result: None,
+                    }
+                }
+            },
+        );
+        futures_util::pin_mut!(responses);
+        let fast = tokio::time::timeout(Duration::from_secs(1), responses.next())
+            .await
+            .expect("fast group ACK must not wait for slow frame sibling")
+            .expect("response")
+            .expect("successful frame");
+        assert_eq!(fast.items.len(), 1);
+        assert_eq!(fast.items[0].request_id, 2);
+        assert_eq!(
+            budget.available_permits(),
+            0,
+            "slow item retains frame bytes"
+        );
+        release_slow.notify_one();
+        let slow = responses.next().await.expect("response").expect("success");
+        assert_eq!(slow.items[0].request_id, 1);
+        assert!(responses.next().await.is_none());
+        assert_eq!(budget.available_permits(), 1);
+        assert_eq!(BUFFERED.load(Ordering::Relaxed), 0);
+    }
 
     #[tokio::test]
     async fn different_owner_pools_never_share_peer_sessions_or_channels() {
@@ -2082,6 +2307,7 @@ mod reconnect_tests {
             .expect("test permit");
         let call = AppendStreamCall {
             envelope: raft_internal_proto::RaftRpcEnvelopeV1 {
+                process_identity: Default::default(),
                 raft_group_id,
                 node_id: 2,
                 protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
@@ -2149,6 +2375,7 @@ mod reconnect_tests {
         let mut network = test_network(transport.clone(), RaftGroupId(1), 2, endpoint.clone());
         let entry_bytes = 1024 * 1024;
         let envelope = || raft_internal_proto::RaftRpcEnvelopeV1 {
+            process_identity: Default::default(),
             raft_group_id: 1,
             node_id: 2,
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
@@ -2215,6 +2442,7 @@ mod reconnect_tests {
             )
             .expect("other groups' queued bytes");
         let envelope = |raft_group_id, bytes: usize| raft_internal_proto::RaftRpcEnvelopeV1 {
+            process_identity: Default::default(),
             raft_group_id,
             node_id: 2,
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
@@ -2264,6 +2492,7 @@ mod reconnect_tests {
         let item = |request_id, raft_group_id| raft_internal_proto::RaftAppendStreamRequestItem {
             request_id,
             envelope: Some(raft_internal_proto::RaftRpcEnvelopeV1 {
+                process_identity: Default::default(),
                 raft_group_id,
                 node_id: 2,
                 protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
@@ -2307,6 +2536,7 @@ mod reconnect_tests {
         remove_shared_channel(&transport, &endpoint);
         let batch_frames_before = GRPC_APPEND_STREAM_BATCH_FRAMES.load(Ordering::Relaxed);
         let envelope = |raft_group_id| raft_internal_proto::RaftRpcEnvelopeV1 {
+            process_identity: Default::default(),
             raft_group_id,
             node_id: 2,
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
@@ -2355,6 +2585,7 @@ mod reconnect_tests {
         let mut first = test_network(transport.clone(), RaftGroupId(1), 2, endpoint.clone());
         let second = test_network(transport.clone(), RaftGroupId(2), 2, endpoint.clone());
         let envelope = |raft_group_id| raft_internal_proto::RaftRpcEnvelopeV1 {
+            process_identity: Default::default(),
             raft_group_id,
             node_id: 2,
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,

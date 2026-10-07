@@ -22,11 +22,11 @@ use openraft::storage::RaftLogStorageExt;
 use ursula_config::WalFsync;
 use ursula_proto::admin::AcceptUnsyncedLossRequest;
 use ursula_raft::AcceptUnsyncedLossOutcome;
-use ursula_raft::JournalTuning;
 use ursula_raft::RecoveryGateError;
 use ursula_raft::RecoveryGateStatus;
-use ursula_raft::RecoveryState;
 use ursula_raft::UrsulaRaftTypeConfig;
+use ursula_raft::wal::JournalTuning;
+use ursula_raft::wal::RecoveryState;
 use ursula_raft::wal::diagnostics::GroupLogState;
 use ursula_raft::wal::diagnostics::PreviousRun;
 use ursula_shard::RaftGroupId;
@@ -522,7 +522,6 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// No index is ever committed with two different entries, and every
 /// acknowledged write survives.
 #[test]
-#[ignore = "#405: a wiped voter can ack a stale leader because the recovery gate screens votes, not appends"]
 fn a_wiped_voter_never_lets_a_stale_leader_commit() {
     let _guard = sim_test_guard();
     for seed in seeds_from_env("RECOVERY_GATE_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {

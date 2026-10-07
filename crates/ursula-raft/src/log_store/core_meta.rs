@@ -79,7 +79,13 @@ const CORE_METADATA_FILE: &str = "journal.meta";
 impl CoreMetadata {
     /// Reads the metadata file at `path`; empty when there is none.
     pub(crate) fn load(path: &Path) -> Result<Self, StateFileError> {
-        Ok(state_file::read(StateFileKind::CoreMetadata, path)?.unwrap_or_default())
+        Self::load_with_presence(path).map(|(metadata, _missing)| metadata)
+    }
+
+    pub(crate) fn load_with_presence(path: &Path) -> Result<(Self, bool), StateFileError> {
+        let metadata = state_file::read(StateFileKind::CoreMetadata, path)?;
+        let missing = metadata.is_none();
+        Ok((metadata.unwrap_or_default(), missing))
     }
 
     /// Replaces the metadata file at `path` with `self`. Returns the number of

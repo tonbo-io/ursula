@@ -14,6 +14,7 @@ mod commit_stall;
 mod egress;
 mod format_epoch;
 mod leadership;
+mod live_topology;
 mod runtime;
 mod snapshot;
 mod topology;
@@ -22,6 +23,7 @@ mod wal_disk;
 
 pub(crate) use format_epoch::check_and_stamp_format_epoch;
 pub(crate) use leadership::handoff_shutdown_leadership;
+pub(crate) use live_topology::spawn_live_topology_cleanup;
 pub use runtime::SpawnRuntimeError;
 pub use runtime::SpawnedRuntime;
 pub use runtime::spawn_runtime;
@@ -54,3 +56,5 @@ mod test_reexports {
     pub(crate) use super::util::leader_counts;
     pub(crate) use super::util::prioritized_transfer_targets;
 }
+
+pub(crate) mod meta;

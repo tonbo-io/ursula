@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -9,6 +11,8 @@ use std::time::SystemTime;
 #[cfg(not(madsim))]
 use std::time::UNIX_EPOCH;
 
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 #[cfg(not(madsim))]
 use tokio::task::JoinSet;
 use ursula_shard::BucketStreamId;
@@ -210,6 +214,8 @@ pub enum RuntimeThreading {
 
 #[derive(Debug, Clone)]
 pub struct ShardRuntime {
+    owner_workers: Arc<OwnerWorkers>,
+    owner_tasks: Vec<mpsc::UnboundedSender<OwnerTask>>,
     shard_map: StaticShardMap,
     mailboxes: Vec<CoreMailbox>,
     metrics: Arc<RuntimeMetricsInner>,
@@ -224,6 +230,56 @@ pub struct ShardRuntime {
     compaction_debt_chunk_bytes: Arc<AtomicU64>,
     /// Each started group's ReadIndex barrier, installed by its core worker.
     read_barriers: ReadIndexBarriers,
+}
+
+type OwnerTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// A scheduled service is cancelled when its owner exits, even in hosted mode.
+struct OwnerService(crate::rt::JoinHandle<()>);
+
+impl Future for OwnerService {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        match Pin::new(&mut self.0).poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(result) => {
+                if let Err(error) = result
+                    && !error.is_cancelled()
+                {
+                    tracing::error!(%error, "owner service stopped abnormally");
+                }
+                std::task::Poll::Ready(())
+            }
+        }
+    }
+}
+
+impl Drop for OwnerService {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[derive(Debug)]
+struct OwnerWorkers {
+    shutdown: crate::rt::sync::watch::Sender<bool>,
+    service_shutdown: crate::rt::sync::watch::Sender<bool>,
+    service_completions: Vec<crate::rt::sync::watch::Receiver<bool>>,
+    handles: std::sync::Mutex<Vec<(CoreId, OwnerHandle)>>,
+}
+
+#[derive(Debug)]
+enum OwnerHandle {
+    Hosted(crate::rt::JoinHandle<()>),
+    #[cfg(not(madsim))]
+    Thread(std::thread::JoinHandle<()>),
+}
+
+impl Drop for OwnerWorkers {
+    fn drop(&mut self) {
+        self.shutdown.send_replace(true);
+    }
 }
 
 /// Node-local position of one group's cold-index repair cursor.
@@ -249,6 +305,33 @@ pub struct PurgeBucketReport {
 }
 
 impl ShardRuntime {
+    /// Schedule a service or background driver on its owning executor.
+    ///
+    /// This startup/control-plane queue is independent of the bounded request
+    /// mailbox. The returned receiver observes completion; dropping it does not
+    /// cancel the service. Owner shutdown drops all remaining service futures.
+    pub fn spawn_on_owner<F>(
+        &self,
+        core_id: CoreId,
+        task: F,
+    ) -> Result<oneshot::Receiver<F::Output>, RuntimeError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let sender = self
+            .owner_tasks
+            .get(usize::from(core_id.0))
+            .ok_or(RuntimeError::MailboxClosed { core_id })?;
+        let (tx, rx) = oneshot::channel();
+        sender
+            .send(Box::pin(async move {
+                crate::core_worker::reply(tx, task.await);
+            }))
+            .map_err(|_closed| RuntimeError::MailboxClosed { core_id })?;
+        Ok(rx)
+    }
+
     pub fn spawn(config: RuntimeConfig) -> Result<Self, RuntimeError> {
         Self::spawn_with_engine_factory(config, InMemoryGroupEngineFactory::default())
     }
@@ -279,8 +362,12 @@ impl ShardRuntime {
         let raft_uncommitted_bytes =
             Arc::new(RaftUncommittedBytesTracker::new(config.raft_group_count));
         let engine_factory: Arc<dyn GroupEngineFactory> = Arc::new(engine_factory);
-        let read_materialization = Arc::new(Semaphore::new(config.mailbox_capacity.max(1)));
         let read_barriers = ReadIndexBarriers::default();
+        let (owner_shutdown, _) = crate::rt::sync::watch::channel(false);
+        let (service_shutdown, _) = crate::rt::sync::watch::channel(false);
+        let mut service_completions = Vec::new();
+        let mut owner_handles = Vec::with_capacity(usize::from(shard_map.core_count()));
+        let mut owner_tasks = Vec::with_capacity(usize::from(shard_map.core_count()));
         let mut mailboxes = Vec::with_capacity(usize::from(shard_map.core_count()));
         for raw_core_id in 0..shard_map.core_count() {
             let core_id = CoreId(raw_core_id);
@@ -296,13 +383,34 @@ impl ShardRuntime {
                 raft_uncommitted_admission,
                 raft_uncommitted_bytes: raft_uncommitted_bytes.clone(),
                 live_read_max_waiters_per_core: config.live_read_max_waiters_per_core,
-                read_materialization: read_materialization.clone(),
+                read_materialization: Arc::new(Semaphore::new(config.mailbox_capacity.max(1))),
                 read_barriers: read_barriers.clone(),
             };
-            spawn_core_worker(&config, worker)?;
+            let (task_tx, task_rx) = mpsc::unbounded_channel();
+            owner_tasks.push(task_tx);
+            let (service_done_tx, service_done_rx) = crate::rt::sync::watch::channel(false);
+            service_completions.push(service_done_rx);
+            owner_handles.push((
+                core_id,
+                spawn_core_worker(
+                    &config,
+                    worker,
+                    task_rx,
+                    owner_shutdown.subscribe(),
+                    service_shutdown.subscribe(),
+                    service_done_tx,
+                )?,
+            ));
             mailboxes.push(CoreMailbox { core_id, tx });
         }
         Ok(Self {
+            owner_tasks,
+            owner_workers: Arc::new(OwnerWorkers {
+                shutdown: owner_shutdown,
+                service_shutdown,
+                service_completions,
+                handles: std::sync::Mutex::new(owner_handles),
+            }),
             shard_map,
             mailboxes,
             metrics,
@@ -1621,6 +1729,64 @@ impl ShardRuntime {
         .await
     }
 
+    /// Cancel and join background services before shutting down group engines.
+    /// No service can enqueue a new group operation after this returns.
+    pub async fn stop_owner_services(&self) {
+        self.owner_workers.service_shutdown.send_replace(true);
+        for completion in &self.owner_workers.service_completions {
+            let mut done = completion.clone();
+            if done.wait_for(|stopped| *stopped).await.is_err() {
+                tracing::warn!("owner stopped before service cancellation completed");
+            }
+        }
+    }
+
+    /// Stop and join owner workers after group engines and external drivers stop.
+    /// Returns the owners that terminated abnormally, preserving all handles
+    /// until shutdown rather than silently detaching them at startup.
+    pub async fn shutdown_owners(&self) -> Vec<CoreId> {
+        self.stop_owner_services().await;
+        self.owner_workers.shutdown.send_replace(true);
+        let handles = std::mem::take(
+            &mut *self
+                .owner_workers
+                .handles
+                .lock()
+                .expect("owner handles mutex"),
+        );
+        let mut failed = Vec::new();
+        for (core_id, handle) in handles {
+            match handle {
+                OwnerHandle::Hosted(handle) => {
+                    if let Err(error) = handle.await {
+                        tracing::warn!(?core_id, %error, "owner task failed");
+                        failed.push(core_id);
+                    }
+                }
+                #[cfg(not(madsim))]
+                OwnerHandle::Thread(handle) => {
+                    match tokio::task::spawn_blocking(move || handle.join()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(panic)) => {
+                            let message = panic
+                                .downcast_ref::<String>()
+                                .map(String::as_str)
+                                .or_else(|| panic.downcast_ref::<&str>().copied())
+                                .unwrap_or("non-string panic");
+                            tracing::warn!(?core_id, message, "owner thread panicked");
+                            failed.push(core_id);
+                        }
+                        Err(error) => {
+                            tracing::warn!(?core_id, %error, "owner thread join task failed");
+                            failed.push(core_id);
+                        }
+                    }
+                }
+            }
+        }
+        failed
+    }
+
     /// Shuts down every hosted group engine, one per group concurrently,
     /// waiting for each to release its durable resources. A group that was
     /// never created is skipped. Returns the first failure after every group
@@ -2062,55 +2228,84 @@ macro_rules! shard_runtime_operations {
 
 crate::ops::runtime_operations!(shard_runtime_operations);
 
-fn spawn_core_worker(config: &RuntimeConfig, worker: CoreWorker) -> Result<(), RuntimeError> {
-    match config.threading {
-        RuntimeThreading::HostedTokio => {
-            crate::rt::spawn(worker.run());
-            Ok(())
+fn spawn_core_worker(
+    config: &RuntimeConfig,
+    worker: CoreWorker,
+    mut tasks_rx: mpsc::UnboundedReceiver<OwnerTask>,
+    mut shutdown: crate::rt::sync::watch::Receiver<bool>,
+    mut service_shutdown: crate::rt::sync::watch::Receiver<bool>,
+    service_done: crate::rt::sync::watch::Sender<bool>,
+) -> Result<OwnerHandle, RuntimeError> {
+    #[cfg(not(madsim))]
+    let core_id = worker.core_id;
+    #[cfg(all(not(madsim), target_os = "linux"))]
+    let affinity = (config.cpu_affinity, config.core_count);
+    let run = async move {
+        let services = async move {
+            let mut tasks = FuturesUnordered::new();
+            loop {
+                tokio::select! {
+                    _ = service_shutdown.changed() => break,
+                    Some(task) = tasks_rx.recv() => tasks.push(OwnerService(crate::rt::spawn(task))),
+                    Some(()) = tasks.next(), if !tasks.is_empty() => {},
+                    else => break,
+                }
+            }
+            tasks_rx.close();
+            while tasks_rx.try_recv().is_ok() {}
+            for task in &tasks {
+                task.0.abort();
+            }
+            while tasks.next().await.is_some() {}
+            service_done.send_replace(true);
+            std::future::pending::<()>().await;
+        };
+        tokio::select! {
+            _ = worker.run() => {}
+            _ = services => {}
+            _ = shutdown.changed() => {}
         }
+    };
+    match config.threading {
+        RuntimeThreading::HostedTokio => Ok(OwnerHandle::Hosted(crate::rt::spawn(run))),
         #[cfg(not(madsim))]
-        RuntimeThreading::ThreadPerCore => {
-            let core_id = worker.core_id;
-            #[cfg(target_os = "linux")]
-            let affinity = (config.cpu_affinity, config.core_count);
-            std::thread::Builder::new()
-                .name(format!("ursula-core-{}", core_id.0))
-                .spawn(move || {
-                    #[cfg(target_os = "linux")]
-                    if let Some(cpus) = core_affinity::get_core_ids() {
-                        let enabled = affinity.0.unwrap_or(cpus.len() == affinity.1);
-                        // Respect the inherited cpuset; explicit oversubscription
-                        // maps workers round-robin onto the allowed CPUs.
-                        if enabled
-                            && let Some(cpu) = usize::from(core_id.0)
-                                .checked_rem(cpus.len())
-                                .and_then(|index| cpus.get(index))
-                            && !core_affinity::set_for_current(*cpu)
-                        {
-                            tracing::warn!(
-                                core_id = core_id.0,
-                                cpu = cpu.id,
-                                "could not set worker CPU affinity"
-                            );
-                        }
-                    } else {
+        RuntimeThreading::ThreadPerCore => std::thread::Builder::new()
+            .name(format!("ursula-core-{}", core_id.0))
+            .spawn(move || {
+                #[cfg(target_os = "linux")]
+                if let Some(cpus) = core_affinity::get_core_ids() {
+                    let enabled = affinity.0.unwrap_or(cpus.len() == affinity.1);
+                    // Respect the inherited cpuset; explicit oversubscription
+                    // maps workers round-robin onto the allowed CPUs.
+                    if enabled
+                        && let Some(cpu) = usize::from(core_id.0)
+                            .checked_rem(cpus.len())
+                            .and_then(|index| cpus.get(index))
+                        && !core_affinity::set_for_current(*cpu)
+                    {
                         tracing::warn!(
                             core_id = core_id.0,
-                            "could not discover allowed CPUs; worker is not pinned"
+                            cpu = cpu.id,
+                            "could not set worker CPU affinity"
                         );
                     }
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("build per-core tokio runtime");
-                    runtime.block_on(worker.run());
-                })
-                .map(|_| ())
-                .map_err(|err| RuntimeError::SpawnCoreThread {
-                    core_id,
-                    message: err.to_string(),
-                })
-        }
+                } else {
+                    tracing::warn!(
+                        core_id = core_id.0,
+                        "could not discover allowed CPUs; worker is not pinned"
+                    );
+                }
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build per-core tokio runtime");
+                runtime.block_on(run);
+            })
+            .map(OwnerHandle::Thread)
+            .map_err(|err| RuntimeError::SpawnCoreThread {
+                core_id,
+                message: err.to_string(),
+            }),
     }
 }
 
