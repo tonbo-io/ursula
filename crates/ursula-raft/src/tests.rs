@@ -1466,7 +1466,7 @@ fn madsim_three_node_openraft_group_strict_replay_probe() {
 
 #[cfg(madsim)]
 #[test]
-#[ignore = "diagnostic probe; run individually because madsim check_determinism state is process-global"]
+#[ignore = "diagnostic probe; full append/read strict replay is the default smoke test"]
 fn madsim_three_node_openraft_group_strict_replay_append_enqueue_probe() {
     check_madsim_determinism(7, madsim::Config::default(), || async {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(7, async {
@@ -1487,7 +1487,7 @@ fn madsim_three_node_openraft_group_strict_replay_append_enqueue_probe() {
 
 #[cfg(madsim)]
 #[test]
-#[ignore = "diagnostic probe; run individually because madsim check_determinism state is process-global"]
+#[ignore = "diagnostic probe; full append/read strict replay is the default smoke test"]
 fn madsim_three_node_openraft_group_strict_replay_append_commit_probe() {
     check_madsim_determinism(7, madsim::Config::default(), || async {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(7, async {
@@ -1514,7 +1514,7 @@ fn madsim_three_node_openraft_group_strict_replay_append_commit_probe() {
 
 #[cfg(madsim)]
 #[test]
-#[ignore = "diagnostic probe; run individually because madsim check_determinism state is process-global"]
+#[ignore = "diagnostic probe; full append/read strict replay is the default smoke test"]
 fn madsim_three_node_openraft_group_strict_replay_append_complete_probe() {
     check_madsim_determinism(7, madsim::Config::default(), || async {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(7, async {
@@ -1544,7 +1544,7 @@ fn madsim_three_node_openraft_group_strict_replay_append_complete_probe() {
 
 #[cfg(madsim)]
 #[test]
-#[ignore = "diagnostic probe; run individually because madsim check_determinism state is process-global"]
+#[ignore = "diagnostic probe; full append/read strict replay is the default smoke test"]
 fn madsim_three_node_openraft_group_strict_replay_append_response_probe() {
     check_madsim_determinism(7, madsim::Config::default(), || async {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(7, async {
@@ -1573,7 +1573,7 @@ fn madsim_three_node_openraft_group_strict_replay_append_response_probe() {
 
 #[cfg(madsim)]
 #[test]
-#[ignore = "diagnostic probe; run individually because madsim check_determinism state is process-global"]
+#[ignore = "diagnostic probe; full append/read strict replay is the default smoke test"]
 fn madsim_three_node_openraft_group_strict_replay_append_leader_read_probe() {
     check_madsim_determinism(7, madsim::Config::default(), || async {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(7, async {
@@ -1600,7 +1600,7 @@ fn madsim_three_node_openraft_group_strict_replay_append_leader_read_probe() {
 
 #[cfg(madsim)]
 #[test]
-#[ignore = "diagnostic probe; run individually because madsim check_determinism state is process-global"]
+#[ignore = "diagnostic probe; full append/read strict replay is the default smoke test"]
 fn madsim_three_node_openraft_group_strict_replay_follower_log_probe() {
     check_madsim_determinism(7, madsim::Config::default(), || async {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(7, async {
@@ -1629,7 +1629,7 @@ fn madsim_three_node_openraft_group_strict_replay_follower_log_probe() {
 
 #[cfg(madsim)]
 #[test]
-#[ignore = "diagnostic probe; run individually because madsim check_determinism state is process-global"]
+#[ignore = "diagnostic probe; full append/read strict replay is the default smoke test"]
 fn madsim_three_node_openraft_group_strict_replay_follower_apply_probe() {
     check_madsim_determinism(7, madsim::Config::default(), || async {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(7, async {
@@ -1660,7 +1660,7 @@ fn madsim_three_node_openraft_group_strict_replay_follower_apply_probe() {
 
 #[cfg(madsim)]
 #[test]
-#[ignore = "diagnostic probe; run individually because madsim check_determinism state is process-global"]
+#[ignore = "diagnostic probe; full append/read strict replay is the default smoke test"]
 fn madsim_three_node_openraft_group_strict_replay_follower_read_probe() {
     check_madsim_determinism(7, madsim::Config::default(), || async {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(7, async {
@@ -1692,10 +1692,6 @@ fn madsim_three_node_openraft_group_strict_replay_follower_read_probe() {
 
 #[cfg(madsim)]
 #[test]
-#[ignore = "diagnostic probe: on the per-core journal, Runtime::check_determinism's two runs \
-            (one thread each) diverge once the Raft groups shut down; \
-            madsim_three_node_openraft_group_replicates_group_writes_deterministically and \
-            ursula-sim's replays still check outcome determinism"]
 fn madsim_three_node_openraft_group_strict_replay_append_probe() {
     check_madsim_determinism(7, madsim::Config::default(), || async {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(7, async {

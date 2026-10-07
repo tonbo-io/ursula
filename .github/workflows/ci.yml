@@ -250,6 +250,14 @@ jobs:
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
             recovery_tests --nocapture
 
+      # Strict replay: madsim's check_determinism runs a three-node cluster on
+      # the per-core journal twice per seed and fails at the first scheduling
+      # difference, which the outcome-level replays cannot see.
+      - name: Run strict-replay determinism checks
+        run: |
+          RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
+            strict_replay --nocapture
+
       - name: Verify expected-failure replay and minimization
         run: |
           assert_minimized_failure_trace() {
