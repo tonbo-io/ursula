@@ -4524,6 +4524,7 @@ dependencies = [
  "bitflags",
  "blake3",
  "bytes",
+ "crc32fast",
  "criterion",
  "fs4",
  "futures-util",
@@ -4563,7 +4564,6 @@ version = "0.6.2"
 dependencies = [
  "blake3",
  "bytes",
- "crc32fast",
  "criterion",
  "crossbeam-utils",
  "futures-util",

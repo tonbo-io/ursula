@@ -35,7 +35,7 @@ Ursula has several useful DST entry points, but it is not yet DST-ready.
 - **Application-level randomness is low.** The server crates do not use `rand::thread_rng`, `Uuid::new_v4`, or `fastrand` for behavioral choices. Most ordering is delegated to Raft and deterministic state-machine application. This is a strong starting point, but not a complete determinism proof because dependencies, clocks, task scheduling, filesystem behavior, and tests still introduce nondeterminism.
 - **The stream state machine is command-driven.** `ursula-stream` has no async runtime or I/O dependency. `StreamStateMachine::apply(command)` is a function of the existing state and the command, with time supplied as `now_ms` in the command/request. This makes it the best first target for property tests.
 - **Raft networking is trait-based.** OpenRaft uses `RaftNetworkV2<UrsulaRaftTypeConfig>` / `RaftNetworkFactory` as the network boundary. Production uses `crates/ursula-raft/src/grpc.rs`. The spike has extracted the in-process network into `crates/ursula-raft/src/registry.rs` and added `InProcessRaftNetworkPolicy` for source/target partitions and simulated delay. This gives Phase 3 a reusable Raft network seam without touching production gRPC.
-- **Raft log storage is trait-based.** `RaftLogStorage` and `RaftLogReader` have memory and file-backed implementations. This gives us a clear place to run memory-only schedules first, then add file-log/failpoint coverage.
+- **The simulator runs the production Raft WAL.** Every file operation of the per-core journal goes through an I/O seam (`JournalDisk` in `crates/ursula-raft/src/log_store/disk.rs`). Under `cfg(madsim)` it is a simulated disk (`SimDisk`) that keeps synced and unsynced pages apart, reverts directory entries that were not `fsync`ed on a power loss, and injects write or `fsync` errors. The harness gives every simulated node its own directory, and restarts recover from what that disk kept. Only the memory-WAL rejoin scenarios still use the memory log store.
 - **Cold storage is already behind `ColdStore`.** `ColdStore` uses opendal memory or S3 backends. The simulator can now build a store from a prebuilt `Operator`, attach an optional fault policy, and override the delay function. The current policy is enough to inject deterministic write/read/delete errors, virtual-time read/write delay, and truncated range reads.
 - **Runtime threading has a usable hosted mode.** `RuntimeThreading::HostedTokio` runs workers on the caller's async runtime. The runtime crate now has a small `rt` shim so project-owned spawn/sync/time calls use Tokio in normal builds and `madsim-tokio` under `cfg(madsim)`. The production default, `ThreadPerCore`, still starts OS threads and builds per-core Tokio runtimes directly, and is intentionally rejected under `cfg(madsim)`.
 - **Runtime can now run on a Raft-backed group engine under madsim.** The `runtime-raft-engine` seed family runs `ShardRuntime::HostedTokio` with a scoped `RaftGroupEngineFactory`, creates a stream, appends through OpenRaft, reads the committed payload back through the runtime API, and records Raft write/apply metrics. This is single-node Raft convergence, not yet a multi-node runtime/Raft network fault scenario.
@@ -73,7 +73,7 @@ The original plan was to add `fail-rs` named fail points at storage and replicat
 
 | Original failpoint target | Now covered by simulator fault |
 |---|---|
-| file-log / WAL write/sync error | `LogWriteError`, `LogSyncError` (planned) — file log is `cfg(not(madsim))`-only, so simulator coverage uses the memory log store with `ColdWriteError`-style errors on the equivalent boundary |
+| file-log / WAL write/sync error | `SimDisk::inject_fault` fails the next write or `fsync` of a journal path, and `SimDisk::power_loss` drops unsynced pages, on the production per-core journal |
 | post-commit pre-apply response | runtime-raft-network workload with `corrupt_runtime_raft_snapshot_append_counts`-style real perturbation and `runtime_raft_network_*` invariants |
 | snapshot build/install | `runtime-raft-network-snapshot-install-failures` (real append-count corruption) + `runtime-raft-network-snapshot-corruption` pipeline-smoke |
 | cold upload/publish | `fail_next_cold_write`, `delay_next_cold_write`, `runtime-raft-network-cold-live-write-failures` |
@@ -265,7 +265,7 @@ Each fault is schedulable by virtual tick/time and is derived from the seed.
 
 **Node/runtime.** `Pause(node, duration)`, `Crash(node)`, `Restart(node)`, `DropInFlightClient(node)`, `SlowActor(node_or_group, duration)`.
 
-**Storage.** `LogWriteError(node)`, `LogSyncError(node)`, `SnapshotBuildError(node)`, `SnapshotInstallError(node)`, `ColdWriteError(rate)`, `ColdReadError(rate)`, `ColdReadTruncate(rate)`, `ColdDeleteError(rate)`, `ColdSlow(duration)`.
+**Storage.** `LogWriteError(node)`, `LogSyncError(node)`, `PowerLoss(node)`, `SnapshotBuildError(node)`, `SnapshotInstallError(node)`, `ColdWriteError(rate)`, `ColdReadError(rate)`, `ColdReadTruncate(rate)`, `ColdDeleteError(rate)`, `ColdSlow(duration)`.
 
 **Cluster.** `MembershipAdd(node)`, `MembershipRemove(node)`, `LeaderHint(node)` or leader-transfer if/when Ursula exposes that path.
 

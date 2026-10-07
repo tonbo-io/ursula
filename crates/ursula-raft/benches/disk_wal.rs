@@ -40,7 +40,6 @@ const APPENDS_PER_ITER: usize = 16;
 
 #[derive(Clone, Copy, Debug)]
 enum Backend {
-    DirectPerGroup,
     SharedPerCore,
     UpstreamRaftLog,
 }
@@ -48,7 +47,6 @@ enum Backend {
 impl Backend {
     fn name(self) -> &'static str {
         match self {
-            Self::DirectPerGroup => "direct-per-group",
             Self::SharedPerCore => "shared-per-core",
             Self::UpstreamRaftLog => "upstream-raft-log",
         }
@@ -87,11 +85,7 @@ fn disk_wal_benches(c: &mut Criterion) {
     ));
     for &group_count in group_counts {
         for &payload_size in payload_sizes {
-            for backend in [
-                Backend::DirectPerGroup,
-                Backend::SharedPerCore,
-                Backend::UpstreamRaftLog,
-            ] {
+            for backend in [Backend::SharedPerCore, Backend::UpstreamRaftLog] {
                 let id = BenchmarkId::new(
                     backend.name(),
                     format!("groups={group_count}/payload={payload_size}"),
@@ -114,11 +108,7 @@ fn disk_wal_benches(c: &mut Criterion) {
         u64::try_from(APPENDS_PER_ITER).expect("append count fits u64"),
     ));
     for &group_count in group_counts {
-        for backend in [
-            Backend::DirectPerGroup,
-            Backend::SharedPerCore,
-            Backend::UpstreamRaftLog,
-        ] {
+        for backend in [Backend::SharedPerCore, Backend::UpstreamRaftLog] {
             append_committed.bench_with_input(
                 BenchmarkId::new(backend.name(), format!("groups={group_count}")),
                 &(backend, group_count),
@@ -137,14 +127,13 @@ fn disk_wal_benches(c: &mut Criterion) {
     let mut recovery = c.benchmark_group("disk_wal_recovery");
     recovery.sample_size(if full { 20 } else { 10 });
     for historical_entries in if full { [1_024, 16_384] } else { [256, 1_024] } {
-        let (dir, path) = runtime.block_on(prepare_direct_store(historical_entries, 256));
+        let dir = runtime.block_on(prepare_recovery_journal(historical_entries, 256));
         recovery.bench_with_input(
             BenchmarkId::from_parameter(historical_entries),
             &historical_entries,
             |b, _| {
                 b.iter(|| {
-                    let reopened =
-                        RaftGroupFileLogStore::shared(&path).expect("reopen benchmark WAL");
+                    let reopened = open_shared_store(dir.path(), 0);
                     black_box(reopened);
                 });
             },
@@ -176,13 +165,6 @@ fn setup_stores(backend: Backend, group_count: usize) -> Stores {
     let dir = tempfile::tempdir().expect("create WAL benchmark directory");
     let group_count_u32 = u32::try_from(group_count).expect("benchmark group count fits u32");
     let stores = match backend {
-        Backend::DirectPerGroup => (0..group_count_u32)
-            .map(|group_id| {
-                RaftGroupFileLogStore::shared(dir.path().join(format!("group-{group_id}.wal")))
-                    .expect("open direct benchmark WAL")
-                    .into()
-            })
-            .collect(),
         Backend::SharedPerCore => {
             let metrics = RuntimeMetrics::new(1, group_count);
             let factory = DurableRaftLogStoreFactory::new(dir.path());
@@ -274,29 +256,33 @@ impl From<BenchmarkRaftLogStore<UrsulaRaftTypeConfig>> for BenchStore {
     }
 }
 
-async fn prepare_direct_store(
-    entries: usize,
-    payload_size: usize,
-) -> (TempDir, std::path::PathBuf) {
+/// Opens one group's store on the shared per-core journal under `root`.
+fn open_shared_store(root: &std::path::Path, group_id: u32) -> Arc<RaftGroupFileLogStore> {
+    DurableRaftLogStoreFactory::new(root)
+        .open(
+            placement(group_id),
+            RuntimeMetrics::new(1, 1).group_engine_metrics(),
+        )
+        .expect("open shared-core benchmark WAL")
+}
+
+async fn prepare_recovery_journal(entries: usize, payload_size: usize) -> TempDir {
     let dir = tempfile::tempdir().expect("create recovery benchmark directory");
-    let path = dir.path().join("group.wal");
-    {
-        let mut store = RaftGroupFileLogStore::shared(&path).expect("open recovery benchmark WAL");
-        let batch = (1..=entries)
-            .map(|index| {
-                entry(
-                    u64::try_from(index).expect("entry index fits u64"),
-                    0,
-                    payload_size,
-                )
-            })
-            .collect::<Vec<_>>();
-        store
-            .append(batch, IOFlushed::noop())
-            .await
-            .expect("prepare recovery benchmark WAL");
-    }
-    (dir, path)
+    let mut store = open_shared_store(dir.path(), 0);
+    let batch = (1..=entries)
+        .map(|index| {
+            entry(
+                u64::try_from(index).expect("entry index fits u64"),
+                0,
+                payload_size,
+            )
+        })
+        .collect::<Vec<_>>();
+    store
+        .append(batch, IOFlushed::noop())
+        .await
+        .expect("prepare recovery benchmark WAL");
+    dir
 }
 
 async fn prepare_read_store(
@@ -304,8 +290,7 @@ async fn prepare_read_store(
     payload_size: usize,
 ) -> (TempDir, Arc<RaftGroupFileLogStore>) {
     let dir = tempfile::tempdir().expect("create read benchmark directory");
-    let mut store = RaftGroupFileLogStore::shared(dir.path().join("group.wal"))
-        .expect("open read benchmark WAL");
+    let mut store = open_shared_store(dir.path(), 0);
     let batch = (1..=entries)
         .map(|index| {
             entry(

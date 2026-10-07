@@ -1,9 +1,27 @@
+//! OpenRaft log stores.
+//!
+//! - `file`: the durable per-group store over the shared per-core journal.
+//! - `journal`: the framed, checksummed journal file format.
+//! - `disk`: the I/O seam every journal file operation goes through.
+//! - `sim_disk`: the simulated disk behind the seam under `cfg(madsim)`.
+//! - `memory`: the volatile store.
+
+mod disk;
 mod file;
+mod journal;
 mod memory;
+#[cfg(madsim)]
+mod sim_disk;
 
 use std::collections::BTreeMap;
 use std::io;
 
+#[cfg(madsim)]
+pub use disk::JournalDisk;
+#[cfg(madsim)]
+pub use disk::JournalFile;
+#[cfg(madsim)]
+pub use disk::LockAttempt;
 pub(crate) use file::CoreFileLogWriter;
 pub use file::RaftGroupFileLogStore;
 pub(crate) use file::elapsed_ns;
@@ -19,6 +37,20 @@ use openraft::alias::VoteOf;
 use openraft::entry::RaftEntry;
 use serde::Deserialize;
 use serde::Serialize;
+#[cfg(madsim)]
+pub use sim_disk::SIM_DISK_PAGE_SIZE;
+#[cfg(madsim)]
+pub use sim_disk::SimDisk;
+#[cfg(madsim)]
+pub use sim_disk::SimDiskError;
+#[cfg(madsim)]
+pub use sim_disk::SimDiskFault;
+#[cfg(madsim)]
+pub use sim_disk::SimFile;
+#[cfg(madsim)]
+pub use sim_disk::SimJournalLock;
+#[cfg(madsim)]
+pub use sim_disk::SimPowerLoss;
 
 use crate::types::UrsulaRaftTypeConfig;
 

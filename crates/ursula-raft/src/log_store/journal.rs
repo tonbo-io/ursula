@@ -2,21 +2,20 @@
 //!
 //! Persistence is kept orthogonal to serialization. The journal moves opaque
 //! versioned, checksummed frames to and from a file and handles the durability
-//! concerns — append, `fsync`, bounded recovery, and recovery of a torn trailing
-//! frame after a crash.
-//! How a record turns into a payload is entirely the [`FrameCodec`]'s business, so
-//! the Raft log store can frame protobuf while the WAL engine frames JSON over the
-//! exact same code.
+//! concerns: append, `fsync`, bounded recovery, and recovery of a torn trailing
+//! frame after a crash. How a record turns into a payload is the
+//! [`FrameCodec`]'s business. Every file operation goes through the
+//! [`Disk`] seam.
 
-use std::fs;
-use std::fs::File;
-use std::fs::OpenOptions;
 use std::io;
-use std::io::Read;
-use std::io::Seek;
-use std::io::Write;
+#[cfg(test)]
 use std::marker::PhantomData;
 use std::path::Path;
+
+use super::disk::Disk;
+use super::disk::DiskFile;
+use super::disk::JournalDisk;
+use super::disk::JournalFile;
 
 const JOURNAL_MAGIC: [u8; 8] = *b"URSJWAL\0";
 /// The journal header version is the format epoch (`ursula_stream::FORMAT_EPOCH`):
@@ -45,10 +44,9 @@ fn journal_header() -> [u8; JOURNAL_HEADER_LEN] {
 
 /// Serialization seam: how one record becomes a frame payload and back.
 ///
-/// `encode` is infallible because the codecs we use (protobuf, JSON over plain
-/// owned types) cannot fail in practice; a codec with fallible encoding should
-/// surface that as an `io::Error` from a panic-documented invariant instead.
-pub trait FrameCodec {
+/// `encode` is infallible because the codecs we use (MessagePack, JSON over
+/// plain owned types) cannot fail in practice.
+pub(crate) trait FrameCodec {
     /// The record type carried in each frame.
     type Record;
 
@@ -60,8 +58,10 @@ pub trait FrameCodec {
 }
 
 /// JSON frame codec for any owned, serde-serializable record.
-pub struct JsonCodec<T>(PhantomData<T>);
+#[cfg(test)]
+pub(crate) struct JsonCodec<T>(PhantomData<T>);
 
+#[cfg(test)]
 impl<T> FrameCodec for JsonCodec<T>
 where T: serde::Serialize + serde::de::DeserializeOwned
 {
@@ -83,15 +83,15 @@ where T: serde::Serialize + serde::de::DeserializeOwned
 /// once on the first [`JournalWriter::sync`] when the file may have been freshly
 /// created, so the file's existence survives a crash.
 #[derive(Debug)]
-pub struct JournalWriter {
-    file: Option<File>,
+pub(crate) struct JournalWriter {
+    file: Option<DiskFile>,
     parent_unsynced: bool,
 }
 
 impl JournalWriter {
     /// Create a writer. Set `needs_parent_sync` when the file may not exist yet, so
     /// the parent directory is `fsync`ed once the file is created.
-    pub fn new(needs_parent_sync: bool) -> Self {
+    pub(crate) fn new(needs_parent_sync: bool) -> Self {
         Self {
             file: None,
             parent_unsynced: needs_parent_sync,
@@ -99,14 +99,17 @@ impl JournalWriter {
     }
 
     /// Create and initialize the journal file even when there are no records.
-    pub fn ensure_created(&mut self, path: &Path) -> io::Result<()> {
-        let _ = self.file_mut(path)?;
-        Ok(())
+    pub(crate) fn ensure_created(&mut self, path: &Path) -> io::Result<()> {
+        self.file_mut(path).map(|_| ())
     }
 
     /// Append one record as a framed payload. Does not durably flush; pair with
     /// [`JournalWriter::sync`] once per batch.
-    pub fn append<C: FrameCodec>(&mut self, path: &Path, record: &C::Record) -> io::Result<()> {
+    pub(crate) fn append<C: FrameCodec>(
+        &mut self,
+        path: &Path,
+        record: &C::Record,
+    ) -> io::Result<()> {
         let payload = C::encode(record);
         if payload.len() > MAX_FRAME_PAYLOAD_BYTES {
             return Err(io::Error::new(
@@ -121,53 +124,54 @@ impl JournalWriter {
         let len = u32::try_from(payload.len()).map_err(|_overflow| {
             io::Error::new(io::ErrorKind::InvalidData, "journal record too large")
         })?;
-        let checksum = crc32fast::hash(&payload);
+        let [l0, l1, l2, l3] = len.to_le_bytes();
+        let [c0, c1, c2, c3] = crc32fast::hash(&payload).to_le_bytes();
         let file = self.file_mut(path)?;
-        file.write_all(&len.to_le_bytes())?;
-        file.write_all(&checksum.to_le_bytes())?;
-        file.write_all(&payload)
+        file.append(&[l0, l1, l2, l3, c0, c1, c2, c3])?;
+        file.append(&payload)
     }
 
     /// `fsync` the file data, plus the parent directory once if it was freshly created.
-    pub fn sync(&mut self, path: &Path) -> io::Result<()> {
-        let file = self.file.as_mut().expect("file opened before sync");
+    pub(crate) fn sync(&mut self, path: &Path) -> io::Result<()> {
+        let file = self.file_mut(path)?;
         file.sync_data()?;
         if self.parent_unsynced
             && let Some(parent) = path.parent()
-            && let Ok(dir) = File::open(parent)
         {
-            dir.sync_all()?;
+            Disk::sync_dir(parent)?;
             self.parent_unsynced = false;
         }
         Ok(())
     }
 
-    fn file_mut(&mut self, path: &Path) -> io::Result<&mut File> {
-        if self.file.is_none() {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut file = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .append(true)
-                .open(path)?;
-            let file_len = file.metadata()?.len();
-            if file_len == 0 {
-                file.write_all(&journal_header())?;
-            } else {
-                validate_file_header(&mut file, path, file_len)?;
-            }
-            self.file = Some(file);
-        }
-        Ok(self.file.as_mut().expect("file opened above"))
+    fn file_mut(&mut self, path: &Path) -> io::Result<&mut DiskFile> {
+        let file = match self.file.take() {
+            Some(file) => file,
+            None => open_journal_for_append(path)?,
+        };
+        Ok(self.file.insert(file))
     }
+}
+
+fn open_journal_for_append(path: &Path) -> io::Result<DiskFile> {
+    if let Some(parent) = path.parent() {
+        Disk::create_dir_all(parent)?;
+    }
+    let mut file = Disk::open_append(path)?;
+    let file_len = file.file_len()?;
+    if file_len == 0 {
+        file.append(&journal_header())?;
+    } else {
+        validate_file_header(&mut file, path, file_len)?;
+    }
+    Ok(file)
 }
 
 /// Read every record from `path`, decoding with `C`. A torn trailing frame left by a
 /// crash mid-write is truncated away and ignored, leaving the file at its last clean
 /// record boundary.
-pub fn replay<C: FrameCodec>(path: &Path) -> io::Result<Vec<C::Record>> {
+#[cfg(test)]
+pub(crate) fn replay<C: FrameCodec>(path: &Path) -> io::Result<Vec<C::Record>> {
     let mut records = Vec::new();
     replay_each::<C>(path, |record| {
         records.push(record);
@@ -177,18 +181,18 @@ pub fn replay<C: FrameCodec>(path: &Path) -> io::Result<Vec<C::Record>> {
 }
 
 /// Stream every valid record from `path` through `visit` without retaining the
-/// entire journal in memory. A torn trailing frame is truncated with the same
-/// recovery semantics as [`replay`].
-pub fn replay_each<C: FrameCodec>(
+/// entire journal in memory. A torn trailing frame is truncated away, leaving
+/// the file at its last clean record boundary.
+pub(crate) fn replay_each<C: FrameCodec>(
     path: &Path,
     mut visit: impl FnMut(C::Record) -> io::Result<()>,
 ) -> io::Result<()> {
-    if !path.exists() {
+    if !Disk::exists(path) {
         return Ok(());
     }
 
-    let mut file = File::open(path)?;
-    let file_len = file.metadata()?.len();
+    let mut file = Disk::open_read(path)?;
+    let file_len = file.file_len()?;
     if file_len == 0 {
         return Ok(());
     }
@@ -271,19 +275,15 @@ pub fn replay_each<C: FrameCodec>(
     }
 
     if valid_len < file_len {
-        truncate_to(
-            path,
-            usize::try_from(valid_len).map_err(|_overflow| {
-                io::Error::new(io::ErrorKind::InvalidData, "journal offset exceeds usize")
-            })?,
-        )?;
+        Disk::truncate(path, valid_len)?;
     }
     Ok(())
 }
 
 /// Decode framed records from an in-memory buffer, returning the records and the byte
 /// length of the valid (fully-written) prefix. A torn trailing frame ends the scan.
-pub fn decode_frames<C: FrameCodec>(bytes: &[u8]) -> io::Result<(Vec<C::Record>, usize)> {
+#[cfg(test)]
+pub(crate) fn decode_frames<C: FrameCodec>(bytes: &[u8]) -> io::Result<(Vec<C::Record>, usize)> {
     let mut records = Vec::new();
     if bytes.is_empty() {
         return Ok((records, 0));
@@ -341,14 +341,13 @@ pub fn decode_frames<C: FrameCodec>(bytes: &[u8]) -> io::Result<(Vec<C::Record>,
     Ok((records, bytes.len()))
 }
 
-fn validate_file_header(file: &mut File, path: &Path, file_len: u64) -> io::Result<()> {
+fn validate_file_header(file: &mut DiskFile, path: &Path, file_len: u64) -> io::Result<()> {
     if file_len < JOURNAL_HEADER_LEN_U64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("journal '{}' has a torn file header", path.display()),
         ));
     }
-    file.rewind()?;
     let mut header = [0_u8; JOURNAL_HEADER_LEN];
     file.read_exact(&mut header)?;
     validate_header_bytes(&header, &format!("journal '{}'", path.display()))
@@ -396,18 +395,15 @@ fn validate_header_bytes(header: &[u8; JOURNAL_HEADER_LEN], description: &str) -
     Ok(())
 }
 
-/// Truncate `path` to `valid_len` bytes, dropping a torn trailing frame, then `fsync`.
-pub fn truncate_to(path: &Path, valid_len: usize) -> io::Result<()> {
-    let file = OpenOptions::new().write(true).open(path)?;
-    file.set_len(u64::try_from(valid_len).map_err(|_overflow| {
-        io::Error::new(io::ErrorKind::InvalidData, "journal offset exceeds u64")
-    })?)?;
-    file.sync_data()
-}
-
-#[cfg(test)]
+/// These tests corrupt real files, so they run against the operating-system disk.
+#[cfg(all(test, not(madsim)))]
 mod tests {
+    use std::fs;
+    use std::fs::File;
+    use std::fs::OpenOptions;
+    use std::io::Seek;
     use std::io::SeekFrom;
+    use std::io::Write;
 
     use super::*;
 

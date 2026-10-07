@@ -30,6 +30,7 @@ use super::placement;
 use super::read_local_payload_eventually;
 use super::seeded_follower_id;
 use super::sim_network_policy;
+use super::standalone_wal_metrics;
 use super::verify_all_nodes_can_read;
 use super::wait_all_nodes_applied;
 
@@ -444,7 +445,7 @@ pub(super) async fn run_isolated_leader_pending_write_snapshot_purge_inner(
 ) -> ThreeNodeRaftSimOutcome {
     let mut trace = SimTrace::default();
     let policy = sim_network_policy();
-    let (registry, mut engines, log_stores, old_leader_id) =
+    let (registry, mut engines, wals, old_leader_id) =
         build_three_node_snapshot_purge_cluster(policy.clone()).await;
     trace.push(SimEvent::ClusterBuilt { seed: config.seed });
     trace.push(SimEvent::LeaderElected {
@@ -511,7 +512,9 @@ pub(super) async fn run_isolated_leader_pending_write_snapshot_purge_inner(
         }));
     }
 
-    let mut old_leader_log_store = log_stores[old_leader_index].clone();
+    let mut old_leader_log_store = wals[old_leader_index]
+        .store(placement().raft_group_id)
+        .expect("old leader holds its raft log store");
     let mut pending_log_index = None;
     for _ in 0..100 {
         let log_state = old_leader_log_store
@@ -724,7 +727,7 @@ pub(super) async fn run_restart_follower_inner(
 ) -> ThreeNodeRaftSimOutcome {
     let mut trace = SimTrace::default();
     let policy = sim_network_policy();
-    let (registry, mut engines, log_stores, raft_config, leader_id) =
+    let (registry, mut engines, wals, raft_config, leader_id) =
         build_restartable_three_node_cluster(policy.clone()).await;
     trace.push(SimEvent::ClusterBuilt { seed: config.seed });
     trace.push(SimEvent::LeaderElected { leader_id });
@@ -795,12 +798,14 @@ pub(super) async fn run_restart_follower_inner(
         InProcessRaftNetworkFactory::new(registry.clone())
             .with_source(restarted_id)
             .with_policy(policy),
-        log_stores[restarted_index].clone(),
+        wals[restarted_index]
+            .open(placement(), standalone_wal_metrics(placement()))
+            .await,
         None,
         None,
     )
     .await
-    .expect("restart follower with the same log store");
+    .expect("restart follower from its journal");
     registry.register(restarted_id, restarted.raft_handle());
     engines[restarted_index] = restarted;
     trace.push(SimEvent::NodeRestarted {
@@ -870,7 +875,7 @@ pub(super) async fn run_leader_failover_inner(
 ) -> ThreeNodeRaftSimOutcome {
     let mut trace = SimTrace::default();
     let policy = sim_network_policy();
-    let (registry, mut engines, log_stores, raft_config, old_leader_id) =
+    let (registry, mut engines, wals, raft_config, old_leader_id) =
         build_restartable_three_node_cluster(policy.clone()).await;
     trace.push(SimEvent::ClusterBuilt { seed: config.seed });
     trace.push(SimEvent::LeaderElected {
@@ -998,12 +1003,14 @@ pub(super) async fn run_leader_failover_inner(
         InProcessRaftNetworkFactory::new(registry.clone())
             .with_source(old_leader_id)
             .with_policy(policy),
-        log_stores[old_leader_index].clone(),
+        wals[old_leader_index]
+            .open(placement(), standalone_wal_metrics(placement()))
+            .await,
         None,
         None,
     )
     .await
-    .expect("restart old leader with the same log store");
+    .expect("restart old leader from its journal");
     registry.register(old_leader_id, restarted.raft_handle());
     engines[old_leader_index] = restarted;
     trace.push(SimEvent::FaultApplied {

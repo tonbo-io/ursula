@@ -40,7 +40,6 @@ mod engine;
 mod error;
 pub mod format_marker;
 mod group_actor;
-pub mod journal;
 mod metrics;
 mod ops;
 mod read_index;

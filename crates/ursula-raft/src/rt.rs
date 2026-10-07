@@ -2,7 +2,7 @@
 //! under `cfg(madsim)` so virtual time/scheduling reaches every call site
 //! that goes through it. Mirrors `ursula-runtime::rt`.
 
-#[cfg(all(test, madsim))]
+#[cfg(madsim)]
 pub use sim_tokio::spawn;
 #[cfg(madsim)]
 pub use sim_tokio::sync;

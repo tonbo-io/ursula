@@ -12,6 +12,7 @@ description = "OpenRaft integration for Ursula's per-group multi-Raft replicatio
 [dependencies]
 bitflags = { workspace = true }
 bytes = { workspace = true }
+crc32fast = { workspace = true }
 futures-util = { workspace = true }
 fs4 = { workspace = true }
 openraft-rt = { workspace = true }
