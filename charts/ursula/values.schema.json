@@ -1672,6 +1672,16 @@
           ],
           "description": "When Raft WAL appends reach stable storage (default never): never acknowledges from the page cache, so a host crash can cost this replica its unsynced tail and it rejoins through the recovery gate; always acknowledges after fsync."
         },
+        "walSegmentBytes": {
+          "type": "integer",
+          "minimum": 4096,
+          "description": "Size at which each core's Raft WAL journal starts a new segment; purge deletes whole segments. Renders raft.wal.segment_size."
+        },
+        "walCacheBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Recent Raft entries kept in memory across the node, split evenly between its groups; older entries are read from disk. Renders raft.wal.cache_size."
+        },
         "minAvailableBytes": {
           "type": "integer",
           "minimum": 0,

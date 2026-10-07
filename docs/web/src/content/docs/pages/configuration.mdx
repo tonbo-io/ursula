@@ -58,6 +58,8 @@ Without `server.cluster_listen`, `server.listen` serves both client/API and Raft
 | `raft.group_count` | `core_count × 16` | Total Raft groups. Higher values improve stream-to-group hash spread |
 | `raft.wal.path` | none | Directory of the Raft WAL. Required when `raft.peers` is set. Raft logs live under `PATH/raft-log`, and removing the directory wipes state cleanly. Without it, a single node runs its WAL in a temporary directory that is removed on clean shutdown |
 | `raft.wal.fsync` | `never` | When journal appends reach stable storage. `never` acknowledges once the write is in the page cache. `always` acknowledges a batch after `fsync`. Votes, each group's log state and the node's run state are always written with `fsync` |
+| `raft.wal.segment_size` | `64MiB` | Size at which each core's journal starts a new segment. Purge deletes whole segments, so this is also how much disk space comes back at a time. At least `4KiB` |
+| `raft.wal.cache_size` | `256MiB` | Recent Raft entries kept in memory across the node, split evenly between its groups. Older entries, such as a lagging follower's catch-up, are read from disk |
 | `raft.wal.min_available_size` | `512MiB` | Reject writes and mark `/__ursula/ready` unavailable below this much free WAL-filesystem space. `0` disables the guard |
 | `raft.wal.resume_available_size` | `1GiB` | Free space required before disk-pressure admission clears. Must exceed the minimum |
 | `raft.peers` | empty | Static gRPC peer list, with one `[[raft.peers]]` entry per voter, including this node |

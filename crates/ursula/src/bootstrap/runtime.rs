@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use ursula_config::WalFsync;
 use ursula_config::config::ColdBackend;
 use ursula_raft::DurableRaftLogStoreFactory;
+use ursula_raft::JournalTuning;
 use ursula_raft::RaftEngineConfig;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::StaticGrpcRaftMembershipConfig;
@@ -61,11 +61,11 @@ enum GroupStorage {
 impl GroupStorage {
     /// Starts the Raft WAL when `persistence` runs Raft: reads the previous
     /// run's state and records this run before any group opens a journal.
-    fn start(persistence: Persistence, fsync: WalFsync) -> Result<Self, SpawnRuntimeError> {
+    fn start(persistence: Persistence, tuning: JournalTuning) -> Result<Self, SpawnRuntimeError> {
         Ok(match persistence {
             Persistence::InMemory => Self::InMemory,
             Persistence::Raft { log_dir } => {
-                Self::Raft(DurableRaftLogStoreFactory::start(log_dir, fsync)?)
+                Self::Raft(DurableRaftLogStoreFactory::start_with(log_dir, tuning)?)
             }
         })
     }
@@ -158,7 +158,12 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
         None
     };
 
-    let storage = GroupStorage::start(persistence, config.raft.wal.fsync)?;
+    let wal = &config.raft.wal;
+    let storage = GroupStorage::start(persistence, JournalTuning {
+        fsync: wal.fsync,
+        segment_bytes: wal.segment_size.as_bytes(),
+        group_cache_bytes: wal.group_cache_bytes(topology.raft_group_count()),
+    })?;
     let spawned = spawn_runtime_core(
         runtime_config,
         cold_store,
