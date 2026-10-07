@@ -15,7 +15,6 @@ mkdir -p "$artifact_root"
   echo "kernel=$(uname -a)"
   echo "filesystem=$(df -k . | tail -n 1)"
   echo "cycles=$cycles"
-  echo "wal_backend=disk"
   echo "topology=three-voter replication plus two-voter late-learner install"
 } >"$artifact_root/environment.txt"
 

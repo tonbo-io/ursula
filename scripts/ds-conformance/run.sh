@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the official Durable Streams conformance suite against one local Ursula
-# node (in-memory Raft log) through proxy.mjs.
+# node (single-voter Raft, its WAL in the work directory) through proxy.mjs.
 #
 # Usage: scripts/ds-conformance/run.sh <ursula-binary> [base-port]
 # Listens on <base-port> (Ursula) and <base-port>+1 (proxy); default 15500.
@@ -35,6 +35,9 @@ fi
 cat >"$work/ursula.toml" <<TOML
 [server]
 listen = "127.0.0.1:$port"
+
+[raft.wal]
+path = "$work/wal"
 TOML
 "$binary" server --config "$work/ursula.toml" --node-id 1 >"$work/ursula.log" 2>&1 &
 pids+=($!)

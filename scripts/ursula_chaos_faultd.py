@@ -301,9 +301,8 @@ class FaultState:
             raise ValueError("process fault requires at least one unit")
         if action == "kill":
             # SIGKILL the unit's processes; systemd Restart= brings ursula back,
-            # so this models a sudden crash, not a graceful stop. On a
-            # --raft-memory node it is a full amnesiac restart that must
-            # re-catch-up from the S3 snapshot plus peer logs.
+            # so this models a sudden crash, not a graceful stop. The node
+            # replays its Raft WAL and catches up from its peers.
             for unit in units:
                 self._must_run([self.systemctl, "kill", "-s", "SIGKILL", unit])
             return {"ok": True, "kind": "process", "action": "kill", "units": units}

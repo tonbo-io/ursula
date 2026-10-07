@@ -52,7 +52,6 @@ CONTENT_TYPE = "application/octet-stream"
 READ_AVAILABILITY_STATUSES = {0, 204, 404, 410, 416, 502, 503}
 # Largest forced cold flush; matches the server's flush-cold `max_bytes` default.
 COLD_FLUSH_MAX_BYTES = 8 * 1024 * 1024
-REVERT_DETECTION_SCENARIOS = {"no_allow_stop"}
 # Scenarios applied as faultd impairments (tc qdisc / iptables) rather than by
 # stopping the instance. Their recovery MUST clear the impairment via faultd
 # (/clear): using "start_instances" is a no-op on a running node that leaves the
@@ -79,21 +78,20 @@ IMPAIRMENT_SCENARIOS = {
     "netem_reorder",
     "netem_duplicate",
 }
-# process_kill restarts a --raft-memory node, which must rebuild every raft group
-# from the S3 snapshot + peer logs (millions of entries) before it rejoins quorum
-# — minutes, not the seconds an impairment /clear takes. Reusing the normal
-# recovery SLO flags every node-crash recovery as slo_missed and trips
-# repair_failed even though the node recovers fine (observed on #526), so
-# catch-up scenarios get a much longer SLO.
+# process_kill crashes a node, which must replay its Raft WAL and catch up from
+# its peers (possibly from an S3 snapshot) before it rejoins quorum: minutes,
+# not the seconds an impairment /clear takes. Reusing the normal recovery SLO
+# flags every node-crash recovery as slo_missed and trips repair_failed even
+# though the node recovers fine (observed on #526), so catch-up scenarios get
+# a much longer SLO.
 CATCH_UP_SCENARIOS = {"process_kill"}
 CATCH_UP_RECOVERY_SLO_SECS = 900
-# The public storage-backend=memory chaos run should keep a surviving quorum. Dropping
-# two nodes in a three-node cluster tests data-loss behavior rather than
-# recovery, especially when the leader is among the stopped nodes.
+# The public chaos run should keep a surviving quorum. Dropping two nodes in a
+# three-node cluster tests data-loss behavior rather than recovery, especially
+# when the leader is among the stopped nodes.
 UNSUPPORTED_QUORUM_LOSS_SCENARIOS = {"two_node_stop", "quorum_loss"}
 FAULT_PROFILES = {
     "network": "netem_delay,netem_loss,asymmetric_partition",
-    "revert-detection": "no_allow_stop",
     # Orthogonal: each fault hits one plane only — cluster scope uses tc
     # filter on the cluster subnets so S3 traffic on ens6 is unaffected;
     # s3_unavailable drops outbound S3 endpoints only. Lets us attribute
@@ -455,7 +453,7 @@ class ChaosAgent:
             raise SystemExit(
                 "unsupported --fault-scenarios for the default chaos run: "
                 + ",".join(configured_unsupported)
-                + "; a 3-node storage-backend=memory run should not intentionally drop quorum"
+                + "; a 3-node chaos run should not intentionally drop quorum"
             )
         self.recovery_slo_secs = args.recovery_slo_secs
         self.first_fault_secs = args.first_fault_secs
@@ -668,7 +666,6 @@ class ChaosAgent:
                 "scenario": latest.get("scenario", "clean_stop"),
                 "targets": [target for target in self.nodes if target.name in target_names],
                 "recover_at": recover_at or utc_now(),
-                "allow_revert": latest.get("allow_next_revert", True),
                 "cleanup": latest.get("cleanup", "start_instances"),
             }
 
@@ -1777,10 +1774,9 @@ class ChaosAgent:
             self.event("warn", message)
 
     def record_producer_probe_skipped(self, message: str) -> None:
-        # Server forgot the producer's dedup/fence state (e.g. leader change under
-        # storage-backend=memory where producer state lives only on the current leader).
-        # The protocol allows this; the probe just cannot exercise the invariant
-        # this round, so it neither succeeds nor fails.
+        # Server forgot the producer's dedup/fence state. The protocol allows
+        # this; the probe just cannot exercise the invariant this round, so it
+        # neither succeeds nor fails.
         self.producer_probe_skipped += 1
         self.event("info", message)
 
@@ -2136,89 +2132,6 @@ class ChaosAgent:
             f"{lag_status.get('max_allowed_lag')} entries{suffix}"
         )
 
-    def allow_next_revert_for_node(self, target: Node) -> None:
-        samples = [self.sample_node(node) for node in self.nodes]
-        nodes_by_id = {
-            sample.get("node_id"): node
-            for sample, node in zip(samples, self.nodes)
-            if isinstance(sample.get("node_id"), int)
-        }
-        target_sample = next((sample for sample in samples if sample.get("name") == target.name), {})
-        target_id = target_sample.get("node_id")
-        if not isinstance(target_id, int):
-            target_id = node_id_from_name(target.name)
-        if not isinstance(target_id, int):
-            self.event("warn", f"skip allow-next-revert for {target.name}: unknown node id")
-            return
-
-        group_leaders: dict[int, int | None] = {}
-        for sample in samples:
-            for state in sample.get("raft_group_states", []):
-                group_id = state.get("raft_group_id")
-                if not isinstance(group_id, int):
-                    continue
-                leader_id = state.get("current_leader")
-                if isinstance(leader_id, int):
-                    group_leaders[group_id] = leader_id
-                else:
-                    group_leaders.setdefault(group_id, None)
-        if not group_leaders:
-            self.event("warn", f"skip allow-next-revert for {target.name}: no Raft groups observed")
-            return
-
-        failed_groups: list[int] = []
-        for group_id, leader_id in sorted(group_leaders.items()):
-            last_error = "no reachable leader observed"
-            preferred_nodes = []
-            leader = nodes_by_id.get(leader_id)
-            if leader is not None:
-                preferred_nodes.append(leader)
-            preferred_nodes.extend(node for node in self.nodes if node not in preferred_nodes)
-            allowed = False
-            for node in preferred_nodes:
-                try:
-                    status, body, _ = self.request(
-                        "POST",
-                        f"{node.admin_url}/__ursula/raft/{group_id}/nodes/{target_id}/allow-next-revert",
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    last_error = str(exc)
-                    continue
-                if status == 200:
-                    allowed = True
-                    break
-                last_error = f"status={status} body={body[:80]!r}"
-            if not allowed:
-                failed_groups.append(group_id)
-                self.event(
-                    "warn",
-                    f"allow-next-revert failed for {target.name} group {group_id} via leader {leader_id}: {last_error}",
-                )
-
-        if failed_groups:
-            self.event(
-                "warn",
-                f"allowed next revert for {target.name} on {len(group_leaders) - len(failed_groups)}/{len(group_leaders)} groups",
-            )
-        else:
-            self.event("info", f"allowed next revert for {target.name} on {len(group_leaders)} Raft groups")
-
-    def wait_for_node_metrics(self, target: Node, *, timeout_secs: int = 90) -> bool:
-        deadline = time.monotonic() + timeout_secs
-        last_error = "not attempted"
-        while time.monotonic() < deadline:
-            try:
-                status, _, _ = self.request("GET", f"{target.base_url}/__ursula/metrics")
-            except Exception as exc:  # noqa: BLE001
-                last_error = str(exc)
-            else:
-                if status == 200:
-                    return True
-                last_error = f"status={status}"
-            time.sleep(5)
-        self.event("warn", f"{target.name} metrics did not become reachable before allow-next-revert: {last_error}")
-        return False
-
     def instance_state(self, node: Node) -> str:
         if self.fault_backend == "kubernetes":
             try:
@@ -2355,9 +2268,6 @@ class ChaosAgent:
             self.event("warn", f"recovering {scenario} fault on {', '.join(node.name for node in targets)}")
             cleanup = self.active_fault.get("cleanup")
             if cleanup == "start_instances":
-                if self.active_fault.get("allow_revert", False):
-                    for node in targets:
-                        self.allow_next_revert_for_node(node)
                 self.start_nodes(targets)
             elif cleanup == "automatic_recreate":
                 # Kubernetes StatefulSet reconciliation already owns restart.
@@ -2423,9 +2333,6 @@ class ChaosAgent:
             return
         scenario = self.choose_fault_scenario()
         targets = self.choose_fault_targets(scenario)
-        allow_revert = scenario in {"clean_stop", "mixed_allow_stop", "rolling_restart"} or (
-            scenario == "mixed_stop" and random.choice([True, False])
-        )
         injection_id = (self.injections[-1]["id"] + 1) if self.injections else 1
         self.active_injection_id = injection_id
         if scenario == "pod_delete":
@@ -2439,8 +2346,6 @@ class ChaosAgent:
             {
                 "id": injection_id,
                 "scenario": scenario,
-                "allow_next_revert": allow_revert,
-                "expected_result": "revert_detection" if scenario in REVERT_DETECTION_SCENARIOS else "recovery",
                 "node_id": targets[0].name.rsplit("-", 1)[-1],
                 "node_name": targets[0].name,
                 "target_nodes": [node.name for node in targets],
@@ -2465,12 +2370,11 @@ class ChaosAgent:
             "scenario": scenario,
             "targets": targets,
             "recover_at": now + timedelta(seconds=fault_duration_secs),
-            "allow_revert": allow_revert,
             "cleanup": cleanup,
         }
         self.publish_status()
         self.event("warn", f"injecting {scenario} on {', '.join(node.name for node in targets)}")
-        self.apply_fault_scenario(scenario, targets, allow_revert=allow_revert)
+        self.apply_fault_scenario(scenario, targets)
         injection = self.current_injection()
         if injection is not None and cleanup == "clear_impairment":
             injected_at = iso(utc_now())
@@ -2576,8 +2480,7 @@ class ChaosAgent:
                     "time": iso(now),
                     "status": "repairing",
                     "message": (
-                        f"recovery missed SLO; repair attempt {repair_count} is restarting {target_label}; "
-                        "log revert will be allowed after target metrics are reachable"
+                        f"recovery missed SLO; repair attempt {repair_count} is restarting {target_label}"
                     ),
                 }
             )
@@ -2585,7 +2488,6 @@ class ChaosAgent:
                 "scenario": f"repair_{injection.get('scenario', 'fault')}",
                 "targets": targets,
                 "recover_at": now + timedelta(seconds=30),
-                "allow_revert": True,
                 "cleanup": "start_instances",
             }
         self.publish_status()
@@ -2600,9 +2502,11 @@ class ChaosAgent:
     def choose_fault_targets(self, scenario: str) -> list[Node]:
         return [random.choice(self.nodes)]
 
-    def apply_fault_scenario(self, scenario: str, targets: list[Node], *, allow_revert: bool = False) -> None:
-        if scenario in {"clean_stop", "no_allow_stop", "mixed_stop", "rolling_restart", "pod_delete"}:
-            self.stop_instances(targets, wait=allow_revert)
+    def apply_fault_scenario(self, scenario: str, targets: list[Node]) -> None:
+        if scenario in {"clean_stop", "mixed_stop", "rolling_restart", "pod_delete"}:
+            # Kubernetes recreates a deleted pod at once, so there is no
+            # stopped state to wait for.
+            self.stop_instances(targets, wait=scenario != "pod_delete")
             return
         if scenario == "netem_delay":
             applied = True
@@ -2846,7 +2750,6 @@ class ChaosAgent:
             "scenario": latest.get("scenario", "fault"),
             "targets": targets,
             "recover_at": recover_at,
-            "allow_revert": latest.get("allow_next_revert", True),
             "cleanup": cleanup,
         }
 
@@ -2863,7 +2766,6 @@ class ChaosAgent:
                 "configured": True,
                 "attempts": 0,
                 "recovered": 0,
-                "detected": 0,
                 "failed": 0,
                 "active": 0,
                 "last_status": None,
@@ -2877,7 +2779,6 @@ class ChaosAgent:
                     "configured": False,
                     "attempts": 0,
                     "recovered": 0,
-                    "detected": 0,
                     "failed": 0,
                     "active": 0,
                     "last_status": None,
@@ -2888,15 +2789,6 @@ class ChaosAgent:
             status = str(injection.get("status") or "unknown")
             entry["last_status"] = status
             entry["last_run_at"] = injection.get("stop_requested_at")
-            detected = injection.get("expected_result") == "revert_detection" and (
-                injection.get("slo_missed_at") is not None
-                or any(
-                    isinstance(event, dict) and event.get("status") == "detected"
-                    for event in injection.get("timeline", [])
-                )
-            )
-            if detected:
-                entry["detected"] += 1
             if status == "recovered":
                 entry["recovered"] += 1
             elif status in {"inject_failed", "slo_missed"} or injection.get("fault_apply_ok") is False:
@@ -3169,8 +3061,8 @@ class ChaosAgent:
         return "major_outage"
 
     def effective_recovery_slo_secs(self, scenario: str | None) -> int:
-        # Node-crash (catch-up) scenarios rebuild raft-memory state from S3 + peer
-        # logs and need far longer than an impairment /clear; see CATCH_UP_SCENARIOS.
+        # Node-crash (catch-up) scenarios replay the WAL and catch up from peers,
+        # which takes far longer than an impairment /clear; see CATCH_UP_SCENARIOS.
         if scenario in CATCH_UP_SCENARIOS:
             return max(self.recovery_slo_secs, CATCH_UP_RECOVERY_SLO_SECS)
         return self.recovery_slo_secs
@@ -3373,19 +3265,14 @@ class ChaosAgent:
                 and injection.get("slo_missed_at") is None
                 and (utc_now() - start_requested_at).total_seconds() > effective_slo
             ):
-                expected_revert_detection = injection.get("expected_result") == "revert_detection"
-                injection["status"] = "detected" if expected_revert_detection else "slo_missed"
+                injection["status"] = "slo_missed"
                 injection["slo_met"] = False
                 injection["slo_missed_at"] = updated_at
                 injection["timeline"].append(
                     {
                         "time": updated_at,
-                        "status": "detected" if expected_revert_detection else "slo_missed",
-                        "message": (
-                            "revert protection detected; node did not recover without allow-next-revert"
-                            if expected_revert_detection
-                            else f"recovery exceeded {effective_slo}s SLO"
-                        ),
+                        "status": "slo_missed",
+                        "message": f"recovery exceeded {effective_slo}s SLO",
                     }
                 )
             if injection.get("start_requested_at") is not None and injection.get("recovered_at") is None and recovered_healthy:
@@ -3861,7 +3748,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--fault-profile",
-        choices=["network", "orthogonal", "revert-detection", "kubernetes", "custom"],
+        choices=["network", "orthogonal", "kubernetes", "custom"],
         default="network",
         help="Preset fault scenario set. Use custom with --fault-scenarios.",
     )

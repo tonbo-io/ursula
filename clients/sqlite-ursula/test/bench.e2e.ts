@@ -116,7 +116,7 @@ it("benchmark: Pi on the ursula VFS against real Ursula", async () => {
 	out.push(`pages per commit p50 ${pct(pages, 50)}, p99 ${pct(pages, 99)}, max ${Math.max(...pages)}`);
 	out.push(`total stream bytes: ${total} (${f(total / all.length)} per commit, ${f(total / turn)} per turn); raw ${raw} (zstd ratio ${f(raw / total)})`);
 	const report = out.join("\n");
-	const setup = process.env.E2E_NODES === "3" ? "3 nodes + gateway, memory WAL, cold S3" : `single node, memory WAL, cold ${process.env.URSULA_COLD ?? "memory"}`;
+	const setup = process.env.E2E_NODES === "3" ? "3 nodes + gateway, disk WAL, cold S3" : `single node, disk WAL, cold ${process.env.URSULA_COLD ?? "memory"}`;
 	console.log(`\n=== sqlite-ursula VFS benchmark (${setup}) ===\n${report}\n`);
 	const summary = process.env.GITHUB_STEP_SUMMARY;
 	if (summary !== undefined) appendFileSync(summary, `### sqlite-ursula VFS benchmark (${setup})\n\n\`\`\`\n${report}\n\`\`\`\n`);

@@ -49,8 +49,8 @@ listen = "127.0.0.1:4437"
 core_count = 4
 
 # Emergency RSS abort threshold. Exceeding it aborts the process, without
-# returning HTTP 503 or gracefully handing off leadership. With memory WAL,
-# this loses all local Raft logs. Omit to disable the monitor.
+# returning HTTP 503 or gracefully handing off leadership. Omit to disable
+# the monitor.
 # node_memory_abort_cap_size = "8GiB"
 
 # Minimum payload size that triggers external cold-store staging instead
@@ -106,11 +106,6 @@ init_membership_per_group = false
 # so this must be comfortably above the S3 per-attempt timeout plus retries.
 # install_snapshot_timeout = "120s"
 
-# Directory for memory-bootstrap marker files.  When set, each group writes
-# a marker after successful membership initialization so that restart skips
-# re-initialization.
-# memory_bootstrap_marker_dir = "/tmp/ursula-raft-memory-bootstrap"
-
 # Consecutive gRPC RPC failures before forcing a transport reconnect.
 # grpc_reconnect_after_failures = 8
 
@@ -121,16 +116,15 @@ init_membership_per_group = false
 # [raft.wal]  — Raft write-ahead log persistence
 # ------------------------------------------------------------------------------
 [raft.wal]
-# WAL persistence backend: "memory" | "disk"
-#   memory  — volatile in-memory log (fastest, data lost on restart)
-#   disk    — durable on-disk log files (requires `path`)
-backend = "memory"
-
-# Directory for on-disk WAL files.  Required when backend is "disk".
-# Ursula appends a "raft-log" subdirectory automatically.
+# The Raft WAL is the per-core journal on disk.
+#
+# Directory for the WAL files.  Ursula appends a "raft-log" subdirectory
+# automatically.  Required when raft.peers is set.  Without it a single node
+# runs its WAL in a fresh temporary directory that is removed on clean
+# shutdown, so nothing survives a restart.
 # path = "/data/ursula"
 
-# When disk WAL appends reach stable storage: "never" | "always"
+# When WAL appends reach stable storage: "never" | "always"
 #   never   — acknowledge from the page cache.  A host crash can cost a
 #             replica its unsynced tail; it then catches up from the leader
 #             before it votes again.  A group whose majority lost it stops
