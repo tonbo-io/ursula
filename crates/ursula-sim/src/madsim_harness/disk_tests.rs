@@ -14,11 +14,16 @@ use openraft::alias::LogIdOf;
 use openraft::alias::VoteOf;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
+use ursula_raft::CoreJournalError;
+use ursula_raft::DurableRaftLogStoreFactory;
 use ursula_raft::InProcessRaftNetworkFactory;
 use ursula_raft::InProcessRaftNetworkPolicy;
 use ursula_raft::InProcessRaftRegistry;
 use ursula_raft::JournalDisk;
+use ursula_raft::JournalError;
 use ursula_raft::JournalFile;
+use ursula_raft::JournalOp;
+use ursula_raft::JournalReplayMode;
 use ursula_raft::LockAttempt;
 use ursula_raft::RaftGroupEngine;
 use ursula_raft::RaftGroupFileLogStore;
@@ -32,6 +37,7 @@ use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::RuntimeMetrics;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
@@ -41,7 +47,6 @@ use ursula_shard::ShardPlacement;
 use super::seeds_from_env;
 use super::sim_test_guard;
 use crate::madsim_harness::run_with_madsim;
-use crate::madsim_harness::seeded_follower_id;
 use crate::madsim_harness::sim_network_policy;
 use crate::madsim_harness::sim_wal::SimNodeWal;
 use crate::madsim_harness::sim_wal::standalone_wal_metrics;
@@ -62,6 +67,14 @@ fn write_file(path: &Path, bytes: &[u8], sync: bool) {
 
 fn sim_disk_error(err: &io::Error) -> Option<&SimDiskError> {
     err.get_ref()?.downcast_ref::<SimDiskError>()
+}
+
+fn core_journal_error(err: &io::Error) -> Option<&CoreJournalError> {
+    err.get_ref()?.downcast_ref::<CoreJournalError>()
+}
+
+fn core_journal(root: &Path) -> PathBuf {
+    root.join("core-0").join("journal.bin")
 }
 
 #[test]
@@ -457,6 +470,21 @@ impl JournalCluster {
         metrics.running_state.is_err()
     }
 
+    /// Waits until OpenRaft stopped every replica of `node_id` after a
+    /// storage error.
+    async fn wait_stopped_by_storage_error(&self, node_id: u64) -> bool {
+        for _ in 0..200 {
+            if JOURNAL_GROUPS
+                .iter()
+                .all(|group| self.stopped_by_storage_error(*group, node_id))
+            {
+                return true;
+            }
+            madsim::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
     /// A node that leads no group, chosen from the seed.
     async fn follower_of_every_group(&self, seed: u64) -> u64 {
         let mut leaders = Vec::new();
@@ -559,35 +587,54 @@ fn power_loss_restart_keeps_every_acknowledged_write() {
     }
 }
 
-/// An injected `fsync` error fails the replica's journal append; OpenRaft
-/// stops that replica, the others keep committing, and the replica rejoins
-/// after a restart from its journal.
-#[test]
-fn journal_fsync_error_stops_only_the_failing_replica() {
-    let _guard = sim_test_guard();
-    for seed in seeds_from_env("JOURNAL_FSYNC_ERROR_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
+/// An injected I/O error poisons the node's core journal: the failing
+/// append, every later write of every group on that core fails with
+/// `WriterPoisoned`, and OpenRaft stops each of the node's replicas. The
+/// others keep committing. A restart (the process aborts in production)
+/// recovers the node from its journal, and no acknowledged write is lost.
+fn journal_io_error_poisons_the_node_until_restart(
+    name: &str,
+    fault: SimDiskFault,
+    failed_op: JournalOp,
+) {
+    for seed in seeds_from_env("JOURNAL_IO_ERROR_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
+        let name = name.to_owned();
         run_with_madsim(seed, async move {
-            let mut cluster = JournalCluster::start("journal-fsync-error").await;
+            let mut cluster = JournalCluster::start(&name).await;
             for group in JOURNAL_GROUPS {
                 cluster.append(group, 3).await;
             }
-            let leader = cluster.leader(0).await;
-            let victim = seeded_follower_id(seed, leader);
-            let journal = cluster.wals[&victim]
-                .root()
-                .join("core-0")
-                .join("journal.bin");
-            SimDisk::inject_fault(&journal, SimDiskFault::Sync).expect("arm fsync fault");
+            let victim = cluster.follower_of_every_group(seed).await;
+            // Keeps the victim's journal writer alive after OpenRaft stops
+            // its replicas and drops their stores.
+            let mut store = cluster.wals[&victim]
+                .store(RaftGroupId(0))
+                .expect("a running replica holds its store");
+            let journal = core_journal(cluster.wals[&victim].root());
+            SimDisk::inject_fault(&journal, fault).expect("arm the fault");
 
             for group in JOURNAL_GROUPS {
                 cluster.append(group, 3).await;
             }
             assert!(
-                JOURNAL_GROUPS
-                    .iter()
-                    .any(|group| cluster.stopped_by_storage_error(*group, victim)),
-                "seed {seed}: the failed fsync stops a replica on node {victim}"
+                cluster.wait_stopped_by_storage_error(victim).await,
+                "seed {seed}: the error stops every replica on node {victim}"
             );
+            let last = store.get_log_state().await.expect("log state").last_log_id;
+            let err = store
+                .truncate_after(last)
+                .await
+                .expect_err("a poisoned journal refuses every write");
+            let Some(CoreJournalError::WriterPoisoned { cause, .. }) = core_journal_error(&err)
+            else {
+                panic!("seed {seed}: expected a poisoned writer, got {err}");
+            };
+            assert!(
+                matches!(**cause, JournalError::Io { op, .. } if op == failed_op),
+                "seed {seed}: unexpected cause {cause}"
+            );
+            drop(store);
+
             cluster.stop_node(victim).await;
             cluster.wals[&victim].process_crash().await;
             cluster.start_node(victim).await;
@@ -599,156 +646,332 @@ fn journal_fsync_error_stops_only_the_failing_replica() {
     }
 }
 
-/// A purge rewrites a large journal online (the simulator lowers the reclaim
-/// threshold). The rewrite replaces the journal with a rename and a directory
-/// `fsync`, so a power loss right after it keeps the purge and every retained
-/// entry.
+#[test]
+fn journal_write_error_poisons_the_node_until_restart() {
+    let _guard = sim_test_guard();
+    journal_io_error_poisons_the_node_until_restart(
+        "journal-write-error",
+        SimDiskFault::Write,
+        JournalOp::Append,
+    );
+}
+
+#[test]
+fn journal_fsync_error_poisons_the_node_until_restart() {
+    let _guard = sim_test_guard();
+    journal_io_error_poisons_the_node_until_restart(
+        "journal-fsync-error",
+        SimDiskFault::Sync,
+        JournalOp::Sync,
+    );
+}
+
+/// A single-node group with enough history that a purge rewrites its
+/// journal online (the simulator lowers the reclaim threshold).
+struct ReclaimGroup {
+    wal: SimNodeWal,
+    metrics: RuntimeMetrics,
+    engine: RaftGroupEngine,
+}
+
+impl ReclaimGroup {
+    async fn start(name: &str) -> Self {
+        let wal = SimNodeWal::provision(name);
+        let placement = group_placement(0);
+        let metrics = RuntimeMetrics::new(1, 1);
+        let mut engine = RaftGroupEngine::new_single_node_on_log_store(
+            placement,
+            wal.open(placement, metrics.group_engine_metrics()).await,
+            None,
+        )
+        .await
+        .expect("start a single-node group");
+        engine
+            .create_stream(
+                CreateStreamRequest::new(group_stream(0), "application/octet-stream"),
+                placement,
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .expect("create a stream");
+        let mut group = Self {
+            wal,
+            metrics,
+            engine,
+        };
+        group.append(0..120).await;
+        group
+    }
+
+    async fn append(&mut self, payloads: std::ops::Range<u8>) {
+        for index in payloads {
+            self.engine
+                .append(
+                    AppendRequest::from_bytes(group_stream(0), vec![index; 128]),
+                    group_placement(0),
+                    ColdWriteAdmission::default(),
+                )
+                .await
+                .expect("append");
+        }
+    }
+
+    /// Snapshots the group and purges all but its last few entries.
+    async fn purge(&self) {
+        let raft = self.engine.raft_handle();
+        raft.trigger().snapshot().await.expect("trigger a snapshot");
+        let snapshot = raft
+            .wait(Some(Duration::from_secs(5)))
+            .metrics(|metrics| metrics.snapshot.is_some(), "snapshot built")
+            .await
+            .expect("wait for the snapshot")
+            .snapshot
+            .expect("snapshot log id");
+        let purge_upto = snapshot.index.saturating_sub(8);
+        raft.trigger()
+            .purge_log(purge_upto)
+            .await
+            .expect("trigger a purge");
+        raft.wait(Some(Duration::from_secs(5)))
+            .metrics(
+                |metrics| {
+                    metrics
+                        .purged
+                        .is_some_and(|purged| purged.index >= purge_upto)
+                },
+                "log purged",
+            )
+            .await
+            .expect("wait for the purge");
+    }
+
+    /// What the group's store holds now.
+    async fn durable_log(&self) -> (Option<LogIdOf<UrsulaRaftTypeConfig>>, DurableGroupLog) {
+        let store = self.wal.store(RaftGroupId(0)).expect("running store");
+        let mut reader = store.clone();
+        let state = reader.get_log_state().await.expect("log state");
+        (
+            state.last_purged_log_id,
+            DurableGroupLog::read(&store).await,
+        )
+    }
+
+    /// Stops the group, cuts the node's power and reopens the store.
+    async fn power_loss_and_reopen(
+        self,
+    ) -> (Option<LogIdOf<UrsulaRaftTypeConfig>>, DurableGroupLog) {
+        self.engine.shutdown().await.expect("stop the group");
+        drop(self.engine);
+        self.wal.power_loss().await;
+        let mut store = self
+            .wal
+            .open(group_placement(0), self.metrics.group_engine_metrics())
+            .await;
+        let state = store.get_log_state().await.expect("recovered log state");
+        (
+            state.last_purged_log_id,
+            DurableGroupLog::read(&store).await,
+        )
+    }
+}
+
+/// A purge rewrites a large journal online, writing every group's live
+/// entries in several chunks (the simulator lowers the chunk size). The
+/// rewrite replaces the journal with a rename and a directory `fsync`, so a
+/// power loss right after it keeps the purge and every retained entry.
 #[test]
 fn online_reclaim_survives_power_loss() {
     let _guard = sim_test_guard();
     for seed in seeds_from_env("ONLINE_RECLAIM_SEEDS", &[1, 2, 3]) {
         run_with_madsim(seed, async move {
-            let wal = SimNodeWal::provision("online-reclaim");
-            let placement = group_placement(0);
-            let metrics = ursula_runtime::RuntimeMetrics::new(1, 1);
-            let mut engine = RaftGroupEngine::new_single_node_on_log_store(
-                placement,
-                wal.open(placement, metrics.group_engine_metrics()).await,
-                None,
-            )
-            .await
-            .expect("start a single-node group");
-            engine
-                .create_stream(
-                    CreateStreamRequest::new(group_stream(0), "application/octet-stream"),
-                    placement,
-                    ColdWriteAdmission::default(),
-                )
-                .await
-                .expect("create a stream");
-            for index in 0..120_u8 {
-                engine
-                    .append(
-                        AppendRequest::from_bytes(group_stream(0), vec![index; 128]),
-                        placement,
-                        ColdWriteAdmission::default(),
-                    )
-                    .await
-                    .expect("append");
-            }
-            let raft = engine.raft_handle();
-            raft.trigger().snapshot().await.expect("trigger a snapshot");
-            let snapshot = raft
-                .wait(Some(Duration::from_secs(5)))
-                .metrics(|metrics| metrics.snapshot.is_some(), "snapshot built")
-                .await
-                .expect("wait for the snapshot")
-                .snapshot
-                .expect("snapshot log id");
-            let purge_upto = snapshot.index.saturating_sub(8);
-            raft.trigger()
-                .purge_log(purge_upto)
-                .await
-                .expect("trigger a purge");
-            raft.wait(Some(Duration::from_secs(5)))
-                .metrics(
-                    |metrics| {
-                        metrics
-                            .purged
-                            .is_some_and(|purged| purged.index >= purge_upto)
-                    },
-                    "log purged",
-                )
-                .await
-                .expect("wait for the purge");
+            let group = ReclaimGroup::start("online-reclaim").await;
+            group.purge().await;
+            let metrics = group.metrics.snapshot();
             assert!(
-                metrics.snapshot().wal_reclaims >= 1,
+                metrics.wal_reclaims >= 1,
                 "seed {seed}: the purge rewrote the journal online"
             );
-            let store = wal.store(RaftGroupId(0)).expect("running store");
-            let mut reader = store.clone();
-            let before = reader.get_log_state().await.expect("log state");
-            let before_log = DurableGroupLog::read(&store).await;
-            drop((reader, store));
-
-            engine.shutdown().await.expect("stop the group");
-            drop(engine);
-            wal.power_loss().await;
-
-            let mut store = wal.open(placement, metrics.group_engine_metrics()).await;
-            let after = store.get_log_state().await.expect("recovered log state");
-            assert_eq!(after.last_purged_log_id, before.last_purged_log_id);
-            assert_eq!(DurableGroupLog::read(&store).await, before_log);
+            assert_eq!(metrics.wal_reclaim_failures, 0);
+            let before = group.durable_log().await;
+            assert_eq!(group.power_loss_and_reopen().await, before);
         });
     }
 }
 
-/// The acceptance test of delivery step 2 of `single-raft-wal.md`: a power
-/// loss that reorders the writeback of unsynced replay hints (committed
-/// markers) must not stop the replica from recovering its synced entries.
-/// Today's strict recovery refuses the zero-filled hole that reordering
-/// leaves, so this fails for some seeds.
+/// A rewrite that fails before it replaces the journal leaves the journal as
+/// it was: the purge that triggered it stays acknowledged, the failure is
+/// counted, the group keeps writing, and a power loss loses nothing.
 #[test]
-#[ignore = "fails until the journal keeps the verified prefix after a host crash (single-raft-wal.md step 2)"]
-fn power_loss_with_unsynced_replay_hints_keeps_synced_entries() {
+fn a_failed_online_reclaim_keeps_the_journal_and_the_group_running() {
     let _guard = sim_test_guard();
-    let mut refused = Vec::new();
-    for seed in seeds_from_env("UNSYNCED_TAIL_SEEDS", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]) {
-        let recovered = run_with_madsim(seed, async move {
-            let wal = SimNodeWal::provision("unsynced-tail");
-            let placement = group_placement(0);
-            let metrics = standalone_wal_metrics(placement);
-            let mut engine = RaftGroupEngine::new_single_node_on_log_store(
-                placement,
-                wal.open(placement, metrics.clone()).await,
-                None,
-            )
-            .await
-            .expect("start a single-node group");
-            engine
-                .create_stream(
-                    CreateStreamRequest::new(group_stream(0), "application/octet-stream"),
-                    placement,
-                    ColdWriteAdmission::default(),
-                )
-                .await
-                .expect("create a stream");
-            engine.shutdown().await.expect("stop the group");
-            drop(engine);
-
-            // Committed markers are journaled without an fsync.
-            let mut store = wal.open(placement, metrics.clone()).await;
-            let synced = DurableGroupLog::read(&store).await;
-            let (first, last) = (
-                *synced.log_ids.first().expect("synced entries"),
-                *synced.log_ids.last().expect("synced entries"),
+    for seed in seeds_from_env("ONLINE_RECLAIM_SEEDS", &[1, 2, 3]) {
+        run_with_madsim(seed, async move {
+            let mut group = ReclaimGroup::start("failed-reclaim").await;
+            let next_generation = core_journal(group.wal.root()).with_extension("compact");
+            SimDisk::inject_fault(&next_generation, SimDiskFault::Write)
+                .expect("fail the next generation");
+            group.purge().await;
+            let metrics = group.metrics.snapshot();
+            assert!(
+                metrics.wal_reclaim_failures >= 1,
+                "seed {seed}: the rewrite failed"
             );
-            for marker in 0..256 {
-                let committed = if marker % 2 == 0 { first } else { last };
-                store
-                    .save_committed(Some(committed))
-                    .await
-                    .expect("journal a committed marker");
-            }
-            drop(store);
-            let report = wal.power_loss().await;
-            let reopened = ursula_raft::DurableRaftLogStoreFactory::new(wal.root())
-                .open(placement, metrics)
-                .map_err(|err| format!("{report:?}: {}", err.message()));
-            match reopened {
-                Ok(store) => {
-                    assert_eq!(DurableGroupLog::read(&store).await, synced);
-                    Ok(())
-                }
-                Err(err) => Err(err),
-            }
+
+            group.append(120..130).await;
+            let raft_metrics =
+                openraft::rt::WatchReceiver::borrow_watched(&group.engine.raft_handle().metrics())
+                    .clone();
+            assert!(
+                raft_metrics.running_state.is_ok(),
+                "seed {seed}: the group keeps running"
+            );
+            let before = group.durable_log().await;
+            assert_eq!(group.power_loss_and_reopen().await, before);
         });
-        if let Err(err) = recovered {
-            refused.push((seed, err));
+    }
+}
+
+/// A rewrite whose directory `fsync` fails leaves it unknown which
+/// generation a crash keeps, so it poisons the writer. The purge that
+/// triggered it was durable and stays acknowledged, and a power loss then
+/// recovers either generation with every acknowledged entry.
+#[test]
+fn a_reclaim_that_cannot_publish_its_generation_poisons_the_writer() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("ONLINE_RECLAIM_SEEDS", &[1, 2, 3]) {
+        run_with_madsim(seed, async move {
+            let group = ReclaimGroup::start("unpublished-reclaim").await;
+            let core_dir = group.wal.root().join("core-0");
+            SimDisk::inject_fault(&core_dir, SimDiskFault::Sync).expect("fail the directory fsync");
+            group.purge().await;
+            assert!(
+                group.metrics.snapshot().wal_reclaim_failures >= 1,
+                "seed {seed}: the rewrite failed"
+            );
+            let (purged, log) = group.durable_log().await;
+
+            let mut store = group.wal.store(RaftGroupId(0)).expect("running store");
+            let err = store
+                .truncate_after(log.log_ids.last().copied())
+                .await
+                .expect_err("a poisoned journal refuses every write");
+            assert!(
+                matches!(
+                    core_journal_error(&err),
+                    Some(CoreJournalError::WriterPoisoned { .. })
+                ),
+                "seed {seed}: {err}"
+            );
+            drop(store);
+            let (recovered_purged, recovered) = group.power_loss_and_reopen().await;
+            assert_eq!(recovered.vote, log.vote, "seed {seed}");
+            assert!(
+                recovered.log_ids.ends_with(&log.log_ids),
+                "seed {seed}: every retained entry survives: {:?} then {:?}",
+                log.log_ids,
+                recovered.log_ids
+            );
+            assert!(recovered_purged <= purged, "seed {seed}");
+        });
+    }
+}
+
+/// A single-node group whose synced entries are followed by an unsynced
+/// tail of committed markers, after a power loss that may reorder the tail's
+/// writeback. Returns what was synced and how a store reopened in `mode`
+/// fared.
+async fn reopen_after_a_reordered_unsynced_tail(
+    mode: JournalReplayMode,
+) -> (DurableGroupLog, Result<DurableGroupLog, String>) {
+    let wal = SimNodeWal::provision("unsynced-tail");
+    let placement = group_placement(0);
+    let metrics = standalone_wal_metrics(placement);
+    let mut engine = RaftGroupEngine::new_single_node_on_log_store(
+        placement,
+        wal.open(placement, metrics.clone()).await,
+        None,
+    )
+    .await
+    .expect("start a single-node group");
+    engine
+        .create_stream(
+            CreateStreamRequest::new(group_stream(0), "application/octet-stream"),
+            placement,
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("create a stream");
+    engine.shutdown().await.expect("stop the group");
+    drop(engine);
+
+    // Committed markers are journaled without an fsync.
+    let mut store = wal.open(placement, metrics.clone()).await;
+    let synced = DurableGroupLog::read(&store).await;
+    let (first, last) = (
+        *synced.log_ids.first().expect("synced entries"),
+        *synced.log_ids.last().expect("synced entries"),
+    );
+    for marker in 0..256 {
+        let committed = if marker % 2 == 0 { first } else { last };
+        store
+            .save_committed(Some(committed))
+            .await
+            .expect("journal a committed marker");
+    }
+    drop(store);
+    let report = wal.power_loss().await;
+    let reopened = DurableRaftLogStoreFactory::new(wal.root())
+        .with_replay_mode(mode)
+        .open(placement, metrics);
+    let reopened = match reopened {
+        Ok(store) => Ok(DurableGroupLog::read(&store).await),
+        Err(err) => Err(format!("{report:?}: {}", err.message())),
+    };
+    (synced, reopened)
+}
+
+const UNSYNCED_TAIL_SEEDS: [u64; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+/// Strict recovery expects every write on disk, so it refuses the hole a
+/// reordered writeback of unsynced committed markers can leave. It never
+/// recovers less than what was synced.
+#[test]
+fn strict_recovery_refuses_a_reordered_unsynced_tail() {
+    let _guard = sim_test_guard();
+    let mut refused = 0;
+    for seed in seeds_from_env("UNSYNCED_TAIL_SEEDS", &UNSYNCED_TAIL_SEEDS) {
+        let (synced, reopened) = run_with_madsim(
+            seed,
+            reopen_after_a_reordered_unsynced_tail(JournalReplayMode::Strict),
+        );
+        match reopened {
+            Ok(recovered) => assert_eq!(recovered, synced, "seed {seed}"),
+            Err(err) => {
+                assert!(err.contains("checksum mismatch"), "seed {seed}: {err}");
+                refused += 1;
+            }
         }
     }
     assert!(
-        refused.is_empty(),
-        "recovery refused a reordered unsynced tail: {refused:#?}"
+        refused > 0,
+        "a reordered writeback must sometimes leave a hole strict recovery refuses"
     );
+}
+
+/// Recovery that keeps the verified prefix recovers every synced entry and
+/// the vote after the same power losses.
+#[test]
+fn verified_prefix_recovery_keeps_every_acknowledged_write_after_a_reordered_tail() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("UNSYNCED_TAIL_SEEDS", &UNSYNCED_TAIL_SEEDS) {
+        let (synced, reopened) = run_with_madsim(
+            seed,
+            reopen_after_a_reordered_unsynced_tail(JournalReplayMode::VerifiedPrefix),
+        );
+        assert_eq!(
+            reopened.unwrap_or_else(|err| panic!("seed {seed}: {err}")),
+            synced,
+            "seed {seed}"
+        );
+    }
 }
