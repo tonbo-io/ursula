@@ -90,24 +90,40 @@ second fsync; it does not change the durable append acknowledgement.
 
 ## On-disk contract
 
-Each active core owns one `core-N/journal.bin`. The v1 format starts with a
-magic/version header and encodes every record as:
+Each active core owns one `core-N/journal.bin`. Format epoch 3 starts the
+file with a 32-byte header (magic, version, header length, a 64-bit generation
+sequence and a CRC32 of the header) and encodes every record as:
 
 ```text
-u32 payload length | u32 CRC32 | MessagePack payload
+u32 payload length | u32 header CRC | u32 payload CRC | MessagePack payload
 ```
 
-Recovery refuses unknown versions, impossible lengths, checksum failures, and
-decoding failures. An incomplete final frame is treated as a crash-torn tail
-and truncated to the last complete checksummed frame. The decoder bounds a
-single frame at 512 MiB before allocating.
+The header CRC covers the generation sequence and the length, so a damaged
+length is detected before replay trusts it. The payload CRC covers the
+sequence, the length and the payload. A new journal is generation 1, and every
+rewrite (startup compaction, online reclaim) writes the next generation, so a
+frame verifies only in the file generation that wrote it.
+
+Replay has two modes, chosen by the caller:
+
+- `Strict` tolerates only an incomplete final frame, which it truncates. Any
+  other frame that fails verification fails recovery with its frame number and
+  offset.
+- `VerifiedPrefix` keeps the frames before the first one that fails
+  verification and truncates the rest, reporting the dropped bytes.
+
+Startup recovery and online reclaim use `Strict`. Online reclaim never
+truncates: a live journal that fails verification stops the writer instead.
+Both modes refuse unknown versions, a damaged file header, oversized frames
+and frames whose checksums verify but whose payload does not decode. The
+decoder bounds a single frame at 512 MiB before allocating.
 
 The writer holds an exclusive advisory lock in `journal.bin.lock`. A second
 process receives a diagnostic error naming the journal, lock path, and recorded
 owner PID instead of concurrently modifying the same WAL.
 
-The journal header version is the format epoch, 2 since Ursula 0.6. There is
-no migration: a version-1 journal (Ursula 0.5.x) and a journal without the
+The journal header version is the format epoch, 3 since the single Raft WAL
+work. There is no migration: journals of epochs 1 and 2 and files without the
 Ursula WAL magic are refused, and the data directory's `FORMAT_EPOCH` marker
 refuses an older directory before any journal is opened.
 

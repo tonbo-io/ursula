@@ -1154,8 +1154,8 @@ pub(crate) fn validate_grpc_metadata(protocol_version: u32) -> Result<(), GrpcRp
         // GroupWrite/GroupRead, so it reads as 0 here.
         let message = format!(
             "{PROTOCOL_MISMATCH_TEXT}: local={RAFT_GRPC_PROTOCOL_VERSION}, \
-             remote={protocol_version} (format epochs differ; an Ursula 0.6 node cannot join a \
-             0.5.x cluster)"
+             remote={protocol_version} (format epochs differ; a node joins only a cluster of its \
+             own format epoch)"
         );
         record_format_epoch_mismatch("inbound", &message);
         return Err(GrpcRpcError::failed_precondition(message));

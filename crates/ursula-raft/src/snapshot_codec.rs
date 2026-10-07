@@ -790,14 +790,14 @@ mod tests {
         .expect("encode footer")
     }
 
-    /// Format epoch 2 (E5): the epoch frame comes first and is checked before
-    /// any other frame.
+    /// E5: the epoch frame comes first and is checked before any other frame.
     #[test]
     fn decode_requires_a_leading_epoch_frame_of_this_epoch() {
         let epoch = ursula_stream::FORMAT_EPOCH;
         let valid = [epoch_frame(epoch), header_frame(), footer_frame()].concat();
-        decode_group_snapshot(&valid).expect("an epoch-2 snapshot decodes");
+        decode_group_snapshot(&valid).expect("a snapshot of this epoch decodes");
 
+        let previous = format!("is format epoch {}", epoch - 1);
         let cases = [
             (
                 [header_frame(), footer_frame()].concat(),
@@ -805,7 +805,7 @@ mod tests {
             ),
             (
                 [epoch_frame(epoch - 1), header_frame(), footer_frame()].concat(),
-                "is format epoch 1",
+                previous.as_str(),
             ),
             (
                 [header_frame(), epoch_frame(epoch), footer_frame()].concat(),

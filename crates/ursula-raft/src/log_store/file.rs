@@ -52,9 +52,14 @@ use super::disk::LockAttempt;
 use super::ensure_consecutive_entries;
 use super::ensure_log_append_boundary;
 use super::journal;
+use super::journal::FIRST_SEQUENCE;
+use super::journal::JournalError;
+use super::journal::JournalOp;
+use super::journal::JournalReplayMode;
 use super::journal::JournalWriter;
+use super::journal::Replayed;
+use super::journal::WRITE_BUFFER_BYTES;
 use super::truncate_entries_after;
-use crate::codec::encode_wire;
 use crate::engine::invalid_data;
 use crate::rt::sync::mpsc;
 use crate::rt::sync::oneshot;
@@ -80,6 +85,8 @@ pub(crate) enum CoreJournalError {
         #[source]
         source: Arc<io::Error>,
     },
+    #[error(transparent)]
+    Journal(Arc<JournalError>),
     #[error(
         "OpenRaft WAL '{}' is already locked at '{}'{}",
         .journal.display(),
@@ -121,11 +128,18 @@ impl CoreJournalError {
     }
 }
 
+impl From<JournalError> for CoreJournalError {
+    fn from(err: JournalError) -> Self {
+        Self::Journal(Arc::new(err))
+    }
+}
+
 /// OpenRaft storage methods report `io::Error`; this is the one conversion.
 impl From<CoreJournalError> for io::Error {
     fn from(err: CoreJournalError) -> Self {
         let kind = match &err {
             CoreJournalError::Io { source, .. } => source.kind(),
+            CoreJournalError::Journal(err) => err.kind(),
             #[cfg(not(madsim))]
             CoreJournalError::SpawnWriter { source } => source.kind(),
             CoreJournalError::Locked { .. } | CoreJournalError::GroupAlreadyOpen { .. } => {
@@ -244,9 +258,11 @@ impl RaftGroupFileLogStore {
 
 impl CoreFileLogWriter {
     /// Opens the journal at `journal_path`: takes its lock, recovers every
-    /// group, compacts the recovered journal and starts the writer.
+    /// group in `replay_mode`, compacts the recovered journal and starts the
+    /// writer.
     pub(crate) fn open(
         journal_path: PathBuf,
+        replay_mode: JournalReplayMode,
         recovery_metrics: Option<(ShardPlacement, GroupEngineMetrics)>,
     ) -> Result<Arc<Self>, CoreJournalError> {
         if let Some(parent) = journal_path.parent() {
@@ -255,33 +271,45 @@ impl CoreFileLogWriter {
         }
         let lock = acquire_journal_lock(&journal_path)?;
         let recovery_started_at = Instant::now();
-        let recovery_bytes = Disk::file_len(&journal_path).unwrap_or(0);
-        let (recovered, recovery_records) =
-            load_log_store_inners_from_core_journal_with_stats(&journal_path)
-                .map_err(|source| CoreJournalError::io(&journal_path, source))?;
+        let recovered = recover_core_journal(&journal_path, replay_mode)?;
         let recovery_ns = elapsed_ns(recovery_started_at);
-        let recovery_live_entries = recovered.values().fold(0_u64, |total, inner| {
+        let replayed = recovered.replayed;
+        let recovery_bytes = replayed
+            .verified_len
+            .saturating_add(replayed.dropped_bytes());
+        let recovery_live_entries = recovered.groups.values().fold(0_u64, |total, inner| {
             total.saturating_add(u64::try_from(inner.entries.len()).unwrap_or(u64::MAX))
         });
         if let Some((placement, metrics)) = &recovery_metrics {
             metrics.record_wal_recovery(
                 *placement,
                 recovery_ns,
-                u64::try_from(recovery_records).unwrap_or(u64::MAX),
+                replayed.frames,
                 recovery_bytes,
                 recovery_live_entries,
             );
         }
         tracing::info!(
             path = %journal_path.display(),
+            ?replay_mode,
             recovery_ns,
-            recovery_records,
+            recovery_records = replayed.frames,
             recovery_bytes,
             recovery_live_entries,
             "recovered OpenRaft core journal"
         );
-        if let Some((before, after)) = compact_core_journal(&journal_path, &recovered)
-            .map_err(|source| CoreJournalError::io(&journal_path, source))?
+        if replayed.dropped_bytes() != 0 {
+            tracing::warn!(
+                path = %journal_path.display(),
+                ?replay_mode,
+                tail = ?replayed.tail,
+                verified_bytes = replayed.verified_len,
+                dropped_bytes = replayed.dropped_bytes(),
+                "truncated the OpenRaft core journal after its last verified frame"
+            );
+        }
+        if let Some((before, after)) =
+            compact_core_journal(&journal_path, &recovered.groups, replayed.sequence)?
         {
             tracing::info!(
                 path = %journal_path.display(),
@@ -290,13 +318,18 @@ impl CoreFileLogWriter {
                 "compacted recovered OpenRaft core journal"
             );
         }
+        let mut journal = JournalWriter::open(&journal_path, FIRST_SEQUENCE)?;
+        if journal.pending_bytes() != 0 {
+            // A new journal: make its header and directory entry durable now.
+            journal.sync()?;
+        }
         let (tx, rx) = mpsc::unbounded_channel();
-        let worker = spawn_core_file_log_writer(journal_path.clone(), rx)?;
+        let worker = spawn_core_file_log_writer(journal_path.clone(), journal, rx)?;
         Ok(Arc::new(Self {
             journal_path,
             tx: Some(tx),
             groups: Mutex::new(RecoveredGroups {
-                recovered,
+                recovered: recovered.groups,
                 opened: BTreeSet::new(),
             }),
             worker: Some(worker),
@@ -389,6 +422,7 @@ fn acquire_journal_lock(journal_path: &Path) -> Result<DiskLock, CoreJournalErro
 #[cfg(not(madsim))]
 fn spawn_core_file_log_writer(
     journal_path: PathBuf,
+    journal: JournalWriter,
     rx: mpsc::UnboundedReceiver<CoreFileLogWrite>,
 ) -> Result<WriterWorker, CoreJournalError> {
     let spawn_error = |source| CoreJournalError::SpawnWriter {
@@ -404,6 +438,7 @@ fn spawn_core_file_log_writer(
         .spawn(move || {
             runtime.block_on(tokio::task::unconstrained(run_core_file_log_writer(
                 journal_path,
+                journal,
                 rx,
             )))
         })
@@ -414,9 +449,14 @@ fn spawn_core_file_log_writer(
 #[cfg(madsim)]
 fn spawn_core_file_log_writer(
     journal_path: PathBuf,
+    journal: JournalWriter,
     rx: mpsc::UnboundedReceiver<CoreFileLogWrite>,
 ) -> Result<WriterWorker, CoreJournalError> {
-    Ok(crate::rt::spawn(run_core_file_log_writer(journal_path, rx)))
+    Ok(crate::rt::spawn(run_core_file_log_writer(
+        journal_path,
+        journal,
+        rx,
+    )))
 }
 
 /// The channel is closed, so the thread finishes its batch and exits.
@@ -439,9 +479,10 @@ fn stop_core_file_log_writer(worker: WriterWorker) {
 
 async fn run_core_file_log_writer(
     journal_path: PathBuf,
+    journal: JournalWriter,
     mut rx: mpsc::UnboundedReceiver<CoreFileLogWrite>,
 ) {
-    let mut journal = JournalWriter::new(!Disk::exists(&journal_path));
+    let mut journal = Some(journal);
     while let Some(first) = rx.recv().await {
         let mut batch = vec![first];
         if let Some(next) = recv_within(&mut rx, CORE_LOG_GROUP_COMMIT_DELAY).await {
@@ -454,8 +495,7 @@ async fn run_core_file_log_writer(
             batch.push(next);
         }
 
-        let result = write_core_log_batch(&journal_path, &mut journal, &batch)
-            .map_err(|source| CoreJournalError::io(&journal_path, source));
+        let result = write_core_log_batch(&journal_path, &mut journal, &batch);
         reply_core_log_batch(batch, result);
     }
 }
@@ -549,13 +589,23 @@ fn reply_core_log_batch(
 
 fn write_core_log_batch(
     journal_path: &Path,
-    journal: &mut JournalWriter,
+    journal: &mut Option<JournalWriter>,
     batch: &[CoreFileLogWrite],
-) -> Result<CoreFileLogWriteTiming, io::Error> {
+) -> Result<CoreFileLogWriteTiming, CoreJournalError> {
+    let writer = match journal {
+        Some(writer) => writer,
+        None => journal.insert(JournalWriter::open(journal_path, FIRST_SEQUENCE)?),
+    };
     let write_started_at = Instant::now();
     for request in batch {
-        write_wire_frame_to_file(journal_path, journal, &request.record)?;
+        writer
+            .append::<WireCodec<CoreJournalRecord>>(&request.record)
+            .map_err(JournalError::from)?;
+        if writer.pending_bytes() >= WRITE_BUFFER_BYTES {
+            writer.flush()?;
+        }
     }
+    writer.flush()?;
     let write_ns = elapsed_ns(write_started_at);
 
     let requires_sync = batch
@@ -563,7 +613,7 @@ fn write_core_log_batch(
         .any(|request| raft_group_log_record_requires_sync(&request.record.record));
     let sync_ns = if requires_sync {
         let sync_started_at = Instant::now();
-        journal.sync(journal_path)?;
+        writer.sync()?;
         elapsed_ns(sync_started_at)
     } else {
         0
@@ -606,7 +656,7 @@ fn write_core_log_batch(
         reclaims,
         reclaimed_bytes,
         reclaim_ns,
-        physical_bytes: Disk::file_len(journal_path)?,
+        physical_bytes: journal.as_ref().map_or(0, JournalWriter::len),
     })
 }
 
@@ -748,55 +798,71 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
     }
 }
 
-fn load_log_store_inners_from_core_journal(
-    journal_path: &Path,
-) -> Result<BTreeMap<u32, RaftGroupLogStoreInner>, io::Error> {
-    load_log_store_inners_from_core_journal_with_stats(journal_path).map(|(inners, _)| inners)
+/// Every group's state recovered from a core journal.
+#[derive(Debug)]
+struct RecoveredJournal {
+    groups: BTreeMap<u32, RaftGroupLogStoreInner>,
+    replayed: Replayed,
 }
 
-fn load_log_store_inners_from_core_journal_with_stats(
+/// Replays `journal_path` in `mode` and truncates what follows its verified
+/// frames.
+fn recover_core_journal(
     journal_path: &Path,
-) -> Result<(BTreeMap<u32, RaftGroupLogStoreInner>, usize), io::Error> {
-    let mut inners = BTreeMap::<u32, RaftGroupLogStoreInner>::new();
-    let mut record_number = 0_usize;
-    journal::replay_each::<WireCodec<CoreJournalRecord>>(journal_path, |record| {
-        record_number = record_number.saturating_add(1);
-        apply_log_store_record(inners.entry(record.group_id).or_default(), record.record).map_err(
-            |err| {
-                io::Error::new(
-                    err.kind(),
-                    format!(
-                        "replay OpenRaft core journal record '{}' record {record_number}: {err}",
-                        journal_path.display(),
-                    ),
-                )
-            },
-        )
-    })?;
-    Ok((inners, record_number))
+    mode: JournalReplayMode,
+) -> Result<RecoveredJournal, JournalError> {
+    let mut groups = BTreeMap::<u32, RaftGroupLogStoreInner>::new();
+    let replayed =
+        journal::recover::<WireCodec<CoreJournalRecord>>(journal_path, mode, |record| {
+            apply_log_store_record(groups.entry(record.group_id).or_default(), record.record)
+        })?;
+    Ok(RecoveredJournal { groups, replayed })
 }
 
+/// Reads the journal a running writer appends to. Its writer finished every
+/// frame it started, so anything but whole verified frames means the file
+/// is not what the writer wrote; nothing is truncated.
+fn read_live_core_journal(journal_path: &Path) -> Result<RecoveredJournal, JournalError> {
+    let mut groups = BTreeMap::<u32, RaftGroupLogStoreInner>::new();
+    let replayed = journal::replay::<WireCodec<CoreJournalRecord>>(
+        journal_path,
+        JournalReplayMode::Strict,
+        |record| apply_log_store_record(groups.entry(record.group_id).or_default(), record.record),
+    )?;
+    replayed.require_clean(journal_path)?;
+    Ok(RecoveredJournal { groups, replayed })
+}
+
+/// Rewrites the journal as the next generation holding only `inners`, when
+/// that is smaller, and returns the sizes before and after. `live_sequence` is
+/// the sequence of the journal being replaced.
 fn compact_core_journal(
     journal_path: &Path,
     inners: &BTreeMap<u32, RaftGroupLogStoreInner>,
-) -> Result<Option<(u64, u64)>, io::Error> {
-    if !Disk::exists(journal_path) {
+    live_sequence: Option<u64>,
+) -> Result<Option<(u64, u64)>, JournalError> {
+    let Some(live_sequence) = live_sequence else {
         return Ok(None);
-    }
-    let before = Disk::file_len(journal_path)?;
+    };
+    let before = Disk::file_len(journal_path)
+        .map_err(|source| JournalError::io(journal_path, JournalOp::Stat, source))?;
     let compact_path = journal_path.with_extension("compact");
     if Disk::exists(&compact_path) {
-        Disk::remove_file(&compact_path)?;
+        Disk::remove_file(&compact_path)
+            .map_err(|source| JournalError::io(&compact_path, JournalOp::Remove, source))?;
     }
 
-    let mut handle = JournalWriter::new(true);
-    handle.ensure_created(&compact_path)?;
+    let mut handle = JournalWriter::open(&compact_path, live_sequence.wrapping_add(1))?;
     for (group_id, inner) in inners {
-        let mut write = |record| -> Result<(), io::Error> {
-            write_wire_frame_to_file(&compact_path, &mut handle, &CoreJournalRecord {
+        let mut write = |record| -> Result<(), JournalError> {
+            handle.append::<WireCodec<CoreJournalRecord>>(&CoreJournalRecord {
                 group_id: *group_id,
                 record,
-            })
+            })?;
+            if handle.pending_bytes() >= WRITE_BUFFER_BYTES {
+                handle.flush()?;
+            }
+            Ok(())
         };
         if let Some(vote) = inner.vote {
             write(RaftGroupLogRecord::SaveVote(vote))?;
@@ -813,27 +879,33 @@ fn compact_core_journal(
             ))?;
         }
     }
-    handle.sync(&compact_path)?;
+    handle.sync()?;
+    let after = handle.len();
     drop(handle);
 
-    let after = Disk::file_len(&compact_path)?;
     if after >= before {
-        Disk::remove_file(&compact_path)?;
+        Disk::remove_file(&compact_path)
+            .map_err(|source| JournalError::io(&compact_path, JournalOp::Remove, source))?;
         return Ok(None);
     }
-    Disk::rename(&compact_path, journal_path)?;
+    Disk::rename(&compact_path, journal_path)
+        .map_err(|source| JournalError::io(journal_path, JournalOp::Rename, source))?;
     if let Some(parent) = journal_path.parent() {
-        Disk::sync_dir(parent)?;
+        Disk::sync_dir(parent)
+            .map_err(|source| JournalError::io(journal_path, JournalOp::SyncDir, source))?;
     }
     Ok(Some((before, after)))
 }
 
 fn reclaim_core_journal_if_needed(
     journal_path: &Path,
-    journal: &mut JournalWriter,
+    journal: &mut Option<JournalWriter>,
     min_physical_bytes: u64,
-) -> Result<Option<(u64, u64)>, io::Error> {
-    if !Disk::exists(journal_path) || Disk::file_len(journal_path)? < min_physical_bytes {
+) -> Result<Option<(u64, u64)>, CoreJournalError> {
+    if journal
+        .as_ref()
+        .is_none_or(|writer| writer.len() < min_physical_bytes)
+    {
         return Ok(None);
     }
 
@@ -841,14 +913,11 @@ fn reclaim_core_journal_if_needed(
     // avoids continuing to append to the unlinked old file after `rename` and
     // keeps the replacement portable to filesystems that reject renaming over
     // an open destination.
-    drop(std::mem::replace(
-        journal,
-        JournalWriter::new(!Disk::exists(journal_path)),
-    ));
+    journal.take();
 
-    let inners = load_log_store_inners_from_core_journal(journal_path)?;
-    let compacted = compact_core_journal(journal_path, &inners)?;
-    *journal = JournalWriter::new(false);
+    let live = read_live_core_journal(journal_path)?;
+    let compacted = compact_core_journal(journal_path, &live.groups, live.replayed.sequence)?;
+    *journal = Some(JournalWriter::open(journal_path, FIRST_SEQUENCE)?);
     Ok(compacted)
 }
 
@@ -859,8 +928,8 @@ struct WireCodec<T>(PhantomData<T>);
 impl<T: Serialize + DeserializeOwned> journal::FrameCodec for WireCodec<T> {
     type Record = T;
 
-    fn encode(record: &T) -> Vec<u8> {
-        encode_wire(record).into()
+    fn encode_into(record: &T, out: &mut Vec<u8>) {
+        rmp_serde::encode::write_named(out, record).expect("wire value serializes to MessagePack");
     }
 
     fn decode(payload: &[u8]) -> Result<T, io::Error> {
@@ -868,18 +937,10 @@ impl<T: Serialize + DeserializeOwned> journal::FrameCodec for WireCodec<T> {
     }
 }
 
-fn write_wire_frame_to_file<T: Serialize + DeserializeOwned>(
-    path: &Path,
-    journal: &mut JournalWriter,
-    value: &T,
-) -> Result<(), io::Error> {
-    journal.append::<WireCodec<T>>(path, value)
-}
-
 #[cfg(test)]
 pub(crate) fn read_wire_frames<T: Serialize + DeserializeOwned>(
     bytes: &[u8],
-) -> Result<Vec<T>, io::Error> {
+) -> Result<Vec<T>, JournalError> {
     journal::decode_frames::<WireCodec<T>>(bytes).map(|(records, _)| records)
 }
 
@@ -958,6 +1019,8 @@ pub(crate) fn apply_log_store_record(
 mod tests {
     use std::fs;
     use std::fs::OpenOptions;
+    use std::io::Seek;
+    use std::io::SeekFrom;
     use std::io::Write;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
@@ -974,15 +1037,41 @@ mod tests {
     use ursula_shard::ShardId;
     use ursula_stream::StreamCommand;
 
-    use super::*;
+    use super::CORE_LOG_ONLINE_RECLAIM_MIN_BYTES;
+    use super::CoreFileLogWriter;
+    use super::CoreJournalError;
+    use super::CoreJournalRecord;
+    use super::EntryOf;
+    use super::FIRST_SEQUENCE;
+    use super::IOFlushed;
+    use super::JournalError;
+    use super::JournalReplayMode;
+    use super::JournalWriter;
+    use super::LogIdOf;
+    use super::Path;
+    use super::PathBuf;
+    use super::RaftGroupFileLogStore;
+    use super::RaftGroupId;
+    use super::RaftGroupLogRecord;
+    use super::RaftLogStorage;
+    use super::ShardPlacement;
+    use super::UrsulaRaftTypeConfig;
+    use super::VoteOf;
+    use super::WireCodec;
+    use super::compact_core_journal;
+    use super::io;
+    use super::journal::ReplayTail;
+    use super::raft_group_log_record_requires_sync;
+    use super::reclaim_core_journal_if_needed;
+    use super::recover_core_journal;
 
     static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_journal_path(name: &str) -> PathBuf {
         let nonce = TEMP_JOURNAL_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir()
-            .join("ursula-raft-file-log-tests")
-            .join(format!("{name}-{}-{nonce}.bin", std::process::id()));
+        let dir = std::env::temp_dir().join("ursula-raft-file-log-tests");
+        fs::create_dir_all(&dir).expect("create the test journal directory");
+        let path = dir.join(format!("{name}-{}-{nonce}.bin", std::process::id()));
         crate::tests::remove_test_path(&path);
         path
     }
@@ -995,6 +1084,21 @@ mod tests {
         }
     }
 
+    fn record(group_id: u32, record: RaftGroupLogRecord) -> CoreJournalRecord {
+        CoreJournalRecord { group_id, record }
+    }
+
+    /// Appends `records` to the journal at `path` in one synced batch.
+    fn write_records(path: &Path, records: impl IntoIterator<Item = CoreJournalRecord>) {
+        let mut writer = JournalWriter::open(path, FIRST_SEQUENCE).expect("open journal");
+        for record in records {
+            writer
+                .append::<WireCodec<CoreJournalRecord>>(&record)
+                .expect("append core journal record");
+        }
+        writer.sync().expect("sync core journal");
+    }
+
     fn append_torn_frame(path: &Path) {
         let mut file = OpenOptions::new()
             .append(true)
@@ -1004,6 +1108,10 @@ mod tests {
             .expect("write torn frame length");
         file.write_all(b"torn").expect("write partial torn payload");
         file.sync_data().expect("sync torn tail");
+    }
+
+    fn file_len(path: &Path) -> u64 {
+        fs::metadata(path).expect("core journal metadata").len()
     }
 
     fn test_log_id(index: u64) -> LogIdOf<UrsulaRaftTypeConfig> {
@@ -1036,6 +1144,15 @@ mod tests {
         openraft::Vote::new_committed(7, 1)
     }
 
+    fn strict(path: &Path) -> super::RecoveredJournal {
+        recover_core_journal(path, JournalReplayMode::Strict).expect("recover core journal")
+    }
+
+    fn remove_journal(path: &Path) {
+        crate::tests::remove_test_path(path);
+        crate::tests::remove_test_path(format!("{}.lock", path.display()));
+    }
+
     #[test]
     fn fsync_policy_keeps_only_replay_hints_best_effort() {
         assert!(raft_group_log_record_requires_sync(
@@ -1059,36 +1176,19 @@ mod tests {
     fn load_core_journal_truncates_torn_tail() {
         let path = temp_journal_path("core-journal-torn-tail");
         let vote = committed_vote();
-        let mut handle = JournalWriter::new(true);
-        write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
-            group_id: 3,
-            record: RaftGroupLogRecord::SaveVote(vote),
-        })
-        .expect("write complete core journal record");
-        handle
-            .sync(&path)
-            .expect("sync complete core journal record");
-        drop(handle);
-        let valid_len = fs::metadata(&path).expect("core journal metadata").len();
+        write_records(&path, [record(3, RaftGroupLogRecord::SaveVote(vote))]);
+        let valid_len = file_len(&path);
 
         append_torn_frame(&path);
-        assert!(
-            fs::metadata(&path)
-                .expect("core journal metadata after torn append")
-                .len()
-                > valid_len
-        );
+        assert!(file_len(&path) > valid_len);
 
-        let inners = load_log_store_inners_from_core_journal(&path)
-            .expect("load core journal with torn tail");
-        assert_eq!(inners.get(&3).and_then(|inner| inner.vote), Some(vote));
+        let recovered = strict(&path);
         assert_eq!(
-            fs::metadata(&path)
-                .expect("core journal metadata after recovery")
-                .len(),
-            valid_len
+            recovered.groups.get(&3).and_then(|inner| inner.vote),
+            Some(vote)
         );
-
+        assert_eq!(recovered.replayed.tail, ReplayTail::Incomplete { bytes: 8 });
+        assert_eq!(file_len(&path), valid_len);
         crate::tests::remove_test_path(&path);
     }
 
@@ -1097,29 +1197,21 @@ mod tests {
         let path = temp_journal_path("core-journal-groups");
         let first_vote = openraft::Vote::new_committed(3, 1);
         let second_vote = openraft::Vote::new_committed(5, 2);
-        let mut handle = JournalWriter::new(true);
-        for (group_id, vote) in [(3, first_vote), (7, second_vote)] {
-            write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
-                group_id,
-                record: RaftGroupLogRecord::SaveVote(vote),
-            })
-            .expect("write core journal group record");
-        }
-        handle.sync(&path).expect("sync core journal groups");
-        drop(handle);
+        write_records(&path, [
+            record(3, RaftGroupLogRecord::SaveVote(first_vote)),
+            record(7, RaftGroupLogRecord::SaveVote(second_vote)),
+        ]);
 
-        let inners =
-            load_log_store_inners_from_core_journal(&path).expect("load all core journal groups");
-        assert_eq!(inners.len(), 2);
+        let recovered = strict(&path);
+        assert_eq!(recovered.groups.len(), 2);
         assert_eq!(
-            inners.get(&3).and_then(|inner| inner.vote),
+            recovered.groups.get(&3).and_then(|inner| inner.vote),
             Some(first_vote)
         );
         assert_eq!(
-            inners.get(&7).and_then(|inner| inner.vote),
+            recovered.groups.get(&7).and_then(|inner| inner.vote),
             Some(second_vote)
         );
-
         crate::tests::remove_test_path(&path);
     }
 
@@ -1128,84 +1220,75 @@ mod tests {
         let path = temp_journal_path("core-journal-compact");
         let first_vote = openraft::Vote::new_committed(3, 1);
         let latest_vote = openraft::Vote::new_committed(5, 1);
-        let mut handle = JournalWriter::new(true);
-        for vote in std::iter::repeat_n(first_vote, 100).chain([latest_vote]) {
-            write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
-                group_id: 7,
-                record: RaftGroupLogRecord::SaveVote(vote),
-            })
-            .expect("write redundant vote");
-        }
-        for record in [
-            RaftGroupLogRecord::Append((1..=3).map(blank_entry).collect()),
-            RaftGroupLogRecord::Purge(test_log_id(2)),
-            RaftGroupLogRecord::SaveCommitted(Some(test_log_id(3))),
-        ] {
-            write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
-                group_id: 7,
-                record,
-            })
-            .expect("write retained log state");
-        }
-        handle.sync(&path).expect("sync redundant journal");
-        drop(handle);
-        let before = fs::metadata(&path).expect("journal metadata").len();
-        let inners = load_log_store_inners_from_core_journal(&path).expect("replay journal");
+        write_records(
+            &path,
+            std::iter::repeat_n(first_vote, 100)
+                .chain([latest_vote])
+                .map(|vote| record(7, RaftGroupLogRecord::SaveVote(vote)))
+                .chain([
+                    record(
+                        7,
+                        RaftGroupLogRecord::Append((1..=3).map(blank_entry).collect()),
+                    ),
+                    record(7, RaftGroupLogRecord::Purge(test_log_id(2))),
+                    record(7, RaftGroupLogRecord::SaveCommitted(Some(test_log_id(3)))),
+                ]),
+        );
+        let before = file_len(&path);
+        let recovered = strict(&path);
+        assert_eq!(recovered.replayed.sequence, Some(FIRST_SEQUENCE));
 
-        let compacted = compact_core_journal(&path, &inners)
+        let compacted = compact_core_journal(&path, &recovered.groups, recovered.replayed.sequence)
             .expect("compact journal")
             .expect("redundant journal should shrink");
 
         assert_eq!(compacted.0, before);
         assert!(compacted.1 < compacted.0);
-        let recovered = load_log_store_inners_from_core_journal(&path).expect("replay compacted");
+        let recovered = strict(&path);
         assert_eq!(
-            recovered.get(&7).and_then(|inner| inner.vote),
-            Some(latest_vote)
+            recovered.replayed.sequence,
+            Some(FIRST_SEQUENCE + 1),
+            "a rewrite is the next generation"
         );
-        let recovered = recovered.get(&7).expect("recovered group");
-        assert_eq!(recovered.last_purged_log_id, Some(test_log_id(2)));
-        assert_eq!(recovered.committed, Some(test_log_id(3)));
-        assert_eq!(recovered.entries.keys().copied().collect::<Vec<_>>(), [3]);
+        let group = recovered.groups.get(&7).expect("recovered group");
+        assert_eq!(group.vote, Some(latest_vote));
+        assert_eq!(group.last_purged_log_id, Some(test_log_id(2)));
+        assert_eq!(group.committed, Some(test_log_id(3)));
+        assert_eq!(group.entries.keys().copied().collect::<Vec<_>>(), [3]);
         crate::tests::remove_test_path(&path);
     }
 
     #[test]
     fn online_reclaim_reopens_the_replaced_core_journal() {
         let path = temp_journal_path("core-journal-online-reclaim");
-        let mut handle = JournalWriter::new(true);
-        for index in 1..=256 {
-            write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
-                group_id: 7,
-                record: RaftGroupLogRecord::Append(vec![blank_entry(index)]),
-            })
-            .expect("write historical core record");
-        }
-        write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
-            group_id: 7,
-            record: RaftGroupLogRecord::Purge(test_log_id(255)),
-        })
-        .expect("write purge frontier");
-        handle.sync(&path).expect("sync historical core journal");
-        let before = fs::metadata(&path).expect("journal metadata").len();
+        write_records(
+            &path,
+            (1..=256)
+                .map(|index| record(7, RaftGroupLogRecord::Append(vec![blank_entry(index)])))
+                .chain([record(7, RaftGroupLogRecord::Purge(test_log_id(255)))]),
+        );
+        let before = file_len(&path);
+        let mut journal = Some(JournalWriter::open(&path, FIRST_SEQUENCE).expect("open journal"));
 
-        let (reclaim_before, reclaim_after) = reclaim_core_journal_if_needed(&path, &mut handle, 0)
-            .expect("online reclaim")
-            .expect("historical journal should shrink");
+        let (reclaim_before, reclaim_after) =
+            reclaim_core_journal_if_needed(&path, &mut journal, 0)
+                .expect("online reclaim")
+                .expect("historical journal should shrink");
         assert_eq!(reclaim_before, before);
         assert!(reclaim_after < reclaim_before);
 
-        write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
-            group_id: 7,
-            record: RaftGroupLogRecord::Append(vec![blank_entry(257)]),
-        })
-        .expect("append after atomic replacement");
-        handle.sync(&path).expect("sync append after reclaim");
-        drop(handle);
+        let writer = journal.as_mut().expect("reopened journal");
+        writer
+            .append::<WireCodec<CoreJournalRecord>>(&record(
+                7,
+                RaftGroupLogRecord::Append(vec![blank_entry(257)]),
+            ))
+            .expect("append after atomic replacement");
+        writer.sync().expect("sync append after reclaim");
+        drop(journal);
 
-        let recovered =
-            load_log_store_inners_from_core_journal(&path).expect("replay reclaimed WAL");
-        let group = recovered.get(&7).expect("recovered group");
+        let recovered = strict(&path);
+        let group = recovered.groups.get(&7).expect("recovered group");
         assert_eq!(group.last_purged_log_id, Some(test_log_id(255)));
         assert_eq!(group.entries.keys().copied().collect::<Vec<_>>(), [
             256, 257
@@ -1213,34 +1296,57 @@ mod tests {
         crate::tests::remove_test_path(&path);
     }
 
+    /// Online reclaim reads the journal its writer appends to. A frame that
+    /// fails verification there is never truncated away.
+    #[test]
+    fn online_reclaim_never_truncates_a_live_journal_that_fails_verification() {
+        let path = temp_journal_path("core-journal-reclaim-corrupt");
+        write_records(
+            &path,
+            (1..=4).map(|index| record(7, RaftGroupLogRecord::Append(vec![blank_entry(index)]))),
+        );
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open journal");
+        file.seek(SeekFrom::Start(40)).expect("seek into frame 1");
+        file.write_all(b"corrupt").expect("corrupt frame 1");
+        file.sync_data().expect("sync corruption");
+        let len = file_len(&path);
+        let mut journal = Some(JournalWriter::open(&path, FIRST_SEQUENCE).expect("open journal"));
+
+        let err = reclaim_core_journal_if_needed(&path, &mut journal, 0)
+            .expect_err("a corrupt live journal is not reclaimed");
+        assert!(
+            matches!(&err, CoreJournalError::Journal(err) if matches!(**err, JournalError::CorruptFrame { frame: 1, .. })),
+            "unexpected error: {err}"
+        );
+        assert_eq!(file_len(&path), len, "nothing is truncated");
+        crate::tests::remove_test_path(&path);
+    }
+
     #[test]
     #[ignore = "writes a production-threshold WAL generation; run through scripts/soak_raft_wal.sh"]
     fn online_reclaim_converges_at_production_threshold() {
         let path = temp_journal_path("core-journal-production-reclaim");
-        let mut handle = JournalWriter::new(true);
-        write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
-            group_id: 7,
-            record: RaftGroupLogRecord::Append(vec![payload_entry(
-                1,
-                usize::try_from(CORE_LOG_ONLINE_RECLAIM_MIN_BYTES)
-                    .expect("reclaim threshold fits usize")
-                    .saturating_add(1024),
-            )]),
-        })
-        .expect("write production-sized historical record");
-        write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
-            group_id: 7,
-            record: RaftGroupLogRecord::Purge(test_log_id(1)),
-        })
-        .expect("write production-sized purge frontier");
-        handle
-            .sync(&path)
-            .expect("sync production-sized core journal");
-        let before = fs::metadata(&path).expect("journal metadata").len();
+        write_records(&path, [
+            record(
+                7,
+                RaftGroupLogRecord::Append(vec![payload_entry(
+                    1,
+                    usize::try_from(CORE_LOG_ONLINE_RECLAIM_MIN_BYTES)
+                        .expect("reclaim threshold fits usize")
+                        .saturating_add(1024),
+                )]),
+            ),
+            record(7, RaftGroupLogRecord::Purge(test_log_id(1))),
+        ]);
+        let before = file_len(&path);
         assert!(before >= CORE_LOG_ONLINE_RECLAIM_MIN_BYTES);
+        let mut journal = Some(JournalWriter::open(&path, FIRST_SEQUENCE).expect("open journal"));
 
         let (reclaim_before, reclaim_after) =
-            reclaim_core_journal_if_needed(&path, &mut handle, CORE_LOG_ONLINE_RECLAIM_MIN_BYTES)
+            reclaim_core_journal_if_needed(&path, &mut journal, CORE_LOG_ONLINE_RECLAIM_MIN_BYTES)
                 .expect("production-threshold online reclaim")
                 .expect("production-sized historical journal should shrink");
         assert_eq!(reclaim_before, before);
@@ -1249,41 +1355,94 @@ mod tests {
             "production-threshold reclaim: before_bytes={reclaim_before} after_bytes={reclaim_after}"
         );
 
-        drop(handle);
-        let recovered =
-            load_log_store_inners_from_core_journal(&path).expect("replay reclaimed WAL");
-        let group = recovered.get(&7).expect("recovered group");
+        drop(journal);
+        let recovered = strict(&path);
+        let group = recovered.groups.get(&7).expect("recovered group");
         assert_eq!(group.last_purged_log_id, Some(test_log_id(1)));
         assert!(group.entries.is_empty());
         crate::tests::remove_test_path(&path);
     }
 
+    /// Strict recovery refuses a hole before intact frames; the verified
+    /// prefix keeps the frames before it.
+    #[test]
+    fn replay_modes_choose_between_failing_closed_and_the_verified_prefix() {
+        let path = temp_journal_path("core-journal-replay-modes");
+        let vote = committed_vote();
+        write_records(&path, [
+            record(3, RaftGroupLogRecord::SaveVote(vote)),
+            record(
+                3,
+                RaftGroupLogRecord::Append((1..=2).map(blank_entry).collect()),
+            ),
+            record(
+                3,
+                RaftGroupLogRecord::Append((3..=4).map(blank_entry).collect()),
+            ),
+        ]);
+        let prefix = strict(&path).replayed;
+        assert_eq!(prefix.frames, 3);
+        write_records(&path, [record(
+            3,
+            RaftGroupLogRecord::Append((5..=6).map(blank_entry).collect()),
+        )]);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open journal");
+        file.seek(SeekFrom::Start(prefix.verified_len))
+            .expect("seek to frame 4");
+        file.write_all(&[0; 16]).expect("zero frame 4");
+        file.sync_data().expect("sync hole");
+        let len = file_len(&path);
+
+        let err = CoreFileLogWriter::open(path.clone(), JournalReplayMode::Strict, None)
+            .expect_err("strict recovery fails closed");
+        assert!(
+            matches!(&err, CoreJournalError::Journal(err) if matches!(**err, JournalError::CorruptFrame { frame: 4, offset, .. } if offset == prefix.verified_len)),
+            "unexpected error: {err}"
+        );
+        assert_eq!(file_len(&path), len, "strict recovery truncates nothing");
+
+        let writer = CoreFileLogWriter::open(path.clone(), JournalReplayMode::VerifiedPrefix, None)
+            .expect("verified-prefix recovery");
+        let inner = writer
+            .take_recovered(RaftGroupId(3))
+            .expect("recovered group");
+        assert_eq!(inner.vote, Some(vote));
+        assert_eq!(inner.entries.keys().copied().collect::<Vec<_>>(), [
+            1, 2, 3, 4
+        ]);
+        drop(writer);
+        remove_journal(&path);
+    }
+
     #[test]
     fn core_file_log_rejects_a_second_owner() {
         let path = temp_journal_path("core-exclusive-lock");
-        let first = CoreFileLogWriter::open(path.clone(), None).expect("open first core owner");
-        let err =
-            CoreFileLogWriter::open(path.clone(), None).expect_err("second core owner must fail");
+        let first = CoreFileLogWriter::open(path.clone(), JournalReplayMode::Strict, None)
+            .expect("open first core owner");
+        let err = CoreFileLogWriter::open(path.clone(), JournalReplayMode::Strict, None)
+            .expect_err("second core owner must fail");
         assert!(
             matches!(&err, CoreJournalError::Locked { owner: Some(owner), .. } if owner.starts_with("pid=")),
             "unexpected error: {err}"
         );
         let err = io::Error::from(err);
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
-        assert!(err.to_string().contains("already locked"));
         drop(first);
-        let reopened =
-            CoreFileLogWriter::open(path.clone(), None).expect("core lock releases on drop");
+        let reopened = CoreFileLogWriter::open(path.clone(), JournalReplayMode::Strict, None)
+            .expect("core lock releases on drop");
         drop(reopened);
-        crate::tests::remove_test_path(&path);
-        crate::tests::remove_test_path(format!("{}.lock", path.display()));
+        remove_journal(&path);
     }
 
     #[tokio::test]
     async fn a_group_opens_once_per_core_writer() {
         let path = temp_journal_path("core-group-reopen");
         let metrics = RuntimeMetrics::new(1, 2).group_engine_metrics();
-        let writer = CoreFileLogWriter::open(path.clone(), None).expect("open core writer");
+        let open = || CoreFileLogWriter::open(path.clone(), JournalReplayMode::Strict, None);
+        let writer = open().expect("open core writer");
         let mut store = RaftGroupFileLogStore::open(placement(1), metrics.clone(), writer.clone())
             .expect("open group store");
         store
@@ -1302,13 +1461,12 @@ mod tests {
             .expect("another group still opens");
         drop(writer);
 
-        let writer = CoreFileLogWriter::open(path.clone(), None).expect("reopen core writer");
+        let writer = open().expect("reopen core writer");
         let mut store = RaftGroupFileLogStore::open(placement(1), metrics, writer)
             .expect("a new writer recovers the group");
         let state = store.get_log_state().await.expect("recovered log state");
         assert_eq!(state.last_log_id, Some(test_log_id(1)));
         drop(store);
-        crate::tests::remove_test_path(&path);
-        crate::tests::remove_test_path(format!("{}.lock", path.display()));
+        remove_journal(&path);
     }
 }

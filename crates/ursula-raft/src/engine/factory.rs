@@ -31,6 +31,7 @@ use crate::grpc::GrpcRaftNetwork;
 use crate::grpc::GrpcRaftNetworkFactory;
 use crate::grpc::probe_rejoin_vote_barrier;
 use crate::log_store::CoreFileLogWriter;
+use crate::log_store::JournalReplayMode;
 use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RaftGroupLogStore;
 use crate::registry::RaftGroupHandleRegistry;
@@ -430,18 +431,29 @@ impl GroupEngineFactory for ColdRaftGroupEngineFactory {
     }
 }
 
+/// Opens each group's durable log store over its core's shared journal.
 #[derive(Debug, Clone)]
 pub struct DurableRaftLogStoreFactory {
     root: PathBuf,
+    replay_mode: JournalReplayMode,
     core_writers: Arc<Mutex<BTreeMap<u16, Weak<CoreFileLogWriter>>>>,
 }
 
 impl DurableRaftLogStoreFactory {
+    /// A factory over the journals under `root` that recovers them in
+    /// [`JournalReplayMode::Strict`].
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            replay_mode: JournalReplayMode::Strict,
             core_writers: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Recovers each core journal in `replay_mode` when it first opens.
+    pub fn with_replay_mode(mut self, replay_mode: JournalReplayMode) -> Self {
+        self.replay_mode = replay_mode;
+        self
     }
 
     pub(crate) fn core_journal_path(&self, core_id: CoreId) -> PathBuf {
@@ -471,6 +483,7 @@ impl DurableRaftLogStoreFactory {
 
         let writer = CoreFileLogWriter::open(
             self.core_journal_path(placement.core_id),
+            self.replay_mode,
             Some((placement, metrics)),
         )
         .map_err(|err| GroupEngineError::new(format!("open OpenRaft core journal: {err}")))?;

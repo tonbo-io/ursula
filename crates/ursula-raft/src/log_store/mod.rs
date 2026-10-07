@@ -27,6 +27,12 @@ pub use file::RaftGroupFileLogStore;
 pub(crate) use file::elapsed_ns;
 #[cfg(test)]
 pub(crate) use file::read_wire_frames;
+pub use journal::FrameDefect;
+pub use journal::HeaderDefect;
+pub use journal::JournalError;
+pub use journal::JournalOp;
+pub use journal::JournalReplayMode;
+pub use journal::RecordTooLarge;
 pub use memory::MemoryRaftLogStore;
 pub use memory::MetaRaftLogStore;
 pub use memory::RaftGroupLogStore;
