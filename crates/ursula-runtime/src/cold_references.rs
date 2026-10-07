@@ -29,7 +29,7 @@ use crate::cold_index::ColdStoreColdIndexPageStore;
 use crate::cold_store::ColdStoreHandle;
 
 /// How many missing object keys a check reports by name.
-pub const MISSING_COLD_OBJECT_SAMPLE: usize = 10;
+const MISSING_COLD_OBJECT_SAMPLE: usize = 10;
 /// Object stats a check keeps in flight at once.
 const COLD_REFERENCE_CHECK_CONCURRENCY: usize = 32;
 /// Pages the check keeps cached while it resolves one stream's ranges.
@@ -42,9 +42,8 @@ pub struct ColdReferenceReport {
     pub referenced: u64,
     /// How many of them the cold store does not hold.
     pub missing: u64,
-    /// Missing keys relative to the cold root, at most
-    /// [`MISSING_COLD_OBJECT_SAMPLE`]: index pages first, then other objects
-    /// in key order.
+    /// Missing keys relative to the cold root, at most ten: index pages
+    /// first, then other objects in key order.
     pub missing_sample: Vec<String>,
 }
 

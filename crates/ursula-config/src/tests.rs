@@ -448,57 +448,28 @@ url = "http://127.0.0.1:4438"
         load_config(Some(tmp.path()), None, Some(1)).expect("a static cluster with a WAL path");
     }
 
-    /// The memory WAL is gone: its settings fail the load, naming the
-    /// release that removed them, instead of being ignored.
+    /// The memory WAL is gone: its settings are unknown keys, which fail the
+    /// load instead of being ignored.
     #[test]
     fn removed_memory_wal_settings_are_refused() {
-        for (section, key, path) in [
-            ("raft.wal", "backend = \"memory\"", "raft.wal.backend"),
-            ("raft.wal", "backend = \"disk\"", "raft.wal.backend"),
-            (
-                "raft.wal",
-                "allow_volatile_multi_peer = true",
-                "raft.wal.allow_volatile_multi_peer",
-            ),
-            (
-                "raft",
-                "memory_bootstrap_marker_dir = \"/tmp/markers\"",
-                "raft.memory_bootstrap_marker_dir",
-            ),
-            ("raft", "rejoin_probe = \"6s\"", "raft.rejoin_probe"),
+        for (section, key) in [
+            ("raft.wal", "backend = \"memory\""),
+            ("raft.wal", "backend = \"disk\""),
+            ("raft.wal", "allow_volatile_multi_peer = true"),
+            ("raft", "memory_bootstrap_marker_dir = \"/tmp/markers\""),
         ] {
             let tmp = temp_config(".toml", &format!("[{section}]\n{key}\n"));
             let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
             assert!(
-                matches!(
-                    &err,
-                    crate::ConfigError::RemovedKeys(keys)
-                        if keys.len() == 1 && keys[0].key == path && keys[0].release == "0.7"
-                ),
+                matches!(err, crate::ConfigError::TomlParse(_)),
+                "{key}: {err}"
+            );
+            let name = key.split(' ').next().unwrap();
+            assert!(
+                err.to_string().contains(&format!("unknown field `{name}`")),
                 "{key}: {err}"
             );
         }
-
-        // Every removed key at once, next to keys that remain.
-        let tmp = temp_config(
-            ".toml",
-            "[raft]\nrejoin_probe = \"6s\"\ngroup_count = 4\n[raft.wal]\nbackend = \
-             \"disk\"\npath = \"/tmp/ursula-wal\"\n",
-        );
-        let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
-        let crate::ConfigError::RemovedKeys(keys) = &err else {
-            panic!("removed keys refused: {err}");
-        };
-        assert_eq!(
-            keys.iter().map(|removed| removed.key).collect::<Vec<_>>(),
-            ["raft.wal.backend", "raft.rejoin_probe"]
-        );
-        assert!(err.to_string().contains("removed in Ursula 0.7"), "{err}");
-
-        // A key that was never valid stays an unknown field.
-        let tmp = temp_config(".toml", "[raft.wal]\nbackend_kind = \"disk\"\n");
-        let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
-        assert!(matches!(err, crate::ConfigError::TomlParse(_)), "{err}");
     }
 
     #[test]

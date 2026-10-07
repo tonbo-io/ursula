@@ -2107,10 +2107,10 @@ pub(crate) async fn flush_cold_stream(
     }
 }
 
-/// The backup format this server exports and imports. It is independent of
-/// the format epoch (`ursula_stream::format`): a 0.7 server imports backups
-/// of 0.6, and refuses 0.5.x groups (E10).
-pub(crate) const BACKUP_FORMAT_VERSION: u32 = ursula_runtime::BACKUP_FORMAT_VERSION;
+/// The backup format is the format epoch: an ursulactl of another epoch
+/// refuses this version with its own check, and this server refuses groups of
+/// another epoch (E10).
+pub(crate) const BACKUP_FORMAT_VERSION: u32 = ursula_runtime::FORMAT_EPOCH;
 pub(crate) const HEADER_BACKUP_FORMAT: &str = "x-ursula-backup-format";
 pub(crate) const HEADER_BACKUP_BLAKE3: &str = "x-ursula-backup-blake3";
 pub(crate) const HEADER_BACKUP_COMMIT_INDEX: &str = "x-ursula-backup-commit-index";
@@ -2186,17 +2186,16 @@ pub(crate) async fn export_backup_group(
     response
 }
 
-/// The only field an import reads before it trusts the payload (E10): the
-/// stream snapshot version, under the MessagePack key Ursula 0.6 wrote.
+/// The only field an import reads before it trusts the payload (E10).
 #[derive(serde::Deserialize)]
-struct BackupVersionProbe {
-    #[serde(default, rename = "format_epoch")]
-    version: Option<u32>,
+struct BackupEpochProbe {
+    #[serde(default)]
+    format_epoch: Option<u32>,
 }
 
 /// Reads one backup group object addressed to group `raft_group_id`: the
 /// group must exist here and the body must be a stream snapshot of this
-/// server's version (E10). A refusal is the `400` to answer.
+/// server's format epoch (E10). A refusal is the `400` to answer.
 fn decode_backup_group(
     state: &HttpState,
     raft_group_id: u64,
@@ -2213,21 +2212,20 @@ fn decode_backup_group(
     let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
         return Err(bad_request("invalid raft group id".to_owned()));
     };
-    // E10: read only the version first, so a 0.5.x group answers 400 instead
-    // of being decoded under this version's rules.
-    match rmp_serde::from_slice::<BackupVersionProbe>(body) {
-        Ok(BackupVersionProbe {
-            version: Some(version),
-        }) if version == ursula_runtime::STREAM_SNAPSHOT_VERSION => {}
-        Ok(BackupVersionProbe { version }) => {
-            let found = version.map_or_else(
-                || "no stream snapshot version (Ursula 0.5.x or earlier)".to_owned(),
-                |version| format!("an unsupported stream snapshot version ({version})"),
+    // E10: read only the epoch first, so a group of another epoch answers
+    // 400 instead of being decoded under this epoch's rules.
+    match rmp_serde::from_slice::<BackupEpochProbe>(body) {
+        Ok(BackupEpochProbe {
+            format_epoch: Some(epoch),
+        }) if epoch == ursula_runtime::FORMAT_EPOCH => {}
+        Ok(BackupEpochProbe { format_epoch }) => {
+            let found = format_epoch.map_or_else(
+                || "no format_epoch".to_owned(),
+                |epoch| format!("an unsupported format_epoch ({epoch})"),
             );
             return Err(bad_request(format!(
-                "backup group has {found}; this server imports stream snapshot version {} \
-                 (Ursula 0.6 and later) only",
-                ursula_runtime::STREAM_SNAPSHOT_VERSION
+                "backup group has {found}; this server imports format epoch {} only",
+                ursula_runtime::FORMAT_EPOCH
             )));
         }
         Err(err) => return Err(bad_request(format!("decode backup snapshot: {err}"))),

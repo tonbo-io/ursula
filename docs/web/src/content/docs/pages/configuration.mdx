@@ -72,11 +72,7 @@ refuses to start without `raft.wal.path`. A single node without a path creates a
 fresh `ursula-wal-*` directory under the system temporary directory, logs its
 location at startup, and removes it on a clean shutdown (`SIGTERM` or Ctrl-C).
 A failed start, or a shutdown that cannot close the WAL, leaves the directory in
-place. Its streams survive no restart. Set `raft.wal.path` to keep them. Configurations
-that still set `raft.wal.backend`, `raft.wal.allow_volatile_multi_peer`,
-`raft.memory_bootstrap_marker_dir` or `raft.rejoin_probe` fail to load with an
-error that names each key and the release that removed it (see
-[Upgrading from 0.6](/docs/operations#upgrading-from-06)).
+place. Its streams survive no restart. Set `raft.wal.path` to keep them.
 
 With `fsync = "never"`, a process crash loses nothing because the page cache
 survives it, and a graceful shutdown `fsync`s every journal before it exits. A

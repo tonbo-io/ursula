@@ -13,13 +13,11 @@ use crate::model::StreamVisibleSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamSnapshot {
-    /// Stream snapshot version ([`crate::STREAM_SNAPSHOT_VERSION`]). The
-    /// MessagePack key stays `format_epoch`, the name Ursula 0.6 wrote it
-    /// under, so 0.6 backups decode. Deliberately not `serde(default)`: a
-    /// snapshot from Ursula 0.5.x has no such field and fails to decode
-    /// instead of being misread.
-    #[serde(rename = "format_epoch")]
-    pub version: u32,
+    /// Format epoch of the binary that wrote this snapshot
+    /// ([`crate::FORMAT_EPOCH`]). Deliberately not `serde(default)`: a
+    /// MessagePack snapshot from Ursula 0.5.x (epoch 1) has no such field and
+    /// fails to decode instead of being misread.
+    pub format_epoch: u32,
     pub buckets: Vec<String>,
     /// Permanent bucket-erasure fences.
     pub erased_buckets: Vec<String>,
@@ -32,11 +30,11 @@ pub struct StreamSnapshot {
     pub last_created_at_ms: u64,
 }
 
-/// An empty snapshot of this binary's version. Fixtures restore from it.
+/// An empty snapshot of this binary's epoch. Fixtures restore from it.
 impl Default for StreamSnapshot {
     fn default() -> Self {
         Self {
-            version: crate::STREAM_SNAPSHOT_VERSION,
+            format_epoch: crate::FORMAT_EPOCH,
             buckets: Vec::new(),
             erased_buckets: Vec::new(),
             streams: Vec::new(),
@@ -96,13 +94,14 @@ pub enum StreamSnapshotError {
         snapshot_offset: u64,
         tail_offset: u64,
     },
-    #[error(
-        "stream snapshot is version {found}; this binary reads stream snapshot version {} only",
-        crate::STREAM_SNAPSHOT_VERSION
-    )]
-    UnsupportedVersion { found: u32 },
+    #[error("{}", snapshot_format_epoch_message(.found))]
+    FormatEpoch { found: u32 },
     #[error("snapshot cold GC entry {seq} has no owning bucket")]
     UnattributedColdGc { seq: u64 },
     #[error("snapshot cold GC entry {seq} targets a stream without a cold generation")]
     ColdGcWithoutGeneration { seq: u64 },
+}
+
+fn snapshot_format_epoch_message(found: &u32) -> String {
+    crate::format_epoch_refusal("snapshot", &format!("is format epoch {found}"))
 }

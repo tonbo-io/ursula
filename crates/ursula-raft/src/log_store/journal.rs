@@ -1,4 +1,4 @@
-//! Append-only framed journal segment, Raft WAL version 3.
+//! Append-only framed journal segment, format epoch 3.
 //!
 //! Persistence is kept orthogonal to serialization. A journal segment moves
 //! opaque checksummed frames to and from a file and handles the durability
@@ -42,10 +42,10 @@ use super::disk::JournalDisk;
 use super::disk::JournalFile;
 
 const JOURNAL_MAGIC: [u8; 8] = *b"URSJWAL\0";
-/// The journal header version is the Raft WAL version
-/// (`ursula_stream::RAFT_WAL_VERSION`). Earlier releases check their own
-/// version exactly, so each refuses the other.
-pub(crate) const JOURNAL_VERSION: u16 = ursula_stream::RAFT_WAL_VERSION;
+/// The journal header version is the format epoch (`ursula_stream::FORMAT_EPOCH`).
+/// Earlier epochs check their own version exactly, so each refuses the other.
+pub(crate) const JOURNAL_VERSION: u16 = ursula_stream::FORMAT_EPOCH as u16;
+const _: () = assert!(ursula_stream::FORMAT_EPOCH <= u16::MAX as u32);
 const JOURNAL_HEADER_LEN: usize = 32;
 const JOURNAL_HEADER_LEN_U16: u16 = 32;
 pub(crate) const JOURNAL_HEADER_LEN_U64: u64 = 32;
@@ -114,7 +114,7 @@ impl fmt::Display for JournalOp {
     }
 }
 
-/// Why a file header is not a valid header of this WAL version.
+/// Why a file header is not a valid header of this format epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum HeaderDefect {
     #[error("the header is incomplete")]
@@ -156,9 +156,9 @@ pub enum JournalError {
     },
     #[error(
         "'{}' has no Ursula WAL magic; it is not an Ursula journal this binary can read \
-         (WAL version {}). Start on an empty raft.wal.path",
+         (format epoch {}). Start on an empty raft.wal.path",
         .path.display(),
-        JOURNAL_VERSION
+        ursula_stream::FORMAT_EPOCH
     )]
     NotAJournal { path: PathBuf },
     #[error("{}", version_refusal(.path, *.version))]
@@ -293,10 +293,9 @@ impl JournalError {
 }
 
 fn version_refusal(path: &Path, version: u16) -> String {
-    ursula_stream::other_release_refusal(
+    ursula_stream::format_epoch_refusal(
         &format!("journal '{}'", path.display()),
         &format!("uses Ursula WAL version {version}"),
-        &format!("Ursula WAL version {JOURNAL_VERSION}"),
     )
 }
 
@@ -1240,7 +1239,7 @@ mod tests {
                 version: 2,
                 ..
             }));
-            assert!(err.to_string().contains("WAL version 3 only"), "{err}");
+            assert!(err.to_string().contains("format epoch 3 only"), "{err}");
         }
         let err = JournalWriter::open(&path, FIRST_SEQUENCE).expect_err("no append to epoch 2");
         assert!(matches!(err, JournalError::UnsupportedVersion {
