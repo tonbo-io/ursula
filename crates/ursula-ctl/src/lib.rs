@@ -16,13 +16,11 @@
 //! - [`backup`]: verifiable cluster backup, verification, and restore.
 //! - [`maintenance`]: node-maintenance verbs (drain, undrain, catch-up wait).
 //! - [`provider`]: cluster manifest loading and node addressing.
-//! - [`legacy_raft`]: optional pre-admin rolling-upgrade transport bridge.
 //! - [`quorum`]: fresh fixed-prefix verification with explicit configured inventory.
 //! - [`startup`]: pre-transport Kubernetes startup binding through the shared CAS.
 //! - [`reservation`]: pure shared maintenance ownership and ConfigMap CAS proposals.
 
 pub mod backup;
-mod legacy_raft;
 pub mod maintenance;
 pub mod metrics;
 pub mod observe;

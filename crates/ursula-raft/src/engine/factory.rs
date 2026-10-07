@@ -19,7 +19,7 @@ use ursula_shard::ShardPlacement;
 use super::RaftGroupEngine;
 use super::RaftGroupEngineOptions;
 use crate::grpc::GrpcRaftNetworkFactory;
-use crate::log_store::RaftWal as DurableRaftLogStoreFactory;
+use crate::log_store::RaftWal;
 use crate::registry::RaftGroupHandleRegistry;
 use crate::rejoin::GroupRejoin;
 use crate::rejoin::RECOVERY_STALL_AFTER;
@@ -98,20 +98,17 @@ fn jittered_snapshot_logs_since_last(base: u64, placement: ShardPlacement, node_
 /// Single-node groups over the per-core journals of `log_stores`.
 #[derive(Debug, Clone)]
 pub struct DurableRaftGroupEngineFactory {
-    log_stores: DurableRaftLogStoreFactory,
+    log_stores: RaftWal,
     cold_store: Option<ColdStoreHandle>,
     registry: Option<RaftGroupHandleRegistry>,
 }
 
 impl DurableRaftGroupEngineFactory {
-    pub fn new(log_stores: DurableRaftLogStoreFactory) -> Self {
+    pub fn new(log_stores: RaftWal) -> Self {
         Self::with_cold_store(log_stores, None)
     }
 
-    pub fn with_cold_store(
-        log_stores: DurableRaftLogStoreFactory,
-        cold_store: Option<ColdStoreHandle>,
-    ) -> Self {
+    pub fn with_cold_store(log_stores: RaftWal, cold_store: Option<ColdStoreHandle>) -> Self {
         Self {
             log_stores,
             cold_store,
@@ -182,7 +179,7 @@ pub struct StaticGrpcRaftGroupEngineFactory {
     initialize_membership_per_group: bool,
     registry: RaftGroupHandleRegistry,
     cold_store: Option<ColdStoreHandle>,
-    log_stores: DurableRaftLogStoreFactory,
+    log_stores: RaftWal,
     snapshot_store: Option<SharedSnapshotStore>,
     engine_config: RaftEngineConfig,
 }
@@ -195,7 +192,7 @@ impl StaticGrpcRaftGroupEngineFactory {
         peers: impl IntoIterator<Item = (u64, String)>,
         initialize_membership: bool,
         registry: RaftGroupHandleRegistry,
-        log_stores: DurableRaftLogStoreFactory,
+        log_stores: RaftWal,
     ) -> Self {
         registry.set_wal_opening(log_stores.opening());
         Self {
@@ -473,7 +470,7 @@ mod tests {
             ],
             true,
             RaftGroupHandleRegistry::default(),
-            DurableRaftLogStoreFactory::start(
+            RaftWal::start(
                 wal_root.path().join(format!("node-{node_id}")),
                 WalFsync::Never,
                 &ursula_shard::StaticShardMap::new(1, 2).expect("valid topology"),

@@ -38,7 +38,7 @@ use ursula_stream::ColdChunkRef;
 use ursula_stream::ExternalPayloadRef;
 use ursula_stream::StreamCommand;
 
-use crate::DurableRaftLogStoreFactory;
+use crate::RaftWal;
 use crate::engine::RaftGroupEngine;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::types::UrsulaRaftTypeConfig;
@@ -85,7 +85,7 @@ async fn cold_engine(cold_store: Arc<ColdStore>) -> (RaftGroupEngine, tempfile::
         .validate()
         .expect("valid config"),
     );
-    let log_store = DurableRaftLogStoreFactory::start(
+    let log_store = RaftWal::start(
         wal_root.path(),
         ursula_config::WalFsync::Never,
         &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),

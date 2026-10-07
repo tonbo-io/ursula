@@ -6,7 +6,7 @@ not open journal writers or individually wire recovery drivers.
 
 | Component | Responsibility and public seam |
 | --- | --- |
-| `RaftWal` | Node run state, per-core writer lifetime, group log stores and shutdown. The seven primary WAL exports live in `ursula_raft::wal`; persisted-format inspection types live under `wal::diagnostics`. `DurableRaftLogStoreFactory` remains an alias. |
+| `RaftWal` | Node run state, per-core writer lifetime, group log stores and shutdown. The seven primary WAL exports live in `ursula_raft::wal`; persisted-format inspection types live under `wal::diagnostics`. |
 | `RecoveryGate::attach` | Bind the follower gate, publish the group's resources, start bootstrap/heal/barrier drivers and retain their task handles. Engine shutdown aborts and joins them; drop cancels startup leftovers. Native gRPC and simulation inject `RecoveryTransport` into the same wiring. |
 | `ElectionPolicy` | Combine node shedding and per-group recovery eligibility, refresh OpenRaft's election switch, and validate outbound handoff targets. Transfers use campaign eligibility because receiving a transfer starts an election. Cold-health pressure alone remains electable. |
 | `GroupEntry` | Keep the active Raft handle, read barrier, recovery gate and cold-index cache together. Production registration publishes them together. The registry routes requests to these entries. |
@@ -37,8 +37,7 @@ vote did not change across the round. The typed response identifies the group,
 leader, term and required applied index. It is an observation, not permission to
 remove a voter. It remains readable after a maintenance fence is retired.
 
-The default `ursulactl` dependency graph excludes `ursula-raft` and OpenRaft.
-Older servers that lack the admin identity protocol require an explicit build
-with `--features legacy-raft`. A current server's admin failure never falls back
-to the legacy Raft RPC. Low-level Rust WAL exports and engine constructors have
-changed; callers should migrate to the facade and options above.
+`ursulactl` uses only the admin protocol and has no Raft RPC compatibility
+adapter or `ursula-raft` dependency. Quorum proofs and self-election requests
+require process identity. Low-level Rust WAL exports and engine constructors
+have changed; callers use `RaftWal` and the engine options above.

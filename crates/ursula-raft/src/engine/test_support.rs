@@ -9,7 +9,7 @@ use ursula_runtime::RuntimeConfig;
 use ursula_runtime::ShardRuntime;
 
 use super::DurableRaftGroupEngineFactory;
-use crate::DurableRaftLogStoreFactory;
+use crate::RaftWal;
 
 /// A runtime of single-node Raft groups whose journals live in a temporary
 /// directory that is removed with it.
@@ -32,7 +32,7 @@ pub(crate) fn spawn_journal_runtime(
     cold_store: Option<Arc<ColdStore>>,
 ) -> JournalRuntime {
     let wal_root = tempfile::tempdir().expect("WAL root");
-    let log_stores = DurableRaftLogStoreFactory::start(
+    let log_stores = RaftWal::start(
         wal_root.path(),
         WalFsync::Never,
         &ursula_shard::StaticShardMap::new(config.core_count, config.raft_group_count)

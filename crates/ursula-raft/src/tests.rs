@@ -105,7 +105,7 @@ impl
 /// Opens `placement()`'s store on a fresh per-core journal under `root`; the
 /// store owns the core writer, so dropping it closes the journal.
 fn open_core_journal_store(root: &Path) -> Result<Arc<RaftGroupFileLogStore>, GroupEngineError> {
-    DurableRaftLogStoreFactory::start(
+    RaftWal::start(
         root,
         WalFsync::Always,
         &ursula_shard::StaticShardMap::new(1, 1)
@@ -118,8 +118,8 @@ fn open_core_journal_store(root: &Path) -> Result<Arc<RaftGroupFileLogStore>, Gr
     )
 }
 
-fn start_wal(root: &Path, cores: usize, groups: usize) -> DurableRaftLogStoreFactory {
-    DurableRaftLogStoreFactory::start(
+fn start_wal(root: &Path, cores: usize, groups: usize) -> RaftWal {
+    RaftWal::start(
         root,
         WalFsync::Always,
         &ursula_shard::StaticShardMap::new(cores, groups).expect("valid topology"),
@@ -131,7 +131,7 @@ fn start_wal(root: &Path, cores: usize, groups: usize) -> DurableRaftLogStoreFac
 /// which the caller keeps while the store is in use.
 fn fresh_journal_store() -> (tempfile::TempDir, Arc<RaftGroupFileLogStore>) {
     let root = tempfile::tempdir().expect("WAL root");
-    let store = DurableRaftLogStoreFactory::start(
+    let store = RaftWal::start(
         root.path(),
         WalFsync::Never,
         &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
@@ -149,7 +149,7 @@ fn fresh_journal_store() -> (tempfile::TempDir, Arc<RaftGroupFileLogStore>) {
 #[cfg(madsim)]
 fn sim_journal_store(name: &str) -> Arc<RaftGroupFileLogStore> {
     let root = SimDisk::provision_dir(name).expect("provision a simulated WAL");
-    DurableRaftLogStoreFactory::start(
+    RaftWal::start(
         root,
         WalFsync::Never,
         &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),

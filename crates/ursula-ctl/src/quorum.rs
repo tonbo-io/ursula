@@ -17,10 +17,6 @@ use ursula_proto::admin::MaintenanceFence;
 use ursula_proto::admin::MaintenanceFenceState;
 use ursula_proto::admin::ProcessIncarnation;
 use ursula_proto::admin::QuorumPrefix;
-use ursula_shard::CoreId;
-use ursula_shard::RaftGroupId;
-use ursula_shard::ShardId;
-use ursula_shard::ShardPlacement;
 
 use crate::MetricsClient;
 use crate::NodeInfo;
@@ -31,7 +27,6 @@ type AppliedPrefixes = BTreeMap<u64, BTreeMap<u32, u64>>;
 #[derive(Debug, Clone)]
 pub struct QuorumVerificationOptions {
     pub group_count: u32,
-    pub core_count: u16,
     pub timeout: Duration,
     pub poll_interval: Duration,
     /// Diagnostic compatibility for the pinned 0.6.2 baseline only. Such a
@@ -279,9 +274,8 @@ async fn verify_observed_quorum(
         || voters.len() != configured_nodes.len()
         || observed_voters.len() != nodes.len()
         || options.group_count == 0
-        || options.core_count == 0
     {
-        bail!("quorum verification requires unique voters and nonempty configured groups/cores");
+        bail!("quorum verification requires unique voters and nonempty configured groups");
     }
     let observe = async {
         let initial = client.fetch_cluster(nodes).await?;
@@ -314,17 +308,8 @@ async fn verify_observed_quorum(
                 .iter()
                 .find(|node| node.id == leader_id)
                 .context("leader is outside configuration")?;
-            let placement = ShardPlacement {
-                raft_group_id: RaftGroupId(group_id),
-                shard_id: ShardId(group_id),
-                core_id: CoreId(u16::try_from(
-                    group_id
-                        .checked_rem(u32::from(options.core_count))
-                        .context("core count is zero")?,
-                )?),
-            };
             probes.push(async move {
-                let proof = client.confirm_quorum(leader, group_id, placement).await?;
+                let proof = client.confirm_quorum(leader, group_id).await?;
                 Ok::<_, anyhow::Error>((group_id, proof))
             });
         }
@@ -562,7 +547,6 @@ mod tests {
         let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
         let options = QuorumVerificationOptions {
             group_count: 2,
-            core_count: 1,
             timeout: Duration::from_secs(1),
             poll_interval: Duration::from_millis(10),
             allow_legacy_eligibility: false,
@@ -664,7 +648,6 @@ mod tests {
             &MetricsClient::new(Duration::from_secs(30)).unwrap(),
             &QuorumVerificationOptions {
                 group_count: 2,
-                core_count: 2,
                 timeout: Duration::from_millis(25),
                 poll_interval: Duration::from_secs(1),
                 allow_legacy_eligibility: false,

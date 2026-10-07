@@ -24,7 +24,7 @@ use ursula_config::WalFsync;
 #[cfg(not(madsim))]
 use ursula_raft::DurableRaftGroupEngineFactory;
 #[cfg(not(madsim))]
-use ursula_raft::DurableRaftLogStoreFactory;
+use ursula_raft::RaftWal;
 #[cfg(not(madsim))]
 use ursula_runtime::AppendRequest;
 #[cfg(not(madsim))]
@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             true,
         ),
     };
-    let wal = DurableRaftLogStoreFactory::start(
+    let wal = RaftWal::start(
         &wal_dir,
         args.wal_fsync,
         &ursula_shard::StaticShardMap::new(args.core_count, args.raft_group_count)?,

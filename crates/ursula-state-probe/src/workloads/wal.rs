@@ -1,5 +1,5 @@
 //! Raft WAL memory: drives `--groups` real log stores on one core journal
-//! (`DurableRaftLogStoreFactory` in a temporary directory, fsync `never`)
+//! (`RaftWal` in a temporary directory, fsync `never`)
 //! with round-robin appends of `--entry-bytes` payloads. Each group is purged
 //! the way the snapshot driver's snapshots purge it: once it holds
 //! `--retain-kib` of log, up to its last entry minus `--keep` (OpenRaft's
@@ -32,9 +32,9 @@ use openraft::vote::RaftLeaderId;
 use openraft::vote::leader_id_adv::CommittedLeaderId;
 use serde_json::json;
 use ursula_config::WalFsync;
-use ursula_raft::DurableRaftLogStoreFactory;
 use ursula_raft::JournalTuning;
 use ursula_raft::RaftGroupFileLogStore;
+use ursula_raft::RaftWal;
 use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::RuntimeMetrics;
@@ -191,7 +191,7 @@ async fn run_async(args: &WalArgs, name: &str, sink: &mut Sink) -> Result<Outcom
     let metrics = RuntimeMetrics::new(1, usize::try_from(groups_n).unwrap_or(usize::MAX));
     let baseline = alloc::heap().bytes;
     let mut groups = {
-        let factory = DurableRaftLogStoreFactory::start_with(
+        let factory = RaftWal::start_with(
             root.path(),
             JournalTuning {
                 fsync: WalFsync::Never,

@@ -283,7 +283,7 @@ pub struct HttpState {
     wal_disk: WalDiskMonitor,
     /// The node's Raft WAL when it runs Raft: how it opened, and the
     /// clean shutdown at exit.
-    raft_wal: Option<ursula_raft::DurableRaftLogStoreFactory>,
+    raft_wal: Option<ursula_raft::RaftWal>,
     /// A Raft protocol (format-epoch) mismatch seen since start: readiness
     /// answers 503 `format_epoch_mismatch` until restart.
     format_epoch_mismatch: ursula_raft::FormatEpochMismatch,
@@ -449,15 +449,12 @@ impl HttpState {
 
     /// Record the node's Raft WAL, so the metrics JSON reports how it opened
     /// and the server shuts it down cleanly.
-    pub fn with_raft_wal(
-        mut self,
-        raft_wal: Option<ursula_raft::DurableRaftLogStoreFactory>,
-    ) -> Self {
+    pub fn with_raft_wal(mut self, raft_wal: Option<ursula_raft::RaftWal>) -> Self {
         self.raft_wal = raft_wal;
         self
     }
 
-    pub(crate) fn raft_wal(&self) -> Option<&ursula_raft::DurableRaftLogStoreFactory> {
+    pub(crate) fn raft_wal(&self) -> Option<&ursula_raft::RaftWal> {
         self.raft_wal.as_ref()
     }
 
@@ -1851,7 +1848,7 @@ struct WalRecoveryReport {
 }
 
 impl WalRecoveryReport {
-    fn new(raft_wal: &ursula_raft::DurableRaftLogStoreFactory) -> Self {
+    fn new(raft_wal: &ursula_raft::RaftWal) -> Self {
         Self {
             fsync: raft_wal.fsync(),
             opening: raft_wal.opening(),

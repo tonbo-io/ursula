@@ -1147,7 +1147,7 @@ mod tests {
 
         use super::AcceptUnsyncedLossOutcome;
         use super::GroupRejoin;
-        use crate::DurableRaftLogStoreFactory;
+        use crate::RaftWal;
         use crate::log_store::GroupLogState;
         use crate::log_store::RUN_STATE_FILE;
         use crate::log_store::RaftGroupFileLogStore;
@@ -1159,7 +1159,7 @@ mod tests {
             raft_group_id: RaftGroupId(0),
         };
         let metrics = ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
-        let open = |wal: &DurableRaftLogStoreFactory| -> std::sync::Arc<RaftGroupFileLogStore> {
+        let open = |wal: &RaftWal| -> std::sync::Arc<RaftGroupFileLogStore> {
             wal.open(placement, metrics.clone())
                 .expect("open the store")
         };
@@ -1172,7 +1172,7 @@ mod tests {
 
         // A new replica: its history is unknown, so the gate is closed and
         // the replica may bootstrap the group.
-        let wal = DurableRaftLogStoreFactory::start(
+        let wal = RaftWal::start(
             dir.path(),
             WalFsync::Never,
             &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
@@ -1198,7 +1198,7 @@ mod tests {
         wal.shutdown().await.expect("clean shutdown");
 
         // A clean restart: the replica holds every entry it acknowledged.
-        let wal = DurableRaftLogStoreFactory::start(
+        let wal = RaftWal::start(
             dir.path(),
             WalFsync::Never,
             &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
@@ -1213,7 +1213,7 @@ mod tests {
         // recovers. It refuses every vote, and the replica that led it starts
         // as a follower.
         std::fs::remove_file(dir.path().join(RUN_STATE_FILE)).expect("remove the run state");
-        let wal = DurableRaftLogStoreFactory::start(
+        let wal = RaftWal::start(
             dir.path(),
             WalFsync::Never,
             &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
@@ -1256,7 +1256,7 @@ mod tests {
 
         // A crash of the next run (no clean shutdown) on the same host keeps
         // the open gate.
-        let wal = DurableRaftLogStoreFactory::start(
+        let wal = RaftWal::start(
             dir.path(),
             WalFsync::Always,
             &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),

@@ -520,7 +520,7 @@ pub(crate) enum WalShutdown {
 /// recording a clean shutdown.
 pub(crate) async fn shutdown_raft_wal(
     runtime: &ursula_runtime::ShardRuntime,
-    raft_wal: Option<&ursula_raft::DurableRaftLogStoreFactory>,
+    raft_wal: Option<&ursula_raft::RaftWal>,
 ) -> WalShutdown {
     let Some(raft_wal) = raft_wal else {
         return WalShutdown::NoWal;

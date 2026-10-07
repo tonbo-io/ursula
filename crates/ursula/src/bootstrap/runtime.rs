@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use ursula_config::config::ColdBackend;
-use ursula_raft::DurableRaftLogStoreFactory;
 use ursula_raft::JournalTuning;
 use ursula_raft::RaftEngineConfig;
 use ursula_raft::RaftGroupHandleRegistry;
+use ursula_raft::RaftWal;
 use ursula_raft::StaticGrpcRaftMembershipConfig;
 use ursula_runtime::ColdStore;
 use ursula_runtime::ColdStoreHandle;
@@ -37,7 +37,7 @@ pub struct SpawnedRuntime {
     pub raft_registry: Option<RaftGroupHandleRegistry>,
     /// The node's Raft WAL when it runs Raft. Shut it down once the
     /// runtime's groups have stopped, so the next start finds a clean run.
-    pub raft_wal: Option<DurableRaftLogStoreFactory>,
+    pub raft_wal: Option<RaftWal>,
 }
 
 /// Failure to spawn a runtime.
@@ -55,7 +55,7 @@ enum GroupStorage {
     /// No Raft: the in-memory engine.
     InMemory,
     /// Raft over the per-core journals of this run of the WAL.
-    Raft(DurableRaftLogStoreFactory),
+    Raft(RaftWal),
 }
 
 impl GroupStorage {
@@ -68,13 +68,13 @@ impl GroupStorage {
     ) -> Result<Self, SpawnRuntimeError> {
         Ok(match persistence {
             Persistence::InMemory => Self::InMemory,
-            Persistence::Raft { log_dir } => Self::Raft(DurableRaftLogStoreFactory::start_with(
+            Persistence::Raft { log_dir } => Self::Raft(RaftWal::start_with(
                 log_dir, tuning, topology,
             )?),
         })
     }
 
-    fn raft_wal(&self) -> Option<DurableRaftLogStoreFactory> {
+    fn raft_wal(&self) -> Option<RaftWal> {
         match self {
             Self::Raft(log_stores) => Some(log_stores.clone()),
             Self::InMemory => None,

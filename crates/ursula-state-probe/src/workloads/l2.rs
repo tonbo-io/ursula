@@ -20,7 +20,7 @@ use serde_json::Value;
 use serde_json::json;
 use ursula_config::WalFsync;
 use ursula_raft::DurableRaftGroupEngineFactory;
-use ursula_raft::DurableRaftLogStoreFactory;
+use ursula_raft::RaftWal;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdChunkRef;
 use ursula_runtime::ColdStore;
@@ -114,7 +114,7 @@ pub fn default_name(args: &L2Args) -> String {
 
 /// The Raft engine's WAL in a temporary directory.
 struct TempWal {
-    log_stores: DurableRaftLogStoreFactory,
+    log_stores: RaftWal,
     root: PathBuf,
 }
 
@@ -149,7 +149,7 @@ fn spawn(
             let root = tempfile::tempdir()
                 .context("create the Raft WAL directory")?
                 .keep();
-            let log_stores = DurableRaftLogStoreFactory::start(
+            let log_stores = RaftWal::start(
                 &root,
                 WalFsync::Never,
                 &ursula_shard::StaticShardMap::new(1, 1)?,

@@ -13,11 +13,6 @@ description = "Safe operational CLI for Ursula clusters: drains raft leaderships
 name = "ursulactl"
 path = "src/bin/ursulactl.rs"
 
-[features]
-default = []
-# Remove this feature when all supported pre-admin migration sources are retired.
-legacy-raft = ["dep:ursula-raft"]
-
 [dependencies]
 anyhow = { workspace = true }
 blake3 = { workspace = true }
@@ -37,7 +32,6 @@ tracing = { workspace = true }
 url = { workspace = true, features = ["serde"] }
 ursula-observability = { workspace = true }
 ursula-proto = { workspace = true }
-ursula-raft = { workspace = true, optional = true }
 ursula-shard = { workspace = true }
 
 [dev-dependencies]

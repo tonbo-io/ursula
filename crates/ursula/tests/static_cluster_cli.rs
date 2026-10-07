@@ -1136,7 +1136,6 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
     // or provider fencing. ChildGuard waits for the original process to exit.
     let options = ursula_ctl::quorum::QuorumVerificationOptions {
         group_count: 6,
-        core_count: 1,
         timeout: Duration::from_secs(15),
         poll_interval: Duration::from_millis(100),
         allow_legacy_eligibility: false,
@@ -1567,7 +1566,6 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
     }
     let options = ursula_ctl::quorum::QuorumVerificationOptions {
         group_count: 6,
-        core_count: 1,
         timeout: Duration::from_secs(15),
         poll_interval: Duration::from_millis(100),
         allow_legacy_eligibility: false,

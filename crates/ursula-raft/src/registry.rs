@@ -1137,7 +1137,7 @@ mod tests {
             1,
             config,
             SingleNodeRaftNetworkFactory,
-            crate::DurableRaftLogStoreFactory::start(
+            crate::RaftWal::start(
                 wal_root.path(),
                 ursula_config::WalFsync::Never,
                 &ursula_shard::StaticShardMap::new(1, 8).expect("valid topology"),

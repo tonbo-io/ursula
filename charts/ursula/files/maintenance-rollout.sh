@@ -71,7 +71,7 @@ maintenance_prefix() {
   # A proof older than 60 s is rejected by the policy. A slow/failed proof
   # cannot admit deletion or completion; no recovery-time optimization implied.
   "${CTL}" verify-quorum --config "${MANIFEST}" --expected-groups "${EXPECTED_GROUPS}" \
-    --core-count "${CORE_COUNT}" --timeout-secs 45 --http-timeout-secs 10 >"${WORK}/observation.json"
+    --timeout-secs 45 --http-timeout-secs 10 >"${WORK}/observation.json"
 }
 
 maintenance_progress() {
@@ -122,7 +122,7 @@ maintenance_takeover() {
 
 maintenance_verify_survivors() {
   "${CTL}" verify-survivors --config "${MANIFEST}" --excluded-node-id "${maintenance_node}" \
-    --expected-groups "${EXPECTED_GROUPS}" --core-count "${CORE_COUNT}" \
+    --expected-groups "${EXPECTED_GROUPS}" \
     --timeout-secs 45 --http-timeout-secs 10 >"${WORK}/survivor-observation.json"
 }
 

@@ -349,84 +349,46 @@ impl MetricsClient {
         }
     }
 
-    /// Trigger a bound admin election on current instances. The deployed
-    /// 0.6.2 migration source retains its shared `TransferLeader` RPC.
+    /// Request an election through the incarnation-bound admin protocol.
     pub async fn request_self_election(
         &self,
         voter: &NodeInfo,
         raft_group_id: u64,
         current_term: u64,
     ) -> Result<()> {
-        // Re-observe before selecting the legacy RPC: a cached legacy absence
-        // must never route an election to a newly guarded replacement.
-        if self.fetch_node(voter).await?.process_incarnation.is_some() {
-            let url = voter
-                .admin_url
-                .join(&format!("/__ursula/raft/{raft_group_id}/self-election"))?;
-            let response = self
-                .admin_request(voter, Method::POST, url.clone())
-                .await?
-                .json(&ursula_proto::admin::SelfElectionRequest { current_term })
-                .send()
-                .await?;
-            if !response.status().is_success() {
-                bail!(
-                    "self-election at node {} returned {}: {}",
-                    voter.id,
-                    response.status(),
-                    response.text().await?
-                );
-            }
-            return Ok(());
-        }
-        // The deployed 0.6.2 migration source has only the shared Raft RPC;
-        // current instances use the incarnation-bound admin route above.
-        let endpoint = voter.http_url.as_ref().ok_or_else(|| {
-            anyhow!(
-                "node {} has no public Raft/client address for survivor term handoff",
-                voter.id
-            )
-        })?;
-        if endpoint.path() != "/" || endpoint.query().is_some() || endpoint.fragment().is_some() {
+        self.fetch_node(voter)
+            .await?
+            .process_incarnation
+            .context("self-election requires process identity")?;
+        let url = voter
+            .admin_url
+            .join(&format!("/__ursula/raft/{raft_group_id}/self-election"))?;
+        let response = self
+            .admin_request(voter, Method::POST, url)
+            .await?
+            .json(&ursula_proto::admin::SelfElectionRequest { current_term })
+            .send()
+            .await?;
+        if !response.status().is_success() {
             bail!(
-                "node {} Raft/client address must not contain a path, query, or fragment",
-                voter.id
+                "self-election at node {} returned {}: {}",
+                voter.id,
+                response.status(),
+                response.text().await?
             );
         }
-        let raft_group_id = u32::try_from(raft_group_id)
-            .with_context(|| format!("raft group id exceeds u32: {raft_group_id}"))?;
-        crate::legacy_raft::request_self_election_via_transfer(
-            endpoint.as_str(),
-            raft_group_id,
-            voter.id,
-            current_term,
-            self.timeout,
-        )
-        .await
-        .map_err(anyhow::Error::msg)
+        Ok(())
     }
 
     pub async fn confirm_quorum(
         &self,
         leader: &NodeInfo,
         group: u32,
-        placement: ursula_shard::ShardPlacement,
     ) -> Result<ursula_proto::admin::QuorumPrefix> {
-        // Re-observe before choosing the legacy bridge; absence is never cached across a replacement.
-        if self.fetch_node(leader).await?.process_incarnation.is_none() {
-            let endpoint = leader
-                .http_url
-                .as_ref()
-                .context("legacy quorum proof needs the Raft endpoint")?;
-            return crate::legacy_raft::confirm_quorum_prefix(
-                placement,
-                leader.id,
-                endpoint.as_str(),
-                self.timeout(),
-            )
-            .await
-            .map_err(anyhow::Error::msg);
-        }
+        self.fetch_node(leader)
+            .await?
+            .process_incarnation
+            .context("quorum proof requires process identity")?;
         let url = leader
             .admin_url
             .join(&format!("/__ursula/raft/{group}/quorum"))?;
@@ -493,7 +455,7 @@ impl MetricsClient {
         voters: &BTreeSet<u64>,
     ) -> Result<()> {
         let path = format!("/__ursula/raft/{raft_group_id}/membership");
-        let mut url = leader.admin_url.join(&path).with_context(|| {
+        let url = leader.admin_url.join(&path).with_context(|| {
             format!(
                 "compose membership url at leader node {} for group {}",
                 leader.id, raft_group_id
@@ -504,15 +466,11 @@ impl MetricsClient {
             .map(u64::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        // Compatibility consumer: 0.4.8 servers split query strings without
-        // URL-decoding values. Keep the comma literal while 0.4.8 remains a
-        // supported rolling-upgrade source; ordinary query-pair encoding turns
-        // it into `%2C` and makes the old server reject every membership change.
         let query = ursula_proto::admin::MembershipQuery { voters: voter_list };
-        url.set_query(Some(&format!("voters={}", query.voters)));
         let resp = self
             .admin_request(leader, Method::POST, url.clone())
             .await?
+            .query(&query)
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;
@@ -547,15 +505,12 @@ impl MetricsClient {
             )
         })?;
         let path = format!("/__ursula/raft/{raft_group_id}/learners/{}", target.id);
-        let mut url = leader.admin_url.join(&path).with_context(|| {
+        let url = leader.admin_url.join(&path).with_context(|| {
             format!(
                 "compose add-learner url at leader node {} for group {}",
                 leader.id, raft_group_id
             )
         })?;
-        // The same 0.4.8 compatibility boundary applies to learner addresses:
-        // its parser expects a literal URL. Remove this raw query construction
-        // once 0.4.8 is no longer a supported rolling-upgrade source.
         if address.query().is_some() || address.fragment().is_some() {
             bail!(
                 "node {} learner address must not contain a query or fragment",
@@ -566,14 +521,10 @@ impl MetricsClient {
             addr: address.to_string(),
             blocking: Some(false),
         };
-        url.set_query(Some(&format!(
-            "addr={}&blocking={}",
-            query.addr,
-            query.blocking.unwrap_or(true)
-        )));
         let resp = self
             .admin_request(leader, Method::POST, url.clone())
             .await?
+            .query(&query)
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;
@@ -952,7 +903,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_to_current_replacement_cannot_reuse_the_unbound_election_rpc() {
+    async fn consensus_admin_operations_require_process_identity() {
+        let (node, _, applied, task) = incarnation_node(1, None).await;
+        let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
+        let election = client.request_self_election(&node, 0, 7).await.unwrap_err();
+        assert!(election.to_string().contains("requires process identity"));
+        let quorum = client.confirm_quorum(&node, 0).await.unwrap_err();
+        assert!(quorum.to_string().contains("requires process identity"));
+        assert_eq!(applied.load(std::sync::atomic::Ordering::SeqCst), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn identity_appearing_after_observation_requires_a_new_client() {
         let (node, identity, _, task) = incarnation_node(1, None).await;
         let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
         client.fetch_node(&node).await.unwrap();
@@ -960,7 +923,7 @@ mod tests {
         let error = client.request_self_election(&node, 0, 7).await.unwrap_err();
         assert!(
             error.to_string().contains("changed during"),
-            "cached legacy transport must stop before HTTP or consensus mutation: {error}"
+            "changed identity must stop before HTTP or consensus mutation: {error}"
         );
         task.abort();
     }
@@ -1035,14 +998,9 @@ mod tests {
             expected_process_incarnation: None,
             expected_maintenance_fence: None,
         };
-        let placement = ursula_shard::ShardPlacement {
-            core_id: ursula_shard::CoreId(0),
-            shard_id: ursula_shard::ShardId(0),
-            raft_group_id: ursula_shard::RaftGroupId(0),
-        };
         let proof = MetricsClient::new(Duration::from_secs(1))
             .unwrap()
-            .confirm_quorum(&node, 0, placement)
+            .confirm_quorum(&node, 0)
             .await
             .unwrap();
         assert_eq!(proof.required_applied_index, 17);
@@ -1066,14 +1024,18 @@ mod tests {
             )
             .route(
                 "/__ursula/raft/0/learners/1",
-                post(move |axum::extract::RawQuery(value)| async move {
-                    *received.lock().unwrap() = value;
-                    axum::Json(ursula_proto::admin::AddLearnerResponse {
-                        raft_group_id: 0,
-                        node_id: 1,
-                        log_index: 7,
-                    })
-                }),
+                post(
+                    move |axum::extract::Query(value): axum::extract::Query<
+                        ursula_proto::admin::AddLearnerQuery,
+                    >| async move {
+                        *received.lock().unwrap() = Some(value);
+                        axum::Json(ursula_proto::admin::AddLearnerResponse {
+                            raft_group_id: 0,
+                            node_id: 1,
+                            log_index: 7,
+                        })
+                    },
+                ),
             );
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let tunnel = Url::parse(&format!("http://{address}")).unwrap();
@@ -1091,10 +1053,10 @@ mod tests {
         let view = client.fetch_node(&node).await.unwrap();
         assert_eq!(view.node.http_url, Some(advertised.clone()));
         client.add_learner(&node, 0, &node).await.unwrap();
-        assert_eq!(
-            query.lock().unwrap().as_deref(),
-            Some(format!("addr={advertised}&blocking=false").as_str())
-        );
+        let received = query.lock().unwrap();
+        let received = received.as_ref().unwrap();
+        assert_eq!(received.addr, advertised.as_str());
+        assert_eq!(received.blocking, Some(false));
         task.abort();
     }
 

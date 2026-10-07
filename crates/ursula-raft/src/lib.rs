@@ -95,10 +95,10 @@ pub use grpc::RAFT_GRPC_TRANSFER_LEADER_PATH;
 pub use grpc::RAFT_GRPC_VOTE_PATH;
 pub use grpc::RaftGrpcMetricsSnapshot;
 pub use grpc::RaftGrpcService;
-pub use grpc::confirm_quorum_prefix;
+#[cfg(test)]
+pub(crate) use grpc::confirm_quorum_prefix;
 pub use grpc::raft_grpc_metrics_snapshot;
 pub use grpc::raft_grpc_service;
-pub use grpc::request_self_election_via_transfer;
 #[cfg(any(test, madsim))]
 pub use in_process::InProcessRaftFaultAction;
 #[cfg(any(test, madsim))]
@@ -178,9 +178,6 @@ pub use types::UrsulaRaftTypeConfig;
 pub use types::UrsulaVote;
 pub use types::UrsulaVoteRequest;
 pub use types::UrsulaVoteResponse;
-
-/// Compatibility name for the node WAL facade.
-pub type DurableRaftLogStoreFactory = RaftWal;
 
 #[cfg(test)]
 mod tests;

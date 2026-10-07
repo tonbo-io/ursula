@@ -20,9 +20,9 @@ use std::sync::Weak;
 use std::time::Duration;
 
 use ursula_config::WalFsync;
-use ursula_raft::DurableRaftLogStoreFactory;
 use ursula_raft::JournalTuning;
 use ursula_raft::RaftGroupFileLogStore;
+use ursula_raft::RaftWal;
 #[cfg(test)]
 use ursula_raft::WalOpening;
 use ursula_raft::wal::diagnostics::SimDisk;
@@ -46,7 +46,7 @@ pub(crate) struct SimNodeWal {
     tuning: JournalTuning,
     topology: ursula_shard::StaticShardMap,
     /// The node's current run of the WAL; `None` while the node is down.
-    run: Arc<Mutex<Option<DurableRaftLogStoreFactory>>>,
+    run: Arc<Mutex<Option<RaftWal>>>,
     stores: Arc<Mutex<BTreeMap<RaftGroupId, Weak<RaftGroupFileLogStore>>>>,
 }
 
@@ -89,13 +89,13 @@ impl SimNodeWal {
     }
 
     /// The node's current run, started when the node is down.
-    fn run(&self) -> Result<DurableRaftLogStoreFactory, GroupEngineError> {
+    fn run(&self) -> Result<RaftWal, GroupEngineError> {
         let mut run = self.run.lock().unwrap_or_else(|poison| poison.into_inner());
         if let Some(run) = run.as_ref() {
             return Ok(run.clone());
         }
         let started =
-            DurableRaftLogStoreFactory::start_with(&self.root, self.tuning, &self.topology)
+            RaftWal::start_with(&self.root, self.tuning, &self.topology)
                 .map_err(|err| GroupEngineError::new(format!("start the Raft WAL: {err}")))?;
         *run = Some(started.clone());
         Ok(started)

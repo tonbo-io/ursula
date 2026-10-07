@@ -15,7 +15,6 @@ use openraft::storage::IOFlushed;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use ursula_config::WalFsync;
-use ursula_raft::DurableRaftLogStoreFactory;
 use ursula_raft::GroupRejoin;
 use ursula_raft::InProcessRaftNetworkFactory;
 use ursula_raft::InProcessRaftNetworkPolicy;
@@ -23,6 +22,7 @@ use ursula_raft::InProcessRaftRegistry;
 use ursula_raft::JournalTuning;
 use ursula_raft::RaftGroupEngine;
 use ursula_raft::RaftGroupFileLogStore;
+use ursula_raft::RaftWal;
 use ursula_raft::RaftWalError;
 use ursula_raft::RecoveryState;
 use ursula_raft::UrsulaRaftTypeConfig;
@@ -1383,7 +1383,7 @@ fn the_run_state_is_the_old_or_the_new_version_after_a_power_loss() {
         run_with_madsim(seed, async move {
             let root = sim_dir("run-state");
             let start = || {
-                DurableRaftLogStoreFactory::start(
+                RaftWal::start(
                     &root,
                     WalFsync::Never,
                     &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
@@ -1890,21 +1890,21 @@ fn wal_topology_publication_survives_power_loss() {
                 let topology = ursula_shard::StaticShardMap::new(4, 64).unwrap();
                 SimDisk::inject_fault(&root.join(relative_path), fault).unwrap();
                 assert!(matches!(
-                    DurableRaftLogStoreFactory::start(&root, WalFsync::Never, &topology),
+                    RaftWal::start(&root, WalFsync::Never, &topology),
                     Err(RaftWalError::RecordTopology(_))
                 ));
                 assert!(!SimDisk::exists(&root.join(RUN_STATE_FILE)));
                 SimDisk::power_loss(&root).unwrap();
                 let wal =
-                    DurableRaftLogStoreFactory::start(&root, WalFsync::Never, &topology).unwrap();
+                    RaftWal::start(&root, WalFsync::Never, &topology).unwrap();
                 drop(wal);
                 SimDisk::power_loss(&root).unwrap();
                 let changed = ursula_shard::StaticShardMap::new(8, 64).unwrap();
                 assert!(matches!(
-                    DurableRaftLogStoreFactory::start(&root, WalFsync::Never, &changed),
+                    RaftWal::start(&root, WalFsync::Never, &changed),
                     Err(RaftWalError::TopologyMismatch { .. })
                 ));
-                DurableRaftLogStoreFactory::start(&root, WalFsync::Never, &topology)
+                RaftWal::start(&root, WalFsync::Never, &topology)
                     .unwrap()
                     .shutdown()
                     .await

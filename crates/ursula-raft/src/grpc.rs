@@ -124,7 +124,8 @@ pub use ursula_proto::admin::QuorumPrefix;
 /// Confirm a group's current quorum without issuing an application write.
 /// This is a point-in-time observation, not a maintenance reservation or a
 /// promise that another participant cannot disrupt a voter immediately after.
-pub async fn confirm_quorum_prefix(
+#[cfg(test)]
+pub(crate) async fn confirm_quorum_prefix(
     placement: ursula_shard::ShardPlacement,
     leader_id: u64,
     address: &str,
@@ -266,68 +267,6 @@ pub(crate) async fn probe_rejoin_vote_barrier(
             .ok_or("recovery peer has no log")?
             .index(),
     ))
-}
-
-/// Ask an existing voter to start an election through the version-one
-/// `TransferLeader` RPC understood by older Ursula servers.
-///
-/// The request carries the voter's observed, uncommitted vote and targets the
-/// same voter. OpenRaft only acts when that vote still exactly matches its
-/// local state, so a stale observation is a no-op. Callers must establish that
-/// the node is a configured, caught-up voter with no current leader before
-/// using this rolling-upgrade bridge.
-pub async fn request_self_election_via_transfer(
-    endpoint: &str,
-    raft_group_id: u32,
-    node_id: u64,
-    current_term: u64,
-    timeout: Duration,
-) -> Result<(), String> {
-    let channel = Endpoint::from_shared(endpoint.to_owned())
-        .map_err(|err| format!("invalid Raft gRPC endpoint {endpoint}: {err}"))?
-        .connect_timeout(timeout)
-        .timeout(timeout)
-        .connect()
-        .await
-        .map_err(|err| format!("connect to Raft gRPC endpoint {endpoint}: {err}"))?;
-    let transfer = self_election_transfer_request(node_id, current_term);
-    let envelope = raft_internal_proto::RaftTransferLeaderRequestV1 {
-        raft_group_id,
-        node_id,
-        protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
-        request: encode_wire(&transfer),
-    };
-    let mut request = tonic::Request::new(envelope);
-    request.set_timeout(timeout);
-    raft_client(channel)
-        .transfer_leader(request)
-        .await
-        .map_err(|err| {
-            format!(
-                "request self-election on node {node_id} for group {raft_group_id} at term {current_term}: {err}"
-            )
-        })?;
-    Ok(())
-}
-
-fn self_election_transfer_request(
-    node_id: u64,
-    current_term: u64,
-) -> TransferLeaderRequest<UrsulaRaftTypeConfig> {
-    TransferLeaderRequest::new(UrsulaVote::new(current_term, node_id), node_id, None)
-}
-
-#[cfg(test)]
-mod self_election_transfer_tests {
-    use super::*;
-
-    #[test]
-    fn bridge_uses_exact_uncommitted_self_vote() {
-        let request = self_election_transfer_request(2, 7_381);
-        assert_eq!(request.from_leader(), &UrsulaVote::new(7_381, 2));
-        assert_eq!(request.to_node_id(), &2);
-        assert_eq!(request.last_log_id(), None);
-    }
 }
 
 #[derive(Clone)]

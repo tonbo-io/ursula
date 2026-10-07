@@ -415,9 +415,9 @@ fn registered_durable_factory(
     registry: &RaftGroupHandleRegistry,
 ) -> (
     ursula_raft::DurableRaftGroupEngineFactory,
-    ursula_raft::DurableRaftLogStoreFactory,
+    ursula_raft::RaftWal,
 ) {
-    let raft_wal = ursula_raft::DurableRaftLogStoreFactory::start(
+    let raft_wal = ursula_raft::RaftWal::start(
         wal_root.path(),
         ursula_config::WalFsync::Never,
         &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
@@ -434,10 +434,7 @@ fn registered_durable_factory(
 /// so the test may then remove the WAL directory. Removing it under a live
 /// core writer fails the writer's next journal write, which stops the
 /// process.
-async fn shutdown_test_wal(
-    runtime: &ShardRuntime,
-    raft_wal: &ursula_raft::DurableRaftLogStoreFactory,
-) {
+async fn shutdown_test_wal(runtime: &ShardRuntime, raft_wal: &ursula_raft::RaftWal) {
     assert_eq!(
         crate::server::shutdown_raft_wal(runtime, Some(raft_wal)).await,
         crate::server::WalShutdown::Clean,
@@ -450,7 +447,7 @@ struct StaticGrpcTestNode {
     registry: RaftGroupHandleRegistry,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<()>,
-    raft_wal: ursula_raft::DurableRaftLogStoreFactory,
+    raft_wal: ursula_raft::RaftWal,
     /// The node's own WAL directory when the test gave it none: a fresh,
     /// empty one per start, as a node that lost its disk restarts.
     /// [`StaticGrpcTestNode::shutdown`] closes the WAL before it goes.
@@ -507,7 +504,7 @@ async fn spawn_static_grpc_test_node(
     config.threading = ursula_runtime::RuntimeThreading::HostedTokio;
     let (log_stores, wal_root) = match storage.raft_log_dir {
         Some(raft_log_dir) => (
-            ursula_raft::DurableRaftLogStoreFactory::start(
+            ursula_raft::RaftWal::start(
                 raft_log_dir,
                 ursula_config::WalFsync::Always,
                 &ursula_shard::StaticShardMap::new(1, raft_group_count).expect("valid topology"),
@@ -518,7 +515,7 @@ async fn spawn_static_grpc_test_node(
         None => {
             let wal_root = tempfile::tempdir().expect("WAL root");
             (
-                ursula_raft::DurableRaftLogStoreFactory::start(
+                ursula_raft::RaftWal::start(
                     wal_root.path(),
                     ursula_config::WalFsync::Never,
                     &ursula_shard::StaticShardMap::new(1, raft_group_count)
@@ -2088,7 +2085,6 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
     .unwrap();
     let mut options = ursula_ctl::quorum::QuorumVerificationOptions {
         group_count: 6,
-        core_count: 1,
         timeout: Duration::from_secs(5),
         poll_interval: Duration::from_millis(10),
         allow_legacy_eligibility: false,
@@ -5046,7 +5042,7 @@ async fn ingress_body_budget_holds_credit_until_response_finishes() {
 async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
     // A replica on an empty WAL starts gated.
     let wal_root = tempfile::tempdir().expect("WAL root");
-    let store = ursula_raft::DurableRaftLogStoreFactory::start(
+    let store = ursula_raft::RaftWal::start(
         wal_root.path(),
         ursula_config::WalFsync::Never,
         &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
@@ -5101,7 +5097,7 @@ async fn accept_unsynced_loss_opens_a_gated_replica_and_is_incarnation_bound() {
     // A replica on an empty WAL: its gate is closed until a barrier or an
     // operator opens it.
     let wal_root = tempfile::tempdir().expect("WAL root");
-    let store = ursula_raft::DurableRaftLogStoreFactory::start(
+    let store = ursula_raft::RaftWal::start(
         wal_root.path(),
         ursula_config::WalFsync::Never,
         &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
@@ -8122,7 +8118,7 @@ fn core_journal_record_bytes(core_dir: &std::path::Path) -> u64 {
 async fn runtime_refuses_persisted_wal_topology_changes() {
     let dir = tempfile::tempdir().expect("WAL root");
     let original = ursula_shard::StaticShardMap::new(4, 8).unwrap();
-    let wal = ursula_raft::DurableRaftLogStoreFactory::start(
+    let wal = ursula_raft::RaftWal::start(
         dir.path(),
         ursula_config::WalFsync::Always,
         &original,
@@ -8204,14 +8200,10 @@ async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrie
     assert_eq!(proof.raft_group_id, 0);
     assert_eq!(proof.leader_id, 1);
     assert!(proof.leader_term > 0);
-    assert!(
-        raft.metrics()
-            .borrow_watched()
-            .last_applied
-            .unwrap()
-            .index()
-            >= proof.required_applied_index
-    );
+    raft.wait(Some(Duration::from_secs(5)))
+        .applied_index_at_least(Some(proof.required_applied_index), "proof prefix applied")
+        .await
+        .unwrap();
     runtime.shutdown_group_engines().await.unwrap();
     spawned.raft_wal.unwrap().shutdown().await.unwrap();
 }

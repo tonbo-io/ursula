@@ -167,7 +167,7 @@ async fn new_recovery_engine(
     tempfile::TempDir,
 ) {
     let wal_root = tempfile::tempdir().expect("WAL root");
-    let store = DurableRaftLogStoreFactory::start(
+    let store = RaftWal::start(
         wal_root.path(),
         WalFsync::Never,
         &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
