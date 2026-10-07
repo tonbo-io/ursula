@@ -206,7 +206,7 @@ ursulactl restore --config new-cluster.json --location s3://backups/ursula/2026-
 
 `backup-create` and `restore` take `--http-timeout-secs` (default `30`). The cold check looks up every object a group references, 32 at a time, in one request per group, so a group with tens of thousands of cold objects needs a longer timeout. An `s3://` location uses the AWS SDK credential chain and `AWS_REGION`. For MinIO or another S3-compatible store, also set `AWS_ENDPOINT_URL`.
 
-The backup format is 2 for Ursula 0.6 and 0.7, independent of the server's format epoch. `ursulactl` 0.7 verifies and restores 0.6 backups, and creates backups of 0.6 clusters. It does not restore into a 0.6 cluster. See [Upgrading from 0.6](/docs/operations#upgrading-from-06).
+The backup format is the format epoch, 3. `ursulactl` refuses a backup or a cluster of another format epoch.
 
 Each command exits `0` on success and non-zero with an error that names the failed check. A refused `restore` imports nothing.
 

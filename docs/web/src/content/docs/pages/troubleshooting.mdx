@@ -46,10 +46,6 @@ replica-rebuild limitations.
 
 Every node of a static cluster keeps its Raft WAL in `raft.wal.path`. Set it to a directory on a persistent volume. Only a single node without `raft.peers` may omit it, and then its WAL lives in a temporary directory that is removed on clean shutdown.
 
-### `config sets a removed key`
-
-The config sets a key that Ursula 0.7 removed: `raft.wal.backend`, `raft.wal.allow_volatile_multi_peer`, `raft.memory_bootstrap_marker_dir` or `raft.rejoin_probe`. The Raft WAL is always the disk journal under `raft.wal.path`, so delete those keys. The error names each key and what replaced it. See [Upgrading from 0.6](/docs/operations#upgrading-from-06).
-
 ### `raft.node_id must be non-zero`
 
 Static Raft mode requires a unique `raft.node_id` in the config file or a `--node-id` override.
@@ -72,7 +68,7 @@ The data directory was written by Ursula 0.5.x or earlier (format epoch 1). This
 
 ### `raft WAL directory … is format epoch N`
 
-The directory's `FORMAT_EPOCH` marker names another epoch: epoch 2 is Ursula 0.6. Run the release that wrote it, or start on an empty directory. To keep the data of a 0.6 cluster, move it with a backup, see [Upgrading from 0.6](/docs/operations#upgrading-from-06).
+The directory's `FORMAT_EPOCH` marker names another epoch. This release reads format epoch 3 only. Run the release that wrote it, or start on an empty directory.
 
 ### `object storage s3://… is not empty and has no URSULA_FORMAT_EPOCH marker`
 
@@ -80,19 +76,19 @@ The cold root (or, with cold storage off, the S3 snapshot namespace) holds objec
 
 ### `object storage s3://… is format epoch N`
 
-The prefix's `URSULA_FORMAT_EPOCH` marker names another epoch. Use a new prefix and never reuse one across epochs. To keep a 0.6 cluster's cold data, copy its objects into the new prefix (see [Copying cold objects](/docs/operations#copying-cold-objects)) and restore a backup.
+The prefix's `URSULA_FORMAT_EPOCH` marker names another epoch. Use a new prefix and never reuse one across epochs.
 
 ### `journal … uses Ursula WAL version N`
 
-A Raft WAL journal of an earlier release: version 1 is Ursula 0.5.x, version 2 is 0.6. This release reads WAL version 3 only. The directory marker normally refuses the directory first, and the journal check is the backstop. Start on an empty `raft.wal.path`. To keep the data of a 0.6 cluster, move it with a backup, see [Upgrading from 0.6](/docs/operations#upgrading-from-06).
+A Raft WAL journal of another format epoch: version 1 is Ursula 0.5.x, version 2 is 0.6. This release reads format epoch 3 only. The directory marker normally refuses the directory first, and the journal check is the backstop. Start on an empty `raft.wal.path`.
 
 ### `peer N (…) refused Raft protocol 3`
 
-A configured peer runs an earlier release (Ursula 0.6 speaks protocol 2, 0.5.x protocol 1). A node cannot join a cluster of another format epoch. Install this release as a new cluster and move the data with a backup, see [Upgrading from 0.6](/docs/operations#upgrading-from-06).
+A configured peer runs a release of another format epoch (Ursula 0.6 speaks protocol 2, 0.5.x protocol 1). A node cannot join a cluster of another format epoch. Install this release as a new cluster.
 
 ### `/__ursula/ready` answers `503` with `format_epoch_mismatch`
 
-The node exchanged a Raft RPC with a peer on another format epoch: a peer that was unreachable during the startup probe, or a node of another release that has this node in its peer list. A 0.6 node reports this after a 0.7 node probes it. The node stays not ready until it restarts. Remove the mismatched node from the peer lists and restart. See [Upgrading from 0.6](/docs/operations#upgrading-from-06).
+The node exchanged a Raft RPC with a peer on another format epoch: a peer that was unreachable during the startup probe, or a node of another release that has this node in its peer list. The node stays not ready until it restarts. Remove the mismatched node from the peer lists and restart.
 
 ### `/__ursula/ready` answers `503` with `recovery_gate_closed`
 
@@ -135,17 +131,13 @@ by the OS lock, not the file's existence.
 
 ## Backup and restore
 
-### `backup manifest format_version 1` or `target cluster speaks backup format 1`
+### `backup manifest format_version N` or `target cluster speaks backup format N`
 
-The backup or the cluster is Ursula 0.5.x. Ursula 0.6 and later read and write backup format 2 only, so a 0.5.x backup cannot be restored.
+The backup or the cluster is of another format epoch. This release reads and writes backup format 3 only, so a backup of another epoch cannot be restored, and a cluster of another epoch cannot be backed up or restored into.
 
 ### `… cold objects this backup references are missing from the target cluster's cold store`
 
 The backup references cold objects that the target's `storage.cold.root` does not hold. `restore` stopped before the first import, so the target is still empty. Copy the source cluster's cold objects into the target's root (see [Copying cold objects](/docs/operations#copying-cold-objects)) and run `restore` again. The error names the first missing keys. A key under `cold-index/` is an index page, so everything that page lists is unchecked until the page is there.
-
-### `the target cluster cannot check cold objects`
-
-The target runs a release before 0.7. Restore with the `ursulactl` of the target's release.
 
 ## Bootstrap and cluster join
 

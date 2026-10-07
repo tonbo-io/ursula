@@ -311,12 +311,10 @@ plus `snapshotStore.prefix`.
 
 ## Upgrade Limitations
 
-Ursula 0.7 (format epoch 3) cannot upgrade a 0.6 release in place. Install it
-as a new release with new PVCs and a new `s3.prefix`, then move the data with
-`ursulactl backup-create`, a copy of the cold objects and `ursulactl restore`.
-Remove `raft.storageMode`, `raft.allowVolatileMultiPeer` and
-`persistence.enabled` from your values first. See the operations guide's
-"Upgrading from 0.6".
+Ursula 0.7 (format epoch 3) cannot read the data or the backups of a 0.6
+release. Install it fresh, as a new release with new PVCs and a new
+`s3.prefix` (and, with cold storage off and S3 snapshots, a new
+`snapshotStore.prefix`).
 
 Ursula 0.6 (format epoch 2) cannot upgrade a 0.5.x release in place. Install it
 fresh: `helm uninstall`, delete the PVCs, and install with a new `s3.prefix`
