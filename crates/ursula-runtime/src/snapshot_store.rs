@@ -136,10 +136,9 @@ pub fn decode_snapshot_envelope<T: serde::de::DeserializeOwned>(
 ) -> Result<T, SnapshotStoreError> {
     if bytes.first() == Some(&b'{') {
         return Err(SnapshotStoreError::Deserialize(
-            ursula_stream::other_release_refusal(
+            ursula_stream::format_epoch_refusal(
                 "snapshot pointer",
-                "uses the JSON envelope of Ursula 0.5.x and earlier",
-                "the MessagePack envelope",
+                "uses the JSON envelope of Ursula 0.5.x and earlier (format epoch 1)",
             ),
         ));
     }
@@ -170,28 +169,21 @@ pub enum SnapshotStoreError {
     Serialize(String),
     #[error("snapshot deserialize: {0}")]
     Deserialize(String),
-    /// A group snapshot whose leading frame names another
-    /// [`ursula_stream::GROUP_SNAPSHOT_VERSION`], or that has no such frame
+    /// A group snapshot whose leading frame names another format epoch than
+    /// [`ursula_stream::FORMAT_EPOCH`], or that has no such frame
     /// (`found: None`, Ursula 0.5.x and earlier).
-    #[error("{}", group_snapshot_version_refusal(*.found))]
+    #[error("{}", group_snapshot_epoch_refusal(*.found))]
     UnsupportedVersion { found: Option<u32> },
     #[error("snapshot io: {0}")]
     Io(#[from] io::Error),
 }
 
-fn group_snapshot_version_refusal(found: Option<u32>) -> String {
+fn group_snapshot_epoch_refusal(found: Option<u32>) -> String {
     let found = found.map_or_else(
-        || "has no leading version frame (Ursula 0.5.x or earlier)".to_owned(),
-        |version| format!("is group snapshot version {version}"),
+        || "has no leading format-epoch frame (Ursula 0.5.x or earlier, format epoch 1)".to_owned(),
+        |epoch| format!("is format epoch {epoch}"),
     );
-    ursula_stream::other_release_refusal(
-        "snapshot",
-        &found,
-        &format!(
-            "group snapshot version {}",
-            ursula_stream::GROUP_SNAPSHOT_VERSION
-        ),
-    )
+    ursula_stream::format_epoch_refusal("snapshot", &found)
 }
 
 impl SnapshotStoreError {
@@ -405,7 +397,6 @@ mod s3 {
     use opendal::ErrorKind;
     use opendal::Operator;
     use opendal::Scheme;
-    use ursula_stream::SNAPSHOT_REFERENCE_VERSION;
 
     use super::SnapshotBytesIterator;
     use super::SnapshotCompression;
@@ -418,6 +409,7 @@ mod s3 {
 
     const S3_SNAPSHOT_ZSTD_LEVEL: i32 = 3;
     const S3_SNAPSHOT_GC_GRACE: Duration = Duration::from_secs(60 * 60);
+    const SNAPSHOT_REFERENCE_VERSION: u32 = ursula_stream::FORMAT_EPOCH;
 
     #[derive(serde::Deserialize, serde::Serialize)]
     struct SnapshotReference {
@@ -1607,7 +1599,8 @@ mod tests {
                 .write_raw_for_tests(
                     &format!("snapshots/group-7/references/node-{node_id}.json"),
                     serde_json::to_vec(&serde_json::json!({
-                        "version": ursula_stream::SNAPSHOT_REFERENCE_VERSION,
+                        // References carry the format epoch.
+                        "version": ursula_stream::FORMAT_EPOCH,
                         "node_id": node_id,
                         "raft_group_id": 7,
                         "snapshot_key": key,

@@ -3,13 +3,8 @@
 //! A backup is a directory (local filesystem or `s3://bucket/prefix`) holding
 //! one MessagePack `group-NNNN.snapshot` object per raft group plus a JSON
 //! `manifest.json`. The manifest carries the backup format version
-//! ([`BACKUP_FORMAT_VERSION`]), per-object byte sizes and BLAKE3 checksums,
-//! and the group commit index each export observed.
-//!
-//! The backup format is independent of the server's format epoch: a backup
-//! is how data moves from one format epoch to the next, so this tool reads
-//! the backups of Ursula 0.6 and restores them into a 0.7 cluster
-//! (`ursula_stream::format`).
+//! ([`BACKUP_FORMAT_VERSION`], the format epoch), per-object byte sizes and
+//! BLAKE3 checksums, and the group commit index each export observed.
 //!
 //! Recovery contract (also documented on the docs site):
 //!
@@ -43,14 +38,12 @@ use ursula_stream::StreamStateMachine;
 use crate::MetricsClient;
 use crate::NodeInfo;
 
-/// The backup format this tool reads and writes, and the one it requires of
-/// a target cluster (E9). Ursula 0.6 and later write format 2. A 0.5.x
-/// backup or cluster reports format 1 and is refused.
-pub const BACKUP_FORMAT_VERSION: u32 = ursula_stream::BACKUP_FORMAT_VERSION;
+/// The backup format is the format epoch. This tool reads and writes only
+/// its own epoch's backups and requires it of a target cluster (E9).
+pub const BACKUP_FORMAT_VERSION: u32 = ursula_stream::FORMAT_EPOCH;
 const MANIFEST_OBJECT: &str = "manifest.json";
 /// The procedure that copies a source cluster's cold objects into the target.
-pub const COLD_COPY_GUIDE_URL: &str =
-    "https://ursula.tonbo.io/docs/operations#copying-cold-objects";
+const COLD_COPY_GUIDE_URL: &str = "https://ursula.tonbo.io/docs/operations#copying-cold-objects";
 /// How many missing cold object keys a restore refusal names.
 const MISSING_COLD_OBJECT_SAMPLE: usize = 5;
 
@@ -81,17 +74,17 @@ pub enum BackupError {
     DecodeManifest(#[source] serde_json::Error),
     #[error("encode backup manifest")]
     EncodeManifest(#[source] serde_json::Error),
-    /// E9: a manifest of another backup format (Ursula 0.5.x wrote 1).
+    /// E9: a manifest of another format epoch.
     #[error(
-        "backup manifest format_version {found}; this ursulactl reads and writes backup format \
-         {BACKUP_FORMAT_VERSION} only (Ursula 0.6 and later)"
+        "backup manifest format_version {found}; this ursulactl reads and writes format epoch \
+         {BACKUP_FORMAT_VERSION} only"
     )]
     UnsupportedManifest { found: u32 },
-    /// E9: a target cluster of another backup format, checked before the
-    /// first export or import.
+    /// E9: a target cluster of another format epoch, checked before the first
+    /// export or import.
     #[error(
-        "target cluster speaks backup format {found}; this ursulactl reads and writes backup \
-         format {BACKUP_FORMAT_VERSION} only (Ursula 0.6 and later)"
+        "target cluster speaks backup format {found}; this ursulactl reads and writes format \
+         epoch {BACKUP_FORMAT_VERSION} only"
     )]
     UnsupportedCluster { found: u32 },
     #[error("manifest lists {listed} group objects but declares {declared} raft groups")]
@@ -158,16 +151,6 @@ pub enum BackupError {
         missing: u64,
         referenced: u64,
         sample: Vec<String>,
-    },
-    /// The target answers no cold-object check: it runs a release before
-    /// 0.7, which this ursulactl does not restore into.
-    #[error(
-        "{url}: the target cluster cannot check cold objects (HTTP {status}); restore with the \
-         ursulactl of the target's release"
-    )]
-    ColdCheckUnsupported {
-        url: url::Url,
-        status: reqwest::StatusCode,
     },
     #[error("admin URL")]
     Url(#[from] url::ParseError),
@@ -491,17 +474,6 @@ impl BackupClient {
                         .await
                         .map_err(|source| BackupError::Request { url, source });
                 }
-                Ok(response)
-                    if matches!(
-                        response.status(),
-                        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
-                    ) =>
-                {
-                    return Err(BackupError::ColdCheckUnsupported {
-                        url,
-                        status: response.status(),
-                    });
-                }
                 Ok(response) => last_error = Some(status_error(url, response).await),
                 Err(source) => last_error = Some(BackupError::Request { url, source }),
             }
@@ -738,10 +710,6 @@ mod tests {
         }
     }
 
-    fn fixture_0_6_2() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/backup-0.6.2")
-    }
-
     #[tokio::test]
     async fn verify_accepts_a_well_formed_backup() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -763,17 +731,6 @@ mod tests {
         let report = verify(&store).await.expect("verify");
         assert_eq!(report.groups, 1);
         assert_eq!(report.buckets, 1);
-    }
-
-    /// A backup written by Ursula 0.6.2's ursulactl verifies unchanged: the
-    /// backup format and the stream snapshot encoding did not change in 0.7.
-    #[tokio::test]
-    async fn verify_accepts_a_backup_written_by_ursula_0_6_2() {
-        let store = store_in(&fixture_0_6_2()).await;
-        let report = verify(&store).await.expect("a 0.6.2 backup verifies");
-        assert_eq!(report.groups, 4);
-        assert_eq!(report.buckets, 4);
-        assert_eq!(report.streams, 8);
     }
 
     #[tokio::test]
@@ -805,7 +762,7 @@ mod tests {
             "{err}"
         );
 
-        // E9: a manifest of another backup format (Ursula 0.5.x wrote 1).
+        // E9: a manifest of another format epoch.
         for found in [BACKUP_FORMAT_VERSION - 1, BACKUP_FORMAT_VERSION + 1] {
             let mut manifest = manifest_for(&[(0, &body)]);
             manifest.format_version = found;
@@ -823,9 +780,9 @@ mod tests {
             );
         }
 
-        // A group snapshot of another stream snapshot version.
+        // A group snapshot of another format epoch.
         let body = rmp_serde::to_vec_named(&StreamSnapshot {
-            version: ursula_stream::STREAM_SNAPSHOT_VERSION + 1,
+            format_epoch: ursula_stream::FORMAT_EPOCH - 1,
             buckets: vec!["tenant-a".to_owned()],
             ..StreamSnapshot::default()
         })
@@ -841,18 +798,19 @@ mod tests {
             )
             .await
             .expect("write manifest");
-        let err = verify(&store).await.expect_err("other version rejected");
+        let err = verify(&store).await.expect_err("other epoch rejected");
         assert!(
             matches!(err, BackupError::InvalidSnapshot {
                 raft_group_id: 0,
-                source: StreamSnapshotError::UnsupportedVersion { .. },
+                source: StreamSnapshotError::FormatEpoch { .. },
             }),
             "{err}"
         );
     }
 
     /// E9: restore checks the target's format before the first import, so
-    /// this ursulactl never pushes snapshots into a 0.5.x cluster.
+    /// this ursulactl never pushes snapshots into a cluster of another format
+    /// epoch.
     #[tokio::test]
     async fn restore_refuses_a_cluster_of_another_format_before_any_import() {
         use std::sync::Arc;
@@ -929,8 +887,8 @@ mod tests {
     }
 
     /// Restore asks the target to check every group's cold references
-    /// before the first import. Missing objects, or a target that cannot
-    /// check, stop it with nothing imported.
+    /// before the first import. Missing objects stop it with nothing
+    /// imported.
     #[tokio::test]
     async fn restore_imports_nothing_when_the_target_lacks_cold_objects() {
         use std::sync::Arc;
@@ -962,101 +920,87 @@ mod tests {
             .await
             .expect("write manifest");
 
-        for cold_check_supported in [true, false] {
-            let imports = Arc::new(AtomicUsize::new(0));
-            let counted = imports.clone();
-            let mut app = Router::new()
-                .route(
-                    "/__ursula/backup/info",
-                    get(|| async {
-                        Json(BackupInfo {
-                            format_version: BACKUP_FORMAT_VERSION,
-                            raft_group_count: 2,
-                        })
-                    }),
-                )
-                .route(
-                    "/__ursula/metrics",
-                    get(|| async {
-                        Json(serde_json::json!({
-                            "process_node_id": 1,
-                            "process_incarnation": "00000000000000000000000000000001"
-                        }))
-                    }),
-                )
-                .route(
-                    "/__ursula/backup/group/{group}/import",
-                    post(move || {
-                        let counted = counted.clone();
-                        async move {
-                            counted.fetch_add(1, Ordering::SeqCst);
-                            StatusCode::OK
-                        }
-                    }),
-                );
-            if cold_check_supported {
-                app = app.route(
-                    "/__ursula/backup/group/{group}/cold-check",
-                    post(
-                        |axum::extract::Path(group): axum::extract::Path<u32>| async move {
-                            Json(BackupColdCheck {
-                                raft_group_id: group,
-                                referenced_objects: 4,
-                                missing_objects: u64::from(group),
-                                missing_sample: (0..group)
-                                    .map(|index| format!("tenant-b/cold/chunk-{index}"))
-                                    .collect(),
-                            })
-                        },
-                    ),
-                );
-            }
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
-            let client = BackupClient::new(
-                MetricsClient::new(std::time::Duration::from_secs(1)).unwrap(),
-                vec![NodeInfo {
-                    id: 1,
-                    admin_url: format!("http://{address}").parse().unwrap(),
-                    host: address.to_string(),
-                    http_url: None,
-                    metrics_url: None,
-                    expected_process_incarnation: None,
-                    expected_maintenance_fence: None,
-                }],
+        let imports = Arc::new(AtomicUsize::new(0));
+        let counted = imports.clone();
+        let app = Router::new()
+            .route(
+                "/__ursula/backup/info",
+                get(|| async {
+                    Json(BackupInfo {
+                        format_version: BACKUP_FORMAT_VERSION,
+                        raft_group_count: 2,
+                    })
+                }),
             )
-            .unwrap();
+            .route(
+                "/__ursula/metrics",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "process_node_id": 1,
+                        "process_incarnation": "00000000000000000000000000000001"
+                    }))
+                }),
+            )
+            .route(
+                "/__ursula/backup/group/{group}/import",
+                post(move || {
+                    let counted = counted.clone();
+                    async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .route(
+                "/__ursula/backup/group/{group}/cold-check",
+                post(
+                    |axum::extract::Path(group): axum::extract::Path<u32>| async move {
+                        Json(BackupColdCheck {
+                            raft_group_id: group,
+                            referenced_objects: 4,
+                            missing_objects: u64::from(group),
+                            missing_sample: (0..group)
+                                .map(|index| format!("tenant-b/cold/chunk-{index}"))
+                                .collect(),
+                        })
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = BackupClient::new(
+            MetricsClient::new(std::time::Duration::from_secs(1)).unwrap(),
+            vec![NodeInfo {
+                id: 1,
+                admin_url: format!("http://{address}").parse().unwrap(),
+                host: address.to_string(),
+                http_url: None,
+                metrics_url: None,
+                expected_process_incarnation: None,
+                expected_maintenance_fence: None,
+            }],
+        )
+        .unwrap();
 
-            let err = restore(&client, &store)
-                .await
-                .expect_err("an incomplete cold store is refused");
-            if cold_check_supported {
-                assert!(
-                    matches!(
-                        &err,
-                        BackupError::ColdObjectsMissing {
-                            missing: 1,
-                            referenced: 8,
-                            sample,
-                        } if sample == &["tenant-b/cold/chunk-0".to_owned()]
-                    ),
-                    "{err}"
-                );
-            } else {
-                assert!(
-                    matches!(err, BackupError::ColdCheckUnsupported {
-                        status: reqwest::StatusCode::NOT_FOUND,
-                        ..
-                    }),
-                    "{err}"
-                );
-            }
-            assert_eq!(imports.load(Ordering::SeqCst), 0, "nothing imported");
-            server.abort();
-        }
+        let err = restore(&client, &store)
+            .await
+            .expect_err("an incomplete cold store is refused");
+        assert!(
+            matches!(
+                &err,
+                BackupError::ColdObjectsMissing {
+                    missing: 1,
+                    referenced: 8,
+                    sample,
+                } if sample == &["tenant-b/cold/chunk-0".to_owned()]
+            ),
+            "{err}"
+        );
+        assert_eq!(imports.load(Ordering::SeqCst), 0, "nothing imported");
+        server.abort();
     }
 
     #[tokio::test]

@@ -11,10 +11,8 @@ message SnapshotFrameV1 {
     StreamAppendCountV1 append_count = 3;
     ColdGcEntryV1 cold_gc = 4;
     SnapshotFooterV1 footer = 5;
-    // Always the first frame, checked before any other frame is decoded. It
-    // carries the group snapshot version (ursula_stream::GROUP_SNAPSHOT_VERSION),
-    // 2 since Ursula 0.6, where it was named after the format epoch.
-    // Snapshots from Ursula 0.5.x and earlier have none.
+    // Always the first frame, checked before any other frame is decoded.
+    // Snapshots from Ursula 0.5.x and earlier (format epoch 1) have none.
     FormatEpochV1 format_epoch = 6;
   }
 }

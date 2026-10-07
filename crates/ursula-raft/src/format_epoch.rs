@@ -1,11 +1,11 @@
 //! Format-epoch checks on the Raft gRPC plane.
 //!
 //! The Raft gRPC protocol version is the format epoch
-//! (`ursula_stream::RAFT_GRPC_PROTOCOL_VERSION`). Every inbound RPC checks it
-//! before the group id and the payload, and Ursula 0.5.x and 0.6 do the same,
-//! so a mismatch is answered `FAILED_PRECONDITION` with
-//! [`PROTOCOL_MISMATCH_TEXT`] in the message. Two mechanisms keep a node of one epoch from serving next to a
-//! node of another:
+//! (`ursula_stream::FORMAT_EPOCH`). Every inbound RPC checks it before the
+//! group id and the payload, and Ursula 0.5.x and 0.6 do the same, so a
+//! mismatch is answered `FAILED_PRECONDITION` with [`PROTOCOL_MISMATCH_TEXT`]
+//! in the message. Two mechanisms keep a node of one epoch from serving next
+//! to a node of another:
 //!
 //! - **Startup peer probe** ([`probe_peer_format_epoch`]): before a node
 //!   writes anything, it sends each configured peer one `Vote` for a group no

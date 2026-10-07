@@ -6635,20 +6635,20 @@ async fn usage_endpoint_reports_per_bucket_committed_counters() {
 }
 
 /// E10: an import is refused with 400 before decoding when its group has no
-/// stream snapshot version (Ursula 0.5.x) or another version.
+/// format epoch (Ursula 0.5.x) or another epoch.
 #[tokio::test]
-async fn backup_import_refuses_groups_without_this_stream_snapshot_version() {
+async fn backup_import_refuses_groups_without_this_format_epoch() {
     let app = test_router();
-    let without_version =
+    let without_epoch =
         rmp_serde::to_vec_named(&json!({"buckets": ["tenant-a"], "streams": []})).unwrap();
-    let other_version = rmp_serde::to_vec_named(&ursula_runtime::StreamSnapshot {
-        version: ursula_runtime::STREAM_SNAPSHOT_VERSION + 1,
+    let other_epoch = rmp_serde::to_vec_named(&ursula_runtime::StreamSnapshot {
+        format_epoch: ursula_runtime::FORMAT_EPOCH - 1,
         ..ursula_runtime::StreamSnapshot::default()
     })
     .unwrap();
     for (body, expected) in [
-        (without_version, "has no stream snapshot version"),
-        (other_version, "unsupported stream snapshot version"),
+        (without_epoch, "has no format_epoch"),
+        (other_epoch, "unsupported format_epoch"),
     ] {
         let response = http_post(
             &app,
@@ -6830,10 +6830,7 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
     assert_eq!(info.status(), StatusCode::OK);
     let info: serde_json::Value =
         serde_json::from_slice(&body_bytes(info).await).expect("backup info json");
-    assert_eq!(
-        info["format_version"],
-        ursula_runtime::BACKUP_FORMAT_VERSION
-    );
+    assert_eq!(info["format_version"], ursula_runtime::FORMAT_EPOCH);
     let group_count = info["raft_group_count"].as_u64().expect("group count");
     let mut exports = Vec::new();
     for group in 0..group_count {

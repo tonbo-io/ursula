@@ -29,7 +29,7 @@ use serde::Serialize;
 use ursula_config::RaftSnapshotBackend;
 use ursula_config::config::ColdBackend;
 use ursula_stream::FORMAT_EPOCH;
-use ursula_stream::UPGRADE_GUIDE_URL;
+use ursula_stream::format_epoch_refusal;
 
 use crate::ColdConfig;
 
@@ -80,12 +80,12 @@ pub enum MarkerState {
 fn epoch_mismatch(location: String, marker: &FormatEpochMarker) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!(
-            "{location} is format epoch {} (written by {}); this binary reads format epoch \
-             {FORMAT_EPOCH} only. There is no in-place upgrade: move the data to a new cluster \
-             with ursulactl backup-create and restore ({UPGRADE_GUIDE_URL}), or run the \
-             release that wrote it",
-            marker.format_epoch, marker.written_by
+        format_epoch_refusal(
+            &location,
+            &format!(
+                "is format epoch {} (written by {})",
+                marker.format_epoch, marker.written_by
+            ),
         ),
     )
 }
