@@ -250,7 +250,8 @@ impl CoreFileLogWriter {
         recovery_metrics: Option<(ShardPlacement, GroupEngineMetrics)>,
     ) -> Result<Arc<Self>, CoreJournalError> {
         if let Some(parent) = journal_path.parent() {
-            Disk::create_dir_all(parent).map_err(|source| CoreJournalError::io(parent, source))?;
+            create_dir_all_durable(parent)
+                .map_err(|source| CoreJournalError::io(parent, source))?;
         }
         let lock = acquire_journal_lock(&journal_path)?;
         let recovery_started_at = Instant::now();
@@ -349,6 +350,25 @@ impl Drop for CoreFileLogWriter {
             stop_core_file_log_writer(worker);
         }
     }
+}
+
+/// Creates `path` and `fsync`s the parent of every directory it creates. The
+/// journal's first `fsync` makes the journal's own entry durable, but a new
+/// directory's entry needs its parent `fsync`ed too, or a power loss can drop
+/// the whole directory with every acknowledged write in it.
+fn create_dir_all_durable(path: &Path) -> io::Result<()> {
+    let created_parents = path
+        .ancestors()
+        .take_while(|dir| !dir.as_os_str().is_empty() && !Disk::exists(dir))
+        .filter_map(Path::parent)
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    Disk::create_dir_all(path)?;
+    for parent in created_parents.iter().rev() {
+        Disk::sync_dir(parent)?;
+    }
+    Ok(())
 }
 
 fn acquire_journal_lock(journal_path: &Path) -> Result<DiskLock, CoreJournalError> {
