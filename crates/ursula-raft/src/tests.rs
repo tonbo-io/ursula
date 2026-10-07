@@ -95,10 +95,23 @@ impl
     > {
         let dir = tempfile::tempdir()
             .map_err(|err| StorageError::write(UrsulaRaftTypeConfig::err_from_error(&err)))?;
-        let store = RaftGroupFileLogStore::shared(dir.path().join("group.wal"))
+        let store = open_core_journal_store(dir.path())
             .map_err(|err| StorageError::write(UrsulaRaftTypeConfig::err_from_error(&err)))?;
         Ok((dir, store, RaftGroupStateMachine::new(placement())))
     }
+}
+
+/// Opens `placement()`'s store on a fresh per-core journal under `root`; the
+/// store owns the core writer, so dropping it closes the journal.
+fn open_core_journal_store(root: &Path) -> Result<Arc<RaftGroupFileLogStore>, GroupEngineError> {
+    DurableRaftLogStoreFactory::new(root).open(
+        placement(),
+        ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+    )
+}
+
+fn core_journal_path(root: &Path) -> PathBuf {
+    root.join("core-0").join("journal.bin")
 }
 
 #[tokio::test]
@@ -723,11 +736,11 @@ fn public_meta_log_store_type_is_exported_from_crate_root() {
 
 #[tokio::test]
 async fn raft_file_log_store_recovers_vote_committed_and_entries() {
-    let path = temp_log_path("recover");
+    let root = tempfile::tempdir().expect("journal root");
     let vote: VoteOf<UrsulaRaftTypeConfig> = openraft::Vote::new_committed(7, 1);
 
     {
-        let mut store = RaftGroupFileLogStore::shared(&path).expect("open file log store");
+        let mut store = open_core_journal_store(root.path()).expect("open file log store");
         store
             .append(
                 vec![
@@ -744,9 +757,12 @@ async fn raft_file_log_store_recovers_vote_committed_and_entries() {
             .await
             .expect("save committed");
     }
-    assert_eq!(wire_frame_count::<RaftGroupLogRecord>(&path), 3);
+    assert_eq!(
+        wire_frame_count::<CoreJournalRecord>(&core_journal_path(root.path())),
+        3
+    );
 
-    let mut reopened = RaftGroupFileLogStore::shared(&path).expect("reopen file log store");
+    let mut reopened = open_core_journal_store(root.path()).expect("reopen file log store");
     let state = reopened.get_log_state().await.expect("log state");
     assert_eq!(state.last_log_id, Some(log_id(2)));
     assert_eq!(
@@ -763,17 +779,15 @@ async fn raft_file_log_store_recovers_vote_committed_and_entries() {
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].log_id, log_id(1));
     assert_eq!(entries[1].log_id, log_id(2));
-
-    remove_test_path(&path);
 }
 
 #[tokio::test]
 async fn raft_file_log_store_skips_duplicate_vote_and_committed_records() {
-    let path = temp_log_path("duplicate-vote-committed");
+    let root = tempfile::tempdir().expect("journal root");
     let vote: VoteOf<UrsulaRaftTypeConfig> = openraft::Vote::new_committed(7, 1);
 
     {
-        let mut store = RaftGroupFileLogStore::shared(&path).expect("open file log store");
+        let mut store = open_core_journal_store(root.path()).expect("open file log store");
         store.save_vote(&vote).await.expect("save vote");
         store
             .save_committed(Some(log_id(2)))
@@ -785,24 +799,25 @@ async fn raft_file_log_store_skips_duplicate_vote_and_committed_records() {
             .await
             .expect("save duplicate committed");
     }
-    assert_eq!(wire_frame_count::<RaftGroupLogRecord>(&path), 2);
+    assert_eq!(
+        wire_frame_count::<CoreJournalRecord>(&core_journal_path(root.path())),
+        2
+    );
 
-    let mut reopened = RaftGroupFileLogStore::shared(&path).expect("reopen file log store");
+    let mut reopened = open_core_journal_store(root.path()).expect("reopen file log store");
     assert_eq!(reopened.read_vote().await.expect("vote"), Some(vote));
     assert_eq!(
         reopened.read_committed().await.expect("committed"),
         Some(log_id(2))
     );
-
-    remove_test_path(&path);
 }
 
 #[tokio::test]
 async fn raft_file_log_store_recovers_truncate_and_purge() {
-    let path = temp_log_path("truncate-purge");
+    let root = tempfile::tempdir().expect("journal root");
 
     {
-        let mut store = RaftGroupFileLogStore::shared(&path).expect("open file log store");
+        let mut store = open_core_journal_store(root.path()).expect("open file log store");
         store
             .append(
                 vec![
@@ -830,9 +845,12 @@ async fn raft_file_log_store_recovers_truncate_and_purge() {
             .expect("append after truncate");
         store.purge(log_id(2)).await.expect("purge file log");
     }
-    assert_eq!(wire_frame_count::<RaftGroupLogRecord>(&path), 4);
+    assert_eq!(
+        wire_frame_count::<CoreJournalRecord>(&core_journal_path(root.path())),
+        4
+    );
 
-    let mut reopened = RaftGroupFileLogStore::shared(&path).expect("reopen file log store");
+    let mut reopened = open_core_journal_store(root.path()).expect("reopen file log store");
     let state = reopened.get_log_state().await.expect("log state");
     assert_eq!(state.last_purged_log_id, Some(log_id(2)));
     assert_eq!(state.last_log_id, Some(log_id(3)));
@@ -844,17 +862,15 @@ async fn raft_file_log_store_recovers_truncate_and_purge() {
         .expect("read recovered entries");
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].log_id, log_id(3));
-
-    remove_test_path(&path);
 }
 
 #[tokio::test]
 async fn raft_file_log_restart_rebuilds_only_through_the_committed_marker() {
-    let path = temp_log_path("committed-boundary");
+    let root = tempfile::tempdir().expect("journal root");
     let stream_id = bsid("committed-boundary");
 
     {
-        let mut store = RaftGroupFileLogStore::shared(&path).expect("open file log store");
+        let mut store = open_core_journal_store(root.path()).expect("open file log store");
         store
             .append(
                 [
@@ -872,7 +888,7 @@ async fn raft_file_log_restart_rebuilds_only_through_the_committed_marker() {
             .expect("persist committed marker");
     }
 
-    let mut reopened = RaftGroupFileLogStore::shared(&path).expect("reopen file log store");
+    let mut reopened = open_core_journal_store(root.path()).expect("reopen file log store");
     let committed = reopened
         .read_committed()
         .await
@@ -907,10 +923,6 @@ async fn raft_file_log_restart_rebuilds_only_through_the_committed_marker() {
         .await
         .expect("read rebuilt stream");
     assert_eq!(read.payload, b"committed");
-
-    drop(reader);
-    drop(reopened);
-    remove_test_path(&path);
 }
 
 #[tokio::test]
@@ -2191,13 +2203,20 @@ async fn raft_group_engine_preserves_stream_error_next_offset() {
 
 #[tokio::test]
 async fn raft_group_engine_recovers_client_writes_from_file_log() {
-    let path = temp_log_path("raft-group-engine-recover");
+    let root = tempfile::tempdir().expect("journal root");
     let stream_id = bsid("raft-engine-recover");
+    let single_node_config = || raft_config("ursula-group-0", 30, 60);
 
     {
-        let mut engine = RaftGroupEngine::new_single_node_with_file_log(placement(), &path)
-            .await
-            .expect("create durable raft group engine");
+        let mut engine = RaftGroupEngine::new_single_node_with_log_store(
+            placement(),
+            1,
+            BasicNode::new("local"),
+            single_node_config(),
+            open_core_journal_store(root.path()).expect("open durable log store"),
+        )
+        .await
+        .expect("create durable raft group engine");
         engine
             .create_stream(
                 CreateStreamRequest::new(stream_id.clone(), "application/octet-stream"),
@@ -2217,9 +2236,15 @@ async fn raft_group_engine_recovers_client_writes_from_file_log() {
         engine.shutdown().await.expect("shutdown first engine");
     }
 
-    let mut recovered = RaftGroupEngine::new_single_node_with_file_log(placement(), &path)
-        .await
-        .expect("reopen durable raft group engine");
+    let mut recovered = RaftGroupEngine::new_single_node_with_log_store(
+        placement(),
+        1,
+        BasicNode::new("local"),
+        single_node_config(),
+        open_core_journal_store(root.path()).expect("reopen durable log store"),
+    )
+    .await
+    .expect("reopen durable raft group engine");
     let read = recovered
         .read_stream(read_req(stream_id, 16), placement())
         .await
@@ -2229,8 +2254,6 @@ async fn raft_group_engine_recovers_client_writes_from_file_log() {
         .shutdown()
         .await
         .expect("shutdown recovered engine");
-
-    remove_test_path(&path);
 }
 
 #[tokio::test]

@@ -9,8 +9,9 @@
 //!   response, and error types that travel through the Raft state machine.
 //! - [`grpc`]: gRPC service ([`RaftGrpcService`]) and network factory
 //!   ([`GrpcRaftNetworkFactory`]) used for inter-node Raft RPCs.
-//! - [`log_store`]: in-memory and durable file-backed Raft log stores (see
-//!   `log_store::memory` and `log_store::file`).
+//! - [`log_store`]: in-memory and durable Raft log stores. The durable store
+//!   writes the shared per-core journal through an I/O seam whose `cfg(madsim)`
+//!   implementation is the simulated disk (`SimDisk`).
 //! - [`registry`]: [`RaftGroupHandleRegistry`] and the single-node test network.
 //! - [`maintenance`]: configuration-backed local Raft maintenance eligibility.
 //! - [`state_machine`]: per-group [`RaftGroupStateMachine`] and snapshot builder.
@@ -92,10 +93,30 @@ pub use grpc::confirm_quorum_prefix;
 pub use grpc::raft_grpc_metrics_snapshot;
 pub use grpc::raft_grpc_service;
 pub use grpc::request_self_election_via_transfer;
+#[cfg(madsim)]
+pub use log_store::JournalDisk;
+#[cfg(madsim)]
+pub use log_store::JournalFile;
+#[cfg(madsim)]
+pub use log_store::LockAttempt;
 pub use log_store::MemoryRaftLogStore;
 pub use log_store::MetaRaftLogStore;
 pub use log_store::RaftGroupFileLogStore;
 pub use log_store::RaftGroupLogStore;
+#[cfg(madsim)]
+pub use log_store::SIM_DISK_PAGE_SIZE;
+#[cfg(madsim)]
+pub use log_store::SimDisk;
+#[cfg(madsim)]
+pub use log_store::SimDiskError;
+#[cfg(madsim)]
+pub use log_store::SimDiskFault;
+#[cfg(madsim)]
+pub use log_store::SimFile;
+#[cfg(madsim)]
+pub use log_store::SimJournalLock;
+#[cfg(madsim)]
+pub use log_store::SimPowerLoss;
 pub use maintenance::RaftMaintenanceIssue;
 pub use maintenance::RaftMaintenanceReport;
 pub use maintenance::check_raft_maintenance;

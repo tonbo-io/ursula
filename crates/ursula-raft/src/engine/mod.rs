@@ -114,7 +114,6 @@ use crate::forward::group_engine_client_write_error;
 use crate::forward::group_engine_forward_to_leader_error;
 use crate::forward::group_engine_initialized_marker_unavailable;
 use crate::forward::write_result_from_raft_response;
-use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RaftGroupLogStore;
 use crate::read_index::ReadIndexBarrier;
 use crate::registry::SingleNodeRaftNetworkFactory;
@@ -157,31 +156,19 @@ impl RaftGroupEngine {
         placement: ShardPlacement,
         metrics: Option<GroupEngineMetrics>,
     ) -> Result<Self, GroupEngineError> {
-        let config = Arc::new(
-            Config {
-                cluster_name: format!("ursula-group-{}", placement.raft_group_id.0),
-                heartbeat_interval: 10,
-                election_timeout_min: 30,
-                election_timeout_max: 60,
-                ..Default::default()
-            }
-            .validate()
-            .map_err(|err| GroupEngineError::new(format!("invalid OpenRaft config: {err}")))?,
-        );
-        Self::new_single_node_with_config_and_metrics(
-            placement,
-            1,
-            BasicNode::new("local"),
-            config,
-            metrics,
-        )
-        .await
+        Self::new_single_node_on_log_store(placement, RaftGroupLogStore::shared(), metrics).await
     }
 
-    pub async fn new_single_node_with_file_log(
+    /// A single-node group over `log_store`, with the defaults of
+    /// [`RaftGroupEngine::new_single_node`].
+    pub async fn new_single_node_on_log_store<LS>(
         placement: ShardPlacement,
-        log_path: impl Into<PathBuf>,
-    ) -> Result<Self, GroupEngineError> {
+        log_store: LS,
+        metrics: Option<GroupEngineMetrics>,
+    ) -> Result<Self, GroupEngineError>
+    where
+        LS: RaftLogStorage<UrsulaRaftTypeConfig>,
+    {
         let config = Arc::new(
             Config {
                 cluster_name: format!("ursula-group-{}", placement.raft_group_id.0),
@@ -193,14 +180,14 @@ impl RaftGroupEngine {
             .validate()
             .map_err(|err| GroupEngineError::new(format!("invalid OpenRaft config: {err}")))?,
         );
-        let log_store = RaftGroupFileLogStore::shared(log_path)
-            .map_err(|err| GroupEngineError::new(format!("open OpenRaft file log: {err}")))?;
-        Self::new_single_node_with_log_store(
+        Self::new_single_node_with_log_store_and_metrics(
             placement,
             1,
             BasicNode::new("local"),
             config,
             log_store,
+            metrics,
+            None,
         )
         .await
     }

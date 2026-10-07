@@ -444,12 +444,6 @@ impl DurableRaftLogStoreFactory {
         }
     }
 
-    pub(crate) fn log_path(&self, placement: ShardPlacement) -> PathBuf {
-        self.root
-            .join(format!("core-{}", placement.core_id.0))
-            .join(format!("group-{}.json", placement.raft_group_id.0))
-    }
-
     pub(crate) fn core_journal_path(&self, core_id: CoreId) -> PathBuf {
         self.root
             .join(format!("core-{}", core_id.0))
@@ -475,10 +469,9 @@ impl DurableRaftLogStoreFactory {
             return Ok(writer);
         }
 
-        let writer = CoreFileLogWriter::shared_with_metrics(
+        let writer = CoreFileLogWriter::open(
             self.core_journal_path(placement.core_id),
-            placement,
-            metrics,
+            Some((placement, metrics)),
         )
         .map_err(|err| GroupEngineError::new(format!("open OpenRaft core journal: {err}")))?;
         writers.insert(placement.core_id.0, Arc::downgrade(&writer));
@@ -491,13 +484,8 @@ impl DurableRaftLogStoreFactory {
         metrics: GroupEngineMetrics,
     ) -> Result<Arc<RaftGroupFileLogStore>, GroupEngineError> {
         let core_writer = self.core_writer(placement, metrics.clone())?;
-        RaftGroupFileLogStore::shared_with_core_writer(
-            self.log_path(placement),
-            placement,
-            metrics,
-            core_writer,
-        )
-        .map_err(|err| GroupEngineError::new(format!("open OpenRaft file log: {err}")))
+        RaftGroupFileLogStore::open(placement, metrics, core_writer)
+            .map_err(|err| GroupEngineError::new(format!("open OpenRaft file log: {err}")))
     }
 }
 

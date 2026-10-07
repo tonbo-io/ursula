@@ -1,12 +1,16 @@
+//! The durable OpenRaft log store: every group's records go to its core's
+//! shared journal through one writer per core.
+//!
+//! The writer is an async loop over the runtime shim's channel. Production
+//! runs it on a dedicated OS thread with a current-thread runtime, so blocking
+//! file I/O stays off the async workers; `cfg(madsim)` runs it as a simulated
+//! task over the simulated disk. Callers await a reply that arrives after the
+//! batch is written and, when it needs it, `fsync`ed.
+
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt::Debug;
-use std::fs;
-use std::fs::File;
-use std::fs::OpenOptions;
 use std::io;
-use std::io::Read;
-use std::io::Seek;
-use std::io::Write;
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::path::Path;
@@ -14,10 +18,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
-use std::sync::mpsc;
-use std::thread::JoinHandle;
+#[cfg(not(madsim))]
+use std::task::Context;
+#[cfg(not(madsim))]
+use std::task::Poll;
+#[cfg(not(madsim))]
+use std::task::Wake;
+#[cfg(not(madsim))]
+use std::task::Waker;
+use std::time::Duration;
 
-use fs4::fs_std::FileExt;
 use openraft::OptionalSend;
 use openraft::alias::EntryOf;
 use openraft::alias::LogIdOf;
@@ -28,124 +38,145 @@ use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::Semaphore;
 use ursula_runtime::GroupEngineMetrics;
-use ursula_runtime::journal;
+use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 
 use super::CoreJournalRecord;
 use super::RaftGroupLogRecord;
 use super::RaftGroupLogStoreInner;
+use super::disk::Disk;
+use super::disk::DiskLock;
+use super::disk::JournalDisk;
+use super::disk::LockAttempt;
 use super::ensure_consecutive_entries;
 use super::ensure_log_append_boundary;
+use super::journal;
+use super::journal::JournalWriter;
 use super::truncate_entries_after;
 use crate::codec::encode_wire;
 use crate::engine::invalid_data;
+use crate::rt::sync::mpsc;
+use crate::rt::sync::oneshot;
 use crate::rt::time::Instant;
 use crate::types::CORE_LOG_GROUP_COMMIT_DELAY;
 use crate::types::CORE_LOG_GROUP_COMMIT_MAX_BATCH;
 use crate::types::UrsulaRaftTypeConfig;
 
-const CORE_LOG_BLOCKING_MAX_CONCURRENCY: usize = 8;
+/// Journal size at which a purge or truncate rewrites the journal online.
+#[cfg(not(madsim))]
 const CORE_LOG_ONLINE_RECLAIM_MIN_BYTES: u64 = 64 * 1024 * 1024;
+/// Simulated journals stay small, so the simulator reclaims at a lower size to
+/// exercise the online rewrite.
+#[cfg(madsim)]
+const CORE_LOG_ONLINE_RECLAIM_MIN_BYTES: u64 = 16 * 1024;
 
+/// Failure of the per-core journal.
+#[derive(Debug, Clone, thiserror::Error)]
+pub(crate) enum CoreJournalError {
+    #[error("OpenRaft core journal I/O on '{}': {source}", .path.display())]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: Arc<io::Error>,
+    },
+    #[error(
+        "OpenRaft WAL '{}' is already locked at '{}'{}",
+        .journal.display(),
+        .lock.display(),
+        .owner.as_deref().map(|owner| format!(" by {owner}")).unwrap_or_default()
+    )]
+    Locked {
+        journal: PathBuf,
+        lock: PathBuf,
+        owner: Option<String>,
+    },
+    #[error(
+        "raft group {} is already open on OpenRaft core journal '{}'",
+        .raft_group_id.0,
+        .journal.display()
+    )]
+    GroupAlreadyOpen {
+        journal: PathBuf,
+        raft_group_id: RaftGroupId,
+    },
+    #[cfg(not(madsim))]
+    #[error("spawn the OpenRaft core journal writer: {source}")]
+    SpawnWriter {
+        #[source]
+        source: Arc<io::Error>,
+    },
+    #[error("OpenRaft core journal writer for '{}' has stopped", .journal.display())]
+    WriterStopped { journal: PathBuf },
+    #[error("OpenRaft core journal state mutex poisoned")]
+    Poisoned,
+}
+
+impl CoreJournalError {
+    fn io(path: &Path, source: io::Error) -> Self {
+        Self::Io {
+            path: path.to_owned(),
+            source: Arc::new(source),
+        }
+    }
+}
+
+/// OpenRaft storage methods report `io::Error`; this is the one conversion.
+impl From<CoreJournalError> for io::Error {
+    fn from(err: CoreJournalError) -> Self {
+        let kind = match &err {
+            CoreJournalError::Io { source, .. } => source.kind(),
+            #[cfg(not(madsim))]
+            CoreJournalError::SpawnWriter { source } => source.kind(),
+            CoreJournalError::Locked { .. } | CoreJournalError::GroupAlreadyOpen { .. } => {
+                io::ErrorKind::AlreadyExists
+            }
+            CoreJournalError::WriterStopped { .. } => io::ErrorKind::BrokenPipe,
+            CoreJournalError::Poisoned => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, err)
+    }
+}
+
+/// One raft group's durable OpenRaft log, stored in its core's shared journal.
 #[derive(Debug)]
 pub struct RaftGroupFileLogStore {
-    path: PathBuf,
-    inner: Mutex<RaftGroupLogStoreInner>,
-    file: Mutex<RaftGroupFileLogHandle>,
-    metrics: Option<RaftGroupFileLogStoreMetrics>,
-    core_writer: Option<Arc<CoreFileLogWriter>>,
-    _lock: Option<JournalLock>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct RaftGroupFileLogStoreMetrics {
     placement: ShardPlacement,
     metrics: GroupEngineMetrics,
+    inner: Mutex<RaftGroupLogStoreInner>,
+    /// Serializes mutations so the journal records them in the same order as
+    /// the in-memory state applies them.
+    write_order: crate::rt::sync::Mutex<()>,
+    core_writer: Arc<CoreFileLogWriter>,
 }
 
-/// Raft log writes frame MessagePack records into the shared append-only
-/// journal.
-type RaftGroupFileLogHandle = journal::JournalWriter;
-
+/// The single writer of one core's journal.
 #[derive(Debug)]
 pub(crate) struct CoreFileLogWriter {
-    tx: Option<mpsc::Sender<CoreFileLogWrite>>,
-    recovered: Mutex<BTreeMap<u32, RaftGroupLogStoreInner>>,
-    blocking: Arc<Semaphore>,
-    _lock: JournalLock,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    journal_path: PathBuf,
+    tx: Option<mpsc::UnboundedSender<CoreFileLogWrite>>,
+    groups: Mutex<RecoveredGroups>,
+    worker: Option<WriterWorker>,
+    /// Released after the worker has stopped (see `Drop`).
+    _lock: DiskLock,
 }
+
+/// Recovered per-group state, handed out once per group.
+#[derive(Debug, Default)]
+struct RecoveredGroups {
+    recovered: BTreeMap<u32, RaftGroupLogStoreInner>,
+    opened: BTreeSet<u32>,
+}
+
+#[cfg(not(madsim))]
+type WriterWorker = std::thread::JoinHandle<()>;
+#[cfg(madsim)]
+type WriterWorker = sim_tokio::task::JoinHandle<()>;
 
 #[derive(Debug)]
-struct JournalLock {
-    _file: File,
-    path: PathBuf,
-}
-
-impl JournalLock {
-    fn acquire(journal_path: &Path) -> Result<Self, io::Error> {
-        let mut lock_name = journal_path.as_os_str().to_owned();
-        lock_name.push(".lock");
-        let path = PathBuf::from(lock_name);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)?;
-        if !file.try_lock_exclusive()? {
-            let mut owner = String::new();
-            file.rewind()?;
-            if let Err(err) = file.read_to_string(&mut owner) {
-                tracing::debug!(%err, "read journal lock owner");
-            }
-            let owner = owner.trim();
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "OpenRaft WAL '{}' is already locked at '{}'{}",
-                    journal_path.display(),
-                    path.display(),
-                    if owner.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" by {owner}")
-                    }
-                ),
-            ));
-        }
-        file.set_len(0)?;
-        file.rewind()?;
-        write!(file, "pid={}", std::process::id())?;
-        file.sync_data()?;
-        Ok(Self { _file: file, path })
-    }
-}
-
-impl Drop for JournalLock {
-    fn drop(&mut self) {
-        if let Err(err) = self._file.unlock() {
-            tracing::warn!(path = %self.path.display(), %err, "failed to unlock OpenRaft WAL");
-        }
-    }
-}
-
-// File-log writer machinery is only reachable under cfg(not(madsim)) — the
-// simulator's `CoreFileLogWriter::shared` panics rather than spawning a
-// writer thread (DoD #1). The type still exists under both cfgs because
-// `CoreFileLogWriter` holds an `mpsc::Sender<CoreFileLogWrite>` field, but
-// no values flow through under cfg(madsim), hence the allow(dead_code).
-#[cfg_attr(madsim, allow(dead_code))]
-#[derive(Debug)]
-pub(crate) struct CoreFileLogWrite {
-    group_id: u32,
-    record: RaftGroupLogRecord,
-    response_tx: mpsc::Sender<Result<CoreFileLogWriteTiming, String>>,
+struct CoreFileLogWrite {
+    record: CoreJournalRecord,
+    reply: oneshot::Sender<Result<CoreFileLogWriteTiming, CoreJournalError>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -161,176 +192,72 @@ pub(crate) struct CoreFileLogWriteTiming {
 }
 
 impl RaftGroupFileLogStore {
-    pub fn open(path: impl Into<PathBuf>) -> Result<Self, io::Error> {
-        Self::open_inner(path.into(), None, None)
-    }
-
-    pub fn open_with_metrics(
-        path: impl Into<PathBuf>,
-        placement: ShardPlacement,
-        metrics: GroupEngineMetrics,
-    ) -> Result<Self, io::Error> {
-        Self::open_inner(
-            path.into(),
-            Some(RaftGroupFileLogStoreMetrics { placement, metrics }),
-            None,
-        )
-    }
-
-    pub(crate) fn open_with_core_writer(
-        path: impl Into<PathBuf>,
+    pub(crate) fn open(
         placement: ShardPlacement,
         metrics: GroupEngineMetrics,
         core_writer: Arc<CoreFileLogWriter>,
-    ) -> Result<Self, io::Error> {
-        Self::open_inner(
-            path.into(),
-            Some(RaftGroupFileLogStoreMetrics { placement, metrics }),
-            Some(core_writer),
-        )
-    }
-
-    pub(crate) fn open_inner(
-        path: PathBuf,
-        metrics: Option<RaftGroupFileLogStoreMetrics>,
-        core_writer: Option<Arc<CoreFileLogWriter>>,
-    ) -> Result<Self, io::Error> {
-        let lock = if core_writer.is_none() {
-            Some(JournalLock::acquire(&path)?)
-        } else {
-            None
-        };
-        let parent_needs_sync = !path.exists();
-        let inner = match (&core_writer, &metrics) {
-            (Some(writer), Some(metrics)) => {
-                writer.take_recovered(metrics.placement.raft_group_id.0)?
-            }
-            _ => load_log_store_inner(&path)?,
-        };
-        Ok(Self {
-            path,
-            inner: Mutex::new(inner),
-            file: Mutex::new(RaftGroupFileLogHandle::new(parent_needs_sync)),
+    ) -> Result<Arc<Self>, CoreJournalError> {
+        let inner = core_writer.take_recovered(placement.raft_group_id)?;
+        Ok(Arc::new(Self {
+            placement,
             metrics,
+            inner: Mutex::new(inner),
+            write_order: crate::rt::sync::Mutex::new(()),
             core_writer,
-            _lock: lock,
-        })
+        }))
     }
 
-    pub fn shared(path: impl Into<PathBuf>) -> Result<Arc<Self>, io::Error> {
-        Self::open(path).map(Arc::new)
-    }
-
-    pub fn shared_with_metrics(
-        path: impl Into<PathBuf>,
-        placement: ShardPlacement,
-        metrics: GroupEngineMetrics,
-    ) -> Result<Arc<Self>, io::Error> {
-        Self::open_with_metrics(path, placement, metrics).map(Arc::new)
-    }
-
-    pub(crate) fn shared_with_core_writer(
-        path: impl Into<PathBuf>,
-        placement: ShardPlacement,
-        metrics: GroupEngineMetrics,
-        core_writer: Arc<CoreFileLogWriter>,
-    ) -> Result<Arc<Self>, io::Error> {
-        Self::open_with_core_writer(path, placement, metrics, core_writer).map(Arc::new)
-    }
-
-    pub(crate) fn lock_inner(&self) -> Result<MutexGuard<'_, RaftGroupLogStoreInner>, io::Error> {
+    fn lock_inner(&self) -> Result<MutexGuard<'_, RaftGroupLogStoreInner>, CoreJournalError> {
         self.inner
             .lock()
-            .map_err(|_poisoned| io::Error::other("raft group file log store mutex poisoned"))
+            .map_err(|_poisoned| CoreJournalError::Poisoned)
     }
 
-    pub(crate) fn lock_file(&self) -> Result<MutexGuard<'_, RaftGroupFileLogHandle>, io::Error> {
-        self.file
-            .lock()
-            .map_err(|_poisoned| io::Error::other("raft group file log store file mutex poisoned"))
-    }
-
-    pub(crate) fn append_record_locked(
-        &self,
-        record: &RaftGroupLogRecord,
-    ) -> Result<(), io::Error> {
-        let timing = if let Some(core_writer) = &self.core_writer {
-            let metrics = self
-                .metrics
-                .as_ref()
-                .expect("core journal writer requires placement metrics");
-            core_writer.append(metrics.placement.raft_group_id.0, record.clone())?
-        } else {
-            let mut file = self.lock_file()?;
-            let (write_ns, sync_ns) = append_log_store_record(&self.path, &mut file, record)?;
-            let fsyncs = u64::from(raft_group_log_record_requires_sync(record));
-            CoreFileLogWriteTiming {
-                write_ns,
-                sync_ns,
-                fsyncs,
-                fsync_records: if fsyncs == 0 {
-                    0
-                } else {
-                    u64::try_from(raft_group_log_record_count(record)).unwrap_or(u64::MAX)
-                },
-                reclaims: 0,
-                reclaimed_bytes: 0,
-                reclaim_ns: 0,
-                physical_bytes: fs::metadata(&self.path)?.len(),
-            }
-        };
-        if let Some(metrics) = &self.metrics {
-            metrics.metrics.record_wal_batch(
-                metrics.placement,
-                raft_group_log_record_count(record),
-                timing.write_ns,
-                timing.sync_ns,
-            );
-            metrics.metrics.record_wal_storage(
-                metrics.placement,
-                timing.fsyncs,
-                timing.fsync_records,
-                timing.reclaims,
-                timing.reclaimed_bytes,
-                timing.reclaim_ns,
-                timing.physical_bytes,
-            );
-        }
+    /// Journals `record` and waits until the writer acknowledges it.
+    async fn append_record(&self, record: RaftGroupLogRecord) -> Result<(), CoreJournalError> {
+        let record_count = raft_group_log_record_count(&record);
+        let timing = self
+            .core_writer
+            .append(CoreJournalRecord {
+                group_id: self.placement.raft_group_id.0,
+                record,
+            })
+            .await?;
+        self.metrics.record_wal_batch(
+            self.placement,
+            record_count,
+            timing.write_ns,
+            timing.sync_ns,
+        );
+        self.metrics.record_wal_storage(
+            self.placement,
+            timing.fsyncs,
+            timing.fsync_records,
+            timing.reclaims,
+            timing.reclaimed_bytes,
+            timing.reclaim_ns,
+            timing.physical_bytes,
+        );
         Ok(())
     }
 }
 
 impl CoreFileLogWriter {
-    #[cfg(all(not(madsim), test))]
-    pub(crate) fn shared(journal_path: impl Into<PathBuf>) -> Result<Arc<Self>, io::Error> {
-        Self::shared_inner(journal_path.into(), None)
-    }
-
-    #[cfg(not(madsim))]
-    pub(crate) fn shared_with_metrics(
-        journal_path: impl Into<PathBuf>,
-        placement: ShardPlacement,
-        metrics: GroupEngineMetrics,
-    ) -> Result<Arc<Self>, io::Error> {
-        Self::shared_inner(journal_path.into(), Some((placement, metrics)))
-    }
-
-    #[cfg(not(madsim))]
-    fn shared_inner(
+    /// Opens the journal at `journal_path`: takes its lock, recovers every
+    /// group, compacts the recovered journal and starts the writer.
+    pub(crate) fn open(
         journal_path: PathBuf,
         recovery_metrics: Option<(ShardPlacement, GroupEngineMetrics)>,
-    ) -> Result<Arc<Self>, io::Error> {
+    ) -> Result<Arc<Self>, CoreJournalError> {
         if let Some(parent) = journal_path.parent() {
-            fs::create_dir_all(parent)?;
+            Disk::create_dir_all(parent).map_err(|source| CoreJournalError::io(parent, source))?;
         }
-        let (tx, rx) = mpsc::channel();
-        let lock = JournalLock::acquire(&journal_path)?;
+        let lock = acquire_journal_lock(&journal_path)?;
         let recovery_started_at = Instant::now();
-        let recovery_bytes = fs::metadata(&journal_path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
+        let recovery_bytes = Disk::file_len(&journal_path).unwrap_or(0);
         let (recovered, recovery_records) =
-            load_log_store_inners_from_core_journal_with_stats(&journal_path)?;
+            load_log_store_inners_from_core_journal_with_stats(&journal_path)
+                .map_err(|source| CoreJournalError::io(&journal_path, source))?;
         let recovery_ns = elapsed_ns(recovery_started_at);
         let recovery_live_entries = recovered.values().fold(0_u64, |total, inner| {
             total.saturating_add(u64::try_from(inner.entries.len()).unwrap_or(u64::MAX))
@@ -352,7 +279,9 @@ impl CoreFileLogWriter {
             recovery_live_entries,
             "recovered OpenRaft core journal"
         );
-        if let Some((before, after)) = compact_core_journal(&journal_path, &recovered)? {
+        if let Some((before, after)) = compact_core_journal(&journal_path, &recovered)
+            .map_err(|source| CoreJournalError::io(&journal_path, source))?
+        {
             tracing::info!(
                 path = %journal_path.display(),
                 before_bytes = before,
@@ -360,181 +289,261 @@ impl CoreFileLogWriter {
                 "compacted recovered OpenRaft core journal"
             );
         }
-        let writer = Arc::new(Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = spawn_core_file_log_writer(journal_path.clone(), rx)?;
+        Ok(Arc::new(Self {
+            journal_path,
             tx: Some(tx),
-            recovered: Mutex::new(recovered),
-            blocking: Arc::new(Semaphore::new(CORE_LOG_BLOCKING_MAX_CONCURRENCY)),
+            groups: Mutex::new(RecoveredGroups {
+                recovered,
+                opened: BTreeSet::new(),
+            }),
+            worker: Some(worker),
             _lock: lock,
-            thread: Mutex::new(None),
-        });
-        let thread = std::thread::Builder::new()
-            .name("ursula-core-file-log-writer".to_owned())
-            .spawn(move || run_core_file_log_writer(journal_path, rx))
-            .map_err(|err| io::Error::other(format!("spawn core file log writer: {err}")))?;
-        *writer
-            .thread
-            .lock()
-            .map_err(|_poisoned| io::Error::other("core file log thread mutex poisoned"))? =
-            Some(thread);
-        Ok(writer)
+        }))
     }
 
-    #[cfg(madsim)]
-    pub(crate) fn shared_with_metrics(
-        _journal_path: impl Into<PathBuf>,
-        _placement: ShardPlacement,
-        _metrics: GroupEngineMetrics,
-    ) -> Result<Arc<Self>, io::Error> {
-        panic!(
-            "CoreFileLogWriter::shared_with_metrics spawns an OS thread and is unavailable under \
-             cfg(madsim); the simulator must use memory-backed log stores via \
-             RaftGroupEngineFactory / RegisteredRaftGroupEngineFactory / \
-             MadsimScopedRaftGroupEngineFactory"
-        );
-    }
-
-    fn take_recovered(&self, group_id: u32) -> Result<RaftGroupLogStoreInner, io::Error> {
-        self.recovered
-            .lock()
-            .map_err(|_poisoned| io::Error::other("core file log recovery mutex poisoned"))
-            .map(|mut recovered| recovered.remove(&group_id).unwrap_or_default())
-    }
-
-    fn blocking_semaphore(&self) -> Arc<Semaphore> {
-        Arc::clone(&self.blocking)
-    }
-
-    pub(crate) fn append(
+    /// Hands out a group's recovered state. A group opens once per writer:
+    /// its state after a reopen would miss what the closed store wrote.
+    fn take_recovered(
         &self,
-        group_id: u32,
-        record: RaftGroupLogRecord,
-    ) -> Result<CoreFileLogWriteTiming, io::Error> {
-        let (response_tx, response_rx) = mpsc::channel();
+        raft_group_id: RaftGroupId,
+    ) -> Result<RaftGroupLogStoreInner, CoreJournalError> {
+        let mut groups = self
+            .groups
+            .lock()
+            .map_err(|_poisoned| CoreJournalError::Poisoned)?;
+        if !groups.opened.insert(raft_group_id.0) {
+            return Err(CoreJournalError::GroupAlreadyOpen {
+                journal: self.journal_path.clone(),
+                raft_group_id,
+            });
+        }
+        Ok(groups
+            .recovered
+            .remove(&raft_group_id.0)
+            .unwrap_or_default())
+    }
+
+    async fn append(
+        &self,
+        record: CoreJournalRecord,
+    ) -> Result<CoreFileLogWriteTiming, CoreJournalError> {
+        let stopped = || CoreJournalError::WriterStopped {
+            journal: self.journal_path.clone(),
+        };
+        let (reply, response) = oneshot::channel();
         self.tx
             .as_ref()
-            .ok_or_else(|| io::Error::other("core file log writer is shutting down"))?
-            .send(CoreFileLogWrite {
-                group_id,
-                record,
-                response_tx,
-            })
-            .map_err(|_closed| io::Error::other("core file log writer closed"))?;
-        let timing = response_rx
-            .recv()
-            .map_err(|_dropped| io::Error::other("core file log writer dropped response"))?
-            .map_err(io::Error::other)?;
-        Ok(timing)
+            .ok_or_else(stopped)?
+            .send(CoreFileLogWrite { record, reply })
+            .map_err(|_closed| stopped())?;
+        response.await.map_err(|_dropped| stopped())?
     }
 }
 
 impl Drop for CoreFileLogWriter {
     fn drop(&mut self) {
         self.tx.take();
-        let Ok(thread) = self.thread.get_mut() else {
-            tracing::warn!("core file log thread mutex poisoned during shutdown");
-            return;
-        };
-        if let Some(thread) = thread.take()
-            && let Err(payload) = thread.join()
-        {
-            tracing::warn!(
-                ?payload,
-                "core file log writer thread panicked during shutdown"
-            );
+        if let Some(worker) = self.worker.take() {
+            stop_core_file_log_writer(worker);
         }
     }
 }
 
-#[cfg_attr(madsim, allow(dead_code))]
-pub(crate) fn run_core_file_log_writer(
-    journal_path: PathBuf,
-    rx: mpsc::Receiver<CoreFileLogWrite>,
-) {
-    let mut journal_handle = RaftGroupFileLogHandle::new(!journal_path.exists());
+fn acquire_journal_lock(journal_path: &Path) -> Result<DiskLock, CoreJournalError> {
+    let mut lock_name = journal_path.as_os_str().to_owned();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    match Disk::try_lock(&lock_path).map_err(|source| CoreJournalError::io(&lock_path, source))? {
+        LockAttempt::Acquired(lock) => Ok(lock),
+        LockAttempt::Held { owner } => Err(CoreJournalError::Locked {
+            journal: journal_path.to_owned(),
+            lock: lock_path,
+            owner,
+        }),
+    }
+}
 
-    while let Ok(first) = rx.recv() {
+/// Production runs the writer on its own thread with a current-thread runtime.
+#[cfg(not(madsim))]
+fn spawn_core_file_log_writer(
+    journal_path: PathBuf,
+    rx: mpsc::UnboundedReceiver<CoreFileLogWrite>,
+) -> Result<WriterWorker, CoreJournalError> {
+    let spawn_error = |source| CoreJournalError::SpawnWriter {
+        source: Arc::new(source),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(spawn_error)?;
+    std::thread::Builder::new()
+        .name("ursula-core-file-log-writer".to_owned())
+        // The writer is the runtime's only task. An exhausted cooperative
+        // budget would make the batching window see an empty channel.
+        .spawn(move || {
+            runtime.block_on(tokio::task::unconstrained(run_core_file_log_writer(
+                journal_path,
+                rx,
+            )))
+        })
+        .map_err(spawn_error)
+}
+
+/// The simulator runs the writer as a simulated task.
+#[cfg(madsim)]
+fn spawn_core_file_log_writer(
+    journal_path: PathBuf,
+    rx: mpsc::UnboundedReceiver<CoreFileLogWrite>,
+) -> Result<WriterWorker, CoreJournalError> {
+    Ok(crate::rt::spawn(run_core_file_log_writer(journal_path, rx)))
+}
+
+/// The channel is closed, so the thread finishes its batch and exits.
+#[cfg(not(madsim))]
+fn stop_core_file_log_writer(worker: WriterWorker) {
+    if let Err(payload) = worker.join() {
+        tracing::warn!(
+            ?payload,
+            "core file log writer thread panicked during shutdown"
+        );
+    }
+}
+
+/// Stopping the task is a process stop: a batch it had not written yet is
+/// lost, and no caller waits for it any more.
+#[cfg(madsim)]
+fn stop_core_file_log_writer(worker: WriterWorker) {
+    worker.abort();
+}
+
+async fn run_core_file_log_writer(
+    journal_path: PathBuf,
+    mut rx: mpsc::UnboundedReceiver<CoreFileLogWrite>,
+) {
+    let mut journal = JournalWriter::new(!Disk::exists(&journal_path));
+    while let Some(first) = rx.recv().await {
         let mut batch = vec![first];
-        if let Ok(next) = rx.recv_timeout(CORE_LOG_GROUP_COMMIT_DELAY) {
+        if let Some(next) = recv_within(&mut rx, CORE_LOG_GROUP_COMMIT_DELAY).await {
             batch.push(next);
         }
         while batch.len() < CORE_LOG_GROUP_COMMIT_MAX_BATCH {
-            match rx.try_recv() {
-                Ok(next) => batch.push(next),
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => break,
-            }
+            let Ok(next) = rx.try_recv() else {
+                break;
+            };
+            batch.push(next);
         }
 
-        let result = write_core_log_batch(&journal_path, &mut journal_handle, &batch);
-        match result {
-            Ok(timing) => {
-                let count = u64::try_from(batch.len()).expect("batch len fits u64");
-                for (request_index, request) in batch.into_iter().enumerate() {
-                    let owns_batch_sample = request_index == 0;
-                    let per_request = CoreFileLogWriteTiming {
-                        write_ns: timing
-                            .write_ns
-                            .checked_div(count)
-                            .unwrap_or(timing.write_ns),
-                        sync_ns: timing.sync_ns.checked_div(count).unwrap_or(timing.sync_ns),
-                        fsyncs: u64::from(owns_batch_sample),
-                        fsync_records: if owns_batch_sample { count } else { 0 },
-                        reclaims: if owns_batch_sample {
-                            timing.reclaims
-                        } else {
-                            0
-                        },
-                        reclaimed_bytes: if owns_batch_sample {
-                            timing.reclaimed_bytes
-                        } else {
-                            0
-                        },
-                        reclaim_ns: if owns_batch_sample {
-                            timing.reclaim_ns
-                        } else {
-                            0
-                        },
-                        physical_bytes: timing.physical_bytes,
-                    };
-                    if request.response_tx.send(Ok(per_request)).is_err() {
-                        tracing::trace!("raft log append caller stopped waiting");
-                    }
+        let result = write_core_log_batch(&journal_path, &mut journal, &batch)
+            .map_err(|source| CoreJournalError::io(&journal_path, source));
+        reply_core_log_batch(batch, result);
+    }
+}
+
+/// Waits up to `window` for the next request.
+///
+/// Tokio timers tick in whole milliseconds, which would stretch the batching
+/// window. The writer owns its thread, so it parks the thread until a request
+/// wakes it or the window ends, as a blocking timed receive would.
+#[cfg(not(madsim))]
+async fn recv_within(
+    rx: &mut mpsc::UnboundedReceiver<CoreFileLogWrite>,
+    window: Duration,
+) -> Option<CoreFileLogWrite> {
+    struct UnparkWriter(std::thread::Thread);
+
+    impl Wake for UnparkWriter {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let deadline = Instant::now().checked_add(window);
+    let waker = Waker::from(Arc::new(UnparkWriter(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        if let Poll::Ready(request) = rx.poll_recv(&mut cx) {
+            return request;
+        }
+        let remaining = deadline?.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        std::thread::park_timeout(remaining);
+    }
+}
+
+/// Simulated time drives the batching window.
+#[cfg(madsim)]
+async fn recv_within(
+    rx: &mut mpsc::UnboundedReceiver<CoreFileLogWrite>,
+    window: Duration,
+) -> Option<CoreFileLogWrite> {
+    crate::rt::time::timeout(window, rx.recv())
+        .await
+        .ok()
+        .flatten()
+}
+
+fn reply_core_log_batch(
+    batch: Vec<CoreFileLogWrite>,
+    result: Result<CoreFileLogWriteTiming, CoreJournalError>,
+) {
+    let timing = match result {
+        Ok(timing) => timing,
+        Err(err) => {
+            for request in batch {
+                if request.reply.send(Err(err.clone())).is_err() {
+                    tracing::trace!("raft log append caller stopped waiting");
                 }
             }
-            Err(err) => {
-                let message = err.to_string();
-                for request in batch {
-                    if request.response_tx.send(Err(message.clone())).is_err() {
-                        tracing::trace!("raft log append caller stopped waiting");
-                    }
-                }
-            }
+            return;
+        }
+    };
+    let count = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+    for (request_index, request) in batch.into_iter().enumerate() {
+        let owns_batch_sample = request_index == 0;
+        let batch_sample = |value: u64| if owns_batch_sample { value } else { 0 };
+        let per_request = CoreFileLogWriteTiming {
+            write_ns: timing
+                .write_ns
+                .checked_div(count)
+                .unwrap_or(timing.write_ns),
+            sync_ns: timing.sync_ns.checked_div(count).unwrap_or(timing.sync_ns),
+            fsyncs: u64::from(owns_batch_sample),
+            fsync_records: batch_sample(count),
+            reclaims: batch_sample(timing.reclaims),
+            reclaimed_bytes: batch_sample(timing.reclaimed_bytes),
+            reclaim_ns: batch_sample(timing.reclaim_ns),
+            physical_bytes: timing.physical_bytes,
+        };
+        if request.reply.send(Ok(per_request)).is_err() {
+            tracing::trace!("raft log append caller stopped waiting");
         }
     }
 }
 
-#[cfg_attr(madsim, allow(dead_code))]
-pub(crate) fn write_core_log_batch(
+fn write_core_log_batch(
     journal_path: &Path,
-    journal_handle: &mut RaftGroupFileLogHandle,
+    journal: &mut JournalWriter,
     batch: &[CoreFileLogWrite],
 ) -> Result<CoreFileLogWriteTiming, io::Error> {
     let write_started_at = Instant::now();
     for request in batch {
-        let journal_record = CoreJournalRecord {
-            group_id: request.group_id,
-            record: request.record.clone(),
-        };
-        write_wire_frame_to_file(journal_path, journal_handle, &journal_record)?;
+        write_wire_frame_to_file(journal_path, journal, &request.record)?;
     }
     let write_ns = elapsed_ns(write_started_at);
 
     let requires_sync = batch
         .iter()
-        .any(|request| raft_group_log_record_requires_sync(&request.record));
+        .any(|request| raft_group_log_record_requires_sync(&request.record.record));
     let sync_ns = if requires_sync {
         let sync_started_at = Instant::now();
-        sync_file_handle(journal_path, journal_handle)?;
+        journal.sync(journal_path)?;
         elapsed_ns(sync_started_at)
     } else {
         0
@@ -544,14 +553,12 @@ pub(crate) fn write_core_log_batch(
     let mut reclaimed_bytes = 0;
     if batch.iter().any(|request| {
         matches!(
-            &request.record,
+            &request.record.record,
             RaftGroupLogRecord::Purge(_) | RaftGroupLogRecord::TruncateAfter(_)
         )
-    }) && let Some((before, after)) = reclaim_core_journal_if_needed(
-        journal_path,
-        journal_handle,
-        CORE_LOG_ONLINE_RECLAIM_MIN_BYTES,
-    )? {
+    }) && let Some((before, after)) =
+        reclaim_core_journal_if_needed(journal_path, journal, CORE_LOG_ONLINE_RECLAIM_MIN_BYTES)?
+    {
         reclaims = 1;
         reclaimed_bytes = before.saturating_sub(after);
         tracing::info!(
@@ -579,7 +586,7 @@ pub(crate) fn write_core_log_batch(
         reclaims,
         reclaimed_bytes,
         reclaim_ns,
-        physical_bytes: fs::metadata(journal_path)?.len(),
+        physical_bytes: Disk::file_len(journal_path)?,
     })
 }
 
@@ -588,8 +595,8 @@ impl RaftLogReader<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
         &mut self,
         range: RB,
     ) -> Result<Vec<EntryOf<UrsulaRaftTypeConfig>>, io::Error> {
-        let inner = self.lock_inner()?;
-        let entries = inner
+        let entries = self
+            .lock_inner()?
             .entries
             .range(range)
             .map(|(_, entry)| entry.clone())
@@ -626,43 +633,29 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
     }
 
     async fn save_vote(&mut self, vote: &VoteOf<UrsulaRaftTypeConfig>) -> Result<(), io::Error> {
-        let store = Arc::clone(self);
         let vote = *vote;
-        let blocking = store
-            .core_writer
-            .as_ref()
-            .map(|writer| writer.blocking_semaphore());
-        spawn_log_store_blocking(blocking, move || {
-            let mut inner = store.lock_inner()?;
-            if inner.vote == Some(vote) {
-                return Ok(());
-            }
-            store.append_record_locked(&RaftGroupLogRecord::SaveVote(vote))?;
-            inner.vote = Some(vote);
-            Ok(())
-        })
-        .await
+        let _order = self.write_order.lock().await;
+        if self.lock_inner()?.vote == Some(vote) {
+            return Ok(());
+        }
+        self.append_record(RaftGroupLogRecord::SaveVote(vote))
+            .await?;
+        self.lock_inner()?.vote = Some(vote);
+        Ok(())
     }
 
     async fn save_committed(
         &mut self,
         committed: Option<LogIdOf<UrsulaRaftTypeConfig>>,
     ) -> Result<(), io::Error> {
-        let store = Arc::clone(self);
-        let blocking = store
-            .core_writer
-            .as_ref()
-            .map(|writer| writer.blocking_semaphore());
-        spawn_log_store_blocking(blocking, move || {
-            let mut inner = store.lock_inner()?;
-            if inner.committed == committed {
-                return Ok(());
-            }
-            store.append_record_locked(&RaftGroupLogRecord::SaveCommitted(committed))?;
-            inner.committed = committed;
-            Ok(())
-        })
-        .await
+        let _order = self.write_order.lock().await;
+        if self.lock_inner()?.committed == committed {
+            return Ok(());
+        }
+        self.append_record(RaftGroupLogRecord::SaveCommitted(committed))
+            .await?;
+        self.lock_inner()?.committed = committed;
+        Ok(())
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogIdOf<UrsulaRaftTypeConfig>>, io::Error> {
@@ -679,129 +672,60 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
         I::IntoIter: OptionalSend,
     {
         let entries = entries.into_iter().collect::<Vec<_>>();
-        let store = Arc::clone(self);
-        let blocking = store
-            .core_writer
-            .as_ref()
-            .map(|writer| writer.blocking_semaphore());
-        spawn_log_store_blocking(blocking, move || {
-            ensure_consecutive_entries::<UrsulaRaftTypeConfig>(&entries)?;
+        ensure_consecutive_entries::<UrsulaRaftTypeConfig>(&entries)?;
+        let _order = self.write_order.lock().await;
+        ensure_log_append_boundary::<UrsulaRaftTypeConfig>(&*self.lock_inner()?, &entries)?;
 
-            let mut inner = store.lock_inner()?;
-            ensure_log_append_boundary::<UrsulaRaftTypeConfig>(&inner, &entries)?;
-
-            let record = RaftGroupLogRecord::Append(entries.clone());
-            if let Err(err) = store.append_record_locked(&record) {
-                callback.io_completed(Err(io::Error::new(err.kind(), err.to_string())));
-                return Err(err);
-            }
+        if let Err(err) = self
+            .append_record(RaftGroupLogRecord::Append(entries.clone()))
+            .await
+        {
+            callback.io_completed(Err(err.clone().into()));
+            return Err(err.into());
+        }
+        {
+            let mut inner = self.lock_inner()?;
             for entry in entries {
                 inner.entries.insert(entry.log_id.index, entry);
             }
-            callback.io_completed(Ok(()));
-            Ok(())
-        })
-        .await
+        }
+        callback.io_completed(Ok(()));
+        Ok(())
     }
 
     async fn truncate_after(
         &mut self,
         last_log_id: Option<LogIdOf<UrsulaRaftTypeConfig>>,
     ) -> Result<(), io::Error> {
-        let store = Arc::clone(self);
-        let blocking = store
-            .core_writer
-            .as_ref()
-            .map(|writer| writer.blocking_semaphore());
-        spawn_log_store_blocking(blocking, move || {
-            let mut inner = store.lock_inner()?;
-            store.append_record_locked(&RaftGroupLogRecord::TruncateAfter(last_log_id))?;
-            truncate_entries_after(&mut inner.entries, last_log_id.map(|log_id| log_id.index));
-            Ok(())
-        })
-        .await
+        let _order = self.write_order.lock().await;
+        self.append_record(RaftGroupLogRecord::TruncateAfter(last_log_id))
+            .await?;
+        truncate_entries_after(
+            &mut self.lock_inner()?.entries,
+            last_log_id.map(|log_id| log_id.index),
+        );
+        Ok(())
     }
 
     async fn purge(&mut self, log_id: LogIdOf<UrsulaRaftTypeConfig>) -> Result<(), io::Error> {
-        let store = Arc::clone(self);
-        let blocking = store
-            .core_writer
-            .as_ref()
-            .map(|writer| writer.blocking_semaphore());
-        spawn_log_store_blocking(blocking, move || {
-            let mut inner = store.lock_inner()?;
-            if inner.last_purged_log_id > Some(log_id) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "cannot move last purged log id backward from {:?} to {:?}",
-                        inner.last_purged_log_id, log_id
-                    ),
-                ));
-            }
-
-            store.append_record_locked(&RaftGroupLogRecord::Purge(log_id))?;
-            inner.last_purged_log_id = Some(log_id);
-            inner.entries.retain(|index, _| *index > log_id.index);
-            Ok(())
-        })
-        .await
-    }
-}
-
-pub(crate) async fn spawn_log_store_blocking<T>(
-    blocking: Option<Arc<Semaphore>>,
-    f: impl FnOnce() -> Result<T, io::Error> + Send + 'static,
-) -> Result<T, io::Error>
-where
-    T: Send + 'static,
-{
-    let permit =
-        match blocking {
-            Some(blocking) => Some(blocking.acquire_owned().await.map_err(|_closed| {
-                io::Error::other("OpenRaft file log blocking limiter closed")
-            })?),
-            None => None,
-        };
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        f()
-    })
-    .await
-    .map_err(|err| io::Error::other(format!("join OpenRaft file log task: {err}")))?
-}
-
-pub(crate) fn load_log_store_inner(path: &Path) -> Result<RaftGroupLogStoreInner, io::Error> {
-    if !path.exists() {
-        return Ok(RaftGroupLogStoreInner::default());
-    }
-
-    let mut inner = RaftGroupLogStoreInner::default();
-    for (record_number, record) in
-        (1_usize..).zip(read_wire_frames_from_file::<RaftGroupLogRecord>(path)?)
-    {
-        apply_log_store_record(&mut inner, record).map_err(|err| {
-            io::Error::new(
-                err.kind(),
+        let _order = self.write_order.lock().await;
+        let last_purged_log_id = self.lock_inner()?.last_purged_log_id;
+        if last_purged_log_id > Some(log_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
                 format!(
-                    "replay OpenRaft log record '{}' record {}: {err}",
-                    path.display(),
-                    record_number
+                    "cannot move last purged log id backward from {last_purged_log_id:?} to {log_id:?}"
                 ),
-            )
-        })?;
-    }
-    Ok(inner)
-}
+            ));
+        }
 
-#[cfg(test)]
-pub(crate) fn load_log_store_inner_from_core_journal(
-    journal_path: &Path,
-    placement: ShardPlacement,
-) -> Result<RaftGroupLogStoreInner, io::Error> {
-    Ok(load_log_store_inners_from_core_journal(journal_path)?
-        .remove(&placement.raft_group_id.0)
-        .unwrap_or_default())
+        self.append_record(RaftGroupLogRecord::Purge(log_id))
+            .await?;
+        let mut inner = self.lock_inner()?;
+        inner.last_purged_log_id = Some(log_id);
+        inner.entries.retain(|index, _| *index > log_id.index);
+        Ok(())
+    }
 }
 
 fn load_log_store_inners_from_core_journal(
@@ -832,25 +756,23 @@ fn load_log_store_inners_from_core_journal_with_stats(
     Ok((inners, record_number))
 }
 
-#[cfg(not(madsim))]
 fn compact_core_journal(
     journal_path: &Path,
     inners: &BTreeMap<u32, RaftGroupLogStoreInner>,
 ) -> Result<Option<(u64, u64)>, io::Error> {
-    if !journal_path.exists() {
+    if !Disk::exists(journal_path) {
         return Ok(None);
     }
-    let before = fs::metadata(journal_path)?.len();
+    let before = Disk::file_len(journal_path)?;
     let compact_path = journal_path.with_extension("compact");
-    if compact_path.exists() {
-        fs::remove_file(&compact_path)?;
+    if Disk::exists(&compact_path) {
+        Disk::remove_file(&compact_path)?;
     }
 
-    let mut handle = RaftGroupFileLogHandle::new(true);
-    let mut wrote_record = false;
+    let mut handle = JournalWriter::new(true);
+    handle.ensure_created(&compact_path)?;
     for (group_id, inner) in inners {
         let mut write = |record| -> Result<(), io::Error> {
-            wrote_record = true;
             write_wire_frame_to_file(&compact_path, &mut handle, &CoreJournalRecord {
                 group_id: *group_id,
                 record,
@@ -871,59 +793,43 @@ fn compact_core_journal(
             ))?;
         }
     }
-    if wrote_record {
-        sync_file_handle(&compact_path, &mut handle)?;
-    } else {
-        handle.ensure_created(&compact_path)?;
-        sync_file_handle(&compact_path, &mut handle)?;
-    }
+    handle.sync(&compact_path)?;
     drop(handle);
 
-    let after = fs::metadata(&compact_path)?.len();
+    let after = Disk::file_len(&compact_path)?;
     if after >= before {
-        fs::remove_file(&compact_path)?;
+        Disk::remove_file(&compact_path)?;
         return Ok(None);
     }
-    fs::rename(&compact_path, journal_path)?;
+    Disk::rename(&compact_path, journal_path)?;
     if let Some(parent) = journal_path.parent() {
-        fs::File::open(parent)?.sync_all()?;
+        Disk::sync_dir(parent)?;
     }
     Ok(Some((before, after)))
 }
 
-#[cfg(not(madsim))]
 fn reclaim_core_journal_if_needed(
     journal_path: &Path,
-    journal_handle: &mut RaftGroupFileLogHandle,
+    journal: &mut JournalWriter,
     min_physical_bytes: u64,
 ) -> Result<Option<(u64, u64)>, io::Error> {
-    if !journal_path.exists() || fs::metadata(journal_path)?.len() < min_physical_bytes {
+    if !Disk::exists(journal_path) || Disk::file_len(journal_path)? < min_physical_bytes {
         return Ok(None);
     }
 
-    // Close the append descriptor before atomically replacing the path. This
-    // avoids continuing to append to the unlinked old inode after `rename` and
+    // Close the append handle before atomically replacing the path. This
+    // avoids continuing to append to the unlinked old file after `rename` and
     // keeps the replacement portable to filesystems that reject renaming over
     // an open destination.
-    let old_handle = std::mem::replace(
-        journal_handle,
-        RaftGroupFileLogHandle::new(!journal_path.exists()),
-    );
-    drop(old_handle);
+    drop(std::mem::replace(
+        journal,
+        JournalWriter::new(!Disk::exists(journal_path)),
+    ));
 
     let inners = load_log_store_inners_from_core_journal(journal_path)?;
     let compacted = compact_core_journal(journal_path, &inners)?;
-    *journal_handle = RaftGroupFileLogHandle::new(false);
+    *journal = JournalWriter::new(false);
     Ok(compacted)
-}
-
-#[cfg(madsim)]
-fn reclaim_core_journal_if_needed(
-    _journal_path: &Path,
-    _journal_handle: &mut RaftGroupFileLogHandle,
-    _min_physical_bytes: u64,
-) -> Result<Option<(u64, u64)>, io::Error> {
-    Ok(None)
 }
 
 /// Frames Raft log records as length-delimited MessagePack for the shared
@@ -942,36 +848,12 @@ impl<T: Serialize + DeserializeOwned> journal::FrameCodec for WireCodec<T> {
     }
 }
 
-pub(crate) fn read_wire_frames_from_file<T: Serialize + DeserializeOwned>(
+fn write_wire_frame_to_file<T: Serialize + DeserializeOwned>(
     path: &Path,
-) -> Result<Vec<T>, io::Error> {
-    journal::replay::<WireCodec<T>>(path)
-}
-
-pub(crate) fn append_log_store_record(
-    path: &Path,
-    handle: &mut RaftGroupFileLogHandle,
-    record: &RaftGroupLogRecord,
-) -> Result<(u64, u64), io::Error> {
-    let write_started_at = Instant::now();
-    write_wire_frame_to_file(path, handle, record)?;
-    let write_ns = elapsed_ns(write_started_at);
-
-    if raft_group_log_record_requires_sync(record) {
-        let sync_started_at = Instant::now();
-        sync_file_handle(path, handle)?;
-        Ok((write_ns, elapsed_ns(sync_started_at)))
-    } else {
-        Ok((write_ns, 0))
-    }
-}
-
-pub(crate) fn write_wire_frame_to_file<T: Serialize + DeserializeOwned>(
-    path: &Path,
-    handle: &mut RaftGroupFileLogHandle,
+    journal: &mut JournalWriter,
     value: &T,
 ) -> Result<(), io::Error> {
-    handle.append::<WireCodec<T>>(path, value)
+    journal.append::<WireCodec<T>>(path, value)
 }
 
 #[cfg(test)]
@@ -979,13 +861,6 @@ pub(crate) fn read_wire_frames<T: Serialize + DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<Vec<T>, io::Error> {
     journal::decode_frames::<WireCodec<T>>(bytes).map(|(records, _)| records)
-}
-
-pub(crate) fn sync_file_handle(
-    path: &Path,
-    handle: &mut RaftGroupFileLogHandle,
-) -> Result<(), io::Error> {
-    handle.sync(path)
 }
 
 pub(crate) fn raft_group_log_record_count(record: &RaftGroupLogRecord) -> usize {
@@ -1057,8 +932,11 @@ pub(crate) fn apply_log_store_record(
     }
 }
 
-#[cfg(test)]
+/// These tests corrupt and inspect real files, so they run against the
+/// operating-system disk.
+#[cfg(all(test, not(madsim)))]
 mod tests {
+    use std::fs;
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::sync::atomic::AtomicU64;
@@ -1070,9 +948,9 @@ mod tests {
     use openraft::vote::RaftLeaderId;
     use openraft::vote::leader_id_adv::CommittedLeaderId;
     use ursula_runtime::GroupWriteCommand;
+    use ursula_runtime::RuntimeMetrics;
     use ursula_shard::BucketStreamId;
     use ursula_shard::CoreId;
-    use ursula_shard::RaftGroupId;
     use ursula_shard::ShardId;
     use ursula_stream::StreamCommand;
 
@@ -1087,6 +965,14 @@ mod tests {
             .join(format!("{name}-{}-{nonce}.bin", std::process::id()));
         crate::tests::remove_test_path(&path);
         path
+    }
+
+    fn placement(raft_group_id: u32) -> ShardPlacement {
+        ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(raft_group_id),
+            raft_group_id: RaftGroupId(raft_group_id),
+        }
     }
 
     fn append_torn_frame(path: &Path) {
@@ -1150,51 +1036,18 @@ mod tests {
     }
 
     #[test]
-    fn load_log_store_inner_truncates_torn_tail() {
-        let path = temp_journal_path("group-log-torn-tail");
-        let vote = committed_vote();
-        let mut handle = RaftGroupFileLogHandle::new(true);
-        append_log_store_record(&path, &mut handle, &RaftGroupLogRecord::SaveVote(vote))
-            .expect("write complete vote record");
-        drop(handle);
-        let valid_len = fs::metadata(&path).expect("journal metadata").len();
-
-        append_torn_frame(&path);
-        assert!(
-            fs::metadata(&path)
-                .expect("journal metadata after torn append")
-                .len()
-                > valid_len
-        );
-
-        let inner = load_log_store_inner(&path).expect("load journal with torn tail");
-        assert_eq!(inner.vote, Some(vote));
-        assert_eq!(
-            fs::metadata(&path)
-                .expect("journal metadata after recovery")
-                .len(),
-            valid_len
-        );
-
-        crate::tests::remove_test_path(&path);
-    }
-
-    #[test]
     fn load_core_journal_truncates_torn_tail() {
         let path = temp_journal_path("core-journal-torn-tail");
-        let placement = ShardPlacement {
-            core_id: CoreId(0),
-            shard_id: ShardId(0),
-            raft_group_id: RaftGroupId(3),
-        };
         let vote = committed_vote();
-        let mut handle = RaftGroupFileLogHandle::new(true);
+        let mut handle = JournalWriter::new(true);
         write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
-            group_id: placement.raft_group_id.0,
+            group_id: 3,
             record: RaftGroupLogRecord::SaveVote(vote),
         })
         .expect("write complete core journal record");
-        sync_file_handle(&path, &mut handle).expect("sync complete core journal record");
+        handle
+            .sync(&path)
+            .expect("sync complete core journal record");
         drop(handle);
         let valid_len = fs::metadata(&path).expect("core journal metadata").len();
 
@@ -1206,9 +1059,9 @@ mod tests {
                 > valid_len
         );
 
-        let inner = load_log_store_inner_from_core_journal(&path, placement)
+        let inners = load_log_store_inners_from_core_journal(&path)
             .expect("load core journal with torn tail");
-        assert_eq!(inner.vote, Some(vote));
+        assert_eq!(inners.get(&3).and_then(|inner| inner.vote), Some(vote));
         assert_eq!(
             fs::metadata(&path)
                 .expect("core journal metadata after recovery")
@@ -1224,7 +1077,7 @@ mod tests {
         let path = temp_journal_path("core-journal-groups");
         let first_vote = openraft::Vote::new_committed(3, 1);
         let second_vote = openraft::Vote::new_committed(5, 2);
-        let mut handle = RaftGroupFileLogHandle::new(true);
+        let mut handle = JournalWriter::new(true);
         for (group_id, vote) in [(3, first_vote), (7, second_vote)] {
             write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
                 group_id,
@@ -1232,7 +1085,7 @@ mod tests {
             })
             .expect("write core journal group record");
         }
-        sync_file_handle(&path, &mut handle).expect("sync core journal groups");
+        handle.sync(&path).expect("sync core journal groups");
         drop(handle);
 
         let inners =
@@ -1250,13 +1103,12 @@ mod tests {
         crate::tests::remove_test_path(&path);
     }
 
-    #[cfg(not(madsim))]
     #[test]
     fn compact_core_journal_keeps_only_recovered_state() {
         let path = temp_journal_path("core-journal-compact");
         let first_vote = openraft::Vote::new_committed(3, 1);
         let latest_vote = openraft::Vote::new_committed(5, 1);
-        let mut handle = RaftGroupFileLogHandle::new(true);
+        let mut handle = JournalWriter::new(true);
         for vote in std::iter::repeat_n(first_vote, 100).chain([latest_vote]) {
             write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
                 group_id: 7,
@@ -1275,7 +1127,7 @@ mod tests {
             })
             .expect("write retained log state");
         }
-        sync_file_handle(&path, &mut handle).expect("sync redundant journal");
+        handle.sync(&path).expect("sync redundant journal");
         drop(handle);
         let before = fs::metadata(&path).expect("journal metadata").len();
         let inners = load_log_store_inners_from_core_journal(&path).expect("replay journal");
@@ -1298,11 +1150,10 @@ mod tests {
         crate::tests::remove_test_path(&path);
     }
 
-    #[cfg(not(madsim))]
     #[test]
     fn online_reclaim_reopens_the_replaced_core_journal() {
         let path = temp_journal_path("core-journal-online-reclaim");
-        let mut handle = RaftGroupFileLogHandle::new(true);
+        let mut handle = JournalWriter::new(true);
         for index in 1..=256 {
             write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
                 group_id: 7,
@@ -1315,7 +1166,7 @@ mod tests {
             record: RaftGroupLogRecord::Purge(test_log_id(255)),
         })
         .expect("write purge frontier");
-        sync_file_handle(&path, &mut handle).expect("sync historical core journal");
+        handle.sync(&path).expect("sync historical core journal");
         let before = fs::metadata(&path).expect("journal metadata").len();
 
         let (reclaim_before, reclaim_after) = reclaim_core_journal_if_needed(&path, &mut handle, 0)
@@ -1329,7 +1180,7 @@ mod tests {
             record: RaftGroupLogRecord::Append(vec![blank_entry(257)]),
         })
         .expect("append after atomic replacement");
-        sync_file_handle(&path, &mut handle).expect("sync append after reclaim");
+        handle.sync(&path).expect("sync append after reclaim");
         drop(handle);
 
         let recovered =
@@ -1342,12 +1193,11 @@ mod tests {
         crate::tests::remove_test_path(&path);
     }
 
-    #[cfg(not(madsim))]
     #[test]
     #[ignore = "writes a production-threshold WAL generation; run through scripts/soak_raft_wal.sh"]
     fn online_reclaim_converges_at_production_threshold() {
         let path = temp_journal_path("core-journal-production-reclaim");
-        let mut handle = RaftGroupFileLogHandle::new(true);
+        let mut handle = JournalWriter::new(true);
         write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
             group_id: 7,
             record: RaftGroupLogRecord::Append(vec![payload_entry(
@@ -1363,7 +1213,9 @@ mod tests {
             record: RaftGroupLogRecord::Purge(test_log_id(1)),
         })
         .expect("write production-sized purge frontier");
-        sync_file_handle(&path, &mut handle).expect("sync production-sized core journal");
+        handle
+            .sync(&path)
+            .expect("sync production-sized core journal");
         let before = fs::metadata(&path).expect("journal metadata").len();
         assert!(before >= CORE_LOG_ONLINE_RECLAIM_MIN_BYTES);
 
@@ -1387,31 +1239,55 @@ mod tests {
     }
 
     #[test]
-    fn direct_file_log_rejects_a_second_owner() {
-        let path = temp_journal_path("direct-exclusive-lock");
-        let first = RaftGroupFileLogStore::shared(&path).expect("open first owner");
-        let err = RaftGroupFileLogStore::shared(&path).expect_err("second owner must fail");
+    fn core_file_log_rejects_a_second_owner() {
+        let path = temp_journal_path("core-exclusive-lock");
+        let first = CoreFileLogWriter::open(path.clone(), None).expect("open first core owner");
+        let err =
+            CoreFileLogWriter::open(path.clone(), None).expect_err("second core owner must fail");
+        assert!(
+            matches!(&err, CoreJournalError::Locked { owner: Some(owner), .. } if owner.starts_with("pid=")),
+            "unexpected error: {err}"
+        );
+        let err = io::Error::from(err);
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert!(err.to_string().contains("already locked"));
-        assert!(err.to_string().contains("pid="));
         drop(first);
-        let reopened = RaftGroupFileLogStore::shared(&path).expect("lock releases on drop");
+        let reopened =
+            CoreFileLogWriter::open(path.clone(), None).expect("core lock releases on drop");
         drop(reopened);
         crate::tests::remove_test_path(&path);
         crate::tests::remove_test_path(format!("{}.lock", path.display()));
     }
 
-    #[cfg(not(madsim))]
-    #[test]
-    fn core_file_log_rejects_a_second_owner() {
-        let path = temp_journal_path("core-exclusive-lock");
-        let first = CoreFileLogWriter::shared(&path).expect("open first core owner");
-        let err = CoreFileLogWriter::shared(&path).expect_err("second core owner must fail");
-        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
-        assert!(err.to_string().contains("already locked"));
-        drop(first);
-        let reopened = CoreFileLogWriter::shared(&path).expect("core lock releases on drop");
-        drop(reopened);
+    #[tokio::test]
+    async fn a_group_opens_once_per_core_writer() {
+        let path = temp_journal_path("core-group-reopen");
+        let metrics = RuntimeMetrics::new(1, 2).group_engine_metrics();
+        let writer = CoreFileLogWriter::open(path.clone(), None).expect("open core writer");
+        let mut store = RaftGroupFileLogStore::open(placement(1), metrics.clone(), writer.clone())
+            .expect("open group store");
+        store
+            .append([blank_entry(1)], IOFlushed::noop())
+            .await
+            .expect("append through the core writer");
+        drop(store);
+
+        let err = RaftGroupFileLogStore::open(placement(1), metrics.clone(), writer.clone())
+            .expect_err("a group must not reopen while its core writer lives");
+        assert!(matches!(err, CoreJournalError::GroupAlreadyOpen {
+            raft_group_id: RaftGroupId(1),
+            ..
+        }));
+        RaftGroupFileLogStore::open(placement(0), metrics.clone(), writer.clone())
+            .expect("another group still opens");
+        drop(writer);
+
+        let writer = CoreFileLogWriter::open(path.clone(), None).expect("reopen core writer");
+        let mut store = RaftGroupFileLogStore::open(placement(1), metrics, writer)
+            .expect("a new writer recovers the group");
+        let state = store.get_log_state().await.expect("recovered log state");
+        assert_eq!(state.last_log_id, Some(test_log_id(1)));
+        drop(store);
         crate::tests::remove_test_path(&path);
         crate::tests::remove_test_path(format!("{}.lock", path.display()));
     }
