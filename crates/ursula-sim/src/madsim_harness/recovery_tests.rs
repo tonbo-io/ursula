@@ -17,7 +17,10 @@ use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use openraft::vote::RaftLeaderId;
 use ursula_config::WalFsync;
+use ursula_proto::admin::AcceptUnsyncedLossRequest;
 use ursula_raft::AcceptUnsyncedLossOutcome;
+use ursula_raft::AcceptUnsyncedLossReport;
+use ursula_raft::RecoveryGateError;
 use ursula_raft::RecoveryGateStatus;
 use ursula_raft::RecoveryState;
 use ursula_raft::UrsulaAppendEntriesRequest;
@@ -152,6 +155,22 @@ async fn wait_healed(cluster: &JournalCluster, context: &str, timeout: Duration)
         );
         madsim::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// The operator's acceptance of the unsynced loss on `node_id`'s replica of
+/// `group`, naming the log the group's metrics show there.
+async fn accept_observed_loss(
+    cluster: &JournalCluster,
+    group: u32,
+    node_id: u64,
+) -> Result<AcceptUnsyncedLossReport, RecoveryGateError> {
+    let replica = metrics(cluster, group, node_id);
+    cluster.rejoins[&(group, node_id)]
+        .accept_unsynced_loss(&AcceptUnsyncedLossRequest {
+            expected_last_log_index: replica.last_log_index,
+            expected_current_term: replica.current_term,
+        })
+        .await
 }
 
 /// No vote was granted by a replica whose gate was closed.
@@ -687,10 +706,10 @@ fn a_majority_power_loss_stops_until_the_operator_accepts_the_loss() {
                 let needed = 2_usize.saturating_sub(survivors.len());
                 for (_, node_id) in gated.into_iter().take(needed) {
                     assert_eq!(
-                        cluster.rejoins[&(group, node_id)]
-                            .accept_unsynced_loss()
+                        accept_observed_loss(&cluster, group, node_id)
                             .await
-                            .expect("accept the unsynced loss"),
+                            .expect("accept the unsynced loss")
+                            .outcome,
                         AcceptUnsyncedLossOutcome::GateOpened,
                         "{context}: node {node_id} group {group}"
                     );

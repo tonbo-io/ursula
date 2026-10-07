@@ -568,8 +568,9 @@ async fn cli_static_grpc_raft_log_dir_recovers_with_bootstrap_enabled_after_rest
 
 /// A single voter whose run state is gone while its journal holds records
 /// cannot know whether it lost acknowledged writes: it comes back gated, its
-/// group has no leader and readiness says why. An operator who accepts the
-/// loss of the unsynced tail opens the gate, and the node serves again with
+/// group has no leader and readiness says why. Once the gate reports the
+/// group stalled, an operator who accepts the loss of the unsynced tail for
+/// the log the metrics show opens the gate, and the node serves again with
 /// what its journal kept.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_single_voter_with_an_unknown_history_serves_after_accept_unsynced_loss() {
@@ -615,14 +616,58 @@ async fn cli_single_voter_with_an_unknown_history_serves_after_accept_unsynced_l
     let ready: serde_json::Value = ready.json().await.expect("readiness JSON");
     assert_eq!(ready["reason"], "recovery_gate_closed", "{ready}");
 
-    let response = admin_test_post(
-        &client,
-        format!("{admin_url}/__ursula/raft/0/recovery/accept-unsynced-loss"),
-    )
-    .await
-    .send()
-    .await
-    .expect("accept the unsynced loss");
+    let accept_url = format!("{admin_url}/__ursula/raft/0/recovery/accept-unsynced-loss");
+    let observe = || async {
+        let metrics: serde_json::Value = client
+            .get(format!("{admin_url}/__ursula/metrics"))
+            .send()
+            .await
+            .expect("metrics")
+            .json()
+            .await
+            .expect("metrics JSON");
+        let group = &metrics["raft_groups"][0];
+        ursula_proto::admin::AcceptUnsyncedLossRequest {
+            expected_last_log_index: group["last_log_index"].as_u64(),
+            expected_current_term: group["current_term"].as_u64().expect("current term"),
+        }
+    };
+    // Not stalled yet: the gate may still open through a barrier.
+    let early = admin_test_post(&client, accept_url.clone())
+        .await
+        .json(&observe().await)
+        .send()
+        .await
+        .expect("accept before the stall");
+    assert_eq!(early.status(), reqwest::StatusCode::CONFLICT);
+    let stall_deadline = std::time::Instant::now()
+        .checked_add(ursula_raft::RECOVERY_STALL_AFTER.saturating_add(Duration::from_secs(30)))
+        .unwrap();
+    loop {
+        let ready: serde_json::Value = client
+            .get(format!("{base_url}/__ursula/ready"))
+            .send()
+            .await
+            .expect("readiness")
+            .json()
+            .await
+            .expect("readiness JSON");
+        if ready["reason"] == "recovery_stalled" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < stall_deadline,
+            "the gated single voter never reported its group stalled: {ready}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let response = admin_test_post(&client, accept_url)
+        .await
+        .json(&observe().await)
+        .send()
+        .await
+        .expect("accept the unsynced loss");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let report: ursula_raft::AcceptUnsyncedLossReport =
         response.json().await.expect("typed report");

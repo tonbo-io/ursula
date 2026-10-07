@@ -168,6 +168,32 @@ impl MaintenanceFenceState {
     }
 }
 
+/// The body of `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`:
+/// the replica's log as the operator saw it in `GET /__ursula/metrics`
+/// (`last_log_index` and `current_term` of the group) when deciding to
+/// accept its loss. The node refuses the request when the replica no longer
+/// holds that log, so the acceptance applies to what the operator saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptUnsyncedLossRequest {
+    /// The group's `last_log_index` on the replica, `null` for an empty log.
+    /// Required, also when `null`.
+    #[serde(deserialize_with = "required_option")]
+    pub expected_last_log_index: Option<u64>,
+    /// The group's `current_term` on the replica.
+    pub expected_current_term: u64,
+}
+
+/// Deserializes an `Option` field that must be present, so that a missing
+/// field is an error rather than `None`.
+fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
 /// A trusted startup helper's acknowledged ownership, loaded before listeners.
 /// The server generates the incarnation; the helper must return it unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,8 +230,43 @@ impl From<ProcessIncarnation> for String {
 
 #[cfg(test)]
 mod tests {
+    use super::AcceptUnsyncedLossRequest;
     use super::MaintenanceFence;
     use super::ProcessIncarnation;
+
+    /// The expected log must be stated, also when it is empty.
+    #[test]
+    fn an_accept_request_names_the_observed_log_explicitly() {
+        assert_eq!(
+            serde_json::from_str::<AcceptUnsyncedLossRequest>(
+                r#"{"expected_last_log_index": 12, "expected_current_term": 3}"#
+            )
+            .unwrap(),
+            AcceptUnsyncedLossRequest {
+                expected_last_log_index: Some(12),
+                expected_current_term: 3,
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<AcceptUnsyncedLossRequest>(
+                r#"{"expected_last_log_index": null, "expected_current_term": 0}"#
+            )
+            .unwrap(),
+            AcceptUnsyncedLossRequest {
+                expected_last_log_index: None,
+                expected_current_term: 0,
+            }
+        );
+        for invalid in [
+            r#"{"expected_current_term": 3}"#,
+            r#"{"expected_last_log_index": 12}"#,
+            r#"{"expected_last_log_index": 12, "expected_current_term": 3, "force": true}"#,
+            r#"{}"#,
+        ] {
+            serde_json::from_str::<AcceptUnsyncedLossRequest>(invalid)
+                .expect_err("an incomplete or unknown expectation must be rejected");
+        }
+    }
 
     #[test]
     fn fence_header_rejects_ambiguous_generations_and_identities() {

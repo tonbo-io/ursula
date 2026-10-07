@@ -59,8 +59,10 @@ curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST "h
 curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/leadership-shed/maintenance
 curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X DELETE http://127.0.0.1:4438/__ursula/leadership-shed/maintenance
 
-# Accept the loss of one group's unsynced tail on this node (see Recovering after a host crash)
-curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/42/recovery/accept-unsynced-loss
+# Accept the loss of one group's unsynced tail on this node, naming the log its metrics show (see Recovering after a host crash)
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -H "content-type: application/json" \
+  -d '{"expected_last_log_index": 1234, "expected_current_term": 7}' \
+  -X POST http://127.0.0.1:4438/__ursula/raft/42/recovery/accept-unsynced-loss
 
 ```
 
@@ -159,17 +161,28 @@ While at most a minority of a group's voters lost their tail, the other voters h
 
 **A majority of a group's voters lost their tail at once.** The gated voters refuse every vote, so the group elects no leader and writes answer `503`. After `30s` without a leader barrier and without applying anything, each gated replica reports its group stalled: readiness reason `recovery_stalled`, the group under `recovery_stalled_groups` in `GET /__ursula/ready` and under `recovery_gates.stalled` in the metrics, the `ursula.raft.recovery_gates{status="stalled"}` gauge, and an error log naming the group. Writes acknowledged after the last `fsync` of the surviving replicas may be gone. Only an operator can accept that. For each stalled group:
 
-1. Read `last_log_index` for the group from `GET /__ursula/metrics` on every voter.
-2. On the gated replica with the longest log, run the call below through its admin listener. Repeat on the next longest until the replicas whose gate is open form a majority of the voters. A replica that was not gated counts as open.
+1. Read `last_log_index` and `current_term` for the group from `GET /__ursula/metrics` on every voter.
+2. On the gated replica with the longest log, run the call below through its admin listener. Its body names the `last_log_index` and `current_term` you read on that replica. Repeat on the next longest until the replicas whose gate is open form a majority of the voters. A replica that was not gated counts as open.
 3. The group elects a leader among the open replicas, preferring the longest log, and the remaining gated replicas catch up from it and open their gates.
 
 ```bash
 # group 42 on this node
-process_incarnation=$(curl --fail http://127.0.0.1:4438/__ursula/metrics | jq -er .process_incarnation)
-curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/42/recovery/accept-unsynced-loss
+metrics=$(curl --fail http://127.0.0.1:4438/__ursula/metrics)
+process_incarnation=$(jq -er .process_incarnation <<<"${metrics}")
+expected=$(jq -ec '.raft_groups[] | select(.raft_group_id == 42)
+  | {expected_last_log_index: .last_log_index, expected_current_term: .current_term}' <<<"${metrics}")
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -H "content-type: application/json" \
+  -d "${expected}" -X POST http://127.0.0.1:4438/__ursula/raft/42/recovery/accept-unsynced-loss
 ```
 
-It answers `{"raft_group_id": 42, "node_id": 1, "outcome": "gate_opened", "last_log_index": 1234}`, or `"already_open"` when the gate was open. The open gate is recorded, so a restart does not close it again. A single-voter group has no other replica to recover from, so it needs this call after every host crash under `never`. Use `fsync = "always"` where that is not acceptable.
+It answers `{"raft_group_id": 42, "node_id": 1, "outcome": "gate_opened", "last_log_index": 1234, "current_term": 7}`, or `"already_open"` when the gate was open. The open gate is recorded, so a restart does not close it again. A replica that led the group before the crash rejoins as a follower, also when it restarts after the call.
+
+The call is refused with `409 Conflict`, and changes nothing, when:
+
+- the replica's gate is closed but not stalled. It may still open through a leader's barrier without losing anything. Wait for `recovery_stalled`.
+- the replica no longer holds the log the body names, because it moved since you read the metrics. Read the metrics again and decide again.
+
+A single-voter group has no other replica to recover from, so it needs this call after every host crash under `never`, once its gate reports the group stalled. Use `fsync = "always"` where that is not acceptable.
 
 `POST /__ursula/cluster-probe` also exists on the client plane, but it is machinery rather than an operator surface: nodes send each other heartbeat-sized bodies through it to verify cluster-plane egress, and it bypasses ingress admission.
 

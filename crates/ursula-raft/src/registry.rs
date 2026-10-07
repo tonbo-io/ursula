@@ -31,6 +31,7 @@ use openraft::storage::RaftStateMachine;
 use openraft::type_config::alias::SnapshotOf as TypeConfigSnapshotOf;
 use openraft::vote::RaftLeaderId;
 use tokio::sync::watch;
+use ursula_proto::admin::AcceptUnsyncedLossRequest;
 use ursula_runtime::ColdIndexPageCache;
 use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::GroupEngineError;
@@ -48,7 +49,7 @@ pub use crate::election::LeadershipShedState;
 use crate::log_store::WalOpening;
 use crate::meta::MetaRaftTypeConfig;
 use crate::read_index::ReadIndexBarrier;
-use crate::rejoin::AcceptUnsyncedLossOutcome;
+use crate::rejoin::AcceptUnsyncedLossReport;
 use crate::rejoin::GroupRejoin;
 use crate::rejoin::RecoveryGateError;
 use crate::rejoin::RecoveryGateStatus;
@@ -515,20 +516,21 @@ impl RaftGroupHandleRegistry {
     }
 
     /// Operator recovery when a majority of the group's voters are gated:
-    /// open this node's recovery gate for the group, accepting that its
-    /// replica may be missing entries it acknowledged, and let the group
+    /// open this node's stalled recovery gate for the group, accepting that
+    /// its replica may be missing entries it acknowledged, and let the group
     /// campaign again (see [`GroupRejoin::accept_unsynced_loss`]).
     pub async fn accept_unsynced_loss(
         &self,
         raft_group_id: RaftGroupId,
-    ) -> Result<AcceptUnsyncedLossOutcome, RecoveryGateError> {
+        expected: &AcceptUnsyncedLossRequest,
+    ) -> Result<AcceptUnsyncedLossReport, RecoveryGateError> {
         let rejoin = self
             .rejoin(raft_group_id)
             .filter(|_| self.contains_group(raft_group_id))
             .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
-        let outcome = rejoin.accept_unsynced_loss().await?;
+        let report = rejoin.accept_unsynced_loss(expected).await?;
         self.refresh_group_elections(raft_group_id);
-        Ok(outcome)
+        Ok(report)
     }
 
     /// The recovery gate of every group that has one on this node.

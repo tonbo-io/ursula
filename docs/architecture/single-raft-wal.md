@@ -164,6 +164,15 @@ a majority's. This replaces `adopt-survivor` and `reinitialize`. A group whose
 state is `Initialized` or `Recovering` never runs `Initialize`, which replaces
 the S3 initialized markers and the restart guard.
 
+An acceptance is a compare-and-act on what the operator saw. Its request names
+the replica's last log index and current term, as the group's metrics showed
+them. The replica refuses it with `409 Conflict`, and changes nothing, unless
+its gate is stalled and it still holds that log. A gate that awaits or
+applies a barrier may still open without losing anything, and a replica whose
+log moved since the operator looked is no longer the one the operator chose.
+The admin incarnation precondition still applies, so a restarted process
+refuses a plan made against the one before it.
+
 ## Journal hardening
 
 - **Fail-stop.** Any write or `fsync` error stops the core writer. Pending

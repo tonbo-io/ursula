@@ -59,7 +59,10 @@
 //! replicas report it ([`RecoveryGateStatus::Stalled`]). An operator who
 //! accepts the loss of the unsynced tail opens the gate on enough replicas
 //! ([`GroupRejoin::accept_unsynced_loss`]); a normal election then needs a
-//! candidate whose log is at least as long as each of theirs.
+//! candidate whose log is at least as long as each of theirs. An acceptance
+//! opens only a stalled gate, and only while the replica still holds the log
+//! the operator saw: a gate that awaits or applies a barrier may still open
+//! without losing anything.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -81,6 +84,7 @@ use openraft::type_config::alias::WatchSenderOf;
 use openraft::vote::RaftLeaderId;
 use serde::Deserialize;
 use serde::Serialize;
+use ursula_proto::admin::AcceptUnsyncedLossRequest;
 use ursula_shard::RaftGroupId;
 
 use crate::log_store::CoreJournalError;
@@ -270,6 +274,25 @@ impl VoteGate {
         *self = Self::Open;
     }
 
+    /// Decide an operator's acceptance of the loss of the unsynced tail,
+    /// made after seeing `expected` on this replica, which now holds
+    /// `actual`. Only a stalled gate opens, and only while the replica holds
+    /// the log the operator saw.
+    pub(crate) fn accept_loss(&self, expected: ReplicaLog, actual: ReplicaLog) -> AcceptLoss {
+        match self {
+            Self::Open => AcceptLoss::AlreadyOpen,
+            Self::Closed {
+                recovery: GateRecovery::Stalled,
+                ..
+            } if expected == actual => AcceptLoss::Open,
+            Self::Closed {
+                recovery: GateRecovery::Stalled,
+                ..
+            } => AcceptLoss::Changed,
+            Self::Closed { .. } => AcceptLoss::NotStalled(self.status()),
+        }
+    }
+
     /// Decide one vote request whose candidate's last log index is
     /// `candidate_last_log_index`.
     pub(crate) fn screen(&mut self, candidate_last_log_index: Option<u64>) -> VoteScreen {
@@ -349,6 +372,47 @@ enum GateOpening {
     AcceptedLoss,
 }
 
+/// A replica's log as the group's metrics show it: what an operator's
+/// acceptance of the unsynced loss names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplicaLog {
+    pub(crate) last_log_index: Option<u64>,
+    pub(crate) current_term: u64,
+}
+
+impl ReplicaLog {
+    /// The log `store` holds, and the term of the vote it runs with.
+    fn of(store: &RaftGroupFileLogStore) -> Self {
+        Self {
+            last_log_index: log_index(store.last_log_id().as_ref()),
+            current_term: store.vote().map_or(0, |vote| vote.leader_id().term()),
+        }
+    }
+}
+
+impl From<&AcceptUnsyncedLossRequest> for ReplicaLog {
+    fn from(request: &AcceptUnsyncedLossRequest) -> Self {
+        Self {
+            last_log_index: request.expected_last_log_index,
+            current_term: request.expected_current_term,
+        }
+    }
+}
+
+/// The gate's answer to an operator's acceptance of the unsynced loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcceptLoss {
+    /// The gate is open: nothing changes.
+    AlreadyOpen,
+    /// Open the gate.
+    Open,
+    /// Refuse: the gate is closed but not stalled, so it may still open
+    /// through a barrier without losing anything.
+    NotStalled(RecoveryGateStatus),
+    /// Refuse: the replica no longer holds the log the operator saw.
+    Changed,
+}
+
 /// What [`GroupRejoin::accept_unsynced_loss`] did on one replica.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -370,6 +434,8 @@ pub struct AcceptUnsyncedLossReport {
     /// The last log index this replica holds; an election prefers the
     /// longest log among the replicas whose gates are open.
     pub last_log_index: Option<u64>,
+    /// The term of the vote this replica holds.
+    pub current_term: u64,
 }
 
 /// Failure to open a recovery gate.
@@ -393,6 +459,28 @@ pub enum RecoveryGateError {
         raft_group_id: RaftGroupId,
         #[source]
         source: CoreJournalError,
+    },
+    #[error(
+        "raft group {}'s recovery gate on this replica is {status:?}, not stalled; accept the \
+         unsynced loss only on a replica that reports its group stalled",
+        .raft_group_id.0
+    )]
+    NotStalled {
+        raft_group_id: RaftGroupId,
+        status: RecoveryGateStatus,
+    },
+    #[error(
+        "raft group {} on this replica holds last log index {last_log_index:?} in term \
+         {current_term}, not the expected last log index {expected_last_log_index:?} in term \
+         {expected_current_term}; observe the group again",
+        .raft_group_id.0
+    )]
+    ReplicaChanged {
+        raft_group_id: RaftGroupId,
+        expected_last_log_index: Option<u64>,
+        expected_current_term: u64,
+        last_log_index: Option<u64>,
+        current_term: u64,
     },
 }
 
@@ -595,14 +683,51 @@ impl GroupRejoin {
     /// open its gate, so it votes and campaigns with the log it holds. The
     /// open gate is recorded. Elections are refreshed by the caller
     /// ([`RaftGroupHandleRegistry::accept_unsynced_loss`]).
+    ///
+    /// `expected` is the replica's log as the operator saw it. The gate opens
+    /// only when it is stalled and the replica still holds that log;
+    /// otherwise the acceptance is refused and nothing changes.
     pub async fn accept_unsynced_loss(
         &self,
-    ) -> Result<AcceptUnsyncedLossOutcome, RecoveryGateError> {
-        if self.vote_gate_open() {
-            return Ok(AcceptUnsyncedLossOutcome::AlreadyOpen);
-        }
-        self.open(GateOpening::AcceptedLoss).await?;
-        Ok(AcceptUnsyncedLossOutcome::GateOpened)
+        expected: &AcceptUnsyncedLossRequest,
+    ) -> Result<AcceptUnsyncedLossReport, RecoveryGateError> {
+        let raft_group_id = self.raft_group_id;
+        let store = self
+            .store
+            .upgrade()
+            .ok_or(RecoveryGateError::StoreClosed { raft_group_id })?;
+        let actual = ReplicaLog::of(&store);
+        drop(store);
+        let decision = self.gate().accept_loss(ReplicaLog::from(expected), actual);
+        let outcome = match decision {
+            AcceptLoss::AlreadyOpen => AcceptUnsyncedLossOutcome::AlreadyOpen,
+            AcceptLoss::Open => {
+                self.open(GateOpening::AcceptedLoss).await?;
+                AcceptUnsyncedLossOutcome::GateOpened
+            }
+            AcceptLoss::NotStalled(status) => {
+                return Err(RecoveryGateError::NotStalled {
+                    raft_group_id,
+                    status,
+                });
+            }
+            AcceptLoss::Changed => {
+                return Err(RecoveryGateError::ReplicaChanged {
+                    raft_group_id,
+                    expected_last_log_index: expected.expected_last_log_index,
+                    expected_current_term: expected.expected_current_term,
+                    last_log_index: actual.last_log_index,
+                    current_term: actual.current_term,
+                });
+            }
+        };
+        Ok(AcceptUnsyncedLossReport {
+            raft_group_id: raft_group_id.0,
+            node_id: self.node_id,
+            outcome,
+            last_log_index: actual.last_log_index,
+            current_term: actual.current_term,
+        })
     }
 
     /// Returns whether the gate just stalled.
@@ -616,7 +741,8 @@ impl GroupRejoin {
                  applied nothing; a majority of the group's voters may be gated, so the group \
                  has no leader and refuses writes. To accept the loss of writes acknowledged \
                  after the last fsync, run POST /__ursula/raft/{}/recovery/accept-unsynced-loss \
-                 on the gated replicas with the longest logs until a leader is elected",
+                 with the group's last_log_index and current_term from the metrics on the \
+                 gated replicas with the longest logs until a leader is elected",
                 self.raft_group_id.0
             );
         }
@@ -807,7 +933,9 @@ mod tests {
     use openraft::alias::LogIdOf;
     use openraft::vote::RaftLeaderId;
 
+    use super::AcceptLoss;
     use super::BootstrapDecision;
+    use super::CatchUpTarget;
     use super::GateRecovery;
     use super::GroupEvidence;
     use super::HealStep;
@@ -815,6 +943,7 @@ mod tests {
     use super::LocalReplica;
     use super::PeerGroupLog;
     use super::RecoveryGateStatus;
+    use super::ReplicaLog;
     use super::RevertedFollowers;
     use super::VoteGate;
     use super::VoteScreen;
@@ -973,6 +1102,52 @@ mod tests {
         assert!(gate.caught_up(follower(Some(3))));
         gate.open();
         assert!(!gate.stall(), "an open gate never stalls");
+    }
+
+    /// An operator's acceptance opens only a stalled gate, and only while
+    /// the replica holds the log the operator saw.
+    #[test]
+    fn an_acceptance_opens_only_a_stalled_gate_with_the_log_the_operator_saw() {
+        let seen = ReplicaLog {
+            last_log_index: Some(9),
+            current_term: 3,
+        };
+        let longer = ReplicaLog {
+            last_log_index: Some(10),
+            ..seen
+        };
+        let newer = ReplicaLog {
+            current_term: 4,
+            ..seen
+        };
+        let target = CatchUpTarget {
+            leader: leader(4, 2),
+            commit_index: 9,
+        };
+        for (recovery, status) in [
+            (
+                GateRecovery::AwaitingBarrier,
+                RecoveryGateStatus::AwaitingBarrier,
+            ),
+            (
+                GateRecovery::CatchingUp(target),
+                RecoveryGateStatus::CatchingUp,
+            ),
+        ] {
+            let gate = VoteGate::Closed {
+                group: GroupEvidence::Initialized,
+                recovery,
+            };
+            assert_eq!(gate.accept_loss(seen, seen), AcceptLoss::NotStalled(status));
+        }
+        let mut gate = VoteGate::closed(GroupEvidence::Initialized);
+        assert!(gate.stall());
+        assert_eq!(gate.accept_loss(seen, seen), AcceptLoss::Open);
+        assert_eq!(gate.accept_loss(seen, longer), AcceptLoss::Changed);
+        assert_eq!(gate.accept_loss(seen, newer), AcceptLoss::Changed);
+        assert_eq!(gate.status(), RecoveryGateStatus::Stalled);
+        gate.open();
+        assert_eq!(gate.accept_loss(longer, seen), AcceptLoss::AlreadyOpen);
     }
 
     #[test]
@@ -1160,13 +1335,16 @@ mod tests {
         use openraft::storage::RaftLogReader;
         use openraft::storage::RaftLogStorage;
         use ursula_config::WalFsync;
+        use ursula_proto::admin::AcceptUnsyncedLossRequest;
         use ursula_shard::CoreId;
         use ursula_shard::RaftGroupId;
         use ursula_shard::ShardId;
         use ursula_shard::ShardPlacement;
 
         use super::AcceptUnsyncedLossOutcome;
+        use super::AcceptUnsyncedLossReport;
         use super::GroupRejoin;
+        use super::RecoveryGateError;
         use crate::RaftWal;
         use crate::log_store::GroupLogState;
         use crate::log_store::RUN_STATE_FILE;
@@ -1270,13 +1448,49 @@ mod tests {
             Some(vote(1, 1)),
             "its vote for itself is no longer a committed leadership"
         );
-        // The operator accepts the loss: the open gate is durable.
+        // The operator accepts the loss once the gate is stalled, naming the
+        // log it saw. An acceptance before that, or for another log, changes
+        // nothing. The open gate is durable.
+        let seen = AcceptUnsyncedLossRequest {
+            expected_last_log_index: Some(1),
+            expected_current_term: 1,
+        };
+        assert!(matches!(
+            gate.accept_unsynced_loss(&seen).await,
+            Err(RecoveryGateError::NotStalled {
+                status: RecoveryGateStatus::AwaitingBarrier,
+                ..
+            })
+        ));
+        assert!(gate.stall());
+        let stale = AcceptUnsyncedLossRequest {
+            expected_last_log_index: Some(0),
+            ..seen
+        };
+        assert!(matches!(
+            gate.accept_unsynced_loss(&stale).await,
+            Err(RecoveryGateError::ReplicaChanged {
+                last_log_index: Some(1),
+                current_term: 1,
+                ..
+            })
+        ));
+        assert_eq!(gate.status(), RecoveryGateStatus::Stalled);
         assert_eq!(
-            gate.accept_unsynced_loss().await.expect("accept"),
-            AcceptUnsyncedLossOutcome::GateOpened
+            gate.accept_unsynced_loss(&seen).await.expect("accept"),
+            AcceptUnsyncedLossReport {
+                raft_group_id: 0,
+                node_id: 1,
+                outcome: AcceptUnsyncedLossOutcome::GateOpened,
+                last_log_index: Some(1),
+                current_term: 1,
+            }
         );
         assert_eq!(
-            gate.accept_unsynced_loss().await.expect("accept again"),
+            gate.accept_unsynced_loss(&stale)
+                .await
+                .expect("accept again")
+                .outcome,
             AcceptUnsyncedLossOutcome::AlreadyOpen
         );
         assert_eq!(store.log_state(), GroupLogState::Initialized);
