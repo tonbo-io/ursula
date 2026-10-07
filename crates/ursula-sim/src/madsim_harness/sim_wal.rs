@@ -142,6 +142,37 @@ impl SimNodeWal {
         SimDisk::process_crash(&self.root).expect("crash a stopped simulated node");
     }
 
+    /// Shuts the node down gracefully, as the server does: `stop_engines`
+    /// stops its Raft groups, then every core writer `fsync`s its journal and
+    /// the run is recorded as clean.
+    ///
+    /// A production writer that loses its last handle `fsync`s on its way
+    /// out; a simulated one stops like a killed process. So the node's
+    /// stores are held while the engines stop, and the writers close here.
+    #[cfg(test)]
+    pub(super) async fn clean_shutdown(&self, stop_engines: impl Future<Output = ()>) {
+        let held = self
+            .stores
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        stop_engines.await;
+        let run = self
+            .run
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        if let Some(run) = run {
+            run.shutdown()
+                .await
+                .expect("shut down a simulated node's Raft WAL");
+        }
+        drop(held);
+        self.wait_stopped().await;
+    }
+
     /// Ends the node's run without a clean shutdown, as a stopped process
     /// does.
     #[cfg(test)]
