@@ -1492,6 +1492,88 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
+    fn supports_append_batch(&self) -> bool {
+        true
+    }
+
+    fn append_batch<'a>(
+        &'a mut self,
+        requests: Vec<AppendRequest>,
+        placement: ShardPlacement,
+        admission: ColdWriteAdmission,
+    ) -> ursula_runtime::GroupAppendBatchFuture<'a> {
+        Box::pin(async move {
+            if !self.raft.is_leader() {
+                let mut results = Vec::with_capacity(requests.len());
+                for request in requests {
+                    results.push(self.append(request, placement, admission).await);
+                }
+                return results;
+            }
+
+            // Check the entire burst against applied hot bytes plus conservative
+            // reservations for earlier accepted entries. Do not admit every item
+            // against the same stale applied total.
+            let count = requests.len();
+            let checked = if admission.max_hot_bytes_per_group.is_none() {
+                Ok((
+                    requests.into_iter().map(GroupWriteCommand::from).collect(),
+                    vec![Ok(()); count],
+                ))
+            } else {
+                self.with_state_machine(move |state_machine| {
+                    Box::pin(async move {
+                        let mut reserved = 0_u64;
+                        let mut commands = Vec::new();
+                        let mut slots = Vec::with_capacity(count);
+                        for request in requests {
+                            match state_machine.engine.check_cold_write_admission(
+                                &request.stream_id,
+                                admission,
+                                request.payload_len().saturating_add(reserved),
+                            ) {
+                                Ok(()) => {
+                                    reserved = reserved.saturating_add(request.payload_len());
+                                    commands.push(GroupWriteCommand::from(request));
+                                    slots.push(Ok(()));
+                                }
+                                Err(error) => slots.push(Err(error)),
+                            }
+                        }
+                        (commands, slots)
+                    })
+                })
+                .await
+            };
+            let (commands, slots) = match checked {
+                Ok(checked) => checked,
+                Err(error) => return vec![Err(error); count],
+            };
+            let responses =
+                crate::forward::write_commands_on_raft(self.raft.clone(), commands).await;
+            let mut responses = match responses {
+                Ok(responses) => responses.into_iter(),
+                Err(error) => {
+                    return slots
+                        .into_iter()
+                        .map(|slot| slot.and(Err(error.clone())))
+                        .collect();
+                }
+            };
+            slots
+                .into_iter()
+                .map(|slot| {
+                    slot?;
+                    match responses.next() {
+                        Some(Ok(GroupWriteResponse::Append(response))) => Ok(response),
+                        Some(Err(error)) => Err(error),
+                        _ => Err(GroupEngineError::new("missing append batch response")),
+                    }
+                })
+                .collect()
+        })
+    }
+
     fn append_external<'a>(
         &'a mut self,
         request: AppendExternalRequest,

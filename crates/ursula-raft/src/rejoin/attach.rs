@@ -160,7 +160,7 @@ impl RecoveryGate {
             config.interval,
         )));
         self.push(crate::rt::spawn(run_rejoin_vote_barrier(
-            engine.raft_handle(),
+            engine.read_barrier.owner().clone(),
             rejoin.clone(),
             election,
             nodes.clone(),

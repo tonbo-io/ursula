@@ -11,9 +11,9 @@ use std::time::Duration;
 use openraft::Config;
 use openraft::alias::LogIdOf;
 use openraft::alias::VoteOf;
-use openraft::storage::IOFlushed;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
+use openraft::storage::RaftLogStorageExt;
 use ursula_config::WalFsync;
 use ursula_raft::GroupRejoin;
 use ursula_raft::InProcessRaftNetworkFactory;
@@ -818,7 +818,22 @@ fn journal_io_error_poisons_the_node_until_restart(
                 "seed {seed}: the error stops every replica on node {victim}"
             );
             SimDisk::clear_faults(cluster.wals[&victim].root()).expect("disarm the other fault");
-            let last = store.get_log_state().await.expect("log state").last_log_id;
+            let last = match store.get_log_state().await {
+                Ok(state) => state.last_log_id,
+                Err(error) => {
+                    // A submitted append that failed its asynchronous flush
+                    // also poisons the readable pending suffix. No caller may
+                    // mistake those entries for a healthy log after the error.
+                    assert!(
+                        matches!(
+                            core_journal_error(&error),
+                            Some(CoreJournalError::WriterPoisoned { .. })
+                        ),
+                        "seed {seed}: unexpected log-state error: {error}"
+                    );
+                    None
+                }
+            };
             let err = store
                 .truncate_after(last)
                 .await
@@ -1566,10 +1581,7 @@ fn a_purge_is_durable_before_the_segments_it_frees_are_deleted() {
             let mut store = wal.open(placement, metrics.clone()).await;
             for chunk in 0..60_u64 {
                 store
-                    .append(
-                        (1..=10).map(|offset| blank_entry(chunk * 10 + offset)),
-                        IOFlushed::noop(),
-                    )
+                    .blocking_append((1..=10).map(|offset| blank_entry(chunk * 10 + offset)))
                     .await
                     .expect("append");
             }
@@ -1651,7 +1663,7 @@ async fn append_spread(
             madsim::task::spawn(async move {
                 madsim::time::sleep(delay).await;
                 store
-                    .append([blank_entry(index)], IOFlushed::noop())
+                    .blocking_append([blank_entry(index)])
                     .await
                     .expect("append");
             })

@@ -381,6 +381,7 @@ impl CoreWorker {
                 .install(placement.raft_group_id, engine.linearizable_read_barrier());
             let (tx, rx) = mpsc::channel(self.group_mailbox_capacity);
             let actor = GroupActor {
+                deferred: None,
                 placement,
                 engine,
                 rx,
@@ -440,6 +441,7 @@ impl CoreWorker {
             .install(placement.raft_group_id, engine.linearizable_read_barrier());
         let (tx, rx) = mpsc::channel(self.group_mailbox_capacity);
         let actor = GroupActor {
+            deferred: None,
             placement,
             engine,
             rx,

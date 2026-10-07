@@ -13,7 +13,7 @@ use openraft::rt::WatchSender;
 use super::GroupRejoin;
 use super::attach::wait_recovery_change;
 use super::log_index;
-use crate::registry::RaftGroupHandle;
+use crate::owner::OwnerRaftHandle;
 use crate::types::UrsulaVote;
 
 /// Opens a gated replica's recovery gate from fresh outbound leader proofs.
@@ -25,7 +25,7 @@ use crate::types::UrsulaVote;
 /// returns. Transport-independent so simulation exercises the production
 /// driver.
 pub async fn run_rejoin_vote_barrier<P, F, E>(
-    raft: RaftGroupHandle,
+    raft: OwnerRaftHandle,
     rejoin: Arc<GroupRejoin>,
     election: crate::ElectionPolicy,
     nodes: BTreeMap<u64, BasicNode>,
@@ -106,5 +106,5 @@ pub async fn run_rejoin_vote_barrier<P, F, E>(
     }
     // The gate never closes again in this run, so this refresh, after the
     // gate opened, is the one that lets the group campaign.
-    election.refresh(&raft, Some(&rejoin));
+    election.refresh(&raft, Some(rejoin));
 }

@@ -32,6 +32,7 @@ categories = ["database-implementations", "network-programming"]
 
 [workspace.dependencies]
 anyhow = "1"
+arc-swap = "1.9"
 axum = "0.8"
 arrow-array = "59.1.0"
 arrow-schema = "59.1.0"
@@ -41,6 +42,7 @@ bytes = "1.7"
 chrono = "0.4"
 clap = {version = "4", features = ["derive"] }
 console-subscriber = "0.5.0"
+core_affinity = "0.8.3"
 crossbeam-utils = "0.8"
 criterion = "0.5"
 crc32fast = "1.5"

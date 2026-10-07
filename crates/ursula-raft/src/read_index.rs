@@ -43,7 +43,7 @@ type Round = Shared<BoxFuture<'static, Outcome>>;
 const OPERATION: &str = "linearizable read";
 
 pub(crate) struct ReadIndexBarrier {
-    raft: RaftGroupHandle,
+    raft: crate::owner::OwnerRaftHandle,
     rounds: Arc<Mutex<Rounds>>,
 }
 
@@ -57,9 +57,13 @@ struct Rounds {
 }
 
 impl ReadIndexBarrier {
+    pub(crate) fn owner(&self) -> &crate::owner::OwnerRaftHandle {
+        &self.raft
+    }
+
     pub(crate) fn new(raft: RaftGroupHandle) -> Self {
         Self {
-            raft,
+            raft: crate::owner::OwnerRaftHandle::new(raft),
             rounds: Arc::default(),
         }
     }
@@ -88,7 +92,11 @@ impl ReadIndexBarrier {
             if let Some(state) = state.upgrade() {
                 state.lock().unwrap_or_else(PoisonError::into_inner).open = false;
             }
-            confirm(&raft).await
+            raft.call(|raft| async move { confirm(&raft).await })
+                .await
+                .map_err(|error| {
+                    GroupEngineError::new(format!("owner read barrier stopped: {error}"))
+                })?
         }
         .boxed()
         .shared();

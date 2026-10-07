@@ -20,6 +20,7 @@
 //! - [`recovery_transport`]: native transport adapter for recovery probes.
 //! - [`registry`]: [`RaftGroupHandleRegistry`] and the single-node network.
 //! - `in_process`: fault-injection network, compiled only for tests and madsim.
+//! - [`owner`]: mailbox dispatch onto each group owner runtime.
 //! - [`maintenance`]: configuration-backed local Raft maintenance eligibility.
 //! - [`state_machine`]: per-group [`RaftGroupStateMachine`] and snapshot builder.
 //! - [`meta`]: meta-group OpenRaft type config and control-plane state machine.
@@ -46,6 +47,8 @@ pub mod raft_internal_proto {
     tonic::include_proto!("ursula.raft.v1");
 }
 
+mod owner;
+pub use owner::OwnerRaftHandle;
 mod codec;
 mod election;
 mod engine;

@@ -64,6 +64,8 @@ use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
 use crate::request::TouchStreamAccessResponse;
 
+pub type GroupAppendBatchFuture<'a> =
+    Pin<Box<dyn Future<Output = Vec<Result<AppendResponse, GroupEngineError>>> + Send + 'a>>;
 pub type GroupAppendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AppendResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupFlushColdFuture<'a> =
@@ -496,6 +498,28 @@ pub trait GroupEngine: Send + 'static {
         placement: ShardPlacement,
         admission: ColdWriteAdmission,
     ) -> GroupAppendFuture<'a>;
+
+    /// Engines with a replicated log can submit a bounded burst together.
+    fn supports_append_batch(&self) -> bool {
+        false
+    }
+
+    /// Submit an actor-bounded burst (at most 32 requests and 1 MiB of payload,
+    /// or one individually larger request), preserving response order.
+    fn append_batch<'a>(
+        &'a mut self,
+        requests: Vec<AppendRequest>,
+        placement: ShardPlacement,
+        admission: ColdWriteAdmission,
+    ) -> GroupAppendBatchFuture<'a> {
+        Box::pin(async move {
+            let mut results = Vec::with_capacity(requests.len());
+            for request in requests {
+                results.push(self.append(request, placement, admission).await);
+            }
+            results
+        })
+    }
 
     fn append_external<'a>(
         &'a mut self,

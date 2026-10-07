@@ -44,7 +44,7 @@ CLI `--node-id` intentionally overrides any `raft.node_id` value in the config f
 | ---------- | ------- | ------- |
 | `server.listen` | `127.0.0.1:4437` | Client/API listener |
 | `server.cluster_listen` | none | Optional separate Raft/cluster listener |
-| `runtime.core_count` | `available_parallelism` | Worker threads, each pinned to its mailbox event loop |
+| `runtime.core_count` | `available_parallelism` | Owner worker threads; Linux attempts affinity within the allowed CPU set. Journal writers and the main Tokio runtime use additional threads |
 | `runtime.live_read_max_waiters_per_core` | `65536` | SSE waiter cap per core. `0` disables the limit |
 | `observability.tokio_console` | `false` | Enables Tokio console when the binary is built with the feature |
 

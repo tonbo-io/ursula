@@ -1,8 +1,10 @@
 //! The durable OpenRaft log store of one raft group, over its core's journal.
 //!
-//! The store sends every record to the core's writer (`writer`) and returns
-//! once the writer acknowledges it, by which time the writer applied it to
-//! the group's [`GroupLog`]. Reads come from that log: the log state and the
+//! Append publishes one bounded readable batch and queues it to the core's
+//! writer (`writer`), then returns before disk I/O. The writer completes
+//! `IOFlushed` after applying the durable record to [`GroupLog`]. Other mutations
+//! wait for that completion, preserving journal order. Reads merge the pending
+//! suffix with the durable log: the log state and the
 //! markers from memory, recent entries from its cache, and older entries
 //! from disk. A disk read runs on Tokio's blocking pool (inline under
 //! `cfg(madsim)`, where the disk is simulated), so a read of a lagging
@@ -71,11 +73,21 @@ pub struct RaftGroupFileLogStore {
     log: Arc<Mutex<GroupLog>>,
     vote: Mutex<Option<VoteOf<UrsulaRaftTypeConfig>>>,
     /// Mirrors the group's durable log state.
-    store_log: Mutex<StoreLog>,
+    store_log: Arc<Mutex<StoreLog>>,
     /// Serializes mutations, so the journal records them in the order
     /// OpenRaft issued them and the writer holds at most one per group.
-    write_order: crate::rt::sync::Mutex<()>,
+    write_order: Arc<crate::rt::sync::Mutex<()>>,
+    pending: Arc<Mutex<PendingAppend>>,
     core_writer: Arc<CoreFileLogWriter>,
+}
+
+/// At most one submitted batch per group. Keeping its entries readable lets
+/// replication overlap the writer without making the retained WAL cache unbounded.
+#[derive(Debug)]
+enum PendingAppend {
+    Idle,
+    Submitted(Vec<Entry>),
+    Failed(CoreJournalError),
 }
 
 /// Whether an empty group's history on this replica is known.
@@ -136,8 +148,9 @@ impl RaftGroupFileLogStore {
             metrics,
             log: opened.log,
             vote: Mutex::new(opened.vote),
-            store_log: Mutex::new(StoreLog::new(opened.state)),
-            write_order: crate::rt::sync::Mutex::new(()),
+            store_log: Arc::new(Mutex::new(StoreLog::new(opened.state))),
+            write_order: Arc::new(crate::rt::sync::Mutex::new(())),
+            pending: Arc::new(Mutex::new(PendingAppend::Idle)),
             core_writer,
         }))
     }
@@ -317,14 +330,34 @@ impl RaftGroupFileLogStore {
         let mut attempt = 0_usize;
         loop {
             attempt = attempt.saturating_add(1);
-            let plan = self.lock_log()?.plan_read(range, max_disk_bytes);
+            let (plan, pending) = {
+                let pending = lock(&self.pending);
+                let entries = match &*pending {
+                    PendingAppend::Idle => Vec::new(),
+                    PendingAppend::Submitted(entries) => entries.clone(),
+                    PendingAppend::Failed(error) => return Err(error.clone()),
+                };
+                let durable_end = entries.first().map_or(range.1, |entry| match range.1 {
+                    Bound::Included(end) if end < entry.log_id.index => range.1,
+                    Bound::Excluded(end) if end <= entry.log_id.index => range.1,
+                    _ => Bound::Excluded(entry.log_id.index),
+                });
+                let plan = self
+                    .lock_log()?
+                    .plan_read((range.0, durable_end), max_disk_bytes);
+                let entries = entries
+                    .into_iter()
+                    .filter(|entry| range.contains(&entry.log_id.index))
+                    .collect::<Vec<_>>();
+                (plan, entries)
+            };
             let mut sample = WalReadSample {
                 cache_hits: u64::try_from(plan.cached.len()).unwrap_or(u64::MAX),
                 ..WalReadSample::default()
             };
             if plan.disk.is_empty() {
                 self.metrics.record_wal_read(self.placement, sample);
-                return Ok(plan.cached);
+                return Ok(merge_pending(plan.cached, pending));
             }
             let dir = self.core_writer.dir().to_owned();
             let group_id = self.placement.raft_group_id.0;
@@ -343,7 +376,7 @@ impl RaftGroupFileLogStore {
                     let mut entries = read.entries;
                     entries.extend(plan.cached);
                     entries.sort_by_key(|entry| entry.log_id.index);
-                    return Ok(entries);
+                    return Ok(merge_pending(entries, pending));
                 }
                 Err(error) if segment_gone(&error) && attempt < READ_ATTEMPTS => {
                     tracing::debug!(
@@ -356,6 +389,18 @@ impl RaftGroupFileLogStore {
             }
         }
     }
+}
+
+// A limited disk read may stop before the pending suffix. Return only the
+// consecutive prefix in that case; the replication reader asks for the rest.
+fn merge_pending(mut durable: Vec<Entry>, pending: Vec<Entry>) -> Vec<Entry> {
+    if let (Some(last), Some(first)) = (durable.last(), pending.first())
+        && last.log_id.index.checked_add(1) != Some(first.log_id.index)
+    {
+        return durable;
+    }
+    durable.extend(pending);
+    durable
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -485,9 +530,32 @@ impl RaftLogReader<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
         &mut self,
         range: RangeInclusive<LogIdOf<UrsulaRaftTypeConfig>>,
     ) -> Result<Vec<LogIdOf<UrsulaRaftTypeConfig>>, io::Error> {
-        Ok(self
+        let pending = lock(&self.pending);
+        let mut keys = self
             .lock_log()?
-            .key_log_ids(range.start().index, range.end().index))
+            .key_log_ids(range.start().index, range.end().index);
+        match &*pending {
+            PendingAppend::Failed(error) => return Err(error.clone().into()),
+            PendingAppend::Idle => {}
+            PendingAppend::Submitted(entries) => {
+                if let Some(first) = entries.first() {
+                    keys = self.lock_log()?.key_log_ids(
+                        range.start().index,
+                        range.end().index.min(first.log_id.index.saturating_sub(1)),
+                    );
+                    keys.retain(|key| key.index < first.log_id.index);
+                }
+                for entry in entries.iter().filter(|entry| {
+                    (range.start().index..=range.end().index).contains(&entry.log_id.index)
+                }) {
+                    match keys.last_mut() {
+                        Some(key) if key.leader_id == entry.log_id.leader_id => *key = entry.log_id,
+                        _ => keys.push(entry.log_id),
+                    }
+                }
+            }
+        }
+        Ok(keys)
     }
 }
 
@@ -495,10 +563,19 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<UrsulaRaftTypeConfig>, io::Error> {
+        let pending = lock(&self.pending);
         let log = self.lock_log()?;
+        let last_log_id = match &*pending {
+            PendingAppend::Idle => log.last_log_id(),
+            PendingAppend::Submitted(entries) => entries
+                .last()
+                .map(|entry| entry.log_id)
+                .or(log.last_log_id()),
+            PendingAppend::Failed(error) => return Err(error.clone().into()),
+        };
         Ok(LogState {
             last_purged_log_id: log.last_purged(),
-            last_log_id: log.last_log_id(),
+            last_log_id,
         })
     }
 
@@ -540,15 +617,53 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
         I::IntoIter: OptionalSend,
     {
         let entries = entries.into_iter().collect::<Vec<_>>();
-        let _order = self.write_order.lock().await;
-        if let Err(err) = self
-            .append_record(RaftGroupLogRecord::Append(entries))
-            .await
-        {
-            callback.io_completed(Err(err.clone().into()));
-            return Err(err.into());
+        let order = self.write_order.clone().lock_owned().await;
+        let record = RaftGroupLogRecord::Append(entries.clone());
+        self.lock_log()?.validate(&record)?;
+        if let PendingAppend::Failed(error) = &*lock(&self.pending) {
+            return Err(error.clone().into());
         }
-        callback.io_completed(Ok(()));
+        let store_log = self.store_log();
+        let first = store_log.first_entry();
+        let initializes = raft_group_log_record_initializes(&record);
+        let count = raft_group_log_record_count(&record);
+        *lock(&self.pending) = PendingAppend::Submitted(entries);
+        let pending = self.pending.clone();
+        let log_state = self.store_log.clone();
+        let metrics = self.metrics.clone();
+        let placement = self.placement;
+        self.core_writer.submit(
+            CoreWriteOp::Record {
+                record: CoreJournalRecord {
+                    group_id: self.placement.raft_group_id.0,
+                    record,
+                },
+                first,
+                log: self.log.clone(),
+            },
+            move |result| {
+                let _order = order;
+                match result {
+                    Ok(timing) => {
+                        if initializes && matches!(store_log, StoreLog::Empty(_)) {
+                            *lock(&log_state) = StoreLog::new(first);
+                        }
+                        metrics.record_wal_batch(placement, count, timing.write_ns, timing.sync_ns);
+                        metrics.record_wal_storage(placement, timing.storage);
+                        if let Some(memory) = timing.memory {
+                            metrics.record_wal_memory(placement, memory);
+                        }
+                        // The writer published the durable index before this callback.
+                        *lock(&pending) = PendingAppend::Idle;
+                        callback.io_completed(Ok(()));
+                    }
+                    Err(error) => {
+                        *lock(&pending) = PendingAppend::Failed(error.clone());
+                        callback.io_completed(Err(error.into()));
+                    }
+                }
+            },
+        );
         Ok(())
     }
 

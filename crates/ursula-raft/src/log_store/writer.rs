@@ -433,7 +433,18 @@ struct CoreFileLogWrite {
 }
 
 /// Where the writer answers one write.
-type WriteReply = oneshot::Sender<Result<CoreFileLogWriteTiming, CoreJournalError>>;
+type WriteResult = Result<CoreFileLogWriteTiming, CoreJournalError>;
+
+enum WriteReply {
+    Wait(oneshot::Sender<WriteResult>),
+    Flush(Box<dyn FnOnce(WriteResult) + Send>),
+}
+
+impl std::fmt::Debug for WriteReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WriteReply")
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum CoreWriteOp {
@@ -696,8 +707,39 @@ impl CoreFileLogWriter {
         op: CoreWriteOp,
     ) -> Result<CoreFileLogWriteTiming, CoreJournalError> {
         let (reply, response) = oneshot::channel();
-        self.send(CoreWriterRequest::Write(CoreFileLogWrite { op, reply }))?;
+        self.send(CoreWriterRequest::Write(CoreFileLogWrite {
+            op,
+            reply: WriteReply::Wait(reply),
+        }))?;
         response.await.map_err(|_dropped| self.stopped())?
+    }
+
+    /// Enqueues an append whose readable memory image is already published.
+    /// Completion belongs to the writer, so cancellation of the caller cannot
+    /// discard the durability notification or release mutation ordering early.
+    pub(crate) fn submit(
+        &self,
+        op: CoreWriteOp,
+        complete: impl FnOnce(WriteResult) + Send + 'static,
+    ) {
+        let request = CoreWriterRequest::Write(CoreFileLogWrite {
+            op,
+            reply: WriteReply::Flush(Box::new(complete)),
+        });
+        match &self.tx {
+            Some(tx) => {
+                if let Err(error) = tx.send(request)
+                    && let CoreWriterRequest::Write(request) = error.0
+                {
+                    request.reply(Err(self.stopped()));
+                }
+            }
+            None => {
+                if let CoreWriterRequest::Write(request) = request {
+                    request.reply(Err(self.stopped()));
+                }
+            }
+        }
     }
 
     /// Writes and `fsync`s everything sent before, then stops the writer.
@@ -1749,8 +1791,13 @@ fn reply_core_log_batch(
 }
 
 fn send_reply(reply: WriteReply, result: Result<CoreFileLogWriteTiming, CoreJournalError>) {
-    if reply.send(result).is_err() {
-        tracing::trace!("raft log append caller stopped waiting");
+    match reply {
+        WriteReply::Wait(reply) => {
+            if reply.send(result).is_err() {
+                tracing::trace!("raft log append caller stopped waiting");
+            }
+        }
+        WriteReply::Flush(complete) => complete(result),
     }
 }
 

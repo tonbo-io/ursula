@@ -1,14 +1,13 @@
 //! Local participation policy, independent of group registration and transport.
 use std::fmt;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 
 use ursula_shard::RaftGroupId;
 
 use crate::UrsulaRaftTypeConfig;
-use crate::registry::RaftGroupHandle;
+use crate::owner::OwnerRaftHandle;
 use crate::rejoin::GroupRejoin;
 
 pub type LeadershipShedFlag = Arc<AtomicU8>;
@@ -143,7 +142,6 @@ impl fmt::Display for LeadershipShedState {
 #[derive(Debug, Clone, Default)]
 pub struct ElectionPolicy {
     shed: LeadershipShedFlag,
-    refresh: Arc<Mutex<()>>,
 }
 
 impl ElectionPolicy {
@@ -175,12 +173,9 @@ impl ElectionPolicy {
         Ok(())
     }
 
-    pub(crate) fn refresh(&self, raft: &RaftGroupHandle, gate: Option<&GroupRejoin>) {
-        let _guard = self
-            .refresh
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        raft.runtime_config().elect(self.may_campaign(gate));
+    pub(crate) fn refresh(&self, raft: &OwnerRaftHandle, gate: Option<Arc<GroupRejoin>>) {
+        let policy = self.clone();
+        raft.elect(move || policy.may_campaign(gate.as_deref()));
     }
 }
 

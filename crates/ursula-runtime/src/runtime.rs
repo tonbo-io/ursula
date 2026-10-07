@@ -2071,6 +2071,28 @@ fn spawn_core_worker(threading: RuntimeThreading, worker: CoreWorker) -> Result<
             std::thread::Builder::new()
                 .name(format!("ursula-core-{}", core_id.0))
                 .spawn(move || {
+                    #[cfg(target_os = "linux")]
+                    if let Some(cpus) = core_affinity::get_core_ids() {
+                        // Respect the inherited cpuset; explicit oversubscription
+                        // maps workers round-robin onto the allowed CPUs.
+                        if let Some(cpu) = usize::from(core_id.0)
+                            .checked_rem(cpus.len())
+                            .and_then(|index| cpus.get(index))
+                        {
+                            if !core_affinity::set_for_current(*cpu) {
+                                tracing::warn!(
+                                    core_id = core_id.0,
+                                    cpu = cpu.id,
+                                    "could not set worker CPU affinity"
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            core_id = core_id.0,
+                            "could not discover allowed CPUs; worker is not pinned"
+                        );
+                    }
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()

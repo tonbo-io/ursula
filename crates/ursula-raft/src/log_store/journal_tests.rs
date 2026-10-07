@@ -197,9 +197,18 @@ impl Core {
 }
 
 async fn append(store: &mut Arc<RaftGroupFileLogStore>, entries: impl IntoIterator<Item = Entry>) {
+    use openraft::type_config::TypeConfigExt;
+    let (flushed, result) = UrsulaRaftTypeConfig::oneshot();
     store
-        .append(entries.into_iter().collect::<Vec<_>>(), IOFlushed::noop())
+        .append(
+            entries.into_iter().collect::<Vec<_>>(),
+            IOFlushed::signal(flushed),
+        )
         .await
+        .expect("submit entries");
+    result
+        .await
+        .expect("flush callback")
         .expect("append entries");
 }
 
@@ -1030,9 +1039,15 @@ async fn fsync_never_acknowledges_from_the_page_cache_and_close_syncs() {
     );
 
     writer.close().await.expect("close the writer");
-    let err = store
-        .append([blank_entry(3)], IOFlushed::noop())
+    use openraft::type_config::TypeConfigExt;
+    let (flushed, result) = UrsulaRaftTypeConfig::oneshot();
+    store
+        .append([blank_entry(3)], IOFlushed::signal(flushed))
         .await
+        .unwrap();
+    let err = result
+        .await
+        .unwrap()
         .expect_err("a closed writer refuses writes");
     assert!(matches!(
         err.get_ref()
@@ -1155,4 +1170,171 @@ async fn segment_reclaim_converges_at_production_size() {
     drop(writer);
     let writer = core.writer();
     assert_eq!(log_ids(&core.store(&writer, 1)).await, [1, 2, 3, 4]);
+}
+
+/// Hold the real writer between records. Append must publish readable entries
+/// without waiting for this writer, but cannot announce durability early.
+#[tokio::test]
+async fn append_is_readable_before_the_writer_runs_and_flush_orders_truncate() {
+    use openraft::type_config::TypeConfigExt;
+
+    use super::writer::CoreWriteOp;
+
+    let core = Core::new(JournalTuning::new(WalFsync::Always));
+    let writer = core.writer();
+    let mut store = core.store(&writer, 0);
+    let (entered, wait_entered) = tokio::sync::oneshot::channel();
+    let (release, wait_release) = std::sync::mpsc::channel::<()>();
+    // Dropping the sender releases the writer even if an assertion unwinds.
+    writer.submit(
+        CoreWriteOp::Vote {
+            group_id: 0,
+            vote: committed_vote(),
+        },
+        move |result| {
+            result.expect("initial vote");
+            entered.send(()).expect("test is waiting");
+            let _released = wait_release.recv();
+        },
+    );
+    wait_entered.await.expect("writer reached barrier");
+    let (flushed, mut flush_result) = UrsulaRaftTypeConfig::oneshot();
+    store
+        .append([blank_entry(1), blank_entry(2)], IOFlushed::signal(flushed))
+        .await
+        .expect("submit append");
+    assert!(matches!(
+        flush_result.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert_eq!(log_ids(&store).await, [1, 2]);
+    assert_eq!(
+        store
+            .try_get_log_entries(2..3)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.log_id.index)
+            .collect::<Vec<_>>(),
+        [2]
+    );
+    assert_eq!(
+        store.get_key_log_ids(log_id(2)..=log_id(2)).await.unwrap(),
+        [log_id(2)]
+    );
+    assert_eq!(
+        store.get_log_state().await.unwrap().last_log_id,
+        Some(log_id(2))
+    );
+    assert_eq!(
+        store.get_key_log_ids(log_id(1)..=log_id(2)).await.unwrap(),
+        [log_id(2)]
+    );
+    let mut truncating = store.clone();
+    let truncate = tokio::spawn(async move { truncating.truncate_after(Some(log_id(1))).await });
+    tokio::task::yield_now().await;
+    assert!(!truncate.is_finished());
+    drop(release);
+    flush_result
+        .await
+        .expect("callback delivered")
+        .expect("durable append");
+    truncate.await.unwrap().unwrap();
+    assert_eq!(log_ids(&store).await, [1]);
+    writer.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use openraft::BasicNode;
+    use openraft::rt::WatchReceiver;
+
+    use super::writer::CoreWriteOp;
+    use crate::InProcessRaftNetworkFactory;
+    use crate::InProcessRaftRegistry;
+    use crate::RaftGroupEngine;
+
+    let cores = (0..3)
+        .map(|_| Core::new(JournalTuning::new(WalFsync::Always)))
+        .collect::<Vec<_>>();
+    let writers = cores.iter().map(Core::writer).collect::<Vec<_>>();
+    let network = InProcessRaftRegistry::default();
+    let config = Arc::new(
+        openraft::Config {
+            enable_tick: false,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap(),
+    );
+    let mut engines = Vec::new();
+    let mut members = BTreeMap::new();
+    for (index, (core, writer)) in cores.iter().zip(&writers).enumerate() {
+        let id = u64::try_from(index).unwrap().saturating_add(1);
+        members.insert(id, BasicNode::new(format!("node-{id}")));
+        let engine = RaftGroupEngine::new_node_with_log_store_and_network(
+            placement(0),
+            id,
+            config.clone(),
+            InProcessRaftNetworkFactory::new(network.clone()).with_source(id),
+            core.store(writer, 0),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        network.register(id, engine.raft_handle());
+        engines.push(engine);
+    }
+    let leader = engines[0].raft_handle();
+    leader.initialize(members).await.unwrap();
+    leader.trigger().elect().await.unwrap();
+    leader
+        .wait(Some(Duration::from_secs(5)))
+        .current_leader(1, "leader elected")
+        .await
+        .unwrap();
+    leader
+        .client_write(GroupWriteCommand::Stream(StreamCommand::CreateBucket {
+            bucket_id: "before-pause".into(),
+        }))
+        .await
+        .unwrap();
+    let before = leader.metrics().borrow_watched().last_log_index;
+    let vote = leader.metrics().borrow_watched().vote;
+    let (entered, wait_entered) = tokio::sync::oneshot::channel();
+    let (release, wait_release) = std::sync::mpsc::channel::<()>();
+    writers[0].submit(CoreWriteOp::Vote { group_id: 0, vote }, move |result| {
+        result.unwrap();
+        entered.send(()).unwrap();
+        let _released = wait_release.recv();
+    });
+    wait_entered.await.unwrap();
+    let writing = leader.clone();
+    let append = tokio::spawn(async move {
+        writing
+            .client_write(GroupWriteCommand::Stream(StreamCommand::CreateBucket {
+                bucket_id: "during-pause".into(),
+            }))
+            .await
+    });
+    // This times out with the synchronous append implementation: Replicate
+    // cannot run until log_store.append returns.
+    engines[1]
+        .raft_handle()
+        .wait(Some(Duration::from_secs(2)))
+        .metrics(
+            |metrics| metrics.last_log_index > before,
+            "replication overlaps local WAL I/O",
+        )
+        .await
+        .unwrap();
+    drop(release);
+    append.await.unwrap().unwrap();
+    for engine in engines {
+        engine.shutdown().await.unwrap();
+    }
 }

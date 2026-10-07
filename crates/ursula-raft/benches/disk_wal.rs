@@ -14,9 +14,9 @@ use openraft::LogId;
 use openraft::alias::EntryOf;
 use openraft::alias::LogIdOf;
 use openraft::entry::RaftEntry;
-use openraft::storage::IOFlushed;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
+use openraft::storage::RaftLogStorageExt;
 use openraft::vote::RaftLeaderId;
 use openraft::vote::leader_id_adv::CommittedLeaderId;
 use tempfile::TempDir;
@@ -252,12 +252,14 @@ fn warm_up(stores: &[BenchStore]) {
                             async move {
                                 let entry = entry(1, group_id, 256);
                                 match &mut store {
-                                    BenchStore::Ursula(store) => {
-                                        store.append([entry], IOFlushed::noop()).await
-                                    }
-                                    BenchStore::Upstream(store) => {
-                                        store.append_durable(vec![entry]).await
-                                    }
+                                    BenchStore::Ursula(store) => store
+                                        .blocking_append([entry])
+                                        .await
+                                        .map_err(anyhow::Error::from),
+                                    BenchStore::Upstream(store) => store
+                                        .append_durable(vec![entry])
+                                        .await
+                                        .map_err(anyhow::Error::from),
                                 }
                             }
                         },
@@ -301,7 +303,7 @@ async fn append_waves(
                     );
                     match &mut store {
                         BenchStore::Ursula(store) => {
-                            store.append([entry], IOFlushed::noop()).await?;
+                            store.blocking_append([entry]).await?;
                             if save_committed {
                                 store.save_committed(Some(log_id(index))).await?;
                             }
@@ -373,7 +375,7 @@ async fn prepare_recovery_journal(entries: usize, payload_size: usize) -> TempDi
         })
         .collect::<Vec<_>>();
     store
-        .append(batch, IOFlushed::noop())
+        .blocking_append(batch)
         .await
         .expect("prepare recovery benchmark WAL");
     drop(store);
@@ -400,7 +402,7 @@ async fn prepare_read_store(
         })
         .collect::<Vec<_>>();
     store
-        .append(batch, IOFlushed::noop())
+        .blocking_append(batch)
         .await
         .expect("prepare read benchmark WAL");
     (dir, store)

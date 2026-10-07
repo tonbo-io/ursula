@@ -119,6 +119,7 @@ pub use command::GroupSnapshot;
 pub use command::GroupWriteCommand;
 pub use engine::GroupAckColdGcFuture;
 pub use engine::GroupAdvanceRetentionFuture;
+pub use engine::GroupAppendBatchFuture;
 pub use engine::GroupAppendFuture;
 pub use engine::GroupBootstrapStreamFuture;
 pub use engine::GroupBucketUsageFuture;

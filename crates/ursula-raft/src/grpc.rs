@@ -77,9 +77,13 @@ fn reply_to<T>(tx: oneshot::Sender<T>, value: T) {
 
 pub(crate) static GRPC_LEADER_CHANNELS: OnceLock<Mutex<BTreeMap<String, Channel>>> =
     OnceLock::new();
-static GRPC_RAFT_CHANNELS: OnceLock<Mutex<BTreeMap<String, SharedRaftChannel>>> = OnceLock::new();
-static GRPC_APPEND_SESSIONS: OnceLock<Mutex<BTreeMap<String, SharedAppendSession>>> =
-    OnceLock::new();
+/// Shared only by groups constructed on one owner core. Connections and
+/// encoders are created by that core, never by a process-wide first caller.
+#[derive(Debug, Default)]
+pub(crate) struct CoreRaftTransport {
+    channels: Mutex<BTreeMap<String, SharedRaftChannel>>,
+    sessions: Mutex<BTreeMap<String, SharedAppendSession>>,
+}
 static GRPC_APPEND_STREAM_SESSIONS_OPENED: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_SESSION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_REQUESTS: AtomicU64 = AtomicU64::new(0);
@@ -273,18 +277,36 @@ pub(crate) async fn probe_rejoin_vote_barrier(
     ))
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct SharedRaftChannel {
     generation: u64,
     channel: Channel,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct SharedAppendSession {
+    _task: Arc<AppendSessionTask>,
     sender: mpsc::UnboundedSender<AppendStreamCall>,
     /// Bytes of Append calls this session may hold before they reach the HTTP/2 encoder
     /// ([`RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES`]).
     budget: Arc<Semaphore>,
+}
+
+#[derive(Debug)]
+enum AppendSessionTask {
+    Running(tokio::task::JoinHandle<()>),
+    #[cfg(test)]
+    Paused,
+}
+
+impl Drop for AppendSessionTask {
+    fn drop(&mut self) {
+        match self {
+            Self::Running(task) => task.abort(),
+            #[cfg(test)]
+            Self::Paused => {}
+        }
+    }
 }
 
 struct AppendStreamCall {
@@ -800,8 +822,10 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 .map(|payload| decode_wire(&payload, "group command"))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
-            let results = write_commands_on_raft(raft, commands)
+            let results = raft
+                .call(move |raft| async move { write_commands_on_raft(raft, commands).await })
                 .await
+                .map_err(|err| tonic::Status::unavailable(err.to_string()))?
                 .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
             let results = results
                 .into_iter()
@@ -904,52 +928,60 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 .registry
                 .read_barrier(placement.raft_group_id)
                 .ok_or_else(|| tonic::Status::not_found("raft group is not registered"))?;
-            let mut engine = RaftGroupEngine {
-                recovery_tasks: crate::rejoin::RecoveryGate::default(),
-                raft,
-                placement,
-                read_barrier,
-                cold_store: self.cold_store.clone(),
-                // The group's shared page cache (bounded-state F13), which
-                // apply-time invalidation reaches; a request-scoped cache only
-                // when none was registered.
-                cold_index_cache: self
-                    .registry
-                    .cold_index_cache(placement.raft_group_id)
-                    .or_else(|| {
-                        self.cold_store.as_ref().map(|cold_store| {
-                            Arc::new(ColdIndexPageCache::new(
-                                Arc::new(ColdStoreColdIndexPageStore::new(cold_store.clone())),
-                                1024,
-                            ))
-                        })
-                    }),
-            };
-            let stream_id = BucketStreamId::new(request.bucket_id, request.stream_id);
-            let result = match required(request.read, "group_read.read")
-                .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?
-            {
-                raft_internal_proto::group_read_request_v1::Read::Head(head) => engine
-                    .head_stream(
-                        head_stream_request_from_v1(stream_id, request.now_ms, head),
-                        placement,
-                    )
-                    .await
-                    .map(|response| raft_internal_proto::GroupReadResponseV1 {
-                        ok: true,
-                        payload: encode_wire(&response),
-                    }),
-                raft_internal_proto::group_read_request_v1::Read::ReadStream(read) => {
-                    let read = read_stream_request_from_v1(stream_id, request.now_ms, read)
-                        .map_err(tonic::Status::invalid_argument)?;
-                    engine.read_stream(read, placement).await.map(|response| {
-                        raft_internal_proto::GroupReadResponseV1 {
-                            ok: true,
-                            payload: encode_wire(&response),
-                        }
+            let cold_store = self.cold_store.clone();
+            let cold_index_cache = self
+                .registry
+                .cold_index_cache(placement.raft_group_id)
+                .or_else(|| {
+                    cold_store.as_ref().map(|cold_store| {
+                        Arc::new(ColdIndexPageCache::new(
+                            Arc::new(ColdStoreColdIndexPageStore::new(cold_store.clone())),
+                            1024,
+                        ))
                     })
-                }
-            };
+                });
+            let result = raft
+                .call(move |raft| async move {
+                    let mut engine = RaftGroupEngine {
+                        recovery_tasks: crate::rejoin::RecoveryGate::default(),
+                        raft,
+                        placement,
+                        read_barrier,
+                        cold_store,
+                        // The group's shared page cache (bounded-state F13), which
+                        // apply-time invalidation reaches; a request-scoped cache only
+                        // when none was registered.
+                        cold_index_cache,
+                    };
+                    let stream_id = BucketStreamId::new(request.bucket_id, request.stream_id);
+                    let result = match required(request.read, "group_read.read")
+                        .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?
+                    {
+                        raft_internal_proto::group_read_request_v1::Read::Head(head) => engine
+                            .head_stream(
+                                head_stream_request_from_v1(stream_id, request.now_ms, head),
+                                placement,
+                            )
+                            .await
+                            .map(|response| raft_internal_proto::GroupReadResponseV1 {
+                                ok: true,
+                                payload: encode_wire(&response),
+                            }),
+                        raft_internal_proto::group_read_request_v1::Read::ReadStream(read) => {
+                            let read = read_stream_request_from_v1(stream_id, request.now_ms, read)
+                                .map_err(tonic::Status::invalid_argument)?;
+                            engine.read_stream(read, placement).await.map(|response| {
+                                raft_internal_proto::GroupReadResponseV1 {
+                                    ok: true,
+                                    payload: encode_wire(&response),
+                                }
+                            })
+                        }
+                    };
+                    Ok::<_, tonic::Status>(result)
+                })
+                .await
+                .map_err(|err| tonic::Status::unavailable(err.to_string()))??;
             let response = match result {
                 Ok(response) => response,
                 Err(err) => raft_internal_proto::GroupReadResponseV1 {
@@ -1041,6 +1073,7 @@ pub(crate) fn validate_grpc_metadata(protocol_version: u32) -> Result<(), GrpcRp
 
 #[derive(Debug, Clone)]
 pub struct GrpcRaftNetworkFactory {
+    transport: Arc<CoreRaftTransport>,
     raft_group_id: RaftGroupId,
     reconnect_threshold: u32,
     rejoin: Option<Arc<GroupRejoin>>,
@@ -1049,10 +1082,16 @@ pub struct GrpcRaftNetworkFactory {
 impl GrpcRaftNetworkFactory {
     pub fn new(raft_group_id: RaftGroupId) -> Self {
         Self {
+            transport: Arc::default(),
             raft_group_id,
             reconnect_threshold: 8,
             rejoin: None,
         }
+    }
+
+    pub(crate) fn with_transport(mut self, transport: Arc<CoreRaftTransport>) -> Self {
+        self.transport = transport;
+        self
     }
 
     pub fn with_reconnect_threshold(mut self, threshold: u32) -> Self {
@@ -1072,7 +1111,8 @@ impl RaftNetworkFactory<UrsulaRaftTypeConfig> for GrpcRaftNetworkFactory {
     type Network = GrpcRaftNetwork;
 
     async fn new_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
-        let mut network = GrpcRaftNetwork::with_threshold(
+        let mut network = GrpcRaftNetwork::with_transport(
+            self.transport.clone(),
             self.raft_group_id,
             target,
             node.addr.clone(),
@@ -1085,6 +1125,7 @@ impl RaftNetworkFactory<UrsulaRaftTypeConfig> for GrpcRaftNetworkFactory {
 
 #[derive(Clone)]
 pub struct GrpcRaftNetwork {
+    transport: Arc<CoreRaftTransport>,
     raft_group_id: RaftGroupId,
     target: u64,
     endpoint: String,
@@ -1092,7 +1133,7 @@ pub struct GrpcRaftNetwork {
     channel_generation: u64,
     /// Streak of consecutive RPC failures on this channel. Reset to 0 on the
     /// next successful RPC. When it crosses `reconnect_threshold` we replace
-    /// the process-wide HTTP/2 channel generation — tonic's `connect_lazy`
+    /// the owner-core HTTP/2 channel generation — tonic's `connect_lazy`
     /// keeps a stuck channel forever otherwise (the TCP socket stays open, the
     /// HTTP/2 streams stay borked, no auto-heal).
     consecutive_failures: u32,
@@ -1124,12 +1165,29 @@ impl GrpcRaftNetwork {
         address: impl Into<String>,
         reconnect_threshold: u32,
     ) -> Self {
+        Self::with_transport(
+            Arc::default(),
+            raft_group_id,
+            target,
+            address,
+            reconnect_threshold,
+        )
+    }
+
+    fn with_transport(
+        transport: Arc<CoreRaftTransport>,
+        raft_group_id: RaftGroupId,
+        target: u64,
+        address: impl Into<String>,
+        reconnect_threshold: u32,
+    ) -> Self {
         let endpoint = normalize_grpc_endpoint(address.into());
-        let (client, channel_generation) = shared_raft_client(&endpoint, None);
+        let (client, channel_generation) = shared_raft_client(&transport, &endpoint, None);
         Self {
             raft_group_id,
             target,
             endpoint,
+            transport,
             client,
             channel_generation,
             consecutive_failures: 0,
@@ -1160,8 +1218,11 @@ impl GrpcRaftNetwork {
                 self.consecutive_failures,
                 route,
             );
-            let (client, generation) =
-                shared_raft_client(&self.endpoint, Some(self.channel_generation));
+            let (client, generation) = shared_raft_client(
+                &self.transport,
+                &self.endpoint,
+                Some(self.channel_generation),
+            );
             self.client = client;
             self.channel_generation = generation;
             self.consecutive_failures = 0;
@@ -1277,8 +1338,8 @@ impl GrpcRaftNetwork {
         let client = self
             .client()
             .map_err(|err| tonic::Status::unavailable(err.to_string()))?;
-        let session =
-            shared_append_session(&self.endpoint, client).map_err(tonic::Status::unavailable)?;
+        let session = shared_append_session(&self.transport, &self.endpoint, client)
+            .map_err(tonic::Status::unavailable)?;
         let charge = append_budget_charge(
             envelope.encoded_len(),
             RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES,
@@ -1382,7 +1443,7 @@ fn raft_client(channel: Channel) -> RaftClient {
         .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
 }
 
-/// Return the process-wide HTTP/2 channel for a Raft peer.
+/// Return the owner-core HTTP/2 channel for a Raft peer.
 ///
 /// OpenRaft constructs one network client per group and peer. Without this
 /// pool, every group creates its own TCP connection even though tonic channels
@@ -1391,8 +1452,9 @@ fn raft_client(channel: Channel) -> RaftClient {
 /// `observed_generation` is `None` for a new group, which always adopts the
 /// current shared channel. A reconnect passes the generation it was using: if
 /// another group has already replaced that generation, it adopts the newer
-/// channel; otherwise it performs exactly one process-wide replacement.
+/// channel; otherwise it performs exactly one replacement within this core.
 fn shared_raft_client(
+    transport: &CoreRaftTransport,
     endpoint: &str,
     observed_generation: Option<u64>,
 ) -> (Result<RaftClient, String>, u64) {
@@ -1405,7 +1467,7 @@ fn shared_raft_client(
             );
         }
     };
-    let channels = GRPC_RAFT_CHANNELS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let channels = &transport.channels;
     let mut channels = match channels.lock() {
         Ok(channels) => channels,
         Err(err) => {
@@ -1442,10 +1504,11 @@ fn shared_raft_client(
 /// another on nearly every Append call. A live stream is already proof that
 /// its underlying channel works; replace it only after its sender closes.
 fn shared_append_session(
+    transport: &CoreRaftTransport,
     endpoint: &str,
     client: RaftClient,
 ) -> Result<SharedAppendSession, String> {
-    let sessions = GRPC_APPEND_SESSIONS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let sessions = &transport.sessions;
     let mut sessions = sessions
         .lock()
         .map_err(|err| format!("raft append session pool lock poisoned for {endpoint}: {err}"))?;
@@ -1456,8 +1519,9 @@ fn shared_append_session(
     }
 
     let (sender, receiver) = mpsc::unbounded_channel();
-    tokio::spawn(run_append_session(client, receiver));
+    let task = tokio::spawn(run_append_session(client, receiver));
     let session = SharedAppendSession {
+        _task: Arc::new(AppendSessionTask::Running(task)),
         sender,
         budget: Arc::new(Semaphore::new(RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES)),
     };
@@ -1493,6 +1557,26 @@ fn collect_append_stream_frame(
 }
 
 type PendingAppend = oneshot::Sender<Result<raft_internal_proto::RaftRpcAckV1, tonic::Status>>;
+
+#[derive(Default)]
+struct PendingAppends(BTreeMap<u64, PendingAppend>);
+
+impl std::ops::Deref for PendingAppends {
+    type Target = BTreeMap<u64, PendingAppend>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for PendingAppends {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for PendingAppends {
+    fn drop(&mut self) {
+        GRPC_APPEND_STREAM_INFLIGHT.fetch_sub(self.len() as u64, Ordering::Relaxed);
+    }
+}
 
 /// One request frame on its way to the encoder, with the queue budget its calls hold until the
 /// encoder takes it.
@@ -1535,7 +1619,7 @@ async fn run_append_session(
     };
 
     let mut wire_sender = Some(wire_sender);
-    let mut pending = BTreeMap::<u64, PendingAppend>::new();
+    let mut pending = PendingAppends::default();
     let mut next_request_id = 1_u64;
     let mut accepting = true;
     let mut last_progress = tokio::time::Instant::now();
@@ -1673,7 +1757,7 @@ async fn run_append_session(
 
     let abandoned = pending.len() as u64;
     GRPC_APPEND_STREAM_INFLIGHT.fetch_sub(abandoned, Ordering::Relaxed);
-    for (_, response) in pending {
+    for (_, response) in std::mem::take(&mut pending.0) {
         reply_to(
             response,
             Err(tonic::Status::unavailable(
@@ -1793,6 +1877,15 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
 
 #[cfg(test)]
 mod reconnect_tests {
+    fn test_network(
+        transport: Arc<CoreRaftTransport>,
+        group: RaftGroupId,
+        target: u64,
+        address: impl Into<String>,
+    ) -> GrpcRaftNetwork {
+        GrpcRaftNetwork::with_transport(transport, group, target, address, 8)
+    }
+
     use std::collections::BTreeSet;
     use std::time::Duration;
 
@@ -1807,17 +1900,38 @@ mod reconnect_tests {
 
     use super::*;
 
-    fn remove_shared_channel(endpoint: &str) {
-        if let Ok(mut channels) = GRPC_RAFT_CHANNELS
-            .get_or_init(|| Mutex::new(BTreeMap::new()))
-            .lock()
-        {
+    #[tokio::test]
+    async fn different_owner_pools_never_share_peer_sessions_or_channels() {
+        let a = CoreRaftTransport::default();
+        let b = CoreRaftTransport::default();
+        let endpoint = "http://127.0.0.1:9";
+        let (client_a, _) = shared_raft_client(&a, endpoint, None);
+        let (client_b, _) = shared_raft_client(&b, endpoint, None);
+        let first = shared_append_session(&a, endpoint, client_a.clone().unwrap()).unwrap();
+        let same = shared_append_session(&a, endpoint, client_a.unwrap()).unwrap();
+        let other = shared_append_session(&b, endpoint, client_b.unwrap()).unwrap();
+        assert!(first.sender.same_channel(&same.sender));
+        assert!(!first.sender.same_channel(&other.sender));
+        assert!(!Arc::ptr_eq(&first.budget, &other.budget));
+        shared_raft_client(&a, endpoint, Some(1)).0.unwrap();
+        assert_eq!(a.channels.lock().unwrap()[endpoint].generation, 2);
+        assert_eq!(b.channels.lock().unwrap()[endpoint].generation, 1);
+    }
+
+    fn remove_shared_channel(transport: &CoreRaftTransport, endpoint: &str) {
+        if let Ok(mut channels) = transport.channels.lock() {
             channels.remove(endpoint);
         }
     }
 
     fn fresh_network(threshold: u32) -> GrpcRaftNetwork {
-        let mut net = GrpcRaftNetwork::new(RaftGroupId(0), 2, "http://127.0.0.1:9999");
+        let transport = Arc::new(CoreRaftTransport::default());
+        let mut net = test_network(
+            transport.clone(),
+            RaftGroupId(0),
+            2,
+            "http://127.0.0.1:9999",
+        );
         // Override threshold so tests don't depend on the env var
         net.reconnect_threshold = threshold;
         net
@@ -1948,18 +2062,20 @@ mod reconnect_tests {
     /// calls fail fast as backpressure, and backpressure does not count toward a channel rebuild.
     #[tokio::test]
     async fn stalled_peer_append_queue_is_bounded_by_its_byte_budget() {
+        let transport = Arc::new(CoreRaftTransport::default());
         let endpoint = "http://127.0.0.1:9".to_owned();
         let (sender, _stalled_receiver) = mpsc::unbounded_channel();
         let budget = Arc::new(Semaphore::new(RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES));
-        GRPC_APPEND_SESSIONS
-            .get_or_init(|| Mutex::new(BTreeMap::new()))
+        transport
+            .sessions
             .lock()
             .expect("append session pool lock")
             .insert(endpoint.clone(), SharedAppendSession {
+                _task: Arc::new(AppendSessionTask::Paused),
                 sender,
                 budget: budget.clone(),
             });
-        let mut network = GrpcRaftNetwork::new(RaftGroupId(1), 2, endpoint.clone());
+        let mut network = test_network(transport.clone(), RaftGroupId(1), 2, endpoint.clone());
         let entry_bytes = 1024 * 1024;
         let envelope = || raft_internal_proto::RaftRpcEnvelopeV1 {
             raft_group_id: 1,
@@ -1996,8 +2112,8 @@ mod reconnect_tests {
             .expect_err("still backlogged");
         assert!(matches!(error, RPCError::Unreachable(_)));
         assert_eq!(network.consecutive_failures, failures_before);
-        GRPC_APPEND_SESSIONS
-            .get_or_init(|| Mutex::new(BTreeMap::new()))
+        transport
+            .sessions
             .lock()
             .expect("append session pool lock")
             .remove(&endpoint);
@@ -2007,14 +2123,16 @@ mod reconnect_tests {
     /// before later small calls, which must not overtake it.
     #[tokio::test]
     async fn large_append_is_not_starved_by_later_small_calls() {
+        let transport = Arc::new(CoreRaftTransport::default());
         let endpoint = "http://127.0.0.1:10".to_owned();
         let (sender, _stalled_receiver) = mpsc::unbounded_channel();
         let budget = Arc::new(Semaphore::new(RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES));
-        GRPC_APPEND_SESSIONS
-            .get_or_init(|| Mutex::new(BTreeMap::new()))
+        transport
+            .sessions
             .lock()
             .expect("append session pool lock")
             .insert(endpoint.clone(), SharedAppendSession {
+                _task: Arc::new(AppendSessionTask::Paused),
                 sender,
                 budget: budget.clone(),
             });
@@ -2031,7 +2149,7 @@ mod reconnect_tests {
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
             payload: vec![7_u8; bytes].into(),
         };
-        let large = GrpcRaftNetwork::new(RaftGroupId(1), 2, endpoint.clone());
+        let large = test_network(transport.clone(), RaftGroupId(1), 2, endpoint.clone());
         let large = tokio::spawn(async move {
             large
                 .try_append_stream(envelope(1, 2 * mib), RPCOption::new(Duration::from_secs(2)))
@@ -2040,7 +2158,7 @@ mod reconnect_tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Budget is free for a small call, but the large one is ahead of it.
-        let small = GrpcRaftNetwork::new(RaftGroupId(2), 2, endpoint.clone())
+        let small = test_network(transport.clone(), RaftGroupId(2), 2, endpoint.clone())
             .try_append_stream(envelope(2, 16), RPCOption::new(Duration::from_millis(50)))
             .await
             .expect_err("the small call waits behind the large one");
@@ -2054,8 +2172,8 @@ mod reconnect_tests {
             large.expect_err("stalled peer").code(),
             tonic::Code::DeadlineExceeded
         );
-        GRPC_APPEND_SESSIONS
-            .get_or_init(|| Mutex::new(BTreeMap::new()))
+        transport
+            .sessions
             .lock()
             .expect("append session pool lock")
             .remove(&endpoint);
@@ -2113,8 +2231,9 @@ mod reconnect_tests {
 
     #[tokio::test]
     async fn append_stream_client_coalesces_concurrent_group_calls() {
+        let transport = Arc::new(CoreRaftTransport::default());
         let (endpoint, _registry, server) = spawn_append_stream_server().await;
-        remove_shared_channel(&endpoint);
+        remove_shared_channel(&transport, &endpoint);
         let batch_frames_before = GRPC_APPEND_STREAM_BATCH_FRAMES.load(Ordering::Relaxed);
         let envelope = |raft_group_id| raft_internal_proto::RaftRpcEnvelopeV1 {
             raft_group_id,
@@ -2123,7 +2242,12 @@ mod reconnect_tests {
             payload: Vec::new().into(),
         };
         let calls = (1..=16).map(|raft_group_id| {
-            let network = GrpcRaftNetwork::new(RaftGroupId(raft_group_id), 2, endpoint.clone());
+            let network = test_network(
+                transport.clone(),
+                RaftGroupId(raft_group_id),
+                2,
+                endpoint.clone(),
+            );
             async move {
                 network
                     .try_append_stream(
@@ -2153,11 +2277,12 @@ mod reconnect_tests {
 
     #[tokio::test]
     async fn groups_share_one_append_stream_and_receive_independent_errors() {
+        let transport = Arc::new(CoreRaftTransport::default());
         let (endpoint, _registry, server) = spawn_append_stream_server().await;
-        remove_shared_channel(&endpoint);
+        remove_shared_channel(&transport, &endpoint);
 
-        let mut first = GrpcRaftNetwork::new(RaftGroupId(1), 2, endpoint.clone());
-        let second = GrpcRaftNetwork::new(RaftGroupId(2), 2, endpoint.clone());
+        let mut first = test_network(transport.clone(), RaftGroupId(1), 2, endpoint.clone());
+        let second = test_network(transport.clone(), RaftGroupId(2), 2, endpoint.clone());
         let envelope = |raft_group_id| raft_internal_proto::RaftRpcEnvelopeV1 {
             raft_group_id,
             node_id: 2,
@@ -2180,16 +2305,16 @@ mod reconnect_tests {
                 .code(),
             tonic::Code::NotFound
         );
-        let shared_session_open = GRPC_APPEND_SESSIONS
-            .get_or_init(|| Mutex::new(BTreeMap::new()))
+        let shared_session_open = transport
+            .sessions
             .lock()
             .expect("append session pool lock")
             .get(&endpoint)
             .is_some_and(|session| !session.sender.is_closed());
         assert!(shared_session_open);
 
-        let original_sender = GRPC_APPEND_SESSIONS
-            .get_or_init(|| Mutex::new(BTreeMap::new()))
+        let original_sender = transport
+            .sessions
             .lock()
             .expect("append session pool lock")
             .get(&endpoint)
@@ -2208,8 +2333,8 @@ mod reconnect_tests {
             result.expect_err("missing group should still fail").code(),
             tonic::Code::NotFound
         );
-        let replacement_sender = GRPC_APPEND_SESSIONS
-            .get_or_init(|| Mutex::new(BTreeMap::new()))
+        let replacement_sender = transport
+            .sessions
             .lock()
             .expect("append session pool lock")
             .get(&endpoint)
@@ -2275,15 +2400,16 @@ mod reconnect_tests {
 
     #[tokio::test]
     async fn networks_share_one_channel_generation_per_endpoint() {
+        let transport = Arc::new(CoreRaftTransport::default());
         let endpoint = "http://127.0.0.1:32197";
-        remove_shared_channel(endpoint);
-        let first = GrpcRaftNetwork::new(RaftGroupId(1), 2, endpoint);
-        let second = GrpcRaftNetwork::new(RaftGroupId(2), 2, endpoint);
+        remove_shared_channel(&transport, endpoint);
+        let first = test_network(transport.clone(), RaftGroupId(1), 2, endpoint);
+        let second = test_network(transport.clone(), RaftGroupId(2), 2, endpoint);
 
         assert_eq!(first.channel_generation, 1);
         assert_eq!(second.channel_generation, first.channel_generation);
-        let channel_count = GRPC_RAFT_CHANNELS
-            .get_or_init(|| Mutex::new(BTreeMap::new()))
+        let channel_count = transport
+            .channels
             .lock()
             .ok()
             .map(|channels| usize::from(channels.contains_key(endpoint)));
@@ -2292,10 +2418,13 @@ mod reconnect_tests {
 
     #[tokio::test]
     async fn stale_network_adopts_rebuilt_generation_without_replacing_it_again() {
+        let transport = Arc::new(CoreRaftTransport::default());
         let endpoint = "http://127.0.0.1:32198";
-        remove_shared_channel(endpoint);
-        let mut first = GrpcRaftNetwork::with_threshold(RaftGroupId(1), 2, endpoint, 1);
-        let mut stale = GrpcRaftNetwork::with_threshold(RaftGroupId(2), 2, endpoint, 1);
+        remove_shared_channel(&transport, endpoint);
+        let mut first =
+            GrpcRaftNetwork::with_transport(transport.clone(), RaftGroupId(1), 2, endpoint, 1);
+        let mut stale =
+            GrpcRaftNetwork::with_transport(transport.clone(), RaftGroupId(2), 2, endpoint, 1);
         let original_generation = first.channel_generation;
 
         first.note_failure("Append");
@@ -2306,8 +2435,8 @@ mod reconnect_tests {
 
         stale.note_failure("Append");
         assert_eq!(stale.channel_generation, first.channel_generation);
-        let pooled_generation = GRPC_RAFT_CHANNELS
-            .get_or_init(|| Mutex::new(BTreeMap::new()))
+        let pooled_generation = transport
+            .channels
             .lock()
             .ok()
             .and_then(|channels| channels.get(endpoint).map(|shared| shared.generation));
@@ -2331,12 +2460,13 @@ mod reconnect_tests {
 
     #[tokio::test]
     async fn rebuild_path_does_not_panic_even_on_unparseable_endpoint() {
+        let transport = Arc::new(CoreRaftTransport::default());
         // tonic accepts a lot of textually-weird endpoints (e.g. "not-a-url"
         // gets normalized to "http://not-a-url" and parses fine; it just
         // fails on connect). Force a real `from_shared` rejection with a
         // genuinely-invalid URI — the rebuild path must surface that as a
         // permanent Err on `client`, not panic, so openraft keeps retrying.
-        let mut net = GrpcRaftNetwork::new(RaftGroupId(0), 2, "http://");
+        let mut net = test_network(transport.clone(), RaftGroupId(0), 2, "http://");
         net.reconnect_threshold = 2;
         net.note_failure("Append");
         net.note_failure("Append");

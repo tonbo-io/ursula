@@ -84,7 +84,7 @@ It establishes these contracts:
 - public callers submit append-shaped commands through `ShardRuntime`;
 - `BucketStreamId` is mapped through `StaticShardMap` to one `CoreId` and one `RaftGroupId`;
 - each core actor owns group placement and dispatches commands for local groups;
-- each touched Raft group is represented by a core-local `GroupEngine` protected by a per-group async mutex, so one group can wait on I/O without forcing the core dispatcher to stop receiving commands for other groups;
+- each touched Raft group is represented by a core-local `GroupEngine` driven by its own mailbox, so one group can wait on I/O without stopping other groups;
 - stream offsets advance only inside the owning actor;
 - runtime metrics expose accepted appends, successful state mutations, routed requests, mutation apply time, mailbox send wait, and mailbox-full events per core/group without a hot-path process-wide accepted counter.
 
@@ -116,7 +116,7 @@ Runtime writes are represented by `GroupWriteCommand`, a serializable group-leve
 
 `RaftGroupStateMachine` applies committed OpenRaft entries through `InMemoryGroupEngine::apply_committed_write`. The adapter can build and install OpenRaft snapshots backed by `GroupSnapshot` bytes, and the unit tests now prove a single-node OpenRaft group can initialize, elect itself, apply create/append writes through `client_write`, and recover those writes after reopening the file log. `RaftGroupEngine` also has a constructor path that accepts an injected `RaftNetworkFactory`; the focused three-node in-process test uses that path to exercise real OpenRaft Vote and AppendEntries replication and then reads the replicated Durable Streams payload from all three state machines. `ShardRuntime::warm_group` can instantiate a group engine on the owning core without using a stream mutation as the trigger, and `RegisteredRaftGroupEngineFactory` can put the resulting runtime-owned `Raft` handle into a `RaftGroupHandleRegistry` keyed by `RaftGroupId`. That registry is the local dispatch boundary a cross-process Raft RPC layer needs before it can serve AppendEntries, Vote, or full-snapshot messages for groups that have not yet received client traffic on the follower node. `router_with_raft_registry` wires that registry into an internal tonic gRPC service mounted on the same Axum listener as the public HTTP API. Vote, AppendEntries, and full-snapshot transfer use typed `RaftInternal` protobuf messages for OpenRaft votes, log ids, log entries, membership, snapshot metadata, and responses. The durable application command schema itself is not a private Raft transport schema; it is the shared `ursula-proto` schema embedded inside those Raft protobuf records. `GrpcRaftNetworkFactory` and `GrpcRaftNetwork` implement the outbound OpenRaft network trait for those RPCs. `StaticGrpcRaftGroupEngineFactory` wires that network into runtime-owned group construction with a static peer map and carries the configured cold store into each group's state machine. The cross-router test starts three Ursula HTTP routers, warms four groups on each node, initializes node 1 with three voters for every group, writes streams placed on all four groups through node 1, and waits until the replicated payloads are readable from every runtime.
 
-AppendEntries transport is multiplexed process-wide per peer. Every group's independent AppendEntries request enters one long-lived bidirectional gRPC stream. The sender drains calls that are already queued into a ZSTD-compressed frame of at most 32 items; it adds no batching delay. Each item keeps a transport-local request id and receives an independent result, so one group does not inherit another group's ordering, commit index, or acknowledgement. Vote and snapshot traffic remain unary. The 0.4 client has one AppendStream path and carries no legacy single-item frame, capability probe, or unary fallback state. Its request and response item lists retain the 0.3.32 batch field numbers, which lets a new client use the same batched wire shape with an old server; the unary Append server method covers the reverse old-client-to-new-server direction during the graceful rollout.
+AppendEntries transport is multiplexed per owner core and peer. Groups on the same core share one long-lived bidirectional gRPC stream and HTTP/2 channel per peer; different cores use independent pools, queues and encoders. The sender drains calls that are already queued into a ZSTD-compressed frame of at most 32 items; it adds no batching delay. Each item keeps a transport-local request id and receives an independent result, so one group does not inherit another group's ordering, commit index, or acknowledgement. Vote and snapshot traffic remain unary. The 0.4 client has one AppendStream path and carries no legacy single-item frame, capability probe, or unary fallback state. Its request and response item lists retain the 0.3.32 batch field numbers, which lets a new client use the same batched wire shape with an old server; the unary Append server method covers the reverse old-client-to-new-server direction during the graceful rollout.
 
 `ursula` now exposes this static cluster shape through the typed config file: `raft.node_id`, `[[raft.peers]]`, `raft.wal.path`, and `raft.init_membership` / `raft.init_membership_per_group`. It warms every group at startup so followers can receive Raft RPCs before client traffic touches those groups, and serves the registered Raft gRPC routes in the production binary. OpenRaft `ForwardToLeader` is preserved as a structured `GroupLeaderHint`, and public write requests that land on followers now return a `307` redirect to the known leader instead of having the follower proxy the body over node-to-node HTTP. Full snapshots use the same gRPC transport. A short EC2 smoke has also run the static cluster shape across three `c7g.4xlarge` nodes with a `c7gn.8xlarge` client and S3 cold storage enabled using the current gRPC internal Raft transport. The smoke verified follower leader redirects, a leader write that committed through gRPC quorum replication, background S3 flush, and S3-backed post-flush readback. The official Durable Streams conformance suite also passed against this EC2 static gRPC shape from the `c7gn.8xlarge` client. The next missing pieces are dynamic/reconfigurable membership and long-running `perf_compare` with S3 cold path enabled. A later EC2 smoke also covered the same static gRPC shape with independent durable OpenRaft log roots plus real S3 cold storage, then restarted all nodes without reinitializing membership and read the cold-backed stream through a restarted follower. Another EC2 smoke covered a restarted late learner: node 1 snapshotted and purged a two-voter durable-log/S3 cluster, node 3 started from an empty durable log root, node 1 added it as a learner, node 3 installed snapshot index 4 through gRPC full-snapshot transfer, and node 3 served the restored cold-backed stream. The local automatic snapshot path is now covered by `openraft_installs_snapshot_for_lagging_learner`, which forces a purged leader to catch up a newly added learner through `RaftNetworkV2::full_snapshot`. That test also fixed the state-machine snapshot retention bug that made leader-side snapshot transfer fail after a successful snapshot build. `static_grpc_raft_installs_snapshot_for_late_learner_over_tcp` extends that coverage to local TCP routers by writing through the leader HTTP API and reading the restored stream through the late learner's HTTP endpoint after gRPC snapshot installation.
 
@@ -201,3 +201,46 @@ This matters for the migration because lagging-follower and restart-level tests 
 - No cross-stream transactions.
 - No immediate monoio rewrite of axum/tonic code.
 - No migration of all current operational workers before ownership boundaries are stable.
+
+## Owner-core execution and WAL submission
+
+Production group construction runs on the owning current-thread runtime. The
+shared registry publishes immutable routing snapshots and `OwnerRaftHandle`
+mailboxes, not raw Raft handles. Protocol RPCs, forwarded reads/writes and admin
+triggers execute through these mailboxes. ReadIndex confirmation also runs on its
+owner. Read-only metric receivers may cross threads. Mailbox jobs run concurrently:
+a proposal waiting for quorum must not block an incoming vote or AppendEntries.
+Inbound append routing takes no process-wide registry mutex.
+
+Each core's transport pool owns its peer connections and append sessions. Session
+backpressure remains byte-bounded per core/peer, so the aggregate node budget can
+be core_count times the former per-peer budget. Groups on the same core still
+share that peer's queue and flow control. No wire protocol change is required.
+
+Ordinary append actors drain up to 32 already-queued appends and 1 MiB of
+payload, stopping at the first non-append command and adding no batching delay.
+An individually larger request is submitted alone. The Raft engine checks
+admission with conservative reservations for the accepted burst and submits the
+commands together. Responses and non-append operations preserve mailbox order.
+Cold metadata mutations retain their serialized preparation/commit boundary.
+
+The log store exposes one pending, readable append batch per group and returns
+before its journal writer performs disk I/O. The writer invokes `IOFlushed` only
+after writing, applying the durable log index and satisfying the configured sync
+policy. Subsequent log mutations wait for that callback, and errors poison the
+pending state. Readers merge the pending suffix with the durable index. This
+allows replication of a new batch to overlap local WAL I/O without an unbounded
+pending-log cache. `blocking_append` is used by durable WAL measurements.
+
+Linux owner threads attempt CPU affinity within their inherited allowed cpuset;
+explicit oversubscription wraps over those CPUs. Affinity failures are logged.
+Other platforms retain one OS thread per owner without physical CPU affinity.
+Each active core journal still uses a dedicated blocking writer. The main Tokio
+runtime and its blocking pool are additional threads; total process threads are
+not equal to runtime.core_count.
+
+DST validates ordering and failure semantics with hosted tasks and simulated disk.
+It cannot validate physical CPU placement, cache-line contention or multicore
+throughput. Real-thread owner dispatch tests and delayed-writer tests cover those
+execution boundaries locally; throughput scaling still requires a multicore
+cluster benchmark and per-thread profiles.

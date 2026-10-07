@@ -4754,8 +4754,9 @@ async fn startup_maintenance_drain_disables_groups_registered_after_the_fence() 
         node.registry
             .get(RaftGroupId(0))
             .expect("other peer group")
-            .runtime_config()
-            .tick(false);
+            .set_tick(false)
+            .await
+            .expect("disable peer ticker on owner");
     }
     // Capture before shutdown: an unfenced follower can start its election
     // while we are awaiting the two peers' shutdown acknowledgements.
