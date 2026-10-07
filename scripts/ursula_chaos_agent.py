@@ -16,6 +16,7 @@ import json
 import os
 import random
 import re
+import signal
 import ssl
 import subprocess
 import sys
@@ -519,6 +520,13 @@ class ChaosAgent:
         self.rollover_in_progress = False
         self.rollover_forced_with_unknown_appends = False
         self.active_append_count = 0
+        self.stop_event = threading.Event()
+        self.stop_reason: str | None = None
+        self.stop_requested_at: float | None = None
+        self.total_run_secs = max(0.0, args.total_run_secs)
+        self.shutdown_drain_secs = max(0.0, args.shutdown_drain_secs)
+        self.managed_threads: list[threading.Thread] = []
+        self.thread_lock = threading.Lock()
         self.run_id = self.workload_run_id(self.run_generation)
         self.streams = self.build_workload_streams(self.run_id)
         self.producer_probe_stream = WorkloadStream(f"{self.run_id}-producer-probe")
@@ -837,12 +845,16 @@ class ChaosAgent:
         headers: dict[str, str] | None = None,
         timeout_secs: float | None = None,
     ) -> tuple[int, bytes, dict[str, str]]:
+        if self.stopping():
+            raise RuntimeError("chaos workload stopping; no new HTTP request")
         timeout = self.timeout_secs if timeout_secs is None else timeout_secs
         # A write/read that lands on a non-leader is answered with a 307 to the
         # leader. urllib does NOT auto-follow 307/308 for non-GET/HEAD methods,
         # so follow it explicitly here, preserving method + body, up to a few
         # hops (leadership can move mid-flight).
         for _hop in range(4):
+            if self.stopping():
+                raise RuntimeError("chaos workload stopping during redirect")
             request = urllib.request.Request(
                 url, data=body, method=method, headers=headers or {}
             )
@@ -1127,7 +1139,7 @@ class ChaosAgent:
 
     def append_once(self, lane_id: int | None = None) -> bool:
         with self.state_lock:
-            if self.rollover_in_progress:
+            if self.rollover_in_progress or self.stopping():
                 return False
             self.active_append_count += 1
         started = time.perf_counter()
@@ -1179,6 +1191,9 @@ class ChaosAgent:
                 payload = pending_payload
                 payload_size = len(payload)
                 payload_kind = "pending"
+            # Keep the identity before the HTTP call so a malformed response,
+            # exception or drain timeout cannot silently erase an unknown write.
+            stream.pending_producer_appends.setdefault(pending_key, payload)
         first_node = attempt_id % len(self.nodes)
         last_error = "no target nodes"
         saw_cold_backpressure = False
@@ -1186,7 +1201,7 @@ class ChaosAgent:
         saw_transient_failure = False
         producer_seq_conflict: tuple[int, int] | None = None
         retry_deadline = time.monotonic() + APPEND_TRANSIENT_RETRY_SECS
-        while True:
+        while not self.stopping():
             retryable_sweep = False
             for attempt in range(len(self.nodes)):
                 node = self.nodes[(first_node + attempt) % len(self.nodes)]
@@ -1277,7 +1292,12 @@ class ChaosAgent:
         # is a clean pre-commit rejection: the record definitively did not
         # commit, so the append is resolved (not unknown) and is recorded as a
         # shed rather than a workload error.
-        is_pure_shed = saw_cold_backpressure and not saw_hard_error and not saw_transient_failure
+        is_pure_shed = (
+            pending_payload is None
+            and saw_cold_backpressure
+            and not saw_hard_error
+            and not saw_transient_failure
+        )
         if producer_seq_conflict is not None:
             expected_seq, received_seq = producer_seq_conflict
             if self.recover_producer_seq_conflict(
@@ -1296,6 +1316,7 @@ class ChaosAgent:
                 return False
         with self.state_lock:
             if is_pure_shed:
+                stream.pending_producer_appends.pop(pending_key, None)
                 self.append_shed += 1
                 self.last_append_shed_error = last_error
                 if lane_id is None:
@@ -2255,7 +2276,7 @@ class ChaosAgent:
                 time.sleep(5)
 
     def create_streams_until_ready(self) -> None:
-        while True:
+        while not self.stopping():
             self.recover_stopped_nodes_on_startup()
             try:
                 self.create_streams()
@@ -2266,6 +2287,8 @@ class ChaosAgent:
                 time.sleep(max(5, min(30, self.status_every)))
 
     def maybe_inject_fault(self) -> None:
+        if self.stopping():
+            return
         now = utc_now()
         if self.disable_faults:
             return
@@ -2531,6 +2554,8 @@ class ChaosAgent:
         return [random.choice(self.nodes)]
 
     def apply_fault_scenario(self, scenario: str, targets: list[Node]) -> None:
+        if self.stopping():
+            return
         if scenario in {"clean_stop", "mixed_stop", "rolling_restart", "pod_delete"}:
             # Kubernetes recreates a deleted pod at once, so there is no
             # stopped state to wait for.
@@ -3560,6 +3585,112 @@ class ChaosAgent:
                     timeout_secs=self.aws_timeout_secs,
                 )
 
+    def stopping(self) -> bool:
+        event = getattr(self, "stop_event", None)
+        return event is not None and event.is_set()
+
+    def request_stop(self, reason: str) -> None:
+        # Signal handlers run on the supervisor, never while it holds state_lock.
+        if not self.stop_event.is_set():
+            self.stop_reason = reason
+            self.stop_requested_at = time.monotonic()
+            self.stop_event.set()
+
+    def start_managed_thread(self, target: Any, name: str, args: tuple = ()) -> None:
+        with self.thread_lock:
+            if self.stopping():
+                return
+            thread = threading.Thread(target=target, args=args, name=name, daemon=True)
+            self.managed_threads.append(thread)
+            thread.start()
+
+    def finish_run(self) -> dict[str, Any]:
+        """Bounded drain; no remote reads or status publication lock on this path."""
+        deadline = (self.stop_requested_at or time.monotonic()) + self.shutdown_drain_secs
+        with self.thread_lock:
+            threads = list(self.managed_threads)
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        unfinished = [thread.name for thread in threads if thread.is_alive()]
+        # Keep the previous topology/health sample, explicitly timestamped there;
+        # final append counters below are captured after the drain deadline.
+        try:
+            status = json.loads(self.status_file.read_text())
+        except (OSError, ValueError):
+            status = {"schema_version": 1}
+        if not isinstance(status, dict):
+            status = {"schema_version": 1}
+        with self.state_lock:
+            unresolved = [
+                {"stream": stream.name, "producer_key": key, "payload_bytes": len(payload)}
+                for stream in self.streams
+                for key, payload in stream.pending_producer_appends.items()
+            ]
+            status.setdefault("workload", {}).update({
+                "append_attempt_total": self.append_attempts,
+                "append_success_total": self.append_success,
+                "append_error_total": self.append_errors,
+                "append_shed_total": self.append_shed,
+                "reader_success_total": self.reader_success,
+                "reader_error_total": self.reader_errors,
+                "active_append_count": self.active_append_count,
+                "append_latency": {
+                    "scope": "logical workload append including retries; cumulative histogram",
+                    "success": append_latency_summary(self.append_latency_success),
+                    "failed_or_shed": append_latency_summary(self.append_latency_failed),
+                },
+            })
+            status.setdefault("integrity", {}).update({
+                "verified_offsets": self.verified_offsets,
+                "mismatch_count": self.mismatch_count,
+                "read_availability_error_count": self.read_availability_errors,
+                "verify_counts": dict(self.verify_counts),
+                "verify_errors": dict(self.verify_errors),
+            })
+            status["final"] = {
+                "reason": self.stop_reason,
+                "captured_at": iso(utc_now()),
+                "drain_timeout_secs": self.shutdown_drain_secs,
+                "drain_completed": not unfinished,
+                "unfinished_threads": unfinished,
+                "inflight_appends_outcome_unknown": self.active_append_count,
+                "unresolved_producer_appends": unresolved,
+                "unresolved_append_lanes": [lane for lane, unknown in enumerate(self.lane_unresolved_appends) if unknown],
+                "unresolved_single_append": self.global_unresolved_append,
+                "previous_rollover_had_unknown_appends": self.rollover_forced_with_unknown_appends,
+                "active_fault": self.active_fault_label(),
+                "active_injection_id": self.active_injection_id,
+            }
+        # A timed-out daemon publisher may still finish later. Its writes can
+        # never overwrite this separate authoritative final artifact.
+        final_path = self.status_file.with_suffix(".final.json")
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = final_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(status, indent=2, sort_keys=True) + "\n")
+        temporary.replace(final_path)
+        print(json.dumps({"final_status_file": str(final_path), "final_status": status}), flush=True)
+        return status
+
+    def run_until_stopped(self) -> dict[str, Any]:
+        errors: list[Exception] = []
+        def workload() -> None:
+            try:
+                self.run_forever()
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+                self.request_stop("workload_error")
+            finally:
+                if not self.stopping():
+                    self.request_stop("workload_completed")
+        self.start_managed_thread(workload, "workload")
+        timeout = self.total_run_secs if self.total_run_secs > 0 else None
+        if not self.stop_event.wait(timeout):
+            self.request_stop("total_run_duration")
+        status = self.finish_run()
+        if errors:
+            raise errors[0]
+        return status
+
     def run_forever(self) -> None:
         self.event("info", "chaos agent started")
         if self.append_workers > 1:
@@ -3572,7 +3703,7 @@ class ChaosAgent:
             return
         last_status = 0.0
         interval = 1.0 / max(1, self.append_per_second)
-        while True:
+        while not self.stopping():
             loop_started = time.monotonic()
             self.maybe_inject_fault()
             self.maybe_rollover_workload_streams()
@@ -3597,11 +3728,11 @@ class ChaosAgent:
                 last_status = loop_started
             elapsed = time.monotonic() - loop_started
             if elapsed < interval:
-                time.sleep(interval - elapsed)
+                self.stop_event.wait(interval - elapsed)
 
     def append_worker_loop(self, lane_id: int) -> None:
         interval = self.append_workers / max(1, self.append_per_second)
-        while True:
+        while not self.stopping():
             loop_started = time.monotonic()
             try:
                 self.append_once(lane_id=lane_id)
@@ -3611,7 +3742,7 @@ class ChaosAgent:
                 self.event("warn", f"append lane {lane_id} error: {exc}")
             elapsed = time.monotonic() - loop_started
             if elapsed < interval:
-                time.sleep(interval - elapsed)
+                self.stop_event.wait(interval - elapsed)
 
     def control_loop(self) -> None:
         # Fault management + status publishing on a dedicated thread, decoupled
@@ -3621,7 +3752,7 @@ class ChaosAgent:
         # mid-fault and read as "ops 0" even while workers keep committing. Here
         # status always refreshes on cadence and recovery is detected promptly.
         last_status = 0.0
-        while True:
+        while not self.stopping():
             loop_started = time.monotonic()
             try:
                 self.maybe_inject_fault()
@@ -3630,30 +3761,24 @@ class ChaosAgent:
                     last_status = loop_started
             except Exception as exc:  # noqa: BLE001
                 self.event("warn", f"control loop error: {exc}")
-            time.sleep(1.0)
+            self.stop_event.wait(1.0)
 
     def start_control_loop(self) -> None:
         if self.control_thread_started:
             return
-        threading.Thread(target=self.control_loop, name="control", daemon=True).start()
+        self.start_managed_thread(self.control_loop, "control")
         self.control_thread_started = True
 
     def run_forever_with_append_workers(self) -> None:
         for lane_id in range(self.append_workers):
-            worker = threading.Thread(
-                target=self.append_worker_loop,
-                args=(lane_id,),
-                name=f"append-lane-{lane_id}",
-                daemon=True,
-            )
-            worker.start()
+            self.start_managed_thread(self.append_worker_loop, f"append-lane-{lane_id}", (lane_id,))
         self.start_control_loop()
         self.event("info", f"{self.append_workers} append lanes started")
 
         last_verified_success = 0
         last_read_probe_success = 0
         last_producer_probe_success = 0
-        while True:
+        while not self.stopping():
             # Probe loop: integrity/read/producer verification + GC churn. These
             # may block against an impaired node, but they no longer gate fault
             # management or status publishing (those run on control_loop).
@@ -3688,7 +3813,7 @@ class ChaosAgent:
                     self.last_gc_churn_success = append_success
             except Exception as exc:  # noqa: BLE001
                 self.event("warn", f"probe loop tick error: {exc}")
-            time.sleep(0.2)
+            self.stop_event.wait(0.2)
 
 
 def parse_node(raw: str) -> Node:
@@ -3739,6 +3864,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--workload-stream-ttl-secs", type=int, default=7200,
                         help="server-side TTL for main workload streams (0 disables)")
+    parser.add_argument("--total-run-secs", type=float, default=0,
+                        help="total process run duration; 0 keeps running continuously")
+    parser.add_argument("--shutdown-drain-secs", type=float, default=30,
+                        help="maximum shared deadline to join in-flight work on stop")
     parser.add_argument("--workload-run-secs", type=int, default=3600,
                         help="seconds before rotating to a fresh workload stream set (0 disables)")
     parser.add_argument("--append-per-second", type=int, default=20)
@@ -3806,9 +3935,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     agent = ChaosAgent(build_parser().parse_args())
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, lambda received, _frame: agent.request_stop(signal.Signals(received).name))
     try:
-        agent.run_forever()
+        agent.run_until_stopped()
     except KeyboardInterrupt:
+        agent.request_stop("SIGINT")
+        agent.finish_run()
         return 130
     except Exception as exc:  # noqa: BLE001
         print(f"fatal: {exc}", file=sys.stderr)

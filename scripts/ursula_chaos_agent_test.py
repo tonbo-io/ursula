@@ -3,6 +3,8 @@ import json
 import subprocess
 import tempfile
 import threading
+import time
+import sys
 import unittest
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -12,6 +14,7 @@ from unittest.mock import patch
 from ursula_chaos_agent import (
     APPEND_LATENCY_BOUNDS_MS,
     append_latency_summary,
+    build_parser,
     CATCH_UP_RECOVERY_SLO_SECS,
     IMPAIRMENT_SCENARIOS,
     NODE_SERVICE_UNIT,
@@ -672,6 +675,149 @@ class ChaosAgentStateTest(unittest.TestCase):
         self.assertEqual(sum(agent.append_latency_failed), 1)
         self.assertEqual(sum(agent.append_latency_success), 0)
 
+
+
+class ChaosAgentShutdownTest(unittest.TestCase):
+    def agent(self, root: str, *, duration: float = 0.02, drain: float = 0.2) -> ChaosAgent:
+        args = build_parser().parse_args([
+            "--node", "n1=i-test=http://unused", "--disable-faults",
+            "--status-file", str(Path(root) / "status.json"),
+            "--total-run-secs", str(duration), "--shutdown-drain-secs", str(drain),
+        ])
+        with patch.object(ChaosAgent, "restore_published_state"):
+            return ChaosAgent(args)
+
+    def test_duration_drains_inflight_append_and_keeps_final_latency(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            agent = self.agent(root)
+            entered = threading.Event()
+            def complete(_lane):
+                entered.set()
+                agent.stop_event.wait()
+                with agent.state_lock:
+                    agent.append_success += 1
+                return True
+            agent._append_once_active = complete
+            def workload():
+                agent.start_managed_thread(lambda: agent.append_once(0), "append")
+                self.assertTrue(entered.wait(1))
+                agent.stop_event.wait()
+            agent.run_forever = workload
+            with patch("builtins.print"):
+                status = agent.run_until_stopped()
+            self.assertEqual(status["final"]["reason"], "total_run_duration")
+            self.assertTrue(status["final"]["drain_completed"])
+            self.assertEqual(status["workload"]["append_success_total"], 1)
+            self.assertEqual(status["workload"]["append_latency"]["success"]["count"], 1)
+            self.assertEqual(status["final"]["inflight_appends_outcome_unknown"], 0)
+            self.assertTrue(all(not thread.is_alive() for thread in agent.managed_threads))
+
+    def test_drain_deadline_labels_unknown_and_final_file_cannot_change_later(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            agent = self.agent(root, drain=0.01)
+            entered, release = threading.Event(), threading.Event()
+            def stuck(_lane):
+                entered.set()
+                release.wait(2)
+                return True
+            agent._append_once_active = stuck
+            def workload():
+                agent.start_managed_thread(lambda: agent.append_once(0), "stuck-append")
+                self.assertTrue(entered.wait(1))
+                agent.stop_event.wait()
+            agent.run_forever = workload
+            try:
+                started = time.monotonic()
+                with patch("builtins.print"):
+                    status = agent.run_until_stopped()
+                self.assertLess(time.monotonic() - started, 1)
+                self.assertFalse(status["final"]["drain_completed"])
+                self.assertEqual(status["final"]["inflight_appends_outcome_unknown"], 1)
+                artifact = Path(root) / "status.final.json"
+                frozen = artifact.read_bytes()
+            finally:
+                release.set()
+                for thread in agent.managed_threads:
+                    thread.join(1)
+            self.assertEqual(artifact.read_bytes(), frozen)
+
+    def test_stop_prevents_new_work_and_retains_malformed_ack_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            agent = self.agent(root)
+            with patch.object(agent, "request", return_value=(200, b"", {})):
+                with self.assertRaisesRegex(RuntimeError, "missing stream-next-offset"):
+                    agent.append_once(0)
+            agent.request_stop("test")
+            with patch.object(agent, "_append_once_active") as append:
+                self.assertFalse(agent.append_once(0))
+                append.assert_not_called()
+            with patch("urllib.request.urlopen") as request:
+                with self.assertRaisesRegex(RuntimeError, "stopping"):
+                    agent.request("GET", "http://unused")
+                request.assert_not_called()
+            with patch.object(agent, "fault_injection_readiness") as readiness:
+                agent.maybe_inject_fault()
+                readiness.assert_not_called()
+            with patch("builtins.print"):
+                status = agent.finish_run()
+            self.assertEqual(len(status["final"]["unresolved_producer_appends"]), 1)
+            self.assertEqual(status["workload"]["append_latency"]["failed_or_shed"]["count"], 1)
+
+    def test_main_handles_sigterm_and_writes_final_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            code = """import os, signal, sys
+import ursula_chaos_agent as c
+def workload(self):
+    os.kill(os.getpid(), signal.SIGTERM)
+    self.stop_event.wait(1)
+c.ChaosAgent.run_forever = workload
+sys.argv = ['agent', '--node', 'n1=i-test=http://unused', '--disable-faults', '--status-file', sys.argv[1]]
+raise SystemExit(c.main())
+"""
+            completed = subprocess.run(
+                [sys.executable, "-c", code, str(Path(root) / "status.json")],
+                cwd=Path(__file__).parent, capture_output=True, text=True, timeout=5,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            status = json.loads((Path(root) / "status.final.json").read_text())
+            self.assertEqual(status["final"]["reason"], "SIGTERM")
+            self.assertTrue(status["final"]["drain_completed"])
+
+    def test_backpressure_retry_does_not_resolve_an_earlier_unknown_append(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            agent = self.agent(root)
+            with patch.object(agent, "request", return_value=(200, b"", {})):
+                with self.assertRaises(RuntimeError):
+                    agent.append_once(0)
+            with patch.object(agent, "request", return_value=(503, b"ColdBackpressure", {})):
+                self.assertFalse(agent.append_once(0))
+            self.assertEqual(agent.append_shed, 0)
+            self.assertTrue(any(stream.pending_producer_appends for stream in agent.streams))
+            agent.request_stop("test")
+            with patch("builtins.print"):
+                status = agent.finish_run()
+            self.assertEqual(len(status["final"]["unresolved_producer_appends"]), 1)
+
+    def test_stop_records_active_fault_without_claiming_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            agent = self.agent(root)
+            agent.active_fault = {
+                "scenario": "pod_delete", "targets": agent.nodes,
+                "recover_at": datetime.now(timezone.utc), "cleanup": "automatic_recreate",
+            }
+            agent.active_injection_id = 9
+            agent.request_stop("test")
+            with patch.object(agent, "stop_instances") as stop:
+                agent.apply_fault_scenario("pod_delete", agent.nodes)
+                stop.assert_not_called()
+            with patch("builtins.print"):
+                status = agent.finish_run()
+            self.assertEqual(status["final"]["active_injection_id"], 9)
+            self.assertIn("pod_delete on n1", status["final"]["active_fault"])
+            json.loads((Path(root) / "status.final.json").read_text())
+
+    def test_default_duration_preserves_continuous_runs(self) -> None:
+        self.assertEqual(build_parser().parse_args([]).total_run_secs, 0)
 
 if __name__ == "__main__":
     unittest.main()

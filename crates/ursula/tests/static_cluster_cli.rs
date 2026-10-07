@@ -605,7 +605,7 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
         .zip(1_u64..)
         .map(|(port, node_id)| (node_id, format!("http://127.0.0.1:{port}")))
         .collect();
-    let initial_peers = peers[..2].to_vec();
+    let meta_ports = [free_port(), free_port(), free_port()];
     let root = std::env::temp_dir().join(format!(
         "ursula-cli-durable-late-learner-{}-{}",
         std::process::id(),
@@ -625,17 +625,17 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
         ports[0],
         1,
         1,
-        &initial_peers,
+        &peers,
         true,
         &root.join("node-1-log"),
     );
     let node1_admin = format!("http://127.0.0.1:{node1_admin_port}");
-    write_cluster_config(
+    let node2_admin_port = write_cluster_config(
         &node2_config,
         ports[1],
         2,
         1,
-        &initial_peers,
+        &peers,
         false,
         &root.join("node-2-log"),
     );
@@ -649,9 +649,29 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
         &root.join("node-3-log"),
     );
 
+    // Every process joins meta genesis, but node3 initially owns no data group.
+    // Its data replica is admitted only by the later durable Move intent.
+    for (index, config) in [&node1_config, &node2_config, &node3_config]
+        .iter()
+        .enumerate()
+    {
+        let mut contents = std::fs::read_to_string(config)
+            .unwrap()
+            .replace("meta = { enabled = false }\n", "")
+            .replace("flush_interval = \"1s\"", "flush_interval = \"1h\"");
+        contents.push_str(&format!("\n[[raft.groups]]\nraft_group_id = 0\nvoters = [1, 2]\n\n[raft.meta]\nenabled = true\nlisten = \"127.0.0.1:{}\"\n", meta_ports[index]));
+        for (peer_index, port) in meta_ports.iter().enumerate() {
+            let id = peer_index.saturating_add(1);
+            contents.push_str(&format!(
+                "\n[[raft.meta.peers]]\nnode_id = {id}\nurl = \"http://127.0.0.1:{port}\"\n"
+            ));
+        }
+        std::fs::write(config, contents).unwrap();
+    }
     let mut children = vec![
         spawn_node_with_cluster_config(binary, &node2_config),
         spawn_node_with_cluster_config(binary, &node1_config),
+        spawn_node_with_cluster_config(binary, &node3_config),
     ];
 
     let client = reqwest::Client::new();
@@ -702,33 +722,100 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
     .expect("trigger leader purge");
     assert_eq!(purge.status(), reqwest::StatusCode::OK);
 
-    children.push(spawn_node_with_cluster_config(binary, &node3_config));
-    wait_until_ready(&client, &peers[2].1, &mut children).await;
-
-    let add_learner = admin_test_post(
+    // Purge the other original owner too, so leadership movement cannot let
+    // the target catch up solely through retained logs instead of a snapshot.
+    let node2_admin = format!("http://127.0.0.1:{node2_admin_port}");
+    let snapshot2 = admin_test_post(&client, format!("{node2_admin}/__ursula/raft/0/snapshot"))
+        .await
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snapshot2.status(), reqwest::StatusCode::OK);
+    let purge2 = admin_test_post(
         &client,
-        format!(
-            "{node1_admin}/__ursula/raft/0/learners/3?addr={}",
-            peers[2].1
-        ),
+        format!("{node2_admin}/__ursula/raft/0/purge?upto={snapshot_index}"),
     )
     .await
     .send()
     .await
-    .expect("add late learner");
-    assert_eq!(add_learner.status(), reqwest::StatusCode::OK);
-
-    wait_metrics_contains(
-        &client,
-        &peers[2].1,
-        &format!("\"snapshot_index\":{snapshot_index}"),
-    )
-    .await;
-    wait_metrics_contains_all(&client, &peers[2].1, &[
-        format!("\"snapshot_index\":{snapshot_index}"),
-        "\"learner_ids\":[3]".to_owned(),
-    ])
-    .await;
+    .unwrap();
+    assert_eq!(purge2.status(), reqwest::StatusCode::OK);
+    wait_until_ready(&client, &peers[2].1, &mut children).await;
+    let before: ursula_proto::admin::NodeMetrics = client
+        .get(format!("{}/__ursula/metrics", peers[2].1))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        before.raft_groups.is_empty(),
+        "target must begin with no data replica"
+    );
+    let begin = admin_test_post(&client, format!("{node1_admin}/__ursula/control/operation"))
+        .await
+        .json(&ursula_control::OperationRequest::Begin {
+            kind: ursula_control::OperationKind::MoveReplicas {
+                source: 2,
+                target: 3,
+                groups: std::collections::BTreeSet::from([ursula_shard::RaftGroupId(0)]),
+            },
+            executor: ursula_proto::admin::ProcessIncarnation::from_bits(42),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(begin.status(), reqwest::StatusCode::OK);
+    let response: ursula_control::ControlResponse = begin.json().await.unwrap();
+    let ursula_control::ControlResponse::Operation(Ok(ursula_control::OperationOutcome::Acquired(
+        token,
+    ))) = response
+    else {
+        panic!("expected Move admission: {response:?}")
+    };
+    for request in [
+        ursula_control::OperationRequest::Reconcile {
+            token: token.clone(),
+        },
+        ursula_control::OperationRequest::CollectEvidence {
+            token: token.clone(),
+        },
+        ursula_control::OperationRequest::Complete { token },
+    ] {
+        let response =
+            admin_test_post(&client, format!("{node1_admin}/__ursula/control/operation"))
+                .await
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK, "{request:?}: {body}");
+        assert!(
+            matches!(
+                serde_json::from_str::<ursula_control::ControlResponse>(&body).unwrap(),
+                ursula_control::ControlResponse::Operation(Ok(_))
+            ),
+            "{body}"
+        );
+    }
+    let after: ursula_proto::admin::NodeMetrics = client
+        .get(format!("{}/__ursula/metrics", peers[2].1))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let group = after
+        .raft_groups
+        .iter()
+        .find(|group| group.raft_group_id == 0)
+        .unwrap();
+    assert!(group.has_snapshot && group.snapshot_index >= Some(snapshot_index));
+    assert_eq!(group.voter_ids, vec![1, 3]);
 
     let late_payload = read_until_replicated(
         &client,
@@ -1614,48 +1701,6 @@ async fn read_until_matches(client: &reqwest::Client, url: &str, expected: &[u8]
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("replicated payload at {url} did not converge: {last:?}");
-}
-
-async fn wait_metrics_contains(client: &reqwest::Client, base_url: &str, needle: &str) -> String {
-    let mut last = String::new();
-    for _ in 0..100 {
-        if let Ok(response) = client
-            .get(format!("{base_url}/__ursula/metrics"))
-            .send()
-            .await
-            && response.status().is_success()
-        {
-            last = response.text().await.expect("metrics body");
-            if last.contains(needle) {
-                return last;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("metrics from {base_url} did not contain {needle}: {last}");
-}
-
-async fn wait_metrics_contains_all(
-    client: &reqwest::Client,
-    base_url: &str,
-    needles: &[String],
-) -> String {
-    let mut last = String::new();
-    for _ in 0..100 {
-        if let Ok(response) = client
-            .get(format!("{base_url}/__ursula/metrics"))
-            .send()
-            .await
-            && response.status().is_success()
-        {
-            last = response.text().await.expect("metrics body");
-            if needles.iter().all(|needle| last.contains(needle)) {
-                return last;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("metrics from {base_url} did not contain all {needles:?}: {last}");
 }
 
 async fn flush_stream_until_cold_hot_bytes_zero(
