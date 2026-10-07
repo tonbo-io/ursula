@@ -237,13 +237,18 @@ jobs:
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
             external_locators_survive producer_state_matches --nocapture
 
-      # Memory-WAL rejoin (0.6.2): a minority restarted empty heals itself to
-      # a voter while writes continue; a majority restarted empty stops writes
-      # without losing an acknowledged one until the operator adopts the
-      # survivor.
-      - name: Run memory-WAL rejoin scenarios
+      # Recovery gate: a replica that may have lost acknowledged entries (a
+      # memory-WAL restart, a disk-WAL power loss under fsync = never) votes
+      # only after it applied a fresh leader barrier, the leader rebuilds or
+      # rewinds it, and a group whose majority is gated stops until the
+      # operator accepts the loss of the unsynced tail. A few seeds each; DST
+      # Nightly sweeps larger ranges.
+      - name: Run recovery-gate scenarios
+        env:
+          RECOVERY_GATE_SEEDS: "1..=3"
         run: |
-          RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- memory_wal_ --nocapture
+          RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
+            memory_wal_ recovery_tests --nocapture
 
       - name: Verify expected-failure replay and minimization
         run: |

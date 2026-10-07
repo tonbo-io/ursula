@@ -12,6 +12,8 @@ use super::*;
 
 #[path = "disk_tests.rs"]
 mod disk_tests;
+#[path = "recovery_tests.rs"]
+mod recovery_tests;
 #[path = "recovery_wiring.rs"]
 mod recovery_wiring;
 
