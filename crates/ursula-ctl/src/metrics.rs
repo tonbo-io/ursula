@@ -45,25 +45,40 @@ impl MetricsClient {
         node: &NodeInfo,
         request: &ursula_control::OperationRequest,
     ) -> Result<ursula_control::ControlResponse> {
-        let url = node.admin_url.join("/__ursula/control/operation")?;
-        let response = self
-            .admin_request(node, Method::POST, url)
-            .await?
-            .json(request)
-            .send()
-            .await
-            .context("submit meta operation")?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .context("read meta operation result")?;
-        let result: ursula_control::ControlResponse = serde_json::from_str(&body)
-            .with_context(|| format!("meta operation returned {status}: {body}"))?;
-        if !status.is_success() || result.is_rejected() {
-            bail!("meta operation rejected: {result:?}");
-        }
-        Ok(result)
+        // Reconcile resumes the same durable operation/action receipts. A 503
+        // during leader discovery is retryable; other intents may create new
+        // operations and must never be replayed automatically.
+        tokio::time::timeout(self.timeout, async {
+            loop {
+                let url = node.admin_url.join("/__ursula/control/operation")?;
+                let response = self
+                    .admin_request(node, Method::POST, url)
+                    .await?
+                    .json(request)
+                    .send()
+                    .await
+                    .context("submit meta operation")?;
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .context("read meta operation result")?;
+                if matches!(request, ursula_control::OperationRequest::Reconcile { .. })
+                    && status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                let result: ursula_control::ControlResponse = serde_json::from_str(&body)
+                    .with_context(|| format!("meta operation returned {status}: {body}"))?;
+                if !status.is_success() || result.is_rejected() {
+                    bail!("meta operation rejected: {result:?}");
+                }
+                return Ok(result);
+            }
+        })
+        .await
+        .context("meta operation exceeded the configured HTTP timeout")?
     }
 
     pub fn timeout(&self) -> Duration {
@@ -675,6 +690,93 @@ mod tests {
             applied,
             task,
         )
+    }
+
+    #[tokio::test]
+    async fn reconcile_retries_only_503_with_same_token_and_one_deadline() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        use ursula_control::ControlResponse;
+        use ursula_control::OperationOutcome;
+        use ursula_control::OperationRequest;
+        use ursula_control::OperationToken;
+
+        for (initial, recover, reconcile, expected_success) in [
+            (StatusCode::SERVICE_UNAVAILABLE, true, true, true),
+            (StatusCode::CONFLICT, false, true, false),
+            (StatusCode::SERVICE_UNAVAILABLE, false, false, false),
+            (StatusCode::SERVICE_UNAVAILABLE, false, true, false),
+        ] {
+            let token = OperationToken {
+                operation_id: 7,
+                generation: 2,
+                executor: ProcessIncarnation::from_bits(9),
+            };
+            let request = if reconcile {
+                OperationRequest::Reconcile { token }
+            } else {
+                OperationRequest::CollectEvidence { token }
+            };
+            let expected = serde_json::to_value(&request).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let app = Router::new().route(
+                "/__ursula/control/operation",
+                post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    assert_eq!(body, expected, "retry must preserve the exact operation");
+                    let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if recover && attempt > 0 {
+                            (
+                                StatusCode::OK,
+                                serde_json::to_string(&ControlResponse::Operation(Ok(
+                                    OperationOutcome::ActionFinished,
+                                )))
+                                .unwrap(),
+                            )
+                        } else {
+                            (initial, "leader unavailable".to_owned())
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let node = NodeInfo {
+                id: 1,
+                admin_url: format!("http://{address}").parse().unwrap(),
+                host: address.to_string(),
+                http_url: None,
+                metrics_url: None,
+                expected_process_incarnation: None,
+            };
+            let client = MetricsClient::new(Duration::from_millis(250)).unwrap();
+            client.incarnations.lock().unwrap().insert(1, None);
+            let started = tokio::time::Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                client.submit_operation(&node, &request),
+            )
+            .await
+            .expect("retry budget must not reset");
+            assert_eq!(result.is_ok(), expected_success, "{result:?}");
+            let count = calls.load(Ordering::SeqCst);
+            if recover {
+                assert_eq!(count, 2);
+            } else if reconcile && initial == StatusCode::SERVICE_UNAVAILABLE {
+                assert!(count >= 2);
+                assert!(started.elapsed() < Duration::from_millis(750));
+            } else {
+                assert_eq!(
+                    count, 1,
+                    "permanent failure or other intent must not replay"
+                );
+            }
+            task.abort();
+            task.await.expect_err("mock server stopped");
+        }
     }
 
     #[tokio::test]

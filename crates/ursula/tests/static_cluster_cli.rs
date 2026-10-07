@@ -2182,7 +2182,35 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
         client: &reqwest::Client,
         admin: &str,
         request: OperationRequest,
+        children: &[ChildGuard],
     ) -> OperationOutcome {
+        if matches!(request, OperationRequest::Reconcile { .. }) {
+            let operator = ursula_ctl::MetricsClient::new(Duration::from_secs(60)).unwrap();
+            let node = ursula_ctl::NodeInfo {
+                id: 1,
+                admin_url: admin.parse().unwrap(),
+                host: "127.0.0.1".into(),
+                http_url: None,
+                metrics_url: None,
+                expected_process_incarnation: None,
+            };
+            return match operator.submit_operation(&node, &request).await {
+                Ok(ControlResponse::Operation(Ok(outcome))) => outcome,
+                result => {
+                    let observed = client
+                        .get(format!("{admin}/__ursula/control/state"))
+                        .send()
+                        .await;
+                    let snapshot = match observed {
+                        Ok(response) => response.text().await,
+                        Err(error) => Err(error),
+                    };
+                    let reports = children.iter().map(child_report).collect::<Vec<_>>();
+                    panic!("{request:?}: {result:?}; control={snapshot:?}; children={reports:#?}");
+                }
+            };
+        }
+
         // Evidence collection may race follower application of the membership
         // commit. Retrying this read-and-observe step preserves the same token.
         for attempt in 0..100 {
@@ -2444,14 +2472,19 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-        let outcome = operation(&client, admin, OperationRequest::Begin {
-            kind: kind.clone(),
-            executor: ProcessIncarnation::from_bits(
-                u128::try_from(sequence)
-                    .expect("sequence")
-                    .saturating_add(100),
-            ),
-        })
+        let outcome = operation(
+            &client,
+            admin,
+            OperationRequest::Begin {
+                kind: kind.clone(),
+                executor: ProcessIncarnation::from_bits(
+                    u128::try_from(sequence)
+                        .expect("sequence")
+                        .saturating_add(100),
+                ),
+            },
+            &children,
+        )
         .await;
         let OperationOutcome::Acquired(token) = outcome else {
             panic!("expected acquired operation")
@@ -2536,19 +2569,34 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
         }
         if matches!(kind, OperationKind::DecommissionNode { .. }) {
             // Populate and promote replacements while the source still serves.
-            operation(&client, admin, OperationRequest::Reconcile {
-                token: token.clone(),
-            })
+            operation(
+                &client,
+                admin,
+                OperationRequest::Reconcile {
+                    token: token.clone(),
+                },
+                &children,
+            )
             .await;
         }
         if !matches!(kind, OperationKind::MoveReplicas { .. }) {
-            operation(&client, admin, OperationRequest::CollectEvidence {
-                token: token.clone(),
-            })
+            operation(
+                &client,
+                admin,
+                OperationRequest::CollectEvidence {
+                    token: token.clone(),
+                },
+                &children,
+            )
             .await;
-            operation(&client, admin, OperationRequest::RetireSource {
-                token: token.clone(),
-            })
+            operation(
+                &client,
+                admin,
+                OperationRequest::RetireSource {
+                    token: token.clone(),
+                },
+                &children,
+            )
             .await;
         }
         if matches!(kind, OperationKind::RebuildReplica { .. }) {
@@ -2628,9 +2676,14 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-        operation(&client, admin, OperationRequest::Reconcile {
-            token: token.clone(),
-        })
+        operation(
+            &client,
+            admin,
+            OperationRequest::Reconcile {
+                token: token.clone(),
+            },
+            &children,
+        )
         .await;
         if matches!(kind, OperationKind::RebuildReplica { .. }) {
             // A survivor may restart in Retired after the replacement has been
@@ -2655,12 +2708,23 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
                 before.operations.replicas[&4]
             );
         }
-        operation(&client, admin, OperationRequest::CollectEvidence {
-            token: token.clone(),
-        })
+        operation(
+            &client,
+            admin,
+            OperationRequest::CollectEvidence {
+                token: token.clone(),
+            },
+            &children,
+        )
         .await;
         assert_eq!(
-            operation(&client, admin, OperationRequest::Complete { token }).await,
+            operation(
+                &client,
+                admin,
+                OperationRequest::Complete { token },
+                &children
+            )
+            .await,
             OperationOutcome::Completed
         );
         read_until_matches(&client, &read, b"durable-before-maintenance").await;
