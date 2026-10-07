@@ -20,6 +20,7 @@ use ursula_state_probe::workloads::w2::W2Args;
 use ursula_state_probe::workloads::w3::W3Args;
 use ursula_state_probe::workloads::w4::W4Args;
 use ursula_state_probe::workloads::w5::W5Args;
+use ursula_state_probe::workloads::wal::WalArgs;
 
 #[global_allocator]
 static GLOBAL: Counting = Counting;
@@ -64,6 +65,8 @@ enum Command {
     Planner(PlannerArgs),
     /// L2: the real ShardRuntime on the in-memory and Raft engines.
     L2(L2Args),
+    /// Raft WAL memory: log stores on one core journal under append and purge.
+    Wal(WalArgs),
     /// Run a whole suite without checking it.
     Suite {
         #[arg(long, value_enum, default_value = "pr")]
@@ -99,6 +102,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::W5(args) => Workload::W5(args),
         Command::Planner(args) => Workload::Planner(args),
         Command::L2(args) => Workload::L2(args),
+        Command::Wal(args) => Workload::Wal(args),
         Command::Suite { suite: name } => {
             let outcome = gate::run_suite(&suite(name)?, &cli.out_dir, echo)?;
             std::fs::write(

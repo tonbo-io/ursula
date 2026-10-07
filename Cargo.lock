@@ -4622,6 +4622,8 @@ dependencies = [
  "blake3",
  "bytes",
  "clap",
+ "futures-util",
+ "openraft",
  "prost 0.13.5",
  "serde",
  "serde_json",
