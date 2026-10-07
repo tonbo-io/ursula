@@ -18,18 +18,18 @@ use openraft::storage::RaftLogStorage;
 use openraft::vote::RaftLeaderId;
 use ursula_config::WalFsync;
 use ursula_raft::AcceptUnsyncedLossOutcome;
-use ursula_raft::GroupLogState;
-use ursula_raft::JournalDisk;
-use ursula_raft::JournalReplayMode;
-use ursula_raft::PreviousRun;
-use ursula_raft::RUN_STATE_FILE;
 use ursula_raft::RecoveryGateStatus;
-use ursula_raft::RecoveryReason;
 use ursula_raft::RecoveryState;
-use ursula_raft::SimDisk;
 use ursula_raft::UrsulaAppendEntriesRequest;
 use ursula_raft::UrsulaAppendEntriesResponse;
 use ursula_raft::UrsulaRaftTypeConfig;
+use ursula_raft::wal::diagnostics::GroupLogState;
+use ursula_raft::wal::diagnostics::JournalDisk;
+use ursula_raft::wal::diagnostics::JournalReplayMode;
+use ursula_raft::wal::diagnostics::PreviousRun;
+use ursula_raft::wal::diagnostics::RUN_STATE_FILE;
+use ursula_raft::wal::diagnostics::RecoveryReason;
+use ursula_raft::wal::diagnostics::SimDisk;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::GroupEngine;
@@ -873,6 +873,90 @@ fn a_replica_that_lost_its_log_rejects_a_stale_term_leader() {
                 acknowledged[&group], cluster.acknowledged[&group],
                 "{context}: the stale leader's write must never commit"
             );
+            cluster.verify_reads().await;
+        });
+    }
+}
+
+#[test]
+fn bootstrap_with_absent_peers_advances_time_and_recovers_when_they_arrive() {
+    let _guard = sim_test_guard();
+    run_with_madsim(7, async {
+        let mut cluster = JournalCluster::unstarted("bootstrap-absent", WalFsync::Never);
+        cluster.start_node(1).await;
+        let began = madsim::time::Instant::now();
+        madsim::time::sleep(Duration::from_millis(250)).await;
+        assert!(began.elapsed() >= Duration::from_millis(250));
+        assert!(metrics(&cluster, 0, 1).current_leader.is_none());
+        cluster.start_node(2).await;
+        cluster.start_node(3).await;
+        cluster.wait_gates_open(Duration::from_secs(5)).await;
+    });
+}
+
+#[test]
+fn another_power_loss_during_remove_voter_finishes_the_joint_without_losing_acks() {
+    let _guard = sim_test_guard();
+    // Seed 2 drops the unsynced journal tail on both staged power losses.
+    for seed in [2] {
+        run_with_madsim(seed, async move {
+            let mut cluster =
+                JournalCluster::start_with_fsync("joint-second-loss", WalFsync::Never).await;
+            let context = format!("joint second loss seed {seed}");
+            for group in JOURNAL_GROUPS {
+                cluster.append(group, 6).await;
+            }
+            let leader = wait_leader(&cluster, 0, &context).await;
+            for group in JOURNAL_GROUPS {
+                let current = wait_leader(&cluster, group, &context).await;
+                if current != leader {
+                    cluster.engines[&(group, current)]
+                        .raft_handle()
+                        .trigger()
+                        .transfer_leader(leader)
+                        .await
+                        .unwrap();
+                }
+                cluster.engines[&(group, leader)]
+                    .raft_handle()
+                    .wait(Some(Duration::from_secs(5)))
+                    .current_leader(leader, "align leaders")
+                    .await
+                    .unwrap();
+            }
+            let followers: Vec<_> = NODES.into_iter().filter(|id| *id != leader).collect();
+            let (a, b) = (followers[0], followers[1]);
+            // Keep B alive, but prevent it from acknowledging RemoveVoter(A).
+            cluster.policy.partition_bidirectional(leader, b);
+            cluster.policy.partition_bidirectional(a, b);
+            assert!(power_loss_and_restart(&mut cluster, a).await > 0);
+            let deadline = madsim::time::Instant::now() + Duration::from_secs(5);
+            let joint_group = loop {
+                if let Some(group) = JOURNAL_GROUPS.into_iter().find(|group| {
+                    metrics(&cluster, *group, leader)
+                        .membership_config
+                        .membership()
+                        .get_joint_config()
+                        .len()
+                        > 1
+                }) {
+                    break group;
+                }
+                assert!(
+                    madsim::time::Instant::now() < deadline,
+                    "{context}: no joint configuration"
+                );
+                madsim::time::sleep(Duration::from_millis(1)).await;
+            };
+            let joint = metrics(&cluster, joint_group, leader);
+            assert!(joint.committed < *joint.membership_config.log_id());
+            // B loses its tail only after A's removal is pending.
+            let before_loss = metrics(&cluster, joint_group, b).last_log_index;
+            assert!(power_loss_and_restart(&mut cluster, b).await > 0);
+            assert!(metrics(&cluster, joint_group, b).last_log_index < before_loss);
+            cluster.policy.clear();
+            wait_healed(&cluster, &context, Duration::from_secs(15)).await;
+            assert_no_vote_while_gated(&cluster, &context);
             cluster.verify_reads().await;
         });
     }

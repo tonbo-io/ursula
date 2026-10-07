@@ -27,7 +27,6 @@ use openraft::error::Unreachable;
 use openraft::network::RPCOption;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
-use openraft::rt::WatchReceiver;
 use openraft::vote::RaftLeaderId;
 use prost::Message;
 use serde::de::DeserializeOwned;
@@ -113,8 +112,6 @@ static GRPC_SNAPSHOT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static GRPC_SNAPSHOT_REQUEST_BYTES: AtomicU64 = AtomicU64::new(0);
 static GRPC_SNAPSHOT_PAYLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 static GRPC_SNAPSHOT_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(0);
-use crate::registry::LeadershipShedFlag;
-use crate::registry::LeadershipShedState;
 use crate::registry::RaftGroupHandleRegistry;
 
 const APPEND_STREAM_BACKLOG_FULL: &str = "raft append stream backlog full";
@@ -122,26 +119,38 @@ pub(crate) const REJOIN_BARRIER_CAPABILITY: &str = "ursula-rejoin-barrier";
 
 pub(crate) type RaftClient = raft_internal_proto::raft_internal_client::RaftInternalClient<Channel>;
 
-/// One fresh, outbound ReadIndex confirmation bound to its committed leader.
-/// The legacy bridge returns the leader's last log as a conservative apply
-/// bound; callers must wait for every required replica to apply that prefix.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct QuorumPrefix {
-    pub raft_group_id: u32,
-    pub leader_id: u64,
-    pub leader_term: u64,
-    pub required_applied_index: u64,
+pub use ursula_proto::admin::QuorumPrefix;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RecoveryProbeError {
+    #[error("recovery transport: {0}")]
+    Transport(#[from] RPCError<UrsulaRaftTypeConfig>),
+    #[error("recovery RPC: {0}")]
+    Rpc(#[from] tonic::Status),
+    #[error("recovery payload: {0}")]
+    Payload(#[from] ursula_runtime::GroupEngineError),
+    #[error("recovery peer does not report itself as committed leader")]
+    NotLeader,
+    #[error("recovery peer changed its vote across the ReadIndex proof")]
+    LeadershipChanged,
+    #[error("recovery peer has no log")]
+    MissingLog,
+    #[error("recovery HEAD unexpectedly found an empty-named stream")]
+    UnexpectedHead,
+    #[error("recovery HEAD did not confirm leadership: {0}")]
+    HeadRejected(#[source] ursula_runtime::GroupEngineError),
 }
 
 /// Confirm a group's current quorum without issuing an application write.
 /// This is a point-in-time observation, not a maintenance reservation or a
 /// promise that another participant cannot disrupt a voter immediately after.
-pub async fn confirm_quorum_prefix(
+#[cfg(test)]
+pub(crate) async fn confirm_quorum_prefix(
     placement: ursula_shard::ShardPlacement,
     leader_id: u64,
     address: &str,
     timeout: Duration,
-) -> Result<QuorumPrefix, String> {
+) -> Result<QuorumPrefix, RecoveryProbeError> {
     let (vote, index) =
         probe_rejoin_vote_barrier(placement, leader_id, leader_id, address, timeout).await?;
     Ok(QuorumPrefix {
@@ -169,28 +178,24 @@ pub(crate) async fn probe_rejoin_vote_barrier(
     leader_id: u64,
     address: &str,
     timeout: Duration,
-) -> Result<(UrsulaVote, u64), String> {
+) -> Result<(UrsulaVote, u64), RecoveryProbeError> {
     let mut network = GrpcRaftNetwork::new(placement.raft_group_id, leader_id, address);
-    let mut client = network.client().map_err(|err| err.to_string())?;
+    let mut client = network.client()?;
     let envelope = network.vote_envelope(crate::rejoin::bootstrap_probe_vote(node_id));
     GRPC_VOTE_REQUESTS.fetch_add(1, Ordering::Relaxed);
     GRPC_VOTE_REQUEST_BYTES.fetch_add(envelope.encoded_len() as u64, Ordering::Relaxed);
     let mut capability_request = tonic::Request::new(envelope);
     capability_request.set_timeout(timeout);
-    let capability_response = client
-        .vote(capability_request)
-        .await
-        .map_err(|err| format!("recovery capability probe: {err}"))?;
+    let capability_response = client.vote(capability_request).await?;
     let explicit_barrier = capability_response
         .metadata()
         .get(REJOIN_BARRIER_CAPABILITY)
         .is_some_and(|value| value == "1");
     let ack = capability_response.into_inner();
     GRPC_VOTE_RESPONSE_BYTES.fetch_add(ack.encoded_len() as u64, Ordering::Relaxed);
-    let response: UrsulaVoteResponse =
-        decode_wire(&ack.payload, "rejoin capability vote").map_err(|err| err.to_string())?;
+    let response: UrsulaVoteResponse = decode_wire(&ack.payload, "rejoin capability vote")?;
     if !response.vote.is_committed() || *response.vote.leader_id().node_id() != leader_id {
-        return Err("recovery peer does not report itself as committed leader".to_owned());
+        return Err(RecoveryProbeError::NotLeader);
     }
     let observed_vote = response.vote;
     // Capability metadata is only a routing hint, never fresh quorum or
@@ -205,22 +210,17 @@ pub(crate) async fn probe_rejoin_vote_barrier(
         match client.rejoin_barrier(barrier_request).await {
             Ok(response) => {
                 let response = response.into_inner();
-                let vote: UrsulaVote = decode_wire(&response.vote, "rejoin barrier vote")
-                    .map_err(|err| err.to_string())?;
+                let vote: UrsulaVote = decode_wire(&response.vote, "rejoin barrier vote")?;
                 if !vote.is_committed() || *vote.leader_id().node_id() != leader_id {
-                    return Err(
-                        "recovery peer does not report itself as committed leader".to_owned()
-                    );
+                    return Err(RecoveryProbeError::NotLeader);
                 }
                 if vote != observed_vote {
-                    return Err(
-                        "recovery peer changed its vote across the ReadIndex proof".to_owned()
-                    );
+                    return Err(RecoveryProbeError::LeadershipChanged);
                 }
                 return Ok((vote, response.index));
             }
             Err(status) if status.code() == tonic::Code::Unimplemented => {}
-            Err(status) => return Err(format!("recovery barrier: {status}")),
+            Err(status) => return Err(status.into()),
         }
     }
     let mut request = tonic::Request::new(raft_internal_proto::GroupReadRequestV1 {
@@ -240,106 +240,37 @@ pub(crate) async fn probe_rejoin_vote_barrier(
         protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
     });
     request.set_timeout(timeout);
-    let response = client
-        .group_read(request)
-        .await
-        .map_err(|err| format!("recovery HEAD: {err}"))?
-        .into_inner();
+    let response = client.group_read(request).await?.into_inner();
     if response.ok {
-        return Err("recovery HEAD unexpectedly found an empty-named stream".to_owned());
+        return Err(RecoveryProbeError::UnexpectedHead);
     }
     let error: ursula_runtime::GroupEngineError =
-        decode_wire(&response.payload, "rejoin HEAD error").map_err(|err| err.to_string())?;
+        decode_wire(&response.payload, "rejoin HEAD error")?;
     if !matches!(
         error.code(),
         Some(ursula_stream::StreamErrorCode::InvalidBucketId)
     ) {
-        return Err(format!(
-            "recovery HEAD did not confirm leadership: {error:?}"
-        ));
+        return Err(RecoveryProbeError::HeadRejected(error));
     }
     let response = network
         .vote(
             crate::rejoin::bootstrap_probe_vote(node_id),
             RPCOption::new(timeout),
         )
-        .await
-        .map_err(|err| format!("recovery vote probe: {err}"))?;
+        .await?;
     if !response.vote.is_committed() || *response.vote.leader_id().node_id() != leader_id {
-        return Err("recovery peer no longer reports itself as committed leader".to_owned());
+        return Err(RecoveryProbeError::NotLeader);
     }
     if response.vote != observed_vote {
-        return Err("recovery peer changed its vote across the legacy ReadIndex proof".to_owned());
+        return Err(RecoveryProbeError::LeadershipChanged);
     }
     Ok((
         response.vote,
         response
             .last_log_id
-            .ok_or("recovery peer has no log")?
+            .ok_or(RecoveryProbeError::MissingLog)?
             .index(),
     ))
-}
-
-/// Ask an existing voter to start an election through the version-one
-/// `TransferLeader` RPC understood by older Ursula servers.
-///
-/// The request carries the voter's observed, uncommitted vote and targets the
-/// same voter. OpenRaft only acts when that vote still exactly matches its
-/// local state, so a stale observation is a no-op. Callers must establish that
-/// the node is a configured, caught-up voter with no current leader before
-/// using this rolling-upgrade bridge.
-pub async fn request_self_election_via_transfer(
-    endpoint: &str,
-    raft_group_id: u32,
-    node_id: u64,
-    current_term: u64,
-    timeout: Duration,
-) -> Result<(), String> {
-    let channel = Endpoint::from_shared(endpoint.to_owned())
-        .map_err(|err| format!("invalid Raft gRPC endpoint {endpoint}: {err}"))?
-        .connect_timeout(timeout)
-        .timeout(timeout)
-        .connect()
-        .await
-        .map_err(|err| format!("connect to Raft gRPC endpoint {endpoint}: {err}"))?;
-    let transfer = self_election_transfer_request(node_id, current_term);
-    let envelope = raft_internal_proto::RaftTransferLeaderRequestV1 {
-        raft_group_id,
-        node_id,
-        protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
-        request: encode_wire(&transfer),
-    };
-    let mut request = tonic::Request::new(envelope);
-    request.set_timeout(timeout);
-    raft_client(channel)
-        .transfer_leader(request)
-        .await
-        .map_err(|err| {
-            format!(
-                "request self-election on node {node_id} for group {raft_group_id} at term {current_term}: {err}"
-            )
-        })?;
-    Ok(())
-}
-
-fn self_election_transfer_request(
-    node_id: u64,
-    current_term: u64,
-) -> TransferLeaderRequest<UrsulaRaftTypeConfig> {
-    TransferLeaderRequest::new(UrsulaVote::new(current_term, node_id), node_id, None)
-}
-
-#[cfg(test)]
-mod self_election_transfer_tests {
-    use super::*;
-
-    #[test]
-    fn bridge_uses_exact_uncommitted_self_vote() {
-        let request = self_election_transfer_request(2, 7_381);
-        assert_eq!(request.from_leader(), &UrsulaVote::new(7_381, 2));
-        assert_eq!(request.to_node_id(), &2);
-        assert_eq!(request.last_log_id(), None);
-    }
 }
 
 #[derive(Clone)]
@@ -607,26 +538,18 @@ impl From<GrpcRpcError> for tonic::Status {
 pub struct RaftGrpcService {
     registry: RaftGroupHandleRegistry,
     cold_store: Option<ColdStoreHandle>,
-    leadership_shed: LeadershipShedFlag,
 }
 
 impl RaftGrpcService {
     pub fn new(registry: RaftGroupHandleRegistry) -> Self {
-        let leadership_shed = registry.leadership_shed_flag();
         Self {
             registry,
             cold_store: None,
-            leadership_shed,
         }
     }
 
     pub fn with_cold_store(mut self, cold_store: Option<ColdStoreHandle>) -> Self {
         self.cold_store = cold_store;
-        self
-    }
-
-    pub fn with_leadership_shed_flag(mut self, leadership_shed: LeadershipShedFlag) -> Self {
-        self.leadership_shed = leadership_shed;
         self
     }
 }
@@ -908,35 +831,22 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             request.protocol_version,
             request.raft_group_id,
         )?;
-        let raft = self
+        let (vote, index) = self
             .registry
-            .get(group)
-            .ok_or_else(|| tonic::Status::not_found("raft group is not registered"))?;
-        if !raft.is_leader() {
-            return Err(tonic::Status::failed_precondition(
-                "recovery barrier requires the current leader",
-            ));
-        }
-        let barrier = self
-            .registry
-            .read_barrier(group)
-            .ok_or_else(|| tonic::Status::not_found("read barrier is not registered"))?;
-        let index = barrier
-            .round()
+            .confirm_recovery_barrier(group)
             .await
-            .map_err(|err| tonic::Status::unavailable(err.to_string()))?
-            .ok_or_else(|| {
-                tonic::Status::failed_precondition("recovery barrier lost leadership")
+            .map_err(|error| match error {
+                crate::QuorumProofError::NotRegistered { .. } => {
+                    tonic::Status::not_found(error.to_string())
+                }
+                crate::QuorumProofError::Read { .. } => {
+                    tonic::Status::unavailable(error.to_string())
+                }
+                _ => tonic::Status::failed_precondition(error.to_string()),
             })?;
-        let metrics = raft.metrics().borrow_watched().clone();
-        if metrics.current_leader != Some(metrics.id) || !metrics.vote.is_committed() {
-            return Err(tonic::Status::failed_precondition(
-                "recovery barrier lost leadership",
-            ));
-        }
         Ok(tonic::Response::new(
             raft_internal_proto::RejoinBarrierResponseV1 {
-                vote: encode_wire(&metrics.vote),
+                vote: encode_wire(&vote),
                 index,
             },
         ))
@@ -952,20 +862,12 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             request.protocol_version,
             request.raft_group_id,
         )?;
-        let shed_state = LeadershipShedState::load(&self.leadership_shed);
-        if let Some(reason) = shed_state.transfer_rejection_reason() {
-            return Err(GrpcRpcError::failed_precondition(format!(
-                "node {reason} shed leadership; refusing TransferLeader for group {}",
-                raft_group_id.0
-            ))
-            .into());
-        }
         let openraft_request: TransferLeaderRequest<UrsulaRaftTypeConfig> =
             decode_rpc_payload(&request.request, "transfer leader request")?;
         self.registry
             .handle_transfer_leader(raft_group_id, openraft_request)
             .await
-            .map_err(|err| tonic::Status::internal(err.to_string()))?;
+            .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
         Ok(tonic::Response::new(
             raft_internal_proto::RaftTransferLeaderAckV1 {},
         ))
@@ -1000,6 +902,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 .read_barrier(placement.raft_group_id)
                 .ok_or_else(|| tonic::Status::not_found("raft group is not registered"))?;
             let mut engine = RaftGroupEngine {
+                recovery_tasks: crate::rejoin::RecoveryGate::default(),
                 raft,
                 placement,
                 read_barrier,

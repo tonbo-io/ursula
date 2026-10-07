@@ -3,7 +3,7 @@
 //! Module map:
 //!
 //! - [`durable`]: generated stream and storage protobuf messages.
-//! - [`admin`]: administrative HTTP identity preconditions.
+//! - [`admin`]: shared administrative HTTP requests, responses and identity preconditions.
 
 pub mod admin;
 

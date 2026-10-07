@@ -151,9 +151,6 @@ pub fn spawn_commit_stall_watchdog(
             };
             let actions = tracker.evaluate(&snaps, my_id, Instant::now(), threshold);
             for action in actions {
-                let Some(raft) = registry.get(RaftGroupId(action.group_id)) else {
-                    continue;
-                };
                 tracing::warn!(
                     "commit-stall: node {my_id} group {} stalled {:.1}s (last_log={:?} committed={:?}); trying targets {:?}",
                     action.group_id,
@@ -169,7 +166,10 @@ pub fn spawn_commit_stall_watchdog(
                     if registry.is_reverted_follower(RaftGroupId(action.group_id), *target) {
                         continue;
                     }
-                    match raft.trigger().transfer_leader(*target).await {
+                    match registry
+                        .transfer_leader(RaftGroupId(action.group_id), *target)
+                        .await
+                    {
                         Ok(()) => {
                             tracing::warn!(
                                 "commit-stall: group {} handed off -> {}",

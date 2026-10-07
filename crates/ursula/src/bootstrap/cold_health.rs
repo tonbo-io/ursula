@@ -177,9 +177,6 @@ pub fn spawn_cold_health_gate(
                         if snap.current_leader != Some(node_id) {
                             continue;
                         }
-                        let Some(raft) = registry.get(RaftGroupId(snap.raft_group_id)) else {
-                            continue;
-                        };
                         let targets = prioritized_transfer_targets(&snap, node_id, &leader_count);
                         if targets.is_empty() {
                             tracing::warn!(
@@ -189,7 +186,10 @@ pub fn spawn_cold_health_gate(
                             continue;
                         }
                         for target in targets {
-                            match raft.trigger().transfer_leader(target).await {
+                            match registry
+                                .transfer_leader(RaftGroupId(snap.raft_group_id), target)
+                                .await
+                            {
                                 Ok(()) => {
                                     tracing::warn!(
                                         "cold-health: node {node_id} yielded leadership of group {} to node {target}",

@@ -95,15 +95,7 @@ pub struct RaftGroupMetricsSnapshot {
     pub log: crate::snapshot_cadence::GroupLogProgress,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RaftGroupMaintenanceState {
-    pub running: bool,
-    pub recovery_ready: bool,
-    pub accepting_transfers: bool,
-    pub membership_joint: bool,
-    pub membership_log_index: Option<u64>,
-    pub stopped_for_operator: bool,
-}
+pub use ursula_proto::admin::RaftGroupMaintenanceState;
 
 /// Static gRPC Raft cluster membership configuration.
 ///

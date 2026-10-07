@@ -200,7 +200,7 @@ fn run_host_cli(interrupt_candidate: bool) {
             maintenance_fence: None,
             prefixes: (0..2)
                 .map(|group| {
-                    (group, ursula_raft::QuorumPrefix {
+                    (group, ursula_proto::admin::QuorumPrefix {
                         raft_group_id: group,
                         leader_id: 2,
                         leader_term: 1,
@@ -755,7 +755,7 @@ fn proposal_is_not_a_receipt_and_conflicting_committed_state_cannot_be_adopted()
             maintenance_fence: Some(fence.clone()),
             prefixes: (0..256)
                 .map(|group| {
-                    (group, ursula_raft::QuorumPrefix {
+                    (group, ursula_proto::admin::QuorumPrefix {
                         raft_group_id: group,
                         leader_id: 2,
                         leader_term: 1,

@@ -102,14 +102,14 @@ async fn enter_pressure(
     let snapshots = registry.metrics_snapshot();
     let counts = leader_counts(&snapshots);
     for snapshot in snapshots {
-        let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) else {
-            continue;
-        };
         if snapshot.current_leader != Some(node_id) {
             continue;
         }
         for target in prioritized_transfer_targets(&snapshot, node_id, &counts) {
-            match raft.trigger().transfer_leader(target).await {
+            match registry
+                .transfer_leader(RaftGroupId(snapshot.raft_group_id), target)
+                .await
+            {
                 Ok(()) => {
                     tracing::warn!(
                         node_id,

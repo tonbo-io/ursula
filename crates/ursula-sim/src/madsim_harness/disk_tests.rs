@@ -15,35 +15,35 @@ use openraft::storage::IOFlushed;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use ursula_config::WalFsync;
-use ursula_raft::CoreJournalError;
-use ursula_raft::DurableRaftLogStoreFactory;
-use ursula_raft::GroupLogState;
 use ursula_raft::GroupRejoin;
 use ursula_raft::InProcessRaftNetworkFactory;
 use ursula_raft::InProcessRaftNetworkPolicy;
 use ursula_raft::InProcessRaftRegistry;
-use ursula_raft::JournalDisk;
-use ursula_raft::JournalError;
-use ursula_raft::JournalFile;
-use ursula_raft::JournalOp;
-use ursula_raft::JournalReplayMode;
 use ursula_raft::JournalTuning;
-use ursula_raft::LockAttempt;
-use ursula_raft::PreviousRun;
-use ursula_raft::RUN_STATE_FILE;
 use ursula_raft::RaftGroupEngine;
 use ursula_raft::RaftGroupFileLogStore;
+use ursula_raft::RaftWal;
 use ursula_raft::RaftWalError;
-use ursula_raft::RecoveryReason;
 use ursula_raft::RecoveryState;
-use ursula_raft::SIM_DISK_PAGE_SIZE;
-use ursula_raft::SimDisk;
-use ursula_raft::SimDiskError;
-use ursula_raft::SimDiskFault;
 use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_raft::WalOpening;
-use ursula_raft::journal_segment_path;
-use ursula_raft::journal_segments;
+use ursula_raft::wal::diagnostics::CoreJournalError;
+use ursula_raft::wal::diagnostics::GroupLogState;
+use ursula_raft::wal::diagnostics::JournalDisk;
+use ursula_raft::wal::diagnostics::JournalError;
+use ursula_raft::wal::diagnostics::JournalFile;
+use ursula_raft::wal::diagnostics::JournalOp;
+use ursula_raft::wal::diagnostics::JournalReplayMode;
+use ursula_raft::wal::diagnostics::LockAttempt;
+use ursula_raft::wal::diagnostics::PreviousRun;
+use ursula_raft::wal::diagnostics::RUN_STATE_FILE;
+use ursula_raft::wal::diagnostics::RecoveryReason;
+use ursula_raft::wal::diagnostics::SIM_DISK_PAGE_SIZE;
+use ursula_raft::wal::diagnostics::SimDisk;
+use ursula_raft::wal::diagnostics::SimDiskError;
+use ursula_raft::wal::diagnostics::SimDiskFault;
+use ursula_raft::wal::diagnostics::journal_segment_path;
+use ursula_raft::wal::diagnostics::journal_segments;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
@@ -369,8 +369,6 @@ pub(super) struct JournalCluster {
     registries: BTreeMap<u32, InProcessRaftRegistry>,
     pub(super) engines: BTreeMap<(u32, u64), RaftGroupEngine>,
     pub(super) rejoins: BTreeMap<(u32, u64), Arc<GroupRejoin>>,
-    /// Each node's process-owned recovery tasks, stopped with the node.
-    drivers: BTreeMap<u64, Vec<madsim::task::JoinHandle<()>>>,
     /// Each node's WAL metrics, kept across its restarts.
     pub(super) metrics: BTreeMap<u64, RuntimeMetrics>,
     pub(super) acknowledged: BTreeMap<u32, Vec<u8>>,
@@ -382,43 +380,7 @@ impl JournalCluster {
     }
 
     pub(super) async fn start_with_fsync(name: &str, fsync: WalFsync) -> Self {
-        let config = Arc::new(
-            Config {
-                cluster_name: name.to_owned(),
-                heartbeat_interval: 10,
-                election_timeout_min: 50,
-                election_timeout_max: 100,
-                ..Default::default()
-            }
-            .validate()
-            .expect("valid raft config"),
-        );
-        let (policy, votes) = recovery_wiring::vote_recording_network_policy();
-        let mut cluster = Self {
-            config,
-            policy,
-            votes,
-            wals: (1..=3)
-                .map(|node_id| {
-                    (
-                        node_id,
-                        SimNodeWal::provision_with_fsync(&format!("{name}-{node_id}"), fsync)
-                            .with_group_count(JOURNAL_GROUPS.len()),
-                    )
-                })
-                .collect(),
-            registries: JOURNAL_GROUPS
-                .iter()
-                .map(|group| (*group, InProcessRaftRegistry::default()))
-                .collect(),
-            engines: BTreeMap::new(),
-            rejoins: BTreeMap::new(),
-            drivers: BTreeMap::new(),
-            metrics: (1..=3)
-                .map(|node_id| (node_id, RuntimeMetrics::new(1, JOURNAL_GROUPS.len())))
-                .collect(),
-            acknowledged: BTreeMap::new(),
-        };
+        let mut cluster = Self::unstarted(name, fsync);
         for node_id in 1..=3 {
             cluster.start_node(node_id).await;
         }
@@ -444,9 +406,47 @@ impl JournalCluster {
         cluster
     }
 
+    pub(super) fn unstarted(name: &str, fsync: WalFsync) -> Self {
+        let config = Arc::new(
+            Config {
+                cluster_name: name.to_owned(),
+                heartbeat_interval: 10,
+                election_timeout_min: 50,
+                election_timeout_max: 100,
+                ..Default::default()
+            }
+            .validate()
+            .expect("valid raft config"),
+        );
+        let (policy, votes) = recovery_wiring::vote_recording_network_policy();
+        Self {
+            config,
+            policy,
+            votes,
+            wals: (1..=3)
+                .map(|node_id| {
+                    (
+                        node_id,
+                        SimNodeWal::provision_with_fsync(&format!("{name}-{node_id}"), fsync)
+                            .with_group_count(JOURNAL_GROUPS.len()),
+                    )
+                })
+                .collect(),
+            registries: JOURNAL_GROUPS
+                .iter()
+                .map(|group| (*group, InProcessRaftRegistry::default()))
+                .collect(),
+            engines: BTreeMap::new(),
+            rejoins: BTreeMap::new(),
+            metrics: (1..=3)
+                .map(|node_id| (node_id, RuntimeMetrics::new(1, JOURNAL_GROUPS.len())))
+                .collect(),
+            acknowledged: BTreeMap::new(),
+        }
+    }
+
     pub(super) async fn start_node(&mut self, node_id: u64) {
         let voters = recovery_wiring::configured_voters(1..=3);
-        let mut drivers = Vec::new();
         for group in JOURNAL_GROUPS {
             let placement = group_placement(group);
             let store = self.wals[&node_id]
@@ -458,10 +458,13 @@ impl JournalCluster {
                 &store,
             ));
             let registry = self.registries[&group].clone();
+            let mut config = (*self.config).clone();
+            config.enable_elect =
+                ursula_raft::ElectionPolicy::default().may_campaign(Some(&rejoin));
             let engine = RaftGroupEngine::new_node_with_log_store_and_network(
                 placement,
                 node_id,
-                self.config.clone(),
+                Arc::new(config),
                 InProcessRaftNetworkFactory::new(registry.clone())
                     .with_source(node_id)
                     .with_policy(self.policy.clone())
@@ -472,7 +475,7 @@ impl JournalCluster {
             )
             .await
             .expect("start a journal-backed replica");
-            drivers.extend(recovery_wiring::wire_recovery(
+            recovery_wiring::wire_recovery(
                 node_id,
                 placement,
                 &engine,
@@ -480,46 +483,14 @@ impl JournalCluster {
                 &registry,
                 &self.policy,
                 &voters,
-            ));
+            );
             registry.register(node_id, engine.raft_handle());
-            if node_id == 1 && !rejoin.holds_group_history() {
-                let raft = engine.raft_handle();
-                let rejoin = rejoin.clone();
-                let voters = voters.clone();
-                let policy = self.policy.clone();
-                drivers.push(madsim::task::spawn(async move {
-                    ursula_raft::run_group_bootstrap(
-                        node_id,
-                        raft,
-                        rejoin,
-                        voters,
-                        move |peer_id, _address| {
-                            let registry = registry.clone();
-                            let policy = policy.clone();
-                            async move {
-                                recovery_wiring::in_process_probe(
-                                    &registry, &policy, node_id, peer_id,
-                                )
-                                .await
-                            }
-                        },
-                        Duration::from_millis(50),
-                        Duration::from_secs(5),
-                    )
-                    .await;
-                }));
-            }
             self.engines.insert((group, node_id), engine);
             self.rejoins.insert((group, node_id), rejoin);
         }
-        self.drivers.insert(node_id, drivers);
     }
 
     pub(super) async fn stop_node(&mut self, node_id: u64) {
-        for driver in self.drivers.remove(&node_id).unwrap_or_default() {
-            driver.abort();
-            let _ = driver.await;
-        }
         for group in JOURNAL_GROUPS {
             self.registries[&group].unregister(node_id);
             let engine = self
@@ -1419,7 +1390,7 @@ fn the_run_state_is_the_old_or_the_new_version_after_a_power_loss() {
         run_with_madsim(seed, async move {
             let root = sim_dir("run-state");
             let start = || {
-                DurableRaftLogStoreFactory::start(
+                RaftWal::start(
                     &root,
                     WalFsync::Never,
                     &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
@@ -1926,21 +1897,20 @@ fn wal_topology_publication_survives_power_loss() {
                 let topology = ursula_shard::StaticShardMap::new(4, 64).unwrap();
                 SimDisk::inject_fault(&root.join(relative_path), fault).unwrap();
                 assert!(matches!(
-                    DurableRaftLogStoreFactory::start(&root, WalFsync::Never, &topology),
+                    RaftWal::start(&root, WalFsync::Never, &topology),
                     Err(RaftWalError::RecordTopology(_))
                 ));
                 assert!(!SimDisk::exists(&root.join(RUN_STATE_FILE)));
                 SimDisk::power_loss(&root).unwrap();
-                let wal =
-                    DurableRaftLogStoreFactory::start(&root, WalFsync::Never, &topology).unwrap();
+                let wal = RaftWal::start(&root, WalFsync::Never, &topology).unwrap();
                 drop(wal);
                 SimDisk::power_loss(&root).unwrap();
                 let changed = ursula_shard::StaticShardMap::new(8, 64).unwrap();
                 assert!(matches!(
-                    DurableRaftLogStoreFactory::start(&root, WalFsync::Never, &changed),
+                    RaftWal::start(&root, WalFsync::Never, &changed),
                     Err(RaftWalError::TopologyMismatch { .. })
                 ));
-                DurableRaftLogStoreFactory::start(&root, WalFsync::Never, &topology)
+                RaftWal::start(&root, WalFsync::Never, &topology)
                     .unwrap()
                     .shutdown()
                     .await

@@ -139,11 +139,7 @@ fn check_cluster_format(info: &BackupInfo) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
-struct BackupInfo {
-    format_version: u32,
-    raft_group_count: u32,
-}
+use ursula_proto::admin::BackupInfo;
 
 pub struct BackupClient {
     http: reqwest::Client,

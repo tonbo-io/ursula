@@ -167,7 +167,7 @@ async fn new_recovery_engine(
     tempfile::TempDir,
 ) {
     let wal_root = tempfile::tempdir().expect("WAL root");
-    let store = DurableRaftLogStoreFactory::start(
+    let store = RaftWal::start(
         wal_root.path(),
         WalFsync::Never,
         &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
@@ -440,7 +440,10 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         crate::confirm_quorum_prefix(placement(), 2, &endpoints[1], Duration::from_secs(1))
             .await
             .unwrap_err();
-    assert!(changed_vote.contains("changed its vote"), "{changed_vote}");
+    assert!(matches!(
+        changed_vote,
+        crate::grpc::RecoveryProbeError::LeadershipChanged
+    ));
     for legacy in [false, true, false] {
         services[1].legacy.store(legacy, Ordering::SeqCst);
         if legacy {

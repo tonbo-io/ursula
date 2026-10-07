@@ -1,5 +1,6 @@
 //! OpenRaft log stores.
 //!
+//! - `wal`: node lifecycle and per-core journal ownership.
 //! - `file`: the durable per-group store over the shared per-core journal.
 //! - `writer`: the single writer of each core's journal: batches, the fsync
 //!   policy, rotation and reclaim.
@@ -37,8 +38,8 @@ mod segment;
 mod sim_disk;
 mod state_file;
 mod topology;
+mod wal;
 mod writer;
-
 use std::io;
 
 pub use core_meta::GroupLogState;
@@ -95,6 +96,7 @@ pub use sim_disk::SimPowerLoss;
 pub use state_file::StateFileDefect;
 pub use state_file::StateFileError;
 pub use state_file::StateFileKind;
+pub use wal::RaftWal;
 pub(crate) use writer::CoreFileLogWriter;
 pub use writer::CoreJournalError;
 pub(crate) use writer::CoreJournalOptions;

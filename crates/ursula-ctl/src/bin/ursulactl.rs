@@ -449,28 +449,20 @@ struct VerifyQuorumArgs {
     config: PathBuf,
     #[arg(long)]
     expected_groups: u32,
-    #[arg(long)]
-    core_count: u16,
     #[arg(long, default_value_t = 120)]
     timeout_secs: u64,
     #[arg(long, default_value_t = 1)]
     poll_interval_secs: u64,
     #[arg(long, default_value_t = 10)]
     http_timeout_secs: u64,
-    /// Only for diagnostic measurements of the pinned 0.6.2 baseline;
-    /// output explicitly reports participation_certified=false.
-    #[arg(long)]
-    allow_legacy_eligibility: bool,
 }
 
 impl VerifyQuorumArgs {
     fn options(&self) -> ursula_ctl::quorum::QuorumVerificationOptions {
         ursula_ctl::quorum::QuorumVerificationOptions {
             group_count: self.expected_groups,
-            core_count: self.core_count,
             timeout: Duration::from_secs(self.timeout_secs),
             poll_interval: Duration::from_secs(self.poll_interval_secs),
-            allow_legacy_eligibility: self.allow_legacy_eligibility,
         }
     }
 }

@@ -325,7 +325,7 @@ fn observation(
     let operation = state.operation().unwrap();
     let prefixes = (0..state.cell.group_count)
         .map(|group| {
-            (group, ursula_raft::QuorumPrefix {
+            (group, ursula_proto::admin::QuorumPrefix {
                 raft_group_id: group,
                 leader_id: 2,
                 leader_term: 5,

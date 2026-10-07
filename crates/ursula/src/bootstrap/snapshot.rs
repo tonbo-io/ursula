@@ -181,6 +181,7 @@ pub fn spawn_snapshot_driver(
     s3_cfg: Option<&ursula_config::S3Config>,
     interval_ms: usize,
     cadence: SnapshotCadence,
+    wal_lagging: Option<std::sync::Arc<ursula_raft::LaggingGroups>>,
     max_groups_per_tick: usize,
 ) {
     if interval_ms == 0 {
@@ -200,7 +201,6 @@ pub fn spawn_snapshot_driver(
     let runtime = runtime.clone();
     let registry = registry.clone();
     let coordinator = registry.snapshot_build_coordinator();
-    let wal_lagging = registry.wal_lagging_groups();
     spawn_log_pressure_monitor(coordinator.clone(), &cadence);
     tokio::spawn(async move {
         let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX));
@@ -234,17 +234,19 @@ pub fn spawn_snapshot_driver(
                 yielded = true;
                 registry.mark_leadership_shed(LeadershipShedReason::SnapshotDriverS3);
                 for snapshot in &snaps {
-                    let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) else {
-                        continue;
-                    };
                     if snapshot.current_leader == Some(snapshot.node_id)
-                        && let Some(target) = snapshot
-                            .voter_ids
-                            .iter()
-                            .copied()
-                            .find(|voter| *voter != snapshot.node_id)
+                        && let Some(target) = snapshot.voter_ids.iter().copied().find(|voter| {
+                            *voter != snapshot.node_id
+                                && !registry.is_reverted_follower(
+                                    RaftGroupId(snapshot.raft_group_id),
+                                    *voter,
+                                )
+                        })
                     {
-                        match raft.trigger().transfer_leader(target).await {
+                        match registry
+                            .transfer_leader(RaftGroupId(snapshot.raft_group_id), target)
+                            .await
+                        {
                             Ok(()) => tracing::warn!(
                                 "s3-unhealthy: node {} yielded leadership of group {} to node {}",
                                 snapshot.node_id,

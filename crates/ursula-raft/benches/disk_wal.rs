@@ -21,8 +21,8 @@ use openraft::vote::RaftLeaderId;
 use openraft::vote::leader_id_adv::CommittedLeaderId;
 use tempfile::TempDir;
 use ursula_config::WalFsync;
-use ursula_raft::DurableRaftLogStoreFactory;
 use ursula_raft::RaftGroupFileLogStore;
+use ursula_raft::RaftWal;
 use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::RuntimeMetrics;
@@ -146,7 +146,7 @@ fn disk_wal_benches(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut elapsed = std::time::Duration::ZERO;
                     for _ in 0..iters {
-                        let factory = DurableRaftLogStoreFactory::start(
+                        let factory = RaftWal::start(
                             dir.path(),
                             WalFsync::Always,
                             &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
@@ -203,7 +203,7 @@ fn setup_stores(backend: Backend, group_count: usize) -> Stores {
     let stores: Vec<BenchStore> = match backend {
         Backend::SharedPerCore(fsync) => {
             let metrics = RuntimeMetrics::new(1, group_count);
-            let factory = DurableRaftLogStoreFactory::start(
+            let factory = RaftWal::start(
                 dir.path(),
                 fsync,
                 &ursula_shard::StaticShardMap::new(1, group_count).expect("valid topology"),
@@ -336,7 +336,7 @@ impl From<BenchmarkRaftLogStore<UrsulaRaftTypeConfig>> for BenchStore {
 
 /// Opens one group's store on the shared per-core journal under `root`.
 fn open_shared_store(root: &std::path::Path, group_id: u32) -> Arc<RaftGroupFileLogStore> {
-    DurableRaftLogStoreFactory::start(
+    RaftWal::start(
         root,
         WalFsync::Always,
         &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
@@ -351,7 +351,7 @@ fn open_shared_store(root: &std::path::Path, group_id: u32) -> Arc<RaftGroupFile
 
 async fn prepare_recovery_journal(entries: usize, payload_size: usize) -> TempDir {
     let dir = tempfile::tempdir().expect("create recovery benchmark directory");
-    let factory = DurableRaftLogStoreFactory::start(
+    let factory = RaftWal::start(
         dir.path(),
         WalFsync::Always,
         &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),

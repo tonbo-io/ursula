@@ -31,10 +31,7 @@ pub(crate) struct LeadershipBalanceAction {
     pub fair: usize,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct LeadershipShedPeerStatus {
-    should_campaign: bool,
-}
+use ursula_proto::admin::LeadershipShedStatus;
 
 async fn leadership_balance_eligible_nodes(
     registry: &RaftGroupHandleRegistry,
@@ -43,7 +40,7 @@ async fn leadership_balance_eligible_nodes(
     client: &reqwest::Client,
 ) -> HashSet<u64> {
     let mut eligible = HashSet::new();
-    if registry.leadership_shed_state().should_campaign() && registry.recovery_barriers_ready() {
+    if registry.participation_status().should_campaign {
         eligible.insert(node_id);
     }
 
@@ -61,7 +58,7 @@ async fn leadership_balance_eligible_nodes(
         let Ok(body) = response.text().await else {
             continue;
         };
-        let Ok(status) = serde_json::from_str::<LeadershipShedPeerStatus>(&body) else {
+        let Ok(status) = serde_json::from_str::<LeadershipShedStatus>(&body) else {
             continue;
         };
         if status.should_campaign {
@@ -268,7 +265,10 @@ pub(crate) async fn handoff_shutdown_leadership(
                 if !caught_up {
                     continue;
                 }
-                match raft.trigger().transfer_leader(target).await {
+                match registry
+                    .transfer_leader(RaftGroupId(snapshot.raft_group_id), target)
+                    .await
+                {
                     Ok(()) => {
                         submitted.insert(snapshot.raft_group_id);
                         break;
@@ -356,7 +356,10 @@ pub fn spawn_leadership_balancer(
                     );
                     continue;
                 }
-                match raft.trigger().transfer_leader(action.target).await {
+                match registry
+                    .transfer_leader(RaftGroupId(action.group_id), action.target)
+                    .await
+                {
                     Ok(()) => tracing::warn!(
                         "leadership-balance: node {my_id} handing group {} -> node {} (fair={})",
                         action.group_id,

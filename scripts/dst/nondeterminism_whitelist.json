@@ -64,7 +64,7 @@
   },
   {
     "category": "std_thread_sleep",
-    "path": "crates/ursula-raft/src/registry.rs",
+    "path": "crates/ursula-raft/src/in_process.rs",
     "snippet_contains": "std::thread::sleep(delay)",
     "reason": "already-cfg-gated",
     "plan": "no action: the call sits inside #[cfg(not(madsim))] async fn sleep_in_process_raft_network and cannot reach the simulator; whitelist entry exists so the audit script doesn't false-positive on it"

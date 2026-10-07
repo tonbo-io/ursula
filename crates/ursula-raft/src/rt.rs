@@ -8,7 +8,7 @@ pub use sim_tokio::spawn;
 pub use sim_tokio::sync;
 #[cfg(madsim)]
 pub use sim_tokio::time;
-#[cfg(all(test, not(madsim)))]
+#[cfg(not(madsim))]
 pub use tokio::spawn;
 #[cfg(not(madsim))]
 pub use tokio::sync;

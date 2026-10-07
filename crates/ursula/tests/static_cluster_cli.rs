@@ -1136,10 +1136,8 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
     // or provider fencing. ChildGuard waits for the original process to exit.
     let options = ursula_ctl::quorum::QuorumVerificationOptions {
         group_count: 6,
-        core_count: 1,
         timeout: Duration::from_secs(15),
         poll_interval: Duration::from_millis(100),
-        allow_legacy_eligibility: false,
     };
     ursula_ctl::wait_cluster_ready(
         "pre-fault host inventory",
@@ -1567,10 +1565,8 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
     }
     let options = ursula_ctl::quorum::QuorumVerificationOptions {
         group_count: 6,
-        core_count: 1,
         timeout: Duration::from_secs(15),
         poll_interval: Duration::from_millis(100),
-        allow_legacy_eligibility: false,
     };
     let started_ms = native_epoch_ms();
     let proof = ursula_ctl::quorum::verify_quorum(&nodes, &ctl, &options)
@@ -2794,7 +2790,7 @@ fn remove_test_path(path: impl AsRef<std::path::Path>) {
 /// The bytes the segments of the core journal in `core_dir` hold beyond
 /// their headers; zero before the journal exists.
 fn core_journal_record_bytes(core_dir: &Path) -> u64 {
-    ursula_raft::journal_segments(core_dir)
+    ursula_raft::wal::diagnostics::journal_segments(core_dir)
         .expect("list the core journal segments")
         .iter()
         .map(|(_, path)| {
