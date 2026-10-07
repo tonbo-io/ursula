@@ -146,9 +146,12 @@ fn disk_wal_benches(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut elapsed = std::time::Duration::ZERO;
                     for _ in 0..iters {
-                        let factory =
-                            DurableRaftLogStoreFactory::start(dir.path(), WalFsync::Always)
-                                .expect("start the benchmark WAL");
+                        let factory = DurableRaftLogStoreFactory::start(
+                            dir.path(),
+                            WalFsync::Always,
+                            &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+                        )
+                        .expect("start the benchmark WAL");
                         let started_at = std::time::Instant::now();
                         let reopened = factory
                             .open(
@@ -200,8 +203,12 @@ fn setup_stores(backend: Backend, group_count: usize) -> Stores {
     let stores: Vec<BenchStore> = match backend {
         Backend::SharedPerCore(fsync) => {
             let metrics = RuntimeMetrics::new(1, group_count);
-            let factory = DurableRaftLogStoreFactory::start(dir.path(), fsync)
-                .expect("start the benchmark WAL");
+            let factory = DurableRaftLogStoreFactory::start(
+                dir.path(),
+                fsync,
+                &ursula_shard::StaticShardMap::new(1, group_count).expect("valid topology"),
+            )
+            .expect("start the benchmark WAL");
             (0..group_count_u32)
                 .map(|group_id| {
                     factory
@@ -329,19 +336,27 @@ impl From<BenchmarkRaftLogStore<UrsulaRaftTypeConfig>> for BenchStore {
 
 /// Opens one group's store on the shared per-core journal under `root`.
 fn open_shared_store(root: &std::path::Path, group_id: u32) -> Arc<RaftGroupFileLogStore> {
-    DurableRaftLogStoreFactory::start(root, WalFsync::Always)
-        .expect("start the benchmark WAL")
-        .open(
-            placement(group_id),
-            RuntimeMetrics::new(1, 1).group_engine_metrics(),
-        )
-        .expect("open shared-core benchmark WAL")
+    DurableRaftLogStoreFactory::start(
+        root,
+        WalFsync::Always,
+        &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+    )
+    .expect("start the benchmark WAL")
+    .open(
+        placement(group_id),
+        RuntimeMetrics::new(1, 1).group_engine_metrics(),
+    )
+    .expect("open shared-core benchmark WAL")
 }
 
 async fn prepare_recovery_journal(entries: usize, payload_size: usize) -> TempDir {
     let dir = tempfile::tempdir().expect("create recovery benchmark directory");
-    let factory = DurableRaftLogStoreFactory::start(dir.path(), WalFsync::Always)
-        .expect("start the benchmark WAL");
+    let factory = DurableRaftLogStoreFactory::start(
+        dir.path(),
+        WalFsync::Always,
+        &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+    )
+    .expect("start the benchmark WAL");
     let mut store = factory
         .open(
             placement(0),

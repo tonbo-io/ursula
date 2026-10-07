@@ -12,9 +12,10 @@
 //! - `journal`: the framed, checksummed format of one segment.
 //! - `core_meta`: each core's metadata file: every group's vote and log
 //!   state (empty, initialized or recovering).
+//! - `topology`: immutable core and group counts of the WAL root.
 //! - `run_state`: the node's run-state file and how the journals open after
 //!   the previous run (the replay-mode decision and the recovery state).
-//! - `state_file`: the atomically replaced, checksummed format of both.
+//! - `state_file`: the atomically replaced, checksummed state-file format.
 //! - `disk`: the I/O seam every journal file operation goes through.
 //! - `sim_disk`: the simulated disk behind the seam under `cfg(madsim)`.
 //! - `meta_test_store`: an in-memory store for the meta Raft's unit tests
@@ -35,6 +36,7 @@ mod segment;
 #[cfg(madsim)]
 mod sim_disk;
 mod state_file;
+mod topology;
 mod writer;
 
 use std::io;

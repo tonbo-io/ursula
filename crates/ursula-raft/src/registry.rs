@@ -1780,6 +1780,7 @@ mod tests {
             crate::engine::DurableRaftLogStoreFactory::start(
                 wal_root.path(),
                 ursula_config::WalFsync::Never,
+                &ursula_shard::StaticShardMap::new(1, 8).expect("valid topology"),
             )
             .unwrap()
             .open(

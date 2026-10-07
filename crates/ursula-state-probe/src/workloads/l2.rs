@@ -149,8 +149,12 @@ fn spawn(
             let root = tempfile::tempdir()
                 .context("create the Raft WAL directory")?
                 .keep();
-            let log_stores = DurableRaftLogStoreFactory::start(&root, WalFsync::Never)
-                .context("start the Raft WAL")?;
+            let log_stores = DurableRaftLogStoreFactory::start(
+                &root,
+                WalFsync::Never,
+                &ursula_shard::StaticShardMap::new(1, 1)?,
+            )
+            .context("start the Raft WAL")?;
             (
                 ShardRuntime::spawn_with_engine_factory_and_cold_store(
                     config,

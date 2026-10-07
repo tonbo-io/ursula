@@ -32,8 +32,13 @@ pub(crate) fn spawn_journal_runtime(
     cold_store: Option<Arc<ColdStore>>,
 ) -> JournalRuntime {
     let wal_root = tempfile::tempdir().expect("WAL root");
-    let log_stores =
-        DurableRaftLogStoreFactory::start(wal_root.path(), WalFsync::Never).expect("start the WAL");
+    let log_stores = DurableRaftLogStoreFactory::start(
+        wal_root.path(),
+        WalFsync::Never,
+        &ursula_shard::StaticShardMap::new(config.core_count, config.raft_group_count)
+            .expect("valid topology"),
+    )
+    .expect("start the WAL");
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
         config,
         DurableRaftGroupEngineFactory::with_cold_store(log_stores, cold_store.clone()),

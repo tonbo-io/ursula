@@ -105,29 +105,43 @@ impl
 /// Opens `placement()`'s store on a fresh per-core journal under `root`; the
 /// store owns the core writer, so dropping it closes the journal.
 fn open_core_journal_store(root: &Path) -> Result<Arc<RaftGroupFileLogStore>, GroupEngineError> {
-    DurableRaftLogStoreFactory::start(root, WalFsync::Always)
-        .map_err(|err| GroupEngineError::new(err.to_string()))?
-        .open(
-            placement(),
-            ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
-        )
+    DurableRaftLogStoreFactory::start(
+        root,
+        WalFsync::Always,
+        &ursula_shard::StaticShardMap::new(1, 1)
+            .map_err(|err| GroupEngineError::new(err.to_string()))?,
+    )
+    .map_err(|err| GroupEngineError::new(err.to_string()))?
+    .open(
+        placement(),
+        ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+    )
 }
 
-fn start_wal(root: &Path) -> DurableRaftLogStoreFactory {
-    DurableRaftLogStoreFactory::start(root, WalFsync::Always).expect("start the Raft WAL")
+fn start_wal(root: &Path, cores: usize, groups: usize) -> DurableRaftLogStoreFactory {
+    DurableRaftLogStoreFactory::start(
+        root,
+        WalFsync::Always,
+        &ursula_shard::StaticShardMap::new(cores, groups).expect("valid topology"),
+    )
+    .expect("start the Raft WAL")
 }
 
 /// `placement()`'s log store on a fresh WAL in a new temporary directory,
 /// which the caller keeps while the store is in use.
 fn fresh_journal_store() -> (tempfile::TempDir, Arc<RaftGroupFileLogStore>) {
     let root = tempfile::tempdir().expect("WAL root");
-    let store = DurableRaftLogStoreFactory::start(root.path(), WalFsync::Never)
-        .expect("start the Raft WAL")
-        .open(
-            placement(),
-            ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
-        )
-        .expect("open the log store");
+    let store = DurableRaftLogStoreFactory::start(
+        root.path(),
+        WalFsync::Never,
+        &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+    )
+    .expect("start the Raft WAL")
+    .open(
+        placement(),
+        ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+    )
+    .expect("open the log store");
     (root, store)
 }
 
@@ -135,13 +149,17 @@ fn fresh_journal_store() -> (tempfile::TempDir, Arc<RaftGroupFileLogStore>) {
 #[cfg(madsim)]
 fn sim_journal_store(name: &str) -> Arc<RaftGroupFileLogStore> {
     let root = SimDisk::provision_dir(name).expect("provision a simulated WAL");
-    DurableRaftLogStoreFactory::start(root, WalFsync::Never)
-        .expect("start the Raft WAL")
-        .open(
-            placement(),
-            ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
-        )
-        .expect("open the log store")
+    DurableRaftLogStoreFactory::start(
+        root,
+        WalFsync::Never,
+        &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+    )
+    .expect("start the Raft WAL")
+    .open(
+        placement(),
+        ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+    )
+    .expect("open the log store")
 }
 
 /// The frames of core 0's journal under the WAL `root`, all segments.
@@ -1124,7 +1142,7 @@ fn dynamic_group_hosting_allows_non_voter_warmup() {
         ],
         false,
         registry.clone(),
-        start_wal(wal_root.path()),
+        start_wal(wal_root.path(), 1, 3),
     )
     .with_per_group_voters(BTreeMap::from([(
         RaftGroupId(2),
@@ -2318,7 +2336,7 @@ async fn shard_runtime_uses_raft_group_engine_factory_for_owned_group() {
     let config = hosted_config(1, 1);
     let runtime = ShardRuntime::spawn_with_engine_factory(
         config,
-        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path())),
+        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 1, 1)),
     )
     .expect("spawn runtime with raft group engine factory");
     let stream_id = bsid("runtime-raft-engine");
@@ -2348,7 +2366,7 @@ async fn warm_group_registers_runtime_owned_raft_handle() {
     let config = hosted_config(2, 4);
     let runtime = ShardRuntime::spawn_with_engine_factory(
         config,
-        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path()))
+        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 2, 4))
             .with_registry(registry.clone()),
     )
     .expect("spawn runtime with registered raft group engine factory");
@@ -2380,7 +2398,7 @@ async fn durable_raft_group_engine_records_file_log_metrics() {
     let config = hosted_config(1, 1);
     let runtime = ShardRuntime::spawn_with_engine_factory(
         config,
-        DurableRaftGroupEngineFactory::new(start_wal(&root)),
+        DurableRaftGroupEngineFactory::new(start_wal(&root, 1, 1)),
     )
     .expect("spawn runtime with durable raft group engine factory");
     let placement = placement();
@@ -2432,7 +2450,7 @@ async fn durable_raft_group_engine_recovers_from_core_journal() {
 
     {
         let config = hosted_config(1, 1);
-        let log_stores = start_wal(&root);
+        let log_stores = start_wal(&root, 1, 1);
         let runtime = ShardRuntime::spawn_with_engine_factory(
             config,
             DurableRaftGroupEngineFactory::new(log_stores.clone()),
@@ -2470,7 +2488,7 @@ async fn durable_raft_group_engine_recovers_from_core_journal() {
 
     {
         let config = hosted_config(1, 1);
-        let log_stores = start_wal(&root);
+        let log_stores = start_wal(&root, 1, 1);
         assert_eq!(log_stores.opening().previous_run, PreviousRun::Clean);
         let recovered = ShardRuntime::spawn_with_engine_factory(
             config,

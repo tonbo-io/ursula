@@ -402,7 +402,8 @@ impl JournalCluster {
                 .map(|node_id| {
                     (
                         node_id,
-                        SimNodeWal::provision_with_fsync(&format!("{name}-{node_id}"), fsync),
+                        SimNodeWal::provision_with_fsync(&format!("{name}-{node_id}"), fsync)
+                            .with_group_count(JOURNAL_GROUPS.len()),
                     )
                 })
                 .collect(),
@@ -1417,7 +1418,13 @@ fn the_run_state_is_the_old_or_the_new_version_after_a_power_loss() {
     for seed in seeds_from_env("STATE_FILE_SEEDS", &[1, 2, 3, 5, 8]) {
         run_with_madsim(seed, async move {
             let root = sim_dir("run-state");
-            let start = || DurableRaftLogStoreFactory::start(&root, WalFsync::Never);
+            let start = || {
+                DurableRaftLogStoreFactory::start(
+                    &root,
+                    WalFsync::Never,
+                    &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+                )
+            };
             let temp = root.join("run-state.running.tmp");
             start()
                 .expect("a first run")
@@ -1690,7 +1697,8 @@ fn a_burst_of_appends_lands_in_one_group_commit() {
             let wal = SimNodeWal::provision_with_tuning("group-commit", JournalTuning {
                 segment_bytes: 1024 * 1024,
                 ..JournalTuning::new(WalFsync::Always)
-            });
+            })
+            .with_group_count(16);
             let metrics = RuntimeMetrics::new(1, 16);
             let mut stores = Vec::new();
             for group in 0..16 {
@@ -1897,6 +1905,47 @@ fn a_lagging_follower_catches_up_from_the_leaders_disk() {
                 after > before,
                 "seed {seed}: the leaders read the entries the follower missed from disk"
             );
+        });
+    }
+}
+
+/// No journal can be opened before the topology record is durable. A failed
+/// publication is retryable on an empty root; a published one survives power
+/// loss and still rejects a different layout.
+#[test]
+fn wal_topology_publication_survives_power_loss() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("STATE_FILE_SEEDS", &[1, 2, 3, 5, 8]) {
+        run_with_madsim(seed, async move {
+            for (name, fault, relative_path) in [
+                ("write", SimDiskFault::Write, "topology.tmp"),
+                ("file-sync", SimDiskFault::Sync, "topology.tmp"),
+                ("directory-sync", SimDiskFault::Sync, ""),
+            ] {
+                let root = sim_dir(&format!("topology-{name}"));
+                let topology = ursula_shard::StaticShardMap::new(4, 64).unwrap();
+                SimDisk::inject_fault(&root.join(relative_path), fault).unwrap();
+                assert!(matches!(
+                    DurableRaftLogStoreFactory::start(&root, WalFsync::Never, &topology),
+                    Err(RaftWalError::RecordTopology(_))
+                ));
+                assert!(!SimDisk::exists(&root.join(RUN_STATE_FILE)));
+                SimDisk::power_loss(&root).unwrap();
+                let wal =
+                    DurableRaftLogStoreFactory::start(&root, WalFsync::Never, &topology).unwrap();
+                drop(wal);
+                SimDisk::power_loss(&root).unwrap();
+                let changed = ursula_shard::StaticShardMap::new(8, 64).unwrap();
+                assert!(matches!(
+                    DurableRaftLogStoreFactory::start(&root, WalFsync::Never, &changed),
+                    Err(RaftWalError::TopologyMismatch { .. })
+                ));
+                DurableRaftLogStoreFactory::start(&root, WalFsync::Never, &topology)
+                    .unwrap()
+                    .shutdown()
+                    .await
+                    .unwrap();
+            }
         });
     }
 }

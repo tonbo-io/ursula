@@ -1700,7 +1700,12 @@ mod tests {
 
         // A new replica: its history is unknown, so the gate is closed and
         // the replica may bootstrap the group.
-        let wal = DurableRaftLogStoreFactory::start(dir.path(), WalFsync::Never).expect("start");
+        let wal = DurableRaftLogStoreFactory::start(
+            dir.path(),
+            WalFsync::Never,
+            &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+        )
+        .expect("start");
         let mut store = open(&wal);
         let gate = GroupRejoin::durable(1, placement.raft_group_id, &store);
         assert_eq!(gate.status(), RecoveryGateStatus::AwaitingBarrier);
@@ -1721,7 +1726,12 @@ mod tests {
         wal.shutdown().await.expect("clean shutdown");
 
         // A clean restart: the replica holds every entry it acknowledged.
-        let wal = DurableRaftLogStoreFactory::start(dir.path(), WalFsync::Never).expect("start");
+        let wal = DurableRaftLogStoreFactory::start(
+            dir.path(),
+            WalFsync::Never,
+            &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+        )
+        .expect("start");
         let store = open(&wal);
         assert!(GroupRejoin::durable(1, placement.raft_group_id, &store).vote_gate_open());
         drop(store);
@@ -1731,7 +1741,12 @@ mod tests {
         // recovers. It refuses every vote, and the replica that led it starts
         // as a follower.
         std::fs::remove_file(dir.path().join(RUN_STATE_FILE)).expect("remove the run state");
-        let wal = DurableRaftLogStoreFactory::start(dir.path(), WalFsync::Never).expect("start");
+        let wal = DurableRaftLogStoreFactory::start(
+            dir.path(),
+            WalFsync::Never,
+            &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+        )
+        .expect("start");
         let mut store = open(&wal);
         assert_eq!(store.log_state(), GroupLogState::Recovering);
         let gate = GroupRejoin::durable(1, placement.raft_group_id, &store);
@@ -1769,7 +1784,12 @@ mod tests {
 
         // A crash of the next run (no clean shutdown) on the same host keeps
         // the open gate.
-        let wal = DurableRaftLogStoreFactory::start(dir.path(), WalFsync::Always).expect("start");
+        let wal = DurableRaftLogStoreFactory::start(
+            dir.path(),
+            WalFsync::Always,
+            &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+        )
+        .expect("start");
         let store = open(&wal);
         let gate = GroupRejoin::durable(1, placement.raft_group_id, &store);
         assert_eq!(

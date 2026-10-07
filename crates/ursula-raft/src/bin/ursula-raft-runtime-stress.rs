@@ -56,7 +56,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             true,
         ),
     };
-    let wal = DurableRaftLogStoreFactory::start(&wal_dir, args.wal_fsync)?;
+    let wal = DurableRaftLogStoreFactory::start(
+        &wal_dir,
+        args.wal_fsync,
+        &ursula_shard::StaticShardMap::new(args.core_count, args.raft_group_count)?,
+    )?;
     let runtime = ShardRuntime::spawn_with_engine_factory(
         config,
         DurableRaftGroupEngineFactory::new(wal.clone()),

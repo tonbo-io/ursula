@@ -44,6 +44,7 @@ const RELEASE_SLEEPS: usize = 1_000;
 pub(crate) struct SimNodeWal {
     root: PathBuf,
     tuning: JournalTuning,
+    topology: ursula_shard::StaticShardMap,
     /// The node's current run of the WAL; `None` while the node is down.
     run: Arc<Mutex<Option<DurableRaftLogStoreFactory>>>,
     stores: Arc<Mutex<BTreeMap<RaftGroupId, Weak<RaftGroupFileLogStore>>>>,
@@ -68,9 +69,17 @@ impl SimNodeWal {
         Self {
             root,
             tuning,
+            topology: ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
             run: Arc::new(Mutex::new(None)),
             stores: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Sets the number of groups before this simulated node first starts.
+    #[cfg(test)]
+    pub(super) fn with_group_count(mut self, groups: usize) -> Self {
+        self.topology = ursula_shard::StaticShardMap::new(1, groups).expect("valid topology");
+        self
     }
 
     /// The node directory; a power loss of the node covers everything below it.
@@ -85,8 +94,9 @@ impl SimNodeWal {
         if let Some(run) = run.as_ref() {
             return Ok(run.clone());
         }
-        let started = DurableRaftLogStoreFactory::start_with(&self.root, self.tuning)
-            .map_err(|err| GroupEngineError::new(format!("start the Raft WAL: {err}")))?;
+        let started =
+            DurableRaftLogStoreFactory::start_with(&self.root, self.tuning, &self.topology)
+                .map_err(|err| GroupEngineError::new(format!("start the Raft WAL: {err}")))?;
         *run = Some(started.clone());
         Ok(started)
     }
