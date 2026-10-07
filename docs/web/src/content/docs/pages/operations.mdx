@@ -264,27 +264,119 @@ ursulactl backup-verify --location s3://backups/ursula/2026-07-25
 ursulactl restore --config new-cluster.yaml --location s3://backups/ursula/2026-07-25
 ```
 
+An `s3://` location uses the AWS SDK credential chain and `AWS_REGION`. For MinIO or another S3-compatible store, also set `AWS_ENDPOINT_URL`, for example `AWS_ENDPOINT_URL=http://minio.internal:9000`.
+
 The recovery contract:
 
-- **Consistency boundary.** Each group export is the deterministic state-machine snapshot the raft snapshot path persists: internally consistent per group while writes continue. Cross-group consistency is not promised; the boundary is per stream. Acknowledged writes in the exporting replica's applied state are included whether or not they were cold-flushed, so **RPO is bounded by export time**, not by the cold-flush interval. `backup-create` asks every node and keeps the reply with the highest group commit index.
-- **Fresh identity on restore.** Restore replays each snapshot as one replicated write on the target cluster, which keeps its own raft membership and log identity — nothing from the source cluster's raft metadata is reused. Groups that already hold buckets refuse the import with `409`; group-count mismatches fail closed before the first import. Group commit indexes and per-stream append counters restart under the new identity; stream bytes, offsets, close/TTL state, published snapshots, retention floors, and producer dedup states are preserved exactly.
-- **Cold objects are part of the backup set.** Snapshots reference cold-tier chunks by object key; point the restored cluster at the same (or a copied) cold-store namespace. `backup-verify` validates snapshots but does not dereference cold objects.
-- **Format compatibility.** The backup format is the format epoch (`format_version` 2 in the manifest and in `/__ursula/backup/info`). `ursulactl` refuses a manifest or a target cluster of another version before the first import, and a server refuses to import a group without format epoch 2 (`400`). Backups of Ursula 0.5.x cannot be restored into 0.6; see [Upgrading to 0.6](#upgrading-to-06).
-- **RTO** is dominated by transferring and importing the group snapshots; each import is a single replicated write per group.
+- **Consistency boundary.** Each group export is the deterministic state-machine snapshot the raft snapshot path persists: internally consistent per group while writes continue. Cross-group consistency is not promised, the boundary is per stream. Acknowledged writes in the exporting replica's applied state are included whether or not they were cold-flushed, so **RPO is bounded by export time**, not by the cold-flush interval. `backup-create` asks every node and keeps the reply with the highest group commit index.
+- **Fresh identity on restore.** Restore replays each snapshot as one replicated write on the target cluster, which keeps its own raft membership and log identity. Nothing from the source cluster's raft metadata is reused. Groups that already hold buckets refuse the import with `409`, and group-count mismatches fail closed before the first import. Group commit indexes and per-stream append counters restart under the new identity. Stream bytes, offsets, close/TTL state, published snapshots, retention floors, and producer dedup states are preserved exactly.
+- **Cold objects are part of the backup set.** Snapshots reference cold-tier chunks, cold-index pages and external payloads by object key. The backup holds the references, not the objects. The restored cluster's cold store must hold the same objects under the same keys: point it at a copy (see [Copying cold objects](#copying-cold-objects)). `backup-verify` validates snapshots but does not dereference cold objects. `restore` asks the target cluster, before the first import, to check every group's references against its own cold store (`POST /__ursula/backup/group/{group}/cold-check`). If any object is missing, it stops with nothing imported and prints how many are missing and the first keys.
+- **Format compatibility.** A backup has its own version, independent of the format epoch: `format_version` 2 in the manifest and in `/__ursula/backup/info`, and stream snapshot version 2 in every group object. Ursula 0.6 and 0.7 both read and write version 2, so a 0.6 backup restores into 0.7 (see [Upgrading from 0.6](#upgrading-from-06)). `ursulactl` refuses a manifest or a target cluster of another version before the first import, and a server refuses to import a group of another stream snapshot version (`400`). Backups of Ursula 0.5.x cannot be restored into 0.6 or later.
+- **RTO** is dominated by transferring and importing the group snapshots. Each import is a single replicated write per group.
 
-The recovery drill — write, snapshot, retain, close; back up; destroy the cluster; restore; verify checksums, offsets, and boundaries; continue appending — runs in CI (`backup_restore_drill_preserves_streams_and_allows_continued_appends`).
+The recovery drill runs in CI (`backup_restore_drill_preserves_streams_and_allows_continued_appends`): write, snapshot, retain and close, back up, destroy the cluster, restore, verify checksums, offsets and boundaries, and continue appending. A second test restores a backup that Ursula 0.6.2 wrote (`cli_restores_a_backup_written_by_ursula_0_6_2`).
 
 What you can additionally rely on:
 
 - **Quorum durability.** Acknowledged writes survive as long as a majority of voters survives. Three voters across AZs tolerate any single-AZ outage.
 - **Cold-tier durability.** Once flushed to S3, a chunk inherits S3-grade durability. The unflushed window is bounded by the flush interval (seconds by default).
-- **Format epoch 2, no migration.** Everything Ursula 0.6 persists or sends
-  between nodes carries format epoch 2: the Raft WAL, snapshots, the
-  object-storage prefix, backups and the Raft gRPC protocol. A 0.6 node refuses
-  data and peers written by Ursula 0.5.x (format epoch 1) and does not migrate
-  them. See [Upgrading to 0.6](#upgrading-to-06).
+- **Format epoch 3.** The Raft WAL directories, the object-storage prefix and
+  the Raft gRPC protocol carry the format epoch. A 0.7 node refuses WAL
+  directories, prefixes and peers of another epoch and does not migrate them.
+  Each persisted artifact also has its own version, which changes only when
+  that artifact's encoding changes: 0.7 changed the Raft WAL (version 3), and
+  backups, stream snapshots, Raft group snapshots, snapshot references and
+  cold-index pages stay at version 2. A backup plus a copy of the cold objects
+  moves data between epochs. See [Upgrading from 0.6](#upgrading-from-06).
 
 Node-level loss: replace the host with the same `node_id` and cluster config, and it rehydrates from peers. Use `ursulactl wait-ready` afterwards to confirm the replacement is voting and caught up before declaring the recovery done. Total-cluster loss: restore the latest verified backup into a fresh cluster as above.
+
+### Copying cold objects
+
+A restored cluster reads cold data under the keys the source cluster wrote, relative to `storage.cold.root`. Copy the source's objects into the target's root after the target has started and written its `URSULA_FORMAT_EPOCH` marker, and before `restore`. Skip two things:
+
+- `URSULA_FORMAT_EPOCH`, the marker. The target's own marker stays.
+- `snapshots/`, the source's Raft snapshots and their references. The target writes its own there. With a custom `storage.snapshot.s3_prefix` inside the cold root, skip that prefix instead.
+
+With the AWS CLI, from the source root to the target root:
+
+```bash
+aws s3 sync s3://my-bucket/ursula-06/cold/ s3://my-bucket/ursula-07/cold/ \
+  --exclude 'URSULA_FORMAT_EPOCH' --exclude 'snapshots/*'
+```
+
+For MinIO or another S3-compatible store, add `--endpoint-url`. The copy must match the backup, so the source must not change its cold objects in between. Stopping writes is not enough: an idle cluster still compacts small cold chunks and deletes the ones it replaced a few minutes later. Stop the source nodes once the backup verifies, then copy. `restore` checks that the copy is complete.
+
+Never point two clusters at one prefix, and never point a new cluster at the source's prefix in place. After a restore both clusters hold the same streams under the same keys, but each one deletes cold objects by its own state alone: the cold GC after a delete, a retention advance or a compaction, the orphan sweep for unreferenced objects older than a day, and the pruning of `snapshots/` by the cluster's own references. Two clusters on one prefix delete objects the other still reads. A 0.7 node refuses a 0.6 prefix anyway, because its `URSULA_FORMAT_EPOCH` marker names epoch 2. A copy also leaves the source cluster and its prefix as they were, so the source stays a way back until the switch.
+
+## Upgrading from 0.6
+
+**0.7 is a breaking release.** It changes the Raft WAL format (format epoch 3). A 0.7 node refuses the WAL directories and the object-storage prefix of a 0.6 cluster, and it does not join 0.6 peers. There is no in-place upgrade and no rolling upgrade. Data moves to a new 0.7 cluster through a backup: `ursulactl backup-create` on the 0.6 cluster, then `ursulactl restore` into the new cluster. The backup format did not change, so 0.7 reads 0.6 backups as they are.
+
+### Change the configuration first
+
+For the 0.7 cluster:
+
+- Remove `raft.wal.backend`, `raft.wal.allow_volatile_multi_peer`, `raft.memory_bootstrap_marker_dir` and `raft.rejoin_probe`. The Raft WAL is always the disk journal. A config that still sets one of these keys fails to load with an error that names the key and the release that removed it.
+- Set `raft.wal.path` on every node of a multi-node cluster. 0.6 defaulted to the memory WAL. 0.7 has none, and a node with `raft.peers` refuses to start without a WAL path.
+- Decide on `raft.wal.fsync`. It defaults to `never`: an append is acknowledged once it is in the page cache, and a host crash can cost that replica its unsynced tail (see [Recovering after a host crash](#recovering-after-a-host-crash)). Set `always` to keep the 0.6 disk WAL behaviour of one `fsync` per batch. With Helm the key is `raft.walFsync`.
+- With Helm, remove `raft.storageMode`, `raft.allowVolatileMultiPeer` and `persistence.enabled`. Every pod gets a PVC for its WAL. The chart's values schema refuses the old keys.
+- Keep `raft.group_count` (Helm `raft.groupCount`) equal to the 0.6 cluster's. Streams hash to groups by this count, and `restore` refuses a target with another count.
+- Use a new object-storage prefix: `storage.cold.root` (Helm `s3.prefix` and `coldStorage.prefix`), and `storage.snapshot.s3_prefix` when only snapshots use S3.
+
+`ursulactl` 0.7 removes the memory-WAL restart verbs: `prepare-restart`, `restart-quiesce-capability`, `finish-prepared-restart`, `abort-prepared-restart`, `prepare-amnesiac-restart`, `repair-restarted-voter`, `prepare-recovery-handoff` and `classify-amnesiac`. A 0.7 voter that lost its log waits behind its recovery gate while its group leaders rebuild it (see [Rejoining a wiped node](#rejoining-a-wiped-node)). Take these verbs out of runbooks and rollout scripts.
+
+### Move the data
+
+1. **Stop writes** to the 0.6 cluster. A backup is consistent per group while writes continue, but nothing written after it reaches the new cluster. Keep the 0.6 nodes running: the backup reads from them.
+2. **Back up and verify.** The `ursulactl` of either release works:
+
+   ```bash
+   ursulactl backup-create --config cluster-06.json --location s3://backups/ursula/upgrade-07
+   ursulactl backup-verify --location s3://backups/ursula/upgrade-07
+   ```
+
+   For MinIO or another S3-compatible store, set `AWS_ENDPOINT_URL` (and `AWS_REGION` and credentials, as for any AWS SDK client) before both commands.
+3. **Stop the 0.6 nodes**, so their compaction and GC cannot change the cold objects before the copy. Send each node `SIGTERM`, or with Helm scale the 0.6 release's StatefulSet to zero:
+
+   ```bash
+   kubectl scale statefulset/ursula --replicas=0
+   ```
+
+   Keep their WAL directories (PVCs) and their prefix. Starting the nodes again is the way back until step 8.
+4. **Install the 0.7 cluster** with the configuration above: empty WAL directories (Helm: new PVCs), the same group count and a new, empty object-storage prefix. Do not configure any 0.6 node as a peer. Wait until it is ready:
+
+   ```bash
+   ursulactl wait-ready --config cluster-07.json --expected-groups 64
+   ```
+
+5. **Copy the cold objects** from the 0.6 prefix into the 0.7 prefix, without `URSULA_FORMAT_EPOCH` and `snapshots/` (see [Copying cold objects](#copying-cold-objects)):
+
+   ```bash
+   aws s3 sync s3://my-bucket/ursula-06/cold/ s3://my-bucket/ursula-07/cold/ \
+     --exclude 'URSULA_FORMAT_EPOCH' --exclude 'snapshots/*'
+   ```
+
+   A 0.6 cluster without an S3 cold store has no cold objects. Skip this step.
+6. **Restore** with the 0.7 `ursulactl`:
+
+   ```bash
+   ursulactl restore --config cluster-07.json --location s3://backups/ursula/upgrade-07
+   ```
+
+   It verifies the backup, checks that the new cluster's cold store holds every cold object the backup references, and only then imports. When an object is missing, it imports nothing and names the first missing keys. Copy again and rerun it. The 0.6 `ursulactl` cannot restore into 0.7: it lacks the process identity header the 0.7 admin plane requires.
+7. **Compare.** `restore` prints the group, bucket and stream counts it imported, which match what `backup-verify` printed. Spot-check streams against `HEAD` answers and reads that you recorded on the 0.6 cluster before step 3: the 0.7 cluster returns the same `Stream-Next-Offset`, `Content-Type`, `Stream-Closed`, `Stream-TTL` or `Stream-Expires-At` and `Stream-Incarnation`, and the same bytes.
+8. **Switch clients** to the 0.7 cluster. Delete the 0.6 cluster and, once you no longer need it, its prefix.
+
+### What carries over
+
+Carried over: stream bytes and offsets, content types, closed state, TTL and expiry, retention floors, published snapshots, the last `Stream-Seq`, stream incarnations, producer state (epochs and duplicate detection), bucket usage counters and bucket erasure fences.
+
+Starts fresh: Raft membership, terms and log indexes (`group_commit_index`), the WAL, per-stream append counters and anything written to the 0.6 cluster after the backup. The cold objects are copies, so the 0.6 prefix can be deleted after the switch. Event-time indexer data under `indexer.s3.prefix` is not part of a backup.
+
+### Do not point 0.7 at a live 0.6 cluster
+
+A 0.7 node never joins a 0.6 cluster, but its startup probe still reaches the 0.6 nodes it is configured with. Each of them records a Raft protocol mismatch and then answers `503` with `format_epoch_mismatch` on `/__ursula/ready` until it restarts. Keep the two clusters' peer lists apart, and never point a 0.7 node at a 0.6 WAL directory or prefix. It refuses them at startup and writes nothing, but [two clusters must never share a prefix](#copying-cold-objects).
 
 ## Upgrading to 0.6
 
@@ -310,7 +402,7 @@ How a 0.6 node refuses old data, and what it prints, is listed under [Startup fa
 - **Object storage.** `URSULA_FORMAT_EPOCH` sits at `storage.cold.root` when the cold backend is S3, otherwise at the S3 snapshot namespace (`storage.snapshot.s3_prefix`) when snapshots live on S3. A namespace that holds objects without the marker is refused, so it must be used only by this cluster. With a memory cold store and inline snapshots there is no object-storage check.
 - **Peers.** Before it writes the markers, a node with configured peers asks each one, in parallel (2 seconds to connect plus 2 seconds for the answer, about 4 seconds at most), whether it speaks Raft protocol 2. A peer that refuses ends startup; an unreachable peer is skipped, because a fresh cluster starts its pods in parallel.
 - **Readiness.** Any later Raft protocol mismatch, inbound or outbound, is logged at error level and makes `/__ursula/ready` answer `503` with `"reason": "format_epoch_mismatch"` until the node restarts.
-- **Backups.** Backups use format version 2. `ursulactl backup-restore` and `backup-create` refuse a cluster that reports another version, and a server refuses to import a group without format epoch 2 (`400`).
+- **Backups.** Backups use format version 2. `ursulactl restore` and `backup-create` refuse a cluster that reports another version, and a server refuses to import a group without stream snapshot version 2 (`400`).
 
 Bucket IDs `snapshots` and any ID starting with `__` are reserved (`400`): `snapshots` is the default raft-snapshot namespace in the object store.
 
