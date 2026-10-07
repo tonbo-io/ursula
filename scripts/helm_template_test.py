@@ -407,6 +407,38 @@ class HelmTemplateConfigTest(unittest.TestCase):
             rendered,
         )
 
+    def test_wal_fsync_policy_is_rendered_and_validated(self) -> None:
+        wal = tomllib.loads(render_config("--set", "s3.bucket=bkt"))["raft"]["wal"]
+        self.assertEqual(wal["fsync"], "always")
+
+        wal = tomllib.loads(render_config("--set", "s3.bucket=bkt", "--set", "raft.walFsync=never"))[
+            "raft"
+        ]["wal"]
+        self.assertEqual(wal["fsync"], "never")
+
+        for values, message in (
+            (("--set", "raft.walFsync=interval"), "walFsync"),
+            (
+                (
+                    "--set",
+                    "raft.storageMode=memory",
+                    "--set",
+                    "raft.allowVolatileMultiPeer=true",
+                    "--set",
+                    "raft.walFsync=never",
+                ),
+                "raft.walFsync=never requires raft.storageMode=logDir",
+            ),
+        ):
+            result = subprocess.run(
+                ["helm", "template", "test", "charts/ursula", "--set", "s3.bucket=bkt", *values],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0, values)
+            self.assertIn(message, result.stderr)
+
     def test_multi_peer_memory_wal_requires_explicit_opt_in(self) -> None:
         result = subprocess.run(
             [

@@ -315,6 +315,13 @@ accepted. The entrypoint should only guard runtime-derived pod ordinal state.
 {{- if and ($storageMode | eq "logDir") ($logDir | eq "") -}}
 {{- fail "raft.logDir must be non-empty when raft.storageMode=logDir" -}}
 {{- end -}}
+{{- $walFsync := .Values.raft.walFsync | toString -}}
+{{- if or ($walFsync | eq "always") ($walFsync | eq "never") | not -}}
+{{- fail (printf "raft.walFsync must be always or never; got %q" .Values.raft.walFsync) -}}
+{{- end -}}
+{{- if and ($storageMode | eq "memory") ($walFsync | eq "never") -}}
+{{- fail "raft.walFsync=never requires raft.storageMode=logDir; a memory WAL has nothing to fsync" -}}
+{{- end -}}
 {{- if and ($storageMode | eq "memory") (gt $replicaCount 1) (not .Values.raft.allowVolatileMultiPeer) -}}
 {{- fail "multi-pod raft.storageMode=memory requires raft.allowVolatileMultiPeer=true to accept the volatile-WAL durability contract; see README Bootstrap Behavior for recovery guarantees and S3 marker prerequisites" -}}
 {{- end -}}
