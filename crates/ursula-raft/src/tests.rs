@@ -2753,7 +2753,7 @@ async fn recovery_proof_rejects_a_vote_change_after_read_index() {
     };
     let result = crate::registry::confirm_recovery_barrier(
         placement().raft_group_id,
-        &engine.raft,
+        engine.read_barrier.owner(),
         &barrier,
     )
     .await;

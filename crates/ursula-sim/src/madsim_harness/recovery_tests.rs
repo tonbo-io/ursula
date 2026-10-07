@@ -926,8 +926,9 @@ fn bootstrap_with_absent_peers_advances_time_and_recovers_when_they_arrive() {
 #[test]
 fn another_power_loss_during_remove_voter_finishes_the_joint_without_losing_acks() {
     let _guard = sim_test_guard();
-    // Seed 2 drops the unsynced journal tail on both staged power losses.
-    for seed in [2] {
+    // With owner mailbox dispatch, seed 1 drops both tails. Keep the loss and
+    // joint-membership preconditions asserted so scheduling drift cannot skip the scenario.
+    for seed in seeds_from_env("JOINT_LOSS_SEEDS", &[1]) {
         run_with_madsim(seed, async move {
             let mut cluster =
                 JournalCluster::start_with_fsync("joint-second-loss", WalFsync::Never).await;
@@ -1043,12 +1044,16 @@ fn leader_process_crash_with_pending_tail_never_reuses_log_ids() {
                 // Kill the writer before shutdown can flush the queued batch.
                 store.abort_simulated_writer();
                 let mut failed_store = store.clone();
-                let failure = loop {
-                    if let Err(error) = failed_store.get_log_state().await {
-                        break error;
+                let failure = madsim::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if let Err(error) = failed_store.get_log_state().await {
+                            break error;
+                        }
+                        madsim::time::sleep(Duration::from_millis(1)).await;
                     }
-                    madsim::task::yield_now().await;
-                };
+                })
+                .await
+                .expect("aborting the writer fails its pending append");
                 assert!(matches!(
                     failure
                         .get_ref()

@@ -24,8 +24,12 @@ fn owner_burst(c: &mut Criterion) {
     group.throughput(Throughput::Elements(32));
     for cores in [1, 4] {
         let root = tempfile::tempdir().expect("WAL directory");
-        let wal =
-            ursula_raft::RaftWal::start(root.path(), ursula_config::WalFsync::Always).expect("WAL");
+        let wal = ursula_raft::RaftWal::start(
+            root.path(),
+            ursula_config::WalFsync::Always,
+            &ursula_shard::StaticShardMap::new(cores, cores).expect("topology"),
+        )
+        .expect("WAL");
         let registry = ursula_raft::RaftGroupHandleRegistry::default();
         let runtime = ShardRuntime::spawn_with_engine_factory(
             RuntimeConfig::new(cores, cores),

@@ -46,27 +46,17 @@ pub struct InProcessRaftRegistry {
 
 impl InProcessRaftRegistry {
     pub fn register(&self, node_id: u64, raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>) {
+        let barrier = Arc::new(crate::read_index::ReadIndexBarrier::new(raft.clone()));
         self.barriers
             .lock()
             .expect("in-process barrier mutex")
-            .insert(
-                node_id,
-                Arc::new(crate::read_index::ReadIndexBarrier::new(raft.clone())),
-            );
+            .insert(node_id, barrier.clone());
         let endpoint = crate::RaftGroupHandleRegistry::default();
         let group = ursula_shard::RaftGroupId(0);
         if let Some(gate) = self.rejoin(node_id) {
             endpoint.register_rejoin(group, gate);
         }
-        endpoint.register_read_barrier(
-            group,
-            self.barriers
-                .lock()
-                .expect("barrier registry")
-                .get(&node_id)
-                .unwrap()
-                .clone(),
-        );
+        endpoint.register_read_barrier(group, barrier);
         endpoint.register(
             ursula_shard::ShardPlacement {
                 shard_id: ursula_shard::ShardId(0),
@@ -132,6 +122,20 @@ impl InProcessRaftRegistry {
             .expect("endpoint registry")
             .get(&node_id)
             .cloned()
+    }
+
+    /// Production inbound vote dispatch, also used by simulated recovery probes.
+    pub async fn vote(
+        &self,
+        node_id: u64,
+        request: crate::UrsulaVoteRequest,
+    ) -> Result<crate::UrsulaVoteResponse, ursula_runtime::GroupEngineError> {
+        let endpoint = self
+            .endpoint(node_id)
+            .ok_or(ursula_runtime::GroupEngineError::Infra(
+                ursula_runtime::GroupInfraError::OwnerStopped,
+            ))?;
+        endpoint.vote(ursula_shard::RaftGroupId(0), request).await
     }
 
     /// Screen the votes and appends delivered to `node_id` through its

@@ -89,16 +89,8 @@ pub(super) async fn in_process_probe(
     if policy.partitioned(node_id, peer_id) {
         return None;
     }
-    let target = registry.get(peer_id)?;
-    let request = ursula_raft::bootstrap_probe_vote(node_id);
-    if let Some(refusal) = registry
-        .rejoin(peer_id)
-        .and_then(|rejoin| rejoin.screen_vote(&request))
-    {
-        return Some(PeerGroupLog::from_vote_response(&refusal));
-    }
-    target
-        .vote(request)
+    registry
+        .vote(peer_id, ursula_raft::bootstrap_probe_vote(node_id))
         .await
         .ok()
         .map(|response| PeerGroupLog::from_vote_response(&response))

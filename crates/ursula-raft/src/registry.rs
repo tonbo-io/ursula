@@ -803,7 +803,7 @@ impl RaftGroupHandleRegistry {
         })
         .await
         .map_err(crate::owner::owner_stopped)?
-        .map_err(|error| GroupEngineError::new(format!("OpenRaft AppendEntries: {error}")))
+        .map_err(crate::owner::owner_raft_error)
     }
 
     pub async fn vote(
@@ -821,7 +821,7 @@ impl RaftGroupHandleRegistry {
         })
         .await
         .map_err(crate::owner::owner_stopped)?
-        .map_err(|error| GroupEngineError::new(format!("OpenRaft Vote: {error}")))
+        .map_err(crate::owner::owner_raft_error)
     }
 
     pub async fn install_full_snapshot(
@@ -840,7 +840,7 @@ impl RaftGroupHandleRegistry {
         let result = raft
             .install_full_snapshot(vote, snapshot)
             .await
-            .map_err(|err| GroupEngineError::new(format!("OpenRaft install snapshot: {err}")));
+            .map_err(crate::owner::owner_stopped);
         drop(_prefetch_guard);
         let publication = self
             .snapshot_install
