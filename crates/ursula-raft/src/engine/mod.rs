@@ -16,7 +16,6 @@ use std::time::Duration;
 
 pub use factory::DurableRaftGroupEngineFactory;
 pub use factory::DurableRaftLogStoreFactory;
-pub use factory::GROUP_ELECTION_TIMEOUT_MIN_MS;
 pub use factory::RaftEngineConfig;
 pub use factory::StaticGrpcRaftGroupEngineFactory;
 use openraft::BasicNode;

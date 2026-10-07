@@ -257,9 +257,9 @@ def shim(role):
                     result = proof(db, nodes)
                 elif command == 'verify-survivors':
                     result = {'synthetic_survivors': True}
-                elif command not in ('prepare-restart', 'drain', 'repair-restarted-voter', 'wait', 'finish-prepared-restart', 'verify-cluster'):
+                elif command not in ('drain', 'wait', 'undrain', 'verify-cluster'):
                     raise RuntimeError(args)
-        paused = role == 'ctl' and args[0] == 'prepare-restart' and db['mode'] == 'pause-prepare'
+        paused = role == 'ctl' and args[0] == 'drain' and db['mode'] == 'pause-drain'
         if paused:
             db['paused'] = True
         write_db(database, db)
@@ -350,6 +350,13 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual([e['generation'] for e in self.deletions()], [1, 2, 3])
         for entry in self.db['nodes'].values():
             self.assertEqual(entry['phase'], 'retired')
+        # Each voter is drained before its Pod is deleted, and undrained only
+        # after it caught up as a voter again.
+        restart_steps = [e['args'][0] if e['role'] == 'ctl' else 'delete'
+                         for e in self.db['events']
+                         if (e['role'] == 'ctl' and e['args'][0] in ('drain', 'wait', 'undrain'))
+                         or 'deleted_node' in e]
+        self.assertEqual(restart_steps, ['drain', 'delete', 'wait', 'undrain'] * 3)
         # Every admission included every configured group and every fixed boot.
         for deletion in self.deletions():
             self.assertEqual(len(deletion['admission']['verification']['prefixes']), 4)
@@ -489,7 +496,7 @@ class RolloutTests(unittest.TestCase):
                 self.assertNotEqual(run.returncode, 0)
                 saved = self.refresh()
                 self.assertFalse(self.deletions())
-                self.assertFalse(any('abort-prepared-restart' in e['args'] for e in self.db['events']))
+                self.assertFalse(any('undrain' in e['args'] for e in self.db['events']))
                 if mode == 'proof-failure':
                     self.assertIsNotNone(saved['operation'])
                     self.assertIsNone(saved['operation']['admission'])
@@ -515,7 +522,7 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(len(self.deletions()), 1)
 
     def test_sigterm_keeps_admitted_operation_and_does_not_undrain(self):
-        self.db['mode'] = 'pause-prepare'
+        self.db['mode'] = 'pause-drain'
         self.save()
         worker = self.run_shell(asynchronous=True)
         deadline = time.monotonic() + 25
@@ -530,8 +537,7 @@ class RolloutTests(unittest.TestCase):
         self.assertIsNotNone(saved['operation']['admission'])
         self.assertIsNone(saved['operation']['replacement'])
         self.assertFalse(self.deletions())
-        self.assertFalse(any('abort-prepared-restart' in e['args'] or 'undrain' in e['args']
-                             for e in self.db['events']))
+        self.assertFalse(any('undrain' in e['args'] for e in self.db['events']))
 
     def test_bound_replacement_container_restart_cannot_refresh_the_plan(self):
         self.db['mode'] = 'after-bind'

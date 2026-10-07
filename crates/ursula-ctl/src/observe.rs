@@ -229,7 +229,6 @@ mod tests {
                     maintenance_fence_uncertain: false,
                     node: node(1),
                     groups: vec![group(7, Some(1)), group(8, Some(2))],
-                    wal_backend: None,
                     raft_maintenance: None,
                 },
                 NodeMetricsView {
@@ -238,7 +237,6 @@ mod tests {
                     maintenance_fence_uncertain: false,
                     node: node(2),
                     groups: vec![group(7, Some(1)), group(8, Some(2))],
-                    wal_backend: None,
                     raft_maintenance: None,
                 },
             ],
@@ -256,7 +254,6 @@ mod tests {
                 maintenance_fence_uncertain: false,
                 node: node(1),
                 groups: vec![group(7, None)],
-                wal_backend: None,
                 raft_maintenance: None,
             }],
         };
@@ -274,7 +271,6 @@ mod tests {
                 maintenance_fence_uncertain: false,
                 node: node(1),
                 groups: vec![group(7, Some(1)), empty_group(8)],
-                wal_backend: None,
                 raft_maintenance: None,
             }],
         };

@@ -146,7 +146,7 @@ maintenance_recover_operation() {
   maintenance_ordinal=$((maintenance_node - 1))
   maintenance_source_uid=$(maintenance_read source-pod-uid)
   maintenance_stage=$(maintenance_read stage)
-  # Start only the two fixed survivors first. The target might be quiesced,
+  # Start only the two fixed survivors first. The target might be drained,
   # deleting, or awaiting Raft-aware readiness; Ready is not authority.
   maintenance_survivor=0
   while [ "${maintenance_survivor}" -lt 3 ]; do
@@ -173,19 +173,14 @@ maintenance_recover_operation() {
       wait_for_pod_started "${maintenance_ordinal}"
       start_forward "${maintenance_ordinal}"
       maintenance_activate "${MANIFEST}"
-      # Already-quiesced targets can resume preparation without the full-node
-      # readiness needed by drain. A live leader refuses quiescence; drain it
-      # normally and retry. Any failure keeps the shared operation reserved.
-      if ! "${CTL}" prepare-restart --config "${MANIFEST}" --node "${maintenance_node}" --http-timeout-secs 30; then
-        "${CTL}" drain --config "${MANIFEST}" --node "${maintenance_node}" \
-          --drain-timeout-secs 300 --ready-timeout-secs 300 --lag-tolerance 16
-        "${CTL}" prepare-restart --config "${MANIFEST}" --node "${maintenance_node}" --http-timeout-secs 30
-      fi
+      # Drain the target before deleting it. Draining an already drained
+      # target is idempotent. Any failure keeps the shared operation reserved.
+      "${CTL}" drain --config "${MANIFEST}" --node "${maintenance_node}" \
+        --drain-timeout-secs 300 --ready-timeout-secs 300 --lag-tolerance 16
       maintenance_verify_survivors
       replace_pod "${maintenance_ordinal}" "${maintenance_source_uid}"
     else
-      # An executor can have died after deletion. Binding is observation only:
-      # repair below validates both fixed survivors before membership changes.
+      # An executor can have died after deletion. Binding is observation only.
       # Do not demand complete three-voter membership during the selected
       # target's automatic remove/learner/promote recovery interval.
       log "source UID already retired; resuming only its saved replacement"
@@ -226,11 +221,11 @@ maintenance_recover_operation() {
     start_forward "${maintenance_ordinal}"
   fi
   maintenance_activate "${MANIFEST}"
-  "${CTL}" repair-restarted-voter --config "${MANIFEST}" --node "${maintenance_node}" \
-    --drain-timeout-secs 300 --http-timeout-secs 60 --lag-tolerance 16
+  # The replacement started drained. Its group leaders rebuild it if it lost
+  # Raft log entries, so wait until it is a caught-up voter, then undrain it.
   "${CTL}" wait --config "${MANIFEST}" --node "${maintenance_node}" \
     --stall-timeout-secs 300 --ready-timeout-secs 1800 --lag-tolerance 16
-  "${CTL}" finish-prepared-restart --config "${MANIFEST}" --node "${maintenance_node}" --http-timeout-secs 30
+  "${CTL}" undrain --config "${MANIFEST}" --node "${maintenance_node}" --http-timeout-secs 30
   wait_for_pod_ready "${maintenance_ordinal}"
   maintenance_prefix
   # Physical UID must remain the single bound replacement; never refresh it.

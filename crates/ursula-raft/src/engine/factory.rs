@@ -49,9 +49,7 @@ use crate::rejoin::run_group_bootstrap;
 use crate::rejoin::run_rejoin_heal;
 
 /// Minimum election timeout of every data-group Raft, in milliseconds.
-/// `ursulactl`'s restart fence waits this long for an in-flight leadership
-/// transfer to settle, so it reads the same constant.
-pub const GROUP_ELECTION_TIMEOUT_MIN_MS: u64 = 1500;
+const GROUP_ELECTION_TIMEOUT_MIN_MS: u64 = 1500;
 
 const REJOIN_VOTE_BARRIER_TIMEOUT: Duration = Duration::from_secs(3);
 

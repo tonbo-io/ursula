@@ -212,7 +212,6 @@ impl RollingRestartValidator {
                         }),
                     }),
                 }],
-                wal_backend: None,
                 raft_maintenance: None,
             };
             per_node.push(view);
