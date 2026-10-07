@@ -375,6 +375,23 @@ pub(crate) fn persist_segments(dir: &Path, segments: &[KeptSegment]) -> Result<u
     Ok(fsyncs)
 }
 
+/// `fsync`s the newest segment of the journal in `dir`, then the directory,
+/// so every frame the journal holds is on disk. Older segments were
+/// `fsync`ed when they were sealed ([`rotate`]). Returns the number of
+/// `fsync`s.
+pub(crate) fn sync_journal(dir: &Path) -> Result<u64, JournalError> {
+    let Some(newest) = list_segments(dir)?.pop() else {
+        return Ok(0);
+    };
+    let path = segment_path(dir, newest);
+    Disk::open_append(&path)
+        .map_err(|source| JournalError::io(&path, JournalOp::Open, source))?
+        .sync_data()
+        .map_err(|source| JournalError::io(&path, JournalOp::Sync, source))?;
+    Disk::sync_dir(dir).map_err(|source| JournalError::io(dir, JournalOp::SyncDir, source))?;
+    Ok(2)
+}
+
 /// Opens segment `id` of the journal in `dir` for appending; a missing
 /// segment is created, and its header and directory entry made durable.
 /// Returns the writer and the number of `fsync`s.

@@ -65,6 +65,7 @@ use openraft::alias::LogIdOf;
 use openraft::entry::RaftEntry;
 pub use run_state::BootId;
 pub use run_state::JournalHistory;
+pub use run_state::JournalSync;
 pub(crate) use run_state::NodeWal;
 pub use run_state::PreviousRun;
 pub use run_state::RUN_STATE_FILE;

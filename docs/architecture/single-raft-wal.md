@@ -115,6 +115,16 @@ Verification therefore cannot skip a bad frame. Because frame checksums cover
 the header, the payload and the segment sequence number, the kept frames form
 a valid log prefix.
 
+The run state records the current run's policy, and a later host crash is
+read by it, so that policy must hold for every write the journals hold. A
+process crash under `never` leaves acknowledged writes in the page cache only.
+A run that starts with `always` after such a crash therefore `fsync`s the
+newest segment of every core journal and its directory before it records
+itself. Older segments were `fsync`ed when they were sealed. If the host
+crashes before that record, the run state still names the `never` run and the
+next start gates every group. A run that keeps `never` has nothing to sync,
+since a host crash after it gates every group anyway.
+
 ## Recovery gate
 
 A replica whose log may be missing entries it acknowledged must not help
