@@ -1,5 +1,7 @@
-//! Identity preconditions for the administrative HTTP protocol.
+//! Typed administrative HTTP requests, responses and identity preconditions.
 
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use serde::Deserialize;
@@ -246,4 +248,181 @@ mod tests {
                 .expect_err("a non-canonical incarnation must be rejected");
         }
     }
+}
+
+/// Result of submitting a planned leadership transfer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferLeaderResponse {
+    pub raft_group_id: u64,
+    #[serde(default)]
+    pub from: Option<u64>,
+    #[serde(default)]
+    pub to: Option<u64>,
+    #[serde(default)]
+    pub current_leader: Option<u64>,
+    pub transferred: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Request a local election against an observed term.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfElectionRequest {
+    pub current_term: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RaftMaintenanceIssue {
+    EmptyExpectedInventory,
+    MissingGroup,
+    UnexpectedGroup,
+    DuplicateGroup,
+    WrongNodeIdentity,
+    RaftStopped,
+    RecoveryBarrier,
+    StoppedForOperator,
+    JointMembership,
+    IncompleteVoterSet,
+    MembershipNotApplied,
+    LeaderUnknown,
+    LeaderOutsideVoters,
+    NotApplied,
+    ApplyLag,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RaftMaintenanceReport {
+    pub version: u32,
+    pub node_id: u64,
+    pub lag_tolerance: u64,
+    pub expected_groups: BTreeMap<u32, BTreeSet<u64>>,
+    pub node_issues: Vec<RaftMaintenanceIssue>,
+    pub group_issues: BTreeMap<u32, Vec<RaftMaintenanceIssue>>,
+}
+
+impl RaftMaintenanceReport {
+    pub fn ready(&self) -> bool {
+        self.version == 1
+            && !self.expected_groups.is_empty()
+            && self.node_issues.is_empty()
+            && self.group_issues.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RaftGroupMaintenanceState {
+    pub running: bool,
+    pub recovery_ready: bool,
+    pub accepting_transfers: bool,
+    pub membership_joint: bool,
+    pub membership_log_index: Option<u64>,
+    pub stopped_for_operator: bool,
+}
+
+/// One fresh, outbound ReadIndex confirmation bound to its committed leader.
+/// The legacy bridge returns the leader's last log as a conservative apply
+/// bound; callers must wait for every required replica to apply that prefix.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QuorumPrefix {
+    pub raft_group_id: u32,
+    pub leader_id: u64,
+    pub leader_term: u64,
+    pub required_applied_index: u64,
+}
+
+/// A group's recovery gate on this replica, as status reports show it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryGateStatus {
+    /// The replica votes and campaigns.
+    Open,
+    /// Gated; no leader has confirmed a barrier yet.
+    AwaitingBarrier,
+    /// Gated, and for the configured stall timeout no leader confirmed a barrier
+    /// and nothing was applied: the group waits for an operator to accept
+    /// the loss of the unsynced tail.
+    Stalled,
+    /// Gated; a leader confirmed a barrier and the replica catches up.
+    CatchingUp,
+}
+
+impl RecoveryGateStatus {
+    pub fn is_stalled(self) -> bool {
+        self == Self::Stalled
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryGatesReport {
+    pub gated: BTreeMap<u32, RecoveryGateStatus>,
+    pub stalled: Vec<u32>,
+}
+impl RecoveryGatesReport {
+    pub fn new(gates: BTreeMap<u32, RecoveryGateStatus>) -> Self {
+        let gated: BTreeMap<_, _> = gates
+            .into_iter()
+            .filter(|(_, status)| *status != RecoveryGateStatus::Open)
+            .collect();
+        let stalled = gated
+            .iter()
+            .filter(|(_, status)| status.is_stalled())
+            .map(|(group, _)| *group)
+            .collect();
+        Self { gated, stalled }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeadershipShedStatus {
+    pub bits: u8,
+    pub state: String,
+    pub should_accept_transfer: bool,
+    pub should_campaign: bool,
+    pub recovery_barriers_ready: bool,
+    pub should_shed_current_leaders: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupInfo {
+    pub format_version: u32,
+    pub raft_group_count: u32,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotResponse {
+    pub raft_group_id: u32,
+    pub snapshot_index: Option<u64>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurgeResponse {
+    pub raft_group_id: u32,
+    pub purged_index: Option<u64>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddLearnerResponse {
+    pub raft_group_id: u32,
+    pub node_id: u64,
+    pub log_index: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MembershipResponse {
+    pub raft_group_id: u32,
+    #[serde(default)]
+    pub voter_ids: BTreeSet<u64>,
+    pub log_index: Option<u64>,
+    pub current_leader: Option<u64>,
+    pub changed: bool,
+    pub reason: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurgeQuery {
+    pub upto: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddLearnerQuery {
+    pub addr: String,
+    pub blocking: Option<bool>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MembershipQuery {
+    pub voters: String,
 }

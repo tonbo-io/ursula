@@ -102,43 +102,53 @@ pub(super) async fn in_process_probe(
 /// drivers belong to the node's process and must be aborted with it.
 pub(super) fn wire_recovery(
     node_id: u64,
-    placement: ShardPlacement,
+    _placement: ShardPlacement,
     engine: &RaftGroupEngine,
     rejoin: &Arc<GroupRejoin>,
     registry: &InProcessRaftRegistry,
     policy: &InProcessRaftNetworkPolicy,
     voters: &BTreeMap<u64, BasicNode>,
-) -> Vec<madsim::task::JoinHandle<()>> {
-    rejoin.bind(&engine.raft_handle());
+) {
     registry.register_rejoin(node_id, rejoin.clone());
-    // The node's own view of its groups, which applies its election policy.
-    let participation = RaftGroupHandleRegistry::default();
-    participation.register_rejoin(placement.raft_group_id, rejoin.clone());
-    participation.register(placement, engine.raft_handle());
-    let probe_registry = registry.clone();
-    let probe_policy = policy.clone();
-    vec![
-        madsim::task::spawn(ursula_raft::run_rejoin_vote_barrier(
-            engine.raft_handle(),
-            rejoin.clone(),
-            participation,
-            voters.clone(),
-            move |leader_id, _address| {
-                let registry = probe_registry.clone();
-                let policy = probe_policy.clone();
-                async move { in_process_barrier(&registry, &policy, node_id, leader_id).await }
-            },
-            Duration::from_secs(1),
-            RECOVERY_DRIVER_INTERVAL,
-            RECOVERY_STALL_AFTER,
-        )),
-        madsim::task::spawn(ursula_raft::run_rejoin_heal(
-            engine.raft_handle(),
-            rejoin.clone(),
-            voters.clone(),
-            RECOVERY_DRIVER_INTERVAL,
-        )),
-    ]
+    engine.attach_recovery(
+        rejoin.clone(),
+        &RaftGroupHandleRegistry::default(),
+        voters.clone(),
+        InProcessRecoveryTransport {
+            registry: registry.clone(),
+            policy: policy.clone(),
+            node_id,
+        },
+        ursula_raft::RecoveryConfig {
+            initialize: node_id == 1,
+            interval: RECOVERY_DRIVER_INTERVAL,
+            barrier_timeout: Duration::from_secs(1),
+            stall_after: RECOVERY_STALL_AFTER,
+            bootstrap_interval: RECOVERY_DRIVER_INTERVAL,
+            bootstrap_warn_after: Duration::from_secs(5),
+        },
+    );
+}
+
+#[derive(Clone)]
+struct InProcessRecoveryTransport {
+    registry: InProcessRaftRegistry,
+    policy: InProcessRaftNetworkPolicy,
+    node_id: u64,
+}
+
+impl ursula_raft::RecoveryTransport for InProcessRecoveryTransport {
+    type Error = String;
+    async fn probe(&self, peer: u64, _address: String) -> Option<PeerGroupLog> {
+        in_process_probe(&self.registry, &self.policy, self.node_id, peer).await
+    }
+    async fn barrier(
+        &self,
+        leader: u64,
+        _address: String,
+    ) -> Result<(UrsulaVote, u64), Self::Error> {
+        in_process_barrier(&self.registry, &self.policy, self.node_id, leader).await
+    }
 }
 
 /// One vote request a replica answered over the in-process network.

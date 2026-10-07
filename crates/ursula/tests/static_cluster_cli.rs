@@ -2794,7 +2794,7 @@ fn remove_test_path(path: impl AsRef<std::path::Path>) {
 /// The bytes the segments of the core journal in `core_dir` hold beyond
 /// their headers; zero before the journal exists.
 fn core_journal_record_bytes(core_dir: &Path) -> u64 {
-    ursula_raft::journal_segments(core_dir)
+    ursula_raft::wal::diagnostics::journal_segments(core_dir)
         .expect("list the core journal segments")
         .iter()
         .map(|(_, path)| {

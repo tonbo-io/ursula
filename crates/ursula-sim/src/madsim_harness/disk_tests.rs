@@ -15,35 +15,35 @@ use openraft::storage::IOFlushed;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use ursula_config::WalFsync;
-use ursula_raft::CoreJournalError;
 use ursula_raft::DurableRaftLogStoreFactory;
-use ursula_raft::GroupLogState;
 use ursula_raft::GroupRejoin;
 use ursula_raft::InProcessRaftNetworkFactory;
 use ursula_raft::InProcessRaftNetworkPolicy;
 use ursula_raft::InProcessRaftRegistry;
-use ursula_raft::JournalDisk;
-use ursula_raft::JournalError;
-use ursula_raft::JournalFile;
-use ursula_raft::JournalOp;
-use ursula_raft::JournalReplayMode;
 use ursula_raft::JournalTuning;
-use ursula_raft::LockAttempt;
-use ursula_raft::PreviousRun;
-use ursula_raft::RUN_STATE_FILE;
 use ursula_raft::RaftGroupEngine;
 use ursula_raft::RaftGroupFileLogStore;
 use ursula_raft::RaftWalError;
-use ursula_raft::RecoveryReason;
 use ursula_raft::RecoveryState;
-use ursula_raft::SIM_DISK_PAGE_SIZE;
-use ursula_raft::SimDisk;
-use ursula_raft::SimDiskError;
-use ursula_raft::SimDiskFault;
 use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_raft::WalOpening;
-use ursula_raft::journal_segment_path;
-use ursula_raft::journal_segments;
+use ursula_raft::wal::diagnostics::CoreJournalError;
+use ursula_raft::wal::diagnostics::GroupLogState;
+use ursula_raft::wal::diagnostics::JournalDisk;
+use ursula_raft::wal::diagnostics::JournalError;
+use ursula_raft::wal::diagnostics::JournalFile;
+use ursula_raft::wal::diagnostics::JournalOp;
+use ursula_raft::wal::diagnostics::JournalReplayMode;
+use ursula_raft::wal::diagnostics::LockAttempt;
+use ursula_raft::wal::diagnostics::PreviousRun;
+use ursula_raft::wal::diagnostics::RUN_STATE_FILE;
+use ursula_raft::wal::diagnostics::RecoveryReason;
+use ursula_raft::wal::diagnostics::SIM_DISK_PAGE_SIZE;
+use ursula_raft::wal::diagnostics::SimDisk;
+use ursula_raft::wal::diagnostics::SimDiskError;
+use ursula_raft::wal::diagnostics::SimDiskFault;
+use ursula_raft::wal::diagnostics::journal_segment_path;
+use ursula_raft::wal::diagnostics::journal_segments;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
@@ -369,8 +369,6 @@ pub(super) struct JournalCluster {
     registries: BTreeMap<u32, InProcessRaftRegistry>,
     pub(super) engines: BTreeMap<(u32, u64), RaftGroupEngine>,
     pub(super) rejoins: BTreeMap<(u32, u64), Arc<GroupRejoin>>,
-    /// Each node's process-owned recovery tasks, stopped with the node.
-    drivers: BTreeMap<u64, Vec<madsim::task::JoinHandle<()>>>,
     /// Each node's WAL metrics, kept across its restarts.
     pub(super) metrics: BTreeMap<u64, RuntimeMetrics>,
     pub(super) acknowledged: BTreeMap<u32, Vec<u8>>,
@@ -413,7 +411,6 @@ impl JournalCluster {
                 .collect(),
             engines: BTreeMap::new(),
             rejoins: BTreeMap::new(),
-            drivers: BTreeMap::new(),
             metrics: (1..=3)
                 .map(|node_id| (node_id, RuntimeMetrics::new(1, JOURNAL_GROUPS.len())))
                 .collect(),
@@ -446,7 +443,6 @@ impl JournalCluster {
 
     pub(super) async fn start_node(&mut self, node_id: u64) {
         let voters = recovery_wiring::configured_voters(1..=3);
-        let mut drivers = Vec::new();
         for group in JOURNAL_GROUPS {
             let placement = group_placement(group);
             let store = self.wals[&node_id]
@@ -472,7 +468,7 @@ impl JournalCluster {
             )
             .await
             .expect("start a journal-backed replica");
-            drivers.extend(recovery_wiring::wire_recovery(
+            recovery_wiring::wire_recovery(
                 node_id,
                 placement,
                 &engine,
@@ -480,46 +476,14 @@ impl JournalCluster {
                 &registry,
                 &self.policy,
                 &voters,
-            ));
+            );
             registry.register(node_id, engine.raft_handle());
-            if node_id == 1 && !rejoin.holds_group_history() {
-                let raft = engine.raft_handle();
-                let rejoin = rejoin.clone();
-                let voters = voters.clone();
-                let policy = self.policy.clone();
-                drivers.push(madsim::task::spawn(async move {
-                    ursula_raft::run_group_bootstrap(
-                        node_id,
-                        raft,
-                        rejoin,
-                        voters,
-                        move |peer_id, _address| {
-                            let registry = registry.clone();
-                            let policy = policy.clone();
-                            async move {
-                                recovery_wiring::in_process_probe(
-                                    &registry, &policy, node_id, peer_id,
-                                )
-                                .await
-                            }
-                        },
-                        Duration::from_millis(50),
-                        Duration::from_secs(5),
-                    )
-                    .await;
-                }));
-            }
             self.engines.insert((group, node_id), engine);
             self.rejoins.insert((group, node_id), rejoin);
         }
-        self.drivers.insert(node_id, drivers);
     }
 
     pub(super) async fn stop_node(&mut self, node_id: u64) {
-        for driver in self.drivers.remove(&node_id).unwrap_or_default() {
-            driver.abort();
-            let _ = driver.await;
-        }
         for group in JOURNAL_GROUPS {
             self.registries[&group].unregister(node_id);
             let engine = self

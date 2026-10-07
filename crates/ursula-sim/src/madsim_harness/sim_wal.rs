@@ -23,11 +23,11 @@ use ursula_config::WalFsync;
 use ursula_raft::DurableRaftLogStoreFactory;
 use ursula_raft::JournalTuning;
 use ursula_raft::RaftGroupFileLogStore;
-use ursula_raft::SimDisk;
-#[cfg(test)]
-use ursula_raft::SimPowerLoss;
 #[cfg(test)]
 use ursula_raft::WalOpening;
+use ursula_raft::wal::diagnostics::SimDisk;
+#[cfg(test)]
+use ursula_raft::wal::diagnostics::SimPowerLoss;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::RuntimeMetrics;

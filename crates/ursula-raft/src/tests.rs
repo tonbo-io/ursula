@@ -164,7 +164,7 @@ fn sim_journal_store(name: &str) -> Arc<RaftGroupFileLogStore> {
 
 /// The frames of core 0's journal under the WAL `root`, all segments.
 fn core_journal_frames(root: &Path) -> usize {
-    crate::journal_segments(&root.join("core-0"))
+    crate::log_store::journal_segments(&root.join("core-0"))
         .expect("list the journal segments")
         .iter()
         .map(|(_, path)| wire_frame_count::<CoreJournalRecord>(path))
@@ -2477,7 +2477,8 @@ async fn durable_raft_group_engine_recovers_from_core_journal() {
             .expect("shut down the Raft WAL cleanly");
     }
 
-    let segments = crate::journal_segments(&root.join("core-0")).expect("journal segments");
+    let segments =
+        crate::log_store::journal_segments(&root.join("core-0")).expect("journal segments");
     assert!(!segments.is_empty(), "core journal should exist");
     assert!(
         segments
@@ -2619,4 +2620,82 @@ pub(crate) fn remove_test_path(path: impl AsRef<std::path::Path>) {
     {
         panic!("remove test path {}: {err}", path.display());
     }
+}
+
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn registry_handoff_rejects_reverted_follower_and_transfers_to_healthy_voter() {
+    use openraft::rt::WatchReceiver;
+    let (_network, engines, leader, _roots) =
+        build_three_node_cluster("handoff-policy", None).await;
+    let engine = engines
+        .iter()
+        .find(|engine| engine.raft.metrics().borrow_watched().id == leader)
+        .unwrap();
+    let raft = engine.raft_handle();
+    let target = (1..=3).find(|id| *id != leader).unwrap();
+    let healthy = (1..=3).find(|id| *id != leader && *id != target).unwrap();
+    raft.wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| {
+                metrics
+                    .replication
+                    .as_ref()
+                    .and_then(|progress| progress.get(&target))
+                    .is_some_and(Option::is_some)
+            },
+            "follower acknowledged a log entry",
+        )
+        .await
+        .unwrap();
+    let registry = RaftGroupHandleRegistry::default();
+    let (_root, store) = fresh_journal_store();
+    let gate = Arc::new(GroupRejoin::durable(
+        leader,
+        placement().raft_group_id,
+        &store,
+    ));
+    gate.bind(&raft);
+    registry.register_rejoin(placement().raft_group_id, gate.clone());
+    registry.register(placement(), raft.clone());
+    let metrics = raft.metrics().borrow_watched().clone();
+    let matched = metrics.replication.as_ref().unwrap()[&target];
+    assert!(gate.follower_lost_log(
+        target,
+        &metrics.vote,
+        matched.as_ref(),
+        None,
+        &UrsulaAppendEntriesResponse::Conflict
+    ));
+    assert!(
+        matches!(registry.transfer_leader(placement().raft_group_id, target).await,
+        Err(LeadershipTransferError::RecoveringTarget { target: rejected, .. }) if rejected == target)
+    );
+    assert!(matches!(
+        registry
+            .transfer_leader(placement().raft_group_id, leader)
+            .await,
+        Err(LeadershipTransferError::InvalidTarget { .. })
+    ));
+    assert!(matches!(
+        registry
+            .transfer_leader(placement().raft_group_id, 99)
+            .await,
+        Err(LeadershipTransferError::InvalidTarget { .. })
+    ));
+    // Rejection leaves the leader able to commit, and a healthy handoff still works.
+    raft.client_write(create_command(ursula_shard::BucketStreamId::new(
+        "default", "handoff",
+    )))
+    .await
+    .unwrap();
+    registry
+        .transfer_leader(placement().raft_group_id, healthy)
+        .await
+        .unwrap();
+    raft.wait(Some(Duration::from_secs(5)))
+        .current_leader(healthy, "healthy voter becomes leader")
+        .await
+        .unwrap();
+    shutdown_all(&engines).await;
 }

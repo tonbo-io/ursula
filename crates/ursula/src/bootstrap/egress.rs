@@ -108,6 +108,7 @@ pub(crate) struct ClusterEgressShedAction {
 pub(crate) fn plan_cluster_egress_shed(
     snaps: &[RaftGroupMetricsSnapshot],
     node_id: u64,
+    eligible: impl Fn(RaftGroupId, u64) -> bool,
 ) -> Vec<ClusterEgressShedAction> {
     let mut planned_load = leader_counts(snaps);
     let mut groups_we_lead: Vec<&RaftGroupMetricsSnapshot> = snaps
@@ -122,7 +123,7 @@ pub(crate) fn plan_cluster_egress_shed(
             .voter_ids
             .iter()
             .copied()
-            .filter(|voter| *voter != node_id)
+            .filter(|voter| *voter != node_id && eligible(RaftGroupId(snap.raft_group_id), *voter))
             .collect();
         targets.sort_by_key(|target| (planned_load.get(target).copied().unwrap_or(0), *target));
         let Some(target) = targets.into_iter().next() else {
@@ -226,12 +227,14 @@ pub fn spawn_egress_gate(
             if !yielded && consecutive_bad >= unhealthy_ticks {
                 yielded = true;
                 registry.mark_leadership_shed(LeadershipShedReason::ClusterEgress);
-                let handoffs = plan_cluster_egress_shed(&snaps, node_id);
+                let handoffs = plan_cluster_egress_shed(&snaps, node_id, |group, target| {
+                    !registry.is_reverted_follower(group, target)
+                });
                 for handoff in handoffs {
-                    let Some(raft) = registry.get(RaftGroupId(handoff.group_id)) else {
-                        continue;
-                    };
-                    if let Err(err) = raft.trigger().transfer_leader(handoff.target).await {
+                    if let Err(err) = registry
+                        .transfer_leader(RaftGroupId(handoff.group_id), handoff.target)
+                        .await
+                    {
                         tracing::error!(
                             "cluster-egress: transfer_leader group {} -> {} failed while yielding: {err}",
                             handoff.group_id,

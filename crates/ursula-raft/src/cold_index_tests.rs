@@ -38,7 +38,7 @@ use ursula_stream::ColdChunkRef;
 use ursula_stream::ExternalPayloadRef;
 use ursula_stream::StreamCommand;
 
-use crate::engine::DurableRaftLogStoreFactory;
+use crate::DurableRaftLogStoreFactory;
 use crate::engine::RaftGroupEngine;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::types::UrsulaRaftTypeConfig;

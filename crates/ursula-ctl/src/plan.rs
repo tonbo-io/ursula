@@ -353,7 +353,7 @@ mod tests {
         assert!(plan_drain(&snapshot, 1).is_empty());
         let peer = &mut snapshot.per_node[1].groups[0];
         peer.last_applied_index = Some(100);
-        peer.maintenance = Some(ursula_raft::RaftGroupMaintenanceState {
+        peer.maintenance = Some(ursula_proto::admin::RaftGroupMaintenanceState {
             running: true,
             recovery_ready: false,
             accepting_transfers: true,
@@ -405,7 +405,7 @@ mod tests {
                 })
                 .collect(),
         };
-        snapshot.per_node[0].raft_maintenance = Some(ursula_raft::RaftMaintenanceReport {
+        snapshot.per_node[0].raft_maintenance = Some(ursula_proto::admin::RaftMaintenanceReport {
             version: 1,
             node_id: 1,
             lag_tolerance: 16,
@@ -415,7 +415,7 @@ mod tests {
             ]),
             node_issues: vec![],
             group_issues: BTreeMap::from([(8, vec![
-                ursula_raft::RaftMaintenanceIssue::MissingGroup,
+                ursula_proto::admin::RaftMaintenanceIssue::MissingGroup,
             ])]),
         });
         let report = check_readiness(&snapshot, 1, 16);

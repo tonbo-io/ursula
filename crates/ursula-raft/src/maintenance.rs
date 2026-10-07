@@ -7,49 +7,10 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-use serde::Deserialize;
-use serde::Serialize;
+pub use ursula_proto::admin::RaftMaintenanceIssue;
+pub use ursula_proto::admin::RaftMaintenanceReport;
 
 use crate::types::RaftGroupMetricsSnapshot;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RaftMaintenanceIssue {
-    EmptyExpectedInventory,
-    MissingGroup,
-    UnexpectedGroup,
-    DuplicateGroup,
-    WrongNodeIdentity,
-    RaftStopped,
-    RecoveryBarrier,
-    StoppedForOperator,
-    JointMembership,
-    IncompleteVoterSet,
-    MembershipNotApplied,
-    LeaderUnknown,
-    LeaderOutsideVoters,
-    NotApplied,
-    ApplyLag,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RaftMaintenanceReport {
-    pub version: u32,
-    pub node_id: u64,
-    pub lag_tolerance: u64,
-    pub expected_groups: BTreeMap<u32, BTreeSet<u64>>,
-    pub node_issues: Vec<RaftMaintenanceIssue>,
-    pub group_issues: BTreeMap<u32, Vec<RaftMaintenanceIssue>>,
-}
-
-impl RaftMaintenanceReport {
-    pub fn ready(&self) -> bool {
-        self.version == 1
-            && !self.expected_groups.is_empty()
-            && self.node_issues.is_empty()
-            && self.group_issues.is_empty()
-    }
-}
 
 /// Require every expected local replica to be running, recovered, a member of
 /// the complete uniform voter set, and applied through its membership entry.

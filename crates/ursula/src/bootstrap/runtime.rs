@@ -213,6 +213,7 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
                 topology.raft_group_count(),
                 config.raft.snapshot_backstop_logs,
             ),
+            spawned.raft_wal.as_ref().map(|wal| wal.lagging_groups()),
             config.raft.snapshot_pressure_max_groups_per_tick,
         );
         leadership::spawn_leadership_balancer(

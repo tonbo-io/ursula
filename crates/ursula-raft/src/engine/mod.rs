@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use factory::DurableRaftGroupEngineFactory;
-pub use factory::DurableRaftLogStoreFactory;
 pub use factory::RaftEngineConfig;
 pub use factory::StaticGrpcRaftGroupEngineFactory;
 use openraft::BasicNode;
@@ -118,7 +117,19 @@ use crate::state_machine::SnapshotBuildCoordinator;
 use crate::state_machine::SnapshotInstallCoordinator;
 use crate::types::UrsulaRaftTypeConfig;
 
+/// Optional capabilities of a group engine, independent of its transport and log store.
+#[derive(Default)]
+pub struct RaftGroupEngineOptions {
+    pub metrics: Option<GroupEngineMetrics>,
+    pub cold_store: Option<ColdStoreHandle>,
+    pub snapshot_store: Option<SharedSnapshotStore>,
+    pub snapshot_build: Option<SnapshotBuildCoordinator>,
+    pub snapshot_install: Option<SnapshotInstallCoordinator>,
+    pub snapshot_metadata_path: Option<PathBuf>,
+}
+
 pub struct RaftGroupEngine {
+    pub(crate) recovery_tasks: crate::rejoin::RecoveryGate,
     pub(crate) raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
     pub(crate) placement: ShardPlacement,
     pub(crate) cold_store: Option<ColdStoreHandle>,
@@ -142,6 +153,7 @@ pub(crate) fn should_forward_stale_follower_read_error(
 impl RaftGroupEngine {
     /// A single-node group over `log_store`, with the timeouts of a
     /// single-node runtime.
+    #[cfg(any(test, madsim))]
     pub async fn new_single_node_on_log_store<LS>(
         placement: ShardPlacement,
         log_store: LS,
@@ -173,6 +185,7 @@ impl RaftGroupEngine {
         .await
     }
 
+    #[cfg(any(test, madsim))]
     pub async fn new_single_node_with_log_store<LS>(
         placement: ShardPlacement,
         node_id: u64,
@@ -189,6 +202,7 @@ impl RaftGroupEngine {
         .await
     }
 
+    #[cfg(any(test, madsim))]
     pub(crate) async fn new_single_node_with_log_store_and_metrics<LS>(
         placement: ShardPlacement,
         node_id: u64,
@@ -201,37 +215,39 @@ impl RaftGroupEngine {
     where
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
-        Self::new_single_node_with_log_store_metrics_and_snapshot_metadata(
-            placement, node_id, node, config, log_store, metrics, cold_store, None,
+        Self::new_single_node(
+            placement,
+            node_id,
+            node,
+            config,
+            log_store,
+            RaftGroupEngineOptions {
+                metrics,
+                cold_store,
+                ..Default::default()
+            },
         )
         .await
     }
 
-    pub(crate) async fn new_single_node_with_log_store_metrics_and_snapshot_metadata<LS>(
+    pub async fn new_single_node<LS>(
         placement: ShardPlacement,
         node_id: u64,
         node: BasicNode,
         config: Arc<Config>,
         log_store: LS,
-        metrics: Option<GroupEngineMetrics>,
-        cold_store: Option<ColdStoreHandle>,
-        snapshot_metadata_path: Option<PathBuf>,
+        options: RaftGroupEngineOptions,
     ) -> Result<Self, GroupEngineError>
     where
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
-        let engine = Self::new_node_full(
+        let engine = Self::new_node(
             placement,
             node_id,
             config,
             SingleNodeRaftNetworkFactory,
             log_store,
-            metrics,
-            cold_store,
-            None,
-            None,
-            None,
-            snapshot_metadata_path,
+            options,
         )
         .await?;
 
@@ -255,6 +271,7 @@ impl RaftGroupEngine {
         Ok(engine)
     }
 
+    #[cfg(any(test, madsim))]
     pub async fn new_node_with_log_store_and_network<NF, LS>(
         placement: ShardPlacement,
         node_id: u64,
@@ -268,43 +285,41 @@ impl RaftGroupEngine {
         NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
-        Self::new_node_full(
+        Self::new_node(
             placement,
             node_id,
             config,
             network_factory,
             log_store,
-            metrics,
-            cold_store,
-            None,
-            None,
-            None,
-            None,
+            RaftGroupEngineOptions {
+                metrics,
+                cold_store,
+                ..Default::default()
+            },
         )
         .await
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "pre-existing constructor shared by every engine variant; a builder should replace it"
-    )]
-    pub async fn new_node_full<NF, LS>(
+    pub async fn new_node<NF, LS>(
         placement: ShardPlacement,
         node_id: u64,
         config: Arc<Config>,
         network_factory: NF,
         log_store: LS,
-        metrics: Option<GroupEngineMetrics>,
-        cold_store: Option<ColdStoreHandle>,
-        snapshot_store: Option<SharedSnapshotStore>,
-        snapshot_build: Option<SnapshotBuildCoordinator>,
-        snapshot_install: Option<SnapshotInstallCoordinator>,
-        snapshot_metadata_path: Option<PathBuf>,
+        options: RaftGroupEngineOptions,
     ) -> Result<Self, GroupEngineError>
     where
         NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
+        let RaftGroupEngineOptions {
+            metrics,
+            cold_store,
+            snapshot_store,
+            snapshot_build,
+            snapshot_install,
+            snapshot_metadata_path,
+        } = options;
         let snapshot_store = snapshot_store.unwrap_or_else(default_snapshot_store);
         let snapshot_build = snapshot_build.unwrap_or_default();
         let snapshot_install = snapshot_install.unwrap_or_default();
@@ -336,6 +351,7 @@ impl RaftGroupEngine {
         .map_err(|err| GroupEngineError::new(format!("create OpenRaft group: {err}")))?;
 
         Ok(Self {
+            recovery_tasks: crate::rejoin::RecoveryGate::default(),
             read_barrier: Arc::new(ReadIndexBarrier::new(raft.clone())),
             raft,
             placement,
@@ -377,7 +393,21 @@ impl RaftGroupEngine {
         self.raft.clone()
     }
 
+    /// Attach production recovery drivers with an injected transport.
+    pub fn attach_recovery<T: crate::RecoveryTransport>(
+        &self,
+        gate: Arc<crate::GroupRejoin>,
+        registry: &crate::RaftGroupHandleRegistry,
+        nodes: BTreeMap<u64, BasicNode>,
+        transport: T,
+        config: crate::RecoveryConfig,
+    ) {
+        self.recovery_tasks
+            .attach(self, gate, registry, nodes, transport, config);
+    }
+
     pub async fn shutdown(&self) -> Result<(), GroupEngineError> {
+        self.recovery_tasks.shutdown().await;
         self.raft
             .shutdown()
             .await

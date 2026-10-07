@@ -16,7 +16,7 @@ use serde::Serialize;
 use ursula_proto::admin::MaintenanceFence;
 use ursula_proto::admin::MaintenanceFenceState;
 use ursula_proto::admin::ProcessIncarnation;
-use ursula_raft::QuorumPrefix;
+use ursula_proto::admin::QuorumPrefix;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardId;
@@ -314,14 +314,6 @@ async fn verify_observed_quorum(
                 .iter()
                 .find(|node| node.id == leader_id)
                 .context("leader is outside configuration")?;
-            let endpoint = leader
-                .http_url
-                .as_ref()
-                .context("quorum proof needs the actual Raft/client endpoint")?;
-            if endpoint.path() != "/" || endpoint.query().is_some() || endpoint.fragment().is_some()
-            {
-                bail!("Raft/client endpoint must not contain a path, query or fragment");
-            }
             let placement = ShardPlacement {
                 raft_group_id: RaftGroupId(group_id),
                 shard_id: ShardId(group_id),
@@ -332,14 +324,7 @@ async fn verify_observed_quorum(
                 )?),
             };
             probes.push(async move {
-                let proof = ursula_raft::confirm_quorum_prefix(
-                    placement,
-                    leader_id,
-                    endpoint.as_str(),
-                    client.timeout(),
-                )
-                .await
-                .map_err(anyhow::Error::msg)?;
+                let proof = client.confirm_quorum(leader, group_id, placement).await?;
                 Ok::<_, anyhow::Error>((group_id, proof))
             });
         }
@@ -427,7 +412,7 @@ mod tests {
                             last_applied_index: Some(20),
                             voter_ids: vec![1, 2, 3],
                             learner_ids: vec![],
-                            maintenance: Some(ursula_raft::RaftGroupMaintenanceState {
+                            maintenance: Some(ursula_proto::admin::RaftGroupMaintenanceState {
                                 running: true,
                                 recovery_ready: true,
                                 membership_joint: false,
@@ -437,7 +422,7 @@ mod tests {
                             }),
                         })
                         .collect(),
-                    raft_maintenance: Some(ursula_raft::RaftMaintenanceReport {
+                    raft_maintenance: Some(ursula_proto::admin::RaftMaintenanceReport {
                         version: 1,
                         node_id: id,
                         lag_tolerance: 16,

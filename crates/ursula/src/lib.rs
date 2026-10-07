@@ -85,7 +85,6 @@ use ursula_proto::admin::MAINTENANCE_FENCE_HEADER;
 use ursula_proto::admin::MaintenanceFence;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
 use ursula_proto::admin::ProcessIncarnation;
-use ursula_raft::LeadershipShedFlag;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::RAFT_GRPC_APPEND_PATH;
 use ursula_raft::RAFT_GRPC_APPEND_STREAM_PATH;
@@ -280,7 +279,6 @@ pub struct HttpState {
     http_metrics: Arc<HttpMetrics>,
     wall_clock: Arc<dyn WallClock>,
     pub node_memory: NodeMemoryMonitor,
-    leadership_shed: LeadershipShedFlag,
     external_payload_min_bytes: usize,
     wal_disk: WalDiskMonitor,
     /// The node's Raft WAL when it runs Raft: how it opened, and the
@@ -358,7 +356,6 @@ impl HttpState {
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
             node_memory: NodeMemoryMonitor::default(),
-            leadership_shed: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             external_payload_min_bytes: 1024 * 1024,
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
@@ -370,7 +367,6 @@ impl HttpState {
         runtime: ShardRuntime,
         raft_registry: RaftGroupHandleRegistry,
     ) -> Self {
-        let leadership_shed = raft_registry.leadership_shed_flag();
         Self {
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
             admin_fence: admin_fence::AdminMutationFence::default(),
@@ -381,7 +377,6 @@ impl HttpState {
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
             node_memory: NodeMemoryMonitor::default(),
-            leadership_shed,
             external_payload_min_bytes: 1024 * 1024,
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
@@ -410,7 +405,6 @@ impl HttpState {
         peers: impl IntoIterator<Item = (u64, String)>,
         per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
     ) -> Self {
-        let leadership_shed = raft_registry.leadership_shed_flag();
         Self {
             runtime,
             raft_registry: Some(raft_registry),
@@ -425,25 +419,11 @@ impl HttpState {
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
             node_memory: NodeMemoryMonitor::default(),
-            leadership_shed,
             external_payload_min_bytes: 1024 * 1024,
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
         }
-    }
-
-    pub fn leadership_shed_flag(&self) -> LeadershipShedFlag {
-        self.leadership_shed.clone()
-    }
-
-    /// Replace the leadership-shed flag with one shared with the bootstrap
-    /// health gates. They set per-gate bits on shed and clear their own bit on
-    /// heal; the raft registry policy decides separately whether the node may
-    /// campaign, shed current leaders, or accept inbound leadership transfer.
-    pub fn with_leadership_shed_flag(mut self, flag: LeadershipShedFlag) -> Self {
-        self.leadership_shed = flag;
-        self
     }
 
     pub fn with_wall_clock(mut self, wall_clock: impl WallClock) -> Self {
@@ -759,11 +739,8 @@ struct HttpRaftGrpcService {
 impl HttpRaftGrpcService {
     fn new(registry: RaftGroupHandleRegistry, state: HttpState) -> Self {
         let cold_store = state.runtime().cold_store();
-        let leadership_shed = state.leadership_shed_flag();
         Self {
-            raft: RaftGrpcService::new(registry)
-                .with_cold_store(cold_store)
-                .with_leadership_shed_flag(leadership_shed),
+            raft: RaftGrpcService::new(registry).with_cold_store(cold_store),
         }
     }
 }
@@ -982,6 +959,10 @@ fn admin_ops_router(state: HttpState) -> Router {
             post(transfer_raft_leader),
         )
         .route(
+            "/__ursula/raft/{raft_group_id}/quorum",
+            get(confirm_raft_quorum),
+        )
+        .route(
             "/__ursula/raft/{raft_group_id}/self-election",
             post(request_raft_self_election),
         )
@@ -1004,6 +985,31 @@ fn admin_ops_router(state: HttpState) -> Router {
         .with_state(state)
 }
 
+fn reject_admin_incarnation(
+    state: &HttpState,
+    headers: &axum::http::HeaderMap,
+) -> Option<Response> {
+    let Some(identity) = headers.get(PROCESS_INCARNATION_HEADER) else {
+        return Some(
+            (
+                StatusCode::PRECONDITION_REQUIRED,
+                "admin operation requires its observed process incarnation",
+            )
+                .into_response(),
+        );
+    };
+    if identity.to_str().ok() != Some(state.process_incarnation.as_str()) {
+        return Some(
+            (
+                StatusCode::PRECONDITION_FAILED,
+                "admin target process incarnation changed; stop the current maintenance plan",
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
 async fn require_admin_incarnation(
     State(state): State<HttpState>,
     request: Request<Body>,
@@ -1013,19 +1019,8 @@ async fn require_admin_incarnation(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
     ) {
-        let Some(identity) = request.headers().get(PROCESS_INCARNATION_HEADER) else {
-            return (
-                StatusCode::PRECONDITION_REQUIRED,
-                "admin mutation requires its observed process incarnation",
-            )
-                .into_response();
-        };
-        if identity.to_str().ok() != Some(state.process_incarnation.as_str()) {
-            return (
-                StatusCode::PRECONDITION_FAILED,
-                "admin target process incarnation changed; stop the current maintenance plan",
-            )
-                .into_response();
+        if let Some(response) = reject_admin_incarnation(&state, request.headers()) {
+            return response;
         }
         // Lifecycle handlers take the write guard themselves. They remain
         // process-bound and validate the supplied immutable executor token.
@@ -1373,23 +1368,14 @@ async fn readiness(State(state): State<HttpState>) -> Response {
 }
 
 async fn leadership_shed_status(State(state): State<HttpState>) -> Response {
-    let recovery_ready = state
-        .raft_registry()
-        .is_none_or(RaftGroupHandleRegistry::recovery_barriers_ready);
-    let shed_state = state
-        .raft_registry()
-        .map(RaftGroupHandleRegistry::leadership_shed_state)
-        .unwrap_or_default();
-    let body = serde_json::json!({
-        "bits": shed_state.bits(),
-        "state": shed_state.to_string(),
-        "should_accept_transfer": shed_state.should_accept_transfer() && recovery_ready,
-        "should_campaign": shed_state.should_campaign() && recovery_ready,
-        "recovery_barriers_ready": recovery_ready,
-        "should_shed_current_leaders": shed_state.should_shed_current_leaders(),
-    })
-    .to_string();
-    json_response(StatusCode::OK, body)
+    axum::Json(
+        state
+            .raft_registry()
+            .cloned()
+            .unwrap_or_default()
+            .participation_status(),
+    )
+    .into_response()
 }
 
 async fn mark_maintenance_drain(State(state): State<HttpState>) -> Response {
@@ -1822,8 +1808,12 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         );
         object.insert(
             "recovery_gates".to_owned(),
-            serde_json::to_value(state.raft_registry().map(RecoveryGatesReport::new))
-                .unwrap_or(serde_json::Value::Null),
+            serde_json::to_value(
+                state
+                    .raft_registry()
+                    .map(RaftGroupHandleRegistry::recovery_report),
+            )
+            .unwrap_or(serde_json::Value::Null),
         );
         let wal_disk = state.wal_disk.snapshot();
         object.insert(
@@ -1866,32 +1856,6 @@ impl WalRecoveryReport {
             fsync: raft_wal.fsync(),
             opening: raft_wal.opening(),
         }
-    }
-}
-
-/// The groups whose recovery gate on this node is closed, in the metrics JSON
-/// as `recovery_gates`. A gated replica stays out of elections until it has
-/// applied a fresh leader barrier; a `stalled` one sees no leader and waits
-/// for an operator.
-#[derive(Debug, serde::Serialize)]
-struct RecoveryGatesReport {
-    gated: BTreeMap<u32, ursula_raft::RecoveryGateStatus>,
-    stalled: Vec<u32>,
-}
-
-impl RecoveryGatesReport {
-    fn new(registry: &RaftGroupHandleRegistry) -> Self {
-        let gated = registry
-            .recovery_gates()
-            .into_iter()
-            .filter(|(_, status)| *status != ursula_raft::RecoveryGateStatus::Open)
-            .collect::<BTreeMap<_, _>>();
-        let stalled = gated
-            .iter()
-            .filter(|(_, status)| **status == ursula_raft::RecoveryGateStatus::Stalled)
-            .map(|(group, _)| *group)
-            .collect();
-        Self { gated, stalled }
     }
 }
 
@@ -2151,14 +2115,14 @@ pub(crate) const HEADER_BACKUP_COMMIT_INDEX: &str = "x-ursula-backup-commit-inde
 
 /// Cluster shape a backup client needs before iterating groups.
 pub(crate) async fn backup_info(State(state): State<HttpState>) -> Response {
-    json_response(
+    (
         StatusCode::OK,
-        serde_json::json!({
-            "format_version": BACKUP_FORMAT_VERSION,
-            "raft_group_count": state.runtime.raft_group_count(),
-        })
-        .to_string(),
+        axum::Json(ursula_proto::admin::BackupInfo {
+            format_version: BACKUP_FORMAT_VERSION,
+            raft_group_count: state.runtime.raft_group_count(),
+        }),
     )
+        .into_response()
 }
 
 /// Exports one group's complete stream state as a MessagePack document.
@@ -2345,31 +2309,22 @@ pub(crate) async fn trigger_raft_snapshot(
     }
 
     let metrics = raft.metrics().borrow_watched().clone();
-    json_response(
+    (
         StatusCode::OK,
-        serde_json::json!({
-            "raft_group_id": raft_group_id.0,
-            "snapshot_index": metrics.snapshot.map(|log_id| log_id.index),
-        })
-        .to_string(),
+        axum::Json(ursula_proto::admin::SnapshotResponse {
+            raft_group_id: raft_group_id.0,
+            snapshot_index: metrics.snapshot.map(|log_id| log_id.index),
+        }),
     )
+        .into_response()
 }
 
 pub(crate) async fn trigger_raft_purge(
     State(state): State<HttpState>,
     Path(raft_group_id): Path<u64>,
-    RawQuery(raw_query): RawQuery,
+    axum::extract::Query(query): axum::extract::Query<ursula_proto::admin::PurgeQuery>,
 ) -> Response {
-    let query = match parse_query(raw_query.as_deref()) {
-        Ok(query) => query,
-        Err(response) => return *response,
-    };
-    let Some(upto) = query
-        .get("upto")
-        .and_then(|value| value.parse::<u64>().ok())
-    else {
-        return (StatusCode::BAD_REQUEST, "upto query parameter is required").into_response();
-    };
+    let upto = query.upto;
     let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
         Ok(resolved) => resolved,
         Err(response) => return *response,
@@ -2396,41 +2351,26 @@ pub(crate) async fn trigger_raft_purge(
             .into_response();
     }
     let metrics = raft.metrics().borrow_watched().clone();
-    json_response(
+    (
         StatusCode::OK,
-        serde_json::json!({
-            "raft_group_id": raft_group_id.0,
-            "purged_index": metrics.purged.map(|log_id| log_id.index),
-        })
-        .to_string(),
+        axum::Json(ursula_proto::admin::PurgeResponse {
+            raft_group_id: raft_group_id.0,
+            purged_index: metrics.purged.map(|log_id| log_id.index),
+        }),
     )
+        .into_response()
 }
 
 pub(crate) async fn add_raft_learner(
     State(state): State<HttpState>,
     Path((raft_group_id, node_id)): Path<(u64, u64)>,
-    RawQuery(raw_query): RawQuery,
+    axum::extract::Query(query): axum::extract::Query<ursula_proto::admin::AddLearnerQuery>,
 ) -> Response {
-    let query = match parse_query(raw_query.as_deref()) {
-        Ok(query) => query,
-        Err(response) => return *response,
-    };
-    let Some(address) = query.get("addr").filter(|value| !value.trim().is_empty()) else {
+    if query.addr.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "addr query parameter is required").into_response();
-    };
-    let blocking = match query.get("blocking") {
-        Some(raw) => match raw.parse::<bool>() {
-            Ok(blocking) => blocking,
-            Err(error) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid blocking query parameter '{raw}': {error}"),
-                )
-                    .into_response();
-            }
-        },
-        None => true,
-    };
+    }
+    let address = query.addr;
+    let blocking = query.blocking.unwrap_or(true);
     let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
         Ok(resolved) => resolved,
         Err(response) => return *response,
@@ -2439,15 +2379,15 @@ pub(crate) async fn add_raft_learner(
         .add_learner(node_id, BasicNode::new(address.clone()), blocking)
         .await
     {
-        Ok(response) => json_response(
+        Ok(response) => (
             StatusCode::OK,
-            serde_json::json!({
-                "raft_group_id": raft_group_id.0,
-                "node_id": node_id,
-                "log_index": response.log_id.index(),
-            })
-            .to_string(),
-        ),
+            axum::Json(ursula_proto::admin::AddLearnerResponse {
+                raft_group_id: raft_group_id.0,
+                node_id,
+                log_index: response.log_id.index(),
+            }),
+        )
+            .into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("add raft learner: {err}"),
@@ -2459,20 +2399,9 @@ pub(crate) async fn add_raft_learner(
 pub(crate) async fn change_raft_membership(
     State(state): State<HttpState>,
     Path(raft_group_id): Path<u64>,
-    RawQuery(raw_query): RawQuery,
+    axum::extract::Query(query): axum::extract::Query<ursula_proto::admin::MembershipQuery>,
 ) -> Response {
-    let query = match parse_query(raw_query.as_deref()) {
-        Ok(query) => query,
-        Err(response) => return *response,
-    };
-    let Some(raw_voters) = query.get("voters").filter(|value| !value.trim().is_empty()) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "voters query parameter is required",
-        )
-            .into_response();
-    };
-    let voters = match parse_voter_ids(raw_voters) {
+    let voters = match parse_voter_ids(&query.voters) {
         Ok(voters) => voters,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
@@ -2482,29 +2411,33 @@ pub(crate) async fn change_raft_membership(
     };
     let metrics = raft.metrics().borrow_watched().clone();
     if metrics.current_leader != Some(metrics.id) {
-        return json_response(
+        return (
             StatusCode::CONFLICT,
-            serde_json::json!({
-                "raft_group_id": raft_group_id.0,
-                "current_leader": metrics.current_leader,
-                "changed": false,
-                "reason": "not leader",
-            })
-            .to_string(),
-        );
+            axum::Json(ursula_proto::admin::MembershipResponse {
+                raft_group_id: raft_group_id.0,
+                current_leader: metrics.current_leader,
+                changed: false,
+                reason: Some("not leader".to_owned()),
+                voter_ids: BTreeSet::new(),
+                log_index: None,
+            }),
+        )
+            .into_response();
     }
 
     match raft.change_membership(voters.clone(), false).await {
-        Ok(response) => json_response(
+        Ok(response) => (
             StatusCode::OK,
-            serde_json::json!({
-                "raft_group_id": raft_group_id.0,
-                "voter_ids": voters,
-                "log_index": response.log_id.index(),
-                "changed": true,
-            })
-            .to_string(),
-        ),
+            axum::Json(ursula_proto::admin::MembershipResponse {
+                raft_group_id: raft_group_id.0,
+                voter_ids: voters,
+                log_index: Some(response.log_id.index()),
+                changed: true,
+                current_leader: None,
+                reason: None,
+            }),
+        )
+            .into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("change raft membership: {err}"),
@@ -2535,66 +2468,86 @@ pub(crate) async fn transfer_raft_leader(
     State(state): State<HttpState>,
     Path((raft_group_id, node_id)): Path<(u64, u64)>,
 ) -> Response {
-    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
+    use ursula_proto::admin::TransferLeaderResponse;
+    use ursula_raft::LeadershipTransferError;
+
+    let (group, raft) = match resolve_raft_group(&state, raft_group_id) {
         Ok(resolved) => resolved,
         Err(response) => return *response,
     };
-    let metrics_before = raft.metrics().borrow_watched().clone();
-    let current_leader = metrics_before.current_leader;
-    let self_id = metrics_before.id;
-    if current_leader != Some(self_id) {
-        return json_response(
-            StatusCode::CONFLICT,
-            serde_json::json!({
-                "raft_group_id": raft_group_id.0,
-                "current_leader": current_leader,
-                "transferred": false,
-                "reason": "not leader",
-            })
-            .to_string(),
-        );
-    }
-    if node_id == self_id {
-        return (
-            StatusCode::BAD_REQUEST,
-            "target node_id is the current leader",
-        )
-            .into_response();
-    }
-    if !metrics_before
-        .membership_config
-        .voter_ids()
-        .any(|voter| voter == node_id)
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            "target node_id is not a voter in this raft group",
-        )
-            .into_response();
-    }
-    if let Err(err) = raft.trigger().transfer_leader(node_id).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("trigger raft transfer leader: {err}"),
-        )
-            .into_response();
-    }
-    json_response(
-        StatusCode::OK,
-        serde_json::json!({
-            "raft_group_id": raft_group_id.0,
-            "from": self_id,
-            "to": node_id,
-            "transferred": true,
+    let Some(registry) = state.raft_registry() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let metrics = raft.metrics().borrow_watched().clone();
+    match registry.transfer_leader(group, node_id).await {
+        Ok(()) => axum::Json(TransferLeaderResponse {
+            raft_group_id,
+            from: Some(metrics.id),
+            to: Some(node_id),
+            current_leader: None,
+            transferred: true,
+            reason: None,
         })
-        .to_string(),
-    )
+        .into_response(),
+        Err(error) => {
+            let status = match &error {
+                LeadershipTransferError::NotRegistered { .. } => StatusCode::NOT_FOUND,
+                LeadershipTransferError::NotLeader { .. }
+                | LeadershipTransferError::RecoveringTarget { .. } => StatusCode::CONFLICT,
+                LeadershipTransferError::InvalidTarget { .. } => StatusCode::BAD_REQUEST,
+                LeadershipTransferError::Raft { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (
+                status,
+                axum::Json(TransferLeaderResponse {
+                    raft_group_id,
+                    from: Some(metrics.id),
+                    to: Some(node_id),
+                    current_leader: metrics.current_leader,
+                    transferred: false,
+                    reason: Some(error.to_string()),
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
-#[derive(serde::Deserialize)]
-struct SelfElectionRequest {
-    current_term: u64,
+async fn confirm_raft_quorum(
+    State(state): State<HttpState>,
+    Path(group): Path<u64>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Some(response) = reject_admin_incarnation(&state, &headers) {
+        return response;
+    }
+    let (group, _) = match resolve_raft_group(&state, group) {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
+    };
+    let Some(registry) = state.raft_registry() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match http_time::timeout(
+        Duration::from_secs(10),
+        registry.confirm_quorum_prefix(group),
+    )
+    .await
+    {
+        Ok(Ok(proof)) => axum::Json(proof).into_response(),
+        Ok(Err(error)) => {
+            let status = match &error {
+                ursula_raft::QuorumProofError::NotRegistered { .. } => StatusCode::NOT_FOUND,
+                ursula_raft::QuorumProofError::Read { .. } => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::CONFLICT,
+            };
+            (status, error.to_string()).into_response()
+        }
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, "quorum confirmation timed out").into_response(),
+    }
 }
+
+use ursula_proto::admin::SelfElectionRequest;
 
 async fn request_raft_self_election(
     State(state): State<HttpState>,

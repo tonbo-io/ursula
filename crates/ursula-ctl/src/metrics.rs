@@ -16,6 +16,7 @@ use ursula_proto::admin::MAINTENANCE_FENCE_HEADER;
 use ursula_proto::admin::MaintenanceFenceState;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
 use ursula_proto::admin::ProcessIncarnation;
+pub use ursula_proto::admin::TransferLeaderResponse;
 
 use crate::provider::NodeInfo;
 
@@ -365,7 +366,7 @@ impl MetricsClient {
             let response = self
                 .admin_request(voter, Method::POST, url.clone())
                 .await?
-                .json(&serde_json::json!({"current_term": current_term}))
+                .json(&ursula_proto::admin::SelfElectionRequest { current_term })
                 .send()
                 .await?;
             if !response.status().is_success() {
@@ -394,7 +395,7 @@ impl MetricsClient {
         }
         let raft_group_id = u32::try_from(raft_group_id)
             .with_context(|| format!("raft group id exceeds u32: {raft_group_id}"))?;
-        ursula_raft::request_self_election_via_transfer(
+        crate::legacy_raft::request_self_election_via_transfer(
             endpoint.as_str(),
             raft_group_id,
             voter.id,
@@ -403,6 +404,51 @@ impl MetricsClient {
         )
         .await
         .map_err(anyhow::Error::msg)
+    }
+
+    pub async fn confirm_quorum(
+        &self,
+        leader: &NodeInfo,
+        group: u32,
+        placement: ursula_shard::ShardPlacement,
+    ) -> Result<ursula_proto::admin::QuorumPrefix> {
+        // Re-observe before choosing the legacy bridge; absence is never cached across a replacement.
+        if self.fetch_node(leader).await?.process_incarnation.is_none() {
+            let endpoint = leader
+                .http_url
+                .as_ref()
+                .context("legacy quorum proof needs the Raft endpoint")?;
+            return crate::legacy_raft::confirm_quorum_prefix(
+                placement,
+                leader.id,
+                endpoint.as_str(),
+                self.timeout(),
+            )
+            .await
+            .map_err(anyhow::Error::msg);
+        }
+        let url = leader
+            .admin_url
+            .join(&format!("/__ursula/raft/{group}/quorum"))?;
+        let response = self
+            .admin_request(leader, Method::GET, url)
+            .await?
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!(
+                "quorum proof at node {} returned {}: {}",
+                leader.id,
+                status,
+                response.text().await?
+            );
+        }
+        let proof: ursula_proto::admin::QuorumPrefix = response.json().await?;
+        if proof.raft_group_id != group || proof.leader_id != leader.id {
+            bail!("quorum proof identity differs from the requested group and leader");
+        }
+        Ok(proof)
     }
 
     pub async fn set_maintenance_drain(&self, node: &NodeInfo, enabled: bool) -> Result<()> {
@@ -462,7 +508,8 @@ impl MetricsClient {
         // URL-decoding values. Keep the comma literal while 0.4.8 remains a
         // supported rolling-upgrade source; ordinary query-pair encoding turns
         // it into `%2C` and makes the old server reject every membership change.
-        url.set_query(Some(&format!("voters={voter_list}")));
+        let query = ursula_proto::admin::MembershipQuery { voters: voter_list };
+        url.set_query(Some(&format!("voters={}", query.voters)));
         let resp = self
             .admin_request(leader, Method::POST, url.clone())
             .await?
@@ -472,6 +519,8 @@ impl MetricsClient {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if status.is_success() {
+            let _: ursula_proto::admin::MembershipResponse =
+                serde_json::from_str(&body).context("decode admin response")?;
             Ok(())
         } else {
             Err(anyhow!(
@@ -513,7 +562,15 @@ impl MetricsClient {
                 target.id
             );
         }
-        url.set_query(Some(&format!("addr={address}&blocking=false")));
+        let query = ursula_proto::admin::AddLearnerQuery {
+            addr: address.to_string(),
+            blocking: Some(false),
+        };
+        url.set_query(Some(&format!(
+            "addr={}&blocking={}",
+            query.addr,
+            query.blocking.unwrap_or(true)
+        )));
         let resp = self
             .admin_request(leader, Method::POST, url.clone())
             .await?
@@ -523,6 +580,8 @@ impl MetricsClient {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if status.is_success() {
+            let _: ursula_proto::admin::AddLearnerResponse =
+                serde_json::from_str(&body).context("decode admin response")?;
             Ok(())
         } else {
             Err(anyhow!(
@@ -545,20 +604,6 @@ fn metrics_base_url(node: &NodeInfo) -> &url::Url {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct TransferLeaderResponse {
-    pub raft_group_id: u64,
-    #[serde(default)]
-    pub from: Option<u64>,
-    #[serde(default)]
-    pub to: Option<u64>,
-    #[serde(default)]
-    pub current_leader: Option<u64>,
-    pub transferred: bool,
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 struct RawMetrics {
     #[serde(default)]
     process_incarnation: Option<ProcessIncarnation>,
@@ -571,7 +616,7 @@ struct RawMetrics {
     #[serde(default)]
     raft_groups: Vec<RawRaftGroup>,
     #[serde(default)]
-    raft_maintenance: Option<ursula_raft::RaftMaintenanceReport>,
+    raft_maintenance: Option<ursula_proto::admin::RaftMaintenanceReport>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -591,14 +636,14 @@ struct RawRaftGroup {
     #[serde(default)]
     learner_ids: Vec<u64>,
     #[serde(default)]
-    maintenance: Option<ursula_raft::RaftGroupMaintenanceState>,
+    maintenance: Option<ursula_proto::admin::RaftGroupMaintenanceState>,
 }
 
 #[derive(Debug, Clone)]
 pub struct NodeMetricsView {
     pub node: NodeInfo,
     pub groups: Vec<RaftGroupView>,
-    pub raft_maintenance: Option<ursula_raft::RaftMaintenanceReport>,
+    pub raft_maintenance: Option<ursula_proto::admin::RaftMaintenanceReport>,
     pub process_incarnation: Option<ProcessIncarnation>,
     pub maintenance_fence: Option<MaintenanceFenceState>,
     pub maintenance_fence_uncertain: bool,
@@ -659,7 +704,7 @@ pub struct RaftGroupView {
     /// their legacy checks until replaced; they cannot certify that a replica
     /// passed its recovery gate. Remove when no retained upgrade source
     /// predates this metrics contract.
-    pub maintenance: Option<ursula_raft::RaftGroupMaintenanceState>,
+    pub maintenance: Option<ursula_proto::admin::RaftGroupMaintenanceState>,
 }
 
 impl RaftGroupView {
@@ -969,6 +1014,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn current_quorum_proof_uses_guarded_admin_without_a_raft_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/__ursula/metrics", axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"process_node_id":1,"process_incarnation":"00000000000000000000000000000001"}))
+            }))
+            .route("/__ursula/raft/0/quorum", axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                assert_eq!(headers[PROCESS_INCARNATION_HEADER], "00000000000000000000000000000001");
+                axum::Json(ursula_proto::admin::QuorumPrefix { raft_group_id: 0, leader_id: 1, leader_term: 3, required_applied_index: 17 })
+            }));
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let node = NodeInfo {
+            id: 1,
+            host: address.to_string(),
+            admin_url: format!("http://{address}").parse().unwrap(),
+            http_url: None,
+            metrics_url: None,
+            expected_process_incarnation: None,
+            expected_maintenance_fence: None,
+        };
+        let placement = ursula_shard::ShardPlacement {
+            core_id: ursula_shard::CoreId(0),
+            shard_id: ursula_shard::ShardId(0),
+            raft_group_id: ursula_shard::RaftGroupId(0),
+        };
+        let proof = MetricsClient::new(Duration::from_secs(1))
+            .unwrap()
+            .confirm_quorum(&node, 0, placement)
+            .await
+            .unwrap();
+        assert_eq!(proof.required_applied_index, 17);
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn tunneled_metrics_do_not_replace_the_advertised_learner_address() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -987,7 +1068,11 @@ mod tests {
                 "/__ursula/raft/0/learners/1",
                 post(move |axum::extract::RawQuery(value)| async move {
                     *received.lock().unwrap() = value;
-                    StatusCode::OK
+                    axum::Json(ursula_proto::admin::AddLearnerResponse {
+                        raft_group_id: 0,
+                        node_id: 1,
+                        log_index: 7,
+                    })
                 }),
             );
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

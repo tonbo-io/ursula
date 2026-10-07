@@ -3,7 +3,8 @@
 //! Module map:
 //!
 //! - [`durable`]: generated stream and storage protobuf messages.
-//! - [`admin`]: administrative HTTP identity preconditions.
+//! - [`admin`]: shared administrative HTTP requests, responses and identity preconditions.
+//! - [`telemetry`]: storage measurement values shared by runtime and Raft.
 
 pub mod admin;
 
@@ -12,3 +13,6 @@ pub mod durable {
 }
 
 pub use durable::*;
+
+/// Shared storage telemetry values.
+pub mod telemetry;

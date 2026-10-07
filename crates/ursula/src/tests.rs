@@ -1895,8 +1895,14 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
         let runtime = spawned.runtime;
         let registry = spawned.raft_registry.expect("registry");
         let opening = spawned.raft_wal.expect("restarted WAL").opening();
-        assert_eq!(opening.previous_run, ursula_raft::PreviousRun::Clean);
-        assert_eq!(opening.replay_mode, ursula_raft::JournalReplayMode::Strict);
+        assert_eq!(
+            opening.previous_run,
+            ursula_raft::wal::diagnostics::PreviousRun::Clean
+        );
+        assert_eq!(
+            opening.replay_mode,
+            ursula_raft::wal::diagnostics::JournalReplayMode::Strict
+        );
         assert_eq!(opening.recovery, ursula_raft::RecoveryState::Normal);
         assert_eq!(
             registry.wal_opening(),
@@ -5107,9 +5113,16 @@ async fn accept_unsynced_loss_opens_a_gated_replica_and_is_incarnation_bound() {
     )
     .expect("open the log store");
     let gate = Arc::new(ursula_raft::GroupRejoin::durable(1, RaftGroupId(0), &store));
-    let engine = ursula_raft::RaftGroupEngine::new_single_node_on_log_store(placement, store, None)
-        .await
-        .expect("single-node group");
+    let engine = ursula_raft::RaftGroupEngine::new_single_node(
+        placement,
+        1,
+        openraft::BasicNode::new("local"),
+        Arc::new(openraft::Config::default().validate().unwrap()),
+        store,
+        ursula_raft::RaftGroupEngineOptions::default(),
+    )
+    .await
+    .expect("single-node group");
     gate.bind(&engine.raft_handle());
     let registry = RaftGroupHandleRegistry::default();
     registry.register_rejoin(RaftGroupId(0), gate.clone());
@@ -6000,6 +6013,19 @@ mod cluster_egress {
     }
 
     #[test]
+    fn egress_shed_skips_recovering_voters_before_assigning_handoffs() {
+        let snaps = vec![
+            snap_with_leader(0, 3, Some(3), vec![1, 2, 3]),
+            snap_with_leader(1, 3, Some(3), vec![1, 3]),
+        ];
+        let actions = plan_cluster_egress_shed(&snaps, 3, |_, target| target != 1);
+        assert_eq!(actions, vec![ClusterEgressShedAction {
+            group_id: 0,
+            target: 2
+        }]);
+    }
+
+    #[test]
     fn egress_shed_spreads_handoffs_across_peer_voters() {
         let snaps = vec![
             snap_with_leader(0, 3, Some(3), vec![1, 2, 3]),
@@ -6010,7 +6036,7 @@ mod cluster_egress {
             snap_with_leader(5, 3, Some(2), vec![1, 2, 3]),
         ];
 
-        let actions = plan_cluster_egress_shed(&snaps, 3);
+        let actions = plan_cluster_egress_shed(&snaps, 3, |_, _| true);
 
         assert_eq!(actions, vec![
             ClusterEgressShedAction {
@@ -8080,7 +8106,7 @@ pub(crate) fn remove_test_path(path: impl AsRef<std::path::Path>) {
 /// The bytes the segments of the core journal in `core_dir` hold beyond
 /// their headers.
 fn core_journal_record_bytes(core_dir: &std::path::Path) -> u64 {
-    ursula_raft::journal_segments(core_dir)
+    ursula_raft::wal::diagnostics::journal_segments(core_dir)
         .expect("list the core journal segments")
         .iter()
         .map(|(_, path)| {
@@ -8120,4 +8146,72 @@ async fn runtime_refuses_persisted_wal_topology_changes() {
             crate::SpawnRuntimeError::RaftWal(ursula_raft::RaftWalError::TopologyMismatch { .. })
         ));
     }
+}
+
+#[tokio::test]
+async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrier() {
+    let root = tempfile::tempdir().unwrap();
+    let spawned = spawn_runtime(
+        &test_config(1, 1),
+        Persistence::Raft {
+            log_dir: root.path().into(),
+        },
+        Topology::static_cluster(
+            1,
+            vec![(1, "http://127.0.0.1:4477".to_owned())],
+            1,
+            true,
+            Default::default(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let runtime = spawned.runtime;
+    let registry = spawned.raft_registry.unwrap();
+    runtime.warm_all_groups().await.unwrap();
+    let raft = registry.get(RaftGroupId(0)).unwrap();
+    raft.wait(Some(Duration::from_secs(5)))
+        .current_leader(1, "single voter elected")
+        .await
+        .unwrap();
+    let state = HttpState::with_raft_registry(runtime.clone(), registry);
+    let identity = state.process_incarnation.clone();
+    let admin = admin_router(state);
+    let path = "/__ursula/raft/0/quorum";
+    let unbound = admin
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unbound.status(), StatusCode::PRECONDITION_REQUIRED);
+    let response = send(
+        &admin,
+        "GET",
+        path,
+        &[(PROCESS_INCARNATION_HEADER, identity.as_str())],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let proof: ursula_proto::admin::QuorumPrefix =
+        serde_json::from_slice(&body_bytes(response).await).unwrap();
+    assert_eq!(proof.raft_group_id, 0);
+    assert_eq!(proof.leader_id, 1);
+    assert!(proof.leader_term > 0);
+    assert!(
+        raft.metrics()
+            .borrow_watched()
+            .last_applied
+            .unwrap()
+            .index()
+            >= proof.required_applied_index
+    );
+    runtime.shutdown_group_engines().await.unwrap();
+    spawned.raft_wal.unwrap().shutdown().await.unwrap();
 }

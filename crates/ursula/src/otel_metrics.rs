@@ -26,9 +26,9 @@ pub(crate) fn register_wal_recovery(recovery: ursula_raft::RecoveryState) {
     let (recovering, reason) = match recovery {
         ursula_raft::RecoveryState::Normal => (0, "none"),
         ursula_raft::RecoveryState::Recovering { reason } => (1, match reason {
-            ursula_raft::RecoveryReason::HostCrash => "host_crash",
-            ursula_raft::RecoveryReason::Poisoned => "poisoned",
-            ursula_raft::RecoveryReason::UnknownHistory => "unknown_history",
+            ursula_raft::wal::diagnostics::RecoveryReason::HostCrash => "host_crash",
+            ursula_raft::wal::diagnostics::RecoveryReason::Poisoned => "poisoned",
+            ursula_raft::wal::diagnostics::RecoveryReason::UnknownHistory => "unknown_history",
         }),
     };
     let _ = global::meter("ursula-raft")

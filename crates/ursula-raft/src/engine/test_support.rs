@@ -9,7 +9,7 @@ use ursula_runtime::RuntimeConfig;
 use ursula_runtime::ShardRuntime;
 
 use super::DurableRaftGroupEngineFactory;
-use super::DurableRaftLogStoreFactory;
+use crate::DurableRaftLogStoreFactory;
 
 /// A runtime of single-node Raft groups whose journals live in a temporary
 /// directory that is removed with it.

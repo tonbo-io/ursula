@@ -27,7 +27,6 @@ use openraft::error::Unreachable;
 use openraft::network::RPCOption;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
-use openraft::rt::WatchReceiver;
 use openraft::vote::RaftLeaderId;
 use prost::Message;
 use serde::de::DeserializeOwned;
@@ -113,8 +112,6 @@ static GRPC_SNAPSHOT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static GRPC_SNAPSHOT_REQUEST_BYTES: AtomicU64 = AtomicU64::new(0);
 static GRPC_SNAPSHOT_PAYLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 static GRPC_SNAPSHOT_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(0);
-use crate::registry::LeadershipShedFlag;
-use crate::registry::LeadershipShedState;
 use crate::registry::RaftGroupHandleRegistry;
 
 const APPEND_STREAM_BACKLOG_FULL: &str = "raft append stream backlog full";
@@ -122,16 +119,7 @@ pub(crate) const REJOIN_BARRIER_CAPABILITY: &str = "ursula-rejoin-barrier";
 
 pub(crate) type RaftClient = raft_internal_proto::raft_internal_client::RaftInternalClient<Channel>;
 
-/// One fresh, outbound ReadIndex confirmation bound to its committed leader.
-/// The legacy bridge returns the leader's last log as a conservative apply
-/// bound; callers must wait for every required replica to apply that prefix.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct QuorumPrefix {
-    pub raft_group_id: u32,
-    pub leader_id: u64,
-    pub leader_term: u64,
-    pub required_applied_index: u64,
-}
+pub use ursula_proto::admin::QuorumPrefix;
 
 /// Confirm a group's current quorum without issuing an application write.
 /// This is a point-in-time observation, not a maintenance reservation or a
@@ -607,26 +595,18 @@ impl From<GrpcRpcError> for tonic::Status {
 pub struct RaftGrpcService {
     registry: RaftGroupHandleRegistry,
     cold_store: Option<ColdStoreHandle>,
-    leadership_shed: LeadershipShedFlag,
 }
 
 impl RaftGrpcService {
     pub fn new(registry: RaftGroupHandleRegistry) -> Self {
-        let leadership_shed = registry.leadership_shed_flag();
         Self {
             registry,
             cold_store: None,
-            leadership_shed,
         }
     }
 
     pub fn with_cold_store(mut self, cold_store: Option<ColdStoreHandle>) -> Self {
         self.cold_store = cold_store;
-        self
-    }
-
-    pub fn with_leadership_shed_flag(mut self, leadership_shed: LeadershipShedFlag) -> Self {
-        self.leadership_shed = leadership_shed;
         self
     }
 }
@@ -908,35 +888,22 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             request.protocol_version,
             request.raft_group_id,
         )?;
-        let raft = self
+        let (vote, index) = self
             .registry
-            .get(group)
-            .ok_or_else(|| tonic::Status::not_found("raft group is not registered"))?;
-        if !raft.is_leader() {
-            return Err(tonic::Status::failed_precondition(
-                "recovery barrier requires the current leader",
-            ));
-        }
-        let barrier = self
-            .registry
-            .read_barrier(group)
-            .ok_or_else(|| tonic::Status::not_found("read barrier is not registered"))?;
-        let index = barrier
-            .round()
+            .confirm_recovery_barrier(group)
             .await
-            .map_err(|err| tonic::Status::unavailable(err.to_string()))?
-            .ok_or_else(|| {
-                tonic::Status::failed_precondition("recovery barrier lost leadership")
+            .map_err(|error| match error {
+                crate::QuorumProofError::NotRegistered { .. } => {
+                    tonic::Status::not_found(error.to_string())
+                }
+                crate::QuorumProofError::Read { .. } => {
+                    tonic::Status::unavailable(error.to_string())
+                }
+                _ => tonic::Status::failed_precondition(error.to_string()),
             })?;
-        let metrics = raft.metrics().borrow_watched().clone();
-        if metrics.current_leader != Some(metrics.id) || !metrics.vote.is_committed() {
-            return Err(tonic::Status::failed_precondition(
-                "recovery barrier lost leadership",
-            ));
-        }
         Ok(tonic::Response::new(
             raft_internal_proto::RejoinBarrierResponseV1 {
-                vote: encode_wire(&metrics.vote),
+                vote: encode_wire(&vote),
                 index,
             },
         ))
@@ -952,20 +919,12 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             request.protocol_version,
             request.raft_group_id,
         )?;
-        let shed_state = LeadershipShedState::load(&self.leadership_shed);
-        if let Some(reason) = shed_state.transfer_rejection_reason() {
-            return Err(GrpcRpcError::failed_precondition(format!(
-                "node {reason} shed leadership; refusing TransferLeader for group {}",
-                raft_group_id.0
-            ))
-            .into());
-        }
         let openraft_request: TransferLeaderRequest<UrsulaRaftTypeConfig> =
             decode_rpc_payload(&request.request, "transfer leader request")?;
         self.registry
             .handle_transfer_leader(raft_group_id, openraft_request)
             .await
-            .map_err(|err| tonic::Status::internal(err.to_string()))?;
+            .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
         Ok(tonic::Response::new(
             raft_internal_proto::RaftTransferLeaderAckV1 {},
         ))
@@ -1000,6 +959,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 .read_barrier(placement.raft_group_id)
                 .ok_or_else(|| tonic::Status::not_found("raft group is not registered"))?;
             let mut engine = RaftGroupEngine {
+                recovery_tasks: crate::rejoin::RecoveryGate::default(),
                 raft,
                 placement,
                 read_barrier,

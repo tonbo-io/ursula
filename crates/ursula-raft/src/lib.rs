@@ -12,10 +12,14 @@
 //! - [`log_store`]: the Raft log store, the only Raft WAL. It writes the
 //!   shared per-core journal through an I/O seam whose `cfg(madsim)`
 //!   implementation is the simulated disk (`SimDisk`), keeps votes and each
-//!   group's log state ([`GroupLogState`]) in per-core metadata files, and
+//!   group's log state ([`wal::diagnostics::GroupLogState`]) in per-core metadata files, and
 //!   records each run of the node in a run-state file that decides how the
 //!   journals reopen ([`WalOpening`]).
-//! - [`registry`]: [`RaftGroupHandleRegistry`] and the single-node test network.
+//! - [`wal`]: node WAL facade and separately named format diagnostics.
+//! - [`election`]: shared campaign and leadership transfer policy.
+//! - [`recovery_transport`]: native transport adapter for recovery probes.
+//! - [`registry`]: [`RaftGroupHandleRegistry`] and the single-node network.
+//! - `in_process`: fault-injection network, compiled only for tests and madsim.
 //! - [`maintenance`]: configuration-backed local Raft maintenance eligibility.
 //! - [`state_machine`]: per-group [`RaftGroupStateMachine`] and snapshot builder.
 //! - [`meta`]: meta-group OpenRaft type config and control-plane state machine.
@@ -43,14 +47,18 @@ pub mod raft_internal_proto {
 }
 
 mod codec;
+mod election;
 mod engine;
 mod format_epoch;
 mod forward;
 mod grpc;
+#[cfg(any(test, madsim))]
+mod in_process;
 mod log_store;
 mod maintenance;
 mod meta;
 mod read_index;
+mod recovery_transport;
 mod registry;
 mod rejoin;
 mod rt;
@@ -62,11 +70,13 @@ mod snapshot_references;
 mod state_machine;
 mod telemetry;
 mod types;
+pub mod wal;
 
+pub use election::ElectionPolicy;
 pub use engine::DurableRaftGroupEngineFactory;
-pub use engine::DurableRaftLogStoreFactory;
 pub use engine::RaftEngineConfig;
 pub use engine::RaftGroupEngine;
+pub use engine::RaftGroupEngineOptions;
 pub use engine::StaticGrpcRaftGroupEngineFactory;
 pub use format_epoch::FormatEpochMismatch;
 pub use format_epoch::PeerFormatEpoch;
@@ -89,53 +99,33 @@ pub use grpc::confirm_quorum_prefix;
 pub use grpc::raft_grpc_metrics_snapshot;
 pub use grpc::raft_grpc_service;
 pub use grpc::request_self_election_via_transfer;
-pub use log_store::BootId;
-pub use log_store::CoreJournalError;
-pub use log_store::FrameDefect;
-pub use log_store::GroupLogState;
-pub use log_store::HeaderDefect;
-#[cfg(madsim)]
-pub use log_store::JournalDisk;
-pub use log_store::JournalError;
-#[cfg(madsim)]
-pub use log_store::JournalFile;
-pub use log_store::JournalHistory;
-pub use log_store::JournalOp;
-pub use log_store::JournalReplayMode;
+#[cfg(any(test, madsim))]
+pub use in_process::InProcessRaftFaultAction;
+#[cfg(any(test, madsim))]
+pub use in_process::InProcessRaftFaultScript;
+#[cfg(any(test, madsim))]
+pub use in_process::InProcessRaftFaultStep;
+#[cfg(any(test, madsim))]
+pub use in_process::InProcessRaftNetwork;
+#[cfg(any(test, madsim))]
+pub use in_process::InProcessRaftNetworkEvent;
+#[cfg(any(test, madsim))]
+pub use in_process::InProcessRaftNetworkFactory;
+#[cfg(any(test, madsim))]
+pub use in_process::InProcessRaftNetworkPolicy;
+#[cfg(any(test, madsim))]
+pub use in_process::InProcessRaftNetworkPolicyEvent;
+#[cfg(any(test, madsim))]
+pub use in_process::InProcessRaftRegistry;
+#[cfg(any(test, madsim))]
+pub use in_process::InProcessRaftRpcKind;
 pub use log_store::JournalTuning;
 pub use log_store::LaggingGroups;
-#[cfg(madsim)]
-pub use log_store::LockAttempt;
-pub use log_store::MarkRecoveringError;
-pub use log_store::PreviousRun;
-pub use log_store::RUN_STATE_FILE;
 pub use log_store::RaftGroupFileLogStore;
+pub use log_store::RaftWal;
 pub use log_store::RaftWalError;
-pub use log_store::RecordTooLarge;
-pub use log_store::RecoveryReason;
 pub use log_store::RecoveryState;
-pub use log_store::RunState;
-pub use log_store::RunStatus;
-#[cfg(madsim)]
-pub use log_store::SIM_DISK_PAGE_SIZE;
-#[cfg(madsim)]
-pub use log_store::SimDisk;
-#[cfg(madsim)]
-pub use log_store::SimDiskError;
-#[cfg(madsim)]
-pub use log_store::SimDiskFault;
-#[cfg(madsim)]
-pub use log_store::SimFile;
-#[cfg(madsim)]
-pub use log_store::SimJournalLock;
-#[cfg(madsim)]
-pub use log_store::SimPowerLoss;
-pub use log_store::StateFileDefect;
-pub use log_store::StateFileError;
-pub use log_store::StateFileKind;
 pub use log_store::WalOpening;
-pub use log_store::journal_segment_path;
-pub use log_store::journal_segments;
 pub use maintenance::RaftMaintenanceIssue;
 pub use maintenance::RaftMaintenanceReport;
 pub use maintenance::check_raft_maintenance;
@@ -146,19 +136,11 @@ pub use meta::MetaRaftHandle;
 pub use meta::MetaRaftSnapshotBuilder;
 pub use meta::MetaRaftStateMachine;
 pub use meta::MetaRaftTypeConfig;
-pub use registry::InProcessRaftFaultAction;
-pub use registry::InProcessRaftFaultScript;
-pub use registry::InProcessRaftFaultStep;
-pub use registry::InProcessRaftNetwork;
-pub use registry::InProcessRaftNetworkEvent;
-pub use registry::InProcessRaftNetworkFactory;
-pub use registry::InProcessRaftNetworkPolicy;
-pub use registry::InProcessRaftNetworkPolicyEvent;
-pub use registry::InProcessRaftRegistry;
-pub use registry::InProcessRaftRpcKind;
 pub use registry::LeadershipShedFlag;
 pub use registry::LeadershipShedReason;
 pub use registry::LeadershipShedState;
+pub use registry::LeadershipTransferError;
+pub use registry::QuorumProofError;
 pub use registry::RaftGroupHandle;
 pub use registry::RaftGroupHandleRegistry;
 pub use registry::SingleNodeRaftNetwork;
@@ -169,8 +151,11 @@ pub use rejoin::GroupBootstrap;
 pub use rejoin::GroupRejoin;
 pub use rejoin::PeerGroupLog;
 pub use rejoin::RECOVERY_STALL_AFTER;
+pub use rejoin::RecoveryConfig;
+pub use rejoin::RecoveryGate;
 pub use rejoin::RecoveryGateError;
 pub use rejoin::RecoveryGateStatus;
+pub use rejoin::RecoveryTransport;
 pub use rejoin::bootstrap_probe_vote;
 pub use rejoin::run_group_bootstrap;
 pub use rejoin::run_rejoin_heal;
@@ -193,6 +178,9 @@ pub use types::UrsulaRaftTypeConfig;
 pub use types::UrsulaVote;
 pub use types::UrsulaVoteRequest;
 pub use types::UrsulaVoteResponse;
+
+/// Compatibility name for the node WAL facade.
+pub type DurableRaftLogStoreFactory = RaftWal;
 
 #[cfg(test)]
 mod tests;

@@ -195,6 +195,15 @@ ursulactl verify-quorum --config cluster.json --expected-groups 256 --core-count
 
 The command requires each configured voter exactly once, every configured group on every voter, complete uniform membership, no learners, and eligible local participation reports. It confirms each group's leader through a new outbound ReadIndex probe, then waits for all replicas to apply the captured prefix under that leader's term. Continuous writes can advance without moving this target. One absolute deadline covers metrics requests, RPCs and waits. The JSON output includes the observation start/end times, each group's leader/term/prefix and every replica's applied index.
 
+Current servers confirm the prefix through the incarnation-bound admin route
+`GET /__ursula/raft/{group}/quorum`. The default CLI build uses shared admin
+protocol types and does not depend on `ursula-raft`.
+
+For migration from servers without this admin protocol, build the explicit
+compatibility adapter with `cargo build -p ursula-ctl --features legacy-raft`.
+The adapter is selected only after a fresh observation finds no process
+incarnation. An admin error on a current server never falls back to gRPC.
+
 The pinned 0.6.2 baseline predates participation reports. `--allow-legacy-eligibility` is an explicit diagnostic option for measuring that baseline and returns `verification.participation_certified=false`. It does not certify the repaired process participation guarantee. The probe uses the existing Vote and linearizable HEAD RPCs for old leaders; it never sends an unknown barrier RPC to their HTTP/gRPC mux.
 
 A successful observation is not a maintenance reservation, a continuously refreshed health claim or physical fencing permission. Independent maintenance workflows still need to serialize disruptions and bind replacement to the actual Pod/process/host incarnation.
