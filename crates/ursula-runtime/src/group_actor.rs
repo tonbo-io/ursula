@@ -512,6 +512,7 @@ macro_rules! group_operations {
 crate::ops::runtime_operations!(group_operations);
 
 pub(crate) struct GroupActor {
+    pub(crate) deferred: Option<Traced<GroupCommand>>,
     pub(crate) placement: ShardPlacement,
     pub(crate) engine: Box<dyn GroupEngine>,
     pub(crate) rx: mpsc::Receiver<Traced<GroupCommand>>,
@@ -582,6 +583,11 @@ impl GroupActor {
         response_tx: oneshot::Sender<Result<AppendResponse, RuntimeError>>,
         raft_uncommitted: Option<UncommittedBytesGuard>,
     ) -> ControlFlow<()> {
+        if self.engine.supports_append_batch() {
+            return self
+                .handle_append_batch(request, response_tx, raft_uncommitted)
+                .await;
+        }
         let stream_id = request.stream_id.clone();
         let response = CoreWorker::commit_append(
             &mut self.engine,
@@ -618,6 +624,97 @@ impl GroupActor {
         ControlFlow::Continue(())
     }
 
+    async fn handle_append_batch(
+        &mut self,
+        request: AppendRequest,
+        response_tx: oneshot::Sender<Result<AppendResponse, RuntimeError>>,
+        guard: Option<UncommittedBytesGuard>,
+    ) -> ControlFlow<()> {
+        const MAX_BATCH: usize = 32;
+        const MAX_BATCH_BYTES: u64 = 1024 * 1024;
+        // An individually larger request keeps its existing single-write path.
+        let mut batch_bytes = request.payload_len();
+        let mut requests = vec![request];
+        let mut replies = vec![(response_tx, guard)];
+        while requests.len() < MAX_BATCH {
+            let Ok(command) = self.rx.try_recv() else {
+                break;
+            };
+            match command.value {
+                GroupCommand::Append { ref request, .. }
+                    if batch_bytes.saturating_add(request.payload_len()) > MAX_BATCH_BYTES =>
+                {
+                    self.deferred = Some(command);
+                    break;
+                }
+                GroupCommand::Append {
+                    request,
+                    response_tx,
+                    raft_uncommitted,
+                } => {
+                    self.metrics
+                        .record_group_mailbox_dequeued(self.placement.raft_group_id);
+                    batch_bytes = batch_bytes.saturating_add(request.payload_len());
+                    requests.push(request);
+                    replies.push((response_tx, raft_uncommitted));
+                }
+                _ => {
+                    self.deferred = Some(command);
+                    break;
+                }
+            }
+        }
+        let streams = requests
+            .iter()
+            .map(|request| (request.stream_id.clone(), request.payload_len()))
+            .collect::<Vec<_>>();
+        let started = crate::rt::time::Instant::now();
+        let responses = self
+            .engine
+            .append_batch(requests, self.placement, self.cold_write_admission)
+            .await;
+        let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.metrics.record_group_engine_exec(
+            self.placement.core_id,
+            self.placement.raft_group_id,
+            elapsed,
+        );
+        let mut changed_streams = Vec::new();
+        for (((stream, incoming_bytes), (tx, guard)), response) in
+            streams.into_iter().zip(replies).zip(responses)
+        {
+            drop(guard);
+            let response = CoreWorker::record_append_result(
+                &self.metrics,
+                self.placement,
+                incoming_bytes,
+                self.cold_write_admission,
+                elapsed,
+                response,
+            );
+            let changed = response
+                .as_ref()
+                .is_ok_and(|response| !response.deduplicated);
+            reply(tx, response);
+            if changed && !changed_streams.contains(&stream) {
+                changed_streams.push(stream);
+            }
+        }
+        // Acknowledge the whole durable burst before waking readers.
+        for stream in changed_streams {
+            CoreWorker::finish_append(
+                &mut self.engine,
+                self.metrics.clone(),
+                self.read_materialization.clone(),
+                &mut self.read_watchers,
+                stream,
+                self.placement,
+            )
+            .await;
+        }
+        ControlFlow::Continue(())
+    }
+
     async fn handle_shutdown_engine(
         &mut self,
         response_tx: oneshot::Sender<Result<(), RuntimeError>>,
@@ -632,7 +729,10 @@ impl GroupActor {
     }
 
     pub(crate) async fn next_command(&mut self) -> Option<Traced<GroupCommand>> {
-        let command = self.rx.recv().await;
+        let command = match self.deferred.take() {
+            Some(command) => Some(command),
+            None => self.rx.recv().await,
+        };
         if command.is_some() {
             self.metrics
                 .record_group_mailbox_dequeued(self.placement.raft_group_id);

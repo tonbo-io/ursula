@@ -2753,13 +2753,137 @@ async fn recovery_proof_rejects_a_vote_change_after_read_index() {
     };
     let result = crate::registry::confirm_recovery_barrier(
         placement().raft_group_id,
-        &engine.raft,
+        engine.read_barrier.owner(),
         &barrier,
     )
     .await;
     assert!(matches!(
         result,
         Err(crate::QuorumProofError::LeadershipChanged { .. })
+    ));
+}
+
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registry_commands_execute_on_the_owner_and_waiters_do_not_block_rpc() {
+    let wal_root = tempfile::tempdir().unwrap();
+    let registry = RaftGroupHandleRegistry::default();
+    let runtime = ShardRuntime::spawn_with_engine_factory(
+        {
+            let mut config = RuntimeConfig::new(1, 2);
+            config.cpu_affinity = Some(true);
+            config
+        },
+        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 1, 2))
+            .with_registry(registry.clone()),
+    )
+    .unwrap();
+    for group in [RaftGroupId(0), RaftGroupId(1)] {
+        runtime.warm_group(group).await.unwrap();
+        let handle = registry.get(group).unwrap();
+        let name = handle
+            .call(|_| async {
+                #[cfg(target_os = "linux")]
+                {
+                    let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+                    let allowed = status
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+                        .unwrap()
+                        .trim();
+                    assert!(
+                        !allowed.contains(','),
+                        "owner must be pinned to one CPU: {allowed}"
+                    );
+                    assert!(
+                        !allowed.contains('-'),
+                        "owner must be pinned to one CPU: {allowed}"
+                    );
+                }
+                std::thread::current().name().unwrap().to_owned()
+            })
+            .await
+            .unwrap();
+        assert_eq!(name, "ursula-core-0");
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let slow = handle.clone();
+        let waiting = tokio::spawn(async move {
+            slow.call(move |_| async move {
+                entered.send(()).unwrap();
+                wait.await.unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        entry.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle.with_raft_state(|_| ()))
+            .await
+            .unwrap()
+            .unwrap();
+        release.send(()).unwrap();
+        waiting.await.unwrap();
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let (held, released) = tokio::sync::oneshot::channel::<()>();
+        let caller = handle.clone();
+        let task = tokio::spawn(async move {
+            caller
+                .call(move |_| async move {
+                    let _held = held;
+                    entered.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                })
+                .await
+        });
+        entry.await.unwrap();
+        task.abort();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), released).await,
+            Ok(Err(_))
+        ));
+        handle.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn replicated_append_batch_reserves_hot_capacity_across_unapplied_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let placement = placement();
+    let factory = DurableRaftGroupEngineFactory::new(start_wal(dir.path(), 1, 1));
+    let metrics = ursula_runtime::RuntimeMetrics::new(1, 1);
+    let mut engine = factory
+        .create(placement, metrics.group_engine_metrics())
+        .await
+        .unwrap();
+    let stream = bsid("batch-capacity");
+    engine
+        .create_stream(
+            create_req(stream.clone()),
+            placement,
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .unwrap();
+    let requests = (0..3)
+        .map(|_| AppendRequest::from_bytes(stream.clone(), vec![7; 4]))
+        .collect();
+    let results = engine
+        .append_batch(requests, placement, ColdWriteAdmission {
+            max_hot_bytes_per_group: Some(8),
+        })
+        .await;
+    assert_eq!(results.len(), 3);
+    assert!(results[0].as_ref().is_ok_and(|r| r.group_hot_bytes == 4));
+    assert!(results[1].as_ref().is_ok_and(|r| r.group_hot_bytes == 8));
+    assert!(matches!(
+        &results[2],
+        Err(ursula_runtime::GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::ColdBackpressure {
+                limit: 8,
+                after_group_hot_bytes: 12,
+                ..
+            }
+        ))
     ));
     engine.shutdown().await.unwrap();
 }

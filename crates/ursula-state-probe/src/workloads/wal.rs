@@ -26,8 +26,8 @@ use openraft::LogId;
 use openraft::alias::EntryOf;
 use openraft::alias::LogIdOf;
 use openraft::entry::RaftEntry;
-use openraft::storage::IOFlushed;
 use openraft::storage::RaftLogStorage;
+use openraft::storage::RaftLogStorageExt;
 use openraft::vote::RaftLeaderId;
 use openraft::vote::leader_id_adv::CommittedLeaderId;
 use serde_json::json;
@@ -149,7 +149,7 @@ async fn step(group: &mut Group, entry_bytes: usize, retain: u64, keep: u64) -> 
     let index = group.last.saturating_add(1);
     group
         .store
-        .append([entry(index, group.id, entry_bytes)], IOFlushed::noop())
+        .blocking_append([entry(index, group.id, entry_bytes)])
         .await
         .with_context(|| format!("append group {} entry {index}", group.id))?;
     group.last = index;

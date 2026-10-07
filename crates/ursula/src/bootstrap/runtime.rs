@@ -147,6 +147,7 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
     );
     engine_config.snapshot_drive_interval_ms = snapshot_drive_interval_ms as u64;
     let registry = RaftGroupHandleRegistry::default()
+        .with_append_transport_budget_bytes(config.raft.append_transport_budget_bytes)
         .with_snapshot_install_max_concurrency(config.raft.snapshot_install_max_concurrency);
     if start_maintenance_drained {
         registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);

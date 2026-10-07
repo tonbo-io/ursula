@@ -926,8 +926,9 @@ fn bootstrap_with_absent_peers_advances_time_and_recovers_when_they_arrive() {
 #[test]
 fn another_power_loss_during_remove_voter_finishes_the_joint_without_losing_acks() {
     let _guard = sim_test_guard();
-    // Seed 2 drops the unsynced journal tail on both staged power losses.
-    for seed in [2] {
+    // With owner mailbox dispatch, seed 5 drops both tails. Keep the loss and
+    // joint-membership preconditions asserted so scheduling drift cannot skip the scenario.
+    for seed in seeds_from_env("JOINT_LOSS_SEEDS", &[5]) {
         run_with_madsim(seed, async move {
             let mut cluster =
                 JournalCluster::start_with_fsync("joint-second-loss", WalFsync::Never).await;
@@ -988,5 +989,111 @@ fn another_power_loss_during_remove_voter_finishes_the_joint_without_losing_acks
             assert_no_vote_while_gated(&cluster, &context);
             cluster.verify_reads().await;
         });
+    }
+}
+
+/// A process crash loses a leader's enqueued (not yet written) suffix even
+/// though both followers have already persisted and applied it. Restoring the
+/// old committed self-vote must not reuse those log ids for different commands.
+#[test]
+fn leader_process_crash_with_pending_tail_never_reuses_log_ids() {
+    let _guard = sim_test_guard();
+    for fsync in [WalFsync::Always, WalFsync::Never] {
+        for seed in [60, 61, 62] {
+            run_with_madsim(seed, async move {
+                let mut cluster = JournalCluster::start_with_fsync("pending-leader", fsync).await;
+                let group = JOURNAL_GROUPS[0];
+                for initial_group in JOURNAL_GROUPS {
+                    cluster.append(initial_group, 2).await;
+                }
+                let leader = wait_leader(&cluster, group, "initial leader").await;
+                let old_vote = metrics(&cluster, group, leader).vote;
+                for engine in cluster.engines.values() {
+                    engine.raft_handle().runtime_config().tick(false);
+                }
+                let store = cluster.wals[&leader].store(RaftGroupId(group)).unwrap();
+                store.pause_simulated_writer(true);
+                let raft = cluster.engines[&(group, leader)].raft_handle();
+                let writing = raft.clone();
+                let before = metrics(&cluster, group, leader).last_log_index.unwrap();
+                let append = madsim::task::spawn(async move {
+                    writing
+                        .client_write(ursula_runtime::GroupWriteCommand::from(
+                            AppendRequest::from_bytes(
+                                group_stream(group),
+                                b"lost-on-leader;".to_vec(),
+                            ),
+                        ))
+                        .await
+                });
+                for follower in NODES.into_iter().filter(|id| *id != leader) {
+                    cluster.engines[&(group, follower)]
+                        .raft_handle()
+                        .wait(Some(Duration::from_secs(2)))
+                        .metrics(
+                            |m| m.last_applied.is_some_and(|id| id.index() > before),
+                            "follower durably applied pending leader tail",
+                        )
+                        .await
+                        .unwrap();
+                }
+                assert!(
+                    !append.is_finished(),
+                    "leader must not acknowledge before local durability"
+                );
+                // Kill the writer before shutdown can flush the queued batch.
+                store.abort_simulated_writer();
+                let mut failed_store = store.clone();
+                let failure = madsim::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if let Err(error) = failed_store.get_log_state().await {
+                            break error;
+                        }
+                        madsim::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("aborting the writer fails its pending append");
+                assert!(matches!(
+                    failure
+                        .get_ref()
+                        .and_then(|error| error
+                            .downcast_ref::<ursula_raft::wal::diagnostics::CoreJournalError>()),
+                    Some(ursula_raft::wal::diagnostics::CoreJournalError::WriterStopped { .. })
+                ));
+                drop(failed_store);
+                drop(store);
+                drop(raft);
+                append.abort();
+                cluster.stop_node(leader).await;
+                cluster.wals[&leader].process_crash().await;
+                cluster.start_node(leader).await;
+                assert_eq!(
+                    cluster.wals[&leader].opening().previous_run,
+                    PreviousRun::ProcessCrash
+                );
+                let restarted = metrics(&cluster, group, leader);
+                assert!(
+                    !(restarted.state == openraft::ServerState::Leader
+                        && restarted.vote == old_vote)
+                );
+                for engine in cluster.engines.values() {
+                    engine.raft_handle().runtime_config().tick(true);
+                }
+                cluster
+                    .acknowledged
+                    .get_mut(&group)
+                    .unwrap()
+                    .extend_from_slice(b"lost-on-leader;");
+                wait_healed(
+                    &cluster,
+                    "recover pending leader tail",
+                    Duration::from_secs(10),
+                )
+                .await;
+                cluster.append(group, 2).await;
+                cluster.verify_reads().await;
+            });
+        }
     }
 }

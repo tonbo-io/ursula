@@ -35,6 +35,7 @@ ursula-proto = { workspace = true }
 ursula-config = { workspace = true }
 ursula-shard = { workspace = true }
 ursula-stream = { workspace = true }
+arc-swap = { workspace = true }
 
 [build-dependencies]
 protoc-bin-vendored = { workspace = true }
@@ -47,6 +48,7 @@ rand = { workspace = true, features = ["std", "std_rng", "thread_rng"] }
 sim-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
+anyhow = { workspace = true }
 axum = { workspace = true }
 blake3 = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
@@ -56,6 +58,10 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 [[bench]]
 name = "disk_wal"
+harness = false
+
+[[bench]]
+name = "owner_burst"
 harness = false
 
 [lints]

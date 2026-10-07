@@ -443,6 +443,12 @@ pub struct AcceptUnsyncedLossReport {
 /// Failure to open a recovery gate.
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryGateError {
+    #[error("raft group {} owner stopped: {source}", .raft_group_id.0)]
+    OwnerStopped {
+        raft_group_id: RaftGroupId,
+        #[source]
+        source: openraft::error::Fatal<UrsulaRaftTypeConfig>,
+    },
     #[error("raft group {} is not registered on this node", .raft_group_id.0)]
     NotRegistered { raft_group_id: RaftGroupId },
     #[error("raft group {} has stopped: its log store is closed", .raft_group_id.0)]
@@ -522,6 +528,13 @@ impl GroupRejoin {
         raft_group_id: RaftGroupId,
         store: &Arc<RaftGroupFileLogStore>,
     ) -> Result<Self, RecoveryGateError> {
+        store
+            .prevent_crashed_leader_resume(node_id)
+            .await
+            .map_err(|source| RecoveryGateError::StartAsFollower {
+                raft_group_id,
+                source,
+            })?;
         let gate = match store.log_state() {
             GroupLogState::Initialized => VoteGate::Open,
             GroupLogState::Recovering => {
@@ -1390,10 +1403,13 @@ mod tests {
         gate.allow_fresh_bootstrap().await.expect("fresh bootstrap");
         assert!(gate.vote_gate_open());
         store.save_vote(&leader(1, 1)).await.expect("vote");
+        let (flushed, result) =
+            <UrsulaRaftTypeConfig as openraft::type_config::TypeConfigExt>::oneshot();
         store
-            .append([entry(1)], IOFlushed::noop())
+            .append([entry(1)], IOFlushed::signal(flushed))
             .await
-            .expect("append");
+            .expect("submit append");
+        result.await.expect("flush callback").expect("append");
         assert_eq!(store.log_state(), GroupLogState::Initialized);
         assert!(gate.holds_group_history());
         drop((gate, store));

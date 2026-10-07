@@ -8,6 +8,8 @@ use crate::config::WalConfig;
 
 #[derive(Debug, Error)]
 pub enum ValidationError {
+    #[error("raft.append_transport_budget_bytes must be between 1 and 4294967295")]
+    AppendTransportBudget,
     #[error("raft.wal.path is required when raft.peers is set")]
     RaftWalPathRequired,
     #[error("storage.cold.s3.bucket is required when cold backend is 's3'")]
@@ -30,6 +32,11 @@ pub enum ValidationError {
 
 impl UrsulaConfig {
     pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.raft.append_transport_budget_bytes == 0
+            || self.raft.append_transport_budget_bytes > u32::MAX as usize
+        {
+            return Err(ValidationError::AppendTransportBudget);
+        }
         if self.raft.node_id == 0 {
             return Err(ValidationError::Other(
                 "raft.node_id is required (use --node-id CLI flag)".into(),

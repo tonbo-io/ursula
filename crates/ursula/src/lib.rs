@@ -86,6 +86,7 @@ use ursula_proto::admin::MaintenanceFence;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
 use ursula_proto::admin::ProcessIncarnation;
 use ursula_raft::LeadershipShedReason;
+use ursula_raft::OwnerRaftHandle;
 use ursula_raft::RAFT_GRPC_APPEND_PATH;
 use ursula_raft::RAFT_GRPC_APPEND_STREAM_PATH;
 use ursula_raft::RAFT_GRPC_FULL_SNAPSHOT_PATH;
@@ -95,7 +96,6 @@ use ursula_raft::RAFT_GRPC_MAX_MESSAGE_BYTES;
 use ursula_raft::RAFT_GRPC_REJOIN_BARRIER_PATH;
 use ursula_raft::RAFT_GRPC_TRANSFER_LEADER_PATH;
 use ursula_raft::RAFT_GRPC_VOTE_PATH;
-use ursula_raft::RaftGroupHandle;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGrpcService;
 use ursula_raft::raft_internal_proto;
@@ -2704,6 +2704,9 @@ pub(crate) async fn accept_unsynced_loss(
             err @ (ursula_raft::RecoveryGateError::Record { .. }
             | ursula_raft::RecoveryGateError::StartAsFollower { .. }),
         ) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        Err(err @ ursula_raft::RecoveryGateError::OwnerStopped { .. }) => {
+            (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
+        }
     }
 }
 
@@ -2714,7 +2717,7 @@ pub(crate) async fn accept_unsynced_loss(
 fn resolve_raft_group(
     state: &HttpState,
     raft_group_id: u64,
-) -> Result<(RaftGroupId, RaftGroupHandle), Box<Response>> {
+) -> Result<(RaftGroupId, OwnerRaftHandle), Box<Response>> {
     let Some(registry) = state.raft_registry() else {
         return Err(Box::new(
             (

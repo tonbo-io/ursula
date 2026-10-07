@@ -138,6 +138,7 @@ impl Core {
 
     fn options(&self, recovery_epoch: u64, node_recovery: RecoveryState) -> CoreJournalOptions {
         CoreJournalOptions {
+            previous_run: super::run_state::PreviousRun::Absent,
             core: CoreId(0),
             tuning: self.tuning,
             recovery_epoch,
@@ -197,9 +198,18 @@ impl Core {
 }
 
 async fn append(store: &mut Arc<RaftGroupFileLogStore>, entries: impl IntoIterator<Item = Entry>) {
+    use openraft::type_config::TypeConfigExt;
+    let (flushed, result) = UrsulaRaftTypeConfig::oneshot();
     store
-        .append(entries.into_iter().collect::<Vec<_>>(), IOFlushed::noop())
+        .append(
+            entries.into_iter().collect::<Vec<_>>(),
+            IOFlushed::signal(flushed),
+        )
         .await
+        .expect("submit entries");
+    result
+        .await
+        .expect("flush callback")
         .expect("append entries");
 }
 
@@ -963,6 +973,58 @@ async fn a_recovering_leaders_demotion_survives_a_clean_restart() {
     }
 }
 
+/// An initialized group also needs durable demotion after a process crash.
+/// A clean stop before any election must not resurrect the old committed vote.
+#[tokio::test]
+async fn a_crashed_leaders_demotion_survives_an_immediate_clean_restart() {
+    use super::run_state::PreviousRun;
+
+    for fsync in [WalFsync::Always, WalFsync::Never] {
+        for previous in [PreviousRun::ProcessCrash, PreviousRun::Clean] {
+            let core = Core::small(fsync);
+            let writer = core.writer();
+            let mut store = core.store(&writer, 1);
+            append(&mut store, [blank_entry(1)]).await;
+            store.save_vote(&committed_vote()).await.expect("vote");
+            drop(store);
+            writer.close().await.expect("persist the initial state");
+            drop(writer);
+
+            let open = |previous_run| {
+                let mut options = core.options(0, RecoveryState::Normal);
+                options.previous_run = previous_run;
+                CoreFileLogWriter::open(core.dir.clone(), options).expect("open writer")
+            };
+            let writer = open(previous);
+            let mut store = core.store(&writer, 1);
+            assert_eq!(store.log_state(), GroupLogState::Initialized);
+            let gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
+                .await
+                .expect("prepare the group before starting Raft");
+            let expected = if previous == PreviousRun::Clean {
+                committed_vote()
+            } else {
+                openraft::Vote::new(7, 1)
+            };
+            assert_eq!(store.read_vote().await.expect("vote"), Some(expected));
+            drop(gate);
+            drop(store);
+            writer
+                .close()
+                .await
+                .expect("clean stop before any election");
+            drop(writer);
+
+            let writer = open(PreviousRun::Clean);
+            let mut store = core.store(&writer, 1);
+            let _gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
+                .await
+                .expect("clean restart");
+            assert_eq!(store.read_vote().await.expect("vote"), Some(expected));
+        }
+    }
+}
+
 /// A crash between a group's first journal write and the metadata write
 /// leaves entries without the flag; recovery restores it, as recovering
 /// when the node is recovering.
@@ -1030,9 +1092,15 @@ async fn fsync_never_acknowledges_from_the_page_cache_and_close_syncs() {
     );
 
     writer.close().await.expect("close the writer");
-    let err = store
-        .append([blank_entry(3)], IOFlushed::noop())
+    use openraft::type_config::TypeConfigExt;
+    let (flushed, result) = UrsulaRaftTypeConfig::oneshot();
+    store
+        .append([blank_entry(3)], IOFlushed::signal(flushed))
         .await
+        .unwrap();
+    let err = result
+        .await
+        .unwrap()
         .expect_err("a closed writer refuses writes");
     assert!(matches!(
         err.get_ref()
@@ -1155,4 +1223,171 @@ async fn segment_reclaim_converges_at_production_size() {
     drop(writer);
     let writer = core.writer();
     assert_eq!(log_ids(&core.store(&writer, 1)).await, [1, 2, 3, 4]);
+}
+
+/// Hold the real writer between records. Append must publish readable entries
+/// without waiting for this writer, but cannot announce durability early.
+#[tokio::test]
+async fn append_is_readable_before_the_writer_runs_and_flush_orders_truncate() {
+    use openraft::type_config::TypeConfigExt;
+
+    use super::writer::CoreWriteOp;
+
+    let core = Core::new(JournalTuning::new(WalFsync::Always));
+    let writer = core.writer();
+    let mut store = core.store(&writer, 0);
+    let (entered, wait_entered) = tokio::sync::oneshot::channel();
+    let (release, wait_release) = std::sync::mpsc::channel::<()>();
+    // Dropping the sender releases the writer even if an assertion unwinds.
+    writer.submit(
+        CoreWriteOp::Vote {
+            group_id: 0,
+            vote: committed_vote(),
+        },
+        move |result| {
+            result.expect("initial vote");
+            entered.send(()).expect("test is waiting");
+            let _released = wait_release.recv();
+        },
+    );
+    wait_entered.await.expect("writer reached barrier");
+    let (flushed, mut flush_result) = UrsulaRaftTypeConfig::oneshot();
+    store
+        .append([blank_entry(1), blank_entry(2)], IOFlushed::signal(flushed))
+        .await
+        .expect("submit append");
+    assert!(matches!(
+        flush_result.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert_eq!(log_ids(&store).await, [1, 2]);
+    assert_eq!(
+        store
+            .try_get_log_entries(2..3)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.log_id.index)
+            .collect::<Vec<_>>(),
+        [2]
+    );
+    assert_eq!(
+        store.get_key_log_ids(log_id(2)..=log_id(2)).await.unwrap(),
+        [log_id(2)]
+    );
+    assert_eq!(
+        store.get_log_state().await.unwrap().last_log_id,
+        Some(log_id(2))
+    );
+    assert_eq!(
+        store.get_key_log_ids(log_id(1)..=log_id(2)).await.unwrap(),
+        [log_id(2)]
+    );
+    let mut truncating = store.clone();
+    let truncate = tokio::spawn(async move { truncating.truncate_after(Some(log_id(1))).await });
+    tokio::task::yield_now().await;
+    assert!(!truncate.is_finished());
+    drop(release);
+    flush_result
+        .await
+        .expect("callback delivered")
+        .expect("durable append");
+    truncate.await.unwrap().unwrap();
+    assert_eq!(log_ids(&store).await, [1]);
+    writer.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use openraft::BasicNode;
+    use openraft::rt::WatchReceiver;
+
+    use super::writer::CoreWriteOp;
+    use crate::InProcessRaftNetworkFactory;
+    use crate::InProcessRaftRegistry;
+    use crate::RaftGroupEngine;
+
+    let cores = (0..3)
+        .map(|_| Core::new(JournalTuning::new(WalFsync::Always)))
+        .collect::<Vec<_>>();
+    let writers = cores.iter().map(Core::writer).collect::<Vec<_>>();
+    let network = InProcessRaftRegistry::default();
+    let config = Arc::new(
+        openraft::Config {
+            enable_tick: false,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap(),
+    );
+    let mut engines = Vec::new();
+    let mut members = BTreeMap::new();
+    for (index, (core, writer)) in cores.iter().zip(&writers).enumerate() {
+        let id = u64::try_from(index).unwrap().saturating_add(1);
+        members.insert(id, BasicNode::new(format!("node-{id}")));
+        let engine = RaftGroupEngine::new_node_with_log_store_and_network(
+            placement(0),
+            id,
+            config.clone(),
+            InProcessRaftNetworkFactory::new(network.clone()).with_source(id),
+            core.store(writer, 0),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        network.register(id, engine.raft_handle());
+        engines.push(engine);
+    }
+    let leader = engines[0].raft_handle();
+    leader.initialize(members).await.unwrap();
+    leader.trigger().elect().await.unwrap();
+    leader
+        .wait(Some(Duration::from_secs(5)))
+        .current_leader(1, "leader elected")
+        .await
+        .unwrap();
+    leader
+        .client_write(GroupWriteCommand::Stream(StreamCommand::CreateBucket {
+            bucket_id: "before-pause".into(),
+        }))
+        .await
+        .unwrap();
+    let before = leader.metrics().borrow_watched().last_log_index;
+    let vote = leader.metrics().borrow_watched().vote;
+    let (entered, wait_entered) = tokio::sync::oneshot::channel();
+    let (release, wait_release) = std::sync::mpsc::channel::<()>();
+    writers[0].submit(CoreWriteOp::Vote { group_id: 0, vote }, move |result| {
+        result.unwrap();
+        entered.send(()).unwrap();
+        let _released = wait_release.recv();
+    });
+    wait_entered.await.unwrap();
+    let writing = leader.clone();
+    let append = tokio::spawn(async move {
+        writing
+            .client_write(GroupWriteCommand::Stream(StreamCommand::CreateBucket {
+                bucket_id: "during-pause".into(),
+            }))
+            .await
+    });
+    // This times out with the synchronous append implementation: Replicate
+    // cannot run until log_store.append returns.
+    engines[1]
+        .raft_handle()
+        .wait(Some(Duration::from_secs(2)))
+        .metrics(
+            |metrics| metrics.last_applied.map(|id| id.index) > before,
+            "follower durable apply overlaps leader WAL I/O",
+        )
+        .await
+        .unwrap();
+    drop(release);
+    append.await.unwrap().unwrap();
+    for engine in engines {
+        engine.shutdown().await.unwrap();
+    }
 }

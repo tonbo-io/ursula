@@ -264,10 +264,12 @@ OpenRaft restores a node whose persisted vote is a committed vote for itself
 as the leader of that term without an election. A recovering replica that led
 the group may have lost entries it appended while its followers kept them, so
 restored leadership would append new entries under their log ids and fork the
-log. A recovering replica's own committed vote is therefore presented
-uncommitted: it starts as a follower that already voted in that term. Under
-`always` the store hands OpenRaft only entries whose batch was `fsync`ed, so a
-replica that is not recovering keeps every entry it ever replicated.
+log. After every non-clean run, the replica's own committed vote is therefore presented
+uncommitted: it starts as a follower that already voted in that term, regardless
+of the recovery gate. Pending entries are readable and may reach followers before
+the local writer runs, including under `always` and process-crash semantics.
+`IOFlushed` still waits for the configured durability policy; a clean shutdown
+flushes the writer before recording `Clean` and may restore leadership directly.
 
 The barrier driver asks the current leader for a fresh outbound ReadIndex
 barrier (`RejoinBarrier`) and opens the gate once the replica applied the

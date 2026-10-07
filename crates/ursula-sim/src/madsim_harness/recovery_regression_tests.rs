@@ -17,9 +17,8 @@ use std::time::Duration;
 
 use openraft::ServerState;
 use openraft::alias::EntryOf;
-use openraft::storage::IOFlushed;
 use openraft::storage::RaftLogReader;
-use openraft::storage::RaftLogStorage;
+use openraft::storage::RaftLogStorageExt;
 use ursula_config::WalFsync;
 use ursula_proto::admin::AcceptUnsyncedLossRequest;
 use ursula_raft::AcceptUnsyncedLossOutcome;
@@ -410,7 +409,7 @@ fn a_switch_to_always_after_a_process_crash_keeps_every_acknowledged_write_or_ga
             // Entries 1..=4, made durable by a graceful shutdown.
             let mut store = never.open(placement, metrics.clone()).await;
             store
-                .append((1..=4).map(blank_entry), IOFlushed::noop())
+                .blocking_append((1..=4).map(blank_entry))
                 .await
                 .expect("append 1..=4");
             never
@@ -420,10 +419,10 @@ fn a_switch_to_always_after_a_process_crash_keeps_every_acknowledged_write_or_ga
                 .await;
 
             // Entries 5..=10, acknowledged from the page cache; then the
-            // process crashes.
+            // process crashes. Wait for IOFlushed: enqueueing alone is not an acknowledgement.
             let mut store = never.open(placement, metrics.clone()).await;
             store
-                .append((5..=10).map(blank_entry), IOFlushed::noop())
+                .blocking_append((5..=10).map(blank_entry))
                 .await
                 .expect("append 5..=10");
             drop(store);

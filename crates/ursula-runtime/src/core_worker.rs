@@ -381,6 +381,7 @@ impl CoreWorker {
                 .install(placement.raft_group_id, engine.linearizable_read_barrier());
             let (tx, rx) = mpsc::channel(self.group_mailbox_capacity);
             let actor = GroupActor {
+                deferred: None,
                 placement,
                 engine,
                 rx,
@@ -440,6 +441,7 @@ impl CoreWorker {
             .install(placement.raft_group_id, engine.linearizable_read_barrier());
         let (tx, rx) = mpsc::channel(self.group_mailbox_capacity);
         let actor = GroupActor {
+            deferred: None,
             placement,
             engine,
             rx,
@@ -1461,33 +1463,34 @@ impl CoreWorker {
     ) -> Result<AppendResponse, RuntimeError> {
         let incoming_bytes = request.payload_len();
         let started_at = Instant::now();
-        let exec_started_at = Instant::now();
-        let response = group
-            .append(request, placement, admission)
-            .await
-            .map_err(|err| {
-                record_cold_backpressure_error(
-                    &metrics,
-                    placement,
-                    incoming_bytes,
-                    admission,
-                    &err,
-                );
-                RuntimeError::group_engine(placement, err)
-            })?;
-        metrics.record_group_engine_exec(
-            placement.core_id,
-            placement.raft_group_id,
-            elapsed_ns(exec_started_at),
-        );
+        let response = group.append(request, placement, admission).await;
+        let elapsed = elapsed_ns(started_at);
+        metrics.record_group_engine_exec(placement.core_id, placement.raft_group_id, elapsed);
+        Self::record_append_result(
+            &metrics,
+            placement,
+            incoming_bytes,
+            admission,
+            elapsed,
+            response,
+        )
+    }
 
+    pub(crate) fn record_append_result(
+        metrics: &RuntimeMetricsInner,
+        placement: ShardPlacement,
+        incoming_bytes: u64,
+        admission: ColdWriteAdmission,
+        elapsed: u64,
+        response: Result<AppendResponse, GroupEngineError>,
+    ) -> Result<AppendResponse, RuntimeError> {
+        let response = response.map_err(|error| {
+            record_cold_backpressure_error(metrics, placement, incoming_bytes, admission, &error);
+            RuntimeError::group_engine(placement, error)
+        })?;
         if !response.deduplicated {
             metrics.record_append(placement.core_id, placement.raft_group_id);
-            metrics.record_applied_mutation(
-                placement.core_id,
-                placement.raft_group_id,
-                elapsed_ns(started_at),
-            );
+            metrics.record_applied_mutation(placement.core_id, placement.raft_group_id, elapsed);
             metrics.record_cold_hot_backlog(
                 placement.raft_group_id,
                 response.stream_hot_bytes,

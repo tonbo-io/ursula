@@ -44,7 +44,8 @@ CLI `--node-id` intentionally overrides any `raft.node_id` value in the config f
 | ---------- | ------- | ------- |
 | `server.listen` | `127.0.0.1:4437` | Client/API listener |
 | `server.cluster_listen` | none | Optional separate Raft/cluster listener |
-| `runtime.core_count` | `available_parallelism` | Worker threads, each pinned to its mailbox event loop |
+| `runtime.cpu_affinity` | automatic | On Linux, `true` forces pinning and `false` disables it; omitted pins only when cpuset size equals core_count |
+| `runtime.core_count` | `available_parallelism` | Owner worker threads; Linux automatically pins only when the allowed cpuset matches this count. Journal writers and the main Tokio runtime use additional threads |
 | `runtime.live_read_max_waiters_per_core` | `65536` | SSE waiter cap per core. `0` disables the limit |
 | `observability.tokio_console` | `false` | Enables Tokio console when the binary is built with the feature |
 
@@ -55,6 +56,7 @@ Without `server.cluster_listen`, `server.listen` serves both client/API and Raft
 | Config key | Default | Purpose |
 | ---------- | ------- | ------- |
 | `raft.node_id` | none | This node's stable ID, usually overridden per host with `--node-id` |
+| `raft.append_transport_budget_bytes` | `134217728` | Node-wide charged append bytes per direction, shared across cores and peers; excludes tonic/socket buffers |
 | `raft.group_count` | `core_count × 16` | Total Raft groups. Higher values improve stream-to-group hash spread |
 | `raft.wal.path` | none | Directory of the Raft WAL. Required when `raft.peers` is set. Raft logs live under `PATH/raft-log`, and removing the directory wipes state cleanly. Without it, a single node runs its WAL in a temporary directory that is removed on clean shutdown |
 | `raft.wal.fsync` | `never` | When journal appends reach stable storage. `never` acknowledges once the write is in the page cache. `always` acknowledges a batch after `fsync`. Votes, each group's log state and the node's run state are always written with `fsync` |

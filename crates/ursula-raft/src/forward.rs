@@ -241,34 +241,45 @@ pub(crate) async fn write_commands_on_raft(
         return Ok(Vec::new());
     }
     let expected_responses = commands.len();
-    let mut stream = raft
-        .client_write_many(commands)
-        .await
-        .map_err(|err| GroupEngineError::new(format!("OpenRaft client_write_many: {err}")))?;
-    let mut responses = Vec::with_capacity(expected_responses);
-    while let Some(result) = stream.try_next().await.map_err(|err| {
-        GroupEngineError::new(format!("OpenRaft client_write_many response stream: {err}"))
-    })? {
-        let response = match result {
-            Ok(response) => write_result_from_raft_response(response.response)?,
-            Err(err) => Err(group_engine_forward_to_leader_error(
-                format!("OpenRaft client_write_many forwarded to leader: {err}"),
-                err.leader_id,
-                err.leader_node.as_ref(),
-                raft.metrics().borrow_watched().id,
-                false,
-            )),
-        };
-        responses.push(response);
+    let stream = raft.client_write_many(commands).await.map_err(|error| {
+        tracing::warn!(%error, "Raft batch submission stopped");
+        GroupEngineError::Infra(ursula_runtime::GroupInfraError::OutcomeUnknown)
+    })?;
+    let responses = stream.map_ok(|result| match result {
+        Ok(response) => write_result_from_raft_response(response.response).unwrap_or_else(Err),
+        Err(err) => Err(group_engine_forward_to_leader_error(
+            format!("OpenRaft client_write_many forwarded to leader: {err}"),
+            err.leader_id,
+            err.leader_node.as_ref(),
+            raft.metrics().borrow_watched().id,
+            false,
+        )),
+    });
+    Ok(collect_batch_responses(responses, expected_responses).await)
+}
+
+/// Preserve every delivered outcome even when a later responder is lost.
+async fn collect_batch_responses<T, E: std::fmt::Display>(
+    mut stream: impl futures_util::Stream<Item = Result<Result<T, GroupEngineError>, E>> + Unpin,
+    expected: usize,
+) -> Vec<Result<T, GroupEngineError>> {
+    let mut responses = Vec::with_capacity(expected);
+    loop {
+        match stream.try_next().await {
+            Ok(Some(response)) => responses.push(response),
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(%error, received = responses.len(), expected, "Raft batch response stream stopped");
+                break;
+            }
+        }
     }
-    if responses.len() != expected_responses {
-        return Err(GroupEngineError::new(format!(
-            "OpenRaft client_write_many returned {} responses for {} commands",
-            responses.len(),
-            expected_responses
-        )));
-    }
-    Ok(responses)
+    responses.resize_with(expected, || {
+        Err(GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::OutcomeUnknown,
+        ))
+    });
+    responses
 }
 
 /// Unwraps a raft-applied response into the write outcome it carries.
@@ -380,4 +391,35 @@ pub(crate) fn group_engine_forward_to_leader_error(
         leader_id,
         leader_node.map(|node| node.addr.clone()),
     )
+}
+#[cfg(test)]
+mod batch_response_tests {
+    use ursula_runtime::GroupEngineError;
+
+    use super::collect_batch_responses;
+    #[tokio::test]
+    async fn fatal_after_applied_prefix_preserves_known_outcomes() {
+        for error in [true, false] {
+            let mut replies = vec![
+                Ok(Ok(7)),
+                Ok(Err(GroupEngineError::stream(
+                    ursula_stream::StreamErrorCode::StreamNotFound,
+                    "absent",
+                ))),
+            ];
+            if error {
+                replies.push(Err("raft stopped"));
+            }
+            let result =
+                collect_batch_responses(futures_util::stream::iter(replies.clone()), 4).await;
+            assert_eq!(result[0], Ok(7));
+            assert_eq!(result[1], replies[1].clone().unwrap());
+            assert!(result[2..].iter().all(|item| matches!(
+                item,
+                Err(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::OutcomeUnknown
+                ))
+            )));
+        }
+    }
 }

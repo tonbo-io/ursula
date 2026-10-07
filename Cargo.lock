@@ -118,6 +118,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4518,6 +4527,8 @@ dependencies = [
 name = "ursula-raft"
 version = "0.6.2"
 dependencies = [
+ "anyhow",
+ "arc-swap",
  "axum 0.8.9",
  "bitflags",
  "blake3",
@@ -4562,6 +4573,7 @@ version = "0.6.2"
 dependencies = [
  "blake3",
  "bytes",
+ "core_affinity",
  "criterion",
  "crossbeam-utils",
  "futures-util",

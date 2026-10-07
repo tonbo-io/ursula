@@ -33,6 +33,9 @@ zstd = { workspace = true }
 [target.'cfg(madsim)'.dependencies]
 sim-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+core_affinity = { workspace = true }
+
 [dev-dependencies]
 criterion = { workspace = true, features = ["async_tokio"] }
 tempfile = { workspace = true }

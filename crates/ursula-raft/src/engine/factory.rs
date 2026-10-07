@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use openraft::BasicNode;
@@ -172,6 +173,7 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
 
 #[derive(Debug, Clone)]
 pub struct StaticGrpcRaftGroupEngineFactory {
+    transports: Arc<Mutex<BTreeMap<u16, Arc<crate::grpc::CoreRaftTransport>>>>,
     node_id: u64,
     peers: BTreeMap<u64, String>,
     per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
@@ -196,6 +198,7 @@ impl StaticGrpcRaftGroupEngineFactory {
     ) -> Self {
         registry.set_wal_opening(log_stores.opening());
         Self {
+            transports: Arc::default(),
             node_id,
             peers: peers.into_iter().collect(),
             per_group_voters: BTreeMap::new(),
@@ -394,7 +397,18 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 Arc::new(raft_config.validate().map_err(|err| {
                     GroupEngineError::new(format!("invalid OpenRaft config: {err}"))
                 })?);
-            let network = GrpcRaftNetworkFactory::new(placement.raft_group_id)
+            let transport = self
+                .transports
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(placement.core_id.0)
+                .or_insert_with(|| {
+                    Arc::new(crate::grpc::CoreRaftTransport::with_budget(
+                        self.registry.append_send_budget.clone(),
+                    ))
+                })
+                .clone();
+            let network = GrpcRaftNetworkFactory::new(transport.clone(), placement.raft_group_id)
                 .with_reconnect_threshold(self.engine_config.grpc_reconnect_after_failures)
                 .with_rejoin(Some(rejoin.clone()));
             let engine = RaftGroupEngine::new_node(
@@ -419,6 +433,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 &self.registry,
                 nodes,
                 crate::recovery_transport::GrpcRecoveryTransport {
+                    transport,
                     placement,
                     node_id: self.node_id,
                     timeout: self.engine_config.bootstrap_peer_connect,
